@@ -1,0 +1,38 @@
+# Announce a release in the Discord's #releases channel, as the server's bot
+# (tools/announce_release.py: the release notes, cleaned up, and the
+# downloads).
+#
+# Two ways in:
+# - "Run workflow" on the Actions page, with a tag (empty: the latest
+#   release). The release job publishes with GitHub's own token and generated
+#   notes, and a release made that way starts no workflow, so this is how a
+#   tagged release is announced once its notes are written.
+# - A release published by a person (or by an API call with a personal
+#   token), for instance a draft published once its notes are final.
+#
+# Needs the DISCORD_BOT_TOKEN secret. The channel id is not a secret.
+name: announce release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to announce (empty for the latest release)
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  discord:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: post to Discord
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: '1557561169768742986'
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: python3 tools/announce_release.py "$TAG"
