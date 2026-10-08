@@ -10,6 +10,12 @@
 # Push a tag v* to publish them as a GitHub release; "Run workflow" on the
 # Actions page builds the same files as artifacts of the run, no release.
 #
+# Every pull request builds them too, to test the branch before it is merged:
+# the packages are artifacts of the run (kept 14 days; the PR gets a comment
+# linking them), never signed (plugins load unsigned unless
+# plugins.signed_only is set) and never published. A newer push to the PR
+# cancels the run still going.
+#
 # The updater (src/host/updater.h) installs the bare executables the publish
 # job adds - bbhost-<version>-windows.exe and bbhost-<version>-linux - and only
 # when SHA256SUMS carries the release key's signature (SHA256SUMS.sig, made
@@ -23,9 +29,14 @@ name: release
 on:
   push:
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: write
+  pull-requests: write
 jobs:
   linux:
     runs-on: ubuntu-24.04
@@ -42,10 +53,11 @@ jobs:
         run: CI_PORTABLE=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/ci_build.sh
       - name: package
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: tools/package_linux.sh build-ci/build/bbhost build/linux
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: linux
           path: |
             build/linux/*.tar.gz
@@ -72,10 +84,11 @@ jobs:
           key: win-deps-${{ hashFiles('tools/win_deps.sh') }}
       - name: build and package
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: CI_PACMAN=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/ci_windows.sh
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: windows
           path: |
             build/win/*.zip
@@ -126,7 +139,7 @@ jobs:
         run: tools/check_release_bundle.sh dist/release
       - name: sign
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: |
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
             if [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then echo "RELEASE_SIGNING_KEY is not set: a release is never published unsigned"; exit 1; fi
@@ -139,8 +152,22 @@ jobs:
           echo "signed: $(wc -c < dist/release/SHA256SUMS.sig) bytes"
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: release
           path: dist/release
+      - name: link the test build on the pull request
+        if: github.event_name == 'pull_request'
+        continue-on-error: true   # a fork's PR has a read-only token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball and Steam Deck kit, unsigned, kept 14 days.
+          Download the \`release\` artifact (all three) or \`windows\` / \`linux\` from the bottom of the run page:
+          $RUN#artifacts"
+          gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
