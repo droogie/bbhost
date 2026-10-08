@@ -135,6 +135,11 @@ jobs:
           done
           (cd dist/release && sha256sum * > SHA256SUMS)
           ls -la dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
+          name: steamdeck
+          path: dist/steamdeck/*.tar.gz
       - name: the bundles go to the live server
         run: tools/check_release_bundle.sh dist/release
       - name: sign
@@ -165,7 +170,7 @@ jobs:
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball and Steam Deck kit, unsigned, kept 14 days.
-          Download the \`release\` artifact (all three) or \`windows\` / \`linux\` from the bottom of the run page:
+          Download \`windows\`, \`linux\` or \`steamdeck\` (each with its package), or \`release\` (everything), from the bottom of the run page:
           $RUN#artifacts"
           gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release
