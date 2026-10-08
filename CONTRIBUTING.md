@@ -32,6 +32,25 @@
   (`render: the woods' trees are instanced draws`), then the cause and how it
   was checked.
 
+## Releasing
+
+A release is an annotated tag on `master` whose message holds the release
+notes:
+
+1. Write the notes for players in a Markdown file: what changed for them
+   first, then the details. No title line; the release is named
+   `bbhost v0.2.17`.
+2. `tools/tag_release.sh v0.2.17 notes.md [commit]` tags the commit (default
+   `HEAD`) with the notes, then `git push <remote> v0.2.17`. The script keeps
+   the notes verbatim: a plain `git tag -F` would drop every line starting with
+   `#`, Markdown headings included.
+
+The `release` workflow builds and signs the packages, publishes the GitHub
+release with those notes, and the bot posts them to the Discord's #releases
+channel. A tag without notes still releases, with GitHub's generated notes,
+but is not announced; write the notes on the release and run *announce
+release* from the Actions page.
+
 ## Where code goes
 
 - **System library calls** (HLE) go in the matching `src/hle/*.cpp`; a new

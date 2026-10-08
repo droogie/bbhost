@@ -9,6 +9,12 @@
 #
 # Push a tag v* to publish them as a GitHub release; "Run workflow" on the
 # Actions page builds the same files as artifacts of the run, no release.
+# The tag is annotated and its message holds the release notes:
+#   tools/tag_release.sh v0.2.17 notes.md && git push <remote> v0.2.17
+# (the message: "bbhost v0.2.17", a blank line, the notes verbatim).
+# The release takes them, and the server's bot posts them to the Discord's
+# #releases channel (tools/announce_release.py). A tag without notes gets
+# GitHub's generated notes and no announcement.
 #
 # Every pull request builds them too, to test the branch before it is merged:
 # the packages are artifacts of the run (kept 14 days; the PR gets a comment
@@ -181,7 +187,31 @@ jobs:
           $RUN#artifacts"
           gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release
+        id: release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --generate-notes
+        run: |
+          # The release notes are the annotated tag's message after its first
+          # line (tools/tag_release.sh). A tag without them gets
+          # GitHub's generated notes and no announcement.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          if grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "announce=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "the tag carries no notes: generated notes, and no Discord announcement (Actions > announce release, once the notes are written)"
+            gh release create "$GITHUB_REF_NAME" dist/release/* --title "bbhost $GITHUB_REF_NAME" --generate-notes
+          fi
+      # A release created with the workflow's token starts no other workflow
+      # (GitHub's rule), so the announcement is made here; announce-release.yml
+      # stays for announcing by hand.
+      - name: announce in Discord
+        if: steps.release.outputs.announce == '1'
+        continue-on-error: true   # the release is out either way; announce by hand if this fails
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: '1557561169768742986'
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/announce_release.py "$GITHUB_REF_NAME"
