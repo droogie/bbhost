@@ -190,6 +190,29 @@ bool ensure_dmem_backing() {
         return false;
     }
     return true;
+#elif defined(__APPLE__)
+    if (g_dmem_fd >= 0) {
+        return true;
+    }
+    // No memfd on macOS: an unlinked POSIX shm object, which macOS lets be
+    // sized only once.
+    char name[32];
+    std::snprintf(name, sizeof(name), "/bb-dmem-%d", static_cast<int>(getpid()));
+    shm_unlink(name);  // left by a crashed process with this pid
+    const int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        host_log("shm_open dmem failed errno=%d", errno);
+        return false;
+    }
+    shm_unlink(name);
+    if (ftruncate(fd, static_cast<off_t>(g_dmem_size)) != 0) {
+        host_log("ftruncate dmem 0x%llx failed errno=%d",
+                 static_cast<unsigned long long>(g_dmem_size), errno);
+        close(fd);
+        return false;
+    }
+    g_dmem_fd = fd;
+    return true;
 #else
     if (g_dmem_fd >= 0) {
         return true;
