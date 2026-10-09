@@ -2252,6 +2252,11 @@ private:
             reject("image_get_lod returns two components, and its dmask selects a third or fourth");
             return;
         }
+        if (in.dmask & 1) {
+            reject("image_get_lod's clamped LOD (component 0): Vulkan's level after the view's and the sampler's clamps is not shown to be "
+                   "GCN's");
+            return;
+        }
         if (std::any_of(kill_proofs.begin(), kill_proofs.end(), [](const KillProof& k) { return k.per_pixel; })) {
             reject("image_get_lod after a kill region where the lift may differ from GCN in pixels it kills: its derivatives would read them");
             return;
@@ -2293,6 +2298,11 @@ private:
     void mimg(const Inst& in) {
         inst_uniform = false;  // texels are not tracked as uniform
         const std::uint32_t op = in.op;
+        if (in.tfe || in.lwe) {  // the translator does not write it either
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "an image instruction") +
+                   " with TFE or LWE: GCN writes a status VGPR after the data, which is not lifted");
+            return;
+        }
         if (op == 96) {
             image_get_lod(in);
             return;
@@ -4255,6 +4265,11 @@ private:
                            "; " + std::to_string(lod_queries.size()) + " image_get_lod" + (queries.empty() ? "" : ":" + queries) +
                            "; in uniform control flow, results written under EXEC, operands GCN's in every pixel of EXEC and the "
                            "coordinates of implicit derivatives in every pixel of the quads of EXEC");
+            if (!lod_queries.empty()) {
+                head.push_back("image_get_lod reads only the unclamped LOD: the host's OpImageQueryLod lambda', as the translator's does, which "
+                               "follows the host's own LOD computation (its precision and anisotropy, a footprint of no size) and is not shown "
+                               "equal to GCN's");
+            }
         }
         if (!divergent_samples.empty()) {
             head.push_back(std::to_string(divergent_samples.size()) + " of these samples inside a loop pixels leave at different iterations, "

@@ -948,7 +948,28 @@ void cases() {
         CHECK(has_op(r.spirv, 105));  // OpImageQueryLod
         CHECK(proof_says(r, "1 image_get_lod"));
     }
-    CHECK(lifted(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x3); }))));
+    // Only the unclamped LOD (component 1): the clamped one (component 0,
+    // Vulkan's level after the view's and the sampler's clamps) is not shown
+    // to be GCN's.
+    CHECK(rejected_with(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x3); })), "image_get_lod's clamped LOD"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x1); })), "image_get_lod's clamped LOD"));
+    CHECK(proof_says(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x2); })), "the host's own LOD computation"));
+    // TFE and LWE: GCN writes a status VGPR after the data, which the lift does not.
+    for (const std::uint32_t bit : {16u, 17u}) {
+        for (const std::uint32_t op : {kSample, kGetLod}) {
+            Asm a;
+            a.sop1(4, 20, kExec);
+            a.wqm();
+            a.interp(2, 0, 0);
+            a.interp(3, 0, 1);
+            a.mimg(op, 4, 2, op == kGetLod ? 0x2 : 0x1);
+            a.w[a.w.size() - 2] |= 1u << bit;
+            a.sop1(4, kExec, 20);
+            a.exp_mrt0(4);
+            a.w.push_back(0xbf810000u);
+            CHECK(rejected_with(lift(a.w), "TFE or LWE"));
+        }
+    }
     CHECK(lifted(lift(divergent([](Asm& a) {
         quad_coords(a);
         a.mimg(kGetLod, 4, 8, 0x2);
