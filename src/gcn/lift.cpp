@@ -48,6 +48,13 @@
 //     unconditional, as in the translator; a pixel whose EXEC bit is clear at
 //     s_endpgm is discarded, and every pixel exported with its bit clear must
 //     be one of them.
+//   * ds_swizzle_b32 in quad mode (and the bit-mask patterns that stay inside
+//     a quad) becomes OpGroupNonUniformQuadBroadcast or QuadSwap: Vulkan lays
+//     a fragment shader's quad out as GCN does (lane 1 right of lane 0, lane 2
+//     below it) and launches helper invocations for the quad's uncovered
+//     pixels. It is accepted only where EXEC is known set in whole-quad mode,
+//     so every lane of the quad is active on GCN and returns its own value, and
+//     only of a value the helper lanes computed as GCN's did (Val::helper_inexact).
 //   * Scalar loads read the storage buffers the reference bound for them
 //     (TranslateResult::buffer_at), with the translator's landing rule: a load
 //     is stored at once and stored again at the next s_waitcnt on lgkmcnt,
@@ -83,6 +90,11 @@ struct Val {
     bool constant = false;
     std::uint32_t bits = 0;  // Word / Float constant
     bool set = false;        // Lane constant
+    // A helper lane (a pixel of the quad the primitive does not cover) may hold
+    // something else on GCN than the lift computes for it: a mask from the
+    // coverage EXEC a pixel shader starts with, or a value written outside
+    // whole-quad mode. Only cross-lane reads (ds_swizzle_b32) look at it.
+    bool helper_inexact = false;
 };
 
 // Register keys: SGPRs 0..103, TTMPs 200..211, VGPRs 256.., and the scalar
@@ -257,9 +269,13 @@ private:
     // An instruction's results are uniform when everything it read was.
     std::set<Id> uniform_ids;
     bool inst_uniform = true;
+    // Something this instruction read is Val::helper_inexact (the EXEC of a
+    // VGPR write included): so are its word and float results.
+    bool inst_helper_inexact = false;
     bool uniform(const Val& v) const { return v.constant || uniform_ids.count(v.id) != 0; }
     Val note_read(const Val& v) {
         if (!uniform(v)) inst_uniform = false;
+        if (v.helper_inexact) inst_helper_inexact = true;
         return v;
     }
     void note_result(const Val& v) {
@@ -471,7 +487,27 @@ private:
         return v.id;
     }
 
-    Val band(const Val& a, const Val& b) {
+    // Mask combinations, with their helper lanes' bits: exact where an exact
+    // constant decides the result (false in an AND, true in an OR), otherwise
+    // as exact as both operands.
+    static Val helper_bits(Val r, const Val& a, const Val& b, bool deciding) {
+        const auto decides = [&](const Val& x) { return x.constant && x.set == deciding && !x.helper_inexact; };
+        r.helper_inexact = !decides(a) && !decides(b) && (a.helper_inexact || b.helper_inexact);
+        return r;
+    }
+    Val band(const Val& a, const Val& b) { return helper_bits(band_value(a, b), a, b, false); }
+    Val bor(const Val& a, const Val& b) { return helper_bits(bor_value(a, b), a, b, true); }
+    Val bxor(const Val& a, const Val& b) {
+        Val r = bxor_value(a, b);
+        r.helper_inexact = a.helper_inexact || b.helper_inexact;
+        return r;
+    }
+    Val bnot(const Val& a) {
+        Val r = bnot_value(a);
+        r.helper_inexact = a.helper_inexact;
+        return r;
+    }
+    Val band_value(const Val& a, const Val& b) {
         if (a.constant) return a.set ? b : lane_const(false);
         if (b.constant) return b.set ? a : lane_const(false);
         if (a.id == b.id) return a;
@@ -520,18 +556,18 @@ private:
         const auto it = conjuncts.find(e.id);
         return it != conjuncts.end() && it->second.count(g.id) != 0;
     }
-    Val bor(const Val& a, const Val& b) {
+    Val bor_value(const Val& a, const Val& b) {
         if (a.constant) return a.set ? lane_const(true) : b;
         if (b.constant) return b.set ? lane_const(true) : a;
         return lane(m.emit(spv::OpLogicalOr, t_bool, {a.id, b.id}));
     }
-    Val bnot(const Val& a) {
+    Val bnot_value(const Val& a) {
         if (a.constant) return lane_const(!a.set);
         const Id r = m.emit(spv::OpLogicalNot, t_bool, {a.id});
         negation_of[r] = a.id;  // (a double negation stays as emitted: the lifts made before keep their exact modules)
         return lane(r);
     }
-    Val bxor(const Val& a, const Val& b) {
+    Val bxor_value(const Val& a, const Val& b) {
         if (a.constant) return a.set ? bnot(b) : b;
         if (b.constant) return b.set ? bnot(a) : a;
         return lane(m.emit(spv::OpLogicalNotEqual, t_bool, {a.id, b.id}));
@@ -753,7 +789,14 @@ private:
         if (e.constant) {
             if (e.set) {
                 reg[key] = v;
+                reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
                 note_result(v);
+            } else if (e.helper_inexact) {
+                // GCN may write the helper lanes the lift leaves alone.
+                const auto it = reg.find(key);
+                Val old = it != reg.end() ? it->second : initial_value(key);
+                old.helper_inexact = true;
+                reg[key] = old;
             }
             note += " v" + std::to_string(idx) + (e.set ? (v.kind == Kind::Float ? ":f32" : ":u32") : ":masked-off");
             return;
@@ -765,6 +808,7 @@ private:
         } else {
             reg[key] = word(m.emit(spv::OpSelect, t_u32, {e.id, as_u(v), as_u(old)}));
         }
+        reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;  // the old value and EXEC were read: in the flag
         if (uniform(v)) masked_uniform[reg[key].id] = {e, v};
         note_result(reg[key]);
         note += " v" + std::to_string(idx) + ":select";
@@ -879,7 +923,11 @@ private:
         const auto F1 = [&] { return src_f(s1, 1, md); };
         const auto out_f = [&](Id v) { write_v(in.dst, result_f(v, md)); return true; };
         const auto out_u = [&](Id v) { write_v(in.dst, word(v)); return true; };
-        const auto carry = [&](Id c) { write_lane(carry_out, band(lane(c), exec_lane())); };  // the translator's ballot of carry & EXEC
+        const auto carry = [&](Id c) {  // the translator's ballot of carry & EXEC
+            Val bit = lane(c);
+            bit.helper_inexact = inst_helper_inexact;
+            write_lane(carry_out, band(bit, exec_lane()));
+        };
         const auto vdst = [&] { return as_f(value(256 + in.dst)); };
         switch (op) {
         case 0: {  // v_cndmask_b32
@@ -1098,8 +1146,10 @@ private:
     void vcmp(std::uint32_t op, const Val& s0, const Val& s1, const Mods& md, std::uint16_t dst_pair) {
         // The ballot the translator writes is the comparison AND this lane's EXEC.
         const Id cond = vcmp_cond(op, s0, s1, md);
+        Val bit = lane(cond);
+        bit.helper_inexact = inst_helper_inexact;  // from the operands
         const Val e = exec_lane();
-        const Val c = band(lane(cond), e);
+        const Val c = band(bit, e);
         note_compare_split(c, e, op, s0, s1, md, cond);
         write_lane(dst_pair, c);
         if (op & 0x10) write_lane(kExecLo, c);
@@ -1248,14 +1298,18 @@ private:
                 return;
             }
             Val r = a;
+            // Whole quads: a constant set mask leaves every lane of a quad with a
+            // pixel set, helpers included; a clear one stays as exact as it was.
+            r.helper_inexact = !a.set && a.helper_inexact;
             if (widen_ok) {
                 // Widening a kill region's EXEC. From EXEC known set, every pixel
                 // computes the region, as GCN's widened quads do wherever a pixel
                 // survives; otherwise the pixel keeps its own bit. Either way the
                 // pixels that differ must be killed at s_endpgm (checked there).
                 Region& k = *open_regions.back();
+                r.helper_inexact = true;  // the helper lanes GCN widens to, where the pixel keeps its own bit
                 if (k.exec_before.constant && k.exec_before.set) {
-                    r = lane_const(true);
+                    r = lane_const(true);  // exact in every quad that survives
                     k.quad_exact = true;
                 } else if (!implies(k.guard, k.exec_before)) {
                     // GCN's whole quads would also run pixels whose guard bit is
@@ -1923,6 +1977,144 @@ private:
         exports.push_back(in.offset);
     }
 
+    // ---- cross-lane: ds_swizzle_b32 ---------------------------------------------------
+    // The swizzle reads the VGPR in its address field and writes no LDS. Quad
+    // mode (offset[15]): lane k of each quad reads lane offset[2k+1:2k]. Bit-mask
+    // mode: lane i of each 32 reads ((i & and) | or) ^ xor, and_mask in
+    // offset[4:0], or_mask [9:5], xor_mask [14:10]. An inactive lane reads as 0
+    // on GCN; here every lane of the quad is active (whole-quad mode, EXEC set),
+    // so the swizzle is a permutation within the quad, which Vulkan's quad
+    // operations name by the same index GCN's lanes have.
+    std::size_t swizzles = 0;
+    Id quad_right = 0, quad_bottom = 0;  // this invocation's column and row in its quad
+    void quad_caps() {
+        m.capability(spv::CapGroupNonUniform);
+        m.capability(spv::CapGroupNonUniformQuad);
+    }
+    // Lane 1 of a quad is right of lane 0 and lane 2 below it (Vulkan's quad
+    // scope instance), so a pixel is in the right column where its x exceeds
+    // its horizontal neighbour's, and in the bottom row likewise in y. Made once,
+    // in the entry block, where every invocation runs.
+    void quad_place() {
+        if (quad_right) return;
+        EntryScope entry(m);
+        if (!in_frag_coord) in_frag_coord = builtin(p_in_v4f, spv::BiFragCoord);
+        const Id fc = m.load(t_v4f, in_frag_coord);
+        const Id x = extract(t_f32, fc, 0), y = extract(t_f32, fc, 1);
+        quad_right = m.emit(spv::OpFOrdGreaterThan, t_bool, {x, quad_swap(t_f32, x, 0)});
+        quad_bottom = m.emit(spv::OpFOrdGreaterThan, t_bool, {y, quad_swap(t_f32, y, 1)});
+    }
+    // QuadSwap direction 0 swaps lanes 0-1 and 2-3, 1 swaps 0-2 and 1-3, 2 swaps 0-3 and 1-2.
+    Id quad_swap(Id type, Id v, std::uint32_t direction) {
+        quad_caps();
+        return m.emit(spv::OpGroupNonUniformQuadSwap, type, {cu(spv::ScopeSubgroup), v, cu(direction)});
+    }
+    // The lane of its quad each lane reads, or false where a lane reads outside
+    // its quad (`why` says how).
+    static bool swizzle_quad_lanes(std::uint32_t off, std::uint32_t sel[4], std::string& why) {
+        if (off & 0x8000) {
+            if (off & 0x7f00) {
+                why = "ds_swizzle_b32 offset " + hex_offset(off) + ": quad mode with bits 14:8 set (the later rotate and FFT modes) is not lifted";
+                return false;
+            }
+            for (std::uint32_t k = 0; k < 4; ++k) sel[k] = (off >> (2 * k)) & 3;
+            return true;
+        }
+        const std::uint32_t and_mask = off & 0x1f, or_mask = (off >> 5) & 0x1f, xor_mask = (off >> 10) & 0x1f;
+        // Lane i keeps its quad (bits 2-4 of i) only when the masks keep those bits.
+        if ((and_mask & 0x1c) != 0x1c || (or_mask & 0x1c) || (xor_mask & 0x1c)) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "ds_swizzle_b32 bit-mask mode (and 0x%02x, or 0x%02x, xor 0x%02x) reads lanes outside the quad, which Vulkan does not lay out",
+                          and_mask, or_mask, xor_mask);
+            why = buf;
+            return false;
+        }
+        for (std::uint32_t k = 0; k < 4; ++k) sel[k] = (((k & and_mask) | or_mask) ^ xor_mask) & 3;
+        return true;
+    }
+    void ds(const Inst& in) {
+        if (in.op != 53) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "unknown") + " is not lifted");
+            return;
+        }
+        if (opt.stage != Stage::Pixel) {
+            reject("ds_swizzle_b32 outside a pixel shader");
+            return;
+        }
+        const std::uint32_t off = in.offset0 | (static_cast<std::uint32_t>(in.offset1) << 8);
+        std::uint32_t sel[4];
+        std::string why;
+        if (!swizzle_quad_lanes(off, sel, why)) {
+            reject(why);
+            return;
+        }
+        if (in.gds) {
+            reject("ds_swizzle_b32 with GDS set");
+            return;
+        }
+        // Every lane of the quad active on GCN: EXEC known set, and in whole-quad
+        // mode (not the coverage a pixel shader starts with, where the helper
+        // lanes are inactive and read as 0).
+        const Val e = exec_lane();
+        if (!(e.constant && e.set)) {
+            reject("ds_swizzle_b32 where EXEC is not known set: a lane outside EXEC reads as 0 on GCN");
+            return;
+        }
+        if (e.helper_inexact) {
+            reject("ds_swizzle_b32 outside whole-quad mode: the quad's helper lanes are inactive on GCN and read as 0");
+            return;
+        }
+        if (std::any_of(kill_proofs.begin(), kill_proofs.end(), [](const KillProof& k) { return k.per_pixel; })) {
+            reject("ds_swizzle_b32 after a kill region where the lift may differ from GCN in pixels it kills: their quad reads them");
+            return;
+        }
+        const Val src = value(256 + in.vaddr);
+        if (const auto init = initials.find(256 + in.vaddr);
+            init != initials.end() && init->second.constant && src.constant && src.kind == init->second.kind && src.bits == init->second.bits) {
+            reject("ds_swizzle_b32 of v" + std::to_string(in.vaddr) + ", a pixel shader input the lift does not model (a barycentric or other SPI input)");
+            return;
+        }
+        if (src.helper_inexact) {
+            reject("ds_swizzle_b32 of v" + std::to_string(in.vaddr) +
+                   ", which the quad's helper lanes may hold differently on GCN (written outside whole-quad mode)");
+            return;
+        }
+        ++swizzles;
+        // A value every invocation holds alike is the same in every lane of the quad.
+        if (uniform(src) || (sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3)) {
+            write_v(in.dst, src);
+            return;
+        }
+        const Id type = src.kind == Kind::Float ? t_f32 : t_u32;
+        const Id v = src.kind == Kind::Float ? as_f(src) : as_u(src);
+        Id r;
+        if (sel[0] == sel[1] && sel[1] == sel[2] && sel[2] == sel[3]) {
+            quad_caps();
+            r = m.emit(spv::OpGroupNonUniformQuadBroadcast, type, {cu(spv::ScopeSubgroup), v, cu(sel[0])});
+        } else {
+            // Lane k reads lane k ^ d_k: itself (0) or a swap (1 across, 2 down, 3 diagonal).
+            Id swapped[4] = {v, 0, 0, 0};
+            for (std::uint32_t k = 0; k < 4; ++k) {
+                const std::uint32_t d = sel[k] ^ k;
+                if (d && !swapped[d]) swapped[d] = quad_swap(type, v, d - 1);
+            }
+            const std::uint32_t d0 = sel[0] ^ 0, d1 = sel[1] ^ 1, d2 = sel[2] ^ 2, d3 = sel[3] ^ 3;
+            if (d0 == d1 && d1 == d2 && d2 == d3) {
+                r = swapped[d0];
+            } else {
+                quad_place();
+                const auto pick = [&](Id cond, std::uint32_t a, std::uint32_t b) {  // a where cond, b elsewhere
+                    return a == b ? swapped[a] : m.emit(spv::OpSelect, type, {cond, swapped[a], swapped[b]});
+                };
+                const Id top = pick(quad_right, d1, d0);
+                const Id bottom = d2 == d0 && d3 == d1 ? top : pick(quad_right, d3, d2);
+                r = top == bottom ? top : m.emit(spv::OpSelect, type, {quad_bottom, bottom, top});
+            }
+        }
+        write_v(in.dst, src.kind == Kind::Float ? flt(r) : word(r));
+    }
+
     void lift_inst(const Inst& in) {
         switch (in.enc) {
         case Enc::SOP1: sop1(in); break;
@@ -1936,6 +2128,7 @@ private:
         case Enc::MIMG: mimg(in); break;
         case Enc::MTBUF: mtbuf(in); break;
         case Enc::EXP: exp(in); break;
+        case Enc::DS: ds(in); break;
         default: reject(std::string(mnemonic(in) ? mnemonic(in) : "unknown") + " is not lifted"); break;
         }
     }
@@ -2032,6 +2225,8 @@ private:
             return true;
         case Enc::VINTRP: case Enc::EXP:
             return true;
+        case Enc::DS:
+            return in.op == 53;  // ds_swizzle_b32: no scalar operand
         default:
             return false;
         }
@@ -2329,7 +2524,27 @@ private:
     void close_arm() {
         Arm& a = arms.back();
         if (!a.in_else) then_to_else(a);  // an if without an else arm: an empty else block
+        // Helper lanes after the join: inexact where either arm left them so
+        // (merge_arms makes its phis without the flag).
+        std::set<int> inexact_regs, inexact_lanes;
+        const auto collect = [&](const std::map<int, Val>& then_end, const std::map<int, Val>& else_end, const std::map<int, Val>& at_branch,
+                                 std::set<int>& out) {
+            const auto flag = [&](const std::map<int, Val>& arm, int k) {
+                if (const auto it = arm.find(k); it != arm.end()) return it->second.helper_inexact;
+                const auto it = at_branch.find(k);
+                return it != at_branch.end() && it->second.helper_inexact;  // else the value at entry: exact
+            };
+            for (const auto* arm : {&then_end, &else_end}) {
+                for (const auto& kv : *arm) {
+                    if (flag(then_end, kv.first) || flag(else_end, kv.first)) out.insert(kv.first);
+                }
+            }
+        };
+        collect(a.reg1, reg, a.reg0, inexact_regs);
+        collect(a.lanes1, lanes, a.lanes0, inexact_lanes);
         merge_arms(a);
+        for (auto& [k, v] : reg) v.helper_inexact = v.helper_inexact || inexact_regs.count(k) != 0;
+        for (auto& [k, v] : lanes) v.helper_inexact = v.helper_inexact || inexact_lanes.count(k) != 0;
         arms.pop_back();
     }
 
@@ -3203,6 +3418,7 @@ private:
         m.name(fn_main, "main");
         cur_label = m.label();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set
+        lanes[kKeyExec].helper_inexact = true;  // and GCN's helper lanes with theirs clear, until whole-quad mode
         lanes[kKeyVcc] = lane_const(false);   // VCC starts clear
         scc_mask = lane_const(false);         // and so does SCC
 
@@ -3279,6 +3495,7 @@ private:
             }
             note.clear();
             inst_uniform = true;
+            inst_helper_inexact = false;
             Region* const starting = !open_regions.empty() && open_regions.back()->kill ? open_regions.back() : nullptr;
             exec_write_ok = starting && kill_exec_write(*starting, in);
             lift_inst(in);
@@ -3376,6 +3593,11 @@ private:
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+        if (swizzles) {
+            head.push_back(std::to_string(swizzles) + " ds_swizzle_b32 within a quad as quad operations in uniform control flow: each under EXEC "
+                           "known set in whole-quad mode, of a value the quad's helper lanes computed as on GCN, and no kill region where "
+                           "pixels may differ before it");
+        }
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }
 };

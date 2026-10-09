@@ -1,5 +1,8 @@
 // The pilot pixel shader (a22c7f71) lifts from the shipped bundle, and the lifter
 // refuses the constructs it cannot prove equal. Skips when the dump is absent.
+// Before that, hand-encoded programs check ds_swizzle_b32: every quad pattern
+// run through a small interpreter of the lifted SPIR-V over one quad, and the
+// cases the lifter must refuse.
 #include "test_app0.h"
 #include "gcn/container.h"
 #include "gcn/isa.h"
@@ -8,9 +11,12 @@
 
 #include <spirv-tools/libspirv.hpp>
 
+#include <array>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -64,6 +70,410 @@ gcn::Program mutate(const gcn::Program& p, std::uint32_t offset, const char* exp
 void make_nop(gcn::Inst& in) {
     in.enc = gcn::Enc::SOPP;
     in.op = 0;
+}
+
+bool spirv_valid(const std::vector<std::uint32_t>& words) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string msg;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+        if (msg.empty()) msg = m;
+    });
+    spvtools::ValidatorOptions vo;
+    vo.SetAllowOffsetTextureOperand(true);
+    const bool valid = tools.Validate(words.data(), words.size(), vo);
+    if (!valid) std::fprintf(stderr, "SPIR-V invalid: %s\n", msg.c_str());
+    return valid;
+}
+
+// ---- hand-encoded pixel shaders (Sea Islands encodings) -------------------------------
+std::uint32_t sopp(std::uint32_t op, std::int16_t simm) { return 0xbf800000u | op << 16 | static_cast<std::uint16_t>(simm); }
+std::uint32_t sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc) { return 0xbe800000u | sdst << 16 | op << 8 | ssrc; }
+std::uint32_t sop2(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc0, std::uint32_t ssrc1) {
+    return 0x80000000u | op << 23 | sdst << 16 | ssrc1 << 8 | ssrc0;
+}
+std::uint32_t sopc(std::uint32_t op, std::uint32_t ssrc0, std::uint32_t ssrc1) { return 0xbf000000u | op << 16 | ssrc1 << 8 | ssrc0; }
+std::uint32_t vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { return 0x7e000000u | vdst << 17 | op << 9 | src0; }
+std::uint32_t vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t vsrc1, std::uint32_t src0) { return op << 25 | vdst << 17 | vsrc1 << 9 | src0; }
+std::uint32_t vopc(std::uint32_t op, std::uint32_t vsrc1, std::uint32_t src0) { return 0x7c000000u | op << 17 | vsrc1 << 9 | src0; }
+std::uint32_t vintrp(std::uint32_t op, std::uint32_t vdst, std::uint32_t attr, std::uint32_t chan, std::uint32_t vsrc) {
+    return 0xc8000000u | vdst << 18 | op << 16 | attr << 10 | chan << 8 | vsrc;
+}
+constexpr std::uint32_t kEndpgm = 0xbf810000u;
+constexpr std::uint32_t kExec = 126, kVcc = 106, kZero = 128, kOne = 242, kV = 256;  // operand codes; 242 is 1.0
+constexpr std::uint32_t kMovB64 = 4, kWqmB64 = 10, kAndSaveexecB64 = 36, kAndB64 = 15;
+constexpr std::uint32_t kVMov = 1, kVSub = 4, kVCndmask = 0, kVCmpGtF32 = 4;
+
+void push(std::vector<std::uint32_t>& w, std::initializer_list<std::uint32_t> words) { w.insert(w.end(), words); }
+// ds_swizzle_b32 vdst, vaddr offset:off, with DATA0 (unused by the instruction) and GDS as given.
+void swizzle(std::vector<std::uint32_t>& w, std::uint32_t vdst, std::uint32_t vaddr, std::uint32_t off, std::uint32_t data0 = 0, bool gds = false) {
+    push(w, {0xd8000000u | 53u << 18 | (gds ? 1u << 17 : 0u) | off, vdst << 24 | data0 << 8 | vaddr});
+}
+// exp mrt0 with the four VGPRs, done, vm, not compressed.
+void export_mrt0(std::vector<std::uint32_t>& w, std::uint32_t v0, std::uint32_t v1, std::uint32_t v2, std::uint32_t v3) {
+    push(w, {0xf8000000u | 1u << 12 | 1u << 11 | 0xfu, v3 << 24 | v2 << 16 | v1 << 8 | v0});
+}
+// The prologue of the game's swizzling programs: save the coverage, whole-quad
+// mode, v2 = attr0.x (from the barycentrics in v0 and v1).
+void wqm_prologue(std::vector<std::uint32_t>& w) {
+    push(w, {sop1(kMovB64, 2, kExec), sop1(kWqmB64, kExec, kExec), vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1)});
+}
+std::vector<std::uint32_t> one_swizzle(std::uint32_t off) {
+    std::vector<std::uint32_t> w;
+    wqm_prologue(w);
+    swizzle(w, 3, 2, off);
+    push(w, {sopp(12, 0xc07f) /* s_waitcnt lgkmcnt(0) */, sop1(kMovB64, kExec, 2)});
+    export_mrt0(w, 3, 3, 3, 3);
+    w.push_back(kEndpgm);
+    return w;
+}
+
+gcn::TranslateOptions synthetic_options(int user_sgprs = 0) {
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Pixel;
+    o.rsrc2 = static_cast<std::uint32_t>(user_sgprs) << 1;
+    o.ps_input_ena = 2;  // PERSP_CENTER: the barycentrics in v0 and v1
+    o.descriptor_set = 1;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    return o;
+}
+struct Lifted {
+    gcn::TranslateResult ref;
+    gcn::LiftResult lift;
+};
+Lifted lift_words(const std::vector<std::uint32_t>& words, const gcn::TranslateOptions& o = synthetic_options()) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    Lifted r;
+    r.ref = gcn::translate(p, o);
+    r.lift = gcn::lift_pixel_shader(p, o, r.ref);
+    return r;
+}
+
+// ---- a straight-line SPIR-V interpreter over one quad ---------------------------------
+// Runs the lifted fragment shader for the four invocations of a quad whose
+// lane 0 sits at framebuffer (x0, y0) - lane 1 right of it, lane 2 below - with
+// attr0.x = the given values, and returns each invocation's mrt0.x. It knows
+// only the instructions a swizzle program lifts to; anything else fails.
+struct QuadRun {
+    bool ok = false;
+    std::string error;
+    std::array<float, 4> out{};
+};
+QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, const std::array<float, 4>& attr0) {
+    QuadRun run;
+    using Vec = std::array<std::uint32_t, 4>;
+    std::map<std::uint32_t, std::array<Vec, 4>> val;  // id -> per-invocation value
+    std::map<std::uint32_t, std::uint32_t> constants, builtin, location, storage;
+    std::map<std::uint32_t, std::array<float, 4>> outputs;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_body = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        switch (op) {
+        case 71:  // OpDecorate
+            if (a[1] == 11) builtin[a[0]] = a[2];
+            if (a[1] == 30) location[a[0]] = a[2];
+            continue;
+        case 59: storage[a[1]] = a[2]; continue;  // OpVariable
+        case 43: constants[a[1]] = a[2]; continue;  // OpConstant (low word)
+        case 41: constants[a[1]] = 1; continue;     // OpConstantTrue
+        case 42: constants[a[1]] = 0; continue;     // OpConstantFalse
+        case 248: in_body = true; continue;         // OpLabel
+        default: break;
+        }
+        if (!in_body) continue;  // types, names, capabilities, the entry point
+        const auto get = [&](std::uint32_t id, int lane) -> Vec {
+            if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            return val[id][static_cast<std::size_t>(lane)];
+        };
+        const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
+        switch (op) {
+        case 61:  // OpLoad
+            for (int l = 0; l < 4; ++l) {
+                if (builtin.count(a[2]) && builtin[a[2]] == 15) {  // FragCoord at the pixel's centre
+                    const float x = x0 + static_cast<float>(l & 1) + 0.5f, y = y0 + static_cast<float>(l >> 1) + 0.5f;
+                    val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(x), std::bit_cast<std::uint32_t>(y), 0, 0};
+                } else if (storage[a[2]] == 1 && location.count(a[2]) && location[a[2]] == 0) {
+                    val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(attr0[static_cast<std::size_t>(l)]), 0, 0, 0};
+                } else {
+                    return fail("a load of something other than FragCoord or attr0");
+                }
+            }
+            break;
+        case 62:  // OpStore
+            if (storage[a[0]] != 3 || !location.count(a[0]) || location[a[0]] != 0) return fail("a store to something other than mrt0");
+            for (int l = 0; l < 4; ++l) outputs[0][static_cast<std::size_t>(l)] = f(get(a[1], l)[0]);
+            break;
+        case 81:  // OpCompositeExtract
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {get(a[2], l)[a[3]], 0, 0, 0};
+            break;
+        case 80:  // OpCompositeConstruct
+            for (int l = 0; l < 4; ++l) {
+                Vec v{};
+                for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = get(a[k], l)[0];
+                val[a[1]][static_cast<std::size_t>(l)] = v;
+            }
+            break;
+        case 124:  // OpBitcast
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = get(a[2], l);
+            break;
+        case 131: case 129: case 133:  // OpFSub, OpFAdd, OpFMul
+            for (int l = 0; l < 4; ++l) {
+                const float x = f(get(a[2], l)[0]), y = f(get(a[3], l)[0]);
+                const float r = op == 131 ? x - y : op == 129 ? x + y : x * y;
+                val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(r), 0, 0, 0};
+            }
+            break;
+        case 186:  // OpFOrdGreaterThan
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {f(get(a[2], l)[0]) > f(get(a[3], l)[0]) ? 1u : 0u, 0, 0, 0};
+            break;
+        case 169:  // OpSelect
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = get(a[2], l)[0] ? get(a[3], l) : get(a[4], l);
+            break;
+        case 365: case 366: {  // OpGroupNonUniformQuadBroadcast / QuadSwap: quad index = lane
+            if (constants[a[2]] != 3) return fail("a quad operation outside subgroup scope");
+            const std::uint32_t k = constants.at(a[4]);
+            for (int l = 0; l < 4; ++l) {
+                const int from = op == 365 ? static_cast<int>(k) : l ^ static_cast<int>(k + 1);
+                val[a[1]][static_cast<std::size_t>(l)] = get(a[3], from);
+            }
+            break;
+        }
+        case 253: case 56: break;  // OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    if (!outputs.count(0)) return fail("mrt0 is not written");
+    for (int l = 0; l < 4; ++l) run.out[static_cast<std::size_t>(l)] = outputs[0][static_cast<std::size_t>(l)];
+    run.ok = true;
+    return run;
+}
+
+std::size_t count_op(const std::vector<std::uint32_t>& spv, std::uint32_t opcode) {
+    std::size_t n = 0;
+    for (std::size_t i = 5; i < spv.size() && (spv[i] >> 16);) {
+        n += (spv[i] & 0xffff) == opcode;
+        i += spv[i] >> 16;
+    }
+    return n;
+}
+
+// Each lane of a quad reads lane sel[k]; the lifted shader, run over a quad at an
+// odd origin (Vulkan does not promise even ones), must return attr0 of that lane.
+void check_quad_pattern(std::uint32_t off, const std::array<std::uint32_t, 4>& sel, const char* what) {
+    const Lifted l = lift_words(one_swizzle(off));
+    for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "%s (offset %04x) rejected: %s\n", what, off, why.c_str());
+    CHECK(l.ref.ok() && l.lift.ok());
+    if (!l.lift.ok()) return;
+    CHECK(spirv_valid(l.lift.spirv));
+    const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+    for (const auto [x0, y0] : {std::pair{0.0f, 0.0f}, std::pair{7.0f, 3.0f}}) {
+        const QuadRun r = run_quad(l.lift.spirv, x0, y0, attr);
+        if (!r.ok) std::fprintf(stderr, "%s (offset %04x): %s\n", what, off, r.error.c_str());
+        CHECK(r.ok);
+        for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+            if (r.out[k] != attr[sel[k]]) {
+                std::fprintf(stderr, "%s (offset %04x): lane %zu read %g, expected lane %u's %g\n", what, off, k, r.out[k], sel[k], attr[sel[k]]);
+                ++g_failures;
+            }
+        }
+    }
+}
+
+void synthetic_swizzles() {
+    // Every quad-mode pattern: lane k reads lane offset[2k+1:2k].
+    for (std::uint32_t pattern = 0; pattern < 256; ++pattern) {
+        check_quad_pattern(0x8000u | pattern, {pattern & 3, (pattern >> 2) & 3, (pattern >> 4) & 3, (pattern >> 6) & 3}, "quad mode");
+    }
+    // Bit-mask mode where the masks keep each lane in its quad: lane i reads ((i & and) | or) ^ xor.
+    for (std::uint32_t and_lo = 0; and_lo < 4; ++and_lo) {
+        for (std::uint32_t or_mask = 0; or_mask < 4; ++or_mask) {
+            for (std::uint32_t xor_mask = 0; xor_mask < 4; ++xor_mask) {
+                const std::uint32_t and_mask = 0x1c | and_lo;
+                std::array<std::uint32_t, 4> sel{};
+                for (std::uint32_t k = 0; k < 4; ++k) sel[k] = (((k & and_mask) | or_mask) ^ xor_mask) & 3;
+                check_quad_pattern(and_mask | or_mask << 5 | xor_mask << 10, sel, "bit-mask mode within a quad");
+            }
+        }
+    }
+
+    // The game's derivative idioms: the coarse ones are broadcasts, the fine ones swaps.
+    {
+        const Lifted coarse = lift_words(one_swizzle(0x8055));  // lane 1 everywhere
+        CHECK(coarse.lift.ok() && count_op(coarse.lift.spirv, 365) == 1 && count_op(coarse.lift.spirv, 366) == 0);
+        const Lifted across = lift_words(one_swizzle(0x80b1));  // [1,0,3,2]: a horizontal swap, no place in the quad needed
+        CHECK(across.lift.ok() && count_op(across.lift.spirv, 366) == 1 && count_op(across.lift.spirv, 169) == 0);
+        const Lifted same = lift_words(one_swizzle(0x80e4));  // [0,1,2,3]: every lane reads itself
+        CHECK(same.lift.ok() && count_op(same.lift.spirv, 365) + count_op(same.lift.spirv, 366) == 0);
+        bool proof = false;
+        for (const std::string& p : coarse.lift.proof) proof |= p.find("1 ds_swizzle_b32") != std::string::npos;
+        CHECK(proof);
+    }
+    // A value every lane holds alike needs no quad operation.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        w.push_back(vop1(kVMov, 4, kOne));
+        swizzle(w, 3, 4, 0x80f5);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        const Lifted l = lift_words(w);
+        CHECK(l.lift.ok() && count_op(l.lift.spirv, 365) + count_op(l.lift.spirv, 366) == 0);
+    }
+    // The operand is the VGPR in the address field; DATA0 is not read, by the
+    // translator either.
+    {
+        std::vector<std::uint32_t> a, b, c;
+        for (auto* w : {&a, &b, &c}) wqm_prologue(*w);
+        a.push_back(vop1(kVMov, 5, kV + 2));
+        b.push_back(vop1(kVMov, 5, kV + 2));
+        c.push_back(vop1(kVMov, 5, kV + 2));
+        swizzle(a, 3, 2, 0x8000, 0);
+        swizzle(b, 3, 2, 0x8000, 5);  // another DATA0
+        swizzle(c, 3, 5, 0x8000, 0);  // another address VGPR (the same value)
+        for (auto* w : {&a, &b, &c}) {
+            push(*w, {sop1(kMovB64, kExec, 2)});
+            export_mrt0(*w, 3, 3, 3, 3);
+            w->push_back(kEndpgm);
+        }
+        const Lifted la = lift_words(a), lb = lift_words(b), lc = lift_words(c);
+        CHECK(la.ref.ok() && lb.ref.ok() && la.ref.spirv == lb.ref.spirv);
+        CHECK(la.lift.ok() && lb.lift.ok() && la.lift.spirv == lb.lift.spirv);
+        // The translation of the swizzle of v0 (the barycentric DATA0 named) is another shader.
+        std::vector<std::uint32_t> d = a;
+        d[d.size() - 5] = 3u << 24 | 0u << 8 | 0u;  // ds_swizzle_b32 v3, v0
+        CHECK(gcn::translate(gcn::decode(d.data(), d.size()), synthetic_options()).spirv != la.ref.spirv);
+        CHECK(lc.lift.ok());
+    }
+
+    // ---- refused ---------------------------------------------------------------------
+    const auto refused = [](const std::vector<std::uint32_t>& w, const char* text, const gcn::TranslateOptions& o = synthetic_options()) {
+        const Lifted l = lift_words(w, o);
+        CHECK(l.ref.ok());
+        CHECK(rejected_with(l.lift, text));
+    };
+    // Lanes outside the quad: bit-mask mode reaching across quads, and the
+    // rotate/FFT encodings of later chips.
+    refused(one_swizzle(0x1f | 4u << 10), "reads lanes outside the quad");
+    refused(one_swizzle(0x0f), "reads lanes outside the quad");
+    refused(one_swizzle(0xc0e4), "bits 14:8");
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        swizzle(w, 3, 2, 0x8000, 0, true);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "GDS");
+    }
+    // Without whole-quad mode the helper lanes are inactive on GCN and read as 0.
+    {
+        std::vector<std::uint32_t> w = {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1)};
+        swizzle(w, 3, 2, 0x8000);
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "outside whole-quad mode");
+    }
+    // ... nor after the coverage is restored.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        w.push_back(sop1(kMovB64, kExec, 2));
+        swizzle(w, 3, 2, 0x8000);
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "outside whole-quad mode");
+    }
+    // A value written before whole-quad mode: GCN's helper lanes never computed it.
+    {
+        std::vector<std::uint32_t> w = {sop1(kMovB64, 2, kExec), vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1), sop1(kWqmB64, kExec, kExec)};
+        swizzle(w, 3, 2, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "may hold differently");
+    }
+    // A value selected by the saved coverage: 0 in GCN's helper lanes, 1.0 here.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {vop1(kVMov, 4, kOne), sop1(kMovB64, kVcc, 2), vop2(kVCndmask, 5, 4, kZero)});
+        swizzle(w, 3, 5, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "may hold differently");
+    }
+    // The same through an if: the then arm writes v2 under the coverage.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {sopc(6, 0, kZero) /* s_cmp_eq_u32 s0, 0 */, sopp(4, 3) /* s_cbranch_scc0 +3 */, sop1(kMovB64, kExec, 2),
+                 vop1(kVMov, 2, kOne), sop1(kWqmB64, kExec, kExec)});
+        swizzle(w, 3, 2, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "may hold differently", synthetic_options(1));
+    }
+    // Inside a region where EXEC is a per-pixel mask: an inactive lane reads as 0.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {vopc(kVCmpGtF32, 2, kZero) /* vcc = 0 > v2 */, sop1(kAndSaveexecB64, 4, kVcc), sopp(8, 2) /* s_cbranch_execz +2 */});
+        swizzle(w, 3, 2, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 4), sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "EXEC is not known set");
+    }
+    // After a kill region that leaves the lift different from GCN in the pixels
+    // it kills, a neighbour would read them.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {vopc(kVCmpGtF32, 2, kZero), sop2(kAndB64, 4, kVcc, kExec), sopp(4, 2) /* s_cbranch_scc0 +2 */,
+                 sop2(kAndB64, kExec, kExec, 4), vop1(kVMov, 2, kOne), sop1(kMovB64, kExec, 193) /* -1 */});
+        swizzle(w, 3, 2, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 4)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "after a kill region");
+    }
+    // A barycentric the lift does not model (v0 is never written).
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        swizzle(w, 3, 0, 0x8000);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        refused(w, "does not model");
+    }
+    // Derivative arithmetic on the swizzles stays valid SPIR-V with the subtraction kept.
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        swizzle(w, 3, 2, 0x8000);
+        swizzle(w, 4, 2, 0x8055);
+        swizzle(w, 5, 2, 0x80aa);
+        push(w, {sopp(12, 0xc07f), vop2(kVSub, 4, 3, kV + 4), vop2(kVSub, 5, 3, kV + 5), sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 4, 5, 2, 2);
+        w.push_back(kEndpgm);
+        const Lifted l = lift_words(w);
+        CHECK(l.lift.ok() && spirv_valid(l.lift.spirv) && count_op(l.lift.spirv, 365) == 3);
+        if (l.lift.ok()) {
+            const QuadRun r = run_quad(l.lift.spirv, 2.0f, 4.0f, {1.0f, 3.0f, 7.0f, 15.0f});
+            CHECK(r.ok && r.out[0] == 2.0f && r.out[3] == 2.0f);  // ddx: lane 1 - lane 0, the same in every lane
+        }
+    }
 }
 
 }  // namespace
@@ -489,16 +899,18 @@ void run() {
 }  // namespace control_flow
 
 int main(int argc, char** argv) {
-    control_flow::run();  // hand-encoded programs, before (and without) the game's
+    // Hand-encoded programs first: they need no game files.
+    control_flow::run();
+    synthetic_swizzles();
+    if (g_failures) {
+        std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
+        return 1;
+    }
     const std::string path = argc > 1 ? argv[1] : test_app0_file("dvdroot_ps4/shader/gxrenderershader.shaderbnd.dcx");
     std::vector<std::uint8_t> raw;
     if (!gcn::read_file(path, raw)) {
-        if (g_failures) {
-            std::fprintf(stderr, "gcn_lift_test: %d check(s) failed\n", g_failures);
-            return 1;
-        }
-        std::printf("gcn_lift_test: hand-encoded programs ok; the pilot skipped: %s not readable\n", path.c_str());
-        return 0;
+        std::printf("gcn_lift_test: the hand-encoded programs pass; the pilot is skipped: %s not readable\n", path.c_str());
+        return kTestSkip;
     }
     std::string err;
     const std::vector<std::uint8_t> b = gcn::dcx_decompress(raw, &err);
@@ -607,6 +1019,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed\n", g_failures);
         return 1;
     }
-    std::printf("gcn_lift_test ok: pilot lifted (%zu words), six constructs rejected\n", ok.spirv.size());
+    std::printf("gcn_lift_test ok: every ds_swizzle_b32 quad pattern lifted exactly, the unproven ones refused; pilot lifted (%zu words), six "
+                "constructs rejected\n",
+                ok.spirv.size());
     return 0;
 }
