@@ -25,9 +25,9 @@
   (`render/...`, `perf/...`, `fix/...`) and open a pull request.
 - Rebase on `origin/master` before opening it; keep history linear, one
   commit per logical change.
-- CI builds Linux and Windows and runs the tests; it must pass. CI has no GPU
-  and no game files, so evidence that a change works in game is yours to
-  bring.
+- CI builds Linux, Windows and macOS and runs the tests; it must pass. CI has
+  no GPU and no game files, so evidence that a change works in game is yours
+  to bring.
 - A commit message says what changed and why: a short subject
   (`render: the woods' trees are instanced draws`), then the cause and how it
   was checked.

@@ -1,6 +1,7 @@
 # bbhost
 
-bbhost is a translation layer that runs Bloodborne on Windows and Linux. The
+bbhost is a translation layer that runs Bloodborne on Windows and Linux, with
+a macOS port in progress. The
 game's own 1.09 executable runs unmodified on the PC's x86-64 CPU; bbhost
 answers its calls into the PS4's system libraries with PC implementations, and
 recompiles its GPU work, GCN shaders and the engine's draw calls, for Vulkan.
@@ -68,7 +69,10 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 ## Status
 
 The game is playable on Windows and Linux: the world, its bosses and online
-sessions. What runs on native code and what is still emulated:
+sessions. The macOS port (an x86_64 build that Rosetta 2 runs on Apple
+Silicon, Vulkan through MoltenVK, macOS 15 or later) builds and passes its
+tests, but the game has not been played on it yet. What runs on native code
+and what is still emulated:
 
 | Part | State |
 |---|---|
@@ -107,7 +111,8 @@ See [docs/rendering.md](docs/rendering.md) for the graphics in detail and
    it (or kept beside it as `CUSA00900-UPDATE`, the way shadPS4 keeps it), and
    the 1.09 `eboot.bin` decrypted to an ELF (SHA-256
    `941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7`).
-2. Download a release for Windows or Linux, or build bbhost yourself.
+2. Download a release for Windows or Linux, or build bbhost yourself. The
+   macOS package is experimental ([running.md](docs/running.md#macos)).
 3. Start `bbhost`. The setup window asks for the two paths, checks them and
    saves them; press Play.
 
@@ -124,13 +129,14 @@ cmake --build build -j
 
 Linux builds natively with GCC or Clang; the Windows executable is
 cross-compiled from Linux with Clang and mingw-w64 (MSVC cannot express the
-calling conventions involved). Dependencies, the Windows build, tests and
-packaging are in [docs/building.md](docs/building.md).
+calling conventions involved); on macOS `tools/build_macos.sh` builds it.
+Dependencies, the Windows and macOS builds, tests and packaging are in
+[docs/building.md](docs/building.md).
 
 ## Documentation
 
 - [Running](docs/running.md) - configuration, controls, saves, troubleshooting, the debug menu
-- [Building](docs/building.md) - Linux, Windows, tests, packages
+- [Building](docs/building.md) - Linux, Windows, macOS, tests, packages
 - [Rendering](docs/rendering.md) - how the graphics work, and what is native
 - [Decompilation](docs/decomp.md) - game functions rewritten as source
 - [Modding](docs/modding.md) - replacement files, params, patches

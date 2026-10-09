@@ -24,7 +24,8 @@ Both must come from a copy of the game you own.
 
 And a PC with:
 
-- x86-64 Windows 10/11 or Linux
+- x86-64 Windows 10/11 or Linux, or a Mac with macOS 15 or later (in
+  progress: see [macOS](#macos) below)
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
 - 16 GB of RAM and 8 GB of video memory are recommended; 6 GB NVIDIA cards
   play at 1080p too
@@ -120,8 +121,9 @@ name box starts from `[player] name`, which the first key typed replaces;
 
 ## Logs
 
-bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows) and
-`run-bbhost.sh` (Linux) write each session's log to `logs/`. A bug report is
+bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows),
+`run-bbhost.sh` (Linux) and `run-bbhost.command` (macOS) write each session's
+log to `logs/`. A bug report is
 most useful with that log attached.
 
 ## Troubleshooting
@@ -192,6 +194,33 @@ or `left not ready (N queries unavailable)`.
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
 and every press acts twice. `tools/steamdeck/STEAMDECK.md` has the setup.
+
+## macOS
+
+The macOS port is new: it builds and passes its tests, but the game has not
+been played on it yet, so expect it not to get far. Reports are welcome.
+
+bbhost for macOS is an x86_64 program. On Apple Silicon Rosetta 2 runs it, and
+the game's code with it; if Rosetta is not installed,
+`softwareupdate --install-rosetta --agree-to-license` installs it. It needs macOS 15
+or later, the first whose Rosetta runs the AVX instructions the game uses.
+Vulkan goes through MoltenVK, which translates it to Metal; the package
+carries MoltenVK and the Vulkan loader, so nothing else is installed.
+
+The package is a zip, `bbhost-mac-<version>.zip`. It is signed ad hoc, not
+with an Apple Developer ID, and not notarized (that needs a paid Apple
+developer account), so macOS refuses to open a copy downloaded with a browser
+("cannot be opened because Apple cannot check it for malicious software").
+After unzipping it, clear the download's quarantine flag once, in Terminal:
+
+```sh
+xattr -dr com.apple.quarantine ~/Games/bbhost-mac-<version>
+```
+
+Then double-click `run-bbhost.command` in that folder, or run it from
+Terminal. It starts bbhost with the bundled MoltenVK and writes the log to
+`logs/`. The configuration, saves and caches are in
+`~/Library/Application Support/bbhost`.
 
 ## Display and frame rate
 
