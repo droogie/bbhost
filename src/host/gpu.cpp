@@ -4778,7 +4778,19 @@ GpuStats host_gpu_stats() {
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
+    for (int i = 0; i < kDrawPsCount; ++i) st.draws_ps[i] = g.draws_ps[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     return st;
+}
+
+const char* host_gpu_draw_fail_name(int reason) {
+    static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
+                                                "primitive type",    "no vertex shader",   "vertex shader",
+                                                "pixel shader",      "fetch shader",       "pipeline build",
+                                                "descriptor set",    "set allocation",     "fallback bindings",
+                                                "pipeline creation", "index buffer",       "indirect arguments",
+                                                "no GPU (device lost)"};
+    return reason >= 0 && reason < kFailCount ? why[reason] : nullptr;
 }
 void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
 
@@ -6243,16 +6255,10 @@ void host_gpu_report() {
              static_cast<unsigned long long>(g.gpu_us.load() / 1000));
     if (const std::string busy = busy_exit_report(); !busy.empty()) host_log("%s", busy.c_str());
     if (g.draw_failures.load()) {
-        static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
-                                                    "primitive type",    "no vertex shader",   "vertex shader",
-                                                    "pixel shader",      "fetch shader",       "pipeline build",
-                                                    "descriptor set",    "set allocation",     "fallback bindings",
-                                                    "pipeline creation", "index buffer",       "indirect arguments",
-                                                    "no GPU (device lost)"};
         std::string line;
         for (int k = 0; k < kFailCount; ++k) {
             if (const std::uint64_t n = g.draw_fail_why[k].load()) {
-                line += (line.empty() ? "" : ", ") + std::string(why[k]) + " " + std::to_string(n);
+                line += (line.empty() ? "" : ", ") + std::string(host_gpu_draw_fail_name(k)) + " " + std::to_string(n);
             }
         }
         host_log("gpu: draw failures by reason: %s", line.c_str());

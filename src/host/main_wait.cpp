@@ -23,10 +23,13 @@
 #include "log.h"
 
 namespace {
-const bool g_on = [] {
+// BBHOST_FRAME_STATS=1 the per-second lines, =2 those and their detail
+// (frame_stats.h).
+const int g_level = [] {
     const char* e = std::getenv("BBHOST_FRAME_STATS");
-    return e && *e == '1';
+    return e && (*e == '1' || *e == '2') ? *e - '0' : 0;
 }();
+const bool g_on = g_level > 0;
 thread_local bool t_main_loop = false;
 // BBHOST_WAIT_LOG=<prefix>[,<prefix>...]: threads whose names start with one
 // of these log every wait of BBHOST_WAIT_LOG_MS (20) or more, with its call
@@ -82,6 +85,7 @@ std::int64_t now_ns() {
 }  // namespace
 
 bool frame_stats_enabled() { return g_on; }
+int frame_stats_level() { return g_level; }
 
 void frame_stats_mark_main_thread() { t_main_loop = true; }
 

@@ -1841,6 +1841,14 @@ bool decomp_selects(const std::string& ps_name) {
     return selection.first || selection.second.count(ps_name) != 0;
 }
 
+// How a draw bound to `p` runs its pixel shader (GpuStats::draws_ps): only the
+// no-fallback variant ever carries a lift.
+int draw_ps_kind(const GfxPipeline& p) {
+    if (p.ps.lifted) return kDrawPsLifted;
+    if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
+    return p.lean ? kDrawPsTranslated : kDrawPsFallback;
+}
+
 struct DrawState {
     std::uint64_t vs_va = 0, ps_va = 0, fetch_va = 0;
     std::uint32_t vs_rsrc1 = 0, vs_rsrc2 = 0, ps_rsrc1 = 0, ps_rsrc2 = 0;
@@ -13124,6 +13132,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (!g.profile_passes) profile_end_locked();
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
+    bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
     if (capture_session) {

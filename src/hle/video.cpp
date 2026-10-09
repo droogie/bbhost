@@ -24,6 +24,8 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -190,6 +192,56 @@ const bool g_present_on_arrival = [] {
     return !(legacy && legacy[0] == '1');
 }();
 
+// BBHOST_TEST_REQUESTS=<dir>: a test harness's requests to the running game
+// (tools/area_check.py, through its probe plugin, at moments the game's own
+// clock picks). Each <dir>/*.req file holds one line, carried out in name
+// order and then deleted:
+//   dump <path>           this displayed frame to <path>, as BBHOST_DUMP_FRAME writes one
+//   capture <n> [<dir>]   with BBHOST_CAPTURE_ARMED=1, BBHOST_CAPTURE_DRAW may take up to n
+//                         more draws, into <dir> (draw_capture.h); 0 stops it
+// The folder is read ten times a second, on the flips.
+void test_requests(std::uint64_t display_va, std::uint64_t count) {
+    static const std::string dir = [] {
+        const char* e = std::getenv("BBHOST_TEST_REQUESTS");
+        return std::string(e && *e ? e : "");
+    }();
+    if (dir.empty()) return;
+    // The vblank's flips and the uncapped ones come here from two threads.
+    static std::mutex mu;
+    std::unique_lock<std::mutex> lock(mu, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(100)) return;
+    last = now;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<fs::path> requests;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().extension() == ".req") requests.push_back(it->path());
+    }
+    std::sort(requests.begin(), requests.end());
+    for (const fs::path& p : requests) {
+        std::string verb, arg, arg2;
+        {
+            std::ifstream f(p);
+            f >> verb >> arg >> arg2;
+        }
+        fs::remove(p, ec);
+        if (verb == "dump" && !arg.empty()) {
+            const bool ok = display_va && host_gpu_dump_display(display_va, arg.c_str());
+            host_log("test: frame dump at flip %llu to %s%s", static_cast<unsigned long long>(count), arg.c_str(), ok ? "" : " failed");
+        } else if (verb == "capture" && !arg.empty()) {
+            const int n = std::atoi(arg.c_str());
+            host_gpu_capture_arm(n, arg2.c_str());
+            host_log("test: draw captures armed for %d at flip %llu%s%s", n, static_cast<unsigned long long>(count), arg2.empty() ? "" : " into ",
+                     arg2.c_str());
+        } else {
+            host_log("test: request %s not understood: %s %s", p.filename().string().c_str(), verb.c_str(), arg.c_str());
+        }
+    }
+}
+
 // `shown`: the presenter already has the frame (BBHOST_PRESENT_ON_ARRIVAL);
 // everything else a completed flip does still happens here.
 void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, std::uint64_t count, std::uint64_t mark, bool shown,
@@ -214,6 +266,7 @@ void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh
         ++next_dump;
         host_gpu_dump_display(display_va, path);
     }
+    test_requests(display_va, count);
     // BBHOST_STALL_TEST=<flip>:<ms>
     static const std::pair<long, long> stall_test = [] {
         const char* e = std::getenv("BBHOST_STALL_TEST");

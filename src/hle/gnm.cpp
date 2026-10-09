@@ -484,6 +484,18 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                  static_cast<unsigned long long>(now.pipelines - last.pipelines),
                  static_cast<unsigned long long>(now.transfers - last.transfers),
                  static_cast<unsigned long long>(now.transfer_batches - last.transfer_batches), hle_gnm_flush_reasons().c_str());
+        {
+            // The window's draws by how their pixel shader ran: the share the
+            // lifter (BBHOST_DECOMP) carries.
+            std::uint64_t ps[kDrawPsCount];
+            for (int i = 0; i < kDrawPsCount; ++i) ps[i] = now.draws_ps[i] - last.draws_ps[i];
+            const std::uint64_t shaded = ps[kDrawPsLifted] + ps[kDrawPsTranslated] + ps[kDrawPsFallback];
+            host_log("  pixel shaders: %llu draws lifted (%.1f%%), %llu translated, %llu on the fallback; %llu draws without one",
+                     static_cast<unsigned long long>(ps[kDrawPsLifted]),
+                     shaded ? 100.0 * static_cast<double>(ps[kDrawPsLifted]) / static_cast<double>(shaded) : 0.0,
+                     static_cast<unsigned long long>(ps[kDrawPsTranslated]), static_cast<unsigned long long>(ps[kDrawPsFallback]),
+                     static_cast<unsigned long long>(ps[kDrawPsNone]));
+        }
         if (const std::string arena = hle_gnm_arena_report(); !arena.empty()) host_log("arena:%s", arena.c_str());
         std::string ph;
         for (int i = 0; i < kPhaseCount; ++i) {

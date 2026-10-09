@@ -8,6 +8,10 @@
 //   BBHOST_CAPTURE_DRAW=<pipeline prefix>[,<prefix>...][%<min count>]   e.g. 8747a367+a22c7f71
 //   BBHOST_CAPTURE_DRAW=*                                 the first draw of each pipeline whose no-fallback variant is
 //                                                         ready, up to BBHOST_CAPTURE_COUNT (tools/lift_verify.py)
+//   BBHOST_CAPTURE_DRAW=*ps                               the same, one draw for each pixel shader
+//   BBHOST_CAPTURE_ARMED=1                                only while a test harness has armed it, for as many draws as
+//                                                         it asked (BBHOST_TEST_REQUESTS "capture <n> [<dir>]",
+//                                                         hle/video.cpp; tools/area_check.py)
 //   BBHOST_CAPTURE_MIN_FLIP=<flip>                        first flip considered
 //   BBHOST_CAPTURE_DIR=<dir>                              parent directory (default tmp/captures)
 //   BBHOST_CAPTURE_COUNT=<n>                              draws to capture (default 1)
