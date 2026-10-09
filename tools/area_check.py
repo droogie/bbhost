@@ -254,9 +254,13 @@ def pass_settings(pass_dir, areas, opts, kind):
         "BBHOST_MAPVAL_DUMPS": str(pass_dir / "frames"), "BBHOST_MAPVAL_CAPTURES": str(pass_dir / "captures"),
     }
     if kind == "capture":
+        # The set cache makes the params block a dynamic (or pushed) uniform
+        # buffer, which changes the translated shader and is not in a
+        # capture's manifest: gcnlift would rebuild the other variant and
+        # every lift check read "not comparable". The perf pass keeps it.
         s.update({"BBHOST_CAPTURE_DRAW": "*ps", "BBHOST_CAPTURE_ARMED": "1",
                   "BBHOST_CAPTURE_COUNT": str(max(1, opts["captures"]) * len(areas)),
-                  "BBHOST_CAPTURE_DIR": str(pass_dir / "captures")})
+                  "BBHOST_CAPTURE_DIR": str(pass_dir / "captures"), "BBHOST_SET_CACHE": "0"})
     for item in opts.get("env", []):
         name, sep, value = item.partition("=")
         if not sep or not name.startswith("BBHOST_") or name in s:
