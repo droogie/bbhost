@@ -11,9 +11,9 @@
 //     set it is a plain value.
 //   * An s_cbranch_execz skips its region only when EXEC is clear, where the
 //     masked writes keep their old values anyway. The region is emitted
-//     unconditionally when it has no image, export or memory instruction, does
-//     not change EXEC, and every scalar register it writes is redefined before
-//     it is read on every path out of it, around loops too (scalar writes are
+//     unconditionally when it writes no memory, sets EXEC only within EXEC at
+//     its start, and every scalar register it writes is redefined before it
+//     is read on every path out of it, around loops too (scalar writes are
 //     not masked, and GCN runs a block once for all lanes when any lane needs
 //     it). A lane mask it writes may stay live where it equals, wherever GCN
 //     can skip the region, its value on the skipped path.
@@ -41,13 +41,26 @@
 //     it: an OpLoopMerge loop per pixel with phis for what the body writes.
 //     A uniform loop exits on a bit every lane holds alike; a divergent one is
 //     the per-lane exit idiom on a loop mask (see "loops" below).
-//   * Implicit-LOD samples are accepted only outside regions with EXEC known
-//     set. The whole function is then uniform control flow, so Vulkan helper
-//     invocations compute the samples for a quad's uncovered pixels as GCN's
-//     whole-quad lanes do, and helper outputs are discarded. Exports are
-//     unconditional, as in the translator; a pixel whose EXEC bit is clear at
-//     s_endpgm is discarded, and every pixel exported with its bit clear must
-//     be one of them.
+//   * Samples run for every pixel in uniform control flow and their texels are
+//     written under EXEC. Where EXEC is known set, Vulkan helper invocations
+//     compute the samples for a quad's uncovered pixels as GCN's whole-quad
+//     lanes do, and helper outputs are discarded. Under a varying EXEC an
+//     explicit-LOD sample reads only the pixel's own operands; an
+//     implicit-LOD sample (and image_get_lod, OpImageQueryLod) needs its
+//     coordinates to hold GCN's values in every pixel of each quad holding an
+//     EXEC pixel, since GCN's texture unit takes the derivatives from the
+//     quad's four lanes, EXEC set or not, as Vulkan takes them from the quad's
+//     four invocations. In a loop pixels leave at different iterations,
+//     where control flow is not uniform, only explicit-LOD samples are
+//     lifted. Exports are unconditional, as in the translator; a pixel whose
+//     EXEC bit is clear at s_endpgm is discarded, and every pixel exported
+//     with its bit clear must be one of them.
+//   * Whole-quad mode of a varying EXEC M (s_wqm_b64 exec, exec, then VALU
+//     work up to s_mov_b64 exec, <M>: the coordinates of a sample in a
+//     divergent region) is lifted for every pixel. What it writes holds GCN's
+//     value only in the quads of M; the lifter keeps, per register, where it
+//     holds GCN's value (`partial`) and checks that at every use, around
+//     loops too. Not in a loop pixels leave at different iterations.
 //   * ds_swizzle_b32 in quad mode (and the bit-mask patterns that stay inside
 //     a quad) becomes OpGroupNonUniformQuadBroadcast or QuadSwap: Vulkan lays
 //     a fragment shader's quad out as GCN does (lane 1 right of lane 0, lane 2
@@ -307,7 +320,7 @@ private:
     std::vector<KillProof> kill_proofs;
     std::vector<Val> export_execs;          // EXEC at exports where it was not known set
     std::map<Id, std::set<Id>> conjuncts;   // the operands of each lane mask built by LogicalAnd
-    std::map<Id, Id> negation_of;           // each lane mask built by LogicalNot -> its operand
+    std::map<Id, Id> negation_of;           // lane masks LogicalNot built, both ways: each -> one that is its negation
     // Values every lane holds alike: built only from constants, user data,
     // scalar loads and other such values (scalar operands never read a VGPR).
     // An instruction's results are uniform when everything it read was.
@@ -610,7 +623,10 @@ private:
     Val bnot_value(const Val& a) {
         if (a.constant) return lane_const(!a.set);
         const Id r = m.emit(spv::OpLogicalNot, t_bool, {a.id});
-        negation_of[r] = a.id;  // (a double negation stays as emitted: the lifts made before keep their exact modules)
+        // Each is the other's negation. (A double negation stays as emitted:
+        // the lifts made before keep their exact modules.)
+        negation_of[r] = a.id;
+        negation_of.emplace(a.id, r);
         return lane(r);
     }
     Val bxor_value(const Val& a, const Val& b) {
@@ -710,6 +726,7 @@ private:
         auto it = reg.find(key);
         if (it == reg.end()) it = reg.emplace(key, initial_value(key)).first;
         note_read(it->second);
+        note_exact_read(key);
         return it->second;
     }
     static int scalar_key(std::uint16_t code) {
@@ -769,6 +786,7 @@ private:
         note += " " + key_name(key) + (v.kind == Kind::Float ? ":f32" : ":u32");
     }
     Val exec_lane() {
+        if (wqm.active) reject("EXEC is used inside a whole-quad block, where it is no per-pixel mask");
         auto it = lanes.find(kKeyExec);
         if (it == lanes.end()) {
             reject("EXEC is not a known per-pixel mask");
@@ -778,6 +796,7 @@ private:
     }
     Val read_lane(std::uint16_t code) {
         int key = -1;
+        if (code == kExecLo && wqm.active) reject("EXEC is read inside a whole-quad block, where it is no per-pixel mask");
         if (code == kExecLo) key = kKeyExec;
         else if (code == kVccLo) key = kKeyVcc;
         else if (code < 104) key = code;
@@ -797,6 +816,7 @@ private:
             reject("a word written into a lane mask");
             return;
         }
+        if (!lane_write_exact(code, v)) return;
         int key = -1;
         if (code == kExecLo) {
             // Skipped, a region leaves EXEC as it was; where a set EXEC lies within
@@ -833,14 +853,20 @@ private:
             reject("a lane mask stored into a VGPR");
             return;
         }
+        if (wqm.active) {
+            whole_quad_write(idx, v);
+            return;
+        }
         const Val e = exec_lane();
         const int key = 256 + idx;
+        const Where read = reads;  // where the value is exact; the old value's read below does not count
         if (e.constant) {
             if (e.set) {
                 reg[key] = v;
                 reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
                 poisoned.erase(key);  // written whole: this pixel's word again
                 note_result(v);
+                note_exact_write(key, read, e);
             } else if (e.helper_inexact) {
                 // GCN may write the helper lanes the lift leaves alone.
                 const auto it = reg.find(key);
@@ -852,6 +878,8 @@ private:
             return;
         }
         const Val old = value(key);
+        reads = read;
+        note_exact_write(key, read, e);
         ++masked_writes;
         if (v.kind == Kind::Float || old.kind == Kind::Float) {
             reg[key] = flt(fsel(e.id, as_f(v), as_f(old)));
@@ -1447,6 +1475,7 @@ private:
         case 10: {  // s_wqm_b64
             const Val a = read_lane(in.src0);
             if (!a.constant && !widen_ok) {
+                if (begin_whole_quad(in, a)) return;
                 reject("whole-quad mode of a mask that is not constant: the result depends on the other pixels of the quad");
                 return;
             }
@@ -1937,19 +1966,299 @@ private:
         return (dim == spv::Dim1D ? 1 : dim == spv::Dim2D ? 2 : 3) + (arrayed ? 1 : 0);
     }
 
+    // ---- whole-quad mode and implicit derivatives ------------------------------------
+    // Every register holds GCN's value in every pixel - is exact - except after
+    // whole-quad mode over a varying EXEC: s_wqm_b64 exec, exec where EXEC is a
+    // mask M (a divergent region's) runs what follows, up to the restore of M,
+    // for every pixel of each quad holding an M pixel (GCN's quads are four
+    // lanes), and the lift runs it for every pixel. A register written there is
+    // exact only in those quads. `partial` keeps where each register written so
+    // is exact, as a lane mask A:
+    //
+    //   * quad: in every pixel of a quad holding a pixel of A;
+    //   * not quad: in the pixels of A (A constant false: none the lifter names).
+    //
+    // A value is exact where every register it is computed from is; a write
+    // under EXEC E is exact in the E pixels where the value is and elsewhere
+    // where the old value was. A lane mask, an export and every operand of a
+    // sample must be exact in the pixels of EXEC. The coordinates of an
+    // implicit-LOD sample or of image_get_lod must also be exact in every pixel
+    // of each quad holding an EXEC pixel: GCN's texture unit takes the
+    // derivatives from the coordinates in the quad's four lanes, EXEC set or
+    // not, and the lift samples in uniform control flow, where Vulkan takes them
+    // from the quad's four invocations, helpers included.
+    struct Exact {
+        bool quad = false;
+        Val mask;
+    };
+    struct Where {             // where a value is exact
+        bool partial = false;  // false: in every pixel
+        Exact at;
+    };
+    std::map<int, Exact> partial;  // register key -> where it is exact; absent: in every pixel
+    Where reads;                   // where every register this instruction read so far is exact
+    struct WholeQuad {             // an open whole-quad block (begin_whole_quad)
+        bool active = false;
+        Val mask;                  // EXEC where it was widened
+        std::uint32_t start = 0, end = 0;
+        std::size_t writes = 0;
+    } wqm;
+    std::vector<std::uint32_t> varying_samples, lod_queries;  // samples under a varying EXEC; image_get_lod
+
+    // `partial` across an if (open_arm, then_to_else, merge_arms): each arm
+    // starts from the branch's, and after the join a register is exact where
+    // it is in both arms - every lane took the same one, the lift knows not which.
+    struct ArmExact {
+        std::map<int, Exact> at_branch, then_end;
+    };
+    std::vector<ArmExact> arm_exact;  // innermost last, as `arms`
+    void exact_open_arm() { arm_exact.push_back({partial, {}}); }
+    void exact_then_to_else() {
+        arm_exact.back().then_end = std::move(partial);
+        partial = arm_exact.back().at_branch;
+    }
+    void exact_merge_arms() {
+        const std::map<int, Exact> then_end = std::move(arm_exact.back().then_end);
+        arm_exact.pop_back();
+        std::set<int> keys;
+        for (const auto& kv : then_end) keys.insert(kv.first);
+        for (const auto& kv : partial) keys.insert(kv.first);
+        std::map<int, Exact> joined;
+        for (int k : keys) {
+            const auto t = then_end.find(k);
+            const Where w = meet(t == then_end.end() ? Where{} : Where{true, t->second}, where_reg(k));
+            if (w.partial) joined[k] = w.at;
+        }
+        partial = std::move(joined);
+    }
+
+    // Inside a kill region widened to whole quads from a varying EXEC, GCN
+    // writes whole quads where the lift keeps each pixel's bit; `partial` does
+    // not follow that (the pixels that differ are killed at s_endpgm), so
+    // nothing there may rely on a register's value in a quad's other pixels.
+    bool in_widened_kill() const {
+        return std::any_of(open_regions.begin(), open_regions.end(), [](const Region* r) { return r->kill && r->widened && !r->quad_exact; });
+    }
+
+    // The pixels of `a` lie within those of `b`.
+    bool within(const Exact& a, const Exact& b) const { return (b.quad || !a.quad) && implies(a.mask, b.mask); }
+    Where where_reg(int key) const {
+        const auto it = partial.find(key);
+        return it == partial.end() ? Where{} : Where{true, it->second};
+    }
+    // Where both are exact: the smaller where one lies within the other.
+    Where meet(const Where& a, const Where& b) {
+        if (!a.partial) return b;
+        if (!b.partial) return a;
+        if (within(a.at, b.at)) return a;
+        if (within(b.at, a.at)) return b;
+        return Where{true, Exact{false, lane_const(false)}};
+    }
+    void note_exact_read(int key) {
+        if (partial.count(key)) reads = meet(reads, where_reg(key));
+    }
+    // Exact in every pixel whose bit of `e` is set ...
+    bool exact_in(const Where& w, const Val& e) const { return !w.partial || implies(e, w.at.mask); }
+    // ... and in every pixel of each quad holding one.
+    bool quad_exact_in(const Where& w, const Val& e) const { return !w.partial || (w.at.quad && implies(e, w.at.mask)); }
+    // Exact in every pixel whose bit of `e` is clear.
+    bool exact_outside(const Where& w, const Val& e) const {
+        if (!w.partial || (e.constant && e.set)) return true;
+        if (e.constant) return false;
+        const auto n = negation_of.find(e.id);
+        return n != negation_of.end() && implies(lane(n->second), w.at.mask);
+    }
+    // Register `key` after a write under EXEC `e` of a value exact at `v`.
+    void note_exact_write(int key, const Where& v, const Val& e) {
+        const Where old = where_reg(key);
+        const bool v_in = exact_in(v, e), old_out = exact_outside(old, e);
+        const Where r = v_in && old_out ? Where{} : v_in ? old : old_out ? v : meet(v, old);
+        if (r.partial) {
+            partial[key] = r.at;
+        } else {
+            partial.erase(key);
+        }
+    }
+    // A lane mask computed from VGPRs (a comparison, a carry) is GCN's where
+    // EXEC is set, clear elsewhere in both; and the write of EXEC that ends a
+    // whole-quad block must restore the mask it widened.
+    bool lane_write_exact(std::uint16_t code, const Val& v) {
+        if (wqm.active && code == kExecLo) {
+            if (!same_lane(v, wqm.mask)) {
+                reject("a whole-quad block does not end by restoring EXEC to the mask it widened");
+                return false;
+            }
+            end_whole_quad();
+        }
+        if (reads.partial && !exact_in(reads, exec_lane())) {
+            reject("a lane mask is computed from a value the lift may hold differently from GCN in pixels of EXEC (written in whole-quad mode)");
+            return false;
+        }
+        return true;
+    }
+
+    // s_wqm_b64 exec, exec over a varying EXEC M (not a kill region's
+    // widening): a block that GCN runs for every pixel of each quad holding an M
+    // pixel, ended by s_mov_b64 exec, <M> before any branch or block boundary.
+    // The lift runs its VGPR writes for every pixel (whole_quad_write) and keeps
+    // EXEC at M; whatever needs EXEC inside the block - a comparison, a sample,
+    // an export, an EXEC read - is rejected. SCC is "some lane of M", as for
+    // M's whole quads. False: not this form (the caller rejects).
+    bool begin_whole_quad(const Inst& in, const Val& m_exec) {
+        if (in.dst != kExecLo || in.src0 != kExecLo || opt.stage != Stage::Pixel) return false;
+        if (in_widened_kill()) {
+            reject("whole-quad block inside a widened kill region, where the lift keeps the pixel's own EXEC bit");
+            return true;
+        }
+        const std::size_t at = static_cast<std::size_t>(&in - prog.insts.data());
+        for (std::size_t i = at + 1; i < prog.insts.size(); ++i) {
+            const Inst& p = prog.insts[i];
+            if (block_starts.count(p.offset) || is_branch(p) || (p.enc == Enc::SOPP && p.op == 1)) break;
+            if (p.enc == Enc::SOP1 && p.op == 4 && p.dst == kExecLo) {
+                wqm = WholeQuad{true, m_exec, in.offset, p.offset, 0};
+                set_scc_mask(m_exec);
+                note_region_write(kKeyExec);
+                note += " exec:whole-quad";
+                return true;
+            }
+        }
+        reject("whole-quad mode of a mask that is not constant, not ended by s_mov_b64 exec before a branch or block boundary");
+        return true;
+    }
+    void end_whole_quad() {
+        res.proof.push_back("whole-quad block " + hex_offset(wqm.start) + "-" + hex_offset(wqm.end) + ": EXEC widened from a varying mask " +
+                            "to its quads and restored to it; its " + std::to_string(wqm.writes) +
+                            " VGPR writes run for every pixel and hold GCN's value in those quads, which every later use checks");
+        wqm.active = false;
+    }
+    // A VGPR write inside a whole-quad block: GCN writes every pixel of each
+    // quad holding a pixel of the block's mask, the lift every pixel.
+    void whole_quad_write(int idx, const Val& v) {
+        if (!quad_exact_in(reads, wqm.mask)) {
+            reject("a whole-quad block computes v" + std::to_string(idx) + " from a value the lift may hold differently from GCN in its quads");
+            return;
+        }
+        const int key = 256 + idx;
+        reg[key] = v;
+        note_result(v);
+        partial[key] = Exact{true, wqm.mask};
+        ++wqm.writes;
+        note += " v" + std::to_string(idx) + ":quad";
+    }
+
+    // The operands of a sample or image_get_lod under EXEC `e`, as the
+    // instruction read them: GCN's in every pixel of EXEC; for implicit
+    // derivatives, the coordinates (VGPRs coord_va..) also in every pixel of
+    // each quad holding one. The sample itself runs for every pixel in uniform
+    // control flow and its result is written under EXEC.
+    bool sample_exact(const Val& e, bool implicit, int coord_va, int ncoord, const char* what) {
+        if (!exact_in(reads, e)) {
+            reject(std::string(what) + " reads an operand the lift may hold differently from GCN in pixels of EXEC (written in whole-quad mode)");
+            return false;
+        }
+        if (implicit && !(e.constant && e.set) && in_widened_kill()) {
+            reject(std::string(what) + " with implicit derivatives under a varying EXEC inside a widened kill region, where GCN computes "
+                   "for whole quads and the lift keeps the pixel's own EXEC bit");
+            return false;
+        }
+        for (int k = 0; implicit && k < ncoord; ++k) {
+            if (!quad_exact_in(where_reg(256 + coord_va + k), e)) {
+                reject(std::string(what) + " with implicit derivatives reads coordinates the lift may hold differently from GCN in pixels of "
+                       "the quads of EXEC");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The sampled image for the reference's image and sampler bindings `ii`,
+    // `si` (the image itself in `image`): the bindings, or bindless their slots
+    // from the params block (StageParams::image_index / sampler_index, members
+    // 7 and 8 here).
+    Id sampled_image(std::uint32_t ii, std::uint32_t si, Id& image) {
+        Id sampler;
+        if (ref.bindless) {
+            const auto slot = [&](std::uint32_t member, std::uint32_t k) {
+                return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(member), cu(k / 4), cu(k % 4)}));
+            };
+            image = m.load(image_types[ii], m.access_chain(m.type_pointer(spv::ScUniformConstant, image_types[ii]), image_vars[ii], {slot(7, ii)}));
+            sampler = m.load(m.type_sampler(), m.access_chain(m.type_pointer(spv::ScUniformConstant, m.type_sampler()), sampler_vars[si], {slot(8, si)}));
+        } else {
+            image = m.load(image_types[ii], image_vars[ii]);
+            sampler = m.load(m.type_sampler(), sampler_vars[si]);
+        }
+        return m.emit(spv::OpSampledImage, m.type_sampled_image(image_types[ii]), {image, sampler});
+    }
+
+    // image_get_lod, as the translator reads it (translate.cpp mimg):
+    // OpImageQueryLod's (d_l - level_base, lambda') - the level a sample would
+    // read after the sampler's and the view's clamps, and the LOD before them
+    // with the sampler's bias - for GCN's clamped and unclamped LOD, written as
+    // the dmask selects. Its derivatives are implicit, as an implicit-LOD
+    // sample's.
+    void image_get_lod(const Inst& in) {
+        if (opt.stage != Stage::Pixel) {
+            reject("image_get_lod outside a pixel shader, where there are no derivatives");
+            return;
+        }
+        const Val e = exec_lane();
+        if (in.dmask & 0xc) {
+            reject("image_get_lod returns two components, and its dmask selects a third or fourth");
+            return;
+        }
+        if (std::any_of(kill_proofs.begin(), kill_proofs.end(), [](const KillProof& k) { return k.per_pixel; })) {
+            reject("image_get_lod after a kill region where the lift may differ from GCN in pixels it kills: its derivatives would read them");
+            return;
+        }
+        const auto ii = ref.image_at.find(in.offset);
+        const auto si = ref.sampler_at.find(in.offset);
+        if (ii == ref.image_at.end() || si == ref.sampler_at.end() || ii->second >= image_vars.size() || si->second >= sampler_vars.size()) {
+            reject("the reference has no image or sampler binding for this image_get_lod");
+            return;
+        }
+        const ImageBinding& b = ref.images[ii->second];
+        if (b.storage || b.kind || b.depth || b.cube) {
+            reject(b.storage ? "image_get_lod of a storage image binding"
+                   : b.kind  ? "image_get_lod of an integer image binding"
+                   : b.depth ? "image_get_lod of a depth binding"
+                             : "image_get_lod of a cube map, whose face coordinates the translator reads as a 2D array's");
+            return;
+        }
+        if (in.unorm || (si->second < opt.sampler_force_unnormalized.size() && opt.sampler_force_unnormalized[si->second])) {
+            reject("image_get_lod with unnormalized coordinates");
+            return;
+        }
+        const int ncoord = coord_count(b.dim, false);  // no layer: OpImageQueryLod takes the coordinates alone
+        std::vector<Id> coords;
+        for (int k = 0; k < ncoord; ++k) coords.push_back(as_f(value(256 + in.vaddr + k)));
+        if (!sample_exact(e, true, in.vaddr, ncoord, "image_get_lod")) return;
+        m.capability(spv::CapImageQuery);
+        Id image;
+        const Id sampled = sampled_image(ii->second, si->second, image);
+        const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2f : t_v3f, coords);
+        const Id lod = m.emit(spv::OpImageQueryLod, t_v2f, {sampled, coord});
+        int out = 0;
+        for (std::uint32_t k = 0; k < 2; ++k) {
+            if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, lod, k)));
+        }
+        lod_queries.push_back(in.offset);
+    }
+
     void mimg(const Inst& in) {
         inst_uniform = false;  // texels are not tracked as uniform
         const std::uint32_t op = in.op;
+        if (op == 96) {
+            image_get_lod(in);
+            return;
+        }
         if (!(op >= 32 && op < 64)) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
         }
-        // Inside a region too: with EXEC known set there the region runs, or a
-        // widened kill region is computed for every pixel that can survive.
-        if (const Val e = exec_lane(); !(e.constant && e.set)) {
-            reject("image sample where EXEC is not known set");
-            return;
-        }
+        // Inside a region too, and under a varying EXEC: the sample runs for
+        // every pixel in uniform control flow and its texel is written under
+        // EXEC; sample_exact decides whether that is GCN's sample.
+        const Val e = exec_lane();
         const std::uint32_t v = op - 32;
         const bool has_o = (v & 16) != 0, has_c = (v & 8) != 0;
         const std::uint32_t low = v & 7;
@@ -1977,23 +2286,8 @@ private:
             return;
         }
         const bool unnormalized = in.unorm || (si->second < opt.sampler_force_unnormalized.size() && opt.sampler_force_unnormalized[si->second]);
-        Id image, sampler;
-        if (ref.bindless) {
-            // The slots, from the params block (StageParams::image_index /
-            // sampler_index, members 7 and 8 here).
-            const auto slot = [&](std::uint32_t member, std::uint32_t k) {
-                return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(member), cu(k / 4), cu(k % 4)}));
-            };
-            image = m.load(image_types[ii->second],
-                           m.access_chain(m.type_pointer(spv::ScUniformConstant, image_types[ii->second]), image_vars[ii->second],
-                                          {slot(7, ii->second)}));
-            sampler = m.load(m.type_sampler(), m.access_chain(m.type_pointer(spv::ScUniformConstant, m.type_sampler()), sampler_vars[si->second],
-                                                              {slot(8, si->second)}));
-        } else {
-            image = m.load(image_types[ii->second], image_vars[ii->second]);
-            sampler = m.load(m.type_sampler(), sampler_vars[si->second]);
-        }
-        const Id sampled = m.emit(spv::OpSampledImage, m.type_sampled_image(image_types[ii->second]), {image, sampler});
+        Id image;
+        const Id sampled = sampled_image(ii->second, si->second, image);
         int va = in.vaddr;
         const auto vgpr = [&](int idx) { return value(256 + idx); };
         Id offset = 0, bias = 0, dx = 0, dy = 0, lod = 0;
@@ -2014,6 +2308,7 @@ private:
             for (int k = 0; k < ng; ++k) gy.push_back(as_f(vgpr(va++)));
         }
         const int ncoord = coord_count(b.dim, b.arrayed);
+        const int coord_va = va;
         std::vector<Id> coords;
         for (int k = 0; k < ncoord; ++k) coords.push_back(as_f(vgpr(va++)));
         if (b.cube) {  // the translator's cube conversion (translate.cpp mimg)
@@ -2063,6 +2358,7 @@ private:
             }
             if (!lod && gx.empty()) lod = cf(0.0f);
         }
+        if (!sample_exact(e, !lod && !dx, coord_va, ncoord, "an image sample")) return;
         std::uint32_t mask = 0;
         std::vector<std::uint32_t> ops = {sampled, coord};
         if (has_c) ops.push_back(dref);
@@ -2087,7 +2383,7 @@ private:
         for (std::uint32_t k = 0; k < 4; ++k) {
             if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, texel, k)));
         }
-        samples.push_back(in.offset);
+        (e.constant && e.set ? samples : varying_samples).push_back(in.offset);
         if (in_divergent_loop()) divergent_samples.push_back(in.offset);  // explicit LOD or gradients (checked above)
     }
 
@@ -2152,6 +2448,10 @@ private:
             for (std::uint32_t k = 0; k < 4; ++k) {
                 if ((in.dmask >> k) & 1) comps[k] = as_f(value(256 + in.vsrc[k]));
             }
+        }
+        if (!exact_in(reads, exec_lane())) {  // the pixels that survive have their EXEC bit set here (checked at s_endpgm)
+            reject("an export reads a value the lift may hold differently from GCN in pixels of EXEC (written in whole-quad mode)");
+            return;
         }
         if (vertex) {  // the translator stores all four components of the position and of a param
             const Id value = m.emit(spv::OpCompositeConstruct, t_v4f, comps);
@@ -2589,6 +2889,7 @@ private:
         a.scc_uniform0 = scc_uniform;
         a.scc_valid0 = scc_valid;
         a.poisoned0 = poisoned;
+        exact_open_arm();
         // s_cbranch_scc0 and s_cbranch_vccz jump where their bit is clear, so the then arm runs where it is set;
         // s_cbranch_scc1 and s_cbranch_vccnz the other way round.
         const Val bit = c.op <= 5 ? scc_mask : vcc_bit;
@@ -2624,6 +2925,7 @@ private:
         scc_uniform = a.scc_uniform0;
         scc_valid = a.scc_valid0;
         poisoned = a.poisoned0;
+        exact_then_to_else();
         cur_label = m.label(a.else_label);
         a.in_else = true;
     }
@@ -2713,6 +3015,7 @@ private:
         }
         reg = std::move(merged);
         poisoned = std::move(lost);
+        exact_merge_arms();
         lanes = std::move(merged_lanes);
         to_float = a.to_float0;
         to_word = a.to_word0;
@@ -2729,6 +3032,8 @@ private:
     void merge_live_arm(Arm& a) {
         const bool else_dead = block_dead;
         block_dead = false;
+        if (else_dead) partial = std::move(arm_exact.back().then_end);  // where the live arm's registers are exact
+        arm_exact.pop_back();
         if (a.then_dead && else_dead) {
             reject("both arms of the if at " + hex_offset(a.c->branch) + " leave the loop");
             return;
@@ -2921,7 +3226,7 @@ private:
                   exec_after + (divergent ? "; s_endpgm kills exactly the guard's clear pixels and no implicit-LOD sample follows" : "");
         }
         res.proof.push_back("region " + hex_offset(r.start) + "-" + hex_offset(r.end) + how +
-                            "; samples only where EXEC is known set, no memory writes" +
+                            "; samples with the operands they read GCN's (see the samples above), no memory writes" +
                             (names.empty() ? "" : "; scalar writes (" + names + ") are redefined before any later read on every path") +
                             (masks_kept ? "; " + std::to_string(masks_kept) +
                                               " lane masks written inside equal, wherever GCN can skip the region, their value on the skipped path"
@@ -3761,6 +4066,7 @@ private:
             note.clear();
             inst_uniform = true;
             inst_helper_inexact = false;
+            reads = {};
             Region* const starting = !open_regions.empty() && open_regions.back()->kill ? open_regions.back() : nullptr;
             exec_write_ok = starting && kill_exec_write(*starting, in);
             lift_inst(in);
@@ -3841,8 +4147,9 @@ private:
                        std::to_string(execz_regions) + " s_cbranch_execz regions, " +
                        std::to_string(kill_regions) + " s_cbranch_scc0 kill regions and " + std::to_string(if_constructs) +
                        " ifs on a bit every lane holds alike; no other branch or program-counter transfer");
-        head.push_back(std::string("EXEC per pixel or vertex: set at entry; whole-quad mode only of a constant mask or in a kill region; comparison "
-                                   "masks are the pixel's own bit; set again before every sample; ") +
+        head.push_back(std::string("EXEC per pixel or vertex: set at entry; whole-quad mode only of a constant mask, in a kill region or in a "
+                                   "block that restores the mask it widened; comparison masks are the pixel's own bit; ") +
+                       (varying_samples.empty() ? "set again before every sample; " : "") +
                        (needs_kill ? "a pixel whose bit is clear at s_endpgm is discarded, as by the translator, and every pixel exported with "
                                      "its bit clear is among them"
                                    : "set at every export and at s_endpgm (no discard)"));
@@ -3855,6 +4162,15 @@ private:
                        (divergent_samples.empty() ? ""
                                                   : "; except, with explicit LOD or gradients, inside a loop pixels leave at different "
                                                     "iterations, where EXEC is set in its body:" + divergent_at));
+        if (!varying_samples.empty() || !lod_queries.empty()) {
+            std::string varying, queries;
+            for (std::uint32_t s : varying_samples) varying += " " + hex_offset(s);
+            for (std::uint32_t s : lod_queries) queries += " " + hex_offset(s);
+            head.push_back(std::to_string(varying_samples.size()) + " image samples under a varying EXEC" + (varying.empty() ? "" : ":" + varying) +
+                           "; " + std::to_string(lod_queries.size()) + " image_get_lod" + (queries.empty() ? "" : ":" + queries) +
+                           "; in uniform control flow, results written under EXEC, operands GCN's in every pixel of EXEC and the "
+                           "coordinates of implicit derivatives in every pixel of the quads of EXEC");
+        }
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");

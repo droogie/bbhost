@@ -1,8 +1,9 @@
 // The pilot pixel shader (a22c7f71) lifts from the shipped bundle, and the lifter
 // refuses the constructs it cannot prove equal. Skips when the dump is absent.
-// Before that, hand-encoded programs check ds_swizzle_b32: every quad pattern
+// Before that, hand-encoded programs check ds_swizzle_b32 (every quad pattern
 // run through a small interpreter of the lifted SPIR-V over one quad, and the
-// cases the lifter must refuse.
+// cases the lifter must refuse), texture LOD and whole-quad mode, loops,
+// regions and ifs, and lane writes; they run without the dump.
 #include "test_app0.h"
 #include "gcn/container.h"
 #include "gcn/isa.h"
@@ -579,6 +580,283 @@ void swizzles_and_loops() {
     }
     CHECK(rejected_with(loop_in_region(true).lift, "ds_swizzle_b32 of v3, which the quad's helper lanes may hold differently"));
 }
+
+bool valid_spirv(const std::vector<std::uint32_t>& spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string msg;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+        if (msg.empty()) msg = m;
+    });
+    spvtools::ValidatorOptions vo;
+    vo.SetAllowOffsetTextureOperand(true);
+    const bool valid = tools.Validate(spirv.data(), spirv.size(), vo);
+    if (!valid) std::fprintf(stderr, "lifted SPIR-V invalid: %s\n", msg.c_str());
+    return valid;
+}
+
+bool proof_says(const gcn::LiftResult& r, const char* text) {
+    for (const std::string& line : r.proof) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    std::fprintf(stderr, "expected a proof line containing \"%s\"\n", text);
+    return false;
+}
+
+bool lifted(const gcn::LiftResult& r) {
+    for (const std::string& why : r.rejections) std::fprintf(stderr, "rejected: %s\n", why.c_str());
+    return r.ok() && valid_spirv(r.spirv);
+}
+
+// ---- texture LOD and whole-quad mode, on hand-encoded programs ---------------------
+// The texture T# is in s[4:11] and the sampler S# in s[12:15], both user data;
+// texture coordinates come from attribute 0.
+namespace lod {
+
+constexpr std::uint32_t kVcc = 106, kExec = 126, kZero = 128, kHalf = 240, kOne = 242;
+constexpr std::uint32_t kSample = 32, kSampleLz = 39, kGetLod = 96;
+
+struct Asm {  // Sea Islands encodings of the instructions the cases use
+    std::vector<std::uint32_t> w;
+    void sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc0) { w.push_back(0xbe800000u | sdst << 16 | op << 8 | ssrc0); }
+    void sop2(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc0, std::uint32_t ssrc1) {
+        w.push_back(0x80000000u | op << 23 | sdst << 16 | ssrc1 << 8 | ssrc0);
+    }
+    void sopc(std::uint32_t op, std::uint32_t ssrc0, std::uint32_t ssrc1) { w.push_back(0xbf000000u | op << 16 | ssrc1 << 8 | ssrc0); }
+    void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
+    void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
+    void vopc(std::uint32_t op, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(0x7c000000u | op << 17 | vsrc1 << 9 | src0); }
+    void interp(std::uint32_t vdst, std::uint32_t attr, std::uint32_t chan) {  // v_interp_p1_f32 / v_interp_p2_f32 from v0, v1
+        w.push_back(0xc8000000u | vdst << 18 | attr << 10 | chan << 8 | 0u);
+        w.push_back(0xc8000000u | vdst << 18 | 1u << 16 | attr << 10 | chan << 8 | 1u);
+    }
+    void mimg(std::uint32_t op, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t dmask, bool unorm = false) {
+        w.push_back(0xf0000000u | op << 18 | (unorm ? 1u << 12 : 0u) | dmask << 8);
+        w.push_back(vaddr | vdata << 8 | (4u / 4) << 16 | (12u / 4) << 21);
+    }
+    void wqm() { sop1(10, kExec, kExec); }
+    void exp_mrt0(std::uint32_t v) {  // exp mrt0, v..v+3 done vm
+        w.push_back(0xf800180fu);
+        w.push_back(v | (v + 1) << 8 | (v + 2) << 16 | (v + 3) << 24);
+    }
+    std::size_t branch(std::uint32_t op) {  // a forward SOPP branch, landed later
+        w.push_back(0xbf800000u | op << 16);
+        return w.size() - 1;
+    }
+    void land(std::size_t at) { w[at] |= static_cast<std::uint16_t>(w.size() - at - 1); }
+    std::uint32_t offset() const { return static_cast<std::uint32_t>(w.size() * 4); }
+};
+
+gcn::LiftResult lift(const std::vector<std::uint32_t>& words, std::uint32_t dim = 1 /* 2D */) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    CHECK(p.errors.empty());
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Pixel;
+    o.rsrc2 = 16u << 1;  // s0-s15 user data
+    o.ps_input_ena = 2;  // v0, v1: the perspective centre
+    o.descriptor_set = 1;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.image_dims = {{dim, false}};
+    const gcn::TranslateResult ref = gcn::translate(p, o);
+    CHECK(ref.ok());
+    return gcn::lift_pixel_shader(p, o, ref);
+}
+
+// Whole-quad mode at entry and the coordinates in v2, v3; then `body` in a
+// region on the pixel's own condition (0 < v2: EXEC M), `tail` after EXEC is
+// restored, and v4..v7 exported.
+std::vector<std::uint32_t> divergent(const std::function<void(Asm&)>& body, const std::function<void(Asm&)>& tail = {}) {
+    Asm a;
+    a.sop1(4, 20, kExec);
+    a.wqm();
+    a.interp(2, 0, 0);
+    a.interp(3, 0, 1);
+    a.vopc(1, kZero, 2);    // v_cmp_lt_f32 vcc, 0, v2
+    a.sop1(36, 22, kVcc);   // s_and_saveexec_b64 s[22:23], vcc
+    const std::size_t skip = a.branch(8);
+    body(a);
+    a.land(skip);
+    a.sop1(4, kExec, 22);   // s_mov_b64 exec, s[22:23]
+    if (tail) tail(a);
+    a.exp_mrt0(4);
+    a.w.push_back(0xbf810000u);
+    return a.w;
+}
+
+// The compiler's idiom for a sample in a divergent region: save EXEC, widen
+// it to whole quads, compute v8 = v2 / 2 and v9 = v3 / 2, restore EXEC.
+void quad_coords(Asm& a, std::uint32_t save = kVcc, std::uint32_t restore = kVcc) {
+    a.sop1(4, save, kExec);
+    a.wqm();
+    a.vop2(8, 8, kHalf, 2);  // v_mul_f32 v8, 0.5, v2
+    a.vop2(8, 9, kHalf, 3);
+    a.sop1(4, kExec, restore);
+}
+
+bool has_op(const std::vector<std::uint32_t>& spirv, std::uint32_t opcode) {
+    for (std::size_t i = 5; i < spirv.size();) {
+        const std::uint32_t n = spirv[i] >> 16;
+        if ((spirv[i] & 0xffff) == opcode) return true;
+        i += n ? n : 1;
+    }
+    return false;
+}
+
+void cases() {
+    // A sample under a varying EXEC whose coordinates were computed for every
+    // pixel: lifted for every pixel, its texel written under EXEC.
+    {
+        const gcn::LiftResult r = lift(divergent([](Asm& a) { a.mimg(kSample, 4, 2, 0xf); }));
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "1 image samples under a varying EXEC"));
+    }
+    {
+        const gcn::LiftResult r = lift(divergent([](Asm& a) { a.mimg(kSampleLz, 4, 2, 0xf); }));
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "1 image samples under a varying EXEC"));
+    }
+    // Its coordinates from a whole-quad block over that EXEC.
+    {
+        const gcn::LiftResult r = lift(divergent([](Asm& a) {
+            quad_coords(a);
+            a.mimg(kSample, 4, 8, 0xf);
+        }));
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "whole-quad block"));
+    }
+    // The block's registers hold GCN's value only in the quads of its EXEC:
+    // not for an export or a sample after EXEC is restored.
+    CHECK(rejected_with(lift(divergent(
+                            [](Asm& a) {
+                                quad_coords(a);
+                                a.mimg(kSample, 4, 8, 0xf);
+                            },
+                            [](Asm& a) { a.vop1(1, 4, 256 + 8); })),  // v_mov_b32 v4, v8
+                        "an export reads a value the lift may hold differently"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { quad_coords(a); }, [](Asm& a) { a.mimg(kSample, 4, 8, 0xf); })),
+                        "an image sample reads an operand the lift may hold differently"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { quad_coords(a); }, [](Asm& a) { a.mimg(kSampleLz, 4, 8, 0xf); })),
+                        "an image sample reads an operand the lift may hold differently"));
+    // A comparison (or anything else that needs EXEC) inside the block.
+    CHECK(rejected_with(lift(divergent([](Asm& a) {
+                            a.sop1(4, kVcc, kExec);
+                            a.wqm();
+                            a.vopc(1, kZero, 3);
+                            a.sop1(4, kExec, kVcc);
+                        })),
+                        "EXEC is used inside a whole-quad block"));
+    // A block that restores another mask (here the entry's), or none before a branch.
+    CHECK(rejected_with(lift(divergent([](Asm& a) { quad_coords(a, kVcc, 20); })), "does not end by restoring EXEC"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) {
+                            a.sop1(4, kVcc, kExec);
+                            a.wqm();
+                            a.vop2(8, 8, kHalf, 2);
+                            const std::size_t skip = a.branch(8);
+                            a.vop2(8, 9, kHalf, 3);
+                            a.land(skip);
+                            a.sop1(4, kExec, kVcc);
+                        })),
+                        "not ended by s_mov_b64 exec"));
+    // Nested regions: a block over the inner EXEC may read the outer block's
+    // registers (its quads lie within the outer's), not the other way round.
+    const auto nested = [](bool outer_reads_inner) {
+        return divergent([outer_reads_inner](Asm& a) {
+            quad_coords(a);                 // v8, v9 over M
+            a.vopc(4, kZero, 3);            // v_cmp_gt_f32 vcc, 0, v3
+            a.sop1(36, 24, kVcc);           // EXEC = M2, within M
+            const std::size_t skip = a.branch(8);
+            a.sop1(4, 26, kExec);
+            a.wqm();
+            a.vop2(3, 10, kOne, 8);         // v_add_f32 v10, 1.0, v8
+            a.vop2(3, 11, kOne, 9);
+            a.sop1(4, kExec, 26);
+            a.mimg(kSample, 4, 10, 0xf);
+            a.land(skip);
+            a.sop1(4, kExec, 24);           // EXEC = M
+            if (outer_reads_inner) {
+                a.sop1(4, 26, kExec);
+                a.wqm();
+                a.vop2(3, 12, kOne, 10);    // v10 holds GCN's value only in the quads of M2
+                a.sop1(4, kExec, 26);
+            }
+        });
+    };
+    CHECK(lifted(lift(nested(false))));
+    CHECK(rejected_with(lift(nested(true)), "a whole-quad block computes v12 from a value the lift may hold differently"));
+    // An if on a scalar condition inside the region: the coordinates come from
+    // a block on one arm and from plain moves on the other; at the join they
+    // hold GCN's value in the quads of the region's EXEC, as the sample needs.
+    {
+        const auto program = [](bool export_v8) {
+            return divergent(
+                [](Asm& b) {
+                    b.sopc(6, 0, kZero);  // s_cmp_eq_u32 s0, 0
+                    const std::size_t to_else = b.branch(4);
+                    quad_coords(b);
+                    const std::size_t to_join = b.branch(2);
+                    b.land(to_else);
+                    b.vop1(1, 8, 256 + 2);  // v_mov_b32 v8, v2
+                    b.vop1(1, 9, 256 + 3);
+                    b.land(to_join);
+                    b.mimg(kSample, 4, 8, 0xf);
+                },
+                [export_v8](Asm& b) {
+                    if (export_v8) b.vop1(1, 5, 256 + 8);
+                });
+        };
+        const gcn::LiftResult r = lift(program(false));
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "if at"));
+        CHECK(rejected_with(lift(program(true)), "an export reads a value the lift may hold differently"));
+    }
+
+    // image_get_lod: OpImageQueryLod, its implicit derivatives as a sample's.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.mimg(kGetLod, 4, 2, 0x2);  // the unclamped LOD alone, as the game reads it
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r));
+        CHECK(has_op(r.spirv, 105));  // OpImageQueryLod
+        CHECK(proof_says(r, "1 image_get_lod"));
+    }
+    CHECK(lifted(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x3); }))));
+    CHECK(lifted(lift(divergent([](Asm& a) {
+        quad_coords(a);
+        a.mimg(kGetLod, 4, 8, 0x2);
+    }))));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { quad_coords(a); }, [](Asm& a) { a.mimg(kGetLod, 4, 8, 0x2); })),
+                        "image_get_lod reads an operand the lift may hold differently"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x4); })), "image_get_lod returns two components"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x2, true); })), "image_get_lod with unnormalized coordinates"));
+    CHECK(rejected_with(lift(divergent([](Asm& a) { a.mimg(kGetLod, 4, 2, 0x2); }), 3 /* cube */), "image_get_lod of a cube map"));
+    // After a kill region that leaves EXEC narrower, pixels the lift may hold
+    // differently from GCN are only killed at the end: no implicit derivatives.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(1, kZero, 2);
+        a.sop2(21, 20, 20, kVcc);      // s_andn2_b64 s[20:21], s[20:21], vcc
+        const std::size_t skip = a.branch(4);
+        a.sop2(15, kExec, kExec, 20);  // s_and_b64 exec, exec, s[20:21]
+        a.vop1(1, 6, kOne);
+        a.land(skip);
+        a.mimg(kGetLod, 4, 2, 0x2);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(a.w), "image_get_lod after a kill region"));
+    }
+}
+
+}  // namespace lod
 
 }  // namespace
 
@@ -1393,6 +1671,7 @@ int main(int argc, char** argv) {
     synthetic_swizzles();
     swizzles_and_loops();
     lane_ops::run();
+    lod::cases();
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
         return 1;
@@ -1474,9 +1753,11 @@ int main(int argc, char** argv) {
     fallback.cb_no_fallback = false;
     CHECK(rejected_with(lift(p, fallback), "no-fallback"));
 
-    // Without the restore after the first masked region, the sample at 0x4cc runs
-    // where EXEC is only the else-mask.
-    CHECK(rejected_with(lift(mutate(p, 0x45c, "s_mov_b64", make_nop), o), "EXEC is not known set"));
+    // Without the restore after the first masked region, EXEC stays the
+    // else-mask: the sample at 0x4cc is lifted under it (its coordinates are
+    // each pixel's own), but the export then writes pixels whose EXEC bit is
+    // clear and s_endpgm does not kill them.
+    CHECK(rejected_with(lift(mutate(p, 0x45c, "s_mov_b64", make_nop), o), "a pixel exported where EXEC was clear is not killed"));
 
     // Without the load at 0x460, s4 written in the second region (0x3ec-0x45c)
     // is read at 0x46c: GCN runs that block for every lane when any lane needs it.
@@ -1490,28 +1771,30 @@ int main(int argc, char** argv) {
     CHECK(rejected_with(lift(mutate(p, 0x3ac, "s_cbranch_execz", [](gcn::Inst& in) { in.op = 6; }), o), "VCC that may differ between lanes"));
 
     // A sample inside a masked region, where EXEC is the region's mask (the
-    // instruction at 0x3b0 becomes the sample from 0x068).
+    // instruction at 0x3b0 becomes the sample from 0x068): its coordinates were
+    // computed for every pixel, so it is lifted for every pixel in uniform
+    // control flow and its texel written under the region's EXEC.
     gcn::Inst sample;
     for (const gcn::Inst& in : p.insts) {
         if (in.offset == 0x68) sample = in;
     }
-    CHECK(rejected_with(lift(mutate(p, 0x3b0, "v_mul_f32",
-                                    [&](gcn::Inst& in) {
-                                        const std::uint32_t at = in.offset;
-                                        const std::uint8_t size = in.size;
-                                        in = sample;
-                                        in.offset = at;
-                                        in.size = size;
-                                    }),
-                             o),
-                        "image sample where EXEC is not known set"));
+    const gcn::LiftResult in_region = lift(mutate(p, 0x3b0, "v_mul_f32", [&](gcn::Inst& in) {
+        const std::uint32_t at = in.offset;
+        const std::uint8_t size = in.size;
+        in = sample;
+        in.offset = at;
+        in.size = size;
+    }), o);
+    CHECK(lifted(in_region));
+    CHECK(proof_says(in_region, "1 image samples under a varying EXEC: 0003b0"));
 
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed\n", g_failures);
         return 1;
     }
-    std::printf("gcn_lift_test ok: every ds_swizzle_b32 quad pattern lifted exactly, the unproven ones refused; pilot lifted (%zu words), six "
-                "constructs rejected\n",
+    std::printf("gcn_lift_test ok: the hand-encoded programs pass (every ds_swizzle_b32 quad pattern lifted exactly, loops, regions and "
+                "ifs, lane writes, texture LOD and whole-quad mode, the unproven ones refused); pilot lifted (%zu words), its constructs "
+                "checked\n",
                 ok.spirv.size());
     return 0;
 }
