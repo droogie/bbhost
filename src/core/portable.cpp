@@ -150,6 +150,14 @@ bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi) {
             l = static_cast<std::uint64_t>(low);
             h = static_cast<std::uint64_t>(high);
         }
+#elif defined(__APPLE__)
+        // stackaddr is the high end.
+        const auto top = reinterpret_cast<std::uint64_t>(pthread_get_stackaddr_np(pthread_self()));
+        const std::size_t size = pthread_get_stacksize_np(pthread_self());
+        if (top && size && top > size) {
+            l = top - size;
+            h = top;
+        }
 #else
         pthread_attr_t attr;
         if (pthread_getattr_np(pthread_self(), &attr) == 0) {
@@ -172,6 +180,10 @@ bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi) {
 std::uint32_t host_thread_id() {
 #if defined(_WIN32)
     return static_cast<std::uint32_t>(GetCurrentThreadId());
+#elif defined(__APPLE__)
+    std::uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<std::uint32_t>(tid);
 #else
     return static_cast<std::uint32_t>(syscall(SYS_gettid));
 #endif
@@ -248,6 +260,10 @@ void host_thread_set_name(const char* name) {
     if (!name || !name[0]) return;
 #if defined(_WIN32)
     pthread_setname_np(pthread_self(), name);
+#elif defined(__APPLE__)
+    char buf[64];  // MAXTHREADNAMESIZE, the terminator included
+    std::snprintf(buf, sizeof(buf), "%s", name);
+    pthread_setname_np(buf);
 #else
     char comm[16];
     host_thread_fit_name(name, comm);

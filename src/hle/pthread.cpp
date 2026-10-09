@@ -500,6 +500,9 @@ GUEST_ABI int hle_sce_rename(void* th, const char* name) {
     if (b->started) {
 #if defined(_WIN32)
         pthread_setname_np(b->pt, b->name);
+#elif defined(__APPLE__)
+        // macOS can name only the calling thread.
+        if (pthread_equal(b->pt, pthread_self())) host_thread_set_name(b->name);
 #else
         char comm[16];
         host_thread_fit_name(b->name, comm);

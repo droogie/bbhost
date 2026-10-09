@@ -35,10 +35,11 @@ void host_read_safe_recover();
 // minute soak (hle/gx_trace.cpp, safe_read).
 bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi);
 // The calling thread's OS id (gettid / GetCurrentThreadId), for logs and keys.
+// macOS: pthread_threadid_np, which fits 32 bits in practice.
 std::uint32_t host_thread_id();
 // Names the calling thread for the tools that list threads: pthread_setname_np
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
-// SetThreadDescription, which the sampler and debuggers read.
+// SetThreadDescription, which the sampler and debuggers read. macOS: 63 chars.
 void host_thread_set_name(const char* name);
 // The largest width and height among the desktop's displays, in physical
 // pixels (each display's current mode). False when the platform does not say
