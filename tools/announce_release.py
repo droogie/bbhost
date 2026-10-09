@@ -60,7 +60,8 @@ def notes(body: str, url: str) -> str:
 
 def downloads(assets: list) -> str:
     kinds = [("Windows", r"^bbhost-win-.*\.zip$"), ("Linux", r"^bbhost-linux-.*\.tar\.gz$"),
-             ("Steam Deck", r"^bbhost-steamdeck-.*\.tar\.gz$")]
+             ("Steam Deck", r"^bbhost-steamdeck-.*\.tar\.gz$"),
+             ("macOS (experimental)", r"^bbhost-mac-.*(?<!\.dSYM)\.zip$")]
     out = []
     for label, pattern in kinds:
         for a in assets:

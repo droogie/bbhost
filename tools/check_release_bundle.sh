@@ -13,6 +13,10 @@ work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 n=0
 for z in "$d"/bbhost-win-*.zip; do [ -f "$z" ] || continue; mkdir -p "$work/w$n"; unzip -q "$z" -d "$work/w$n"; n=$((n + 1)); done
 for t in "$d"/bbhost-linux-*.tar.gz "$d"/bbhost-steamdeck-*.tar.gz; do [ -f "$t" ] || continue; mkdir -p "$work/l$n"; tar xzf "$t" -C "$work/l$n"; n=$((n + 1)); done
+for z in "$d"/bbhost-mac-*.zip; do
+    case $z in *.dSYM.zip) continue ;; esac   # the debug information, not a bundle
+    [ -f "$z" ] || continue; mkdir -p "$work/m$n"; unzip -q "$z" -d "$work/m$n"; n=$((n + 1))
+done
 [ "$n" -gt 0 ] || fail "no bundles in $d"
 # Only the example config may name a server (it shows the defaults).
 if find "$work" -name '*.toml' ! -name bbhost.example.toml -exec grep -lE '^[[:space:]]*(host|np_server|auth_server)[[:space:]]*=' {} + | grep .; then
@@ -27,7 +31,7 @@ while IFS= read -r f; do
     if tr -d '\r' < "$f" | grep -E '^[^r#].*--config|^bbhost\.exe .*--config'; then fail "${f#"$work"/} passes a config"; fi
 done < <(find "$work" -name 'run-bbhost.bat')
 # What a first start writes (core/config.cpp's template), in each executable.
-for b in "$d"/bbhost "$d"/bbhost.exe; do
+for b in "$d"/bbhost "$d"/bbhost.exe "$d"/bbhost-macos; do
     [ -f "$b" ] || continue
     s=$(strings -a "$b")
     for want in 'host = "thehuntersdream.com"' 'scheme = "https"' 'verify_tls = true' 'require_account = true' \

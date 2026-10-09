@@ -1,6 +1,7 @@
 # Builds bbhost, its tools and tests on Ubuntu 24.04 and runs ctest, for every
 # push and pull request (tools/ci_build.sh; no game files - the tests that read
 # them skip). The dependency prefix (Vulkan headers, SDL3, ffmpeg) is cached.
+# tests-macos: an x86_64 build run under Rosetta 2 (tools/build_macos.sh).
 name: build
 on:
   push:
@@ -28,3 +29,31 @@ jobs:
       - name: logs on failure
         if: failure()
         run: tail -n 80 build-ci/*.log || true
+
+  macos:
+    # Not a required check yet, while the macOS port is new.
+    name: tests-macos
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: ~/VulkanSDK
+          key: vulkan-sdk-macos-${{ hashFiles('tools/ci_macos_setup.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: build-macos/prefix
+          key: deps-${{ runner.os }}-${{ hashFiles('tools/build_macos.sh') }}
+      - name: Rosetta 2 and the Vulkan SDK
+        run: tools/ci_macos_setup.sh
+      - name: build and test
+        # The runner's Homebrew is arm64: none of its libraries can go into
+        # an x86_64 bbhost.
+        run: CI_CMAKE_ARGS="-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew" tools/build_macos.sh
+      - name: logs on failure
+        if: failure()
+        run: tail -n 80 build-macos/*.log || true
