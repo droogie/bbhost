@@ -664,6 +664,13 @@ if(UNIX)
       target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
       add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
       set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      # The vertex stage's lane without subgroup built-ins: SPIR-V always, run
+      # on a device when there is one.
+      add_executable(gcn_vertex_stage_test tests/gcn_vertex_stage_test.cpp)
+      target_link_libraries(gcn_vertex_stage_test PRIVATE gcn ${SPIRV_TOOLS_LIB} Vulkan::Vulkan)
+      add_test(NAME gcn_vertex_stage_test COMMAND gcn_vertex_stage_test)
+      set_tests_properties(gcn_vertex_stage_test PROPERTIES TIMEOUT 60)
     endif()
   endif()
 endif()

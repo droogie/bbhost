@@ -241,6 +241,10 @@ struct TranslateOptions {
     // of LDS, more than Vulkan devices have to offer, so the array we declare is
     // the size COMPUTE_PGM_RSRC2 asks for, capped here.
     std::uint32_t max_lds_bytes = 32 * 1024;
+    // Lane index from an exclusive subgroup add instead of
+    // SubgroupLocalInvocationId: MoltenVK has no subgroup built-ins outside
+    // fragment and compute, so a vertex stage reading one fails to compile.
+    bool lane_from_scan = false;
     const Program* fetch = nullptr;   // VS fetch shader, inlined at s_swappc_b64
     // Vertex stage without `fetch`: s_swappc_b64 loads these elements from
     // vertex input where it would have called the fetch shader.

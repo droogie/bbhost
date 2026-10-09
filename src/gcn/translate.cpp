@@ -394,6 +394,27 @@ struct Translator {
     Id cu(std::uint32_t v) { return m.const_u32(v); }
 
     Id lane() { return ld(v_lane); }
+    // TranslateOptions::lane_from_scan. The lane must be the subgroup's own
+    // numbering (ballots and shuffles index by it), and the exclusive add only
+    // counts active invocations below this one, so it is used as an index:
+    // the lane is the position of the entry ballot's rank-th set bit, right
+    // even with inactive lanes in between. Call at entry, before any branch.
+    Id lane_by_scan(Id lo, Id hi) {
+        const Id rank = m.emit(spv::OpGroupNonUniformIAdd, t_u32, {cu(spv::ScopeSubgroup), spv::GoExclusiveScan, c_one_u});
+        const Id in_lo = popcnt(lo);
+        const Id upper = uge(rank, in_lo);  // a 64-lane subgroup's lane 32 or above
+        Id word = sel(upper, hi, lo);
+        Id n = sel(upper, isub(rank, in_lo), rank);
+        Id pos = sel(upper, cu(32), c_zero_u);
+        for (std::uint32_t width = 16; width; width >>= 1) {
+            const Id count = popcnt(iand(word, cu((1u << width) - 1)));
+            const Id skip = uge(n, count);
+            n = sel(skip, isub(n, count), n);
+            word = sel(skip, m.emit(spv::OpShiftRightLogical, t_u32, {word, cu(width)}), word);
+            pos = sel(skip, iadd(pos, cu(width)), pos);
+        }
+        return pos;
+    }
     // Bit of a 64-bit mask (lo, hi) for this lane.
     Id mask_bit(Id lo, Id hi) {
         const Id l = lane();
@@ -3761,7 +3782,11 @@ struct Translator {
         }
 
         // Built-in inputs
-        in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        if (opt.lane_from_scan) {
+            m.capability(spv::CapGroupNonUniformArithmetic);
+        } else {
+            in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        }
         if (opt.stage == Stage::Vertex) {
             in_vertex_index = builtin_in(p_in_u32, spv::BiVertexIndex, "vertex_index");
             in_instance_index = builtin_in(p_in_u32, spv::BiInstanceIndex, "instance_index");
@@ -3868,10 +3893,16 @@ struct Translator {
             m.emit_void(spv::OpKill, {});
             m.label(l_on);
         }
-        m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        Id entry_lo = 0, entry_hi = 0;  // lane_from_scan: one entry ballot for both uses
+        if (opt.lane_from_scan) {
+            ballot(m.const_bool(true), entry_lo, entry_hi);
+            m.store(v_lane, lane_by_scan(entry_lo, entry_hi));
+        } else {
+            m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        }
         {
-            Id lo, hi;
-            ballot(m.const_bool(true), lo, hi);
+            Id lo = entry_lo, hi = entry_hi;
+            if (!opt.lane_from_scan) ballot(m.const_bool(true), lo, hi);
             m.store(v_exec_lo, lo);
             m.store(v_exec_hi, hi);
             refresh_exec_bit();

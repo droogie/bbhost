@@ -44,6 +44,15 @@ bool read_header(const gcn::BundleEntry& e, const gcn::ShaderCode& code, Header&
     return true;
 }
 
+// GCN2SPV_LANE_SCAN=1: as on MoltenVK, no subgroup built-ins in these stages.
+bool lane_from_scan(gcn::Stage stage) {
+    static const bool on = [] {
+        const char* e = std::getenv("GCN2SPV_LANE_SCAN");
+        return e && e[0] == '1';
+    }();
+    return on && (stage == gcn::Stage::Vertex || stage == gcn::Stage::TessEval);
+}
+
 gcn::TranslateOptions options_for(const Header& h) {
     gcn::TranslateOptions o;
     o.stage = h.stage;
@@ -69,6 +78,7 @@ gcn::TranslateOptions options_for(const Header& h) {
         return !(e && e[0] == '0');
     }();
     o.exec_known = exec_known;
+    o.lane_from_scan = lane_from_scan(o.stage);
     if (h.stage == gcn::Stage::Pixel) {
         o.ps_input_ena = h.regs[8];
         o.descriptor_set = 1;
@@ -178,6 +188,7 @@ int main(int argc, char** argv) {
             o.tess_role = gcn::TranslateOptions::TessRole::Domain;
             o.domain_level = stage.size() > 3 ? static_cast<std::uint32_t>(std::atoi(stage.c_str() + 3)) : 1;
         } else o.stage = gcn::Stage::Vertex;
+        o.lane_from_scan = lane_from_scan(o.stage);
         const char* out = nullptr;
         gcn::Program fetch;
         for (int a = 6; a < argc; ++a) {

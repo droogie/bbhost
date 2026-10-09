@@ -52,9 +52,10 @@ enum Op : std::uint16_t {
     OpUnreachable = 255, OpGroupNonUniformElect = 333, OpGroupNonUniformAll = 334,
     OpGroupNonUniformAny = 335, OpGroupNonUniformBroadcast = 337, OpGroupNonUniformBroadcastFirst = 338,
     OpGroupNonUniformBallot = 339, OpGroupNonUniformBallotBitCount = 342, OpGroupNonUniformShuffle = 345,
-    OpGroupNonUniformShuffleXor = 346, OpDemoteToHelperInvocation = 5380,
+    OpGroupNonUniformShuffleXor = 346, OpGroupNonUniformIAdd = 349, OpDemoteToHelperInvocation = 5380,
     OpGroupNonUniformQuadBroadcast = 365, OpGroupNonUniformQuadSwap = 366,
 };
+enum GroupOperation : std::uint32_t { GoReduce = 0, GoInclusiveScan = 1, GoExclusiveScan = 2 };
 
 enum Glsl : std::uint32_t {
     GlslRound = 1, GlslRoundEven = 2, GlslTrunc = 3, GlslFAbs = 4, GlslSAbs = 5, GlslFSign = 6, GlslFloor = 8,

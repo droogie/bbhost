@@ -128,6 +128,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.i32(o.debug_ps);
     for (std::uint32_t t : o.cs_threads) h.u32(t);
     h.u32(o.max_lds_bytes);
+    h.flag(o.lane_from_scan);
     h.flag(o.fetch != nullptr);  // the program it points at, after the options
     h.u32(static_cast<std::uint32_t>(o.vertex_input.size()));
     for (const gcn::VertexElement& e : o.vertex_input) {

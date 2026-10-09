@@ -3277,6 +3277,19 @@ std::uint64_t ps_stage_key(const PsStageInputs& in) {
     if (g.bindless) key ^= 0xb1d1e55b1d1e55ull;  // another translation
     return dims_modes_key(key, *in.dims, *in.modes);
 }
+// MoltenVK's vertex and evaluation stages run ballots and shuffles but have no
+// subgroup built-ins, and are left out of subgroupSupportedStages.
+bool stage_lane_from_scan(gcn::Stage stage) {
+    VkShaderStageFlags bit = VK_SHADER_STAGE_COMPUTE_BIT;
+    switch (stage) {
+    case gcn::Stage::Vertex: bit = VK_SHADER_STAGE_VERTEX_BIT; break;
+    case gcn::Stage::Pixel: bit = VK_SHADER_STAGE_FRAGMENT_BIT; break;
+    case gcn::Stage::Compute: bit = VK_SHADER_STAGE_COMPUTE_BIT; break;
+    case gcn::Stage::TessControl: bit = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; break;
+    case gcn::Stage::TessEval: bit = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; break;
+    }
+    return (g.subgroup_stages & bit) == 0;
+}
 gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     gcn::TranslateOptions po;
     po.stage = gcn::Stage::Pixel;
@@ -3299,6 +3312,7 @@ gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     po.ps_flat_mask = in.flat_mask;
     po.ps_input_map = *in.input_map;
     po.ps_clip_discard = in.clip_discard;
+    po.lane_from_scan = stage_lane_from_scan(po.stage);
     return po;
 }
 // BBHOST_CLIP_VARYING=0 (checks): clip distances go to the clipper again
@@ -3474,6 +3488,7 @@ gcn::TranslateOptions tess_ls_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
     o.fetch = fetch;
     o.exec_known = g.exec_known;
     o.descriptor_set = 0;
+    o.lane_from_scan = stage_lane_from_scan(o.stage);
     return o;
 }
 // The two stages of a tessellated draw that carry no GCN code, made once:
@@ -3558,6 +3573,7 @@ VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name
     o.tess_cw = s.tess_cw;
     o.exec_known = g.exec_known;
     o.descriptor_set = 0;
+    o.lane_from_scan = stage_lane_from_scan(o.stage);
     const gcn::Program prog = gcn::decode(hs->words.data(), hs->words.size());
     const gcn::TranslateResult r = translate_cached(prog, o);
     VkShaderModule m = VK_NULL_HANDLE;
@@ -3805,6 +3821,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
         vo.tess_patch_cull = tess_patch_cull_near() != 0.0f;
         vo.tess_patch_cull_all = tess_patch_cull_near() < 0.0f;
     }
+    vo.lane_from_scan = stage_lane_from_scan(vo.stage);
     return vo;
 }
 bool note_vs_precompile_hit(std::uint64_t vs_key);
@@ -14449,6 +14466,8 @@ static bool draw_impl(const GpuDraw& d) {
             cd.translate.set("tess_lds_bound", tess_lds_bound());  // the tessellation stages' LDS checks (TranslateOptions::tess_lds_bound)
             cd.translate.set("bindless", g.bindless);
         }
+        cd.translate.set("vs_lane_from_scan", stage_lane_from_scan(bind_pl->tess_hw ? gcn::Stage::TessEval : gcn::Stage::Vertex));
+        cd.translate.set("ps_lane_from_scan", stage_lane_from_scan(gcn::Stage::Pixel));
         capture_session = capture_begin_locked(std::move(cd));
     }
     draw_stamp.to(kRenderCostVariant);
