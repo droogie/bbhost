@@ -175,10 +175,11 @@ void av_trace(const char* what, std::uintptr_t h) {
 // DL_PANIC "Mutex is not initialized" (DLLightMutex.cpp) as the title's
 // attract movie opens, whenever a thread is slow to start. So READY waits
 // until a thread made after the source was added has reached its entry: at
-// most a second, for an owner that makes none. BBHOST_MOVIE_READY_NOW=1
+// most a second, for an owner that makes none, and no longer than the player
+// stays open (a close joins this thread). BBHOST_MOVIE_READY_NOW=1
 // reports it at once, as before (an A/B switch for the race, which
 // BBHOST_TEST_THREAD_START_MS brings about on demand).
-void hold_ready(const Player& p) {
+void hold_ready(Player& p) {
     static const bool now = [] {
         const char* e = std::getenv("BBHOST_MOVIE_READY_NOW");
         return e && e[0] == '1';
@@ -186,8 +187,13 @@ void hold_ready(const Player& p) {
     if (now) return;
     const auto t0 = std::chrono::steady_clock::now();
     const auto ran = [&] { return hle_threads_made() > p.threads_at_source && hle_threads_starting() == 0; };
+    const auto closing = [&] {
+        std::lock_guard<std::mutex> lk(p.emu);
+        return p.equit;
+    };
     bool timed_out = false;
     while (!ran()) {
+        if (closing()) return;
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) {
             timed_out = true;
             break;
