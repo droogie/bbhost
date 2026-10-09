@@ -747,7 +747,12 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
     std::uint64_t chain_returns[8] = {};  // the frame-pointer chain's first return addresses
     {
         const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
+#if defined(__APPLE__)
+        // Rosetta 2 puts thread stacks low: ask the VM map, not the address.
+        if (hle_kernel_va_mapped(rsp, 64) || host_readable(rsp, 64)) {
+#else
         if (hle_kernel_va_mapped(rsp, 64) || rsp > 0x700000000000ull) {
+#endif
             const auto* sp = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
             host_log("  stack %llx: %llx %llx %llx %llx  %llx %llx %llx %llx",
                      static_cast<unsigned long long>(rsp),
@@ -764,7 +769,11 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
         int depth = 0;
 
         for (; rbp > rsp && rbp - rsp < (256u << 20) && (rbp & 7) == 0 &&
+#if defined(__APPLE__)
+               (hle_kernel_va_mapped(rbp, 16) || host_readable(rbp, 16));
+#else
                (hle_kernel_va_mapped(rbp, 16) || rbp > 0x700000000000ull);
+#endif
              ++depth) {
             const auto* f = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rbp));
             if (depth < 16 && len < static_cast<int>(sizeof(chain)) - 20)
@@ -821,7 +830,11 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
             if (r) where(r, "frame");
         }
         const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
+#if defined(__APPLE__)
+        if (host_readable(rsp, 128 * 8)) {  // the 128 words the loop reads
+#else
         if (rsp > 0x700000000000ull) {
+#endif
             const auto* sp = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
             for (int k = 0, shown = 0; k < 128 && shown < 16; ++k) shown += where(sp[k], "stack word") ? 1 : 0;
         }

@@ -149,6 +149,9 @@ struct Entry {
 };
 
 std::uint64_t g_slide = 0;
+#if defined(__APPLE__)
+std::uint64_t g_image_end = 0;  // the eboot's image is [g_slide, g_image_end)
+#endif
 std::mutex g_mu;
 std::unordered_map<std::uint64_t, Entry> g_by_holder;      // under g_mu
 std::map<std::uint64_t, std::uint64_t> g_by_memory;        // memory base -> holder, live entries only
@@ -578,7 +581,13 @@ void trace_map(const Pending& p) {
     if (first && g_trace_logged.fetch_add(1) < 64) {
         char who[160] = "";
 #if !defined(_WIN32)
+#if defined(__APPLE__)
+        // On macOS the host sits among guest addresses: a host caller is one
+        // outside the eboot's image.
+        if (p.ret < g_slide || p.ret >= g_image_end) {
+#else
         if (p.ret > 0x100000000000ull) {  // a host caller: name it
+#endif
             Dl_info info{};
             if (dladdr(reinterpret_cast<void*>(static_cast<std::uintptr_t>(p.ret)), &info) && info.dli_sname) {
                 std::snprintf(who, sizeof(who), " (host %s+0x%llx)", info.dli_sname,
@@ -587,7 +596,7 @@ void trace_map(const Pending& p) {
 #if defined(__APPLE__)
                 const char* name = nullptr;
                 std::uint64_t base = 0;
-                if (host_image_of(p.ret, false, &name, &base))
+                if (host_image_of(p.ret, true, &name, &base))  // code: bbhost's data holds the guest's windows
                     std::snprintf(who, sizeof(who), " (host %s+0x%llx)", name, static_cast<unsigned long long>(p.ret - base));
                 else std::snprintf(who, sizeof(who), " (host, generated code)");
 #else
@@ -704,6 +713,9 @@ std::uint64_t gx_resources_create_failures() { return g_create_failures.load(std
 
 void gx_resources_install(ElfImage* image) {
     g_slide = image->mem.slide;
+#if defined(__APPLE__)
+    g_image_end = image->mem.slide + image->mem.size;
+#endif
     g_trace = [] {
         const char* e = std::getenv("BBHOST_GX_MAP_TRACE");
         return e && e[0] == '1';

@@ -19,6 +19,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace {
 
@@ -348,7 +351,13 @@ int write_watch_fault_writers(std::uint64_t* pcs, std::uint64_t* callers, std::u
         std::uint32_t n;
     };
     std::vector<Writer> seen;
+#if defined(__APPLE__)
+    // Host code lies among guest addresses on macOS; the guest's is in the
+    // eboot's window.
+    const auto guest = [](std::uint64_t a) { return a >= kMacVmImageBase && a < kMacVmImageBase + kMacVmImageSize; };
+#else
     const auto guest = [](std::uint64_t a) { return a > 0x10000 && a < 0x100000000000ull; };
+#endif
     for (unsigned i = 0; i < kFaultRing; ++i) {
         if (!g_fault_addr[i].load(std::memory_order_acquire)) continue;
         std::uint64_t pc = 0, caller = 0;

@@ -34,6 +34,8 @@
 #include <mach-o/dyld.h>
 #include <mach-o/ldsyms.h>
 #include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 bool host_mkdir(const char* path) {
@@ -491,6 +493,23 @@ bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::u
         }
     }
     return false;
+}
+
+bool host_readable(std::uint64_t addr, std::size_t len) {
+    for (std::uint64_t at = addr; at < addr + len;) {
+        mach_vm_address_t a = at;
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_short_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &a, &size, &depth, reinterpret_cast<vm_region_recurse_info_t>(&info),
+                                   &count) != KERN_SUCCESS ||
+            a > at || !(info.protection & VM_PROT_READ)) {
+            return false;
+        }
+        at = a + size;
+    }
+    return true;
 }
 #else
 extern "C" char __executable_start;

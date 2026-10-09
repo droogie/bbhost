@@ -60,8 +60,12 @@ std::string host_exe_path();
 // and where its Mach-O header is loaded (addr minus that is what atos -l
 // takes with the header's link address). dyld's image list, for what Linux
 // asks dl_iterate_phdr; false for any address outside them, the guest's
-// included.
+// included. (bbhost's data segment holds the guest's low windows,
+// core/mac_vm.h: for an address there only a code lookup says false.)
 bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base);
+// macOS: [addr, addr+len) is mapped readable. Fault- and lock-free, so the
+// fault handler may ask; Rosetta 2's stacks can't be told by address.
+bool host_readable(std::uint64_t addr, std::size_t len);
 #endif
 // Windows: the threads host_thread_set_name named, with their CPU time
 // (kernel + user, 100 ns units), for frame statistics. A registry, not a
