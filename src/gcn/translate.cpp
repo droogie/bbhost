@@ -545,10 +545,12 @@ struct Translator {
     // v_cvt_pkrtz_f16_f32's two floats, by the VGPR that holds their pack, for as
     // long as it does and the block that packed them is the current one: a
     // compressed export of the VGPR rounds them (emit_rtz_half) rather than
-    // decoding the pack.
+    // decoding the pack - where the pack was written: under a varying EXEC
+    // (`exec`, the bit its write selected on) only where that bit is set.
     struct PackedPair {
         Id lo, hi;
         std::uint32_t block;
+        Id exec = 0;
     };
     std::map<int, PackedPair> packed_pairs;
     // The device rounds f32 to f16 toward zero itself (native_half_rtz, the
@@ -558,11 +560,13 @@ struct Translator {
     // A float pair rounded toward zero to half precision and back, natively.
     Id native_rtz_pair(Id v2f) { return m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpFConvert, t_v2h, {v2f})}); }
     // VGPR write predicated on EXEC (a plain store where the lane bit is known set).
+    Id last_write_exec = 0;  // the EXEC bit the last write_v selected on (0: EXEC known set)
     void write_v(int idx, Id value) {
         if (!lane_syms.empty()) forget_lanes(idx);
         if (!packed_pairs.empty()) packed_pairs.erase(idx);
         const Id var = vgpr_var(idx);
-        m.store(var, exec_known() ? value : m.emit(spv::OpSelect, t_u32, {exec_bit(), value, ld(var)}));
+        last_write_exec = exec_known() ? 0 : exec_bit();
+        m.store(var, last_write_exec ? m.emit(spv::OpSelect, t_u32, {last_write_exec, value, ld(var)}) : value);
     }
     // VALU destination that may be a VGPR (VOP1/2) — same thing, kept for clarity.
     void write_vdst(const Inst& in, Id value) { write_v(in.dst, value); }
@@ -1179,7 +1183,16 @@ struct Translator {
         switch (op) {
         case 0: {  // v_cndmask_b32: src1 if mask bit else src0
             Id bit = vop3 ? mask_bit(carry_in_pair_lo, carry_in_pair_hi) : vcc_bit();
-            return done_u(sel(bit, s1, s0));
+            // VOP3: the sources' abs and neg modifiers apply, abs first, as to a
+            // float operation's (the compiler writes |a|, |b| and -a, -b forms):
+            // sign-bit operations on the words, which the select passes on.
+            const auto modified = [&](Id x, int k) {
+                if (!vop3) return x;
+                if (md.abs & (1 << k)) x = iand(x, cu(0x7fffffffu));
+                if (md.neg & (1 << k)) x = ixor(x, cu(0x80000000u));
+                return x;
+            };
+            return done_u(sel(bit, modified(s1, 1), modified(s0, 0)));
         }
         case 1: {  // v_readlane_b32 sdst, vsrc, lane
             int cell_lane = 0;
@@ -1203,6 +1216,7 @@ struct Translator {
         case 2: {  // v_writelane_b32 vdst, ssrc, lane
             const Id lane_sel = iand(s1, cu(63));
             const Id var = vgpr_var(in.dst);
+            packed_pairs.erase(in.dst);  // a lane of it is a scalar now, no pack's
             m.store(var, sel(ieq(lane(), lane_sel), s0, ld(var)));
             int ln = 0;
             if (cur_offset < kFetchBias && !spill.cells.empty() &&
@@ -1309,7 +1323,7 @@ struct Translator {
             const Id v2 = m.emit(spv::OpCompositeConstruct, t_v2f, {lo, hi});
             done_u(native_rtz ? m.emit(spv::OpBitcast, t_u32, {m.emit(spv::OpFConvert, t_v2h, {v2})})
                               : m.ext_inst(t_u32, spv::GlslPackHalf2x16, {v2}));
-            if (exec_known() && export_rtz_on()) packed_pairs[in.dst] = {lo, hi, m.blocks()};
+            if (export_rtz_on()) packed_pairs[in.dst] = {lo, hi, m.blocks(), last_write_exec};
             return true;
         }
         case 48: {  // v_cvt_pk_u16_u32
@@ -3063,6 +3077,27 @@ struct Translator {
         if (in.compr) {
             for (int pair = 0; pair < 2; ++pair) {
                 if (!((in.dmask >> (pair * 2)) & 3)) continue;
+                if (const auto pk = packed_pairs.find(in.vsrc[pair]); pk != packed_pairs.end() && pk->second.block == m.blocks() && pk->second.exec) {
+                    // Packed under a varying EXEC: rounded where it was written, the old word decoded elsewhere.
+                    const Id packed = ld(vgpr_var(in.vsrc[pair]));
+                    Id r0, r1, d0, d1;
+                    if (native_rtz) {
+                        const Id r = native_rtz_pair(m.emit(spv::OpCompositeConstruct, t_v2f, {pk->second.lo, pk->second.hi}));
+                        r0 = extract(t_f32, r, 0);
+                        r1 = extract(t_f32, r, 1);
+                        const Id d = m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpBitcast, t_v2h, {packed})});
+                        d0 = extract(t_f32, d, 0);
+                        d1 = extract(t_f32, d, 1);
+                    } else {
+                        r0 = emit_rtz_half(m, half_types(), pk->second.lo);
+                        r1 = emit_rtz_half(m, half_types(), pk->second.hi);
+                        d0 = emit_unpack_half16(m, half_types(), iand(packed, cu(0xffff)));
+                        d1 = emit_unpack_half16(m, half_types(), shr(packed, cu(16)));
+                    }
+                    comps[pair * 2] = m.emit(spv::OpSelect, t_f32, {pk->second.exec, r0, d0});
+                    comps[pair * 2 + 1] = m.emit(spv::OpSelect, t_f32, {pk->second.exec, r1, d1});
+                    continue;
+                }
                 if (const auto pk = packed_pairs.find(in.vsrc[pair]); pk != packed_pairs.end() && pk->second.block == m.blocks()) {
                     if (native_rtz) {
                         const Id r = native_rtz_pair(m.emit(spv::OpCompositeConstruct, t_v2f, {pk->second.lo, pk->second.hi}));

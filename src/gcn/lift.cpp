@@ -88,9 +88,10 @@
 //     so is reading vN as this pixel's word before it is written whole again.
 //
 // Operations mirror translate.cpp exactly (GLSL.std.450 Fma for mac/mad,
-// NMin/NMax, the legacy multiply's zero rule, PackHalf2x16 exports, the cube
-// helpers and sample operand order), so a lifted shader can be compared with
-// its reference texel for texel.
+// NMin/NMax, the legacy multiply's zero rule, PackHalf2x16 exports and their
+// rounding toward zero, the cube helpers, v_cndmask_b32's source modifiers on
+// the sign bit, and sample operand order), so a lifted shader can be compared
+// with its reference texel for texel.
 #include "gcn/lift.h"
 
 #include "gcn/half.h"
@@ -231,6 +232,13 @@ private:
         std::uint32_t block;  // Module::blocks() when packed
     };
     std::map<Id, PackedPair> packed_pairs;  // v_cvt_pkrtz_f16_f32's result -> its two floats
+    // ... and that result written under a varying EXEC: the select -> the pair
+    // and the EXEC bit it selected on (translate.cpp PackedPair::exec).
+    struct MaskedPack {
+        PackedPair pair;
+        Id exec;
+    };
+    std::map<Id, MaskedPack> masked_packs;
     bool native_rtz = false;  // as the translator (gcn/half.h native_half_rtz)
     Id t_v2h = 0;
 
@@ -889,6 +897,7 @@ private:
         }
         reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;  // the old value and EXEC were read: in the flag
         if (uniform(v)) masked_uniform[reg[key].id] = {e, v};
+        if (const auto pk = packed_pairs.find(v.id); pk != packed_pairs.end() && !v.constant) masked_packs[reg[key].id] = {pk->second, e.id};
         note_result(reg[key]);
         note += " v" + std::to_string(idx) + ":select";
     }
@@ -1012,12 +1021,29 @@ private:
         case 0: {  // v_cndmask_b32
             const Val bit = mask ? *mask : read_lane(kVccLo);
             if (bit.kind != Kind::Lane) return true;
+            if (md.omod || md.clamp) {
+                reject("v_cndmask_b32 with an output modifier or clamp");
+                return true;
+            }
+            // VOP3: the sources' abs and neg modifiers apply, abs first, as to a
+            // float operation's - on the sign bit, as the translator applies them
+            // (translate.cpp vop2), so the selected word keeps every other bit.
+            const auto modified = [&](const Val& x, int k) {
+                const bool abs = (md.abs >> k) & 1, neg = (md.neg >> k) & 1;
+                if (!abs && !neg) return x;
+                if (x.constant) return word_const((abs ? x.bits & 0x7fffffffu : x.bits) ^ (neg ? 0x80000000u : 0u));
+                Id w = as_u(x);
+                if (abs) w = ibin(spv::OpBitwiseAnd, w, cu(0x7fffffffu));
+                if (neg) w = ibin(spv::OpBitwiseXor, w, cu(0x80000000u));
+                return word(w);
+            };
+            const Val a = modified(s0, 0), b = modified(s1, 1);
             if (bit.constant) {
-                write_v(in.dst, bit.set ? s1 : s0);
-            } else if (s0.kind == Kind::Float || s1.kind == Kind::Float) {
-                write_v(in.dst, flt(fsel(bit.id, as_f(s1), as_f(s0))));
+                write_v(in.dst, bit.set ? b : a);
+            } else if (a.kind == Kind::Float || b.kind == Kind::Float) {
+                write_v(in.dst, flt(fsel(bit.id, as_f(b), as_f(a))));
             } else {
-                write_v(in.dst, word(m.emit(spv::OpSelect, t_u32, {bit.id, as_u(s1), as_u(s0)})));
+                write_v(in.dst, word(m.emit(spv::OpSelect, t_u32, {bit.id, as_u(b), as_u(a)})));
             }
             return true;
         }
@@ -2454,7 +2480,31 @@ private:
                     }
                     continue;
                 }
-                const Id w = as_u(value(256 + in.vsrc[pair]));
+                const Val src = value(256 + in.vsrc[pair]);
+                if (const auto mp = masked_packs.find(src.id); !src.constant && mp != masked_packs.end() && mp->second.pair.block == m.blocks()) {
+                    // Packed under a varying EXEC, as the translator rounds it:
+                    // toward zero where the pack was written, the old word decoded elsewhere.
+                    const Id w = as_u(src);
+                    Id r0, r1, d0, d1;
+                    if (native_rtz) {
+                        const Id r = m.emit(spv::OpFConvert, t_v2f,
+                                            {m.emit(spv::OpFConvert, t_v2h, {m.emit(spv::OpCompositeConstruct, t_v2f, {mp->second.pair.lo, mp->second.pair.hi})})});
+                        r0 = m.emit(spv::OpCompositeExtract, t_f32, {r, 0u});
+                        r1 = m.emit(spv::OpCompositeExtract, t_f32, {r, 1u});
+                        const Id d = m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpBitcast, t_v2h, {w})});
+                        d0 = m.emit(spv::OpCompositeExtract, t_f32, {d, 0u});
+                        d1 = m.emit(spv::OpCompositeExtract, t_f32, {d, 1u});
+                    } else {
+                        r0 = emit_rtz_half(m, {t_bool, t_u32, t_i32, t_f32}, mp->second.pair.lo);
+                        r1 = emit_rtz_half(m, {t_bool, t_u32, t_i32, t_f32}, mp->second.pair.hi);
+                        d0 = unpack_half(ibin(spv::OpBitwiseAnd, w, cu(0xffff)));
+                        d1 = unpack_half(ibin(spv::OpShiftRightLogical, w, cu(16)));
+                    }
+                    comps[pair * 2] = fsel(mp->second.exec, r0, d0);
+                    comps[pair * 2 + 1] = fsel(mp->second.exec, r1, d1);
+                    continue;
+                }
+                const Id w = as_u(src);
                 if (native_rtz) {  // f16 to f32 is exact
                     const Id r = m.emit(spv::OpFConvert, t_v2f, {m.emit(spv::OpBitcast, t_v2h, {w})});
                     comps[pair * 2] = m.emit(spv::OpCompositeExtract, t_f32, {r, 0u});

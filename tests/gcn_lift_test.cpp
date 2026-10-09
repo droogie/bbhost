@@ -232,8 +232,24 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
                 val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(r), 0, 0, 0};
             }
             break;
-        case 186:  // OpFOrdGreaterThan
-            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {f(get(a[2], l)[0]) > f(get(a[3], l)[0]) ? 1u : 0u, 0, 0, 0};
+        case 186: case 184:  // OpFOrdGreaterThan, OpFOrdLessThan
+            for (int l = 0; l < 4; ++l) {
+                const float x = f(get(a[2], l)[0]), y = f(get(a[3], l)[0]);
+                val[a[1]][static_cast<std::size_t>(l)] = {(op == 186 ? x > y : x < y) ? 1u : 0u, 0, 0, 0};
+            }
+            break;
+        case 156:  // OpIsNan
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {f(get(a[2], l)[0]) != f(get(a[2], l)[0]) ? 1u : 0u, 0, 0, 0};
+            break;
+        case 166: case 167: case 197: case 198: case 199:  // OpLogicalOr, OpLogicalAnd, OpBitwiseOr, OpBitwiseXor, OpBitwiseAnd
+            for (int l = 0; l < 4; ++l) {
+                const std::uint32_t x = get(a[2], l)[0], y = get(a[3], l)[0];
+                const std::uint32_t r = op == 166 || op == 197 ? x | y : op == 167 || op == 199 ? x & y : x ^ y;
+                val[a[1]][static_cast<std::size_t>(l)] = {r, 0, 0, 0};
+            }
+            break;
+        case 168:  // OpLogicalNot
+            for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {get(a[2], l)[0] ? 0u : 1u, 0, 0, 0};
             break;
         case 169:  // OpSelect
             for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = get(a[2], l)[0] ? get(a[3], l) : get(a[4], l);
@@ -474,6 +490,90 @@ void synthetic_swizzles() {
         if (l.lift.ok()) {
             const QuadRun r = run_quad(l.lift.spirv, 2.0f, 4.0f, {1.0f, 3.0f, 7.0f, 15.0f});
             CHECK(r.ok && r.out[0] == 2.0f && r.out[3] == 2.0f);  // ddx: lane 1 - lane 0, the same in every lane
+        }
+    }
+}
+
+// VOP3 v_cndmask_b32 applies its sources' abs and neg modifiers, abs first,
+// as a float operation's (the game's own compiler writes |v7|, |v8| and -v10,
+// -v9 forms, and LLVM folds negations into the instruction for this chip).
+// x = attr0.x; vcc = 0 < x; v3 = vcc ? src1 : src0 with both sources v2.
+std::vector<std::uint32_t> cndmask_program(std::uint32_t abs, std::uint32_t neg) {
+    std::vector<std::uint32_t> w = {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1)};
+    w.push_back(vopc(1 /* v_cmp_lt_f32 */, 2, kZero));
+    push(w, {0xd2000000u | abs << 8 | 3u, neg << 29 | kVcc << 18 | (kV + 2) << 9 | (kV + 2)});  // v_cndmask_b32 v3, v2, v2, vcc
+    export_mrt0(w, 3, 3, 3, 3);
+    w.push_back(kEndpgm);
+    return w;
+}
+void cndmask_modifiers() {
+    const std::array<float, 4> x = {-2.0f, 3.0f, -0.5f, 1.25f};
+    const Lifted plain = lift_words(cndmask_program(0, 0));
+    struct Case {
+        std::uint32_t abs, neg;
+        std::array<float, 4> expect;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0, 0, {-2.0f, 3.0f, -0.5f, 1.25f}, "v2, v2"},
+        {0, 1, {2.0f, 3.0f, 0.5f, 1.25f}, "-v2, v2"},
+        {1, 0, {2.0f, 3.0f, 0.5f, 1.25f}, "|v2|, v2"},
+        {0, 2, {-2.0f, -3.0f, -0.5f, -1.25f}, "v2, -v2 (the conditional negation)"},
+        {3, 0, {2.0f, 3.0f, 0.5f, 1.25f}, "|v2|, |v2|"},
+        {0, 3, {2.0f, -3.0f, 0.5f, -1.25f}, "-v2, -v2"},
+        {1, 1, {-2.0f, 3.0f, -0.5f, 1.25f}, "-|v2|, v2 (abs, then neg)"},
+    };
+    for (const Case& c : cases) {
+        const Lifted l = lift_words(cndmask_program(c.abs, c.neg));
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "v_cndmask_b32 %s rejected: %s\n", c.what, why.c_str());
+        CHECK(l.ref.ok() && l.lift.ok() && spirv_valid(l.lift.spirv));
+        if (!l.lift.ok()) continue;
+        const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, x);
+        if (!r.ok) std::fprintf(stderr, "v_cndmask_b32 %s: %s\n", c.what, r.error.c_str());
+        CHECK(r.ok);
+        for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+            if (std::bit_cast<std::uint32_t>(r.out[k]) != std::bit_cast<std::uint32_t>(c.expect[k])) {
+                std::fprintf(stderr, "v_cndmask_b32 %s, x = %g: got %g, expected %g\n", c.what, x[k], r.out[k], c.expect[k]);
+                ++g_failures;
+            }
+        }
+        // The reference applies them too: a modified form is another translation.
+        if (c.abs || c.neg) CHECK(l.ref.spirv != plain.ref.spirv);
+    }
+    // An output modifier or clamp on it is refused.
+    {
+        std::vector<std::uint32_t> w = cndmask_program(0, 1);
+        w[4] |= 1u << 27;  // the second word's omod: mul:2
+        CHECK(rejected_with(lift_words(w).lift, "v_cndmask_b32 with an output modifier or clamp"));
+    }
+}
+
+// v_cvt_pkrtz_f16_f32 and a compressed export of its result: the export
+// rounds the pair toward zero itself (gcn/half.h emit_rtz_half, whose clamp
+// constant is 0x477fe000), as GCN's pack does, also where the pack was
+// written under a varying EXEC - in the lift and the reference alike.
+bool has_u32_constant(const std::vector<std::uint32_t>& spv, std::uint32_t value) {
+    for (std::size_t i = 5; i < spv.size() && (spv[i] >> 16);) {
+        if ((spv[i] & 0xffff) == 43 && (spv[i] >> 16) == 4 && spv[i + 3] == value) return true;
+        i += spv[i] >> 16;
+    }
+    return false;
+}
+void packed_exports() {
+    for (const bool varying : {false, true}) {
+        std::vector<std::uint32_t> w = {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1), vop1(kVMov, 3, kZero)};
+        if (varying) push(w, {vopc(kVCmpGtF32, 2, kZero) /* vcc = 0 > x */, sop1(kAndSaveexecB64, 4, kVcc)});
+        w.push_back(vop2(47, 3, 2, kV + 2));  // v_cvt_pkrtz_f16_f32 v3, v2, v2
+        push(w, {0xf8000000u | 1u << 12 | 1u << 11 | 1u << 10 | 0xfu, 3u | 3u << 8});  // exp mrt0 v3, v3 done compr vm
+        w.push_back(kEndpgm);
+        const Lifted l = lift_words(w);
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "packed export rejected: %s\n", why.c_str());
+        CHECK(l.ref.ok() && l.lift.ok() && spirv_valid(l.lift.spirv));
+        if (!has_u32_constant(l.lift.spirv, 0x477fe000u) || !has_u32_constant(l.ref.spirv, 0x477fe000u)) {
+            std::fprintf(stderr, "a compressed export of a pack %s is not rounded toward zero (lift %d, reference %d)\n",
+                         varying ? "under a varying EXEC" : "with EXEC set", has_u32_constant(l.lift.spirv, 0x477fe000u),
+                         has_u32_constant(l.ref.spirv, 0x477fe000u));
+            ++g_failures;
         }
     }
 }
@@ -1904,6 +2004,8 @@ void run() {
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
     control_flow::run();
+    cndmask_modifiers();
+    packed_exports();
     synthetic_swizzles();
     swizzles_and_loops();
     lane_ops::run();
