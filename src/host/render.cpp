@@ -262,7 +262,7 @@ struct GfxPipeline {
     gcn::TranslateResult tess_hs;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
-    // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
+    // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layouts.
     VkDescriptorSetLayout set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     // The no-fallback variant, once a draw whose constant buffers all bound
@@ -1904,6 +1904,7 @@ const bool g_dump_spirv = [] {
 }();
 void dump_spirv(const std::string& name, const std::vector<std::uint32_t>& spirv) {
     if (!g_dump_spirv) return;
+    host_mkdir("build");  // mkdir makes one level
     host_mkdir("build/spv");
     const std::string path = "build/spv/" + name + ".spv";
     if (FILE* f = std::fopen(path.c_str(), "wb")) {
@@ -2649,10 +2650,12 @@ void apply_table_masks_locked() {
 // BBHOST_SET_LAYOUTS (on unless 0): each graphics pipeline's sets have a layout
 // with only the params buffer and the bindings its stage's translation
 // declares, instead of the shared layout's 113, so allocating and binding a set
-// covers the descriptors the stage uses. Stages with the same bindings share a
-// layout, and pipelines with the same pair share a pipeline layout: a
-// no-fallback variant declares its base pipeline's bindings, so it takes the
-// sets written for them. Compute dispatches keep the shared layout.
+// covers the descriptors the stage uses. Stages of one set with the same
+// bindings share a layout, and pipelines with the same pair share a pipeline
+// layout: a no-fallback variant declares its base pipeline's bindings, so it
+// takes the sets written for them. With Gpu::per_stage_sets each set is
+// visible to its own stages only, so per-stage limits count each shader apart.
+// Compute dispatches keep the shared layout.
 const bool g_set_layouts = [] {
     const char* e = std::getenv("BBHOST_SET_LAYOUTS");
     return !(e && e[0] == '0');
@@ -2662,7 +2665,7 @@ const bool g_set_layouts = [] {
 // link from pipeline libraries whose shaders are compiled when GX creates them:
 // a cold world load stalls 12.6 s
 // against 19.4 s, for 2.4% more GPU time and 1.1 GiB more host memory in steady
-// state. Needs the per-stage set layouts; both sets take the shared layout
+// state. Needs the per-stage set layouts; both sets take the shared layouts
 // (build_gfx_pipeline).
 bool use_pipeline_library() {
     static const bool on = [] {
@@ -2675,39 +2678,12 @@ std::mutex g_stage_layout_mu;  // pipelines are built on worker threads too
 std::unordered_map<std::uint64_t, VkDescriptorSetLayout> g_stage_set_layouts;  // by binding list, under g_stage_layout_mu
 std::unordered_map<std::uint64_t, VkPipelineLayout> g_stage_pipe_layouts;       // by set layout pair, under g_stage_layout_mu
 
-VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta) {
+// `set`: 0 for the vertex shader's set, 1 for the pixel shader's.
+VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta, int set) {
     std::lock_guard<std::mutex> lk(g_stage_layout_mu);
-    std::vector<VkDescriptorSetLayoutBinding> binds;
-    binds.push_back({gcn::kBindingParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
-    for (const gcn::ImageBinding& b : meta.images) {
-        binds.push_back({b.binding, b.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL,
-                         nullptr});
-    }
-    for (const gcn::SamplerBinding& b : meta.samplers) {
-        binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr});
-    }
-    if (meta.bindless) {  // images and samplers are set 3's
-        binds.erase(std::remove_if(binds.begin(), binds.end(),
-                                   [](const VkDescriptorSetLayoutBinding& b) {
-                                       return b.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
-                                              b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
-                                              b.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER;
-                                   }),
-                    binds.end());
-    }
-    for (const gcn::BufferBinding& b : meta.buffers) {
-        if (cb_push_on()) break;  // set 2, pushed
-        binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-    }
-    std::sort(binds.begin(), binds.end(), [](const VkDescriptorSetLayoutBinding& a, const VkDescriptorSetLayoutBinding& b) {
-        return a.binding < b.binding;
-    });
-    binds.erase(std::unique(binds.begin(), binds.end(),
-                            [](const VkDescriptorSetLayoutBinding& a, const VkDescriptorSetLayoutBinding& b) {
-                                return a.binding == b.binding && a.descriptorType == b.descriptorType;
-                            }),
-                binds.end());
-    std::uint64_t key = 1469598103934665603ull;
+    const VkShaderStageFlags stages = gfx_set_stages(g.per_stage_sets, set);
+    const std::vector<VkDescriptorSetLayoutBinding> binds = stage_set_bindings(meta, params_descriptor_type(), !cb_push_on(), stages);
+    std::uint64_t key = fnv1a(&stages, sizeof(stages));
     for (const VkDescriptorSetLayoutBinding& b : binds) {
         key = fnv1a(&b.binding, sizeof(b.binding), key);
         key = fnv1a(&b.descriptorType, sizeof(b.descriptorType), key);
@@ -4622,16 +4598,19 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         pl.rect_tes = t.evaluation;
     }
 
+    if (!stage_fits_device(pl.vs.meta(), vs_name) || !stage_fits_device(pl.ps.meta(), ps_name)) {
+        return fail("more samplers than the device binds a stage");
+    }
     if (g_set_layouts) {
         // Pipeline libraries: every vertex shader's set has the shared layout, so a
         // pixel shader's fragment-shader library is laid out the same whatever
         // vertex shader it runs with. (Libraries laid out with their own set only,
         // a null or empty set in the other stage's slot and independent sets,
         // fast-linked into pipelines that lost the device on the RTX 4070 driver.)
-        pl.set_layouts[0] = use_pipeline_library() ? g.gfx_set_layout : stage_set_layout(pl.vs.meta());
-        // Under libraries both sets take the shared layout, so a vertex shader's
+        pl.set_layouts[0] = use_pipeline_library() ? g.gfx_set_layouts[0] : stage_set_layout(pl.vs.meta(), 0);
+        // Under libraries both sets take the shared layouts, so a vertex shader's
         // pre-rasterization library does not depend on its pixel shader (step 6b).
-        pl.set_layouts[1] = use_pipeline_library() ? g.gfx_set_layout : stage_set_layout(pl.ps.meta());  // params only without a PS
+        pl.set_layouts[1] = use_pipeline_library() ? g.gfx_set_layouts[1] : stage_set_layout(pl.ps.meta(), 1);  // params only without a PS
         pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? stage_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1]) : VK_NULL_HANDLE;
         if (pl.tess_set_layout) {  // a native hull pipeline's, or a particle LS's constant buffers
             pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? tess_native_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1], pl.tess_set_layout)
@@ -4808,7 +4787,7 @@ VkPipeline create_library(VkGraphicsPipelineCreateInfo& gpci, VkGraphicsPipeline
 }
 
 // A vertex shader's pre-rasterization library, with a rect list's geometry
-// shader. Both sets take the shared layout and it gets no target formats (step
+// shader. Both sets take the shared layouts and it gets no target formats (step
 // 6b), so it is keyed by the shaders and raster state alone and can be compiled
 // before any draw uses it (step 6d).
 // The raster states each vertex shader's libraries were built in, for the
@@ -5596,9 +5575,10 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!stage_fits_device(stage.meta(), job.name)) return give_up("more samplers than the device binds a stage");
     const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries (build_gfx_pipeline)
-    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
+    const VkDescriptorSetLayout set = g.gfx_set_layouts[1];  // both sets take the shared layouts under libraries (build_gfx_pipeline)
+    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layouts[0], set) : VK_NULL_HANDLE;
     dump_spirv("precompile-" + job.name, stage.meta().spirv);
     t_library_owner = job.name.c_str();
     const VkPipeline library = layout ? fragment_library(stage.meta(), stage.module, set, layout) : VK_NULL_HANDLE;
@@ -5731,13 +5711,13 @@ void precompile_manifest(const ManifestStage& m) {
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
         if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
+    ok = ok && stage_fits_device(stage.meta(), m.name);
     if (ok && !m.tess_hw && !m.domain_level) {
-        const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
-        const VkDescriptorSetLayout sets[2] = {set, set};
-        const VkPipelineLayout layout = set ? stage_pipeline_layout(set, set) : VK_NULL_HANDLE;
+        const VkDescriptorSetLayout sets[2] = {g.gfx_set_layouts[0], g.gfx_set_layouts[1]};  // the shared layouts under libraries
+        const VkPipelineLayout layout = sets[0] && sets[1] ? stage_pipeline_layout(sets[0], sets[1]) : VK_NULL_HANDLE;
         t_library_owner = m.name.c_str();
         if (m.stage) {
-            ok = layout && fragment_library(stage.meta(), stage.module, set, layout) != VK_NULL_HANDLE;
+            ok = layout && fragment_library(stage.meta(), stage.module, sets[1], layout) != VK_NULL_HANDLE;
         } else {
             const ShaderStage no_gs;
             ok = layout && pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) != VK_NULL_HANDLE;
@@ -5833,9 +5813,10 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!stage_fits_device(stage.meta(), job.name)) return give_up("more samplers than the device binds a stage");
     const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
-    const VkPipelineLayout layout = stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout);
+    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layouts[0], g.gfx_set_layouts[1]};  // the shared layouts under libraries
+    const VkPipelineLayout layout = stage_pipeline_layout(sets[0], sets[1]);
     const ShaderStage no_gs;
     t_library_owner = job.name.c_str();
     const VkPipeline library = layout ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) : VK_NULL_HANDLE;
@@ -11714,7 +11695,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             host_log("render: tessellation LS %s: %s", pl.name.c_str(),
                      !prog.errors.empty() ? prog.errors[0].what.c_str() : pl.meta.errors[0].c_str());
             pl.failed = true;
-        } else if (!make_module(pl.meta.spirv, module)) {
+        } else if (!stage_fits_device(pl.meta, pl.name) || !make_module(pl.meta.spirv, module)) {
             pl.failed = true;
         } else {
             dump_spirv(pl.name, pl.meta.spirv);
@@ -14093,7 +14074,7 @@ static bool draw_impl(const GpuDraw& d) {
             stage_params[st] = params;
             stage_first_buffer[st] = first_buffer;
             draw_stamp.to(kRenderCostBuffers);
-            const VkDescriptorSetLayout layout = pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout;
+            const VkDescriptorSetLayout layout = pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st];
             static thread_local std::vector<std::uint64_t> material;
             if (!meta.bindless) stage_final_views(meta, stage_images[st], pl.name.c_str(), views);
             const auto handle = [](auto h) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(h)); };
@@ -14127,7 +14108,7 @@ static bool draw_impl(const GpuDraw& d) {
             VkDescriptorPool pool = VK_NULL_HANDLE;
             VkDescriptorSet set = set_cache_alloc(layout, pool);
             const bool cached = set != VK_NULL_HANDLE;
-            if (!cached) set = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+            if (!cached) set = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
             if (!set) {
                 draw_failed(kFailSet);
                 return false;
@@ -14194,7 +14175,7 @@ static bool draw_impl(const GpuDraw& d) {
         stage_params[st] = params;
         stage_first_buffer[st] = first_buffer;
         draw_stamp.to(kRenderCostBuffers);
-        sets[st] = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+        sets[st] = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
         bump(g_set_built);
         if (!sets[st]) {
             static std::atomic<int> logs{0};
@@ -14370,7 +14351,7 @@ static bool draw_impl(const GpuDraw& d) {
                 // would change it. Take a fresh set and slot and write the
                 // whole stage into them instead. (With constant buffers pushed,
                 // the set holds none, and the params slot is this draw's own.)
-                const VkDescriptorSet fresh = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+                const VkDescriptorSet fresh = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
                 if (!fresh) {
                     static std::atomic<int> logs{0};
                     if (logs.fetch_add(1) < 4) {

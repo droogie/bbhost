@@ -8,6 +8,7 @@
 
 #include "gcn/translate.h"
 #include "hle/modules.h"
+#include "host/descriptor_layouts.h"
 #include "host/gpu.h"
 #include "host/stream_ops.h"
 
@@ -77,7 +78,6 @@ bool image_memory_in_vram(const ImageMemory& m);
 constexpr std::uint64_t kChunkBytes = 1ull << gcn::kDmemChunkShift;
 // How far a whole-span import runs on into the next chunk (gpu.cpp map setup).
 constexpr std::uint64_t kChunkOverlap = 64ull << 20;
-constexpr std::uint32_t kMaxImages = 32;
 // A frame with more draws than this takes a mid-frame submit (render.cpp).
 // Measured 2026-09-26: 354 flips of ~11,000 in a combat soak, and 45 of 60 in
 // the worst seconds - but those submits wait on nothing (`gpu-wait` 0-1 ms a
@@ -221,6 +221,10 @@ struct Gpu {
     bool has_depth_bias_clamp = false;    // VkPhysicalDeviceFeatures::depthBiasClamp
     bool has_tessellation = false;        // VkPhysicalDeviceFeatures::tessellationShader
     bool has_geometry_shader = false;     // VkPhysicalDeviceFeatures::geometryShader (none on MoltenVK)
+    // VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers (MoltenVK: 16): the
+    // shared sets declare no more (shared_set_samplers), and a stage whose
+    // translation names more is not built (stage_fits_device).
+    std::uint32_t max_stage_samplers = kMaxImages;
     std::uint32_t subgroup_stages = 0;    // VkPhysicalDeviceSubgroupProperties::supportedStages
     // Pixel shaders at wave32 (gcn/wave.h):
     // decided at device creation (gpu.cpp), given to each fragment stage by
@@ -399,10 +403,19 @@ struct Gpu {
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
     // BBHOST_BINDLESS=1 (bindless.cpp): graphics stages read
     // images and samplers from one global set (set 3); their own sets hold the
-    // params block alone. gfx_set_layout is the graphics stage sets' layout:
-    // set_layout's, or the params block alone when bindless.
+    // params block alone. gfx_set_layouts are the graphics stage sets' shared
+    // layouts, set 0's and set 1's: set_layout's bindings, or the params block
+    // alone when bindless - one layout, set_layout itself without bindless,
+    // or with per_stage_sets two, each read by its own stages (kGfxSetStages).
     bool bindless = false;
-    VkDescriptorSetLayout gfx_set_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gfx_set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // The descriptor layouts per stage (descriptor_layouts.h): only on MoltenVK,
+    // where the layouts as they are - every binding in every stage - are over
+    // the device's per-stage limits (old_layouts_over_limits). The
+    // graphics sets' bindings, the pushed constant buffers' and every
+    // pipeline's own sets then name only the stages that read them, and the
+    // shared sets declare no more samplers than a stage may bind.
+    bool per_stage_sets = false;
     VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
     VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
@@ -1593,5 +1606,11 @@ extern VkDescriptorBufferInfo g_params_desc;
 // A view is being let go: the cached sets that hold it are dropped. Under g.mu.
 void set_cache_forget_view_locked(VkImageView view);
 std::string set_cache_report();
+
+// Whether a translated stage's bindings fit the device's per-stage limits: its
+// samplers against max_stage_samplers (gpu.cpp). Where they do not, the stage
+// is said once by `name` and its pipeline is not built - its layout would be
+// over the device's limit, or (a shared set) without the binding at all.
+bool stage_fits_device(const gcn::TranslateResult& meta, const std::string& name);
 
 }  // namespace gpu

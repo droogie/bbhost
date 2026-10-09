@@ -1863,6 +1863,7 @@ bool init_locked() {
     host_log("gpu: stage interface limits: vertex outputs %u, geometry outputs %u, fragment inputs %u components",
              props.limits.maxVertexOutputComponents, props.limits.maxGeometryOutputComponents, props.limits.maxFragmentInputComponents);
     g.max_anisotropy = props.limits.maxSamplerAnisotropy;
+    g.max_stage_samplers = props.limits.maxPerStageDescriptorSamplers;
     g.ssbo_align = props.limits.minStorageBufferOffsetAlignment ? props.limits.minStorageBufferOffsetAlignment : 1;
     g.ssbo_max_range = props.limits.maxStorageBufferRange;
     // BBHOST_CB_SSBO=0: constant buffers stay on the page-table path. =1: they
@@ -2443,64 +2444,90 @@ bool init_locked() {
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.side_cache) != VK_SUCCESS) g.side_cache = VK_NULL_HANDLE;
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.opt_cache) != VK_SUCCESS) g.opt_cache = VK_NULL_HANDLE;
 
-    // Descriptor layout: params UBO, then sampled images, samplers, storage images.
-    std::vector<VkDescriptorSetLayoutBinding> binds;
-    binds.push_back({gcn::kBindingParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
-    for (std::uint32_t k = 0; k < kMaxImages; ++k) {
-        binds.push_back({gcn::kBindingImage0 + k, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
-        binds.push_back({gcn::kBindingSampler0 + k, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr});
-        binds.push_back({gcn::kBindingStorageImage0 + k, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
+    // Descriptor layout: params UBO, then sampled images, samplers, storage
+    // images (descriptor_layouts.h). Per stage only on MoltenVK; another
+    // driver over its limits keeps them, and the excess is said.
+    const VkDescriptorType params = params_descriptor_type();
+    const std::string old_over = old_layouts_over_limits(params, cb_push_on(), props.limits);
+    g.per_stage_sets = g.moltenvk && !old_over.empty();
+    const std::uint32_t samplers = shared_set_samplers(g.per_stage_sets, g.max_stage_samplers);
+    // The graphics layout's first excess, or the compute layout's.
+    const std::size_t over_gfx = old_over.find("graphics layout");
+    std::string first_over = old_over.substr(over_gfx == std::string::npos ? 0 : over_gfx);
+    first_over = first_over.substr(0, first_over.find("; "));
+    if (g.per_stage_sets) {
+        host_log("gpu: descriptor sets per stage, %u samplers a stage (a shader with more is not built): with every binding in every "
+                 "stage the layouts are over the device's limits (%s, and more)",
+                 samplers, first_over.c_str());
+    } else if (!old_over.empty()) {
+        host_log("gpu: descriptor sets with every binding in every stage, over the device's per-stage limits (%s, and more)",
+                 first_over.c_str());
+    } else {
+        host_log("gpu: descriptor sets with every binding in every stage (within the device's per-stage limits)");
     }
-    for (std::uint32_t k = 0; k < gcn::kMaxBuffers && !cb_push_on(); ++k) {
-        binds.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-    }
-    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = static_cast<std::uint32_t>(binds.size());
-    lci.pBindings = binds.data();
-    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &g.set_layout) != VK_SUCCESS) {
+    const auto make_set_layout = [](const std::vector<VkDescriptorSetLayoutBinding>& binds, VkDescriptorSetLayoutCreateFlags flags,
+                                    VkDescriptorSetLayout& out) {
+        VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        lci.flags = flags;
+        lci.bindingCount = static_cast<std::uint32_t>(binds.size());
+        lci.pBindings = binds.data();
+        return vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &out) == VK_SUCCESS;
+    };
+    const std::vector<VkDescriptorSetLayoutBinding> binds = shared_set_bindings(params, samplers, !cb_push_on(), VK_SHADER_STAGE_ALL);
+    if (!make_set_layout(binds, 0, g.set_layout)) {
         host_log("gpu: descriptor set layout failed");
         return false;
     }
+    const std::vector<VkDescriptorSetLayoutBinding> cbs =
+        cb_push_on() ? cb_push_bindings(g.per_stage_sets) : std::vector<VkDescriptorSetLayoutBinding>{};
     if (cb_push_on()) {
-        std::vector<VkDescriptorSetLayoutBinding> cbs;
-        for (std::uint32_t k = 0; k < 2 * gcn::kMaxBuffers; ++k) {
-            cbs.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-        }
-        VkDescriptorSetLayoutCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        pci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        pci.bindingCount = static_cast<std::uint32_t>(cbs.size());
-        pci.pBindings = cbs.data();
-        if (vkCreateDescriptorSetLayout(g.device, &pci, nullptr, &g.cb_push_layout) != VK_SUCCESS) {
+        if (!make_set_layout(cbs, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, g.cb_push_layout)) {
             host_log("gpu: constant-buffer push descriptor layout failed");
             return false;
         }
         host_log("gpu: constant buffers are pushed per draw (set 2); descriptor sets cached by content");
     }
-    // Graphics stages under bindless keep only their params
-    // block in their own sets; images and samplers are set 3's.
-    g.gfx_set_layout = g.set_layout;
     if (g.bindless) {
         VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
         VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         pp.pNext = &p12;
         vkGetPhysicalDeviceProperties2(g.phys, &pp);
-        const VkDescriptorSetLayoutBinding params{gcn::kBindingParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr};
-        VkDescriptorSetLayoutCreateInfo sci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        sci.bindingCount = 1;
-        sci.pBindings = &params;
-        g.bindless = vkCreateDescriptorSetLayout(g.device, &sci, nullptr, &g.gfx_set_layout) == VK_SUCCESS &&
-                     bindless_create_locked(std::min(p12.maxDescriptorSetUpdateAfterBindSampledImages, p12.maxDescriptorSetUpdateAfterBindStorageImages),
+        g.bindless = bindless_create_locked(std::min(p12.maxDescriptorSetUpdateAfterBindSampledImages, p12.maxDescriptorSetUpdateAfterBindStorageImages),
                                             p12.maxDescriptorSetUpdateAfterBindSamplers);
-        if (!g.bindless) g.gfx_set_layout = g.set_layout;
+    }
+    // Per stage, set 0's bindings name the vertex stages and set 1's the
+    // fragment stage, so neither counts against the other's limits.
+    std::vector<VkDescriptorSetLayoutBinding> gfx_binds[2];
+    for (int st = 0; st < 2; ++st) {
+        gfx_binds[st] = shared_set_bindings(params, samplers, !cb_push_on(), gfx_set_stages(g.per_stage_sets, st));
+        if (g.bindless) gfx_binds[st].resize(1);  // the params block, binding 0
+    }
+    if (!g.per_stage_sets && !g.bindless) {
+        g.gfx_set_layouts[0] = g.gfx_set_layouts[1] = g.set_layout;
+    } else {
+        for (int st = 0; st < (g.per_stage_sets ? 2 : 1); ++st) {
+            if (!make_set_layout(gfx_binds[st], 0, g.gfx_set_layouts[st])) {
+                host_log("gpu: graphics descriptor set layout failed");
+                return false;
+            }
+        }
+        if (!g.per_stage_sets) g.gfx_set_layouts[1] = g.gfx_set_layouts[0];
     }
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &g.set_layout;
     vkCreatePipelineLayout(g.device, &plci, nullptr, &g.pipe_layout);
-    VkDescriptorSetLayout four[4] = {g.gfx_set_layout, g.gfx_set_layout, g.cb_push_layout, g.bindless_layout};
+    VkDescriptorSetLayout four[4] = {g.gfx_set_layouts[0], g.gfx_set_layouts[1], g.cb_push_layout, g.bindless_layout};
     plci.setLayoutCount = g.bindless ? 4 : cb_push_on() ? 3 : 2;
     plci.pSetLayouts = four;
     vkCreatePipelineLayout(g.device, &plci, nullptr, &g.gfx_pipe_layout);
+    // Bindless's global set is update-after-bind, under limits of its own.
+    if (g.per_stage_sets) {
+        const std::string compute = layout_over_limits({{&binds}}, props.limits);
+        const std::string graphics = layout_over_limits({{&gfx_binds[0]}, {&gfx_binds[1]}, {&cbs}}, props.limits);
+        if (!compute.empty()) host_log("gpu: the compute pipeline layout is over the device's limits: %s", compute.c_str());
+        if (!graphics.empty()) host_log("gpu: the graphics pipeline layout is over the device's limits: %s", graphics.c_str());
+    }
     // Allocating a set consumes every binding the layout declares, bound or not.
     // kSpareSets: room for the sets alloc_set_locked allocates ahead.
     constexpr std::uint32_t kSpareSets = 1024;
@@ -2691,6 +2718,20 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 
 void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescriptorBufferInfo& slot) {
     std::memcpy(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), &params, sizeof(params));
+}
+
+bool stage_fits_device(const gcn::TranslateResult& meta, const std::string& name) {
+    // PSSL has 16 sampler slots a stage, as MoltenVK: a shader naming more is
+    // left out rather than bound short.
+    if (!g.per_stage_sets || meta.samplers.size() <= g.max_stage_samplers) return true;
+    static std::mutex mu;
+    static std::unordered_set<std::string> said;  // under mu
+    std::lock_guard<std::mutex> lk(mu);
+    if (said.size() < 64 && said.insert(name).second) {
+        host_log("gpu: shader %s binds %zu samplers, more than the %u a stage the device has: not built", name.c_str(), meta.samplers.size(),
+                 g.max_stage_samplers);
+    }
+    return false;
 }
 
 // Sets come from the current slot's pool eight at a time: a draw takes two,
@@ -3469,7 +3510,12 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
+    if (!stage_fits_device(pl.meta, name)) {
+        pl.failed = true;
+        return pl;
+    }
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
+        host_mkdir("build");  // the parent first: mkdir makes one level
         host_mkdir("build/spv");
         const std::string path = "build/spv/" + name + "-cs.spv";
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
@@ -3595,8 +3641,10 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     std::string why;
     e.meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes));
     if (!e.meta.ok()) why = "translation: " + e.meta.errors[0];
+    else if (!stage_fits_device(e.meta, name)) why = "more samplers than the device binds a stage";
     if (why.empty()) {
         if (const char* env = std::getenv("BBHOST_DUMP_SPIRV"); env && env[0] == '1') {
+            host_mkdir("build");  // the parent first: mkdir makes one level
             host_mkdir("build/spv");
             const std::string path = "build/spv/" + name + "-cs.spv";
             if (FILE* f = std::fopen(path.c_str(), "wb")) {

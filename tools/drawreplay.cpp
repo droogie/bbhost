@@ -42,6 +42,7 @@
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
 #include "core/sha256.h"
 #include "gcn/translate.h"
+#include "host/descriptor_layouts.h"
 #include "replay/compare.h"
 #include "replay/json.h"
 
@@ -659,7 +660,8 @@ public:
         if (native_layout_) vkDestroyPipelineLayout(dev_.device, native_layout_, nullptr);
         if (tess_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, tess_set_layout_, nullptr);
         if (empty_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, empty_set_layout_, nullptr);
-        if (set_layout_) vkDestroyDescriptorSetLayout(dev_.device, set_layout_, nullptr);
+        if (set_layouts_[1] && set_layouts_[1] != set_layouts_[0]) vkDestroyDescriptorSetLayout(dev_.device, set_layouts_[1], nullptr);
+        if (set_layouts_[0]) vkDestroyDescriptorSetLayout(dev_.device, set_layouts_[0], nullptr);
         if (cb_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, cb_set_layout_, nullptr);
         for (auto& st : stages_) {
             dev_.destroy(st.params);
@@ -1089,7 +1091,7 @@ public:
         // Descriptor sets; views that alias the depth target view this run's image.
         check(vkResetDescriptorPool(dev_.device, pool_, 0), "vkResetDescriptorPool");
         VkDescriptorSet sets[4] = {};
-        VkDescriptorSetLayout layouts[4] = {set_layout_, set_layout_, cb_set_layout_, tess_set_layout_};
+        VkDescriptorSetLayout layouts[4] = {set_layouts_[0], set_layouts_[1], cb_set_layout_, tess_set_layout_};
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsai.descriptorPool = pool_;
         dsai.descriptorSetCount = ro.native || ro.ls_set4 ? 4 : 3;
@@ -1138,6 +1140,7 @@ public:
             for (const json::Value& b : json::arr(stages[st], "samplers")) {
                 const std::uint32_t binding = json::u32(b, "binding");
                 if (binding < gcn::kBindingSampler0 || binding >= gcn::kBindingSampler0 + 32) fail("sampler binding out of range");
+                if (binding >= gcn::kBindingSampler0 + stage_samplers_) fail("more samplers than the device binds a stage");
                 image_infos.push_back({samplers_.at(json::str(b, "sampler")), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
                 VkWriteDescriptorSet ws{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 ws.dstSet = sets[st];
@@ -1500,31 +1503,43 @@ private:
     }
 
     void build_layout() {
-        // bbhost's set layout (src/host/gpu.cpp): the modules were translated against it.
-        std::vector<VkDescriptorSetLayoutBinding> binds;
-        binds.push_back({gcn::kBindingParams, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-        for (std::uint32_t k = 0; k < 32; ++k) {
-            binds.push_back({gcn::kBindingImage0 + k, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
-            binds.push_back({gcn::kBindingSampler0 + k, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr});
-            binds.push_back({gcn::kBindingStorageImage0 + k, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
+        // bbhost's set layouts (src/host/descriptor_layouts.h), which the
+        // modules were translated against: shared by all stages unless over
+        // the device's per-stage limits (MoltenVK), then per stage as there.
+        using Binds = std::vector<VkDescriptorSetLayoutBinding>;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(dev_.phys, &props);
+        const Binds shared = gpu::shared_set_bindings(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, gpu::kMaxImages, true, VK_SHADER_STAGE_ALL);
+        const Binds all_cbs = gpu::cb_push_bindings(false);
+        const bool per_stage = !gpu::layout_over_limits({{&shared}, {&shared}, {&all_cbs}}, props.limits).empty();
+        bool pushed = false;
+        for (const json::Value& st : json::arr(cap_.m, "stages")) {
+            if (json::flag(st, "present")) pushed = pushed || spirv_uses_set(words_of(cap_.blob(json::str(st, "spirv")), "stage SPIR-V"), 2);
         }
-        for (std::uint32_t k = 0; k < gcn::kMaxBuffers; ++k) {
-            binds.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+        stage_samplers_ = gpu::shared_set_samplers(per_stage, props.limits.maxPerStageDescriptorSamplers);
+        if (per_stage) {
+            std::printf("drawreplay: descriptor sets per stage, %u samplers a stage, constant buffers in %s: the layouts as they are "
+                        "are over the device's limits\n",
+                        stage_samplers_, pushed ? "set 2" : "the stage sets");
         }
-        VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        lci.bindingCount = static_cast<std::uint32_t>(binds.size());
-        lci.pBindings = binds.data();
-        check(vkCreateDescriptorSetLayout(dev_.device, &lci, nullptr, &set_layout_), "vkCreateDescriptorSetLayout");
-        // Set 2: the constant buffers, both stages' bindings (spirv_uses_set).
-        std::vector<VkDescriptorSetLayoutBinding> cbs;
-        for (std::uint32_t k = 0; k < 2 * gcn::kMaxBuffers; ++k) {
-            cbs.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+        const auto make = [&](const Binds& binds, VkDescriptorSetLayout& out) {
+            VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            lci.bindingCount = static_cast<std::uint32_t>(binds.size());
+            lci.pBindings = binds.data();
+            check(vkCreateDescriptorSetLayout(dev_.device, &lci, nullptr, &out), "vkCreateDescriptorSetLayout");
+        };
+        if (per_stage) {
+            for (int st = 0; st < 2; ++st) {
+                make(gpu::shared_set_bindings(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage_samplers_, !pushed, gpu::kGfxSetStages[st]),
+                     set_layouts_[st]);
+            }
+            make(pushed ? gpu::cb_push_bindings(true) : Binds{}, cb_set_layout_);
+        } else {
+            make(shared, set_layouts_[0]);
+            set_layouts_[1] = set_layouts_[0];
+            make(all_cbs, cb_set_layout_);  // set 2: the constant buffers, both stages' bindings
         }
-        VkDescriptorSetLayoutCreateInfo cci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        cci.bindingCount = static_cast<std::uint32_t>(cbs.size());
-        cci.pBindings = cbs.data();
-        check(vkCreateDescriptorSetLayout(dev_.device, &cci, nullptr, &cb_set_layout_), "vkCreateDescriptorSetLayout");
-        VkDescriptorSetLayout three[3] = {set_layout_, set_layout_, cb_set_layout_};
+        VkDescriptorSetLayout three[3] = {set_layouts_[0], set_layouts_[1], cb_set_layout_};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plci.setLayoutCount = 3;
         plci.pSetLayouts = three;
@@ -1544,7 +1559,7 @@ private:
         check(vkCreateDescriptorSetLayout(dev_.device, &tci, nullptr, &tess_set_layout_), "vkCreateDescriptorSetLayout (tess)");
         VkDescriptorSetLayoutCreateInfo eci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         check(vkCreateDescriptorSetLayout(dev_.device, &eci, nullptr, &empty_set_layout_), "vkCreateDescriptorSetLayout (empty)");
-        VkDescriptorSetLayout five[5] = {set_layout_, set_layout_, cb_set_layout_, empty_set_layout_, tess_set_layout_};
+        VkDescriptorSetLayout five[5] = {set_layouts_[0], set_layouts_[1], cb_set_layout_, empty_set_layout_, tess_set_layout_};
         plci.setLayoutCount = 5;
         plci.pSetLayouts = five;
         check(vkCreatePipelineLayout(dev_.device, &plci, nullptr, &native_layout_), "vkCreatePipelineLayout (native)");
@@ -1760,7 +1775,8 @@ private:
     std::map<std::string, VkImageView> views_;
     std::map<std::string, VkSampler> samplers_;
     StageData stages_[2];
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layouts_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // one layout twice unless per stage
+    std::uint32_t stage_samplers_ = gpu::kMaxImages;                              // the samplers a stage set declares
     VkDescriptorSetLayout cb_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tess_set_layout_ = VK_NULL_HANDLE, empty_set_layout_ = VK_NULL_HANDLE;
