@@ -148,8 +148,10 @@ class TourTest(unittest.TestCase):
         self.assertEqual(s["BBHOST_CAPTURE_ARMED"], "1")
         self.assertEqual((s["BBHOST_FRAME_STATS"], s["BBHOST_FRAME_DETAIL"]), ("1", "1"))
         self.assertEqual(s["BBHOST_TEST_REQUESTS"], "/r/capture/requests")
+        self.assertEqual(s["BBHOST_SET_CACHE"], "0")  # captures gcnlift can rebuild
         perf = ac.pass_settings(Path("/r/perf"), ac.pick_areas("central-yharnam"), opts, "perf")
         self.assertNotIn("BBHOST_CAPTURE_DRAW", perf)
+        self.assertNotIn("BBHOST_SET_CACHE", perf)  # measured as players run
         with self.assertRaises(ValueError):
             ac.pass_settings(Path("/r"), areas, dict(opts, env=["BBHOST_FRAME_STATS=1"]), "perf")
         with self.assertRaises(ValueError):
