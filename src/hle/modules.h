@@ -54,7 +54,8 @@ void* hle_kernel_dmem_mirror();
 // ELF addresses.
 std::uint64_t hle_image_slide();
 // Windows: reserves the guest's fixed address windows as placeholders; call
-// first thing in main, before anything else can take them. Linux: no-op.
+// first thing in main, before anything else can take them. macOS: the same,
+// false when not all held. Linux: no-op.
 bool hle_kernel_reserve_guest_windows();
 std::uint64_t hle_kernel_dmem_high();  // highest allocated physical end
 // Live guest mappings, for the GPU page table.

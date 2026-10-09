@@ -16,6 +16,9 @@
 #include <sys/mman.h>
 #include <time.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace gsync {
 
@@ -38,6 +41,10 @@ std::uint8_t* arena_map() {
 #if defined(_WIN32)
     return static_cast<std::uint8_t*>(
         VirtualAlloc(reinterpret_cast<void*>(kArenaBase), kArenaSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#elif defined(__APPLE__)
+    // In bbhost's high window (core/mac_vm.h), or anywhere free in a test.
+    return static_cast<std::uint8_t*>(mac_vm_map(reinterpret_cast<void*>(kArenaBase), kArenaSize, PROT_READ | PROT_WRITE,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, MacVmPlace::NoReplace));
 #else
     void* m = mmap(reinterpret_cast<void*>(kArenaBase), kArenaSize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);

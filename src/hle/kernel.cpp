@@ -44,6 +44,9 @@
 #define SYS_memfd_create 319
 #endif
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace {
 
@@ -61,7 +64,9 @@ constexpr std::uint64_t kDmemVaBase = 0x100000000ull;
 // GX also fills command buffers at this window + phys when phys fits in 4 GiB.
 constexpr std::uint64_t kGpuDmemBase = 0xFF00000000ull;
 constexpr std::uint64_t kGnmVaMask = 0xFFFFFFFFFFull;
-// Windows: where the image goes when its preferred slide is taken (memory.cpp).
+// Windows: where the image goes when its preferred slide is taken (memory.cpp);
+// macOS: where it always goes, bbhost's own image being at 0x400000 there
+// (core/mac_vm.h).
 constexpr std::uint64_t kImageFallbackBase = 0x300000000ull;
 constexpr std::uint64_t kPage = 0x4000;  // Orbis page
 
@@ -293,6 +298,15 @@ void* host_map_anon(void* hint, std::uint64_t len, int sce_prot, Fix fix) {
     const std::uint64_t round = (len + 0xffff) & ~std::uint64_t(0xffff);
     if (sce_prot == 0) return win_vm_place(hint, round, place, kGnmVaMask);
     return win_vm_alloc(hint, round, static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
+#elif defined(__APPLE__)
+    // macOS: the guest's windows are placeholders (core/mac_vm.h), which a
+    // fixed mapping takes and an unmapping gives back; macOS has no
+    // MAP_FIXED_NOREPLACE.
+    const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
+                             : fix == Fix::Exact     ? MacVmPlace::Exact
+                             : fix == Fix::NoReplace ? MacVmPlace::NoReplace
+                                                     : MacVmPlace::Anywhere;
+    return mac_vm_map(hint, len, host_prot(sce_prot), MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0, place);
 #else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     if (hint && fix == Fix::Exact) {
@@ -327,6 +341,12 @@ void* host_map_dmem(void* hint, std::uint64_t len, int sce_prot, Fix fix, std::i
     if (static_cast<std::uint64_t>(phys) + round > g_dmem_size) return nullptr;
     return win_vm_map(g_dmem_map, hint, round, static_cast<std::uint64_t>(phys),
                       static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
+#elif defined(__APPLE__)
+    const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
+                             : fix == Fix::Exact     ? MacVmPlace::Exact
+                             : fix == Fix::NoReplace ? MacVmPlace::NoReplace
+                                                     : MacVmPlace::Anywhere;
+    return mac_vm_map(hint, len, host_prot(sce_prot), MAP_SHARED, g_dmem_fd, static_cast<std::uint64_t>(phys), place);
 #else
     int flags = MAP_SHARED;
     if (hint && fix == Fix::Exact) {
@@ -354,6 +374,9 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
 #if defined(_WIN32)
     (void)dmem;
     win_vm_unmap(reinterpret_cast<void*>(p), (len + 0xffff) & ~std::uint64_t(0xffff));
+#elif defined(__APPLE__)
+    (void)dmem;
+    mac_vm_unmap(reinterpret_cast<void*>(p), len);  // a window's pages become placeholders again
 #else
     (void)dmem;
     munmap(reinterpret_cast<void*>(p), static_cast<std::size_t>(len));
@@ -714,6 +737,30 @@ bool hle_kernel_reserve_guest_windows() {
         GetExitCodeProcess(pi.hProcess, &code);
         _exit(static_cast<int>(code));
     }
+    return ok;
+#elif defined(__APPLE__)
+    // The low windows are a zero-fill section of bbhost's image
+    // (core/mac_reserve.cpp), there before Rosetta 2 or any dylib maps; the
+    // high ones must be taken before anything else maps. No relaunch as on
+    // Windows: a new process would be laid out the same.
+    std::uint64_t lo = 0, hi = 0;
+    mac_vm_image_reservation(&lo, &hi);
+    bool ok = lo <= kDmemVaBase && hi >= kImageFallbackBase + kMacVmImageSize;
+    if (!ok) {
+        host_log("mac-vm: the image's reservation [0x%llx, 0x%llx) does not cover [0x%llx, 0x%llx): bbhost was not linked "
+                 "as CMakeLists.txt links it",
+                 static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+                 static_cast<unsigned long long>(kDmemVaBase),
+                 static_cast<unsigned long long>(kImageFallbackBase + kMacVmImageSize));
+    }
+    ok = ok && mac_vm_adopt(lo, hi);
+    ok = mac_vm_reserve(kMacVmHighBase, kMacVmHighEnd - kMacVmHighBase) && ok;
+    host_log("mac-vm: guest windows [0x%llx, 0x%llx) (dmem from 0x%llx, the eboot at 0x%llx) and [0x%llx, 0x%llx) "
+             "(host mappings, sync arena, GPU alias at 0x%llx) %s",
+             static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+             static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kImageFallbackBase),
+             static_cast<unsigned long long>(kMacVmHighBase), static_cast<unsigned long long>(kMacVmHighEnd),
+             static_cast<unsigned long long>(kGpuDmemBase), ok ? "held" : "NOT held");
     return ok;
 #else
     return true;

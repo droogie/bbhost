@@ -61,7 +61,13 @@ std::uint8_t* page_near(std::uint64_t lo, std::uint64_t hi) {
         munmap(p, kPage);
     }
     const auto at = [&](std::uint64_t a) -> std::uint8_t* {
+#if defined(__APPLE__)
+        // No MAP_FIXED_NOREPLACE on macOS: the address goes as a hint, as to
+        // the kernels below.
+        void* q = mmap(reinterpret_cast<void*>(a), kPage, kProt, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#else
         void* q = mmap(reinterpret_cast<void*>(a), kPage, kProt, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+#endif
         if (q == MAP_FAILED) return nullptr;
         if (reinterpret_cast<std::uint64_t>(q) == a) return static_cast<std::uint8_t*>(q);
         munmap(q, kPage);  // a kernel that took it as a hint

@@ -1007,6 +1007,10 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__)
     rosetta_advertise_avx(argv);  // before anything else: it may start bbhost again
     host_log("bbhost %s (%s, macOS x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+    if (!hle_kernel_reserve_guest_windows()) {  // before anything else can take those addresses
+        host_log("bbhost: the guest's address windows are not all free; see the mac-vm lines above");
+        return 1;
+    }
 #else
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
 #endif

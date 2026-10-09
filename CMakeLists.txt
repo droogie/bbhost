@@ -363,6 +363,15 @@ set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS 
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
 
+# macOS: the guest's low windows are a zero-fill section in bbhost's own image
+# (core/mac_vm.h), so the image is fixed low, non-PIE (deprecated flags, but
+# they work). mac_reserve.cpp must stay the last source, or ld puts other
+# zero-fill data past it, out of rip-relative reach.
+if(APPLE)
+  target_sources(bbhost PRIVATE src/core/mac_vm.cpp src/core/mac_reserve.cpp)
+  target_link_options(bbhost PRIVATE -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x10000 -Wl,-no_pie -Wl,-no_fixup_chains)
+endif()
+
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
 else()
@@ -493,6 +502,9 @@ if(UNIX)
               src/core/tls_rewrite.cpp)
   target_include_directories(eboot_kit PUBLIC src include tests tests/decomp)
   target_compile_definitions(eboot_kit PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  if(APPLE)
+    target_sources(eboot_kit PRIVATE src/core/mac_vm.cpp)  # core/memory.cpp maps the image through it
+  endif()
   # decomp_<name>: tests/decomp/<name>_test.cpp, with SOURCES built beside it,
   # LIBS linked, and ARGS for its run.
   function(bbhost_decomp_test name)
@@ -518,7 +530,15 @@ if(UNIX)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp src/core/futex.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
+  if(APPLE)
+    target_sources(sync_test PRIVATE src/core/mac_vm.cpp)  # the arena is mapped through it
+  endif()
   add_test(NAME sync_test COMMAND sync_test)
+  if(APPLE)
+    add_executable(mac_vm_test tests/mac_vm_test.cpp src/core/mac_vm.cpp)
+    target_include_directories(mac_vm_test PRIVATE src)
+    add_test(NAME mac_vm_test COMMAND mac_vm_test)
+  endif()
   add_executable(at9_test tests/at9_test.cpp src/hle/ajm.cpp src/host/main_wait.cpp)
   target_include_directories(at9_test PRIVATE src third_party/libatrac9/C/src)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
