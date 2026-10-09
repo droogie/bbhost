@@ -17,6 +17,9 @@
 #else
 #include <sys/mman.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace {
 
@@ -52,6 +55,10 @@ std::uint8_t* page_near(std::uint64_t lo, std::uint64_t hi) {
         if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), kPage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
             return static_cast<std::uint8_t*>(p);
     return nullptr;
+#elif defined(__APPLE__)
+    // Near the image only bbhost's own windows (core/mac_vm.h) are mapped.
+    (void)reaches;
+    return static_cast<std::uint8_t*>(mac_vm_map_near(lo, hi, kPage, PROT_READ | PROT_WRITE | PROT_EXEC));
 #else
     constexpr int kProt = PROT_READ | PROT_WRITE | PROT_EXEC;
     // The low 2 GiB first: they hold the image at its preferred slide.
@@ -61,13 +68,7 @@ std::uint8_t* page_near(std::uint64_t lo, std::uint64_t hi) {
         munmap(p, kPage);
     }
     const auto at = [&](std::uint64_t a) -> std::uint8_t* {
-#if defined(__APPLE__)
-        // No MAP_FIXED_NOREPLACE on macOS: the address goes as a hint, as to
-        // the kernels below.
-        void* q = mmap(reinterpret_cast<void*>(a), kPage, kProt, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#else
         void* q = mmap(reinterpret_cast<void*>(a), kPage, kProt, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-#endif
         if (q == MAP_FAILED) return nullptr;
         if (reinterpret_cast<std::uint64_t>(q) == a) return static_cast<std::uint8_t*>(q);
         munmap(q, kPage);  // a kernel that took it as a hint

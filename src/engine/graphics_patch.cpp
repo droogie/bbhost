@@ -33,6 +33,9 @@
 #else
 #include <sys/mman.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace {
 
@@ -87,7 +90,7 @@ constexpr std::uint64_t kCaCopy = 0x269faa8;
 // mov eax, [rbp-0xa70] ; mov [rbx+0xac], eax
 const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0x83, 0xac, 0x00, 0x00, 0x00};
 
-std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
+std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page (on macOS the page after it)
 std::atomic<std::uint64_t> g_seen_serial{0};
 std::atomic<bool> g_ssao{true}, g_aa{true};
 
@@ -261,15 +264,24 @@ void set_chromatic_aberration(bool on) {
 }
 
 // The copy, through the mask. The stub has to be within a rel32 of the code,
-// so its page comes from the low 2 GiB.
+// so its page comes from the low 2 GiB (on macOS, bbhost's windows near the
+// image).
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
 #if defined(_WIN32)
     (void)image;
     (void)at;
     return false;
 #else
+#if defined(__APPLE__)
+    // Rosetta 2 retranslates a code page on each write (~30 us) and the mask
+    // is written while the stub runs, so it lives on a non-executable page.
+    constexpr std::size_t kPages = 0x2000, kMaskAt = 0x1000;
+    void* page = mac_vm_map_near(at, at + sizeof(kCaCopyBytes), kPages, PROT_READ | PROT_WRITE);
+    if (!page) return false;
+#else
     void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return false;
+#endif
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
     const std::uint64_t back = at + sizeof(kCaCopyBytes);
@@ -280,7 +292,9 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
         return true;
     };
     std::int32_t to_stub = 0, to_back = 0, to_mask = 0;
+#if !defined(__APPLE__)
     constexpr std::size_t kMaskAt = 0x40;
+#endif
     // mov eax, [rbp-0xa70]
     std::memcpy(c, kCaCopyBytes, 6);
     // and eax, [rip+mask]
@@ -292,18 +306,29 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     c[18] = 0xe9;
     if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
+#if defined(__APPLE__)
+        mac_vm_unmap(page, kPages);
+#else
         munmap(page, 0x1000);
+#endif
         return false;
     }
     std::memcpy(c + 8, &to_mask, 4);
     std::memcpy(c + 19, &to_back, 4);
+#if defined(__APPLE__)
+    mprotect(page, 0x1000, PROT_READ | PROT_EXEC);  // the stub's page: code from here on
+#endif
     g_ca_mask = reinterpret_cast<std::atomic<std::uint32_t>*>(c + kMaskAt);
     g_ca_mask->store(0xffffffffu);
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
         g_ca_mask = nullptr;
+#if defined(__APPLE__)
+        mac_vm_unmap(page, kPages);
+#else
         munmap(page, 0x1000);
+#endif
         return false;
     }
     p[0] = 0xe9;  // jmp stub
@@ -769,6 +794,8 @@ void* alloc_exec_near(std::uint64_t at) {
     for (std::uint64_t a = base + 0x10000; a - base < reach; a += 0x10000)
         if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
     return nullptr;
+#elif defined(__APPLE__)
+    return mac_vm_map_near(at, at + 5, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
 #else
     void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return nullptr;
