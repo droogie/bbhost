@@ -880,6 +880,24 @@ void cases() {
 }
 
 
+// Implicit derivatives read the quad's helper lanes, which compute the
+// coordinates on GCN only in whole-quad mode: interpolated without it, they
+// are refused; an explicit-LOD sample reads the pixel's own coordinates only.
+void helper_lanes() {
+    const auto without_wqm = [](std::uint32_t op, std::uint32_t dmask) {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.mimg(op, 4, 2, dmask);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    CHECK(rejected_with(lift(without_wqm(kSample, 0xf)), "an image sample with implicit derivatives reads coordinates the quad's helper lanes"));
+    CHECK(rejected_with(lift(without_wqm(kGetLod, 0x2)), "image_get_lod with implicit derivatives reads coordinates the quad's helper lanes"));
+    CHECK(lifted(lift(without_wqm(kSampleLz, 0xf))));
+}
+
 // Texture LOD and whole-quad blocks with the lifted loops. s0 is the uniform
 // loop count; scratch SGPRs from s20 (s4-s15 hold the T# and S#).
 void back(Asm& a, std::uint32_t op, std::size_t target) {  // a backward branch from the next slot
@@ -1891,6 +1909,7 @@ int main(int argc, char** argv) {
     lane_ops::run();
     lod::cases();
     lod::loops();
+    lod::helper_lanes();
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
         return 1;

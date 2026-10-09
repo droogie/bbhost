@@ -50,11 +50,12 @@
 //     coordinates to hold GCN's values in every pixel of each quad holding an
 //     EXEC pixel, since GCN's texture unit takes the derivatives from the
 //     quad's four lanes, EXEC set or not, as Vulkan takes them from the quad's
-//     four invocations. In a loop pixels leave at different iterations,
-//     where control flow is not uniform, only explicit-LOD samples are
-//     lifted. Exports are unconditional, as in the translator; a pixel whose
-//     EXEC bit is clear at s_endpgm is discarded, and every pixel exported
-//     with its bit clear must be one of them.
+//     four invocations; the quad's helper lanes compute them on GCN only in
+//     whole-quad mode (Val::helper_inexact). In a loop pixels leave at
+//     different iterations, where control flow is not uniform, only
+//     explicit-LOD samples are lifted. Exports are unconditional, as in the
+//     translator; a pixel whose EXEC bit is clear at s_endpgm is discarded,
+//     and every pixel exported with its bit clear must be one of them.
 //   * Whole-quad mode of a varying EXEC M (s_wqm_b64 exec, exec, then VALU
 //     work up to s_mov_b64 exec, <M>: the coordinates of a sample in a
 //     divergent region) is lifted for every pixel. What it writes holds GCN's
@@ -67,9 +68,9 @@
 //     below it) and launches helper invocations for the quad's uncovered
 //     pixels. It is accepted only where EXEC is known set in whole-quad mode,
 //     so every lane of the quad is active on GCN and returns its own value, and
-//     only of a value the helper lanes computed as GCN's did (Val::helper_inexact,
-//     carried around loops), never inside a loop pixels leave at different
-//     iterations.
+//     only of a value the helper lanes computed as GCN's did
+//     (Val::helper_inexact, carried around loops), never inside a loop pixels
+//     leave at different iterations.
 //   * Scalar loads read the storage buffers the reference bound for them
 //     (TranslateResult::buffer_at), with the translator's landing rule: a load
 //     is stored at once and stored again at the next s_waitcnt on lgkmcnt,
@@ -2173,6 +2174,13 @@ private:
             if (!quad_exact_in(where_reg(256 + coord_va + k), e)) {
                 reject(std::string(what) + " with implicit derivatives reads coordinates the lift may hold differently from GCN in pixels of "
                        "the quads of EXEC");
+                return false;
+            }
+            // The quad's helper lanes too: GCN's texture unit reads their
+            // VGPRs, which they computed only in whole-quad mode.
+            if (const auto it = reg.find(256 + coord_va + k); it != reg.end() && it->second.helper_inexact) {
+                reject(std::string(what) + " with implicit derivatives reads coordinates the quad's helper lanes may hold differently on GCN "
+                       "(written outside whole-quad mode)");
                 return false;
             }
         }
