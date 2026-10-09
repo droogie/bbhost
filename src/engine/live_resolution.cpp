@@ -27,6 +27,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+
 // Addresses are Binary Ninja's (0x400000 base).
 //
 // Dark Souls III PC changes resolution through its GX device: ResizeBuffers,
@@ -556,8 +560,19 @@ std::atomic<std::uint64_t>* g_rect_size = nullptr;      // the stubs': h << 32 |
 bool install_display_rect_stubs() {
     for (const RectSite& s : kRectSites)
         if (std::memcmp(guest_ptr(g_image->mem, guest(s.at)), s.bytes, s.n) != 0) return false;
+#if defined(__APPLE__)
+    // Slots on a non-executable page, stubs on the next: Rosetta 2 retranslates
+    // a code page on each write (~30 us), and set_display_rect writes them live.
+    auto* page = static_cast<std::uint8_t*>(host_page_alloc(0x2000, true));
+    if (!page) return false;
+    if (mprotect(page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+        host_page_free(page, 0x2000);
+        return false;
+    }
+#else
     auto* page = static_cast<std::uint8_t*>(host_page_alloc(0x1000, true));
     if (!page) return false;
+#endif
     const auto addr = [](const std::uint8_t* p) { return reinterpret_cast<std::uint64_t>(p); };
     const auto rip32 = [&](std::uint8_t* at, const std::uint8_t* end, const std::uint8_t* target) {
         const auto d = static_cast<std::int32_t>(static_cast<std::int64_t>(addr(target)) - static_cast<std::int64_t>(addr(end)));
@@ -565,7 +580,11 @@ bool install_display_rect_stubs() {
     };
     std::uint8_t* const res_slot = page;
     std::uint8_t* const size_slot = page + 8;
+#if defined(__APPLE__)
+    std::uint8_t* c = page + 0x1000;
+#else
     std::uint8_t* c = page + 0x40;
+#endif
     static const std::uint8_t jmp_abs[6] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};  // jmp [rip+0]
     struct Jump {
         std::uint64_t at, stub;
