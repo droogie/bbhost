@@ -294,7 +294,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SDL3=1)
   target_link_libraries(bbhost PRIVATE SDL3::SDL3 Vulkan::Vulkan)
   # The setup window (host/launcher.h): Dear ImGui (MIT,
-  # https://github.com/ocornut/imgui, third_party/imgui/VERSION) on SDL3's 2D renderer.
+  # https://github.com/ocornut/imgui, third_party/imgui/VERSION.txt) on SDL3's 2D renderer.
   add_library(imgui STATIC third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_sdl3.cpp third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp
