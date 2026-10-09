@@ -1804,7 +1804,11 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     }();
 
     // Taps the port itself asks for (hle_pad_tap): a press the game reads as
-    // the player's, for a few polls.
+    // the player's, for a few polls - on a pad that is there. With no window
+    // and no controller (a headless test run) the record is a disconnected
+    // pad, whose buttons the game ignores, so the first tap plugs one in for
+    // the rest of the run, with a clock of its own.
+    static std::atomic<bool> tap_pad{false};
     {
         std::lock_guard<std::mutex> lk(g_taps_mu);
         const auto now = std::chrono::steady_clock::now();
@@ -1813,8 +1817,18 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                 it = g_taps.erase(it);
                 continue;
             }
-            if (now >= it->from) p.buttons |= it->button;
+            if (now >= it->from) {
+                p.buttons |= it->button;
+                tap_pad.store(true, std::memory_order_relaxed);
+            }
             ++it;
+        }
+    }
+    if (!p.connected && tap_pad.load(std::memory_order_relaxed)) {
+        p.connected = true;
+        if (!p.timestamp) {
+            p.timestamp = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         }
     }
     if (autopress) {
