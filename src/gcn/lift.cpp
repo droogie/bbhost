@@ -527,9 +527,8 @@ private:
     }
     Val bnot(const Val& a) {
         if (a.constant) return lane_const(!a.set);
-        if (const auto it = negation_of.find(a.id); it != negation_of.end()) return lane(it->second);
         const Id r = m.emit(spv::OpLogicalNot, t_bool, {a.id});
-        negation_of[r] = a.id;
+        negation_of[r] = a.id;  // (a double negation stays as emitted: the lifts made before keep their exact modules)
         return lane(r);
     }
     Val bxor(const Val& a, const Val& b) {
