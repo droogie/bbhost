@@ -40,6 +40,10 @@
 // multiset of its records; every other byte of every page exactly.
 //
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
+// The portability subset's features struct is in the beta header.
+#if defined(__APPLE__)
+#define VK_ENABLE_BETA_EXTENSIONS 1
+#endif
 #include "core/sha256.h"
 #include "gcn/translate.h"
 #include "host/descriptor_layouts.h"
@@ -247,6 +251,7 @@ public:
     VkFence fence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties mem{};
     bool depth_bounds = false;
+    bool sampler_lod_bias = true;      // false where the portability subset has no sampler mip LOD bias (MoltenVK)
     bool gpl = false;                  // VK_EXT_graphics_pipeline_library (--library)
     float timestamp_period_ns = 0.0f;  // 0: the queue has no timestamp queries
     std::string name;
@@ -263,6 +268,17 @@ public:
         }
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
+        // A portability driver (MoltenVK) is listed only to an instance that
+        // asks for it, where the loader offers the extension.
+        std::uint32_t nie = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
+        std::vector<VkExtensionProperties> iprops(nie);
+        vkEnumerateInstanceExtensionProperties(nullptr, &nie, iprops.data());
+        for (const VkExtensionProperties& e : iprops) {
+            if (std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != 0) continue;
+            exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
         ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
         ici.ppEnabledLayerNames = layers.data();
         ici.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
@@ -316,12 +332,15 @@ public:
         std::vector<VkExtensionProperties> props(next);
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, props.data());
         std::vector<const char*> dext;
-        bool gpl_ext = false, lib_ext = false;
+        bool gpl_ext = false, lib_ext = false, portability = false;
         for (const VkExtensionProperties& e : props) {
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) dext.push_back("VK_KHR_maintenance8");
             if (std::strcmp(e.extensionName, "VK_EXT_graphics_pipeline_library") == 0) gpl_ext = true;
             if (std::strcmp(e.extensionName, "VK_KHR_pipeline_library") == 0) lib_ext = true;
+            if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) portability = true;
         }
+        // A device that lists the portability subset must have it enabled.
+        if (portability) dext.push_back("VK_KHR_portability_subset");
         gpl = gpl_ext && lib_ext;
         if (gpl) {  // bbhost's BBHOST_PIPELINE_LIBRARY path, replayed with --library
             dext.push_back("VK_KHR_pipeline_library");
@@ -334,22 +353,42 @@ public:
         VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
         fgpl.graphicsPipelineLibrary = VK_TRUE;
         if (gpl) f13.pNext = &fgpl;
+#if defined(__APPLE__)
+        // As bbhost: enable every portability-subset feature the device has.
+        VkPhysicalDevicePortabilitySubsetFeaturesKHR fport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+        if (portability) {
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &fport;
+            vkGetPhysicalDeviceFeatures2(phys, &qf);
+            fport.pNext = f13.pNext;
+            f13.pNext = &fport;
+            sampler_lod_bias = fport.samplerMipLodBias == VK_TRUE;
+        }
+#endif
+        VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        have.pNext = &have12;
+        vkGetPhysicalDeviceFeatures2(phys, &have);
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         f12.pNext = &f13;
         f12.bufferDeviceAddress = VK_TRUE;
+        f12.samplerMirrorClampToEdge = have12.samplerMirrorClampToEdge;
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &f12;
         f2.features.shaderInt64 = VK_TRUE;
         f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
         f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-        f2.features.geometryShader = VK_TRUE;
+        // MoltenVK has no geometry stage or cull distances: a capture that
+        // needs one fails at its pipeline.
+        f2.features.geometryShader = supported.geometryShader;
         f2.features.tessellationShader = supported.tessellationShader;  // as bbhost: its host tessellator's stages
+        f2.features.shaderTessellationAndGeometryPointSize = supported.shaderTessellationAndGeometryPointSize;
         f2.features.independentBlend = VK_TRUE;
         f2.features.fillModeNonSolid = VK_TRUE;
         f2.features.depthClamp = VK_TRUE;
         f2.features.dualSrcBlend = VK_TRUE;
         f2.features.shaderClipDistance = VK_TRUE;
-        f2.features.shaderCullDistance = VK_TRUE;
+        f2.features.shaderCullDistance = supported.shaderCullDistance;
         f2.features.samplerAnisotropy = VK_TRUE;
         f2.features.fragmentStoresAndAtomics = VK_TRUE;
         f2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
@@ -1598,6 +1637,11 @@ private:
             sci.addressModeV = static_cast<VkSamplerAddressMode>(json::u32(s, "address_v"));
             sci.addressModeW = static_cast<VkSamplerAddressMode>(json::u32(s, "address_w"));
             sci.mipLodBias = json::read_f32(s, "mip_lod_bias");
+            if (sci.mipLodBias != 0.0f && !dev_.sampler_lod_bias) {
+                // As bbhost's sampler_for; may then differ from `live`.
+                std::fprintf(stderr, "drawreplay: sampler %s: mip LOD bias %g left out, the device has none\n", id.c_str(), sci.mipLodBias);
+                sci.mipLodBias = 0.0f;
+            }
             sci.anisotropyEnable = json::flag(s, "anisotropy_enable") ? VK_TRUE : VK_FALSE;
             sci.maxAnisotropy = json::read_f32(s, "max_anisotropy");
             sci.compareEnable = json::flag(s, "compare_enable") ? VK_TRUE : VK_FALSE;
