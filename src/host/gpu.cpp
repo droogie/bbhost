@@ -4352,6 +4352,10 @@ void defer_destroy(const DevBuffer& b) { g.slots[g.slot].garbage.push_back(b); }
 // chunks are free for reuse, and up to kStagingKeepBytes of them are kept.
 std::atomic<std::uint64_t> g_staging_created{0}, g_staging_placed{0};
 
+// 256 MiB on MoltenVK: each chunk is one more device-address buffer made
+// resident for every dispatch.
+std::uint64_t staging_chunk_bytes() { return g.moltenvk ? 256ull << 20 : kStagingChunkBytes; }
+
 //
 // The command buffers that follow one another share a chunk: one per command
 // buffer held a whole 64 MiB chunk for a few uploads until it retired, and with
@@ -4362,7 +4366,7 @@ bool acquire_staging_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
     // No command buffer reads the current chunk any more: start it over.
     if (g.staging_cur.buffer && !g.staging_users.count(g.staging_cur.buffer)) g.staging_cur_used = 0;
     if (!g.staging_cur.buffer || g.staging_cur_used + need > g.staging_cur.size) {
-        const std::uint64_t want = std::max(need, kStagingChunkBytes);
+        const std::uint64_t want = std::max(need, staging_chunk_bytes());
         DevBuffer chunk;
         auto it = std::find_if(g.staging_free.begin(), g.staging_free.end(), [&](const DevBuffer& c) { return c.size >= want; });
         if (it != g.staging_free.end()) {
@@ -4836,10 +4840,10 @@ void start_memory_reserve() {
             for (;;) {
                 {
                     std::lock_guard<GpuMutex> lk(g.mu);
-                    if (g.staging_free_bytes + kStagingChunkBytes > std::min(upto, kStagingKeepBytes)) break;
+                    if (g.staging_free_bytes + staging_chunk_bytes() > std::min(upto, kStagingKeepBytes)) break;
                 }
                 DevBuffer chunk;
-                if (!create_dev_buffer(chunk, kStagingChunkBytes, true)) break;
+                if (!create_dev_buffer(chunk, staging_chunk_bytes(), true)) break;
                 std::lock_guard<GpuMutex> lk(g.mu);
                 g.staging_free.push_back(chunk);
                 g.staging_free_bytes += chunk.size;
@@ -4989,7 +4993,7 @@ void start_memory_reserve() {
                     live = heap_live_blocks_locked();
                 }
                 host_log("gpu: memory keeper: gave back %s in %.1f ms (%zu blocks live, %llu MiB of staging kept)",
-                         gone.empty() ? "64 MiB of upload staging" : "an image heap block",
+                         gone.empty() ? "a chunk of upload staging" : "an image heap block",
                          std::chrono::duration<double, std::milli>(last_given - t0).count(), live,
                          static_cast<unsigned long long>(g.staging_free_bytes >> 20));
             }
