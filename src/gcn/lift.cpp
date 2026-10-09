@@ -66,6 +66,12 @@
 //     when its words are descriptors and nothing else: the reference binds
 //     images, samplers and buffers by their resource paths, never by the
 //     words, so the lift loads nothing and rejects any read of them as data.
+//   * SGPR spills (v_writelane_b32 vN, s, L ... v_readlane_b32 d, vN, L with a
+//     constant lane): the reference reads the scalar from a variable of its
+//     own wherever only the writes to that (VGPR, lane) reach the read
+//     (gcn/wave.h, spill cells), and the lift keeps that cell as a register.
+//     Any other v_readlane_b32 reads another pixel's VGPR and is rejected, and
+//     so is reading vN as this pixel's word before it is written whole again.
 //
 // Operations mirror translate.cpp exactly (GLSL.std.450 Fma for mac/mad,
 // NMin/NMax, the legacy multiply's zero rule, PackHalf2x16 exports, the cube
@@ -75,6 +81,7 @@
 
 #include "gcn/half.h"
 #include "gcn/spirv.h"
+#include "gcn/wave.h"
 
 #include <algorithm>
 #include <bit>
@@ -109,6 +116,17 @@ constexpr int kKeyM0 = 124;
 constexpr int kKeyScc = 1000;
 constexpr int kKeyExec = 1001;
 constexpr int kKeyVcc = 1002;
+// A spill cell (gcn/wave.h): the scalar a v_writelane_b32 parked in lane L of
+// VGPR N, kept as a register of its own.
+constexpr int kKeyCell = 4096;
+constexpr int cell_key(int vgpr, int lane) { return kKeyCell + vgpr * 64 + lane; }
+// A lane operand of v_readlane_b32 / v_writelane_b32 that names a lane
+// itself: an inline integer 0..63, as translate.cpp const_lane.
+bool const_lane(std::uint16_t code, int& lane) {
+    if (code < 128 || code > 192) return false;
+    lane = code - 128;
+    return lane < 64;
+}
 
 struct Region {
     std::uint32_t branch = 0, start = 0, end = 0;  // the branch, masked instructions [start, end)
@@ -144,6 +162,7 @@ std::string key_name(int key) {
     if (key == kKeyM0) return "m0";
     if (key < 104) return "s" + std::to_string(key);
     if (key >= 200 && key < 212) return "ttmp" + std::to_string(key - 200);
+    if (key >= kKeyCell) return "lane " + std::to_string((key - kKeyCell) % 64) + " of v" + std::to_string((key - kKeyCell) / 64);
     if (key >= 256) return "v" + std::to_string(key - 256);
     return "?";
 }
@@ -258,6 +277,9 @@ private:
     std::vector<std::uint32_t> divergent_samples;  // inside a divergent loop
     std::size_t buffer_loads = 0, masked_writes = 0;
 
+    // The reference's spill cells (the same analysis translate.cpp runs).
+    const SpillCells spill = spill_cells_on() ? spill_cells(prog) : SpillCells{};
+    std::size_t cell_reads = 0;
     // Words of scalar loads the reference walks the page table for, by the
     // OpUndef that stands for them: only descriptors may come from there.
     std::map<Id, std::uint32_t> descriptor_words;  // id -> the load's offset
@@ -682,6 +704,9 @@ private:
         return init->second;
     }
     Val& value(int key) {
+        if (key >= 256 && key < kKeyCell && poisoned.count(key)) {
+            reject(key_name(key) + " holds a word in one lane since a v_writelane_b32 and is read as this pixel's");
+        }
         auto it = reg.find(key);
         if (it == reg.end()) it = reg.emplace(key, initial_value(key)).first;
         note_read(it->second);
@@ -814,6 +839,7 @@ private:
             if (e.set) {
                 reg[key] = v;
                 reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
+                poisoned.erase(key);  // written whole: this pixel's word again
                 note_result(v);
             } else if (e.helper_inexact) {
                 // GCN may write the helper lanes the lift leaves alone.
@@ -1257,6 +1283,63 @@ private:
         }
     }
 
+    // ---- lane writes (SGPR spills) ---------------------------------------------------
+    // v_writelane_b32 vN, s, L parks a scalar in lane L of vN (ignoring EXEC);
+    // v_readlane_b32 d, vN, L takes it back. Where the reference reads the
+    // spill cell (SpillCells::reads), the lift reads the value the cell's
+    // writes left on this path, from the register cell_key(N, L): its
+    // updates join at ifs like any register's, and one inside a region is a
+    // scalar write the region's liveness check sees. vN itself now differs
+    // between lanes, so it is not this pixel's word until written whole.
+    void lane_op(const Inst& in) {
+        const bool vop3 = in.enc == Enc::VOP3;
+        const bool write = (vop3 ? in.op - 0x100 : in.op) == 2;
+        const std::uint16_t lane_code = vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256);  // a scalar code either way
+        int ln = -1;
+        const bool known = const_lane(lane_code, ln);
+        if (write) {
+            if (in.src0 >= 256) {
+                reject("v_writelane_b32 of a VGPR");
+                return;
+            }
+            const Val v = read(in.src0, in);
+            if (known) {
+                // Moved, never converted (a descriptor word stays one). A cell
+                // the reference does not read is never read here either.
+                reg[cell_key(in.dst, ln)] = v;
+                note_result(v);
+                note_region_write(cell_key(in.dst, ln));
+            }
+            // Without a known lane every cell of vN is gone in the reference
+            // too (gcn/wave.h): no later v_readlane_b32 of vN reads one.
+            poisoned.insert(256 + in.dst);
+            note += " " + (known ? key_name(cell_key(in.dst, ln)) : "v" + std::to_string(in.dst) + " lane ?") + ":cell";
+            return;
+        }
+        if (in.src0 < 256) {
+            reject("v_readlane_b32 of a scalar operand");
+            return;
+        }
+        const int vgpr = in.src0 - 256;
+        if (!known) {
+            reject("v_readlane_b32 of a lane held in a register reads another pixel's VGPR");
+            return;
+        }
+        if (!spill.reads.count(in.offset)) {
+            reject("v_readlane_b32 reads " + key_name(cell_key(vgpr, ln)) +
+                   ", which no v_writelane_b32 alone reaches on every path: another pixel's VGPR, not a spilled scalar");
+            return;
+        }
+        const auto it = reg.find(cell_key(vgpr, ln));
+        if (it == reg.end()) {  // the reference's analysis says the cell holds; the lift found no write on this path
+            reject("v_readlane_b32 of a spill cell the lift saw no v_writelane_b32 fill");
+            return;
+        }
+        note_read(it->second);
+        write_scalar(in.dst, it->second);
+        ++cell_reads;
+    }
+
     // ---- 64-bit operands -------------------------------------------------------------
     // A 64-bit operand's words, as translate.cpp read_pair_raw reads them: a
     // register pair, or an inline integer (sign-extended) or literal
@@ -1306,7 +1389,7 @@ private:
         Mods md;
         const auto unsupported = [&] { reject(std::string("unsupported ") + mnemonic(in)); };
         if (in.enc == Enc::VOP2) {
-            if (in.op == 1 || in.op == 2) return unsupported();
+            if (in.op == 1 || in.op == 2) return lane_op(in);  // v_readlane_b32 / v_writelane_b32
             if (!vop2(in.op, in, read(in.src0, in), read(in.src1, in), md, nullptr, kVccLo)) unsupported();
             return;
         }
@@ -1329,7 +1412,7 @@ private:
         if (in.op == 0x161) return lshl_b64(in);  // its first operand is a 64-bit pair
         if (in.op < 0x140) {
             const std::uint32_t op = in.op - 0x100;
-            if (op == 1 || op == 2) return unsupported();
+            if (op == 1 || op == 2) return lane_op(in);
             const Val s0 = read(in.src0, in), s1 = read(in.src1, in);
             const bool takes_mask = op == 0 || (op >= 40 && op <= 42);  // v_cndmask's select, the carry in
             Val mask;
@@ -2328,6 +2411,20 @@ private:
             return true;
         }
         case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3:
+            if ((in.enc == Enc::VOP2 && (in.op == 1 || in.op == 2)) || (in.enc == Enc::VOP3 && (in.op == 0x101 || in.op == 0x102))) {
+                // v_readlane_b32 / v_writelane_b32: the lane operand is a scalar code, and the cell is state of its own
+                const std::uint16_t lane_code = in.enc == Enc::VOP3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256);
+                int ln = 0;
+                if (!const_lane(lane_code, ln)) return false;  // any lane: not modelled
+                if (in.op == 2 || in.op == 0x102) {
+                    rd(in.src0);
+                    w.insert(cell_key(in.dst, ln));
+                } else {
+                    if (in.src0 >= 256) r.insert(cell_key(in.src0 - 256, ln));
+                    wr(in.dst);
+                }
+                return true;
+            }
             if (in.enc == Enc::VOP3 && in.op == 0x161) {  // v_lshl_b64: a 64-bit first operand
                 rd_pair(in.src0);
                 rd(in.src1);
@@ -3769,6 +3866,11 @@ private:
         if (descriptor_loads) {
             head.push_back(std::to_string(descriptor_loads) + " scalar loads the reference walks the page table for hold descriptors only: "
                            "no word of them is read as data, and the reference binds by resource path, not by the words");
+        }
+        if (cell_reads) {
+            head.push_back(std::to_string(cell_reads) + " v_readlane_b32 of spilled scalars, each from the spill cell the reference reads "
+                           "(only its v_writelane_b32s reach it, on every path); a VGPR a scalar is parked in is not read as this "
+                           "pixel's word until written whole");
         }
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }

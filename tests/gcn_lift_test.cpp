@@ -1002,9 +1002,9 @@ void run() {
 
 }  // namespace control_flow
 
-// Small synthetic pixel shaders for the remaining scalar and 64-bit
-// instructions: scalar loads that only fetch descriptors, s_cselect_b32 and
-// v_lshl_b64.
+// Small synthetic pixel shaders for the lane writes and the remaining scalar
+// and 64-bit instructions: SGPR spills (v_writelane_b32 / v_readlane_b32),
+// scalar loads that only fetch descriptors, s_cselect_b32 and v_lshl_b64.
 // Each lift is checked against the reasons it must give, and each lifted
 // module is validated. No game files needed.
 namespace lane_ops {
@@ -1108,6 +1108,21 @@ bool proof_has(const gcn::LiftResult& r, const char* text) {
     return false;
 }
 
+// Whether the module loads user SGPR `k` (params member 2, uvec4 k / 4, component k % 4).
+bool loads_user_sgpr(const std::vector<std::uint32_t>& spv, std::uint32_t k) {
+    std::map<std::uint32_t, std::uint32_t> consts;  // id -> value of 32-bit OpConstants
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t op = spv[i] & 0xffff, len = spv[i] >> 16;
+        if (!len || i + len > spv.size()) break;
+        if (op == 43 && len == 4) consts[spv[i + 2]] = spv[i + 3];
+        if (op == 65 && len == 7) {  // OpAccessChain type id base i0 i1 i2
+            const auto c = [&](std::size_t j) { const auto it = consts.find(spv[i + j]); return it == consts.end() ? ~0u : it->second; };
+            if (c(4) == 2 && c(5) == k / 4 && c(6) == k % 4) return true;
+        }
+        i += len;
+    }
+    return false;
+}
 
 // Whether the module has a 64-bit OpShiftLeftLogical (the runtime v_lshl_b64).
 bool has_u64_shift(const std::vector<std::uint32_t>& spv) {
@@ -1129,6 +1144,122 @@ Asm start() {
     return a;
 }
 
+void spills() {
+    // Parked in lane 3 of v5, s2 is clobbered and comes back through the cell
+    // into s6: the lift reads user SGPR 2 there, as the reference's cell does.
+    const auto spill = [](const std::function<void(Asm&)>& between, std::uint32_t read_lane = 3) {
+        Asm a = start();
+        a.vop2(kWritelane, 5, 2, kC0 + 3);  // v_writelane_b32 v5, s2, 3
+        a.sop1(kSMov, 2, kC0);              // s_mov_b32 s2, 0
+        between(a);
+        a.vop2(kReadlane, 6, kV + 5, kC0 + read_lane);  // v_readlane_b32 s6, v5, read_lane
+        a.vop2(kVMul, 3, 6, 2);                          // v_mul_f32 v3, s6, v2
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        return a.w;
+    };
+    const gcn::LiftResult ok = lift_words(spill([](Asm&) {}));
+    CHECK(lifted_valid(ok));
+    CHECK(proof_has(ok, "1 v_readlane_b32 of spilled scalars"));
+    CHECK(loads_user_sgpr(ok.spirv, 2));
+    // The same through the VOP3 forms.
+    {
+        Asm a = start();
+        a.vop3(0x102, 5, 2, kC0 + 3);       // v_writelane_b32 v5, s2, 3
+        a.sop1(kSMov, 2, kC0);
+        a.vop3(0x101, 6, kV + 5, kC0 + 3);  // v_readlane_b32 s6, v5, 3
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        const gcn::LiftResult r = lift_words(a.w);
+        CHECK(lifted_valid(r));
+        CHECK(loads_user_sgpr(r.spirv, 2));
+    }
+    // A lane nothing parked a scalar in: the reference shuffles, reading another pixel.
+    CHECK(rejected_with(lift_words(spill([](Asm&) {}, 4)), "no v_writelane_b32 alone reaches"));
+    // v5 differs between lanes now: it is not this pixel's word.
+    CHECK(rejected_with(lift_words(spill([](Asm& a) { a.vop1(kVMov, 7, kV + 5); })), "v5 holds a word in one lane"));
+    // Written whole again it is, but the cell is gone (the reference shuffles).
+    {
+        Asm a = start();
+        a.vop2(kWritelane, 5, 2, kC0 + 3);
+        a.vop1(kVMov, 5, kOne);       // v_mov_b32 v5, 1.0
+        a.vop2(kVMul, 3, kV + 5, 2);  // v_mul_f32 v3, v5, v2
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        CHECK(lifted_valid(lift_words(a.w)));
+    }
+    CHECK(rejected_with(lift_words(spill([](Asm& a) { a.vop1(kVMov, 5, kOne); })), "no v_writelane_b32 alone reaches"));
+    // A lane held in a register, writing or reading.
+    {
+        Asm a = start();
+        a.vop2(kWritelane, 5, 2, 3);  // v_writelane_b32 v5, s2, s3: every cell of v5 is gone
+        a.vop2(kReadlane, 6, kV + 5, kC0 + 3);
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "no v_writelane_b32 alone reaches"));
+    }
+    {
+        Asm a = start();
+        a.vop2(kWritelane, 5, 2, kC0 + 3);
+        a.vop2(kReadlane, 6, kV + 5, 3);  // v_readlane_b32 s6, v5, s3
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "lane held in a register"));
+    }
+    // A lane mask is not a word to park.
+    {
+        Asm a = start();
+        a.vop3(kCmpLt, 8, kHalf, kV + 2);   // v_cmp_lt_f32 s[8:9], 0.5, v2
+        a.vop2(kWritelane, 5, 8, kC0 + 3);  // v_writelane_b32 v5, s8, 3
+        a.vop2(kReadlane, 6, kV + 5, kC0 + 3);
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "s8 holds a lane mask"));
+    }
+    // Parked on both arms of an if on a scalar condition: the cell joins as a phi.
+    {
+        Asm a = start();
+        a.sopc(kSCmpEqU32, 0, kC0);  // s_cmp_eq_u32 s0, 0
+        const std::uint32_t branch = a.at();
+        a.sopp(kScc1);                      // s_cbranch_scc1 else (patched below)
+        a.vop2(kWritelane, 5, 1, kC0);      // then: v_writelane_b32 v5, s1, 0
+        const std::uint32_t jump = a.at();
+        a.sopp(kBranch);                    // s_branch join (patched below)
+        const std::uint32_t else_at = a.at();
+        a.vop2(kWritelane, 5, 2, kC0);      // else: v_writelane_b32 v5, s2, 0
+        const std::uint32_t join = a.at();
+        a.vop2(kReadlane, 6, kV + 5, kC0);  // v_readlane_b32 s6, v5, 0
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        a.w[branch / 4] |= static_cast<std::uint16_t>((else_at - branch - 4) / 4);
+        a.w[jump / 4] |= static_cast<std::uint16_t>((join - jump - 4) / 4);
+        const gcn::LiftResult r = lift_words(a.w);
+        CHECK(lifted_valid(r));
+        CHECK(proof_has(r, "1 ifs on a bit every lane holds alike"));
+        CHECK(loads_user_sgpr(r.spirv, 1) && loads_user_sgpr(r.spirv, 2));
+    }
+    // Parked again inside an s_cbranch_execz region: GCN skips the region
+    // where no pixel needs it, keeping the first value; the lift would not.
+    {
+        Asm a = start();
+        a.vop2(kWritelane, 5, 1, kC0);  // v_writelane_b32 v5, s1, 0
+        a.vopc(kCmpLt, kHalf, 2);       // v_cmp_lt_f32 vcc, 0.5, v2
+        a.sop1(kSAndSaveexec, 8, kVcc);
+        a.branch(kExecz, a.at() + 8);
+        a.vop2(kWritelane, 5, 2, kC0);  // v_writelane_b32 v5, s2, 0 (the region)
+        a.sop1(kSMov64, kExec, 8);      // s_mov_b64 exec, s[8:9]
+        a.vop2(kReadlane, 6, kV + 5, kC0);
+        a.vop2(kVMul, 3, 6, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "lane 0 of v5 is written inside region"));
+    }
+}
 
 void descriptor_loads() {
     // s[2:3] copied to s[20:21]: the reference stops binding the table (its
@@ -1248,6 +1379,7 @@ void lshl_b64() {
 }
 
 void run() {
+    spills();
     descriptor_loads();
     cselect();
     lshl_b64();
