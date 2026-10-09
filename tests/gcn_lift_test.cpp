@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1001,11 +1002,227 @@ void run() {
 
 }  // namespace control_flow
 
+// Small synthetic pixel shaders for the remaining scalar and 64-bit
+// instructions: s_cselect_b32 and v_lshl_b64.
+// Each lift is checked against the reasons it must give, and each lifted
+// module is validated. No game files needed.
+namespace lane_ops {
+
+// Encoders for the fields gcn/decode.cpp reads.
+struct Asm {
+    std::vector<std::uint32_t> w;
+    std::uint32_t at() const { return static_cast<std::uint32_t>(w.size() * 4); }
+    void sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc) { w.push_back(0xbe800000u | sdst << 16 | op << 8 | ssrc); }
+    void sop2(std::uint32_t op, std::uint32_t sdst, std::uint32_t s0, std::uint32_t s1) {
+        w.push_back(0x80000000u | op << 23 | sdst << 16 | s1 << 8 | s0);
+    }
+    void sopc(std::uint32_t op, std::uint32_t s0, std::uint32_t s1) { w.push_back(0xbf000000u | op << 16 | s1 << 8 | s0); }
+    void sopp(std::uint32_t op, std::int16_t simm = 0) { w.push_back(0xbf800000u | op << 16 | static_cast<std::uint16_t>(simm)); }
+    // A forward branch to `target` (a byte offset), from the next instruction slot.
+    void branch(std::uint32_t op, std::uint32_t target) { sopp(op, static_cast<std::int16_t>((static_cast<int>(target) - static_cast<int>(at()) - 4) / 4)); }
+    void smrd(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t offset_dw) {
+        w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | 1u << 8 | offset_dw);
+    }
+    void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
+    // `vsrc1` is the 8-bit field: a VGPR index, or for v_readlane/v_writelane_b32 the lane's scalar code.
+    void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
+    void vopc(std::uint32_t op, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(0x7c000000u | op << 17 | vsrc1 << 9 | src0); }
+    void vop3(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t src1, std::uint32_t src2 = 0) {
+        w.push_back(0xd0000000u | op << 17 | vdst);
+        w.push_back(src0 | src1 << 9 | src2 << 18);
+    }
+    void interp(std::uint32_t vdst, std::uint32_t attr, std::uint32_t chan) {  // v_interp_p1_f32 / p2_f32 over v0, v1
+        w.push_back(0xc8000000u | vdst << 18 | 0u << 16 | attr << 10 | chan << 8 | 0u);
+        w.push_back(0xc8000000u | vdst << 18 | 1u << 16 | attr << 10 | chan << 8 | 1u);
+    }
+    void mimg(std::uint32_t op, std::uint32_t dmask, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc, std::uint32_t ssamp) {
+        w.push_back(0xf0000000u | op << 18 | dmask << 8);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | (ssamp / 4) << 21);
+    }
+    void exp_mrt0(std::uint32_t v0, std::uint32_t v1, std::uint32_t v2, std::uint32_t v3) {  // exp mrt0 ... done vm
+        w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);
+        w.push_back(v0 | v1 << 8 | v2 << 16 | v3 << 24);
+    }
+    void endpgm() { sopp(1); }
+};
+
+// Operand codes.
+constexpr std::uint32_t kV = 256;  // + VGPR index, for 9-bit operands
+constexpr std::uint32_t kC0 = 128;  // the inline integer 0; kC0 + n is n (0..64)
+constexpr std::uint32_t kHalf = 240, kOne = 242, kTwo = 244;  // 0.5, 1.0, 2.0
+constexpr std::uint32_t kVcc = 106, kExec = 126;
+// Opcodes.
+constexpr std::uint32_t kSMov = 3, kSMov64 = 4, kSAndSaveexec = 36;            // SOP1
+constexpr std::uint32_t kSCselect = 10, kSAnd64 = 15;                          // SOP2
+constexpr std::uint32_t kSCmpEqU32 = 6;                                        // SOPC
+constexpr std::uint32_t kBranch = 2, kScc1 = 5, kExecz = 8, kWaitcnt = 12;     // SOPP
+constexpr std::uint32_t kLoadX4 = 2, kLoadX8 = 3;                              // SMRD
+constexpr std::uint32_t kVMov = 1, kCvtF32U32 = 6, kCvtU32F32 = 7;             // VOP1
+constexpr std::uint32_t kReadlane = 1, kWritelane = 2, kVAdd = 3, kVMul = 8;   // VOP2
+constexpr std::uint32_t kCmpLt = 1;                                            // VOPC
+constexpr std::uint32_t kLshlB64 = 0x161;                                      // VOP3
+constexpr std::uint32_t kSampleLz = 39;                                        // MIMG
+
+// Translates as the renderer's no-fallback variant (user SGPRs s0..s3,
+// interpolation at the centre) and lifts against that reference.
+gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program* out = nullptr) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    CHECK(p.errors.empty());
+    if (out) *out = p;
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Pixel;
+    o.rsrc2 = 4u << 1;    // four user SGPRs
+    o.ps_input_ena = 2;   // PERSP_CENTER: i, j in v0, v1
+    o.descriptor_set = 1;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    const gcn::TranslateResult ref = gcn::translate(p, o);
+    if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors[0].c_str());
+    CHECK(ref.ok());
+    return gcn::lift_pixel_shader(p, o, ref);
+}
+
+bool lifted_valid(const gcn::LiftResult& r) {
+    for (const std::string& why : r.rejections) std::fprintf(stderr, "rejected: %s\n", why.c_str());
+    if (!r.ok()) return false;
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string msg;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+        if (msg.empty()) msg = m;
+    });
+    spvtools::ValidatorOptions vo;
+    vo.SetAllowOffsetTextureOperand(true);
+    if (!tools.Validate(r.spirv.data(), r.spirv.size(), vo)) {
+        std::fprintf(stderr, "lifted SPIR-V invalid: %s\n", msg.c_str());
+        return false;
+    }
+    return true;
+}
+
+
+
+// Whether the module has a 64-bit OpShiftLeftLogical (the runtime v_lshl_b64).
+bool has_u64_shift(const std::vector<std::uint32_t>& spv) {
+    std::set<std::uint32_t> u64;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t op = spv[i] & 0xffff, len = spv[i] >> 16;
+        if (!len || i + len > spv.size()) break;
+        if (op == 21 && len == 4 && spv[i + 2] == 64) u64.insert(spv[i + 1]);  // OpTypeInt 64
+        if (op == 196 && u64.count(spv[i + 1])) return true;
+        i += len;
+    }
+    return false;
+}
+
+// v2 = attr0.x, per pixel.
+Asm start() {
+    Asm a;
+    a.interp(2, 0, 0);
+    return a;
+}
+
+
+
+void cselect() {
+    const auto sel = [](const std::function<void(Asm&)>& set_scc) {
+        Asm a = start();
+        set_scc(a);
+        a.sop2(kSCselect, 4, kOne, kTwo);  // s_cselect_b32 s4, 1.0, 2.0
+        a.vop2(kVMul, 3, 4, 2);            // v_mul_f32 v3, s4, v2
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        return a.w;
+    };
+    CHECK(lifted_valid(lift_words(sel([](Asm& a) { a.sopc(kSCmpEqU32, 0, kC0); }))));
+    // SCC as "some lane of the mask is set": the other pixels decide it.
+    CHECK(rejected_with(lift_words(sel([](Asm& a) {
+                            a.vopc(kCmpLt, kHalf, 2);
+                            a.sop2(kSAnd64, 6, kVcc, kExec);  // s_and_b64 s[6:7], vcc, exec
+                        })),
+                        "s_cselect_b32 on an SCC that is not a scalar condition"));
+    // After an s_cbranch_execz region that writes s5: s_cselect_b32 redefines
+    // s5 (the region's write is dead), or reads it (rejected).
+    const auto after_region = [](std::uint32_t src0) {
+        Asm a = start();
+        a.vopc(kCmpLt, kHalf, 2);
+        a.sop1(kSAndSaveexec, 8, kVcc);
+        a.branch(kExecz, a.at() + 8);
+        a.sop1(kSMov, 5, kC0);  // s_mov_b32 s5, 0 (the region)
+        a.sop1(kSMov64, kExec, 8);
+        a.sopc(kSCmpEqU32, 0, kC0);
+        a.sop2(kSCselect, 5, src0, kTwo);  // s_cselect_b32 s5, src0, 2.0
+        a.vop2(kVMul, 3, 5, 2);
+        a.exp_mrt0(3, 3, 3, 3);
+        a.endpgm();
+        return a.w;
+    };
+    CHECK(lifted_valid(lift_words(after_region(kOne))));
+    CHECK(rejected_with(lift_words(after_region(5)), "s5 is written inside region"));
+}
+
+void lshl_b64() {
+    // v[0:1] = 0 << 0: folded.
+    {
+        Asm a;
+        a.vop3(kLshlB64, 0, kC0, kC0);  // v_lshl_b64 v[0:1], 0, 0
+        a.exp_mrt0(0, 1, 0, 1);
+        a.endpgm();
+        const gcn::LiftResult r = lift_words(a.w);
+        CHECK(lifted_valid(r));
+        CHECK(!has_u64_shift(r.spirv));
+    }
+    // A per-pixel pair shifted at run time, as the translator does it.
+    {
+        Asm a = start();
+        a.vop1(kCvtU32F32, 3, kV + 2);           // v_cvt_u32_f32 v3, v2
+        a.vop1(kVMov, 4, kC0 + 7);               // v_mov_b32 v4, 7
+        a.vop3(kLshlB64, 6, kV + 3, kC0 + 36);   // v_lshl_b64 v[6:7], v[3:4], 36
+        a.vop1(kCvtF32U32, 8, kV + 6);
+        a.vop1(kCvtF32U32, 9, kV + 7);
+        a.exp_mrt0(8, 9, 8, 9);
+        a.endpgm();
+        const gcn::LiftResult r = lift_words(a.w);
+        CHECK(lifted_valid(r));
+        CHECK(has_u64_shift(r.spirv));
+    }
+    // VCC is a lane mask, not a number.
+    {
+        Asm a = start();
+        a.vopc(kCmpLt, kHalf, 2);
+        a.vop3(kLshlB64, 0, kVcc, kC0 + 1);  // v_lshl_b64 v[0:1], vcc, 1
+        a.exp_mrt0(0, 1, 0, 1);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "unsupported 64-bit operand"));
+    }
+    // Its first operand is a pair: s1, written in a region, is read after it.
+    {
+        Asm a = start();
+        a.vopc(kCmpLt, kHalf, 2);
+        a.sop1(kSAndSaveexec, 8, kVcc);
+        a.branch(kExecz, a.at() + 8);
+        a.sop1(kSMov, 1, kC0);  // s_mov_b32 s1, 0 (the region)
+        a.sop1(kSMov64, kExec, 8);
+        a.vop3(kLshlB64, 4, 0, kC0 + 1);  // v_lshl_b64 v[4:5], s[0:1], 1
+        a.vop1(kCvtF32U32, 6, kV + 5);
+        a.exp_mrt0(6, 6, 6, 6);
+        a.endpgm();
+        CHECK(rejected_with(lift_words(a.w), "s1 is written inside region"));
+    }
+}
+
+void run() {
+    cselect();
+    lshl_b64();
+}
+
+}  // namespace lane_ops
+
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
     control_flow::run();
     synthetic_swizzles();
     swizzles_and_loops();
+    lane_ops::run();
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
         return 1;

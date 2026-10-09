@@ -1239,6 +1239,51 @@ private:
         }
     }
 
+    // ---- 64-bit operands -------------------------------------------------------------
+    // A 64-bit operand's words, as translate.cpp read_pair_raw reads them: a
+    // register pair, or an inline integer (sign-extended) or literal
+    // (zero-extended). Lane masks (VCC, EXEC, an SGPR pair holding one) and SCC
+    // are not lifted as numbers.
+    bool read_pair_words(std::uint16_t code, const Inst& in, Val& lo, Val& hi) {
+        if (code < 104 || code >= 256 || (code >= 112 && code < 124)) {
+            lo = read(code, in);
+            hi = read(static_cast<std::uint16_t>(code + 1), in);
+            return true;
+        }
+        if (code == kLiteral) {
+            lo = word_const(in.literal);
+            hi = word_const(0);
+        } else if (code >= 128 && code <= 192) {
+            lo = word_const(code - 128u);
+            hi = word_const(0);
+        } else if (code >= 193 && code <= 208) {
+            lo = word_const(static_cast<std::uint32_t>(-static_cast<int>(code - 192)));
+            hi = word_const(0xffffffffu);
+        } else {
+            reject("unsupported 64-bit operand " + operand_name(code, in.literal, 2));
+            return false;
+        }
+        return true;
+    }
+    void lshl_b64(const Inst& in) {  // v_lshl_b64: D = S0.u64 << (S1 & 63), as translate.cpp
+        Val lo, hi;
+        if (!read_pair_words(in.src0, in, lo, hi)) return;
+        const Val s1 = read(in.src1, in);
+        if (lo.constant && hi.constant && s1.constant) {  // integer arithmetic: folding is exact
+            const std::uint64_t r = ((static_cast<std::uint64_t>(hi.bits) << 32) | lo.bits) << (s1.bits & 63);
+            write_v(in.dst, word_const(static_cast<std::uint32_t>(r)));
+            write_v(in.dst + 1, word_const(static_cast<std::uint32_t>(r >> 32)));
+            return;
+        }
+        const auto widen = [&](const Val& v) { return m.emit(spv::OpUConvert, t_u64, {as_u(v)}); };
+        const Id wide = m.emit(spv::OpBitwiseOr, t_u64, {widen(lo), m.emit(spv::OpShiftLeftLogical, t_u64, {widen(hi), m.const_u64(32)})});
+        const Id r = m.emit(spv::OpShiftLeftLogical, t_u64, {wide, m.emit(spv::OpUConvert, t_u64, {ibin(spv::OpBitwiseAnd, as_u(s1), cu(63))})});
+        const Id r_lo = m.emit(spv::OpUConvert, t_u32, {r});
+        const Id r_hi = m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpShiftRightLogical, t_u64, {r, m.const_u64(32)})});
+        write_v(in.dst, word(r_lo));
+        write_v(in.dst + 1, word(r_hi));
+    }
+
     void valu(const Inst& in) {
         Mods md;
         const auto unsupported = [&] { reject(std::string("unsupported ") + mnemonic(in)); };
@@ -1263,6 +1308,7 @@ private:
             vcmp(in.op, read(in.src0, in), read(in.src1, in), md, in.sdst);
             return;
         }
+        if (in.op == 0x161) return lshl_b64(in);  // its first operand is a 64-bit pair
         if (in.op < 0x140) {
             const std::uint32_t op = in.op - 0x100;
             if (op == 1 || op == 2) return unsupported();
@@ -1356,6 +1402,24 @@ private:
         }
     }
 
+    // s_cselect_b32: S0 where SCC is set, else S1; SCC is left as it was. As
+    // s_cmovk_i32, only on an SCC that is a scalar condition (from a scalar
+    // compare: every lane alike, so the result is uniform where S0 and S1 are).
+    void s_cselect(const Inst& in) {
+        if (!scc_valid || !scc_uniform) {
+            reject("s_cselect_b32 on an SCC that is not a scalar condition");
+            return;
+        }
+        const Val a = read(in.src0, in), b = read(in.src1, in);
+        if (scc_mask.constant) {
+            write_scalar(in.dst, scc_mask.set ? a : b);
+        } else if (a.kind == Kind::Float || b.kind == Kind::Float) {
+            write_scalar(in.dst, flt(fsel(scc_mask.id, as_f(a), as_f(b))));
+        } else {
+            write_scalar(in.dst, word(m.emit(spv::OpSelect, t_u32, {scc_mask.id, as_u(a), as_u(b)})));
+        }
+    }
+
     void sop2(const Inst& in) {
         switch (in.op) {
         case 15: case 17: case 19: case 21: case 23: {
@@ -1367,6 +1431,7 @@ private:
             set_scc_mask(r);
             return;
         }
+        case 10: s_cselect(in); return;
         default:
             if (sop2_word_kind(in.op)) return sop2_word(in);
             reject(std::string("unsupported ") + mnemonic(in));
@@ -2185,6 +2250,7 @@ private:
             if (in.op == 15 || in.op == 17 || in.op == 19 || in.op == 21 || in.op == 23) {
                 rd_pair(in.src0); rd_pair(in.src1); wr_pair(in.dst); w.insert(kKeyScc); return true;
             }
+            if (in.op == 10) { rd(in.src0); rd(in.src1); r.insert(kKeyScc); wr(in.dst); return true; }  // s_cselect_b32
             if (const int kind = sop2_word_kind(in.op)) {
                 rd(in.src0); rd(in.src1); wr(in.dst);
                 if (kind == 1) w.insert(kKeyScc);
@@ -2217,6 +2283,11 @@ private:
             return true;
         }
         case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3:
+            if (in.enc == Enc::VOP3 && in.op == 0x161) {  // v_lshl_b64: a 64-bit first operand
+                rd_pair(in.src0);
+                rd(in.src1);
+                return true;
+            }
             rd(in.src0);
             if (in.enc != Enc::VOP1) rd(in.src1);
             if (in.enc == Enc::VOP3) {
