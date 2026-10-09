@@ -184,6 +184,10 @@ public:
     Id emit(Op op, Id result_type, const std::vector<std::uint32_t>& operands);
     // Instruction without a result.
     void emit_void(Op op, const std::vector<std::uint32_t>& operands);
+    // Replaces operand `index` of the function-body instruction that defined
+    // `result`: a loop header's OpPhi gets its back-edge value once the loop
+    // body is emitted. False when there is no such instruction or operand.
+    bool set_operand(Id result, std::size_t index, std::uint32_t value);
     Id ext_inst(Id result_type, Glsl inst, const std::vector<Id>& operands);
 
     Id load(Id type, Id ptr) { return emit(OpLoad, type, {ptr}); }
