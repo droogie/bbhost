@@ -57,6 +57,19 @@ target while editing; `tools/win_tests.sh` builds and runs the low-level host
 tests (calling-convention thunks, TLS, `setjmp`/`longjmp`, `va_list`) under
 wine.
 
+## macOS (in progress)
+
+`tools/build_macos.sh` builds an x86_64 bbhost, which Rosetta 2 runs on Apple
+Silicon, against the LunarG Vulkan SDK (`~/VulkanSDK/<version>/macOS`, or
+`VULKAN_SDK`): Vulkan goes through MoltenVK, the SDK's KosmicKrisp being
+arm64-only. The build tree runs as it is: bbhost finds the SDK's loader by its
+rpath, and the loader finds MoltenVK and the validation layer through the
+manifests CMake writes into `vulkan/icd.d` and `vulkan/explicit_layer.d` beside
+the executable. A bbhost started anywhere else needs
+`VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json`, and
+`VK_LAYER_PATH=<sdk>/share/vulkan/explicit_layer.d` for
+`BBHOST_VK_VALIDATE=1`, unless the SDK was installed system-wide.
+
 ## Tests
 
 ```sh
