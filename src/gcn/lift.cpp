@@ -2110,10 +2110,17 @@ private:
             reject("whole-quad block inside a widened kill region, where the lift keeps the pixel's own EXEC bit");
             return true;
         }
+        if (in_divergent_loop()) {  // the quads' other pixels may have left the loop: the lift would not run them
+            reject("whole-quad block inside a loop pixels leave at different iterations");
+            return true;
+        }
         const std::size_t at = static_cast<std::size_t>(&in - prog.insts.data());
+        const auto loop_header = [&](std::uint32_t offset) {  // a block of the lift's own, and each iteration enters it with another EXEC
+            return std::any_of(loops.begin(), loops.end(), [&](const Loop& l) { return l.header == offset; });
+        };
         for (std::size_t i = at + 1; i < prog.insts.size(); ++i) {
             const Inst& p = prog.insts[i];
-            if (block_starts.count(p.offset) || is_branch(p) || (p.enc == Enc::SOPP && p.op == 1)) break;
+            if (block_starts.count(p.offset) || loop_header(p.offset) || is_branch(p) || (p.enc == Enc::SOPP && p.op == 1)) break;
             if (p.enc == Enc::SOP1 && p.op == 4 && p.dst == kExecLo) {
                 wqm = WholeQuad{true, m_exec, in.offset, p.offset, 0};
                 set_scc_mask(m_exec);
@@ -2140,6 +2147,7 @@ private:
         }
         const int key = 256 + idx;
         reg[key] = v;
+        reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;  // GCN's helper lanes compute it in the block's quads
         note_result(v);
         partial[key] = Exact{true, wqm.mask};
         ++wqm.writes;
@@ -2199,6 +2207,10 @@ private:
     void image_get_lod(const Inst& in) {
         if (opt.stage != Stage::Pixel) {
             reject("image_get_lod outside a pixel shader, where there are no derivatives");
+            return;
+        }
+        if (in_divergent_loop()) {
+            reject("image_get_lod inside a loop pixels leave at different iterations: its derivatives would read pixels that left");
             return;
         }
         const Val e = exec_lane();
@@ -2586,8 +2598,13 @@ private:
             return;
         }
         ++swizzles;
+        const bool identity = sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3;
+        // Each lane reads one of its quad: the result holds GCN's value in a quad
+        // where the source does in the whole quad (`partial`), and nowhere the
+        // lifter can name where the source does only in some of its pixels.
+        if (!identity && reads.partial && !reads.at.quad) reads = Where{true, Exact{false, lane_const(false)}};
         // A value every invocation holds alike is the same in every lane of the quad.
-        if (uniform(src) || (sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3)) {
+        if (uniform(src) || identity) {
             write_v(in.dst, src);
             return;
         }
@@ -3283,9 +3300,11 @@ private:
             Val scc;
             bool scc_uniform = false, scc_valid = true;
             std::set<int> poisoned;
+            std::map<int, Exact> partial;
             bool per_pixel = false;
         };
         std::vector<Exit> exits;
+        std::map<int, Exact> partial0;  // where the phis' VGPRs hold GCN's value at the header: where they did on entry
         std::map<Id, Id> to_float0, to_word0;
         std::vector<Id> assumed;  // divergent: what the body knows is set
         std::size_t arms0 = 0, regions0 = 0;
@@ -3602,6 +3621,7 @@ private:
             if (w.uni) uniform_ids.insert(phi);
             l.phis.push_back({w.key, w.kind, phi, w.uni, w.inexact});
             l.vgpr_phis += w.key >= 256;
+            if (const auto it = partial.find(w.key); it != partial.end()) l.partial0[w.key] = it->second;
         }
         for (const Entry& k : masks) {
             const Id phi = m.emit(spv::OpPhi, t_bool, {k.id, l.preheader, k.id, l.continue_label});
@@ -3685,6 +3705,7 @@ private:
         x.scc_uniform = scc_uniform;
         x.scc_valid = scc_valid;
         x.poisoned = poisoned;
+        x.partial = partial;
         x.per_pixel = per_pixel;
         if (always) {
             // It ends the arm it is in: an if's then arm, or its else arm.
@@ -3779,6 +3800,14 @@ private:
                 return;
             }
             if (!helper_lanes_kept(p.key, p.helper_inexact, v)) return;
+            // Where it holds GCN's value: at least where the header assumed.
+            const auto at_header = l.partial0.find(p.key);
+            const Where header = at_header == l.partial0.end() ? Where{} : Where{true, at_header->second}, now = where_reg(p.key);
+            if (now.partial && (!header.partial || !within(header.at, now.at))) {
+                reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) +
+                       " holding GCN's value in fewer pixels than it left with (written in whole-quad mode)");
+                return;
+            }
             back.push_back({p.id, p.kind == Kind::Float ? as_f(v) : as_u(v)});
         }
         // (In a divergent loop's body EXEC at entry is known set, so EXEC and
@@ -3818,6 +3847,7 @@ private:
         scc_uniform = x.scc_uniform;
         scc_valid = x.scc_valid;
         poisoned = x.poisoned;
+        partial = x.partial;
         to_float = l.to_float0;
         to_word = l.to_word0;
         pending.clear();
@@ -4158,10 +4188,7 @@ private:
         std::string divergent_at;
         for (std::uint32_t s : divergent_samples) divergent_at += " " + hex_offset(s);
         head.push_back(std::to_string(samples.size()) + " image samples outside regions with EXEC set, in uniform control flow (helper "
-                       "invocations stand in for whole-quad lanes):" + at +
-                       (divergent_samples.empty() ? ""
-                                                  : "; except, with explicit LOD or gradients, inside a loop pixels leave at different "
-                                                    "iterations, where EXEC is set in its body:" + divergent_at));
+                       "invocations stand in for whole-quad lanes):" + at);
         if (!varying_samples.empty() || !lod_queries.empty()) {
             std::string varying, queries;
             for (std::uint32_t s : varying_samples) varying += " " + hex_offset(s);
@@ -4170,6 +4197,10 @@ private:
                            "; " + std::to_string(lod_queries.size()) + " image_get_lod" + (queries.empty() ? "" : ":" + queries) +
                            "; in uniform control flow, results written under EXEC, operands GCN's in every pixel of EXEC and the "
                            "coordinates of implicit derivatives in every pixel of the quads of EXEC");
+        }
+        if (!divergent_samples.empty()) {
+            head.push_back(std::to_string(divergent_samples.size()) + " of these samples inside a loop pixels leave at different iterations, "
+                           "where control flow is not uniform: with explicit LOD or gradients only:" + divergent_at);
         }
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +

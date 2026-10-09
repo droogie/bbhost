@@ -879,6 +879,201 @@ void cases() {
     }
 }
 
+
+// Texture LOD and whole-quad blocks with the lifted loops. s0 is the uniform
+// loop count; scratch SGPRs from s20 (s4-s15 hold the T# and S#).
+void back(Asm& a, std::uint32_t op, std::size_t target) {  // a backward branch from the next slot
+    a.w.push_back(0xbf800000u | op << 16 | static_cast<std::uint16_t>(static_cast<int>(target) - static_cast<int>(a.w.size()) - 1));
+}
+void loops() {
+    // The per-lane exit idiom (v5 counts up to int(x)) around `body`, in whole-quad mode.
+    const auto divergent_loop = [](const std::function<void(Asm&)>& body) {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(8, 4, 256 + 2);           // v_cvt_i32_f32 v4, v2
+        a.vop1(1, 5, kZero);
+        a.sop1(4, 26, kExec);
+        a.sop1(4, 24, kExec);            // the loop mask L
+        const std::size_t header = a.w.size();
+        a.vopc(0x84, 256 + 4, 5);        // v_cmp_gt_i32 vcc, v4, v5: stay
+        a.sop1(4, 28, kExec);
+        a.sop2(21, kExec, 28, kVcc);     // EXEC = the lanes leaving
+        a.sop2(21, 24, 24, kExec);       // L loses them
+        const std::size_t exit = a.branch(4);
+        a.sop2(15, kExec, 28, 24);       // EXEC = the lanes staying
+        body(a);
+        a.vop2(37, 5, kZero + 1, 5);     // v_add_i32 v5, 1, v5
+        back(a, 2, header);
+        a.land(exit);
+        a.sop1(4, kExec, 26);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(8);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    // A whole-quad block over a region's EXEC in its body: the quad's other pixels may have left.
+    CHECK(rejected_with(lift(divergent_loop([](Asm& a) {
+                            a.vopc(1, kZero, 2);
+                            a.sop1(36, 30, kVcc);
+                            const std::size_t skip = a.branch(8);
+                            a.sop1(4, kVcc, kExec);
+                            a.wqm();
+                            a.vop2(8, 8, kHalf, 2);
+                            a.sop1(4, kExec, kVcc);
+                            a.land(skip);
+                            a.sop1(4, kExec, 30);
+                        })),
+                        "whole-quad block inside a loop pixels leave at different iterations"));
+    CHECK(rejected_with(lift(divergent_loop([](Asm& a) { a.mimg(kGetLod, 8, 2, 0x2); })),
+                        "image_get_lod inside a loop pixels leave at different iterations"));
+
+    // A whole-quad block that would end past a loop header: GCN runs the
+    // header's later iterations under the restored mask, not whole quads.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(1, kZero, 2);
+        a.sop1(36, 22, kVcc);            // EXEC = M
+        const std::size_t skip = a.branch(8);
+        a.sop1(4, 30, kExec);
+        a.wqm();
+        a.vop2(8, 8, kHalf, 2);
+        a.sop1(3, 32, kZero);
+        const std::size_t header = a.w.size();
+        a.vop2(8, 8, kHalf, 2);
+        a.sop1(4, kExec, 30);            // the restore, in the loop
+        a.sop2(0, 32, 32, kZero + 1);
+        a.sopc(3, 32, 0);                // s_cmp_ge_i32 s32, s0
+        const std::size_t exit = a.branch(5);
+        back(a, 2, header);
+        a.land(exit);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(a.w), "not ended by s_mov_b64 exec before a branch or block boundary"));
+    }
+
+    // In a uniform loop: v8, v9 are the coordinates of an implicit-LOD sample
+    // at the top, rewritten in a whole-quad block over a region's EXEC below
+    // it, so the next iteration's sample would read them where they hold
+    // GCN's value only in that region's quads.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(1, 8, 256 + 2);
+        a.vop1(1, 9, 256 + 3);
+        a.sop1(3, 32, kZero);
+        const std::size_t header = a.w.size();
+        a.sopc(3, 32, 0);
+        const std::size_t exit = a.branch(5);
+        a.mimg(kSample, 4, 8, 0xf);
+        a.vopc(1, kZero, 2);
+        a.sop1(36, 22, kVcc);
+        const std::size_t skip = a.branch(8);
+        a.sop1(4, kVcc, kExec);
+        a.wqm();
+        a.vop2(8, 8, kHalf, 2);
+        a.vop2(8, 9, kHalf, 3);
+        a.sop1(4, kExec, kVcc);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        a.sop2(0, 32, 32, kZero + 1);
+        back(a, 2, header);
+        a.land(exit);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(a.w), "v8 comes back to the header of the loop at"));
+    }
+    // The loop's exit carries where its registers hold GCN's value: v8 leaves
+    // right after a whole-quad block wrote it, though later in the body it is
+    // rewritten for every pixel.
+    const auto leaves_partial = [](bool export_v8) {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(1, 8, 256 + 2);
+        a.sop1(3, 32, kZero);
+        const std::size_t header = a.w.size();
+        a.vopc(1, kZero, 2);
+        a.sop1(36, 22, kVcc);
+        const std::size_t skip = a.branch(8);
+        a.sop1(4, kVcc, kExec);
+        a.wqm();
+        a.vop2(8, 8, kHalf, 2);
+        a.sop1(4, kExec, kVcc);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        a.sopc(3, 32, 0);
+        const std::size_t exit = a.branch(5);
+        a.vop1(1, 8, 256 + 2);
+        a.sop2(0, 32, 32, kZero + 1);
+        back(a, 2, header);
+        a.land(exit);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(export_v8 ? 8 : 12);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    {
+        const gcn::LiftResult r = lift(leaves_partial(false));
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "whole-quad block"));
+        CHECK(proof_says(r, "uniform, left on a bit every lane holds alike"));
+    }
+    CHECK(rejected_with(lift(leaves_partial(true)), "an export reads a value the lift may hold differently"));
+    // An if whose else arm leaves the loop joins with the then arm's values,
+    // and with where they hold GCN's value: v8 from a whole-quad block, so
+    // the implicit-LOD sample after the join is refused.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(1, 8, 256 + 2);
+        a.vop1(1, 9, 256 + 3);
+        a.sop1(3, 32, kZero);
+        const std::size_t header = a.w.size();
+        a.sopc(4, 32, 0);                // s_cmp_lt_i32 s32, s0: another iteration
+        const std::size_t to_else = a.branch(4);
+        a.vopc(1, kZero, 2);
+        a.sop1(36, 22, kVcc);
+        const std::size_t skip = a.branch(8);
+        a.sop1(4, kVcc, kExec);
+        a.wqm();
+        a.vop2(8, 8, kHalf, 2);
+        a.sop1(4, kExec, kVcc);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        const std::size_t to_join = a.branch(2);
+        a.land(to_else);
+        const std::size_t exit = a.branch(2);  // the else arm leaves the loop
+        a.land(to_join);
+        a.mimg(kSample, 4, 8, 0xf);
+        a.sop2(0, 32, 32, kZero + 1);
+        back(a, 2, header);
+        a.land(exit);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(a.w), "an image sample reads an operand the lift may hold differently"));
+    }
+}
+
 }  // namespace lod
 
 }  // namespace
@@ -1695,6 +1890,7 @@ int main(int argc, char** argv) {
     swizzles_and_loops();
     lane_ops::run();
     lod::cases();
+    lod::loops();
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
         return 1;
