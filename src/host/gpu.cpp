@@ -39,7 +39,9 @@
 #include <io.h>
 #else
 #include <fcntl.h>
+#if defined(__linux__)
 #include <linux/udmabuf.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -284,7 +286,9 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     return vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
 }
 
-#if !defined(_WIN32)
+// TODO(macos): no dma-buf; direct memory goes in as host pointers, as on
+// Windows.
+#if defined(__linux__)
 // Direct memory as dma-bufs. AMD's Linux kernel driver takes only anonymous
 // memory as a host pointer - amdgpu makes every userptr ANONONLY, so a mapping
 // with a file behind it is refused (-EPERM, which RADV reports as
@@ -419,7 +423,7 @@ Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
     }
     auto c = std::make_unique<Chunk>();
     const auto t0 = std::chrono::steady_clock::now();
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     const VkResult r = host_span(*c, ptr, size);
 #else
     const VkResult r = g.dmem_dmabuf ? dmabuf_span(*c, offset, size) : host_span(*c, ptr, size);
@@ -455,7 +459,7 @@ void choose_dmem_import() {
     const VkResult r = host_span(c, g.mirror, 1ull << gcn::kPageShift);
     free_import(c);
     if (r == VK_SUCCESS) return;
-#if !defined(_WIN32)
+#if defined(__linux__)
     if (g.can_dmabuf) {
         g.udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
         if (g.udmabuf < 0) {
@@ -1710,7 +1714,7 @@ bool init_locked() {
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
                               static_cast<unsigned long long>(c.heaps >> 20));
-#if !defined(_WIN32)
+#if defined(__linux__)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
         has_swapchain = c.swapchain;
