@@ -2,7 +2,8 @@
 # Copies the official plugins of a build into a package's plugins/ folder,
 # without their DWARF, and signs each one (docs/plugins.md, "Official
 # plugins"): <file>.sig is the release key's Ed25519 signature over the file
-# as shipped, which the host checks before it loads the plugin.
+# as shipped, which the host checks before it loads the plugin. On macOS this
+# needs OpenSSL 3 (LibreSSL has no Ed25519).
 #   tools/package_plugins.sh BUILD_PLUGIN_DIR PACKAGE_PLUGIN_DIR
 # The key comes from RELEASE_SIGNING_KEY (the PEM text: the release workflow's
 # secret) or RELEASE_SIGNING_KEY_FILE; without either the plugins ship unsigned.
@@ -22,7 +23,13 @@ for p in $plugins; do
     for f in "$from/$p.so" "$from/$p.dll"; do
         [ -f "$f" ] || continue
         out="$to/$(basename "$f")"
-        objcopy --strip-debug "$f" "$out" 2>/dev/null || llvm-objcopy --strip-debug "$f" "$out" 2>/dev/null || cp "$f" "$out"
+        if [ "$(uname)" = Darwin ]; then
+            # strip leaves the linker's ad-hoc signature stale: re-sign.
+            strip -S -o "$out" "$f"
+            codesign --force --sign - "$out" 2>/dev/null
+        else
+            objcopy --strip-debug "$f" "$out" 2>/dev/null || llvm-objcopy --strip-debug "$f" "$out" 2>/dev/null || cp "$f" "$out"
+        fi
         if [ -n "$key" ]; then
             openssl pkeyutl -sign -inkey "$key" -rawin -in "$out" -out "$out.sig"
         fi
