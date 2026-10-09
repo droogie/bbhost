@@ -216,6 +216,7 @@ struct Gpu {
     bool has_depth_bounds = false;        // VkPhysicalDeviceFeatures::depthBounds
     bool has_depth_bias_clamp = false;    // VkPhysicalDeviceFeatures::depthBiasClamp
     bool has_tessellation = false;        // VkPhysicalDeviceFeatures::tessellationShader
+    bool has_geometry_shader = false;     // VkPhysicalDeviceFeatures::geometryShader (none on MoltenVK)
     std::uint32_t subgroup_stages = 0;    // VkPhysicalDeviceSubgroupProperties::supportedStages
     // Pixel shaders at wave32 (gcn/wave.h):
     // decided at device creation (gpu.cpp), given to each fragment stage by

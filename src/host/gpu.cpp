@@ -2123,13 +2123,11 @@ bool init_locked() {
     f2.features.shaderInt64 = VK_TRUE;
     f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    f2.features.geometryShader = VK_TRUE;
     f2.features.independentBlend = VK_TRUE;
     f2.features.fillModeNonSolid = VK_TRUE;
     f2.features.depthClamp = VK_TRUE;
     f2.features.dualSrcBlend = VK_TRUE;
     f2.features.shaderClipDistance = VK_TRUE;
-    f2.features.shaderCullDistance = VK_TRUE;
     f2.features.samplerAnisotropy = VK_TRUE;
     // The buffer shadow's mirrors are sparse buffers with a 64 KiB device page
     // bound per guest page actually copied (buffer_shadow.cpp): a full 1 GiB
@@ -2209,6 +2207,10 @@ bool init_locked() {
     // an evaluation shader. Optional: without it the emulation stays.
     g.has_tessellation = supported.tessellationShader == VK_TRUE;
     f2.features.tessellationShader = supported.tessellationShader;
+    // RectList draws make their fourth corner in a geometry shader; Metal has
+    // no geometry stage.
+    g.has_geometry_shader = supported.geometryShader == VK_TRUE;
+    f2.features.geometryShader = supported.geometryShader;
     // f16 rounded toward zero by the device itself: GCN's v_cvt_pkrtz_f16_f32
     // and the packed colour exports that read it become two native conversions
     // a pair (gcn/half.h native_half_rtz), where the exact integer form was ~6
@@ -2313,7 +2315,7 @@ bool init_locked() {
         host_log("gpu: depth clamp %s", g.dynamic_depth_clamp ? "dynamic (VK_EXT_extended_dynamic_state3)" : "in the pipeline");
     }
     if (g.device == VK_NULL_HANDLE) {
-        host_log("gpu: device creation failed (needs Vulkan 1.3 dynamic rendering, bufferDeviceAddress, shaderInt64, geometry shaders, host memory import)");
+        host_log("gpu: device creation failed (needs Vulkan 1.3 dynamic rendering, bufferDeviceAddress, shaderInt64, host memory import)");
         return false;
     }
     g.get_host_pointer_props = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
@@ -2526,13 +2528,14 @@ bool init_locked() {
         return false;
     }
     choose_dmem_import();
-    host_log("gpu: %s (Vulkan %u.%u), subgroup size %u (stages 0x%x: %s%s%s), host pointer alignment %u%s%s%s%s", props.deviceName,
+    host_log("gpu: %s (Vulkan %u.%u), subgroup size %u (stages 0x%x: %s%s%s), host pointer alignment %u%s%s%s%s%s", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), subp.subgroupSize,
              g.subgroup_stages, (g.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT) ? "vertex " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) ? "tess-eval " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ? "compute" : "", g.host_pointer_align,
              g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
-             g.has_tessellation ? ", tessellation" : "", portability ? ", portability subset" : "");
+             g.has_tessellation ? ", tessellation" : "", g.has_geometry_shader ? ", geometry shaders" : ", no geometry shaders",
+             portability ? ", portability subset" : "");
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
     // translator above (they are part of every key).
