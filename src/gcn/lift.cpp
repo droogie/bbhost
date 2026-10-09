@@ -3062,7 +3062,7 @@ private:
                                "it; no implicit-LOD sample inside)"
                          : std::string("uniform, left on a bit every lane holds alike")) +
             "; " + std::to_string(l.phis.size()) + " phis (" + std::to_string(l.vgpr_phis) + " VGPRs, " + std::to_string(l.lane_phis) + " lane masks)" +
-            (kept.empty() ? "" : "; " + kept + " come back to the header unchanged"));
+            (kept.empty() ? "" : "; back at the header unchanged: " + kept));
     }
 
     // ---- module ----------------------------------------------------------------------
