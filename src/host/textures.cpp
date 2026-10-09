@@ -2903,6 +2903,16 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     std::int32_t bias = static_cast<std::int32_t>(s[2] & 0x3fff);
     if (bias & 0x2000) bias -= 0x4000;
     sci.mipLodBias = static_cast<float>(bias) / 256.0f;
+    // No mip LOD bias on MoltenVK (Metal samplers have none): mips are picked
+    // unbiased. Not folded into the shaders: the S# is read after translation,
+    // and SPIR-V's Bias exists for implicit levels only.
+    if (sci.mipLodBias != 0.0f && !g.sampler_lod_bias) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            host_log("texture: S# LOD bias %g left out, as every other: the device has no sampler mip LOD bias", sci.mipLodBias);
+        }
+        sci.mipLodBias = 0.0f;
+    }
     // The comparison only applies to samplers the shader uses with
     // image_sample_c* (Vulkan needs compareEnable for Dref ops and forbids it
     // for plain sampling); DEPTH_COMPARE_FUNC gives the function.

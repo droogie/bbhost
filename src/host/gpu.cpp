@@ -2058,6 +2058,7 @@ bool init_locked() {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
     }
+    g.sampler_lod_bias = true;  // unless the portability subset leaves it out
 #if defined(__APPLE__)
     // Using a subset feature not enabled is invalid even where the device has
     // it, so every one it has is enabled.
@@ -2069,6 +2070,7 @@ bool init_locked() {
         vkGetPhysicalDeviceFeatures2(g.phys, &qf);
         fport.pNext = f13.pNext;
         f13.pNext = &fport;
+        g.sampler_lod_bias = fport.samplerMipLodBias == VK_TRUE;
         host_log("gpu: portability subset: point polygons %d, sampler mip LOD bias %d, tessellation isolines %d and point mode %d, "
                  "triangle fans %d, format swizzles %d, format reinterpretation %d",
                  static_cast<int>(fport.pointPolygons), static_cast<int>(fport.samplerMipLodBias),
