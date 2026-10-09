@@ -232,7 +232,8 @@ def run_toml(app0, eboot, data, p2p_port, width, height, old_hunters=False):
         "# tools/area_check.py: this run's own configuration - offline, on a copy of the seed.",
         "[paths]", "app0 = %s" % toml_str(app0), "data = %s" % toml_str(data), "eboot = %s" % toml_str(eboot), "",
         "[online]", 'host = "127.0.0.1"', "p2p_port = %d" % p2p_port, "",
-        "[video]", "width = %d" % width, "height = %d" % height, "",
+        "# The window and what the game renders at (the Resolution setting).",
+        "[video]", "width = %d" % width, "height = %d" % height, "resolution = %s" % toml_str("%dx%d" % (width, height)), "",
         "[startup]", "skip_intro = true", "",
         "# The developer sample and visitor plugins stay out of the measurement.",
         "[plugins]", "hello = false", "join_modded_worlds = false", ""]
@@ -319,6 +320,7 @@ TOUR_START = re.compile(PROBE + r"tour-start ")
 PROBE_LINE = re.compile(PROBE)
 TOUR_DONE = re.compile(PROBE + r"tour-done ")
 VERSION = re.compile(r"\] bbhost (v\S+) \(")
+RENDERING = re.compile(r"\] resolution: display buffers \d+x\d+, rendering (\d+)x(\d+)")
 FATAL = re.compile(r"SIGSEGV pc=|dumped core|Segmentation fault|the device is lost|VK_ERROR_DEVICE_LOST|\] DL_PANIC ")
 PROBLEM = re.compile(r"HLE stub #|descriptor set allocation failed|wait timed out|capture: .*abandoned")
 
@@ -349,6 +351,7 @@ class Log:
         self.events = []      # (index, kind, data)
         self.version = None
         self.world = None
+        self.rendering = None  # [w, h]: the last size the game rendered at
         self.tour_done = False
         self.fatal = []
         for i, line in enumerate(lines):
@@ -445,6 +448,9 @@ class Log:
         m = VERSION.search(line)
         if m and not self.version:
             self.version = m.group(1)
+        m = RENDERING.search(line)
+        if m:
+            self.rendering = [int(m.group(1)), int(m.group(2))]
         if FATAL.search(line):
             self.fatal.append(line.strip()[:300])
         elif PROBLEM.search(line):
@@ -621,7 +627,7 @@ def pass_report(lines, areas, kind):
     log = Log(lines)
     segs = area_segments(log, {a.id for a in areas})
     out = {"kind": kind, "version": log.version, "world": log.world, "tour_done": log.tour_done, "fatal": log.fatal[:20],
-           "areas": {}}
+           "rendering": log.rendering, "areas": {}}
     for a in areas:
         if a.id in segs:
             out["areas"][a.id] = area_report(log, a, segs[a.id], kind)
@@ -1026,9 +1032,11 @@ def summary_text(report):
     for kind in ("perf", "capture"):
         p = report.get("passes", {}).get(kind)
         if p:
-            out.append("%s pass: %s in %.0f s, world %s, tour %s%s" % (
+            out.append("%s pass: %s in %.0f s, world %s, tour %s%s%s" % (
                 kind, p.get("stop_reason"), p.get("elapsed_s", 0), "reached" if p.get("world") else "NOT reached",
-                "done" if p.get("tour_done") else "NOT done", ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
+                "done" if p.get("tour_done") else "NOT done",
+                (", rendering %dx%d" % tuple(p["rendering"])) if p.get("rendering") else "",
+                ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
     out.append("")
     for aid, a in report.get("areas", {}).items():
         out.append("%-18s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
@@ -1365,6 +1373,9 @@ def problems_of(report):
             out.append("%s pass: the game died (%s)" % (kind, p["fatal"][0][:120]))
         if not p.get("tour_done"):
             out.append("%s pass: the tour did not finish (%s)" % (kind, p.get("stop_reason")))
+        size = report.get("run", {}).get("size")
+        if size and p.get("rendering") and list(p["rendering"]) != list(size):
+            out.append("%s pass: rendered at %dx%d, not the %dx%d asked for" % (kind, p["rendering"][0], p["rendering"][1], size[0], size[1]))
     for aid, a in report.get("areas", {}).items():
         if a.get("status") != "ok":
             out.append("%s: %s" % (aid, a.get("status")))
@@ -1480,7 +1491,7 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         "bbhost": opts["bbhost"], "bbhost_sha256": plan["bbhost_sha256"], "numa_node": opts["numa_node"], "fps": opts["fps"],
         "pipeline_cache": opts["pipeline_cache"], "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platform": platform.platform(), "load_before": os.getloadavg() if hasattr(os, "getloadavg") else None,
-        "settle_s": opts["settle"], "measure_s": opts["measure"]}, "passes": {}}
+        "settle_s": opts["settle"], "measure_s": opts["measure"], "size": [opts["width"], opts["height"]]}, "passes": {}}
     passes, lifts = {}, None
     for k in kinds:
         t0 = time.monotonic()
@@ -1490,7 +1501,8 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         say_t("starting (%s)" % (out / k))
         launched = launch(out / k, plans[k], say_t)
         passes[k] = finish_pass(out / k, areas, k, launched, opts)
-        report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version")}
+        report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version",
+                                                             "rendering")}
         say_t("%s after %.0f s" % (launched["stop_reason"], launched["elapsed_s"]))
         if k == "capture":
             lifts = verify_lifts(out / k, areas, opts, say_t)
@@ -1527,7 +1539,8 @@ def do_report(args):
         if p.is_file():
             lifts[a.id] = json.loads(p.read_text())
     report = {"schema": SCHEMA, "version": 1, "dir": str(run), "run": old.get("run", {}), "passes": {
-        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version")} for k, v in passes.items()}}
+        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering")}
+        for k, v in passes.items()}}
     report["areas"] = merge(passes.get("perf"), passes.get("capture"), lifts, areas)
     report["problems"] = problems_of(report)
     (run / "report.json").write_text(json.dumps(report, indent=2) + "\n")

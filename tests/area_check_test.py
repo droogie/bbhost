@@ -205,6 +205,10 @@ class TourTest(unittest.TestCase):
         t = tomllib.loads(ac.run_toml("/g/CUSA00900", "/e/eboot.bin", Path("/r/perf/data"), 9446, 1920, 1080))
         self.assertEqual(t["paths"], {"app0": "/g/CUSA00900", "data": "/r/perf/data", "eboot": "/e/eboot.bin"})
         self.assertEqual(t["online"], {"host": "127.0.0.1", "p2p_port": 9446})
+        # The render size (the Resolution setting), not only the window's.
+        self.assertEqual(t["video"], {"width": 1920, "height": 1080, "resolution": "1920x1080"})
+        wide = tomllib.loads(ac.run_toml("/g", "/e", Path("/d"), 9446, 3440, 1440))
+        self.assertEqual(wide["video"]["resolution"], "3440x1440")
         self.assertFalse(t["plugins"]["hello"])
         self.assertNotIn("patches", t)
         dlc = tomllib.loads(ac.run_toml("/g", "/e", Path("/d"), 9446, 1920, 1080, old_hunters=True))
@@ -249,6 +253,16 @@ class LogTest(unittest.TestCase):
             self.assertIsNotNone(m, prefix)
             self.assertEqual((m.group(1), m.group(2)), ("central-yharnam", "arrived"))
         self.assertTrue(ac.TOUR_DONE.search("[bbhost] plugin: mapval tour-done 1.000"))
+
+    def test_render_size_is_checked(self):
+        lines = ["[bbhost] resolution: display buffers 5120x2160, rendering 1920x1080",
+                 "[bbhost] world: the first in-game frame, flip 1500, 31.0 s after start"]
+        rep = ac.pass_report(lines, ac.pick_areas("hunters-dream"), "perf")
+        self.assertEqual(rep["rendering"], [1920, 1080])
+        report = {"run": {"size": [3840, 2160]}, "passes": {"perf": dict(rep, tour_done=True)}, "areas": {}}
+        self.assertIn("perf pass: rendered at 1920x1080, not the 3840x2160 asked for", ac.problems_of(report))
+        report["run"]["size"] = [1920, 1080]
+        self.assertFalse([p for p in ac.problems_of(report) if "rendered at" in p])
 
     def test_places_from_the_log(self):
         lines, window = self.run_lines()
