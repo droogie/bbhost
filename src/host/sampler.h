@@ -20,6 +20,9 @@
 // walks the guest's frame pointers (the eboot keeps them) and marks those
 // addresses with a leading 'g' - they are Binary Ninja addresses; in host
 // code (an HLE call) it unwinds the host frames.
+//
+// Windows and macOS sample without signals: the sampler thread suspends each
+// thread and reads its stack (macOS: through vm_read_overwrite).
 
 #include <cstdint>
 
@@ -39,8 +42,9 @@ void sampler_recover();
 // module+offset, guest ones as Binary Ninja addresses; tools/hang_stacks.py
 // names ours). For runs on machines the log is all we get from: one that
 // stops without a crash report then says whether it hung and where.
-// Windows: from the start, with a line every 5 s, the threads suspended to
-// read them. Linux: once the game has flipped 60 times, each thread's stack
-// taken by its own SIGPROF handler (a signal can cut a blocking call short,
-// so not during the start).
+// Windows and macOS: from the start, with a line every 5 s, the threads
+// suspended to read them (macOS leaves out Rosetta's own thread). Linux:
+// once the game has flipped 60 times, each thread's stack taken by its own
+// SIGPROF handler (a signal can cut a blocking call short, so not during
+// the start).
 void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi);
