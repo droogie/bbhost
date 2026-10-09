@@ -128,11 +128,15 @@ VkPipeline g_pipeline = VK_NULL_HANDLE;
 DevBuffer g_state;  // State, host-visible: the report reads its counters
 DevBuffer g_preds;  // kPreds x {draw, seen}
 std::uint32_t g_pred_next = 0;
+// One buffer each, a slice per slot: MoltenVK makes every buffer with a
+// device address resident for each dispatch.
+DevBuffer g_items, g_results;
 
 // Per command-buffer slot: its queries, its items and where their results go.
 struct SlotOcc {
     VkQueryPool pool = VK_NULL_HANDLE;
-    DevBuffer items, results;
+    DevBuffer items, results;            // the slot's slices of g_items and g_results (map and address at the slice)
+    VkDeviceSize results_offset = 0;     // the results slice in g_results
     std::uint32_t queries = 0, nitems = 0;            // used by this recording
     std::uint32_t queries_done = 0, items_done = 0;   // resolved so far
     std::uint32_t to_reset = kQueries;                 // reset at the next recording's start (all, the first time)
@@ -257,7 +261,8 @@ void resolve_locked(bool mid) {
     if (so.queries > so.queries_done) {
         // With availability and without waiting: a query AMD never resolves
         // must not hang the GPU; the shader leaves its dump unwritten.
-        rec().copy_query_results(so.pool, so.queries_done, so.queries - so.queries_done, so.results.buffer, 16ull * so.queries_done, 16,
+        rec().copy_query_results(so.pool, so.queries_done, so.queries - so.queries_done, so.results.buffer,
+                                 so.results_offset + 16ull * so.queries_done, 16,
                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | (g_wait ? VK_QUERY_RESULT_WAIT_BIT : 0));
         VkMemoryBarrier cb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         cb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -350,14 +355,24 @@ void occlusion_device_ready_locked() {
     if (!failed && !create_dev_buffer(g_state, sizeof(State), true, true)) failed = "its state buffer";
     if (!failed) std::memset(g_state.map, 0, sizeof(State));
     if (!failed && !make_preds_locked()) failed = "its predicate buffer";
+    constexpr VkDeviceSize kItemBytes = 16ull * kItems, kResultBytes = 16ull * kQueries;
+    const auto slots = static_cast<VkDeviceSize>(g.slot_count);
+    if (!failed && !create_dev_buffer(g_items, kItemBytes * slots, true)) failed = "its item buffer";
+    if (!failed && !create_dev_buffer(g_results, kResultBytes * slots, false)) failed = "its result buffer";
     for (int k = 0; !failed && k < g.slot_count; ++k) {
         SlotOcc& so = g_occ[k];
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_OCCLUSION;
         qci.queryCount = kQueries;
         if (vkCreateQueryPool(g.device, &qci, nullptr, &so.pool) != VK_SUCCESS) failed = "a query pool";
-        else if (!create_dev_buffer(so.items, 16ull * kItems, true)) failed = "an item buffer";
-        else if (!create_dev_buffer(so.results, 16ull * kQueries, false)) failed = "a result buffer";
+        so.items = g_items;
+        so.items.map = static_cast<std::uint8_t*>(g_items.map) + kItemBytes * k;
+        so.items.address += kItemBytes * k;
+        so.items.size = kItemBytes;
+        so.results = g_results;
+        so.results_offset = kResultBytes * k;
+        so.results.address += so.results_offset;
+        so.results.size = kResultBytes;
     }
     if (failed) {
         host_log("occlusion: off - %s could not be made; every query reads visible, as before", failed);
