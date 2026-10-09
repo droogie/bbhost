@@ -104,12 +104,33 @@ VkFormat cb_format(const CbInfo& i) {
     }
 }
 
+// 16-bit depth with stencil: D24_UNORM_S8_UINT, else D32_SFLOAT_S8_UINT
+// (Apple GPUs and AMD have no 24-bit depth). The guest still sees unorm depth
+// (RtImage::depth_stand_in). Depth bias steps differ: 2^-24 for D24, one ulp
+// of the depth for D32F.
+VkFormat depth16_stencil_format() {
+    static const VkFormat f = [] {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((fp.optimalTilingFeatures & need) == need) return VK_FORMAT_D24_UNORM_S8_UINT;
+        host_log("render: D24_UNORM_S8_UINT is no depth target here (features 0x%x): 16-bit depth with stencil is drawn into D32_SFLOAT_S8_UINT",
+                 fp.optimalTilingFeatures);
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }();
+    return f;
+}
 VkFormat db_format(std::uint32_t z_info, std::uint32_t stencil_info) {
     const std::uint32_t zf = z_info & 3;
     const bool stencil = (stencil_info & 1) != 0;
     if (zf == 0) return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_UNDEFINED;
-    if (zf == 1) return stencil ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D16_UNORM;
+    if (zf == 1) return stencil ? depth16_stencil_format() : VK_FORMAT_D16_UNORM;
     return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+}
+// As fills, copies and readbacks see the memory: a stand-in holds unorm.
+bool depth_is_float(const RtImage& r) {
+    return (r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D32_SFLOAT_S8_UINT) && !r.depth_stand_in;
 }
 
 VkCompareOp compare_op(std::uint32_t f) {
@@ -1289,7 +1310,7 @@ std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint
 void copy_layers_locked(const RtImage& from, RtImage& to);
 
 RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std::uint32_t height, bool depth,
-                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0) {
+                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0, bool depth_stand_in = false) {
     // An image this one replaces whose last write was a fill (RtImage::
     // fill_last): the new image starts with that fill if it covers it. The
     // blood layers' small targets move between sizes as well as between sRGB
@@ -1356,14 +1377,16 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         // A draw into slice k of a layered target names SLICE_MAX = k (a cube's
         // faces are drawn one slice at a time), so fewer slices than the image
         // has is the same target.
-        if (r.format == format && r.width == width && r.height == height && r.layers >= layers) {
+        // A depth stand-in is another guest format than a real D32_SFLOAT_S8_UINT.
+        const bool same_format = r.format == format && r.depth_stand_in == depth_stand_in;
+        if (same_format && r.width == width && r.height == height && r.layers >= layers) {
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
             rt_written(r);
             return &r;
         }
         g.rt_replacements.fetch_add(1);
-        if (r.format == format && r.width == width && r.height == height) {
+        if (same_format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
             // cube's first frame this happens once per face.
             static std::atomic<int> logs{0};
@@ -1414,6 +1437,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     r.width = width;
     r.height = height;
     r.depth = depth;
+    r.depth_stand_in = depth_stand_in;
     r.layers = std::max(layers, 1u);
     r.slice_bytes = slice_bytes;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1584,17 +1608,19 @@ std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws 
 
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, bool depth_stand_in = false) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
+        bool depth_stand_in = false;
         RtImage* rt = nullptr;
     };
     static Memo memo[9];
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
-        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
+        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
+        m.depth_stand_in == depth_stand_in) {
         apply_pending_clear(*m.rt);
         rt_written(*m.rt);
         return m.rt;
@@ -1653,8 +1679,8 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     } else {
         ++g_extent_guessed;
     }
-    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, rt};
+    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, depth_stand_in);
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, depth_stand_in, rt};
     return rt;
 }
 
@@ -7582,7 +7608,7 @@ bool render_clear_by_fill_locked(std::uint64_t va, std::size_t bytes, std::uint3
     if (r.depth) {
         float f;
         std::memcpy(&f, &value, 4);
-        rgba[0] = r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? f : static_cast<float>(value & 0xffffff) / 16777215.0f;
+        rgba[0] = depth_is_float(r) ? f : static_cast<float>(value & 0xffffff) / 16777215.0f;
     } else if (value != 0 && rt_bytes_per_pixel(r) == 4 &&
                (r.format == VK_FORMAT_R8G8B8A8_UNORM || r.format == VK_FORMAT_R8G8B8A8_SRGB || bgra)) {
         // Unpacked as the memory layout the shader would see (RGBA order).
@@ -8460,7 +8486,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     // A depth source becomes an R32_SFLOAT colour snapshot (its Z plane),
     // sampled by the lighting passes as a plain float texture.
     const bool from_depth = src.depth;
-    if (from_depth && src.format != VK_FORMAT_D32_SFLOAT && src.format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+    if (from_depth && !depth_is_float(src)) {
         note_copy_refused_locked(kCopyRefusedDepthFormat, via, src_base, dst_base, bytes);
         return false;
     }
@@ -12657,8 +12683,10 @@ static bool draw_impl(const GpuDraw& d) {
                 // slices of DEPTH_SIZE's padded w x h follow each other.
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
+                // depth16_stencil_format: 16-bit depth with stencil in D32_SFLOAT_S8_UINT.
+                const bool stand_in = (z_info & 3) == 1 && df == VK_FORMAT_D32_SFLOAT_S8_UINT;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent);
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, stand_in);
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;
@@ -15474,6 +15502,51 @@ void host_gpu_refill_selftest() {
         ++g_rt_gen;
         bump_view_epoch();
     }
+
+    // A fill of a D32_SFLOAT_S8_UINT target is unorm for a depth stand-in,
+    // float otherwise; the same memory asked for the other way is a new image.
+    {
+        constexpr std::uint32_t kSide = 64;
+        constexpr std::size_t kBytes = kSide * kSide * 4;
+        auto first_depth = [&](RtImage& r) -> float {
+            DevBuffer staging;
+            if (!create_dev_buffer(staging, 4, true)) return -1.0f;
+            begin_recording_locked();
+            render_end_pass_locked();
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            region.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
+            flush_locked();
+            float f = -1.0f;
+            std::memcpy(&f, staging.map, 4);
+            vkDestroyBuffer(g.device, staging.buffer, nullptr);
+            vkFreeMemory(g.device, staging.memory, nullptr);
+            return f;
+        };
+        struct DepthCase {
+            const char* name;
+            bool stand_in;
+            std::uint32_t value;
+            float want;
+        };
+        const DepthCase depth_cases[] = {{"16-bit depth with stencil", true, 0x00800000u, 8388608.0f / 16777215.0f},
+                                         {"32-bit float depth with stencil", false, 0x3e800000u, 0.25f},
+                                         {"16-bit depth with stencil again", true, 0x00400000u, 4194304.0f / 16777215.0f}};
+        for (const DepthCase& c : depth_cases) {
+            RtImage* r = rt_image(kBase, VK_FORMAT_D32_SFLOAT_S8_UINT, kSide, kSide, true, 1, kBytes, c.stand_in);
+            if (!r) {
+                host_log("refill test: no depth target");
+                break;
+            }
+            const bool cleared = render_clear_by_fill_locked(kBase, kBytes, c.value);
+            const float got = first_depth(*r);
+            const bool pass = cleared && r->depth_stand_in == c.stand_in && std::abs(got - c.want) < 1e-6f;
+            host_log("refill test: a fill of a %s target before any draw clears it to %.7f (want %.7f) - %s", c.name, got, c.want,
+                     pass ? "PASS" : "FAIL");
+        }
+        drop();
+    }
 }
 
 // BBHOST_DUMP_ALL=1 also writes every colour target as build/rt-<base>.ppm.
@@ -16299,7 +16372,7 @@ namespace {
 // flushes once for all of them and takes the bytes (take_target_pixels).
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     const bool depth = r.depth;
-    if (depth && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
+    if (depth && !depth_is_float(r)) return false;
     out.width = r.width;
     out.height = r.height;
     out.format = r.format;

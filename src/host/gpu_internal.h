@@ -862,6 +862,9 @@ struct RtImage {
     std::uint64_t base = 0;
     bool depth = false;
     bool storage = false;      // created with STORAGE usage (a depth snapshot: depth_copy_record_locked writes it)
+    // D32_SFLOAT_S8_UINT standing in for a missing D24_UNORM_S8_UINT: fills,
+    // copies and readbacks still treat it as unorm depth (depth_is_float).
+    bool depth_stand_in = false;
     bool initialised = false;  // layout moved to GENERAL
     // Depth targets: the HTILE metadata buffer (DB_HTILE_DATA_BASE). The
     // engine clears depth by filling HTILE; the next draw that binds the
