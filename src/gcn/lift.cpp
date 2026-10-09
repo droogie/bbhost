@@ -13,8 +13,10 @@
 //     masked writes keep their old values anyway. The region is emitted
 //     unconditionally when it has no image, export or memory instruction, does
 //     not change EXEC, and every scalar register it writes is redefined before
-//     it is read afterwards (scalar writes are not masked, and GCN runs a
-//     block once for all lanes when any lane needs it).
+//     it is read on every path out of it, around loops too (scalar writes are
+//     not masked, and GCN runs a block once for all lanes when any lane needs
+//     it). A lane mask it writes may stay live where it equals, wherever GCN
+//     can skip the region, its value on the skipped path.
 //   * An s_cbranch_scc0 region (the alpha-test kill idiom) is emitted
 //     unconditionally too when SCC was "some lane of mask M is set" and the
 //     region's first instruction ANDs M into EXEC: a pixel whose M bit is
@@ -22,14 +24,23 @@
 //     If EXEC after it differs from EXEC at the branch, or the region widens
 //     EXEC to whole quads (s_wqm_b64; the lifted pixel keeps its own bit), the
 //     lift can differ from GCN only in pixels whose M bit is clear: EXEC at
-//     s_endpgm must then be M itself, and no implicit-LOD sample may follow.
+//     s_endpgm must then lie within M, and no implicit-LOD sample may follow.
+//     Widening from a varying EXEC needs M within it. Kill regions nest, the
+//     inner one's mask within the outer one's.
 //   * An s_cbranch_scc0/scc1 or s_cbranch_vccz/vccnz whose bit every lane
 //     holds alike becomes structured control flow: SCC from a scalar compare
 //     (scalar operands never read a VGPR), or VCC computed only from
-//     constants, user data and loads. It has a then arm, an else arm where an
-//     s_branch closes the then arm, and a merge whose phis carry the values
-//     the arms left different. An s_branch closing no then arm (a loop) is
-//     rejected.
+//     constants, user data and loads - or VCC a comparison of values every
+//     lane holds alike where EXEC is set, ANDed with an EXEC GCN cannot reach
+//     the branch with empty (EXEC where the innermost region began). It has a
+//     then arm, an else arm where an s_branch closes the then arm, and a
+//     merge whose phis carry the values the arms left different. In an
+//     else-if chain whose inner arms jump straight to the outer join, the
+//     inner if joins at the s_branch closing the outer then arm instead.
+//   * A backward s_branch closes a loop, left only for the instruction after
+//     it: an OpLoopMerge loop per pixel with phis for what the body writes.
+//     A uniform loop exits on a bit every lane holds alike; a divergent one is
+//     the per-lane exit idiom on a loop mask (see "loops" below).
 //   * Implicit-LOD samples are accepted only outside regions with EXEC known
 //     set. The whole function is then uniform control flow, so Vulkan helper
 //     invocations compute the samples for a quad's uncovered pixels as GCN's
@@ -92,6 +103,7 @@ struct Region {
     bool widened = false;     // the AND is followed by s_wqm_b64 exec, exec
     bool quad_exact = false;  // widened from EXEC known set: every pixel computes the region, as GCN's widened quads do
     Val guard, exec_before;
+    std::map<int, Val> lanes_at_branch;  // the lane masks where the branch tests whether to skip the region
     // EXEC where the region's writes begin (after a kill region's AND and
     // widening); every EXEC set inside the region must lie within it.
     Val exec_in;
@@ -120,7 +132,12 @@ std::string key_name(int key) {
 
 class Lifter {
 public:
-    Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r) : prog(p), opt(o), ref(r) {}
+    // `loop_phis`: lane masks (loop header, key) an earlier attempt found
+    // changed around a loop; they get phis instead of being assumed unchanged.
+    using LoopPhis = std::set<std::pair<std::uint32_t, int>>;
+    Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r, const LoopPhis& loop_phis = {})
+        : prog(p), opt(o), ref(r), lane_phi_hints(loop_phis) {}
+    LoopPhis more_lane_phis;  // set when a lift failed only because a lane mask needs a phi
 
     LiftResult run() {
         check_program();
@@ -189,9 +206,14 @@ private:
         std::uint32_t join = 0;
     };
     std::vector<Construct> constructs;
+    std::vector<std::uint32_t> threaded_joins;  // ifs of an else-if chain joined at the enclosing then arm's s_branch
     struct Arm {  // an open if
         Construct* c = nullptr;
         std::uint64_t seq = 0;
+        // VCC was a uniform condition ANDed with EXEC, at the start of the
+        // region beginning here (0: the bit itself was uniform).
+        std::uint32_t split_region = 0;
+        bool then_dead = false;  // the then arm ended by leaving a loop
         Id merge = 0, then_label = 0, else_label = 0, then_end = 0;
         bool in_else = false;
         std::map<int, Val> reg0, lanes0, reg1, lanes1;  // at the branch; at the then arm's end
@@ -211,6 +233,7 @@ private:
 
     // Proof bookkeeping
     std::vector<std::uint32_t> samples, exports;
+    std::vector<std::uint32_t> divergent_samples;  // inside a divergent loop
     std::size_t buffer_loads = 0, masked_writes = 0;
 
     // SCC as the translator leaves it after a 64-bit mask op: some lane of
@@ -228,6 +251,7 @@ private:
     std::vector<KillProof> kill_proofs;
     std::vector<Val> export_execs;          // EXEC at exports where it was not known set
     std::map<Id, std::set<Id>> conjuncts;   // the operands of each lane mask built by LogicalAnd
+    std::map<Id, Id> negation_of;           // each lane mask built by LogicalNot -> its operand
     // Values every lane holds alike: built only from constants, user data,
     // scalar loads and other such values (scalar operands never read a VGPR).
     // An instruction's results are uniform when everything it read was.
@@ -266,6 +290,7 @@ private:
             reject("the program does not end in s_endpgm");
         }
         const std::uint32_t end = last.offset + last.size * 4;
+        find_loops();  // first: a forward branch may be a loop's exit
         for (const Inst& in : prog.insts) {
             cur = in.offset;
             // s_swappc_b64 calls the fetch shader; with vertex input a vertex
@@ -275,6 +300,7 @@ private:
             if (in.enc == Enc::SOPP && in.op == 1 && &in != &last) reject("s_endpgm before the end of the program");
             if (!is_branch(in)) continue;
             const std::uint32_t target = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+            if (loop_branch(in.offset)) continue;  // a back edge or a loop exit (find_loops)
             if (target <= in.offset || target > end) {
                 reject(std::string(mnemonic(in)) + " must branch forward within the program");
             } else if (in.op == 2) {
@@ -290,7 +316,7 @@ private:
                 c.negate = in.op == 5 || in.op == 7;
                 c.else_start = target;
                 c.join = target;
-                if (const Inst* jump = inst_at(target - 4); jump && jump->enc == Enc::SOPP && jump->op == 2) {
+                if (const Inst* jump = inst_at(target - 4); jump && jump->enc == Enc::SOPP && jump->op == 2 && !loop_branch(jump->offset)) {
                     const std::uint32_t join = jump->offset + 4 + static_cast<std::uint32_t>(jump->imm) * 4;
                     if (join > target && join < end) {
                         c.else_jump = jump->offset;
@@ -323,6 +349,7 @@ private:
                 block_starts.insert(r.end);
             }
         }
+        thread_if_joins();
         std::set<std::uint32_t> else_jumps;
         for (const Construct& c : constructs) {
             if (c.else_jump && !else_jumps.insert(c.else_jump).second) {
@@ -331,9 +358,9 @@ private:
             }
         }
         for (const Inst& in : prog.insts) {
-            if (in.enc == Enc::SOPP && in.op == 2 && !else_jumps.count(in.offset)) {
+            if (in.enc == Enc::SOPP && in.op == 2 && !else_jumps.count(in.offset) && !loop_branch(in.offset)) {
                 cur = in.offset;
-                reject("s_branch that does not close an if's then arm (loops are not lifted)");
+                reject("s_branch that does not close an if's then arm, end a loop or leave one");
             }
         }
         std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) { return a.start < b.start; });
@@ -370,6 +397,33 @@ private:
                     reject("the ifs at " + hex_offset(c.branch) + " and " + hex_offset(o.branch) + " overlap");
                 }
             }
+        }
+        check_loop_nesting();
+    }
+
+    // An else-if chain: an if inside another's then arm whose arms jump
+    // straight to the outer join, past the s_branch that closes the outer then
+    // arm. That s_branch only jumps to the same join, so jumping to it instead
+    // is the same program, and the inner if then joins there, inside the outer
+    // then arm. Each such if takes the nearest enclosing s_branch.
+    void thread_if_joins() {
+        const auto target_of = [&](std::uint32_t at) {
+            const Inst* in = inst_at(at);
+            return in ? in->offset + 4 + static_cast<std::uint32_t>(in->imm) * 4 : 0u;
+        };
+        for (Construct& c : constructs) {
+            std::uint32_t best = 0;
+            for (const Construct& o : constructs) {
+                if (&o == &c || !o.else_jump || o.branch >= c.branch || target_of(o.else_jump) != c.join) continue;
+                if (o.else_jump <= c.branch || o.else_jump >= c.join) continue;
+                if (c.else_jump && o.else_jump < c.else_start) continue;  // it would end the inner then arm instead
+                if (!best || o.else_jump < best) best = o.else_jump;
+            }
+            if (!best) continue;
+            if (!c.else_jump) c.else_start = best;
+            c.join = best;
+            block_starts.insert(best);
+            threaded_joins.push_back(c.branch);
         }
     }
 
@@ -420,6 +474,8 @@ private:
     Val band(const Val& a, const Val& b) {
         if (a.constant) return a.set ? b : lane_const(false);
         if (b.constant) return b.set ? a : lane_const(false);
+        if (a.id == b.id) return a;
+        if (negated(a, b)) return lane_const(false);  // a & !a: a mask with the active lanes removed from itself
         const Id r = m.emit(spv::OpLogicalAnd, t_bool, {a.id, b.id});
         std::set<Id>& c = conjuncts[r];
         for (const Val* x : {&a, &b}) {
@@ -431,9 +487,34 @@ private:
     static bool same_lane(const Val& a, const Val& b) {
         return a.kind == Kind::Lane && b.kind == Kind::Lane && a.constant == b.constant && (a.constant ? a.set == b.set : a.id == b.id);
     }
+    // One is the other's LogicalNot.
+    bool negated(const Val& a, const Val& b) const {
+        if (a.constant || b.constant) return a.constant && b.constant && a.set != b.set;
+        const auto na = negation_of.find(a.id), nb = negation_of.find(b.id);
+        return (na != negation_of.end() && na->second == b.id) || (nb != negation_of.end() && nb->second == a.id);
+    }
+    // Wherever `skip` is clear, `now` equals `before`: both lie within it, or
+    // `now` is `before` with only masks within `skip` removed (an AND with
+    // their negations). A region GCN skips because `skip` is clear in every
+    // lane leaves such a mask as the lift computes it.
+    bool same_where_clear(const Val& now, const Val& before, const Val& skip) const {
+        if (same_lane(now, before)) return true;
+        if (implies(now, skip) && implies(before, skip)) return true;
+        if (now.constant || before.constant) return false;
+        const auto it = conjuncts.find(now.id);
+        if (it == conjuncts.end() || !it->second.count(before.id)) return false;
+        const auto bc = conjuncts.find(before.id);
+        for (const Id c : it->second) {
+            if (c == before.id || (bc != conjuncts.end() && bc->second.count(c)) || conjuncts.count(c)) continue;  // `before`, or an AND node
+            const auto neg = negation_of.find(c);
+            if (neg == negation_of.end() || !implies(lane(neg->second), skip)) return false;
+        }
+        return true;
+    }
     // Every pixel whose `e` bit is set has its `g` bit set.
     bool implies(const Val& e, const Val& g) const {
         if (g.constant) return g.set || (e.constant && !e.set);
+        if (assumed.count(g.id)) return true;  // set wherever the lift is (a divergent loop's body)
         if (e.constant) return !e.set;
         if (e.id == g.id) return true;
         const auto it = conjuncts.find(e.id);
@@ -444,7 +525,13 @@ private:
         if (b.constant) return b.set ? lane_const(true) : a;
         return lane(m.emit(spv::OpLogicalOr, t_bool, {a.id, b.id}));
     }
-    Val bnot(const Val& a) { return a.constant ? lane_const(!a.set) : lane(m.emit(spv::OpLogicalNot, t_bool, {a.id})); }
+    Val bnot(const Val& a) {
+        if (a.constant) return lane_const(!a.set);
+        if (const auto it = negation_of.find(a.id); it != negation_of.end()) return lane(it->second);
+        const Id r = m.emit(spv::OpLogicalNot, t_bool, {a.id});
+        negation_of[r] = a.id;
+        return lane(r);
+    }
     Val bxor(const Val& a, const Val& b) {
         if (a.constant) return a.set ? bnot(b) : b;
         if (b.constant) return b.set ? bnot(a) : a;
@@ -603,7 +690,7 @@ private:
             reject("EXEC is not a known per-pixel mask");
             return lane_const(true);
         }
-        return note_read(it->second);
+        return note_read(known(it->second));
     }
     Val read_lane(std::uint16_t code) {
         int key = -1;
@@ -614,7 +701,7 @@ private:
         else if (code == 193) return lane_const(true);  // -1: every lane
         if (key >= 0) {
             if (poisoned.count(key)) reject(key_name(key) + " is read as a lane mask after an if that left one in it on one arm only");
-            if (auto it = lanes.find(key); it != lanes.end()) return note_read(it->second);
+            if (auto it = lanes.find(key); it != lanes.end()) return note_read(known(it->second));
             reject((key == kKeyVcc ? std::string("vcc") : operand_name(code)) + " is read as a lane mask but does not hold one");
         } else {
             reject("unsupported 64-bit mask operand " + operand_name(code));
@@ -679,6 +766,7 @@ private:
         } else {
             reg[key] = word(m.emit(spv::OpSelect, t_u32, {e.id, as_u(v), as_u(old)}));
         }
+        if (uniform(v)) masked_uniform[reg[key].id] = {e, v};
         note_result(reg[key]);
         note += " v" + std::to_string(idx) + ":select";
     }
@@ -1010,7 +1098,10 @@ private:
     }
     void vcmp(std::uint32_t op, const Val& s0, const Val& s1, const Mods& md, std::uint16_t dst_pair) {
         // The ballot the translator writes is the comparison AND this lane's EXEC.
-        const Val c = band(lane(vcmp_cond(op, s0, s1, md)), exec_lane());
+        const Id cond = vcmp_cond(op, s0, s1, md);
+        const Val e = exec_lane();
+        const Val c = band(lane(cond), e);
+        note_compare_split(c, e, op, s0, s1, md, cond);
         write_lane(dst_pair, c);
         if (op & 0x10) write_lane(kExecLo, c);
     }
@@ -1167,6 +1258,11 @@ private:
                 if (k.exec_before.constant && k.exec_before.set) {
                     r = lane_const(true);
                     k.quad_exact = true;
+                } else if (!implies(k.guard, k.exec_before)) {
+                    // GCN's whole quads would also run pixels whose guard bit is
+                    // set but whose EXEC bit was clear, which the lift leaves out.
+                    reject("a kill region widens to whole quads with its guard not within EXEC at the branch");
+                    return;
                 }
             }
             write_lane(in.dst, r);
@@ -1212,8 +1308,77 @@ private:
             set_scc_mask(r);
             return;
         }
-        default: reject(std::string("unsupported ") + mnemonic(in));
+        default:
+            if (sop2_word_kind(in.op)) return sop2_word(in);
+            reject(std::string("unsupported ") + mnemonic(in));
         }
+    }
+
+    // The 32-bit SOP2 integer operations, as translate.cpp sop2 computes them
+    // (loop counters and indices): 1 when SCC is written, 2 when it is not.
+    static int sop2_word_kind(std::uint16_t op) {
+        switch (op) {
+        case 0: case 1: case 2: case 3: case 6: case 7: case 8: case 9: case 14: case 16: case 18: case 20: case 22: case 24: case 26:
+        case 28: case 30: case 32: case 34: case 39: case 40:
+            return 1;
+        case 36: case 38: return 2;
+        default: return 0;
+        }
+    }
+    void sop2_word(const Inst& in) {
+        const Val va = read(in.src0, in), vb = read(in.src1, in);
+        if (va.kind == Kind::Lane || vb.kind == Kind::Lane) {
+            reject("a lane mask is used as a word");
+            return;
+        }
+        const Id a = as_u(va), b = as_u(vb);
+        const auto nonzero = [&](Id r) { return m.emit(spv::OpINotEqual, t_bool, {r, cu(0)}); };
+        Id r = 0, scc = 0;
+        switch (in.op) {
+        case 0: case 1: {  // s_add_u32 / s_sub_u32: SCC is the carry or the borrow
+            const Id c = m.emit(in.op == 0 ? spv::OpIAddCarry : spv::OpISubBorrow, m.type_struct({t_u32, t_u32}), {a, b});
+            r = extract(t_u32, c, 0);
+            scc = nonzero(extract(t_u32, c, 1));
+            break;
+        }
+        case 2: case 3: {  // s_add_i32 / s_sub_i32: SCC is the signed overflow
+            r = ibin(in.op == 2 ? spv::OpIAdd : spv::OpISub, a, b);
+            const Id sign_ab = shift(spv::OpShiftRightLogical, ibin(spv::OpBitwiseXor, a, b), cu(31));
+            const Id flipped = nonzero(shift(spv::OpShiftRightLogical, ibin(spv::OpBitwiseXor, a, r), cu(31)));
+            scc = m.emit(spv::OpLogicalAnd, t_bool, {in.op == 2 ? ieq(sign_ab, cu(0)) : nonzero(sign_ab), flipped});
+            break;
+        }
+        case 6: case 7: case 8: case 9: {  // s_min_i32 / s_min_u32 / s_max_i32 / s_max_u32: SCC is whether S0 was taken
+            static const spv::Op kCmp[4] = {spv::OpSLessThan, spv::OpULessThan, spv::OpSGreaterThan, spv::OpUGreaterThan};
+            scc = m.emit(kCmp[in.op - 6], t_bool, {a, b});
+            r = m.emit(spv::OpSelect, t_u32, {scc, a, b});
+            break;
+        }
+        case 14: r = ibin(spv::OpBitwiseAnd, a, b); break;
+        case 16: r = ibin(spv::OpBitwiseOr, a, b); break;
+        case 18: r = ibin(spv::OpBitwiseXor, a, b); break;
+        case 20: r = ibin(spv::OpBitwiseAnd, a, m.emit(spv::OpNot, t_u32, {b})); break;
+        case 22: r = ibin(spv::OpBitwiseOr, a, m.emit(spv::OpNot, t_u32, {b})); break;
+        case 24: r = m.emit(spv::OpNot, t_u32, {ibin(spv::OpBitwiseAnd, a, b)}); break;
+        case 26: r = m.emit(spv::OpNot, t_u32, {ibin(spv::OpBitwiseOr, a, b)}); break;
+        case 28: r = m.emit(spv::OpNot, t_u32, {ibin(spv::OpBitwiseXor, a, b)}); break;
+        case 30: r = shift(spv::OpShiftLeftLogical, a, b); break;
+        case 32: r = shift(spv::OpShiftRightLogical, a, b); break;
+        case 34: r = shift(spv::OpShiftRightArithmetic, a, b); break;
+        case 36: r = shift(spv::OpShiftLeftLogical, ibin(spv::OpISub, shift(spv::OpShiftLeftLogical, cu(1), a), cu(1)), b); break;  // s_bfm_b32
+        case 38: r = ibin(spv::OpIMul, a, b); break;
+        case 39: case 40: {  // s_bfe_u32 / s_bfe_i32: offset S1[4:0], width S1[22:16]
+            const Id off = ibin(spv::OpBitwiseAnd, b, cu(31));
+            const Id width = ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, b, cu(16)), cu(0x7f));
+            r = in.op == 39 ? m.emit(spv::OpBitFieldUExtract, t_u32, {a, off, width})
+                            : from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(a), off, width}));
+            break;
+        }
+        default: reject(std::string("unsupported ") + mnemonic(in)); return;
+        }
+        if (!scc && sop2_word_kind(in.op) == 1) scc = nonzero(r);  // the rest: SCC is whether the result is not zero
+        write_scalar(in.dst, word(r));
+        if (scc) set_scc_bool(lane(scc));
     }
 
     // translate.cpp sopc / sopk. Kind: 0 eq, 1 ne, 2 sgt, 3 sge, 4 slt, 5 sle,
@@ -1299,10 +1464,11 @@ private:
                 return;
             }
             // A guard is defined before its branch, so it is the same on either
-            // path: with EXEC equal to it here, the pixels where the lift may
-            // differ from GCN are killed in both, and the others match exactly.
+            // path: with EXEC within it here, the pixels where the lift may
+            // differ from GCN are killed in both, and the others match exactly
+            // (an outer kill region's guard contains the inner ones').
             for (const KillProof& k : kill_proofs) {
-                if (!same_lane(e, k.guard)) reject("EXEC at s_endpgm is not the guard of a kill region, so a pixel where the lift differs from GCN may survive");
+                if (!implies(e, k.guard)) reject("EXEC at s_endpgm is not within the guard of a kill region, so a pixel where the lift differs from GCN may survive");
             }
             for (const Val& x : export_execs) {
                 if (!implies(e, x)) reject("a pixel exported where EXEC was clear is not killed at s_endpgm");
@@ -1541,6 +1707,10 @@ private:
             reject("implicit-LOD sample after a kill region where the lift may differ from GCN in pixels it kills: its derivatives would read them");
             return;
         }
+        if (in_divergent_loop() && !has_l && !has_lz && !has_d) {
+            reject("implicit-LOD sample inside a loop pixels leave at different iterations: its derivatives would read pixels that left");
+            return;
+        }
         const auto ii = ref.image_at.find(in.offset);
         const auto si = ref.sampler_at.find(in.offset);
         if (ii == ref.image_at.end() || si == ref.sampler_at.end() || ii->second >= image_vars.size() || si->second >= sampler_vars.size()) {
@@ -1666,6 +1836,7 @@ private:
             if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, texel, k)));
         }
         samples.push_back(in.offset);
+        if (in_divergent_loop()) divergent_samples.push_back(in.offset);  // explicit LOD or gradients (checked above)
     }
 
     void vintrp(const Inst& in) {
@@ -1681,6 +1852,10 @@ private:
         // The translator exports whatever EXEC holds; a pixel whose bit is clear
         // here must be killed at s_endpgm (checked there).
         const bool vertex = opt.stage == Stage::Vertex;
+        if (!open_loops.empty()) {
+            reject("export inside a loop");
+            return;
+        }
         if (const Val e = exec_lane(); !(e.constant && e.set)) {
             if (vertex) {
                 reject("export where EXEC is not known set in a vertex shader, which has no discard");
@@ -1806,6 +1981,11 @@ private:
             if (in.op == 15 || in.op == 17 || in.op == 19 || in.op == 21 || in.op == 23) {
                 rd_pair(in.src0); rd_pair(in.src1); wr_pair(in.dst); w.insert(kKeyScc); return true;
             }
+            if (const int kind = sop2_word_kind(in.op)) {
+                rd(in.src0); rd(in.src1); wr(in.dst);
+                if (kind == 1) w.insert(kKeyScc);
+                return true;
+            }
             return false;
         case Enc::SOPC:
             rd(in.src0);
@@ -1893,6 +2073,85 @@ private:
         return nullptr;
     }
 
+    // ---- a uniform condition under EXEC -----------------------------------------------
+    // A VGPR written under a varying EXEC with a value every lane holds alike
+    // holds that value wherever that EXEC is set.
+    struct MaskedUniform {
+        Val exec, value;
+    };
+    std::map<Id, MaskedUniform> masked_uniform;
+    // A comparison's ballot that is a condition every lane holds alike ANDed
+    // with EXEC: the comparison of operands that are uniform where `exec` is set.
+    struct CompareSplit {
+        Val exec;
+        std::uint32_t op = 0;
+        Val u0, u1;
+        Mods md;
+        Id cond = 0;  // the uniform condition, once emitted
+    };
+    std::map<Id, CompareSplit> compare_splits;
+    Val vcc_bit;              // what the s_cbranch_vccz/vccnz being lifted tests (vcc_branch_bit)
+    std::uint32_t vcc_split = 0;
+    static bool empty(const Val& v) { return !v.constant && !v.id; }
+    // What `v` holds wherever `e` is set, if every lane holds it alike there.
+    Val uniform_where(const Val& v, const Val& e) const {
+        if (uniform(v)) return v;
+        if (v.constant || v.kind == Kind::Lane) return Val{};
+        if (const auto it = masked_uniform.find(v.id); it != masked_uniform.end() && implies(e, it->second.exec)) return it->second.value;
+        return Val{};
+    }
+    void note_compare_split(const Val& ballot, const Val& e, std::uint32_t op, const Val& s0, const Val& s1, const Mods& md, Id cond) {
+        if (ballot.constant || e.constant) return;
+        const Val u0 = uniform_where(s0, e), u1 = uniform_where(s1, e);
+        if (empty(u0) || empty(u1)) return;
+        CompareSplit s;
+        s.exec = e;
+        s.op = op;
+        s.u0 = u0;
+        s.u1 = u1;
+        s.md = md;
+        if (uniform(s0) && uniform(s1)) s.cond = cond;  // the comparison itself is uniform
+        compare_splits[ballot.id] = s;
+    }
+    // GCN cannot reach this point with `e` empty in the whole wave: `e` is EXEC
+    // where the innermost open region began, which its s_cbranch_execz tested
+    // (or which a kill region narrowed to a guard that its s_cbranch_scc0 tested).
+    const Region* region_tested(const Val& e) const {
+        if (open_regions.empty()) return nullptr;
+        const Region& r = *open_regions.back();
+        if (!same_lane(e, r.exec_in)) return nullptr;
+        if (r.kill && !implies(r.guard, r.exec_before)) return nullptr;
+        return &r;
+    }
+    // The bit an s_cbranch_vccz/vccnz at this point tests, when every lane
+    // holds it alike: VCC itself, or the uniform condition of a ballot ANDed
+    // with an EXEC GCN cannot reach the branch with empty (its wave-wide test
+    // is then the condition). `split_region`: the region that EXEC began.
+    bool vcc_branch_bit(Val& bit, std::uint32_t& split_region) {
+        split_region = 0;
+        const auto v = lanes.find(kKeyVcc);
+        if (v == lanes.end() || poisoned.count(kKeyVcc)) return false;
+        if (uniform(v->second)) {
+            bit = v->second;
+            return true;
+        }
+        const auto s = v->second.constant ? compare_splits.end() : compare_splits.find(v->second.id);
+        const auto e = lanes.find(kKeyExec);
+        if (s == compare_splits.end() || e == lanes.end() || !same_lane(e->second, s->second.exec)) return false;
+        const Region* r = region_tested(e->second);
+        if (!r) return false;
+        if (!s->second.cond) s->second.cond = vcmp_cond(s->second.op, s->second.u0, s->second.u1, s->second.md);
+        bit = lane(s->second.cond);
+        split_region = r->start;
+        return true;
+    }
+    std::string if_condition_proof(const Arm& a) const {
+        if (a.c->op <= 5) return "SCC from a scalar compare";
+        if (!a.split_region) return "VCC computed only from constants, user data and loads";
+        return "VCC is a comparison of values every lane holds alike where EXEC is set, ANDed with EXEC as it was when the region at " +
+               hex_offset(a.split_region) + " began, which GCN cannot reach empty; the wave-wide test is the comparison";
+    }
+
     // An if on a scalar condition: a selection whose then arm runs where the
     // branch falls through. Every lane takes the same arm, so the arms are
     // plain structured control flow.
@@ -1913,7 +2172,8 @@ private:
         a.poisoned0 = poisoned;
         // s_cbranch_scc0 and s_cbranch_vccz jump where their bit is clear, so the then arm runs where it is set;
         // s_cbranch_scc1 and s_cbranch_vccnz the other way round.
-        const Val bit = c.op <= 5 ? scc_mask : lanes.at(kKeyVcc);
+        const Val bit = c.op <= 5 ? scc_mask : vcc_bit;
+        a.split_region = c.op <= 5 ? 0 : vcc_split;
         const Id cond = bit.constant ? m.const_bool(bit.set != c.negate) : c.negate ? m.emit(spv::OpLogicalNot, t_bool, {bit.id}) : bit.id;
         m.emit_void(spv::OpSelectionMerge, {a.merge, 0u});
         m.emit_void(spv::OpBranchConditional, {cond, a.then_label, a.else_label});
@@ -1930,7 +2190,12 @@ private:
         a.scc_uniform1 = scc_uniform;
         a.scc_valid1 = scc_valid;
         a.poisoned1 = poisoned;
-        m.emit_void(spv::OpBranch, {a.merge});
+        if (block_dead) {  // it left the loop: no edge to the merge
+            a.then_dead = true;
+            block_dead = false;
+        } else {
+            m.emit_void(spv::OpBranch, {a.merge});
+        }
         a.then_end = cur_label;
         reg = a.reg0;
         lanes = a.lanes0;
@@ -1947,6 +2212,10 @@ private:
     // arm's value (the else arm, still open, converts); conversions made inside
     // the arms are forgotten.
     void merge_arms(Arm& a) {
+        if (a.then_dead || block_dead) {
+            merge_live_arm(a);
+            return;
+        }
         const auto same = [](const Val& x, const Val& y) {
             return x.kind == y.kind && x.constant == y.constant && (x.constant ? (x.kind == Kind::Lane ? x.set == y.set : x.bits == y.bits) : x.id == y.id);
         };
@@ -2025,10 +2294,38 @@ private:
         to_float = a.to_float0;
         to_word = a.to_word0;
         static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
-        res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " +
-                            (a.c->op <= 5 ? "SCC from a scalar compare" : "VCC computed only from constants, user data and loads") +
+        res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
                             ", the same in every lane; " + (a.c->else_jump ? "then and else arms" : "a then arm") +
-                            " joined at " + hex_offset(a.c->join) + " with " + std::to_string(phis.size()) + " phis");
+                            " joined at " + hex_offset(a.c->join) + " with " + std::to_string(phis.size()) + " phis" +
+                            (std::count(threaded_joins.begin(), threaded_joins.end(), a.c->branch)
+                                 ? " (its arms jump past this s_branch to the join it jumps to: the same program)"
+                                 : ""));
+    }
+    // One arm of the if left the loop it is in: the join has the other arm's
+    // values, from its one edge.
+    void merge_live_arm(Arm& a) {
+        const bool else_dead = block_dead;
+        block_dead = false;
+        if (a.then_dead && else_dead) {
+            reject("both arms of the if at " + hex_offset(a.c->branch) + " leave the loop");
+            return;
+        }
+        if (!else_dead) m.emit_void(spv::OpBranch, {a.merge});
+        cur_label = m.label(a.merge);
+        if (else_dead) {
+            reg = a.reg1;
+            lanes = a.lanes1;
+            scc_mask = a.scc1v;
+            scc_uniform = a.scc_uniform1;
+            scc_valid = a.scc_valid1;
+            poisoned = a.poisoned1;
+        }
+        to_float = a.to_float0;
+        to_word = a.to_word0;
+        static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
+        res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
+                            ", the same in every lane; its " + (else_dead ? "else" : "then") + " arm leaves the loop, so the join at " +
+                            hex_offset(a.c->join) + " has the other arm's values");
     }
     void close_arm() {
         Arm& a = arms.back();
@@ -2037,31 +2334,96 @@ private:
         arms.pop_back();
     }
 
-    // Whether the instruction at `at` runs after region `r`: on every path
-    // (its writes end the region's values), on some (an if arm the region is
-    // not in: its reads count, its writes do not), or never (the other arm of
-    // an if the region is inside).
-    enum class Path { Every, Some, Never };
-    static int arm_of(const Construct& c, std::uint32_t at) {
-        if (at >= c.branch + 4 && at < (c.else_jump ? c.else_jump : c.join)) return 1;
-        if (c.else_jump && at >= c.else_start && at < c.join) return 2;
-        return 0;
+    // ---- liveness over GCN's control flow -------------------------------------------
+    // The instructions control can reach next from instruction `i` on GCN: the
+    // next one and every branch target, backward ones included. Every path the
+    // lift takes is one of these (it runs regions unconditionally, which is
+    // the fall-through edge), so a value no path reads is dead in both.
+    std::size_t index_of(std::uint32_t offset) const {
+        const auto it = std::lower_bound(prog.insts.begin(), prog.insts.end(), offset,
+                                         [](const Inst& in, std::uint32_t off) { return in.offset < off; });
+        return static_cast<std::size_t>(it - prog.insts.begin());
     }
-    Path path_after(const Region& r, std::uint32_t at) const {
-        Path p = Path::Every;
-        for (const Construct& c : constructs) {
-            if (!(at > c.branch && at < c.join)) continue;
-            const int arm_at = arm_of(c, at), arm_r = r.start > c.branch && r.start < c.join ? arm_of(c, r.start) : 0;
-            if (arm_r && arm_at && arm_at != arm_r) return Path::Never;
-            if (!arm_at || arm_at != arm_r) p = Path::Some;
+    void successors(std::size_t i, std::vector<std::size_t>& out) const {
+        out.clear();
+        const Inst& in = prog.insts[i];
+        if (in.enc == Enc::SOPP && in.op == 1) return;  // s_endpgm
+        if (!(in.enc == Enc::SOPP && in.op == 2) && i + 1 < prog.insts.size()) out.push_back(i + 1);
+        if (is_branch(in)) {
+            const std::uint32_t target = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+            if (const std::size_t t = index_of(target); t < prog.insts.size() && prog.insts[t].offset == target) out.push_back(t);
         }
-        return p;
+    }
+    // Whether some path from instruction `from` reads one of `keys` before
+    // writing it. On a read, `at` is the reading instruction and `key` the key;
+    // `unmodelled` is set when the path meets an instruction scalar_rw cannot
+    // describe. With `exec_reads`, every vector and memory instruction reads
+    // EXEC as well (it runs under it).
+    bool read_before_written(std::size_t from, const std::set<int>& keys, bool exec_reads, std::uint32_t& at, int& key,
+                             bool& unmodelled) const {
+        unmodelled = false;
+        std::map<std::size_t, std::set<int>> seen;
+        std::vector<std::pair<std::size_t, std::set<int>>> work;
+        if (from < prog.insts.size() && !keys.empty()) work.push_back({from, keys});
+        std::vector<std::size_t> next;
+        while (!work.empty()) {
+            auto [i, live] = std::move(work.back());
+            work.pop_back();
+            std::set<int>& done = seen[i];
+            for (auto it = live.begin(); it != live.end();) it = done.count(*it) ? live.erase(it) : std::next(it);
+            if (live.empty()) continue;
+            done.insert(live.begin(), live.end());
+            const Inst& in = prog.insts[i];
+            std::set<int> rd, wr;
+            if (!scalar_rw(in, rd, wr)) {
+                at = in.offset;
+                unmodelled = true;
+                return true;
+            }
+            if (exec_reads) {
+                switch (in.enc) {
+                case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3: case Enc::VINTRP: case Enc::MIMG: case Enc::MTBUF:
+                case Enc::MUBUF: case Enc::EXP: case Enc::DS:
+                    rd.insert(kKeyExec);
+                    break;
+                default: break;
+                }
+            }
+            for (int k : live) {
+                if (rd.count(k)) {
+                    at = in.offset;
+                    key = k;
+                    return true;
+                }
+            }
+            for (int k : wr) live.erase(k);
+            if (live.empty()) continue;
+            successors(i, next);
+            for (std::size_t j : next) work.push_back({j, live});
+        }
+        return false;
     }
 
     void close_region(Region& r, std::size_t next_index) {
         r.closed = true;
         std::set<int> live = r.scalar_writes;
         live.erase(kKeyExec);  // EXEC changes inside regions are rejected where they happen, or handled below
+        // GCN skips the region only where the mask it tests is clear in every
+        // lane; a lane mask that is the same there either way may stay live.
+        const Val skip = r.kill ? r.guard : r.exec_before;
+        std::size_t masks_kept = 0;
+        for (auto it = live.begin(); it != live.end();) {
+            const int k = *it;
+            const int pair = k == kKeyVcc || (k < 104 && lanes.count(k)) ? k : k > 0 && k < 104 && lanes.count(k - 1) ? k - 1 : -1;
+            const auto now = pair >= 0 ? lanes.find(pair) : lanes.end();
+            const auto before = pair >= 0 ? r.lanes_at_branch.find(pair) : r.lanes_at_branch.end();
+            if (now != lanes.end() && before != r.lanes_at_branch.end() && same_where_clear(now->second, before->second, skip)) {
+                it = live.erase(it);
+                ++masks_kept;
+            } else {
+                ++it;
+            }
+        }
         std::string exec_after;
         bool divergent = false;
         if (r.kill) {
@@ -2081,28 +2443,22 @@ private:
             }
             ++kill_regions;
         }
-        for (std::size_t i = next_index; i < prog.insts.size() && !live.empty(); ++i) {
-            const Inst& in = prog.insts[i];
-            const Path path = path_after(r, in.offset);
-            if (path == Path::Never) continue;
-            std::set<int> rd, wr;
-            if (!scalar_rw(in, rd, wr)) {
-                cur = in.offset;
+        // Every path out of the region, through the rest of the program and
+        // around loops, must write each of them before reading it.
+        std::uint32_t read_at = 0;
+        int read_key = 0;
+        bool unmodelled = false;
+        if (read_before_written(next_index, live, false, read_at, read_key, unmodelled)) {
+            cur = read_at;
+            const Inst* in = inst_at(read_at);
+            if (unmodelled) {
                 reject("cannot show the scalar writes of region " + hex_offset(r.start) + "-" + hex_offset(r.end) + " are dead: " +
-                       (mnemonic(in) ? mnemonic(in) : "unknown") + " is not modelled");
-                return;
+                       (in && mnemonic(*in) ? mnemonic(*in) : "unknown") + " is not modelled");
+            } else {
+                reject(key_name(read_key) + " is written inside region " + hex_offset(r.start) + "-" + hex_offset(r.end) +
+                       " (where GCN runs the block for every lane if any lane needs it) and read here");
             }
-            for (int k : live) {
-                if (rd.count(k)) {
-                    cur = in.offset;
-                    reject(key_name(k) + " is written inside region " + hex_offset(r.start) + "-" + hex_offset(r.end) +
-                           " (where GCN runs the block for every lane if any lane needs it) and read here");
-                    return;
-                }
-            }
-            if (path == Path::Every) {
-                for (int k : wr) live.erase(k);
-            }
+            return;
         }
         std::string names;
         for (int k : r.scalar_writes) names += (names.empty() ? "" : ", ") + key_name(k);
@@ -2119,7 +2475,594 @@ private:
         }
         res.proof.push_back("region " + hex_offset(r.start) + "-" + hex_offset(r.end) + how +
                             "; samples only where EXEC is known set, no memory writes" +
-                            (names.empty() ? "" : "; scalar writes (" + names + ") are redefined before any later read"));
+                            (names.empty() ? "" : "; scalar writes (" + names + ") are redefined before any later read on every path") +
+                            (masks_kept ? "; " + std::to_string(masks_kept) +
+                                              " lane masks written inside equal, wherever GCN can skip the region, their value on the skipped path"
+                                        : ""));
+    }
+
+    // ---- loops -----------------------------------------------------------------------
+    // A loop is a backward s_branch (its back edge, at `latch`) to its header.
+    // Control leaves it only for the instruction after the back edge (`exit`),
+    // from branches inside it. The lift is one OpLoopMerge loop per pixel: the
+    // registers the body writes become phis at the header, and the one exit
+    // carries its values to the merge.
+    //
+    //   * A uniform loop exits on a bit every lane holds alike (SCC from a
+    //     scalar compare, a uniform VCC, a constant): every pixel runs the
+    //     iterations GCN's wave runs. EXEC, and every lane mask an iteration
+    //     reads before writing, must come back to the header as they left it
+    //     (or, on a second attempt, a lane mask gets a phi).
+    //   * A divergent loop is the compiler's per-lane exit idiom,
+    //         s_andn2_b64 L, L, exec   ; L loses the lanes leaving (EXEC holds them)
+    //         s_cbranch_scc0 exit      ; no lane left in L: the wave is done
+    //     with L equal to EXEC where the loop begins. A pixel leaves when its
+    //     own L bit clears. On GCN it then runs the remaining iterations with
+    //     its EXEC bit clear (L only loses lanes, and EXEC in the body stays
+    //     within L), so its VGPRs keep what they held when it left. After the
+    //     exit test the body knows the pixel's L bit is set, and so is EXEC as
+    //     it was at entry (L started as it); a pixel back at the header has
+    //     EXEC and L set, which is EXEC at entry again, so both keep that value
+    //     there and must come back set. Everything scalar the loop writes
+    //     (SGPRs, SCC, VCC, EXEC) must be dead after it, as GCN may run more
+    //     iterations than the pixel did, and no implicit-LOD sample or other
+    //     cross-lane read may run inside (the rest of its quad may have left).
+    struct Loop {
+        std::uint32_t header = 0, latch = 0, exit = 0;
+        std::size_t header_index = 0, latch_index = 0;
+        int mask = -1;                // divergent: the loop mask's SGPR pair
+        std::uint32_t mask_exit = 0;  // divergent: the s_cbranch_scc0 that tests it
+        // While lifting
+        Id preheader = 0, header_label = 0, continue_label = 0, merge_label = 0;
+        struct Phi {
+            int key;
+            Kind kind;
+            Id id;
+            bool uniform;  // a scalar from values every lane holds alike: checked at the back edge
+        };
+        std::vector<Phi> phis;
+        std::map<int, Val> unchanged;  // lane masks assumed to come back to the header as they left it
+        std::set<int> writes;          // scalar keys the body writes (scalar_rw)
+        std::size_t vgpr_phis = 0, lane_phis = 0;
+        struct Exit {
+            Id from = 0;
+            std::map<int, Val> reg, lanes;
+            Val scc;
+            bool scc_uniform = false, scc_valid = true;
+            std::set<int> poisoned;
+            bool per_pixel = false;
+        };
+        std::vector<Exit> exits;
+        std::map<Id, Id> to_float0, to_word0;
+        std::vector<Id> assumed;  // divergent: what the body knows is set
+        std::size_t arms0 = 0, regions0 = 0;
+    };
+    std::vector<Loop> loops;  // by header
+    std::vector<Loop*> open_loops;
+    std::set<std::uint32_t> loop_exits;  // branches that leave their innermost loop for its exit
+    std::set<Id> assumed;                // lane masks set wherever the lift now is (a divergent loop's body)
+    bool block_dead = false;             // the current block ended by leaving a loop
+    const LoopPhis lane_phi_hints;
+    std::size_t loops_lifted = 0, divergent_loops = 0;
+
+    bool loop_branch(std::uint32_t offset) const {
+        if (loop_exits.count(offset)) return true;
+        return std::any_of(loops.begin(), loops.end(), [&](const Loop& l) { return l.latch == offset; });
+    }
+    const Loop* innermost_loop(std::uint32_t offset) const {
+        const Loop* best = nullptr;
+        for (const Loop& l : loops) {
+            if (offset >= l.header && offset <= l.latch && (!best || l.header > best->header)) best = &l;
+        }
+        return best;
+    }
+    bool in_divergent_loop() const {
+        return std::any_of(open_loops.begin(), open_loops.end(), [](const Loop* l) { return l->mask >= 0; });
+    }
+    // `v` as the lift knows it here: set where a divergent loop's body knows so.
+    Val known(const Val& v) {
+        if (v.constant || v.kind != Kind::Lane || assumed.empty()) return v;
+        if (assumed.count(v.id)) return lane_const(true);
+        if (const auto it = negation_of.find(v.id); it != negation_of.end() && assumed.count(it->second)) return lane_const(false);
+        return v;
+    }
+
+    void find_loops() {
+        for (std::size_t i = 0; i < prog.insts.size(); ++i) {
+            const Inst& in = prog.insts[i];
+            if (!is_branch(in)) continue;
+            const std::uint32_t target = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+            if (target > in.offset) continue;
+            cur = in.offset;
+            const std::size_t h = index_of(target);
+            if (in.op != 2) {
+                reject(std::string(mnemonic(in)) + " branches backward: only an s_branch is lifted as a loop's back edge");
+            } else if (h >= prog.insts.size() || prog.insts[h].offset != target) {
+                reject("s_branch branches backward to no instruction");
+            } else {
+                Loop l;
+                l.header = target;
+                l.latch = in.offset;
+                l.exit = in.offset + 4;
+                l.header_index = h;
+                l.latch_index = i;
+                loops.push_back(l);
+            }
+        }
+        std::sort(loops.begin(), loops.end(), [](const Loop& a, const Loop& b) { return a.header < b.header; });
+        bool nested = true;
+        for (std::size_t k = 1; k < loops.size(); ++k) {
+            for (std::size_t j = 0; j < k; ++j) {
+                const Loop& o = loops[j];
+                const Loop& l = loops[k];
+                cur = l.latch;
+                if (l.header == o.header) {
+                    reject("two back edges to the loop header at " + hex_offset(o.header));
+                    nested = false;
+                } else if (l.header <= o.latch && l.latch > o.latch) {
+                    reject("the loops at " + hex_offset(o.header) + " and " + hex_offset(l.header) + " overlap");
+                    nested = false;
+                }
+            }
+        }
+        if (!nested) return;
+        // Every other branch stays inside its innermost loop, or leaves it for its exit.
+        for (const Inst& in : prog.insts) {
+            if (!is_branch(in)) continue;
+            const std::uint32_t target = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+            const Loop* from = innermost_loop(in.offset);
+            if ((from && in.offset == from->latch) || target <= in.offset) continue;  // a back edge, or rejected above
+            cur = in.offset;
+            if (from && target == from->exit) {
+                loop_exits.insert(in.offset);
+                continue;
+            }
+            if (from && target > from->latch) reject("a branch leaves the loop at " + hex_offset(from->header) + " for somewhere other than its exit");
+            for (const Loop& l : loops) {
+                if (target > l.header && target <= l.latch && !(in.offset >= l.header && in.offset <= l.latch)) {
+                    reject("a branch enters the loop at " + hex_offset(l.header) + " past its header");
+                }
+            }
+        }
+    }
+    // Ifs and regions nest with loops: inside the body, around the whole loop, or apart.
+    void check_loop_nesting() {
+        for (Loop& l : loops) {
+            // The divergent exit idiom, at the loop's top level: s_andn2_b64 L,
+            // L, exec right before an s_cbranch_scc0 to the exit. (Inside an if
+            // arm the same pair is the uniform loop's way out: L is EXEC there,
+            // so no lane is left and the branch is always taken.)
+            for (std::size_t i = l.header_index + 1; i < l.latch_index; ++i) {
+                const Inst& br = prog.insts[i];
+                const Inst& andn2 = prog.insts[i - 1];
+                if (!(br.enc == Enc::SOPP && br.op == 4 && loop_exits.count(br.offset) && innermost_loop(br.offset) == &l)) continue;
+                if (!(andn2.enc == Enc::SOP2 && andn2.op == 21 && andn2.dst < 103 && andn2.src0 == andn2.dst && andn2.src1 == kExecLo)) continue;
+                const auto inside = [&](std::uint32_t x0, std::uint32_t x1) { return x0 >= l.header && x0 < br.offset && br.offset < x1; };
+                if (std::any_of(constructs.begin(), constructs.end(), [&](const Construct& c) { return inside(c.branch, c.join); }) ||
+                    std::any_of(regions.begin(), regions.end(), [&](const Region& r) { return inside(r.branch, r.end); })) {
+                    continue;
+                }
+                if (l.mask >= 0) {
+                    cur = br.offset;
+                    reject("two divergent exits from the loop at " + hex_offset(l.header));
+                }
+                l.mask = andn2.dst;
+                l.mask_exit = br.offset;
+            }
+            const auto fits = [&](std::uint32_t x0, std::uint32_t x1) {
+                return x1 <= l.header || x0 >= l.exit || (x0 >= l.header && x1 <= l.latch) || (x0 < l.header && x1 >= l.exit);
+            };
+            for (const Region& r : regions) {
+                if (!fits(r.branch, r.end)) {
+                    cur = r.branch;
+                    reject("a region overlaps the loop at " + hex_offset(l.header));
+                }
+            }
+            for (const Construct& c : constructs) {
+                if (!fits(c.branch, c.join)) {
+                    cur = c.branch;
+                    reject("the if at " + hex_offset(c.branch) + " overlaps the loop at " + hex_offset(l.header));
+                }
+            }
+        }
+    }
+
+    // VGPRs an instruction may write (more is harmless: a phi that comes back unchanged).
+    static void vector_writes(const Inst& in, std::set<int>& w) {
+        const auto range = [&](int first, int n) {
+            for (int k = 0; k < n; ++k) w.insert(256 + first + k);
+        };
+        switch (in.enc) {
+        case Enc::VOP1: if (in.op != 0 && in.op != 2) range(in.dst, 1); break;  // not v_nop, v_readfirstlane_b32
+        case Enc::VOP2: if (in.op != 1) range(in.dst, 1); break;                // not v_readlane_b32
+        case Enc::VOP3: if (in.op >= 0x100 && in.op != 0x101 && in.op != 0x182) range(in.dst, 2); break;  // not a compare; 64-bit results
+        case Enc::VINTRP: range(in.dst, 1); break;
+        case Enc::MIMG: range(in.vdata, 4); break;
+        case Enc::MTBUF: case Enc::MUBUF: range(in.vdata, 4); break;
+        case Enc::DS: range(in.dst, 4); break;
+        default: break;
+        }
+    }
+    static void exec_reader(const Inst& in, std::set<int>& rd) {
+        switch (in.enc) {
+        case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3: case Enc::VINTRP: case Enc::MIMG: case Enc::MTBUF:
+        case Enc::MUBUF: case Enc::EXP: case Enc::DS:
+            rd.insert(kKeyExec);
+            break;
+        default: break;
+        }
+    }
+    // The keys of `keys` some path from instruction `from` reads before writing
+    // (vector and memory instructions read EXEC).
+    std::set<int> read_first(std::size_t from, const std::set<int>& keys, bool& unmodelled) const {
+        std::set<int> found;
+        unmodelled = false;
+        std::map<std::size_t, std::set<int>> seen;
+        std::vector<std::pair<std::size_t, std::set<int>>> work;
+        if (from < prog.insts.size() && !keys.empty()) work.push_back({from, keys});
+        std::vector<std::size_t> next;
+        while (!work.empty()) {
+            auto [i, live] = std::move(work.back());
+            work.pop_back();
+            std::set<int>& done = seen[i];
+            for (auto it = live.begin(); it != live.end();) it = done.count(*it) || found.count(*it) ? live.erase(it) : std::next(it);
+            if (live.empty()) continue;
+            done.insert(live.begin(), live.end());
+            std::set<int> rd, wr;
+            if (!scalar_rw(prog.insts[i], rd, wr)) {
+                unmodelled = true;
+                return found;
+            }
+            exec_reader(prog.insts[i], rd);
+            for (auto it = live.begin(); it != live.end();) {
+                if (rd.count(*it)) {
+                    found.insert(*it);
+                    it = live.erase(it);
+                } else {
+                    it = wr.count(*it) ? live.erase(it) : std::next(it);
+                }
+            }
+            if (live.empty()) continue;
+            successors(i, next);
+            for (std::size_t j : next) work.push_back({j, live});
+        }
+        return found;
+    }
+
+    void open_loop(Loop& l) {
+        cur = l.header;
+        if (block_dead) {
+            reject("a loop begins after an unconditional loop exit");
+            return;
+        }
+        std::set<int> vgprs;
+        for (std::size_t i = l.header_index; i <= l.latch_index; ++i) {
+            std::set<int> rd, wr;
+            if (!scalar_rw(prog.insts[i], rd, wr)) {
+                cur = prog.insts[i].offset;
+                reject(std::string(mnemonic(prog.insts[i]) ? mnemonic(prog.insts[i]) : "unknown") + " inside the loop at " + hex_offset(l.header) +
+                       " is not modelled");
+                return;
+            }
+            l.writes.insert(wr.begin(), wr.end());
+            vector_writes(prog.insts[i], vgprs);
+        }
+        bool unmodelled = false;
+        const std::set<int> exposed = read_first(l.header_index, l.writes, unmodelled);
+        if (unmodelled) {
+            reject("cannot show what the loop at " + hex_offset(l.header) + " reads before writing");
+            return;
+        }
+        if (l.writes.count(kKeyScc)) {
+            if (exposed.count(kKeyScc)) {
+                reject("SCC is read before it is written in an iteration of the loop at " + hex_offset(l.header));
+                return;
+            }
+            scc_valid = false;
+        }
+        struct Entry {
+            int key;
+            Kind kind;
+            Id id;
+            bool uni;
+        };
+        std::vector<Entry> words;
+        std::vector<std::pair<int, Id>> masks;  // lane masks that get phis
+        const auto add_word = [&](int k) {
+            const Val v = value(k);
+            const bool f = v.kind == Kind::Float;
+            words.push_back({k, f ? Kind::Float : Kind::Word, f ? v.id : as_u(v), k < 256 && uniform(v)});
+        };
+        for (int k : vgprs) add_word(k);
+        const auto e = lanes.find(kKeyExec);
+        Val exec0 = e != lanes.end() ? e->second : lane_const(true);
+        for (int k : l.writes) {
+            if (k == kKeyScc || k == kKeyExec || k == l.mask || k == l.mask + 1) continue;
+            const bool lane_key = k == kKeyVcc || lanes.count(k);
+            const bool lane_high = k > 0 && k < 104 && lanes.count(k - 1);
+            if (lane_high) continue;
+            const bool read = exposed.count(k) || (k < 103 && lane_key && exposed.count(k + 1));
+            if (!lane_key) {
+                if (read) {
+                    add_word(k);
+                } else {
+                    poisoned.insert(k);  // written before it is read: its value here is never used
+                }
+                continue;
+            }
+            const auto it = lanes.find(k);
+            if (!read) {
+                lanes.erase(k);
+                if (k < 104) {
+                    poisoned.insert(k);
+                    poisoned.insert(k + 1);
+                }
+            } else if (it == lanes.end()) {
+                continue;  // no mask here (VCC's words were written): reading it before writing it rejects
+            } else if (lane_phi_hints.count({l.header, k})) {
+                masks.push_back({k, it->second.constant ? m.const_bool(it->second.set) : it->second.id});
+            } else {
+                l.unchanged[k] = it->second;
+            }
+        }
+        if (l.writes.count(kKeyExec) && l.mask < 0) l.unchanged[kKeyExec] = exec0;
+        if (l.mask >= 0) {
+            const auto lm = lanes.find(l.mask);
+            if (lm == lanes.end() || !same_lane(lm->second, exec0)) {
+                reject("the loop at " + hex_offset(l.header) + " tests " + key_name(l.mask) + " as its loop mask, which does not start as EXEC");
+                return;
+            }
+            l.unchanged[kKeyExec] = exec0;
+            l.unchanged[l.mask] = exec0;
+        }
+        l.preheader = cur_label;
+        l.header_label = m.fresh();
+        l.continue_label = m.fresh();
+        l.merge_label = m.fresh();
+        l.to_float0 = to_float;
+        l.to_word0 = to_word;
+        l.arms0 = arms.size();
+        l.regions0 = open_regions.size();
+        m.emit_void(spv::OpBranch, {l.header_label});
+        cur_label = m.label(l.header_label);
+        for (const Entry& w : words) {
+            const Id phi = m.emit(spv::OpPhi, w.kind == Kind::Float ? t_f32 : t_u32, {w.id, l.preheader, w.id, l.continue_label});
+            reg[w.key] = w.kind == Kind::Float ? flt(phi) : word(phi);
+            if (w.uni) uniform_ids.insert(phi);
+            l.phis.push_back({w.key, w.kind, phi, w.uni});
+            l.vgpr_phis += w.key >= 256;
+        }
+        for (const auto& [k, entry] : masks) {
+            const Id phi = m.emit(spv::OpPhi, t_bool, {entry, l.preheader, entry, l.continue_label});
+            lanes[k] = lane(phi);
+            l.phis.push_back({k, Kind::Lane, phi, false});
+            ++l.lane_phis;
+        }
+        const Id body = m.fresh();
+        m.emit_void(spv::OpLoopMerge, {l.merge_label, l.continue_label, 0u});
+        m.emit_void(spv::OpBranch, {body});
+        cur_label = m.label(body);
+        pending.clear();
+        open_loops.push_back(&l);
+        if (l.mask >= 0) {
+            // A pixel in the body has EXEC at entry set: it took the exit test
+            // with its mask set in the first iteration, and the mask started as EXEC.
+            if (!exec0.constant) l.assumed.push_back(exec0.id);
+        }
+    }
+
+    // A branch to the innermost loop's exit, after its instruction was lifted.
+    void loop_exit(const Inst& in) {
+        Loop& l = *open_loops.back();
+        if (innermost_loop(in.offset) != &l) {
+            reject("a branch leaves a loop that is not the innermost open one");
+            return;
+        }
+        Id leave = 0;  // where the branch is taken; 0 with `always`
+        bool always = false, per_pixel = false;
+        if (in.op == 2) {
+            always = true;
+        } else if (in.op == 4 || in.op == 5) {
+            const bool on_set = in.op == 5;  // s_cbranch_scc1 is taken where SCC is set
+            const Val scc = known(scc_mask);
+            if (!scc_valid) {
+                reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) + " on an SCC an if left different on its arms");
+                return;
+            } else if (scc.constant) {
+                if (scc.set != on_set) return;  // never taken
+                always = true;
+            } else if (scc_uniform) {
+                leave = on_set ? scc.id : bnot(scc).id;
+            } else if (in.offset == l.mask_exit) {
+                per_pixel = true;
+                if (!divergent_exit(l, scc)) return;
+                leave = bnot(scc).id;
+            } else {
+                reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) +
+                       " on an SCC that is neither a scalar condition nor the divergent loop's exit test");
+                return;
+            }
+        } else if (in.op == 6 || in.op == 7) {
+            Val bit;
+            std::uint32_t split = 0;
+            if (!vcc_branch_bit(bit, split)) {
+                reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) + " on a VCC that may differ between lanes");
+                return;
+            }
+            bit = known(bit);
+            const bool on_set = in.op == 7;  // s_cbranch_vccnz is taken where VCC is set
+            if (bit.constant) {
+                if (bit.set != on_set) return;
+                always = true;
+            } else {
+                leave = on_set ? bit.id : bnot(bit).id;
+            }
+        } else {
+            reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) +
+                   ": only s_branch, s_cbranch_scc0/scc1 and s_cbranch_vccz/vccnz are lifted as loop exits");
+            return;
+        }
+        if (!l.exits.empty()) {
+            reject("a second exit from the loop at " + hex_offset(l.header) + " (one is lifted)");
+            return;
+        }
+        Loop::Exit x;
+        x.reg = reg;
+        x.lanes = lanes;
+        x.scc = scc_mask;
+        x.scc_uniform = scc_uniform;
+        x.scc_valid = scc_valid;
+        x.poisoned = poisoned;
+        x.per_pixel = per_pixel;
+        if (always) {
+            // It ends the arm it is in: an if's then arm, or its else arm.
+            const std::uint32_t next = in.offset + 4;
+            const bool ends_arm = arms.size() > l.arms0 && (next == arms.back().c->else_jump || next == arms.back().c->join);
+            if (!ends_arm) {
+                reject("an unconditional exit from the loop at " + hex_offset(l.header) + " that does not end an if's arm");
+                return;
+            }
+            x.from = cur_label;
+            m.emit_void(spv::OpBranch, {l.merge_label});
+            block_dead = true;
+        } else {
+            const Id brk = m.fresh(), cont = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {cont, 0u});
+            m.emit_void(spv::OpBranchConditional, {leave, brk, cont});
+            x.from = m.label(brk);
+            m.emit_void(spv::OpBranch, {l.merge_label});
+            cur_label = m.label(cont);
+        }
+        l.exits.push_back(std::move(x));
+        if (per_pixel) {
+            const Val mk = known(scc_mask);
+            l.assumed.push_back(mk.id);
+            if (const auto it = conjuncts.find(mk.id); it != conjuncts.end()) l.assumed.insert(l.assumed.end(), it->second.begin(), it->second.end());
+            for (const Id a : l.assumed) assumed.insert(a);
+        }
+    }
+    // The divergent exit test: at the loop's top level, on the mask's current
+    // value, which lies within EXEC at the header.
+    bool divergent_exit(const Loop& l, const Val& m_val) {
+        if (arms.size() != l.arms0 || open_regions.size() != l.regions0) {
+            reject("the divergent exit of the loop at " + hex_offset(l.header) + " is inside an if or a region of its body");
+            return false;
+        }
+        const auto lm = lanes.find(l.mask);
+        if (lm == lanes.end() || !same_lane(known(lm->second), m_val)) {
+            reject("the divergent exit of the loop at " + hex_offset(l.header) + " does not test " + key_name(l.mask) + " as it is");
+            return false;
+        }
+        if (!implies(m_val, l.unchanged.at(kKeyExec))) {
+            reject("the mask the divergent exit of the loop at " + hex_offset(l.header) + " tests is not within EXEC at the header");
+            return false;
+        }
+        return true;
+    }
+
+    // The back edge, after its s_branch was lifted.
+    void loop_back_edge(Loop& l) {
+        cur = l.latch;
+        if (block_dead) {
+            reject("the back edge of the loop at " + hex_offset(l.header) + " follows an unconditional exit");
+            return;
+        }
+        if (arms.size() != l.arms0 || open_regions.size() != l.regions0) {
+            reject("an if or a region is still open at the back edge of the loop at " + hex_offset(l.header));
+            return;
+        }
+        if (l.mask >= 0 && (l.exits.empty() || !l.exits[0].per_pixel)) {
+            reject("the divergent loop at " + hex_offset(l.header) + " was not left at its exit test");
+            return;
+        }
+        std::vector<std::pair<Id, Id>> back;  // phi, value
+        for (const Loop::Phi& p : l.phis) {
+            if (p.kind == Kind::Lane) {
+                const auto it = lanes.find(p.key);
+                if (it == lanes.end() || poisoned.count(p.key)) {
+                    reject(key_name(p.key) + " leaves the header of the loop at " + hex_offset(l.header) + " as a lane mask and comes back as something else");
+                    return;
+                }
+                const Val v = known(it->second);
+                back.push_back({p.id, v.constant ? m.const_bool(v.set) : v.id});
+                continue;
+            }
+            if (poisoned.count(p.key) || lanes.count(p.key) || (p.key > 0 && p.key < 104 && lanes.count(p.key - 1))) {
+                reject(key_name(p.key) + " leaves the header of the loop at " + hex_offset(l.header) + " as a word and comes back as a lane mask or unknown");
+                return;
+            }
+            const Val v = value(p.key);
+            if (p.uniform && !uniform(v)) {
+                reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) + " with a value lanes may not hold alike");
+                return;
+            }
+            back.push_back({p.id, p.kind == Kind::Float ? as_f(v) : as_u(v)});
+        }
+        // (In a divergent loop's body EXEC at entry is known set, so EXEC and
+        // the mask must come back known set.)
+        for (const auto& [k, entry] : l.unchanged) {
+            const auto it = lanes.find(k);
+            if (it == lanes.end() || !same_lane(known(it->second), known(entry))) {
+                if (k != kKeyExec && k != l.mask && it != lanes.end()) more_lane_phis.insert({l.header, k});
+                reject(key_name(k) + " comes back to the header of the loop at " + hex_offset(l.header) + " changed");
+                return;
+            }
+        }
+        m.emit_void(spv::OpBranch, {l.continue_label});
+        m.label(l.continue_label);
+        m.emit_void(spv::OpBranch, {l.header_label});
+        for (const auto& [phi, v] : back) m.set_operand(phi, 2, v);
+        block_dead = true;  // the merge block starts at the exit, next
+    }
+
+    // The exit's merge block, at the loop's exit.
+    void close_loop() {
+        Loop& l = *open_loops.back();
+        open_loops.pop_back();
+        cur = l.exit;
+        for (const Id a : l.assumed) assumed.erase(a);
+        if (l.exits.empty()) {
+            reject("the loop at " + hex_offset(l.header) + " has no exit");
+            return;
+        }
+        const Loop::Exit& x = l.exits[0];
+        cur_label = m.label(l.merge_label);
+        block_dead = false;
+        reg = x.reg;
+        lanes = x.lanes;
+        scc_mask = x.scc;
+        scc_uniform = x.scc_uniform;
+        scc_valid = x.scc_valid;
+        poisoned = x.poisoned;
+        to_float = l.to_float0;
+        to_word = l.to_word0;
+        pending.clear();
+        if (l.mask >= 0) {
+            // GCN may run more iterations than this pixel: nothing scalar the
+            // loop writes may be read after it before it is written again.
+            std::uint32_t at = 0;
+            int key = 0;
+            bool unmodelled = false;
+            if (read_before_written(index_of(l.exit), l.writes, true, at, key, unmodelled)) {
+                cur = at;
+                reject(unmodelled ? "cannot show what the divergent loop at " + hex_offset(l.header) + " writes is dead after it"
+                                  : key_name(key) + " is written inside the divergent loop at " + hex_offset(l.header) +
+                                        " and read after it (GCN may run more iterations than the pixel)");
+                return;
+            }
+            ++divergent_loops;
+        }
+        ++loops_lifted;
+        std::string kept;
+        for (const auto& [k, v] : l.unchanged) kept += (kept.empty() ? "" : ", ") + key_name(k);
+        res.proof.push_back(
+            "loop " + hex_offset(l.header) + "-" + hex_offset(l.latch) + ": " +
+            (l.mask >= 0 ? "divergent, the per-lane exit idiom on " + key_name(l.mask) + " at " + hex_offset(l.mask_exit) +
+                               " (EXEC and the mask keep EXEC at entry at the header and come back set; what the loop writes is dead after "
+                               "it; no implicit-LOD sample inside)"
+                         : std::string("uniform, left on a bit every lane holds alike")) +
+            "; " + std::to_string(l.phis.size()) + " phis (" + std::to_string(l.vgpr_phis) + " VGPRs, " + std::to_string(l.lane_phis) + " lane masks)" +
+            (kept.empty() ? "" : "; " + kept + " come back to the header unchanged"));
     }
 
     // ---- module ----------------------------------------------------------------------
@@ -2269,6 +3212,11 @@ private:
         for (std::size_t i = 0; i < prog.insts.size(); ++i) {
             const Inst& in = prog.insts[i];
             cur = in.offset;
+            // A loop's exit begins its merge block, before what encloses the loop closes.
+            if (!open_loops.empty() && in.offset == open_loops.back()->exit) {
+                close_loop();
+                if (!res.rejections.empty()) return;
+            }
             // Close the regions and ifs that end here, innermost first.
             for (;;) {
                 const bool region_due = !open_regions.empty() && in.offset >= open_regions.back()->end;
@@ -2283,10 +3231,14 @@ private:
                 }
                 if (!res.rejections.empty()) return;
             }
+            // After an unconditional loop exit only the s_branch closing that then arm may follow.
+            if (block_dead && !(!arms.empty() && !arms.back().in_else && in.offset == arms.back().c->else_jump)) {
+                reject("an instruction follows an unconditional loop exit");
+                return;
+            }
             if (block_starts.count(in.offset)) pending.clear();  // the translator's landing rule is per block
             Construct* const branch_if = construct_at(in.offset);
-            const bool uniform_if =
-                branch_if && (branch_if->op <= 5 ? scc_valid && scc_uniform : lanes.count(kKeyVcc) && uniform(lanes.at(kKeyVcc)));
+            const bool uniform_if = branch_if && (branch_if->op <= 5 ? scc_valid && scc_uniform : vcc_branch_bit(vcc_bit, vcc_split));
             if (next_region < regions.size() && in.offset == regions[next_region].branch) {
                 Region& r = regions[next_region];
                 if (uniform_if) {
@@ -2294,12 +3246,17 @@ private:
                 } else if (r.kill && !scc_valid) {
                     reject("s_cbranch_scc0 tests an SCC an earlier if left different on its arms");
                     return;
-                } else if (r.kill && !open_regions.empty()) {
-                    reject("s_cbranch_scc0 kill region inside another region");
+                } else if (r.kill && !open_loops.empty()) {
+                    reject("s_cbranch_scc0 kill region inside a loop");
                     return;
                 } else {
+                    // A kill region inside another is the same idiom one level
+                    // down: GCN evaluates its branch only where the outer one
+                    // runs, the lift always, and a pixel whose guard bit is
+                    // clear writes nothing either way.
                     r.guard = scc_mask;
                     r.exec_before = exec_lane();
+                    r.lanes_at_branch = lanes;
                 }
             } else if (branch_if && !uniform_if) {
                 reject(std::string(mnemonic(in)) +
@@ -2315,6 +3272,12 @@ private:
                     open_regions.push_back(&r);
                 }
             }
+            // A loop begins inside what is open here.
+            for (Loop& l : loops) {
+                if (l.header != in.offset) continue;
+                open_loop(l);
+                if (!res.rejections.empty()) return;
+            }
             note.clear();
             inst_uniform = true;
             Region* const starting = !open_regions.empty() && open_regions.back()->kill ? open_regions.back() : nullptr;
@@ -2328,6 +3291,12 @@ private:
             res.listing += (open_regions.empty() ? "" : " [region]") + std::string(arms.empty() ? "" : arms.back().in_else ? " [else]" : " [then]") + note + "\n";
             if (is_branch(in)) pending.clear();
             if (!res.rejections.empty()) return;
+            if (!open_loops.empty() && in.offset == open_loops.back()->latch) {
+                loop_back_edge(*open_loops.back());
+            } else if (loop_exits.count(in.offset)) {
+                loop_exit(in);
+            }
+            if (!res.rejections.empty()) return;
             if (uniform_if) open_arm(*branch_if, ++seq);
             if (!arms.empty() && !arms.back().in_else && in.offset == arms.back().c->else_jump) then_to_else(arms.back());
         }
@@ -2338,6 +3307,8 @@ private:
                 close_region(*done, prog.insts.size());
             } else if (!arms.empty()) {
                 reject("an if is still open at the end of the program");
+            } else if (!open_loops.empty()) {
+                reject("a loop is still open at the end of the program");
             } else {
                 break;
             }
@@ -2383,7 +3354,10 @@ private:
     void finish_proof() {
         std::vector<std::string> head;
         const std::size_t execz_regions = static_cast<std::size_t>(std::count_if(regions.begin(), regions.end(), [](const Region& r) { return !r.kill; }));
-        head.push_back(std::to_string(prog.insts.size()) + " instructions, forward only: " + std::to_string(execz_regions) + " s_cbranch_execz regions, " +
+        head.push_back(std::to_string(prog.insts.size()) + " instructions, " +
+                       (loops_lifted ? std::to_string(loops_lifted) + " loops (" + std::to_string(divergent_loops) + " with per-lane exits) and otherwise forward: "
+                                     : std::string("forward only: ")) +
+                       std::to_string(execz_regions) + " s_cbranch_execz regions, " +
                        std::to_string(kill_regions) + " s_cbranch_scc0 kill regions and " + std::to_string(if_constructs) +
                        " ifs on a bit every lane holds alike; no other branch or program-counter transfer");
         head.push_back(std::string("EXEC per pixel or vertex: set at entry; whole-quad mode only of a constant mask or in a kill region; comparison "
@@ -2393,8 +3367,13 @@ private:
                                    : "set at every export and at s_endpgm (no discard)"));
         std::string at;
         for (std::uint32_t s : samples) at += " " + hex_offset(s);
+        std::string divergent_at;
+        for (std::uint32_t s : divergent_samples) divergent_at += " " + hex_offset(s);
         head.push_back(std::to_string(samples.size()) + " image samples outside regions with EXEC set, in uniform control flow (helper "
-                       "invocations stand in for whole-quad lanes):" + at);
+                       "invocations stand in for whole-quad lanes):" + at +
+                       (divergent_samples.empty() ? ""
+                                                  : "; except, with explicit LOD or gradients, inside a loop pixels leave at different "
+                                                    "iterations, where EXEC is set in its body:" + divergent_at));
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
@@ -2411,8 +3390,17 @@ LiftResult lift_stage(Stage stage, const Program& program, const TranslateOption
         wrong.rejections.push_back(stage == Stage::Pixel ? "the options are not a pixel shader's" : "the options are not a vertex shader's");
         return wrong;
     }
-    Lifter l(program, options, reference);
-    return l.run();
+    // A lane mask a loop changes before it is read again gets a phi on a second
+    // attempt: the first assumes every one comes back unchanged, which the
+    // usual loop-exit idioms need to fold their tests.
+    Lifter::LoopPhis phis;
+    for (int attempt = 0;; ++attempt) {
+        Lifter l(program, options, reference, phis);
+        LiftResult r = l.run();
+        const std::size_t before = phis.size();
+        phis.insert(l.more_lane_phis.begin(), l.more_lane_phis.end());
+        if (phis.size() == before || attempt == 8) return r;
+    }
 }
 }  // namespace
 
