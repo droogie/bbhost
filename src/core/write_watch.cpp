@@ -136,8 +136,9 @@ __attribute__((no_stack_protector, always_inline)) inline int protect_pages(std:
 }
 #elif defined(__APPLE__)
 // libc's mprotect: the raw call below is Linux's system call convention.
-// macOS's libc reaches errno through GS, not FS, and the guest's TLS there is
-// to leave GS the system's (TODO(macos): guest TLS, core/thunk.cpp).
+// macOS's libc reaches errno through GS, which stays the system's on a guest
+// thread too - the guest's TCB is one pthread key's value there
+// (core/tls_rewrite.h) - so the wrapper is safe wherever this runs.
 // Returns 0 or the errno value.
 __attribute__((no_stack_protector, always_inline)) inline int protect_pages(std::uint64_t addr, std::uint64_t len,
                                                                             bool writable) {

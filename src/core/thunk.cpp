@@ -23,7 +23,9 @@
 #else
 #include <pthread.h>
 #include <signal.h>
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -136,7 +138,7 @@ std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* c, std::uint64_t id, void* 
 
 namespace {
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 // Linux >= 5.9 exposes FSGSBASE to user mode; wrfsbase is a few cycles
 // instead of a syscall per HLE call. Probed once from the aux vector.
 const bool g_fsgsbase = (getauxval(AT_HWCAP2) & HWCAP2_FSGSBASE) != 0;
@@ -160,8 +162,8 @@ inline void* get_fs() {
     return reinterpret_cast<void*>(v);
 }
 #else
-// Windows: the guest reads its TCB through GS (core/tls_rewrite.h), FS is
-// never touched, and the slot is the process's own TLS slot.
+// Windows and macOS: the guest reads its TCB through GS (core/tls_rewrite.h),
+// FS is never touched, and the slot is the process's own TLS slot.
 constexpr bool g_fsgsbase = false;
 inline void set_fs(void*) {}
 inline void* get_fs() { return nullptr; }
@@ -174,7 +176,9 @@ inline void* get_fs() { return nullptr; }
 constexpr std::size_t kHostStack = 1u << 20;
 constexpr std::size_t kHostGuard = 0x1000;
 thread_local std::uint8_t* t_host_stack = nullptr;
+#if defined(__linux__)
 thread_local std::uint8_t* t_guest_teb = nullptr;  // GS mode: the TEB stand-in
+#endif
 #if defined(_WIN32)
 // Windows dispatches an exception only while rsp lies inside the TEB's
 // stack limits, so the switch to the host stack moves those limits with it
@@ -207,7 +211,7 @@ void host_stack_free() {
 extern "C" GUEST_ABI void hle_fs_host() {
     // GS mode: FS is glibc's (or Windows' own) throughout; nothing to switch.
     if (tls_gs_mode()) return;
-#if !defined(_WIN32)
+#if defined(__linux__)
     GuestTcb* tcb = nullptr;
     asm volatile("mov %%fs:0, %0" : "=r"(tcb));
     if (tcb && tcb->self == tcb && tcb->magic == kTcbMagic && tcb->host_fs) {
@@ -990,7 +994,8 @@ void* guest_thread_enter() {
     tcb->magic = kTcbMagic;
     tcb->host_fs = get_fs();
     std::uint64_t guard = 0;
-#if !defined(_WIN32)
+    // glibc's canary (fs:0x28), for host code run under guest FS.
+#if defined(__linux__)
     asm volatile("mov %%fs:0x28, %0" : "=r"(guard));
 #endif
     tcb->stack_guard = guard;
@@ -1001,6 +1006,8 @@ void* guest_thread_enter() {
         host_log("guest tcb %p guard=0x%llx %s", static_cast<void*>(tcb), static_cast<unsigned long long>(guard),
 #if defined(_WIN32)
                  "gs-slot=TlsAlloc");
+#elif defined(__APPLE__)
+                 "gs-slot=pthread-key");
 #else
                  tls_gs_mode() ? (g_fsgsbase ? "gs-slot=wrgsbase" : "gs-slot=arch_prctl")
                                : (g_fsgsbase ? "fs-switch=wrfsbase" : "fs-switch=arch_prctl"));
@@ -1012,6 +1019,9 @@ void* guest_thread_enter() {
         // The real TEB: the slot the rewritten sites read is this process's
         // TLS slot (core/tls_rewrite.cpp took it from TlsAlloc).
         TlsSetValue(tls_gs_slot(), tcb);
+#elif defined(__APPLE__)
+        // The rewritten sites read gs:[8*key], this pthread key's value.
+        pthread_setspecific(static_cast<pthread_key_t>(tls_gs_slot()), tcb);
 #else
         // The Windows shape on Linux: the rewritten sites read
         // gs:[TlsSlots+8n], so GS gets a TEB-sized block whose slot holds the
@@ -1038,7 +1048,9 @@ void guest_thread_leave(void* tcb_v) {
     }
 #if defined(_WIN32)
     if (tls_gs_mode()) TlsSetValue(tls_gs_slot(), nullptr);
-#else
+#elif defined(__APPLE__)
+    pthread_setspecific(static_cast<pthread_key_t>(tls_gs_slot()), nullptr);
+#elif defined(__linux__)
     if (t_guest_teb) {
         if (g_fsgsbase) {
             asm volatile("wrgsbase %0" : : "r"(static_cast<std::uint8_t*>(nullptr)) : "memory");

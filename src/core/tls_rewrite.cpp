@@ -9,6 +9,9 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <cstdio>
 #endif
 
 namespace {
@@ -19,18 +22,44 @@ const std::uint32_t kSlot = [] {
     if (slot == TLS_OUT_OF_INDEXES || slot >= kTebTlsSlotCount) std::abort();  // must sit in TEB.TlsSlots
     return static_cast<std::uint32_t>(slot);
 }();
+#elif defined(__APPLE__)
+// The key's value is the guest TCB. Probe that it reads back at gs:[8*key]
+// before any site depends on it: without that the guest finds no TCB.
+const std::uint32_t kSlot = [] {
+    pthread_key_t key = 0;
+    const int e = pthread_key_create(&key, nullptr);
+    if (e != 0 || key >= kTsdSlotCount) {
+        std::fprintf(stderr, "[bbhost] tls: no pthread key for the guest's TCB (error %d, key %lu of %u)\n", e,
+                     static_cast<unsigned long>(key), kTsdSlotCount);
+        std::abort();
+    }
+    static const char probe = 0;
+    pthread_setspecific(key, &probe);
+    const void* seen = nullptr;
+    asm volatile("movq %%gs:(%1), %0" : "=r"(seen) : "r"(static_cast<std::uint64_t>(key) * 8));
+    pthread_setspecific(key, nullptr);
+    if (seen != &probe) {
+        std::fprintf(stderr,
+                     "[bbhost] tls: pthread key %lu does not read back at gs:0x%lx (%p, want %p); this macOS keeps "
+                     "its TSD elsewhere and the guest's TLS cannot work\n",
+                     static_cast<unsigned long>(key), static_cast<unsigned long>(key) * 8, seen,
+                     static_cast<const void*>(&probe));
+        std::abort();
+    }
+    return static_cast<std::uint32_t>(key);
+}();
 #else
 constexpr std::uint32_t kSlot = 60;  // the Linux stand-in's slot
 #endif
 
 // GS mode (the guest's fs:[0] reads rewritten to a GS slot, FS left to the
-// host) is what Windows always runs, and the Linux default since 2026-10-04:
-// the thunk no longer switches FS twice a call (four alternating soaks:
-// main-loop work 11.34/11.62 ms against 11.63/11.73, p95 lower), and host
-// code that touches thread-local state - libm's errno - can run raw.
-// BBHOST_TLS_GS=0 goes back to switching FS.
+// host) is what Windows and macOS always run, and the Linux default since
+// 2026-10-04: the thunk no longer switches FS twice a call (four
+// alternating soaks: main-loop work 11.34/11.62 ms against 11.63/11.73, p95
+// lower), and host code that touches thread-local state - libm's errno - can
+// run raw. BBHOST_TLS_GS=0 goes back to switching FS, on Linux only.
 const bool g_gs_mode = [] {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     return true;
 #else
     const char* e = std::getenv("BBHOST_TLS_GS");
@@ -42,7 +71,7 @@ const bool g_gs_mode = [] {
 
 bool tls_gs_mode() { return g_gs_mode; }
 
-std::uint32_t tls_gs_disp() { return kTebTlsSlots + 8 * kSlot; }
+std::uint32_t tls_gs_disp() { return kGsSlotsBase + 8 * kSlot; }
 
 std::uint32_t tls_gs_slot() { return kSlot; }
 

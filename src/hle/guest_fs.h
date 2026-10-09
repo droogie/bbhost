@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 #include <asm/prctl.h>
 #include <sys/prctl.h>
 #ifndef ARCH_SET_FS
