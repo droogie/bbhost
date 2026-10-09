@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bbhost's entitlements (tools/package_macos.sh). They take effect only under
+  the hardened runtime, which a Developer ID signature for notarization
+  turns on; the package's ad-hoc signature does not, and runs without them.
+  With it, bbhost would need:
+    allow-unsigned-executable-memory: the game's code is loaded into
+      writable memory, patched, and made executable without MAP_JIT, and the
+      thunks and stub pages are written the same way;
+    disable-library-validation: plugins, and the bundled MoltenVK and Vulkan
+      loader, are signed by someone else (or ad hoc).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
