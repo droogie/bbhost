@@ -2,6 +2,7 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
+#include "core/portable.h"
 #include "log.h"
 #include "replay/json.h"
 
@@ -62,6 +63,8 @@ fs::path exe_path() {
     const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
     buf.resize(n);
     return fs::path(buf);
+#elif defined(__APPLE__)
+    return fs::path(host_exe_path());
 #else
     std::error_code ec;
     return fs::read_symlink("/proc/self/exe", ec);

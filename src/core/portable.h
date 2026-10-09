@@ -49,8 +49,20 @@ bool host_desktop_max_size(int* w, int* h);
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.
 void host_thread_fit_name(const char* name, char (&out)[16]);
 // Where this executable is loaded: code addresses minus this are what
-// addr2line takes (the link addresses, PIE's start at 0).
+// addr2line takes (the link addresses, PIE's start at 0). macOS: for atos -l.
 std::uintptr_t host_image_base();
+#if defined(__APPLE__)
+// macOS: this executable's path, symbolic links resolved (_NSGetExecutablePath
+// and realpath), or empty - where Linux reads /proc/self/exe.
+std::string host_exe_path();
+// macOS: the loaded image (this executable or a library) one of whose
+// segments holds addr - an executable segment when code_only - with its path
+// and where its Mach-O header is loaded (addr minus that is what atos -l
+// takes with the header's link address). dyld's image list, for what Linux
+// asks dl_iterate_phdr; false for any address outside them, the guest's
+// included.
+bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base);
+#endif
 // Windows: the threads host_thread_set_name named, with their CPU time
 // (kernel + user, 100 ns units), for frame statistics. A registry, not a
 // Toolhelp snapshot: that walks every thread on the system, tens of

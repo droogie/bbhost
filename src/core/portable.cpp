@@ -29,6 +29,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <climits>
+#include <mach-o/dyld.h>
+#include <mach-o/ldsyms.h>
+#include <mach-o/loader.h>
+#endif
 
 bool host_mkdir(const char* path) {
 #if defined(_WIN32)
@@ -450,6 +456,42 @@ void host_page_guard(void* p, std::size_t size) {
 #if defined(_WIN32)
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__ImageBase); }
+#elif defined(__APPLE__)
+std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&_mh_execute_header); }
+
+std::string host_exe_path() {
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // the size it needs
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    char real[PATH_MAX];
+    return realpath(path.c_str(), real) ? std::string(real) : std::string();
+}
+
+bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base) {
+    const std::uint32_t n = _dyld_image_count();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto* h = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(i));
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        const auto slide = static_cast<std::uint64_t>(_dyld_get_image_vmaddr_slide(i));
+        const auto* lc = reinterpret_cast<const load_command*>(h + 1);
+        for (std::uint32_t k = 0; k < h->ncmds; ++k) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
+                // __PAGEZERO, no access, spans the low 4 GiB: never a module's.
+                const bool counts = code_only ? (seg->initprot & VM_PROT_EXECUTE) != 0 : seg->initprot != 0;
+                const std::uint64_t lo = seg->vmaddr + slide;
+                if (counts && addr >= lo && addr - lo < seg->vmsize) {
+                    *name = _dyld_get_image_name(i);
+                    *base = reinterpret_cast<std::uint64_t>(h);
+                    return true;
+                }
+            }
+            lc = reinterpret_cast<const load_command*>(reinterpret_cast<const char*>(lc) + lc->cmdsize);
+        }
+    }
+    return false;
+}
 #else
 extern "C" char __executable_start;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__executable_start); }

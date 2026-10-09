@@ -40,7 +40,9 @@
 #include "host/gpu.h"
 #include "log.h"
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
 #endif
@@ -582,6 +584,13 @@ void trace_map(const Pending& p) {
                 std::snprintf(who, sizeof(who), " (host %s+0x%llx)", info.dli_sname,
                               static_cast<unsigned long long>(p.ret - reinterpret_cast<std::uintptr_t>(info.dli_saddr)));
             } else {
+#if defined(__APPLE__)
+                const char* name = nullptr;
+                std::uint64_t base = 0;
+                if (host_image_of(p.ret, false, &name, &base))
+                    std::snprintf(who, sizeof(who), " (host %s+0x%llx)", name, static_cast<unsigned long long>(p.ret - base));
+                else std::snprintf(who, sizeof(who), " (host, generated code)");
+#else
                 struct Find { std::uint64_t a; std::uint64_t base; const char* name; bool hit; } f{p.ret, 0, nullptr, false};
                 dl_iterate_phdr(
                     [](dl_phdr_info* i, std::size_t, void* d) {
@@ -600,6 +609,7 @@ void trace_map(const Pending& p) {
                 if (f.hit) std::snprintf(who, sizeof(who), " (host %s+0x%llx)", f.name && f.name[0] ? f.name : "bbhost",
                                          static_cast<unsigned long long>(p.ret - f.base));
                 else std::snprintf(who, sizeof(who), " (host, generated code)");
+#endif
             }
         }
 #endif

@@ -1,4 +1,5 @@
 #include "core/config.h"
+#include "core/portable.h"
 #include "core/sfo.h"
 #include "log.h"
 #include "bbhost_version.h"
@@ -214,6 +215,10 @@ std::string exe_dir() {
     for (char& ch : p) {
         if (ch == '\\') ch = '/';
     }
+    const std::size_t slash = p.find_last_of('/');
+    return slash == std::string::npos ? "." : p.substr(0, slash);
+#elif defined(__APPLE__)
+    const std::string p = host_exe_path();
     const std::size_t slash = p.find_last_of('/');
     return slash == std::string::npos ? "." : p.substr(0, slash);
 #else
