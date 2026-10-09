@@ -20,18 +20,29 @@ struct Site {
     std::uint64_t bytes = 0;
     std::uint64_t count = 0;
     std::uint64_t calls = 0, us = 0;  // every allocation made here, and the driver's time for them
+    std::uint64_t addressed = 0;      // of `count`, those made for buffers with device addresses
 };
 struct Block {
     std::uint64_t bytes = 0;
     std::uint32_t type = 0;
     bool limited = false;  // counted against BBHOST_TEST_VRAM_MB
     bool local = false;    // counted in g_local_bytes
+    bool addressed = false;  // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
     std::string site;
 };
 std::mutex g_mu;
 std::unordered_map<std::uint64_t, Block> g_blocks;  // by the handle's value
 std::map<std::string, Site> g_sites;
 std::map<std::uint32_t, std::uint64_t> g_by_type;
+std::uint64_t g_addressed = 0;  // live blocks with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+
+bool for_device_address(const VkMemoryAllocateInfo* info) {
+    for (auto* p = static_cast<const VkBaseInStructure*>(info->pNext); p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+            return (reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(p)->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) != 0;
+    }
+    return false;
+}
 // BBHOST_TEST_VRAM_MB (bb_memory_test_limit): the memory types of the
 // device-local heap, and what they may hold in all before an allocation in
 // them fails as a full card's does. 0: no limit.
@@ -100,6 +111,7 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
         b.bytes = info->allocationSize;
         b.type = info->memoryTypeIndex;
         b.limited = limited;
+        b.addressed = for_device_address(info);
         b.site = site_name(file, line);
         if (g_local_types) {
             b.local = ((g_local_types >> b.type) & 1) != 0;
@@ -111,6 +123,8 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
         ++s.count;
         ++s.calls;
         s.us += us;
+        s.addressed += b.addressed;
+        g_addressed += b.addressed;
         // A slow one is a frame's worth when it lands in play (host-visible
         // memory is pinned page by page): say where and when.
         if (us >= 4000) {
@@ -134,6 +148,8 @@ void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCa
             Site& s = g_sites[it->second.site];
             s.bytes -= it->second.bytes;
             --s.count;
+            s.addressed -= it->second.addressed;
+            g_addressed -= it->second.addressed;
             g_by_type[it->second.type] -= it->second.bytes;
             if (it->second.limited) g_limited_bytes -= it->second.bytes;
             if (it->second.local) g_local_bytes -= it->second.bytes;
@@ -169,5 +185,31 @@ std::string bb_memory_sites_report() {
                       static_cast<unsigned long long>(s.count), static_cast<unsigned long long>(s.calls), s.us / 1000.0);
         out += buf;
     }
+    std::snprintf(buf, sizeof(buf), " for device addresses %llu blocks", static_cast<unsigned long long>(g_addressed));
+    out += buf;
+    return out;
+}
+
+std::uint64_t bb_memory_address_blocks() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_addressed;
+}
+
+std::string bb_memory_address_report() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::vector<std::pair<std::string, std::uint64_t>> v;
+    for (const auto& [name, s] : g_sites) {
+        if (s.addressed) v.emplace_back(name, s.addressed);
+    }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(g_addressed));
+    std::string out = buf;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s%s %llu", i ? ", " : " (by allocation site: ", v[i].first.c_str(),
+                      static_cast<unsigned long long>(v[i].second));
+        out += buf;
+    }
+    if (!v.empty()) out += ')';
     return out;
 }

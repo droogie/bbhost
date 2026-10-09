@@ -103,6 +103,21 @@ const bool g_import_whole = [] {
 }();
 std::atomic<std::uint64_t> g_imports_made{0}, g_imports_merged{0}, g_import_bytes{0}, g_import_us{0};
 
+// MoltenVK makes every buffer with a device address resident for each
+// dispatch (~0.45 us a buffer under Rosetta), so direct memory goes in as
+// whole chunks and the rest are counted, said past the budget.
+constexpr std::uint64_t kAddressBuffersBudget = 50;
+std::atomic<std::uint64_t> g_address_said{kAddressBuffersBudget};
+void address_buffers_check() {
+    if (!g.moltenvk) return;
+    const std::uint64_t n = bb_memory_address_blocks();
+    std::uint64_t said = g_address_said.load(std::memory_order_relaxed);
+    if (n <= said || !g_address_said.compare_exchange_strong(said, n + 15)) return;
+    host_log("gpu: buffers with device addresses: %s - more than the %llu MoltenVK keeps cheap; it makes each resident for every "
+             "dispatch (~0.45 us)",
+             bb_memory_address_report().c_str(), static_cast<unsigned long long>(kAddressBuffersBudget));
+}
+
 // ---- The submission thread (BBHOST_SUBMIT_THREAD, on unless 0) ----
 // vkQueueSubmit off the command processor. The kernel's half of a submission
 // grows with the buffers it has to make resident - all of them, since shaders
@@ -268,6 +283,11 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
         host_log("gpu: no host-coherent memory type for a host pointer (bits 0x%x)", hp.memoryTypeBits);
         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
+    static std::once_flag said;
+    std::call_once(said, [&] {
+        host_log("gpu: direct memory's imports in memory type %u (flags 0x%x; the driver allows types 0x%x for it)", type,
+                 g.mem_props.memoryTypes[type].propertyFlags, hp.memoryTypeBits);
+    });
     VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -452,6 +472,7 @@ Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
                  static_cast<unsigned long long>(c->address), static_cast<long long>(us));
     }
     g.dmem[index].imports.push_back(std::move(c));
+    address_buffers_check();
     return g.dmem[index].imports.back().get();
 }
 
@@ -462,7 +483,14 @@ void choose_dmem_import() {
     Chunk c;
     const VkResult r = host_span(c, g.mirror, 1ull << gcn::kPageShift);
     free_import(c);
-    if (r == VK_SUCCESS) return;
+    if (r == VK_SUCCESS) {
+        host_log("gpu: direct memory goes to the GPU as host pointers, %s", g_import_whole
+                     ? "each 1 GiB chunk's GPU-visible span in one import, made with the mappings (BBHOST_IMPORT_WINDOWS=1: 16 MiB windows)"
+                     : "16 MiB windows as the GPU first reaches them (BBHOST_IMPORT_WINDOWS=1)");
+        if (g.moltenvk && !g_import_whole)
+            host_log("gpu: each window is a buffer MoltenVK makes resident for every dispatch - BBHOST_IMPORT_WINDOWS=1 is slow here");
+        return;
+    }
 #if defined(__linux__)
     if (g.can_dmabuf) {
         g.udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
@@ -682,6 +710,7 @@ const Chunk* import_anon(std::uint64_t va, std::uint64_t len) {
     bai.buffer = c.buffer;
     c.address = vkGetBufferDeviceAddress(g.device, &bai);
     c.size = len;
+    address_buffers_check();
     return &(g.anon_imports[va] = c);
 }
 
@@ -967,6 +996,7 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
     if (host_visible) {
         vkMapMemory(g.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map);
     }
+    address_buffers_check();
     return true;
 }
 
@@ -1149,8 +1179,8 @@ bool rebuild_page_tables() {
     }
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 12) {
-        host_log("gpu: page tables rebuilt: %zu mappings, %zu pages of 64 KiB, %zu skipped, %zu L2 tables", maps.size(),
-                 pages, skipped, g.l2.size());
+        host_log("gpu: page tables rebuilt: %zu mappings, %zu pages of 64 KiB, %zu skipped, %zu L2 tables; %llu buffers with device addresses",
+                 maps.size(), pages, skipped, g.l2.size(), static_cast<unsigned long long>(bb_memory_address_blocks()));
     }
     return true;
 }
@@ -1761,6 +1791,7 @@ bool init_locked() {
             host_log("gpu: driver %s, %s (id %d, conformance %u.%u.%u.%u; driverVersion 0x%x)", drv.driverName, drv.driverInfo,
                      static_cast<int>(drv.driverID), drv.conformanceVersion.major, drv.conformanceVersion.minor,
                      drv.conformanceVersion.subminor, drv.conformanceVersion.patch, dp.properties.driverVersion);
+            g.moltenvk = drv.driverID == VK_DRIVER_ID_MOLTENVK;
         }
         // Other programs' hooks, loaded with the instance (most come in as an
         // implicit Vulkan layer): said now, and again if the device is lost.
@@ -2536,6 +2567,12 @@ bool init_locked() {
              g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
              g.has_tessellation ? ", tessellation" : "", g.has_geometry_shader ? ", geometry shaders" : ", no geometry shaders",
              portability ? ", portability subset" : "");
+    if (g.moltenvk)
+        host_log("gpu: buffers with device addresses so far: %s; MoltenVK makes each resident for every dispatch, and more than %llu "
+                 "are logged as they come",
+                 bb_memory_address_report().c_str(), static_cast<unsigned long long>(kAddressBuffersBudget));
+    else
+        host_log("gpu: buffers with device addresses so far: %s", bb_memory_address_report().c_str());
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
     // translator above (they are part of every key).

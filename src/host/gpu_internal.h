@@ -22,6 +22,10 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
                          VkDeviceMemory* out, const char* file, int line);
 void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
 std::string bb_memory_sites_report();
+// Live blocks for buffers with device addresses, in all and by site: what
+// MoltenVK makes resident for every dispatch.
+std::uint64_t bb_memory_address_blocks();
+std::string bb_memory_address_report();
 // BBHOST_TEST_VRAM_MB: allocations in the memory types of `types` (a bit each)
 // fail with VK_ERROR_OUT_OF_DEVICE_MEMORY once they would hold more than
 // `bytes` together - a smaller card's video memory acted out on a bigger one.
@@ -375,6 +379,9 @@ struct Gpu {
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
     bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
+    // MoltenVK makes every buffer with a device address resident for each
+    // dispatch, so they are kept few.
+    bool moltenvk = false;
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start
