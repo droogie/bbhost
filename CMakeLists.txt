@@ -9,6 +9,20 @@ if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR
     "bbhost must be built with Clang on Windows so guest SysV functions can be implemented with __attribute__((sysv_abi)).")
 endif()
+if(APPLE)
+  set(BBHOST_MACOS_ARCH "${CMAKE_OSX_ARCHITECTURES}")
+  if(NOT BBHOST_MACOS_ARCH)
+    set(BBHOST_MACOS_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  if(NOT BBHOST_MACOS_ARCH STREQUAL "x86_64")
+    message(FATAL_ERROR
+      "bbhost runs the game's x86-64 code in its own process, so on macOS it is built for x86_64 alone "
+      "(-DCMAKE_OSX_ARCHITECTURES=x86_64; tools/build_macos.sh), and Rosetta 2 runs it on Apple Silicon.")
+  endif()
+  # Apple's clang searches /usr/local/include before -isystem dirs, so a
+  # Homebrew ffmpeg's headers would shadow the prefix's; -I wins.
+  set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
+endif()
 
 # LibAtrac9 (MIT, https://github.com/Thealexbarney/LibAtrac9): ATRAC9 decoding for sceAjm.
 file(GLOB LIBATRAC9_SOURCES third_party/libatrac9/C/src/*.c)
@@ -249,6 +263,14 @@ find_package(SDL3 CONFIG QUIET)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavformat libavutil libswscale libswresample)
+endif()
+if(FFMPEG_FOUND AND APPLE)
+  # CMake dedups repeated "-framework" words, orphaning the framework names.
+  get_target_property(BBHOST_FFMPEG_LINK_OPTIONS PkgConfig::FFMPEG INTERFACE_LINK_OPTIONS)
+  if(BBHOST_FFMPEG_LINK_OPTIONS)
+    string(REGEX REPLACE "-framework;([^;]+)" "SHELL:-framework \\1" BBHOST_FFMPEG_LINK_OPTIONS "${BBHOST_FFMPEG_LINK_OPTIONS}")
+    set_target_properties(PkgConfig::FFMPEG PROPERTIES INTERFACE_LINK_OPTIONS "${BBHOST_FFMPEG_LINK_OPTIONS}")
+  endif()
 endif()
 if(FFMPEG_FOUND)
   message(STATUS "bbhost: ffmpeg found; movies decode")
