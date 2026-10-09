@@ -79,7 +79,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-import world_baseline  # noqa: E402  (launch_argv, digest, the title's taps)
+import world_baseline  # noqa: E402  (launch_argv, file_inventory, digest)
 
 SCHEMA = "bbhost-area-check"
 EBOOT_109_SHA256 = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
@@ -89,6 +89,14 @@ QUIET_RADIUS = 40.0
 # How far behind a boss's fog wall the view stands: the boss rush plugin's
 # stand-off, which it checked in each arena (plugins/boss_rush).
 FOG_STANDOFF = 1.0
+# The way through the title: the menus' confirm button, asked of the host
+# (BBHOST_TEST_REQUESTS "menutap confirm") every TITLE_TAP_EVERY_S seconds from
+# TITLE_TAP_FIRST_S until the world's first frame. The host presses it only
+# while one of the game's menus has the input, so a request that arrives as the
+# world loads presses nothing; and it reaches the title whenever the title
+# comes - a new build's first start compiles its shader caches before it.
+TITLE_TAP_FIRST_S = 5.0
+TITLE_TAP_EVERY_S = 2.0
 
 
 # --- the places ---------------------------------------------------------------
@@ -237,7 +245,6 @@ def pass_settings(pass_dir, areas, opts, kind):
     """The game's BBHOST_* settings for one pass."""
     s = {
         "BBHOST_HEADLESS": "1", "BBHOST_NP_SIGNED_OUT": "1", "BBHOST_SETUP_WINDOW": "0", "BBHOST_SKIP_INTRO": "1",
-        "BBHOST_AUTOPRESS": world_baseline.AUTOPRESS,
         "BBHOST_CONFIG_DIR": str(pass_dir / "cfg"), "BBHOST_OPTIONS_PATH": str(pass_dir / "cfg" / "bbhost-options.toml"),
         "BBHOST_PIPELINE_CACHE": "1" if opts["pipeline_cache"] else "0",
         "BBHOST_GAME_FPS": str(opts["fps"]), "BBHOST_FRAME_STATS": "1", "BBHOST_FRAME_DETAIL": "1", "BBHOST_STALL_MS": "40",
@@ -1211,13 +1218,23 @@ def game_env(settings):
     return env
 
 
+def title_tap(requests, n):
+    """The n-th press of the menus' confirm button on the way through the
+    title, as a request file the host carries out on a flip (after the probe's
+    numbered ones, which sort first)."""
+    (requests / ("title-%03d.req" % n)).write_text("menutap confirm\n")
+
+
 def launch(pass_dir, plan, say):
     """Runs the game until the tour is done (or it dies, or the budget is out),
-    with its log in run.log."""
+    with its log in run.log. Until the world's first frame it presses confirm
+    in the title's menus (TITLE_TAP_EVERY_S)."""
     env = game_env(plan["settings"])
+    requests = Path(plan["settings"]["BBHOST_TEST_REQUESTS"])
     started = time.monotonic()
     deadline = started + plan["budget_s"]
     world_deadline = started + 300
+    next_tap, taps = started + TITLE_TAP_FIRST_S, 0
     stop_reason, term_at, pending = None, None, b""
     world = done = False
     with (pass_dir / "run.log").open("wb") as log:
@@ -1232,6 +1249,10 @@ def launch(pass_dir, plan, say):
                         stop_reason = "out of time"
                     if stop_reason is None and not world and now > world_deadline:
                         stop_reason = "the world was not reached"
+                    if not world and stop_reason is None and now >= next_tap:
+                        taps += 1
+                        title_tap(requests, taps)
+                        next_tap = now + TITLE_TAP_EVERY_S
                     if stop_reason and term_at is None:
                         proc.send_signal(signal.SIGTERM)
                         term_at = now

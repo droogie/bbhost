@@ -1748,15 +1748,6 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         if (!e || !std::strchr(e, ':')) {
             return v;
         }
-        static const struct {
-            const char* name;
-            std::uint32_t bit;
-        } names[] = {{"lup", 0x10000u}, {"ldown", 0x20000u}, {"lleft", 0x40000u}, {"lright", 0x80000u},  // left stick, full
-                     {"rup", 0x200000u}, {"rdown", 0x400000u}, {"rleft", 0x800000u}, {"rright", 0x1000000u},  // right stick, full
-                     {"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u},
-                     {"options", 0x8u}, {"up", 0x10u},        {"down", 0x40u},     {"left", 0x80u},
-                     {"right", 0x20u},  {"l1", 0x400u},       {"r1", 0x800u},      {"l2", 0x100u},
-                     {"r2", 0x200u},    {"l3", 0x2u},         {"r3", 0x4u},        {"touch", 0x100000u}};
         std::string spec(e);
         std::size_t pos = 0;
         while (pos < spec.size()) {
@@ -1789,11 +1780,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                 t.hold_ms = static_cast<std::uint32_t>(std::strtoul(name.c_str() + colon2 + 1, nullptr, 10));
                 name = name.substr(0, colon2);
             }
-            for (const auto& n : names) {
-                if (name == n.name) {
-                    t.button = n.bit;
-                }
-            }
+            t.button = hle_pad_button_named(name);
             if (t.button) {
                 v.push_back(t);
             }
@@ -2160,6 +2147,22 @@ void hle_register_system() {
     REG("scePadSetTiltCorrectionState", hle_ok);
     REG("scePadSetVibration", hle_pad_vibrate);
 #undef REG
+}
+
+std::uint32_t hle_pad_button_named(const std::string& name) {
+    static const struct {
+        const char* name;
+        std::uint32_t bit;
+    } names[] = {{"lup", 0x10000u}, {"ldown", 0x20000u}, {"lleft", 0x40000u}, {"lright", 0x80000u},  // left stick, full
+                 {"rup", 0x200000u}, {"rdown", 0x400000u}, {"rleft", 0x800000u}, {"rright", 0x1000000u},  // right stick, full
+                 {"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u},
+                 {"options", 0x8u}, {"up", 0x10u},        {"down", 0x40u},     {"left", 0x80u},
+                 {"right", 0x20u},  {"l1", 0x400u},       {"r1", 0x800u},      {"l2", 0x100u},
+                 {"r2", 0x200u},    {"l3", 0x2u},         {"r3", 0x4u},        {"touch", 0x100000u}};
+    for (const auto& n : names) {
+        if (name == n.name) return n.bit;
+    }
+    return 0;
 }
 
 void hle_pad_tap(std::uint32_t button, int delay_ms, int hold_ms) {

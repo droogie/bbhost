@@ -9,7 +9,9 @@ from pathlib import Path
 import random
 import sys
 import tempfile
+import textwrap
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("area_check", Path(__file__).resolve().parents[1] / "tools/area_check.py")
 ac = importlib.util.module_from_spec(spec)
@@ -152,6 +154,50 @@ class TourTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ac.pass_settings(Path("/r"), areas, dict(opts, env=["PATH=/x"]), "perf")
         self.assertEqual(ac.pass_settings(Path("/r"), areas, dict(opts, env=["BBHOST_X=1"]), "perf")["BBHOST_X"], "1")
+        # No presses at fixed times: the title is passed with menutap requests (launch).
+        self.assertNotIn("BBHOST_AUTOPRESS", perf)
+
+    def test_title_taps_until_the_world(self):
+        """launch() asks for the menus' confirm button until the world's first
+        frame, and no more after it: a stand-in game answers two requests, then
+        logs the world and the end of the tour."""
+        game = textwrap.dedent("""
+            import os, sys, time
+            req = sys.argv[1]
+            seen = 0
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 20:
+                for name in sorted(os.listdir(req)):
+                    path = os.path.join(req, name)
+                    print("[bbhost] test: " + open(path).read().strip() + " from " + name, flush=True)
+                    os.remove(path)
+                    seen += 1
+                if seen >= 2:
+                    print("[bbhost] world: the first in-game frame, flip 1200, 31.0 s after start", flush=True)
+                    time.sleep(0.5)
+                    leftover = sorted(os.listdir(req))
+                    print("[bbhost] leftover %d" % len(leftover), flush=True)
+                    print("[bbhost] mapval tour-done 1.000", flush=True)
+                    time.sleep(0.2)
+                    sys.exit(0)
+                time.sleep(0.02)
+            sys.exit(3)
+        """)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "requests").mkdir()
+            (d / "game.py").write_text(game)
+            plan = {"argv": [sys.executable, str(d / "game.py"), str(d / "requests")], "budget_s": 30,
+                    "settings": {"BBHOST_TEST_REQUESTS": str(d / "requests")}}
+            with mock.patch.object(ac, "TITLE_TAP_FIRST_S", 0.1), mock.patch.object(ac, "TITLE_TAP_EVERY_S", 0.5):
+                out = ac.launch(d, plan, lambda *_: None)
+            log = (d / "run.log").read_text()
+        self.assertEqual(out["stop_reason"], "tour done")
+        self.assertIn("test: menutap confirm from title-001.req", log)
+        self.assertIn("test: menutap confirm from title-002.req", log)
+        # Nothing asked for after the world's first frame.
+        self.assertIn("leftover 0", log)
+        self.assertNotIn("title-003", log)
 
     def test_run_toml(self):
         import tomllib

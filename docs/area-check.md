@@ -32,7 +32,11 @@ changed for the rest of the run.
 A run copies a data folder (`--seed`: its saves hold a character in the world,
 which Continue loads), plays it headless and offline, pinned to one NUMA node
 with `numactl`, with the map-validation probe plugin (`tools/mapval_plugin.c`)
-moving the player. At each place the probe travels to a lamp the way the
+moving the player. It gets through the title by asking the game for the menus'
+confirm button every 2 s until the world's first frame (the test request
+`menutap confirm`, which bbhost carries out only while one of the game's menus
+has the input), so it reaches the title whenever the title comes: a build's
+first start compiles its shader caches before it. At each place the probe travels to a lamp the way the
 Hunter's Dream headstones do, moves to the place's view, switches off the
 ordinary enemies within 40 m, puts the camera behind the player and holds
 still:

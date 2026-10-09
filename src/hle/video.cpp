@@ -5,6 +5,7 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "engine/guest.h"
+#include "engine/menu_pointer.h"
 #include "host/gpu.h"
 #include "core/config.h"
 #include "host/window.h"
@@ -199,6 +200,12 @@ const bool g_present_on_arrival = [] {
 //   dump <path>           this displayed frame to <path>, as BBHOST_DUMP_FRAME writes one
 //   capture <n> [<dir>]   with BBHOST_CAPTURE_ARMED=1, BBHOST_CAPTURE_DRAW may take up to n
 //                         more draws, into <dir> (draw_capture.h); 0 stops it
+//   tap <button> [<ms>]   press a pad button for <ms> (200), named as BBHOST_AUTOPRESS
+//                         names them, or `confirm`: the button this region's menus
+//                         confirm with (Cross; Circle on a Japanese build)
+//   menutap <button> [<ms>]  the same, only while one of the game's menus has the
+//                         input - the way through the title that cannot press
+//                         anything in the world, however late it arrives
 // The folder is read ten times a second, on the flips.
 void test_requests(std::uint64_t display_va, std::uint64_t count) {
     static const std::string dir = [] {
@@ -236,6 +243,19 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             host_gpu_capture_arm(n, arg2.c_str());
             host_log("test: draw captures armed for %d at flip %llu%s%s", n, static_cast<unsigned long long>(count), arg2.empty() ? "" : " into ",
                      arg2.c_str());
+        } else if ((verb == "tap" || verb == "menutap") && !arg.empty()) {
+            const std::uint32_t button = arg == "confirm" ? menu_confirm_button() : hle_pad_button_named(arg);
+            const int hold = arg2.empty() ? 200 : std::atoi(arg2.c_str());
+            if (!button || (button & 0x1ef0000u) || hold <= 0) {
+                host_log("test: %s %s %s: not a pad button and a hold", verb.c_str(), arg.c_str(), arg2.c_str());
+            } else if (verb == "menutap" && !menu_pointer_in_menu()) {
+                host_log("test: menutap %s at flip %llu: no menu has the input, not pressed", arg.c_str(),
+                         static_cast<unsigned long long>(count));
+            } else {
+                hle_pad_tap(button, 0, hold);
+                host_log("test: %s %s (0x%x) for %d ms at flip %llu", verb.c_str(), arg.c_str(), button, hold,
+                         static_cast<unsigned long long>(count));
+            }
         } else {
             host_log("test: request %s not understood: %s %s", p.filename().string().c_str(), verb.c_str(), arg.c_str());
         }
