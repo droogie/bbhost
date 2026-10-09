@@ -2,8 +2,10 @@
 // refuses the constructs it cannot prove equal. Skips when the dump is absent.
 // Before that, hand-encoded programs check ds_swizzle_b32 (every quad pattern
 // run through a small interpreter of the lifted SPIR-V over one quad, and the
-// cases the lifter must refuse), texture LOD and whole-quad mode, loops,
-// regions and ifs, and lane writes; they run without the dump.
+// cases the lifter must refuse), v_cndmask_b32's source modifiers (through the
+// same interpreter) and packed exports, texture LOD and whole-quad mode,
+// loops, regions and ifs and the wave-wide tests of masks they rest on, and
+// lane writes; they run without the dump.
 #include "test_app0.h"
 #include "gcn/container.h"
 #include "gcn/isa.h"
@@ -993,6 +995,7 @@ void cases() {
         a.sop2(15, kExec, kExec, 20);  // s_and_b64 exec, exec, s[20:21]
         a.vop1(1, 6, kOne);
         a.land(skip);
+        a.sop1(4, kExec, 20);          // EXEC set again from the guard, as the compiler does
         a.mimg(kGetLod, 4, 2, 0x2);
         a.exp_mrt0(4);
         a.w.push_back(0xbf810000u);
@@ -1174,6 +1177,48 @@ void loops() {
         CHECK(proof_says(r, "uniform, left on a bit every lane holds alike"));
     }
     CHECK(rejected_with(lift(leaves_partial(true)), "an export reads a value the lift may hold differently"));
+    // A loop pixels leave at different iterations inside a kill region widened
+    // from EXEC known set, where every pixel computes the region: GCN runs it
+    // only in the quads holding a pixel the guard keeps, so the lift's other
+    // quads leave it at the first exit test (their pixels are killed, and
+    // they no longer run iterations on data GCN never looked at).
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);            // the guard starts as the coverage
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(4, kZero, 2);             // v_cmp_gt_f32 vcc, 0, v2: kill
+        a.sop2(21, 20, 20, kVcc);        // s_andn2_b64 s[20:21], s[20:21], vcc
+        const std::size_t end = a.branch(4);
+        a.sop2(15, kExec, kExec, 20);    // s_and_b64 exec, exec, s[20:21]
+        a.wqm();                         // widened from EXEC known set
+        a.vop1(8, 4, 256 + 3);           // v4 = int(v3): the count
+        a.vop1(1, 5, kZero);
+        a.vop1(1, 8, kZero);
+        a.sop1(4, 26, kExec);
+        a.sop1(4, 24, kExec);            // the loop mask L
+        const std::size_t header = a.w.size();
+        a.vopc(0x84, 256 + 4, 5);        // v_cmp_gt_i32 vcc, v4, v5: stay
+        a.sop1(4, 28, kExec);
+        a.sop2(21, kExec, 28, kVcc);
+        a.sop2(21, 24, 24, kExec);
+        const std::size_t exit = a.branch(4);
+        a.sop2(15, kExec, 28, 24);
+        a.vop2(3, 8, kOne, 8);           // v8 += 1.0
+        a.vop2(37, 5, kZero + 1, 5);     // v_add_i32 v5, 1, v5
+        back(a, 2, header);
+        a.land(exit);
+        a.sop1(4, kExec, 26);
+        a.land(end);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(8);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r));
+        CHECK(proof_says(r, "quads without a covered pixel the guard keeps"));
+        CHECK(has_op(r.spirv, 366));  // OpGroupNonUniformQuadSwap
+    }
     // An if whose else arm leaves the loop joins with the then arm's values,
     // and with where they hold GCN's value: v8 from a whole-quad block, so
     // the implicit-LOD sample after the join is refused.
@@ -1630,9 +1675,392 @@ void regions_and_ifs() {
     }
 }
 
+// A uniform loop counting in `counter` up to the user SGPR s1. s0 and s1 are
+// registers like any other (only a loop where pixels leave at different
+// iterations has a mask pair the lift treats apart).
+Asm counted_loop(std::uint32_t counter) {
+    Asm a;
+    a.interp(2, 0, 0);
+    a.sop1(kSMov, counter, kC0);                    // s<counter> = 0
+    a.vop1(kVMov, 3, kC0);                          // v3 = 0
+    const std::uint32_t header = a.at();
+    a.sopc(kSCmpGeI32, counter, 1);                 // s<counter> >= s1: done
+    const std::size_t exit = a.forward(kScc1);
+    a.vop2(kVAddF32, 3, kOne, 3);                   // v3 += 1.0
+    a.sop2(kSAddU32, counter, counter, kC0 + 1);    // s<counter> += 1
+    a.branch(kBranch, header);
+    a.land(exit);
+    a.exp_mrt0(3);
+    a.sopp(kEndpgm);
+    return a;
+}
+
+// A lane mask in s[mask:mask+1] flipped each iteration of a loop counted by
+// the user SGPR s2, selecting v3 into v4.
+Asm flipped_mask(std::uint32_t mask) {
+    Asm b;
+    b.interp(2, 0, 0);
+    b.vop1(kVMov, 3, kC0);
+    b.sop1(kSMov, 5, kC0);
+    b.vopc(kCmpLtF32, kC0, 2);                      // vcc = 0 < x
+    b.sop1(kSMov64, mask, kVcc);
+    const std::uint32_t header = b.at();
+    b.sopc(kSCmpGeI32, 5, 2);                       // s5 >= s2: done
+    const std::size_t exit = b.forward(kScc1);
+    b.sop2(kSXor64, mask, mask, kExec);             // flip
+    b.w.push_back(0xd2000000u | 4u);                // v_cndmask_b32 v4, 0, v3, s[mask:mask+1] (VOP3 0x100)
+    b.w.push_back(kC0 | (kV + 3) << 9 | mask << 18);
+    b.vop2(kVAddF32, 3, kV + 4, 3);
+    b.sop2(kSAddU32, 5, 5, kC0 + 1);
+    b.branch(kBranch, header);
+    b.land(exit);
+    b.exp_mrt0(3);
+    b.sopp(kEndpgm);
+    return b;
+}
+
+void loop_registers() {
+    {
+        const gcn::LiftResult s0 = lift(counted_loop(0)), s5 = lift(counted_loop(5));
+        CHECK(lifted_valid(s0, "a uniform loop counting in s0"));
+        CHECK(proof_has(s0, "2 phis (1 VGPRs, 0 lane masks)"));  // the counter is carried around the loop
+        CHECK(s0.ok() && s5.ok() && s0.spirv == s5.spirv);
+    }
+    for (const std::uint32_t mask : {0u, 20u}) {
+        const gcn::LiftResult r = lift(flipped_mask(mask));
+        CHECK(lifted_valid(r, "a lane mask flipped around a uniform loop"));
+        CHECK(proof_has(r, "1 lane masks)"));
+    }
+}
+
+constexpr std::uint32_t kSCmpLtI32 = 4, kCmpGeI32 = 0x86, kCmpEqU32 = 0xc2;  // SOPC, VOPC
+
+// A uniform loop counted by s5 whose exit sits inside an s_cbranch_execz
+// region of its body (EXEC = the pixels with s5 >= int(x)): GCN tests it
+// only in iterations where some pixel enters the region.
+Asm exit_in_region(bool in_if_arm) {
+    Asm a;
+    a.interp(2, 0, 0);
+    a.vop1(kVCvtI32F32, 4, kV + 2);
+    a.vop1(kVMov, 3, kC0);
+    a.sop1(kSMov, 5, kC0);
+    const std::uint32_t header = a.at();
+    a.vopc(kCmpGeI32, 5, 4);                        // vcc = s5 >= v4
+    a.sop1(kSAndSaveexec, 10, kVcc);
+    const std::size_t region = a.forward(kExecz);
+    std::size_t exit;
+    if (in_if_arm) {
+        a.sopc(kSCmpLtI32, 5, 0);                   // s5 < s0: stay
+        const std::size_t skip = a.forward(kScc1);
+        exit = a.forward(kBranch);                  // the then arm leaves the loop
+        a.land(skip);
+    } else {
+        a.sopc(kSCmpGeI32, 5, 0);                   // s5 >= s0: done
+        exit = a.forward(kScc1);
+    }
+    a.vop2(kVAddF32, 6, kOne, 6);
+    a.land(region);
+    a.sop1(kSMov64, kExec, 10);
+    a.vop2(kVAddF32, 3, kOne, 3);
+    a.sop2(kSAddU32, 5, 5, kC0 + 1);
+    a.branch(kBranch, header);
+    a.land(exit);
+    a.sop1(kSMov64, kExec, 10);
+    a.exp_mrt0(3);
+    a.sopp(kEndpgm);
+    return a;
+}
+
+// The per-lane exit idiom (each pixel adds while v5 < int(x)) with `body`
+// after the exit test: before EXEC is set to the lanes staying when
+// `before_restore`, else after it. Branches the body records in `exits`
+// land at the loop's exit.
+Asm divergent_body(const std::function<void(Asm&, std::vector<std::size_t>&)>& body, bool before_restore = false,
+                   std::uint32_t mask_from = kExec) {
+    std::vector<std::size_t> exits;
+    Asm a;
+    a.interp(2, 0, 0);
+    a.vop1(kVCvtI32F32, 4, kV + 2);
+    a.vop1(kVMov, 3, kC0);
+    a.vop1(kVMov, 5, kC0);
+    a.sop1(kSMov64, 10, kExec);                     // EXEC at entry, for after the loop
+    a.sop1(kSMov64, 12, mask_from);                 // the loop mask L
+    const std::uint32_t header = a.at();
+    a.vopc(kCmpGtI32, kV + 4, 5);                   // vcc = v4 > v5: stay
+    a.sop1(kSMov64, 14, kExec);
+    a.sop2(kSAndn2_64, kExec, 14, kVcc);            // EXEC = the lanes leaving
+    a.sop2(kSAndn2_64, 12, 12, kExec);              // L loses them
+    const std::size_t exit = a.forward(kScc0);
+    if (before_restore) body(a, exits);
+    a.sop2(kSAnd64, kExec, 14, 12);                 // EXEC = the lanes staying
+    if (!before_restore) body(a, exits);
+    a.vop2(kVAddI32, 5, kC0 + 1, 5);
+    a.branch(kBranch, header);
+    a.land(exit);
+    for (const std::size_t e : exits) a.land(e);
+    a.sop1(kSMov64, kExec, 10);
+    a.exp_mrt0(3);
+    a.sopp(kEndpgm);
+    return a;
+}
+
+void loop_exits_and_masks() {
+    CHECK(rejected_with(lift(exit_in_region(false)), "inside a region of its body"));
+    CHECK(rejected_with(lift(exit_in_region(true)), "inside a region of its body"));
+
+    // The game's idiom in a loop pixels leave at different iterations: EXEC
+    // narrowed by s_and_saveexec_b64 around a region and restored from the
+    // saved mask, within the loop mask throughout.
+    const auto add = [](Asm& a) { a.vop2(kVAddF32, 3, kOne, 3); };
+    {
+        const gcn::LiftResult r = lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) {
+            a.vopc(kCmpLtF32, kC0, 2);              // vcc = 0 < x
+            a.sop1(kSAndSaveexec, 16, kVcc);
+            add(a);
+            const std::size_t skip = a.forward(kExecz);
+            add(a);
+            a.land(skip);
+            a.sop1(kSMov64, kExec, 16);
+            add(a);
+        }));
+        CHECK(lifted_valid(r, "a region in a loop pixels leave at different iterations"));
+        CHECK(proof_has(r, "divergent, the per-lane exit idiom on s12"));
+    }
+    // EXEC widened past the loop mask: GCN runs the lanes that left again.
+    // Whole-quad mode (their quad-mates may still be in the loop) ...
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) {
+                            a.sop1(kSMov64, 16, kExec);
+                            a.sop1(kSWqm, kExec, kExec);
+                            add(a);
+                            a.sop1(kSMov64, kExec, 16);
+                        })),
+                        "whole-quad mode inside a loop pixels leave at different iterations"));
+    // ... EXEC at the loop's entry restored, after the lanes staying were set or before ...
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) {
+                            a.sop1(kSMov64, 16, kExec);
+                            a.sop1(kSMov64, kExec, 10);
+                            add(a);
+                            a.sop1(kSMov64, kExec, 16);
+                        })),
+                        "beyond the loop mask"));
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) {
+                            a.sop1(kSMov64, kExec, 10);
+                            add(a);
+                        }, true)),
+                        "beyond the loop mask"));
+    // ... or a write under the lanes leaving, which have left in the lift.
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) { add(a); }, true)), "beyond the loop mask"));
+    // The loop mask refilled with EXEC at entry: the lanes that left rejoin it (GCN never ends the loop).
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) {
+                            add(a);
+                            a.sop1(kSMov64, 12, 10);
+                        })),
+                        "loop mask"));
+    // A wave-wide exit on "some lane left this iteration" (s14 & ~s12): the
+    // lift knows the mask only for the pixel it runs.
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>& exits) {
+                            add(a);
+                            a.sop2(kSAndn2_64, 18, 14, 12);
+                            exits.push_back(a.forward(kScc1));
+                        })),
+                        "leaves the loop at"));
+    // A uniform loop's exit on "some lane outside EXEC" (-1 & ~EXEC): set on
+    // GCN in the helper and empty lanes, which the lift does not run.
+    {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.vop1(kVMov, 3, kC0);
+        a.sop1(kSMov, 5, kC0);
+        const std::uint32_t header = a.at();
+        a.sopc(kSCmpGeI32, 5, 0);
+        const std::size_t exit1 = a.forward(kScc1);
+        a.vop2(kVAddF32, 3, kOne, 3);
+        a.sop2(kSAndn2_64, 20, 193 /* -1 */, kExec);
+        const std::size_t exit2 = a.forward(kScc1);
+        a.sop2(kSAddU32, 5, 5, kC0 + 1);
+        a.branch(kBranch, header);
+        a.land(exit1);
+        a.land(exit2);
+        a.exp_mrt0(3);
+        a.sopp(kEndpgm);
+        CHECK(rejected_with(lift(a), "leaves the loop at"));
+    }
+    // x & ~(x & EXEC) with x = ~vcc, after whole-quad mode: clear for every
+    // pixel, but set on GCN in the lanes no pixel occupies (EXEC holds none of
+    // them), so the lift must not take x & EXEC for x.
+    {
+        Asm a;
+        a.sop1(kSWqm, kExec, kExec);
+        a.interp(2, 0, 0);
+        a.vop1(kVMov, 3, kC0);
+        a.vopc(kCmpGtF32, kC0, 2);                  // vcc = 0 > x
+        a.sop2(kSAndn2_64, 20, 193 /* -1 */, kVcc);  // s[20:21] = ~vcc
+        a.sop2(kSAnd64, 22, 20, kExec);             // s[22:23] = ~vcc & EXEC
+        a.sop1(kSMov, 5, kC0);
+        const std::uint32_t header = a.at();
+        a.sopc(kSCmpGeI32, 5, 0);
+        const std::size_t exit1 = a.forward(kScc1);
+        a.vop2(kVAddF32, 3, kOne, 3);
+        a.sop2(kSAndn2_64, 24, 20, 22);             // the lanes outside EXEC
+        const std::size_t exit2 = a.forward(kScc1);
+        a.sop2(kSAddU32, 5, 5, kC0 + 1);
+        a.branch(kBranch, header);
+        a.land(exit1);
+        a.land(exit2);
+        a.exp_mrt0(3);
+        a.sopp(kEndpgm);
+        CHECK(rejected_with(lift(a), "leaves the loop at"));
+    }
+    // The per-lane exit pair inside an if arm of a uniform loop, where the mask
+    // is EXEC itself: x & ~x is clear in every lane of the wave, so SCC is
+    // clear and the arm leaves the loop.
+    {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.vop1(kVMov, 3, kC0);
+        a.vopc(kCmpLtF32, kC0, 2);                  // vcc = 0 < x
+        a.sop1(kSAndSaveexec, 10, kVcc);            // EXEC = the pixels with 0 < x
+        const std::size_t region = a.forward(kExecz);
+        a.sop1(kSMov64, 20, kExec);
+        a.sop1(kSMov, 5, kC0);
+        const std::uint32_t header = a.at();
+        a.sopc(kSCmpGeI32, 5, 0);                   // s5 >= s0: the then arm
+        const std::size_t skip = a.forward(kScc0);
+        a.sop2(kSAndn2_64, 20, 20, kExec);          // EXEC & ~EXEC
+        const std::size_t exit = a.forward(kScc0);  // always taken
+        a.land(skip);
+        a.vop2(kVAddF32, 3, kOne, 3);
+        a.sop2(kSAddU32, 5, 5, kC0 + 1);
+        a.branch(kBranch, header);
+        a.land(exit);
+        a.land(region);
+        a.sop1(kSMov64, kExec, 10);
+        a.exp_mrt0(3);
+        a.sopp(kEndpgm);
+        const gcn::LiftResult r = lift(a);
+        CHECK(lifted_valid(r, "a uniform loop left through the per-lane exit pair in an if arm"));
+        CHECK(proof_has(r, "its then arm leaves the loop"));
+    }
+    // v_cmpx narrows EXEC in each iteration of a uniform loop: EXEC does not
+    // come back to the header as it left.
+    {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.vop1(kVMov, 3, kC0);
+        a.sop1(kSMov, 5, kC0);
+        const std::uint32_t header = a.at();
+        a.sopc(kSCmpGeI32, 5, 0);
+        const std::size_t exit = a.forward(kScc1);
+        a.vopc(0x11 /* v_cmpx_lt_f32 */, kV + 3, 2);  // EXEC &= v3 < x
+        a.vop2(kVAddF32, 3, kOne, 3);
+        a.sop2(kSAddU32, 5, 5, kC0 + 1);
+        a.branch(kBranch, header);
+        a.land(exit);
+        a.exp_mrt0(3);
+        a.sopp(kEndpgm);
+        CHECK(rejected_with(lift(a), "exec comes back to the header of the loop at"));
+    }
+    // The loop mask must start as a copy of EXEC, not as an equal constant (-1 has every lane, EXEC only the running pixels').
+    CHECK(rejected_with(lift(divergent_body([&](Asm& a, std::vector<std::size_t>&) { add(a); }, false, 193 /* -1 */)), "does not start as EXEC"));
+}
+
+// An alpha-test kill region; after it EXEC stays as the region narrowed it,
+// or is set again from the guard. GCN skips the region when no pixel of the
+// wave passes, so EXEC there keeps the pixels the lift kills.
+Asm kill_then_export(bool restore_from_guard) {
+    Asm a;
+    a.sop1(kSMov64, 20, kExec);
+    a.interp(2, 0, 0);
+    a.vop1(kVMov, 3, kTwo);
+    a.vopc(kCmpGtF32, kC0, 2);                      // vcc = 0 > x: kill
+    a.sop2(kSAndn2_64, 20, 20, kVcc);
+    const std::size_t end = a.forward(kScc0);
+    a.sop2(kSAnd64, kExec, kExec, 20);
+    a.vop2(kVMulF32, 3, kV + 2, 2);
+    a.land(end);
+    if (restore_from_guard) a.sop1(kSMov64, kExec, 20);
+    a.exp_mrt0(3);
+    a.sopp(kEndpgm);
+    return a;
+}
+
+// A uniform loop counted by the user SGPR s1 inside an s_cbranch_execz
+// region: the lift runs it for every pixel, also in waves GCN skips.
+Asm loop_in_region() {
+    Asm a;
+    a.interp(2, 0, 0);
+    a.vop1(kVMov, 3, kC0);
+    a.vopc(kCmpLtF32, kC0, 2);                      // vcc = 0 < x
+    a.sop1(kSAndSaveexec, 10, kVcc);
+    const std::size_t region = a.forward(kExecz);
+    a.sop1(kSMov, 5, kC0);
+    const std::uint32_t header = a.at();
+    a.sopc(kSCmpGeI32, 5, 1);
+    const std::size_t exit = a.forward(kScc1);
+    a.vop2(kVAddF32, 3, kOne, 3);
+    a.sop2(kSAddU32, 5, 5, kC0 + 1);
+    a.branch(kBranch, header);
+    a.land(exit);
+    a.land(region);
+    a.sop1(kSMov64, kExec, 10);
+    a.exp_mrt0(3);
+    a.sopp(kEndpgm);
+    return a;
+}
+
+void regions_and_kills() {
+    CHECK(lifted_valid(lift(kill_then_export(true)), "a kill region, EXEC set from the guard after it"));
+    CHECK(rejected_with(lift(kill_then_export(false)), "EXEC as the kill region at"));
+    {
+        const gcn::LiftResult r = lift(loop_in_region());
+        CHECK(lifted_valid(r, "a uniform loop inside a region"));
+        CHECK(proof_has(r, "the count GCN runs in any wave that enters it"));
+    }
+    // A uniform VGPR written outside whole-quad mode (EXEC = the coverage)
+    // and compared in it: GCN's helper lanes kept v5 = 0, and their VCC bits
+    // take part in the wave-wide s_cbranch_vccz.
+    {
+        Asm a;
+        a.sop1(kSMov64, 20, kExec);                 // the coverage
+        a.sop1(kSWqm, kExec, kExec);
+        a.interp(2, 0, 0);
+        a.vop1(kVMov, 5, kC0);                      // v5 = 0 in every lane of the quads
+        a.sop1(kSAndSaveexec, 22, 20);              // EXEC = the coverage
+        a.vop1(kVMov, 5, 0);                        // v5 = s0 in the covered pixels
+        a.sop1(kSMov64, kExec, 22);                 // whole-quad mode again
+        a.vopc(kCmpEqU32, kC0, 5);                  // vcc = 0 == v5
+        const std::size_t to_else = a.forward(kVccz);
+        a.vop1(kVMov, 6, kOne);
+        const std::size_t to_join = a.forward(kBranch);
+        a.land(to_else);
+        a.vop1(kVMov, 6, kTwo);
+        a.land(to_join);
+        a.sop1(kSMov64, kExec, 20);
+        a.exp_mrt0(6);
+        a.sopp(kEndpgm);
+        CHECK(rejected_with(lift(a), "VCC that may differ between lanes"));
+    }
+    // Whole quads of a mask clear in every covered pixel but set in GCN's
+    // helper lanes (the complement of the coverage): GCN sets the covered
+    // pixels of every partly covered quad.
+    {
+        Asm a;
+        a.sop2(kSAndn2_64, 0, 193 /* -1 */, kExec);  // s[0:1] = ~EXEC
+        a.sop1(kSWqm, 2, 0);                        // s[2:3] = whole quads of it
+        a.w.push_back(0xd2000000u | 3u);            // v_cndmask_b32 v3, 0, 1.0, s[2:3]
+        a.w.push_back(kC0 | kOne << 9 | 2u << 18);
+        a.exp_mrt0(3);
+        a.sopp(kEndpgm);
+        CHECK(rejected_with(lift(a), "whole-quad mode of a mask"));
+    }
+}
+
 void run() {
     loops();
     regions_and_ifs();
+    loop_registers();
+    loop_exits_and_masks();
+    regions_and_kills();
 }
 
 }  // namespace control_flow
@@ -2153,9 +2581,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed\n", g_failures);
         return 1;
     }
-    std::printf("gcn_lift_test ok: the hand-encoded programs pass (every ds_swizzle_b32 quad pattern lifted exactly, loops, regions and "
-                "ifs, lane writes, texture LOD and whole-quad mode, the unproven ones refused); pilot lifted (%zu words), its constructs "
-                "checked\n",
+    std::printf("gcn_lift_test ok: the hand-encoded programs pass (every ds_swizzle_b32 quad pattern lifted exactly, v_cndmask_b32's "
+                "modifiers and packed exports, loops, regions and ifs, lane writes, texture LOD and whole-quad mode, the unproven ones "
+                "refused); pilot lifted (%zu words), its constructs checked\n",
                 ok.spirv.size());
     return 0;
 }
