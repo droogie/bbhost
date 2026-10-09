@@ -291,15 +291,17 @@ GPU_BUSY = re.compile(r"gpu busy ([\d.]+) ms/s")
 DETAIL = re.compile(r"\] frame detail: draws (\d+): pixel shader lifted (\d+), translated (\d+), fallback (\d+), none (\d+); "
                     r"draw failures (\d+)(?: \((.*)\))?")
 INTERVALS = re.compile(r"\] frame intervals ms:((?: [\d.]+)+)\s*$")
-TRAVEL = re.compile(r"\] mapval step \d+ travel (\S+) ([\d.]+) return point (\d+) block ([0-9a-f]+) -> (\w+)")
-TRAVEL_DONE = re.compile(r"\] mapval travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s")
-TRAVEL_FAILED = re.compile(r"\] mapval travel-failed (\S+) ([\d.]+) in ([0-9a-f]+) after ([\d.]+) s")
-MARK = re.compile(r"\] mapval mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)")
-AT = re.compile(r"\] mapval at (\S+?):view ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
-REWARP = re.compile(r"\] mapval rewarp ")
-RETRAVEL = re.compile(r"\] mapval retravel ")
-QUIET = re.compile(r"\] mapval quiet [\d.]+ (\d+) enemies within")
-CAMERA = re.compile(r"\] mapval camera [\d.]+ (\w+)")
+# The probe's lines, as bbhost logs a plugin's ("plugin: <line>", host/plugins.cpp).
+PROBE = r"\] (?:plugin: )?mapval "
+TRAVEL = re.compile(PROBE + r"step \d+ travel (\S+) ([\d.]+) return point (\d+) block ([0-9a-f]+) -> (\w+)")
+TRAVEL_DONE = re.compile(PROBE + r"travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s")
+TRAVEL_FAILED = re.compile(PROBE + r"travel-failed (\S+) ([\d.]+) in ([0-9a-f]+) after ([\d.]+) s")
+MARK = re.compile(PROBE + r"mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)")
+AT = re.compile(PROBE + r"at (\S+?):view ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
+REWARP = re.compile(PROBE + r"rewarp ")
+RETRAVEL = re.compile(PROBE + r"retravel ")
+QUIET = re.compile(PROBE + r"quiet [\d.]+ (\d+) enemies within")
+CAMERA = re.compile(PROBE + r"camera [\d.]+ (\w+)")
 DUMP_DONE = re.compile(r"\] test: frame dump at flip (\d+) to (\S+?)( failed)?\s*$")
 CAPTURE_WROTE = re.compile(r"\] capture: wrote (\S+)/manifest\.json \((\S+), flip (\d+)")
 CAPTURE_REJECTED = re.compile(r"\] capture: (\S+) draw \d+ \(flip \d+\) not captured: (.*?)\s*$")
@@ -313,8 +315,9 @@ PS_LIFTED = re.compile(r"\] render: PS (\w+) lifted \(")
 PS_NOT_LIFTED = re.compile(r"\] render: PS (\w+) not lifted, translated shader kept: (.*?)\s*$")
 PIPELINE_FAILED = re.compile(r"\] render: pipeline (\S+) failed to build")
 WORLD = re.compile(r"\] world: the first in-game frame, flip (\d+), ([\d.]+) s after start")
-TOUR_START = re.compile(r"\] mapval tour-start ")
-TOUR_DONE = re.compile(r"\] mapval tour-done ")
+TOUR_START = re.compile(PROBE + r"tour-start ")
+PROBE_LINE = re.compile(PROBE)
+TOUR_DONE = re.compile(PROBE + r"tour-done ")
 VERSION = re.compile(r"\] bbhost (v\S+) \(")
 FATAL = re.compile(r"SIGSEGV pc=|dumped core|Segmentation fault|the device is lost|VK_ERROR_DEVICE_LOST|\] DL_PANIC ")
 PROBLEM = re.compile(r"HLE stub #|descriptor set allocation failed|wait timed out|capture: .*abandoned")
@@ -379,7 +382,7 @@ class Log:
             if m and self.seconds:
                 self.seconds[-1][1]["intervals"].extend(float(v) for v in m.group(1).split())
                 return
-        if "] mapval " in line:
+        if "mapval " in line and PROBE_LINE.search(line):
             for kind, rx in (("travel", TRAVEL), ("travel_done", TRAVEL_DONE), ("travel_failed", TRAVEL_FAILED),
                              ("mark", MARK), ("at", AT), ("quiet", QUIET), ("camera", CAMERA)):
                 m = rx.search(line)

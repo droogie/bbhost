@@ -51,7 +51,8 @@ def second(intervals, **kw):
 
 
 def mapval(fmt, *args):
-    return "[bbhost] " + (fmt % args)
+    """A probe line as bbhost logs a plugin's."""
+    return "[bbhost] plugin: " + (fmt % args)
 
 
 def area_lines(area, t, block, window_intervals, view=None, settle_events=(), dump_dir="frames", kind="perf", captures=()):
@@ -177,7 +178,7 @@ class TourTest(unittest.TestCase):
                     time.sleep(0.5)
                     leftover = sorted(os.listdir(req))
                     print("[bbhost] leftover %d" % len(leftover), flush=True)
-                    print("[bbhost] mapval tour-done 1.000", flush=True)
+                    print("[bbhost] plugin: mapval tour-done 1.000", flush=True)
                     time.sleep(0.2)
                     sys.exit(0)
                 time.sleep(0.02)
@@ -223,7 +224,7 @@ class LogTest(unittest.TestCase):
         window[5][10] = 40.0  # one hitch
         lines = ["[bbhost] bbhost v0.2.16-14-g2291ffe+ (2291ffe+, Linux x86-64)",
                  "[bbhost] world: the first in-game frame, flip %d, %.1f s after start" % (1500, 31.0),
-                 "[bbhost] mapval tour-start %.3f" % 100.0]
+                 "[bbhost] plugin: mapval tour-start %.3f" % 100.0]
         lines += area_lines(cy, 100.0, "18010000", window, settle_events=[
             "[bbhost] render: PS a22c7f71 lifted (%d words; translated %d)" % (900, 2000),
             "[bbhost] render: PS 6c5edb96 not lifted, translated shader kept: %s" % "0x01c: ds_swizzle_b32 is not lifted",
@@ -238,8 +239,16 @@ class LogTest(unittest.TestCase):
             "[bbhost] render: pipeline %s failed to build; its draws are skipped (first at flip %d)" % ("1111+2222", 1300)])
         view = rom.view()
         lines += area_lines(rom, 160.0, "20000000", [[16.7] * 60 for _ in range(20)], view=view)
-        lines.append("[bbhost] mapval tour-done %.3f" % 220.0)
+        lines.append("[bbhost] plugin: mapval tour-done %.3f" % 220.0)
         return lines, window
+
+    def test_probe_lines_with_and_without_the_plugin_prefix(self):
+        line = "mapval mark central-yharnam:arrived 108.000 18010000 1.000 2.000 3.000 yaw 0.500"
+        for prefix in ("[bbhost] plugin: ", "[bbhost] "):
+            m = ac.MARK.search(prefix + line)
+            self.assertIsNotNone(m, prefix)
+            self.assertEqual((m.group(1), m.group(2)), ("central-yharnam", "arrived"))
+        self.assertTrue(ac.TOUR_DONE.search("[bbhost] plugin: mapval tour-done 1.000"))
 
     def test_places_from_the_log(self):
         lines, window = self.run_lines()
