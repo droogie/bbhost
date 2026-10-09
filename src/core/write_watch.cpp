@@ -134,6 +134,19 @@ __attribute__((no_stack_protector, always_inline)) inline int protect_pages(std:
     return (e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_NO_SYSTEM_RESOURCES || e == ERROR_COMMITMENT_LIMIT) ? ENOMEM
                                                                                                           : EACCES;
 }
+#elif defined(__APPLE__)
+// libc's mprotect: the raw call below is Linux's system call convention.
+// macOS's libc reaches errno through GS, not FS, and the guest's TLS there is
+// to leave GS the system's (TODO(macos): guest TLS, core/thunk.cpp).
+// Returns 0 or the errno value.
+__attribute__((no_stack_protector, always_inline)) inline int protect_pages(std::uint64_t addr, std::uint64_t len,
+                                                                            bool writable) {
+    if (mprotect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)), static_cast<std::size_t>(len),
+                 writable ? (PROT_READ | PROT_WRITE) : PROT_READ) == 0) {
+        return 0;
+    }
+    return errno;
+}
 #else
 // mprotect without libc: its wrapper sets errno on failure, and errno is
 // thread-local - through FS, which on a guest thread is the guest's.
