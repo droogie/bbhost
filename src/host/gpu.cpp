@@ -1,3 +1,7 @@
+// macOS: VkPhysicalDevicePortabilitySubsetFeaturesKHR is in the beta header.
+#if defined(__APPLE__)
+#define VK_ENABLE_BETA_EXTENSIONS 1
+#endif
 #include "core/config.h"
 #include "core/host_clock.h"
 #include "core/paced_file.h"
@@ -1422,6 +1426,7 @@ struct Candidate {
     std::uint32_t family = 0, queues = 0;
     bool sparse = false, maint8 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
     bool memory_fd = false, dma_buf = false;
+    bool portability = false;  // VK_KHR_portability_subset listed: a device that must have it enabled (MoltenVK)
     int type_rank = 0;
     VkDeviceSize local = 0;
     VkDeviceSize heaps = 0;  // every heap, device-local or not (memory_tight)
@@ -1461,6 +1466,7 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             if (std::strcmp(e.extensionName, "VK_AMD_buffer_marker") == 0) c.buffer_marker = true;
             if (std::strcmp(e.extensionName, "VK_KHR_external_memory_fd") == 0) c.memory_fd = true;
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_dma_buf") == 0) c.dma_buf = true;
+            if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) c.portability = true;
         }
         VkPhysicalDeviceProperties dp{};
         vkGetPhysicalDeviceProperties(d, &dp);
@@ -1570,6 +1576,29 @@ bool small_vram(const Candidate& c) {
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
 
+// macOS: MoltenVK is a portability driver - Vulkan over Metal, with what Metal
+// lacks left out and listed (VK_KHR_portability_subset) - and the loader shows
+// such a driver's devices only to an instance that asks for them, with
+// VK_KHR_portability_enumeration and its flag. Every instance bbhost makes on
+// macOS asks; a loader too old to know the extension shows them anyway.
+void portability_enumeration(VkInstanceCreateInfo& ici, std::vector<const char*>& exts) {
+#if defined(__APPLE__)
+    std::uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> props(n);
+    if (n) vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (std::strcmp(props[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != 0) continue;
+        exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        break;
+    }
+#else
+    (void)ici;
+    (void)exts;
+#endif
+}
+
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
 // running or not, and leaves out while DISABLE_VULKAN_OBS_CAPTURE is set. On
@@ -1662,6 +1691,7 @@ bool init_locked() {
         iext.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    portability_enumeration(ici, iext);
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = static_cast<std::uint32_t>(iext.size());
     ici.ppEnabledExtensionNames = iext.data();
@@ -1683,7 +1713,7 @@ bool init_locked() {
         }
         host_log("gpu: validation layer enabled");
     }
-    bool has_swapchain = false;
+    bool has_swapchain = false, portability = false;
     std::vector<Candidate> usable;
     const int chosen = choose_device(g.instance, true, usable);
     if (chosen < 0) {
@@ -1718,6 +1748,7 @@ bool init_locked() {
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
         has_swapchain = c.swapchain;
+        portability = c.portability;
         host_log("gpu: diagnostics available: VK_EXT_device_fault=%d VK_NV_device_diagnostic_checkpoints=%d VK_AMD_buffer_marker=%d",
                  static_cast<int>(c.fault), static_cast<int>(c.checkpoints), static_cast<int>(c.buffer_marker));
         {
@@ -1928,6 +1959,8 @@ bool init_locked() {
         dext.push_back("VK_EXT_graphics_pipeline_library");
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
+    // Required where listed (VUID-VkDeviceCreateInfo-pProperties-04451).
+    if (portability) dext.push_back("VK_KHR_portability_subset");
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -1977,6 +2010,25 @@ bool init_locked() {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
     }
+#if defined(__APPLE__)
+    // Using a subset feature not enabled is invalid even where the device has
+    // it, so every one it has is enabled.
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR fport{};
+    fport.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR;
+    if (portability) {
+        VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        qf.pNext = &fport;
+        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+        fport.pNext = f13.pNext;
+        f13.pNext = &fport;
+        host_log("gpu: portability subset: point polygons %d, sampler mip LOD bias %d, tessellation isolines %d and point mode %d, "
+                 "triangle fans %d, format swizzles %d, format reinterpretation %d",
+                 static_cast<int>(fport.pointPolygons), static_cast<int>(fport.samplerMipLodBias),
+                 static_cast<int>(fport.tessellationIsolines), static_cast<int>(fport.tessellationPointMode),
+                 static_cast<int>(fport.triangleFans), static_cast<int>(fport.imageViewFormatSwizzle),
+                 static_cast<int>(fport.imageViewFormatReinterpretation));
+    }
+#endif
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
     // asking for a size, and Vulkan then holds every stage to the device's
@@ -2474,13 +2526,13 @@ bool init_locked() {
         return false;
     }
     choose_dmem_import();
-    host_log("gpu: %s (Vulkan %u.%u), subgroup size %u (stages 0x%x: %s%s%s), host pointer alignment %u%s%s%s", props.deviceName,
+    host_log("gpu: %s (Vulkan %u.%u), subgroup size %u (stages 0x%x: %s%s%s), host pointer alignment %u%s%s%s%s", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), subp.subgroupSize,
              g.subgroup_stages, (g.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT) ? "vertex " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) ? "tess-eval " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ? "compute" : "", g.host_pointer_align,
              g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
-             g.has_tessellation ? ", tessellation" : "");
+             g.has_tessellation ? ", tessellation" : "", portability ? ", portability subset" : "");
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
     // translator above (they are part of every key).
@@ -5322,12 +5374,17 @@ bool host_gpu_memory_tight() {
     bool tight = false;
     if (g_enabled) {
         obs_capture_policy();  // before the first instance, this one
-        // Before the device: an instance of its own, without extensions.
+        // Before the device: an instance of its own, without the window's
+        // extensions.
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "bbhost";
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
+        std::vector<const char*> iext;
+        portability_enumeration(ici, iext);
+        ici.enabledExtensionCount = static_cast<std::uint32_t>(iext.size());
+        ici.ppEnabledExtensionNames = iext.data();
         VkInstance instance = VK_NULL_HANDLE;
         if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
             std::vector<Candidate> usable;
