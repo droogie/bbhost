@@ -2738,7 +2738,9 @@ struct Translator {
         }
         case 118: write_v(in.dst, rd(iadd(addr, cu(off)))); write_v(in.dst + 1, rd(iadd(addr, cu(off + 4)))); break;
         case 53: {  // ds_swizzle_b32
-            const Id v = read_s(in.src0, in);
+            // Its one operand is the VGPR in the address field; DATA0 is unused
+            // (the game's programs leave it 0, so reading it shuffled v0).
+            const Id v = addr;
             const Id l = lane();
             Id src_lane;
             if (off & 0x8000) {  // quad permute mode
