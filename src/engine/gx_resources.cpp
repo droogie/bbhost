@@ -28,6 +28,7 @@
 //             0x256d690 (rdi = holder + 0x18).
 #include "engine/gx_resources.h"
 
+#include "core/asm_sym.h"
 #include "core/elf.h"
 #include "core/portable.h"
 #include "core/write_watch.h"
@@ -685,13 +686,8 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
 }
 
 extern "C" void* g_gx_res_after_thunk = nullptr;
-#if defined(_WIN32)
-#define GR_TYPE_(n)
-#else
-#define GR_TYPE_(n) ".type " #n ", @function\n"
-#endif
-asm(".text\n.globl gx_res_ret\n" GR_TYPE_(gx_res_ret) "gx_res_ret:\n"
-    "push %rax\n push %rdx\n mov %rax, %rdi\n call *g_gx_res_after_thunk(%rip)\n"
+asm(".text\n.globl " ASM_SYM(gx_res_ret) "\n" ASM_TYPE_FUNCTION(gx_res_ret) ASM_SYM(gx_res_ret) ":\n"
+    "push %rax\n push %rdx\n mov %rax, %rdi\n call *" ASM_SYM(g_gx_res_after_thunk) "(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 std::uint64_t gx_resources_create_failures() { return g_create_failures.load(std::memory_order_relaxed); }

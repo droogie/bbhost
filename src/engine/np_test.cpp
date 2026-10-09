@@ -1,5 +1,6 @@
 #include "engine/np_test.h"
 
+#include "core/asm_sym.h"
 #include "core/elf.h"
 #include "core/thunk.h"
 #include "engine/addr.h"
@@ -342,13 +343,8 @@ extern "C" GUEST_ABI void dl_free_note(std::uint64_t ptr) {
 }
 extern "C" void* g_dl_alloc_result_thunk = nullptr;
 extern "C" void dl_alloc_ret();
-#if defined(_WIN32)
-#define DL_TYPE_(n)
-#else
-#define DL_TYPE_(n) ".type " #n ", @function\n"
-#endif
-asm(".text\n.globl dl_alloc_ret\n" DL_TYPE_(dl_alloc_ret) "dl_alloc_ret:\n"
-    "push %rax\n push %rdx\n mov %rax, %rdi\n call *g_dl_alloc_result_thunk(%rip)\n"
+asm(".text\n.globl " ASM_SYM(dl_alloc_ret) "\n" ASM_TYPE_FUNCTION(dl_alloc_ret) ASM_SYM(dl_alloc_ret) ":\n"
+    "push %rax\n push %rdx\n mov %rax, %rdi\n call *" ASM_SYM(g_dl_alloc_result_thunk) "(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 void np_test_install(ElfImage* image) {
