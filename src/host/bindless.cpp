@@ -119,6 +119,15 @@ bool bindless_create_locked(std::uint32_t max_images, std::uint32_t max_samplers
     lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
     lci.bindingCount = 3;
     lci.pBindings = binds;
+    // Past maxPerSetDescriptors only if the device says so; MoltenVK (1212 a
+    // set) says no, so bindless is off there.
+    VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+    vkGetDescriptorSetLayoutSupport(g.device, &lci, &support);
+    if (!support.supported) {
+        host_log("gpu: bindless: the device does not take a global set of %u descriptors (vkGetDescriptorSetLayoutSupport); off",
+                 g_images.capacity + g_storage.capacity + g_sampler_capacity);
+        return false;
+    }
     if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &g.bindless_layout) != VK_SUCCESS) {
         host_log("gpu: bindless: the global set's layout failed; off");
         return false;
