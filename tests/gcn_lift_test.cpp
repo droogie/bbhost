@@ -476,6 +476,109 @@ void synthetic_swizzles() {
     }
 }
 
+// ds_swizzle_b32 and loops. Every pixel runs a uniform loop's iterations, so a
+// swizzle there sees its quad; in a loop pixels leave at different iterations
+// it would not. A value that comes back to a loop's header with helper lanes
+// GCN may hold differently is inexact there (found on a second attempt).
+std::uint32_t branch_to(const std::vector<std::uint32_t>& w, std::uint32_t op, std::size_t target) {  // from the next slot
+    return sopp(op, static_cast<std::int16_t>(static_cast<int>(target) - static_cast<int>(w.size()) - 1));
+}
+void swizzles_and_loops() {
+    constexpr std::uint32_t kSMov = 3, kSAddU32 = 0, kSAndn2B64 = 21, kSCmpGeI32 = 3, kVAddF32 = 3, kVAddI32 = 37, kVCvtI32F32 = 8;
+    constexpr std::uint32_t kCmpGtI32 = 0x84, kBranch = 2, kScc0 = 4, kScc1 = 5;
+    // acc += swizzle(v6) s0 times; `inexact_write` rewrites v6 under the
+    // coverage EXEC at the end of each iteration.
+    const auto uniform_loop = [&](bool inexact_write) {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);  // v2 = x, in whole-quad mode
+        push(w, {vop1(kVMov, 3, kZero), vop1(kVMov, 6, kV + 2), sop1(kSMov, 5, kZero)});
+        const std::size_t header = w.size();
+        w.push_back(sopc(kSCmpGeI32, 5, 0));  // s5 >= s0
+        const std::size_t exit = w.size();
+        w.push_back(0);
+        swizzle(w, 4, 6, 0x8055);
+        w.push_back(vop2(kVAddF32, 3, 3, kV + 4));
+        if (inexact_write) {
+            push(w, {sop1(kMovB64, kExec, 2), vop1(kVMov, 6, kV + 2), sop1(kWqmB64, kExec, kExec)});
+        } else {
+            w.push_back(vop1(kVMov, 6, kV + 3));
+        }
+        w.push_back(sop2(kSAddU32, 5, 5, kZero + 1));
+        w.push_back(branch_to(w, kBranch, header));
+        w[exit] = sopp(kScc1, static_cast<std::int16_t>(w.size() - exit - 1));
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        return w;
+    };
+    {
+        const Lifted l = lift_words(uniform_loop(false), synthetic_options(1));
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "swizzle in a uniform loop rejected: %s\n", why.c_str());
+        CHECK(l.lift.ok() && spirv_valid(l.lift.spirv) && count_op(l.lift.spirv, 365) == 1 && count_op(l.lift.spirv, 246) == 1);
+    }
+    {
+        const Lifted l = lift_words(uniform_loop(true), synthetic_options(1));
+        CHECK(l.ref.ok());
+        CHECK(rejected_with(l.lift, "ds_swizzle_b32 of v6, which the quad's helper lanes may hold differently"));
+    }
+    // The per-lane exit idiom in whole-quad mode: each pixel adds 1.0 while v5 < int(x).
+    {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {vop1(kVCvtI32F32, 4, kV + 2), vop1(kVMov, 3, kZero), vop1(kVMov, 5, kZero), sop1(kMovB64, 10, kExec),
+                 sop1(kMovB64, 12, kExec)});
+        const std::size_t header = w.size();
+        push(w, {vopc(kCmpGtI32, 5, kV + 4), sop1(kMovB64, 14, kExec), sop2(kSAndn2B64, kExec, 14, kVcc), sop2(kSAndn2B64, 12, 12, kExec)});
+        const std::size_t exit = w.size();
+        w.push_back(0);
+        w.push_back(sop2(kAndB64, kExec, 14, 12));
+        swizzle(w, 6, 2, 0x8055);
+        push(w, {vop2(kVAddF32, 3, 3, kV + 6), vop2(kVAddI32, 5, 5, kZero + 1)});
+        w.push_back(branch_to(w, kBranch, header));
+        w[exit] = sopp(kScc0, static_cast<std::int16_t>(w.size() - exit - 1));
+        push(w, {sop1(kMovB64, kExec, 10), sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 3, 3, 3, 3);
+        w.push_back(kEndpgm);
+        const Lifted l = lift_words(w);
+        CHECK(l.ref.ok());
+        CHECK(rejected_with(l.lift, "ds_swizzle_b32 inside a loop pixels leave at different iterations"));
+    }
+    // That loop inside a region whose EXEC (`coverage`: ANDed with the
+    // coverage the program started with) GCN's helper lanes do not share: in
+    // the body EXEC is known set, but not in GCN's helper lanes, so what the
+    // loop computes is not theirs, and a swizzle after it is refused.
+    const auto loop_in_region = [&](bool coverage) {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);
+        push(w, {vop1(kVCvtI32F32, 4, kV + 2), vop1(kVMov, 3, kZero), vop1(kVMov, 5, kZero), vopc(kVCmpGtF32, 2, kZero) /* vcc = 0 > x */,
+                 sop2(kAndB64, 16, kVcc, coverage ? 2 : kExec), sop1(kAndSaveexecB64, 18, 16)});
+        const std::size_t region = w.size();
+        w.push_back(0);
+        push(w, {sop1(kMovB64, 10, kExec), sop1(kMovB64, 12, kExec)});
+        const std::size_t header = w.size();
+        push(w, {vopc(kCmpGtI32, 5, kV + 4), sop1(kMovB64, 14, kExec), sop2(kSAndn2B64, kExec, 14, kVcc), sop2(kSAndn2B64, 12, 12, kExec)});
+        const std::size_t exit = w.size();
+        w.push_back(0);
+        push(w, {sop2(kAndB64, kExec, 14, 12), vop2(kVAddF32, 3, 3, kOne), vop2(kVAddI32, 5, 5, kZero + 1)});
+        w.push_back(branch_to(w, kBranch, header));
+        w[exit] = sopp(kScc0, static_cast<std::int16_t>(w.size() - exit - 1));
+        w.push_back(sop1(kMovB64, kExec, 10));
+        w[region] = sopp(8 /* s_cbranch_execz */, static_cast<std::int16_t>(w.size() - region - 1));
+        w.push_back(sop1(kMovB64, kExec, 18));
+        swizzle(w, 6, 3, 0x8055);
+        push(w, {sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 6, 6, 6, 6);
+        w.push_back(kEndpgm);
+        return lift_words(w);
+    };
+    {
+        const Lifted l = loop_in_region(false);
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "swizzle after a loop in a region rejected: %s\n", why.c_str());
+        CHECK(l.lift.ok() && spirv_valid(l.lift.spirv) && count_op(l.lift.spirv, 365) == 1);
+    }
+    CHECK(rejected_with(loop_in_region(true).lift, "ds_swizzle_b32 of v3, which the quad's helper lanes may hold differently"));
+}
+
 }  // namespace
 
 // Hand-encoded pixel shaders for the lifter's control flow: loops (uniform and
@@ -902,6 +1005,7 @@ int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
     control_flow::run();
     synthetic_swizzles();
+    swizzles_and_loops();
     if (g_failures) {
         std::fprintf(stderr, "gcn_lift_test: %d check(s) failed in the hand-encoded programs\n", g_failures);
         return 1;

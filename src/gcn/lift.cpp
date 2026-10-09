@@ -54,7 +54,9 @@
 //     below it) and launches helper invocations for the quad's uncovered
 //     pixels. It is accepted only where EXEC is known set in whole-quad mode,
 //     so every lane of the quad is active on GCN and returns its own value, and
-//     only of a value the helper lanes computed as GCN's did (Val::helper_inexact).
+//     only of a value the helper lanes computed as GCN's did (Val::helper_inexact,
+//     carried around loops), never inside a loop pixels leave at different
+//     iterations.
 //   * Scalar loads read the storage buffers the reference bound for them
 //     (TranslateResult::buffer_at), with the translator's landing rule: a load
 //     is stored at once and stored again at the next s_waitcnt on lgkmcnt,
@@ -146,10 +148,14 @@ class Lifter {
 public:
     // `loop_phis`: lane masks (loop header, key) an earlier attempt found
     // changed around a loop; they get phis instead of being assumed unchanged.
+    // `loop_inexact`: registers (loop header, key) an earlier attempt found
+    // coming back to the header with helper lanes GCN may hold differently
+    // (Val::helper_inexact); they are inexact at the header from the start.
     using LoopPhis = std::set<std::pair<std::uint32_t, int>>;
-    Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r, const LoopPhis& loop_phis = {})
-        : prog(p), opt(o), ref(r), lane_phi_hints(loop_phis) {}
+    Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r, const LoopPhis& loop_phis = {}, const LoopPhis& loop_inexact = {})
+        : prog(p), opt(o), ref(r), lane_phi_hints(loop_phis), inexact_hints(loop_inexact) {}
     LoopPhis more_lane_phis;  // set when a lift failed only because a lane mask needs a phi
+    LoopPhis more_inexact;    // ... or because helper lanes came back around a loop less exact than they left
 
     LiftResult run() {
         check_program();
@@ -2069,6 +2075,12 @@ private:
             reject("ds_swizzle_b32 after a kill region where the lift may differ from GCN in pixels it kills: their quad reads them");
             return;
         }
+        // In a loop pixels leave at different iterations, the rest of the quad
+        // may have left: the lift's quad operation would not see their values.
+        if (in_divergent_loop()) {
+            reject("ds_swizzle_b32 inside a loop pixels leave at different iterations");
+            return;
+        }
         const Val src = value(256 + in.vaddr);
         if (const auto init = initials.find(256 + in.vaddr);
             init != initials.end() && init->second.constant && src.constant && src.kind == init->second.kind && src.bits == init->second.bits) {
@@ -2525,7 +2537,9 @@ private:
         Arm& a = arms.back();
         if (!a.in_else) then_to_else(a);  // an if without an else arm: an empty else block
         // Helper lanes after the join: inexact where either arm left them so
-        // (merge_arms makes its phis without the flag).
+        // (merge_arms makes its phis without the flag). An arm that left the
+        // loop it is in does not reach the join: merge_live_arm keeps the
+        // other arm's values, flags and all.
         std::set<int> inexact_regs, inexact_lanes;
         const auto collect = [&](const std::map<int, Val>& then_end, const std::map<int, Val>& else_end, const std::map<int, Val>& at_branch,
                                  std::set<int>& out) {
@@ -2540,8 +2554,10 @@ private:
                 }
             }
         };
-        collect(a.reg1, reg, a.reg0, inexact_regs);
-        collect(a.lanes1, lanes, a.lanes0, inexact_lanes);
+        if (!a.then_dead && !block_dead) {
+            collect(a.reg1, reg, a.reg0, inexact_regs);
+            collect(a.lanes1, lanes, a.lanes0, inexact_lanes);
+        }
         merge_arms(a);
         for (auto& [k, v] : reg) v.helper_inexact = v.helper_inexact || inexact_regs.count(k) != 0;
         for (auto& [k, v] : lanes) v.helper_inexact = v.helper_inexact || inexact_lanes.count(k) != 0;
@@ -2732,7 +2748,8 @@ private:
             int key;
             Kind kind;
             Id id;
-            bool uniform;  // a scalar from values every lane holds alike: checked at the back edge
+            bool uniform;         // a scalar from values every lane holds alike: checked at the back edge
+            bool helper_inexact;  // Val::helper_inexact at the header: the back edge's value may not be less exact
         };
         std::vector<Phi> phis;
         std::map<int, Val> unchanged;  // lane masks assumed to come back to the header as they left it
@@ -2756,7 +2773,7 @@ private:
     std::set<std::uint32_t> loop_exits;  // branches that leave their innermost loop for its exit
     std::set<Id> assumed;                // lane masks set wherever the lift now is (a divergent loop's body)
     bool block_dead = false;             // the current block ended by leaving a loop
-    const LoopPhis lane_phi_hints;
+    const LoopPhis lane_phi_hints, inexact_hints;
     std::size_t loops_lifted = 0, divergent_loops = 0;
 
     bool loop_branch(std::uint32_t offset) const {
@@ -2774,11 +2791,19 @@ private:
         return std::any_of(open_loops.begin(), open_loops.end(), [](const Loop* l) { return l->mask >= 0; });
     }
     // `v` as the lift knows it here: set where a divergent loop's body knows so.
+    // The helper lanes' bits stay as exact as `v`'s were.
     Val known(const Val& v) {
         if (v.constant || v.kind != Kind::Lane || assumed.empty()) return v;
-        if (assumed.count(v.id)) return lane_const(true);
-        if (const auto it = negation_of.find(v.id); it != negation_of.end() && assumed.count(it->second)) return lane_const(false);
-        return v;
+        Val r;
+        if (assumed.count(v.id)) {
+            r = lane_const(true);
+        } else if (const auto it = negation_of.find(v.id); it != negation_of.end() && assumed.count(it->second)) {
+            r = lane_const(false);
+        } else {
+            return v;
+        }
+        r.helper_inexact = v.helper_inexact;
+        return r;
     }
 
     void find_loops() {
@@ -2978,14 +3003,17 @@ private:
             int key;
             Kind kind;
             Id id;
-            bool uni;
+            bool uni, inexact;
         };
+        // Helper lanes at the header: as exact as on entry, unless an earlier
+        // attempt saw them come back less exact.
+        const auto inexact_at_header = [&](int k, const Val& v) { return v.helper_inexact || inexact_hints.count({l.header, k}) != 0; };
         std::vector<Entry> words;
-        std::vector<std::pair<int, Id>> masks;  // lane masks that get phis
+        std::vector<Entry> masks;  // lane masks that get phis
         const auto add_word = [&](int k) {
             const Val v = value(k);
             const bool f = v.kind == Kind::Float;
-            words.push_back({k, f ? Kind::Float : Kind::Word, f ? v.id : as_u(v), k < 256 && uniform(v)});
+            words.push_back({k, f ? Kind::Float : Kind::Word, f ? v.id : as_u(v), k < 256 && uniform(v), inexact_at_header(k, v)});
         };
         for (int k : vgprs) add_word(k);
         const auto e = lanes.find(kKeyExec);
@@ -3014,7 +3042,8 @@ private:
             } else if (it == lanes.end()) {
                 continue;  // no mask here (VCC's words were written): reading it before writing it rejects
             } else if (lane_phi_hints.count({l.header, k})) {
-                masks.push_back({k, it->second.constant ? m.const_bool(it->second.set) : it->second.id});
+                masks.push_back({k, Kind::Lane, it->second.constant ? m.const_bool(it->second.set) : it->second.id, false,
+                                 inexact_at_header(k, it->second)});
             } else {
                 l.unchanged[k] = it->second;
             }
@@ -3027,7 +3056,12 @@ private:
                 return;
             }
             l.unchanged[kKeyExec] = exec0;
-            l.unchanged[l.mask] = exec0;
+            l.unchanged[l.mask] = lm->second;
+        }
+        for (auto& [k, v] : l.unchanged) {  // assumed unchanged, helper lanes included
+            if (!inexact_at_header(k, v)) continue;
+            v.helper_inexact = true;
+            if (const auto it = lanes.find(k); it != lanes.end()) it->second.helper_inexact = true;
         }
         l.preheader = cur_label;
         l.header_label = m.fresh();
@@ -3042,14 +3076,16 @@ private:
         for (const Entry& w : words) {
             const Id phi = m.emit(spv::OpPhi, w.kind == Kind::Float ? t_f32 : t_u32, {w.id, l.preheader, w.id, l.continue_label});
             reg[w.key] = w.kind == Kind::Float ? flt(phi) : word(phi);
+            reg[w.key].helper_inexact = w.inexact;
             if (w.uni) uniform_ids.insert(phi);
-            l.phis.push_back({w.key, w.kind, phi, w.uni});
+            l.phis.push_back({w.key, w.kind, phi, w.uni, w.inexact});
             l.vgpr_phis += w.key >= 256;
         }
-        for (const auto& [k, entry] : masks) {
-            const Id phi = m.emit(spv::OpPhi, t_bool, {entry, l.preheader, entry, l.continue_label});
-            lanes[k] = lane(phi);
-            l.phis.push_back({k, Kind::Lane, phi, false});
+        for (const Entry& k : masks) {
+            const Id phi = m.emit(spv::OpPhi, t_bool, {k.id, l.preheader, k.id, l.continue_label});
+            lanes[k.key] = lane(phi);
+            lanes[k.key].helper_inexact = k.inexact;
+            l.phis.push_back({k.key, Kind::Lane, phi, false, k.inexact});
             ++l.lane_phis;
         }
         const Id body = m.fresh();
@@ -3190,6 +3226,15 @@ private:
             return;
         }
         std::vector<std::pair<Id, Id>> back;  // phi, value
+        // What the header assumed of the helper lanes must hold for the value
+        // that comes back; if not, a second attempt assumes less.
+        const auto helper_lanes_kept = [&](int key, bool at_header, const Val& v) {
+            if (!v.helper_inexact || at_header) return true;
+            more_inexact.insert({l.header, key});
+            reject(key_name(key) + " comes back to the header of the loop at " + hex_offset(l.header) +
+                   " with helper lanes GCN may hold differently, which the header did not assume");
+            return false;
+        };
         for (const Loop::Phi& p : l.phis) {
             if (p.kind == Kind::Lane) {
                 const auto it = lanes.find(p.key);
@@ -3198,6 +3243,7 @@ private:
                     return;
                 }
                 const Val v = known(it->second);
+                if (!helper_lanes_kept(p.key, p.helper_inexact, v)) return;
                 back.push_back({p.id, v.constant ? m.const_bool(v.set) : v.id});
                 continue;
             }
@@ -3210,6 +3256,7 @@ private:
                 reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) + " with a value lanes may not hold alike");
                 return;
             }
+            if (!helper_lanes_kept(p.key, p.helper_inexact, v)) return;
             back.push_back({p.id, p.kind == Kind::Float ? as_f(v) : as_u(v)});
         }
         // (In a divergent loop's body EXEC at entry is known set, so EXEC and
@@ -3221,6 +3268,7 @@ private:
                 reject(key_name(k) + " comes back to the header of the loop at " + hex_offset(l.header) + " changed");
                 return;
             }
+            if (!helper_lanes_kept(k, entry.helper_inexact, it->second)) return;
         }
         m.emit_void(spv::OpBranch, {l.continue_label});
         m.label(l.continue_label);
@@ -3613,14 +3661,17 @@ LiftResult lift_stage(Stage stage, const Program& program, const TranslateOption
     }
     // A lane mask a loop changes before it is read again gets a phi on a second
     // attempt: the first assumes every one comes back unchanged, which the
-    // usual loop-exit idioms need to fold their tests.
-    Lifter::LoopPhis phis;
+    // usual loop-exit idioms need to fold their tests. Likewise a register
+    // whose helper lanes come back around a loop less exact than they left
+    // is inexact at the header on the next attempt.
+    Lifter::LoopPhis phis, inexact;
     for (int attempt = 0;; ++attempt) {
-        Lifter l(program, options, reference, phis);
+        Lifter l(program, options, reference, phis, inexact);
         LiftResult r = l.run();
-        const std::size_t before = phis.size();
+        const std::size_t before = phis.size() + inexact.size();
         phis.insert(l.more_lane_phis.begin(), l.more_lane_phis.end());
-        if (phis.size() == before || attempt == 8) return r;
+        inexact.insert(l.more_inexact.begin(), l.more_inexact.end());
+        if (phis.size() + inexact.size() == before || attempt == 8) return r;
     }
 }
 }  // namespace
