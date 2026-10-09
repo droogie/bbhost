@@ -154,6 +154,10 @@ void hle_video_set_picture(unsigned w, unsigned h);
 // A pad press the game reads as the player's: `button` (the pad's bits) from
 // `delay_ms` on, held `hold_ms`. Any thread.
 void hle_pad_tap(std::uint32_t button, int delay_ms, int hold_ms);
+// Guest threads scePthreadCreate has made, and how many of them have not yet
+// reached their entry (pthread.cpp).
+std::uint64_t hle_threads_made();
+int hle_threads_starting();
 void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented fps)
 // The game's pace once engine/frame_rate.cpp chose it (30, 60, 90, 0 uncapped):
 // 30 and 60 cap the flips at that rate; 90 and uncapped complete them at once.

@@ -121,6 +121,7 @@ struct Player {
     std::condition_variable ecv;
     std::deque<std::int32_t> events;
     bool equit = false;
+    std::uint64_t threads_at_source = 0;  // hle_threads_made() when the source was added (hold_ready)
 };
 
 std::mutex g_mu;
@@ -165,6 +166,44 @@ void av_trace(const char* what, std::uintptr_t h) {
     if (g_av_calls.fetch_add(1) < 80) host_log("avplayer: %s (0x%llx)", what, static_cast<unsigned long long>(h));
 }
 
+// The console's player reports READY once it has opened and buffered the
+// source, well after sceAvPlayerAddSource returns; ours had it ready at once.
+// The game makes its movie's audio thread (Mv_AudioPlayThread) just after
+// that call, and its READY handler (sub_2cff6a0) takes that thread not
+// running yet for a failed setup: CSMovieIns::STEP_Wait_Setup closes the
+// player, which frees the thread object the new thread is about to lock -
+// DL_PANIC "Mutex is not initialized" (DLLightMutex.cpp) as the title's
+// attract movie opens, whenever a thread is slow to start. So READY waits
+// until a thread made after the source was added has reached its entry: at
+// most a second, for an owner that makes none. BBHOST_MOVIE_READY_NOW=1
+// reports it at once, as before (an A/B switch for the race, which
+// BBHOST_TEST_THREAD_START_MS brings about on demand).
+void hold_ready(const Player& p) {
+    static const bool now = [] {
+        const char* e = std::getenv("BBHOST_MOVIE_READY_NOW");
+        return e && e[0] == '1';
+    }();
+    if (now) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ran = [&] { return hle_threads_made() > p.threads_at_source && hle_threads_starting() == 0; };
+    bool timed_out = false;
+    while (!ran()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // Its first steps: the handler reads the state the thread sets first thing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) {
+        host_log("avplayer: READY after %lld ms%s", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                        std::chrono::steady_clock::now() - t0).count()),
+                 timed_out ? ", no new thread ran" : ", once the thread made after the source was running");
+    }
+}
+
 void event_thread_main(Player* p) {
     // A host thread that calls into the guest needs a guest TLS block; run
     // host code with host FS and let hle_call_guest6 switch for the call.
@@ -179,6 +218,7 @@ void event_thread_main(Player* p) {
             ev = p->events.front();
             p->events.pop_front();
         }
+        if (ev == kStateReady) hold_ready(*p);
         if (g_av_calls.load() < 80) host_log("avplayer: event %d delivered", ev);
         hle_call_guest6(p->init.event_callback, reinterpret_cast<std::int64_t>(p->init.event_object), ev, 0, 0, 0, 0);
     }
@@ -525,6 +565,7 @@ GUEST_ABI int hle_av_add_source(std::uintptr_t h, const char* path) {
         return 0;
     }
     host_log("sceAvPlayerAddSource %s -> %s", p->source.c_str(), host.c_str());
+    p->threads_at_source = hle_threads_made();
     send_event(*p, kStateReady);
     if (p->auto_start && (p = ensure_buffers(lock, h, p)) != nullptr) begin_playback(*p);
 #else
