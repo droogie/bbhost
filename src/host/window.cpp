@@ -1534,6 +1534,11 @@ bool host_window_start(int width, int height, const char* title) {
 #if defined(BBHOST_HAVE_SDL3)
 namespace {
 bool window_start_impl(int width, int height, const char* title) {
+#if defined(__APPLE__)
+    // Fullscreen in place, as on PC, not in a Space of its own behind an
+    // animation.
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -1541,8 +1546,13 @@ bool window_start_impl(int width, int height, const char* title) {
     // The options are read before the window exists, so a saved Fullscreen
     // is only a wish until here (host_window_set_fullscreen).
     const bool fullscreen = g_want_fullscreen.load();
-    g_window = SDL_CreateWindow(title, width, height,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+#if defined(__APPLE__)
+    // Retina pixels, not points scaled up blurred; the presenter already
+    // reads sizes in pixels.
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#endif
+    g_window = SDL_CreateWindow(title, width, height, flags);
     if (g_window && fullscreen) host_log("window: fullscreen");
     if (!g_window) {
         host_log("SDL_CreateWindow failed: %s", SDL_GetError());
