@@ -2266,6 +2266,15 @@ bool init_locked() {
     if (!g.has_tess_geom_point_size && (g.has_tessellation || g.has_geometry_shader)) {
         host_log("gpu: no shaderTessellationAndGeometryPointSize: geometry and evaluation stages leave the vertex shader's point size out");
     }
+    // S# clamp mode 3 needs MIRROR_CLAMP_TO_EDGE, a feature since Vulkan 1.2.
+    {
+        VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        q2.pNext = &q12;
+        vkGetPhysicalDeviceFeatures2(g.phys, &q2);
+        g.has_mirror_clamp = q12.samplerMirrorClampToEdge == VK_TRUE;
+        f12.samplerMirrorClampToEdge = q12.samplerMirrorClampToEdge;
+    }
     // f16 rounded toward zero by the device itself: GCN's v_cvt_pkrtz_f16_f32
     // and the packed colour exports that read it become two native conversions
     // a pair (gcn/half.h native_half_rtz), where the exact integer form was ~6

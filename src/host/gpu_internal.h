@@ -224,6 +224,8 @@ struct Gpu {
     // shaderTessellationAndGeometryPointSize: needed to pass the point size
     // through the geometry and evaluation stages.
     bool has_tess_geom_point_size = false;
+    // samplerMirrorClampToEdge: S# clamp mode 3, mirrored repeat without it.
+    bool has_mirror_clamp = false;
     // VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers (MoltenVK: 16): the
     // shared sets declare no more (shared_set_samplers), and a stage whose
     // translation names more is not built (stage_fits_device).

@@ -2870,7 +2870,16 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
         case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 2: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 3: {
+            // MIRROR_ONCE_LAST_TEXEL. Without mirror-clamp, a mirrored repeat:
+            // the same over [-1, 1], the one mirror image the mode is for.
+            if (g.has_mirror_clamp) return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                host_log("texture: S# mirror-once clamp as a mirrored repeat: the device has no samplerMirrorClampToEdge");
+            }
+            return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        }
         case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         }
