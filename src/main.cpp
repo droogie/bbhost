@@ -68,6 +68,10 @@
 #if defined(__linux__)
 #include <link.h>
 #endif
+#if defined(__APPLE__)
+#include <setjmp.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 void exit_reports();  // the reports a run prints when ended from outside (below)
@@ -270,6 +274,107 @@ void log_cpu() {
     host_log("cpu: %s (family 0x%x, model 0x%x, stepping %u%s), %u threads", *name ? name : "unknown", family, model, stepping,
              hybrid ? ", hybrid" : "", std::thread::hardware_concurrency());
 }
+
+#if defined(__APPLE__)
+// Rosetta 2 (macOS 15+) runs AVX and friends but its CPUID shows them only
+// with ROSETTA_ADVERTISE_AVX=1, and game code picks its path by CPUID: so
+// re-exec once with it set. A value already set (even 0) is respected.
+bool rosetta_translated() {
+    int v = 0;
+    std::size_t n = sizeof(v);
+    return sysctlbyname("sysctl.proc_translated", &v, &n, nullptr, 0) == 0 && v == 1;
+}
+
+void rosetta_advertise_avx(char** argv) {
+    if (!rosetta_translated() || std::getenv("ROSETTA_ADVERTISE_AVX")) return;
+    const std::string exe = host_exe_path();
+    if (exe.empty()) return;
+    setenv("ROSETTA_ADVERTISE_AVX", "1", 1);
+    execv(exe.c_str(), argv);
+    const int e = errno;
+    unsetenv("ROSETTA_ADVERTISE_AVX");
+    host_log("cpu: starting again with ROSETTA_ADVERTISE_AVX=1 failed (%s); the game's CPUID shows no AVX", std::strerror(e));
+}
+
+// Executed under a SIGILL catcher, since CPUID may not tell what Rosetta runs.
+// LZCNT is judged by its result: without it the same bytes are BSR.
+sigjmp_buf g_cpu_probe_jb;
+void cpu_probe_sigill(int) { siglongjmp(g_cpu_probe_jb, 1); }
+template <typename F>
+bool cpu_runs(F f) {
+    if (sigsetjmp(g_cpu_probe_jb, 1) != 0) return false;
+    return f();
+}
+
+void check_cpu(int argc, char** argv) {
+    struct sigaction sa{}, old{};
+    sa.sa_handler = cpu_probe_sigill;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, &old);
+    const struct {
+        const char* name;
+        bool runs;
+    } probes[] = {
+        {"AVX", cpu_runs([] {
+             asm volatile("vxorps %%ymm0, %%ymm0, %%ymm0\n\tvzeroupper" ::: "xmm0");
+             return true;
+         })},
+        {"AVX2", cpu_runs([] {
+             asm volatile("vpaddd %%ymm0, %%ymm0, %%ymm0\n\tvzeroupper" ::: "xmm0");
+             return true;
+         })},
+        {"F16C", cpu_runs([] {
+             asm volatile("vcvtph2ps %%xmm0, %%xmm0" ::: "xmm0");
+             return true;
+         })},
+        {"BMI1", cpu_runs([] {
+             unsigned v = 0xf0, r = 1;
+             asm volatile("andn %1, %1, %0" : "=r"(r) : "r"(v));
+             return r == 0;
+         })},
+        {"POPCNT", cpu_runs([] {
+             unsigned v = 0xf0f0, r = 0;
+             asm volatile("popcnt %1, %0" : "=r"(r) : "r"(v));
+             return r == 8;
+         })},
+        {"LZCNT", cpu_runs([] {
+             unsigned v = 1, r = 0;
+             asm volatile("lzcnt %1, %0" : "=r"(r) : "r"(v));
+             return r == 31;
+         })},
+        {"MOVBE", cpu_runs([] {
+             std::uint32_t m = 0x11223344, r = 0;
+             asm volatile("movbe %1, %0" : "=r"(r) : "m"(m));
+             return r == 0x44332211;
+         })},
+    };
+    sigaction(SIGILL, &old, nullptr);
+    std::string missing;
+    for (const auto& p : probes) {
+        if (!p.runs) missing += std::string(missing.empty() ? "" : ", ") + p.name;
+    }
+    const bool rosetta = rosetta_translated();
+    if (missing.empty()) {
+        const char* adv = std::getenv("ROSETTA_ADVERTISE_AVX");
+        host_log("cpu: AVX, AVX2, F16C, BMI1, POPCNT, LZCNT and MOVBE run%s", !rosetta ? ""
+                 : adv && std::strcmp(adv, "1") == 0 ? " (Rosetta 2; CPUID shows them: ROSETTA_ADVERTISE_AVX=1)"
+                                                     : " (Rosetta 2; CPUID does not show them)");
+        return;
+    }
+    const std::string text =
+        rosetta ? "bbhost needs macOS 15 or later: Rosetta 2 runs AVX and the other instructions the game's code uses "
+                  "from macOS 15 on, and here it does not run " + missing + "."
+                : "This processor does not run " + missing + ", which the game's code uses (the PS4's processor has "
+                  "them all), so bbhost cannot run the game on it.";
+    host_log("cpu: %s", text.c_str());
+    // A Finder launch has no terminal for the log; --headless has nobody to
+    // close a box.
+    bool headless = false;
+    for (int i = 1; i < argc; ++i) headless = headless || std::strcmp(argv[i], "--headless") == 0;
+    if (!headless) host_window_error_box("bbhost cannot run here", text.c_str());
+    std::exit(1);
+}
+#endif
 
 }  // namespace
 
@@ -900,11 +1005,15 @@ int main(int argc, char** argv) {
     }
 #else
 #if defined(__APPLE__)
+    rosetta_advertise_avx(argv);  // before anything else: it may start bbhost again
     host_log("bbhost %s (%s, macOS x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
 #else
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
 #endif
     log_cpu();
+#if defined(__APPLE__)
+    check_cpu(argc, argv);
+#endif
     std::signal(SIGTERM, on_term);
     {
         struct sigaction sa{};
