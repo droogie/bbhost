@@ -1,4 +1,5 @@
 #include "engine/params.h"
+#include "engine/param_lookup.h"
 
 #include "core/config.h"
 #include "core/elf.h"
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -34,6 +36,7 @@ struct Table {
     std::uint32_t rows = 0;
     std::uint8_t format = 0, flags = 0;
     bool overridden = false;
+    std::shared_ptr<bbhost::param_detail::MissIndex> misses;
     std::string param_type;  // the file's type name at +0xc ("EQUIP_PARAM_WEAPON_ST"), which names its definition
 };
 std::mutex g_mu;
@@ -256,7 +259,8 @@ void walk() {
             Table& t = g_tables[name];
             if (t.file == file && t.rows == rows) continue;  // seen, unchanged
             const bool reloaded = t.file != 0;
-            t = Table{name, cap, file, rows, format, flags, false, std::string(type)};
+            t = Table{name, cap, file, rows, format, flags, false,
+                      std::make_shared<bbhost::param_detail::MissIndex>(), std::string(type)};
             host_log("params: slot %u %s: %s, %u rows, format %u/%u at 0x%llx%s", slot, name.c_str(), type, rows, format, flags,
                      static_cast<unsigned long long>(file), reloaded ? " (reloaded)" : "");
             if (!reloaded) {
@@ -297,21 +301,10 @@ void* params_row(const char* table, std::uint32_t id, std::size_t* bytes) {
         if (it == g_tables.end()) return nullptr;
         t = it->second;
     }
-    // The records' ids ascend; a binary search over them.
-    std::uint32_t lo = 0, hi = t.rows;
-    while (lo < hi) {
-        const std::uint32_t mid = lo + (hi - lo) / 2;
-        std::uint32_t rid = 0;
-        std::uint64_t data = 0;
-        if (!record(t, mid, &rid, &data)) return nullptr;
-        if (rid == id) {
-            if (bytes) *bytes = row_size(t);
-            return reinterpret_cast<void*>(static_cast<std::uintptr_t>(data));
-        }
-        if (rid < id) lo = mid + 1;
-        else hi = mid;
-    }
-    return nullptr;
+    const auto data = bbhost::param_detail::lookup(id, t.rows,
+        [&](std::uint32_t i, std::uint32_t* rid, std::uint64_t* address) { return record(t, i, rid, address); }, *t.misses);
+    if (data && bytes) *bytes = row_size(t);
+    return data ? reinterpret_cast<void*>(static_cast<std::uintptr_t>(data)) : nullptr;
 }
 
 bool params_ids(const char* table, std::uint32_t* ids, std::size_t max, std::size_t* count) {
