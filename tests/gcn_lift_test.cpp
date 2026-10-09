@@ -643,7 +643,6 @@ struct Asm {  // Sea Islands encodings of the instructions the cases use
         return w.size() - 1;
     }
     void land(std::size_t at) { w[at] |= static_cast<std::uint16_t>(w.size() - at - 1); }
-    std::uint32_t offset() const { return static_cast<std::uint32_t>(w.size() * 4); }
 };
 
 gcn::LiftResult lift(const std::vector<std::uint32_t>& words, std::uint32_t dim = 1 /* 2D */) {
@@ -808,6 +807,30 @@ void cases() {
         CHECK(lifted(r));
         CHECK(proof_says(r, "if at"));
         CHECK(rejected_with(lift(program(true)), "an export reads a value the lift may hold differently"));
+    }
+
+    // Inside a kill region widened to whole quads from a varying EXEC, GCN
+    // computes whole quads where the lift keeps each pixel's bit: no implicit
+    // derivatives under its EXEC there.
+    {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(1, kZero, 2);
+        a.sop1(36, 22, kVcc);           // EXEC = M
+        a.vopc(1, kZero, 3);
+        a.sop1(4, 24, kExec);
+        a.sop2(21, 24, 24, kVcc);       // the guard: M and not (0 < v3)
+        const std::size_t skip = a.branch(4);
+        a.sop2(15, kExec, kExec, 24);   // s_and_b64 exec, exec, s[24:25]
+        a.wqm();                        // widened from a varying EXEC
+        a.mimg(kSample, 4, 2, 0xf);
+        a.land(skip);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(a.w), "an image sample with implicit derivatives under a varying EXEC inside a widened kill region"));
     }
 
     // image_get_lod: OpImageQueryLod, its implicit derivatives as a sample's.
