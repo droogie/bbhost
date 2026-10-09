@@ -2259,6 +2259,13 @@ bool init_locked() {
     // no geometry stage.
     g.has_geometry_shader = supported.geometryShader == VK_TRUE;
     f2.features.geometryShader = supported.geometryShader;
+    // Without it those stages leave the point size out: they make triangles,
+    // where it does nothing.
+    g.has_tess_geom_point_size = supported.shaderTessellationAndGeometryPointSize == VK_TRUE;
+    f2.features.shaderTessellationAndGeometryPointSize = supported.shaderTessellationAndGeometryPointSize;
+    if (!g.has_tess_geom_point_size && (g.has_tessellation || g.has_geometry_shader)) {
+        host_log("gpu: no shaderTessellationAndGeometryPointSize: geometry and evaluation stages leave the vertex shader's point size out");
+    }
     // f16 rounded toward zero by the device itself: GCN's v_cvt_pkrtz_f16_f32
     // and the packed colour exports that read it become two native conversions
     // a pair (gcn/half.h native_half_rtz), where the exact integer form was ~6

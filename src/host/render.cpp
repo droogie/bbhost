@@ -4278,6 +4278,9 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // No point size for tessellated rect lists: MoltenVK draws nothing when
     // the vertex stage writes one.
     if (s.rect && rect_list_path() == RectPath::kTessellation) vs_out_cntl &= ~(1u << 16);
+    // A domain shader as the evaluation stage writes one only where the
+    // device lets that stage (Gpu::has_tess_geom_point_size).
+    if (s.tess_hw && !g.has_tess_geom_point_size) vs_out_cntl &= ~(1u << 16);
     const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
                               vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
                               s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
@@ -4586,8 +4589,9 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     }
     // Rect list: the triangle expanded into its rectangle (rect_list_path).
     if (s.rect && rect_list_path() == RectPath::kGeometry) {
+        // Point size only where a geometry shader may write it.
         const std::vector<std::uint32_t> gs = gcn::make_rect_geometry_shader(pl.vs.meta().vs_params, pl.vs.meta().vs_clip_count,
-                                                                             pl.vs.meta().vs_point_size);
+                                                                             pl.vs.meta().vs_point_size && g.has_tess_geom_point_size);
         dump_spirv(pl.name + "-gs", gs);
         pl.gs.fresh().spirv = gs;
         if (!make_module(gs, pl.gs.module)) return fail("GS module");

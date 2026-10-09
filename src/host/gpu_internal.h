@@ -221,6 +221,9 @@ struct Gpu {
     bool has_depth_bias_clamp = false;    // VkPhysicalDeviceFeatures::depthBiasClamp
     bool has_tessellation = false;        // VkPhysicalDeviceFeatures::tessellationShader
     bool has_geometry_shader = false;     // VkPhysicalDeviceFeatures::geometryShader (none on MoltenVK)
+    // shaderTessellationAndGeometryPointSize: needed to pass the point size
+    // through the geometry and evaluation stages.
+    bool has_tess_geom_point_size = false;
     // VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers (MoltenVK: 16): the
     // shared sets declare no more (shared_set_samplers), and a stage whose
     // translation names more is not built (stage_fits_device).
