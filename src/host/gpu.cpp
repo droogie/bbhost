@@ -1464,6 +1464,7 @@ struct Candidate {
     // now: the driver's budget less its usage (VK_EXT_memory_budget), else the
     // heap's size (small_vram).
     VkDeviceSize local_free = 0;
+    VkDeviceSize budget = 0;  // macOS: the driver's budget for its heaps (VK_EXT_memory_budget; memory_tight)
 };
 
 // The usable devices of `instance` and the index of the one to run on in
@@ -1519,6 +1520,16 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             }
             break;
         }
+#if defined(__APPLE__)
+        for (const VkExtensionProperties& e : exts) {
+            if (std::strcmp(e.extensionName, "VK_EXT_memory_budget") != 0) continue;
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            mp2.pNext = &mb;
+            vkGetPhysicalDeviceMemoryProperties2(d, &mp2);
+            for (std::uint32_t h = 0; h < mp2.memoryProperties.memoryHeapCount; ++h) c.budget += mb.heapBudget[h];
+        }
+#endif
         c.type_rank = dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 4
                       : dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3
                       : dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 2
@@ -1577,9 +1588,13 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
 // direct memory's imports alone are ~4.7 GiB: a Steam Deck (1 GiB of VRAM,
 // 8 GiB of GTT) failed its submissions in the world. BBHOST_TIGHT_MEMORY=0/1
 // says instead.
+//
+// On a Mac the one heap is all memory, shared with macOS and the game: judged
+// by Metal's working set (the driver's budget) instead.
 bool memory_tight(const Candidate& c) {
     const char* e = std::getenv("BBHOST_TIGHT_MEMORY");
     if (e && *e) return e[0] != '0';
+    if (c.budget) return c.budget < (12ull << 30);
     return c.heaps < (12ull << 30);
 }
 std::atomic<int> g_tight{-1};  // memory_tight of the device run on, -1 until known
@@ -1772,8 +1787,9 @@ bool init_locked() {
         }
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
-        if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
-                              static_cast<unsigned long long>(c.heaps >> 20));
+        if (g.tight) host_log("gpu: %llu MiB %s: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
+                              static_cast<unsigned long long>((c.budget ? c.budget : c.heaps) >> 20),
+                              c.budget ? "in the driver's budget" : "in all heaps");
 #if defined(__linux__)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
