@@ -20,6 +20,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gpu {
@@ -508,9 +509,26 @@ bool save_due_locked(bool force) {
 std::atomic<std::uint64_t> g_window_hits{0}, g_window_hit_us{0}, g_window_misses{0}, g_window_miss_us{0};
 std::atomic<std::uint64_t> g_window_lift_hits{0}, g_window_lift_misses{0};
 
-}  // namespace
+// GCN gives a workgroup 64 KiB of LDS, Apple's GPUs 32: the translator cuts
+// the array to max_lds_bytes, so an access past it is out of bounds. Said
+// once a program.
+void note_lds_limit(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& t) {
+    const std::uint32_t asked = ((o.rsrc2 >> 15) & 0x1ff) * 512;  // LDS_SIZE, in 128-dword granules
+    if (!t.lds_bytes || asked <= t.lds_bytes) return;
+    KeyHasher h;
+    hash_program(h, prog);
+    static std::mutex mu;
+    static std::unordered_set<std::uint64_t> said;  // under mu
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!said.insert(h.a).second) return;
+    }
+    host_log("render: compute shader %016llx (%zu instructions, COMPUTE_PGM_RSRC2 %08x) asks for %u bytes of LDS; the device gives "
+             "a workgroup %u (maxComputeSharedMemorySize), so its LDS is cut to %u and an access past that is out of bounds",
+             static_cast<unsigned long long>(h.a), prog.insts.size(), o.rsrc2, asked, o.max_lds_bytes, t.lds_bytes);
+}
 
-gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, TranslationUse use) {
+gcn::TranslateResult translate_through_cache(const gcn::Program& prog, const gcn::TranslateOptions& o, TranslationUse use) {
     const bool paths = use == TranslationUse::kPaths;
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
         if (g_tc_enabled && !g_tc.ready.load(std::memory_order_acquire)) g_tc.early.fetch_add(1, std::memory_order_relaxed);
@@ -540,6 +558,14 @@ gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::Trans
     Writer w;
     write_result(w, t, !paths);
     store(key, w);
+    return t;
+}
+
+}  // namespace
+
+gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, TranslationUse use) {
+    gcn::TranslateResult t = translate_through_cache(prog, o, use);
+    if (use == TranslationUse::kStage && o.stage == gcn::Stage::Compute) note_lds_limit(prog, o, t);
     return t;
 }
 
