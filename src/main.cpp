@@ -1020,6 +1020,11 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__)
     rosetta_advertise_avx(argv);  // before anything else: it may start bbhost again
     host_log("bbhost %s (%s, macOS x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+    // The write watch, guest protections and stub pages assume 4 KiB pages.
+    if (getpagesize() != 4096) {
+        host_log("bbhost: the page size is %d bytes; bbhost needs 4 KiB pages (an x86_64 build run by Rosetta 2)", getpagesize());
+        return 1;
+    }
     if (!hle_kernel_reserve_guest_windows()) {  // before anything else can take those addresses
         host_log("bbhost: the guest's address windows are not all free; see the mac-vm lines above");
         return 1;
