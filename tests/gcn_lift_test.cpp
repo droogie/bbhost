@@ -1003,7 +1003,8 @@ void run() {
 }  // namespace control_flow
 
 // Small synthetic pixel shaders for the remaining scalar and 64-bit
-// instructions: s_cselect_b32 and v_lshl_b64.
+// instructions: scalar loads that only fetch descriptors, s_cselect_b32 and
+// v_lshl_b64.
 // Each lift is checked against the reasons it must give, and each lifted
 // module is validated. No game files needed.
 namespace lane_ops {
@@ -1099,6 +1100,13 @@ bool lifted_valid(const gcn::LiftResult& r) {
     return true;
 }
 
+bool proof_has(const gcn::LiftResult& r, const char* text) {
+    for (const std::string& line : r.proof) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    std::fprintf(stderr, "expected a proof line containing \"%s\"\n", text);
+    return false;
+}
 
 
 // Whether the module has a 64-bit OpShiftLeftLogical (the runtime v_lshl_b64).
@@ -1122,6 +1130,35 @@ Asm start() {
 }
 
 
+void descriptor_loads() {
+    // s[2:3] copied to s[20:21]: the reference stops binding the table (its
+    // registers are written) and walks the page table for both loads. They
+    // are a T# and an S#, which the sample binds by path.
+    const auto sample = [](const std::function<void(Asm&)>& after) {
+        Asm a;
+        a.sop1(kSMov, 20, 2);
+        a.sop1(kSMov, 21, 3);
+        a.smrd(kLoadX8, 8, 20, 0);   // s_load_dwordx8 s[8:15], s[20:21], 0x0
+        a.smrd(kLoadX4, 16, 20, 8);  // s_load_dwordx4 s[16:19], s[20:21], 0x8
+        a.vop1(kVMov, 4, kHalf);
+        a.vop1(kVMov, 5, kHalf);
+        a.sopp(kWaitcnt, 0);
+        a.mimg(kSampleLz, 0xf, 0, 4, 8, 16);  // image_sample_lz v[0:3], v[4:5], s[8:15], s[16:19]
+        after(a);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    const gcn::LiftResult ok = lift_words(sample([](Asm&) {}));
+    CHECK(lifted_valid(ok));
+    CHECK(proof_has(ok, "2 scalar loads the reference walks the page table for hold descriptors only"));
+    // A word of them read as data: the reference reads it from guest memory.
+    CHECK(rejected_with(lift_words(sample([](Asm& a) {
+                            a.vop1(kVMov, 6, 16);       // v_mov_b32 v6, s16 (a copy is still a descriptor)
+                            a.vop2(kVAdd, 0, kV + 0, 6);  // v_add_f32 v0, v0, v6
+                        })),
+                        "data from a scalar load the reference walks the page table for"));
+}
 
 void cselect() {
     const auto sel = [](const std::function<void(Asm&)>& set_scc) {
@@ -1211,6 +1248,7 @@ void lshl_b64() {
 }
 
 void run() {
+    descriptor_loads();
     cselect();
     lshl_b64();
 }

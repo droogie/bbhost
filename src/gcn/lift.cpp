@@ -62,6 +62,10 @@
 //     is stored at once and stored again at the next s_waitcnt on lgkmcnt,
 //     within one block. Indexed tbuffer loads read the element the
 //     reference's indexed binding holds, decoded as the translator decodes it.
+//     A scalar load the reference walks the page table for is lifted only
+//     when its words are descriptors and nothing else: the reference binds
+//     images, samplers and buffers by their resource paths, never by the
+//     words, so the lift loads nothing and rejects any read of them as data.
 //
 // Operations mirror translate.cpp exactly (GLSL.std.450 Fma for mac/mad,
 // NMin/NMax, the legacy multiply's zero rule, PackHalf2x16 exports, the cube
@@ -253,6 +257,18 @@ private:
     std::vector<std::uint32_t> samples, exports;
     std::vector<std::uint32_t> divergent_samples;  // inside a divergent loop
     std::size_t buffer_loads = 0, masked_writes = 0;
+
+    // Words of scalar loads the reference walks the page table for, by the
+    // OpUndef that stands for them: only descriptors may come from there.
+    std::map<Id, std::uint32_t> descriptor_words;  // id -> the load's offset
+    std::size_t descriptor_loads = 0;
+    bool descriptor(const Val& v) const { return !v.constant && v.kind == Kind::Word && descriptor_words.count(v.id) != 0; }
+    void reject_descriptor_read(const Val& v) {
+        const std::uint32_t at = descriptor_words.at(v.id);
+        const Inst* load = inst_at(at);
+        reject("data from a scalar load the reference walks the page table for (only its descriptors are lifted): " +
+               std::string(load && mnemonic(*load) ? mnemonic(*load) : "the load") + " at " + hex_offset(at));
+    }
 
     // SCC as the translator leaves it after a 64-bit mask op: some lane of
     // scc_mask is set.
@@ -465,6 +481,7 @@ private:
             reject("a lane mask is used as a number");
             return cf(0.0f);
         }
+        if (descriptor(v)) reject_descriptor_read(v);
         if (v.constant) return cf(std::bit_cast<float>(v.bits));
         if (auto it = to_float.find(v.id); it != to_float.end()) return it->second;
         const Id r = m.emit(spv::OpBitcast, t_f32, {v.id});
@@ -473,6 +490,7 @@ private:
         return r;
     }
     Id as_u(const Val& v) {
+        if (descriptor(v)) reject_descriptor_read(v);
         if (v.kind == Kind::Word) return v.id;
         if (v.kind == Kind::Lane) {
             reject("a lane mask is used as a number");
@@ -1617,9 +1635,36 @@ private:
         }
     }
 
+    // A scalar load the reference walks the page table for: its words reach
+    // the reference's output only if something reads them as data, since the
+    // reference binds images, samplers and buffers by their resource paths
+    // (translate.cpp image_for, sampler_for, indexed_buffer_load) and never by
+    // the words. Each word is an OpUndef the lift never computes with: any
+    // read of it as a number rejects (as_u, as_f), copies and joins keep it a
+    // descriptor, and image and buffer instructions do not read it.
+    void descriptor_load(const Inst& in, int count) {
+        Id undef;
+        {
+            EntryScope entry(m);
+            undef = m.emit(spv::OpUndef, t_u32, {});
+        }
+        descriptor_words[undef] = in.offset;
+        Pending p{in.sdst, {}};
+        const std::size_t mark = note.size();
+        for (int k = 0; k < count; ++k) {
+            write_scalar(static_cast<std::uint16_t>(in.sdst + k), word(undef));
+            p.values.push_back(word(undef));
+        }
+        note.resize(mark);
+        note += " " + operand_name(in.sdst, 0, count) + ":descriptor";
+        pending.push_back(std::move(p));
+        ++descriptor_loads;
+    }
+
     void smrd(const Inst& in) {
         const int count = in.op < 8 ? (1 << in.op) : (in.op < 13 ? (1 << (in.op - 8)) : 0);
         const auto site = ref.buffer_at.find(in.offset);
+        if (count && site == ref.buffer_at.end()) return descriptor_load(in, count);
         if (!count || site == ref.buffer_at.end() || site->second >= buffer_vars.size()) {
             reject(std::string(mnemonic(in)) + " is not read through a bound storage buffer in the reference");
             return;
@@ -2541,6 +2586,10 @@ private:
             const Val t = at(a.reg1, k), e = at(reg, k);
             if (same(t, e)) {
                 merged[k] = t;
+                continue;
+            }
+            if (descriptor(t) || descriptor(e)) {  // a descriptor word on either arm: still never data
+                merged[k] = descriptor(t) ? t : e;
                 continue;
             }
             phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e), uniform(t) && uniform(e)});
@@ -3716,6 +3765,10 @@ private:
             head.push_back(std::to_string(swizzles) + " ds_swizzle_b32 within a quad as quad operations in uniform control flow: each under EXEC "
                            "known set in whole-quad mode, of a value the quad's helper lanes computed as on GCN, and no kill region where "
                            "pixels may differ before it");
+        }
+        if (descriptor_loads) {
+            head.push_back(std::to_string(descriptor_loads) + " scalar loads the reference walks the page table for hold descriptors only: "
+                           "no word of them is read as data, and the reference binds by resource path, not by the words");
         }
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }
