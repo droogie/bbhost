@@ -45,8 +45,9 @@ tells you which paths to fill in.
 is read in layers, each overriding only the keys it sets:
 
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
-   `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
-   (`BBHOST_CONFIG_DIR` replaces the folder);
+   `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux, and
+   `~/Library/Application Support/bbhost` on macOS unless `XDG_CONFIG_HOME` is
+   set there too (`BBHOST_CONFIG_DIR` replaces the folder);
 2. `bbhost.toml` in the working directory, or next to the executable;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
@@ -62,7 +63,8 @@ in `bbhost-options.toml`.
 ## Saves
 
 Saves are in `<data>/saves/SPRJ0005`, where `<data>` defaults to
-`%LOCALAPPDATA%\bbhost\data` or `~/.local/share/bbhost/data`. Each time the
+`%LOCALAPPDATA%\bbhost\data`, `~/.local/share/bbhost/data` (Linux) or
+`~/Library/Application Support/bbhost/data` (macOS). Each time the
 game writes a save (at most every five minutes) a copy goes to
 `<data>/save-backups/`, and the newest eight are kept. To restore one, quit and
 copy its files over `<data>/saves/SPRJ0005`.
