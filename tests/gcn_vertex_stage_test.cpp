@@ -1,17 +1,22 @@
-// The vertex stage on a device without the subgroup built-ins there
-// (MoltenVK).
+// The vertex stage on a device without the subgroup built-ins there or
+// without geometry shaders - MoltenVK has neither.
 //
 // TranslateOptions::lane_from_scan works the lane out from an exclusive add
 // and a ballot instead of reading SubgroupLocalInvocationId; the SPIR-V must
 // validate and read no such built-in, and the module without the option still
-// reads it.
+// reads it. make_rect_tess_shaders draws a RECTLIST through the tessellator;
+// both of its stages must validate for any interface.
 //
 // Then, on a Vulkan device (MoltenVK is found through portability
-// enumeration), the shaders run: points from a translated vertex shader whose
+// enumeration), the shaders run. Points from a translated vertex shader whose
 // colours come from a compare's mask bit, an EXEC-masked write and the lane's
 // count must come out per vertex for every wave size, with the lane from the
 // scan and - where the device lists the vertex stage - from the built-in.
-// Without a device only the SPIR-V is checked.
+// Rectangles from a translated vertex shader must cover exactly the
+// parallelogram v0 v1 v2 span, with the varying the same affine function of
+// the position over it, and be culled exactly when the triangle v0 v1 v2 is:
+// through the tessellation stages and, where the device has one, the
+// geometry shader. Without a device only the SPIR-V is checked.
 #include "gcn/isa.h"
 #include "gcn/spirv.h"
 #include "gcn/translate.h"
@@ -99,6 +104,34 @@ Words lane_program(std::uint32_t width) {
     return w;
 }
 
+// Vertex i of a rectangle at (x[i], y[i]) in NDC, param0 its position; with
+// `clip`, clip distance 0 its x too (kClipX), so the left half is clipped.
+// No misc vector or point size: MoltenVK's vertex-to-control-stage hand-off
+// then draws nothing (render.cpp leaves the point size out there too).
+constexpr std::uint32_t kClipX = (1u << 0) | (1u << 22);  // PA_CL_VS_OUT_CNTL: CLIP_DIST_ENA_0, VS_OUT_CCDIST0_VEC_ENA
+Words rect_program(const float x[3], const float y[3], bool clip) {
+    Words w;
+    mov_literal(w, 1, x[0]);
+    mov_literal(w, 5, x[1]);
+    mov_literal(w, 6, x[2]);
+    mov_literal(w, 2, y[0]);
+    mov_literal(w, 7, y[1]);
+    mov_literal(w, 8, y[2]);
+    vopc(w, 0xc2, 0, kOne);        // v_cmp_eq_u32 vcc, 1, v0
+    vop2(w, 0, 1, 5, kV + 1);      // v_cndmask_b32 v1, v1, v5, vcc
+    vop2(w, 0, 2, 7, kV + 2);      // v_cndmask_b32 v2, v2, v7, vcc
+    vopc(w, 0xc2, 0, 128 + 2);     // v_cmp_eq_u32 vcc, 2, v0
+    vop2(w, 0, 1, 6, kV + 1);      // v_cndmask_b32 v1, v1, v6, vcc
+    vop2(w, 0, 2, 8, kV + 2);      // v_cndmask_b32 v2, v2, v8, vcc
+    vop1(w, 1, 3, kZero);          // v_mov_b32 v3, 0
+    vop1(w, 1, 4, kOneF);          // v_mov_b32 v4, 1.0
+    export_(w, 32, 1, 2, 3, 4, false);
+    export_(w, 12, 1, 2, 3, 4, !clip);
+    if (clip) export_(w, 13, 1, 3, 3, 3, true);  // exp pos1: the clip distances
+    w.push_back(kEndpgm);
+    return w;
+}
+
 gcn::TranslateResult translate_vs(const Words& words, bool lane_from_scan, std::uint32_t vs_out_cntl) {
     const gcn::Program p = gcn::decode(words.data(), words.size());
     if (!p.errors.empty()) throw std::runtime_error("decode: " + p.errors[0].what);
@@ -167,6 +200,14 @@ void spirv_checks() {
         const gcn::TranslateResult r = gcn::translate(gcn::decode(ps.data(), ps.size()), o);
         expect(r.ok() && validate(r.spirv).empty(), "a pixel stage with lane_from_scan validates");
     }
+    for (const std::vector<std::uint32_t>& params : {std::vector<std::uint32_t>{}, {0}, {0, 3, 5}}) {
+        for (int clips : {0, 2}) {
+            const gcn::RectTessShaders t = gcn::make_rect_tess_shaders(params, clips);
+            const std::string what = std::to_string(params.size()) + " params, " + std::to_string(clips) + " clip distances";
+            expect(validate(t.control).empty(), "rect control stage, " + what + ": " + validate(t.control));
+            expect(validate(t.evaluation).empty(), "rect evaluation stage, " + what + ": " + validate(t.evaluation));
+        }
+    }
     std::printf("gcn_vertex_stage_test: SPIR-V checks done\n");
 }
 
@@ -189,7 +230,7 @@ struct Device {
     VkBuffer params = VK_NULL_HANDLE, readback = VK_NULL_HANDLE;
     VkDeviceMemory params_mem = VK_NULL_HANDLE, readback_mem = VK_NULL_HANDLE;
     void* readback_map = nullptr;
-    bool tessellation = false, geometry = false;
+    bool tessellation = false, geometry = false, clip_distance = false;
     std::uint32_t subgroup_stages = 0;
     std::string name;
     std::vector<VkShaderModule> modules;
@@ -270,6 +311,7 @@ struct Device {
             if (phys) {
                 tessellation = f.features.tessellationShader == VK_TRUE;
                 geometry = f.features.geometryShader == VK_TRUE;
+                clip_distance = f.features.shaderClipDistance == VK_TRUE;
                 subgroup_stages = sub.supportedStages;
                 name = props.properties.deviceName;
                 break;
@@ -294,6 +336,7 @@ struct Device {
         VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f.pNext = &v12;
         f.features.shaderInt64 = VK_TRUE;
+        f.features.shaderClipDistance = clip_distance ? VK_TRUE : VK_FALSE;
         f.features.tessellationShader = tessellation ? VK_TRUE : VK_FALSE;
         f.features.geometryShader = geometry ? VK_TRUE : VK_FALSE;
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -605,6 +648,103 @@ void lane_checks(Device& d, VkShaderModule fs) {
     }
 }
 
+void rect_checks(Device& d, VkShaderModule fs) {
+    constexpr std::uint32_t kSize = 32;
+    struct Case {
+        const char* name;
+        float px[3], py[3];  // v0, v1, v2 in pixels
+        bool clip;           // clip distance 0 is x: the left half goes
+    };
+    const Case cases[] = {
+        {"axis-aligned", {4, 27, 4}, {6, 6, 21}, false},
+        {"sheared, the other way round", {5, 13, 27}, {5, 25, 9}, false},
+        {"clipped at x = 0", {4, 27, 4}, {6, 6, 21}, true},
+    };
+    for (const Case& c : cases) {
+        if (c.clip && !d.clip_distance) continue;
+        float x[3], y[3];
+        for (int i = 0; i < 3; ++i) {
+            x[i] = c.px[i] * 2.0f / kSize - 1.0f;
+            y[i] = c.py[i] * 2.0f / kSize - 1.0f;
+        }
+        const bool lane_from_scan = !(d.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT);
+        const gcn::TranslateResult vs = translate_vs(rect_program(x, y, c.clip), lane_from_scan, c.clip ? kClipX : 0);
+        expect(vs.vs_clip_count == (c.clip ? 1 : 0), std::string(c.name) + ": the vertex shader's clip distances");
+        Device::Stages plain;
+        plain.vs = d.module(vs.spirv);
+        plain.fs = fs;
+        struct Path {
+            const char* name;
+            Device::Stages st;
+        };
+        std::vector<Path> paths;
+        if (d.tessellation) {
+            const gcn::RectTessShaders t = gcn::make_rect_tess_shaders(vs.vs_params, vs.vs_clip_count);
+            Path p{"tessellation", plain};
+            p.st.tcs = d.module(t.control);
+            p.st.tes = d.module(t.evaluation);
+            paths.push_back(p);
+        }
+        if (d.geometry) {
+            Path p{"geometry shader", plain};
+            p.st.gs = d.module(gcn::make_rect_geometry_shader(vs.vs_params, vs.vs_clip_count, vs.vs_point_size));
+            paths.push_back(p);
+        }
+        // p = v0 + s (v1 - v0) + t (v2 - v0), in pixels.
+        const float ax = c.px[1] - c.px[0], ay = c.py[1] - c.py[0], bx = c.px[2] - c.px[0], by = c.py[2] - c.py[0];
+        const float det = ax * by - ay * bx;
+        for (const Path& p : paths) {
+            const std::vector<float> px = d.draw(p.st, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 3, kSize, kSize);
+            if (px.empty()) {
+                expect(false, std::string(c.name) + " through " + p.name + ": the pipeline was not created");
+                continue;
+            }
+            int inside = 0, bad = 0;
+            for (std::uint32_t j = 0; j < kSize; ++j) {
+                for (std::uint32_t i = 0; i < kSize; ++i) {
+                    const float qx = i + 0.5f - c.px[0], qy = j + 0.5f - c.py[0];
+                    const float s = (qx * by - qy * bx) / det, t = (ax * qy - ay * qx) / det;
+                    // Distances in pixels from the parallelogram's edges.
+                    const float ds = std::fabs(det) / std::sqrt(bx * bx + by * by), dt = std::fabs(det) / std::sqrt(ax * ax + ay * ay);
+                    const float edge = std::min(std::min(s, 1.0f - s) * ds, std::min(t, 1.0f - t) * dt);
+                    const float* col = &px[(j * kSize + i) * 4];
+                    const float nx = (i + 0.5f) * 2.0f / kSize - 1.0f, ny = (j + 0.5f) * 2.0f / kSize - 1.0f;
+                    const float clip = c.clip ? nx * kSize / 2.0f : 1.0f;  // the clip distance, in pixels
+                    if (edge > 0.75f && clip > 0.75f) {
+                        ++inside;
+                        if (std::fabs(col[0] - nx) > 1e-3f || std::fabs(col[1] - ny) > 1e-3f || col[2] != 0.0f || col[3] != 1.0f) {
+                            if (bad++ < 4) std::printf("  %s through %s: pixel (%u, %u) inside is (%g, %g, %g, %g), not (%g, %g, 0, 1)\n", c.name, p.name, i, j, col[0], col[1], col[2], col[3], nx, ny);
+                        }
+                    } else if (edge < -0.75f || clip < -0.75f) {
+                        if (col[0] != -2.0f || col[3] != -2.0f) {
+                            if (bad++ < 4) std::printf("  %s through %s: pixel (%u, %u) outside is drawn\n", c.name, p.name, i, j);
+                        }
+                    }
+                }
+            }
+            expect(bad == 0 && inside > 50, std::string(c.name) + " through " + p.name + ": the parallelogram and its varying" +
+                                                (c.clip ? ", clipped" : ""));
+            // Culled exactly when the triangle v0 v1 v2 would be.
+            for (VkFrontFace front : {VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FRONT_FACE_CLOCKWISE}) {
+                if (c.clip) break;
+                const auto drawn = [](const std::vector<float>& t) {
+                    for (std::size_t k = 0; k < t.size(); k += 4) {
+                        if (t[k + 3] != -2.0f) return true;
+                    }
+                    return false;
+                };
+                const bool tri = drawn(d.draw(plain, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 3, kSize, kSize, VK_CULL_MODE_BACK_BIT, front));
+                const bool rect = drawn(d.draw(p.st, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 3, kSize, kSize, VK_CULL_MODE_BACK_BIT, front));
+                expect(tri == rect, std::string(c.name) + " through " + p.name + ": culled as the triangle is (" +
+                                        (front == VK_FRONT_FACE_CLOCKWISE ? "clockwise" : "counter-clockwise") + " front faces: triangle " +
+                                        (tri ? "drawn" : "culled") + ", rectangle " + (rect ? "drawn" : "culled") + ")");
+            }
+            std::printf("gcn_vertex_stage_test: %s rectangle through %s: %d pixels inside checked\n", c.name, p.name, inside);
+        }
+    }
+    if (!d.tessellation && !d.geometry) std::printf("gcn_vertex_stage_test: the device has neither tessellation nor geometry shaders\n");
+}
+
 }  // namespace
 
 int main() try {
@@ -613,9 +753,11 @@ int main() try {
     if (!d.init()) {
         std::printf("gcn_vertex_stage_test: no suitable Vulkan device: device checks skipped\n");
     } else {
-        std::printf("gcn_vertex_stage_test: %s (subgroup stages 0x%x)\n", d.name.c_str(), d.subgroup_stages);
+        std::printf("gcn_vertex_stage_test: %s (subgroup stages 0x%x, tessellation %d, geometry shader %d)\n", d.name.c_str(),
+                    d.subgroup_stages, d.tessellation ? 1 : 0, d.geometry ? 1 : 0);
         const VkShaderModule fs = d.module(passthrough_fs());
         lane_checks(d, fs);
+        rect_checks(d, fs);
     }
     if (g_fail) {
         std::printf("gcn_vertex_stage_test: %d failed\n", g_fail);

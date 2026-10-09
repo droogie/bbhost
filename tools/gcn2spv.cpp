@@ -132,8 +132,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (std::string(argv[1]) == "--tess-stubs") {
-        // The two generated stages of a tessellated draw, validated.
+        // The generated tessellation and rect-list stages, validated.
         const float outer[4] = {1.0f, 1.0f, 1.0f, 1.0f}, inner[2] = {1.0f, 1.0f};
+        const gcn::RectTessShaders rect = gcn::make_rect_tess_shaders({0, 1, 4}, 2);
         spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
         tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* msg) {
             std::fprintf(stderr, "  %s\n", msg);
@@ -142,7 +143,9 @@ int main(int argc, char** argv) {
         for (const auto& [name, words] : std::vector<std::pair<const char*, std::vector<std::uint32_t>>>{
                  {"tessellation vertex stage", gcn::make_tess_passthrough_vs()},
                  {"tessellation control stage", gcn::make_tess_constant_tcs(outer, inner, 1)},
-                 {"tessellation control stage, attributes", gcn::make_tess_constant_tcs(outer, inner, 1, 8)}}) {
+                 {"tessellation control stage, attributes", gcn::make_tess_constant_tcs(outer, inner, 1, 8)},
+                 {"rect list control stage", rect.control},
+                 {"rect list evaluation stage", rect.evaluation}}) {
             const bool ok = tools.Validate(words);
             std::printf("%s: %zu words, %s\n", name, words.size(), ok ? "valid" : "INVALID");
             bad += !ok;

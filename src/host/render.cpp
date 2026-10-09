@@ -216,6 +216,8 @@ struct ShaderStage {
 struct GfxPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     ShaderStage vs, ps, gs;
+    // Rect lists without a geometry stage (rect_list_path); shared, not owned.
+    VkShaderModule rect_tcs = VK_NULL_HANDLE, rect_tes = VK_NULL_HANDLE;
     // A tessellated draw's generated vertex and control stages. The
     // domain shader stays in `vs` - it binds what a vertex stage binds, so
     // every descriptor, prefetch and user-data path is the one already there -
@@ -3529,6 +3531,45 @@ VkShaderModule tess_passthrough_module(const std::string& dump_name) {
     return module;
 }
 
+// Rect lists need a fourth vertex: from a geometry shader, else (Metal has no
+// geometry stage) from the tessellator. BBHOST_RECT_GS=0 forces tessellation.
+enum class RectPath { kGeometry, kTessellation, kTriangle };
+RectPath rect_list_path() {
+    static const RectPath path = [] {
+        const char* e = std::getenv("BBHOST_RECT_GS");
+        if (g.has_geometry_shader && !(e && e[0] == '0')) return RectPath::kGeometry;
+        if (g.has_tessellation) {
+            host_log("render: rect lists through the tessellation stages (%s)",
+                     g.has_geometry_shader ? "BBHOST_RECT_GS=0" : "the device has no geometry shader");
+            return RectPath::kTessellation;
+        }
+        host_log("render: rect lists drawn as their first triangle: the device has neither geometry nor tessellation shaders");
+        return RectPath::kTriangle;
+    }();
+    return path;
+}
+// One per vertex-shader interface, never destroyed. Null on failure.
+struct RectTessModules {
+    VkShaderModule control = VK_NULL_HANDLE, evaluation = VK_NULL_HANDLE;
+};
+RectTessModules rect_tess_modules(const std::vector<std::uint32_t>& params, int clip_count, const std::string& dump_name) {
+    static std::mutex mu;
+    static std::map<std::pair<std::vector<std::uint32_t>, int>, RectTessModules> modules;  // under mu
+    const auto key = std::make_pair(params, clip_count);
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = modules.find(key); it != modules.end()) return it->second;
+    const gcn::RectTessShaders t = gcn::make_rect_tess_shaders(params, clip_count);
+    dump_spirv(dump_name + "-rect-tcs", t.control);
+    dump_spirv(dump_name + "-rect-tes", t.evaluation);
+    RectTessModules m;
+    if (!make_module(t.control, m.control) || !make_module(t.evaluation, m.evaluation)) {
+        if (m.control) vkDestroyShaderModule(g.device, m.control, nullptr);
+        m = RectTessModules{};
+    }
+    modules.emplace(key, m);
+    return m;
+}
+
 // The game's own hull shader as a tessellation control stage (DrawState::
 // tess_hull), one per program and shape. It binds nothing: its constant
 // buffers are read through the page table, and its user data and the LDS
@@ -4228,10 +4269,13 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     pl.clip_discard = clip_discard;
     pl.tess_hw = s.tess_hw;
     pl.tess_control_points = s.tess_control_points;
-    const std::uint32_t vs_out_cntl =
+    std::uint32_t vs_out_cntl =
         s.vs_out_cntl | (clip_discard ? gcn::TranslateOptions::kVsOutCntlClipVarying |
                                             ((clip_discard >> 8) & 31) << gcn::TranslateOptions::kVsOutCntlClipLocationShift
                                       : 0u);
+    // No point size for tessellated rect lists: MoltenVK draws nothing when
+    // the vertex stage writes one.
+    if (s.rect && rect_list_path() == RectPath::kTessellation) vs_out_cntl &= ~(1u << 16);
     const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
                               vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
                               s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
@@ -4538,13 +4582,18 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                  s.tess_control_points, s.tess_outer[0], s.tess_outer[1], s.tess_outer[2], s.tess_outer[3], s.tess_inner[0],
                  s.tess_inner[1]);
     }
-    // Rect list: geometry shader expanding the triangle into its rectangle.
-    if (s.rect) {
+    // Rect list: the triangle expanded into its rectangle (rect_list_path).
+    if (s.rect && rect_list_path() == RectPath::kGeometry) {
         const std::vector<std::uint32_t> gs = gcn::make_rect_geometry_shader(pl.vs.meta().vs_params, pl.vs.meta().vs_clip_count,
                                                                              pl.vs.meta().vs_point_size);
         dump_spirv(pl.name + "-gs", gs);
         pl.gs.fresh().spirv = gs;
         if (!make_module(gs, pl.gs.module)) return fail("GS module");
+    } else if (s.rect && rect_list_path() == RectPath::kTessellation) {
+        const RectTessModules t = rect_tess_modules(pl.vs.meta().vs_params, pl.vs.meta().vs_clip_count, pl.name);
+        if (!t.control) return fail("rect tessellation modules");
+        pl.rect_tcs = t.control;
+        pl.rect_tes = t.evaluation;
     }
 
     if (g_set_layouts) {
@@ -4747,11 +4796,19 @@ struct PreRasterStates {
 // The host tessellator's part of a pre-rasterization library: its
 // generated vertex stage (the LS translated, or the pass-through), the control
 // stage made for the hull shader's factors, and the patch size. The domain
-// shader is the library's `vs`, as the evaluation stage.
+// shader is the library's `vs`, as the evaluation stage. A rect list sets
+// `evaluation` instead: `vs` stays the vertex stage.
 struct TessLibraryStages {
-    VkShaderModule vertex = VK_NULL_HANDLE, control = VK_NULL_HANDLE;
+    VkShaderModule vertex = VK_NULL_HANDLE, control = VK_NULL_HANDLE, evaluation = VK_NULL_HANDLE;
     std::uint32_t control_points = 1;
 };
+const TessLibraryStages* rect_library_stages(const GfxPipeline& pl, TessLibraryStages& t) {
+    if (!pl.rect_tes) return nullptr;
+    t.control = pl.rect_tcs;
+    t.evaluation = pl.rect_tes;
+    t.control_points = 3;
+    return &t;
+}
 
 // `vertex_formats`: 48 specialization words for the vertex shader, for an
 // optimized relink (relink_pipeline) - 16 vertex-format descriptors
@@ -4788,6 +4845,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         const std::uint64_t t[3] = {reinterpret_cast<std::uint64_t>(tess->vertex), reinterpret_cast<std::uint64_t>(tess->control),
                                     tess->control_points};
         key = fnv1a(t, sizeof(t), key ^ 0x7e55000000000000ull);
+        if (tess->evaluation) key = fnv1a(&tess->evaluation, sizeof(tess->evaluation), key ^ 0x7ec7000000000000ull);
     }
     if (vertex_formats) key = fnv1a(vertex_formats, 48 * sizeof(std::uint32_t), key ^ 0x5bec000000000000ull);
     return pipeline_library(kLibPreRaster, key, "pre-rasterization", vs.meta().spirv.size(), [&] {
@@ -4800,7 +4858,12 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
             stages.push_back(si);
         };
         VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
-        if (tess) {
+        if (tess && tess->evaluation) {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, vs.module);
+            stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tess->control);
+            stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tess->evaluation);
+            ts.patchControlPoints = tess->control_points;
+        } else if (tess) {
             stage(VK_SHADER_STAGE_VERTEX_BIT, tess->vertex);
             stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tess->control);
             stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, vs.module);
@@ -4816,7 +4879,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
             return e;
         }();
         const VkSpecializationInfo spec{48, spec_entries.data(), 48 * sizeof(std::uint32_t), vertex_formats};
-        if (vertex_formats && !tess) stages.front().pSpecializationInfo = &spec;
+        if (vertex_formats && (!tess || tess->evaluation)) stages.front().pSpecializationInfo = &spec;  // the translated vertex stage
         if (gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, gs.module);
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount = 1;
@@ -5335,7 +5398,9 @@ void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
         if (job.specialize_formats) std::copy(job.vertex_formats, job.vertex_formats + 16, words);
         std::copy(job.w3[0], job.w3[0] + 16, words + 16);
         std::copy(job.stride[0], job.stride[0] + 16, words + 32);
-        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words)) {
+        TessLibraryStages rect;
+        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts,
+                                                     rect_library_stages(pl, rect), words)) {
             libraries[1] = pr;
             if (job.specialize_formats) w.relinks_specialized.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -6048,7 +6113,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    const VkPrimitiveTopology topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
+    const VkPrimitiveTopology topology = pl.tess_hw || pl.rect_tes ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     std::uint64_t vi_key = fnv1a(&topology, sizeof(topology));
     if (vertex_input) vi_key = fnv1a(&vertex_input->hash, sizeof(vertex_input->hash), vi_key);
     const VkPipeline vi = pipeline_library(kLibVertexInput, vi_key, "vertex input", 0, [&] {
@@ -6073,7 +6138,8 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         tess.control = pl.tess_tcs;
         tess.control_points = pl.tess_control_points;
     }
-    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr);
+    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts,
+                                             pl.tess_hw ? &tess : rect_library_stages(pl, tess));
 
     const VkPipeline fs = fragment_library(pl.ps.meta(), pl.ps.module, pl.set_layouts[1], pl.layout);
 
@@ -6154,6 +6220,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     } else {
         stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
     }
+    if (pl.rect_tes) {  // a rect list's expansion without a geometry stage
+        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.rect_tcs);
+        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.rect_tes);
+    }
     if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
     if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
     // Pixel shaders at wave32: built whole, the fragment stage is given its
@@ -6176,10 +6246,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     const GfxFixedState f = fixed_state(s);
-    ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
+    ia.topology = pl.tess_hw || pl.rect_tes ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
-    ts.patchControlPoints = std::max<std::uint32_t>(1, pl.tess_control_points);
+    ts.patchControlPoints = pl.rect_tes ? 3 : std::max<std::uint32_t>(1, pl.tess_control_points);
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1;
     vp.scissorCount = 1;
@@ -6223,7 +6293,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     gpci.pStages = stages.data();
     gpci.pVertexInputState = &vi;
     gpci.pInputAssemblyState = &ia;
-    if (pl.tess_hw) gpci.pTessellationState = &ts;
+    if (pl.tess_hw || pl.rect_tes) gpci.pTessellationState = &ts;
     gpci.pViewportState = &vp;
     gpci.pRasterizationState = &rs;
     gpci.pMultisampleState = &ms;
@@ -6261,7 +6331,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
             host_log("render: slow pipeline %s%s on %s: vkCreateGraphicsPipelines %lld ms; SPIR-V words VS %zu, PS %zu%s; VS params %zu, "
                      "PS images %zu, buffers VS %zu PS %zu",
                      pl.name.c_str(), pl.lean ? " (no-fallback)" : "", t_pipeline_worker ? "a worker" : "the command processor",
-                     static_cast<long long>(ms_), pl.vs.meta().spirv.size(), pl.ps.meta().spirv.size(), pl.gs.module ? ", with GS" : "",
+                     static_cast<long long>(ms_), pl.vs.meta().spirv.size(), pl.ps.meta().spirv.size(), pl.gs.module ? ", with GS" : pl.rect_tes ? ", with rect tessellation" : "",
                      pl.vs.meta().vs_params.size(), pl.ps.meta().images.size(), pl.vs.meta().buffers.size(), pl.ps.meta().buffers.size());
         }
     }
@@ -14451,7 +14521,8 @@ static bool draw_impl(const GpuDraw& d) {
         // only for programs that can discard (ps_early_tests_matter).
         cd.translate.set("early_fragment_tests", spirv_has_early_fragment_tests(bind_pl->ps.meta().spirv));
         cd.translate.set("debug_ps", g_debug_ps_color);
-        cd.translate.set("rect_geometry_shader", s.rect);
+        cd.translate.set("rect_geometry_shader", s.rect && bind_pl->gs.module);
+        cd.translate.set("rect_tessellation", bind_pl->rect_tes != VK_NULL_HANDLE);
         cd.translate.set("ps_lifted", bind_pl->ps.lifted);
         cd.translate.set("vs_lifted", bind_pl->vs.lifted);
         cd.translate.set("vertex_formats_from_params", bind_pl->vs_formats_from_params);

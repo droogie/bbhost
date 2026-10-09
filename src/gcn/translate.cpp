@@ -4926,4 +4926,120 @@ std::vector<std::uint32_t> make_rect_geometry_shader(const std::vector<std::uint
     return m.assemble();
 }
 
+RectTessShaders make_rect_tess_shaders(const std::vector<std::uint32_t>& param_locations, int clip_count) {
+    using spv::Id;
+    // gl_MaxPatchVertices, as glslang declares the input arrays.
+    constexpr std::uint32_t kMaxPatchVertices = 32;
+    RectTessShaders out;
+    for (int evaluation = 0; evaluation < 2; ++evaluation) {
+        spv::Module m;
+        m.capability(spv::CapShader);
+        m.capability(spv::CapTessellation);
+        if (clip_count) m.capability(spv::CapClipDistance);
+        m.memory_model(0 /* Logical */, 1 /* GLSL450 */);
+        const Id t_void = m.type_void();
+        const Id t_bool = m.type_bool();
+        const Id t_f32 = m.type_float(32);
+        const Id t_i32 = m.type_int(32, true);
+        const Id t_v3f = m.type_vector(t_f32, 3);
+        const Id t_v4f = m.type_vector(t_f32, 4);
+        // No point size: see make_rect_tess_shaders in translate.h.
+        std::vector<Id> members = {t_v4f};
+        if (clip_count) members.push_back(m.type_array(t_f32, m.const_u32(static_cast<std::uint32_t>(clip_count))));
+        const Id t_pv = m.type_struct(members);
+        m.decorate(t_pv, spv::DecBlock);
+        m.member_decorate(t_pv, 0, spv::DecBuiltIn, {spv::BiPosition});
+        if (clip_count) m.member_decorate(t_pv, 1, spv::DecBuiltIn, {3 /* ClipDistance */});
+        const Id c_in_n = m.const_u32(kMaxPatchVertices), c_three = m.const_u32(3);
+        const Id in_pv = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_pv, c_in_n)), spv::ScInput);
+        const Id out_pv = m.global_variable(m.type_pointer(spv::ScOutput, evaluation ? t_pv : m.type_array(t_pv, c_three)), spv::ScOutput);
+        m.name(in_pv, "gl_in");
+        m.name(out_pv, "gl_out");
+        std::vector<Id> interface = {in_pv, out_pv};
+        std::vector<std::pair<Id, Id>> params;  // (in array var, out var)
+        for (std::uint32_t loc : param_locations) {
+            const Id in = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_v4f, c_in_n)), spv::ScInput);
+            const Id o = m.global_variable(m.type_pointer(spv::ScOutput, evaluation ? t_v4f : m.type_array(t_v4f, c_three)), spv::ScOutput);
+            m.decorate(in, spv::DecLocation, {loc});
+            m.decorate(o, spv::DecLocation, {loc});
+            interface.push_back(in);
+            interface.push_back(o);
+            params.push_back({in, o});
+        }
+        const Id p_in_v4 = m.type_pointer(spv::ScInput, t_v4f), p_out_v4 = m.type_pointer(spv::ScOutput, t_v4f);
+        const Id p_in_f = m.type_pointer(spv::ScInput, t_f32), p_out_f = m.type_pointer(spv::ScOutput, t_f32);
+        const auto ci = [&](std::uint32_t v) { return m.const_i32(static_cast<std::int32_t>(v)); };
+        Id in_builtin = 0, outer = 0, inner = 0;
+        if (evaluation) {
+            in_builtin = m.global_variable(m.type_pointer(spv::ScInput, t_v3f), spv::ScInput);
+            m.decorate(in_builtin, spv::DecBuiltIn, {spv::BiTessCoord});
+            m.name(in_builtin, "tess_coord");
+        } else {
+            in_builtin = m.global_variable(m.type_pointer(spv::ScInput, t_i32), spv::ScInput);
+            m.decorate(in_builtin, spv::DecBuiltIn, {spv::BiInvocationId});
+            m.name(in_builtin, "invocation_id");
+            outer = m.global_variable(m.type_pointer(spv::ScOutput, m.type_array(t_f32, m.const_u32(4))), spv::ScOutput);
+            inner = m.global_variable(m.type_pointer(spv::ScOutput, m.type_array(t_f32, m.const_u32(2))), spv::ScOutput);
+            m.decorate(outer, spv::DecBuiltIn, {spv::BiTessLevelOuter});
+            m.decorate(inner, spv::DecBuiltIn, {spv::BiTessLevelInner});
+            m.decorate(outer, spv::DecPatch);
+            m.decorate(inner, spv::DecPatch);
+            m.name(outer, "tess_level_outer");
+            m.name(inner, "tess_level_inner");
+            interface.push_back(outer);
+            interface.push_back(inner);
+        }
+        interface.push_back(in_builtin);
+        const Id fn = m.begin_function(t_void, m.type_function(t_void, {}));
+        m.label();
+        if (!evaluation) {
+            // Levels 1 all round: one quad, two triangles.
+            const Id id = m.load(t_i32, in_builtin);
+            m.store(m.access_chain(p_out_v4, out_pv, {id, ci(0)}), m.load(t_v4f, m.access_chain(p_in_v4, in_pv, {id, ci(0)})));
+            for (int k = 0; k < clip_count; ++k) {
+                m.store(m.access_chain(p_out_f, out_pv, {id, ci(1), ci(static_cast<std::uint32_t>(k))}),
+                        m.load(t_f32, m.access_chain(p_in_f, in_pv, {id, ci(1), ci(static_cast<std::uint32_t>(k))})));
+            }
+            for (const auto& [in, o] : params) m.store(m.access_chain(p_out_v4, o, {id}), m.load(t_v4f, m.access_chain(p_in_v4, in, {id})));
+            for (std::uint32_t k = 0; k < 4; ++k) m.store(m.access_chain(p_out_f, outer, {ci(k)}), m.const_f32(1.0f));
+            for (std::uint32_t k = 0; k < 2; ++k) m.store(m.access_chain(p_out_f, inner, {ci(k)}), m.const_f32(1.0f));
+        } else {
+            // (0,0) v0, (1,0) v1, (0,1) v2, (1,1) v1 + v2 - v0 as in the GS.
+            const Id coord = m.load(t_v3f, in_builtin);
+            const Id u = m.emit(spv::OpFOrdGreaterThan, t_bool, {m.emit(spv::OpCompositeExtract, t_f32, {coord, 0}), m.const_f32(0.5f)});
+            const Id v = m.emit(spv::OpFOrdGreaterThan, t_bool, {m.emit(spv::OpCompositeExtract, t_f32, {coord, 1}), m.const_f32(0.5f)});
+            const auto corner = [&](Id type, Id a, Id b, Id c) {
+                const Id d = m.emit(spv::OpFSub, type, {m.emit(spv::OpFAdd, type, {b, c}), a});
+                return m.emit(spv::OpSelect, type, {u, m.emit(spv::OpSelect, type, {v, d, b}), m.emit(spv::OpSelect, type, {v, c, a})});
+            };
+            std::vector<Id> pos(3);
+            for (std::uint32_t k = 0; k < 3; ++k) pos[k] = m.load(t_v4f, m.access_chain(p_in_v4, in_pv, {ci(k), ci(0)}));
+            m.store(m.access_chain(p_out_v4, out_pv, {ci(0)}), corner(t_v4f, pos[0], pos[1], pos[2]));
+            for (int k = 0; k < clip_count; ++k) {
+                std::vector<Id> d(3);
+                for (std::uint32_t i = 0; i < 3; ++i) {
+                    d[i] = m.load(t_f32, m.access_chain(p_in_f, in_pv, {ci(i), ci(1), ci(static_cast<std::uint32_t>(k))}));
+                }
+                m.store(m.access_chain(p_out_f, out_pv, {ci(1), ci(static_cast<std::uint32_t>(k))}), corner(t_f32, d[0], d[1], d[2]));
+            }
+            for (const auto& [in, o] : params) {
+                std::vector<Id> p(3);
+                for (std::uint32_t i = 0; i < 3; ++i) p[i] = m.load(t_v4f, m.access_chain(p_in_v4, in, {ci(i)}));
+                m.store(o, corner(t_v4f, p[0], p[1], p[2]));
+            }
+        }
+        m.emit_void(spv::OpReturn, {});
+        m.end_function();
+        m.entry_point(evaluation ? spv::EmTessellationEvaluation : spv::EmTessellationControl, fn, "main", interface);
+        // Modes in both stages: Metal needs the domain in the control stage.
+        // Cw keeps triangles wound as v0 v1 v2 (domain origin upper left).
+        m.execution_mode(fn, spv::ExQuads);
+        m.execution_mode(fn, spv::ExSpacingEqual);
+        m.execution_mode(fn, spv::ExVertexOrderCw);
+        if (!evaluation) m.execution_mode(fn, spv::ExOutputVertices, {3});
+        (evaluation ? out.evaluation : out.control) = m.assemble();
+    }
+    return out;
+}
+
 }  // namespace gcn
