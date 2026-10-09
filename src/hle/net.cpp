@@ -14,8 +14,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#if defined(__linux__)
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -138,9 +140,9 @@ inline void sock_setopt_int(sockfd_t fd, int level, int name, int v) { ::setsock
 inline bool sock_ok(sockfd_t fd) { return fd != kBadSock; }
 
 // The game's epoll over our own wake word instead of the kernel's epoll and
-// eventfds: Windows has neither, and on Linux BBHOST_NET_POLL=1 runs this
-// path so it is proven on the same co-op runs. A P2P socket is readable when
-// its inbox has a datagram; a UDP socket is polled with a zero timeout; a
+// eventfds: Windows and macOS have neither, and on Linux BBHOST_NET_POLL=1 runs
+// this path so it is proven on the same co-op runs. A P2P socket is readable
+// when its inbox has a datagram; a UDP socket is polled with a zero timeout; a
 // wait sleeps on one word every reader, control change and abort bumps
 // (net_wake), ten milliseconds at a time for the UDP sockets.
 //
@@ -153,7 +155,7 @@ inline bool sock_ok(sockfd_t fd) { return fd != kBadSock; }
 // timeout it ignored; winpthreads' condition variable returned at once on a
 // sub-millisecond one, and the loop spun out the rest).
 const bool g_net_poll = [] {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     return true;
 #else
     const char* e = std::getenv("BBHOST_NET_POLL");
@@ -565,7 +567,7 @@ GUEST_ABI int hle_net_socket(const char* name, int domain, int type, int) {
     } else if (domain == 2 && type == 6) {
         sock.p2p = true;
         sock.queue = std::make_shared<SockQueue>();
-#if !defined(_WIN32)
+#if defined(__linux__)
         if (!g_net_poll) sock.queue->qfd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE);
 #endif
         sock.queue->sock = id;
@@ -979,7 +981,7 @@ GUEST_ABI int hle_net_epoll_create(const char* name, int) {
     if (name) {
         ep->name = name;
     }
-#if !defined(_WIN32)
+#if defined(__linux__)
     if (!g_net_poll) {
         ep->efd = ::epoll_create1(EPOLL_CLOEXEC);
         ep->wake = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -1037,7 +1039,7 @@ GUEST_ABI int hle_net_epoll_control(int id, int op, int sock, void* event) {
         ep.watch[sock] = sev.events;
         ep.data[sock] = sev.data;
     }
-#if !defined(_WIN32)
+#if defined(__linux__)
     if (!g_net_poll) {
         auto sit = g_net_socks.find(sock);
         int fd = -1;
@@ -1126,7 +1128,7 @@ GUEST_ABI int hle_net_epoll_wait(int id, void* events, int maxevents, int timeou
             host_futex_wait(&g_net_wake_word, gen, &until);
         }
     }
-#if !defined(_WIN32)
+#if defined(__linux__)
     if (ep->efd >= 0) {
         // timeout is in microseconds, -1 forever.
         const int ms = timeout < 0 ? -1 : static_cast<int>((timeout + 999) / 1000);
