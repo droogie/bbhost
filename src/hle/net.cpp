@@ -134,7 +134,18 @@ inline ssize_type sock_sendto(sockfd_t fd, const void* buf, std::size_t len, boo
 inline ssize_type sock_send(sockfd_t fd, const void* buf, std::size_t len, bool dontwait) {
     return ::send(fd, buf, len, dontwait ? MSG_DONTWAIT : 0);
 }
+#if defined(__APPLE__)
+// macOS has no MSG_NOSIGNAL: SO_NOSIGPIPE keeps a send on a dead socket from
+// killing the process.
+inline sockfd_t sock_udp() {
+    const sockfd_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    const int one = 1;
+    if (fd >= 0) ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    return fd;
+}
+#else
 inline sockfd_t sock_udp() { return ::socket(AF_INET, SOCK_DGRAM, 0); }
+#endif
 inline void sock_setopt_int(sockfd_t fd, int level, int name, int v) { ::setsockopt(fd, level, name, &v, sizeof(v)); }
 #endif
 inline bool sock_ok(sockfd_t fd) { return fd != kBadSock; }
