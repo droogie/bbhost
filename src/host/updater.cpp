@@ -215,6 +215,10 @@ void set_plugins_status(const std::string& s) {
 #if defined(_WIN32)
 constexpr const char* kPluginSuffix = "-windows.dll";
 constexpr const char* kPluginExt = ".dll";
+#elif defined(__APPLE__)
+// A plugin on macOS is a Mach-O bundle, still named .so (CMake's MODULE).
+constexpr const char* kPluginSuffix = "-macos.so";
+constexpr const char* kPluginExt = ".so";
 #else
 constexpr const char* kPluginSuffix = "-linux.so";
 constexpr const char* kPluginExt = ".so";
