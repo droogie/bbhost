@@ -99,8 +99,10 @@ between two identical runs. Frames are compared by the share of pixels that
 changed, a blurred difference that leaves noise out, and an 8 x 8 table of
 brightness changes; a picture of the difference goes in `diffs/`.
 `ab.txt` lists what is worse beyond the noise floor, then what is better. A
-build older than the check reports fewer numbers (no frame intervals, no
-draws by shader kind) and the comparison leaves those out.
+build older than the check still gives fps, its seconds' worst frames, the GPU
+busy meter and the hitches, but no frame intervals (its percentiles are marked
+approximate), draws by shader kind, frames or captures; the comparison leaves
+out what one side lacks.
 
 ## The switches it uses
 
@@ -108,7 +110,7 @@ These are for test runs and off by default.
 
 | Switch | What it does |
 |---|---|
-| `BBHOST_FRAME_STATS=2` | after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
+| `BBHOST_FRAME_DETAIL=1` | with `BBHOST_FRAME_STATS=1`: after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
 | `BBHOST_TEST_WARP=1` | lets plugins move the player (the probe) |
 | `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |

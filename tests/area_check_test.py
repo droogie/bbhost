@@ -143,7 +143,7 @@ class TourTest(unittest.TestCase):
         s = ac.pass_settings(Path("/r/capture"), areas, opts, "capture")
         self.assertEqual(s["BBHOST_CAPTURE_DRAW"], "*ps")
         self.assertEqual(s["BBHOST_CAPTURE_ARMED"], "1")
-        self.assertEqual(s["BBHOST_FRAME_STATS"], "2")
+        self.assertEqual((s["BBHOST_FRAME_STATS"], s["BBHOST_FRAME_DETAIL"]), ("1", "1"))
         self.assertEqual(s["BBHOST_TEST_REQUESTS"], "/r/capture/requests")
         perf = ac.pass_settings(Path("/r/perf"), ac.pick_areas("central-yharnam"), opts, "perf")
         self.assertNotIn("BBHOST_CAPTURE_DRAW", perf)
@@ -429,7 +429,7 @@ import json, os, sys, time
 from pathlib import Path
 tour = Path(os.environ["BBHOST_MAPVAL_TOUR"]).read_text().splitlines()
 dumps, captures = Path(os.environ["BBHOST_MAPVAL_DUMPS"]), Path(os.environ["BBHOST_MAPVAL_CAPTURES"])
-assert os.environ["BBHOST_FRAME_STATS"] == "2" and os.environ["BBHOST_TEST_WARP"] == "1"
+assert os.environ["BBHOST_FRAME_STATS"] == "1" and os.environ["BBHOST_FRAME_DETAIL"] == "1" and os.environ["BBHOST_TEST_WARP"] == "1"
 out = sys.stdout
 def log(s):
     out.write("[bbhost] " + s + "\n")

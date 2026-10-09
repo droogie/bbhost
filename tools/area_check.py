@@ -34,7 +34,7 @@ with its lift and with its translation and compares the outputs byte for byte.
 Captures stall the GPU, which is why they get a session of their own.
 
 Per place the report gives, for the window: fps and the exact frame-time
-percentiles (BBHOST_FRAME_STATS=2: every flip interval), the GPU busy meter
+percentiles (BBHOST_FRAME_DETAIL=1: every flip interval), the GPU busy meter
 (ms of GPU work a second; not BBHOST_GPU_PROFILE, which records in place), the
 main loop's work, the draws by how their pixel shader ran (lifted, translated,
 the page-table fallback's translation, none) and the draw failures by reason;
@@ -240,7 +240,7 @@ def pass_settings(pass_dir, areas, opts, kind):
         "BBHOST_AUTOPRESS": world_baseline.AUTOPRESS,
         "BBHOST_CONFIG_DIR": str(pass_dir / "cfg"), "BBHOST_OPTIONS_PATH": str(pass_dir / "cfg" / "bbhost-options.toml"),
         "BBHOST_PIPELINE_CACHE": "1" if opts["pipeline_cache"] else "0",
-        "BBHOST_GAME_FPS": str(opts["fps"]), "BBHOST_FRAME_STATS": "2", "BBHOST_STALL_MS": "40",
+        "BBHOST_GAME_FPS": str(opts["fps"]), "BBHOST_FRAME_STATS": "1", "BBHOST_FRAME_DETAIL": "1", "BBHOST_STALL_MS": "40",
         "BBHOST_TEST_WARP": "1", "BBHOST_TEST_REQUESTS": str(pass_dir / "requests"),
         "BBHOST_MAPVAL_TOUR": str(pass_dir / "tour.txt"), "BBHOST_MAPVAL_START": "%g" % opts["start"],
         "BBHOST_MAPVAL_DUMPS": str(pass_dir / "frames"), "BBHOST_MAPVAL_CAPTURES": str(pass_dir / "captures"),
@@ -467,7 +467,7 @@ def summarize_values(values):
 
 def window_stats(seconds):
     """What a window of per-second records says. Frame times are exact when
-    every second carried its intervals (BBHOST_FRAME_STATS=2); otherwise fps
+    every second carried its intervals (BBHOST_FRAME_DETAIL=1); otherwise fps
     and the worst second's p95 and max stand in, marked approximate."""
     if not seconds:
         return None

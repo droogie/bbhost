@@ -83,10 +83,10 @@ struct State {
     std::vector<double> intervals_ms;
     std::unordered_map<int, ThreadTime> threads;
     GpuBusy gpu{};  // host_gpu_busy() when the window opened
-    GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_STATS=2)
+    GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_DETAIL=1)
 };
 
-// BBHOST_FRAME_STATS=2: the second's draws by how their pixel shader ran,
+// BBHOST_FRAME_DETAIL=1: the second's draws by how their pixel shader ran,
 // its draw failures by reason, and every flip interval in it, in lines short
 // enough for the log's line.
 void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<double>& intervals_ms) {
@@ -135,7 +135,7 @@ void frame_stats_on_flip() {
         s.window_start = s.last_flip = now;
         s.threads = thread_times();
         s.gpu = host_gpu_busy();
-        if (frame_stats_level() >= 2) s.stats = host_gpu_stats();
+        if (frame_stats_detail()) s.stats = host_gpu_stats();
         return;
     }
     s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_flip).count());
@@ -216,7 +216,7 @@ void frame_stats_on_flip() {
              secs, n, static_cast<double>(n) / secs, displayed, sum / static_cast<double>(n), p95, worst, over16, over33, total,
              top.c_str(), static_cast<double>(sync_ns) / 1e6, static_cast<double>(sleep_ns) / 1e6,
              static_cast<double>(file_ns) / 1e6, work.c_str(), gpu.c_str());
-    if (frame_stats_level() >= 2) {
+    if (frame_stats_detail()) {
         const GpuStats stats = host_gpu_stats();
         log_detail(s.stats, stats, s.intervals_ms);
         s.stats = stats;

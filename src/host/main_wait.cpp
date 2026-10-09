@@ -23,13 +23,17 @@
 #include "log.h"
 
 namespace {
-// BBHOST_FRAME_STATS=1 the per-second lines, =2 those and their detail
-// (frame_stats.h).
-const int g_level = [] {
+const bool g_on = [] {
     const char* e = std::getenv("BBHOST_FRAME_STATS");
-    return e && (*e == '1' || *e == '2') ? *e - '0' : 0;
+    return e && *e == '1';
 }();
-const bool g_on = g_level > 0;
+// BBHOST_FRAME_DETAIL=1: the per-second lines' detail (frame_stats.h). A
+// switch of its own, so a harness asking for it still gets the `frames:`
+// lines from a build that predates it.
+const bool g_detail = [] {
+    const char* e = std::getenv("BBHOST_FRAME_DETAIL");
+    return g_on && e && *e == '1';
+}();
 thread_local bool t_main_loop = false;
 // BBHOST_WAIT_LOG=<prefix>[,<prefix>...]: threads whose names start with one
 // of these log every wait of BBHOST_WAIT_LOG_MS (20) or more, with its call
@@ -85,7 +89,7 @@ std::int64_t now_ns() {
 }  // namespace
 
 bool frame_stats_enabled() { return g_on; }
-int frame_stats_level() { return g_level; }
+bool frame_stats_detail() { return g_detail; }
 
 void frame_stats_mark_main_thread() { t_main_loop = true; }
 
