@@ -31,6 +31,7 @@
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
 #include "engine/five_players.h"
+#include "engine/chara_id.h"
 #include "engine/lua_events.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
@@ -400,6 +401,8 @@ void hle_patch_guest(ElfImage* image) {
     playlog_install(image);
     // How long a touched summon sign may take (engine/sos_signs.h).
     sos_signs_install(image);
+    // A character the server never gave an id asks again (engine/chara_id.h).
+    chara_id_install(image);
     // The Hunter's Dream mirror, the developers' "Put on Disguise" (engine/change_appearance.h).
     change_appearance_install(image);
     // The Altar of Despair's "Rebirth in the Nightmare" (engine/rebirth.h).
