@@ -149,15 +149,15 @@ target_link_libraries(bbhost PRIVATE ZLIB::ZLIB)
 
 # The git revision the binary logs on its first line (build/gen/bbhost_version.h,
 # rewritten by every build only when it changes): a crash report from a
-# machine names the build to symbolize it against. bbhost_build_id.h beside it:
-# the shader caches' stamp for "the same build".
+# machine names the build to symbolize it against.
 add_custom_target(bbhost_version
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/bbhost_version.h
-          -DBUILD_ID_OUT=${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
-  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h ${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h)
+          -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h)
 add_dependencies(bbhost bbhost_version)
 # The translator's fingerprint (build/gen/translator_fingerprint.h): the
-# translation cache's key for "the same translator".
+# translation cache's key for "the same translator" - its sources and the
+# cache's own key and entry code.
 add_custom_target(bbhost_translator_fingerprint
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h
           -P ${CMAKE_SOURCE_DIR}/cmake/translator_fingerprint.cmake

@@ -67,11 +67,14 @@ game writes a save (at most every five minutes) a copy goes to
 copy its files over `<data>/saves/SPRJ0005`.
 
 The shader caches in `<data>/bbhost` (`translation-cache.bin`,
-`vulkan-pipeline-cache.bin`) belong to the build that made them: a new or
-updated bbhost finds another build's name in `shader-cache-build.txt`, throws
-both away (`gpu: shader caches made by ..., this is ...: cleared`) and builds
-them again while the title loads, from `stage-manifest.bin`, the list of the
-game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them.
+`vulkan-pipeline-cache.bin`) belong to the shader translator that made them,
+which `shader-cache-build.txt` names. An update that leaves the translator
+alone keeps them, so it starts as fast as the build before it; one that
+changed the translator throws both away (`gpu: shader caches made by
+translator ..., this is translator ...: cleared`) and builds them again while
+the title and the loading screens are up, from `stage-manifest.bin`, the list
+of the game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them
+anyway. The files are safe to delete: the next start builds them again.
 
 ## Controls
 
