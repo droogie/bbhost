@@ -22,6 +22,7 @@
 #include "engine/yebis.h"
 #include "engine/guest.h"
 #include "decomp/decomp.h"
+#include "host/fmod_project_init.h"
 #include "decomp/events/flag_store.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -407,7 +408,9 @@ void hle_patch_guest(ElfImage* image) {
     five_players_install(image);
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
     decomp_add_areas();
+    fmod_project_init::add_hooks();
     decomp_install(image);
+    fmod_project_init::qualify();
     // After the list: the mouse turns our follow camera when it is in place,
     // else the game's by hooks (engine/mouse_camera.h).
     mouse_camera_install(image);
