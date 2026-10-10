@@ -537,6 +537,8 @@ std::string stage_manifest_path();
 // otherwise.
 void precompile_set_loading(bool loading);
 void precompile_set_world_reached();
+// The jobs queued and compiling on the precompile workers.
+std::size_t precompile_backlog();
 
 // gpu.cpp
 bool init_locked();

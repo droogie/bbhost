@@ -5713,6 +5713,7 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
+std::size_t host_gpu_shader_backlog() { return gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0; }
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);

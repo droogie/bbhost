@@ -724,4 +724,6 @@ std::string translation_cache_window() {
 
 const char* translator_fingerprint() { return BBHOST_TRANSLATOR_FINGERPRINT; }
 
+bool translation_cache_cold() { return g_tc.ready.load(std::memory_order_acquire) && g_tc.on && g_tc.loaded == 0; }
+
 }  // namespace gpu

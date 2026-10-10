@@ -60,5 +60,9 @@ std::string translation_cache_window();
 // The translator's fingerprint (cmake/translator_fingerprint.cmake), which the
 // shader caches are stamped with: another one starts them all again.
 const char* translator_fingerprint();
+// This start had no translations to take: the cache was empty, unreadable or
+// another translator's, so every shader is translated again. False with the
+// cache off, and before it is loaded.
+bool translation_cache_cold();
 
 }  // namespace gpu
