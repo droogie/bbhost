@@ -4,6 +4,7 @@
 #include <locale>
 #include "core/write_watch.h"
 #include "hle/common.h"
+#include "hle/libc_ctype.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
 #include "hle/hle.h"
@@ -68,50 +69,10 @@ short g_toupper[257];
 lconv g_lconv{};
 std::once_flag g_ctype_once;
 
-// Dinkum _Ctype bits (what the eboot masks with: 0x01 for GUID hex scans,
-// 0x02 before _Getptolower, 0x20 for digits).
-constexpr short kXD = 0x001;  // hex digit
-constexpr short kUP = 0x002;  // upper
-constexpr short kSP = 0x004;  // space
-constexpr short kPU = 0x008;  // punct
-constexpr short kLO = 0x010;  // lower
-constexpr short kDI = 0x020;  // digit
-constexpr short kCN = 0x040;  // control
-constexpr short kBB = 0x080;  // blank (space, tab)
-constexpr short kXS = 0x100;  // extra space
-constexpr short kXA = 0x200;  // extra alpha
-
 void init_ctype() {
     for (int i = 0; i < 257; ++i) {
         const int c = i - 1;
-        short bits = 0;
-        if (c >= 0 && c < 128) {
-            if (c >= '0' && c <= '9') {
-                bits |= kDI | kXD;
-            }
-            if (c >= 'A' && c <= 'Z') {
-                bits |= kUP;
-            }
-            if (c >= 'a' && c <= 'z') {
-                bits |= kLO;
-            }
-            if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                bits |= kXD;
-            }
-            if (c == ' ' || c == '\t') {
-                bits |= kBB;
-            }
-            if (c == ' ' || (c >= '\t' && c <= '\r')) {
-                bits |= kSP;
-            }
-            if (c < 0x20 || c == 0x7f) {
-                bits |= kCN;
-            }
-            if (c > 0x20 && c < 0x7f && !(bits & (kDI | kUP | kLO))) {
-                bits |= kPU;
-            }
-        }
-        g_ctype[i] = bits;
+        g_ctype[i] = bb::libc::ctype_flags(c);
         g_tolower[i] = static_cast<short>(c >= 'A' && c <= 'Z' ? c + 32 : c);
         g_toupper[i] = static_cast<short>(c >= 'a' && c <= 'z' ? c - 32 : c);
     }
