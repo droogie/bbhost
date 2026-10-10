@@ -530,6 +530,13 @@ if(UNIX)
   endif()
 endif()
 
+# Exercise the Windows chromatic copy stub and portable view-field suppression.
+enable_testing()
+add_executable(chromatic_stub_test tests/chromatic_stub_test.cpp)
+target_include_directories(chromatic_stub_test PRIVATE src)
+target_compile_options(chromatic_stub_test PRIVATE -UNDEBUG)
+add_test(NAME chromatic_stub_test COMMAND chromatic_stub_test)
+
 # `cmake --build build --target smoke`: 60 s run must time out (124) without a core dump.
 # For the Windows cross build (`cmake --build build-win --target smoke`) the
 # run is bbhost.exe under wine, ended by BBHOST_EXIT_FLIP (tools/win_smoke.sh).

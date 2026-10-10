@@ -1,5 +1,6 @@
 #include "guest_abi.h"
 #include "engine/graphics_patch.h"
+#include "engine/chromatic_stub.h"
 
 #include "core/elf.h"
 #include "core/memory.h"
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -65,15 +67,18 @@ namespace {
 //     (sub_269e990, the renderer in r9) writes each bool as setting && that
 //     bit, for every renderer - there are several (two in the graphics
 //     manager, a child of each, and menu views) - before it draws.
-//   - Chromatic aberration is an amount the area's lens parameters give each
+//   - Chromatic aberration has an enable integer and four dispersion values
+//     the area's lens parameters give each
 //     frame: sub_128a710 fills a block on the stack from two parameter sets,
 //     and the same function then copies it field by field into the global
-//     post-process block at 0x59406e0 - the amount by
+//     post-process block at 0x59406e0 - the enable integer by
 //     `mov eax, [rbp-0xa70]; mov [rbx+0xac], eax` at 0x269faa8, the copy the
 //     community patch replaces with a store of 0. Here those 12 bytes become
-//     a jump to a stub that does the same copy with the amount ANDed with a
+//     a jump to a stub that does the same copy with the enable value ANDed with a
 //     mask the host owns: all ones for on, 0 for off. The code is written
-//     once, at load; turning it on or off is one store to the mask.
+//     once, at load; turning it on or off is one store to the mask. The YEBIS
+//     record hook also clears lateral and uniform dispersion (+0xb4..+0xc0)
+//     when off: the enable integer alone does not remove the colour fringing.
 //   - Motion blur and depth of field are shader patches (host/shader_patch.h).
 //   - Bloom and vignette are two of the area's draw parameters, changed in the
 //     block the game hands YEBIS each frame - "Draw parameters" below.
@@ -138,7 +143,7 @@ constexpr std::size_t kSaturation = 0xc8, kVignettePower = 0xd0, kGlareLuminance
 constexpr std::size_t kYebisHeld = 0x2710;  // on the YEBIS object: the block was not refreshed
 std::uint8_t* g_post_block = nullptr;
 std::atomic<float> g_bloom{1.0f}, g_saturation{1.0f};
-std::atomic<bool> g_vignette{true};
+std::atomic<bool> g_vignette{true}, g_chromatic{true};
 
 // Ambient occlusion strength. The SSAO bank (+0x5968) is blended the same way
 // (sub_1285500, into a 0x6c-byte block) and copied into the SSAO object the
@@ -255,18 +260,35 @@ const float g_shadow_scale_env = [] {
 }();
 
 void set_chromatic_aberration(bool on) {
+    g_chromatic.store(on, std::memory_order_relaxed);
     if (!g_ca_mask) return;
     const std::uint32_t want = on ? 0xffffffffu : 0u;
     if (g_ca_mask->exchange(want) != want) host_log("graphics: chromatic aberration %s", on ? "on" : "off");
 }
 
-// The copy, through the mask. The stub has to be within a rel32 of the code,
-// so its page comes from the low 2 GiB.
+// The copy, through the mask. Windows can use an absolute 12-byte jump here:
+// rax is overwritten by the displaced mov eax anyway. Linux keeps its rel32
+// stub. Neither route calls host code or changes the guest's other registers.
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
 #if defined(_WIN32)
-    (void)image;
-    (void)at;
-    return false;
+    auto* c = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                                    PAGE_EXECUTE_READWRITE));
+    if (!c) return false;
+    const auto back = at + sizeof(kCaCopyBytes);
+    auto* mask = new (c + engine::ca_mask_offset) std::atomic<std::uint32_t>(0xffffffffu);
+    auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
+    const auto lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
+    if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
+        VirtualFree(c, 0, MEM_RELEASE);
+        return false;
+    }
+    engine::emit_ca_absolute_stub(p, c, back);
+    FlushInstructionCache(GetCurrentProcess(), c, 34);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(kCaCopyBytes));
+    guest_protect_rx(&image->mem, lo, hi - lo);
+    g_ca_mask = mask;
+    host_log("graphics: installed Windows chromatic aberration copy mask");
+    return true;
 #else
     void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return false;
@@ -504,6 +526,7 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
     const float bloom = g_bloom.load(std::memory_order_relaxed);
     const bool vignette = g_vignette.load(std::memory_order_relaxed);
     const float saturation = g_saturation.load(std::memory_order_relaxed);
+    engine::apply_chromatic_setting(g_post_block, g_chromatic.load(std::memory_order_relaxed));
     if (saturation != 1.0f) {
         float s = 0;
         std::memcpy(&s, g_post_block + kSaturation, 4);
@@ -530,9 +553,9 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
     return 0;
 }
 
-// Where the copy lands: the post-process block's chromatic aberration amount.
+// Where the copy lands: the post-process block's chromatic enable integer.
 constexpr std::uint64_t kCaAmount = 0x594078c;
-const float* g_ca_amount = nullptr;
+const std::uint32_t* g_ca_amount = nullptr;
 
 // BBHOST_DRAWPARAM_PROBE=1: which draw-parameter entries each view asks for,
 // and whether they exist. sub_269e990 fetches two entries from each of twelve
@@ -981,14 +1004,13 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[0])));
     if (g_ca_amount) {
-        // What the last view copied, logged when it changes: the area's own
-        // amount through the mask. 0 with the setting on means this place has
-        // none, which is why a test of the setting there shows nothing.
-        static float last = -1.0f;
+        // This is an enable integer, not a float amount. Visible dispersion
+        // also has separate coefficients, suppressed at the YEBIS copy hook.
+        static std::uint32_t last = ~0u;
         static std::atomic<int> logs{0};
-        const float now = *reinterpret_cast<const volatile float*>(g_ca_amount);
+        const auto now = *reinterpret_cast<const volatile std::uint32_t*>(g_ca_amount);
         if (now != last && logs.fetch_add(1) < 16) {
-            host_log("graphics: chromatic aberration amount %g", now);
+            host_log("graphics: chromatic aberration enable %u", now);
         }
         last = now;
     }
@@ -1059,7 +1081,7 @@ void live_install(ElfImage* image) {
     } else if (!install_ca_stub(image, ca)) {
         host_log("graphics: cannot place chromatic aberration's stub; it stays on");
     } else {
-        g_ca_amount = static_cast<const float*>(guest_ptr(image->mem, at(kCaAmount)));
+        g_ca_amount = static_cast<const std::uint32_t*>(guest_ptr(image->mem, at(kCaAmount)));
     }
     if (!install_prologue_hook(image, at(kRenderView), kRenderViewPrologue, sizeof(kRenderViewPrologue),
                                reinterpret_cast<void*>(&render_view_hook))) {
