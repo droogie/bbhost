@@ -32,7 +32,7 @@
 #include <vector>
 
 #if defined(BBHOST_HAVE_CURL)
-#include <curl/curl.h>
+#include "net/curl_tls.h"
 #endif
 
 namespace {
@@ -286,16 +286,7 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
         constexpr long kMinConnectMs = 5000;
         const long want_ms = eff.connect_timeout_us ? static_cast<long>(eff.connect_timeout_us / 1000) : 10000;
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, want_ms < kMinConnectMs ? kMinConnectMs : want_ms);
-        if (!config().online_verify_tls) {
-            curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-            curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-        }
-#if defined(_WIN32)
-        // schannel also asks the CA whether the certificate was revoked and fails
-        // when that lookup cannot be made (firewalls, captive networks); the chain
-        // and name are still checked.
-        curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
-#endif
+        net::configure_curl_tls(c, config().online_verify_tls);
         // The game's own user agent with bbhost's name and version after it,
         // so a server can tell bbhost clients and their versions apart. The
         // game's text stays the prefix, which is what anything matching on
