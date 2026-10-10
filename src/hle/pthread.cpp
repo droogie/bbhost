@@ -40,8 +40,14 @@ struct ThreadBody {
     bool detached;
     bool started;
     bool host_born;
+    bool finished;
 };
 static_assert(sizeof(ThreadBody) <= 248, "ThreadBody fits gsync::Thread");
+
+// Publish the native handle before a child can run or release its body.
+// Completion and detach also share this lock: either may be the last user
+// of a detached handle, including a detach after the thread has returned.
+std::mutex g_thread_lifecycle_mu;
 
 ThreadBody* body(gsync::Thread* t) {
     return reinterpret_cast<ThreadBody*>(reinterpret_cast<std::uint8_t*>(t) + 8);
@@ -336,10 +342,12 @@ int test_thread_start_ms() {
 }
 
 void* thread_tramp(void* p) {
+    {
+        std::lock_guard<std::mutex> lock(g_thread_lifecycle_mu);
+    }
     auto* t = static_cast<gsync::Thread*>(p);
     ThreadBody* b = body(t);
     gsync::set_current_thread(t);
-    b->pt = pthread_self();
     b->tid = host_thread_id();
     b->started = true;
     if (b->name[0]) {
@@ -365,8 +373,12 @@ void* thread_tramp(void* p) {
         guest_thread_leave(b->tcb);
     }
     void* r = b->retval;
-    if (b->detached) {
-        gsync::thread_free(t);
+    {
+        std::lock_guard<std::mutex> lock(g_thread_lifecycle_mu);
+        b->finished = true;
+        if (b->detached) {
+            gsync::thread_free(t);
+        }
     }
     return r;
 }
@@ -412,6 +424,7 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     }
     // Publish the handle before the thread can run so the child never sees
     // an empty slot.
+    std::lock_guard<std::mutex> lock(g_thread_lifecycle_mu);
     *th = t;
     g_threads_starting.fetch_add(1);
     g_threads_made.fetch_add(1);
@@ -424,9 +437,8 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
         gsync::thread_free(t);
         return to_freebsd(e);
     }
-    // The child also stores pthread_self() into b->pt, but the guest may
-    // scePthreadDetach/Join the new handle before the child has run; libc
-    // dereferences a null pthread_t.
+    // The child is still behind the lifecycle lock. Even an immediately
+    // exiting detached thread cannot free b before this publication.
     b->pt = pt;
     return 0;
 }
@@ -447,11 +459,16 @@ int pthread_join_impl(void* th, void** ret) {
         return gsync::kEINVAL;
     }
     ThreadBody* b = body(t);
-    if (b->host_born || b->detached) {
-        return gsync::kEINVAL;
+    pthread_t pt;
+    {
+        std::lock_guard<std::mutex> lock(g_thread_lifecycle_mu);
+        if (b->host_born || b->detached) {
+            return gsync::kEINVAL;
+        }
+        pt = b->pt;
     }
     void* r = nullptr;
-    int e = pthread_join(b->pt, &r);
+    int e = pthread_join(pt, &r);
     if (e) {
         return to_freebsd(e);
     }
@@ -471,11 +488,19 @@ int pthread_detach_impl(void* th) {
         return gsync::kEINVAL;
     }
     ThreadBody* b = body(t);
-    if (b->host_born) {
+    std::lock_guard<std::mutex> lock(g_thread_lifecycle_mu);
+    if (b->host_born || b->detached) {
         return gsync::kEINVAL;
     }
+    const int e = pthread_detach(b->pt);
+    if (e) {
+        return to_freebsd(e);
+    }
     b->detached = true;
-    return to_freebsd(pthread_detach(b->pt));
+    if (b->finished) {
+        gsync::thread_free(t);
+    }
+    return 0;
 }
 GUEST_ABI int hle_sce_pthread_detach(void* th) { return sce(pthread_detach_impl(th)); }
 
