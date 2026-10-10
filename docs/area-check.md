@@ -15,17 +15,27 @@ draw them, place by place. Two builds can be run against each other.
 | `old-yharnam` | Old Yharnam | its lamp |
 | `forbidden-woods` | Forbidden Woods (tessellated meshes) | its lamp |
 | `moonside-lake` | Byrgenwerth, Rom's arena | the first lamp, then the lake's doorway |
+| `nightmare-of-mensis` | Nightmare of Mensis, Mergo's Loft and the brain's window | the Nightmare of Mensis lamp, then the rocks above the north path |
 | `fishing-hamlet` | Fishing Hamlet, the Orphan of Kos's coast | the first lamp, then the arena's edge |
 | `astral-clocktower` | Lady Maria's arena | the Research Hall lamp, then the arena's door |
 | `lumenwood-garden` | The Living Failures' garden | the Research Hall lamp, then the balcony's door |
 | `hunters-nightmare` | Ludwig's arena | the first lamp, then the arena's edge |
+| `laurence-staircase` | The staircase up to the Nightmare Grand Cathedral, Laurence's arena | the first lamp, then the staircase's upper flight |
 
-The last four are The Old Hunters' and need it on (bbhost's default). An
+The last five are The Old Hunters' and need it on (bbhost's default). An
 arena view stands just outside the boss's fog wall, facing in, where the boss
 rush plugin starts its rounds, without walking in. Two arenas are behind
-doors, which the run opens with the flags the boss rush uses. The
-places are visited in the order given, and what a place changes (a door) stays
-changed for the rest of the run.
+doors, which the run opens with the flags the boss rush uses.
+
+Mensis and the staircase are views rather than arenas, two of the heaviest
+scenes the game draws, and each has a standpoint of its own: a position in the
+map's layout and a facing. Mergo's Loft is seen from the top of a rock slope
+off the path, where the brain's gaze frenzies the player; the probe keeps the
+HP full. The staircase is seen from its upper flight, facing up, above the
+landing where an executioner wakes when the player comes down.
+
+The places are visited in the order given, and what a place changes (a door)
+stays changed for the rest of the run.
 
 ## What a run does
 
@@ -89,7 +99,7 @@ and writes the plan, the tours, the configs and the commands, and starts
 nothing. `--areas` picks places, `--settle`, `--measure` and `--captures`
 change the timings, `--pipeline-cache off` compiles every shader when first
 met instead of from the seed's stage manifest. The dry run says how long each
-pass should take: about 12 minutes each for all ten places, then the lift
+pass should take: about 15 minutes each for all twelve places, then the lift
 checks.
 
 ## Reading an A/B

@@ -23,9 +23,12 @@ then holds still:
 The places (`areas`) are visited in the order given. An arena's view stands
 just outside the boss's fog wall, facing in, as plugins/boss_rush starts its
 rounds; two arenas are behind doors, which the travel there opens with the
-boss rush's flags (they stay open for the rest of the run). The Old Hunters'
-places need its patch on (bbhost's default; the run's config says so when
-they are listed).
+boss rush's flags (they stay open for the rest of the run). Two places are
+views with a standpoint of their own, two of the heaviest scenes the game
+draws: Mergo's Loft from the rocks above Mensis's north path, and the
+staircase up to the Nightmare Grand Cathedral. The Old Hunters' places need
+its patch on (bbhost's default; the run's config says so when they are
+listed).
 
 That is the perf pass. The capture pass visits the same places and, after the
 settle, lets BBHOST_CAPTURE_DRAW=*ps take the first draw of up to --captures
@@ -89,6 +92,11 @@ QUIET_RADIUS = 40.0
 # How far behind a boss's fog wall the view stands: the boss rush plugin's
 # stand-off, which it checked in each arena (plugins/boss_rush).
 FOG_STANDOFF = 1.0
+# A standpoint of a place's own is checked against the layout: something it
+# puts on the ground (an object, a character, a player start) within this many
+# metres. A lookout over a vista can be 40 m from the nearest; a standpoint in
+# the block's own frame instead of the MSB's is hundreds of metres out.
+STAND_REACH = 50.0
 # The way through the title: the menus' confirm button, asked of the host
 # (BBHOST_TEST_REQUESTS "menutap confirm") every TITLE_TAP_EVERY_S seconds from
 # TITLE_TAP_FIRST_S until the world's first frame. The host presses it only
@@ -103,15 +111,17 @@ TITLE_TAP_EVERY_S = 2.0
 
 class Area:
     """A place: a lamp (ReturnPointParam row) the travel takes, and where to
-    stand after it - where the travel puts the player, or just outside a boss's
-    fog wall facing the arena (the wall's MSB position and rotation, as
-    plugins/boss_rush keeps them). `flags`: event flags turned on before the
-    travel's load reads them - the doors in front of two arenas, as the boss
-    rush opens them."""
+    stand after it - where the travel puts the player, just outside a boss's
+    fog wall facing the arena (`fog`: the wall's MSB position and rotation, as
+    plugins/boss_rush keeps them), or a standpoint of its own (`stand`: an MSB
+    position on the ground and the facing in degrees, for a view no wall
+    gives). `flags`: event flags turned on before the travel's load reads
+    them - the doors in front of two arenas, as the boss rush opens them."""
 
-    def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=()):
+    def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=(), stand=None):
         self.id, self.name, self.block, self.return_point, self.fog, self.dlc = ident, name, block, return_point, fog, dlc
         self.flags = tuple(flags)
+        self.stand = tuple(stand) if stand else None
 
     def block_hex(self):
         a, b, c, d = (int(x) for x in self.block[1:].split("_"))
@@ -120,7 +130,10 @@ class Area:
     def view(self):
         """(x, y, z, yaw in radians) in the MSB's frame, or None. A thing at yaw
         t faces (-sin t, -cos t): the wall faces into its arena, so the view
-        stands behind it, facing as it does."""
+        stands behind it, facing as it does. A standpoint is the view as it is."""
+        if self.stand:
+            x, y, z, deg = self.stand
+            return (x, y, z, math.radians(deg))
         if not self.fog:
             return None
         x, y, z, deg = self.fog
@@ -130,8 +143,8 @@ class Area:
     def as_dict(self):
         v = self.view()
         return {"id": self.id, "name": self.name, "block": self.block, "return_point": self.return_point, "dlc": self.dlc,
-                "fog": list(self.fog) if self.fog else None, "view": [round(c, 4) for c in v] if v else None,
-                "flags": list(self.flags)}
+                "fog": list(self.fog) if self.fog else None, "stand": list(self.stand) if self.stand else None,
+                "view": [round(c, 4) for c in v] if v else None, "flags": list(self.flags)}
 
 
 AREAS = (
@@ -143,6 +156,12 @@ AREAS = (
     # The lake's door (m32_00's 13200040 and its opening's 13200120) open.
     Area("moonside-lake", "Byrgenwerth: Moonside Lake, Rom's arena", "m32_00_00_00", 3202950,
          fog=(-452.874, -175.03, 392.65, 70.0), flags=(13200040, 13200120)),
+    # A lookout: the top of the rock slope off the north path (navmesh piece
+    # h000003), facing Mergo's Loft's west front and the brain's lit window.
+    # The brain's gaze (the evil eye, m26_00's 2600100/2600101) frenzies the
+    # player here; the probe keeps the HP full.
+    Area("nightmare-of-mensis", "Nightmare of Mensis: Mergo's Loft from the north path's rocks", "m26_00_00_00", 2602950,
+         stand=(15.0, 1020.2, 95.0, -85.0)),
     Area("fishing-hamlet", "Fishing Hamlet: the coast, the Orphan of Kos", "m36_00_00_00", 3602950,
          fog=(-700.2, 1580.5, -906.2, 0.0), dlc=True),
     Area("astral-clocktower", "Astral Clocktower: Lady Maria's arena", "m35_00_00_00", 3502950,
@@ -152,6 +171,13 @@ AREAS = (
          fog=(-378.54, 1592.9, -824.55, 90.0), dlc=True, flags=(13501200, 13504220)),
     Area("hunters-nightmare", "Hunter's Nightmare: Ludwig's arena", "m34_00_00_00", 3402950,
          fog=(-407.93, 1503.8, -716.45, 0.0), dlc=True),
+    # The great staircase up to the Nightmare Grand Cathedral (Laurence's
+    # arena), on its upper flight 24 m below the fog wall, facing up. The
+    # executioner on the landing below (m34_00's event 13405103) wakes when
+    # the player enters region 3402300 - from 26 m below the wall down - or
+    # comes within 7 m of it.
+    Area("laurence-staircase", "Hunter's Nightmare: the staircase up to the Nightmare Grand Cathedral", "m34_00_00_00", 3402950,
+         stand=(-462.9, 1530.7, -313.47, -150.0), dlc=True),
 )
 AREA_BY_ID = {a.id: a for a in AREAS}
 
@@ -281,7 +307,7 @@ def pass_budget(areas, opts, kind):
 
 def estimate(areas, opts, kind):
     """Seconds a pass usually takes (a travel ~25 s)."""
-    per = 25 + (3 if any(a.fog for a in areas) else 0)
+    per = 25 + (3 if any(a.view() for a in areas) else 0)
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * opts["dump_gap"] + 1 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"])
     return 60 + opts["start"] + per * len(areas)
@@ -1043,7 +1069,7 @@ def summary_text(report):
                 ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
     out.append("")
     for aid, a in report.get("areas", {}).items():
-        out.append("%-18s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
+        out.append("%-19s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
         w = a.get("window")
         if w:
             fm = w.get("frame_ms", {})
@@ -1153,8 +1179,11 @@ def read_paths(config):
 
 def check_areas(areas, app0):
     """Each place's lamp and view against the game's data: the ReturnPointParam
-    row is there and in the place's block, the block's layout is there, and a
-    view stands within 3 m of a map object (the fog wall it was taken from)."""
+    row is there and in the place's block, the block's layout is there, a fog
+    wall's view stands within 3 m of a map object (the wall it was taken from)
+    and a standpoint within STAND_REACH of something the layout puts on the
+    ground (an object, a character, a player start) - not out in the void, or
+    in the block's own frame instead of the MSB's."""
     import bbparam
     import msb
     rows = dict(bbparam.load_table("ReturnPointParam", app0))
@@ -1172,16 +1201,35 @@ def check_areas(areas, app0):
         path = Path(app0) / "dvdroot_ps4" / "map" / "mapstudio" / (a.block + ".msb.dcx")
         if not path.is_file():
             r["problems"].append("no layout %s" % path.name)
-        elif a.fog:
+        elif a.fog or a.stand:
             parts = msb.parts(msb.load(str(path)))
-            fx, fy, fz, _ = a.fog
-            near = min(((p["pos"][0] - fx) ** 2 + (p["pos"][1] - fy) ** 2 + (p["pos"][2] - fz) ** 2, p["name"])
-                       for p in parts if p["type"] == 1)
-            r["fog_object"] = {"name": near[1], "distance_m": round(math.sqrt(near[0]), 3)}
-            if near[0] > 9.0:
-                r["problems"].append("no map object within 3 m of the fog wall position (nearest %s at %.1f m)" % (near[1], math.sqrt(near[0])))
+            if a.fog:
+                fx, fy, fz, _ = a.fog
+                near = min(((p["pos"][0] - fx) ** 2 + (p["pos"][1] - fy) ** 2 + (p["pos"][2] - fz) ** 2, p["name"])
+                           for p in parts if p["type"] == 1)
+                r["fog_object"] = {"name": near[1], "distance_m": round(math.sqrt(near[0]), 3)}
+                if near[0] > 9.0:
+                    r["problems"].append("no map object within 3 m of the fog wall position (nearest %s at %.1f m)" % (near[1], math.sqrt(near[0])))
+            if a.stand:
+                sx, sy, sz, _ = a.stand
+                near = min((((p["pos"][0] - sx) ** 2 + (p["pos"][1] - sy) ** 2 + (p["pos"][2] - sz) ** 2, p["name"])
+                            for p in parts if p["type"] in (1, 2, 4)), default=(math.inf, None))
+                r["stand_near"] = {"name": near[1], "distance_m": round(math.sqrt(near[0]), 3)}
+                if near[0] > STAND_REACH ** 2:
+                    r["problems"].append("nothing the layout places within %.0f m of the standpoint (nearest %s at %.1f m)" % (
+                        STAND_REACH, near[1], math.sqrt(near[0])))
         results.append(r)
     return results
+
+
+def check_note(c):
+    """What a place's check found the view near: 'fog object o349000_0000 at 0.00 m'."""
+    out = []
+    if c.get("fog_object"):
+        out.append("fog object %s at %.2f m" % (c["fog_object"]["name"], c["fog_object"]["distance_m"]))
+    if c.get("stand_near"):
+        out.append("standpoint %.2f m from %s" % (c["stand_near"]["distance_m"], c["stand_near"]["name"]))
+    return "; ".join(out)
 
 
 def tool_paths(bbhost):
@@ -1478,8 +1526,8 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
     (out / "plan.json").write_text(json.dumps(plan, indent=2, default=str) + "\n")
     bad = [c for c in checks if c["problems"]]
     for c in checks:
-        extra = ("; fog object %s at %.2f m" % (c["fog_object"]["name"], c["fog_object"]["distance_m"])) if c.get("fog_object") else ""
-        say("  %-18s lamp %s%s%s" % (c["id"], (c.get("lamp") or {}).get("row", "?"), extra,
+        extra = ("; " + check_note(c)) if check_note(c) else ""
+        say("  %-19s lamp %s%s%s" % (c["id"], (c.get("lamp") or {}).get("row", "?"), extra,
                                       ("; PROBLEM: " + "; ".join(c["problems"])) if c["problems"] else ""))
     for k, p in plans.items():
         say("%s pass: about %.0f min (at most %.0f), %s" % (k, p["estimate_s"] / 60, p["budget_s"] / 60, " ".join(p["argv"])))
@@ -1597,14 +1645,13 @@ def do_areas(args):
     areas = pick_areas(args.areas)
     for a in areas:
         v = a.view()
-        print("%-18s %s, %s (0x%s), lamp %d%s%s" % (a.id, a.name, a.block, a.block_hex(), a.return_point,
+        print("%-19s %s, %s (0x%s), lamp %d%s%s" % (a.id, a.name, a.block, a.block_hex(), a.return_point,
                                                     (", view %.2f %.2f %.2f yaw %.3f" % v) if v else "", ", The Old Hunters" if a.dlc else ""))
     if args.app0:
         bad = 0
         for c in check_areas(areas, args.app0):
             bad += bool(c["problems"])
-            print("  %-18s %s" % (c["id"], "; ".join(c["problems"]) or ("ok" + (
-                " (fog object %s at %.2f m)" % (c["fog_object"]["name"], c["fog_object"]["distance_m"]) if c.get("fog_object") else ""))))
+            print("  %-19s %s" % (c["id"], "; ".join(c["problems"]) or ("ok" + (" (%s)" % check_note(c) if check_note(c) else ""))))
         return 1 if bad else 0
     return 0
 
