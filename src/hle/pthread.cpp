@@ -13,10 +13,12 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -317,6 +319,22 @@ GUEST_ABI void* hle_tls_get_addr(std::uint64_t* idx) {
     return tcb - kGuestTls + (off < kGuestTls ? off : 0);
 }
 
+// Guest threads made by scePthreadCreate, and those of them not yet in
+// their entry: the movie player's READY waits on both (hle_threads_made,
+// avplayer.cpp).
+std::atomic<std::uint64_t> g_threads_made{0};
+std::atomic<int> g_threads_starting{0};
+
+// BBHOST_TEST_THREAD_START_MS=N: every guest thread waits N ms before its
+// entry - a loaded machine's slow thread start, on demand.
+int test_thread_start_ms() {
+    static const int ms = [] {
+        const char* e = std::getenv("BBHOST_TEST_THREAD_START_MS");
+        return e ? std::atoi(e) : 0;
+    }();
+    return ms;
+}
+
 void* thread_tramp(void* p) {
     auto* t = static_cast<gsync::Thread*>(p);
     ThreadBody* b = body(t);
@@ -334,6 +352,10 @@ void* thread_tramp(void* p) {
         b->can_exit = true;
         void* tcb = guest_thread_enter();
         b->tcb = tcb;
+        if (const int ms = test_thread_start_ms()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+        g_threads_starting.fetch_sub(1);
         b->retval = reinterpret_cast<Fn>(b->entry)(b->arg);
         b->can_exit = false;
         guest_thread_leave(tcb);
@@ -391,10 +413,13 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     // Publish the handle before the thread can run so the child never sees
     // an empty slot.
     *th = t;
+    g_threads_starting.fetch_add(1);
+    g_threads_made.fetch_add(1);
     pthread_t pt;
     int e = pthread_create(&pt, &ha, thread_tramp, t);
     pthread_attr_destroy(&ha);
     if (e) {
+        g_threads_starting.fetch_sub(1);
         *th = nullptr;
         gsync::thread_free(t);
         return to_freebsd(e);
@@ -537,6 +562,9 @@ GUEST_ABI unsigned hle_atomic_sub4(std::atomic<unsigned>* p, unsigned v) {
 }
 
 }  // namespace
+
+std::uint64_t hle_threads_made() { return g_threads_made.load(); }
+int hle_threads_starting() { return g_threads_starting.load(); }
 
 void hle_register_pthread() {
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))

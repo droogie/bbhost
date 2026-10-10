@@ -158,6 +158,10 @@ void hle_pad_tap(std::uint32_t button, int delay_ms, int hold_ms);
 // 0 for none. The stick names (lup, rright, ...) are bits above the pad's,
 // which only the autopress script turns into a deflection.
 std::uint32_t hle_pad_button_named(const std::string& name);
+// Guest threads scePthreadCreate has made, and how many of them have not yet
+// reached their entry (pthread.cpp).
+std::uint64_t hle_threads_made();
+int hle_threads_starting();
 void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented fps)
 // The game's pace once engine/frame_rate.cpp chose it (30, 60, 90, 0 uncapped):
 // 30 and 60 cap the flips at that rate; 90 and uncapped complete them at once.
