@@ -411,6 +411,11 @@ void host_gpu_set_loading(bool loading);
 // The first in-game frame (engine/loading.cpp): the shader compiles at the
 // start go from half the hardware threads to a quarter (render.cpp, precompiler).
 void host_gpu_world_reached();
+// On a start that builds every shader again - the first one after an update
+// that changed the shader translator, or the first ever - the compiles still
+// queued or running on the precompile workers; 0 otherwise (the window's
+// notice, host/window.cpp).
+std::size_t host_gpu_shader_backlog();
 std::string host_gpu_memory_budget_report();
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();

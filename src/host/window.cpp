@@ -1939,6 +1939,37 @@ bool host_window_pump() {
         }
     }
     {
+        // The first start after an update that changed the shader translator
+        // (and the first ever) builds every shader again. On a few cores that
+        // runs past the title into the first minute of play, which stutters
+        // while it lasts (on the Steam Deck the start's 3,000 compiles take its
+        // four workers 26 s): say so, top right, below the FPS counter. A
+        // backlog gone within two seconds - most PCs' - never shows, and the
+        // line does not start over in the short lulls between GX's bursts of
+        // creations.
+        static std::chrono::steady_clock::time_point busy_from{}, busy_last{};
+        const std::size_t left = host_gpu_shader_backlog();
+        const auto now = std::chrono::steady_clock::now();
+        if (left >= 32) {
+            if (busy_from == std::chrono::steady_clock::time_point{} || now - busy_last > std::chrono::seconds(3)) busy_from = now;
+            busy_last = now;
+        }
+        if (left > 0 && busy_from != std::chrono::steady_clock::time_point{} && now - busy_from >= std::chrono::seconds(2) &&
+            now - busy_last <= std::chrono::seconds(3)) {
+            float dw = 0.0f;
+            {
+                std::lock_guard<std::mutex> ml(g_mouse_mu);
+                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+            }
+            char text[64];
+            std::snprintf(text, sizeof(text), "Building shaders: %zu left", left);
+            const float scale = 0.8f, w = host_overlay_text_width(scale, text);
+            const float x = dw - w - 20.0f, y = host_settings().fps_counter ? 14.0f + 24.0f * scale + 16.0f : 14.0f;
+            host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
+            host_overlay_text(x, y, scale, 0xe8dcc0ffu, text);
+        }
+    }
+    {
         // The text box that stands in for the PS4's on-screen keyboard. The
         // game never owns a text field - sceImeDialog is a system overlay, so
         // the system is the one that has to show what is being typed. The

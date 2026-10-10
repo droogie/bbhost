@@ -14608,6 +14608,15 @@ void precompile_set_world_reached() {
     precompile_boost_update("the first in-game frame");
 }
 
+std::size_t precompile_backlog() {
+    Precompiler* w = g_precompiler.load();
+    if (!w) return 0;
+    std::lock_guard<std::mutex> lk(w->mu);
+    std::size_t n = w->jobs.size();
+    for (const auto& [name, k] : w->running) n += static_cast<std::size_t>(k);
+    return n;
+}
+
 // At the end of device init: the manifest's stages go to the precompile
 // workers, ahead of anything GX creates.
 void stage_manifest_load(const std::string& path) {
