@@ -113,6 +113,7 @@ path at all:
 | `gcndis` | disassembles GCN programs |
 | F12 in game | dumps the frame, every render target and the draw list into a folder of its own (`tools/f12_check.py` reads it; `BBHOST_F12_PNG=1` for PNG) |
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game |
+| `tools/area_check.py` | ten places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |

@@ -46,6 +46,8 @@ struct Config {
     int count = 1;
     int every = 1;  // capture one of every n matching draws (distinct light instances)
     bool each = false;  // '*': the first draw of each pipeline whose no-fallback variant is ready (tools/lift_verify.py)
+    bool each_ps = false;  // '*ps': the same, one draw for each pixel shader
+    bool armed = false;    // BBHOST_CAPTURE_ARMED=1: only while armed (host_gpu_capture_arm)
 };
 
 const Config& config() {
@@ -59,8 +61,10 @@ const Config& config() {
             s.resize(pc);
         }
         c.prefix = s;
-        c.each = s == "*";
+        c.each_ps = s == "*ps";
+        c.each = s == "*" || c.each_ps;
         c.enabled = !s.empty();
+        if (const char* a = std::getenv("BBHOST_CAPTURE_ARMED")) c.armed = a[0] == '1';
         if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
         if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         if (const char* n = std::getenv("BBHOST_CAPTURE_COUNT")) c.count = std::max(1, std::atoi(n));
@@ -71,8 +75,11 @@ const Config& config() {
 }
 
 int g_captured = 0;  // under g.mu
-std::set<std::string> g_each_seen;  // BBHOST_CAPTURE_DRAW=*: pipelines already captured (under g.mu)
+std::set<std::string> g_each_seen;  // BBHOST_CAPTURE_DRAW=*: pipelines (*ps: pixel shaders) already captured (under g.mu)
 int g_rejected = 0;
+// BBHOST_CAPTURE_ARMED=1: the draws still to take, and where (under g.mu).
+int g_armed = 0;
+std::string g_armed_dir;
 std::uint64_t g_matches = 0;  // matching draws seen, for BBHOST_CAPTURE_EVERY
 
 struct Readback {
@@ -351,7 +358,12 @@ bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::ui
     if (!(c.enabled && g_captured < c.count && g_rejected < kMaxRejections && flip >= c.min_flip && count >= c.min_count)) {
         return false;
     }
-    if (c.each) return lean_ready && g_each_seen.insert(pipeline).second;
+    if (c.armed && g_armed <= 0) return false;
+    if (c.each) {
+        // A pipeline is named <vertex shader>+<pixel shader>.
+        const std::size_t plus = pipeline.rfind('+');
+        return lean_ready && g_each_seen.insert(c.each_ps && plus != std::string::npos ? pipeline.substr(plus + 1) : pipeline).second;
+    }
     // A comma-separated list captures any of them: two passes of one surface
     // in the same frame, which is how their inputs can be compared.
     bool any = false;
@@ -400,7 +412,7 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     char leaf[160];
     std::snprintf(leaf, sizeof(leaf), "%s-f%llu-d%llu", d.pipeline.c_str(), static_cast<unsigned long long>(d.flip),
                   static_cast<unsigned long long>(d.draw_index));
-    s.dir = cfg.dir + "/" + leaf;
+    s.dir = (cfg.armed && !g_armed_dir.empty() ? g_armed_dir : cfg.dir) + "/" + leaf;
     std::error_code ec;
     if (fs::exists(s.dir, ec)) return reject("capture directory " + s.dir + " already exists");
     if (!fs::create_directories(fs::path(s.dir) / "blobs", ec)) return reject("cannot create " + s.dir + ": " + ec.message());
@@ -846,9 +858,18 @@ void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
         return;
     }
     ++g_captured;
+    if (g_armed > 0) --g_armed;
     host_log("capture: wrote %s/manifest.json (%s, flip %llu, draw %llu, %zu blobs, %llu bytes)", s.dir.c_str(),
              s.draw.pipeline.c_str(), static_cast<unsigned long long>(s.draw.flip), static_cast<unsigned long long>(s.draw.draw_index),
              blobs.object.size(), static_cast<unsigned long long>(total));
 }
 
 }  // namespace gpu
+
+void host_gpu_capture_arm(int draws, const char* dir) {
+    using namespace gpu;
+    std::lock_guard<GpuMutex> lock(g.mu);
+    g_armed = draws > 0 ? draws : 0;
+    if (dir && *dir) g_armed_dir = dir;
+    g_rejected = 0;  // each arming gets the attempts a run has
+}

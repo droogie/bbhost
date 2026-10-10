@@ -10,7 +10,10 @@ For each draw capture under CAPTURES (a directory of capture directories, as
 gcnlift rebuilds the pixel stage's translation options from the manifest,
 requires the retranslation to equal the captured SPIR-V, and lifts. drawreplay
 renders the draw with the captured modules and again with the lifted pixel
-shader, and compares the outputs byte for byte.
+shader, and compares the outputs byte for byte. A draw captured with its lift
+bound (BBHOST_DECOMP, on by default) is replayed against the translation
+instead (--ps <out>/<name>/lift/reference.spv): either way one run has the
+lift and the other the translation.
 
 Writes <out>/summary.json and prints one line per capture plus the totals:
 lifted and byte-identical, lifted but different, rejected (with the reasons),
@@ -64,7 +67,16 @@ def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps"):
         row["detail"] = [report.get("spirv_error", "invalid SPIR-V")]
         return row
     replay_dir = out / name / "replay"
-    replay = subprocess.run([str(drawreplay), str(capture), f"--{stage}", str(lift_dir / "lifted.spv"), "--no-live", "--out", str(replay_dir)],
+    # The other compiler's module: the lift against a captured translation,
+    # the translation against a captured lift.
+    captured_lift = report.get("captured_module") == "lifted"
+    other = lift_dir / ("reference.spv" if captured_lift else "lifted.spv")
+    row["compared"] = "captured lift, translation replayed" if captured_lift else "captured translation, lift replayed"
+    if not other.is_file():
+        row["status"] = "error"
+        row["detail"] = ["gcnlift wrote no %s" % other.name]
+        return row
+    replay = subprocess.run([str(drawreplay), str(capture), f"--{stage}", str(other), "--no-live", "--out", str(replay_dir)],
                             capture_output=True, text=True, timeout=timeout)
     rep = load(replay_dir / "report.json")
     row["drawreplay_exit"] = replay.returncode

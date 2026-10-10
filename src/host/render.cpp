@@ -203,6 +203,7 @@ struct ShaderStage {
     void take(const std::shared_ptr<const Cached>& hit) {  // the stage cache's entry, kept alive by the pointer
         shared = std::shared_ptr<const gcn::TranslateResult>(hit, &hit->meta);
         own = gcn::TranslateResult{};
+        lifted = hit->lifted;
     }
 };
 struct GfxPipeline {
@@ -1841,6 +1842,14 @@ bool decomp_selects(const std::string& ps_name) {
     return selection.first || selection.second.count(ps_name) != 0;
 }
 
+// How a draw bound to `p` runs its pixel shader (GpuStats::draws_ps): only the
+// no-fallback variant ever carries a lift.
+int draw_ps_kind(const GfxPipeline& p) {
+    if (p.ps.lifted) return kDrawPsLifted;
+    if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
+    return p.lean ? kDrawPsTranslated : kDrawPsFallback;
+}
+
 struct DrawState {
     std::uint64_t vs_va = 0, ps_va = 0, fetch_va = 0;
     std::uint32_t vs_rsrc1 = 0, vs_rsrc2 = 0, ps_rsrc1 = 0, ps_rsrc2 = 0;
@@ -2603,6 +2612,9 @@ std::uint64_t lift_key(std::uint64_t key, bool lifted) { return lifted ? key ^ k
 struct CachedStage {
     gcn::TranslateResult meta;
     VkShaderModule module = VK_NULL_HANDLE;
+    // The lift's module rather than the translation's. A lift key holds either:
+    // a rejected lift caches the translation under it.
+    bool lifted = false;
 };
 std::mutex g_stage_cache_mu;
 std::unordered_map<std::uint64_t, std::shared_ptr<const CachedStage>> g_stage_cache;
@@ -2613,10 +2625,11 @@ std::shared_ptr<const CachedStage> cached_stage(std::uint64_t key) {
     return it == g_stage_cache.end() ? nullptr : it->second;
 }
 
-void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module) {
+void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module, bool lifted) {
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;
     entry->module = module;
+    entry->lifted = lifted;
     std::lock_guard<std::mutex> lk(g_stage_cache_mu);
     g_stage_cache.emplace(key, std::move(entry));
 }
@@ -3727,7 +3740,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             t_stage = std::chrono::steady_clock::now();
             if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("PS module");
             if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
-            if (ps_cacheable) cache_stage(ps_key, pl.ps.meta(), pl.ps.module);
+            if (ps_cacheable) cache_stage(ps_key, pl.ps.meta(), pl.ps.module, pl.ps.lifted);
         }
     }
     // Vertex shader (+ fetch shader)
@@ -3829,7 +3842,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         t_stage = std::chrono::steady_clock::now();
         if (!make_module(pl.vs.meta().spirv, pl.vs.module)) return fail("VS module");
         if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
-        if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module);
+        if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module, pl.vs.lifted);
     }
     // The LS as the pipeline's own vertex stage, so the control
     // point reaches the evaluation stage through the pipeline and no compute
@@ -3869,7 +3882,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!ls_hit) {
             dump_spirv(pl.name + "-tess-ls", pl.tess_ls.meta().spirv);
             if (!make_module(pl.tess_ls.meta().spirv, pl.tess_ls.module)) return fail("tessellation LS module");
-            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module);
+            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module, false);
             manifest_note_ls(ls_key, ls->name, ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
         }
     }
@@ -4848,10 +4861,11 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
             if (lifted.ok()) {
                 stage.fresh().spirv = std::move(lifted.spirv);
                 stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+                stage.lifted = true;
             }
         }
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module);
+        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
@@ -4885,7 +4899,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!ok) {
             spirv_drop_early_fragment_tests(twin.spirv);
             ok = make_module(twin.spirv, twin_module);
-            if (ok && cacheable) cache_stage(twin_key, twin, twin_module);
+            if (ok && cacheable) cache_stage(twin_key, twin, twin_module, stage.lifted);
         }
         t_library_owner = job.name.c_str();
         ok = ok && fragment_library(twin, twin_module, set, layout) != VK_NULL_HANDLE;
@@ -4918,7 +4932,7 @@ void precompile_manifest(const ManifestStage& m) {
         if (ok && !(g_stage_cache_on && cached_stage(key))) {
             ls.fresh() = translate_cached(prog, tess_ls_options(m.rsrc1, m.rsrc2, m.tess_attr_vec4s, m.fetch_words.empty() ? nullptr : &fprog));
             ok = ls.meta().ok() && make_module(ls.meta().spirv, ls.module);
-            if (ok && g_stage_cache_on) cache_stage(key, ls.meta(), ls.module);
+            if (ok && g_stage_cache_on) cache_stage(key, ls.meta(), ls.module, false);
         }
         g_manifest.compile_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -4969,6 +4983,7 @@ void precompile_manifest(const ManifestStage& m) {
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+                    stage.lifted = true;
                 }
             }
         } else {
@@ -4976,11 +4991,14 @@ void precompile_manifest(const ManifestStage& m) {
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
                 gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-                if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+                if (lifted.ok()) {
+                    stage.fresh().spirv = std::move(lifted.spirv);
+                    stage.lifted = true;
+                }
             }
         }
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
-        if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module);
+        if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     if (ok && !m.tess_hw && !m.domain_level) {
         const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
@@ -5073,11 +5091,14 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         // same stage the draw wants and is not thrown away for it.
         if (lift) {
             gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-            if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+            if (lifted.ok()) {
+                stage.fresh().spirv = std::move(lifted.spirv);
+                stage.lifted = true;
+            }
         }
         dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module);
+        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
@@ -13124,6 +13145,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (!g.profile_passes) profile_end_locked();
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
+    bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
     if (capture_session) {

@@ -344,7 +344,17 @@ struct GpuStats {
     std::uint64_t phase_ns[8];
     // host_gpu_draw calls, failures, and calls that had nothing to draw.
     std::uint64_t draw_calls, draw_failures, draws_empty;
+    // The draws by how their pixel shader ran (DrawPs), and the failures by
+    // reason (host_gpu_draw_fail_name).
+    std::uint64_t draws_ps[4];
+    std::uint64_t draw_fail_why[16];
 };
+// How a draw's pixel shader ran: its typed lift (BBHOST_DECOMP), a
+// translation in the no-fallback pipeline (not lifted, or not asked to be),
+// the page-table fallback pipeline's translation, or no pixel shader at all.
+enum DrawPs { kDrawPsLifted, kDrawPsTranslated, kDrawPsFallback, kDrawPsNone, kDrawPsCount };
+// A draw failure reason's name ("pixel shader"), or null past the last.
+const char* host_gpu_draw_fail_name(int reason);
 enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };
 static const char* const kPhaseNames[8] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait"};
 void host_gpu_phase_add(int phase, std::uint64_t ns);
@@ -488,6 +498,9 @@ void host_gpu_request_dump();
 bool host_gpu_take_dump_request(std::string* dir);
 // The folder of the capture asked for last ("" before the first).
 std::string host_gpu_capture_dir();
+// BBHOST_CAPTURE_ARMED=1 (draw_capture.h): BBHOST_CAPTURE_DRAW may take up to
+// `draws` more draws from now, into `dir` when it is not empty; 0 stops it.
+void host_gpu_capture_arm(int draws, const char* dir);
 // The capture's image format: ".ppm", or ".png" with BBHOST_F12_PNG=1.
 const char* host_gpu_capture_ext();
 // BBHOST_RT_REFILL_TEST=1: a re-created target starts with the fill its old image took (render.cpp).

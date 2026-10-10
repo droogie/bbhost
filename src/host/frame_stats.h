@@ -6,6 +6,12 @@
 // busiest threads by CPU (from /proc/self/task, so every guest and host
 // thread is counted by name). The bottleneck at a given frame rate is the
 // thread near 100%.
+//
+// BBHOST_FRAME_DETAIL=1 (with BBHOST_FRAME_STATS=1): also, after each
+// `frames:` line, a `frame detail:` line with the second's draws by how their
+// pixel shader ran and its draw failures by reason, and `frame intervals ms:`
+// lines with every interval of that second - what a harness takes exact
+// percentiles of over a window of its own (tools/area_check.py).
 
 // Called on every flip the game submits.
 void frame_stats_on_flip();
@@ -37,6 +43,7 @@ private:
 // main_wait.cpp: BBHOST_FRAME_STATS=1, and the time waited of a kind since
 // the last call (taken and reset).
 bool frame_stats_enabled();
+bool frame_stats_detail();  // BBHOST_FRAME_DETAIL=1 as well
 std::uint64_t main_thread_waited_ns(int kind);
 
 // The main loop's work in each frame: from the game's frame-time manager

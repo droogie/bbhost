@@ -83,7 +83,38 @@ struct State {
     std::vector<double> intervals_ms;
     std::unordered_map<int, ThreadTime> threads;
     GpuBusy gpu{};  // host_gpu_busy() when the window opened
+    GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_DETAIL=1)
 };
+
+// BBHOST_FRAME_DETAIL=1: the second's draws by how their pixel shader ran,
+// its draw failures by reason, and every flip interval in it, in lines short
+// enough for the log's line.
+void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<double>& intervals_ms) {
+    std::uint64_t ps[kDrawPsCount];
+    for (int i = 0; i < kDrawPsCount; ++i) ps[i] = now.draws_ps[i] - was.draws_ps[i];
+    std::string why;
+    for (int k = 0; k < 16; ++k) {
+        const std::uint64_t n = now.draw_fail_why[k] - was.draw_fail_why[k];
+        const char* name = host_gpu_draw_fail_name(k);
+        if (n && name) why += (why.empty() ? " (" : ", ") + std::string(name) + " " + std::to_string(n);
+    }
+    if (!why.empty()) why += ")";
+    host_log("frame detail: draws %llu: pixel shader lifted %llu, translated %llu, fallback %llu, none %llu; draw failures %llu%s",
+             static_cast<unsigned long long>(now.draws - was.draws), static_cast<unsigned long long>(ps[kDrawPsLifted]),
+             static_cast<unsigned long long>(ps[kDrawPsTranslated]), static_cast<unsigned long long>(ps[kDrawPsFallback]),
+             static_cast<unsigned long long>(ps[kDrawPsNone]), static_cast<unsigned long long>(now.draw_failures - was.draw_failures),
+             why.c_str());
+    constexpr std::size_t kPerLine = 100;  // 100 x " 16.67": well inside host_log's 1 KiB
+    for (std::size_t at = 0; at < intervals_ms.size(); at += kPerLine) {
+        std::string line;
+        for (std::size_t i = at; i < intervals_ms.size() && i < at + kPerLine; ++i) {
+            char v[24];
+            std::snprintf(v, sizeof(v), " %.2f", intervals_ms[i]);
+            line += v;
+        }
+        host_log("frame intervals ms:%s", line.c_str());
+    }
+}
 
 }  // namespace
 
@@ -104,6 +135,7 @@ void frame_stats_on_flip() {
         s.window_start = s.last_flip = now;
         s.threads = thread_times();
         s.gpu = host_gpu_busy();
+        if (frame_stats_detail()) s.stats = host_gpu_stats();
         return;
     }
     s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_flip).count());
@@ -184,6 +216,11 @@ void frame_stats_on_flip() {
              secs, n, static_cast<double>(n) / secs, displayed, sum / static_cast<double>(n), p95, worst, over16, over33, total,
              top.c_str(), static_cast<double>(sync_ns) / 1e6, static_cast<double>(sleep_ns) / 1e6,
              static_cast<double>(file_ns) / 1e6, work.c_str(), gpu.c_str());
+    if (frame_stats_detail()) {
+        const GpuStats stats = host_gpu_stats();
+        log_detail(s.stats, stats, s.intervals_ms);
+        s.stats = stats;
+    }
     s.intervals_ms.clear();
     s.window_start = now;
     s.threads = std::move(cur);
