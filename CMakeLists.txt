@@ -530,6 +530,25 @@ if(UNIX)
   endif()
 endif()
 
+# Immutable descriptor keys and pool/view lifetime invalidation, without a device.
+enable_testing()
+add_executable(immutable_descriptor_memo_test tests/immutable_descriptor_memo_test.cpp)
+target_include_directories(immutable_descriptor_memo_test PRIVATE src)
+add_test(NAME immutable_descriptor_memo_test COMMAND immutable_descriptor_memo_test)
+
+if(WIN32)
+  add_executable(graphics_ca_windows_test tests/graphics_ca_windows_test.cpp)
+  target_include_directories(graphics_ca_windows_test PRIVATE src)
+  target_compile_features(graphics_ca_windows_test PRIVATE cxx_std_20)
+  add_test(NAME graphics_ca_windows_test COMMAND graphics_ca_windows_test)
+  set_tests_properties(graphics_ca_windows_test PROPERTIES TIMEOUT 30)
+
+  add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  target_include_directories(thunk_args PRIVATE src)
+  target_link_libraries(thunk_args PRIVATE winpthread winmm)
+  add_test(NAME thunk_args COMMAND thunk_args)
+endif()
+
 # `cmake --build build --target smoke`: 60 s run must time out (124) without a core dump.
 # For the Windows cross build (`cmake --build build-win --target smoke`) the
 # run is bbhost.exe under wine, ended by BBHOST_EXIT_FLIP (tools/win_smoke.sh).
