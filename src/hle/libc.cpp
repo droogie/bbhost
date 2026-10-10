@@ -5,6 +5,7 @@
 #include "core/write_watch.h"
 #include "hle/common.h"
 #include "hle/libc_ctype.h"
+#include "hle/libc_random.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
 #include "hle/hle.h"
@@ -579,8 +580,9 @@ GUEST_ABI void hle_qsort(void* base, std::uint64_t n, std::uint64_t sz, int (*cm
         t_qsort_cmp = saved;
     }
 }
-GUEST_ABI void hle_srand(unsigned s) { std::srand(s); }
-GUEST_ABI int hle_rand() { return std::rand(); }
+bb::libc::Random g_random;
+GUEST_ABI void hle_srand(unsigned s) { g_random.seed(s); }
+GUEST_ABI int hle_rand() { return g_random.next(); }
 
 GUEST_ABI int hle_mkdir(const char* p, int mode) {
     std::string host = hle_fs_map_path(p);
