@@ -685,6 +685,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, 20, 20, 24, 255);
+        SDL_SetRenderScale(
+            ren,
+            io.DisplayFramebufferScale.x,
+            io.DisplayFramebufferScale.y
+        );
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
         SDL_RenderPresent(ren);
