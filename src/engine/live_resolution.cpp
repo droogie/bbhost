@@ -612,6 +612,60 @@ void set_display_rect(std::uint64_t out, std::uint32_t w, std::uint32_t h) {
     if (res && at_<std::uint8_t>(res + 0x38) == 3) g_rect_resource->store(res);
 }
 
+// ---- The scene's own targets unless both sides match ----------------------------
+//
+// GXSceneContext::Initialize (sub_26c39f0) takes the output entry's
+// DefRenderTarget and DefDepthStencil (or the targets its description names)
+// for its own when they are the size it builds for - but its test passes when
+// either side matches: the width (`je` at 0x26c3af3) or else the height
+// (0x26c3b04) for the colour target, the same pair at 0x26c3b44 / 0x26c3b56
+// for the depth. On the console the display buffers are the render size and
+// both sides match. Here they are the largest size a live change can reach,
+// so a render size that shares one side with them - 3840x2160's height in
+// 5120x2160 buffers, 5120x1440's width, a 16:9 size on an ultrawide screen's
+// height - had the graphics manager's scene render its picture into the
+// display buffer itself. YEBIS then took the display buffer for its back
+// buffer and made its whole chain at the display buffers' size (5120x2160,
+// 2560x1080, 3136x882 ... for a 3840x2160 picture), and the picture came out
+// black with a grey band from x = w * w / 5120. Here both sides must match:
+// the first `je` becomes a `jne` to the not-matching path, so a width that
+// differs goes there and the height decides only when the width matched.
+// BBHOST_SCENE_BOTH_SIDES=0 leaves the game's test.
+struct BothSidesSite {
+    std::uint64_t at;
+    std::uint8_t game[2], both[2];
+};
+constexpr BothSidesSite kBothSidesSites[] = {
+    {0x26c3af3, {0x74, 0x36}, {0x75, 0x11}},  // colour: je 0x26c3b2b (keep) -> jne 0x26c3b06 (make its own)
+    {0x26c3b44, {0x74, 0x33}, {0x75, 0x12}},  // depth: je 0x26c3b79 (keep) -> jne 0x26c3b58 (make its own)
+};
+
+bool g_both_sides = false;  // install_scene_both_sides() went in
+
+// Where the graphics manager's scene renders its picture at w x h, by the test
+// Initialize makes (the patched one or the game's), for the log.
+const char* scene_target_path(std::uint32_t w, std::uint32_t h) {
+    const bool wide = g_display[0] == w, tall = g_display[1] == h;
+    return (g_both_sides ? wide && tall : wide || tall) ? "straight into the display buffers" : "into a target of its own";
+}
+
+// All or none, as the rectangle stubs.
+bool install_scene_both_sides() {
+    if (const char* e = std::getenv("BBHOST_SCENE_BOTH_SIDES"); e && e[0] == '0') {
+        host_log("resolution: scene contexts keep the game's either-side size test (BBHOST_SCENE_BOTH_SIDES=0)");
+        return false;
+    }
+    for (const BothSidesSite& s : kBothSidesSites)
+        if (std::memcmp(guest_ptr(g_image->mem, guest(s.at)), s.game, sizeof(s.game)) != 0) {
+            host_log("resolution: the scene context's size test is not as expected; it keeps the game's either-side test");
+            return false;
+        }
+    for (const BothSidesSite& s : kBothSidesSites)
+        if (!code_write(s.at, s.both, sizeof(s.both))) return false;
+    host_log("resolution: a scene context renders into the display buffers only when both their sides match its size");
+    return true;
+}
+
 // ---- DefDepthStencil at the render size -----------------------------------------
 //
 // The GX init makes DefDepthStencil (the output entry's +0x70) at the size
@@ -759,11 +813,11 @@ bool resize(std::uint32_t w, std::uint32_t h) {
     g_applied.fetch_add(1);
     std::uint64_t largest = 0;
     const std::uint64_t free_mib = target_heap_free_mib(dev, &largest);
-    host_log("resolution: %ux%u -> %ux%u in %lld ms (%d other scene contexts, %d destroyed since the last change; %d Scaleform viewports, "
-             "%d YEBIS frees dropped; render-target heap %llu MiB free, largest block %llu)",
+    host_log("resolution: %ux%u -> %ux%u in %lld ms, the scene %s (%d other scene contexts, %d destroyed since the last change; "
+             "%d Scaleform viewports, %d YEBIS frees dropped; render-target heap %llu MiB free, largest block %llu)",
              was_w, was_h, w, h,
              static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()),
-             ctxs, g_ctx_gone.exchange(0), movies, g_dead_frees.load(), (unsigned long long)free_mib, (unsigned long long)largest);
+             scene_target_path(w, h), ctxs, g_ctx_gone.exchange(0), movies, g_dead_frees.load(), (unsigned long long)free_mib, (unsigned long long)largest);
     return fitted && (w != was_w || h != was_h);
 }
 
@@ -916,7 +970,8 @@ GUEST_ABI std::int64_t gx_init_call_hook(std::uint64_t, const std::uint64_t* sav
     const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
     if (out) {
         const std::uint32_t w = g_res_words[0], h = g_res_words[1];
-        host_log("resolution: display buffers %ux%u, rendering %ux%u", at_<std::uint32_t>(out + 0x80), at_<std::uint32_t>(out + 0x84), w, h);
+        host_log("resolution: display buffers %ux%u, rendering %ux%u; the scene renders %s", at_<std::uint32_t>(out + 0x80),
+                 at_<std::uint32_t>(out + 0x84), w, h, scene_target_path(w, h));
         at_<std::uint32_t>(out + 0x80) = w;
         at_<std::uint32_t>(out + 0x84) = h;
         at_<float>(out + 0x88) = 0.0f;
@@ -1109,6 +1164,7 @@ bool live_resolution_install(ElfImage* image) {
     }
     if (!install_display_rect_stubs())
         host_log("resolution: the render-target viewport code is not as expected; debug draws keep the display buffers' size");
+    g_both_sides = install_scene_both_sides();
     if (!engine_prologue_hook(image, guest(kGxFree), free_pro, sizeof(free_pro), reinterpret_cast<void*>(&gx_free_hook)) ||
         !engine_prologue_hook(image, guest(kGxFreeRecord), free_rec_pro, sizeof(free_rec_pro), reinterpret_cast<void*>(&gx_free_record_hook)) ||
         !engine_prologue_hook(image, guest(kSwfPlayerCtor), swf_ctor_pro, sizeof(swf_ctor_pro), reinterpret_cast<void*>(&swf_player_ctor_hook)) ||
