@@ -3,6 +3,7 @@
 #include "core/portable.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
+#include "host/immutable_descriptor_memo.h"
 #include "host/shader_patch.h"
 #include "host/translation_cache.h"
 
@@ -51,6 +52,18 @@ void device_lost_locked(const char* where);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
 
 namespace {
+
+// Exact immutable compute contents within each slot pool's current generation.
+// BBHOST_COMPUTE_SET_CACHE=0 retains allocation/update on every dispatch.
+const bool g_compute_set_cache = [] {
+    const char* e = std::getenv("BBHOST_COMPUTE_SET_CACHE");
+    return !(e && e[0] == '0');
+}();
+ImmutableDescriptorMemo<VkDescriptorSet> g_compute_sets[kSlots];
+
+void compute_sets_forget_view(VkImageView view) {
+    for (auto& memo : g_compute_sets) memo.forget_view(descriptor_handle(view));
+}
 
 const bool g_enabled = [] {
     const char* e = std::getenv("BBHOST_GPU");
@@ -1900,6 +1913,7 @@ bool init_locked() {
     // driver took the shaders anyway; others need not. Without the feature a
     // sample's offset moves its coordinates instead
     // (gcn::set_runtime_sample_offsets, below).
+    g.maintenance8_enabled = false;
     VkPhysicalDeviceMaintenance8FeaturesKHR fm8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     if (g.has_maint8) {
         VkPhysicalDeviceMaintenance8FeaturesKHR q8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
@@ -1907,6 +1921,7 @@ bool init_locked() {
         qf.pNext = &q8;
         vkGetPhysicalDeviceFeatures2(g.phys, &qf);
         fm8.maintenance8 = q8.maintenance8;
+        g.maintenance8_enabled = q8.maintenance8 == VK_TRUE;
         if (q8.maintenance8) {
             fm8.pNext = f13.pNext;
             f13.pNext = &fm8;
@@ -3856,6 +3871,7 @@ void retire_slot_locked(int k) {
     }
     vkResetFences(g.device, 1, &sl.fence);
     vkResetDescriptorPool(g.device, sl.pool, 0);
+    g_compute_sets[k].clear();
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
         vkDestroyBuffer(g.device, b.buffer, nullptr);
@@ -4400,19 +4416,24 @@ void defer_destroy_image(VkImage image, VkDeviceMemory memory) {
 void defer_destroy_view(VkImageView view) {
     bump_view_epoch();
     if (!view) return;
+    compute_sets_forget_view(view);
     set_cache_forget_view_locked(view);
     forget_view_locked(view);
     bindless_view_retired_locked(view);
     g.slots[g.slot].dead_views.push_back(view);
 }
 
-// A view no memo, cached set or bindless slot ever held - one a pass makes for
-// itself - goes without moving the view epoch. The depth snapshot's two views
+// A view outside the texture/graphics memos - one a pass makes for itself -
+// goes without moving the view epoch. Utility descriptor memos forget it
+// explicitly. The depth snapshot's two views
 // a frame went through defer_destroy_view, and the two bumps emptied both
 // view memos every frame: on a Steam Deck building views was 9.5% of the
 // command processor, the words memo hit 47%.
 void defer_destroy_private_view(VkImageView view) {
-    if (view) g.slots[g.slot].dead_views.push_back(view);
+    if (view) {
+        compute_sets_forget_view(view);
+        g.slots[g.slot].dead_views.push_back(view);
+    }
 }
 
 const std::uint8_t* imported_bytes_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint64_t* guest_va) {
@@ -5124,24 +5145,60 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
     VkDescriptorBufferInfo ubi{};
     alloc_params_slot_locked(params, ubi);
-    VkDescriptorSet set = alloc_set_locked();
-    if (!set) {
-        host_log("gpu: descriptor set allocation failed");
-        g.failures.fetch_add(1);
-        return false;
-    }
-    std::vector<VkWriteDescriptorSet> writes;
+    static thread_local std::vector<VkWriteDescriptorSet> writes;
+    static thread_local std::vector<VkDescriptorImageInfo> infos;
+    static thread_local ImmutableDescriptorKey descriptor_key;
+    writes.clear();
+    infos.clear();
+    writes.reserve(1 + pl.meta.images.size() + pl.meta.samplers.size());
+    infos.reserve(pl.meta.images.size() + pl.meta.samplers.size() + 1);
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = set;
     w.dstBinding = gcn::kBindingParams;
     w.descriptorCount = 1;
     w.descriptorType = params_descriptor_type();
     w.pBufferInfo = set_cache_on() ? &g_params_desc : &ubi;
     writes.push_back(w);
-    std::vector<VkDescriptorImageInfo> infos;
-    infos.reserve(pl.meta.images.size() + pl.meta.samplers.size() + 1);
-    bind_stage_images(set, pl.meta, stage_images, writes, infos, pl.name.c_str());
-    vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // This still performs final fallback selection on every dispatch. The key
+    // describes those final writes, not the prefetch's possibly null views.
+    bind_stage_images(VK_NULL_HANDLE, pl.meta, stage_images, writes, infos, pl.name.c_str());
+    descriptor_key.layout = descriptor_handle(g.set_layout);
+    descriptor_key.bindings.clear();
+    descriptor_key.bindings.reserve(writes.size());
+    for (const auto& write : writes) {
+        for (std::uint32_t i = 0; i < write.descriptorCount; ++i) {
+            ImmutableDescriptorBinding b;
+            b.binding = write.dstBinding;
+            b.array_element = write.dstArrayElement + i;
+            b.type = write.descriptorType;
+            if (write.pBufferInfo) {
+                const auto& info = write.pBufferInfo[i];
+                b.buffer = descriptor_handle(info.buffer); b.offset = info.offset; b.range = info.range;
+            }
+            if (write.pImageInfo) {
+                const auto& info = write.pImageInfo[i];
+                b.sampler = descriptor_handle(info.sampler); b.view = descriptor_handle(info.imageView);
+                b.image_layout = info.imageLayout;
+            }
+            descriptor_key.bindings.push_back(b);
+        }
+    }
+    auto& memo = g_compute_sets[g.slot];
+    memo.observe_epoch(view_epoch());
+    // Non-dynamic params name a new buffer slice on every dispatch. Keep that
+    // branch uncached (and its individual buffer/offset/range in the writes).
+    const bool reuse = g_compute_set_cache && set_cache_on();
+    VkDescriptorSet set = reuse ? memo.find(descriptor_key) : VK_NULL_HANDLE;
+    if (!set) {
+        set = alloc_set_locked();
+        if (!set) {
+            host_log("gpu: descriptor set allocation failed");
+            g.failures.fetch_add(1);
+            return false;
+        }
+        for (auto& write : writes) write.dstSet = set;
+        vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        if (reuse) memo.remember(descriptor_key, set);
+    }
     rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
     rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);

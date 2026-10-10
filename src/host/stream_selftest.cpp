@@ -149,11 +149,12 @@ VkShaderModule make_module(const std::uint32_t* words, std::size_t bytes) {
     return m;
 }
 
-bool make_image(VkImage& image, VkDeviceMemory& mem, std::uint32_t size, VkImageUsageFlags usage) {
+bool make_image(VkImage& image, VkDeviceMemory& mem, std::uint32_t size, VkImageUsageFlags usage,
+                VkFormat format = VK_FORMAT_R32_UINT, VkDeviceSize* allocation_size = nullptr) {
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R32_UINT;
+    ici.format = format;
     ici.extent = {size, size, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
@@ -174,8 +175,8 @@ bool make_image(VkImage& image, VkDeviceMemory& mem, std::uint32_t size, VkImage
         image = VK_NULL_HANDLE;
         return false;
     }
-    vkBindImageMemory(g.device, image, mem, 0);
-    return true;
+    if (allocation_size) *allocation_size = req.size;
+    return vkBindImageMemory(g.device, image, mem, 0) == VK_SUCCESS;
 }
 
 bool setup(Resources& r) {
@@ -295,10 +296,11 @@ bool setup(Resources& r) {
         cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         cbs.attachmentCount = 1;
         cbs.pAttachments = &ba;
-        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        const VkDynamicState dyn[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE};
         VkPipelineDynamicStateCreateInfo ds{};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        ds.dynamicStateCount = 2;
+        ds.dynamicStateCount = g.has_gpl ? 4 : 2;
         ds.pDynamicStates = dyn;
         const VkFormat fmt = VK_FORMAT_R32_UINT;
         VkPipelineRenderingCreateInfo rci{};
@@ -561,10 +563,16 @@ struct Arm {
         const bool packet_begins = rng.below(2) == 0;
         if (!packet_begins) begin_pass();
         const std::uint32_t draws = 1 + rng.below(3);
+        DrawBindingState bindings;
+        bindings.use_layout(r.gfx_layout);
+        DrawLibraryState previous;
+        std::uint32_t last_buffer = 0, last_slot = 0;
         for (std::uint32_t i = 0; i < draws; ++i) {
             const std::uint32_t x0 = rng.below(kImage), y0 = rng.below(kImage);
             const std::uint32_t w = 1 + rng.below(kImage - x0), h = 1 + rng.below(kImage - y0);
-            const std::uint32_t x = rng.below(3), slot = rng.below(kSlots);
+            const bool repeat = i && rng.below(2) == 0;
+            const std::uint32_t x = repeat ? last_buffer : rng.below(3), slot = repeat ? last_slot : rng.below(kSlots);
+            last_buffer = x; last_slot = slot;
             DrawCmds c(true);
             if (i == 0 && packet_begins) {
                 VkRenderingAttachmentInfo* att = s.take<VkRenderingAttachmentInfo>(1);
@@ -583,6 +591,13 @@ struct Arm {
                 s.garble();
             }
             c.bind_pipeline(r.gfx);
+            if (g.has_gpl) {
+                DrawLibraryState now;
+                now.front = i & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+                const auto fields = (i ? draw_library_changes(previous, now) : kLibraryAll) & (kLibraryCull | kLibraryFront);
+                if (fields) c.library_state(now, false, fields);
+                previous = now;
+            }
             VkViewport* vp = s.take<VkViewport>(1);
             *vp = VkViewport{0.0f, 0.0f, static_cast<float>(kImage), static_cast<float>(kImage), 0.0f, 1.0f};
             c.viewport(*vp);
@@ -593,7 +608,7 @@ struct Arm {
             VkDescriptorBufferInfo* info = s.take<VkDescriptorBufferInfo>(1);
             *binding = 0;
             *info = {b(x), slot * kSlotWords * 4ull, kSlotWords * 4ull};
-            c.push_buffers(r.gfx_layout, binding, info, 1);
+            if (bindings.push(binding, info, 1)) c.push_buffers(r.gfx_layout, binding, info, 1);
             s.garble();
             DrawCall call;
             call.kind = DrawCall::kDirect;
@@ -854,6 +869,102 @@ std::uint64_t compare(const Resources& r, const Model& m, const char* way, int r
     return diffs;
 }
 
+// Exercise the production ordinary depth snapshot route in every recorder mode.
+// Separate allocations establish the direct image copy's non-overlap guard.
+bool ordinary_depth_snapshot(const Way& way, VkFormat format) {
+    constexpr std::uint32_t pixels = kImage * kImage;
+    constexpr VkDeviceSize bytes = pixels * 4ull;
+    RtImage source, destination;
+    DevBuffer upload, readback;
+    const auto cleanup = [&] {
+        flush_locked();
+        for (const auto* image : {&source, &destination}) {
+            if (image->image) vkDestroyImage(g.device, image->image, nullptr);
+            if (image->memory.memory) vkFreeMemory(g.device, image->memory.memory, nullptr);
+        }
+        for (const auto* buffer : {&upload, &readback}) {
+            if (buffer->map) vkUnmapMemory(g.device, buffer->memory);
+            if (buffer->buffer) vkDestroyBuffer(g.device, buffer->buffer, nullptr);
+            if (buffer->memory) vkFreeMemory(g.device, buffer->memory, nullptr);
+        }
+    };
+    if (!stream_test_set_mode(way.mode, way.submit)) return false;
+    begin_recording_locked();
+    const auto setup_image = [&](RtImage& image, bool depth, VkFormat image_format) {
+        image.format = image_format;
+        image.width = image.height = kImage;
+        image.depth = depth;
+        image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (!make_image(image.image, image.memory.memory, kImage, image.usage, image_format, &image.memory.size)) return false;
+        const VkImageAspectFlags aspects = depth ? VK_IMAGE_ASPECT_DEPTH_BIT |
+            (image_format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0) : VK_IMAGE_ASPECT_COLOR_BIT;
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image.image;
+        barrier.subresourceRange = {aspects, 0, 1, 0, 1};
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &barrier);
+        image.initialised = true;
+        return true;
+    };
+    bool ok = setup_image(source, true, format) && setup_image(destination, false, VK_FORMAT_R32_SFLOAT) &&
+              create_dev_buffer(upload, bytes, true, true) && create_dev_buffer(readback, bytes, true, true);
+    if (!ok) { cleanup(); return false; }
+    const char* direct_env = std::getenv("BBHOST_DEPTH_DIRECT_COPY");
+    const bool direct_enabled = g.maintenance8_enabled && !(direct_env && direct_env[0] == '0');
+    unsigned direct = 0, buffer = 0;
+    Scratch scratch;
+    for (unsigned iteration = 0; iteration < 4; ++iteration) {
+        begin_recording_locked();
+        auto* bits = static_cast<std::uint32_t*>(upload.map);
+        for (unsigned p = 0; p < pixels; ++p) {
+            const float value = float((p * 7919 + iteration * 3571) % 16777216) / 16777216.0f;
+            std::memcpy(bits + p, &value, sizeof(value));
+        }
+        bits[0] = 0; bits[1] = 0x3f800000; bits[2] = 1; bits[3] = 0x3eaaaaab;
+        const std::vector<std::uint32_t> expected(bits, bits + pixels);
+        write_combine_fence();
+        full_barrier(scratch);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.imageExtent = {kImage, kImage, 1};
+        rec().copy_buffer_to_image(upload.buffer, source.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        full_barrier(scratch);
+        // Unknown usage must retain the safe buffer path even with maintenance8.
+        const auto usage = source.usage;
+        if (iteration == 3) source.usage = 0;
+        RenderCopyRoute route{};
+        ok = render_depth_snapshot_selftest_locked(source, destination, route) && ok;
+        source.usage = usage;
+        const auto expected_route = direct_enabled && iteration != 3 ? RenderCopyRoute::DepthDirect : RenderCopyRoute::DepthBuffer;
+        ok = route == expected_route && ok;
+        direct += route == RenderCopyRoute::DepthDirect;
+        buffer += route == RenderCopyRoute::DepthBuffer;
+        full_barrier(scratch);
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rec().copy_image_to_buffer(destination.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &region);
+        flush_locked();
+        ok = std::memcmp(expected.data(), readback.map, bytes) == 0 && ok;
+        begin_recording_locked();
+        full_barrier(scratch);
+        const VkClearDepthStencilValue clear{0.75f, 29};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        rec().clear_depth_stencil_image(source.image, VK_IMAGE_LAYOUT_GENERAL, clear, 1, &range);
+        full_barrier(scratch);
+        rec().copy_image_to_buffer(destination.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &region);
+        flush_locked();
+        ok = std::memcmp(expected.data(), readback.map, bytes) == 0 && ok;
+    }
+    host_log("stream selftest: ordinary depth snapshot format %u, %s: %u direct, %u buffer, exact bits / overwrite / immutable %s",
+             format, way.name, direct, buffer, ok ? "pass" : "FAIL");
+    cleanup();
+    return ok;
+}
+
 // One way of running a round's sequence; its differences from the model.
 bool run_way(Resources& r, const Way& way, std::uint64_t seed, int round, RoundStats& st) {
     if (!stream_test_set_mode(way.mode, way.submit)) {
@@ -1026,6 +1137,7 @@ std::string benchmark(Resources& r) {
             draw.ns[way] = time_ns(1000, [&](std::uint32_t) {
                 DrawCmds c(true);
                 c.bind_pipeline(r.gfx);
+                if (g.has_gpl) c.library_state(DrawLibraryState{}, false, kLibraryCull | kLibraryFront);
                 c.viewport(vp);
                 c.scissor(sc);
                 c.push_buffers(r.gfx_layout, &binding, &info, 1);
@@ -1074,12 +1186,65 @@ int host_gpu_stream_selftest(int rounds) {
         return 2;
     }
     std::lock_guard<GpuMutex> lock(g.mu);
+    const std::uint64_t validation0 = g_validation_messages.load();
+    if (!texture_upload_plan_selftest()) return 1;
+    for (const Way& way : kWays)
+        for (const auto format : {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT})
+            if (!ordinary_depth_snapshot(way, format)) return 1;
     Resources r;
     if (!setup(r)) {
         host_log("stream selftest: setting up its buffers, image and pipelines failed");
         return 2;
     }
-    const std::uint64_t validation0 = g_validation_messages.load();
+    bool proof = true;
+    const DrawLibraryState original;
+    const auto changed = [&](auto alter, std::uint32_t field) {
+        auto now = original;
+        alter(now);
+        proof = draw_library_changes(original, now) == field && proof;
+    };
+    changed([](auto& s) { s.cull = VK_CULL_MODE_BACK_BIT; }, kLibraryCull);
+    changed([](auto& s) { s.front = VK_FRONT_FACE_CLOCKWISE; }, kLibraryFront);
+    changed([](auto& s) { s.depth_test = VK_TRUE; }, kLibraryDepthTest);
+    changed([](auto& s) { s.depth_write = VK_TRUE; }, kLibraryDepthWrite);
+    changed([](auto& s) { s.depth_compare = VK_COMPARE_OP_LESS; }, kLibraryDepthCompare);
+    changed([](auto& s) { s.bounds_test = VK_TRUE; }, kLibraryBoundsTest);
+    changed([](auto& s) { s.stencil_test = VK_TRUE; }, kLibraryStencilTest);
+    changed([](auto& s) { s.front_ops.passOp = VK_STENCIL_OP_REPLACE; }, kLibraryFrontOps);
+    changed([](auto& s) { s.back_ops.compareOp = VK_COMPARE_OP_ALWAYS; }, kLibraryBackOps);
+    changed([](auto& s) { s.bias_constant = -0.0f; }, kLibraryBias);
+    changed([](auto& s) { s.bias_clamp = 1.0f; }, kLibraryBias);
+    changed([](auto& s) { s.bias_slope = 1.0f; }, kLibraryBias);
+    changed([](auto& s) { s.depth_clamp = VK_TRUE; }, kLibraryDepthClamp);
+    changed([](auto& s) { s.front_ops.reference = 57; s.back_ops.writeMask = 255; }, 0);
+    proof = !draw_library_changes(original, original) && proof;
+    DrawBindingState state;
+    const auto check = [&](bool actual, bool expected) { proof = actual == expected && proof; };
+    state.use_layout(r.gfx_layout);
+    std::uint32_t bindings[2] = {0, 1};
+    VkDescriptorBufferInfo infos[2] = {{r.buf[0].buffer, 0, 128}, {r.buf[1].buffer, 128, 256}};
+    check(state.push(bindings, infos, 2), true);
+    check(state.push(bindings, infos, 2), false);
+    ++infos[1].offset; check(state.push(bindings, infos, 2), true);
+    ++infos[1].range; check(state.push(bindings, infos, 2), true);
+    ++bindings[1]; check(state.push(bindings, infos, 2), true);
+    infos[1].buffer = r.buf[2].buffer; check(state.push(bindings, infos, 2), true);
+    state.use_layout(r.comp_layout); check(state.push(bindings, infos, 2), true);
+    check(state.push(bindings, infos, 1), true);
+    check(state.push(bindings, infos, 1), false);
+    const auto global = (VkDescriptorSet)(std::uintptr_t)1;
+    check(state.bind_global(global), true); check(state.bind_global(global), false);
+    state.use_layout(r.gfx_layout); check(state.bind_global(global), true);
+    VkBuffer vb[2] = {r.buf[0].buffer, r.buf[1].buffer}; VkDeviceSize offsets[2] = {0, 256};
+    check(state.vertex(vb, offsets, 2), true); check(state.vertex(vb, offsets, 2), false);
+    ++offsets[1]; check(state.vertex(vb, offsets, 2), true);
+    std::swap(vb[0], vb[1]); check(state.vertex(vb, offsets, 2), true);
+    check(state.vertex(vb, offsets, 1), true);
+    state = {}; state.use_layout(r.gfx_layout);
+    check(state.push(bindings, infos, 1), true); check(state.vertex(vb, offsets, 1), true);
+    check(state.bind_global(global), true);
+    host_log("stream selftest: fieldwise state / exact bindings / layouts / reset proof %s", proof ? "pass" : "FAIL");
+    if (!proof) return 1;
     std::uint64_t seed0 = host_clock_monotonic_ns();
     if (const char* e = std::getenv("BBHOST_STREAM_SELFTEST_SEED"); e && *e) seed0 = std::strtoull(e, nullptr, 0);
     RoundStats total;
@@ -1127,13 +1292,13 @@ int host_gpu_stream_selftest(int rounds) {
             break;
         }
     }
+    if (g.ok && !failed_rounds) host_log("%s", benchmark(r).c_str());
     const std::uint64_t validation = g_validation_messages.load() - validation0;
     host_log("stream selftest: %d rounds, %llu ops threaded, %llu differences (in place, draws on the recorder, inline, threaded); "
              "validation messages %llu; occlusion queries unresolved %llu; timestamps unavailable %llu, going backwards %llu",
              rounds, static_cast<unsigned long long>(ops), static_cast<unsigned long long>(total.differences),
              static_cast<unsigned long long>(validation), static_cast<unsigned long long>(total.occ_unresolved),
              static_cast<unsigned long long>(total.ts_unavailable), static_cast<unsigned long long>(total.ts_backwards));
-    if (g.ok && !failed_rounds) host_log("%s", benchmark(r).c_str());
     host_log("%s", recorder_report().c_str());
     const bool pass = g.ok && !failed_rounds && !validation;
     host_log("stream selftest: %s", pass ? "pass" : "FAIL");
