@@ -3709,7 +3709,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                  pl.ps.meta().spirv.size());
                     }
                     pl.ps.fresh().spirv = std::move(lifted.spirv);
-                    pl.ps.fresh().wave64_needs = 0;  // no cross-lane operation left: any subgroup size (gcn/wave.h)
+                    pl.ps.fresh().wave64_needs = 0;  // quad operations at most, which no subgroup size changes (gcn/wave.h)
                     pl.ps.lifted = true;
                 } else if (first) {
                     host_log("render: PS %s not lifted, translated shader kept: %s", ps_name.c_str(), lifted.rejections[0].c_str());

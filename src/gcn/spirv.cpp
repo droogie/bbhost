@@ -268,6 +268,15 @@ Id Module::emit(Op op, Id result_type, const std::vector<std::uint32_t>& operand
 void Module::emit_void(Op op, const std::vector<std::uint32_t>& operands) {
     (to_entry_ ? entry_ : body_).push_back({op, 0, 0, operands});
 }
+bool Module::set_operand(Id result, std::size_t index, std::uint32_t value) {
+    for (auto it = body_.rbegin(); it != body_.rend(); ++it) {
+        if (it->result != result) continue;
+        if (index >= it->operands.size()) return false;
+        it->operands[index] = value;
+        return true;
+    }
+    return false;
+}
 Id Module::ext_inst(Id result_type, Glsl inst, const std::vector<Id>& operands) {
     std::vector<std::uint32_t> ops = {ext_glsl(), static_cast<std::uint32_t>(inst)};
     ops.insert(ops.end(), operands.begin(), operands.end());

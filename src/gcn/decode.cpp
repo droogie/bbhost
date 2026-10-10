@@ -753,6 +753,14 @@ std::string format(const Inst& in) {
         break;
     }
     case Enc::VOP2:
+        if (in.op == 1 || in.op == 2) {
+            // v_readlane_b32 sD, vN, lane / v_writelane_b32 vN, s, lane: the
+            // lane is a scalar operand in the VGPR field, and a read's
+            // destination an SGPR.
+            s += " " + (in.op == 1 ? sreg(in.dst, 1) : vreg(in.dst, 1)) + ", " + sreg(in.src0, 1) + ", " +
+                 sreg(static_cast<std::uint16_t>(in.src1 - 256), 1);
+            break;
+        }
         s += " " + vreg(in.dst, 1) + ", " + sreg(in.src0, 1) + ", " + sreg(in.src1, 1);
         if (in.op == 32) {
             std::snprintf(buf, sizeof(buf), ", 0x%x", in.literal);
@@ -769,9 +777,13 @@ std::string format(const Inst& in) {
         s += " vcc, " + sreg(in.src0, w) + ", " + sreg(in.src1, w);
         break;
     case Enc::VOP3: {
-        const int nsrc = in.op < 0x100 ? 2 : in.op < 0x140 ? 2 : in.op < 0x180 ? 3 : 1;
+        // The 64-bit shifts, f64 arithmetic and the multiplies at 0x161-0x16c
+        // take two sources.
+        const int nsrc = in.op < 0x100 ? 2 : in.op < 0x140 ? 2 : in.op < 0x180 ? (in.op >= 0x161 && in.op <= 0x16c ? 2 : 3) : 1;
         if (in.op < 0x100) {
             s += " " + sreg(in.sdst, 2);
+        } else if (in.op == 0x101) {
+            s += " " + sreg(in.dst, 1);  // v_readlane_b32: an SGPR
         } else {
             s += " " + vreg(in.dst, w);
             if (in.sdst || (in.op >= 0x125 && in.op <= 0x12a) || in.op == 0x16d || in.op == 0x16e) {
@@ -785,7 +797,9 @@ std::string format(const Inst& in) {
             count = 3;
         }
         for (int k = 0; k < count; ++k) {
-            s += ", " + vop3_src(in, k, srcs[k], w);
+            // A 64-bit shift's amount, and a lane operand, are one dword.
+            const bool one = (k == 1 && in.op >= 0x161 && in.op <= 0x163) || in.op == 0x101 || in.op == 0x102;
+            s += ", " + vop3_src(in, k, srcs[k], one ? 1 : w);
         }
         if (in.clamp) s += " clamp";
         if (in.omod == 1) s += " mul:2";

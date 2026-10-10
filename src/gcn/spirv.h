@@ -53,6 +53,7 @@ enum Op : std::uint16_t {
     OpGroupNonUniformAny = 335, OpGroupNonUniformBroadcast = 337, OpGroupNonUniformBroadcastFirst = 338,
     OpGroupNonUniformBallot = 339, OpGroupNonUniformBallotBitCount = 342, OpGroupNonUniformShuffle = 345,
     OpGroupNonUniformShuffleXor = 346, OpDemoteToHelperInvocation = 5380,
+    OpGroupNonUniformQuadBroadcast = 365, OpGroupNonUniformQuadSwap = 366,
 };
 
 enum Glsl : std::uint32_t {
@@ -73,6 +74,7 @@ enum Capability : std::uint32_t {
     CapImageCubeArray = 34, CapDemoteToHelperInvocation = 5379, CapPhysicalStorageBufferAddresses = 5347,
     CapTessellation = 3, CapSampledImageArrayDynamicIndexing = 29, CapStorageImageArrayDynamicIndexing = 31,
     CapRuntimeDescriptorArray = 5302, CapDenormPreserve = 4464, CapRoundingModeRTZ = 4468,
+    CapGroupNonUniformQuad = 68,
 };
 
 enum StorageClass : std::uint32_t {
@@ -184,6 +186,10 @@ public:
     Id emit(Op op, Id result_type, const std::vector<std::uint32_t>& operands);
     // Instruction without a result.
     void emit_void(Op op, const std::vector<std::uint32_t>& operands);
+    // Replaces operand `index` of the function-body instruction that defined
+    // `result`: a loop header's OpPhi gets its back-edge value once the loop
+    // body is emitted. False when there is no such instruction or operand.
+    bool set_operand(Id result, std::size_t index, std::uint32_t value);
     Id ext_inst(Id result_type, Glsl inst, const std::vector<Id>& operands);
 
     Id load(Id type, Id ptr) { return emit(OpLoad, type, {ptr}); }
