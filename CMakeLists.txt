@@ -445,6 +445,17 @@ if(UNIX)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
   add_test(NAME sync_test COMMAND sync_test)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Exercise pthread.cpp itself with a quarantined arena and a native
+    # create wrapper that lets the detached child finish before returning.
+    # Unused HLE entry points are discarded instead of linking the runtime.
+    add_executable(thread_lifetime_test tests/thread_lifetime_test.cpp)
+    target_include_directories(thread_lifetime_test PRIVATE src)
+    target_compile_options(thread_lifetime_test PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(thread_lifetime_test PRIVATE -Wl,--gc-sections)
+    target_link_libraries(thread_lifetime_test PRIVATE pthread)
+    add_test(NAME thread_lifetime_test COMMAND thread_lifetime_test)
+  endif()
   add_executable(at9_test tests/at9_test.cpp src/hle/ajm.cpp src/host/main_wait.cpp)
   target_include_directories(at9_test PRIVATE src third_party/libatrac9/C/src)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
