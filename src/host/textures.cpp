@@ -15,6 +15,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <deque>
 #include <bit>
@@ -518,6 +519,10 @@ struct Surface {
     // command buffer, and a CP write over it (mark_surfaces_dirty_locked)
     // clears this so the next bind looks again.
     std::uint64_t refreshed_serial = 0;
+    // The flip and the time (steady clock, ms) it was made at or a shader, a
+    // fill, a copy or an upload last wrote its image: its age and order for
+    // the reuse retire (textures_retire_reused_locked).
+    std::uint64_t written_flip = 0, written_ms = 0;
     std::uint32_t hot = 0;  // checks left before backing off again; see below
     std::uint32_t unchanged = 0;  // consecutive checks that found the memory unchanged (check backoff)
     std::uint32_t uploads = 0;
@@ -1320,7 +1325,12 @@ bool surface_pages(std::uint64_t va, std::uint64_t end) {
     }
     return false;
 }
+void surface_written(Surface& sf) {
+    sf.written_flip = hle_video_flip_count();
+    sf.written_ms = now_ms();
+}
 void note_surface_added(Surface& sf) {
+    surface_written(sf);
     occupancy_add(sf, 1);
     if (sf.total_src <= kLargeSurfaceSrc) return;
     g_large_surfaces[sf.base] = &sf;
@@ -1954,6 +1964,14 @@ void drop_rt_region(RtRegion& reg) {
     invalidate_rt_views(reg.img.base);
     defer_destroy_view(reg.img.view);
     defer_destroy_image(reg.img.image, reg.img.memory);
+}
+
+void textures_drop_rt_regions_locked(std::uint64_t base) {
+    for (auto it = g_rt_regions.lower_bound(std::make_tuple(base, 0u, 0u, std::numeric_limits<int>::min()));
+         it != g_rt_regions.end() && std::get<0>(it->first) == base;) {
+        drop_rt_region(it->second);
+        it = g_rt_regions.erase(it);
+    }
 }
 
 VkImageView rt_region_view(RtImage& rt, const std::uint32_t* w, std::uint32_t width, std::uint32_t height) {
@@ -2847,6 +2865,7 @@ void surface_queue_writeback(std::uint64_t base) {
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() || it->second.failed || it->second.thick) return;
     it->second.gpu_written = true;
+    surface_written(it->second);
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 16) {
         const Surface& sf = it->second;
@@ -2937,6 +2956,7 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         rec().clear_color_image(sf.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        surface_written(sf);
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
@@ -3005,6 +3025,7 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     r.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0};
     r.imageExtent = {w, h, 1};
     rec().copy_buffer_to_image(staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    surface_written(sf);
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3187,6 +3208,7 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (dst.surface) surface_written(*dst.surface);
     if (dst.surface && !dst.surface->gpu_written) {
         dst.surface->gpu_written = true;
         dst.surface->watched = false;
@@ -3261,6 +3283,50 @@ void textures_before_submit() {
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) PrepPool::get().wait(*p);
     g_batch_preps.clear();
     retire_surfaces_locked();
+    image_reuse_sweep_locked();
+}
+
+ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+    ReuseRetired out;
+    static std::uint64_t cursor = 0;  // the next base the scan looks at
+    int k = 0;
+    auto it = g_surfaces.lower_bound(cursor);
+    for (; it != g_surfaces.end();) {
+        if ((++k & 15) == 0 && std::chrono::steady_clock::now() >= deadline) break;
+        Surface& sf = it->second;
+        const std::size_t span = std::max<std::size_t>(sf.total_src, 1);
+        if (!sf.image || !sf.gpu_written || sf.written_ms + idle_ms > now || gx_resource_at(sf.base, span, nullptr) ||
+            (!gx_resource_newer_overlapping(sf.base, span, sf.written_flip) &&
+             !render_target_newer_overlapping_locked(sf.base, span, sf.written_flip, nullptr))) {
+            ++it;
+            continue;
+        }
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("texture: shader-written 0x%llx %ux%u (%llu KiB) retired: a newer object holds its memory, last written %llu s ago",
+                     static_cast<unsigned long long>(sf.base), sf.width, sf.height, static_cast<unsigned long long>(sf.memory.size >> 10),
+                     static_cast<unsigned long long>((now - sf.written_ms) / 1000));
+        }
+        ++out.n;
+        out.bytes += sf.memory.size;
+        // The copies made of its levels go with it: keyed by its base, they
+        // would hold their memory until a surface at that base was read again.
+        for (auto la = g_level_aliases.lower_bound(std::make_tuple(sf.base, 0u, 0u, 0u, std::numeric_limits<int>::min()));
+             la != g_level_aliases.end() && std::get<0>(la->first) == sf.base;) {
+            invalidate_rt_views(la->second.img.base);
+            defer_destroy_view(la->second.img.view);
+            defer_destroy_image(la->second.img.image, la->second.img.memory);
+            la = g_level_aliases.erase(la);
+        }
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+    }
+    cursor = it == g_surfaces.end() ? 0 : it->first;  // at the end the next scan starts over
+    if (out.n) bump_view_epoch();
+    return out;
 }
 
 // The wait above, made first without the renderer's mutex, for the jobs

@@ -16,6 +16,7 @@
 // Every vkAllocateMemory/vkFreeMemory in the files that include this header
 // is tagged with its site (gpu_memtrack.cpp), so a VRAM report can say which
 // allocation holds what - the question when several instances share a GPU.
+#include <chrono>
 #include <string>
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
                          VkDeviceMemory* out, const char* file, int line);
@@ -783,9 +784,43 @@ struct RtImage {
     std::uint64_t fill_va = 0;
     std::uint64_t pending_seen = 0;  // g_pending_gen when apply_pending_clear last scanned for it (render.cpp)
     std::size_t fill_bytes = 0;
+    // The flip it was made at, and the flip and the time (steady clock, ms) a
+    // draw, a fill or a copy last wrote it: its age and order for the reuse
+    // retire (image_reuse_sweep_locked).
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
+// Images over memory the game has given to something newer. On the console a
+// render target, a copy's snapshot or a shader-written texture is only memory:
+// when the game frees it and makes a newer object there, the old contents are
+// gone. Here each is an image kept by its guest address, which nothing removed
+// but an image of another shape at the same base - so an area's targets and
+// compute textures stayed after the game had moved on, and device memory
+// climbed with every new place (1080p: +1.5 GiB of image heap over ten
+// places, 4K: a 12 GB card full by the fifth). Once a second
+// (image_reuse_sweep_locked, from the submit) an image no draw, fill or copy
+// has written for BBHOST_IMG_REUSE_IDLE seconds (10), on memory no live GX
+// resource holds whole, goes once a GX resource, target or snapshot made after
+// its last write holds part of its memory. BBHOST_IMG_RETIRE_REUSED=0 keeps
+// them. All under g.mu.
+void image_reuse_sweep_locked();
+struct ReuseRetired {
+    std::uint64_t n = 0, bytes = 0;
+};
+// Each scan goes on from where the last one stopped and stops at `deadline`,
+// so a sweep holds g.mu for a bounded time however many images there are.
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
+                                         std::chrono::steady_clock::time_point deadline);  // render.cpp: targets and snapshots
+ReuseRetired textures_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
+                                           std::chrono::steady_clock::time_point deadline);  // textures.cpp: shader-written surfaces
+// Whether a target or snapshot made after `after_flip` (other than `self`)
+// covers part of [va, va + bytes).
+bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self);
+// The copies made of the target at `base` for regions a texture read (textures.cpp).
+void textures_drop_rt_regions_locked(std::uint64_t base);
+// The reuse retire's line for the 5-second report.
+std::string image_reuse_report_locked();
 RtImage* find_render_target(std::uint64_t base);
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's

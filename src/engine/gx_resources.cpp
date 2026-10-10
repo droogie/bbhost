@@ -894,6 +894,25 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     return true;
 }
 
+bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip) {
+    if (!bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    // Live resources do not overlap each other: those that start inside the
+    // range, and the one before it if it reaches in.
+    auto it = g_by_memory.lower_bound(va);
+    const auto newer = [&](std::map<std::uint64_t, std::uint64_t>::const_iterator m) {
+        auto h = g_by_holder.find(m->second);
+        if (h == g_by_holder.end()) return false;
+        const GxResourceInfo& r = h->second.info;
+        return r.alive && r.created_flip > after_flip && r.memory < va + bytes && r.memory + r.bytes > va;
+    };
+    if (it != g_by_memory.begin() && newer(std::prev(it))) return true;
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) {
+        if (newer(it)) return true;
+    }
+    return false;
+}
+
 void gx_resources_report() {
     if (!g_gx_res_after_thunk) return;
     std::size_t live = 0;

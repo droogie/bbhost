@@ -1167,6 +1167,31 @@ bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
 // extent learned. target_image() reuses its last answer until then.
 std::uint64_t g_rt_gen = 1;
 
+std::uint64_t steady_ms() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// A draw, a fill or a copy wrote the target (the reuse retire's age and order).
+void rt_written(RtImage& r) {
+    r.written_flip = hle_video_flip_count();
+    r.written_ms = steady_ms();
+}
+// The reuse retire's bases and when it retired them, to count a target made
+// again at a base it had retired within the idle time - the sign of retiring
+// too early (each such remake costs an allocation and the old contents).
+std::unordered_map<std::uint64_t, std::uint64_t> g_reuse_retired_at;  // under g.mu
+std::uint64_t g_reuse_remade = 0;                                     // under g.mu
+// BBHOST_IMG_REUSE_IDLE=<s>: how long nothing may have written an image before
+// the reuse retire looks at it (10 s).
+std::uint64_t reuse_idle_ms() {
+    static const std::uint64_t ms = [] {
+        const char* e = std::getenv("BBHOST_IMG_REUSE_IDLE");
+        const std::uint64_t s = e && *e ? std::strtoull(e, nullptr, 10) : 10;
+        return (s ? s : 10) * 1000;
+    }();
+    return ms;
+}
+
 std::uint32_t unpadded(std::unordered_map<std::uint64_t, std::uint32_t>& seen, std::uint64_t base, std::uint32_t padded,
                        std::uint32_t scissor_edge) {
     if (auto it = seen.find(base); it != seen.end() && plausible_extent(it->second, padded)) {
@@ -1252,6 +1277,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             ++g_rt_gen;
             RtImage& kept = (g_rts[base] = std::move(promoted));
             g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(kept));
+            rt_written(kept);
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
@@ -1273,6 +1299,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         if (r.format == format && r.width == width && r.height == height && r.layers >= layers) {
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
+            rt_written(r);
             return &r;
         }
         g.rt_replacements.fetch_add(1);
@@ -1402,6 +1429,18 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     ++g_rt_gen;
     RtImage& created = (g_rts[base] = r);
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(created));
+    rt_written(created);
+    created.created_flip = created.written_flip;
+    if (auto ra = g_reuse_retired_at.find(base); ra != g_reuse_retired_at.end()) {
+        if (created.written_ms - ra->second < reuse_idle_ms()) {
+            if (++g_reuse_remade <= 8) {
+                host_log("render: %s target 0x%llx %ux%u format %d made again %llu ms after the reuse retire took its image (flip %llu)",
+                         depth ? "depth" : "colour", static_cast<unsigned long long>(base), width, height, static_cast<int>(format),
+                         static_cast<unsigned long long>(created.written_ms - ra->second), static_cast<unsigned long long>(created.written_flip));
+            }
+        }
+        g_reuse_retired_at.erase(ra);
+    }
     bump_view_epoch();
     if (grow) {
         created.htile = grown_from.htile;
@@ -1495,6 +1534,7 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
         apply_pending_clear(*m.rt);
+        rt_written(*m.rt);
         return m.rt;
     }
     std::uint32_t w = 0, h = 0;
@@ -6716,6 +6756,7 @@ bool clear_target_locked(std::uint64_t va, std::size_t bytes, const float rgba[4
     auto it = g_rts.find(va);
     if (it == g_rts.end()) return false;
     if (bytes < rt_size_bytes(it->second)) return false;
+    rt_written(it->second);
     clear_image_locked(it->second, rgba);
     note_fill_last(it->second, va, bytes, rgba);
     return true;
@@ -7325,6 +7366,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         ++g_rt_gen;
         st = g_snapshots.emplace(dst_base, r).first;
         g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(st->second));
+        rt_written(st->second);
+        st->second.created_flip = st->second.written_flip;
         bump_view_epoch();
     }
     if (!into) {
@@ -7340,6 +7383,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         }
     }
     RtImage& dst = into ? *into : st->second;
+    rt_written(dst);
     begin_recording_locked();
     render_end_pass_locked();
     if (!dst.initialised) {
@@ -7753,6 +7797,118 @@ std::string render_barriers_report() {
                   static_cast<unsigned long long>(g_barriers_paid.load()), static_cast<unsigned long long>(g_barriers_skipped.load()),
                   static_cast<unsigned long long>(g_barriers_mid_pass.load()));
     return b;
+}
+
+bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self) {
+    const auto scan = [&](const std::map<std::uint64_t, RtImage>& m) {
+        auto it = m.lower_bound(va + bytes);
+        while (it != m.begin()) {
+            --it;
+            const RtImage& r = it->second;
+            if (r.base + g_max_rt_bytes <= va) break;
+            if (&r != self && r.created_flip > after_flip && ranges_overlap(va, bytes, r.base, std::max<std::size_t>(rt_size_bytes(r), 1))) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return scan(g_rts) || scan(g_snapshots);
+}
+
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+    ReuseRetired out;
+    static std::uint64_t cursor_rts = 0, cursor_snapshots = 0;  // the next base each scan looks at
+    bool stopped = false;
+    const auto sweep = [&](std::map<std::uint64_t, RtImage>& m, bool snapshots, std::uint64_t& cursor) {
+        if (stopped) return;
+        int k = 0;
+        for (auto it = m.lower_bound(cursor); it != m.end();) {
+            if ((++k & 15) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                cursor = it->first;
+                stopped = true;
+                return;
+            }
+            RtImage& r = it->second;
+            const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
+            if (r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
+                (!gx_resource_newer_overlapping(r.base, span, r.written_flip) &&
+                 !render_target_newer_overlapping_locked(r.base, span, r.written_flip, &r))) {
+                ++it;
+                continue;
+            }
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 8) {
+                host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired: a newer object holds its memory, last written %llu s ago",
+                         snapshots ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width,
+                         r.height, static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20),
+                         static_cast<unsigned long long>((now_ms - r.written_ms) / 1000));
+            }
+            ++out.n;
+            out.bytes += r.memory.size;
+            if (g_reuse_retired_at.size() > 65536) g_reuse_retired_at.clear();
+            g_reuse_retired_at[it->first] = now_ms;
+            textures_drop_rt_regions_locked(it->first);
+            destroy_rt_image(r);
+            it = m.erase(it);
+        }
+        cursor = 0;  // the scan reached the end: the next one starts over
+    };
+    sweep(g_rts, false, cursor_rts);
+    sweep(g_snapshots, true, cursor_snapshots);
+    if (out.n) {
+        ++g_rt_gen;
+        bump_view_epoch();
+    }
+    return out;
+}
+
+namespace {
+ReuseRetired g_reuse_targets, g_reuse_textures;  // retired so far (under g.mu)
+std::uint64_t g_reuse_sweeps = 0, g_reuse_sweep_us = 0, g_reuse_sweep_max_us = 0;  // what the sweeps cost (under g.mu)
+}  // namespace
+
+void image_reuse_sweep_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_IMG_RETIRE_REUSED");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    static std::uint64_t last = 0;
+    const std::uint64_t now = steady_ms();
+    if (now - last < 1000) return;
+    last = now;
+    // At most 0.3 ms of g.mu a second: the scans go on where they stopped,
+    // and take turns going first so neither waits on the other.
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::microseconds(300);
+    static bool textures_first = false;
+    textures_first = !textures_first;
+    ReuseRetired t, x;
+    if (textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    if (!textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    const std::uint64_t us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    ++g_reuse_sweeps;
+    g_reuse_sweep_us += us;
+    g_reuse_sweep_max_us = std::max(g_reuse_sweep_max_us, us);
+    g_reuse_targets.n += t.n;
+    g_reuse_targets.bytes += t.bytes;
+    g_reuse_textures.n += x.n;
+    g_reuse_textures.bytes += x.bytes;
+}
+
+std::string image_reuse_report_locked() {
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
+                  "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
+                  static_cast<unsigned long long>(g_reuse_targets.n), static_cast<unsigned long long>(g_reuse_targets.bytes >> 20),
+                  static_cast<unsigned long long>(g_reuse_textures.n), static_cast<unsigned long long>(g_reuse_textures.bytes >> 20),
+                  static_cast<unsigned long long>(g_reuse_remade), static_cast<unsigned long long>(g_reuse_sweeps),
+                  static_cast<unsigned long long>(g_reuse_sweeps ? g_reuse_sweep_us / g_reuse_sweeps : 0),
+                  static_cast<unsigned long long>(g_reuse_sweep_max_us));
+    return buf;
 }
 
 }  // namespace gpu
