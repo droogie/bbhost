@@ -137,9 +137,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_log("setup: no window (%s); edit %s instead", SDL_GetError(), config_user_file().c_str());
         return LauncherResult::Quit;
     }
-    SDL_Window* win = SDL_CreateWindow("bbhost setup", 980, 760,
+    const float scale = std::max(1.0f, SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay()));
+    SDL_Window* win = SDL_CreateWindow("bbhost setup", static_cast<int>(980 * scale), static_cast<int>(760 * scale),
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    const float scale = win ? std::max(1.0f, SDL_GetWindowDisplayScale(win)) : 1.0f;
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, nullptr) : nullptr;
     if (!win || !ren) {
         host_log("setup: no window (%s); edit %s instead", SDL_GetError(), config_user_file().c_str());
@@ -153,6 +153,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // nothing written beside the exe
     ImGui::StyleColorsDark();
+    ImGui::GetStyle().ScaleAllSizes(scale);
+    ImGui::GetStyle().FontScaleDpi = scale;
     ImGui::GetStyle().FontSizeBase = 17.0f;
     ImGui_ImplSDL3_InitForSDLRenderer(win, ren);
     ImGui_ImplSDLRenderer3_Init(ren);
