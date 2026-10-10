@@ -53,6 +53,9 @@ void gx_resources_install(ElfImage* image);
 std::uint64_t gx_resources_create_failures();
 // The live resource whose memory covers [va, va + bytes), if any.
 bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// Whether a live resource made after flip `after_flip` holds memory in
+// [va, va + bytes): the game gave that memory to something newer.
+bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip);
 // The kernel unmapped [va, va + len): resources whose memory lay there are
 // dead for the registry's purposes, holder or no holder (the game releases
 // an area's texture pool under holders it keeps).
