@@ -92,6 +92,7 @@ add_executable(bbhost
   src/engine/mouse_camera_stubs.cpp
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
+  src/host/fmod_project_init.cpp
   src/engine/frame_rate.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
@@ -344,8 +345,13 @@ else()
   target_compile_options(bbhost PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
+enable_testing()
+add_executable(fmod_project_init_test tests/fmod_project_init_test.cpp src/host/fmod_project_init.cpp)
+target_include_directories(fmod_project_init_test PRIVATE src)
+target_compile_features(fmod_project_init_test PRIVATE cxx_std_17)
+add_test(NAME fmod_project_init_test COMMAND fmod_project_init_test)
+
 if(UNIX)
-  enable_testing()
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
