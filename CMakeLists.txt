@@ -76,6 +76,7 @@ add_executable(bbhost
   src/engine/rebirth.cpp
   src/engine/rebirth_script.cpp
   src/engine/dream_mirror_layout.cpp
+  src/engine/chara_id.cpp
   src/engine/five_players.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
