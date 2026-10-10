@@ -10,6 +10,7 @@ import random
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest import mock
 
@@ -90,8 +91,8 @@ def area_lines(area, t, block, window_intervals, view=None, settle_events=(), du
 
 class TourTest(unittest.TestCase):
     def test_places_and_views(self):
-        self.assertEqual(len(ac.AREAS), 10)
-        self.assertEqual(len({a.id for a in ac.AREAS}), 10)
+        self.assertEqual(len(ac.AREAS), 12)
+        self.assertEqual(len({a.id for a in ac.AREAS}), 12)
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())
@@ -103,6 +104,29 @@ class TourTest(unittest.TestCase):
         self.assertAlmostEqual(yaw, math.radians(deg))
         self.assertAlmostEqual(x - fx, math.sin(yaw) * ac.FOG_STANDOFF)
         self.assertTrue(all(a.dlc for a in ac.AREAS if a.block[:3] in ("m34", "m35", "m36")))
+        self.assertFalse(any(a.dlc for a in ac.AREAS if a.block[:3] not in ("m34", "m35", "m36")))
+        # The free views: a standpoint of their own, no wall.
+        for ident in ("nightmare-of-mensis", "laurence-staircase"):
+            a = ac.AREA_BY_ID[ident]
+            self.assertIsNone(a.fog)
+            sx, sy, sz, sdeg = a.stand
+            self.assertEqual(a.view(), (sx, sy, sz, math.radians(sdeg)))
+
+    def test_standpoint(self):
+        """A standpoint is the view as it is, the facing in radians - over a
+        fog wall's, if a place had both - and the plan keeps it."""
+        fog = (-450.9, 1535.71, -292.69, -150.0)
+        walled = ac.Area("x", "X", "m34_00_00_00", 3402950, fog=fog)
+        both = ac.Area("x", "X", "m34_00_00_00", 3402950, fog=fog, stand=(-472.9, 1526.28, -330.8, 30.0))
+        self.assertEqual(both.view(), (-472.9, 1526.28, -330.8, math.radians(30.0)))
+        self.assertNotEqual(walled.view(), both.view())
+        d = both.as_dict()
+        self.assertEqual(d["stand"], [-472.9, 1526.28, -330.8, 30.0])
+        self.assertEqual(d["view"], [-472.9, 1526.28, -330.8, round(math.radians(30.0), 4)])
+        self.assertEqual(d["fog"], list(fog))
+        self.assertIsNone(walled.as_dict()["stand"])
+        self.assertIsNone(ac.AREA_BY_ID["central-yharnam"].as_dict()["view"])
+        json.dumps(d)
 
     def test_pick_areas(self):
         self.assertEqual([a.id for a in ac.pick_areas("all")], [a.id for a in ac.AREAS])
@@ -135,6 +159,11 @@ class TourTest(unittest.TestCase):
         k = lines.index("mark central-yharnam:measure")
         self.assertEqual(lines[k + 1], "hold %.1f" % ac.DEFAULTS["measure"])
         self.assertEqual(lines[k + 2], "mark central-yharnam:measured")
+        # A standpoint's warp comes right after the travel, as a fog wall's does.
+        text = ac.tour(ac.pick_areas("laurence-staircase"), dict(ac.DEFAULTS), "perf")
+        x, y, z, yaw = ac.AREA_BY_ID["laurence-staircase"].view()
+        self.assertIn("travel 3402950 22000000 laurence-staircase\nwarp laurence-staircase:view %.3f %.3f %.3f %.4f 1.0\n"
+                      % (x, y, z, yaw), text)
 
     def test_capture_tour_and_settings(self):
         areas = ac.pick_areas("hunters-nightmare")
@@ -220,6 +249,45 @@ class TourTest(unittest.TestCase):
         for bad in ('/a"b', "C:\\game", "/a\nb"):
             with self.assertRaises(ValueError):
                 ac.toml_str(bad)
+
+
+class CheckAreasTest(unittest.TestCase):
+    def test_lamps_fog_walls_and_standpoints(self):
+        """check_areas against stand-in game data: the lamp's row and its block,
+        a fog wall's object, a standpoint near something the layout puts on the
+        ground (an object, a character or a start - not a map piece, which sits
+        at the block's origin)."""
+        rows = {3402950: {"areaNo": 34, "blockNo": 0, "warpChairNo": 44},
+                2602950: {"areaNo": 26, "blockNo": 0, "warpChairNo": 28}}
+        layout = [{"name": "o349000_0000", "type": 1, "pos": [-450.9, 1535.71, -292.69]},
+                  {"name": "c4010_0001", "type": 2, "pos": [-472.49, 1525.72, -330.776]},
+                  {"name": "m000000_0000", "type": 0, "pos": [27.0, 26.0, 169.0]},
+                  {"name": "h000000_0000", "type": 5, "pos": [27.0, 26.0, 169.0]}]
+        fakes = {"bbparam": types.SimpleNamespace(load_table=lambda table, app0: list(rows.items())),
+                 "msb": types.SimpleNamespace(load=lambda path: path, parts=lambda raw: layout)}
+        stairs = (-472.9, 1526.28, -330.8, -150.0)
+        areas = [ac.Area("fog", "F", "m34_00_00_00", 3402950, fog=(-450.9, 1535.71, -292.69, -150.0)),
+                 ac.Area("stand", "S", "m34_00_00_00", 3402950, stand=stairs),
+                 # The block's own frame (the MSB's less its MapOffset): nothing near.
+                 ac.Area("local", "L", "m34_00_00_00", 3402950, stand=(27.1, 26.28, 169.2, -150.0)),
+                 ac.Area("wrong-lamp", "W", "m34_00_00_00", 2602950, stand=stairs),
+                 ac.Area("no-layout", "N", "m26_00_00_00", 2602950, stand=(-56.79, 974.82, 18.92, -75.0))]
+        with tempfile.TemporaryDirectory() as tmp:
+            maps = Path(tmp) / "dvdroot_ps4" / "map" / "mapstudio"
+            maps.mkdir(parents=True)
+            (maps / "m34_00_00_00.msb.dcx").write_bytes(b"")
+            with mock.patch.dict(sys.modules, fakes):
+                got = {c["id"]: c for c in ac.check_areas(areas, tmp)}
+        self.assertEqual(got["fog"]["problems"], [])
+        self.assertEqual(got["fog"]["fog_object"], {"name": "o349000_0000", "distance_m": 0.0})
+        self.assertEqual(got["fog"]["lamp"], {"row": 3402950, "block": "m34_00_00_00", "headstone_slot": 44})
+        self.assertEqual(got["stand"]["problems"], [])
+        self.assertNotIn("fog_object", got["stand"])
+        self.assertEqual(ac.check_note(got["stand"]), "standpoint 0.69 m from c4010_0001")
+        self.assertEqual(len(got["local"]["problems"]), 1)
+        self.assertIn("within %.0f m of the standpoint" % ac.STAND_REACH, got["local"]["problems"][0])
+        self.assertEqual(got["wrong-lamp"]["problems"], ["row 2602950 is in m26_00_00_00, not m34_00_00_00"])
+        self.assertEqual(got["no-layout"]["problems"], ["no layout m26_00_00_00.msb.dcx"])
 
 
 class LogTest(unittest.TestCase):
