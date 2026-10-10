@@ -23,6 +23,12 @@ struct HostSettings {
     int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90; 0 is uncapped
     bool fps_counter = false;
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
+    int output_width = 1920, output_height = 1080; // reconstructed/native display size
+    int dlss_mode = 0; // Off, DLAA, Quality, Balanced, Performance, Ultra Performance
+    int upscaler_backend = 0; // 0 DLSS, 1 FSR3, 2 FSR4
+    int frame_generation_backend = 0; // 0 DLSS, 1 FSR3
+    bool frame_generation = false; // captured at startup
+    int frame_generation_factor = 2; // 2x/3x/4x, subject to NGX capabilities
 
     // Camera: multipliers on LockCamParam's values (engine/camera.cpp)
     float fov_scale = 1.0f;              // 1.0 the game's own; +5% a step
@@ -70,3 +76,6 @@ struct HostSettings {
 
 // A copy of the current settings.
 HostSettings host_settings();
+// Immutable after the game starts. Restart-required temporal settings cannot
+// change underneath a renderer or presenter while F10 edits next-run choices.
+const HostSettings& host_startup_settings();

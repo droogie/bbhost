@@ -43,6 +43,10 @@ bool host_opt_get(const char* key);
 bool host_opt_resolution(int* w, int* h);
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
+// The selected native/output size, before a DLSS preset lowers the input size.
+bool host_opt_display_resolution(int* w, int* h);
+// Setup's arbitrary size, exposed as a final choice in F10. Invalid sizes rejected.
+bool host_opt_set_custom_resolution(int w, int h);
 // The game's frame rate (engine/frame_rate.h): 30, 60, 90, or 0 for
 // uncapped; the file's key is still frame_cap. Same setting, same file.
 int host_opt_frame_cap();

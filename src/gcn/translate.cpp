@@ -82,6 +82,7 @@ struct Translator {
     Id t_void, t_bool, t_u32, t_i32, t_u64, t_f32, t_v2u, t_v4u, t_v2f, t_v3f, t_v4f, t_v4b, t_v2i, t_v3i, t_v4i, t_v3u;
     Id p_fn_u32, p_fn_bool, p_fn_u64;
     Id p_psb_u32;  // PhysicalStorageBuffer pointer to u32
+    Id p_psb_v4f = 0;  // PhysicalStorageBuffer pointer to v4f
     Id t_psb_block, p_psb_block;  // Block { u32 } reached through a physical address
     Id t_psb_block64, p_psb_block64, p_psb_u64;  // Block { u64 } for page-table entries
     Id p_wg_u32, t_lds_array, p_wg_lds;
@@ -158,6 +159,10 @@ struct Translator {
     // sampler_index members, and the global arrays (one alias of the image
     // array per image type, and the sampler array).
     std::uint32_t bindless_image_member = 0, bindless_sampler_member = 0;
+    // TranslateOptions::object_motion
+    std::uint32_t motion_pos_member = 0;
+    std::uint32_t motion_u32_member[8] = {};
+    std::uint32_t motion_scale_member = 0;
     std::map<Id, Id> bindless_image_arrays;
     Id bindless_sampler_array = 0;
     Id bindless_array(Id t_elem, std::uint32_t binding, const char* name) {
@@ -214,7 +219,7 @@ struct Translator {
         std::uint32_t block;
     };
     std::vector<BufferSite> buffer_sites;
-    Id p_uni_u32 = 0;
+    Id p_uni_u32 = 0, p_uni_u64 = 0, p_uni_v2f = 0;
     // Control flow
     std::set<std::uint32_t> block_starts;
     Id lbl_dispatch_merge = 0, lbl_loop_merge = 0;
@@ -291,6 +296,7 @@ struct Translator {
         p_fn_bool = m.type_pointer(spv::ScFunction, t_bool);
         p_fn_u64 = m.type_pointer(spv::ScFunction, t_u64);
         p_psb_u32 = m.type_pointer(spv::ScPhysicalStorageBuffer, t_u32);
+        p_psb_v4f = m.type_pointer(spv::ScPhysicalStorageBuffer, t_v4f);
         t_psb_block = m.type_struct({t_u32});
         m.decorate(t_psb_block, spv::DecBlock);
         m.member_decorate(t_psb_block, 0, spv::DecOffset, {0});
@@ -1085,6 +1091,15 @@ struct Translator {
         in_location_vars[location] = var;
         return var;
     }
+    Id in_raw_location(std::uint32_t location) {
+        if (auto at = in_location_vars.find(location); at != in_location_vars.end()) return at->second;
+        const Id var = m.global_variable(p_in_v4f, spv::ScInput);
+        m.decorate(var, spv::DecLocation, {location});
+        m.name(var, "motion_in_" + std::to_string(location));
+        interface.push_back(var);
+        in_location_vars[location] = var;
+        return var;
+    }
     Id out_param(int n) {
         auto it = out_params.find(n);
         if (it != out_params.end()) return it->second;
@@ -1104,6 +1119,122 @@ struct Translator {
             if (opt.output_links[k] == n) vars.push_back(out_param(static_cast<int>(k)));
         }
         return vars;
+    }
+    void emit_vertex_motion() {
+        const Id position = out_position ? m.load(t_v4f, out_position) : vec4f(cf(0.0f), cf(0.0f), cf(0.0f), cf(1.0f));
+        const Id bda_pos = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(motion_pos_member)}));
+        const Id store_base = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[0])}));
+        const Id load_base = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[1])}));
+        const Id vertices = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[2])}));
+        const Id first_vertex = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[3])}));
+        const Id instances = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[4])}));
+        const Id first_instance = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[5])}));
+        const Id flags = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(motion_u32_member[6])}));
+
+        const Id raw_vertex = m.load(t_u32, in_vertex_index);
+        const Id raw_instance = m.load(t_u32, in_instance_index);
+        const Id vertex = m.emit(spv::OpISub, t_u32, {raw_vertex, first_vertex});
+        const Id instance = m.emit(spv::OpISub, t_u32, {raw_instance, first_instance});
+        const Id v_in_range = m.emit(spv::OpULessThan, t_bool, {vertex, vertices});
+        const Id i_in_range = m.emit(spv::OpULessThan, t_bool, {instance, instances});
+        const Id in_range = m.emit(spv::OpLogicalAnd, t_bool, {v_in_range, i_in_range});
+        const Id slot = m.emit(spv::OpIAdd, t_u32, {vertex, m.emit(spv::OpIMul, t_u32, {instance, vertices})});
+
+        auto flag_bit = [&](std::uint32_t bit) {
+            const Id masked = m.emit(spv::OpBitwiseAnd, t_u32, {flags, cu(bit)});
+            const Id has_bit = m.emit(spv::OpINotEqual, t_bool, {masked, c_zero_u});
+            return m.emit(spv::OpLogicalAnd, t_bool, {in_range, has_bit});
+        };
+        const Id do_store = flag_bit(1);  // bit 0: store (1)
+        const Id do_load = flag_bit(2);   // bit 1: load (2)
+
+        auto calc_addr = [&](Id base_idx) {
+            const Id total_idx = m.emit(spv::OpIAdd, t_u32, {base_idx, slot});
+            const Id idx_64 = m.emit(spv::OpUConvert, t_u64, {total_idx});
+            const Id byte_offset = m.emit(spv::OpIMul, t_u64, {idx_64, m.const_u64(16)});
+            return m.emit(spv::OpIAdd, t_u64, {bda_pos, byte_offset});
+        };
+
+        const Id store_label = m.fresh();
+        const Id store_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {store_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {do_store, store_label, store_merge});
+        m.label(store_label);
+        const Id store_address = calc_addr(store_base);
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            const Id offset_addr = i == 0 ? store_address : m.emit(spv::OpIAdd, t_u64, {store_address, m.const_u64(i * 4)});
+            const Id ptr = m.emit(spv::OpConvertUToPtr, p_psb_u32, {offset_addr});
+            const Id comp = m.emit(spv::OpCompositeExtract, t_f32, {position, i});
+            const Id bits = m.emit(spv::OpBitcast, t_u32, {comp});
+            m.emit(spv::OpAtomicExchange, t_u32, {ptr, cu(spv::ScopeDevice), cu(spv::MsNone), bits});
+        }
+        m.emit_void(spv::OpBranch, {store_merge});
+        m.label(store_merge);
+
+        const Id load_label = m.fresh();
+        const Id load_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {load_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {do_load, load_label, load_merge});
+        m.label(load_label);
+        const Id load_address = calc_addr(load_base);
+        const Id load_ptr = m.emit(spv::OpConvertUToPtr, p_psb_v4f, {load_address});
+        const Id loaded = m.emit(spv::OpLoad, t_v4f, {load_ptr, 2u /* Aligned */, 16u});
+        m.emit_void(spv::OpBranch, {load_merge});
+        m.label(load_merge);
+
+        const Id loaded_phi = m.emit(spv::OpPhi, t_v4f, {position, store_merge, loaded, load_label});
+        const Id valid_flag = m.emit(spv::OpSelect, t_f32, {do_load, cf(1.0f), cf(0.0f)});
+        const Id previous = m.emit(spv::OpCompositeInsert, t_v4f, {valid_flag, loaded_phi, 2u});
+
+        m.store(out_param(static_cast<int>(opt.motion_location)), position);
+        m.store(out_param(static_cast<int>(opt.motion_location + 1)), previous);
+    }
+    void emit_pixel_motion() {
+        const Id in_cur_var = in_raw_location(opt.motion_location);
+        const Id in_prev_var = in_raw_location(opt.motion_location + 1);
+        const Id cur_clip = m.load(t_v4f, in_cur_var);
+        const Id prev_clip = m.load(t_v4f, in_prev_var);
+
+        const Id p_scale = m.access_chain(p_uni_v2f, ubo_var, {cu(motion_scale_member)});
+        const Id scale = m.load(t_v2f, p_scale);
+        const Id xscale = m.emit(spv::OpCompositeExtract, t_f32, {scale, 0u});
+        const Id yscale = m.emit(spv::OpCompositeExtract, t_f32, {scale, 1u});
+
+        const Id cur_x = m.emit(spv::OpCompositeExtract, t_f32, {cur_clip, 0u});
+        const Id cur_y = m.emit(spv::OpCompositeExtract, t_f32, {cur_clip, 1u});
+        const Id cur_w = m.emit(spv::OpCompositeExtract, t_f32, {cur_clip, 3u});
+
+        const Id prev_x = m.emit(spv::OpCompositeExtract, t_f32, {prev_clip, 0u});
+        const Id prev_y = m.emit(spv::OpCompositeExtract, t_f32, {prev_clip, 1u});
+        const Id prev_valid_flag = m.emit(spv::OpCompositeExtract, t_f32, {prev_clip, 2u});
+        const Id prev_w = m.emit(spv::OpCompositeExtract, t_f32, {prev_clip, 3u});
+
+        const Id cur_ndc_x = m.emit(spv::OpFDiv, t_f32, {cur_x, cur_w});
+        const Id cur_ndc_y = m.emit(spv::OpFDiv, t_f32, {cur_y, cur_w});
+        const Id prev_ndc_x = m.emit(spv::OpFDiv, t_f32, {prev_x, prev_w});
+        const Id prev_ndc_y = m.emit(spv::OpFDiv, t_f32, {prev_y, prev_w});
+
+        const Id diff_x = m.emit(spv::OpFSub, t_f32, {prev_ndc_x, cur_ndc_x});
+        const Id diff_y = m.emit(spv::OpFSub, t_f32, {prev_ndc_y, cur_ndc_y});
+        const Id dx = m.emit(spv::OpFMul, t_f32, {diff_x, xscale});
+        const Id dy = m.emit(spv::OpFMul, t_f32, {diff_y, yscale});
+
+        const Id eps = cf(1e-5f);
+        const Id cur_w_ok = m.emit(spv::OpFOrdGreaterThan, t_bool, {cur_w, eps});
+        const Id prev_w_ok = m.emit(spv::OpFOrdGreaterThan, t_bool, {prev_w, eps});
+        const Id w_ok = m.emit(spv::OpLogicalAnd, t_bool, {cur_w_ok, prev_w_ok});
+        const Id prev_z_ok = m.emit(spv::OpFOrdGreaterThan, t_bool, {prev_valid_flag, cf(0.5f)});
+        const Id is_valid = m.emit(spv::OpLogicalAnd, t_bool, {w_ok, prev_z_ok});
+
+        const Id out_dx = m.emit(spv::OpSelect, t_f32, {is_valid, dx, cf(0.0f)});
+        const Id out_dy = m.emit(spv::OpSelect, t_f32, {is_valid, dy, cf(0.0f)});
+        const Id out_valid = m.emit(spv::OpSelect, t_f32, {is_valid, cf(1.0f), cf(0.0f)});
+
+        const Id frag_coord_val = m.load(t_v4f, in_frag_coord);
+        const Id frag_depth = m.emit(spv::OpCompositeExtract, t_f32, {frag_coord_val, 2u});
+
+        const Id motion_vec = vec4f(out_dx, out_dy, out_valid, frag_depth);
+        m.store(out_param(7), motion_vec);
     }
     Id builtin_in(Id ptr_type, spv::BuiltIn bi, const char* nm) {
         const Id var = m.global_variable(ptr_type, spv::ScInput);
@@ -3387,6 +3518,16 @@ struct Translator {
             members.push_back(t_bias_arr);
             members.push_back(t_bias_arr);
         }
+        if (opt.object_motion) {
+            motion_pos_member = static_cast<std::uint32_t>(members.size());
+            members.push_back(t_u64);
+            for (int k = 0; k < 8; ++k) {
+                motion_u32_member[k] = static_cast<std::uint32_t>(members.size());
+                members.push_back(t_u32);
+            }
+            motion_scale_member = static_cast<std::uint32_t>(members.size());
+            members.push_back(t_v2f);
+        }
         const Id t_ubo = m.type_struct(members);
         m.decorate(t_ubo, spv::DecBlock);
         m.member_decorate(t_ubo, 0, spv::DecOffset, {0});
@@ -3405,14 +3546,27 @@ struct Translator {
             m.member_decorate(t_ubo, bindless_image_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, image_index))});
             m.member_decorate(t_ubo, bindless_sampler_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, sampler_index))});
         }
+        if (opt.object_motion) {
+            m.member_decorate(t_ubo, motion_pos_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_positions))});
+            m.member_decorate(t_ubo, motion_u32_member[0], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_store))});
+            m.member_decorate(t_ubo, motion_u32_member[1], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_load))});
+            m.member_decorate(t_ubo, motion_u32_member[2], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_vertices))});
+            m.member_decorate(t_ubo, motion_u32_member[3], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_first_vertex))});
+            m.member_decorate(t_ubo, motion_u32_member[4], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_instances))});
+            m.member_decorate(t_ubo, motion_u32_member[5], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_first_instance))});
+            m.member_decorate(t_ubo, motion_u32_member[6], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_flags))});
+            m.member_decorate(t_ubo, motion_u32_member[7], spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_pad))});
+            m.member_decorate(t_ubo, motion_scale_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, motion_scale))});
+        }
         const Id p_ubo = m.type_pointer(spv::ScUniform, t_ubo);
         ubo_var = m.global_variable(p_ubo, spv::ScUniform);
         m.decorate(ubo_var, spv::DecDescriptorSet, {opt.descriptor_set});
         m.decorate(ubo_var, spv::DecBinding, {kBindingParams});
         m.name(ubo_var, "params");
         interface.push_back(ubo_var);
-        const Id p_uni_u64 = m.type_pointer(spv::ScUniform, t_u64);
+        p_uni_u64 = m.type_pointer(spv::ScUniform, t_u64);
         p_uni_u32 = m.type_pointer(spv::ScUniform, t_u32);
+        p_uni_v2f = m.type_pointer(spv::ScUniform, t_v2f);
 
         // LDS
         const std::uint32_t lds_words = lds_words_for(opt);
@@ -3922,6 +4076,9 @@ struct Translator {
             m.store(out_param(static_cast<int>(TranslateOptions::vs_clip_location(opt.vs_out_cntl))),
                     vec4f(cf(1.0f), cf(1.0f), cf(1.0f), cf(1.0f)));
         }
+        if (opt.stage == Stage::Vertex && opt.object_motion) {
+            emit_vertex_motion();
+        }
         if (opt.stage == Stage::Pixel && !(opt.exec_known && lane_end_seen && lane_end.count(kExecLo))) {
             // Lanes whose EXEC bit is clear at the end were killed (nothing to
             // kill where every way out keeps the lane bit set).
@@ -3932,6 +4089,9 @@ struct Translator {
             m.label(l_kill);
             m.emit_void(spv::OpKill, {});
             m.label(l_ret);
+        }
+        if (opt.stage == Stage::Pixel && opt.object_motion) {
+            emit_pixel_motion();
         }
         m.emit_void(spv::OpReturn, {});
         m.end_function();

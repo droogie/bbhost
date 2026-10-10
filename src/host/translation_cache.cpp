@@ -108,6 +108,8 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     for (const std::string& s : o.cb_ssbo_exclude) h.str(s);
     h.flag(o.cb_no_fallback);
     h.flag(o.exec_known);
+    h.flag(o.object_motion);
+    h.u32(o.motion_location);
     h.u32(o.rsrc1);
     h.u32(o.rsrc2);
     h.u32(o.ps_input_ena);

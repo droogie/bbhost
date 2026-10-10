@@ -71,9 +71,8 @@ PadState host_pad_state();
 // device, so this is a channel of its own rather than part of PadState: a pad
 // cannot carry a position.
 struct MouseState {
-    // Where the pointer is in the game's own display buffer, in pixels - the
-    // presenter stretches that buffer over the whole window, so this is the
-    // window position scaled by it. Both 0 when the window has never presented.
+    // Position in the presented picture's pixels, after reconstruction. The
+    // window/swapchain letterbox is removed. Both 0 before the first present.
     float x = 0.0f, y = 0.0f;
     bool in_window = false;
     bool moved = false;             // moved since the previous read
@@ -177,6 +176,7 @@ struct PresentFlip {
     std::uint64_t submit_need = ~0ull;  // host_gpu_work_needs() when the flip arrived; ~0: not known, submit
     std::uint64_t arrived_ns = 0;       // steady clock when the flip was queued (for the flip-to-present time); 0: not known
     bool on_arrival = false;            // shown when it arrived, before its vblank completes it (BBHOST_PRESENT_ON_ARRIVAL)
+    std::uint64_t temporal_frame = 0;   // captured DLAA / FG frame index under GPU lock
 };
 // Present one frame: copies the render target the game displays (`display_va`
 // from sceVideoOutRegisterBuffers) into the swapchain, or clears when there

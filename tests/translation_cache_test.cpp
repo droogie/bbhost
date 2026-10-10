@@ -122,6 +122,17 @@ void run_start(const std::vector<Case>& cases, const std::vector<gcn::TranslateR
 }  // namespace
 
 int main(int argc, char** argv) {
+    // These key checks also run without a game dump in CI. Motion-enabled
+    // shaders and their output locations must not reuse ordinary translations.
+    gcn::Program empty;
+    gcn::TranslateOptions plain, motion;
+    motion.object_motion = true;
+    const auto plain_key = key_for(empty, plain, TranslationUse::kStage);
+    const auto motion_key = key_for(empty, motion, TranslationUse::kStage);
+    CHECK(!(plain_key == motion_key));
+    motion.motion_location = 3;
+    CHECK(!(motion_key == key_for(empty, motion, TranslationUse::kStage)));
+    if (g_failures) return 1;
     std::vector<std::string> bundles;
     for (int a = 1; a < argc; ++a) bundles.emplace_back(argv[a]);
     if (bundles.empty()) {

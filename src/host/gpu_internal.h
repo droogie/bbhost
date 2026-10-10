@@ -68,7 +68,7 @@ constexpr std::uint32_t kMaxImages = 32;
 // window), so the ring is a symptom of a heavy frame, not its cost. Raising it
 // doubles the descriptor pools as well; do not without a measurement.
 constexpr std::uint32_t kMaxQueued = 2048;    // dispatches + draws per flush
-constexpr std::uint32_t kParamsStride = 512;  // bytes per StageParams slot in the ring (352 bytes, a multiple of 256)
+constexpr std::uint32_t kParamsStride = 768;  // 576-byte StageParams, rounded to a multiple of 256
 constexpr std::uint32_t kStageSlots = 2;      // VS + PS descriptor sets per draw
 // Command buffers in flight, at most (BBHOST_GPU_SLOTS picks fewer, Gpu::slot_count).
 // The command processor submits after every game command buffer - about 11 a

@@ -12,6 +12,7 @@
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/options.h"
+#include "host/settings.h"
 #include "log.h"
 
 #include <algorithm>
@@ -1088,6 +1089,10 @@ bool live_resolution_install(ElfImage* image) {
         return !(e && e[0] == '0');
     }();
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
+    const HostSettings& display = host_startup_settings();
+    const std::uint32_t output_w = static_cast<std::uint32_t>(display.output_width);
+    const std::uint32_t output_h = static_cast<std::uint32_t>(display.output_height);
+    const std::uint64_t output_px = static_cast<std::uint64_t>(output_w) * output_h;
     const bool tight = live && host_gpu_memory_tight();
     // How large a live change may go: the largest display's size (a picture
     // larger than every screen only scales down), or the starting size when
@@ -1119,7 +1124,7 @@ bool live_resolution_install(ElfImage* image) {
         max_w = std::min<std::uint32_t>(max_w, 1920);
         max_h = std::min<std::uint32_t>(max_h, 1080);
     }
-    const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
+    const std::uint64_t live_px = std::max(std::max(start_px, output_px), std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
     grow_gfx_heap(image, !live ? start_px : live_px);
     if (tight)
         host_log("resolution: live changes up to %.1f million pixels, the GPU's memory is tight (larger sizes apply at the next start)",
@@ -1133,8 +1138,8 @@ bool live_resolution_install(ElfImage* image) {
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, guest(kResWidth)));
     // The widest and tallest entry a live change can reach (above), or the
     // starting size when larger.
-    g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
-    g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
+    g_display[0] = std::max(std::max(max_w, static_cast<std::uint32_t>(w)), output_w);
+    g_display[1] = std::max(std::max(max_h, static_cast<std::uint32_t>(h)), output_h);
     host_log("resolution: live changes up to %ux%u (%s); larger sizes apply at the next start", g_display[0], g_display[1], max_why);
 
     // Every edit is checked before any is made, so a mismatch leaves the

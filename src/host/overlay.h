@@ -6,7 +6,7 @@
 // system on-screen keyboard, and the options screen - without touching a menu
 // asset or the dump.
 //
-// Coordinates are the game's display-buffer pixels, the same space
+// Coordinates are the presented picture's pixels after reconstruction, the same space
 // host_mouse_state() reports its position in, so a hit test and a drawn
 // highlight agree without either knowing the window size.
 
@@ -17,7 +17,7 @@
 // Colours are 0xRRGGBBAA. The window's pump builds a frame's overlay from
 // host_overlay_reset() and hands it to the presenter whole with
 // host_overlay_commit(); presents in between keep drawing the last one.
-void host_overlay_reset();
+void host_overlay_reset(float display_w = 0.0f, float display_h = 0.0f);
 void host_overlay_commit();
 void host_overlay_rect(float x, float y, float w, float h, std::uint32_t rgba);
 void host_overlay_tri(float x0, float y0, float x1, float y1, float x2, float y2, std::uint32_t rgba);

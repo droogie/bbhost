@@ -1,6 +1,7 @@
 #include "net/session.h"
 
 #include "core/config.h"
+#include "core/portable.h"
 #include "core/thunk.h"
 #include "hle/net_p2p.h"
 #include "hle/hle.h"
@@ -52,6 +53,7 @@ std::atomic<bool> g_drun{false};
 std::atomic<std::thread::id> g_dtid{};
 
 void dispatcher_main() {
+    host_thread_set_name("bb-np");
     // One guest TCB for the life of the thread: the callbacks the game
     // registered read fs:-relative state, and this is the only thread of ours
     // that calls them (avplayer.cpp does the same for its event callback).
@@ -91,7 +93,6 @@ void dispatcher_ensure_locked() {
     if (g_drun.load()) return;
     g_drun.store(true);
     g_dthread = std::thread(dispatcher_main);
-    pthread_setname_np(g_dthread.native_handle(), "bb-np");
     g_dthread.detach();
 }
 
@@ -118,6 +119,7 @@ std::function<void(const json::Value&)> g_handler;
 long long g_cursor = 0;
 
 void poller_main() {
+    host_thread_set_name("bb-np-poll");
     const std::string me = online_id();
     int interval_ms = 250;
     while (g_pollrun.load()) {
@@ -588,6 +590,7 @@ std::condition_variable g_keepcv;
 std::mutex g_keepmu;
 
 void keepalive_main() {
+    host_thread_set_name("bb-np-keep");
     std::string last;
     {
         std::lock_guard<std::mutex> lk(g_mapped.mu);
@@ -630,11 +633,9 @@ void poller_start(std::function<void(const json::Value& event)> handler) {
     g_pollrun.store(true);
     g_cursor = 0;
     g_pollthread = std::thread(poller_main);
-    pthread_setname_np(g_pollthread.native_handle(), "bb-np-poll");
     g_pollthread.detach();
     if (!g_keeprun.exchange(true)) {
         std::thread t(keepalive_main);
-        pthread_setname_np(t.native_handle(), "bb-np-keep");
         t.detach();
     }
 }

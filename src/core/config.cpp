@@ -157,6 +157,20 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("video.window_mode", &c->window_mode);
     str("video.model_detail", &c->model_detail);
     num("video.vblank_hz", &c->vblank_hz);
+    str("dlss.mode", &c->dlss_mode);
+    num("dlss.output_width", &c->dlss_output_width);
+    num("dlss.output_height", &c->dlss_output_height);
+    str("dlss.upscaler_backend", &c->upscaler_backend);
+    str("dlss.frame_generation_backend", &c->frame_generation_backend);
+    num("dlss.frame_generation_factor", &c->dlss_fg_factor);
+    {
+        auto it = kv.find("dlss.frame_generation");
+        if (it != kv.end()) c->dlss_frame_generation = it->second == "true" || it->second == "1";
+    }
+    {
+        auto it = kv.find("dlss.object_motion");
+        if (it != kv.end()) c->dlss_object_motion = it->second == "true" || it->second == "1";
+    }
     {
         auto it = kv.find("startup.setup_window");
         if (it != kv.end()) c->setup_always = it->second == "true" || it->second == "1";
@@ -733,6 +747,14 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (const char* e = std::getenv("BBHOST_IME")) {
         if (std::strcmp(e, "type") == 0 || std::strcmp(e, "auto") == 0) c.ime_mode = e;
     }
+    if (const char* e = std::getenv("BBHOST_UPSCALER")) {
+        if (std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "fsr4") == 0)
+            c.upscaler_backend = e;
+    }
+    if (const char* e = std::getenv("BBHOST_FG_BACKEND")) {
+        if (std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr3") == 0)
+            c.frame_generation_backend = e;
+    }
     g_cfg = c;
     *out = c;
     return true;
@@ -959,6 +981,24 @@ bool config_write_template(const std::string& path) {
            "# vblank_hz = 0\n"
            "# true: no window, no presentation (smoke tests)\n"
            "headless = false\n"
+           "\n[dlss]\n"
+           "# Requires an NVIDIA RTX GPU and ngx_bridge.dll/nvngx_dlss.dll beside bbhost.\n"
+           "# off, dlaa, quality, balanced, performance, ultra_performance.\n"
+           "mode = \"off\"\n"
+           "# Output size; 0 follows the selected display resolution.\n"
+           "# SR presets automatically choose a lower game render size.\n"
+           "output_width = 0\n"
+           "output_height = 0\n"
+           "# Upscaler backend: dlss, fsr3, fsr4 (experimental)\n"
+           "upscaler_backend = \"dlss\"\n"
+           "# Frame generation backend: dlss, fsr3\n"
+           "frame_generation_backend = \"dlss\"\n"
+           "# DLSS Frame Generation requires nvngx_dlssg.dll and supported hardware.\n"
+           "# This generates displayed frames without changing the gameplay rate.\n"
+           "frame_generation = false\n"
+           "frame_generation_factor = 2\n"
+           "# Animated mesh vectors for DLSS and frame generation. Restart after changing.\n"
+           "object_motion = false\n"
            "\n# Key bindings. The in-game System > Key Bindings screen changes these\n"
            "# and saves them in bbhost-options.toml, which wins over this file; what\n"
            "# is here are the defaults for a player who never opens it. Each action\n"

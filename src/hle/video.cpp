@@ -560,7 +560,7 @@ void start_vsync() {
                     static std::once_flag once;
                     std::call_once(once, [] {
                         std::thread([] {
-                            pthread_setname_np(pthread_self(), "bb-poolwatch");
+                            host_thread_set_name("bb-poolwatch");
                             int lowest = 99, last = -2;
                             for (;;) {
                                 const int free_now = hle_guest_pool_free();

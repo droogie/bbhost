@@ -968,6 +968,12 @@ int main(int argc, char** argv) {
     // and they seed from bbhost.toml, so a run with no options file behaves
     // exactly as it did.
     host_options_load();
+    {
+        const HostSettings& h = host_startup_settings();
+        host_log("display: render %dx%d -> output %dx%d, DLSS mode %d, frame generation %dx",
+                 h.res_width, h.res_height, h.output_width, h.output_height,
+                 h.dlss_mode, h.frame_generation ? h.frame_generation_factor : 1);
+    }
     config_set_skip_intro(host_settings().skip_logos);
     // The PC enhancements are read the same way, once: each installs (or its
     // patch applies) while the guest is prepared, so a change waits for the

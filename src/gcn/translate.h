@@ -184,6 +184,8 @@ struct TranslateOptions {
     // mov, and/or, whole-quad mode and save/restore can keep it) and emit plain
     // register writes, unguarded memory writes and no final kill there.
     bool exec_known = true;
+    bool object_motion = false;
+    std::uint32_t motion_location = 0;
     std::uint32_t rsrc1 = 0;         // SPI_SHADER_PGM_RSRC1 / COMPUTE_PGM_RSRC1
     std::uint32_t rsrc2 = 0;          // SPI_SHADER_PGM_RSRC2 / COMPUTE_PGM_RSRC2
     std::uint32_t ps_input_ena = 0;   // SPI_PS_INPUT_ENA
@@ -430,8 +432,20 @@ struct StageParams {
     // renderer's global descriptor arrays (images[n], samplers[n]).
     std::uint32_t image_index[16];
     std::uint32_t sampler_index[16];
+    // TranslateOptions::object_motion (offset 512, std140)
+    std::uint64_t motion_positions;       // device address of clip positions buffer (PSB)
+    std::uint32_t motion_store;           // vertex index base for current frame write (0 = skip)
+    std::uint32_t motion_load;            // vertex index base for previous frame read (0 = skip)
+    std::uint32_t motion_vertices;        // vertex count for this draw range
+    std::uint32_t motion_first_vertex;    // min index / first vertex to subtract
+    std::uint32_t motion_instances;       // instance count
+    std::uint32_t motion_first_instance;  // first instance
+    std::uint32_t motion_flags;           // bit 0: store (1), bit 1: load (2)
+    std::uint32_t motion_pad;
+    float motion_scale[2];                // viewport half-width, -half-height
+    std::uint32_t motion_reserved[4];     // pad to 576 bytes
 };
-static_assert(offsetof(StageParams, image_index) == 384 && sizeof(StageParams) == 512, "the params block's layout is the shaders'");
+static_assert(offsetof(StageParams, image_index) == 384 && offsetof(StageParams, motion_positions) == 512 && sizeof(StageParams) == 576, "the params block's layout is the shaders'");
 // TessRole::LsCompute: StageParams::vertex_formats as the draw's control points.
 constexpr int kTessIndexLo = 0, kTessIndexHi = 1;  // index buffer guest address (0: none)
 constexpr int kTessCount = 2;                      // control points

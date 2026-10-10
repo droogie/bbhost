@@ -44,6 +44,17 @@ struct HostConfig {
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     bool headless = false;     // video.headless / --headless / BBHOST_HEADLESS=1
+    // [dlss]: output dimensions are independent of the game's render size.
+    // Zero uses the selected game resolution. Frame generation affects only
+    // presentation; it must not raise the game's simulation rate.
+    std::string dlss_mode = "off"; // off, dlaa, quality, balanced, performance, ultra_performance
+    int dlss_output_width = 0;
+    int dlss_output_height = 0;
+    std::string upscaler_backend = "dlss"; // dlss, fsr3, fsr4
+    std::string frame_generation_backend = "dlss"; // dlss, fsr3
+    bool dlss_frame_generation = false;
+    int dlss_fg_factor = 2;
+    bool dlss_object_motion = false; // animated mesh vectors; optional extra GPU work
     bool skip_intro = false;   // startup.skip_intro / BBHOST_SKIP_INTRO=0|1: the three company logos only
     // loading.quick_reentry / BBHOST_QUICK_REENTRY=0|1: a load after a death or
     // lamp travel ends when the area is ready, not after the game's 12-second

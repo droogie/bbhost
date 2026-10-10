@@ -1,6 +1,7 @@
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
+#include "host/display_settings.h"
 
 #include "host/bindings.h"
 #include "host/overlay.h"
@@ -88,8 +89,18 @@ enum SettingId {
     kChangeAppearance,
     kRebirth,
     kFivePlayers,
+    kObjectMotion,
+    kUpscalerBackend,
+    kDlssMode,
+    kFgBackend,
+    kFrameGeneration,
     kSettingCount,
 };
+
+// Stable storage: the choices table retains this pointer as setup replaces
+// the custom size. Existing preset indices remain unchanged.
+constexpr int kCustomResolution = 14;
+char g_custom_resolution[32] = "Custom (setup)";
 
 // A row on screen: a section header, a setting, or the close button.
 struct Row {
@@ -212,11 +223,11 @@ Setting g_set[kSettingCount] = {
     // place, and the other shapes are engine/live_resolution.cpp's. 960x600
     // and 1024x640 are the Deck's screen at 75% and 80%: it holds 60 fps there
     // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
-    {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
+    {"resolution", "Display resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
                                   "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640"}, 2,
-     "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
-     "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
+                                  "5120x1440", "1280x800", "960x600", "1024x640", g_custom_resolution}, 2,
+     "Native rendering or reconstruction output size. Quality presets select a lower render size. The HUD stays centered at 16:9. "
+     "Custom sizes are entered in setup. Changes with reconstruction require a restart.",
      true},
     {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
@@ -239,6 +250,16 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.", true},
     {"five_players", "Five players", {"On", "Off"}, 0,
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
+    {"object_motion", "Object motion vectors", {"Off", "On"}, 0,
+     "Tracks animated meshes for reconstruction and frame generation. Uses extra GPU time and memory. Requires a restart.", true},
+    {"upscaler_backend", "Upscaler backend", {"DLSS", "FSR 3.1", "FSR 4 (Experimental)"}, 0,
+     "Reconstruction provider: DLSS (RTX only), FSR 3.1, or FSR 4 (experimental v0.7 ML model; falls back cleanly if shaders missing). Requires a restart.", true},
+    {"dlss_mode", "Reconstruction quality", {"Off", "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"}, 0,
+     "DLAA/Native AA renders at native resolution. SR presets render fewer pixels and reconstruct the selected display size. Requires a restart.", true},
+    {"fg_backend", "FG backend", {"DLSS", "FSR 3.1"}, 0,
+     "Frame generation provider: DLSS (RTX 40 series or newer) or experimental FSR 3.1 (2x only; fast motion can show interpolation artifacts). Requires a restart.", true},
+    {"frame_generation", "Frame generation", {"Off", "2x", "3x", "4x"}, 0,
+     "Adds a generated frame between game frames. FSR FG supports 2x only. Experimental 3x/4x can have uneven pacing under FPS limits. Requires a restart.", true},
 };
 
 const Row g_rows[] = {
@@ -263,6 +284,11 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
     {Row::Option, nullptr, kAntiAlias},
+    {Row::Option, nullptr, kUpscalerBackend},
+    {Row::Option, nullptr, kDlssMode},
+    {Row::Option, nullptr, kFgBackend},
+    {Row::Option, nullptr, kFrameGeneration},
+    {Row::Option, nullptr, kObjectMotion},
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kBloom},
@@ -341,7 +367,8 @@ bool selectable(int r) {
 // after a smaller start) applies on the next run like any restart setting.
 bool res_live(int index) {
     unsigned w = 0, h = 0;
-    return live_resolution_available() && std::sscanf(g_set[kResolution].values[static_cast<std::size_t>(index)], "%ux%u", &w, &h) == 2 &&
+    return g_set[kDlssMode].index == 0 && live_resolution_available() && host_startup_settings().dlss_mode == 0 &&
+           std::sscanf(g_set[kResolution].values[static_cast<std::size_t>(index)], "%ux%u", &w, &h) == 2 &&
            live_resolution_can(w, h);
 }
 
@@ -620,6 +647,11 @@ void apply(int id) {
         case kDepthOfField:
         case kChromaticAberration:
         case kResolution: {
+            // The hooks may already accept requests before the GX device is
+            // ready. Do not queue a display-size request over the lower SR
+            // render size during that startup interval.
+            if (g_set[kDlssMode].index != 0 ||
+                (live_resolution_can(256, 144) && host_startup_settings().dlss_mode != 0)) break;
             unsigned w = 0, h = 0;
             // A change the player made asks to be kept (g_res_prev set by
             // set_index); going back, and the start, ask nothing. BBHOST_RES
@@ -699,19 +731,28 @@ void rebuild_settings() {
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.fps_counter = on_of(kFpsCounter);
+    h.upscaler_backend = index_of(kUpscalerBackend);
+    h.dlss_mode = index_of(kDlssMode);
+    h.frame_generation_backend = index_of(kFgBackend);
+    h.frame_generation = on_of(kFrameGeneration);
+    h.frame_generation_factor = std::max(2, index_of(kFrameGeneration) + 1);
+    if (h.frame_generation_backend == 1 && h.frame_generation_factor > 2) {
+        h.frame_generation_factor = 2;
+    }
     {
         // BBHOST_RES=WxH still wins, so an A/B run started with one behaves
         // the way its command line says.
-        unsigned w = 0, hh = 0;
+        int w = 1920, hh = 1080, forced_w = 0, forced_h = 0;
         const char* e = std::getenv("BBHOST_RES");
-        if (!(e && e[0] && std::sscanf(e, "%ux%u", &w, &hh) == 2)) {
-            const Setting& r = g_set[kResolution];
-            if (std::sscanf(r.values[static_cast<std::size_t>(r.index)], "%ux%u", &w, &hh) != 2) w = hh = 0;
-        }
-        if (w && hh) {
-            h.res_width = static_cast<int>(w);
-            h.res_height = static_cast<int>(hh);
-        }
+        const Setting& r = g_set[kResolution];
+        host::parse_resolution(r.values[static_cast<std::size_t>(r.index)], &w, &hh);
+        if (e && e[0]) host::parse_resolution(e, &forced_w, &forced_h);
+        const auto dimensions = host::display_dimensions(w, hh, h.dlss_mode,
+            0, 0, forced_w, forced_h);
+        h.res_width = dimensions.render_width;
+        h.res_height = dimensions.render_height;
+        h.output_width = dimensions.output_width;
+        h.output_height = dimensions.output_height;
     }
     // Distance and height: 5 is the game's own, 10% a step either way. Field
     // of view: 0 is the game's own, 5% wider a step (BBHOST_FOV overrides).
@@ -762,7 +803,10 @@ void rebuild_settings() {
 
 void set_index(int id, int index, bool from_file) {
     Setting& s = g_set[id];
-    const int n = static_cast<int>(s.values.size());
+    // FSR has only Off/2x, even when experimental DLSS MFG is opted in.
+    // Wrap over those two choices so Right from 2x can turn generation off.
+    const int n = id == kFrameGeneration && g_set[kFgBackend].index == 1 ?
+                  2 : static_cast<int>(s.values.size());
     index = ((index % n) + n) % n;
     if (index == s.index && from_file) {
         return;
@@ -772,6 +816,15 @@ void set_index(int id, int index, bool from_file) {
         if (index == g_res_prev) g_res_prev = -1;  // back where it started: nothing to ask
     }
     s.index = index;
+    if (!from_file) {
+        if (id == kFgBackend && index == 1 && g_set[kFrameGeneration].index > 1) {
+            g_set[kFrameGeneration].index = 1;
+        }
+        if (id == kFrameGeneration && g_set[kFgBackend].index == 1 && index > 1) {
+            g_set[kFrameGeneration].index = 1;
+            s.index = 1;
+        }
+    }
     g_serial.fetch_add(1, std::memory_order_release);
     rebuild_settings();
     if (!from_file) {
@@ -817,6 +870,10 @@ void host_options_load() {
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
+    if (!host::experimental_mfg_enabled()) {
+        g_set[kFrameGeneration].values.resize(2);
+        g_set[kFrameGeneration].note = "Adds one generated frame between game frames. Use 60 fps gameplay for multiplayer. Requires a restart.";
+    }
     // bbhost.toml still sets the defaults; the options file is what the player
     // changed, and the environment switches still win over both.
     host_bindings_load_defaults();
@@ -827,6 +884,15 @@ void host_options_load() {
     g_set[kChangeAppearance].index = config().change_appearance ? 0 : 1;
     g_set[kRebirth].index = config().rebirth ? 0 : 1;
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
+    g_set[kObjectMotion].index = config().dlss_object_motion ? 1 : 0;
+    g_set[kUpscalerBackend].index = host::parse_upscaler_backend(config().upscaler_backend);
+    g_set[kDlssMode].index = host::dlss_mode_index(config().dlss_mode);
+    g_set[kFgBackend].index = host::parse_fg_backend(config().frame_generation_backend);
+    g_set[kFrameGeneration].index = config().dlss_frame_generation ?
+        std::clamp(config().dlss_fg_factor, 2, static_cast<int>(g_set[kFrameGeneration].values.size())) - 1 : 0;
+    if (g_set[kFgBackend].index == 1 && g_set[kFrameGeneration].index > 1) {
+        g_set[kFrameGeneration].index = 1;
+    }
     // video.fps_cap is the frame rate's default: 30, 60, 90 or 0 (uncapped);
     // another number takes the nearest rate below it.
     {
@@ -839,14 +905,28 @@ void host_options_load() {
     // kit's 1280x800, fullscreen; video.model_detail), by the entry's name.
     const auto seed = [](int id, const std::string& value) {
         for (std::size_t k = 0; !value.empty() && k < g_set[id].values.size(); ++k)
-            if (value == g_set[id].values[k]) g_set[id].index = static_cast<int>(k);
+            if (value == g_set[id].values[k]) { g_set[id].index = static_cast<int>(k); return; }
+        int w = 0, h = 0;
+        if (id == kResolution && host::parse_resolution(value, &w, &h)) {
+            std::snprintf(g_custom_resolution, sizeof(g_custom_resolution), "%dx%d", w, h);
+            g_set[id].index = kCustomResolution;
+        }
     };
     seed(kResolution, config().resolution);
+    // Legacy SR profiles used separate output dimensions. Seed the display
+    // selector from them; a later F10/setup choice still takes precedence.
+    if (g_set[kDlssMode].index >= 2 && host::valid_resolution(config().dlss_output_width, config().dlss_output_height)) {
+        char size[32];
+        std::snprintf(size, sizeof(size), "%dx%d", config().dlss_output_width, config().dlss_output_height);
+        seed(kResolution, size);
+    }
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kChangeAppearance),
-                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers)})
+                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kObjectMotion),
+                         static_cast<int>(kUpscalerBackend), static_cast<int>(kDlssMode),
+                         static_cast<int>(kFgBackend), static_cast<int>(kFrameGeneration)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
@@ -902,6 +982,10 @@ void host_options_load() {
             }
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
+            if (key == "resolution") seed(kResolution, val);
+            if (key == "frame_generation" && val == "On") val = "2x";
+            if (key == "dlss_mode" && val == "DLAA") val = "Native AA";
+            if (key == "frame_generation" && !host::experimental_mfg_enabled() && (val == "3x" || val == "4x")) val = "2x";
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
@@ -978,6 +1062,27 @@ void host_options_load() {
     }
     // The environment switches the track was brought up with still win, so a
     // run started with one behaves the way it says on the command line.
+    if (const char* e = std::getenv("BBHOST_UPSCALER"); e && e[0])
+        g_set[kUpscalerBackend].index = host::parse_upscaler_backend(e);
+    if (const char* e = std::getenv("BBHOST_FG_BACKEND"); e && e[0])
+        g_set[kFgBackend].index = host::parse_fg_backend(e);
+    if (const char* e = std::getenv("BBHOST_DLSS_MODE"); e && e[0])
+        g_set[kDlssMode].index = host::dlss_mode_index(e);
+    if (const char* e = std::getenv("BBHOST_DLSS_FG"); e && e[0])
+        g_set[kFrameGeneration].index = e[0] >= '2' && e[0] <= '4' ? e[0] - '1' :
+            (e[0] == '1' || e[0] == 't' || e[0] == 'T' ? 1 : 0);
+    g_set[kFrameGeneration].index = std::clamp(g_set[kFrameGeneration].index, 0,
+        static_cast<int>(g_set[kFrameGeneration].values.size()) - 1);
+    if (g_set[kFgBackend].index == 1 && g_set[kFrameGeneration].index > 1) {
+        g_set[kFrameGeneration].index = 1;
+    }
+    if (const char* e = std::getenv("BBHOST_DLAA"); e && e[0] == '0') {
+        g_set[kDlssMode].index = 0;
+        g_set[kFrameGeneration].index = 0;
+    }
+    if (const char* e = std::getenv("BBHOST_OBJECT_MOTION"); e && e[0]) {
+        g_set[kObjectMotion].index = e[0] == '0' ? 0 : 1;
+    }
     if (const char* e = std::getenv("BBHOST_MOUSE_MENU"); e && e[0]) {
         g_set[kMouseMenu].index = e[0] == '0' ? 0 : 1;
     }
@@ -1340,6 +1445,11 @@ HostSettings host_settings() {
     return g_settings;
 }
 
+const HostSettings& host_startup_settings() {
+    static const HostSettings settings = host_settings();
+    return settings;
+}
+
 namespace {
 // Which way round a two-value setting reads comes from the values themselves,
 // not a list of ids kept in step by hand: a new {"On","Off"} setting was
@@ -1392,6 +1502,19 @@ bool host_opt_resolution(int* w, int* h) {
 }
 
 int host_opt_resolution_index() { return g_set[kResolution].index; }
+
+bool host_opt_display_resolution(int* w, int* h) {
+    const Setting& r = g_set[kResolution];
+    return host::parse_resolution(r.values[static_cast<std::size_t>(r.index)], w, h);
+}
+
+bool host_opt_set_custom_resolution(int w, int h) {
+    if (!host::valid_resolution(w, h)) return false;
+    std::snprintf(g_custom_resolution, sizeof(g_custom_resolution), "%dx%d", w, h);
+    set_index(kResolution, kCustomResolution, false);
+    save();
+    return true;
+}
 
 void host_opt_set_resolution_index(int i) {
     if (i < 0 || static_cast<std::size_t>(i) >= g_set[kResolution].values.size()) {

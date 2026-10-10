@@ -7,6 +7,8 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
+#include "host/dlaa.h"
+#include "host/object_motion.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
@@ -248,6 +250,7 @@ struct GfxPipeline {
     // 1 for d3ca03f3+111fce32, 2 for 7d668276+e0305cef (the YEBIS probes in
     // draw_impl, which log once), 0 for the rest; -1 until a draw asks.
     std::int8_t yebis_probe = -1;
+    std::int8_t dlaa_anchor = -1;  // 1 for DLAA's anchor (dlaa_is_anchor), 0 for the rest; -1 until a draw asks
     // The optimized relink, queued at the pipeline's first draw
     // (queue_library_relink): its libraries, and the vertex library's
     // specialization - the elements' formats, the state it was made with.
@@ -1891,6 +1894,8 @@ int draw_ps_kind(const GfxPipeline& p) {
 }
 
 struct DrawState {
+    bool object_motion = false;
+    std::uint32_t motion_location = 0;
     std::uint64_t vs_va = 0, ps_va = 0, fetch_va = 0;
     std::uint32_t vs_rsrc1 = 0, vs_rsrc2 = 0, ps_rsrc1 = 0, ps_rsrc2 = 0;
     std::uint32_t prim = 0;
@@ -1968,6 +1973,7 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
         std::uint32_t state[12];
         std::uint32_t color_mask[8];
         std::uint32_t formats[9];
+        std::uint32_t object_motion, motion_location;
         // What program_fp stands for, when the draw carries none.
         std::uint32_t vte, ps_input_ena, vs_out_cntl, cb_shader_mask, ps_input_cntl[32];
     } k;
@@ -1975,6 +1981,8 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
     k.vs = vs_hash;
     k.fetch = fetch_hash;
     k.ps = ps_hash;
+    k.object_motion = s.object_motion;
+    k.motion_location = s.object_motion ? s.motion_location : 0;
     k.prim = s.prim;
     k.domain_level = s.domain_level;
     k.tess_hw = s.tess_hw;
@@ -2207,7 +2215,16 @@ GfxFixedState fixed_state(const DrawState& s) {
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) last = t;
     }
+    if (s.object_motion) last = 7;
     for (int t = 0; t <= last; ++t) {
+        if (t == 7 && s.object_motion) {
+            VkPipelineColorBlendAttachmentState b{};
+            b.colorWriteMask = 0xf;
+            f.blends.push_back(b);
+            f.color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
+            f.color_slots.push_back(t);
+            continue;
+        }
         if (!s.color[t]) {
             f.blends.push_back(VkPipelineColorBlendAttachmentState{});  // write mask 0
             f.color_formats.push_back(VK_FORMAT_UNDEFINED);
@@ -3115,6 +3132,8 @@ struct PsStageInputs {
     const std::vector<bool>* modes;
     const std::vector<std::uint8_t>* input_map;  // ps_input_locations
     std::uint32_t clip_discard = 0;              // TranslateOptions::ps_clip_discard
+    bool object_motion = false;
+    std::uint32_t motion_location = 0;
 };
 std::uint64_t ps_stage_key(const PsStageInputs& in) {
     std::uint64_t key = fnv1a(in.words->data(), in.words->size() * 4, 0x9e3779b97f4a7c15ull);
@@ -3122,6 +3141,7 @@ std::uint64_t ps_stage_key(const PsStageInputs& in) {
     key = fnv1a(pk, sizeof(pk), key);
     key = fnv1a(&in.early_fragment_tests, 1, key);
     key = fnv1a(&in.no_fallback, 1, key);
+    if (in.object_motion) key = fnv1a(&in.motion_location, sizeof(in.motion_location), key ^ 0x0b1ec7a11ull);
     key = fnv1a(in.input_map->data(), in.input_map->size(), key);
     if (in.clip_discard) key = fnv1a(&in.clip_discard, sizeof(in.clip_discard), key ^ 0xc11bd15cull);
     if (g.bindless) key ^= 0xb1d1e55b1d1e55ull;  // another translation
@@ -3149,6 +3169,8 @@ gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     po.ps_flat_mask = in.flat_mask;
     po.ps_input_map = *in.input_map;
     po.ps_clip_discard = in.clip_discard;
+    po.object_motion = in.object_motion;
+    po.motion_location = in.motion_location;
     return po;
 }
 // BBHOST_CLIP_VARYING=0 (checks): clip distances go to the clipper again
@@ -3275,6 +3297,8 @@ struct VsStageInputs {
     bool tess_attrs = false;
     std::uint32_t tess_attr_vec4s = 8;
     std::uint32_t tess_window = 0;  // TranslateOptions::tess_window: the game's own hull runs
+    bool object_motion = false;
+    std::uint32_t motion_location = 0;
 };
 std::uint64_t vs_stage_key(const VsStageInputs& in) {
     std::uint64_t key = fnv1a(in.words->data(), in.words->size() * 4);
@@ -3288,6 +3312,7 @@ std::uint64_t vs_stage_key(const VsStageInputs& in) {
         }
     }
     key = fnv1a(&in.no_fallback, 1, key);
+    if (in.object_motion) key = fnv1a(&in.motion_location, sizeof(in.motion_location), key ^ 0x0b1ec7a11ull);
     if (in.domain_level) key = fnv1a(&in.domain_level, 4, key ^ 0x7e55u);
     if (in.tess_hw) {
         key = fnv1a(&in.tess_control_points, 4, key ^ 0x7e56u);
@@ -3477,6 +3502,7 @@ void manifest_add(std::uint64_t key, std::shared_ptr<const ManifestStage> m) {
     g_manifest.recorded.fetch_add(1, std::memory_order_relaxed);
 }
 void manifest_note_ps(std::uint64_t key, const std::string& name, const PsStageInputs& in, bool lift) {
+    if (in.object_motion) return;  // draw-specific variants stay in the translation cache
     if (!stage_manifest_on()) return;
     {
         std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -3500,6 +3526,7 @@ void manifest_note_ps(std::uint64_t key, const std::string& name, const PsStageI
     manifest_add(key, std::move(m));
 }
 void manifest_note_vs(std::uint64_t key, const std::string& name, const VsStageInputs& in, bool lift) {
+    if (in.object_motion) return;
     if (!stage_manifest_on()) return;
     {
         std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -3603,6 +3630,8 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
     vo.cb_ssbo = g.cb_ssbo;
     vo.cb_no_fallback = in.no_fallback;
     vo.exec_known = g.exec_known;
+    vo.object_motion = in.object_motion;
+    vo.motion_location = in.motion_location;
     if (in.tess_hw || in.domain_level) {
         // A domain shader has no vertex input: its control points come from
         // the buffer the LS compute pass wrote. Carrying the vertex path's
@@ -3700,8 +3729,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         clip_discard = ps_clip_discard_count(s.vs_out_cntl, vs_words, ps_input_map);
         const bool early_fragment_tests = !(s.depth_control & 5) && !clip_discard && ps_early_tests_matter(ps_words) != 0;
         const PsStageInputs ps_in{&ps_words, s.ps_rsrc1, s.ps_rsrc2, s.ps_input_ena, ps_flat_mask, early_fragment_tests, stage_lean,
-                                  &ps_dims, &ps_sampler_modes, &ps_input_map, clip_discard};
-        const bool ps_lift = stage_lean && decomp_selects(ps_name);
+                                  &ps_dims, &ps_sampler_modes, &ps_input_map, clip_discard, s.object_motion, s.motion_location};
+        const bool ps_lift = !s.object_motion && stage_lean && decomp_selects(ps_name);
         const std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
         const bool ps_cacheable = g_stage_cache_on;
         const std::shared_ptr<const CachedStage> ps_hit = ps_cacheable ? cached_stage(ps_key) : nullptr;
@@ -3805,10 +3834,10 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vertex_input ? &vertex_input->elements : nullptr,
                               vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
                               s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
-                              s.tess_window};
+                              s.tess_window, s.object_motion, s.motion_location};
     // BBHOST_DECOMP: the no-fallback variant of a selected vertex shader on
     // vertex input runs its lift, under a key of its own.
-    const bool vs_decomp = stage_lean && vertex_input && !g_vs_dispatcher && decomp_selects(vs_name);
+    const bool vs_decomp = !s.object_motion && stage_lean && vertex_input && !g_vs_dispatcher && decomp_selects(vs_name);
     const std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp);
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
@@ -5194,6 +5223,7 @@ void note_not_ready_locked(Precompiler& w, const std::string& name, int type, st
 // A draw translated a vertex shader after all: why its compile at creation did
 // not serve (the first differing input).
 void note_vs_precompile_miss(const std::string& name, const VsStageInputs& in) {
+    if (in.object_motion) return;
     if (!precompile_enabled() || !in.no_fallback) return;  // only the no-fallback variant is compiled ahead
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -5242,6 +5272,7 @@ bool note_precompile_hit(std::uint64_t ps_key) {  // true: a stage compiled at c
 // A draw translated a pixel shader after all: why its compile at creation did
 // not serve (the first differing input).
 void note_precompile_miss(const std::string& name, const PsStageInputs& in) {
+    if (in.object_motion) return;
     if (!precompile_enabled() || !in.no_fallback) return;  // only the no-fallback variant is compiled ahead
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -5953,7 +5984,17 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) last = t;
     }
+    if (t_object_motion_draw) last = 7;
     for (int t = 0; t <= last; ++t) {
+        if (t == 7 && t_object_motion_draw) {
+            VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            a.imageView = object_motion_get_attachment_view(s.depth->width, s.depth->height);
+            a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colors.push_back(a);
+            continue;
+        }
         if (!s.color[t]) {
             colors.push_back(VkRenderingAttachmentInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
             continue;
@@ -6007,6 +6048,9 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
 
 std::uint64_t pass_key(const DrawState& s) {
     std::uint64_t h = 1469598103934665603ull;
+    const VkImageView motion = t_object_motion_draw && s.depth
+        ? object_motion_get_attachment_view(s.depth->width, s.depth->height) : VK_NULL_HANDLE;
+    h = fnv1a(&motion, sizeof(motion), h);
     for (int t = 0; t < 8; ++t) {
         const std::uint64_t b = s.color[t] ? s.color[t]->base ^ (static_cast<std::uint64_t>(s.color_layer[t]) << 48) : 0;
         h = fnv1a(&b, 8, h);
@@ -8064,6 +8108,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        if (g_dlaa_cb_capturing.load(std::memory_order_relaxed) && !b.pointer) dlaa_cb_note_locked(i, base, bytes);
+        if (t_dlaa_main_draw && t_dlaa_cb_stage == 0 && !b.pointer) dlaa_camera_note_locked(base, bytes);
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
         Located loc;
@@ -10997,7 +11043,24 @@ bool host_gpu_draw(const GpuDraw& d) {
     return tess_draw_one(d, t);
 }
 
+struct SrHudState {
+    bool active = false;
+    std::uint64_t target_rt = 0;
+    std::uint64_t depth_rt = 0;
+    std::uint32_t in_w = 0;
+    std::uint32_t in_h = 0;
+    std::uint32_t out_w = 0;
+    std::uint32_t out_h = 0;
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+};
+static SrHudState s_sr_hud;
+
 static bool draw_impl(const GpuDraw& d) {
+    struct ObjectMotionScope {
+        ObjectMotionScope() { t_object_motion_draw = false; t_object_motion_location = 0; }
+        ~ObjectMotionScope() { t_object_motion_draw = false; t_object_motion_location = 0; }
+    } object_motion_scope;
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
     g.draw_calls.fetch_add(1, std::memory_order_relaxed);
@@ -11583,6 +11646,116 @@ static bool draw_impl(const GpuDraw& d) {
     const std::vector<std::pair<std::uint32_t, bool>>& ps_dims = key_stages[1].dims;
     const std::vector<bool>& vs_sampler_modes = key_stages[0].modes;
     const std::vector<bool>& ps_sampler_modes = key_stages[1].modes;
+    motion::History::Allocation object_allocation{};
+    int object_targets = 0;
+    for (int t = 0; t < 7; ++t) object_targets += s.color[t] && s.color_mask[t];
+    if (object_motion_enabled() && dlaa_motion_active_locked() && s.depth && !s.depth_layer &&
+        !s.color[7] && object_targets >= 4 && !s.rect && !t_tess && !s.domain_level && !s.tess_hw &&
+        !d.indirect_va && !ps_words.empty() && (gx_geometry || use_vertex_input) &&
+        dlaa_main_draw_locked(s.depth->base, s.depth_control, s.prim, d.index_count)) {
+        // Resolve the same VS bindings as the draw, including GX record draws
+        // whose command-stream user data is deliberately omitted.
+        // The ordinary path-only translation omits constant-buffer bindings.
+        // Keep a separate CB-aware analysis, cached once per vertex program.
+        static std::unordered_map<std::uint64_t, gcn::TranslateResult> object_paths;
+        auto [paths_it, inserted] = object_paths.try_emplace(vs_hash);
+        if (inserted) {
+            gcn::TranslateOptions options;
+            options.stage = gcn::Stage::Vertex;
+            options.rsrc1 = s.vs_rsrc1;
+            options.rsrc2 = s.vs_rsrc2;
+            options.cb_ssbo = true;
+            paths_it->second = translate_cached(gcn::decode(vs_words.data(), vs_words.size()), options, TranslationUse::kPaths);
+        }
+        const auto& bindings = paths_it->second.buffers;
+        const GxStagePlan* plan = gx_stage[0] && g_binding_plans ? &stage_plan(paths_it->second, *gx_stage[0]) : nullptr;
+        bool skeleton = false, small_skeleton = false;
+        std::uint64_t palette = 1469598103934665603ull;
+        for (std::size_t i = 0; i < bindings.size(); ++i) {
+            const auto& b = bindings[i];
+            if (b.pointer) continue;
+            std::uint32_t words[4]{};
+            if (!resolve_via_plan(plan ? &plan->buffers[i] : nullptr, b.path, s.vs_user, gx_stage[0], 4, words)) continue;
+            const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
+            if (stride != 16) continue;
+            const std::uint64_t bytes = std::uint64_t(words[2]) * stride;
+            if (bytes > 16384) continue;
+            const auto role = motion::ClassifyBuffer(static_cast<std::uint32_t>(bytes));
+            skeleton |= role == motion::BufferRole::Skeleton;
+            if (role == motion::BufferRole::SmallSkeleton) {
+                const std::uint64_t base = words[0] | (std::uint64_t(words[1] & 0xff) << 32);
+                if (base && hle_kernel_va_mapped(base, bytes)) {
+                    std::array<std::uint8_t, 624> bones{};
+                    if (bytes <= bones.size()) {
+                        read_guest_locked(base, bytes, bones.data());
+                        palette = fnv1a(bones.data(), bytes, palette);
+                        small_skeleton = true;
+                    }
+                }
+            }
+        }
+        if ((skeleton || small_skeleton) && object_motion_init_locked()) {
+            motion::Draw object_draw{};
+            object_draw.shader = vs_hash;
+            object_draw.geometry = fetch_hash;
+            if (gx_geometry) {
+                object_draw.geometry = fnv1a(&gx_geometry->vtx_valid, sizeof(gx_geometry->vtx_valid), object_draw.geometry);
+                for (int slot = 0; slot < 16; ++slot) {
+                    if ((gx_geometry->vtx_valid >> slot) & 1)
+                        object_draw.geometry = fnv1a(gx_geometry->vtx_rec[slot], 16, object_draw.geometry);
+                }
+            } else {
+                object_draw.geometry = fnv1a(vertex_input.va, vertex_input.bindings.size() * sizeof(vertex_input.va[0]), object_draw.geometry);
+            }
+            object_draw.indices = d.index_va;
+            object_draw.index_count = d.index_count;
+            object_draw.instances = d.instance_count;
+            if (d.index_va) {
+                const std::uint32_t index_size = d.index_type == 1 ? 4 : 2;
+                const std::uint64_t bytes = std::uint64_t(d.index_count) * index_size;
+                if (hle_kernel_va_mapped(d.index_va, bytes)) {
+                    const auto range = object_motion_index_cache().Get(
+                        {d.index_va, d.index_count, index_size, in.base_vertex, false},
+                        object_motion_history().CurrentFrame(), [&] {
+                            const void* data = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(d.index_va));
+                            const auto vertices = index_size == 4
+                                ? motion::IndexedRange(std::span(static_cast<const std::uint32_t*>(data), d.index_count), in.base_vertex, false)
+                                : motion::IndexedRange(std::span(static_cast<const std::uint16_t*>(data), d.index_count), in.base_vertex, false);
+                            return motion::IndexRangeCache::Result{vertices, fnv1a(data, bytes)};
+                        });
+                    object_draw.vertices = range.range;
+                    object_draw.topology = range.topology;
+                }
+            } else if (in.base_vertex >= 0) {
+                object_draw.vertices = {static_cast<std::uint32_t>(in.base_vertex), d.index_count};
+            }
+            const motion::History::GateKey gate{object_draw.shader, object_draw.geometry, object_draw.indices,
+                object_draw.index_count, object_draw.instances, 0, 0};
+            if (skeleton || object_motion_is_moving_locked(gate, palette)) {
+                // Reserve two unused varyings, including the original VS exports
+                // and the clip-distance varying created by the host.
+                const auto inputs = ps_input_locations(ps_read_inputs(ps_words), s.ps_input_cntl);
+                std::uint32_t used = 0;
+                for (const auto location : inputs) if (location < 32) used |= 1u << location;
+                const auto vertex_program = gcn::decode(vs_words.data(), vs_words.size());
+                for (const auto& instruction : vertex_program.insts)
+                    if (instruction.enc == gcn::Enc::EXP && instruction.tgt >= 32 && instruction.tgt < 64)
+                        used |= 1u << (instruction.tgt - 32);
+                const std::uint32_t clip = ps_clip_discard_count(s.vs_out_cntl, vs_words, inputs);
+                if (clip) used |= 1u << ((clip >> 8) & 31);
+                for (std::uint32_t location = 0; location < 29; ++location) {
+                    if (used & (3u << location)) continue;
+                    object_motion_prepare_target_locked(s.depth->width, s.depth->height, s.depth->base);
+                    if (!object_motion_get_attachment_view(s.depth->width, s.depth->height)) break;
+                    object_allocation = object_motion_prepare_draw_locked(object_draw);
+                    if (!object_allocation.flags) break;
+                    s.object_motion = t_object_motion_draw = true;
+                    s.motion_location = t_object_motion_location = location;
+                    break;
+                }
+            }
+        }
+    }
     std::uint64_t key = pipeline_key(s, vs_hash, use_vertex_input ? vertex_input.hash : fetch_hash, ps_hash);
     const VertexInputPlan* vertex_plan = use_vertex_input ? &vertex_input : nullptr;
     {
@@ -11618,6 +11791,47 @@ static bool draw_impl(const GpuDraw& d) {
                      static_cast<unsigned long long>(hle_video_flip_count()));
         }
         return false;
+    }
+    // DLAA: at the anchor (YEBIS's first colour write), before its pass, the
+    // HDR scene it samples goes through DLSS (dlaa.cpp).
+    if (pl.dlaa_anchor < 0) pl.dlaa_anchor = dlaa_is_anchor(pl.name) ? 1 : 0;
+    if (pl.dlaa_anchor == 1) {
+        s_sr_hud = {};
+        std::uint64_t sampled[2] = {};
+        const auto& images = pl.ps.meta().images;
+        const int n = static_cast<int>(std::min<std::size_t>(images.size(), 2));
+        for (int k = 0; k < n; ++k) {
+            std::uint32_t tw[8] = {};
+            if (resolve_binding(images[k].path, s.ps_user, gx_stage[1], 8, tw)) sampled[k] = tsharp_base(tw);
+        }
+        dlaa_anchor_locked(sampled, n);
+    }
+    // The depth-only HUD clear (34e8a281) has no colour attachment. Capture
+    // the composed scene at the first actual colour HUD draw instead, before
+    // any health bars or text are blended into it. The temporal backend dedups
+    // this by scene frame, independently of CPU flip counters.
+    if (pl.name.rfind("81d336ce+", 0) == 0 && s.color[0] && s.color_mask[0]) {
+        const auto w = static_cast<std::uint32_t>(std::abs(s.vport[0] * 2.0f));
+        const auto h = static_cast<std::uint32_t>(std::abs(s.vport[2] * 2.0f));
+        std::uint32_t capture_w = w;
+        std::uint32_t capture_h = h;
+        if (dlss_sr_is_active()) {
+            std::uint32_t out_w = w, out_h = h;
+            if (dlss_sr_upscale_hud_locked(s.color[0], w, h, &out_w, &out_h)) {
+                s_sr_hud.active = true;
+                s_sr_hud.target_rt = s.color[0]->base;
+                s_sr_hud.depth_rt = s.depth ? s.depth->base : 0;
+                s_sr_hud.in_w = w;
+                s_sr_hud.in_h = h;
+                s_sr_hud.out_w = out_w;
+                s_sr_hud.out_h = out_h;
+                s_sr_hud.scale_x = static_cast<float>(out_w) / static_cast<float>(w);
+                s_sr_hud.scale_y = static_cast<float>(out_h) / static_cast<float>(h);
+                capture_w = out_w;
+                capture_h = out_h;
+            }
+        }
+        dlaa_capture_hudless_locked(s.color[0], capture_w, capture_h);
     }
     // A pipeline that reads memory through the page table could read a
     // copy-back's destination before its copy is in place (copy versions).
@@ -12360,11 +12574,24 @@ static bool draw_impl(const GpuDraw& d) {
 
     int reused_way[2] = {-1, -1};
     std::uint32_t stage_named[2] = {0, 0};  // user-data dwords each stage built from GX
+    t_dlaa_main_draw = dlaa_main_draw_locked(s.depth ? s.depth->base : 0, s.depth_control, s.prim, d.index_count);
     for (int st = 0; st < 2; ++st) {
         const gcn::TranslateResult& meta = st == 0 ? pl.vs.meta() : pl.ps.meta();
         const std::size_t stage_writes = writes.size();
         gcn::StageParams params{};
         params.l1_table = g.l1.address;
+        if (s.object_motion) {
+            params.motion_positions = object_motion_positions_bda();
+            params.motion_store = object_allocation.store;
+            params.motion_load = object_allocation.load;
+            params.motion_vertices = object_allocation.vertices;
+            params.motion_first_vertex = object_allocation.first_vertex;
+            params.motion_instances = object_allocation.instances;
+            params.motion_first_instance = object_allocation.first_instance;
+            params.motion_flags = object_allocation.flags;
+            params.motion_scale[0] = s.vport[0];
+            params.motion_scale[1] = s.vport[2];
+        }
         std::memcpy(params.user_sgpr, st == 0 ? s.vs_user : s.ps_user, sizeof(params.user_sgpr));
         if (st == 0 && t_tess) {
             params.lds_address = t_tess->lds_address;
@@ -12492,7 +12719,9 @@ static bool draw_impl(const GpuDraw& d) {
             std::memcpy(params.vertex_formats, t_tess->hs_user, sizeof(params.vertex_formats));
             if (gx_stage[0]) put_tess_constants(*gx_stage[0], t_tess->tess_vsharp, params.user_sgpr);
         }
+        t_dlaa_cb_stage = static_cast<int>(st);  // F12's constant-buffer capture (dlaa.cpp)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st]);
+        t_dlaa_cb_stage = -1;
         if (!meta.buffers.empty()) {
             any_buffers = true;
             all_bound = all_bound && params.cb_valid == (1u << meta.buffers.size()) - 1;
@@ -13006,6 +13235,7 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     g_pass_profile_name = &bind_pl->profile_name;
+    if (s.object_motion) object_motion_attach_locked(VK_NULL_HANDLE, s.depth->width, s.depth->height, s.depth->base);
     begin_pass(s, pass_key(s), sample_hazard);
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
@@ -13152,16 +13382,54 @@ static bool draw_impl(const GpuDraw& d) {
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
     }
+    // DLAA's jitter: the scene's geometry shifted by a sub-pixel amount (dlaa.cpp).
+    if (t_dlaa_main_draw) {
+        float jx = 0.0f, jy = 0.0f;
+        dlaa_jitter_locked(&jx, &jy);
+        vp.x += jx;
+        vp.y += jy;
+        t_dlaa_main_draw = false;
+    }
     // A reversed range (zscale < 0) stays reversed: Vulkan only requires
     // both ends inside [0, 1].
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f);
     vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
+    VkRect2D sc = s.scissor;
+    if (s_sr_hud.active) {
+        const bool is_finalcopy = (pl.name.rfind("89cda9e4+", 0) == 0);
+        const bool is_ui_target = (s.color[0] && s.color[0]->base == s_sr_hud.target_rt);
+        const bool is_ui_depth = (s.depth && s_sr_hud.depth_rt && s.depth->base == s_sr_hud.depth_rt);
+        if (is_ui_target || is_ui_depth) {
+            if (is_ui_target && s.depth && !s_sr_hud.depth_rt) {
+                s_sr_hud.depth_rt = s.depth->base;
+            }
+            vp.x *= s_sr_hud.scale_x;
+            vp.y *= s_sr_hud.scale_y;
+            vp.width *= s_sr_hud.scale_x;
+            vp.height *= s_sr_hud.scale_y;
+            sc.offset.x = static_cast<std::int32_t>(std::round(sc.offset.x * s_sr_hud.scale_x));
+            sc.offset.y = static_cast<std::int32_t>(std::round(sc.offset.y * s_sr_hud.scale_y));
+            sc.extent.width = static_cast<std::uint32_t>(std::round(sc.extent.width * s_sr_hud.scale_x));
+            sc.extent.height = static_cast<std::uint32_t>(std::round(sc.extent.height * s_sr_hud.scale_y));
+        } else if (is_finalcopy) {
+            // Preserve the guest's negative-height viewport (GCN Y-down),
+            // including its origin, while expanding the final copy.
+            vp.x *= s_sr_hud.scale_x;
+            vp.y *= s_sr_hud.scale_y;
+            vp.width *= s_sr_hud.scale_x;
+            vp.height *= s_sr_hud.scale_y;
+            sc.offset.x = 0;
+            sc.offset.y = 0;
+            sc.extent.width = s_sr_hud.out_w;
+            sc.extent.height = s_sr_hud.out_h;
+            s_sr_hud.active = false;
+        }
+    }
     if (!g_recorded.viewport_set || std::memcmp(&g_recorded.viewport, &vp, sizeof(vp)) != 0) {
         cmds.viewport(vp);
         g_recorded.viewport = vp;
         g_recorded.viewport_set = true;
     }
-    VkRect2D sc = s.scissor;
     sc.extent.width = std::min<std::uint32_t>(sc.extent.width, g_pass.extent.width > static_cast<std::uint32_t>(sc.offset.x) ? g_pass.extent.width - sc.offset.x : 0);
     sc.extent.height = std::min<std::uint32_t>(sc.extent.height, g_pass.extent.height > static_cast<std::uint32_t>(sc.offset.y) ? g_pass.extent.height - sc.offset.y : 0);
     if (!sc.extent.width || !sc.extent.height) {
@@ -13565,6 +13833,8 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         r.tex0 = r.tex[0];
+        t_dlaa_main_draw = false;
+        dlaa_after_draw_locked(r);
     }
     if (g_trace) {
         static std::atomic<int> logs{0};
@@ -13705,6 +13975,7 @@ void host_gpu_request_dump() {
     if (g_dump_request.load(std::memory_order_acquire)) return;  // one already waits for its flip
     g_capture_dir = new_capture_dir();
     g_dump_request.store(true, std::memory_order_release);
+    gpu::dlaa_request_cb_capture(g_capture_dir);
     host_log("dump: F12 capture on the next flip, into %s", capture_dir_shown(g_capture_dir).c_str());
 }
 bool host_gpu_take_dump_request(std::string* dir) {

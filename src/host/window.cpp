@@ -10,10 +10,13 @@
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "host/dlaa.h"
+#include "host/frame_generation.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
 #include "host/present_pass.h"
+#include "host/presentation_coordinates.h"
 #include "host/ingame_menu.h"
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
@@ -58,18 +61,11 @@ PadState g_pad;
 // (21:9, 32:9) or above and below a taller one. It was stretched over the
 // whole window, which on an ultrawide made everything a third wider. The same
 // rectangle serves the swapchain (pixels) and the pointer (window units).
-struct FitRect {
-    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
-};
-FitRect fit_picture(float w, float h, float dw, float dh) {
-    if (w <= 0.0f || h <= 0.0f || dw <= 0.0f || dh <= 0.0f) return {0.0f, 0.0f, w, h};
-    const float s = std::min(w / dw, h / dh);
-    const float fw = dw * s, fh = dh * s;
-    return {(w - fw) * 0.5f, (h - fh) * 0.5f, fw, fh};
-}
+using host::FitRect;
+using host::fit_picture;
 
 // The pointer. Positions arrive in window coordinates and are kept in the
-// game's display-buffer pixels, through the picture's rectangle (fit_picture);
+// presented picture's pixels, through its rectangle (fit_picture);
 // over the bars it is outside the game. The size comes from whatever was last
 // presented; before the first present there is nothing to scale by and the
 // pointer reads as outside the window.
@@ -130,6 +126,14 @@ std::atomic<std::uint32_t> g_swap_w{0}, g_swap_h{0};
 float g_mouse_win_x = 0.0f, g_mouse_win_y = 0.0f;  // under g_mouse_mu: the last position in window units
 int g_mouse_win_w = 0, g_mouse_win_h = 0;          // and the window's size then
 
+void mouse_remap_locked() {
+    g_mouse.in_window = host::window_to_picture(g_mouse_win_x, g_mouse_win_y,
+        static_cast<float>(g_mouse_win_w), static_cast<float>(g_mouse_win_h),
+        static_cast<float>(g_swap_w.load(std::memory_order_relaxed)),
+        static_cast<float>(g_swap_h.load(std::memory_order_relaxed)),
+        static_cast<float>(g_display_w), static_cast<float>(g_display_h), g_mouse.x, g_mouse.y);
+}
+
 void mouse_moved_locked(float win_x, float win_y) {
     int ww = 0, wh = 0;
     SDL_GetWindowSize(g_window, &ww, &wh);
@@ -137,18 +141,7 @@ void mouse_moved_locked(float win_x, float win_y) {
     g_mouse_win_y = win_y;
     g_mouse_win_w = ww;
     g_mouse_win_h = wh;
-    if (ww <= 0 || wh <= 0 || !g_display_w || !g_display_h) {
-        g_mouse.in_window = false;
-        return;
-    }
-    const std::uint32_t sw = g_swap_w.load(std::memory_order_relaxed), sh = g_swap_h.load(std::memory_order_relaxed);
-    const float fw = sw ? static_cast<float>(sw) : static_cast<float>(ww), fh = sh ? static_cast<float>(sh) : static_cast<float>(wh);
-    const float px = win_x * fw / static_cast<float>(ww), py = win_y * fh / static_cast<float>(wh);
-    const FitRect r = fit_picture(fw, fh, static_cast<float>(g_display_w), static_cast<float>(g_display_h));
-    g_mouse.x = (px - r.x) * static_cast<float>(g_display_w) / r.w;
-    g_mouse.y = (py - r.y) * static_cast<float>(g_display_h) / r.h;
-    g_mouse.in_window = g_mouse.x >= 0.0f && g_mouse.y >= 0.0f && g_mouse.x < static_cast<float>(g_display_w) &&
-                        g_mouse.y < static_cast<float>(g_display_h);
+    mouse_remap_locked();
     g_mouse.moved = true;
     g_mouse_last_motion = std::chrono::steady_clock::now();
 }
@@ -300,6 +293,7 @@ struct Presenter {
     std::mutex mu;
     bool ok = false;
     std::uint64_t frames = 0;
+    std::int64_t present_block_ns = 0;
 };
 Presenter g_vk;
 
@@ -659,6 +653,7 @@ bool vk_start() {
     vkCreateFence(g_vk.device, &fci, nullptr, &g_vk.fence);
     VkFenceCreateInfo afci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(g_vk.device, &afci, nullptr, &g_vk.acquire_fence) != VK_SUCCESS) g_vk.acquire_fence = VK_NULL_HANDLE;
+    host::fg_get().init(g_vk.instance, g_vk.phys, g_vk.device, g_vk.family, g_vk.queue);
     g_vk.ok = true;
     host_log("vulkan: %s, swapchain %ux%u, %zu images", props.deviceName, g_vk.extent.width, g_vk.extent.height,
              g_vk.images.size());
@@ -714,29 +709,24 @@ struct PresentStats {
 };
 PresentStats g_pstats;
 
-void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
+struct PresentSourceImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0;
+    std::uint64_t display_va = 0;
+    VkSemaphore ready = VK_NULL_HANDLE;
+    bool generated_output = false;
+    std::int64_t present_at_ns = 0;
+};
+
+bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
+                             unsigned display_w, unsigned display_h,
+                             const PresentFlip& flip, bool submit_renderer_work) {
     const auto t_enter = std::chrono::steady_clock::now();
     const std::uint64_t cpu_enter = host_thread_cpu_ns();
     const auto us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
     };
-    present_step("taking the present lock");
-    std::lock_guard<std::mutex> lock(g_vk.mu);
-    if (!g_vk.ok) {
-        return;
-    }
-    // BBHOST_PRESENT_DELAY_US: pretend the display blocks us for this long, so
-    // a run on a virtual display (Xvfb never blocks in acquire) can be checked
-    // against what a real vsync does to the game's frame rate.
-    static const long fake_wait_us = [] {
-        const char* e = std::getenv("BBHOST_PRESENT_DELAY_US");
-        return e ? std::strtol(e, nullptr, 10) : 0L;
-    }();
-    if (fake_wait_us > 0) host_sleep_us(static_cast<std::uint64_t>(fake_wait_us));
-    // Wait for the previous present and acquire the next image *without* the
-    // renderer lock: on a FIFO swapchain the acquire blocks until the display's
-    // next vblank, and holding the GPU lock across that stalls the command
-    // processor - the game's own thread - for most of a frame.
     present_step("waiting for the last present");
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
     host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
@@ -768,7 +758,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
-        return;
+        return false;
     }
     // SUBOPTIMAL is a success: the image is ours and can be presented. Windows
     // can say it every frame (borderless fullscreen after an alt-tab), and a
@@ -787,14 +777,14 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         const bool remade = vk_create_swapchain();
         host_gpu_unlock();
         if (!remade) {
-            return;
+            return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
         r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
-        return;
+        return false;
     }
     if (by_fence) {
         // Until the display lets go of the image. With FIFO and frames queued
@@ -818,18 +808,33 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         return e && e[0] == '1';
     }();
     present_step("submitting the renderer's work");
-    if (present_flush) {
-        host_gpu_flush();
-        ++g_pstats.submits_forced;
-    } else if (host_gpu_submit_for_flip(g_present_submit_always ? ~0ull : flip.submit_need)) {
-        ++g_pstats.submits_forced;
-    } else {
-        ++g_pstats.submits_left;
+    if (submit_renderer_work) {
+        if (present_flush) {
+            host_gpu_flush();
+            ++g_pstats.submits_forced;
+        } else if (host_gpu_submit_for_flip(g_present_submit_always ? ~0ull : flip.submit_need)) {
+            ++g_pstats.submits_forced;
+        } else {
+            ++g_pstats.submits_left;
+        }
     }
     const auto t_flushed = std::chrono::steady_clock::now();
-    present_step("taking the renderer lock");
-    host_gpu_lock();
-    bool locked = true;
+    // Leased FG images and the compositor's command/descriptor resources are
+    // owned by this presenter, serialized by g_vk.mu and the previous fence.
+    // They do not touch the renderer's mutable display-image cache. Waiting
+    // for its recording mutex on every subframe needlessly couples MFG to
+    // the next real frame. Swapchain rebuilds above still take both locks;
+    // overlay/font uploads retain their own queue serialization.
+    const bool independent = source.generated_output && source.image && g_vk.present_queue && !submit_renderer_work;
+    static const bool force_renderer_lock = [] {
+        const char* e = std::getenv("BBHOST_FG_PRESENT_LOCK");
+        return e && e[0] == '1';
+    }();
+    bool locked = !independent || force_renderer_lock;
+    if (locked) {
+        present_step("taking the renderer lock");
+        host_gpu_lock();
+    }
     struct Unlock {
         bool& locked;
         ~Unlock() {
@@ -842,11 +847,24 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_vk.cmd, &bi);
     host_gpu_busy_present_begin(g_vk.cmd);  // the busy meter's first timestamp (host/gpu_busy.cpp)
+    const unsigned eff_w = display_w ? display_w : source.width;
+    const unsigned eff_h = display_h ? display_h : source.height;
+    {
+        // Share the size actually being presented, after SR/FG has resolved
+        // it. The queued guest flip still describes the lower render input.
+        std::lock_guard<std::mutex> ml(g_mouse_mu);
+        if (g_display_w != eff_w || g_display_h != eff_h) {
+            g_display_w = eff_w;
+            g_display_h = eff_h;
+            // Remap a stationary pointer without inventing motion or clicks.
+            mouse_remap_locked();
+        }
+    }
     // The picture's rectangle (fit_picture); what it does not cover is black.
     VkRect2D area{{0, 0}, g_vk.extent};
-    if (display_w && display_h) {
+    if (eff_w && eff_h) {
         const FitRect f = fit_picture(static_cast<float>(g_vk.extent.width), static_cast<float>(g_vk.extent.height),
-                                      static_cast<float>(display_w), static_cast<float>(display_h));
+                                      static_cast<float>(eff_w), static_cast<float>(eff_h));
         const auto x0 = static_cast<std::int32_t>(std::lround(f.x)), y0 = static_cast<std::int32_t>(std::lround(f.y));
         const auto x1 = static_cast<std::int32_t>(std::lround(f.x + f.w)), y1 = static_cast<std::int32_t>(std::lround(f.y + f.h));
         if (x1 > x0 && y1 > y0) area = {{x0, y0}, {static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)}};
@@ -857,27 +875,27 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // nothing around it but the frame's clear, a flat grey. Then only the
     // stage's part of the picture is shown, black beside it on a wider
     // screen or above and below it on a taller one (the Steam Deck's 16:10).
-    std::uint32_t src_x = 0, src_y = 0, src_w = display_w, src_h = display_h;
+    std::uint32_t src_x = 0, src_y = 0, src_w = eff_w, src_h = eff_h;
     VkRect2D shown = area;
-    const std::uint64_t w9 = static_cast<std::uint64_t>(display_w) * 9, h16 = static_cast<std::uint64_t>(display_h) * 16;
-    if (display_w && display_h && (w9 > h16 + 9 || h16 > w9 + 16) && engine_scene_view_flip() + 3 < hle_video_flip_count()) {
+    const std::uint64_t w9 = static_cast<std::uint64_t>(eff_w) * 9, h16 = static_cast<std::uint64_t>(eff_h) * 16;
+    if (eff_w && eff_h && (w9 > h16 + 9 || h16 > w9 + 16) && engine_scene_view_flip() + 3 < hle_video_flip_count()) {
         if (w9 > h16) {
-            src_w = (display_h * 16 + 4) / 9;
-            src_x = (display_w - src_w) / 2;
+            src_w = (eff_h * 16 + 4) / 9;
+            src_x = (eff_w - src_w) / 2;
         } else {
-            src_h = (display_w * 9 + 8) / 16;
-            src_y = (display_h - src_h) / 2;
+            src_h = (eff_w * 9 + 8) / 16;
+            src_y = (eff_h - src_h) / 2;
         }
-        const double kx = static_cast<double>(area.extent.width) / static_cast<double>(display_w);
-        const double ky = static_cast<double>(area.extent.height) / static_cast<double>(display_h);
+        const double kx = static_cast<double>(area.extent.width) / static_cast<double>(eff_w);
+        const double ky = static_cast<double>(area.extent.height) / static_cast<double>(eff_h);
         shown.offset.x = area.offset.x + static_cast<std::int32_t>(std::lround(src_x * kx));
         shown.offset.y = area.offset.y + static_cast<std::int32_t>(std::lround(src_y * ky));
         shown.extent.width = static_cast<std::uint32_t>(std::lround(src_w * kx));
         shown.extent.height = static_cast<std::uint32_t>(std::lround(src_h * ky));
     }
     const bool bars = shown.extent.width != g_vk.extent.width || shown.extent.height != g_vk.extent.height;
-    const float overlay_w = static_cast<float>(display_w ? display_w : g_vk.extent.width);
-    const float overlay_h = static_cast<float>(display_h ? display_h : g_vk.extent.height);
+    const float overlay_w = static_cast<float>(eff_w ? eff_w : g_vk.extent.width);
+    const float overlay_h = static_cast<float>(eff_h ? eff_h : g_vk.extent.height);
     // The swapchain image is written from the stage its acquire is waited at.
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     bool recorded = false;
@@ -888,19 +906,35 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         PresentSource src;
         void* image = nullptr;
         std::uint32_t format = 0, iw = 0, ih = 0;
-        const bool have = display_va && host_gpu_display_image(display_va, &image, &format, &iw, &ih);
+        bool have = false;
+        if (source.image) {
+            image = source.image;
+            format = static_cast<std::uint32_t>(source.format);
+            iw = source.width;
+            ih = source.height;
+            have = true;
+        } else if (source.display_va) {
+            have = host_gpu_display_image(source.display_va, &image, &format, &iw, &ih);
+        }
         bool magnified = false;
         if (have) {
             src.image = static_cast<VkImage>(image);
             src.format = static_cast<VkFormat>(format);
             src.width = iw;
             src.height = ih;
-            // The region render_blit_display_locked takes: the registered
-            // size, inside the target (which may carry tiling padding rows).
-            src.x = std::min(src_x, iw);
-            src.y = std::min(src_y, ih);
-            src.w = src_w && src.x + src_w <= iw ? src_w : iw - src.x;
-            src.h = src_h && src.y + src_h <= ih ? src_h : ih - src.y;
+            if (source.image) {
+                src.x = 0;
+                src.y = 0;
+                src.w = iw;
+                src.h = ih;
+            } else {
+                // The region render_blit_display_locked takes: the registered
+                // size, inside the target (which may carry tiling padding rows).
+                src.x = std::min(src_x, iw);
+                src.y = std::min(src_y, ih);
+                src.w = src_w && src.x + src_w <= iw ? src_w : iw - src.x;
+                src.h = src_h && src.y + src_h <= ih ? src_h : ih - src.y;
+            }
             magnified = src.w <= shown.extent.width && src.h <= shown.extent.height &&
                         (src.w < shown.extent.width || src.h < shown.extent.height);
         }
@@ -960,8 +994,20 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         // Blit the game's display buffer; dark red (cycling with the buffer
         // index) when the renderer has not produced it yet.
         void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
-        if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
-                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
+        if (source.image) {
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[0] = {0, 0, 0};
+            blit.srcOffsets[1] = {static_cast<int32_t>(source.width), static_cast<int32_t>(source.height), 1};
+            blit.dstSubresource = blit.srcSubresource;
+            blit.dstOffsets[0] = {shown.offset.x, shown.offset.y, 0};
+            blit.dstOffsets[1] = {shown.offset.x + static_cast<int32_t>(shown.extent.width),
+                                 shown.offset.y + static_cast<int32_t>(shown.extent.height), 1};
+            vkCmdBlitImage(g_vk.cmd, source.image, VK_IMAGE_LAYOUT_GENERAL, g_vk.images[idx],
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            ++g_pstats.blits;
+        } else if (!source.display_va || !host_gpu_blit_display(g_vk.cmd, source.display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
+                                                                shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
             VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
@@ -1016,14 +1062,33 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     const VkSemaphore rendered = idx < g_vk.render_sems.size() && g_vk.render_sems[idx] ? g_vk.render_sems[idx] : g_vk.render_sem;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &rendered;
+    const VkSemaphore waits[2] = {source.ready, acquire_sem};
+    const VkPipelineStageFlags stages[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, wait_stage};
+    if (source.ready) {
+        si.waitSemaphoreCount = by_fence ? 1 : 2;
+        si.pWaitSemaphores = waits;
+        si.pWaitDstStageMask = stages;
+    }
     present_step("submitting the blit");
     // Through the submission thread when it runs: queued behind the game's
     // work under the renderer's lock, which then goes at once - the kernel's
     // ~1.3 ms of vkQueueSubmit on a Steam Deck, held under it, cost the
     // command processor ~1.5 ms a frame. Only presenting waits for the
     // submission to have gone in.
-    const std::uint64_t ticket = host_gpu_submit_presenter(g_vk.cmd, by_fence ? nullptr : acquire_sem, wait_stage, rendered, g_vk.fence);
-    if (ticket) {
+    // Immutable, completed FG outputs can be composited on the presenter's
+    // queue. Putting their blits behind newer game renders delays every
+    // subframe by that entire renderer backlog. The ready semaphore carries
+    // memory visibility from NGX on the renderer queue to this queue.
+    const std::uint64_t ticket = source.generated_output ? 0 :
+        host_gpu_submit_presenter(g_vk.cmd, source.ready ? source.ready : (by_fence ? nullptr : acquire_sem),
+            source.ready ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : wait_stage, rendered, g_vk.fence);
+    if (independent) {
+        if (locked) {
+            host_gpu_unlock();
+            locked = false;
+        }
+        if (vkQueueSubmit(g_vk.present_queue, 1, &si, g_vk.fence) != VK_SUCCESS) return false;
+    } else if (ticket) {
         host_gpu_unlock();
         locked = false;
         host_gpu_wait_submitted(ticket);
@@ -1037,11 +1102,20 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     const auto t_submitted = std::chrono::steady_clock::now();
     // The frame done on the GPU before the present is asked for, on no lock
     // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
-    if (g_vk.gpu_wait) {
+    if (g_vk.gpu_wait || source.present_at_ns) {
         present_step("waiting for the frame on the GPU");
-        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
+        const auto waited = vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
+        if (source.present_at_ns && waited != VK_SUCCESS) return false;
     }
     const auto t_gpu_done = std::chrono::steady_clock::now();
+    // Prepare and complete the FG compositor copy before its deadline, then
+    // pace QueuePresent itself. Sleeping before acquire/record/submit exposed
+    // every variation in those costs to the displayed generated->real interval.
+    if (source.present_at_ns) {
+        present_step("pacing the completed frame");
+        host_sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(source.present_at_ns)));
+    }
+    const auto t_present_call = std::chrono::steady_clock::now();
     // The present itself goes on this thread's own queue, with no lock: it can
     // block - Xvfb copies the image inside it, ~20 ms a frame, and a full FIFO
     // waits for the display - and under the renderer's lock that held the
@@ -1076,6 +1150,13 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // longer fits: out of date always, suboptimal only on a new size.
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && surface_size_changed())) g_swap_dirty.store(true);
     const auto t_presented = std::chrono::steady_clock::now();
+    // Driver frame limits can sleep inside QueuePresent. Learn that cost so
+    // FG selects a subframe for when the call will return, rather than sending
+    // an already obsolete image and making the real frame wait behind it.
+    const auto block_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t_presented - t_present_call).count();
+    g_vk.present_block_ns = static_cast<std::int64_t>(g_vk.present_block_ns * 0.98);
+    if (block_ns >= 1000000 && block_ns < 100000000)
+        g_vk.present_block_ns = std::max<std::int64_t>(g_vk.present_block_ns, block_ns);
     present_step("idle");
     ++g_vk.frames;
     note_present(t_presented);
@@ -1091,12 +1172,12 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     static std::uint64_t flush_us = 0, lock_us = 0, blit_us = 0, submit_us = 0, queue_present_us = 0;
     static auto last = std::chrono::steady_clock::now();
     wait_us += us(t_enter, t_acquired);
-    work_us += us(t_acquired, t_submitted) + us(t_gpu_done, t_presented);
+    work_us += us(t_acquired, t_submitted) + us(t_present_call, t_presented);
     flush_us += us(t_acquired, t_flushed);
     lock_us += us(t_flushed, t_locked);
     blit_us += us(t_locked, t_recorded);
     submit_us += us(t_recorded, t_submitted);
-    queue_present_us += us(t_gpu_done, t_presented);
+    queue_present_us += us(t_present_call, t_presented);
     PresentStats& ps = g_pstats;
     ps.gpu_wait_us += us(t_submitted, t_gpu_done);
     if (flip.arrived_ns) {
@@ -1141,6 +1222,217 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         wait_us = work_us = flush_us = lock_us = blit_us = submit_us = queue_present_us = 0;
         last = now;
     }
+    return true;
+}
+
+bool fg_pipeline_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("BBHOST_FG_PIPELINE");
+        return !e || e[0] != '0';
+    }();
+    return enabled;
+}
+
+void vk_present_generated(int buffer_index, std::uint64_t display_va, const PresentFlip& flip,
+                          const gpu::DlssFgGuides& guides, unsigned slot) {
+    std::lock_guard<std::mutex> lock(g_vk.mu);
+    if (!g_vk.ok) return;
+    auto& fg = host::fg_get();
+    present_step("waiting for generated frame set");
+    if (!fg.wait_evaluation(1000000000ull, slot)) return;
+    const auto now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    std::uint64_t source = 0, ready = 0;
+    fg.evaluation_times(slot, &source, &ready);
+    static host::FgSchedule schedule([] {
+        const char* e = std::getenv("BBHOST_FG_SMOOTH");
+        return !e || e[0] != '0';
+    }());
+    schedule.observe(source, ready, guides.render_frame_index, now_ns(),
+                     guides.frame_ms, host_startup_settings().frame_cap);
+    const bool suppressed = fg.is_interpolation_disabled(slot);
+    if (suppressed) host::fg_note_interpolation_disabled();
+    const unsigned factor = fg.generated_count() + 1;
+    PresentSourceImage image;
+    image.format = fg.generated_format(); image.width = fg.width(); image.height = fg.height();
+    image.generated_output = true;
+    image.ready = fg.ready_semaphore(slot);
+    unsigned shown = 0, skipped = 0;
+    static const bool late_pace = [] {
+        const char* e = std::getenv("BBHOST_FG_LATE_PACE");
+        return !e || e[0] != '0';
+    }();
+    for (unsigned first = suppressed ? factor : 1; first <= factor; ++first) {
+        const auto cost = std::min(g_vk.present_block_ns, schedule.period());
+        const unsigned position = suppressed ? factor : schedule.next_position(first, factor, now_ns() + cost);
+        skipped += position - first;
+        first = position;
+        const auto deadline = schedule.deadline(position, factor);
+        image.present_at_ns = !suppressed && late_pace ? deadline - cost : 0;
+        if (!suppressed && !late_pace)
+            host_sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadline - cost)));
+        const bool real = position == factor;
+        image.image = real ? fg.real_image(slot) : fg.generated_image(position - 1, slot);
+        image.display_va = real ? display_va : 0;
+        if (present_swapchain_image(image, buffer_index, image.width, image.height, flip, false)) {
+            if (image.ready) { fg.note_ready_waited(slot); image.ready = VK_NULL_HANDLE; }
+            if (real) host::fg_note_real_presented();
+            else host::fg_note_generated_presented();
+            ++shown;
+        }
+    }
+    // The producer may overwrite this slot immediately after its lease is
+    // returned. Retire its final compositor read on the separate queue first.
+    // A timeout must not return the lease while the compositor still reads
+    // these images. The existing presentation watchdog diagnoses a hung GPU.
+    const VkResult retired = vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    if (retired != VK_SUCCESS) {
+        host_log("framegen: compositor retirement failed (%d)", static_cast<int>(retired));
+        g_vk.ok = false;
+    }
+    static const bool trace = [] { const char* e = std::getenv("BBHOST_FG_TIMING"); return e && e[0] == '1'; }();
+    if (trace) host_log("fg-pipeline: render=%llu GPU_source_ns=%llu GPU_ready_ns=%llu period_ms=%.3f shown=%u expired=%u suppressed=%d present_block_ms=%.3f",
+        static_cast<unsigned long long>(guides.render_frame_index), static_cast<unsigned long long>(source),
+        static_cast<unsigned long long>(ready), schedule.period() / 1e6, shown, skipped, suppressed, g_vk.present_block_ns / 1e6);
+}
+
+void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
+    present_step("taking the present lock");
+    std::lock_guard<std::mutex> lock(g_vk.mu);
+    if (!g_vk.ok) {
+        return;
+    }
+
+    static const long fake_wait_us = [] {
+        const char* e = std::getenv("BBHOST_PRESENT_DELAY_US");
+        return e ? std::strtol(e, nullptr, 10) : 0L;
+    }();
+    if (fake_wait_us > 0) host_sleep_us(static_cast<std::uint64_t>(fake_wait_us));
+
+    host_gpu_lock();
+    gpu::dlss_sr_display_dimensions_locked(display_va, &display_w, &display_h);
+    host_gpu_unlock();
+
+    gpu::DlssFgGuides guides{};
+    bool have_guides = false;
+    void* disp_img = nullptr;
+    std::uint32_t disp_fmt = 0, disp_w = 0, disp_h = 0;
+
+    const bool fg_active = !fg_pipeline_enabled() && host::fg_enabled() && host::fg_available() && display_va && flip.temporal_frame;
+    if (fg_active) {
+        host_gpu_lock();
+        have_guides = gpu::dlaa_get_fg_guides_locked(display_va, flip.temporal_frame, &guides);
+        const bool have_disp = host_gpu_display_image(display_va, &disp_img, &disp_fmt, &disp_w, &disp_h);
+        host_gpu_unlock();
+
+        if (have_guides && guides.valid && have_disp && guides.frame_index == flip.temporal_frame) {
+            static const bool present_flush = [] {
+                const char* e = std::getenv("BBHOST_PRESENT_FLUSH");
+                return e && e[0] == '1';
+            }();
+            if (present_flush) {
+                host_gpu_flush();
+                ++g_pstats.submits_forced;
+            } else if (host_gpu_submit_for_flip(g_present_submit_always ? ~0ull : flip.submit_need)) {
+                ++g_pstats.submits_forced;
+            } else {
+                ++g_pstats.submits_left;
+            }
+
+            // Submit FG evaluation on separate command buffer with dedicated fence under GPU lock
+            const auto evaluation_start = std::chrono::steady_clock::now();
+            host_gpu_lock();
+            // Revalidate under the same lock as evaluation recording: the
+            // renderer may have reused this display buffer since the first lookup.
+            have_guides = gpu::dlaa_get_fg_guides_locked(display_va, flip.temporal_frame, &guides);
+            const bool current_display = host_gpu_display_image(display_va, &disp_img, &disp_fmt, &disp_w, &disp_h);
+            const unsigned picture_w = guides.hudless_width;
+            const unsigned picture_h = guides.hudless_height;
+            const bool matching = have_guides && current_display && picture_w && picture_h &&
+                                  picture_w <= disp_w && picture_h <= disp_h;
+            const bool eval_submitted = matching && host::fg_get().evaluate_submit(
+                static_cast<VkImage>(disp_img), VK_NULL_HANDLE, static_cast<VkFormat>(disp_fmt),
+                picture_w, picture_h, guides);
+            host_gpu_unlock();
+
+            // Wait for evaluation fence without holding GPU lock
+            const bool eval_ok = eval_submitted && host::fg_get().wait_evaluation();
+            const auto evaluation_ready = std::chrono::steady_clock::now();
+
+            // Read suppression flag only AFTER GPU completion
+            const bool suppressed = !eval_ok || host::fg_get().is_interpolation_disabled();
+
+            if (!suppressed) {
+                // Display generated frame first
+                PresentSourceImage gen_src;
+                gen_src.image = host::fg_get().generated_image();
+                gen_src.format = host::fg_get().generated_format();
+                gen_src.width = host::fg_get().width();
+                gen_src.height = host::fg_get().height();
+                const unsigned count = host::fg_get().generated_count();
+                const auto deadline = [&](unsigned index) {
+                    return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
+                        host::fg_real_deadline_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            evaluation_start.time_since_epoch()).count(), guides.frame_ms,
+                            host_startup_settings().frame_cap, count + 1, index)));
+                };
+                for (unsigned i = 0; i < count; ++i) {
+                    if (i) host_sleep_until(deadline(i));
+                    gen_src.image = host::fg_get().generated_image(i);
+                    if (present_swapchain_image(gen_src, buffer_index, gen_src.width, gen_src.height, flip, false))
+                        host::fg_note_generated_presented();
+                }
+                const auto before_spacing = std::chrono::steady_clock::now();
+                host_sleep_until(deadline(0));
+                const auto after_spacing = std::chrono::steady_clock::now();
+
+                // Followed by owned OutputReal
+                PresentSourceImage real_src;
+                real_src.image = host::fg_get().real_image();
+                real_src.format = host::fg_get().generated_format();
+                real_src.width = host::fg_get().width();
+                real_src.height = host::fg_get().height();
+                real_src.display_va = display_va;
+                if (present_swapchain_image(real_src, buffer_index, real_src.width, real_src.height, flip, false)) {
+                    host::fg_note_real_presented();
+                }
+                static const bool timing_trace = [] {
+                    const auto* e = std::getenv("BBHOST_FG_TIMING");
+                    return e && e[0] == '1';
+                }();
+                if (timing_trace) {
+                    const auto end = std::chrono::steady_clock::now();
+                    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                    host_log("fg-timing: render=%llu flip=%llu input_ms=%.3f eval_ms=%.3f gen_ms=%.3f sleep_ms=%.3f real_ms=%.3f pair_ms=%.3f",
+                        static_cast<unsigned long long>(guides.render_frame_index),
+                        static_cast<unsigned long long>(guides.frame_index), guides.frame_ms,
+                        ms(evaluation_start, evaluation_ready), ms(evaluation_ready, before_spacing),
+                        ms(before_spacing, after_spacing), ms(after_spacing, end), ms(evaluation_start, end));
+                }
+                return;
+            } else if (eval_ok) {
+                host::fg_note_interpolation_disabled();
+                // Interpolation suppressed: display only the real frame
+                PresentSourceImage real_src;
+                real_src.image = host::fg_get().real_image();
+                real_src.format = host::fg_get().generated_format();
+                real_src.width = host::fg_get().width();
+                real_src.height = host::fg_get().height();
+                real_src.display_va = display_va;
+                if (present_swapchain_image(real_src, buffer_index, real_src.width, real_src.height, flip, false)) {
+                    host::fg_note_real_presented();
+                }
+                return;
+            }
+        }
+    }
+
+    // Standard present path (no FG or mismatched guide)
+    PresentSourceImage std_src;
+    std_src.display_va = display_va;
+    present_swapchain_image(std_src, buffer_index, display_w, display_h, flip, true);
 }
 
 // ---- input -----------------------------------------------------------------
@@ -1658,6 +1950,12 @@ bool host_window_pump() {
                 if (host_options_key(e.key.scancode, e.key.repeat)) {
                     break;
                 }
+                // Ctrl+F1-F4: DLAA's keys (host/dlaa.h); Ctrl+F5-F8 the same,
+                // for keyboards where another program holds a Ctrl+F1-F4 hotkey.
+                if (!e.key.repeat && (e.key.mod & SDL_KMOD_CTRL) && e.key.scancode >= SDL_SCANCODE_F1 &&
+                    e.key.scancode <= SDL_SCANCODE_F8 && gpu::dlaa_hotkey(1 + (e.key.scancode - SDL_SCANCODE_F1) % 4)) {
+                    break;
+                }
                 if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_F11) {
                     g_ime_test_reopen.store(true, std::memory_order_relaxed);
                     break;
@@ -1860,7 +2158,15 @@ bool host_window_pump() {
     }
     // The host overlay's contents for this frame. Rebuilt from scratch each
     // pump; when nothing draws, the presenter's path is exactly as it was.
-    host_overlay_reset();
+    float overlay_display_w = 1920.0f, overlay_display_h = 1080.0f;
+    {
+        std::lock_guard<std::mutex> ml(g_mouse_mu);
+        if (g_display_w && g_display_h) {
+            overlay_display_w = static_cast<float>(g_display_w);
+            overlay_display_h = static_cast<float>(g_display_h);
+        }
+    }
+    host_overlay_reset(overlay_display_w, overlay_display_h);
     // The FPS counter, top right, under everything else the overlay draws.
     // The number is refreshed twice a second: every frame, it flickers
     // between neighbours and cannot be read.
@@ -1892,11 +2198,7 @@ bool host_window_pump() {
                 busy_at[0] = now;
             }
         }
-        float dw = 0.0f;
-        {
-            std::lock_guard<std::mutex> ml(g_mouse_mu);
-            dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
-        }
+        const float dw = overlay_display_w;
         char text[48];
         if (gpu_pct >= 0) {
             std::snprintf(text, sizeof(text), "%d FPS  GPU %d%%", shown, gpu_pct);
@@ -1923,12 +2225,7 @@ bool host_window_pump() {
             }
         }
         if (!text.empty()) {
-            float dw = 0.0f, dh = 0.0f;
-            {
-                std::lock_guard<std::mutex> ml(g_mouse_mu);
-                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
-                dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
-            }
+            const float dw = overlay_display_w, dh = overlay_display_h;
             const float scale = 1.25f, w = host_overlay_text_width(scale, text.c_str());
             const float x = (dw - w) * 0.5f, y = dh * 0.22f;
             const auto a = [&](std::uint32_t rgba) {
@@ -1976,12 +2273,7 @@ bool host_window_pump() {
         // window title used to do it, which was a placeholder.
         std::lock_guard<std::mutex> lock(g_text_mu);
         if (g_text_on) {
-            float dw = 0.0f, dh = 0.0f;
-            {
-                std::lock_guard<std::mutex> ml(g_mouse_mu);
-                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
-                dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
-            }
+            const float dw = overlay_display_w, dh = overlay_display_h;
             const float bw = dw * 0.5f, bh = 150.0f;
             const float bx = (dw - bw) * 0.5f, by = dh * 0.62f;
             host_overlay_rect(bx - 3.0f, by - 3.0f, bw + 6.0f, bh + 6.0f, 0xc8a05aff);  // the game's gold, as a border
@@ -2015,13 +2307,7 @@ bool host_window_pump() {
     option_menu_poll();
     // The port's own options screen (F10), under the pointer.
     {
-        float dw = 0.0f, dh = 0.0f;
-        {
-            std::lock_guard<std::mutex> ml(g_mouse_mu);
-            dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
-            dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
-        }
-        host_options_frame(dw, dh);
+        host_options_frame(overlay_display_w, overlay_display_h);
     }
     // The pointer. The game has no cursor asset and needs none - this is the
     // host's own. It draws only once the pointer has been in the window, so a
@@ -2141,12 +2427,105 @@ struct PendingPresent {
     std::uint64_t va = 0;
     unsigned w = 0, h = 0;
     PresentFlip flip;
+    int fg_slot = -1;
+    gpu::DlssFgGuides guides{};
 };
 std::mutex g_present_mu;
 std::condition_variable g_present_cv;
 PendingPresent g_present_next;
 bool g_present_quit = false;
 std::thread g_present_thread;
+std::thread g_fg_thread;
+std::deque<PendingPresent> g_prepared;
+std::array<bool, host::FrameGenerator::kFrameSlots> g_fg_leased{};
+
+int acquire_fg_slot(unsigned w, unsigned h, VkFormat format) {
+    auto& fg = host::fg_get();
+    if (host_startup_settings().frame_generation_backend == 1 && format == VK_FORMAT_B8G8R8A8_UNORM)
+        format = VK_FORMAT_R8G8B8A8_UNORM;
+    std::unique_lock<std::mutex> lk(g_present_mu);
+    const bool resize = !fg.ready() || fg.width() != w || fg.height() != h || fg.generated_format() != format;
+    if (resize) {
+        // No consumer can retain an old image while ensure_feature destroys it.
+        for (const auto& p : g_prepared) if (p.fg_slot >= 0) g_fg_leased[p.fg_slot] = false;
+        g_prepared.clear();
+        g_present_cv.wait(lk, [] {
+            return g_present_quit || std::none_of(g_fg_leased.begin(), g_fg_leased.end(), [](bool busy) { return busy; });
+        });
+    }
+    while (!g_present_quit) {
+        for (unsigned i = 0; i < g_fg_leased.size(); ++i) {
+            if (!g_fg_leased[i] && fg.slot_available(i)) { g_fg_leased[i] = true; return i; }
+        }
+        // Drop an obsolete presentation, not its NGX evaluation. History remains
+        // consecutive even when the display or a driver cap cannot show it all.
+        for (auto it = g_prepared.begin(); it != g_prepared.end(); ++it) {
+            if (it->fg_slot >= 0 && fg.evaluation_finished(it->fg_slot)) {
+                const int slot = it->fg_slot;
+                g_prepared.erase(it);
+                return slot;
+            }
+        }
+        g_present_cv.wait_for(lk, std::chrono::milliseconds(2));
+    }
+    return -1;
+}
+
+bool prepare_fg(PendingPresent& p) {
+    if (!host::fg_enabled() || !host::fg_available() || !p.va || !p.flip.temporal_frame) return false;
+    void* image = nullptr;
+    std::uint32_t format = 0, w = 0, h = 0;
+    gpu::DlssFgGuides guides{};
+    host_gpu_lock();
+    const bool matching = gpu::dlaa_get_fg_guides_locked(p.va, p.flip.temporal_frame, &guides) &&
+        host_gpu_display_image(p.va, &image, &format, &w, &h) && guides.hudless_width && guides.hudless_height &&
+        guides.hudless_width <= w && guides.hudless_height <= h;
+    host_gpu_unlock();
+    if (!matching) return false;
+    const int slot = acquire_fg_slot(guides.hudless_width, guides.hudless_height, static_cast<VkFormat>(format));
+    if (slot < 0) return false;
+    host_gpu_submit_for_flip(p.flip.submit_need);
+    host_gpu_lock();
+    const bool current = gpu::dlaa_get_fg_guides_locked(p.va, p.flip.temporal_frame, &guides) &&
+        host_gpu_display_image(p.va, &image, &format, &w, &h) && guides.hudless_width <= w && guides.hudless_height <= h;
+    const bool ok = current && host::fg_get().evaluate_submit(static_cast<VkImage>(image), VK_NULL_HANDLE,
+        static_cast<VkFormat>(format), guides.hudless_width, guides.hudless_height, guides, slot);
+    host_gpu_unlock();
+    if (ok) { p.fg_slot = slot; p.guides = guides; }
+    else {
+        std::lock_guard<std::mutex> lk(g_present_mu);
+        g_fg_leased[slot] = false;
+        g_present_cv.notify_all();
+    }
+    return ok;
+}
+
+void fg_thread_main() {
+    host_thread_set_name("bb-framegen");
+    host_thread_set_class(HostThreadClass::GpuFeed, "bb-framegen");
+    for (;;) {
+        PendingPresent p;
+        {
+            std::unique_lock<std::mutex> lk(g_present_mu);
+            g_present_cv.wait(lk, [] { return g_present_quit || g_present_next.has; });
+            if (g_present_quit) return;
+            p = g_present_next; g_present_next.has = false;
+        }
+        prepare_fg(p);
+        {
+            std::lock_guard<std::mutex> lk(g_present_mu);
+            if (g_present_quit) return;
+            // Loading/menu frames have no temporal guides and use the native
+            // path. Bound that queue as well, retiring unused output leases.
+            if (p.fg_slot < 0) {
+                for (const auto& old : g_prepared) if (old.fg_slot >= 0) g_fg_leased[old.fg_slot] = false;
+                g_prepared.clear();
+            }
+            g_prepared.push_back(p);
+            g_present_cv.notify_all();
+        }
+    }
+}
 
 void present_thread_main() {
     host_thread_set_name("bb-present");
@@ -2155,12 +2534,21 @@ void present_thread_main() {
         PendingPresent p;
         {
             std::unique_lock<std::mutex> lk(g_present_mu);
-            g_present_cv.wait(lk, [] { return g_present_quit || g_present_next.has; });
+            g_present_cv.wait(lk, [] { return g_present_quit ||
+                (fg_pipeline_enabled() && host::fg_enabled() ? !g_prepared.empty() : g_present_next.has); });
             if (g_present_quit) return;
-            p = g_present_next;
-            g_present_next.has = false;
+            if (fg_pipeline_enabled() && host::fg_enabled()) {
+                p = g_prepared.front(); g_prepared.pop_front();
+            } else {
+                p = g_present_next; g_present_next.has = false;
+            }
         }
-        vk_present(p.buffer, p.va, p.w, p.h, p.flip);
+        if (p.fg_slot >= 0) {
+            vk_present_generated(p.buffer, p.va, p.flip, p.guides, p.fg_slot);
+            std::lock_guard<std::mutex> lk(g_present_mu);
+            g_fg_leased[p.fg_slot] = false;
+            g_present_cv.notify_all();
+        } else vk_present(p.buffer, p.va, p.w, p.h, p.flip);
         // With V-Sync on this returned on the display's vblank: the flip clock
         // uses it to stay in phase with the display.
         g_present_last_ns.store(static_cast<std::uint64_t>(
@@ -2201,10 +2589,12 @@ void host_window_stop() {
         g_present_quit = true;
         g_present_cv.notify_all();
     }
+    if (g_fg_thread.joinable()) g_fg_thread.join();
     if (g_present_thread.joinable()) g_present_thread.join();
     if (g_vk.ok) {
         std::lock_guard<std::mutex> lock(g_vk.mu);
         g_vk.ok = false;
+        host::fg_get().shutdown();
         host_gpu_lock();
         host_gpu_queue_lock();
         vkDeviceWaitIdle(g_vk.device);
@@ -2257,19 +2647,9 @@ void host_mouse_describe(char* out, std::size_t n) {
 
 bool host_mouse_stage_position(float& x, float& y) {
 #if defined(BBHOST_HAVE_SDL3)
-    float px = 0.0f, py = 0.0f;
-    if (!host_mouse_position(px, py)) {
-        return false;
-    }
-    unsigned bw = 0, bh = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_mouse_mu);
-        bw = g_display_w;
-        bh = g_display_h;
-    }
-    if (!bw || !bh) {
-        return false;
-    }
+    // Read position and dimensions together across loading/SR transitions.
+    std::lock_guard<std::mutex> lock(g_mouse_mu);
+    if (!g_mouse.in_window) return false;
     // The menu movies are authored on a 1920x1080 stage. host_mouse_position
     // already reports display-buffer pixels rather than window pixels, so
     // window size and fullscreen need no handling here; only the buffer's own
@@ -2277,10 +2657,8 @@ bool host_mouse_stage_position(float& x, float& y) {
     // buffer wider than 16:9 - the 21:9 and 32:9 entries - it is the middle
     // 16:9 of the picture, the sides outside it, and in a taller one (16:10)
     // the band between the top and the bottom (engine/live_resolution.cpp).
-    const float s = std::min(static_cast<float>(bw) / 1920.0f, static_cast<float>(bh) / 1080.0f);
-    x = (px - (static_cast<float>(bw) - 1920.0f * s) * 0.5f) / s;
-    y = (py - (static_cast<float>(bh) - 1080.0f * s) * 0.5f) / s;
-    return true;
+    return host::picture_to_menu_stage(g_mouse.x, g_mouse.y,
+        static_cast<float>(g_display_w), static_cast<float>(g_display_h), x, y);
 #else
     (void)x;
     (void)y;
@@ -2351,20 +2729,22 @@ void host_pad_rumble(std::uint8_t small, std::uint8_t large) {
 void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
 #if defined(BBHOST_HAVE_SDL3)
     if (g_active) {
+        PresentFlip captured_flip = flip;
+        if (!captured_flip.temporal_frame && display_va) {
+            host_gpu_lock();
+            captured_flip.temporal_frame = gpu::dlaa_fg_frame_id_locked(display_va);
+            host_gpu_unlock();
+        }
         std::lock_guard<std::mutex> lk(g_present_mu);
         if (!g_present_thread.joinable()) g_present_thread = std::thread(present_thread_main);
+        if (fg_pipeline_enabled() && host::fg_enabled() && !g_fg_thread.joinable())
+            g_fg_thread = std::thread(fg_thread_main);
         if (g_present_next.has && g_present_dropped.fetch_add(1) % 300 == 0) {
             host_log("present: display behind the game; dropped %llu frames so far",
                      static_cast<unsigned long long>(g_present_dropped.load()));
         }
-        g_present_next = PendingPresent{true, buffer_index, display_va, display_w, display_h, flip};
-        g_present_cv.notify_one();
-        {
-            // What the pointer's window position scales by.
-            std::lock_guard<std::mutex> ml(g_mouse_mu);
-            g_display_w = display_w;
-            g_display_h = display_h;
-        }
+        g_present_next = PendingPresent{true, buffer_index, display_va, display_w, display_h, captured_flip};
+        g_present_cv.notify_all();
     }
 #else
     (void)buffer_index;
