@@ -57,5 +57,8 @@ void translation_cache_report();
 // Since the last call: "translations N cached (x ms), M translated (y ms)", or
 // empty when there were none (the 300-flip report).
 std::string translation_cache_window();
+// The translator's fingerprint (cmake/translator_fingerprint.cmake), which the
+// shader caches are stamped with: another one starts them all again.
+const char* translator_fingerprint();
 
 }  // namespace gpu

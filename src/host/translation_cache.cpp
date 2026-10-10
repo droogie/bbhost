@@ -722,4 +722,6 @@ std::string translation_cache_window() {
     return buf;
 }
 
+const char* translator_fingerprint() { return BBHOST_TRANSLATOR_FINGERPRINT; }
+
 }  // namespace gpu

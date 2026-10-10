@@ -52,27 +52,3 @@ endif()
 if(NOT old STREQUAL content)
   file(WRITE ${OUT} "${content}")
 endif()
-# BUILD_ID_OUT (bbhost_build_id.h), when given: the version, and on a tree with
-# changes a hash of them as well ("v0.2.11-22-gabc1234+3fa2c1d0"), so two builds
-# of different uncommitted work differ too. The shader caches are stamped with
-# it and thrown away by another build (src/host/gpu.cpp,
-# shader_caches_check_build). A header of its own: an edit changes it, and only
-# gpu.cpp reads it.
-if(BUILD_ID_OUT)
-  set(id "${version}")
-  if(version MATCHES "\\+$" AND NOT from_env)
-    execute_process(COMMAND git -c core.excludesFile=/dev/null diff HEAD --no-ext-diff
-      WORKING_DIRECTORY ${SRC} OUTPUT_VARIABLE diff ERROR_QUIET)
-    string(SHA256 dh "${diff}")
-    string(SUBSTRING "${dh}" 0 8 dh)
-    set(id "${version}${dh}")
-  endif()
-  set(content "#pragma once\n#define BBHOST_BUILD_ID \"${id}\"\n")
-  set(old "")
-  if(EXISTS ${BUILD_ID_OUT})
-    file(READ ${BUILD_ID_OUT} old)
-  endif()
-  if(NOT old STREQUAL content)
-    file(WRITE ${BUILD_ID_OUT} "${content}")
-  endif()
-endif()
