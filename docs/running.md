@@ -251,3 +251,7 @@ sessions with the plugin on keep their messages, bloodstains and statistics
 apart from other players'. Using it to cheat against other players - in their
 worlds, in invasions or on the leaderboards - gets an account banned. Trying it
 out online with friends is fine.
+
+## Windows crash capture
+
+For opt-in triage and full-memory dumps, see [Windows crash dumps](windows-crash-dumps.md).
