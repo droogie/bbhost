@@ -1,7 +1,9 @@
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/maskmov_rewrite.h"
 #include "core/sha256.h"
 #include "core/tls_rewrite.h"
+#include "engine/addr.h"
 #include "log.h"
 
 #include <algorithm>
@@ -308,6 +310,8 @@ bool load_orbis_elf(const char* path, ElfImage* image) {
     host_log("bound %zu JUMP_SLOT imports (%zu named)", image->imports.size(), named);
 
     TlsRewriteStats tls_st;
+    MaskmovRewriteStats maskmov_st;
+    const bool maskmov = maskmov_rewrite_wanted();
     for (int i = 0; i < eh.e_phnum; ++i) {
         if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X)) {
             const std::size_t sz = static_cast<std::size_t>((ph[i].p_memsz + 0xfff) & ~0xfffull);
@@ -317,12 +321,18 @@ bool load_orbis_elf(const char* path, ElfImage* image) {
                 tls_rewrite_to_gs(image, image->mem.slide + ph[i].p_vaddr, static_cast<std::size_t>(ph[i].p_filesz),
                                   &tls_st);
             }
+            // Rosetta 2's masked stores clobber neighbours (maskmov_rewrite.h).
+            if (maskmov) {
+                maskmov_rewrite(image, image->mem.slide + ph[i].p_vaddr, static_cast<std::size_t>(ph[i].p_filesz),
+                                image->sha256 == kEboot109Sha256, &maskmov_st);
+            }
             if (!guest_protect_rx(&image->mem, image->mem.slide + ph[i].p_vaddr, sz)) {
                 return false;
             }
         }
     }
     if (tls_gs_mode()) tls_rewrite_report(tls_st);
+    if (maskmov) maskmov_rewrite_report(maskmov_st);
 
     image->entry = image->mem.slide + eh.e_entry;
     if (image->init) {

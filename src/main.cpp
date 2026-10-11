@@ -8,6 +8,7 @@
 #include "core/thunk.h"
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/maskmov_rewrite.h"
 #include "core/win_watch.h"
 #include "core/write_watch.h"
 #include "engine/addr.h"
@@ -453,6 +454,7 @@ void exit_reports() {
     frame_pool_report();
     key_prompts_report();
     decomp_report();
+    maskmov_rewrite_exit_report();
     mouse_camera_report();
 }
 

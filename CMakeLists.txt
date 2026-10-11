@@ -67,6 +67,7 @@ add_executable(bbhost
   src/host/win_crash.cpp
   src/host/plugins.cpp
   src/core/tls_rewrite.cpp
+  src/core/maskmov_rewrite.cpp
   src/core/config.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
@@ -521,12 +522,20 @@ if(UNIX)
   add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
   target_include_directories(paced_file_test PRIVATE src)
   add_test(NAME paced_file_test COMMAND paced_file_test)
+
+  add_executable(maskmov_rewrite_test tests/maskmov_rewrite_test.cpp src/core/maskmov_rewrite.cpp src/decomp/insn.cpp)
+  target_include_directories(maskmov_rewrite_test PRIVATE src)
+  target_link_libraries(maskmov_rewrite_test PRIVATE pthread)
+  if(APPLE)
+    target_sources(maskmov_rewrite_test PRIVATE src/core/mac_vm.cpp)
+  endif()
+  add_test(NAME maskmov_rewrite_test COMMAND maskmov_rewrite_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
   # without the eboot.
   add_library(eboot_kit STATIC tests/decomp/eboot_kit.cpp src/core/elf.cpp src/core/memory.cpp src/core/sha256.cpp
-              src/core/tls_rewrite.cpp)
+              src/core/tls_rewrite.cpp src/core/maskmov_rewrite.cpp src/decomp/insn.cpp)
   target_include_directories(eboot_kit PUBLIC src include tests tests/decomp)
   target_compile_definitions(eboot_kit PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(APPLE)
