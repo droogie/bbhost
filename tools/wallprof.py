@@ -22,6 +22,7 @@ import bisect
 import collections
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -78,9 +79,13 @@ for line in open(a.prefix + '.maps'):
     maps.append((start, end, perm, off, path))
 maps.sort()
 base = {}
+link = {}
 for start, end, perm, off, path in maps:
     if path.startswith('/') and path not in base:
         base[path] = start - off  # the first mapping of a file sits at its ELF address 0
+        link[path] = off  # macOS: the image's __TEXT link address
+HAVE_ADDR2LINE = shutil.which('addr2line') is not None
+HAVE_ATOS = not HAVE_ADDR2LINE and shutil.which('atos') is not None
 execs = [(s, e, p) for s, e, perm, off, p in maps if 'x' in perm]
 starts = [m[0] for m in execs]
 
@@ -107,10 +112,19 @@ for path, addrs in wanted.items():
     addrs = sorted(addrs)
     rel = [x - base.get(path, 0) for x in addrs]
     out = []
-    if os.path.exists(path):
+    if os.path.exists(path) and HAVE_ADDR2LINE:
         r = subprocess.run(['addr2line', '-f', '-C', '-e', path] + ['%x' % x for x in rel],
                            capture_output=True, text=True)
         out = r.stdout.splitlines()
+    elif os.path.exists(path) and HAVE_ATOS:
+        # macOS: a map's offset is the image's __TEXT link address, so load
+        # atos there. Its one line per address becomes addr2line's pairs.
+        r = subprocess.run(['atos', '-o', path, '-arch', 'x86_64', '-l', '%x' % link.get(path, 0)] +
+                           ['%x' % x for x in rel], capture_output=True, text=True)
+        for ln in r.stdout.splitlines():
+            fn = re.sub(r' \(in [^)]*\)', '', ln).strip()
+            fn = re.sub(r' \([^()]*:\d+\)$', '', fn)
+            out += ['??' if re.match(r'^0x[0-9a-f]+$', fn) else fn, '']
     short = os.path.basename(path)
     for i, x in enumerate(addrs):
         fn = out[2 * i] if 2 * i < len(out) else '??'
@@ -132,7 +146,10 @@ def name_of(addr, k):
 
 
 WAITS = re.compile(r'futex|__lll_lock_wait|pthread_cond_(timed)?wait|ioctl|__poll|ppoll|epoll_wait|'
-                   r'nanosleep|clock_nanosleep|sched_yield|__GI___select|read$|__libc_read|syscall')
+                   r'nanosleep|clock_nanosleep|sched_yield|__GI___select|read$|__libc_read|syscall|'
+                   # macOS (libsystem_kernel's traps)
+                   r'__psynch_cvwait|__psynch_mutexwait|__ulock_wait|semaphore_.*wait_trap|mach_msg2?_trap|'
+                   r'__semwait_signal|__workq_kernreturn|kevent|__select|swtch_pri|thread_switch')
 
 for thread, stacks in sorted(samples.items(), key=lambda kv: -len(kv[1])):
     n = len(stacks)
