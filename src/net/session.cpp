@@ -1,6 +1,7 @@
 #include "net/session.h"
 
 #include "core/config.h"
+#include "core/host_thread.h"
 #include "core/portable.h"
 #include "core/thunk.h"
 #include "hle/net_p2p.h"
@@ -48,7 +49,7 @@ std::mutex g_dmu;
 std::condition_variable g_dcv;
 std::deque<Due> g_due;  // kept sorted on insert
 std::uint64_t g_seq = 0;
-std::thread g_dthread;
+HostThread g_dthread;  // runs the game's callbacks: guest calls, on its own stack
 std::atomic<bool> g_drun{false};
 std::atomic<std::thread::id> g_dtid{};
 
@@ -92,7 +93,7 @@ void dispatcher_main() {
 void dispatcher_ensure_locked() {
     if (g_drun.load()) return;
     g_drun.store(true);
-    g_dthread = std::thread(dispatcher_main);
+    g_dthread = HostThread(dispatcher_main);
     g_dthread.detach();
 }
 

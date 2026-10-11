@@ -7,6 +7,7 @@
 #include "hle/common.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
+#include "core/host_thread.h"
 #include "core/thunk.h"
 #include "hle/fs.h"
 
@@ -116,7 +117,8 @@ struct Player {
     // controller thread after the API call that caused them returns; the
     // game's READY handler assumes sceAvPlayerAddSource has completed
     // (it creates its movie thread from an object initialised afterwards).
-    std::thread event_thread;
+    // It runs the game's event callback: a guest call, on its own stack.
+    HostThread event_thread;
     std::mutex emu;
     std::condition_variable ecv;
     std::deque<std::int32_t> events;
@@ -238,7 +240,7 @@ void send_event(Player& p, std::int32_t event) {
     std::lock_guard<std::mutex> lk(p.emu);
     if (!p.event_thread.joinable()) {
         p.equit = false;
-        p.event_thread = std::thread(event_thread_main, &p);
+        p.event_thread = HostThread(event_thread_main, &p);
     }
     p.events.push_back(event);
     p.ecv.notify_all();
