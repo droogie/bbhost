@@ -2350,6 +2350,25 @@ struct Translator {
         }
         return {addr_add(base, off), stride};
     }
+    // The hardware's NUM_RECORDS check for writes (SGPR offset not checked).
+    // Needed: particle shaders take indices from GDS counters, which are not
+    // emulated, and unchecked writes landed on the game's CPU-only heaps.
+    Id buffer_write_in_range(const Inst& in) {
+        if (in.addr64) return m.const_bool(true);  // no range check in this mode
+        const Id w1 = read_s(in.srsrc + 1, in), records = read_s(in.srsrc + 2, in);
+        const Id stride = iand(shr(w1, cu(16)), cu(0x3fff));
+        int va = in.vaddr;
+        const Id index = in.idxen ? ld(vgpr_var(va++)) : c_zero_u;
+        Id off = cu(in.offset12);
+        if (in.offen) off = iadd(off, ld(vgpr_var(va)));
+        const Id raw = ieq(stride, c_zero_u);
+        return bor(band(raw, ult(off, records)), band(bnot(raw), ult(index, records)));
+    }
+    template <typename F>
+    void buffer_write_guard(const Inst& in, F body) {
+        const Id ok = buffer_write_in_range(in);
+        if_then(exec_known() ? ok : band(exec_bit(), ok), body);
+    }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
         {
@@ -2368,7 +2387,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 for (int k = 0; k < n; ++k) store_u32_at(addr_addc(ba.addr, k * 4), vals[k]);
             });
         };
@@ -2390,7 +2409,7 @@ struct Translator {
             std::vector<Id> vals;
             for (int k = 0; k < nv; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
             vals = store_dst_sel_rt(vals, w3);
-            exec_guard([&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
+            buffer_write_guard(in, [&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
             break;
         }
         case 8: case 9: case 10: case 11: {  // ubyte/sbyte/ushort/sshort
@@ -2414,7 +2433,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             const Id mask = cu(op == 24 ? 0xffu : 0xffffu);
             const Id val = iand(ld(vgpr_var(in.vdata)), mask);
-            exec_guard([&] { store_masked_any(ba.addr, val, c_zero_u, mask, c_zero_u); });
+            buffer_write_guard(in, [&] { store_masked_any(ba.addr, val, c_zero_u, mask, c_zero_u); });
             break;
         }
         case 28:
@@ -2443,7 +2462,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             const Id val = ld(vgpr_var(in.vdata));
             Id result_var = m.local_variable(p_fn_u32, c_zero_u);
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 const Id p = guest_ptr(ba.addr);
                 const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), val});
                 m.store(result_var, r);
@@ -2868,7 +2887,7 @@ struct Translator {
             }
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 if (bits[0] == 32) {
                     for (int k = 0; k < n && k < count; ++k) store_u32_at(addr_addc(ba.addr, k * 4), vals[k]);
                 } else if (bits[0] == 16 && in.nfmt == 7) {
