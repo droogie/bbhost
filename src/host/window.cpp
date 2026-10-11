@@ -297,6 +297,7 @@ struct Presenter {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
     bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
+    bool via_dxgi = false;      // the driver presents through DXGI: seen at the first swapchain, kept for the later ones
     std::mutex mu;
     bool ok = false;
     std::uint64_t frames = 0;
@@ -378,6 +379,11 @@ const char* present_mode_name(VkPresentModeKHR m) {
 // FIFO - where every frame waits its turn, up to two refreshes behind with
 // three images. V-Sync off: IMMEDIATE (shown at once, tearing), else MAILBOX.
 // FIFO is the only mode a surface must support, so it is what is left.
+// V-Sync on where the driver presents through DXGI (NVIDIA's on a hybrid
+// laptop's display wired to the integrated GPU): FIFO. There MAILBOX - and
+// IMMEDIATE - fall to ~5 presents a second once the game's GPU work passes
+// ~60% busy, the game still at 60, and stay there while it does; FIFO holds
+// 60 (RTX 4060 Laptop, 610.88: 937 frames dropped in a 75 s run against 6).
 // BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
 // (FIFO when the surface lacks it); =old is the choice before this one (FIFO
 // with V-Sync; MAILBOX, else IMMEDIATE, without).
@@ -408,6 +414,8 @@ VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
         if (f == "latest") want = {VK_PRESENT_MODE_FIFO_LATEST_READY_KHR};
 #endif
         why += "; BBHOST_PRESENT_MODE=" + f;
+    } else if (vsync && g_vk.via_dxgi) {
+        why += "; FIFO: the driver presents through DXGI";
     } else if (vsync) {
         want = {VK_PRESENT_MODE_MAILBOX_KHR};
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
@@ -528,6 +536,7 @@ bool vk_create_swapchain() {
     }
     [[maybe_unused]] const std::string modules_after = host_graphics_modules();
     g_vk.mode = sci.presentMode;
+    bool remake = false;  // DXGI seen for the first time and it changes the mode: made again below
     if (old) {
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         host_log("present: swapchain %ux%u", g_vk.extent.width, g_vk.extent.height);
@@ -566,6 +575,12 @@ bool vk_create_swapchain() {
         host_log("present: Windows' graphics modules: %s before the swapchain, %s after%s",
                  modules_before.empty() ? "none" : modules_before.c_str(), modules_after.empty() ? "none" : modules_after.c_str(),
                  via_dxgi ? " - the driver presents through DXGI" : "");
+        // Only the first swapchain sees d3d12.dll load, so the finding is kept.
+        if (via_dxgi && !g_vk.via_dxgi) {
+            g_vk.via_dxgi = true;
+            std::string again;
+            remake = choose_present_mode(vsync, again) != g_vk.mode;
+        }
 #endif
     }
     g_swap_w.store(g_vk.extent.width, std::memory_order_relaxed);
@@ -601,6 +616,10 @@ bool vk_create_swapchain() {
     host_log("present: %s, V-Sync %s (%s); %u images (%u asked, the surface's least %u); %s", present_mode_name(g_vk.mode), vsync ? "on" : "off",
              why.c_str(), n, images, caps.minImageCount,
              pass ? "the picture, the overlay and the menu in one pass" : "the picture blitted, the overlay in a pass of its own");
+    if (remake) {
+        host_log("present: made again for the mode the DXGI path takes");
+        return vk_create_swapchain();
+    }
     return true;
 }
 
