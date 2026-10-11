@@ -19,6 +19,9 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #else
 #include "core/portable.h"
 #endif
@@ -35,7 +38,28 @@ struct ThreadTime {
 // utime + stime of every thread of this process, in clock ticks, by tid.
 std::unordered_map<int, ThreadTime> thread_times() {
     std::unordered_map<int, ThreadTime> out;
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    // No /proc: Mach's threads. The 64-bit id cut to an int only has to be
+    // unique.
+    thread_act_array_t list = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) return out;
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        thread_extended_info_data_t ext{};
+        mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT;
+        thread_identifier_info_data_t id{};
+        mach_msg_type_number_t idn = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(list[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&ext), &n) == KERN_SUCCESS &&
+            thread_info(list[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id), &idn) == KERN_SUCCESS) {
+            ThreadTime t;
+            t.ticks = (ext.pth_user_time + ext.pth_system_time) / 1000;  // ns -> us
+            t.name = ext.pth_name[0] ? ext.pth_name : "bbhost";
+            out.emplace(static_cast<int>(id.thread_id), std::move(t));
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list), count * sizeof(thread_act_t));
+#elif !defined(_WIN32)
     DIR* d = opendir("/proc/self/task");
     if (!d) return out;
     while (dirent* e = readdir(d)) {
@@ -137,7 +161,9 @@ void frame_stats_on_flip() {
     if (!on) return;
     static State s;
     static const long hz = [] {
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+        return 1000000L;  // thread_times counts microseconds there
+#elif !defined(_WIN32)
         return sysconf(_SC_CLK_TCK);
 #else
         return 10000000L;  // GetThreadTimes counts 100 ns units
