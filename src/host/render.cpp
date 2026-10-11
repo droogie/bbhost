@@ -18,6 +18,7 @@
 #include "gcn/names.h"
 #include "gcn/wave.h"
 #include "gcn/isa.h"
+#include "gcn/spirv.h"
 #include "hle/modules.h"
 #include "log.h"
 
@@ -6200,6 +6201,20 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     return ok;
 }
 
+// An empty module (not kept) counts as writing one.
+bool spirv_writes_position(const std::vector<std::uint32_t>& spirv) {
+    if (spirv.size() <= 5) return true;
+    for (std::size_t at = 5; at < spirv.size();) {
+        const std::uint32_t count = spirv[at] >> 16, op = spirv[at] & 0xffff;
+        if (count == 0 || at + count > spirv.size()) return true;
+        if (op == spv::OpDecorate && count >= 4 && spirv[at + 2] == spv::DecBuiltIn && spirv[at + 3] == spv::BiPosition) return true;
+        if (op == spv::OpMemberDecorate && count >= 5 && spirv[at + 3] == spv::DecBuiltIn && spirv[at + 4] == spv::BiPosition) return true;
+        if (op == spv::OpFunction) return false;  // decorations come before every function
+        at += count;
+    }
+    return false;
+}
+
 // The Vulkan pipeline of a translated and laid-out GfxPipeline, from any draw
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
@@ -6236,17 +6251,29 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.rect_tes);
     }
     if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
-    if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
-    // Pixel shaders at wave32: built whole, the fragment stage is given its
-    // subgroup size here (linked, in its library: fragment_library).
     // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
     // buffers) is built whole: its layout has a set past the shared ones,
     // which the fragment library a pixel shader shares does not.
     const bool linked = use_pipeline_library() && pl.layout && !pl.tess_set_layout;
+    // GX binds a GS object's export shader as a VS that only stores to
+    // buffers and writes no position. Metal refuses to link a fragment stage
+    // whose inputs no vertex output writes, so such a pipeline discards
+    // rasterization and drops the pixel shader; its stores still run.
+    const bool no_raster = !linked && !pl.gs.module && !spirv_writes_position(pl.vs.meta().spirv);
+    if (no_raster && pl.ps.module) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("render: pipeline %s: its vertex stage writes no position, so it discards rasterization and leaves out its pixel shader",
+                     pl.name.c_str());
+        }
+    }
+    if (pl.ps.module && !no_raster) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    // Pixel shaders at wave32: built whole, the fragment stage is given its
+    // subgroup size here (linked, in its library: fragment_library).
     const char* const owner = t_library_owner;
     t_library_owner = pl.name.c_str();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ps_wave{};
-    const bool ps_sized = !linked && pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
+    const bool ps_sized = !linked && pl.ps.module && !no_raster && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     if (vertex_input) {  // Vulkan vertex input
@@ -6274,6 +6301,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     rs.depthBiasConstantFactor = f.bias_constant;
     rs.depthBiasClamp = f.bias_clamp;
     rs.depthBiasSlopeFactor = f.bias_slope;
+    rs.rasterizerDiscardEnable = no_raster ? VK_TRUE : VK_FALSE;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
