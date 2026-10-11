@@ -23,6 +23,11 @@ __pycache__/
 build-win/
 build-linux-portable/
 /build-ci/
+/build-crash/
+# Opt-in crash captures can contain private runtime data and game memory.
+*.dmp
+*.dmp.partial
+*.dmp.capturing
 # Private working notes and the eboot's symbol files stay out of the repository.
 /notes/
 /symbols/

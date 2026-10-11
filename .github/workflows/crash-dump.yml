@@ -1,0 +1,35 @@
+name: Windows crash collector
+on:
+  pull_request:
+    paths:
+      - 'src/host/crash_dump.*'
+      - 'src/host/win_crash.*'
+      - 'tools/crash_dump_helper.cpp'
+      - 'tests/crash_dump*'
+      - 'tests/windows_crash/**'
+      - 'cmake/crash_dump.cmake'
+      - '.github/workflows/crash-dump.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-python
+      - run: cmake -S tests/windows_crash -B build-crash -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build-crash
+      - run: ctest --test-dir build-crash --output-on-failure

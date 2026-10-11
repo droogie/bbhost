@@ -3,6 +3,7 @@
 #if defined(_WIN32)
 
 #include "core/portable.h"
+#include "host/crash_dump.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
@@ -185,6 +186,9 @@ LONG CALLBACK crash_veh(EXCEPTION_POINTERS* ep) {
                  static_cast<unsigned long long>(ep->ContextRecord->Rip));
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    // Save guest faults before reporting or a later filter can terminate us.
+    // Earlier VEH handlers still get first chance to handle expected faults.
+    if (in_guest(ep->ContextRecord->Rip)) crash_dump::capture(ep);
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
         // Little stack is left; the one line is what fits.
         host_log("SIGSEGV pc=0x%llx STACK_OVERFLOW rsp=0x%llx thread %u",
@@ -197,6 +201,7 @@ LONG CALLBACK crash_veh(EXCEPTION_POINTERS* ep) {
 }
 
 LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
+    crash_dump::capture(ep);
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     // 0x20474343 ("CCG "): a C++ exception nothing caught, which reaches this
     // filter before std::terminate would. The vectored handler reports only
@@ -226,6 +231,7 @@ void log_own_stack() {
 // laptop's runs did, every time, at the same point. Each now says what it was
 // and where, then leaves with 134.
 [[noreturn]] void end_after(const char* what) {
+    crash_dump::capture(nullptr);
     host_log("crash: %s (thread %lu)", what, static_cast<unsigned long>(GetCurrentThreadId()));
     log_own_stack();
     hle_fs_log_recent_opens();
@@ -257,6 +263,11 @@ void on_purecall() { end_after("a pure virtual function was called"); }
 }  // namespace
 
 void win_crash_install() {
+    if (!crash_dump::initialize()) {
+        std::fprintf(stderr, "[bbhost] full dump: collector initialization FAILED; stopping before gameplay\n");
+        std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 78);
+    }
     static PVOID h = AddVectoredExceptionHandler(0, crash_veh);  // last of the vectored handlers
     (void)h;
     SetUnhandledExceptionFilter(crash_filter);

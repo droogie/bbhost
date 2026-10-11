@@ -50,6 +50,7 @@ add_executable(bbhost
   src/core/win_vm.cpp
   src/core/win_watch.cpp
   src/host/win_crash.cpp
+  src/host/crash_dump.cpp
   src/host/plugins.cpp
   src/core/tls_rewrite.cpp
   src/core/config.cpp
@@ -167,6 +168,9 @@ add_dependencies(bbhost bbhost_translator_fingerprint)
 # The Windows exe's icon and version details.
 if(WIN32)
   enable_language(RC)
+  enable_testing()
+  include(cmake/crash_dump.cmake)
+  add_dependencies(bbhost crash_dump_helper)
   target_sources(bbhost PRIVATE res/bbhost.rc)
   set_source_files_properties(res/bbhost.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")

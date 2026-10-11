@@ -30,6 +30,7 @@ cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE.txt"
 tools/package_plugins.sh "$(dirname "$exe")/plugins" "$dir/plugins"
 llvm-objcopy --strip-debug "$exe" "$dir/bbhost.exe"
+llvm-objcopy --strip-debug "$(dirname "$exe")/crash_dump_helper.exe" "$dir/crash_dump_helper.exe"
 cp "$exe" "$out/$name.debug.exe"
 sed -e 's#^app0 = .*#app0 = "C:/Games/CUSA00900"#' \
     -e 's#^eboot = .*#eboot = "./eboot-109-decrypted.bin"#' \
