@@ -6384,10 +6384,13 @@ bool write_file_paced(const std::string& path, const char* data, std::size_t siz
 // a soak's saves added.
 void save_pipeline_cache_now(const std::string& path, bool periodic) {
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> data(g_cache_size_hint ? g_cache_size_hint + (g_cache_size_hint >> 3) + (1u << 20) : 0);
+    // MoltenVK sizes its data only in the size query and forgets it when a
+    // shader joins the cache, so a data call needs a fresh query, again if a
+    // pipeline joined between.
+    std::vector<char> data(!g.moltenvk && g_cache_size_hint ? g_cache_size_hint + (g_cache_size_hint >> 3) + (1u << 20) : 0);
     std::size_t size = data.size();
     VkResult r = size ? vkGetPipelineCacheData(g.device, g.cache, &size, data.data()) : VK_INCOMPLETE;
-    if (r == VK_INCOMPLETE) {  // grew past the guess, or no guess yet
+    for (int attempt = 0; r == VK_INCOMPLETE && attempt < 4; ++attempt) {  // grew past the guess, or no guess
         size = 0;
         if (vkGetPipelineCacheData(g.device, g.cache, &size, nullptr) != VK_SUCCESS || !size) return;
         data.resize(size);
@@ -6501,9 +6504,12 @@ void host_gpu_save_pipeline_cache_at_exit() {
         while (g_cache_users.load() != 0 && std::chrono::steady_clock::now() < until) host_sleep_us(200);
         if (g_cache_users.load() == 0) merge_side_caches();
         else host_log("gpu: pipeline cache: a pipeline still compiling at exit; what the side caches hold is left out of the save");
-        g_cache_divert.store(false);
     }
+    // Still diverted while it serializes: a pipeline the game creates
+    // meanwhile goes to the side cache (and is built again next run) rather
+    // than changing the main one between the size query and the data.
     save_pipeline_cache_now(path, false);  // the flag stays set: no save after this one
+    g_cache_divert.store(false);
     stage_manifest_save(stage_manifest_path());
     translation_cache_save(translation_cache_path(), true);
 }
