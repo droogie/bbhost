@@ -1486,9 +1486,10 @@ bool window_start_impl(int width, int height, const char* title);
 // messages go to that thread's queue, and the system destroys it when that
 // thread exits. Made on the helper, it showed for a moment and was gone (a
 // Windows 11 laptop, every run), while the game ran on without it; the
-// caller is the thread that pumps it (run_guest_start).
+// caller is the thread that pumps it (run_guest_start). Same on macOS: SDL's
+// Cocoa driver starts on the main thread only.
 bool host_window_start(int width, int height, const char* title) {
-#if defined(BBHOST_HAVE_SDL3) && defined(_WIN32)
+#if defined(BBHOST_HAVE_SDL3) && (defined(_WIN32) || defined(__APPLE__))
     return window_start_impl(width, height, title);
 #elif defined(BBHOST_HAVE_SDL3)
     // The shared state lives past a return from here (the thread may not
