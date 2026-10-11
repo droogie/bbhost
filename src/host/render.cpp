@@ -16236,10 +16236,25 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                 std::free(draws_text);
             }
             std::size_t failed = 0;
-            for (const auto& t : images) {
-                if (!write_target_image(*t)) ++failed;
-                vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
-                vkFreeMemory(g.device, t->staging.memory, nullptr);
+            if (g.moltenvk) {
+                // MoltenVK makes every device-address buffer resident, unretained,
+                // in every command buffer: freeing these under frames in flight
+                // loses the device. Free them after a flush.
+                for (const auto& t : images) {
+                    if (!write_target_image(*t)) ++failed;
+                }
+                std::lock_guard<GpuMutex> lock(g.mu);
+                if (g.ok) flush_locked();
+                for (const auto& t : images) {
+                    vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
+                    vkFreeMemory(g.device, t->staging.memory, nullptr);
+                }
+            } else {
+                for (const auto& t : images) {
+                    if (!write_target_image(*t)) ++failed;
+                    vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
+                    vkFreeMemory(g.device, t->staging.memory, nullptr);
+                }
             }
             if (failed) host_log("dump: F12 could not write %zu of the %zu images", failed, images.size());
             host_log("dump: F12 files written to %s - send that folder with the log", folder.c_str());
