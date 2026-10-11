@@ -2469,7 +2469,12 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     const std::uint32_t slices = type == 10 ? depth : layers;
     if (fi.format == VK_FORMAT_UNDEFINED || width == 0 || height == 0 || slices == 0 || base == 0) {
         static std::atomic<int> logs{0};
-        if (logs.fetch_add(1) < 8) host_log("texture: unsupported T# dfmt=%u nfmt=%u type=%u %ux%u", dfmt, nfmt, type, width, height);
+        // A T# with no base is the game's null texture (its format is
+        // supported, there is just nothing to read): said apart from the rest.
+        if (logs.fetch_add(1) < 8) {
+            host_log("texture: %s T# dfmt=%u nfmt=%u type=%u %ux%u%s", base == 0 ? "null (base 0)" : "unsupported", dfmt, nfmt, type,
+                     width, height, fi.format == VK_FORMAT_UNDEFINED ? ", no Vulkan format" : "");
+        }
         g_unsupported.fetch_add(1);
         return VK_NULL_HANDLE;
     }

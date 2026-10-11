@@ -8777,7 +8777,7 @@ void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre,
                 const std::uint64_t tbase = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) << 8;
                 host_log("render: %s binding %u (%s) has no texture: %s, want dim %u%s, got dim %u%s",
                          pipeline_name ? pipeline_name : "?", b.binding, b.path.str().c_str(),
-                         !resolved ? "T# unreadable" : !shape_ok ? "wrong shape" : "unsupported format", b.dim,
+                         !resolved ? "T# unreadable" : !shape_ok ? "wrong shape" : tbase == 0 ? "a null T# (base 0)" : "unsupported format", b.dim,
                          b.arrayed ? " array" : "", got_dim, got_arrayed ? " array" : "");
                 host_log("  T# %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
                 host_log("  reads as T#: base 0x%llx dfmt %u nfmt %u %ux%u type %u tiling %u%s",
