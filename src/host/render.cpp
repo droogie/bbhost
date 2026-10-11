@@ -10432,6 +10432,7 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
 std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) {
     if (!data || !bytes || !align || (align & (align - 1))) return 0;
     std::lock_guard<GpuMutex> lk(g.mu);
+    if (!init_locked()) return 0;  // no device: the tables stay on the command stream
     return ring_place(static_cast<const std::uint8_t*>(data), bytes, align < 8 ? 8 : align);
 }
 

@@ -1221,6 +1221,20 @@ int main(int argc, char** argv) {
             host_options_apply();  // the display settings, now that there is one
         }
     }
+#if defined(__APPLE__)
+    // A Mac run without a GPU shows nothing: end with the reason rather than
+    // run blind, unless BBHOST_GPU=0 asked for that.
+    if (!windowed && !(std::getenv("BBHOST_GPU") && std::getenv("BBHOST_GPU")[0] == '0') && !host_gpu_available()) {
+        const char* text =
+            "bbhost found no usable Vulkan 1.3 GPU. It reaches MoltenVK through the Vulkan loader and the driver "
+            "manifest found relative to the executable (the build folder's layout, or the packaged app's): run "
+            "bbhost where it was built or from the package, not a copy moved elsewhere.";
+        host_log("gpu: %s (BBHOST_GPU=0 runs without one)", text);
+        if (host_window_video_up()) host_window_error_box("bbhost cannot run here", text);
+        std::fflush(nullptr);
+        std::exit(1);
+    }
+#endif
     host_log("calling _start 0x%llx (CRT runs _init, stack=0x%zx)",
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);

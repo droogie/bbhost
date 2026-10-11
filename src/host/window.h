@@ -63,6 +63,9 @@ void host_window_stop();
 // when it is closed; at once without SDL.
 void host_window_error_box(const char* title, const char* text);
 bool host_window_active();
+// Whether host_window_start got SDL's video up (there is a screen to show
+// host_window_error_box on), even when the window itself then failed.
+bool host_window_video_up();
 
 // Snapshot of controller/keyboard state for scePad.
 PadState host_pad_state();

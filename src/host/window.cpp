@@ -50,6 +50,8 @@ static std::atomic<std::uint64_t> g_window_pixels{0};
 namespace {
 
 std::atomic<bool> g_active{false};
+// SDL's video came up (an error box can show), whether or not the window did.
+std::atomic<bool> g_video_up{false};
 std::mutex g_pad_mu;
 PadState g_pad;
 
@@ -1543,6 +1545,7 @@ bool window_start_impl(int width, int height, const char* title) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
+    g_video_up = true;
     // The options are read before the window exists, so a saved Fullscreen
     // is only a wish until here (host_window_set_fullscreen).
     const bool fullscreen = g_want_fullscreen.load();
@@ -2235,6 +2238,7 @@ void host_window_stop() {
 }
 
 bool host_window_active() { return g_active.load(); }
+bool host_window_video_up() { return g_video_up.load(); }
 
 MouseState host_mouse_state() {
     std::lock_guard<std::mutex> lock(g_mouse_mu);

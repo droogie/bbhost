@@ -1078,6 +1078,8 @@ static void shader_caches_check_build() {
 
 // Rebuild the guest page tables when the mapping list changed.
 bool rebuild_page_tables() {
+    // Without a device the imports would call function pointers never loaded.
+    if (!g.ok) return false;
     static std::uint64_t seen_gen = 0;
     const std::uint64_t gen = hle_kernel_maps_generation();
     if (gen == seen_gen) {
