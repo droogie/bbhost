@@ -11,6 +11,10 @@
 #include <cstring>
 #include <pthread.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace {
 
 int g_fail = 0;
@@ -21,6 +25,31 @@ int g_fail = 0;
             ++g_fail;                                                  \
         }                                                              \
     } while (0)
+
+#if defined(_WIN32)
+struct StackBounds {
+    void* base;
+    void* limit;
+};
+StackBounds stack_bounds() {
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    return {tib->StackBase, tib->StackLimit};
+}
+void check_stack_bounds(StackBounds expected) {
+    const auto actual = stack_bounds();
+    CHECK(actual.base == expected.base);
+    CHECK(actual.limit == expected.limit);
+}
+void check_native_stack(void* expected_base) {
+    const auto actual = stack_bounds();
+    std::uintptr_t rsp;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp));
+    CHECK(actual.base == expected_base);
+    // Native stack probes may grow StackLimit during ordinary calls.
+    CHECK(reinterpret_cast<std::uintptr_t>(actual.limit) <= rsp);
+    CHECK(rsp < reinterpret_cast<std::uintptr_t>(actual.base));
+}
+#endif
 
 GUEST_ABI std::int64_t nine(std::int64_t a, std::int64_t b, std::int64_t c, std::int64_t d,
                             std::int64_t e, std::int64_t f, std::int64_t g, std::int64_t h,
@@ -107,6 +136,9 @@ GUEST_ABI std::int64_t fs_probe(void* cb) {
 }
 
 void* fs_thread(void*) {
+#if defined(_WIN32)
+    const auto native_bounds = stack_bounds();
+#endif
     using Fn = std::int64_t(GUEST_ABI*)(void*);
     auto* fn = reinterpret_cast<Fn>(thunk_wrap(reinterpret_cast<void*>(&fs_probe)));
     void* tcb = guest_thread_enter();
@@ -115,6 +147,9 @@ void* fs_thread(void*) {
     std::int64_t r = fn(reinterpret_cast<void*>(&fs_probe_cb));
     std::uint64_t after = fs0_magic();
     guest_thread_leave(tcb);
+#if defined(_WIN32)
+    check_native_stack(native_bounds.base);
+#endif
     CHECK(before == kTcbMagic);
     CHECK(after == kTcbMagic);
     // FS mode switches the segment for host code; GS mode leaves it, so the
@@ -139,6 +174,53 @@ GUEST_ABI std::int64_t call_jumper(void* cb) {
     hle_call_guest<std::int64_t>(cb, 0, 0);
     return -1;  // never
 }
+
+#if defined(_WIN32)
+void* g_stack_jmp_thunk = nullptr;
+GUEST_ABI void stack_jumper(void* buf) {
+    hle_longjmp_raw(buf, 0);
+}
+
+// Resume on the HLE stack with the outer thunk still active. Its normal
+// return must restore the native bounds after the inner thunk was skipped.
+GUEST_ABI std::int64_t nested_stack_jump() {
+    volatile StackBounds saved_bounds{};
+    alignas(16) std::uint64_t buf[12];
+    int v = hle_setjmp_raw(buf);
+    if (v == 0) {
+        const auto bounds = stack_bounds();
+        saved_bounds.base = bounds.base;
+        saved_bounds.limit = bounds.limit;
+        reinterpret_cast<void(GUEST_ABI*)(void*)>(g_stack_jmp_thunk)(buf);
+        CHECK(false);
+    }
+    CHECK(v == 1);
+    check_stack_bounds({saved_bounds.base, saved_bounds.limit});
+    return 73;
+}
+
+// Like hle_pthread_exit: save on the native thread stack, enter guest mode,
+// jump out of a thunked HLE call, then free the HLE stack and finish the thread.
+void* stack_jump_thread(void*) {
+    volatile StackBounds saved_bounds{};
+    alignas(16) std::uint64_t buf[12];
+    void* volatile tcb = nullptr;
+    int v = hle_setjmp_raw(buf);
+    if (v == 0) {
+        const auto bounds = stack_bounds();
+        saved_bounds.base = bounds.base;
+        saved_bounds.limit = bounds.limit;
+        tcb = guest_thread_enter();
+        reinterpret_cast<void(GUEST_ABI*)(void*)>(g_stack_jmp_thunk)(buf);
+        CHECK(false);
+    }
+    CHECK(v == 1);
+    check_stack_bounds({saved_bounds.base, saved_bounds.limit});
+    guest_thread_leave(tcb);
+    check_native_stack(saved_bounds.base);
+    return nullptr;
+}
+#endif
 
 // thunk_wrap_capture_frame(): the DL_PANIC path. The loader patches the
 // guest function's first byte, so the stub runs before anything touches the
@@ -218,6 +300,9 @@ void check_capture_frame() {
 }  // namespace
 
 int main() {
+#if defined(_WIN32)
+    const auto native_bounds = stack_bounds();
+#endif
     {
         int v = hle_setjmp_raw(g_jb);
         if (v == 0) {
@@ -225,8 +310,16 @@ int main() {
         }
         CHECK(v == 5);
         volatile int marker = 7;
+#if defined(_WIN32)
+        volatile StackBounds saved_bounds{};
+#endif
         int w = hle_setjmp_raw(g_jb);
         if (w == 0) {
+#if defined(_WIN32)
+            const auto bounds = stack_bounds();
+            saved_bounds.base = bounds.base;
+            saved_bounds.limit = bounds.limit;
+#endif
             using Fn = std::int64_t(GUEST_ABI*)(void*);
             auto* fn = reinterpret_cast<Fn>(thunk_wrap(reinterpret_cast<void*>(&call_jumper)));
             fn(reinterpret_cast<void*>(&jumper));
@@ -234,7 +327,17 @@ int main() {
         }
         CHECK(w == 42);
         CHECK(marker == 7);
+#if defined(_WIN32)
+        check_stack_bounds({saved_bounds.base, saved_bounds.limit});
+#endif
     }
+#if defined(_WIN32)
+    g_stack_jmp_thunk = thunk_wrap(reinterpret_cast<void*>(&stack_jumper));
+    auto* nested_jump = reinterpret_cast<decltype(&nested_stack_jump)>(
+        thunk_wrap(reinterpret_cast<void*>(&nested_stack_jump)));
+    CHECK(nested_jump() == 73);
+    check_native_stack(native_bounds.base);
+#endif
     using Fn9 = decltype(&nine);
     auto* n9 = reinterpret_cast<Fn9>(thunk_wrap(reinterpret_cast<void*>(&nine)));
     CHECK(n9(1, 2, 3, 4, 5, 6, 7, 8, 9) == nine(1, 2, 3, 4, 5, 6, 7, 8, 9));
@@ -266,6 +369,11 @@ int main() {
     pthread_t th;
     pthread_create(&th, nullptr, fs_thread, nullptr);
     pthread_join(th, nullptr);
+#if defined(_WIN32)
+    CHECK(pthread_create(&th, nullptr, stack_jump_thread, nullptr) == 0);
+    CHECK(pthread_join(th, nullptr) == 0);
+    check_native_stack(native_bounds.base);
+#endif
 
     if (g_fail) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

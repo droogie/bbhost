@@ -2,6 +2,7 @@
 // stage's user data become Vulkan images (untiled on upload) and samplers.
 // Render targets sampled as textures alias the render target image.
 #include "host/gpu_internal.h"
+#include "host/texture_upload_plan.h"
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -1002,14 +1003,17 @@ std::atomic<std::uint64_t> g_gpu_untiled{0}, g_gpu_untiled_bytes{0}, g_gpu_until
 // shader does not copy, source bytes outside one imported mapping, or a
 // linear or 1D level whose elements would reach past its slice (the CPU makes
 // that surface zeros; it keeps those).
-bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileGpuPass>& passes, VkDeviceAddress src_copy = 0) {
+bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileGpuPass>& passes, VkDeviceAddress src_copy = 0,
+                     std::uint32_t first_level = 0) {
     if (sf.type == 10 || sf.thick || (sf.esize != 4 && sf.esize != 8 && sf.esize != 16) || (sf.base & 3)) return false;
     // src_copy: the surface's bytes copied whole to device-local memory, the
     // same layout from there; else read in place through the import.
     const VkDeviceAddress src = src_copy ? src_copy : guest_device_address(sf.base, sf.total_src);
     if (!src) return false;
     const MacroMode mm = macro_mode_for(sf.esize);
-    for (const Surface::Level& lv : sf.levels) {
+    const std::size_t dst_base = sf.levels[first_level].dst_off;
+    for (std::size_t l = first_level; l < sf.levels.size(); ++l) {
+        const Surface::Level& lv = sf.levels[l];
         UntileGpuPass pass;
         switch (lv.tiling) {
         case 8: case 9: pass.mode = 0; break;
@@ -1025,7 +1029,7 @@ bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileG
             if ((last_tile + 1) * 64 * es > lv.src_slice_bytes) return false;
         }
         pass.src = src + lv.src_off;
-        pass.dst = dst + lv.dst_off;
+        pass.dst = dst + lv.dst_off - dst_base;
         pass.src_slice_bytes = lv.src_slice_bytes;
         pass.dst_slice_bytes = lv.dst_slice_bytes;
         pass.width_e = lv.w_e;
@@ -1043,7 +1047,17 @@ bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileG
 
 void check_stale_upload(const Surface& sf);
 
-bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
+// The raw fallback is retained for production A/B with profiling disabled.
+void texture_upload_barrier(VkPipelineStageFlags src, VkPipelineStageFlags dst, std::uint32_t nmem,
+                            const VkMemoryBarrier* mem, std::uint32_t nimg, const VkImageMemoryBarrier* img) {
+    if (texture_stream_enabled()) rec().pipeline_barrier(src, dst, 0, nmem, mem, 0, nullptr, nimg, img);
+    else vkCmdPipelineBarrier(g_cmd(), src, dst, 0, nmem, mem, 0, nullptr, nimg, img);
+}
+
+bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first, std::uint32_t first_level = 0) {
+    // Only carry_surface_locked requests a suffix, after whole-plan admission.
+    const std::size_t dst_base = sf.levels[first_level].dst_off;
+    const std::size_t upload_bytes = sf.total_dst - dst_base;
     // An earlier upload still being prepared fills its own staging span (the
     // submission waits for it); its hashes are superseded by this one's.
     sf.prep.reset();
@@ -1086,35 +1100,36 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
         guest_device_address(sf.base, sf.total_src)) {
         vram_src = locate(sf.base, sf.total_src);
-        if (vram_src.buffer && vram_src.avail >= sf.total_src && acquire_scratch_locked(vram, vram_src_span + sf.total_dst, vram_off)) {
-            in_vram = gpu_untile_plan(sf, vram.address + vram_off + vram_src_span, passes, vram.address + vram_off);
+        if (vram_src.buffer && vram_src.avail >= sf.total_src && acquire_scratch_locked(vram, vram_src_span + upload_bytes, vram_off)) {
+            in_vram = gpu_untile_plan(sf, vram.address + vram_off + vram_src_span, passes, vram.address + vram_off, first_level);
             if (!in_vram) passes.clear();
         }
     }
-    if (!in_vram && !acquire_staging_locked(staging, sf.total_dst, staging_offset)) return false;
+    if (!in_vram && !acquire_staging_locked(staging, upload_bytes, staging_offset)) return false;
     g_tex_staging_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
     auto prep = std::make_shared<TexturePrep>();
     prep->src = src;
     prep->dst = static_cast<std::uint8_t*>(staging.map);  // null on the device-local route: the prep only hashes
     prep->base = sf.base;
-    prep->levels = sf.levels;
+    prep->levels.assign(sf.levels.begin() + first_level, sf.levels.end());
+    for (Surface::Level& lv : prep->levels) lv.dst_off -= dst_base;
     prep->slices = sf.slices;
     prep->esize = sf.esize;
     prep->width = sf.width;
     prep->height = sf.height;
     prep->tiling = sf.tiling;
     prep->total_src = sf.total_src;
-    prep->total_dst = sf.total_dst;
+    prep->total_dst = upload_bytes;
     // On the GPU where it can: the prep only hashes the source, off this
     // thread, and nothing waits for it before the submission.
     const bool on_gpu = in_vram || (g_gpu_untile && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
-                                    gpu_untile_plan(sf, staging.address + staging_offset, passes));
+                                    gpu_untile_plan(sf, staging.address + staging_offset, passes, 0, first_level));
     if (g_gpu_untile && !on_gpu) g_gpu_untile_declined.fetch_add(1, std::memory_order_relaxed);
     DevBuffer cpu_copy;  // BBHOST_GPU_UNTILE=2: the CPU's untile of the same upload, compared later
     if (on_gpu && g_gpu_untile == 2) {
         VkDeviceSize cpu_offset = 0;
-        if (acquire_staging_locked(cpu_copy, sf.total_dst, cpu_offset)) {
-            std::memset(cpu_copy.map, 0, sf.total_dst);
+        if (acquire_staging_locked(cpu_copy, upload_bytes, cpu_offset)) {
+            std::memset(cpu_copy.map, 0, upload_bytes);
             prep->dst = static_cast<std::uint8_t*>(cpu_copy.map);
             run_prep(*prep);  // untiles into the copy and hashes
             sf.content_hash = prep->content_hash;
@@ -1153,16 +1168,17 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
         VkMemoryBarrier rb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, nullptr, 0, nullptr);
+        texture_upload_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &rb, 0, nullptr);
         static const std::string fetch_name = "tex-fetch";
         profile_begin_locked(&fetch_name);
         const VkBufferCopy fetch{vram_src.offset, vram_off, sf.total_src};
-        vkCmdCopyBuffer(g_cmd(), vram_src.buffer, vram.buffer, 1, &fetch);
+        if (texture_stream_enabled()) rec().copy_buffer(vram_src.buffer, vram.buffer, 1, &fetch);
+        else vkCmdCopyBuffer(g_cmd(), vram_src.buffer, vram.buffer, 1, &fetch);
         profile_end_locked();
         VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0, nullptr);
+        texture_upload_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1, &fb, 0, nullptr);
         g_untiled_vram.fetch_add(1, std::memory_order_relaxed);
         g_untiled_vram_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
     }
@@ -1170,14 +1186,14 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
         if (cpu_copy.map) {
             // A compare: the GPU's span starts from zeros as the CPU's copy
             // did, so elements neither writes (past a 2D slice) agree.
-            vkCmdFillBuffer(g_cmd(), staging.buffer, staging_offset, (sf.total_dst + 3) & ~std::size_t{3}, 0);
+            if (texture_stream_enabled()) rec().fill_buffer(staging.buffer, staging_offset, (upload_bytes + 3) & ~std::size_t{3}, 0);
+            else vkCmdFillBuffer(g_cmd(), staging.buffer, staging_offset, (upload_bytes + 3) & ~std::size_t{3}, 0);
             VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             fb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0,
-                                 nullptr);
+            texture_upload_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1, &fb, 0, nullptr);
             g.slots[g.slot].untile_checks.push_back(
-                {static_cast<const std::uint8_t*>(staging.map), static_cast<const std::uint8_t*>(cpu_copy.map), sf.total_dst, sf.base});
+                {static_cast<const std::uint8_t*>(staging.map), static_cast<const std::uint8_t*>(cpu_copy.map), upload_bytes, sf.base});
         }
         // BBHOST_GPU_PROFILE: the untile and the copy as entries of their own.
         static const std::string untile_name = "tex-untile";
@@ -1187,9 +1203,9 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
         VkMemoryBarrier ub{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         ub.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         ub.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ub, 0, nullptr, 0, nullptr);
+        texture_upload_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &ub, 0, nullptr);
         g_gpu_untiled.fetch_add(1, std::memory_order_relaxed);
-        g_gpu_untiled_bytes.fetch_add(sf.total_dst, std::memory_order_relaxed);
+        g_gpu_untiled_bytes.fetch_add(upload_bytes, std::memory_order_relaxed);
     }
     const std::uint32_t layers = sf.type == 10 ? 1 : sf.layers;
     const std::uint32_t nlevels = static_cast<std::uint32_t>(sf.levels.size());
@@ -1198,16 +1214,16 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = sf.image;
-    b.subresourceRange = {aspect, 0, nlevels, 0, layers};
+    b.subresourceRange = {aspect, first_level, nlevels - first_level, 0, layers};
     b.srcAccessMask = first ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    texture_upload_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 1, &b);
     std::vector<VkBufferImageCopy> regions;
-    for (std::uint32_t l = 0; l < nlevels; ++l) {
+    for (std::uint32_t l = first_level; l < nlevels; ++l) {
         const Surface::Level& lv = sf.levels[l];
         for (std::uint32_t sl = 0; sl < layers; ++sl) {
             VkBufferImageCopy r{};
-            r.bufferOffset = (in_vram ? vram_off + vram_src_span : staging_offset) + lv.dst_off + sl * lv.dst_slice_bytes;
+            r.bufferOffset = (in_vram ? vram_off + vram_src_span : staging_offset) + lv.dst_off - dst_base + sl * lv.dst_slice_bytes;
             r.imageSubresource = {aspect, l, sl, 1};
             r.imageExtent = {std::max(1u, sf.width >> l), (sf.type == 8 || sf.type == 12) ? 1u : std::max(1u, sf.height >> l),
                              sf.type == 10 ? std::max(1u, sf.depth >> l) : 1u};
@@ -1216,21 +1232,27 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     }
     static const std::string upload_copy_name = "tex-upload-copy";
     profile_begin_locked(&upload_copy_name);
-    vkCmdCopyBufferToImage(g_cmd(), in_vram ? vram.buffer : staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           static_cast<std::uint32_t>(regions.size()), regions.data());
+    // Rec deep-copies these transient upload regions.
+    if (texture_stream_enabled()) {
+        rec().copy_buffer_to_image(in_vram ? vram.buffer : staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    static_cast<std::uint32_t>(regions.size()), regions.data());
+    } else {
+        vkCmdCopyBufferToImage(g_cmd(), in_vram ? vram.buffer : staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<std::uint32_t>(regions.size()), regions.data());
+    }
     profile_end_locked();
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    texture_upload_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 1, &b);
     // The staging span is free for reuse once this command buffer retired.
     g_tex_record_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
     sf.exact_at_ms = now_ms();
     sf.checked_at_ms = now_ms();
     ++sf.uploads;
     g_uploads.fetch_add(1);
-    g_upload_bytes.fetch_add(sf.total_dst);
+    g_upload_bytes.fetch_add(upload_bytes);
     return true;
 }
 std::map<std::uint64_t, Surface> g_surfaces;        // by base VA
@@ -1877,6 +1899,15 @@ void refresh_surface_locked(Surface& sf) {
 // before, rainbow noise on everyone a hit bloodied. Now the levels both images
 // have are carried, and the ones the old image never had come from memory.
 std::atomic<std::uint64_t> g_surface_carries{0};
+const bool g_carry_added_mips = [] {
+    const char* e = std::getenv("BBHOST_CARRY_ADDED_MIPS");
+    return !(e && e[0] == '0');
+}();
+const bool g_texture_upload_stats = [] {
+    const char* e = std::getenv("BBHOST_TEXTURE_UPLOAD_STATS");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_carry_added_uploads{0}, g_carry_omitted_bytes{0}, g_carry_whole_uploads{0};
 
 bool carry_surface_locked(Surface& dst, const Surface& src) {
     if (!src.gpu_written || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
@@ -1891,23 +1922,35 @@ bool carry_surface_locked(Surface& dst, const Surface& src) {
     const bool partial = dst.levels.size() > nlevels;
     static const bool no_partial = [] { const char* e = std::getenv("BBHOST_CARRY_LEVELS"); return e && *e == '0'; }();
     if (partial && no_partial) return false;
-    if (partial && !upload_surface(dst, VK_IMAGE_ASPECT_COLOR_BIT, true)) return false;
+    // The omitted common levels must not hide run_prep's whole-upload failure.
+    // Every layout, including those levels, is admitted before compacting the
+    // added levels. Otherwise retain the original upload and its all-zero path.
+    const bool added_only = partial && g_carry_added_mips && texture_upload_layouts_supported(dst.levels, dst.esize);
+    if (partial && !upload_surface(dst, VK_IMAGE_ASPECT_COLOR_BIT, true, added_only ? static_cast<std::uint32_t>(nlevels) : 0)) return false;
+    if (partial && g_texture_upload_stats) {
+        (added_only ? g_carry_added_uploads : g_carry_whole_uploads).fetch_add(1, std::memory_order_relaxed);
+        if (added_only) g_carry_omitted_bytes.fetch_add(dst.levels[nlevels].dst_off, std::memory_order_relaxed);
+    }
     begin_recording_locked();
     render_end_pass_locked();
-    auto barrier = [](VkImage img, VkImageLayout from, VkAccessFlags src_access, VkAccessFlags dst_access) {
+    auto barrier = [](VkImage img, VkImageLayout from, VkAccessFlags src_access, VkAccessFlags dst_access,
+                      std::uint32_t levels = VK_REMAINING_MIP_LEVELS) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = from;
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = img;
-        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, VK_REMAINING_ARRAY_LAYERS};
         b.srcAccessMask = src_access;
         b.dstAccessMask = dst_access;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
-                             1, &b);
+        texture_upload_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 1, &b);
     };
     barrier(src.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    if (partial) {
+    if (added_only) {
+        // Only added levels have left UNDEFINED so far; do not discard them
+        // when initializing the common levels that this copy fills completely.
+        barrier(dst.image, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT, static_cast<std::uint32_t>(nlevels));
+    } else if (partial) {
         barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     } else {
         barrier(dst.image, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -1921,8 +1964,13 @@ bool carry_surface_locked(Surface& dst, const Surface& src) {
         r.extent = {src.levels[l].w_e, src.levels[l].h_e, 1};
         regions.push_back(r);
     }
-    vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL,
-                   static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (texture_stream_enabled()) {
+        rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL,
+                         static_cast<std::uint32_t>(regions.size()), regions.data());
+    } else {
+        vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL,
+                       static_cast<std::uint32_t>(regions.size()), regions.data());
+    }
     barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     // The memory underneath is what it was; only a change to it from here on
     // is a new upload.
@@ -3730,6 +3778,383 @@ bool describe_sampler_locked(VkSampler sampler, VkSamplerCreateInfo& out) {
 
 void forget_view_locked(VkImageView view) { g_view_records.erase(view); }
 
+// Called by --stream-selftest under g.mu. Local source snapshots exercise the
+// production CPU prep without pretending to be kernel-admitted guest mappings.
+bool texture_upload_plan_selftest() {
+    const std::uint64_t validation_before = g_validation_messages.load();
+    bool ok = true;
+    unsigned checks = 0, cases = 0;
+    auto check = [&](bool result, const char* what, std::uint32_t tiling = 0, std::uint32_t esize = 0) {
+        ++checks;
+        if (!result) {
+            ok = false;
+            host_log("texture upload selftest: FAIL %s (tiling %u, esize %u)", what, tiling, esize);
+        }
+    };
+    auto prep_for = [](TexturePrep& p, const Surface& sf, const std::vector<std::uint8_t>& source,
+                       std::uint8_t* dst, std::size_t first, bool hash_only = false) {
+        p.src = source.data();
+        p.base = reinterpret_cast<std::uintptr_t>(source.data());
+        p.dst = dst;
+        p.levels.assign(sf.levels.begin() + first, sf.levels.end());
+        const std::size_t dst_base = sf.levels[first].dst_off;
+        for (auto& lv : p.levels) lv.dst_off -= dst_base;
+        p.slices = sf.slices;
+        p.esize = sf.esize;
+        p.width = sf.width;
+        p.height = sf.height;
+        p.tiling = sf.tiling;
+        p.total_src = sf.total_src;
+        p.total_dst = sf.total_dst - dst_base;
+        p.hash_only = hash_only;
+    };
+    constexpr std::uint32_t modes[] = {8, 9, 13, 5, 0, 14, 10, 2, 3, 4};
+    constexpr std::uint32_t sizes[] = {1, 2, 4, 8, 12, 16};
+    for (const auto tiling : modes) {
+        for (const auto esize : sizes) {
+            Surface sf;
+            sf.type = 13;
+            sf.esize = esize;
+            sf.tiling = tiling;
+            sf.slices = sf.layers = 3;
+            sf.pow2pad = true;
+            const MacroMode mm = macro_mode_for(esize);
+            const bool macro = tiling == 14 || tiling == 10 || tiling == 2 || tiling == 3 || tiling == 4;
+            sf.width = macro ? 64 * mm.aspect + 1 : 35;
+            sf.height = macro ? 8 * mm.bank_height * mm.banks / mm.aspect + 1 : 19;
+            sf.pitch_e = sf.width + 7;
+            compute_levels(sf, 5, 1);
+            std::vector<std::uint8_t> source(sf.total_src);
+            for (std::size_t i = 0; i < source.size(); ++i)
+                source[i] = static_cast<std::uint8_t>((i * 37) ^ (i >> 7) ^ (i >> 15) ^ 0x6d);
+            std::vector<std::uint8_t> reference(sf.total_dst, 0), full(sf.total_dst, 0xcd);
+            bool ref_ok = true;
+            for (const auto& lv : sf.levels) {
+                for (std::uint32_t sl = 0; sl < sf.slices; ++sl) {
+                    ref_ok = untile_slice_reference(reference.data() + lv.dst_off + sl * lv.dst_slice_bytes,
+                                                     source.data() + lv.src_off + sl * lv.src_slice_bytes,
+                                                     lv.src_slice_bytes, lv.tiling, lv.w_e, lv.h_e, lv.pitch_e, esize) && ref_ok;
+                }
+            }
+            check(texture_upload_layouts_supported(sf.levels, esize), "valid whole layout admitted", tiling, esize);
+            check(ref_ok, "reference layout supported", tiling, esize);
+            TexturePrep whole;
+            prep_for(whole, sf, source, full.data(), 0);
+            run_prep(whole);
+            check(full == reference, "production full detile equals per-element reference", tiling, esize);
+            for (const std::size_t first : {std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
+                const std::size_t omitted = sf.levels[first].dst_off;
+                const std::size_t bytes = sf.total_dst - omitted;
+                std::vector<std::uint8_t> compact(bytes + 32, 0xcd);
+                TexturePrep suffix;
+                prep_for(suffix, sf, source, compact.data() + 16, first);
+                run_prep(suffix);
+                check(std::all_of(compact.begin(), compact.begin() + 16, [](auto v) { return v == 0xcd; }) &&
+                          std::all_of(compact.end() - 16, compact.end(), [](auto v) { return v == 0xcd; }),
+                      "compact detile stays inside staging span", tiling, esize);
+                check(std::equal(reference.begin() + omitted, reference.end(), compact.begin() + 16),
+                      "added mip bytes equal full upload", tiling, esize);
+                // Model the carry overwrite with bytes distinct from guest memory.
+                std::vector<std::uint8_t> carried(omitted, 0xa7), before = full, after(sf.total_dst);
+                std::copy(carried.begin(), carried.end(), before.begin());
+                std::copy(carried.begin(), carried.end(), after.begin());
+                std::copy(compact.begin() + 16, compact.end() - 16, after.begin() + omitted);
+                check(before == after, "full upload plus carry equals compact upload plus carry", tiling, esize);
+                check(suffix.content_hash == whole.content_hash && suffix.exact_hash == whole.exact_hash &&
+                          suffix.total_src == sf.total_src && suffix.base == whole.base,
+                      "suffix prep retains whole source identity and hashes", tiling, esize);
+                if (esize == 4 || esize == 8 || esize == 16) {
+                    std::vector<UntileGpuPass> passes;
+                    // Address arithmetic only: src_copy never dereferences guest VA.
+                    constexpr VkDeviceAddress src_addr = 0x100000, dst_addr = 0x800000;
+                    check(gpu_untile_plan(sf, dst_addr, passes, src_addr, static_cast<std::uint32_t>(first)),
+                          "GPU suffix plan admitted", tiling, esize);
+                    bool exact = passes.size() == sf.levels.size() - first;
+                    for (std::size_t i = 0; i < passes.size(); ++i) {
+                        const auto& lv = sf.levels[first + i];
+                        const auto& pass = passes[i];
+                        exact = exact && pass.src == src_addr + lv.src_off && pass.dst == dst_addr + lv.dst_off - omitted &&
+                                pass.src_slice_bytes == lv.src_slice_bytes && pass.dst_slice_bytes == lv.dst_slice_bytes &&
+                                pass.width_e == lv.w_e && pass.height_e == lv.h_e && pass.pitch_e == lv.pitch_e &&
+                                pass.esize == esize && pass.slices == sf.slices;
+                    }
+                    check(exact, "GPU suffix offsets retain absolute source and compact destination", tiling, esize);
+                }
+            }
+            ++cases;
+        }
+    }
+    // A failure in an older mip must still zero valid added mips. The gate
+    // must inspect the whole plan, rather than only the suffix it would upload.
+    for (const std::uint32_t bad : {8u, 13u, 7u, 19u}) {
+        Surface sf;
+        sf.width = 16;
+        sf.height = 16;
+        sf.pitch_e = 16;
+        sf.type = 9;
+        sf.esize = 4;
+        sf.tiling = 8;
+        compute_levels(sf, 3, 1);
+        sf.levels[0].tiling = bad;
+        sf.levels[0].src_slice_bytes = 4;  // linear/thin/thick fail after at most one element
+        std::vector<std::uint8_t> source(sf.total_src, 0x5b), full(sf.total_dst, 0xcd);
+        check(!texture_upload_layouts_supported(sf.levels, sf.esize), "invalid older mip declines suffix", bad, sf.esize);
+        TexturePrep whole;
+        prep_for(whole, sf, source, full.data(), 0);
+        run_prep(whole);
+        check(std::all_of(full.begin(), full.end(), [](auto v) { return v == 0; }),
+              "invalid older mip zeros whole upload including additions", bad, sf.esize);
+        std::vector<Surface::Level> added(sf.levels.begin() + 1, sf.levels.end());
+        check(texture_upload_layouts_supported(added, sf.esize), "valid additions cannot mask invalid older mip", bad, sf.esize);
+    }
+    // Macro detile's out-of-range elements are defined black, even when staging
+    // is reused; this layout is safe to admit despite a truncated source slice.
+    {
+        Surface sf;
+        sf.width = sf.height = 16;
+        sf.pitch_e = 128;
+        sf.type = 9;
+        sf.esize = 4;
+        sf.tiling = 14;
+        sf.levels = {{16, 16, 128, 14, 0, 4, 0, 1024}};
+        sf.total_src = 4;
+        sf.total_dst = 1024;
+        std::vector<std::uint8_t> source(4, 0x5b), full(1024, 0xcd), reference(1024, 0);
+        TexturePrep whole;
+        prep_for(whole, sf, source, full.data(), 0);
+        run_prep(whole);
+        const bool ref_ok = untile_slice_reference(reference.data(), source.data(), 4, 14, 16, 16, 128, 4);
+        check(texture_upload_layouts_supported(sf.levels, 4) && ref_ok && full == reference && full[0] == 0x5b && full[4] == 0,
+              "truncated macro slice writes defined black into reused staging", 14, 4);
+        sf.levels[0].w_e = 0;
+        check(!texture_upload_layouts_supported(sf.levels, 4), "zero extent declines suffix");
+        sf.levels.clear();
+        check(!texture_upload_layouts_supported(sf.levels, 4), "empty plan declines suffix");
+    }
+    // A carried level's source bytes and the sampled hash's blind gaps remain
+    // in the hash-only prep used by GPU detile and in the CPU suffix prep.
+    {
+        Surface sf;
+        sf.width = sf.height = sf.pitch_e = 512;
+        sf.type = 9;
+        sf.esize = 4;
+        sf.tiling = 8;
+        compute_levels(sf, 3, 1);
+        std::vector<std::uint8_t> source(sf.total_src, 0x35), dst(sf.total_dst - sf.levels[2].dst_off);
+        TexturePrep initial, changed, cpu;
+        prep_for(initial, sf, source, nullptr, 2, true);
+        run_prep(initial);
+        source[96] ^= 0x7f;  // older mip, outside the first 64-byte sampled window
+        prep_for(changed, sf, source, nullptr, 2, true);
+        run_prep(changed);
+        prep_for(cpu, sf, source, dst.data(), 2);
+        run_prep(cpu);
+        check(initial.content_hash == changed.content_hash && initial.exact_hash != changed.exact_hash,
+              "whole-source exact hash detects carried mip change outside sampled windows");
+        source[0] ^= 0x3f;
+        TexturePrep sampled;
+        prep_for(sampled, sf, source, nullptr, 2, true);
+        run_prep(sampled);
+        check(sampled.content_hash != changed.content_hash && cpu.content_hash == changed.content_hash &&
+                  cpu.exact_hash == changed.exact_hash,
+              "CPU and GPU hash-only suffix prep both hash carried source levels");
+    }
+    // Real device buffers let the production GPU detile run without importing
+    // a made-up guest VA. Exercise the production common-level image carry,
+    // then upload added mips explicitly: upload_surface's guest mapping/watch
+    // gate and partial-carry ordering are deliberately outside this fixture.
+    const std::uint64_t mappings_before = hle_kernel_maps_generation();
+    if (g.ok && g.device) {
+        const bool gpu_ready = untile_gpu_available_locked();
+        check(gpu_ready, "production GPU detile pipeline available");
+        for (const auto tiling : {8u, 13u, 14u}) {
+            for (const bool on_gpu : {false, true}) {
+                if (on_gpu && !gpu_ready) continue;
+                Surface dst;
+                dst.width = 256;
+                dst.height = 128;
+                dst.pitch_e = 256;
+                dst.type = 13;
+                dst.tiling = tiling;
+                dst.esize = 4;
+                dst.slices = dst.layers = 2;
+                dst.format = VK_FORMAT_R32_UINT;
+                compute_levels(dst, 3, 1);
+                const auto all_levels = dst.levels;
+                const std::size_t omitted = dst.levels[1].dst_off;
+                const std::size_t suffix_bytes = dst.total_dst - omitted;
+                std::vector<std::uint8_t> source(dst.total_src), expected(dst.total_dst, 0);
+                for (std::size_t i = 0; i < source.size(); ++i)
+                    source[i] = static_cast<std::uint8_t>((i * 17) ^ (i >> 11) ^ 0x53);
+                TexturePrep cpu;
+                prep_for(cpu, dst, source, expected.data(), 0);
+                run_prep(cpu);
+                // Distinguish the shader-written common level from guest bytes.
+                for (std::size_t i = 0; i < omitted; ++i) expected[i] ^= 0xb6;
+                dst.base = reinterpret_cast<std::uintptr_t>(source.data());
+                Surface src = dst;
+                src.gpu_written = true;
+                src.levels.resize(1);
+                dst.levels.resize(1);  // common-only carry needs no admitted guest mapping
+                VkDeviceMemory src_mem = VK_NULL_HANDLE, dst_mem = VK_NULL_HANDLE;
+                DevBuffer tiled, linear, readback;
+                auto make_image = [&](Surface& sf, std::uint32_t levels, VkDeviceMemory& memory) {
+                    auto& ci = sf.info;
+                    ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                    ci.imageType = VK_IMAGE_TYPE_2D;
+                    ci.format = sf.format;
+                    ci.extent = {sf.width, sf.height, 1};
+                    ci.mipLevels = levels;
+                    ci.arrayLayers = sf.layers;
+                    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+                    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                    if (vkCreateImage(g.device, &ci, nullptr, &sf.image) != VK_SUCCESS) return false;
+                    VkMemoryRequirements req{};
+                    vkGetImageMemoryRequirements(g.device, sf.image, &req);
+                    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = req.size;
+                    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    return ai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(g.device, &ai, nullptr, &memory) == VK_SUCCESS &&
+                           vkBindImageMemory(g.device, sf.image, memory, 0) == VK_SUCCESS;
+                };
+                const bool setup = make_image(src, 1, src_mem) && make_image(dst, 3, dst_mem) &&
+                                   create_dev_buffer(tiled, dst.total_src, true, true) &&
+                                   create_dev_buffer(linear, dst.total_dst + 32, true, true) &&
+                                   create_dev_buffer(readback, dst.total_dst, true, true) && tiled.map && linear.map && readback.map;
+                check(setup, "GPU carry/upload fixture allocated", tiling, 4);
+                if (setup) {
+                    std::memcpy(tiled.map, source.data(), source.size());
+                    std::memset(linear.map, 0xcd, linear.size);
+                    std::memcpy(static_cast<std::uint8_t*>(linear.map) + 16, expected.data(), expected.size());
+                    std::memset(readback.map, 0xcd, readback.size);
+                    begin_recording_locked();
+                    render_end_pass_locked();
+                    auto memory_barrier = [&](VkAccessFlags from, VkAccessFlags to, VkPipelineStageFlags a, VkPipelineStageFlags b) {
+                        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                        mb.srcAccessMask = from;
+                        mb.dstAccessMask = to;
+                        rec().pipeline_barrier(a, b, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                    };
+                    auto image_barrier = [&](VkImage image, VkImageLayout from, VkImageLayout to, std::uint32_t first,
+                                             std::uint32_t count, VkAccessFlags a, VkAccessFlags b) {
+                        VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                        ib.oldLayout = from;
+                        ib.newLayout = to;
+                        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        ib.image = image;
+                        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, first, count, 0, dst.layers};
+                        ib.srcAccessMask = a;
+                        ib.dstAccessMask = b;
+                        rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               0, 0, nullptr, 0, nullptr, 1, &ib);
+                    };
+                    memory_barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                   VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    image_barrier(src.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 1,
+                                  0, VK_ACCESS_TRANSFER_WRITE_BIT);
+                    std::vector<VkBufferImageCopy> common;
+                    for (std::uint32_t sl = 0; sl < dst.layers; ++sl) {
+                        VkBufferImageCopy r{};
+                        r.bufferOffset = 16 + sl * all_levels[0].dst_slice_bytes;
+                        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sl, 1};
+                        r.imageExtent = {dst.width, dst.height, 1};
+                        common.push_back(r);
+                    }
+                    rec().copy_buffer_to_image(linear.buffer, src.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                              static_cast<std::uint32_t>(common.size()), common.data());
+                    image_barrier(src.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, 0, 1,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    const bool carried = carry_surface_locked(dst, src);
+                    check(carried, "production common mip carry recorded", tiling, 4);
+                    dst.levels = all_levels;
+                    // Finish the common copy before reusing the linear buffer.
+                    memory_barrier(VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    std::vector<UntileGpuPass> passes;
+                    const bool planned = gpu_untile_plan(dst, linear.address + 16, passes, tiled.address, 1);
+                    check(planned, "real device-address suffix plan admitted", tiling, 4);
+                    if (on_gpu && planned) {
+                        for (const auto& pass : passes) untile_gpu_record_locked(pass);
+                        memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    }
+                    // CPU compact output occupies a different span, so it cannot
+                    // race the earlier common-level upload's read of linear.
+                    DevBuffer cpu_suffix;
+                    bool suffix_ready = on_gpu;
+                    if (!on_gpu) {
+                        suffix_ready = create_dev_buffer(cpu_suffix, suffix_bytes, true, true) && cpu_suffix.map;
+                        if (suffix_ready) {
+                            TexturePrep suffix;
+                            prep_for(suffix, dst, source, static_cast<std::uint8_t*>(cpu_suffix.map), 1);
+                            run_prep(suffix);
+                            memory_barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                           VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        }
+                    }
+                    check(suffix_ready, "suffix staging ready", tiling, 4);
+                    if (carried && suffix_ready && (!on_gpu || planned)) {
+                        image_barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, 2,
+                                      0, VK_ACCESS_TRANSFER_WRITE_BIT);
+                        std::vector<VkBufferImageCopy> added, reads;
+                        for (std::uint32_t l = 0; l < all_levels.size(); ++l) {
+                            for (std::uint32_t sl = 0; sl < dst.layers; ++sl) {
+                                VkBufferImageCopy r{};
+                                r.bufferOffset = all_levels[l].dst_off + sl * all_levels[l].dst_slice_bytes;
+                                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, sl, 1};
+                                r.imageExtent = {std::max(1u, dst.width >> l), std::max(1u, dst.height >> l), 1};
+                                reads.push_back(r);
+                                if (l) {
+                                    r.bufferOffset = (on_gpu ? 16 : 0) + r.bufferOffset - omitted;
+                                    added.push_back(r);
+                                }
+                            }
+                        }
+                        rec().copy_buffer_to_image(on_gpu ? linear.buffer : cpu_suffix.buffer, dst.image,
+                                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                  static_cast<std::uint32_t>(added.size()), added.data());
+                        image_barrier(dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, 1, 2,
+                                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                        image_barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, 0, 3,
+                                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                        rec().copy_image_to_buffer(dst.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer,
+                                                  static_cast<std::uint32_t>(reads.size()), reads.data());
+                        memory_barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+                        flush_locked();
+                        check(g.ok && std::memcmp(readback.map, expected.data(), expected.size()) == 0,
+                              on_gpu ? "GPU suffix upload plus actual carry matches all mip/layer bytes"
+                                     : "CPU suffix upload plus actual carry matches all mip/layer bytes", tiling, 4);
+                    } else {
+                        flush_locked();
+                    }
+                    if (cpu_suffix.map) vkUnmapMemory(g.device, cpu_suffix.memory);
+                    if (cpu_suffix.buffer) vkDestroyBuffer(g.device, cpu_suffix.buffer, nullptr);
+                    if (cpu_suffix.memory) vkFreeMemory(g.device, cpu_suffix.memory, nullptr);
+                }
+                for (auto* b : {&tiled, &linear, &readback}) {
+                    if (b->map) vkUnmapMemory(g.device, b->memory);
+                    if (b->buffer) vkDestroyBuffer(g.device, b->buffer, nullptr);
+                    if (b->memory) vkFreeMemory(g.device, b->memory, nullptr);
+                }
+                if (src.image) vkDestroyImage(g.device, src.image, nullptr);
+                if (dst.image) vkDestroyImage(g.device, dst.image, nullptr);
+                if (src_mem) vkFreeMemory(g.device, src_mem, nullptr);
+                if (dst_mem) vkFreeMemory(g.device, dst_mem, nullptr);
+            }
+        }
+    } else {
+        host_log("texture upload selftest: GPU fixtures skipped (no initialized device)");
+    }
+    check(hle_kernel_maps_generation() == mappings_before, "selftest preserves guest mapping registry");
+    check(g_validation_messages.load() == validation_before, "GPU fixtures emit no Vulkan validation messages");
+    host_log("texture upload selftest: %s, %u checks across %u mip-chain layouts (CPU detile/reference, compact carry model, fallback, whole-source hashes, GPU plan offsets; device-buffer carry/upload)",
+             ok ? "PASS" : "FAIL", checks, cases);
+    return ok;
+}
+
 std::uint64_t textures_upload_count() { return g_uploads.load(); }
 void textures_time_us(std::uint64_t out[5]) {
     out[0] = g_tex_image_us.load();
@@ -3824,6 +4249,11 @@ void textures_report() {
                  g_gpu_untile, static_cast<unsigned long long>(g_gpu_untiled.load()), static_cast<unsigned long long>(g_gpu_untiled_bytes.load() >> 20),
                  static_cast<unsigned long long>(g_gpu_untile_declined.load()), static_cast<unsigned long long>(g_untiled_vram.load()),
                  static_cast<unsigned long long>(g_untiled_vram_bytes.load() >> 20), untile_gpu_report().c_str());
+    }
+    if (g_texture_upload_stats) {
+        host_log("texture: carry uploads added-mips-only=%llu whole=%llu omitted detile/staging/upload=%llu bytes (BBHOST_CARRY_ADDED_MIPS=%d)",
+                 static_cast<unsigned long long>(g_carry_added_uploads.load()), static_cast<unsigned long long>(g_carry_whole_uploads.load()),
+                 static_cast<unsigned long long>(g_carry_omitted_bytes.load()), g_carry_added_mips ? 1 : 0);
     }
     {
         // Who takes the faults still in the ring (the last 16384), as Binary

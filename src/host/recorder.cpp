@@ -109,6 +109,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     VkPipeline pipeline = VK_NULL_HANDLE;  // null: keep the bound one
     bool library = false;
     DrawLibraryState lib{};
+    std::uint32_t library_fields = kLibraryAll;
     bool has_depth_bounds = false;
     bool bind_sets = false;
     bool bindless = false;  // set 3, the global views and samplers, too
@@ -330,7 +331,7 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         vkCmdBeginRendering(cmd, &p.rendering);
     }
     if (p.pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-    if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
+    if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds, p.library_fields);
     if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
     if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
     if (p.pushes) {
@@ -1406,12 +1407,14 @@ void DrawCmds::bind_pipeline(VkPipeline pipeline) {
     static_cast<DrawPacket*>(packet_)->pipeline = pipeline;
 }
 
-void DrawCmds::library_state(const DrawLibraryState& s, bool has_depth_bounds) {
+void DrawCmds::library_state(const DrawLibraryState& s, bool has_depth_bounds, std::uint32_t fields) {
+    if (!fields) return;
     if (!packet_) {
-        record_library_state(g_cmd(), s, has_depth_bounds);
+        record_library_state(g_cmd(), s, has_depth_bounds, fields);
         return;
     }
     DrawPacket& p = *static_cast<DrawPacket*>(packet_);
+    p.library_fields = p.library ? p.library_fields | fields : fields;
     p.library = true;
     p.lib = s;
     p.has_depth_bounds = has_depth_bounds;
@@ -1634,18 +1637,41 @@ bool DrawCmds::begin_rendering(const VkRenderingInfo& ri) {
 
 // ---- the commands themselves, shared by both paths ----
 
-void record_library_state(VkCommandBuffer cmd, const DrawLibraryState& s, bool has_depth_bounds) {
-    vkCmdSetCullMode(cmd, s.cull);
-    vkCmdSetFrontFace(cmd, s.front);
-    vkCmdSetDepthTestEnable(cmd, s.depth_test);
-    vkCmdSetDepthWriteEnable(cmd, s.depth_write);
-    vkCmdSetDepthCompareOp(cmd, s.depth_compare);
-    if (has_depth_bounds) vkCmdSetDepthBoundsTestEnable(cmd, s.bounds_test);
-    vkCmdSetStencilTestEnable(cmd, s.stencil_test);
-    vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, s.front_ops.failOp, s.front_ops.passOp, s.front_ops.depthFailOp, s.front_ops.compareOp);
-    vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, s.back_ops.failOp, s.back_ops.passOp, s.back_ops.depthFailOp, s.back_ops.compareOp);
-    vkCmdSetDepthBias(cmd, s.bias_constant, s.bias_clamp, s.bias_slope);
-    if (g.dynamic_depth_clamp) g.cmd_set_depth_clamp_enable(cmd, s.depth_clamp);
+std::uint32_t draw_library_changes(const DrawLibraryState& a, const DrawLibraryState& b) {
+    std::uint32_t fields = 0;
+    if (a.cull != b.cull) fields |= kLibraryCull;
+    if (a.front != b.front) fields |= kLibraryFront;
+    if (a.depth_test != b.depth_test) fields |= kLibraryDepthTest;
+    if (a.depth_write != b.depth_write) fields |= kLibraryDepthWrite;
+    if (a.depth_compare != b.depth_compare) fields |= kLibraryDepthCompare;
+    if (a.bounds_test != b.bounds_test) fields |= kLibraryBoundsTest;
+    if (a.stencil_test != b.stencil_test) fields |= kLibraryStencilTest;
+    auto ops_differ = [](const VkStencilOpState& x, const VkStencilOpState& y) {
+        return x.failOp != y.failOp || x.passOp != y.passOp || x.depthFailOp != y.depthFailOp || x.compareOp != y.compareOp;
+    };
+    if (ops_differ(a.front_ops, b.front_ops)) fields |= kLibraryFrontOps;
+    if (ops_differ(a.back_ops, b.back_ops)) fields |= kLibraryBackOps;
+    if (std::memcmp(&a.bias_constant, &b.bias_constant, sizeof(float)) ||
+        std::memcmp(&a.bias_clamp, &b.bias_clamp, sizeof(float)) ||
+        std::memcmp(&a.bias_slope, &b.bias_slope, sizeof(float))) fields |= kLibraryBias;
+    if (a.depth_clamp != b.depth_clamp) fields |= kLibraryDepthClamp;
+    return fields;
+}
+
+void record_library_state(VkCommandBuffer cmd, const DrawLibraryState& s, bool has_depth_bounds, std::uint32_t fields) {
+    if (fields & kLibraryCull) vkCmdSetCullMode(cmd, s.cull);
+    if (fields & kLibraryFront) vkCmdSetFrontFace(cmd, s.front);
+    if (fields & kLibraryDepthTest) vkCmdSetDepthTestEnable(cmd, s.depth_test);
+    if (fields & kLibraryDepthWrite) vkCmdSetDepthWriteEnable(cmd, s.depth_write);
+    if (fields & kLibraryDepthCompare) vkCmdSetDepthCompareOp(cmd, s.depth_compare);
+    if (has_depth_bounds && (fields & kLibraryBoundsTest)) vkCmdSetDepthBoundsTestEnable(cmd, s.bounds_test);
+    if (fields & kLibraryStencilTest) vkCmdSetStencilTestEnable(cmd, s.stencil_test);
+    if (fields & kLibraryFrontOps)
+        vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, s.front_ops.failOp, s.front_ops.passOp, s.front_ops.depthFailOp, s.front_ops.compareOp);
+    if (fields & kLibraryBackOps)
+        vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, s.back_ops.failOp, s.back_ops.passOp, s.back_ops.depthFailOp, s.back_ops.compareOp);
+    if (fields & kLibraryBias) vkCmdSetDepthBias(cmd, s.bias_constant, s.bias_clamp, s.bias_slope);
+    if (g.dynamic_depth_clamp && (fields & kLibraryDepthClamp)) g.cmd_set_depth_clamp_enable(cmd, s.depth_clamp);
 }
 
 void record_stencil_words(VkCommandBuffer cmd, const std::uint32_t w[6]) {

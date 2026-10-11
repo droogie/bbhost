@@ -178,7 +178,8 @@ thread_local std::uint8_t* t_guest_teb = nullptr;  // GS mode: the TEB stand-in
 // Windows dispatches an exception only while rsp lies inside the TEB's
 // stack limits, so the switch to the host stack moves those limits with it
 // (hle_host_stack_enter) and back on the outermost return
-// (hle_host_stack_leave); the guest's own are kept here meanwhile.
+// (hle_host_stack_leave); raw longjmp restores the saved limits and depth
+// when it bypasses that return path. The guest's own are kept here meanwhile.
 thread_local void* t_guest_stack_base = nullptr;
 thread_local void* t_guest_stack_limit = nullptr;
 thread_local int t_host_stack_depth = 0;
@@ -663,9 +664,27 @@ hle_call_guest6:
 extern "C" void hle_thunk_common();
 
 // jmp_buf: [0] rbx [1] rbp [2] r12 [3] r13 [4] r14 [5] r15 [6] rsp-after-ret
-// [7] return address [8] mxcsr (low 32) + x87 cw (high 16). 72 of the 96
-// bytes FreeBSD reserves.
+// [7] return address [8] mxcsr (low 32) + x87 cw (next 16). The first 72
+// bytes have the same layout on both platforms. Windows uses the remaining
+// three qwords of FreeBSD's 96-byte buffer for TEB stack bounds and HLE depth.
 #if defined(_WIN32)
+extern "C" GUEST_ABI void hle_jmp_stack_save(std::uint64_t* buf) {
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    buf[9] = reinterpret_cast<std::uint64_t>(tib->StackBase);
+    buf[10] = reinterpret_cast<std::uint64_t>(tib->StackLimit);
+    buf[11] = static_cast<std::uint64_t>(t_host_stack_depth);
+}
+
+extern "C" GUEST_ABI void hle_jmp_stack_restore(const std::uint64_t* buf) {
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    tib->StackBase = reinterpret_cast<void*>(buf[9]);
+    tib->StackLimit = reinterpret_cast<void*>(buf[10]);
+    t_host_stack_depth = static_cast<int>(buf[11]);
+    // At a nonzero depth the destination is still on the HLE stack; the
+    // outer thunk's guest bounds remain in t_guest_stack_base/limit for its
+    // eventual normal return. At depth zero the next enter saves them anew.
+}
+
 asm(R"(
     .text
     .globl hle_setjmp_raw
@@ -682,11 +701,22 @@ hle_setjmp_raw:
     mov %rax, 56(%rdi)
     stmxcsr 64(%rdi)
     fnstcw 68(%rdi)
+    push %rdi
+    call hle_jmp_stack_save
+    pop %rdi
     xor %eax, %eax
     ret
 
     .globl hle_longjmp_raw
 hle_longjmp_raw:
+    # Keep both SysV arguments across the helper, with a 16-byte-aligned call.
+    sub $24, %rsp
+    mov %rdi, 0(%rsp)
+    mov %esi, 8(%rsp)
+    call hle_jmp_stack_restore
+    mov 0(%rsp), %rdi
+    mov 8(%rsp), %esi
+    add $24, %rsp
     mov 0(%rdi), %rbx
     mov 8(%rdi), %rbp
     mov 16(%rdi), %r12

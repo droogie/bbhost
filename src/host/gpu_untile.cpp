@@ -6,6 +6,7 @@
 // device address and writes the linear elements into the same staging span;
 // the copy into the image stays as it was (textures.cpp, upload_surface).
 #include "host/gpu_internal.h"
+#include "host/texture_upload_plan.h"
 #include "host/shaders/untile.spv.h"
 #include "log.h"
 
@@ -65,10 +66,16 @@ bool untile_gpu_available_locked() {
 void untile_gpu_record_locked(const UntileGpuPass& pass) {
     const Push push{pass.src,     pass.dst,  pass.src_slice_bytes, pass.dst_slice_bytes, pass.width_e, pass.height_e,
                     pass.pitch_e, pass.esize, pass.mode,           pass.bank_height,     pass.aspect,  pass.banks};
-    VkCommandBuffer cmd = g_cmd();
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
-    vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd, (pass.width_e + 7) / 8, (pass.height_e + 7) / 8, pass.slices);
+    if (texture_stream_enabled()) {
+        rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
+        rec().push_constants(g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        rec().dispatch((pass.width_e + 7) / 8, (pass.height_e + 7) / 8, pass.slices);
+    } else {
+        VkCommandBuffer cmd = g_cmd();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
+        vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (pass.width_e + 7) / 8, (pass.height_e + 7) / 8, pass.slices);
+    }
 }
 
 void untile_checks_run_locked(std::vector<UntileCheck>& checks) {

@@ -1386,6 +1386,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                 (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    r.usage = ici.usage;
+    r.samples = ici.samples;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) {
         host_log("render: image creation failed (format %d %ux%u)", format, width, height);
@@ -7268,7 +7270,8 @@ RtImage* find_render_target(std::uint64_t base) {
     return st == g_snapshots.end() ? nullptr : &st->second;
 }
 
-bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes) {
+bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, RenderCopyRoute* route) {
+    if (route) *route = RenderCopyRoute::Unknown;
     // BBHOST_WATCH_COPY_DST=0x<base>: every whole-target copy into that
     // address, with the flip. A frame can go wrong without any draw being
     // different - the engine also moves whole surfaces around, and a copy from
@@ -7341,6 +7344,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         // A depth snapshot is written by the copy's compute pass (depth_copy.cpp).
         r.storage = from_depth && depth_copy_available_locked();
         if (r.storage) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        r.usage = ici.usage;
+        r.samples = ici.samples;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) return false;
         if (!rt_image_memory(r.image, r.memory)) {
@@ -7392,8 +7397,41 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         dst.initialised = true;
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    // maintenance8 makes the depth aspect of D32/D32S8 bitwise compatible
+    // with R32. Keep the compute/buffer routes on older devices or images
+    // whose actual creation metadata does not establish copy legality.
+    static const bool direct_depth_copy = [] {
+        const char* e = std::getenv("BBHOST_DEPTH_DIRECT_COPY");
+        return !(e && e[0] == '0');
+    }();
+    const auto separate_memory = [](const RtImage& a, const RtImage& b) {
+        if (!a.memory.memory || !b.memory.memory) return false;
+        if (a.memory.memory != b.memory.memory) return true;
+        return a.memory.offset <= b.memory.offset ? a.memory.size <= b.memory.offset - a.memory.offset
+                                                 : b.memory.size <= a.memory.offset - b.memory.offset;
+    };
+    bool by_direct = from_depth && direct_depth_copy && g.maintenance8_enabled &&
+        dst.format == VK_FORMAT_R32_SFLOAT && src.samples == VK_SAMPLE_COUNT_1_BIT && dst.samples == src.samples &&
+        (src.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (dst.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+        src.width == dst.width && src.height == dst.height && src.image != dst.image && separate_memory(src, dst);
+    if (by_direct) {
+        static VkPhysicalDevice cached_device = VK_NULL_HANDLE;
+        static std::map<VkFormat, VkFormatFeatureFlags> features;
+        if (cached_device != g.phys) { features.clear(); cached_device = g.phys; }
+        const auto optimal_features = [&](VkFormat format) {
+            auto [it, inserted] = features.try_emplace(format, 0);
+            if (inserted) {
+                VkFormatProperties properties{};
+                vkGetPhysicalDeviceFormatProperties(g.phys, format, &properties);
+                it->second = properties.optimalTilingFeatures;
+            }
+            return it->second;
+        };
+        by_direct = (optimal_features(src.format) & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) &&
+                    (optimal_features(dst.format) & VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+    }
     // A depth plane into a snapshot made for it: one compute pass.
-    const bool by_compute = from_depth && dst.storage && depth_copy_available_locked();
+    const bool by_compute = !by_direct && from_depth && dst.storage && depth_copy_available_locked();
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = by_compute ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -7402,11 +7440,12 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     static std::map<std::string, std::string> copy_names;
     if (g.profile) {
         char key[96];
-        std::snprintf(key, sizeof(key), "rt-copy-%s-%ux%u-f%d", by_compute ? "depth-compute" : from_depth ? "depth" : "colour", src.width,
+        std::snprintf(key, sizeof(key), "rt-copy-%s-%ux%u-f%d", by_direct ? "depth-direct" : by_compute ? "depth-compute" : from_depth ? "depth" : "colour", src.width,
                       src.height, static_cast<int>(src.format));
         profile_begin_locked(&copy_names.emplace(key, key).first->second);
     }
     if (by_compute && depth_copy_record_locked(src.image, src.format, dst.image, src.width, src.height)) {
+        if (route) *route = RenderCopyRoute::DepthCompute;
         if (g.profile) profile_end_locked();
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -7422,8 +7461,16 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
-    if (from_depth) {
-        // Depth and colour formats cannot be copied image-to-image: go through a
+    if (by_direct) {
+        if (route) *route = RenderCopyRoute::DepthDirect;
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {src.width, src.height, 1};
+        rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    } else if (from_depth) {
+        if (route) *route = RenderCopyRoute::DepthBuffer;
+        // Without maintenance8, depth and colour formats cannot be copied image-to-image: go through a
         // buffer. One, kept and grown: a buffer allocated per copy and freed
         // at the slot's retirement was ~4% of the command processor in the
         // world (vkAllocateMemory and vkFreeMemory, several copies a frame).
@@ -7450,6 +7497,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         rec().copy_buffer_to_image(scratch.buffer, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
     } else {
+        if (route) *route = RenderCopyRoute::Colour;
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -7464,6 +7512,19 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     dst.fill_last = false;
     g_rt_copies.fetch_add(1);
     return true;
+}
+
+// Register borrowed fixture images only while calling the real copy route.
+// RtImage owns no RAII handles; erasing these entries does not destroy images.
+bool render_depth_snapshot_selftest_locked(const RtImage& source, const RtImage& destination, RenderCopyRoute& route) {
+    constexpr std::uint64_t src_base = 0x7ffe00000000ull, dst_base = src_base + 0x1000000;
+    if (g_rts.count(src_base) || g_rts.count(dst_base) || g_snapshots.count(dst_base)) return false;
+    g_rts.emplace(src_base, source);
+    g_rts.emplace(dst_base, destination);
+    const bool ok = render_copy_target_locked(src_base, dst_base, std::size_t(source.width) * source.height * 4, &route);
+    g_rts.erase(src_base);
+    g_rts.erase(dst_base);
+    return ok;
 }
 
 bool resolve_resource(const gcn::ResourcePath& path, const std::uint32_t* user, int ndw, std::uint32_t* out,
@@ -7934,6 +7995,7 @@ struct RecordedState {
     // Pipelines linked from libraries: the state they take per draw.
     bool library_set = false;
     DrawLibraryState library{};
+    DrawBindingState bindings{};
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
@@ -13085,11 +13147,15 @@ static bool draw_impl(const GpuDraw& d) {
         // them all again, not only what changed.
         if (!bind_pl->library) g_recorded.library_set = false;
     }
+    const VkPipelineLayout draw_layout = bind_pl->layout ? bind_pl->layout : g.gfx_pipe_layout;
+    // Even a compatible but different layout conservatively forces all library
+    // state. This also invalidates higher sets before rebinding sets 0/1.
+    if (g_recorded.bindings.layout != draw_layout) g_recorded.library_set = false;
+    g_recorded.bindings.use_layout(draw_layout);
     if (bind_pl->library) {  // BBHOST_PIPELINE_LIBRARY: rasterizer, depth and stencil state per draw
         GfxFixedState d;
         fixed_raster_depth(s, d);
         DrawLibraryState now;
-        std::memset(&now, 0, sizeof(now));  // padding compares too
         now.cull = d.cull_mode;
         now.front = d.front_face;
         now.depth_test = d.depth_test;
@@ -13110,15 +13176,29 @@ static bool draw_impl(const GpuDraw& d) {
             now.bias_slope = d.bias_slope;
         }
         now.depth_clamp = g.dynamic_depth_clamp && d.depth_clamp ? VK_TRUE : VK_FALSE;
-        if (!g_recorded.library_set || std::memcmp(&g_recorded.library, &now, sizeof(now)) != 0) {
-            cmds.library_state(now, g.has_depth_bounds);
+        static const bool fieldwise = [] {
+            const char* e = std::getenv("BBHOST_DYNAMIC_FIELDS");
+            return !(e && e[0] == '0');
+        }();
+        std::uint32_t fields = !g_recorded.library_set ? kLibraryAll : draw_library_changes(g_recorded.library, now);
+        if (!fieldwise && fields) fields = kLibraryAll;
+        if (fields) {
+            cmds.library_state(now, g.has_depth_bounds, fields);
             g_recorded.library = now;
             g_recorded.library_set = true;
         }
     }
     const std::uint32_t params_offsets[2] = {static_cast<std::uint32_t>(ubi[0].offset), static_cast<std::uint32_t>(ubi[1].offset)};
-    const VkPipelineLayout draw_layout = bind_pl->layout ? bind_pl->layout : g.gfx_pipe_layout;
-    cmds.bind_sets(draw_layout, sets, set_cache_on() ? params_offsets : nullptr, bind_pl->vs.meta().bindless);
+    static const bool dedup_bindings = [] {
+        const char* e = std::getenv("BBHOST_DRAW_BINDING_DEDUP");
+        return !(e && e[0] == '0');
+    }();
+    const bool bind_global = bind_pl->vs.meta().bindless &&
+                             (g_recorded.bindings.bind_global(g.bindless_set) || !dedup_bindings);
+    // Never suppress sets 0/1: identical image descriptors do not imply equal
+    // params dynamic offsets. With the exact layout retained, this bind cannot
+    // disturb set 2 or set 3; a later set-2 push uses that same layout as well.
+    cmds.bind_sets(draw_layout, sets, set_cache_on() ? params_offsets : nullptr, bind_global);
     if (cb_push_on() && any_buffers) {
         // The draw's constant buffers, each bound over its own range.
         std::uint32_t bindings[2 * gcn::kMaxBuffers];
@@ -13131,7 +13211,8 @@ static bool draw_impl(const GpuDraw& d) {
                 ranges[n] = buffer_infos[stage_first_buffer[st] + i];
             }
         }
-        cmds.push_buffers(draw_layout, bindings, ranges, n);
+        if (g_recorded.bindings.push(bindings, ranges, n) || !dedup_bindings)
+            cmds.push_buffers(draw_layout, bindings, ranges, n);
     }
     draw_stamp.to(kRenderCostBindCmds);
     // Viewport: screen = offset + ndc * scale (y scale is negative on GCN for a y-down framebuffer).
@@ -13234,7 +13315,9 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     if (use_vertex_input) {
-        cmds.vertex_buffers(static_cast<std::uint32_t>(vertex_input.bindings.size()), vertex_input.buffer, vertex_input.offset);
+        const auto n = static_cast<std::uint32_t>(vertex_input.bindings.size());
+        if (g_recorded.bindings.vertex(vertex_input.buffer, vertex_input.offset, n) || !dedup_bindings)
+            cmds.vertex_buffers(n, vertex_input.buffer, vertex_input.offset);
     }
     draw_stamp.to(kRenderCostGeometry);
     if (g.cmd_buffer_marker) {

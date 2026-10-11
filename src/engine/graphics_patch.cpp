@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -87,7 +88,7 @@ constexpr std::uint64_t kCaCopy = 0x269faa8;
 // mov eax, [rbp-0xa70] ; mov [rbx+0xac], eax
 const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0x83, 0xac, 0x00, 0x00, 0x00};
 
-std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
+std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's writable data page
 std::atomic<std::uint64_t> g_seen_serial{0};
 std::atomic<bool> g_ssao{true}, g_aa{true};
 
@@ -260,16 +261,23 @@ void set_chromatic_aberration(bool on) {
     if (g_ca_mask->exchange(want) != want) host_log("graphics: chromatic aberration %s", on ? "on" : "off");
 }
 
-// The copy, through the mask. The stub has to be within a rel32 of the code,
-// so its page comes from the low 2 GiB.
+void* alloc_exec_near(std::uint64_t at, std::size_t size = 0x1000);
+
+// The copy, through the mask. Both jumps must fit a rel32, including when
+// Windows places the guest above 4 GiB. Keep the live mask writable while
+// the stub's instructions are read/execute only.
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
+    constexpr std::size_t kPageSize = 0x1000, kAllocationSize = 2 * kPageSize;
+    constexpr std::size_t kMaskAt = kPageSize, kStubSize = 25;
+    void* page = alloc_exec_near(at, kAllocationSize);
+    if (!page) return false;
+    const auto release = [&] {
 #if defined(_WIN32)
-    (void)image;
-    (void)at;
-    return false;
+        VirtualFree(page, 0, MEM_RELEASE);
 #else
-    void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (page == MAP_FAILED) return false;
+        munmap(page, kAllocationSize);
+#endif
+    };
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
     const std::uint64_t back = at + sizeof(kCaCopyBytes);
@@ -280,38 +288,78 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
         return true;
     };
     std::int32_t to_stub = 0, to_back = 0, to_mask = 0;
-    constexpr std::size_t kMaskAt = 0x40;
     // mov eax, [rbp-0xa70]
     std::memcpy(c, kCaCopyBytes, 6);
+    // The displaced MOVs leave flags intact; the mask's AND must too.
+    c[6] = 0x9c;  // pushfq
     // and eax, [rip+mask]
-    c[6] = 0x23;
-    c[7] = 0x05;
+    c[7] = 0x23;
+    c[8] = 0x05;
+    c[13] = 0x9d;  // popfq
     // mov [rbx+0xac], eax
-    std::memcpy(c + 12, kCaCopyBytes + 6, 6);
+    std::memcpy(c + 14, kCaCopyBytes + 6, 6);
     // jmp back
-    c[18] = 0xe9;
-    if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
+    c[20] = 0xe9;
+    if (!rel32(stub + 13, stub + kMaskAt, &to_mask) || !rel32(stub + kStubSize, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
-        munmap(page, 0x1000);
+        release();
         return false;
     }
-    std::memcpy(c + 8, &to_mask, 4);
-    std::memcpy(c + 19, &to_back, 4);
-    g_ca_mask = reinterpret_cast<std::atomic<std::uint32_t>*>(c + kMaskAt);
-    g_ca_mask->store(0xffffffffu);
+    std::memcpy(c + 9, &to_mask, 4);
+    std::memcpy(c + 21, &to_back, 4);
+    auto* mask = new (c + kMaskAt) std::atomic<std::uint32_t>{0xffffffffu};
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free, "the stub reads the mask as one aligned dword");
+#if defined(_WIN32)
+    DWORD old = 0;
+    if (!VirtualProtect(c + kMaskAt, kPageSize, PAGE_READWRITE, &old) ||
+        !VirtualProtect(c, kPageSize, PAGE_EXECUTE_READ, &old) ||
+        !FlushInstructionCache(GetCurrentProcess(), c, kStubSize)) {
+        release();
+        return false;
+    }
+#else
+    if (mprotect(c + kMaskAt, kPageSize, PROT_READ | PROT_WRITE) != 0 ||
+        mprotect(c, kPageSize, PROT_READ | PROT_EXEC) != 0) {
+        release();
+        return false;
+    }
+#endif
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
+#if defined(_WIN32)
+    auto* code_page = guest_ptr(image->mem, lo);
+    DWORD code_protection = 0;
+    if (!VirtualProtect(code_page, hi - lo, PAGE_EXECUTE_READWRITE, &code_protection)) {
+#else
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
-        g_ca_mask = nullptr;
-        munmap(page, 0x1000);
+#endif
+        release();
         return false;
     }
     p[0] = 0xe9;  // jmp stub
     std::memcpy(p + 1, &to_stub, 4);
     std::memset(p + 5, 0x90, sizeof(kCaCopyBytes) - 5);
-    guest_protect_rx(&image->mem, lo, hi - lo);
-    return true;
+#if defined(_WIN32)
+    if (!FlushInstructionCache(GetCurrentProcess(), p, sizeof(kCaCopyBytes)) ||
+        !VirtualProtect(code_page, hi - lo, code_protection, &old)) {
+        // Installation runs before guest threads start. Revert before freeing
+        // the stub so a failed install never leaves a jump into freed memory.
+        std::memcpy(p, kCaCopyBytes, sizeof(kCaCopyBytes));
+        FlushInstructionCache(GetCurrentProcess(), p, sizeof(kCaCopyBytes));
+        VirtualProtect(code_page, hi - lo, code_protection, &old);
+        release();
+        return false;
+    }
+#else
+    if (!guest_protect_rx(&image->mem, lo, hi - lo)) {
+        std::memcpy(p, kCaCopyBytes, sizeof(kCaCopyBytes));
+        guest_protect_rx(&image->mem, lo, hi - lo);
+        release();
+        return false;
+    }
 #endif
+    g_ca_mask = mask;  // publish only after the complete patch is executable
+    return true;
 }
 
 std::atomic<bool> g_motion_blur{true};
@@ -759,22 +807,31 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
 
 // An executable page within a rel32 of `at`, for a stub a jump or call there
 // can reach. Null when none is free.
-void* alloc_exec_near(std::uint64_t at) {
+void* alloc_exec_near(std::uint64_t at, std::size_t size) {
 #if defined(_WIN32)
     // Downwards from `at` and then upwards, a 64 KiB allocation granule at a
-    // time, inside the reach of a rel32.
-    const std::uint64_t reach = 0x7ff00000ull, base = at & ~0xffffull;
-    for (std::uint64_t a = base - 0x10000; a > 0x10000 && base - a < reach; a -= 0x10000)
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
-    for (std::uint64_t a = base + 0x10000; a - base < reach; a += 0x10000)
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+    // time, inside the reach of a rel32. Bound the search before arithmetic
+    // so low slides cannot underflow, nor high ones exceed application space.
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::uint64_t granule = info.dwAllocationGranularity;
+    const std::uint64_t min = reinterpret_cast<std::uint64_t>(info.lpMinimumApplicationAddress);
+    const std::uint64_t max = reinterpret_cast<std::uint64_t>(info.lpMaximumApplicationAddress);
+    if (!size || size > max - min) return nullptr;
+    const std::uint64_t reach = 0x7ff00000ull, base = at & ~(granule - 1);
+    for (std::uint64_t d = granule; d < reach && base >= d && base - d >= min; d += granule)
+        if (base - d <= max - size + 1)
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(base - d), size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+    for (std::uint64_t d = granule; d < reach && base <= max - size + 1 && d <= max - size + 1 - base; d += granule)
+        if (base + d >= min)
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(base + d), size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
     return nullptr;
 #else
-    void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    void* page = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return nullptr;
     const std::int64_t d = static_cast<std::int64_t>(reinterpret_cast<std::uint64_t>(page)) - static_cast<std::int64_t>(at);
     if (d < INT32_MIN + 0x1000ll || d > INT32_MAX - 0x1000ll) {
-        munmap(page, 0x1000);
+        munmap(page, size);
         return nullptr;
     }
     return page;
