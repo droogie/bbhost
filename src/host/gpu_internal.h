@@ -620,6 +620,8 @@ std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
 void defer_destroy(const DevBuffer& b);  // freed once the current command buffer retired
+// On macOS the memory waits for every submission recorded so far to retire.
+void free_dev_buffer_locked(const DevBuffer& b);
 // Upload staging: `size` bytes placed in a mapped host-visible chunk the current command buffer shares with the ones
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to
 // the span; `offset` is the span's offset in it.

@@ -3627,8 +3627,7 @@ void textures_retired(int slot) {
                          n > 0 ? f[0] : 0.f, n > 1 ? f[1] : 0.f, n > 2 ? f[2] : 0.f, n > 2 ? f[n / 2] : 0.f, n > 0 ? f[n - 1] : 0.f);
             }
         }
-        vkDestroyBuffer(g.device, wb.staging.buffer, nullptr);
-        vkFreeMemory(g.device, wb.staging.memory, nullptr);
+        free_dev_buffer_locked(wb.staging);
     }
     g_slot_writebacks[slot].clear();
 }

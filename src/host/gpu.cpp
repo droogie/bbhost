@@ -4045,6 +4045,34 @@ void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out) {
     }
 }
 
+// MoltenVK names every device-address buffer in each command buffer it
+// encodes, without a reference: freeing its memory while a later submission
+// is in flight loses the device. The buffer goes at once, its memory once
+// everything recorded so far has retired.
+std::vector<std::pair<std::uint64_t, VkDeviceMemory>> g_late_memory;  // (g.flushes when freed, memory)
+
+void free_late_memory_locked() {
+    std::size_t kept = 0;
+    for (auto& [serial, mem] : g_late_memory) {
+        if (g.completed_submits >= serial || !g.ok) {
+            vkFreeMemory(g.device, mem, nullptr);
+        } else {
+            g_late_memory[kept++] = {serial, mem};
+        }
+    }
+    g_late_memory.resize(kept);
+}
+
+void free_dev_buffer_locked(const DevBuffer& b) {
+    if (b.buffer) vkDestroyBuffer(g.device, b.buffer, nullptr);
+    if (!b.memory) return;
+    if (g.moltenvk) {
+        g_late_memory.emplace_back(g.flushes, b.memory);
+    } else {
+        vkFreeMemory(g.device, b.memory, nullptr);
+    }
+}
+
 namespace {
 void heap_release(const ImageMemory& m);  // the image heap, below
 void scratch_let_go_locked(const DevBuffer& b);  // the untile scratch, below
@@ -4056,8 +4084,7 @@ void staging_let_go_locked(const DevBuffer& b) {
         g.staging_free.push_back(b);
         g.staging_free_bytes += b.size;
     } else {
-        vkDestroyBuffer(g.device, b.buffer, nullptr);
-        vkFreeMemory(g.device, b.memory, nullptr);
+        free_dev_buffer_locked(b);
     }
 }
 }  // namespace
@@ -4380,10 +4407,7 @@ void retire_slot_locked(int k) {
     indirect_clamp_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
-    for (DevBuffer& b : sl.garbage) {
-        vkDestroyBuffer(g.device, b.buffer, nullptr);
-        vkFreeMemory(g.device, b.memory, nullptr);
-    }
+    for (DevBuffer& b : sl.garbage) free_dev_buffer_locked(b);
     sl.garbage.clear();
     untile_checks_run_locked(sl.untile_checks);  // before their staging is reused
     for (const DevBuffer& b : sl.staging_chunks) {
@@ -4418,6 +4442,7 @@ void retire_slot_locked(int k) {
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }
+    if (!g_late_memory.empty()) free_late_memory_locked();
     collect_profile_locked(sl);
     busy_retired_locked(sl, true);
     glitch_slot_done_locked(sl);
@@ -4491,8 +4516,7 @@ void scratch_let_go_locked(const DevBuffer& b) {
         g.scratch_free.push_back(b);
         g.scratch_free_bytes += b.size;
     } else {
-        vkDestroyBuffer(g.device, b.buffer, nullptr);
-        vkFreeMemory(g.device, b.memory, nullptr);
+        free_dev_buffer_locked(b);
     }
 }
 }  // namespace
@@ -5028,6 +5052,7 @@ void start_memory_reserve() {
             // turn, two seconds apart.
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
+            std::uint64_t chunks_after = 0;  // g.flushes when they were taken
             // Down to the reserve, an empty block goes back at once, spare or
             // not: the targets want the room more.
             const bool short_now = vram_within_reserve();
@@ -5056,6 +5081,7 @@ void start_memory_reserve() {
                         chunks.push_back(g.staging_free.back());
                         g.staging_free_bytes -= g.staging_free.back().size;
                         g.staging_free.pop_back();
+                        chunks_after = g.flushes;
                     }
                 } else {
                     over_floor_since = {};
@@ -5064,9 +5090,26 @@ void start_memory_reserve() {
             if (!gone.empty() || !chunks.empty()) {
                 const auto t0 = std::chrono::steady_clock::now();
                 for (VkDeviceMemory m : gone) vkFreeMemory(g.device, m, nullptr);
-                for (DevBuffer& c : chunks) {
-                    vkDestroyBuffer(g.device, c.buffer, nullptr);
-                    vkFreeMemory(g.device, c.memory, nullptr);
+                if (g.moltenvk && !chunks.empty()) {
+                    // A device-address buffer: every submission encoded while it
+                    // lived names it (free_dev_buffer_locked). Its memory waits for them.
+                    {
+                        std::lock_guard<GpuMutex> lk(g.mu);
+                        for (DevBuffer& c : chunks) vkDestroyBuffer(g.device, c.buffer, nullptr);
+                    }
+                    for (;;) {
+                        {
+                            std::lock_guard<GpuMutex> lk(g.mu);
+                            if (g.completed_submits >= chunks_after || !g.ok) break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    for (DevBuffer& c : chunks) vkFreeMemory(g.device, c.memory, nullptr);
+                } else {
+                    for (DevBuffer& c : chunks) {
+                        vkDestroyBuffer(g.device, c.buffer, nullptr);
+                        vkFreeMemory(g.device, c.memory, nullptr);
+                    }
                 }
                 last_given = std::chrono::steady_clock::now();
                 std::size_t live;
