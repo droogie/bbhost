@@ -155,12 +155,18 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 if (kind && !std::strcmp(kind, "invalid")) std::fclose(static_cast<FILE*>(nullptr));
                 *static_cast<volatile int*>(nullptr) = 1;
             }
-            if ((exit_flip && hle_video_flip_count() >= exit_flip) ||
-                (exit_seconds > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= exit_seconds)) {
+            const std::uint64_t flips_now = hle_video_flip_count();
+            const double secs_now = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
+            const bool flip_hit = exit_flip && flips_now >= exit_flip;
+            if (flip_hit || (exit_seconds > 0 && secs_now >= exit_seconds)) {
                 // The guest keeps running while this prints; the window is
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
-                host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                if (flip_hit)
+                    host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                else
+                    host_log("exit: %.0f s reached at flip %llu (BBHOST_EXIT_SECONDS)", exit_seconds,
+                             static_cast<unsigned long long>(flips_now));
                 exit_reports();
                 // The cache save takes the GPU lock, which the command
                 // processor (still running) may hold for good: a helper
