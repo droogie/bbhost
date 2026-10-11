@@ -3872,7 +3872,7 @@ void retire_slot_locked(int k) {
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
-        if (b.buffer == VK_NULL_HANDLE) continue; // Geçersiz handle kontrolü
+        if (b.buffer == VK_NULL_HANDLE) continue; // Invalid handle check
         vkDestroyBuffer(g.device, b.buffer, nullptr);
         vkFreeMemory(g.device, b.memory, nullptr);
     }
