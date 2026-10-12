@@ -59,6 +59,11 @@ name = "Hunter"
 ime = "type"
 
 [video]
+# PC graphics overrides are off by default, as in the original source.
+# Enable the PC Graphics / PC Effects menus and their live overrides with:
+# pc_graphics = true
+# BBHOST_PC_GRAPHICS=0/1 overrides this startup choice; restart after changing it.
+# BBHOST_TIMELINE=0 restores fence polling for GPU completion comparisons.
 # The window's size (fullscreen takes the desktop's).
 width = 1920
 height = 1080

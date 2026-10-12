@@ -137,7 +137,32 @@ const bool g_submit_thread_on = [] {
 // the last kForeignSubmit id: published after vkQueueSubmit returned.
 std::atomic<std::uint64_t> g_stream_submitted{0};
 std::atomic<std::uint64_t> g_foreign_submitted{0};
+std::atomic<bool> g_timeline_on{false};  // Gpu::timeline made: set once, before any submission
 constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_presenter's tickets for a kForeignSubmit
+
+// A game submission (`serial` its Gpu::flushes) also signals the timeline
+// with serial + 1: added to `si`'s signals, the binary ones it has keeping
+// their places (their values are ignored), held in this until the submit.
+struct TimelineSignal {
+    VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    VkSemaphore sems[2] = {};
+    std::uint64_t values[2] = {}, wait_values[2] = {};
+    void add(VkSubmitInfo& si, std::uint64_t serial) {
+        if (!g.timeline || serial == ~0ull || si.signalSemaphoreCount > 1 || si.waitSemaphoreCount > 2) return;
+        const std::uint32_t n = si.signalSemaphoreCount;
+        for (std::uint32_t i = 0; i < n; ++i) sems[i] = si.pSignalSemaphores[i];
+        sems[n] = g.timeline;
+        values[n] = serial + 1;
+        si.signalSemaphoreCount = n + 1;
+        si.pSignalSemaphores = sems;
+        ti.signalSemaphoreValueCount = n + 1;
+        ti.pSignalSemaphoreValues = values;
+        ti.waitSemaphoreValueCount = si.waitSemaphoreCount;
+        ti.pWaitSemaphoreValues = si.waitSemaphoreCount ? wait_values : nullptr;
+        ti.pNext = si.pNext;
+        si.pNext = &ti;
+    }
+};
 
 // One job to the queue, under its lock; a failure is kept for the command
 // processor (take_submit_failure_locked).
@@ -154,6 +179,8 @@ void submit_job_now(const SubmitJob& job) {
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &job.signal;
     }
+    TimelineSignal tl;
+    tl.add(si, job.serial);
     VkResult r;
     {
         std::lock_guard<std::mutex> q(g.queue_mu);
@@ -2170,6 +2197,8 @@ bool init_locked() {
         const char* e = std::getenv("BBHOST_HALF_NATIVE");
         const bool native = q12.shaderFloat16 && p12.shaderRoundingModeRTZFloat16 && p12.shaderDenormPreserveFloat16 && !(e && e[0] == '0');
         if (q12.shaderFloat16) f12.shaderFloat16 = VK_TRUE;
+        if (q12.timelineSemaphore && !(std::getenv("BBHOST_TIMELINE") && std::getenv("BBHOST_TIMELINE")[0] == '0'))
+            f12.timelineSemaphore = VK_TRUE;
         if (supported.shaderInt16) f2.features.shaderInt16 = VK_TRUE;
         g.has_f16_math = q12.shaderFloat16 && supported.shaderInt16;
         gcn::set_native_half_rtz(native);
@@ -2272,6 +2301,16 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (f12.timelineSemaphore) {
+        VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        st.initialValue = 0;
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &st;
+        if (vkCreateSemaphore(g.device, &sci, nullptr, &g.timeline) != VK_SUCCESS) g.timeline = VK_NULL_HANDLE;
+    }
+    host_log("gpu: submissions %s", g.timeline ? "signal a timeline semaphore: completion is read and waited for without the renderer's lock"
+                                              : "are followed by their fences alone (no timeline semaphore, or BBHOST_TIMELINE=0)");
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.family;
@@ -2482,6 +2521,8 @@ bool init_locked() {
     // translator above (they are part of every key).
     translation_cache_load(translation_cache_path());
     g.ok = true;
+    // Publish the lock-free completion path only after initialization succeeds.
+    g_timeline_on.store(g.timeline != VK_NULL_HANDLE, std::memory_order_release);
     start_submit_thread();
     start_hang_watchdog();
     start_memory_reserve();
@@ -5239,6 +5280,8 @@ void submit_locked() {
         cur.in_flight = true;
     } else {
         busy_submitted_locked(cur);
+        TimelineSignal tl;
+        tl.add(si, cur.serial);
         const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
@@ -7076,6 +7119,12 @@ std::uint64_t host_gpu_work_needs() {
 }
 
 std::uint64_t host_gpu_submissions_completed() {
+    if (g_timeline_on.load(std::memory_order_acquire)) {
+        std::uint64_t v = 0;
+        if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
+            return ~0ull;  // nothing more will run: nothing to wait for
+        return v;
+    }
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return ~0ull;  // nothing more will run: nothing to wait for
     std::uint64_t done = g.completed_submits;
@@ -7086,6 +7135,16 @@ std::uint64_t host_gpu_submissions_completed() {
         }
     }
     return done;
+}
+
+bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
+    if (!g_timeline_on.load(std::memory_order_acquire)) return false;
+    if (g_device_lost.load(std::memory_order_relaxed)) return true;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g.timeline;
+    wi.pValues = &need;
+    return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
 }
 
 void host_gpu_report() {

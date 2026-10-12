@@ -162,6 +162,10 @@ void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.
 bool host_window_pixels(int* w, int* h);
+// `fn` is told the window's pixel size now (if there is a window) and each
+// time it changes - a resize, a fullscreen toggle, a display change - on the
+// window's thread. One listener (the light grid, engine/graphics_patch.cpp).
+void host_window_on_pixels(void (*fn)(int, int));
 // The refresh rate of the display the window is on, in Hz, or 0
 // when there is no window (headless) or the display does not say. The flip
 // clock runs at this rate instead of assuming 59.94 Hz.

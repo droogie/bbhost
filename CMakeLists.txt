@@ -113,6 +113,7 @@ add_executable(bbhost
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/options.cpp
+  src/host/settings.cpp
   src/host/updater.cpp
   src/host/update_verify.cpp
   src/host/bindings.cpp
@@ -359,6 +360,9 @@ add_executable(libc_stdio_test tests/libc_stdio_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_stdio_test PRIVATE src)
 target_compile_features(libc_stdio_test PRIVATE cxx_std_17)
 find_package(Threads REQUIRED)
+add_executable(frame_pacing_test tests/frame_pacing_test.cpp)
+target_include_directories(frame_pacing_test PRIVATE src)
+add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 target_link_libraries(libc_stdio_test PRIVATE Threads::Threads)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET libc_stdio_test PROPERTY CROSSCOMPILING_EMULATOR wine)
@@ -447,6 +451,20 @@ if(UNIX)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
+  add_executable(pc_graphics_test tests/pc_graphics_test.cpp src/host/settings.cpp)
+  target_include_directories(pc_graphics_test PRIVATE src)
+  foreach(mode default config-on config-off env-on env-off empty-env cache)
+    add_test(NAME pc_graphics_${mode} COMMAND pc_graphics_test ${mode})
+  endforeach()
+  add_executable(settings_snapshot_test tests/settings_snapshot_test.cpp src/host/shader_patch.cpp)
+  target_include_directories(settings_snapshot_test PRIVATE src)
+  target_link_libraries(settings_snapshot_test PRIVATE Threads::Threads)
+  add_test(NAME settings_snapshot_test COMMAND settings_snapshot_test)
+  add_executable(camera_settings_test tests/camera_settings_test.cpp src/engine/camera.cpp)
+  target_include_directories(camera_settings_test PRIVATE src)
+  target_link_libraries(camera_settings_test PRIVATE Threads::Threads)
+  add_test(NAME camera_settings_test COMMAND camera_settings_test)
+  set_tests_properties(settings_snapshot_test camera_settings_test PROPERTIES TIMEOUT 10)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)

@@ -256,6 +256,12 @@ struct Gpu {
     // shaderFloat16 and shaderInt16 enabled: the host's own shaders may do f16
     // math (the half-precision FSR 1, fsr.cpp).
     bool has_f16_math = false;
+    // The game's submissions' timeline (Vulkan 1.2 timeline semaphore): each
+    // signals its serial + 1 (Gpu::flushes), so how far the GPU got is one
+    // counter read without the renderer's lock, and a wait for a frame is a
+    // sleep in the driver, not a poll (host_gpu_wait_completed). Null without
+    // timelineSemaphore, or with BBHOST_TIMELINE=0: the slots' fences, polled.
+    VkSemaphore timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;

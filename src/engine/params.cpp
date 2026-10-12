@@ -4,6 +4,7 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
 #include "engine/paramdef.h"
 #include "hle/fs.h"
 #include "log.h"
@@ -287,6 +288,7 @@ void params_tick() {
     // at 30) sees new tables and reloads without costing the frame.
     if (g_ticks++ % 150 != 0) return;
     walk();
+    camera_refresh();
 }
 
 void* params_row(const char* table, std::uint32_t id, std::size_t* bytes) {

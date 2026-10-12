@@ -198,11 +198,7 @@ void label_for(const Tag& t, bool mouse_camera, char* out, std::size_t n) {
 
 // The setting, re-read when anything changed rather than on every call.
 bool prompts_wanted() {
-    static std::atomic<std::uint64_t> seen{~0ull};
-    static std::atomic<int> mode{0};
-    const std::uint64_t now = host_opt_serial();
-    if (seen.exchange(now) != now) mode.store(host_settings().button_prompts, std::memory_order_relaxed);
-    switch (mode.load(std::memory_order_relaxed)) {
+    switch (host_settings().button_prompts) {
         case 1: return true;                    // Keyboard
         case 2: return false;                   // Controller
         default: return host_input_device() == InputDevice::KeyboardMouse;  // Auto: the device last used
@@ -210,11 +206,7 @@ bool prompts_wanted() {
 }
 
 bool mouse_is_camera() {
-    static std::atomic<std::uint64_t> seen{~0ull};
-    static std::atomic<int> on{1};
-    const std::uint64_t now = host_opt_serial();
-    if (seen.exchange(now) != now) on.store(host_settings().mouse_camera ? 1 : 0, std::memory_order_relaxed);
-    return on.load(std::memory_order_relaxed) != 0;
+    return host_settings().mouse_camera;
 }
 
 void note_unknown(const char* tag) {

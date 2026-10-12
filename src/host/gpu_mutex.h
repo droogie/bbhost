@@ -6,8 +6,16 @@
 // caller's return address) and its thread; every unlock adds the hold time
 // to that site, and a lock that had to wait adds the wait to the waiting
 // site. Every few seconds the log gets the sites that held it longest and
-// the ones that waited longest, symbolized. Off, it is a std::mutex and one
-// predictable branch.
+// the ones that waited longest, symbolized. Off, it is a HostLock (core/futex.h:
+// one compare-and-swap to take and give back, a sleep on the word only when a
+// thread must wait) and one predictable branch. It was a std::mutex, which in
+// this build is winpthreads': every contended take a kernel wait and every
+// release to a sleeper a kernel wake. An ETW CPU trace in Kyo's area at ~112
+// fps uncapped (Radeon 8060S) had 25% of the command processor in that
+// mutex's slow path and 23,400 context switches a second on it - the vblank's
+// flip waiter took it some 2,000 times a second to ask the fences.
+
+#include "core/futex.h"
 
 #include <atomic>
 #include <cstdint>
@@ -64,7 +72,7 @@ private:
 
     std::atomic<void*> holder_{nullptr};
     std::atomic<std::uint64_t> acquires_{0};
-    std::mutex m_;
+    HostLock m_;
     void* site_ = nullptr;          // under m_
     std::uint64_t since_ns_ = 0;    // under m_
 };

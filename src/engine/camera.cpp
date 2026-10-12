@@ -66,6 +66,12 @@ struct Table {
 std::mutex g_mu;
 std::vector<Table> g_tables;
 std::atomic<int> g_state{0};  // 0 not looked, 1 looking, 2 done
+std::atomic<std::uint64_t> g_revision{1};  // discovery and parameter maintenance
+std::atomic<bool> g_modified{false};  // another view thread may have applied an override
+std::atomic<std::uint64_t> g_applied_serial{0}, g_seen_revision{0}, g_seen_maps{0};
+std::atomic<std::uint64_t> g_scanned_revision{0}, g_scanned_maps{0};
+const Scales kGame{1.0f, 1.0f, 1.0f};
+Scales g_applied = kGame;  // protected by g_mu; all view threads share the table
 
 // A header that is the file's, not the name turning up somewhere else.
 bool plausible(const std::uint8_t* base, std::size_t room) {
@@ -122,14 +128,14 @@ void find_tables() {
              found.size(), static_cast<unsigned long long>(scanned >> 20));
     std::lock_guard<std::mutex> lock(g_mu);
     g_tables = std::move(found);
+    if (!g_tables.empty()) g_revision.fetch_add(1, std::memory_order_release);
     g_state.store(2, std::memory_order_release);
 }
 
 // The multipliers the settings object carries (host/settings.h): distance
 // and height 10% a step around the game's own, field of view 5% wider a
 // step, BBHOST_FOV overriding.
-Scales wanted_scales() {
-    const HostSettings hs = host_settings();
+Scales wanted_scales(const HostSettings& hs) {
     return Scales{hs.camera_distance_scale, hs.camera_height_scale, hs.fov_scale};
 }
 
@@ -184,6 +190,12 @@ void camera_install(ElfImage* image) {
     }
 }
 
+void camera_refresh() {
+    // Parameter reloads can reuse an address and write the same type name.
+    // The repository's existing maintenance pass requests an integrity check.
+    g_revision.fetch_add(1, std::memory_order_release);
+}
+
 void camera_tick() {
     if (fov_watching()) {
         // Find the table and watch it; touch nothing.
@@ -192,27 +204,71 @@ void camera_tick() {
         fov_watch();
         return;
     }
-    const Scales k = wanted_scales();
-    static const Scales kGame{1.0f, 1.0f, 1.0f};
-    static Scales applied = kGame;
-    if (k == kGame && applied == kGame) return;
+    HostSettings hs = host_settings();
+    Scales k = wanted_scales(hs);
+    const bool restore = k == kGame && g_modified.load(std::memory_order_acquire);
+    if (k == kGame && !restore) return;
+    const std::uint64_t revision = g_revision.load(std::memory_order_acquire);
+    const std::uint64_t maps = hle_kernel_maps_generation();
     int state = g_state.load(std::memory_order_acquire);
-    if (state == 0 && g_state.compare_exchange_strong(state, 1)) {
-        std::thread(find_tables).detach();
+    if (state == 0) {
+        // Do not rescan all guest mappings on every view if the parameters
+        // have not loaded yet. Retry on new mappings or parameter maintenance.
+        if (g_scanned_revision.load(std::memory_order_acquire) == revision &&
+            g_scanned_maps.load(std::memory_order_acquire) == maps) return;
+        if (g_state.compare_exchange_strong(state, 1)) {
+            g_scanned_revision.store(revision, std::memory_order_release);
+            g_scanned_maps.store(maps, std::memory_order_release);
+            std::thread(find_tables).detach();
+        }
         return;
     }
     if (state != 2) return;
+    if (g_applied_serial.load(std::memory_order_acquire) == hs.serial &&
+        g_seen_revision.load(std::memory_order_acquire) == revision &&
+        g_seen_maps.load(std::memory_order_acquire) == maps) return;
     std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    // Re-read after taking the table lock: another view thread may have
+    // consumed a newer menu change while this call was waiting.
+    hs = host_settings();
+    k = wanted_scales(hs);
+    if (g_tables.empty()) {
+        // A completed discovery with no tables is pending, not permanently
+        // applied. A later load must get another chance to find the table.
+        // Retain the generations from when discovery started. A mapping or
+        // maintenance change during that scan still needs its own retry.
+        g_state.store(0, std::memory_order_release);
+        return;
+    }
+    const bool refresh = k != g_applied || g_seen_revision.load(std::memory_order_relaxed) != revision;
+    if (!refresh && g_seen_maps.load(std::memory_order_relaxed) == maps) {
+        // A different option changed; the camera multipliers did not.
+        g_applied_serial.store(hs.serial, std::memory_order_release);
+        return;
+    }
     for (const Table& t : g_tables) {
         // Still the table it was: a param reload would move it, and writing
         // through the old address would write into whatever took its place.
-        if (std::memcmp(t.base + kTypeAt, kTypeName, sizeof(kTypeName)) != 0) {
+        std::array<std::uint8_t, kRowsAt> header{};
+        std::uint16_t rows = 0;
+        const bool readable = host_read_safe(t.base, header.data(), header.size());
+        if (readable) std::memcpy(&rows, header.data() + kRowCountAt, sizeof(rows));
+        if (!readable || rows != t.rows ||
+            std::memcmp(header.data() + kTypeAt, kTypeName, sizeof(kTypeName)) != 0) {
             host_log("camera: LockCamParam moved; looking again");
             g_tables.clear();
+            g_scanned_revision.store(0, std::memory_order_release);
             g_state.store(0, std::memory_order_release);
             return;
         }
+    }
+    g_seen_maps.store(maps, std::memory_order_release);
+    // Mapping churn only requires validating the cached header. The row walk
+    // runs for a camera change, completed discovery or maintenance request.
+    if (!refresh) {
+        g_applied_serial.store(hs.serial, std::memory_order_release);
+        return;
     }
     for (Table& t : g_tables) {
         for (std::uint32_t r = 0; r < t.rows; ++r) {
@@ -227,9 +283,12 @@ void camera_tick() {
             }
         }
     }
-    if (k != applied) {
+    if (k != g_applied) {
         host_log("camera: distance x%g, height x%g, field of view x%g (%zu table(s))", k[0], k[1], k[2],
                  g_tables.size());
-        applied = k;
     }
+    g_applied = k;
+    g_modified.store(k != kGame, std::memory_order_release);
+    g_seen_revision.store(revision, std::memory_order_release);
+    g_applied_serial.store(hs.serial, std::memory_order_release);
 }

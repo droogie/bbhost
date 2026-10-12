@@ -37,23 +37,23 @@ const Patch kPatches[] = {
 };
 constexpr std::size_t kCount = sizeof(kPatches) / sizeof(kPatches[0]);
 
-std::atomic<std::uint64_t> g_seen_serial{0};
-std::atomic<std::uint32_t> g_mask{0};
+thread_local std::uint64_t g_seen_serial = 0;
+thread_local std::uint32_t g_mask = 0;
 
 }  // namespace
 
 std::uint32_t shader_patch_mask() {
     const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.load(std::memory_order_acquire) != serial) {
+    if (g_seen_serial != serial) {
         std::uint32_t m = 0;
         const HostSettings hs = host_settings();
         for (std::size_t i = 0; i < kCount; ++i) {
             if (!(hs.*(kPatches[i].setting))) m |= 1u << i;
         }
-        g_mask.store(m, std::memory_order_release);
-        g_seen_serial.store(serial, std::memory_order_release);
+        g_mask = m;
+        g_seen_serial = hs.serial;
     }
-    return g_mask.load(std::memory_order_acquire);
+    return g_mask;
 }
 
 bool shader_patch_touches(const std::string& name) {

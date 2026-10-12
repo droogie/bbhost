@@ -15,6 +15,7 @@
 #include "hle/modules.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/settings.h"
 #include "log.h"
 
 #include <atomic>
@@ -1617,6 +1618,8 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
     // lines and **scrolls**, with the scroll bar the port's movie gives it, so
     // rows past the fifth need no slot of their own.
     for (const auto& r : rows) {
+        const auto id = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(r[0]));
+        if (!host_pc_graphics() && (id == kSystemGraphicsRowId || id == kSystemEffectsRowId)) continue;  // host/settings.h
         Captions c(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(r[0])));
         GuestFunction f(kRowFunctorVTable, r[1]);
         hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);

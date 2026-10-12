@@ -589,6 +589,10 @@ std::uint64_t host_gpu_draw_mark();
 // and how many have (~0 with no GPU to wait for).
 std::uint64_t host_gpu_work_needs();
 std::uint64_t host_gpu_submissions_completed();
+// Sleeps until `need` submissions have finished (the timeline semaphore) or
+// `timeout_ns` passed: true when they have. False at once without a timeline
+// (the caller polls host_gpu_submissions_completed as before).
+bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns);
 const char* host_present_step(double& seconds);  // window.cpp: what the presenting thread is doing  // BBHOST_STALL_TEST: hold the renderer, as a frame dump does
 // Last few recorded draws, read without the renderer lock: for the watchdog,
 // which runs precisely when some thread is stuck holding it.

@@ -89,6 +89,7 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<std::uint64_t> g_seen_serial{0};
+std::mutex g_refresh_mu;
 std::atomic<bool> g_ssao{true}, g_aa{true};
 
 // ---- Draw parameters ---------------------------------------------------------
@@ -338,8 +339,10 @@ GUEST_ABI std::int64_t velocity_post_hook(std::uint64_t, const std::uint64_t*) {
 
 void refresh_settings() {
     const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.exchange(serial) == serial) return;
+    if (g_seen_serial.load(std::memory_order_acquire) == serial) return;
+    std::lock_guard<std::mutex> lock(g_refresh_mu);
     const HostSettings hs = host_settings();
+    if (g_seen_serial.load(std::memory_order_relaxed) == hs.serial) return;
     g_ssao.store(hs.ssao);
     g_aa.store(hs.anti_alias);
     set_chromatic_aberration(hs.chromatic_aberration);
@@ -352,6 +355,7 @@ void refresh_settings() {
     if (!g_lod_bias_env) g_lod_bias.store(hs.lod_bias);
     g_shadow_scale.store(hs.shadow_scale > 1.0f ? hs.shadow_scale
                                                 : g_shadow_scale_env > 0.0f ? g_shadow_scale_env : 1.0f);
+    g_seen_serial.store(hs.serial, std::memory_order_release);
 }
 
 // sub_12669d0's entry: the SSAO object in rdi, its block just copied in.
@@ -843,13 +847,15 @@ constexpr std::size_t kLightTileW = 0x78a8, kLightTileH = 0x78ac;
 const std::uint64_t* g_graphics_manager = nullptr;  // the slot, slid; null when off
 const std::uint32_t* g_res_words = nullptr;         // render width, height
 std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: that tile instead (experiments)
-// Tiles a side: 4 (a quarter of the window each way), or 1 with
-// BBHOST_LIGHT_GRID=window - one tile the window's size, the community "REAL
-// LightGrid 1080p" patch's 1920x1080 at that size. Measured on a Radeon 8060S
-// (2026-10-08, the Hunter's Dream, 1080p, GPU ms per 300 flips, two minutes
-// each): 4 a side 1,878-2,027, one tile 1,960-2,096 (+5%), the main loop's
-// work 3.51 against 3.50 ms - the quarter tiles stay the default.
-std::uint32_t g_tiles_per_axis = 4;
+// Tiles a side: 1 - one tile the window's size, Kyo's "REAL LightGrid 1080p"
+// (the constructor's 1920x1080) at whatever size the window or display is, in
+// one job ("Light Grid Div 1x1"): each light binned and drawn once. 4 (a
+// quarter of the window each way) with BBHOST_LIGHT_GRID=quarter. Measured on
+// a Radeon 8060S: 2026-10-08, the Hunter's Dream, GPU ms per 300 flips, 4 a
+// side 1,878-2,027 and one tile 1,960-2,096; 2026-10-12, Kyo's area uncapped
+// and GPU-bound, Model detail Normal, 45 s each: one tile 160.2 fps, 4 a side
+// 159.2, the game's own 128x128 tiles in 3x3 jobs (BBHOST_LIGHT_GRID=0) 165.1.
+std::uint32_t g_tiles_per_axis = 1;
 std::uint64_t g_tile_from = 0;
 bool g_task_steal = false;                          // BBHOST_TASK_TUNE=s (task_tune_install, below)                      // BBHOST_LIGHT_GRID_FROM=flip: the game's tiles before it (A/B in one run)
 
@@ -910,6 +916,8 @@ void lod_bias_tick() {
 }
 
 void lod_bias_install(ElfImage* image) {
+    const char* forced = std::getenv("BBHOST_LOD_BIAS");
+    if (!host_pc_graphics() && !(forced && *forced)) return;
     g_rend_man = static_cast<const std::uint64_t*>(guest_ptr(image->mem, image->mem.slide + (kRendManSlot - kPreferredGuestSlide)));
     if (const char* e = std::getenv("BBHOST_LOD_BIAS"); e && *e) {
         g_lod_bias.store(std::clamp(std::atoi(e), -2, 2));
@@ -944,7 +952,7 @@ void light_grid_install(ElfImage* image) {
         return;
     }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID_FROM"); e && *e) g_tile_from = std::strtoull(e, nullptr, 10);
-    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "window") == 0) g_tiles_per_axis = 1;
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "quarter") == 0) g_tiles_per_axis = 4;
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
@@ -964,7 +972,7 @@ void light_grid_install(ElfImage* image) {
     div[1] = 1;
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, at(0x55289f8)));  // res_width, res_height (below)
     g_graphics_manager = static_cast<const std::uint64_t*>(guest_ptr(image->mem, at(kGraphicsManagerSlot)));
-    host_log("graphics: light grid - one job of %ux%u tiles sized to the window (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=window: one window-sized tile)",
+    host_log("graphics: light grid - one job of %ux%u tiles sized to the window (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=quarter: 4x4, =0: the game's)",
              g_tiles_per_axis, g_tiles_per_axis);
 }
 
@@ -980,6 +988,7 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     lod_bias_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[0])));
+    if (!host_pc_graphics()) return 0;  // leave the renderer flags and debug menu in charge
     if (g_ca_amount) {
         // What the last view copied, logged when it changes: the area's own
         // amount through the mask. 0 with the setting on means this place has
@@ -1052,14 +1061,17 @@ void live_install(ElfImage* image) {
     lod_bias_install(image);
     task_tune_install(image);
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
-    const std::uint64_t ca = at(kCaCopy);
-    if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
-        host_log("graphics: refused, 0x%llx is not chromatic aberration's copy; it stays on",
-                 static_cast<unsigned long long>(kCaCopy));
-    } else if (!install_ca_stub(image, ca)) {
-        host_log("graphics: cannot place chromatic aberration's stub; it stays on");
-    } else {
-        g_ca_amount = static_cast<const float*>(guest_ptr(image->mem, at(kCaAmount)));
+    const bool pc_graphics = host_pc_graphics();
+    if (pc_graphics) {
+        const std::uint64_t ca = at(kCaCopy);
+        if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
+            host_log("graphics: refused, 0x%llx is not chromatic aberration's copy; it stays on",
+                     static_cast<unsigned long long>(kCaCopy));
+        } else if (!install_ca_stub(image, ca)) {
+            host_log("graphics: cannot place chromatic aberration's stub; it stays on");
+        } else {
+            g_ca_amount = static_cast<const float*>(guest_ptr(image->mem, at(kCaAmount)));
+        }
     }
     if (!install_prologue_hook(image, at(kRenderView), kRenderViewPrologue, sizeof(kRenderViewPrologue),
                                reinterpret_cast<void*>(&render_view_hook))) {
@@ -1067,40 +1079,54 @@ void live_install(ElfImage* image) {
                  "and AA stay on",
                  static_cast<unsigned long long>(kRenderView));
     }
-    if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
-                               reinterpret_cast<void*>(&yebis_record_hook))) {
-        host_log("graphics: refused, 0x%llx is not the YEBIS record's prologue (or no room for its hook); "
-                 "bloom and vignette stay as the area has them",
-                 static_cast<unsigned long long>(kYebisRecord));
-    } else {
-        g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));
+    if (pc_graphics || g_post_poke.n > 0) {
+        if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
+                                   reinterpret_cast<void*>(&yebis_record_hook))) {
+            host_log("graphics: refused, 0x%llx is not the YEBIS record's prologue (or no room for its hook); "
+                     "bloom and vignette stay as the area has them",
+                     static_cast<unsigned long long>(kYebisRecord));
+        } else {
+            g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));
+        }
     }
-    if (!install_prologue_hook(image, at(kSsaoDraw), kSsaoDrawPrologue, sizeof(kSsaoDrawPrologue),
-                               reinterpret_cast<void*>(&ssao_draw_hook))) {
-        host_log("graphics: refused, 0x%llx is not the SSAO draw's prologue (or no room for its hook); "
-                 "AO strength stays as the area has it",
-                 static_cast<unsigned long long>(kSsaoDraw));
+    if (pc_graphics) {
+        if (!install_prologue_hook(image, at(kSsaoDraw), kSsaoDrawPrologue, sizeof(kSsaoDrawPrologue),
+                                   reinterpret_cast<void*>(&ssao_draw_hook))) {
+            host_log("graphics: refused, 0x%llx is not the SSAO draw's prologue (or no room for its hook); "
+                     "AO strength stays as the area has it",
+                     static_cast<unsigned long long>(kSsaoDraw));
+        }
     }
-    if (!install_jump_hook(image, at(kFogUploadJump), at(kTableUpload), reinterpret_cast<void*>(&fog_upload_hook))) {
-        host_log("graphics: refused, 0x%llx is not the fog table's jump to its upload (or no room for a stub); "
-                 "fog stays as the area has it",
-                 static_cast<unsigned long long>(kFogUploadJump));
+    if (pc_graphics || g_fog_test.n > 0) {
+        if (!install_jump_hook(image, at(kFogUploadJump), at(kTableUpload), reinterpret_cast<void*>(&fog_upload_hook))) {
+            host_log("graphics: refused, 0x%llx is not the fog table's jump to its upload (or no room for a stub); "
+                     "fog stays as the area has it",
+                     static_cast<unsigned long long>(kFogUploadJump));
+        }
     }
-    if (!install_prologue_hook(image, at(kVelocityPost), kVelocityPostPrologue, sizeof(kVelocityPostPrologue),
-                               reinterpret_cast<void*>(&velocity_post_hook))) {
-        host_log("graphics: refused, 0x%llx is not motion blur's velocity post-pass; it runs with blur off too",
-                 static_cast<unsigned long long>(kVelocityPost));
+    if (pc_graphics) {
+        if (!install_prologue_hook(image, at(kVelocityPost), kVelocityPostPrologue, sizeof(kVelocityPostPrologue),
+                                   reinterpret_cast<void*>(&velocity_post_hook))) {
+            host_log("graphics: refused, 0x%llx is not motion blur's velocity post-pass; it runs with blur off too",
+                     static_cast<unsigned long long>(kVelocityPost));
+        }
     }
-    if (!install_prologue_hook(image, at(kShadowSetup), kShadowSetupPrologue, sizeof(kShadowSetupPrologue),
-                               reinterpret_cast<void*>(&shadow_setup_hook))) {
-        host_log("graphics: refused, 0x%llx is not the shadow setup's prologue (or no room for its hook); "
-                 "shadow distance stays as the area has it",
-                 static_cast<unsigned long long>(kShadowSetup));
+    if (pc_graphics || g_shadow_scale_env > 0.0f) {
+        if (!install_prologue_hook(image, at(kShadowSetup), kShadowSetupPrologue, sizeof(kShadowSetupPrologue),
+                                   reinterpret_cast<void*>(&shadow_setup_hook))) {
+            host_log("graphics: refused, 0x%llx is not the shadow setup's prologue (or no room for its hook); "
+                     "shadow distance stays as the area has it",
+                     static_cast<unsigned long long>(kShadowSetup));
+        }
     }
     refresh_settings();
-    host_log("graphics: SSAO and its strength, anti-aliasing, chromatic aberration, bloom, vignette, saturation, "
-             "fog and shadow distance follow their settings live%s",
-             g_ca_mask ? "" : " (chromatic aberration excepted)");
+    if (pc_graphics) {
+        host_log("graphics: SSAO and its strength, anti-aliasing, chromatic aberration, bloom, vignette, saturation, "
+                 "fog and shadow distance follow their settings live%s",
+                 g_ca_mask ? "" : " (chromatic aberration excepted)");
+    } else {
+        host_log("graphics: PC graphics effect hooks off; explicit diagnostic overrides still apply");
+    }
 }
 
 // The rest of the flag block, for probing.

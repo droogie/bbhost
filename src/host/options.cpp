@@ -1,6 +1,7 @@
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
+#include "host/settings_snapshot.h"
 
 #include "host/bindings.h"
 #include "host/overlay.h"
@@ -119,7 +120,7 @@ Setting g_set[kSettingCount] = {
     // reads as 60 (host_options_load).
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off). Applies on the next run.",
+     "(the display's refresh rate with V-Sync on, no limit off). Applies on the next run.",
      false},
     // What reaches the screen, counted by the presenter (host/window.cpp).
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
@@ -251,11 +252,12 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
 };
 
-const Row g_rows[] = {
+const Row kAllRows[] = {
     {Row::Header, "DISPLAY"},
     {Row::Option, nullptr, kWindowMode},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
+    {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
@@ -282,7 +284,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
-    {Row::Option, nullptr, kResolution},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
@@ -310,7 +311,19 @@ const Row g_rows[] = {
     {Row::Action, "Open the release page", -1, 11},
     {Row::Close, "Close"},
 };
-constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
+constexpr int kRowCount = static_cast<int>(sizeof(kAllRows) / sizeof(kAllRows[0]));
+// The rows shown: kAllRows, less the GRAPHICS section while the PC graphics
+// settings are off (host_pc_graphics, the default). Built once.
+Row g_rows[kRowCount];
+int g_row_n = 0;
+void rows_init() {
+    if (g_row_n) return;
+    bool skip = false;
+    for (const Row& r : kAllRows) {
+        if (r.kind == Row::Header) skip = !host_pc_graphics() && std::strcmp(r.text, "GRAPHICS") == 0;
+        if (!skip) g_rows[g_row_n++] = r;
+    }
+}
 
 std::atomic<bool> g_open{false};
 int g_sel = 1;  // the first selectable row
@@ -343,7 +356,7 @@ int g_res_prev = -1;
 bool g_res_reverting = false;  // the change back itself asks nothing
 
 bool selectable(int r) {
-    return r >= 0 && r < kRowCount && g_rows[r].kind != Row::Header && g_rows[r].kind != Row::Info;
+    return r >= 0 && r < g_row_n && g_rows[r].kind != Row::Header && g_rows[r].kind != Row::Info;
 }
 
 // Whether the resolution entry `index` changes while the game runs. One past
@@ -693,21 +706,16 @@ void save() {
     host_log("options: saved %s", path.c_str());
 }
 
-// Bumped on every change, for readers that act on a setting live and would
-// rather not look it up by name on every frame (host_opt_serial).
-std::atomic<std::uint64_t> g_serial{1};
-
 // The settings object (host/settings.h): every field from the table, scaled
-// the way its consumer wants it, rebuilt whenever a setting changes.
-std::mutex g_settings_mu;
-HostSettings g_settings;
+// the way its consumer wants it, rebuilt whenever a setting changes. The
+// generation is published with the snapshot, never before it is ready.
+HostSettingsSnapshot g_settings;
 
 bool on_of(int id) { return reads_on(g_set[id], g_set[id].index); }
 int index_of(int id) { return g_set[id].index; }
 
 void rebuild_settings() {
     HostSettings h;
-    h.serial = g_serial.load(std::memory_order_acquire);
     h.fullscreen = index_of(kWindowMode) == 1;
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
@@ -764,14 +772,30 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
+    // The PC graphics settings off (the default): the game's own look, whatever
+    // the file says - every value one bbhost leaves alone (HostSettings' own).
+    if (!host_pc_graphics()) {
+        const HostSettings game;
+        h.ssao = game.ssao;
+        h.motion_blur = game.motion_blur;
+        h.anti_alias = game.anti_alias;
+        h.depth_of_field = game.depth_of_field;
+        h.chromatic_aberration = game.chromatic_aberration;
+        h.vignette = game.vignette;
+        h.bloom = game.bloom;
+        h.saturation = game.saturation;
+        h.fog = game.fog;
+        h.ao_strength = game.ao_strength;
+        h.shadow_scale = game.shadow_scale;
+        h.lod_bias = game.lod_bias;
+    }
     h.skip_logos = on_of(kSkipLogos);
     h.debug_menu = on_of(kDebugMenu);
     h.debug_camera = on_of(kDebugCamera);
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    g_settings = h;
+    g_settings.publish(h);
 }
 
 void set_index(int id, int index, bool from_file) {
@@ -786,7 +810,6 @@ void set_index(int id, int index, bool from_file) {
         if (index == g_res_prev) g_res_prev = -1;  // back where it started: nothing to ask
     }
     s.index = index;
-    g_serial.fetch_add(1, std::memory_order_release);
     rebuild_settings();
     if (!from_file) {
         g_dirty = true;
@@ -827,6 +850,7 @@ void host_options_apply() {
 }
 
 void host_options_load() {
+    rows_init();
     // Once: the setup window (host/launcher.h) loads them before it shows them.
     static bool loaded = false;
     if (loaded) return;
@@ -1061,8 +1085,8 @@ bool host_options_key(int scancode, bool repeat) {
     }
     const int step = scancode == SDL_SCANCODE_UP ? -1 : scancode == SDL_SCANCODE_DOWN ? 1 : 0;
     if (step) {
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
+        for (int i = 0; i < g_row_n; ++i) {
+            g_sel = (g_sel + step + g_row_n) % g_row_n;
             if (selectable(g_sel)) {
                 break;
             }
@@ -1133,6 +1157,7 @@ void host_options_frame(float display_w, float display_h) {
 
 namespace {
 void options_panel_frame(float display_w, float display_h) {
+    rows_init();
     edit_poll();
     // Tall enough for every row: headers take 32 px, rows 40, and the note and
     // key guide under them 100. A fixed 620 had been outgrown by the rows, and
@@ -1144,7 +1169,7 @@ void options_panel_frame(float display_w, float display_h) {
     // list scrolls: the rows that fit are drawn, the selection is kept in
     // view, and a hint says there is more above or below.
     float rows_h = 0.0f;
-    for (const Row& r : g_rows) rows_h += r.kind == Row::Header ? 32.0f : 40.0f;
+    for (int i = 0; i < g_row_n; ++i) rows_h += g_rows[i].kind == Row::Header ? 32.0f : 40.0f;
     const float room = display_h - 20.0f - 178.0f;
     const float fit = 1.0f;
     const bool scrolls = rows_h > room && room > 0.0f;
@@ -1182,7 +1207,7 @@ void options_panel_frame(float display_w, float display_h) {
     last_x = m.x;
     last_y = m.y;
     if (g_laid_out && m.in_window && (moved || (m.pressed & 3u))) {
-        for (int r = 0; r < kRowCount; ++r) {
+        for (int r = 0; r < g_row_n; ++r) {
             if (!selectable(r) || m.x < g_row_x || m.x > g_row_x + g_row_w) {
                 continue;
             }
@@ -1215,8 +1240,8 @@ void options_panel_frame(float display_w, float display_h) {
     }
     if (m.wheel != 0.0f) {
         const int step = m.wheel > 0.0f ? -1 : 1;
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
+        for (int i = 0; i < g_row_n; ++i) {
+            g_sel = (g_sel + step + g_row_n) % g_row_n;
             if (selectable(g_sel)) {
                 break;
             }
@@ -1249,7 +1274,7 @@ void options_panel_frame(float display_w, float display_h) {
         y += 24.0f;
     }
     bool more_below = false;
-    for (int r = 0; r < kRowCount; ++r) {
+    for (int r = 0; r < g_row_n; ++r) {
         const Row& row = g_rows[r];
         const float h = (row.kind == Row::Header ? 32.0f : 40.0f) * fit;
         if (r < g_scroll || y + h > y_end - (scrolls ? 24.0f : 0.0f)) {
@@ -1350,8 +1375,7 @@ void options_panel_frame(float display_w, float display_h) {
 }  // namespace
 
 HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+    return g_settings.read();
 }
 
 namespace {
@@ -1377,7 +1401,7 @@ int setting_id(const char* key) {
 
 }  // namespace
 
-std::uint64_t host_opt_serial() { return g_serial.load(std::memory_order_acquire); }
+std::uint64_t host_opt_serial() { return g_settings.serial(); }
 
 bool host_opt_default_get(const char* key) {
     const int id = setting_id(key);

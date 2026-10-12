@@ -3,8 +3,8 @@
 // bbhost-options.toml edit by name (host/options.h), read back by every
 // consumer as typed, already-scaled fields. The table in options.cpp is the
 // single source; it rebuilds this snapshot on every change, and a reader
-// takes a copy (host_settings()) whenever host_opt_serial() has moved, or
-// on the frame it needs it - the copy is small and the lock is short.
+// takes a copy (host_settings()) whenever host_opt_serial() has moved. Reads
+// in between return a cached copy per thread without taking a shared lock.
 //
 // The graphics half is shaped after what DS3 keeps in its CSGraphicsConfig
 // (the released PC binary's RTTI names the class): per-effect switches and
@@ -74,3 +74,8 @@ struct HostSettings {
 
 // A copy of the current settings.
 HostSettings host_settings();
+// The PC graphics settings (F10's GRAPHICS, the in-game PC Graphics and PC
+// Effects) in use: off by default (BBHOST_PC_GRAPHICS=1 or [video]
+// pc_graphics = true), and then the game's own look - nothing installed for
+// them, nothing written, and the debug menu's own switches in charge.
+bool host_pc_graphics();

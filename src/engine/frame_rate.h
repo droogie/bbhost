@@ -29,7 +29,8 @@
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
 //  - uncapped: the same, with a target of the display's refresh rate with
-//    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
+//    V-Sync on and no practical limit with it off (BBHOST_UNCAPPED_FPS=N sets
+//    an explicit 30..1000 cap); code
 //    immediates and counts at 120's values.
 // Above 60 and uncapped flips complete as soon as they are recorded (the game
 // paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,

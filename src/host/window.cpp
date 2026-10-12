@@ -46,6 +46,8 @@
 
 // The swapchain's extent (width << 32 | height) for host_window_pixels; 0 before one.
 static std::atomic<std::uint64_t> g_window_pixels{0};
+// Told the window's pixel size when it changes (host_window_on_pixels).
+static std::atomic<void (*)(int, int)> g_on_pixels{nullptr};
 
 namespace {
 
@@ -476,7 +478,12 @@ bool vk_create_swapchain() {
     if (g_vk.extent.width == 0 || g_vk.extent.height == 0) {
         return false;
     }
-    g_window_pixels.store(static_cast<std::uint64_t>(g_vk.extent.width) << 32 | g_vk.extent.height, std::memory_order_relaxed);
+    {
+        const std::uint64_t px = static_cast<std::uint64_t>(g_vk.extent.width) << 32 | g_vk.extent.height;
+        if (g_window_pixels.exchange(px, std::memory_order_relaxed) != px) {
+            if (void (*fn)(int, int) = g_on_pixels.load(std::memory_order_acquire)) fn(static_cast<int>(g_vk.extent.width), static_cast<int>(g_vk.extent.height));
+        }
+    }
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sci.surface = g_vk.surface;
@@ -2373,6 +2380,12 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     (void)display_h;
     (void)flip;
 #endif
+}
+
+void host_window_on_pixels(void (*fn)(int, int)) {
+    g_on_pixels.store(fn, std::memory_order_release);
+    int w = 0, h = 0;
+    if (fn && host_window_pixels(&w, &h)) fn(w, h);
 }
 
 bool host_window_pixels(int* w, int* h) {

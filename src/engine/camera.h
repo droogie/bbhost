@@ -12,6 +12,9 @@ struct ElfImage;
 // hash has been checked, like every address-based patch.
 void camera_install(ElfImage* image);
 
-// Called for every view (engine/graphics_patch.cpp's render-view hook): finds
-// the table once, then keeps it at the settings.
+// Called for every view: unchanged settings and parameters return before
+// locking or walking rows. Finds the table asynchronously when needed.
 void camera_tick();
+// The param repository's existing 150-frame maintenance pass requests a
+// check for in-place reloads. The next scene view applies it, not this caller.
+void camera_refresh();

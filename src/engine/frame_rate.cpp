@@ -1,5 +1,6 @@
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
+#include "engine/frame_pacing.h"
 #include "engine/frame_rate_step.h"
 #include "engine/frame_tick.h"
 #include "engine/np_test.h"
@@ -50,7 +51,7 @@ constexpr std::uint32_t kModeSixty = 2;
 
 // The game's pace: 30 (its own), a fixed rate (60, 90, 120: the game's mode 2
 // with a 1/fps target), or uncapped (the same with the target the display's
-// refresh rate or 1/240 s). Kyo's FPS++ lists for 1.09 (60 and 90 FPS++ 1.0,
+// refresh rate with V-Sync on, else no practical frame limit). Kyo's FPS++ lists for 1.09 (60 and 90 FPS++ 1.0,
 // and his 1.3 lists with yogesh1239's high-FPS fixes) are the source of most
 // of what follows; every value and code site is checked against the eboot's
 // bytes before anything is written, and each is done natively - values for
@@ -307,7 +308,7 @@ static_assert(rated_in_constants(), "every rated value is one of kConstants (its
 // Bloodborne ships 33333: at 60 the game posts two frames of sound requests
 // per update, and some attack sounds played half as often as at 30
 // (2026-09-30). The digits, in place: one update a frame at every rate, and
-// at the uncapped mode's 240 (04166).
+// at 240 Hz in uncapped mode (04166), independently of the frame limiter.
 enum class Count : std::uint8_t {
     Frames,  // was * fps / 30
     Micros,  // was * 30 / fps
@@ -570,10 +571,9 @@ static_assert(dt_loads_clear_of(kSixtySites) && dt_loads_clear_of(kFrameTimeSite
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
-// The uncapped mode: the game's frame limit and the reference rate for what
+// The uncapped mode: the reference rate for what
 // cannot follow the frame time (code immediates, frame counts) - Kyo's
 // uncapped list takes 120's values too.
-constexpr int kUncappedMaxFps = 240;
 constexpr int kUncappedReferenceFps = 120;
 
 // The rates the Frame rate option offers besides 30 and uncapped
@@ -1109,41 +1109,44 @@ void note_main_frame_work(std::uint64_t m) {
     if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
 }
 
-// The uncapped mode's frame limit: BBHOST_UNCAPPED_FPS=N (30..240) if set;
+// The uncapped mode's optional frame limit: BBHOST_UNCAPPED_FPS=N (30..1000) if set;
 // else, with V-Sync on, the display's refresh rate (a PC game's V-Sync: no
-// frame the display cannot show), and with it off 240. Asked every frame; the
+// frame the display cannot show), and with it off no practical frame limit. Asked every frame; the
 // refresh rate is cached by the window (once a second) and V-Sync read again
 // only when a setting changed.
 float uncapped_target() {
     static const int forced = [] {
         const char* e = std::getenv("BBHOST_UNCAPPED_FPS");
         const int v = e && *e ? std::atoi(e) : 0;
-        return v <= 0 ? 0 : std::clamp(v, 30, kUncappedMaxFps);
+        return v <= 0 ? 0 : v;
     }();
-    float limit = static_cast<float>(kUncappedMaxFps);
+    float limit = 0.0f;
     if (forced) {
-        limit = static_cast<float>(forced);
+        limit = frame_pacing::uncapped_limit(forced, false, 0.0f);
     } else {
         static std::uint64_t serial = 0;
         static bool vsync = true;
         if (const std::uint64_t s = host_opt_serial(); s != serial) {
-            serial = s;
-            vsync = host_settings().vsync;
+            const HostSettings hs = host_settings();
+            vsync = hs.vsync;
+            serial = hs.serial;
         }
         if (vsync) {
             const float hz = host_window_refresh_hz();  // 0 headless, or when the display does not say
-            if (hz >= 30.0f) limit = std::min(limit, hz);
+            limit = frame_pacing::uncapped_limit(0, true, hz);
         }
     }
     static float said = -1.0f;
     if (limit != said) {
         said = limit;
-        host_log("frame rate: uncapped, at most %.2f fps (%s)", static_cast<double>(limit),
-                 forced                                          ? "BBHOST_UNCAPPED_FPS"
-                 : limit < static_cast<float>(kUncappedMaxFps) ? "V-Sync on: the display's refresh rate"
-                                                                 : "the mode's limit");
+        if (limit > 0.0f) {
+            host_log("frame rate: uncapped, at most %.2f fps (%s)", static_cast<double>(limit),
+                     forced ? "BBHOST_UNCAPPED_FPS" : "V-Sync on: the display's refresh rate");
+        } else {
+            host_log("frame rate: uncapped, no frame limit (V-Sync off or no display refresh; BBHOST_UNCAPPED_FPS=N sets one)");
+        }
     }
-    return 1.0f / limit;
+    return frame_pacing::target_for_limit(limit);
 }
 
 // BBHOST_TEST_FPS_SWING (a test switch, converted rates only): the target
@@ -1233,7 +1236,7 @@ float pace_target() {
 // as the 60 FPS++ cave has it (a loading screen has no target: the measured
 // time), times a plugin's time scale, at most 1/30 - the play time's
 // milliseconds from it, and the values that follow the frame's seconds, from
-// dt: the same with the uncapped limit as the floor while a loading screen
+// dt: the same with a separate simulation floor while a loading screen
 // has no target. Above 60 the cloth's stiffness scale: the square of its
 // solver rate (one substep a frame) against the 60 its part files were
 // authored at, (60 dt)^2, at most 1 (below 60 the cloth keeps the 60
@@ -1254,7 +1257,7 @@ void each_frame(const SprjFlipper* f) {
             put<std::int32_t>(g_play_ms_va, ms);
         }
     }
-    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
+    const float floor_s = frame_pacing::step_floor(f->target_frame_seconds);
     const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
@@ -1473,7 +1476,7 @@ int apply_rate(ElfImage* image, int want) {
     }
     for (const Counted& c : kCounts) {
         std::uint8_t now[8];
-        count_bytes(c, c.kind == Count::Digits && mode == 0 ? kUncappedMaxFps : fps, now);
+        count_bytes(c, c.kind == Count::Digits && mode == 0 ? frame_pacing::kSoundHz : fps, now);
         write(c.at, now, c.n);
     }
     for (const Bytes& b : kBytes) write(b.at, b.now, b.n);
@@ -1718,7 +1721,7 @@ void frame_rate_install(ElfImage* image) {
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
     char target[96];
     if (got == 0) {
-        std::snprintf(target, sizeof(target), "the step following the measured frame time, clamped to 1/%d..1/30 s", kUncappedMaxFps);
+        std::snprintf(target, sizeof(target), "measured frame time; calibrated values floored at 1/%d s", frame_pacing::kStepFloorFps);
     } else {
         std::snprintf(target, sizeof(target), "a 1/%d s target", got);
     }
