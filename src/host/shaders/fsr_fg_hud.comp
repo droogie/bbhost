@@ -1,0 +1,38 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_shader_image_load_formatted : require
+// Compute pass extracting RGB HUD difference between full real color and
+// exact current hudless color, and either isolating HUD or compositing HUD
+// over generated frame.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D full_real;
+layout(set = 0, binding = 1) uniform texture2D hudless_real;
+layout(set = 0, binding = 2) uniform image2D ui_hud;
+layout(set = 0, binding = 3) uniform image2D generated_target;
+layout(set = 0, binding = 4) uniform texture2D generated_source;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint mode; // 0: extract HUD to ui_hud, 1: composite ui_hud onto generated_target
+};
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(width) || xy.y >= int(height)) return;
+
+    if (mode == 0u) {
+        vec4 real_col = texelFetch(full_real, xy, 0);
+        vec4 hudless_col = texelFetch(hudless_real, xy, 0);
+        vec3 diff = abs(real_col.rgb - hudless_col.rgb);
+        // Any noticeable divergence is game HUD (threshold 2.0 / 255.0)
+        float hud_mask = (max(diff.r, max(diff.g, diff.b)) > (2.0 / 255.0)) ? 1.0 : 0.0;
+        imageStore(ui_hud, xy, vec4(real_col.rgb * hud_mask, hud_mask));
+    } else {
+        vec4 hud_val = imageLoad(ui_hud, xy);
+        vec4 gen_val = texelFetch(generated_source, xy, 0);
+        vec3 final_rgb = mix(gen_val.rgb, hud_val.rgb, hud_val.a);
+        imageStore(generated_target, xy, vec4(final_rgb, 1.0));
+    }
+}

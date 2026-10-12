@@ -7,7 +7,7 @@ bool host_gpu_memory_tight() { return false; }
 bool host_gpu_small_vram() { return false; }
 void host_gpu_queue_lock() {}
 void host_gpu_queue_unlock() {}
-std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*) { return 0; }
+std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*, std::uint64_t) { return 0; }
 void host_gpu_wait_submitted(std::uint64_t) {}
 GpuBusy host_gpu_busy() { return {}; }
 void host_gpu_busy_present_begin(void*) {}

@@ -1,3 +1,4 @@
+#include "host/reflex.h"
 #include "hle/common.h"
 #include "hle/np.h"
 #include "hle/fs.h"
@@ -1546,6 +1547,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         return static_cast<int>(0x80920002u);  // SCE_PAD_ERROR_INVALID_HANDLE
     }
     std::memset(st, 0, 120);
+    host::reflex::on_input_sampled();
     PadState p = host_pad_state();
     const std::uint32_t device_buttons = p.buttons;  // pad and keyboard, before the mouse
     // BBHOST_MOUSE_MENU=1: the pointer drives the menus through the pad, which

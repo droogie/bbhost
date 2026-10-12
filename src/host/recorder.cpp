@@ -405,12 +405,12 @@ void replay_block(const Block& b) {
             // submits them (enqueue's mutex would also drain them).
             write_combine_fence();
             g_last_serial.store(r->serial, std::memory_order_relaxed);
-            stream_submit_job(r->cmds, r->ncmds, r->wait, r->wait_stage, VK_NULL_HANDLE, r->fence, r->items, r->serial, 0);
+            stream_submit_job(r->cmds, r->ncmds, r->wait, r->wait_stage, VK_NULL_HANDLE, r->fence, r->items, r->serial, 0, r->reflex_frame_id);
             break;
         }
         case Op::kForeignSubmit: {
             const auto* r = reinterpret_cast<const stream::ForeignSubmit*>(p);
-            stream_submit_job(&r->cmd, 1, r->wait, r->wait_stage, r->signal, r->fence, 0, ~0ull, r->id);
+            stream_submit_job(&r->cmd, 1, r->wait, r->wait_stage, r->signal, r->fence, 0, ~0ull, r->id, r->reflex_frame_id);
             break;
         }
         case Op::kDrawState: {
@@ -976,7 +976,7 @@ void Rec::end_submit(const stream::EndSubmit& s) {
     publish_block(true);
 }
 
-std::uint64_t Rec::foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal, VkFence fence) {
+std::uint64_t Rec::foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal, VkFence fence, std::uint64_t reflex_frame_id) {
     static std::uint64_t next = 0;  // under g.mu
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kForeignSubmit, sizeof(stream::ForeignSubmit));
@@ -987,6 +987,7 @@ std::uint64_t Rec::foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipel
     r->wait_stage = wait_stage;
     r->signal = signal;
     r->fence = fence;
+    r->reflex_frame_id = reflex_frame_id;
     r->id = ++next;
     const std::uint64_t id = r->id;
     publish_block(true);  // (inline: replayed here, and the record may be reused after)

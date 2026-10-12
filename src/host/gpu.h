@@ -505,7 +505,7 @@ void host_gpu_queue_unlock();
 // VkSemaphore to signal, VkFence): its ticket, or 0 when the thread is off
 // and the caller submits itself. The renderer's lock can go once it is
 // queued; host_gpu_wait_submitted(ticket) before presenting what it renders.
-std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence);
+std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence, std::uint64_t reflex_frame_id = 0);
 void host_gpu_queue_lock_only();  // the queue's mutex without waiting for the thread (after host_gpu_wait_submitted)
 void host_gpu_wait_submitted(std::uint64_t ticket);
 // How busy the GPU is with our work (gpu_busy.cpp): the union of the time

@@ -31,6 +31,8 @@ struct Vertex {
 std::mutex g_mu;
 std::vector<Vertex> g_verts;  // being built by the pump (under g_mu)
 std::vector<Vertex> g_shown;  // what presents draw (under g_mu)
+float g_build_w = 0.0f, g_build_h = 0.0f;
+float g_shown_w = 0.0f, g_shown_h = 0.0f;
 std::atomic<std::size_t> g_shown_count{0};
 
 // Presenter-owned, created once for the swapchain's format.
@@ -89,14 +91,18 @@ VkShaderModule make_module(VkDevice device, const std::uint32_t* words, std::siz
 
 }  // namespace
 
-void host_overlay_reset() {
+void host_overlay_reset(float display_w, float display_h) {
     std::lock_guard<std::mutex> lk(g_mu);
     g_verts.clear();
+    g_build_w = display_w;
+    g_build_h = display_h;
 }
 
 void host_overlay_commit() {
     std::lock_guard<std::mutex> lk(g_mu);
     g_shown.swap(g_verts);
+    g_shown_w = g_build_w;
+    g_shown_h = g_build_h;
     g_shown_count.store(g_shown.size(), std::memory_order_release);
 }
 
@@ -434,6 +440,12 @@ std::uint32_t host_overlay_record(VkCommandBuffer cmd, VkRect2D area, float disp
         if (g_shown.empty() || bytes > g_vbo_bytes) return 0;
         std::memcpy(g_vbo_map, g_shown.data(), bytes);
         count = static_cast<std::uint32_t>(g_shown.size());
+        // A queued overlay retains its own coordinate space when a loading,
+        // fallback or SR transition changes the picture before the next pump.
+        if (g_shown_w > 0.0f && g_shown_h > 0.0f) {
+            display_w = g_shown_w;
+            display_h = g_shown_h;
+        }
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1, &g_dset, 0, nullptr);

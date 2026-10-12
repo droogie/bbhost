@@ -80,7 +80,7 @@ constexpr std::uint32_t kMaxImages = 32;
 // window), so the ring is a symptom of a heavy frame, not its cost. Raising it
 // doubles the descriptor pools as well; do not without a measurement.
 constexpr std::uint32_t kMaxQueued = 2048;    // dispatches + draws per flush
-constexpr std::uint32_t kParamsStride = 512;  // bytes per StageParams slot in the ring (352 bytes, a multiple of 256)
+constexpr std::uint32_t kParamsStride = 768;  // 576-byte StageParams, rounded to a multiple of 256
 constexpr std::uint32_t kStageSlots = 2;      // VS + PS descriptor sets per draw
 // Command buffers in flight, at most (BBHOST_GPU_SLOTS picks fewer, Gpu::slot_count).
 // The command processor submits after every game command buffer - about 11 a
@@ -408,6 +408,7 @@ struct Gpu {
     VkDeviceMemory ubo_mem = VK_NULL_HANDLE;
     void* ubo_map = nullptr;
     std::uint32_t queued = 0;   // params/descriptor slots used in the current command buffer
+    std::uint64_t recording_reflex_id = 0;
     bool recording = false;
     std::uint64_t record_serial = 0;  // bumped whenever g.cmd_ starts recording (render.cpp's state cache)
     std::uint64_t flushes = 0;  // submissions
@@ -1361,7 +1362,7 @@ std::string stream_last_op();  // for the device-loss and hang reports
 // queue's lock without it; `serial` (a game submission's Gpu::flushes, ~0
 // otherwise) and `foreign_id` (kForeignSubmit's) are published once it went.
 void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal,
-                       VkFence fence, std::uint32_t items, std::uint64_t serial, std::uint64_t foreign_id);
+                       VkFence fence, std::uint32_t items, std::uint64_t serial, std::uint64_t foreign_id, std::uint64_t reflex_frame_id);
 std::uint64_t stream_submitted_serial();  // the game submissions gone to the queue: the last one's serial + 1
 // What a submission costs on its way (recorder.cpp reports it): the command
 // buffers' begin and end, wherever they run; slot retirement and its fence
@@ -1405,7 +1406,7 @@ public:
     // takes.
     void begin(VkCommandBuffer cmd);
     void end_submit(const stream::EndSubmit& s);
-    std::uint64_t foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal, VkFence fence);
+    std::uint64_t foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal, VkFence fence, std::uint64_t reflex_frame_id);
     void pipeline_barrier(VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, std::uint32_t nmem,
                           const VkMemoryBarrier* mem, std::uint32_t nbuf, const VkBufferMemoryBarrier* buf, std::uint32_t nimg,
                           const VkImageMemoryBarrier* img);

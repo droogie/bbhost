@@ -1,3 +1,4 @@
+#include "host/reflex.h"
 // CPU-visible side effects of a Gnm command stream. Until Phase 3 there is
 // no GPU, but the engine still waits on labels, fences and timestamps that
 // EVENT_WRITE_EOP / RELEASE_MEM / WRITE_DATA / DMA_DATA would produce. Walk
@@ -2099,6 +2100,7 @@ struct Job {
     std::deque<std::vector<std::uint8_t>> owned;  // deque: push_back must not move the earlier buffers
     std::vector<std::pair<const void*, std::size_t>> guest;  // the originals, for the snapshot comparison
     std::function<void()> done;
+    std::uint64_t reflex_frame_id = 0;  // immutable simulation ID captured on the submitting thread
     std::uint64_t free_event = 0;  // g_arena_free_event when submitted (BBHOST_ARENA_MONITOR)
 };
 
@@ -2214,6 +2216,7 @@ void cp_thread(Queue* q, int id) {
             job = std::move(q->jobs.front());
             q->jobs.pop_front();
         }
+        host::reflex::set_cp_thread_frame_id(job.reflex_frame_id);
         cpu_profile_tick(profile);
         t_job_free_event = g_arena_monitor ? job.free_event : ~0ull;
         for (const auto& cb : job.cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
@@ -2292,6 +2295,7 @@ void cp_thread(Queue* q, int id) {
             ++q->retired;
             g_retired_total.fetch_add(1, std::memory_order_release);
         }
+        host::reflex::set_cp_thread_frame_id(0);
         q->cv.notify_all();
         q->drained.notify_all();
     }
@@ -2372,7 +2376,10 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         const char* e = std::getenv("BBHOST_SYNC_GNM");
         return e && e[0] == '1';
     }();
+    const auto frame_id = host::reflex::current_sim_frame_id();
     if (sync_gfx && queue_id == 0) {
+        const auto saved_frame = host::reflex::cp_thread_frame_id();
+        host::reflex::set_cp_thread_frame_id(frame_id);
         const int saved = t_queue_id;
         t_queue_id = 0;
         for (std::size_t i = 0; i < cbs.size(); ++i) {
@@ -2393,6 +2400,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         if (done) {
             done();
         }
+        host::reflex::set_cp_thread_frame_id(saved_frame);
         return;
     }
     Queue* q = queue_for(queue_id);
@@ -2426,6 +2434,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     } else {
         q->jobs.push_back(Job{cbs, ce_cbs, {}, {}, std::move(done)});
     }
+    q->jobs.back().reflex_frame_id = frame_id;
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
     ++q->submitted;
     g_submitted_total.fetch_add(1, std::memory_order_release);

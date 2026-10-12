@@ -1,3 +1,4 @@
+#include "host/reflex.h"
 #include "hle/common.h"
 
 #include "core/portable.h"
@@ -366,6 +367,7 @@ GUEST_ABI int hle_gnm_submit(unsigned count, void** dcb, unsigned* dcb_bytes, vo
 }
 GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes,
                                  int handle, int buffer, unsigned, std::int64_t arg) {
+    host::reflex::on_simulation_end();
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes),
                          [handle, buffer, arg] {
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded

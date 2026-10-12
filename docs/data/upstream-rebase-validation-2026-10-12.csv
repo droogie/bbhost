@@ -1,0 +1,7 @@
+case,build,source_cap,window_start_s,window_end_s,submitted_fps,display_fps,display_p99_ms,missing_display_rows,settled_samples,settled_minutes,private_min_mib,private_max_mib,private_slope_mib_min
+central_dlss_3x,v1,30,110,140,90.04,89.77,13.536,8,,,,,
+central_dlss_4x,v1,30,110,140,119.86,119.79,10.610,6,,,,,
+dream_fsr_2x,v1,30,110,140,60.00,59.80,18.964,0,,,,,
+dream_fsr_2x_repaired_soak,v2,60,300,550,118.24,118.24,13.362,0,,,,,
+saved_dlss_4x,final,30,120,170,119.66,119.69,10.784,9,,,,,
+dream_fsr_2x_repaired_memory,v2,60,315,555,,,,,9,4.0,8231.83984375,8239.18359375,-1.5395833333333333

@@ -77,6 +77,24 @@ fps_cap = 30
 # OBS's Window Capture records bbhost without it. (Windows only.)
 # obs_capture = "auto"
 
+[dlss]
+upscaler_backend = "dlss" # dlss, fsr3, or fsr4 (optional model download)
+frame_generation_backend = "dlss" # dlss or fsr3 (2x only)
+# Off, native DLAA, or a super-resolution preset. Setup and F10 share these
+# choices. Restart after changing any temporal-rendering setting.
+mode = "off" # off, dlaa, quality, balanced, performance, ultra_performance
+# 0 follows the selected display resolution, including custom sizes. SR
+# presets choose a lower input size automatically; BBHOST_RES overrides it.
+output_width = 0
+output_height = 0
+frame_generation = false # The game still simulates at its own rate
+frame_generation_factor = 2 # 2, 3 or 4; unsupported higher factors fall back to 2
+# Extra animated-mesh motion for DLAA, DLSS SR and frame generation.
+# Uses additional GPU time and about 128 MiB of vertex history plus a motion
+# image. F10 > GRAPHICS saves this setting; restart after changing it.
+# BBHOST_OBJECT_MOTION=0 or 1 overrides the saved choice for this run.
+object_motion = false
+
 [startup]
 # Bloodborne 1.09: skip FromSoftware, Japan Studio and SCE logos, and the
 # "Exit Game may not have been selected" warning after closing the window.

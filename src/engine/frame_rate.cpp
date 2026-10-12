@@ -1,3 +1,4 @@
+#include "host/reflex.h"
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
 #include "engine/frame_rate_step.h"
@@ -1292,6 +1293,18 @@ void each_frame(const SprjFlipper* f) {
 
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
+    auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
+    const bool converted = g_game_fps != 30;
+    if (g_source == Source::Ours) {
+        note_main_frame_work(saved[5]);
+        RealClock clock;
+        g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
+        sprj_flipper_update(f, clock, pace_target());
+        g_fast_target = false;
+        // Finish both pacing waits before sampling input or running the frame's
+        // host callbacks. Their work belongs to this simulation ID as well.
+        host::reflex::on_frame_begin();
+    }
     np_test_tick();  // the online test hook wants the main thread, once a frame
     params_tick();   // the param repository walk (engine/params.h)
     lua_events_tick();  // named Lua events queued from any thread (engine/lua_events.h)
@@ -1302,14 +1315,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     rebirth_tick();     // the altar's rebirth: the host's half of its talk script (engine/rebirth.h)
     world_chr_tick();   // a test warp a plugin queued this frame (BBHOST_TEST_WARP, engine/world_chr.h)
     loading_tick(hle_video_flip_count());  // the loading screens' lengths and the first in-game frame (engine/loading.h)
-    auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
-    const bool converted = g_game_fps != 30;
     if (g_source == Source::Ours) {
-        note_main_frame_work(saved[5]);
-        RealClock clock;
-        g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
-        sprj_flipper_update(f, clock, pace_target());
-        g_fast_target = false;
         if (converted) each_frame(f);
         if (g_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("frame source: SprjFlipper::Update is ours (0x%llx, %s); the guest's no longer runs",

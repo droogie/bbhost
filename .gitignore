@@ -21,8 +21,15 @@ compile_commands.json
 __pycache__/
 /bbhost-options.toml
 build-win/
+/build-dev/
+/build-ngx/
+/*-configure.log
+/*-compile.log
+/build-*.log
 build-linux-portable/
 /build-ci/
 # Private working notes and the eboot's symbol files stay out of the repository.
 /notes/
 /symbols/
+# The DLSS SDK and Vulkan headers ngx_bridge builds against (docs/dlaa.md).
+/tools/ngx_bridge/external/

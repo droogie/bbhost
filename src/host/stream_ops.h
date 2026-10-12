@@ -69,6 +69,7 @@ struct EndSubmit {
     VkPipelineStageFlags wait_stage;
     std::uint32_t pad;
     VkFence fence;
+    std::uint64_t reflex_frame_id; // simulation ID captured at recording start
     std::uint64_t serial;  // Gpu::flushes of this submission
 };
 struct ForeignSubmit {
@@ -78,6 +79,7 @@ struct ForeignSubmit {
     std::uint32_t pad;
     VkSemaphore signal;
     VkFence fence;
+    std::uint64_t reflex_frame_id;
     std::uint64_t id;  // what host_gpu_wait_submitted waits for
 };
 struct DrawState {

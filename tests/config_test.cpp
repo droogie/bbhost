@@ -98,6 +98,10 @@ int main() {
     // No bbhost.toml in the working directory to layer over the user's.
     if (chdir((g_dir / "work").c_str()) != 0) return 1;
 
+    CHECK(!load("[dlss]\nmode = \"quality\"\n").dlss_object_motion);
+    CHECK(load("[dlss]\nobject_motion = true\n").dlss_object_motion);
+    CHECK(!load("[dlss]\nobject_motion = false\n").dlss_object_motion);
+
     // A note after a quoted value is not part of it.
     {
         HostConfig c = load("[online]\nhost = \"192.168.1.50\"  # added by bbhost v0.2.0: the server\n"
