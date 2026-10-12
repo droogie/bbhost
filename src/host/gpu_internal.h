@@ -1340,6 +1340,10 @@ void textures_retired(int slot);                    // that submission completed
 
 // render.cpp
 void render_end_pass_locked();   // ends dynamic rendering if active (before dispatch/flush)
+// Clears held back for the next pass's load op (BBHOST_FOLD_CLEARS); flush
+// before recording anything else.
+extern bool g_clears_pending;
+void pending_clears_flush_locked(const char* why = "");
 void render_report();
 bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, VkImage dst, VkRect2D area, VkExtent2D src,
                                 std::uint32_t src_x = 0, std::uint32_t src_y = 0, VkImageView dst_view = VK_NULL_HANDLE);

@@ -736,6 +736,19 @@ void before_op(void* site) {
 
 // A record of `payload` bytes appended to the open block; its payload.
 std::uint8_t* append_record(Op kind, std::size_t payload) {
+    // Held-back clears go before any command but these, which cannot depend
+    // on them (image transitions flush them themselves).
+    if (g_clears_pending) {
+        switch (kind) {
+        case Op::kBarrier: case Op::kTransferBarrier: case Op::kCopyOrderBarrier: case Op::kPassBarrier: case Op::kEndRendering:
+        case Op::kBeginRendering: case Op::kDrawState: case Op::kBindPipeline: case Op::kBindSets: case Op::kPushConstants:
+        case Op::kUpdateSets: case Op::kMarker:
+            break;
+        default:
+            pending_clears_flush_locked(stream::op_name(kind));
+            break;
+        }
+    }
     Block& b = open_block();
     const std::size_t bytes = sizeof(stream::Header) + round8(payload);
     const std::size_t words = bytes / 8;
@@ -769,6 +782,11 @@ template <class T> void put_array(std::uint8_t*& at, const T* src, std::size_t n
 // replayed (under g.mu). `site` is who records, for the census and
 // BBHOST_GPU_PROFILE=2's gaps.
 VkCommandBuffer in_place(void* site) {
+    if (g_clears_pending) {  // whatever is recorded in place comes after them
+        char why[48];
+        std::snprintf(why, sizeof(why), "in place, site %llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(site) - host_image_base()));
+        pending_clears_flush_locked(why);
+    }
     if (g.profile_gaps) profile_note_site_locked(site);
     if (g_census_on) ++g_census[site];
     if (g_mode != kModeOff && g_blocks) {
@@ -996,6 +1014,7 @@ std::uint64_t Rec::foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipel
 void Rec::pipeline_barrier(VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, std::uint32_t nmem,
                            const VkMemoryBarrier* mem, std::uint32_t nbuf, const VkBufferMemoryBarrier* buf, std::uint32_t nimg,
                            const VkImageMemoryBarrier* img) {
+    if (nimg && g_clears_pending) pending_clears_flush_locked("an image barrier");  // a transition could discard what they clear
     bool chained = false;
     for (std::uint32_t k = 0; k < nmem; ++k) chained |= mem[k].pNext != nullptr;
     for (std::uint32_t k = 0; k < nbuf; ++k) chained |= buf[k].pNext != nullptr;
@@ -1638,6 +1657,7 @@ bool DrawCmds::transfer_end() {
 }
 
 bool DrawCmds::copy_region(VkImage src, VkImage dst, std::uint32_t width, std::uint32_t height, bool dst_initialised) {
+    if (g_clears_pending) pending_clears_flush_locked("a region copy");  // the copy may read a target a held-back clear writes
     if (!packet_) return false;
     DrawPacket& p = *static_cast<DrawPacket*>(packet_);
     // After a transfer batch's start its end must come first (replay order).

@@ -6681,6 +6681,107 @@ void end_pass_for_draw_locked() {
     copy_versions_pass_end_locked();
 }
 
+// ---- Clears folded into the next pass (BBHOST_FOLD_CLEARS) ----
+// MoltenVK makes each vkCmdClear*Image a Metal render encoder of its own, a
+// GPU gap. A clear is held back and becomes the next pass's LOAD_OP_CLEAR when
+// that pass covers the whole image layer; any other recorded work flushes the
+// held clears first (recorder.cpp's hooks). Default on with MoltenVK only.
+bool fold_clears_on() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_FOLD_CLEARS");
+        return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
+    }();
+    return mode < 0 ? g.moltenvk : mode == 1;
+}
+struct HeldClear {
+    const RtImage* r;  // compared, never read: what it was is kept here
+    std::uint64_t base;
+    VkImage image;
+    std::uint32_t width, height;
+    VkImageSubresourceRange range;
+    VkClearValue value;
+};
+std::vector<HeldClear> g_held_clears;  // under g.mu, oldest first
+std::atomic<std::uint64_t> g_clears_folded{0}, g_clears_unfolded{0};
+
+void record_clear_now(const HeldClear& c) {
+    if (c.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+        rec().clear_color_image(c.image, VK_IMAGE_LAYOUT_GENERAL, c.value.color, 1, &c.range);
+    } else {
+        rec().clear_depth_stencil_image(c.image, VK_IMAGE_LAYOUT_GENERAL, c.value.depthStencil, 1, &c.range);
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+// The caller still records the barrier. False: the caller records the clear.
+bool hold_clear_locked(RtImage& r, const VkImageSubresourceRange& range, const VkClearValue& value) {
+    if (!fold_clears_on() || range.baseMipLevel || range.levelCount != 1 || range.layerCount != 1) return false;
+    for (const HeldClear& c : g_held_clears) {
+        if (c.image == r.image) {
+            pending_clears_flush_locked();  // a second clear of it: the first goes in order
+            break;
+        }
+    }
+    g_held_clears.push_back(HeldClear{&r, r.base, r.image, r.width, r.height, range, value});
+    g_clears_pending = true;
+    return true;
+}
+
+// Held clears that don't fold into this pass are recorded before it.
+void fold_pending_clears_locked(const DrawState& s, VkExtent2D extent, std::vector<VkRenderingAttachmentInfo>& colors,
+                                VkRenderingAttachmentInfo& depth, VkRenderingAttachmentInfo* stencil) {
+    std::vector<HeldClear> pending;
+    pending.swap(g_held_clears);
+    g_clears_pending = false;
+    for (const HeldClear& c : pending) {
+        bool folded = false;
+        const bool whole = c.width == extent.width && c.height == extent.height;
+        if (whole && (c.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) {
+            for (std::size_t t = 0; t < colors.size() && !folded; ++t) {
+                if (s.color[t] != c.r || s.color[t]->image != c.image || s.color_layer[t] != c.range.baseArrayLayer ||
+                    colors[t].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    continue;
+                }
+                colors[t].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                colors[t].clearValue = c.value;
+                folded = true;
+            }
+        } else if (whole && s.depth == c.r && s.depth->image == c.image && s.depth_layer == c.range.baseArrayLayer &&
+                   depth.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+                   (!stencil || stencil->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)) {
+            const bool st = (c.range.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+            if (!st || stencil) {
+                if (c.range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    depth.clearValue = c.value;
+                }
+                if (st) {
+                    stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    stencil->clearValue = c.value;
+                }
+                folded = true;
+            }
+        }
+        if (folded) {
+            g_clears_folded.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            static std::set<std::uint64_t> seen_bases;
+            g_clears_unfolded.fetch_add(1, std::memory_order_relaxed);
+            if (seen_bases.size() < 64 && seen_bases.insert(c.base).second) {
+                host_log("render: clear of 0x%llx (%ux%u, layer %u, aspect %x) not folded into the pass beginning on %ux%u (depth 0x%llx layer %u, "
+                         "rt0 0x%llx)",
+                         static_cast<unsigned long long>(c.base), c.width, c.height, c.range.baseArrayLayer, c.range.aspectMask,
+                         extent.width, extent.height, static_cast<unsigned long long>(s.depth ? s.depth->base : 0), s.depth_layer,
+                         static_cast<unsigned long long>(s.color[0] ? s.color[0]->base : 0));
+            }
+            record_clear_now(c);
+        }
+    }
+}
+
 // `hazard`: the draw samples a target written since the last barrier (lazy
 // pass barriers), so the barrier is paid before it, inside a pass or not.
 void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
@@ -6736,6 +6837,10 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         if (!extent.width || s.depth->width < extent.width) extent.width = s.depth->width;
         if (!extent.height || s.depth->height < extent.height) extent.height = s.depth->height;
     }
+    if (g_clears_pending) {
+        const bool has_stencil = s.depth && s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM;
+        fold_pending_clears_locked(s, extent, colors, depth, has_stencil ? &stencil : nullptr);
+    }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent};
     ri.layerCount = 1;
@@ -6783,7 +6888,9 @@ void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t
     if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!range.aspectMask) return;
-    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    VkClearValue cv{};
+    cv.depthStencil = v;
+    if (!hold_clear_locked(r, range, cv)) rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -7269,6 +7376,26 @@ DrawCmds* draw_packet_early_locked() {
     return g_draw_cmds->deferred() ? g_draw_cmds : nullptr;
 }
 
+bool g_clears_pending = false;
+
+void pending_clears_flush_locked(const char* why) {
+    if (g_held_clears.empty()) return;
+    std::vector<HeldClear> pending;
+    pending.swap(g_held_clears);
+    g_clears_pending = false;
+    for (const HeldClear& c : pending) {
+        g_clears_unfolded.fetch_add(1, std::memory_order_relaxed);
+        static std::set<std::string> seen;
+        char key[160];
+        std::snprintf(key, sizeof(key), "0x%llx (%ux%u) recorded before other work (%s)", static_cast<unsigned long long>(c.base),
+                      c.width, c.height, why);
+        if (seen.size() < 64 && seen.insert(key).second) {
+            host_log("render: clear of %s at flip %llu", key, static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        record_clear_now(c);
+    }
+}
+
 void render_end_pass_locked() {
     if (g_pass.active) {
         g_pass.active = false;
@@ -7466,7 +7593,9 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         if (logs.fetch_add(1) < 12) {
             host_log("render: fill clear of depth target 0x%llx to %g", static_cast<unsigned long long>(r.base), v.depth);
         }
-        rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        VkClearValue cv{};
+        cv.depthStencil = v;
+        if (!hold_clear_locked(r, range, cv)) rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     } else {
         VkClearColorValue v{};
         const bool bgra = r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB;
@@ -7474,7 +7603,9 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         v.float32[1] = rgba[1];
         v.float32[2] = bgra ? rgba[0] : rgba[2];
         v.float32[3] = rgba[3];
-        rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        VkClearValue cv{};
+        cv.color = v;
+        if (!hold_clear_locked(r, range, cv)) rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -7813,7 +7944,13 @@ std::string render_fill_stats() {
                   static_cast<unsigned long long>(g_fill_surfaces.load()),
                   static_cast<unsigned long long>(g_fill_surfaces_skipped.load()), g_pending_clears.size(), g_pending_clear_max,
                   static_cast<unsigned long long>(g_pending_scan_steps), static_cast<unsigned long long>(g_pending_scans));
-    return buf;
+    std::string out = buf;
+    if (fold_clears_on()) {
+        std::snprintf(buf, sizeof(buf), "; clears folded into a pass's load op %llu, recorded %llu",
+                      static_cast<unsigned long long>(g_clears_folded.load()), static_cast<unsigned long long>(g_clears_unfolded.load()));
+        out += buf;
+    }
+    return out;
 }
 
 void render_report() {
