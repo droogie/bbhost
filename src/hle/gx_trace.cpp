@@ -4691,9 +4691,12 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     if (!wd) wd = wrapper_dispatch(static_cast<Kind>(id), f, caller);
     if (g_gnm_sources) note_source(cb, cmd, end, wd == 2 ? kSourceWrapper : caller);
     if (wd == 2) return 1;
+    // Dispatch records serve only the coverage trace, unlike draw records
+    // which also supply the renderer. Do not retain them outside its window.
+    const bool keep_record = id < kEmitDispatch || id > kEmitDispatchQueue || in_window(flip);
     const bool from_gx = caller >= kGxImmediateLo && caller < kGxImmediateHi && t_last.kind < kEmitAuto;
     GxRecordsPtr records;
-    if (from_gx && g_backend && sample_bindings()) {
+    if (keep_record && from_gx && g_backend && sample_bindings()) {
         GxCostTimer records_timer(kCostRecords);
         records = snapshot_records(t_last);  // after the commit, before the lock
     }
@@ -4711,6 +4714,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         }
         if (end < cmd + 64) ++g.near_end;
     }
+    if (!keep_record) return 0;
     if (g_by_packet.size() > (1u << 20)) g_by_packet.clear();
     EmitRec& e = g_by_packet[cmd];
     e.kind = static_cast<Kind>(id);
