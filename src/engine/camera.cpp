@@ -5,6 +5,7 @@
 #include "core/elf.h"
 #include "core/memory.h"
 #include "engine/addr.h"
+#include "engine/params.h"
 #include "hle/modules.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -184,52 +185,74 @@ void camera_install(ElfImage* image) {
     }
 }
 
-void camera_tick() {
-    if (fov_watching()) {
-        // Find the table and watch it; touch nothing.
-        int state = g_state.load(std::memory_order_acquire);
-        if (state == 0 && g_state.compare_exchange_strong(state, 1)) std::thread(find_tables).detach();
-        fov_watch();
-        return;
-    }
-    const Scales k = wanted_scales();
-    static const Scales kGame{1.0f, 1.0f, 1.0f};
-    static Scales applied = kGame;
-    if (k == kGame && applied == kGame) return;
+void camera_debug_tick() {
+    if (!fov_watching()) return;
+    // Find the table and watch it; touch nothing.
     int state = g_state.load(std::memory_order_acquire);
-    if (state == 0 && g_state.compare_exchange_strong(state, 1)) {
-        std::thread(find_tables).detach();
-        return;
-    }
-    if (state != 2) return;
-    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
-    if (!lock.owns_lock()) return;
-    for (const Table& t : g_tables) {
-        // Still the table it was: a param reload would move it, and writing
-        // through the old address would write into whatever took its place.
-        if (std::memcmp(t.base + kTypeAt, kTypeName, sizeof(kTypeName)) != 0) {
-            host_log("camera: LockCamParam moved; looking again");
-            g_tables.clear();
-            g_state.store(0, std::memory_order_release);
-            return;
+    if (state == 0 && g_state.compare_exchange_strong(state, 1)) std::thread(find_tables).detach();
+    fov_watch();
+}
+
+namespace {
+
+// The repository's LockCamParam as last seen: its rows' own values (read when
+// the table is loaded, before anything of ours), what was last written, and
+// the scales that was for. Its rows are the file the camera's update reads
+// (engine/params.h), so one copy; the scan above found it twice, mapped at
+// two addresses.
+std::mutex g_apply_mu;
+std::vector<void*> g_rows;
+std::vector<Scales> g_orig;
+Scales g_applied{1.0f, 1.0f, 1.0f};
+
+// Writes orig * k into each row; under g_apply_mu.
+void write_rows_locked(const Scales& k) {
+    for (std::size_t r = 0; r < g_rows.size(); ++r) {
+        auto* row = static_cast<std::uint8_t*>(g_rows[r]);
+        for (int f = 0; f < 3; ++f) {
+            const float want = g_orig[r][f] * k[f];
+            float now = 0.0f;
+            std::memcpy(&now, row + kFieldAt[f], 4);
+            if (now != want) std::memcpy(row + kFieldAt[f], &want, 4);
         }
     }
-    for (Table& t : g_tables) {
-        for (std::uint32_t r = 0; r < t.rows; ++r) {
-            std::uint64_t off = 0;
-            std::memcpy(&off, t.base + kRowsAt + r * kRowRecord + 8, 8);
-            for (int f = 0; f < 3; ++f) {
-                auto* v = reinterpret_cast<float*>(t.base + off + kFieldAt[f]);
-                if (*v != t.written[r][f]) t.orig[r][f] = *v;  // the game's own, first seen or reloaded
-                const float want = t.orig[r][f] * k[f];
-                if (*v != want) *v = want;
-                t.written[r][f] = want;
-            }
-        }
+    if (k != g_applied) {
+        host_log("camera: distance x%g, height x%g, field of view x%g (%zu LockCamParam rows, written once)", k[0], k[1], k[2],
+                 g_rows.size());
+        g_applied = k;
     }
-    if (k != applied) {
-        host_log("camera: distance x%g, height x%g, field of view x%g (%zu table(s))", k[0], k[1], k[2],
-                 g_tables.size());
-        applied = k;
+}
+
+}  // namespace
+
+void camera_table_loaded() {
+    if (fov_watching()) return;
+    std::uint32_t ids[512];
+    std::size_t count = 0;
+    if (!params_ids("LockCamParam", ids, sizeof(ids) / sizeof(ids[0]), &count) || count > sizeof(ids) / sizeof(ids[0])) return;
+    std::lock_guard<std::mutex> lock(g_apply_mu);
+    g_rows.clear();
+    g_orig.clear();
+    for (std::size_t i = 0; i < count; ++i) {
+        std::size_t bytes = 0;
+        void* row = params_row("LockCamParam", ids[i], &bytes);
+        if (!row || (bytes && bytes < kRowSize)) continue;
+        Scales o{};
+        for (int f = 0; f < 3; ++f) std::memcpy(&o[f], static_cast<const std::uint8_t*>(row) + kFieldAt[f], 4);
+        g_rows.push_back(row);
+        g_orig.push_back(o);
     }
+    // A loaded table holds the game's own values: ours go in only when the
+    // settings are not the game's.
+    g_applied = Scales{1.0f, 1.0f, 1.0f};
+    const Scales k = wanted_scales();
+    if (k != g_applied) write_rows_locked(k);
+}
+
+void camera_settings_changed() {
+    if (fov_watching()) return;
+    const Scales k = wanted_scales();
+    std::lock_guard<std::mutex> lock(g_apply_mu);
+    if (k == g_applied || g_rows.empty()) return;
+    write_rows_locked(k);
 }

@@ -107,7 +107,25 @@ struct VertexElement {
     std::uint32_t vdata = 0;  // first VGPR written
     std::uint32_t count = 0;  // VGPRs written, 1-4
     std::uint32_t w3 = 0;     // the record's word 3: data format [18:15], number format [14:12], DST_SEL [11:0]
+    // 8 or 16: the format's 8- or 16-bit components arrive packed, as the
+    // record holds them, in the dwords of an R16/R32/R32G32 attribute (the
+    // host's choice where the element's address and stride allow it), and
+    // the shader takes them apart; 0: one component a channel. AMD's compiler
+    // fetches an R8G8B8A8 or R16G16B16A16 attribute one component a load,
+    // since Vulkan promises it only the component's alignment: four typed
+    // loads where one dword load does.
+    std::uint32_t packed = 0;
 };
+// The width of `dfmt`'s components where an attribute can carry them packed
+// (0: it cannot): 8_8 as R16_UINT, 8_8_8_8 and 16_16 as R32_UINT, 16_16_16_16
+// as R32G32_UINT.
+inline std::uint32_t vertex_packed_bits(std::uint32_t dfmt) {
+    switch (dfmt) {
+    case 3: case 10: return 8;   // 8_8 (R16_UINT), 8_8_8_8 (R32_UINT)
+    case 5: case 12: return 16;  // 16_16 (R32_UINT), 16_16_16_16 (R32G32_UINT)
+    default: return 0;
+    }
+}
 
 // TranslateOptions::vertex_formats_from_params: the loader's descriptor of an
 // element's word 3 (StageParams::vertex_formats), or 0 when the loader does not
@@ -115,10 +133,12 @@ struct VertexElement {
 // load_vertex_input converts it (1 the raw bits of a float, or of a 32-bit
 // unorm or snorm; 2 the raw bits of an integer: uint, or a 32-bit sint; 3 unorm8;
 // 4 sint16). Bits 4-6: the data format's component count. Bits 8-11: the
-// components past it that read one. DST_SEL must select each of the format's
-// components in place and 0 or 1 past them, as every element of a cold world
-// load did; the loader stays small enough not to slow the driver's compile.
-inline std::uint32_t vertex_format_descriptor(std::uint32_t w3) {
+// components past it that read one. Bits 12-13: VertexElement::packed (1: 8-bit
+// components packed in the input's dwords, 2: 16-bit; 0: one a channel).
+// DST_SEL must select each of the format's components in place and 0 or 1 past
+// them, as every element of a cold world load did; the loader stays small
+// enough not to slow the driver's compile.
+inline std::uint32_t vertex_format_descriptor(std::uint32_t w3, std::uint32_t packed = 0) {
     const std::uint32_t dfmt = (w3 >> 15) & 0xf, nfmt = (w3 >> 12) & 7;
     std::uint32_t count = 0, bits = 0;
     switch (dfmt) {
@@ -151,7 +171,8 @@ inline std::uint32_t vertex_format_descriptor(std::uint32_t w3) {
             return 0;
         }
     }
-    return kind | count << 4 | ones << 8;
+    const std::uint32_t packing = packed == 8 && bits == 8 ? 1u : packed == 16 && bits == 16 ? 2u : 0u;
+    return kind | count << 4 | ones << 8 | packing << 12;
 }
 // Location n's descriptor is also specialization constant kVertexFormatSpecId
 // + n: 0, the default, reads StageParams::vertex_formats; a pipeline's key holds
@@ -265,6 +286,12 @@ struct TranslateOptions {
     // and the pixel stage's from 128.
     int cb_descriptor_set = -1;
     std::uint32_t cb_binding_base = 112;  // kBindingStorageBuffer0
+    // The host binds every constant buffer at its V#'s base (StageParams::
+    // cb_bias_dw always 0): the shader indexes each from dword 0 rather than
+    // from a bias read from the params. Constant offsets stay constants, which
+    // the driver loads several dwords at a time; added to a bias, AMD's
+    // compiler loaded each dword with an address add of its own.
+    bool cb_bias_zero = false;
     // Image dimensions per T# use site, filled by the host from the resolved
     // T#s (spv::Dim, arrayed). Missing entries default to 2D. Bits 8-9 of the
     // dim are the texel kind (ImageBinding::kind), 0 when not given.

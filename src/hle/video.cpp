@@ -513,6 +513,7 @@ void flip_waiter() {
         };
         std::vector<Done> present;
         bool still = false;
+        std::uint64_t need = ~0ull;  // the oldest waiting flip's submission count
         {
             std::lock_guard<std::mutex> lock(g_vo_mu);
             const std::uint64_t now = steady_ns();
@@ -530,14 +531,30 @@ void flip_waiter() {
                     const bool newer = !p.flip_queue.empty() && p.flip_queue.front().at_once && p.flip_queue.front().gpu_need <= gpu_done;
                     present.push_back({req.buffer, va, p.display_w, p.display_h, static_cast<unsigned>(p.flip_count), req.mark, newer, req.present});
                 }
-                still = still || (p.open && !p.flip_queue.empty() && p.flip_queue.front().at_once);
+                if (p.open && !p.flip_queue.empty() && p.flip_queue.front().at_once) {
+                    still = true;
+                    need = std::min(need, p.flip_queue.front().gpu_need);
+                }
             }
         }
         for (Done& d : present) {
             if (!d.leave) d.leave = !g_flip_uncapped.load() && !loading_show_due(steady_ns());
             present_flip(d.buffer, d.va, d.w, d.h, d.count, d.mark, d.leave, d.flip);
         }
-        if (still) std::this_thread::sleep_for(std::chrono::microseconds(500));
+        // Its frame not run yet: sleep in the driver until that submission is
+        // done (the timeline semaphore), 2 ms at most so a newer flip is seen.
+        // It polled every 500 us, asking the fences under the renderer's lock
+        // each time - ~2,000 takes a second against the command processor's,
+        // and a flip completed up to a poll late (a cap on a light frame's
+        // rate: the title at ~900 fps). Without a timeline, the poll.
+        if (still) {
+            const bool timeline = host_gpu_wait_completed(0, 0);  // true at once when there is one
+            if (timeline && need != ~0ull) {
+                host_gpu_wait_completed(need, 2'000'000);
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+        }
     }
 }
 
@@ -1072,7 +1089,7 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
             if (n == 0) {
                 host_log("video: a loading screen's or an uncapped flip waits for its frame on the GPU (BBHOST_FLIP_AFTER_GPU=0 "
                          "completes it on recording)");
-            } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0) {
+            } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0 && host_tooling()) {
                 host_log("video: %llu of %llu uncapped and loading-screen flips waited for their frame, the longest %.1f ms",
                          static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(g_holds.flips.load()),
                          g_holds.longest_ns.load() / 1e6);

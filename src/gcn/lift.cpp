@@ -198,6 +198,15 @@ struct Region {
     bool disabled = false;  // an s_cbranch_scc0 whose SCC was a scalar condition: an if, not a kill region
     std::uint64_t seq = 0;  // opening order among regions and ifs
     std::set<int> in_mask0;  // Lifter::in_mask where the region begins
+    // Run as a branch on the pixel's EXEC bit (Lifter::region_branch_open):
+    // its merge and skip blocks, and the lift's state at the branch.
+    bool branched = false;
+    spv::Id rb_merge = 0, rb_skip = 0;
+    std::map<int, Val> rb_reg0, rb_lanes0;
+    std::map<spv::Id, spv::Id> rb_to_float0, rb_to_word0;
+    Val rb_scc0;
+    bool rb_scc_uniform0 = false, rb_scc_valid0 = true;
+    std::set<int> rb_poisoned0, rb_in_mask0;
 };
 
 bool is_branch(const Inst& in) { return in.enc == Enc::SOPP && (in.op == 2 || (in.op >= 4 && in.op <= 9)); }
@@ -1258,13 +1267,17 @@ private:
     // One 16-bit half, decoded exactly as the translator decodes it (gcn/half.h).
     Id unpack_half(Id h) { return emit_unpack_half16(m, {t_bool, t_u32, t_i32, t_f32}, h); }
     Id mul_legacy(Id a, Id b) {  // as the translator writes it (translate.cpp mul_legacy)
+        // x * x: one operand is zero only when both are, so the zero rule
+        // never decides (a dot product's squares, a third of the light pass's).
+        if (legacy_mul_plain() || a == b) return fmul(a, b);
         if (legacy_mul_min_form()) return fsel(feq(ext(spv::GlslNMin, {ext(spv::GlslFAbs, {a}), ext(spv::GlslFAbs, {b})}), cf(0.0f)), cf(0.0f), fmul(a, b));
         const Id zero = m.emit(spv::OpLogicalOr, t_bool, {feq(a, cf(0.0f)), feq(b, cf(0.0f))});
         return fsel(zero, cf(0.0f), fmul(a, b));
     }
-    Id clamp_inf(Id v) {
+    Id clamp_inf(Id v) {  // as the translator writes it (translate.cpp clamp_inf): the sign onto FLT_MAX's bits
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        return fsel(inf, fmul(ext(spv::GlslFSign, {v}), cf(3.4028235e38f)), v);
+        const Id sign = ibin(spv::OpBitwiseAnd, m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u));
+        return fsel(inf, m.emit(spv::OpBitcast, t_f32, {ibin(spv::OpBitwiseOr, sign, cu(0x7f7fffffu))}), v);
     }
 
     // `mask`: v_cndmask's select or the carry in, from src2 (VOP3); VCC otherwise.
@@ -2311,7 +2324,7 @@ private:
             ++constant_loads;
             return;
         }
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
             const Id at = m.emit(spv::OpIAdd, t_u32, {bias, cu(off_dw + static_cast<std::uint32_t>(k))});
@@ -2332,7 +2345,7 @@ private:
     std::size_t ranged_loads = 0;
     void ranged_load(const Inst& in, int count, std::uint32_t index) {
         const Id first = shift(spv::OpShiftRightLogical, as_u(read(static_cast<std::uint16_t>(in.imm), in)), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
@@ -2365,6 +2378,8 @@ private:
         const Id v = m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {spec, cu(0)}), spec, loaded});
         return values.emplace(index, v).first->second;
     }
+    // buffers[index]'s dword bias inside its binding, as translate.cpp cb_bias reads it.
+    Id cb_bias(std::uint32_t index) { return opt.cb_bias_zero ? cu(0) : params_load(bias_loads, 4, index); }
     Id params_load(std::map<std::uint32_t, Id>& cache, std::uint32_t member, std::uint32_t index) {
         auto it = cache.find(index);
         if (it == cache.end()) {
@@ -2441,7 +2456,7 @@ private:
         const std::uint32_t index = site->second;
         const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
         const Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, as_u(value(256 + in.vaddr)), stride_dw));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         std::vector<Id> words;
@@ -2511,7 +2526,7 @@ private:
         const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
         const std::uint32_t index = site->second;
         const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         for (int k = 0; k < n; ++k) {
             const Id v = as_u(value(256 + in.vdata + k));
@@ -2556,8 +2571,11 @@ private:
             const Id count = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(4)), cu(7));
             const Id integer = m.emit(spv::OpLogicalOr, t_bool, {ieq(kind, cu(2)), ieq(kind, cu(4))});
             const Id one = m.emit(spv::OpSelect, t_u32, {integer, cu(1), cu(std::bit_cast<std::uint32_t>(1.0f))});
+            const Id packing = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(12)), cu(3));  // VertexElement::packed
             for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-                const Id c = extract(t_u32, raw, k);
+                const Id byte = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(8 * k), cu(8)});
+                const Id half = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, k / 2), cu(16 * (k % 2)), cu(16)});
+                const Id c = m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(1)), byte, m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(2)), half, extract(t_u32, raw, k)})});
                 const Id unorm8 = m.emit(spv::OpBitcast, t_u32, {fdiv(m.emit(spv::OpConvertUToF, t_f32, {c}), cf(255.0f))});
                 const Id sint16 = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(c), cu(0), cu(16)}));
                 // kinds 1 and 2: the raw bits
@@ -2596,15 +2614,16 @@ private:
                 reject("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? cu(1) : as_u(float_const(1.0f));
             std::vector<Id> comps(4, cu(0));
             {
                 EntryScope entry(m);  // inputs and their conversions dominate every block
                 const Id raw = m.load(t_v4u, var);
                 for (int k = 0, bit = 0; k < count; bit += bits[k], ++k) {
-                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(static_cast<std::uint32_t>(bit)),
-                                                                                  cu(static_cast<std::uint32_t>(bits[k]))})
+                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)),
+                                                                                  cu(static_cast<std::uint32_t>(bit % 32)), cu(static_cast<std::uint32_t>(bits[k]))})
                                         : extract(t_u32, raw, static_cast<std::uint32_t>(k));
                     comps[static_cast<std::size_t>(k)] = convert_component(c, bits[k], nfmt);
                 }
@@ -4406,6 +4425,200 @@ private:
         return false;
     }
 
+    // ---- regions as branches --------------------------------------------------------
+    // GCN skips an s_cbranch_execz region in a wave none of whose lanes has
+    // its EXEC bit set; the lift ran it for every pixel and kept the old
+    // values where the bit is clear (select), so a light out of range of a
+    // whole wave, or YEBIS's taps where nothing is out of focus, cost every
+    // pixel all of their instructions. On the Radeon 8060S in Kyo's room
+    // (2026-10-15) the main light pass's lift ran 741 vector instructions to
+    // the console's 445, and the reference translation, which branches on an
+    // empty EXEC, ran that pass in 0.66 ms to the lift's 0.85 and YEBIS's
+    // 7d668276+157a299c in 0.12 to 0.33. A region whose every instruction
+    // gives a pixel the same values taken or skipped where its bit is clear
+    // is now a branch on the pixel's EXEC bit: the then block holds the region
+    // as before, the skip block the values at the branch, and the merge a phi
+    // for each value they leave different - for a pixel whose bit is clear,
+    // what the select kept. The driver then skips the then block in a wave
+    // none of whose pixels takes it, as GCN does. Not for a region that reads
+    // other pixels or the quad (an implicit-LOD sample, a LOD query, LDS and
+    // its swizzles, v_readlane / v_writelane), writes memory or exports, holds
+    // an if, a loop or a kill region, or widens EXEC to whole quads; nor one
+    // inside a loop or an if. A region inside a branched one may branch too.
+    // BBHOST_LIFT_BRANCH=0: every region runs for every pixel, as before.
+    static bool lift_branch_on() {
+        static const bool on = [] {
+            const char* e = std::getenv("BBHOST_LIFT_BRANCH");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+    bool region_branchable(const Region& r) const {
+        if (r.kill || r.disabled || r.exec_before.constant || r.exec_before.kind != Kind::Lane) return false;
+        for (const Inst& in : prog.insts) {
+            if (in.offset < r.start || in.offset >= r.end) continue;
+            const char* n = mnemonic(in);
+            if (!n) return false;
+            if (in.enc == Enc::EXP || in.enc == Enc::DS) return false;
+            if (in.enc == Enc::SOPP) {
+                if (is_branch(in) && in.op != 8) return false;  // an if, a kill region, a loop (s_cbranch_execz: a region within)
+                if (in.op == 1 || in.op == 10 || (in.op >= 16 && in.op <= 18)) return false;  // s_endpgm, s_barrier, s_sendmsg(halt), s_trap
+            }
+            const std::string s(n);
+            if (s.find("store") != std::string::npos || s.find("atomic") != std::string::npos) return false;
+            if (s.rfind("image_get_lod", 0) == 0) return false;
+            if (s.rfind("image_sample", 0) == 0 || s.rfind("image_gather", 0) == 0) {
+                // Its LOD given (_l, _lz) or its gradients (_d, _cd): nothing
+                // from the rest of the quad.
+                bool explicit_lod = false;
+                for (std::size_t at = s.find('_', 6); at != std::string::npos;) {
+                    const std::size_t next = s.find('_', at + 1);
+                    const std::string part = s.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+                    explicit_lod |= part == "l" || part == "lz" || part == "d" || part == "cd";
+                    at = next;
+                }
+                if (!explicit_lod) return false;
+            }
+            if (s == "v_readlane_b32" || s == "v_writelane_b32" || s == "v_readfirstlane_b32" || s.rfind("s_wqm", 0) == 0) return false;
+        }
+        return true;
+    }
+    void region_branch_open(Region& r) {
+        r.branched = true;
+        r.rb_merge = m.fresh();
+        r.rb_skip = m.fresh();
+        const Id then_label = m.fresh();
+        r.rb_reg0 = reg;
+        r.rb_lanes0 = lanes;
+        r.rb_to_float0 = to_float;
+        r.rb_to_word0 = to_word;
+        r.rb_scc0 = scc_mask;
+        r.rb_scc_uniform0 = scc_uniform;
+        r.rb_scc_valid0 = scc_valid;
+        r.rb_poisoned0 = poisoned;
+        r.rb_in_mask0 = in_mask;
+        m.emit_void(spv::OpSelectionMerge, {r.rb_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {r.exec_before.id, then_label, r.rb_skip});
+        cur_label = m.label(then_label);
+    }
+    // After close_region's checks, which see the region's end as the then
+    // block leaves it.
+    void region_branch_close(Region& r) {
+        const auto same = [](const Val& x, const Val& y) {
+            return x.kind == y.kind && x.constant == y.constant && (x.constant ? (x.kind == Kind::Lane ? x.set == y.set : x.bits == y.bits) : x.id == y.id);
+        };
+        const std::map<int, Val> reg1 = reg, lanes1 = lanes;
+        const std::set<int> poisoned1 = poisoned, in_mask1 = in_mask;
+        const Val scc1 = scc_mask;
+        const bool scc_uniform1 = scc_uniform, scc_valid1 = scc_valid;
+        m.emit_void(spv::OpBranch, {r.rb_merge});
+        const Id then_end = cur_label;
+        // The skip block: the values at the branch (any conversion a phi
+        // needs is made here).
+        cur_label = m.label(r.rb_skip);
+        reg = r.rb_reg0;
+        lanes = r.rb_lanes0;
+        to_float = r.rb_to_float0;
+        to_word = r.rb_to_word0;
+        const auto at = [&](const std::map<int, Val>& arm, int key) {
+            if (const auto it = arm.find(key); it != arm.end()) return it->second;
+            if (const auto it = r.rb_reg0.find(key); it != r.rb_reg0.end()) return it->second;
+            return initial_value(key);
+        };
+        struct Phi {
+            int key;
+            Kind kind;
+            Id then_value, skip_value;
+        };
+        std::vector<Phi> phis;
+        std::set<int> lane_keys;
+        for (const auto& [k, v] : lanes1) lane_keys.insert(k);
+        for (const auto& [k, v] : lanes) lane_keys.insert(k);
+        std::map<int, Val> merged_lanes;
+        std::set<int> lost = poisoned1;
+        lost.insert(poisoned.begin(), poisoned.end());
+        for (int k : lane_keys) {
+            const auto t = lanes1.find(k);
+            const auto e = lanes.find(k);
+            if (t == lanes1.end() || e == lanes.end()) {
+                // A mask made inside the region only: unknown after it.
+                if (k != kKeyVcc && k != kKeyExec) {
+                    lost.insert(k);
+                    lost.insert(k + 1);
+                }
+                continue;
+            }
+            if (same(t->second, e->second)) {
+                merged_lanes[k] = t->second;
+                merged_lanes[k].wave_exact = t->second.wave_exact && e->second.wave_exact;
+                merged_lanes[k].helpers_clear = t->second.helpers_clear && e->second.helpers_clear;
+                merged_lanes[k].helper_inexact = t->second.helper_inexact || e->second.helper_inexact;
+                if (t->second.content != e->second.content) merged_lanes[k] = new_content(merged_lanes[k]);
+            } else {
+                phis.push_back({k, Kind::Lane, t->second.id, e->second.id});
+            }
+        }
+        std::set<int> keys;
+        for (const auto& [k, v] : reg1) keys.insert(k);
+        for (const auto& [k, v] : reg) keys.insert(k);
+        std::map<int, Val> merged;
+        std::map<int, bool> inexact;
+        for (int k : keys) {
+            if (lane_keys.count(k) || (k > 0 && k < 104 && lane_keys.count(k - 1)) || lost.count(k)) continue;  // a lane mask's words, or lost
+            const Val t = at(reg1, k), e = at(reg, k);
+            if (same(t, e)) {
+                merged[k] = t;
+                continue;
+            }
+            if (descriptor(t) || descriptor(e)) {  // a descriptor word on either path: still never data
+                merged[k] = descriptor(t) ? t : e;
+                continue;
+            }
+            inexact[k] = t.helper_inexact || e.helper_inexact;
+            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e)});
+        }
+        m.emit_void(spv::OpBranch, {r.rb_merge});
+        const Id skip_end = cur_label;
+        cur_label = m.label(r.rb_merge);
+        for (const Phi& p : phis) {
+            // Never uniform: the branch is the pixel's own bit.
+            const Id type = p.kind == Kind::Lane ? t_bool : p.kind == Kind::Float ? t_f32 : t_u32;
+            const Id id = m.emit(spv::OpPhi, type, {p.then_value, then_end, p.skip_value, skip_end});
+            if (p.kind == Kind::Lane) {
+                Val v = new_content(lane(id));
+                v.helper_inexact = lanes1.at(p.key).helper_inexact || r.rb_lanes0.at(p.key).helper_inexact;
+                merged_lanes[p.key] = v;
+            } else {
+                Val v = p.kind == Kind::Float ? flt(id) : word(id);
+                v.helper_inexact = inexact[p.key];
+                merged[p.key] = v;
+            }
+        }
+        reg = std::move(merged);
+        lanes = std::move(merged_lanes);
+        to_float = r.rb_to_float0;
+        to_word = r.rb_to_word0;
+        poisoned = std::move(lost);
+        in_mask = in_mask1;
+        for (auto it = in_mask.begin(); it != in_mask.end();) it = r.rb_in_mask0.count(*it) ? std::next(it) : in_mask.erase(it);
+        // SCC the region wrote is dead after it (close_region showed it): the
+        // value at the branch dominates the merge.
+        if (scc_valid1 && r.rb_scc_valid0 && scc_uniform1 == r.rb_scc_uniform0 && same(scc1, r.rb_scc0)) {
+            scc_mask = r.rb_scc0;
+            scc_uniform = r.rb_scc_uniform0;
+            scc_valid = true;
+        } else {
+            scc_mask = r.rb_scc0;
+            scc_uniform = r.rb_scc_uniform0;
+            scc_valid = false;
+        }
+        ++branched_regions;
+        res.proof.push_back("region " + hex_offset(r.start) + "-" + hex_offset(r.end) + " branches on the pixel's EXEC bit at " +
+                            hex_offset(r.branch) + ": nothing in it reads another pixel or writes memory, so a pixel whose bit is clear "
+                            "gets what the select kept; " + std::to_string(phis.size()) + " phis");
+    }
+    std::size_t branched_regions = 0;
+
     void close_region(Region& r, std::size_t next_index) {
         r.closed = true;
         // Within a loop's mask after the region only where so on both paths: a
@@ -5842,6 +6055,7 @@ private:
                     Region* done = open_regions.back();
                     open_regions.pop_back();
                     close_region(*done, i);
+                    if (res.rejections.empty() && done->branched) region_branch_close(*done);
                 } else {
                     close_arm();
                 }
@@ -5895,6 +6109,8 @@ private:
                     r.seq = ++seq;
                     r.in_mask0 = in_mask;
                     open_regions.push_back(&r);
+                    if (lift_branch_on() && opt.stage == Stage::Pixel && open_loops.empty() && arms.empty() && region_branchable(r))
+                        region_branch_open(r);
                 }
             }
             // A loop begins inside what is open here.
@@ -5932,6 +6148,7 @@ private:
                 Region* done = open_regions.back();
                 open_regions.pop_back();
                 close_region(*done, prog.insts.size());
+                if (res.rejections.empty() && done->branched) region_branch_close(*done);
             } else if (!arms.empty()) {
                 reject("an if is still open at the end of the program");
             } else if (!open_loops.empty()) {

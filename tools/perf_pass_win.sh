@@ -14,7 +14,25 @@
 # config's data/saves); PERF_SECONDS (150), PERF_HEADLESS (1); PERF_UNCAPPED
 # (1, the default: BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1 - no frame target and
 # flips complete at once, the machine's true frame rate standing still; 0: the
-# 60 cap).
+# 60 cap); PERF_TOML_EXTRA, a file appended to the run's bbhost.toml ([patches]
+# switches, ...); PERF_ETW=<seconds>: a WPR CPU trace that long, from PERF_ETW_AT
+# (70) seconds into the run (tools/etw: one UAC prompt), reported into
+# build/perf/NAME.etw.txt by thread, module and function.
+# PERF_GAMEPAD (1): a controller drives the game too (0: BBHOST_NO_GAMEPAD, for
+# a run nothing should touch); PERF_DEBUG_MENU (1): the Debug Menu plugin is on
+# (its DLL must be in the exe's plugins/: tools/win_build_msys2.sh builds the
+# official plugins); PERF_TAPS: the scripted presses (default: Cross through
+# the title; "" none). PERF_PLAY=1: a session to play - a live fullscreen
+# window nothing keeps in front, no scripted presses, the player's own options
+# (%APPDATA%/bbhost/bbhost-options.toml: its Frame rate, not the bench's 60 or
+# BBHOST_UNCAP), an hour unless PERF_SECONDS says otherwise.
+# PERF_MENUTAP=1: through the title by asking for the menus' confirm every
+# 2 s for the first PERF_MENUTAP_SECONDS (70), carried out only while one of
+# the game's menus has the input (the test request menutap), in place of the
+# timed Cross presses - which the world takes too once it is up (a lamp next
+# to the save opened and travelled: a run measured another area). PERF_DUMP_AT
+# ="s[,s...]": the displayed frame at those seconds into the run, as
+# build/perf/NAME-<s>.ppm (with BBHOST_DUMP_DRAWS=<n> its draw list in the log).
 # Runs play on build/perf/data (a copy of the saves; the pipeline cache stays
 # between runs so compiles do not land in the measured seconds) and write
 # build/perf/NAME.log, NAME.perfmon.
@@ -31,7 +49,17 @@ field() { sed -n "s/^$1 *= *\"\(.*\)\"/\1/p" "$toml" | head -1; }
 app0=$(field app0); eboot=$(field eboot); data=$(field data)
 saves=${PERF_SAVES:-$data/saves}
 [ -d "$saves" ] || { echo "no saves at $saves (PERF_SAVES)"; exit 1; }
-secs=${PERF_SECONDS:-150}
+play=()
+if [ "${PERF_PLAY:-0}" = 1 ]; then
+    PERF_FULLSCREEN=${PERF_FULLSCREEN:-1}
+    PERF_TAPS=${PERF_TAPS-}
+    PERF_UNCAPPED=${PERF_UNCAPPED:-0}
+    secs=${PERF_SECONDS:-3600}
+    opts="${APPDATA:-$HOME/AppData/Roaming}/bbhost/bbhost-options.toml"
+    [ -f "$opts" ] && play=(BBHOST_OPTIONS_PATH="$(cygpath -w "$opts" 2>/dev/null || echo "$opts")")
+else
+    secs=${PERF_SECONDS:-150}
+fi
 out=build/perf
 mkdir -p "$out/data" "$out/cfg"
 rm -rf "$out/data/saves"
@@ -56,21 +84,73 @@ skip_intro = true
 setup_window = false
 [update]
 check = false
+[plugins]
+debug_menu = $([ "${PERF_DEBUG_MENU:-1}" = 1 ] && echo true || echo false)
+# Its settings counted as seen: a run with a window otherwise opened the setup
+# window on the Plugins tab and waited there (headless runs skip it).
+seen = "debug_menu@1.0.0"
 [bbhost]
 config_version = 3
 TOML
+[ -n "${PERF_TOML_EXTRA:-}" ] && cat "$PERF_TOML_EXTRA" >> "$out/cfg/bbhost.toml"
 rm -f "$out/data/bbhost/gpu-device-lost.txt" "$out/$NAME.perfmon"
 # Title: Cross through the "press any button", Continue and any notice.
-taps="20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"
+taps=${PERF_TAPS-"20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"}
+reqs=()
+if [ "${PERF_MENUTAP:-0}" = 1 ] || [ -n "${PERF_DUMP_AT:-}" ]; then
+    reqdir="$root/$out/req"
+    rm -rf "$out/req"
+    mkdir -p "$out/req"
+    reqs=(BBHOST_TEST_REQUESTS="$reqdir")
+    [ "${PERF_MENUTAP:-0}" = 1 ] && taps=""
+    (
+        t=0
+        dumps=",${PERF_DUMP_AT:-},"
+        while [ $t -lt "$secs" ]; do
+            sleep 1
+            t=$((t + 1))
+            if [ "${PERF_MENUTAP:-0}" = 1 ] && [ $t -le "${PERF_MENUTAP_SECONDS:-70}" ] && [ $((t % 2)) = 0 ]; then
+                echo "menutap confirm 1500" > "$out/req/tap-$t.tmp" && mv "$out/req/tap-$t.tmp" "$out/req/tap-$(printf %04d $t).req"
+            fi
+            case "$dumps" in *",$t,"*)
+                echo "dump $root/$out/$NAME-$t.ppm" > "$out/req/dump-$t.tmp" && mv "$out/req/dump-$t.tmp" "$out/req/dump-$(printf %04d $t).req" ;;
+            esac
+        done
+    ) &
+    reqloop=$!
+fi
+if [ "${PERF_DEBUG_MENU:-1}" = 1 ] && [ ! -f "$(dirname "$exe")/plugins/debug_menu.dll" ]; then
+    echo "note: no $(dirname "$exe")/plugins/debug_menu.dll - the debug menu needs the plugin (tools/win_build_msys2.sh builds it)"
+fi
+nogamepad=1; [ "${PERF_GAMEPAD:-1}" = 1 ] && nogamepad=0
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/perfmon.ps1 -Name bbhost -Seconds "$secs" -Out "$root/$out/$NAME.perfmon" > /dev/null 2>&1 &
 mon=$!
-[ -n "${PERF_FULLSCREEN:-}" ] && { PERF_HEADLESS=0; powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/keep_focus.ps1 -Name bbhost -Seconds "$((secs + 60))" > /dev/null 2>&1 & }
+if [ -n "${PERF_FULLSCREEN:-}" ]; then
+    PERF_HEADLESS=0
+    [ "${PERF_PLAY:-0}" = 1 ] || { powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/keep_focus.ps1 -Name bbhost -Seconds "$((secs + 60))" > /dev/null 2>&1 & }
+fi
+etw=""
+if [ -n "${PERF_ETW:-}" ]; then
+    rm -f "$out/$NAME.etl"
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools/etw/record.ps1 -Delay "${PERF_ETW_AT:-70}"         -Seconds "$PERF_ETW" -Out "$root/$out/$NAME.etl" > "$out/$NAME.etw-record.txt" 2>&1 &
+    etw=$!
+fi
 uncap=()
 [ "${PERF_UNCAPPED:-1}" = 1 ] && uncap=(BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1)
-env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=1 BBHOST_SKIP_INTRO=1 \
-    BBHOST_HEADLESS=${PERF_HEADLESS:-1} BBHOST_FRAME_STATS=1 BBHOST_GAME_FPS=60 \
-    BBHOST_EXIT_SECONDS=$secs BBHOST_AUTOPRESS="$taps" "${uncap[@]}" "$@" \
+env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=$nogamepad BBHOST_SKIP_INTRO=1 \
+    BBHOST_HEADLESS=${PERF_HEADLESS:-1} BBHOST_FRAME_STATS=1 $([ "${PERF_PLAY:-0}" = 1 ] || echo BBHOST_GAME_FPS=60) \
+    BBHOST_EXIT_SECONDS=$secs BBHOST_AUTOPRESS="$taps" "${uncap[@]}" "${play[@]}" "${reqs[@]}" "$@" \
     timeout $((secs + 120)) "$exe" --config "$root/$out/cfg/bbhost.toml" > "$out/$NAME.log" 2>&1
 echo "exit $?" >> "$out/$NAME.log"
+[ -n "${reqloop:-}" ] && kill "$reqloop" 2>/dev/null
 wait $mon 2>/dev/null
 python tools/perf_pass_summary.py "$out/$NAME.log" "$out/$NAME.perfmon"
+if [ -n "$etw" ]; then
+    wait $etw
+    if [ -f "$out/$NAME.etl" ]; then
+        python tools/etw/profile.py "$out/$NAME.etl" "$out/$NAME.etw.pickle" &&
+            python tools/etw/report.py "$out/$NAME.etw.pickle" --exe "$exe" --eboot "$eboot" --log "$out/$NAME.log"                 > "$out/$NAME.etw.txt" && echo "etw: $out/$NAME.etw.txt" && head -24 "$out/$NAME.etw.txt"
+    else
+        echo "etw: no trace ($(tail -1 "$out/$NAME.etw-record.txt"))"
+    fi
+fi

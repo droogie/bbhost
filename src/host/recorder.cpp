@@ -74,7 +74,8 @@ const char* stream::op_name(stream::Op op) {
                                         "copy order",     "pass barrier", "end rendering",  "begin rendering", "fill",     "copy",
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
-                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker"};
+                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
+                                        "push buffers"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -377,6 +378,21 @@ template <class T> const T* tail(const std::uint8_t*& at, std::size_t n) {
     return t;
 }
 
+// n storage buffers pushed into set `set` (Op::kPushBuffers, Rec::push_buffers).
+void push_buffer_writes(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n,
+                        const std::uint32_t* bindings, const VkDescriptorBufferInfo* infos) {
+    VkWriteDescriptorSet writes[2 * gcn::kMaxBuffers];
+    n = std::min<std::uint32_t>(n, 2 * gcn::kMaxBuffers);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        writes[k] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[k].dstBinding = bindings[k];
+        writes[k].descriptorCount = 1;
+        writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[k].pBufferInfo = &infos[k];
+    }
+    g.cmd_push_descriptor_set(cmd, bind_point, layout, set, n, writes);
+}
+
 void replay_block(const Block& b) {
     const VkCommandBuffer cmd = b.cmd;
     std::size_t at = 0;
@@ -569,6 +585,14 @@ void replay_block(const Block& b) {
         case Op::kDispatchIndirect: {
             const auto* r = reinterpret_cast<const stream::DispatchIndirect*>(p);
             vkCmdDispatchIndirect(cmd, r->buffer, r->offset);
+            break;
+        }
+        case Op::kPushBuffers: {
+            const auto* r = reinterpret_cast<const stream::PushBuffers*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            const auto* bindings = tail<std::uint32_t>(q, r->n);
+            const auto* infos = tail<VkDescriptorBufferInfo>(q, r->n);
+            push_buffer_writes(cmd, r->bind_point, r->layout, r->set, r->n, bindings, infos);
             break;
         }
         case Op::kCount: break;
@@ -1239,6 +1263,19 @@ void Rec::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kDispatch, sizeof(stream::Dispatch));
     *put_struct<stream::Dispatch>(at) = stream::Dispatch{x, y, z, 0};
+    after_op();
+}
+
+void Rec::push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n, const std::uint32_t* bindings,
+                       const VkDescriptorBufferInfo* infos) {
+    if (!n) return;
+    if (!stream_on()) return push_buffer_writes(in_place(REC_SITE), bind_point, layout, set, n, bindings, infos);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kPushBuffers, round8(sizeof(stream::PushBuffers)) + round8(n * sizeof(std::uint32_t)) +
+                                                           round8(n * sizeof(VkDescriptorBufferInfo)));
+    *put_struct<stream::PushBuffers>(at) = stream::PushBuffers{layout, bind_point, set, n, 0};
+    put_array(at, bindings, n);
+    put_array(at, infos, n);
     after_op();
 }
 

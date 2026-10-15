@@ -1,0 +1,24 @@
+# Glow: force on + Blur 12.5/12.5/30 (all time slots): Kyo's patch for 1.09, from Kyo's shadPS4 list
+# (user/patches/shadPS4/Bloodborne.xml), byte for byte: 2 lines, 87 bytes.
+#
+# Glow needs the glow buffer at its full size: low-res-aux-targets leaves it
+# so (Kyo's resolution patches make it 80x45).
+#
+# Off until turned on: the setup window's Patches tab, or `glow-blur = true` under
+# [patches] in bbhost.toml, turns it on for the next start.
+[patch]
+name = "glow-blur"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo)"
+enabled = false
+order = 1
+
+[site.s000]
+address = "0x0125c680"
+expect = "80 7f 14 00 75 25 83 3e 00 0f 95 47 15 c5 fa 10 46 04 c5 fa 11 47 08 c5 fa 10 46 08 c5 fa 11 47 0c c5 fa 10 46 0c c5 fa 11 47 10 c3"
+bytes = "80 7f 14 00 75 19 c6 47 15 01 c7 47 08 00 00 48 41 c7 47 0c 00 00 48 41 c7 47 10 00 00 f0 41 c3 cc cc cc cc cc cc cc cc cc cc cc cc"
+
+[site.s001]
+address = "0x026c461e"
+expect = "49 8b 85 00 02 00 00 48 89 84 24 18 02 00 00 48 8b 44 24 38 48 89 84 24 30 02 00 00 49 8d bd 98 03 00 00 48 8d b4 24 00 02 00 00"
+bytes = "48 8d b4 24 00 02 00 00 49 8b 85 00 02 00 00 48 89 46 18 48 8b 44 24 38 48 89 46 30 49 8d bd 98 03 00 00 e8 da 1d fa ff eb 06 cc"

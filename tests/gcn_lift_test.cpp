@@ -3569,6 +3569,12 @@ VertexRun run_vertex(const std::vector<std::uint32_t>& spv, const std::map<std::
             set(a[1], static_cast<std::uint32_t>(x));
             break;
         }
+        case 203: {  // OpBitFieldUExtract (an element's packed components, VertexElement::packed)
+            const std::uint32_t off = g0(a[3]), count = g0(a[4]);
+            if (count == 0 || off + count > 32) return fail("a bit field outside the word");
+            set(a[1], count == 32 ? g0(a[2]) : (g0(a[2]) >> off) & ((1u << count) - 1));
+            break;
+        }
         case 253: case 56: break;  // OpReturn, OpFunctionEnd
         default: return fail("unsupported opcode " + std::to_string(op));
         }

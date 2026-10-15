@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,17 +29,56 @@ struct Site {
     std::uint64_t address = 0;  // guest VA at the preferred base
     std::vector<std::uint8_t> expect, bytes;
     bool code = true;
+    // Patches this site steps aside for: while any of them is on, this site
+    // is neither checked nor written - two patches that write the same bytes
+    // differently, the one named here having the last word.
+    std::vector<std::string> yields;
 };
 
 struct Manifest {
-    std::string path, name, eboot, description, option;
+    std::string path, name, eboot, description, option, group;
     bool enabled = true;
+    int order = 0;  // [patch] order: its place in the list it came from (later wins)
     std::vector<Site> sites;
 };
+
+// What the applied manifests wrote, by guest address at the preferred base:
+// the manifest each byte is now, and the eboot's own byte under it. A later
+// manifest's site is checked against those, so it may write over an earlier
+// one's bytes (patch_manifest_owner answers the host's own patches).
+struct Written {
+    std::string owner;
+    std::uint8_t original = 0;
+};
+std::map<std::uint64_t, Written> g_written;
 
 std::string unquote(const std::string& v) {
     if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'') && v.back() == v.front()) return v.substr(1, v.size() - 2);
     return v;
+}
+
+// A TOML array of strings, ["a", "b"] (or a lone string).
+std::vector<std::string> parse_string_list(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool quoted = false;
+    char q = 0;
+    for (char c : text) {
+        if (quoted) {
+            if (c == q) {
+                quoted = false;
+                out.push_back(cur);
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        } else if (c == '"' || c == '\'') {
+            quoted = true;
+            q = c;
+        }
+    }
+    if (out.empty() && !text.empty() && text.front() != '[') out.push_back(unquote(text));
+    return out;
 }
 
 bool parse_hex_bytes(const std::string& text, std::vector<std::uint8_t>* out) {
@@ -72,7 +112,11 @@ bool parse_manifest(const std::string& path, Manifest* m, std::string* err) {
     m->eboot = get("patch.eboot");
     m->description = get("patch.description");
     m->option = get("patch.option");
-    const std::string en = get("patch.enabled");
+    m->group = get("patch.group");
+    m->order = std::atoi(get("patch.order").c_str());
+    // `default`: the name an earlier port of Kyo's list gave the same switch.
+    std::string en = get("patch.enabled");
+    if (en.empty()) en = get("patch.default");
     m->enabled = en.empty() || en == "true" || en == "1";
     if (m->name.empty() || m->eboot.empty()) {
         *err = "[patch] needs name and eboot";
@@ -100,6 +144,8 @@ bool parse_manifest(const std::string& path, Manifest* m, std::string* err) {
             }
         } else if (field == "kind") {
             s.code = val != "data";
+        } else if (field == "yields") {
+            s.yields = parse_string_list(v);
         }
     }
     for (auto& [id, s] : sites) {
@@ -127,10 +173,29 @@ bool option_on(const std::string& option, bool* known) {
     return false;
 }
 
-void apply(ElfImage* image, const Manifest& m) {
+// Whether a site steps aside for a patch that is on (Site::yields).
+bool yielded(const Site& s, const std::set<std::string>& on) {
+    for (const std::string& y : s.yields) {
+        if (on.count(y)) return true;
+    }
+    return false;
+}
+
+// The eboot's own byte at a guest address (preferred base): under whatever an
+// applied manifest wrote there.
+std::uint8_t original_byte(std::uint64_t address, std::uint8_t now) {
+    const auto it = g_written.find(address);
+    return it == g_written.end() ? now : it->second.original;
+}
+
+void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) {
     GuestMemory& mem = image->mem;
-    // Every site checked before any is written.
+    // Every site checked before any is written - against the eboot's own
+    // bytes, under any an earlier manifest wrote: manifests apply in their
+    // list's order (order, then name), and where two write the same bytes the
+    // later one's stand, as shadPS4 applies Kyo's list.
     for (const Site& s : m.sites) {
+        if (yielded(s, on)) continue;
         if (s.address < kPreferredGuestSlide) {
             host_log("patch: %s refused: site %s address 0x%llx is below the image", m.name.c_str(), s.id.c_str(),
                      static_cast<unsigned long long>(s.address));
@@ -143,26 +208,46 @@ void apply(ElfImage* image, const Manifest& m) {
             return;
         }
         const auto* p = static_cast<const std::uint8_t*>(guest_ptr(mem, mem.slide + off));
-        if (std::memcmp(p, s.expect.data(), s.expect.size()) != 0) {
-            // Already applied (the bytes are what the patch writes) is not a
-            // refusal: the same file from two directories, or a rerun.
-            if (std::memcmp(p, s.bytes.data(), s.bytes.size()) == 0) continue;
+        // Already applied (the bytes are what the patch writes) is not a
+        // refusal: the same file from two directories, or a rerun.
+        if (std::memcmp(p, s.bytes.data(), s.bytes.size()) == 0) continue;
+        for (std::size_t i = 0; i < s.expect.size(); ++i) {
+            if (p[i] == s.expect[i] || p[i] == s.bytes[i] || original_byte(s.address + i, p[i]) == s.expect[i]) continue;
             host_log("patch: %s refused: unexpected bytes at 0x%llx (site %s)", m.name.c_str(),
                      static_cast<unsigned long long>(s.address), s.id.c_str());
             return;
         }
     }
-    int written = 0;
+    int written = 0, stepped_aside = 0, already = 0;
+    std::string aside, over;
     for (const Site& s : m.sites) {
+        if (yielded(s, on)) {
+            ++stepped_aside;
+            for (const std::string& y : s.yields) {
+                if (on.count(y) && aside.find(y) == std::string::npos) aside += (aside.empty() ? "" : ", ") + y;
+            }
+            continue;
+        }
         const std::uint64_t at = mem.slide + (s.address - kPreferredGuestSlide);
         auto* p = static_cast<std::uint8_t*>(guest_ptr(mem, at));
-        if (std::memcmp(p, s.bytes.data(), s.bytes.size()) == 0) continue;
+        if (std::memcmp(p, s.bytes.data(), s.bytes.size()) == 0) {
+            already += s.bytes != s.expect;  // another patch wrote the same (a site that writes what is there counts neither way)
+            continue;
+        }
         const std::uint64_t lo = at & ~0xfffull, hi = (at + s.bytes.size() + 0xfff) & ~0xfffull;
         const bool ok = s.code ? guest_protect_rwx(&mem, lo, hi - lo) : guest_protect_rw(&mem, lo, hi - lo);
         if (!ok) {
             host_log("patch: %s: cannot unprotect 0x%llx (site %s); the rest is left alone", m.name.c_str(),
                      static_cast<unsigned long long>(s.address), s.id.c_str());
             return;
+        }
+        for (std::size_t i = 0; i < s.bytes.size(); ++i) {
+            if (p[i] == s.bytes[i]) continue;
+            const auto [it, fresh] = g_written.try_emplace(s.address + i, Written{m.name, p[i]});
+            if (!fresh && it->second.owner != m.name) {
+                if (over.find(it->second.owner) == std::string::npos) over += (over.empty() ? "" : ", ") + it->second.owner;
+                it->second.owner = m.name;
+            }
         }
         std::memcpy(p, s.bytes.data(), s.bytes.size());
         if (s.code && !guest_protect_rx(&mem, lo, hi - lo)) {
@@ -172,7 +257,11 @@ void apply(ElfImage* image, const Manifest& m) {
         }
         ++written;
     }
-    host_log("patch: %s: %d of %zu sites written%s%s", m.name.c_str(), written, m.sites.size(),
+    std::string notes;
+    if (already) notes += " (" + std::to_string(already) + " already as it writes them)";
+    if (stepped_aside) notes += " (" + std::to_string(stepped_aside) + " left to " + aside + ")";
+    if (!over.empty()) notes += " (over " + over + "'s bytes, as it comes after in the list)";
+    host_log("patch: %s: %d of %zu sites written%s%s%s", m.name.c_str(), written, m.sites.size(), notes.c_str(),
              m.description.empty() ? "" : " - ", m.description.c_str());
 }
 
@@ -239,6 +328,12 @@ bool patch_manifest_option_known(const std::string& option) {
     return known;
 }
 
+bool patch_manifest_on(const std::string& name, bool enabled) {
+    const std::string v = config_value("patches." + name);
+    if (!v.empty()) return !(v == "false" || v == "0");
+    return enabled && !patch_manifest_off(name);
+}
+
 bool patch_manifest_off(const std::string& name) {
     const std::string v = config_value("patches." + name);
     if (!v.empty()) return v == "false" || v == "0";
@@ -266,10 +361,17 @@ std::vector<PatchListing> patch_manifests_list(const std::string& mods) {
             l.option = m.option;
             l.eboot = m.eboot;
             l.enabled = m.enabled;
+            l.group = m.group;
+            l.order = m.order;
         }
         out.push_back(l);
     }
     return out;
+}
+
+const char* patch_manifest_owner(std::uint64_t address, std::size_t n) {
+    const auto it = g_written.lower_bound(address);
+    return it != g_written.end() && it->first < address + n ? it->second.owner.c_str() : nullptr;
 }
 
 void patch_manifests_apply(ElfImage* image) {
@@ -285,6 +387,8 @@ void patch_manifests_apply(ElfImage* image) {
                  dirs.size() > 2 ? ", the mods directory" : "");
         return;
     }
+    // Which are on, first: a site may step aside for another patch (yields).
+    std::vector<Manifest> chosen;
     for (const auto& [name, path] : files) {
         Manifest m;
         std::string err;
@@ -297,9 +401,9 @@ void patch_manifests_apply(ElfImage* image) {
                      image->sha256.c_str());
             continue;
         }
-        if (!m.enabled) continue;
-        if (patch_manifest_off(m.name)) {
-            host_log("patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)", m.name.c_str());
+        if (!patch_manifest_on(m.name, m.enabled)) {
+            // Off by the player, or off until the player turns it on (enabled = false).
+            if (m.enabled) host_log("patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)", m.name.c_str());
             continue;
         }
         if (!m.option.empty()) {
@@ -321,6 +425,26 @@ void patch_manifests_apply(ElfImage* image) {
                 continue;
             }
         }
-        apply(image, m);
+        chosen.push_back(std::move(m));
     }
+    // In their list's order; one of a group (variants of one patch: Kyo's
+    // analog run ranges, Performance Patch v3's two) - the setup window turns
+    // the others off, and a bbhost.toml with two on keeps the later.
+    std::stable_sort(chosen.begin(), chosen.end(), [](const Manifest& a, const Manifest& b) { return a.order < b.order; });
+    std::map<std::string, std::string> group_on;
+    for (auto it = chosen.rbegin(); it != chosen.rend(); ++it) {
+        if (!it->group.empty()) group_on.try_emplace(it->group, it->name);
+    }
+    std::vector<Manifest> apply_list;
+    for (Manifest& m : chosen) {
+        if (!m.group.empty() && group_on[m.group] != m.name) {
+            host_log("patch: %s off: %s, another of group %s, is on (one at a time)", m.name.c_str(), group_on[m.group].c_str(),
+                     m.group.c_str());
+            continue;
+        }
+        apply_list.push_back(std::move(m));
+    }
+    std::set<std::string> on;
+    for (const Manifest& m : apply_list) on.insert(m.name);
+    for (const Manifest& m : apply_list) apply(image, m, on);
 }

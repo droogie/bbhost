@@ -217,14 +217,18 @@ Setting g_set[kSettingCount] = {
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
-    // and scrolls through more; the ultrawide ones and
-    // the Steam Deck's 16:10 go after the 16:9 ones so a saved entry keeps its
-    // place, and the other shapes are engine/live_resolution.cpp's. 960x600
-    // and 1024x640 are the Deck's screen at 75% and 80%: it holds 60 fps there
-    // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
-    {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
-                                  "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640"}, 2,
+    // and scrolls through more. In order of size within each shape - 16:9,
+    // then 16:10, 4:3, 21:9 and 32:9 - and saved by name, not by place, so a
+    // saved entry survives the order changing (engine/option_menu.cpp's
+    // kResolutions and host/launcher.cpp's labels follow this list). The
+    // other shapes are engine/live_resolution.cpp's. 960x600 and 1024x640 are
+    // the Deck's screen at 75% and 80%: it holds 60 fps there (pixel-bound at
+    // 1280x800, ~45), and the presenter upscales by FSR 1.
+    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
+                                  "1920x1080", "2560x1440", "2880x1620", "3200x1800", "3840x2160",
+                                  "960x600", "1024x640", "1280x800", "1920x1200", "2560x1600",
+                                  "1280x960", "1440x1080", "2560x1080", "3440x1440", "5120x2160",
+                                  "3840x1080", "5120x1440"}, 5,
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
      true},
@@ -251,11 +255,12 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
 };
 
-const Row g_rows[] = {
+const Row kAllRows[] = {
     {Row::Header, "DISPLAY"},
     {Row::Option, nullptr, kWindowMode},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
+    {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
@@ -282,7 +287,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
-    {Row::Option, nullptr, kResolution},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
@@ -310,7 +314,23 @@ const Row g_rows[] = {
     {Row::Action, "Open the release page", -1, 11},
     {Row::Close, "Close"},
 };
-constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
+constexpr int kRowCount = static_cast<int>(sizeof(kAllRows) / sizeof(kAllRows[0]));
+// The graphics settings that scale an area's blended values on every view
+// (engine/graphics_patch.cpp): shown and applied only with host_pc_graphics().
+bool per_view_setting(int id) {
+    return id == kBloom || id == kVignette || id == kShadowDistance || id == kAoStrength || id == kSaturation || id == kFog;
+}
+// The rows shown: kAllRows, less the per-view graphics rows while the PC
+// graphics settings are off (host_pc_graphics, the default). Built once.
+Row g_rows[kRowCount];
+int g_row_n = 0;
+void rows_init() {
+    if (g_row_n) return;
+    for (const Row& r : kAllRows) {
+        if (r.kind == Row::Option && !host_pc_graphics() && per_view_setting(r.setting)) continue;
+        g_rows[g_row_n++] = r;
+    }
+}
 
 std::atomic<bool> g_open{false};
 int g_sel = 1;  // the first selectable row
@@ -343,7 +363,7 @@ int g_res_prev = -1;
 bool g_res_reverting = false;  // the change back itself asks nothing
 
 bool selectable(int r) {
-    return r >= 0 && r < kRowCount && g_rows[r].kind != Row::Header && g_rows[r].kind != Row::Info;
+    return r >= 0 && r < g_row_n && g_rows[r].kind != Row::Header && g_rows[r].kind != Row::Info;
 }
 
 // Whether the resolution entry `index` changes while the game runs. One past
@@ -764,6 +784,18 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
+    // The PC graphics settings off (the default): the per-view ones are the
+    // area's own, whatever the file says (HostSettings' own values). The rest
+    // are written once at their source and again only when they change.
+    if (!host_pc_graphics()) {
+        const HostSettings game;
+        h.vignette = game.vignette;
+        h.bloom = game.bloom;
+        h.saturation = game.saturation;
+        h.fog = game.fog;
+        h.ao_strength = game.ao_strength;
+        h.shadow_scale = game.shadow_scale;
+    }
     h.skip_logos = on_of(kSkipLogos);
     h.debug_menu = on_of(kDebugMenu);
     h.debug_camera = on_of(kDebugCamera);
@@ -827,6 +859,7 @@ void host_options_apply() {
 }
 
 void host_options_load() {
+    rows_init();
     // Once: the setup window (host/launcher.h) loads them before it shows them.
     static bool loaded = false;
     if (loaded) return;
@@ -1061,8 +1094,8 @@ bool host_options_key(int scancode, bool repeat) {
     }
     const int step = scancode == SDL_SCANCODE_UP ? -1 : scancode == SDL_SCANCODE_DOWN ? 1 : 0;
     if (step) {
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
+        for (int i = 0; i < g_row_n; ++i) {
+            g_sel = (g_sel + step + g_row_n) % g_row_n;
             if (selectable(g_sel)) {
                 break;
             }
@@ -1133,6 +1166,7 @@ void host_options_frame(float display_w, float display_h) {
 
 namespace {
 void options_panel_frame(float display_w, float display_h) {
+    rows_init();
     edit_poll();
     // Tall enough for every row: headers take 32 px, rows 40, and the note and
     // key guide under them 100. A fixed 620 had been outgrown by the rows, and
@@ -1144,7 +1178,7 @@ void options_panel_frame(float display_w, float display_h) {
     // list scrolls: the rows that fit are drawn, the selection is kept in
     // view, and a hint says there is more above or below.
     float rows_h = 0.0f;
-    for (const Row& r : g_rows) rows_h += r.kind == Row::Header ? 32.0f : 40.0f;
+    for (int i = 0; i < g_row_n; ++i) rows_h += g_rows[i].kind == Row::Header ? 32.0f : 40.0f;
     const float room = display_h - 20.0f - 178.0f;
     const float fit = 1.0f;
     const bool scrolls = rows_h > room && room > 0.0f;
@@ -1182,7 +1216,7 @@ void options_panel_frame(float display_w, float display_h) {
     last_x = m.x;
     last_y = m.y;
     if (g_laid_out && m.in_window && (moved || (m.pressed & 3u))) {
-        for (int r = 0; r < kRowCount; ++r) {
+        for (int r = 0; r < g_row_n; ++r) {
             if (!selectable(r) || m.x < g_row_x || m.x > g_row_x + g_row_w) {
                 continue;
             }
@@ -1215,8 +1249,8 @@ void options_panel_frame(float display_w, float display_h) {
     }
     if (m.wheel != 0.0f) {
         const int step = m.wheel > 0.0f ? -1 : 1;
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
+        for (int i = 0; i < g_row_n; ++i) {
+            g_sel = (g_sel + step + g_row_n) % g_row_n;
             if (selectable(g_sel)) {
                 break;
             }
@@ -1249,7 +1283,7 @@ void options_panel_frame(float display_w, float display_h) {
         y += 24.0f;
     }
     bool more_below = false;
-    for (int r = 0; r < kRowCount; ++r) {
+    for (int r = 0; r < g_row_n; ++r) {
         const Row& row = g_rows[r];
         const float h = (row.kind == Row::Header ? 32.0f : 40.0f) * fit;
         if (r < g_scroll || y + h > y_end - (scrolls ? 24.0f : 0.0f)) {
@@ -1349,9 +1383,33 @@ void options_panel_frame(float display_w, float display_h) {
 }
 }  // namespace
 
+// The graphics settings that scale an area's blended values on every view -
+// bloom, vignette, saturation, fog, AO strength, shadow distance: off unless
+// BBHOST_PC_GRAPHICS=1 or [video] pc_graphics = true. Off, their rows are not
+// shown and nothing of theirs is installed or run in a frame.
+bool host_pc_graphics() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("BBHOST_PC_GRAPHICS"); e && *e) return e[0] == '1';
+        const std::string v = config_value("video.pc_graphics");
+        return v == "true" || v == "1";
+    }();
+    return on;
+}
+
 HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+    // A copy per thread, made again only when the settings have changed: the
+    // FPS counter, the pointer and every pad read ask each frame, and a lock
+    // and a copy each time were work for nothing. Keyed by the serial the
+    // copy was built at (HostSettings::serial), which trails host_opt_serial()
+    // while a change is being made, so a copy taken then is taken again.
+    thread_local HostSettings copy;
+    thread_local bool have = false;
+    if (!have || copy.serial != host_opt_serial()) {
+        std::lock_guard<std::mutex> lk(g_settings_mu);
+        copy = g_settings;
+        have = true;
+    }
+    return copy;
 }
 
 namespace {

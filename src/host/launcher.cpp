@@ -180,6 +180,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool check_updates = cfg.update_check == 1;
 #endif
     bool show_every_start = cfg.setup_always;
+    bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
     bool fullscreen = host_opt_index("window_mode") == 1;
@@ -187,10 +188,13 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     int resolution = host_opt_resolution_index();
-    static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
-                                               "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
-                                               "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
-                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
+    // In the setting's order (host/options.cpp): by size within each shape.
+    static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
+                                               "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
+                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
+                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
+                                               "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
+                                               "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
     static const int kCaps[] = {30, 60, 90, 120, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
@@ -235,9 +239,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::vector<PatchRow> patch_rows;
     for (PatchListing& p : patch_manifests_list(cfg.mods.empty() ? cfg.data + "/mods" : cfg.mods)) {
         PatchRow r;
-        r.on = r.was = !patch_manifest_off(p.name);
+        r.on = r.was = patch_manifest_on(p.name, p.enabled);
         r.p = std::move(p);
         patch_rows.push_back(std::move(r));
+    }
+    // Two of a group on (a bbhost.toml edited by hand): the one the loader
+    // applies, the last in the list's order, stays on.
+    for (PatchRow& r : patch_rows) {
+        if (r.p.group.empty() || !r.on) continue;
+        for (const PatchRow& o : patch_rows) {
+            if (&o == &r || o.p.group != r.p.group || !o.on || !o.p.option.empty()) continue;
+            if (std::make_pair(o.p.order, o.p.name) > std::make_pair(r.p.order, r.p.name)) r.on = false;
+        }
     }
     auto patch_switch = [&](PatchRow& r) -> bool* {
         const std::string& o = r.p.option;
@@ -301,6 +314,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         e.push_back({"update", "check", check_updates ? "true" : "false"});
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
+        e.push_back({"debug", "tooling", tooling ? "true" : "false"});
         // What this bbhost's file looks like (core/config.h): a value saved
         // from here is a choice.
         e.push_back({"bbhost", "config_version", std::to_string(kUserConfigVersion)});
@@ -424,28 +438,40 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::TextDisabled("A patch made for another eboot is never applied.");
                 ImGui::Spacing();
                 if (patch_rows.empty()) ImGui::TextDisabled("No patches found.");
+                // Whether a row's switch can be changed here.
+                auto switchable = [&](const PatchRow& r) {
+                    const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
+                    const bool unknown_option = !r.p.option.empty() && !patch_manifest_option_known(r.p.option);
+                    return r.p.error.empty() && !other_eboot && !unknown_option && (!r.p.option.empty() || bare_key(r.p.name));
+                };
                 for (std::size_t i = 0; i < patch_rows.size(); ++i) {
                     PatchRow& r = patch_rows[i];
                     const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
                     const bool unknown_option = !r.p.option.empty() && !patch_manifest_option_known(r.p.option);
-                    const bool fixed = !r.p.error.empty() || !r.p.enabled || other_eboot || unknown_option ||
-                                       (r.p.option.empty() && !bare_key(r.p.name));
+                    const bool fixed = !switchable(r);
                     bool* on = patch_switch(r);
                     bool off = false;
                     ImGui::PushID(static_cast<int>(i));
                     ImGui::BeginDisabled(fixed);
-                    ImGui::Checkbox(r.p.name.c_str(), fixed ? &off : on);
+                    // Variants of one patch (a group) are one at a time: turning
+                    // one on turns the others off.
+                    if (ImGui::Checkbox(r.p.name.c_str(), fixed ? &off : on) && !fixed && *on && !r.p.group.empty()) {
+                        for (PatchRow& o : patch_rows) {
+                            if (&o != &r && o.p.group == r.p.group && switchable(o)) *patch_switch(o) = false;
+                        }
+                    }
                     ImGui::EndDisabled();
                     ImGui::PopID();
                     ImGui::Indent();
                     ImGui::PushTextWrapPos(0.0f);
                     if (!r.p.description.empty()) ImGui::TextDisabled("%s", r.p.description.c_str());
-                    const std::string why = !r.p.error.empty()        ? "Not read: " + r.p.error + "."
-                                            : !r.p.enabled            ? "Turned off in its own file ([patch] enabled = false)."
-                                            : other_eboot             ? "Made for another eboot: not applied."
-                                            : unknown_option          ? "Follows " + r.p.option + ", which this bbhost does not know: not applied."
-                                            : r.p.option.empty() && !bare_key(r.p.name) ? "Its name cannot be a bbhost.toml key, so it is always on."
-                                                                                       : patch_note(r);
+                    std::string why = !r.p.error.empty()        ? "Not read: " + r.p.error + "."
+                                      : other_eboot             ? "Made for another eboot: not applied."
+                                      : unknown_option          ? "Follows " + r.p.option + ", which this bbhost does not know: not applied."
+                                      : r.p.option.empty() && !bare_key(r.p.name) ? "Its name cannot be a bbhost.toml key, so it is always on."
+                                                                                 : patch_note(r);
+                    if (!fixed && !r.p.enabled) why = "Off unless turned on here. " + why;
+                    if (!fixed && !r.p.group.empty()) why = "One of the " + r.p.group + " variants: one is on at a time. " + why;
                     const std::string where = generic(fs::path(r.p.path).lexically_normal().string());
                     ImGui::TextDisabled("%s %s", why.c_str(), where.c_str());
                     ImGui::PopTextWrapPos();
@@ -453,18 +479,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::Spacing();
                 }
                 if (!patch_rows.empty()) {
-                    auto set_all = [&](bool v) {
+                    // All off, or each patch as its own file has it (a patch that
+                    // says enabled = false off, the rest on); one that follows a
+                    // setting keeps that setting's own default.
+                    auto set_all = [&](bool defaults) {
                         for (PatchRow& r : patch_rows) {
-                            const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
-                            if (!r.p.error.empty() || !r.p.enabled || other_eboot) continue;
-                            if (!r.p.option.empty() && !patch_manifest_option_known(r.p.option)) continue;
-                            if (r.p.option.empty() && !bare_key(r.p.name)) continue;
-                            *patch_switch(r) = v;
+                            if (!switchable(r) || (defaults && !r.p.option.empty())) continue;
+                            *patch_switch(r) = defaults && r.p.enabled;
                         }
                     };
                     if (ImGui::Button("All off (the game's code as it shipped)")) set_all(false);
                     ImGui::SameLine();
-                    if (ImGui::Button("All on##patches")) set_all(true);
+                    if (ImGui::Button("Defaults##patches")) set_all(true);
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -635,6 +661,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");
+
+        ImGui::SeparatorText("Diagnostics");
+        ImGui::Checkbox("Tooling and logging", &tooling);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("The periodic reports in the log, the stall detector, the GPU busy meter (GPU %% beside the FPS counter) "
+                            "and the recent-draw history. Off gives the game that headroom; the log keeps the start, warnings and "
+                            "errors. Leave it on when reporting a problem.");
+        ImGui::PopTextWrapPos();
 
         ImGui::SeparatorText("Updates");
         ImGui::Checkbox("Check for a newer bbhost at start", &check_updates);

@@ -25,7 +25,12 @@
 // inside its command buffer (barriers draining, a pass waiting on the last);
 // the GPU is ours there too, as Windows would count it. Not counted: the
 // buffer shadow's upload command buffer that goes in the same submission
-// ahead of the game's (off on integrated GPUs) and the start-up one-shots.
+// ahead of the game's (off on integrated GPUs) - counted since an RTX 5080's
+// log read 64% here while Task Manager's 3D engine sat at 100%: its per-draw
+// vertex copies, 9-37 MiB a frame from host memory, ran there - and the
+// start-up one-shots. The uploads go in the same submission just ahead of the
+// game's command buffer, so its span starts at theirs (a third timestamp,
+// written by the uploads).
 // The presenter's blit waits for the swapchain image's semaphore; AMD's,
 // NVIDIA's and Mesa's drivers wait for a submission's semaphores before its
 // command buffers start, so its span does not hold the display's wait - and
@@ -188,7 +193,7 @@ VkQueryPool make_pair_pool() {
     VkQueryPoolCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qci.queryCount = 2;
+    qci.queryCount = 3;  // the pair, and the game's slots' upload start
     VkQueryPool pool = VK_NULL_HANDLE;
     if (vkCreateQueryPool(g.device, &qci, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
     return pool;  // reset by each command buffer that writes it, before its first timestamp
@@ -204,8 +209,13 @@ bool read_pair(VkQueryPool pool, std::uint64_t (&ts)[2]) {
 
 void busy_init_locked() {
     g.busy = false;
-    if (const char* e = std::getenv("BBHOST_GPU_BUSY"); e && e[0] == '0') {
+    const char* e = std::getenv("BBHOST_GPU_BUSY");
+    if (e && e[0] == '0') {
         host_log("gpu: busy meter off (BBHOST_GPU_BUSY=0)");
+        return;
+    }
+    if (!host_tooling() && !(e && e[0] == '1')) {
+        host_log("gpu: busy meter off (tooling off; BBHOST_GPU_BUSY=1 turns it on)");
         return;
     }
     std::uint32_t nq = 0;
@@ -254,6 +264,7 @@ void busy_begin_locked(Gpu::Slot& sl) {
     // goes as unreadable.
     if (sl.busy_written) deliver(kGame, 0, 0, false);
     sl.busy_written = false;
+    sl.busy_upload = false;
     if (!g.busy || !sl.busy_pool) return;
     // Outside any render pass: nothing is recorded yet.
     if (stream_on()) {
@@ -273,6 +284,15 @@ void busy_end_locked(Gpu::Slot& sl) {
         vkCmdWriteTimestamp(g.cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.busy_pool, 1);
     }
     sl.busy_written = true;
+}
+
+// The buffer shadow's upload command buffer as it begins (buffer_shadow.cpp,
+// upload_cmd_locked): its start is the span's start when the slot retires.
+void busy_upload_begin_locked(Gpu::Slot& sl, VkCommandBuffer cmd) {
+    if (!g.busy || !sl.busy_pool || !cmd) return;
+    vkCmdResetQueryPool(cmd, sl.busy_pool, 2, 1);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.busy_pool, 2);
+    sl.busy_upload = true;
 }
 
 void busy_submitted_locked(Gpu::Slot& sl) {
@@ -305,6 +325,14 @@ void busy_retired_locked(Gpu::Slot& sl, bool ok) {
     sl.busy_written = false;
     std::uint64_t ts[2] = {0, 0};
     const bool have = ok && read_pair(sl.busy_pool, ts);
+    if (have && sl.busy_upload) {
+        std::uint64_t up = 0;
+        if (vkGetQueryPoolResults(g.device, sl.busy_pool, 2, 1, sizeof(up), &up, sizeof(up), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            ((up - ts[0]) & g_meter.mask) > (g_meter.mask >> 1)) {  // earlier than the game's start, wrap-aware
+            ts[0] = up;
+        }
+    }
+    sl.busy_upload = false;
     deliver(kGame, ts[0], ts[1], have);
 }
 

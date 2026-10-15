@@ -36,9 +36,9 @@ std::string translation_switches() {
         return std::string(name) + "=" + (e ? e : "") + ";";
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
-                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
+                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_plain() ? "plain" : legacy_mul_min_form() ? "min" : "select") + ";";
     for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
-                             "BBHOST_TBUFFER_DST_SEL"}) {
+                             "BBHOST_TBUFFER_DST_SEL", "BBHOST_LIFT_BRANCH"}) {
         s += env(name);
     }
     return s;
@@ -854,7 +854,7 @@ struct Translator {
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         const Id first = shr(offset_bytes, cu(2));
         const auto bound_reads = [&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
@@ -930,7 +930,7 @@ struct Translator {
         std::vector<Id> vals;
         for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
         exec_guard([&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
@@ -946,6 +946,9 @@ struct Translator {
         return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var,
                                             {cu(member), cu(static_cast<std::uint32_t>(index / 4)), cu(static_cast<std::uint32_t>(index % 4))}));
     }
+    // buffers[index]'s dword bias inside its binding (StageParams::cb_bias_dw):
+    // 0 where the host binds every buffer at its base (TranslateOptions::cb_bias_zero).
+    Id cb_bias(std::size_t index) { return opt.cb_bias_zero ? c_zero_u : params_u32(4, index); }
     Id buffer_bound(std::size_t index) {
         const Id valid_bits = m.load(t_u32, params_head_v4 ? m.access_chain(p_uni_u32, ubo_var, {cu(3), c_zero_u})
                                                            : m.access_chain(p_uni_u32, ubo_var, {cu(3)}));
@@ -958,7 +961,7 @@ struct Translator {
         res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         if (opt.cb_no_fallback) {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
@@ -973,7 +976,7 @@ struct Translator {
         m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
         m.emit_void(spv::OpBranchConditional, {valid, l_bound, l_walk});
         m.label(l_bound);
-        const Id bias = params_u32(4, index);
+        const Id bias = cb_bias(index);
         for (int k = 0; k < n; ++k) {
             const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
             m.store(vars[static_cast<std::size_t>(k)], m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, at})));
@@ -1320,6 +1323,9 @@ struct Translator {
         // and a select before. NMin, so a NaN beside a zero still gives zero
         // (FMin may answer the NaN, as NVIDIA's did). BBHOST_LEGACY_MUL=select:
         // the old form.
+        // x * x: one operand is zero only when both are, so the zero rule never
+        // decides; the plain multiply is the same value (lift.cpp mul_legacy).
+        if (legacy_mul_plain() || a == b) return fmul(a, b);
         if (legacy_mul_min_form()) return fsel(feq(fmin_(fabs_(a), fabs_(b)), cf(0.0f)), cf(0.0f), fmul(a, b));
         const Id zero = bor(feq(a, cf(0.0f)), feq(b, cf(0.0f)));
         return fsel(zero, cf(0.0f), fmul(a, b));
@@ -1506,10 +1512,13 @@ struct Translator {
     Id rcp(Id x) { return fdiv(cf(1.0f), x); }
     Id rsq(Id x) { return m.ext_inst(t_f32, spv::GlslInverseSqrt, {x}); }
     Id clamp_inf(Id v) {
-        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX
+        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX, the sign moved onto
+        // FLT_MAX's bits (one v_and_or_b32; FSign(v) * FLT_MAX was two
+        // compares and two selects on AMD's compiler).
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        const Id big = m.ext_inst(t_f32, spv::GlslFSign, {v});
-        return fsel(inf, fmul(big, cf(3.4028235e38f)), v);
+        const Id sign = m.emit(spv::OpBitwiseAnd, t_u32, {m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u)});
+        const Id big = m.emit(spv::OpBitcast, t_f32, {m.emit(spv::OpBitwiseOr, t_u32, {sign, cu(0x7f7fffffu)})});
+        return fsel(inf, big, v);
     }
 
     bool vop1(std::uint32_t op, const Inst& in, Id s0, const Mods& md) {
@@ -2673,8 +2682,11 @@ struct Translator {
         const Id kind = iand(d, cu(7));
         const Id count = iand(shr(d, cu(4)), cu(7));
         const Id one = sel(bor(ieq(kind, cu(2)), ieq(kind, cu(4))), c_one_u, u(cf(1.0f)));
+        const Id packing = iand(shr(d, cu(12)), cu(3));  // VertexElement::packed: 1 bytes, 2 halves in the input's dwords
         for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-            const Id c = extract(t_u32, raw, k);
+            const Id byte = ubfe(extract(t_u32, raw, 0), 8 * k, 8);
+            const Id half = ubfe(extract(t_u32, raw, k / 2), 16 * (k % 2), 16);
+            const Id c = sel(ieq(packing, c_one_u), byte, sel(ieq(packing, cu(2)), half, extract(t_u32, raw, k)));
             const Id unorm8 = u(fdiv(u2f(c), cf(255.0f)));
             const Id sint16 = ui(m.emit(spv::OpBitFieldSExtract, t_i32, {i(c), c_zero_u, cu(16)}));
             const Id converted = sel(ieq(kind, cu(3)), unorm8, sel(ieq(kind, cu(4)), sint16, c));  // kinds 1 and 2: the raw bits
@@ -2706,12 +2718,13 @@ struct Translator {
                 error("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? c_one_u : u(cf(1.0f));
             std::vector<Id> comps(4, c_zero_u);
             int bit = 0;
             for (int k = 0; k < count; ++k) {
-                const Id c = packed ? ubfe(extract(t_u32, raw, 0), bit, bits[k]) : extract(t_u32, raw, k);
+                const Id c = packed ? ubfe(extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)), bit % 32, bits[k]) : extract(t_u32, raw, k);
                 comps[k] = convert_component(c, bits[k], nfmt);
                 bit += bits[k];
             }

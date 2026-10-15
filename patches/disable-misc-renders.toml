@@ -1,0 +1,37 @@
+# Disable Misc. Renders: Kyo's 1.09 patch from his shadPS4 list
+# (Bloodborne.xml), byte for byte. Off until turned on (the setup window's
+# Patches tab, or disable-misc-renders = true under [patches] in bbhost.toml).
+#
+# Four of the scene context's render-target creations (each `call 0x2666420`)
+# become `xor eax, eax`: the target is reported not made, and its pass is not
+# drawn.
+[patch]
+name = "disable-misc-renders"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn"
+enabled = false
+order = 132
+
+# call 0x2666420 -> xor eax, eax
+[site.target-a]
+address = "0x026c4649"
+expect = "e8 d2 1d fa ff"
+bytes = "31 c0 0f 1f 00"
+
+# call 0x2666420 -> xor eax, eax
+[site.target-b]
+address = "0x026c3e43"
+expect = "e8 d8 25 fa ff"
+bytes = "31 c0 0f 1f 00"
+
+# call 0x2666420 -> xor eax, eax
+[site.target-c]
+address = "0x026c43ca"
+expect = "e8 51 20 fa ff"
+bytes = "31 c0 0f 1f 00"
+
+# call 0x2666420 -> xor eax, eax
+[site.target-d]
+address = "0x026c4740"
+expect = "e8 db 1c fa ff"
+bytes = "31 c0 0f 1f 00"

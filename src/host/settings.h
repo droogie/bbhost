@@ -74,3 +74,11 @@ struct HostSettings {
 
 // A copy of the current settings.
 HostSettings host_settings();
+// The graphics settings that scale an area's blended values on every view
+// (bloom, vignette, saturation, fog, AO strength, shadow distance) in use: off
+// by default (BBHOST_PC_GRAPHICS=1 or [video] pc_graphics = true), and then
+// the area's own - their rows not shown, nothing of theirs run in a frame.
+// The others (SSAO, anti-aliasing, motion blur, depth of field, chromatic
+// aberration, model detail) are always there: written once at their source,
+// and again only when they change.
+bool host_pc_graphics();

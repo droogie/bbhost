@@ -1,0 +1,66 @@
+# HD Motion Blur 360p (640x360): Kyo's 1.09 patch from his shadPS4 list
+# (Bloodborne.xml), byte for byte. Off until turned on (the setup window's
+# Patches tab, or hd-motion-blur-360p = true under [patches] in bbhost.toml).
+#
+# Motion blur's buffers at a fixed size: the scene context's half-size target
+# and the half-size depth render at 640x360, the quarter-size one at
+# 320x180, and the scene context's flag at +0x2a10 set
+# (`mov byte [rbx+0x2a10], 0` at 0x26c2657, its immediate at 0x26c265d). The
+# same words as low-res-aux-targets and Enable Screen Space Reflections, which
+# step aside for this one, as it comes after them in the list.
+[patch]
+name = "hd-motion-blur-360p"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "HD Motion Blur 360p (640x360) - Kyo's patch"
+enabled = false
+order = 181
+group = "hd-motion-blur"
+
+# mov eax, 640
+[site.scene-half-width]
+address = "0x026c3de4"
+expect = "41 8b 07 d1 e8"
+bytes = "b8 80 02 00 00"
+yields = ["hd-motion-blur-4k"]
+
+# mov eax, 360
+[site.scene-half-height]
+address = "0x026c3df0"
+expect = "41 8b 47 04 d1 e8"
+bytes = "b8 68 01 00 00 90"
+yields = ["hd-motion-blur-4k"]
+
+# mov dword [rsp], 640
+[site.depth-half-width]
+address = "0x0125b1a3"
+expect = "8b 03 d1 e8 89 04 24"
+bytes = "c7 04 24 80 02 00 00"
+yields = ["hd-motion-blur-4k"]
+
+# mov dword [rsp+4], 360
+[site.depth-half-height]
+address = "0x0125b1aa"
+expect = "8b 43 04 d1 e8 89 44 24 04"
+bytes = "c7 44 24 04 68 01 00 00 90"
+yields = ["hd-motion-blur-4k"]
+
+# mov dword [rsp], 320
+[site.depth-quarter-width]
+address = "0x0125b1d6"
+expect = "8b 03 c1 e8 02 89 04 24"
+bytes = "c7 04 24 40 01 00 00 90"
+yields = ["hd-motion-blur-4k"]
+
+# mov dword [rsp+4], 180
+[site.depth-quarter-height]
+address = "0x0125b1de"
+expect = "8b 43 04 c1 e8 02 89 44 24 04"
+bytes = "c7 44 24 04 b4 00 00 00 90 90"
+yields = ["hd-motion-blur-4k"]
+
+# mov byte [rbx+0x2a10], 0 -> 1
+[site.hd-flag]
+address = "0x026c265d"
+expect = "00"
+bytes = "01"
+yields = ["hd-motion-blur-4k"]

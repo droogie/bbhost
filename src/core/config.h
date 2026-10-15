@@ -76,6 +76,10 @@ struct HostConfig {
     // is true, a build from source's false (its harnesses never stop there);
     // BBHOST_SETUP_WINDOW=0|1 overrides.
     bool setup_always = false;
+    // debug.tooling / BBHOST_TOOLING=0|1 (the setup window's Game tab): the
+    // periodic reports and the instrumentation behind them (log.h,
+    // host_tooling). Off, a run logs its start, warnings and errors only.
+    bool tooling = true;
 };
 
 // Parse argv (--config, --app0, --data, --eboot, first positional = eboot),

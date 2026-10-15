@@ -7,6 +7,15 @@
 #include <unistd.h>
 #endif
 
+// The setup window's "Tooling and logging" (bbhost.toml [debug] tooling,
+// BBHOST_TOOLING=0|1; on by default): the periodic reports - the 300-flip
+// block, the renderer's, the GX threads', the presenter's - the stall
+// detector, the GPU busy meter and the recent-draw ring. Off, none of them
+// runs and the log has the start, warnings and errors. Set once, by main()
+// after the configuration is final, before the game's threads start.
+inline bool g_host_tooling = true;
+inline bool host_tooling() { return g_host_tooling; }
+
 // One write per line so lines from different threads do not interleave.
 inline void host_log_line(const char* line) {
 #if defined(_WIN32)

@@ -1,0 +1,143 @@
+# Movement + Roll-Dodge 1.1x (normal size): Kyo's patch for 1.09, from Kyo's shadPS4 list
+# (user/patches/shadPS4/Bloodborne.xml), byte for byte: 25 lines, 219 bytes.
+#
+# Twenty of its words are the follow camera constructor's defaults
+# (0x183a4c3..0x183a939), which the frame-rate conversion writes too: with
+# this on they are left as it writes them (Kyo's 60 fps values x1.1) and the
+# rest of the conversion goes on (engine/frame_rate.cpp). Its code goes over
+# assert strings in the read-only data (0x4d3be00), next to debug-dash's and
+# bigger-weapons-1-2x's.
+#
+# Off until turned on: the setup window's Patches tab, or `movement-roll-1-1x = true` under
+# [patches] in bbhost.toml, turns it on for the next start.
+[patch]
+name = "movement-roll-1-1x"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Movement + Roll-Dodge 1.1x (normal size) (Kyo)"
+enabled = false
+order = 177
+
+[site.s000]
+address = "0x0183a4c3"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s001]
+address = "0x0183a4cd"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s002]
+address = "0x0183a4d7"
+expect = "9a 99 99 3e"
+bytes = "49 b5 60 3d"
+
+[site.s003]
+address = "0x0183a4e1"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s004]
+address = "0x0183a4f5"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s005]
+address = "0x0183a4ff"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s006]
+address = "0x0183a509"
+expect = "8f c2 f5 3c"
+bytes = "f0 10 87 3c"
+
+[site.s007]
+address = "0x0183a527"
+expect = "cd cc cc 3d"
+bytes = "a2 e0 5e 3e"
+
+[site.s008]
+address = "0x0183a531"
+expect = "9a 99 99 3e"
+bytes = "a2 e0 5e 3e"
+
+[site.s009]
+address = "0x0183a53b"
+expect = "9a 99 99 3e"
+bytes = "9e a1 27 3e"
+
+[site.s010]
+address = "0x0183a8c1"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s011]
+address = "0x0183a8cb"
+expect = "00 00 80 3e"
+bytes = "49 b5 60 3d"
+
+[site.s012]
+address = "0x0183a8d5"
+expect = "9a 99 99 3e"
+bytes = "49 b5 60 3d"
+
+[site.s013]
+address = "0x0183a8df"
+expect = "9a 99 99 3e"
+bytes = "49 b5 60 3d"
+
+[site.s014]
+address = "0x0183a8f3"
+expect = "cd cc cc 3d"
+bytes = "49 b5 60 3d"
+
+[site.s015]
+address = "0x0183a8fd"
+expect = "00 00 80 3e"
+bytes = "49 b5 60 3d"
+
+[site.s016]
+address = "0x0183a907"
+expect = "8f c2 f5 3c"
+bytes = "f0 10 87 3c"
+
+[site.s017]
+address = "0x0183a925"
+expect = "cd cc cc 3e"
+bytes = "a2 e0 5e 3e"
+
+[site.s018]
+address = "0x0183a92f"
+expect = "cd cc cc 3e"
+bytes = "a2 e0 5e 3e"
+
+[site.s019]
+address = "0x0183a939"
+expect = "9a 99 99 3e"
+bytes = "9e a1 27 3e"
+
+[site.s020]
+address = "0x01e4a638"
+expect = "c5 f8 28 02 c5 f8 29 87 40 02 00 00"
+bytes = "e9 c3 17 ef 02 90 90 90 90 90 90 90"
+
+[site.s021]
+address = "0x04d3be00"
+expect = "20 61 74 74 65 6d 70 74 65 64 20 74 6f 20 69 6e 69 74 69 61 6c 69 7a 65 20 74 77 69 63 65 2e 28 45 42 55 53 59 29 00 4c 6f 67 69 63 61 6c 20 45 72 72 6f 72 2e 20 47 69 76 65 6e 20 61 64 64 72"
+bytes = "c5 f8 28 02 48 8b 05 6d 2a c0 00 48 85 c0 74 3e 48 8b 40 60 48 85 c0 74 35 48 3b 47 08 75 2f c4 e3 79 40 c8 71 c5 fa 10 56 08 c5 ea 59 15 2e 00 00 00 c5 ea 59 d2 c5 f8 2e ca 76 0a c5 f8 59 05"
+
+[site.s022]
+address = "0x04d3be40"
+expect = "65 73 73 20 74 6f 20 4f 53 20 41 50 49 20 63 61 6c 6c 20 69 73 20 69 6e 63 6f 72"
+bytes = "3c 00 00 00 eb 08 c5 f8 59 05 22 00 00 00 c5 f8 29 87 40 02 00 00 e9 e9 e7 10 fd"
+
+[site.s023]
+address = "0x04d3be60"
+expect = "28 45 46 41"
+bytes = "00 00 c0 40"
+
+[site.s024]
+address = "0x04d3be70"
+expect = "20 45 72 72 6f 72 2e 20 47 69 76 65 6e 20 72 77 6c 6f 63 6b 20 69 64 20 69 73 20 69 6e 76 61 6c"
+bytes = "cd cc 8c 3f cd cc 8c 3f cd cc 8c 3f 00 00 80 3f cd cc 8c 3f cd cc 8c 3f cd cc 8c 3f 00 00 80 3f"

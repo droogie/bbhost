@@ -10,6 +10,7 @@
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
 #include "engine/menu_memory.h"
+#include "engine/patch_manifest.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
@@ -90,6 +91,9 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<std::uint64_t> g_seen_serial{0};
 std::atomic<bool> g_ssao{true}, g_aa{true};
+// Bumped when the SSAO or AA setting changes: each renderer is given the
+// values once a generation (render_view_hook). 0: never changed - the game's.
+std::atomic<std::uint32_t> g_flags_gen{0};
 
 // ---- Draw parameters ---------------------------------------------------------
 //
@@ -260,16 +264,17 @@ void set_chromatic_aberration(bool on) {
     if (g_ca_mask->exchange(want) != want) host_log("graphics: chromatic aberration %s", on ? "on" : "off");
 }
 
+void* alloc_exec_near(std::uint64_t at);
+void free_exec_page(void* page);
+
 // The copy, through the mask. The stub has to be within a rel32 of the code,
-// so its page comes from the low 2 GiB.
+// so its page comes from near it (alloc_exec_near). On Windows there was no
+// such page here until 2026-10-14: the stub was never placed, every run said
+// "it stays on", and the setting did nothing (Kyo: "chromatic aberration
+// disable actually doesn't even currently work").
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
-#if defined(_WIN32)
-    (void)image;
-    (void)at;
-    return false;
-#else
-    void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (page == MAP_FAILED) return false;
+    void* page = alloc_exec_near(at);
+    if (!page) return false;
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
     const std::uint64_t back = at + sizeof(kCaCopyBytes);
@@ -292,7 +297,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     c[18] = 0xe9;
     if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
-        munmap(page, 0x1000);
+        free_exec_page(page);
         return false;
     }
     std::memcpy(c + 8, &to_mask, 4);
@@ -303,7 +308,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
         g_ca_mask = nullptr;
-        munmap(page, 0x1000);
+        free_exec_page(page);
         return false;
     }
     p[0] = 0xe9;  // jmp stub
@@ -311,7 +316,6 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     std::memset(p + 5, 0x90, sizeof(kCaCopyBytes) - 5);
     guest_protect_rx(&image->mem, lo, hi - lo);
     return true;
-#endif
 }
 
 std::atomic<bool> g_motion_blur{true};
@@ -319,29 +323,64 @@ std::atomic<int> g_lod_bias{0};  // the model detail bias to keep (lod_bias_tick
 bool g_lod_bias_env = false;     // BBHOST_LOD_BIAS set: the setting does not move it
 
 // Motion blur's velocity post-pass. Before YEBIS blurs, the scene renderer
-// runs sub_1264430 (its only caller, 0x26ab381, when the graphics manager's
-// +0x78b4 is set): two ping-pong passes over the velocity map into a
-// half-res pair (+0xcf8/+0xd50) that only the motion blur reads. With the
-// Motion Blur setting off the blur's shader is patched away
-// (host/shader_patch.cpp), so the pass is work nobody looks at, and is
-// skipped (the community "Disable Misc. Renders" removes the second target
-// for the same effect). The velocity map itself is still drawn: leaving it
-// out whites out the frame.
-constexpr std::uint64_t kVelocityPost = 0x1264430;
-// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x28
-constexpr std::uint8_t kVelocityPostPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
-                                                  0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+// runs sub_1264430 (its only caller, 0x26ab381) when the graphics manager's
+// +0x78b4 is set (`cmp byte [r12+0x78b4], 0; je` at 0x26ab345): two
+// ping-pong passes over the velocity map into a half-res pair (+0xcf8/+0xd50)
+// that only the motion blur reads. With the Motion Blur setting off the
+// blur's shader is patched away (host/shader_patch.cpp), so the pass is work
+// nobody looks at. The switch is written at its source instead of the pass
+// being skipped by a hook on every call: the manager's constructor's
+// immediate (`mov byte [rbx+0x78b4], 1` at 0x2695ce6) and the live manager's
+// byte, once when the setting changes - the debug menu's "Enable VeloMap
+// Dilation" is the same byte and keeps it in between. The velocity map itself
+// is still drawn: leaving it out whites out the frame.
+constexpr std::uint64_t kVelocityCtor = 0x2695ce6;
+const std::uint8_t kVelocityCtorBytes[] = {0xc6, 0x83, 0xb4, 0x78, 0x00, 0x00, 0x01};
+constexpr std::size_t kVelocitySwitch = 0x78b4;
+std::uint8_t* g_velocity_ctor = nullptr;  // the constructor's immediate, when its bytes were the game's
+GuestMemory g_velocity_mem{};
+std::uint64_t g_velocity_slide = 0;
+constexpr std::uint64_t kGraphicsManagerOfBlur = 0x5940dd8;
 
-GUEST_ABI std::int64_t velocity_post_hook(std::uint64_t, const std::uint64_t*) {
-    return g_motion_blur.load(std::memory_order_relaxed) ? 0 : 1;  // nonzero: the call returns at once
+void motion_blur_apply(bool on) {
+    const std::uint8_t want = on ? 1 : 0;
+    if (g_velocity_ctor && *g_velocity_ctor != want) {
+        const std::uint64_t at = reinterpret_cast<std::uint64_t>(g_velocity_ctor);
+        if (guest_protect_rwx(&g_velocity_mem, at & ~0xfffull, 0x1000)) {
+            *g_velocity_ctor = want;
+            guest_protect_rx(&g_velocity_mem, at & ~0xfffull, 0x1000);
+        }
+    }
+    std::uint64_t gm = 0;
+    if (g_velocity_slide)
+        std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManagerOfBlur - kPreferredGuestSlide))), 8);
+    if (gm) *reinterpret_cast<volatile std::uint8_t*>(static_cast<std::uintptr_t>(gm + kVelocitySwitch)) = want;
+    host_log("graphics: motion blur %s (its velocity pass %s)", on ? "on" : "off", on ? "runs" : "skipped at the graphics manager's switch");
 }
 
 void refresh_settings() {
-    const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.exchange(serial) == serial) return;
+    if (g_seen_serial.load(std::memory_order_relaxed) == host_opt_serial()) return;
     const HostSettings hs = host_settings();
-    g_ssao.store(hs.ssao);
-    g_aa.store(hs.anti_alias);
+    // The serial the copy was made at: one taken while a change was being
+    // made is behind host_opt_serial(), and the next view takes it again.
+    g_seen_serial.store(hs.serial, std::memory_order_relaxed);
+    // SSAO and AA go to the renderers once each when they change - or at the
+    // first view when the file asks for other than the game's own
+    // (render_view_hook); never while they are the game's.
+    static bool ssao_was = true, aa_was = true;
+    if (hs.ssao != ssao_was || hs.anti_alias != aa_was) {
+        ssao_was = hs.ssao;
+        aa_was = hs.anti_alias;
+        g_ssao.store(hs.ssao);
+        g_aa.store(hs.anti_alias);
+        g_flags_gen.fetch_add(1, std::memory_order_release);
+    }
+    static bool blur_was = true;
+    if (hs.motion_blur != blur_was) {
+        blur_was = hs.motion_blur;
+        motion_blur_apply(hs.motion_blur);
+    }
+    camera_settings_changed();
     set_chromatic_aberration(hs.chromatic_aberration);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
@@ -757,6 +796,14 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     return 0;
 }
 
+void free_exec_page(void* page) {
+#if defined(_WIN32)
+    VirtualFree(page, 0, MEM_RELEASE);
+#else
+    munmap(page, 0x1000);
+#endif
+}
+
 // An executable page within a rel32 of `at`, for a stub a jump or call there
 // can reach. Null when none is free.
 void* alloc_exec_near(std::uint64_t at) {
@@ -829,59 +876,118 @@ bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, 
 //   2 x 2 tiles (960x540)      6.14 / 12.1
 //   4 x 4 tiles (480x270)      5.98 / 12.5             373k draws
 //
-// so the tile here is a quarter of the frame on each axis - most of the CPU
-// saved, none of the GPU added - and the frame is the larger of the
-// presented image (window, or display in fullscreen) and the render size,
+// so the tile here is a sixth of the frame on each axis (g_tiles_per_axis,
+// below, for the measurements that chose it) and the frame is the larger of
+// the presented image (window, or display in fullscreen) and the render size,
 // with one job ("Div" 1x1). Written on every view when it changed: the size
 // is read each frame (0x26a5d22, 0x26b4cb7) and the bins are allocated per
 // frame, so a resize or a new render size takes effect on the next frame.
 // Never 0 - it is a divisor (0x26a5d43). BBHOST_LIGHT_GRID=0 keeps the
-// game's tiles and jobs; =WxH a fixed tile, for measuring.
+// game's tiles and jobs; =<N> N tiles a side (1: one tile, the frame); =WxH
+// a fixed tile, for measuring.
 constexpr std::uint64_t kGraphicsManagerSlot = 0x5940dd8;
 constexpr std::uint64_t kLightGridDiv = 0x553ae80;  // x, y
 constexpr std::size_t kLightTileW = 0x78a8, kLightTileH = 0x78ac;
 const std::uint64_t* g_graphics_manager = nullptr;  // the slot, slid; null when off
 const std::uint32_t* g_res_words = nullptr;         // render width, height
 std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: that tile instead (experiments)
-// Tiles a side: 4 (a quarter of the window each way), or 1 with
-// BBHOST_LIGHT_GRID=window - one tile the window's size, the community "REAL
-// LightGrid 1080p" patch's 1920x1080 at that size. Measured on a Radeon 8060S
-// (2026-10-08, the Hunter's Dream, 1080p, GPU ms per 300 flips, two minutes
-// each): 4 a side 1,878-2,027, one tile 1,960-2,096 (+5%), the main loop's
-// work 3.51 against 3.50 ms - the quarter tiles stay the default.
-std::uint32_t g_tiles_per_axis = 4;
-std::uint64_t g_tile_from = 0;
+// Tiles a side, in one job ("Light Grid Div 1x1"): 6, a sixth of the frame
+// each way (320x180 at 1080p, 640x360 at 4K), so the count stays the same at
+// every resolution. 1 is one tile the frame's size, Kyo's "REAL LightGrid
+// 1080p" (the constructor's 1920x1080) at whatever size the window or display
+// is: each light binned and drawn once, but every light group shaded over the
+// whole frame. Measured on a Radeon 8060S: 2026-10-08, the Hunter's Dream, GPU
+// ms per 300 flips, 4 a side 1,878-2,027 and one tile 1,960-2,096; 2026-10-12,
+// Kyo's area uncapped and GPU-bound, Model detail Normal, 45 s each: one tile
+// 160.2 fps, 4 a side 159.2, the game's own 128x128 tiles in 3x3 jobs
+// (BBHOST_LIGHT_GRID=0) 165.1. 2026-10-14, the room NVIDIA players drop to
+// ~35 fps in (Kyo's save; 1080p, headless, the light pass's GPU ms a frame /
+// draws a frame / the command processor's ms a frame, two runs each in
+// A-B-C-C-B-A order): one tile 1.45-1.51 / 885, the game's tiles 0.87 / 1162,
+// 4 a side 0.83-0.86 / 918 / 6.8, 6 a side 0.74-0.76 / 961 / 6.5-6.7, 8 a side
+// 0.73-0.76 / 1020 / 7.3 - 8 shades no less than 6 and its ~60 more draws
+// cost the command processor ~0.7 ms. BBHOST_LIGHT_GRID=<N> sets N (=1 the
+// one tile of before, =quarter 4).
+std::uint32_t g_tiles_per_axis = 6;
+// The tile is the GraphicsManager's own, written once by its constructor
+// (sub_26958d0: mov dword [rbx+0x78a8], 128 at 0x2695cb6 and [rbx+0x78ac] at
+// 0x2695cc0 - Kyo's "REAL LightGrid 1080p" puts 1920 and 1080 there) and
+// never by the game again, so bbhost sets it the same way: the constructor's
+// immediates at install, the live manager's two words only when the window's
+// or display's size changes (light_grid_window, told by the window on a
+// resize or fullscreen toggle). Nothing for it runs in a frame.
+constexpr std::uint64_t kTileCtorW = 0x2695cb6, kTileCtorH = 0x2695cc0;  // 10 bytes each, the imm32 at +6
+constexpr std::uint8_t kTileCtorWas[2][10] = {{0xc7, 0x83, 0xa8, 0x78, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00},
+                                              {0xc7, 0x83, 0xac, 0x78, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00}};
+GuestMemory g_tile_mem{};
+std::uint64_t g_tile_ctor[2] = {0, 0};  // the immediates' addresses, slid (0: not ours to write)
+std::mutex g_tile_mu;
 bool g_task_steal = false;                          // BBHOST_TASK_TUNE=s (task_tune_install, below)                      // BBHOST_LIGHT_GRID_FROM=flip: the game's tiles before it (A/B in one run)
 
-void light_grid_tick() {
-    if (!g_graphics_manager) return;
-    if (g_tile_from && hle_video_flip_count() < g_tile_from) return;
-    const std::uint64_t gm = *g_graphics_manager;
-    if (!gm) return;
-    if (g_task_steal) *reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(gm + 0x78bd)) = 1;
-    int ww = 0, wh = 0;
-    host_window_pixels(&ww, &wh);
-
-    // The grid follows the window - the presented image, or the display in
-    // fullscreen - not the render size: a 2560x1440 picture shown in a
-    // 1920x1080 window bins against 1920x1080's grid. Headless (no window),
-    // the render size.
+// The tile for a frame of fw x fh (the window, the display in fullscreen, or
+// the render size headless): the frame over the tiles a side, or a fixed
+// tile (BBHOST_LIGHT_GRID=WxH). Written into the constructor's immediates and
+// the live manager, under g_tile_mu; nothing happens when they hold it already.
+void light_grid_apply(std::uint32_t fw, std::uint32_t fh) {
+    if (!fw || !fh) return;
     const std::uint32_t tiles = g_tiles_per_axis;
-    const std::uint32_t fw = ww > 0 ? static_cast<std::uint32_t>(ww) : g_res_words[0];
-    const std::uint32_t fh = wh > 0 ? static_cast<std::uint32_t>(wh) : g_res_words[1];
     std::uint32_t tw = std::clamp<std::uint32_t>((fw + tiles - 1) / tiles, 128u, 16384u);
     std::uint32_t th = std::clamp<std::uint32_t>((fh + tiles - 1) / tiles, 128u, 16384u);
     if (g_tile_fixed[0]) {
         tw = std::clamp<std::uint32_t>(g_tile_fixed[0], 16u, 16384u);
         th = std::clamp<std::uint32_t>(g_tile_fixed[1], 16u, 16384u);
     }
+    const std::uint32_t want[2] = {tw, th};
+    for (int k = 0; k < 2; ++k) {
+        if (!g_tile_ctor[k]) continue;
+        auto* imm = static_cast<std::uint32_t*>(guest_ptr(g_tile_mem, g_tile_ctor[k] + 6));
+        if (*imm == want[k]) continue;
+        const std::uint64_t page = g_tile_ctor[k] & ~0xfffull;
+        if (!guest_protect_rwx(&g_tile_mem, page, 0x2000)) continue;
+        std::memcpy(imm, &want[k], 4);
+        guest_protect_rx(&g_tile_mem, page, 0x2000);
+    }
+    const std::uint64_t gm = g_graphics_manager ? *g_graphics_manager : 0;
+    if (!gm) return;  // not made yet: its constructor writes the size
     auto* tile = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(gm + kLightTileW));
     if (tile[0] == tw && tile[1] == th) return;
     static std::atomic<int> logs{0};
-    if (logs.fetch_add(1) < 8) host_log("graphics: light grid tile %ux%u -> %ux%u (window %dx%d, render %ux%u)", tile[0], tile[1], tw, th, ww, wh, g_res_words[0], g_res_words[1]);
+    if (logs.fetch_add(1) < 8) host_log("graphics: light grid tile %ux%u -> %ux%u (a %ux%u frame)", tile[0], tile[1], tw, th, fw, fh);
     tile[0] = tw;
     tile[1] = th;
     static_assert(kLightTileH == kLightTileW + 4, "the tile's height follows its width");
+}
+
+// The presented image's size (light_grid_window) and the render size the tile
+// was last made for, under g_tile_mu.
+std::uint32_t g_window_px[2] = {0, 0};
+std::uint32_t g_render_px[2] = {0, 0};
+
+// The tile for the larger of the presented image and the render size on each
+// side: sized to the window alone, a window a little smaller than the render
+// (a 1910x1015 one over 1920x1080, a Linux player's) made the grid 2x2 tiles,
+// every light drawn once a tile it touches and each tile's lights a pass of
+// their own - ~100 render passes a frame against ~25.
+void light_grid_refresh_locked() {
+    g_render_px[0] = g_res_words ? g_res_words[0] : 0;
+    g_render_px[1] = g_res_words ? g_res_words[1] : 0;
+    light_grid_apply(std::max(g_window_px[0], g_render_px[0]), std::max(g_window_px[1], g_render_px[1]));
+}
+
+// The window's pixel size, now and whenever it changes (host_window_on_pixels).
+void light_grid_window(int w, int h) {
+    std::lock_guard<std::mutex> lock(g_tile_mu);
+    g_window_px[0] = static_cast<std::uint32_t>(std::max(w, 0));
+    g_window_px[1] = static_cast<std::uint32_t>(std::max(h, 0));
+    light_grid_refresh_locked();
+}
+
+// A view's check that the render size is the one the tile was made for (a
+// live resolution change, PC Graphics' Resolution): two words a view.
+void light_grid_render_size_tick() {
+    if (!g_res_words || (g_res_words[0] == g_render_px[0] && g_res_words[1] == g_render_px[1])) return;
+    std::lock_guard<std::mutex> lock(g_tile_mu);
+    light_grid_refresh_locked();
 }
 
 // Model detail. Every mesh draw (sub_216f9d0, 0x216fc09) picks its level as
@@ -897,11 +1003,19 @@ void light_grid_tick() {
 constexpr std::uint64_t kRendManSlot = 0x5940298;
 const std::uint64_t* g_rend_man = nullptr;
 
+// Written when the setting changes (or the render manager's settings are
+// made again), not held every frame: the debug menu's LodLvBias changes it in
+// between and keeps it.
 void lod_bias_tick() {
     if (!g_rend_man || !*g_rend_man) return;
     const int want = g_lod_bias.load(std::memory_order_relaxed);
     const std::uint64_t settings = *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(*g_rend_man + 0x10));
     if (!settings) return;
+    static std::uint64_t applied_at = 0;
+    static int applied = 0;
+    if (settings == applied_at && want == applied) return;
+    applied_at = settings;
+    applied = want;
     auto* bias = reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(settings + 0x530));
     if (*bias == want) return;
     static std::atomic<int> logs{0};
@@ -943,29 +1057,57 @@ void light_grid_install(ElfImage* image) {
         host_log("graphics: light grid as the game has it (BBHOST_LIGHT_GRID=0)");
         return;
     }
-    if (const char* e = std::getenv("BBHOST_LIGHT_GRID_FROM"); e && *e) g_tile_from = std::strtoull(e, nullptr, 10);
-    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "window") == 0) g_tiles_per_axis = 1;
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "quarter") == 0) g_tiles_per_axis = 4;
+    // =<N>: N tiles a side (1 is one tile the frame's size).
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && *e >= '1' && *e <= '9' && !std::strchr(e, 'x')) {
+        g_tiles_per_axis = static_cast<std::uint32_t>(std::clamp(std::atoi(e), 1, 32));
+    }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
     }
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
+    // The game's 3x3, or 1x1 already: a patch list's (Performance Patch v3
+    // writes the split and a 1920x1080 tile, and with it applied this
+    // refused, so the tile never followed the window - Kyo's log, 2026-10-14).
     auto* div = static_cast<std::uint32_t*>(guest_ptr(image->mem, at(kLightGridDiv)));
-    if (div[0] != 3 || div[1] != 3) {
+    const bool patched = div[0] == 1 && div[1] == 1;
+    if (!patched && (div[0] != 3 || div[1] != 3)) {
         host_log("graphics: refused, the light grid's job split at 0x%llx holds %ux%u, not 3x3",
                  static_cast<unsigned long long>(kLightGridDiv), div[0], div[1]);
         return;
     }
-    if (!guest_protect_rw(&image->mem, at(kLightGridDiv) & ~0xfffull, 0x1000)) {
+    if (!patched && !guest_protect_rw(&image->mem, at(kLightGridDiv) & ~0xfffull, 0x1000)) {
         host_log("graphics: cannot unprotect the light grid's job split");
         return;
     }
-    div[0] = 1;
-    div[1] = 1;
+    if (!patched) {
+        div[0] = 1;
+        div[1] = 1;
+    }
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, at(0x55289f8)));  // res_width, res_height (below)
     g_graphics_manager = static_cast<const std::uint64_t*>(guest_ptr(image->mem, at(kGraphicsManagerSlot)));
-    host_log("graphics: light grid - one job of %ux%u tiles sized to the window (was 3x3 jobs of 128x128 tiles; BBHOST_LIGHT_GRID=window: one window-sized tile)",
-             g_tiles_per_axis, g_tiles_per_axis);
+    g_tile_mem = image->mem;
+    const std::uint64_t ctor[2] = {at(kTileCtorW), at(kTileCtorH)};
+    for (int k = 0; k < 2; ++k) {
+        // The instruction with any immediate: a patch list may have put its own size there already.
+        if (std::memcmp(guest_ptr(image->mem, ctor[k]), kTileCtorWas[k], 6) == 0) g_tile_ctor[k] = ctor[k];
+    }
+    if (!g_tile_ctor[0] || !g_tile_ctor[1]) {
+        host_log("graphics: the GraphicsManager constructor's 128x128 tile is not at 0x%llx/0x%llx; the size is written into the "
+                 "manager alone", static_cast<unsigned long long>(kTileCtorW), static_cast<unsigned long long>(kTileCtorH));
+        g_tile_ctor[0] = g_tile_ctor[1] = 0;
+    }
+    {
+        // The render size until the window says otherwise (headless, it stays).
+        std::lock_guard<std::mutex> lock(g_tile_mu);
+        light_grid_refresh_locked();
+    }
+    host_window_on_pixels(&light_grid_window);
+    host_log("graphics: light grid - one job of %ux%u tiles sized to the larger of the window and the render size, set by the "
+             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=<N>: N "
+             "a side, =1 one tile, =0 the game's)",
+             g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
 // The flip during which the scene's view was last drawn, plus one (0: none
@@ -975,9 +1117,8 @@ std::atomic<std::uint64_t> g_scene_view_flip{0};
 GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* saved) {
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     refresh_settings();
-    camera_tick();
-    light_grid_tick();
     lod_bias_tick();
+    if (g_graphics_manager) light_grid_render_size_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[0])));
     if (g_ca_amount) {
@@ -992,13 +1133,31 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         }
         last = now;
     }
+    // SSAO and AA: a renderer's two flags, written once a generation - when
+    // the setting changes, or at its first view when the file asks for other
+    // than the game's own - and left alone in between, so the debug menu's
+    // "Enable SSAO" and "Enable AntiAliasing" (the same bytes) keep what they
+    // set. Held every view until 2026-10-14, the PC graphics settings off
+    // included, which turned the debug menu's switches back on.
+    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire);
     auto* r = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[0]));
-    if (r) {
-        std::uint64_t caps = 0;
-        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
-        const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
-        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
-        if (r[kSsaoFlag] != ssao || r[kAaFlag] != aa) {
+    if (r && gen) {
+        struct Given {
+            std::uint8_t* renderer;
+            std::uint32_t gen;
+        };
+        static Given given[16] = {};
+        static unsigned next = 0;
+        Given* g = nullptr;
+        for (Given& c : given) g = c.renderer == r ? &c : g;
+        if (!g || g->gen != gen) {
+            if (!g) g = &given[next++ % 16];
+            g->renderer = r;
+            g->gen = gen;
+            std::uint64_t caps = 0;
+            std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+            const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
+            const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {
                 host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u", static_cast<void*>(r),
@@ -1052,7 +1211,25 @@ void live_install(ElfImage* image) {
     lod_bias_install(image);
     task_tune_install(image);
     const auto at = [&](std::uint64_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
+    // The settings applied once, at their source, and again only when they
+    // change - SSAO, AA, motion blur, depth of field, chromatic aberration,
+    // model detail, the camera - are installed always. The ones that scale an
+    // area's blended values every view (bloom, vignette, saturation, fog, AO
+    // strength, shadow distance) only with host_pc_graphics(): off by default,
+    // their rows not shown, nothing of theirs run in a frame.
+    const bool pc = host_pc_graphics();
     const std::uint64_t ca = at(kCaCopy);
+    {
+        auto* v = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kVelocityCtor)));
+        g_velocity_slide = image->mem.slide;
+        if (std::memcmp(v, kVelocityCtorBytes, sizeof(kVelocityCtorBytes)) == 0) {
+            g_velocity_mem = image->mem;
+            g_velocity_ctor = v + 6;
+        } else {
+            host_log("graphics: 0x%llx is not the graphics manager's motion blur switch; the velocity pass runs with blur off too",
+                     static_cast<unsigned long long>(kVelocityCtor));
+        }
+    }
     if (std::memcmp(guest_ptr(image->mem, ca), kCaCopyBytes, sizeof(kCaCopyBytes)) != 0) {
         host_log("graphics: refused, 0x%llx is not chromatic aberration's copy; it stays on",
                  static_cast<unsigned long long>(kCaCopy));
@@ -1066,6 +1243,14 @@ void live_install(ElfImage* image) {
         host_log("graphics: refused, 0x%llx is not the render-view prologue (or no room for its hook); SSAO "
                  "and AA stay on",
                  static_cast<unsigned long long>(kRenderView));
+    }
+    if (!pc) {
+        host_log("graphics: SSAO, anti-aliasing, motion blur, depth of field, chromatic aberration%s and model detail are "
+                 "written once, when they differ from the game's own, and again only when they change; bloom, vignette, "
+                 "saturation, fog, AO strength and shadow distance are the area's own (BBHOST_PC_GRAPHICS=1 or [video] "
+                 "pc_graphics = true: their settings, applied every view)",
+                 g_ca_mask ? "" : " (not this one: its stub could not be placed)");
+        return;
     }
     if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
                                reinterpret_cast<void*>(&yebis_record_hook))) {
@@ -1085,11 +1270,6 @@ void live_install(ElfImage* image) {
         host_log("graphics: refused, 0x%llx is not the fog table's jump to its upload (or no room for a stub); "
                  "fog stays as the area has it",
                  static_cast<unsigned long long>(kFogUploadJump));
-    }
-    if (!install_prologue_hook(image, at(kVelocityPost), kVelocityPostPrologue, sizeof(kVelocityPostPrologue),
-                               reinterpret_cast<void*>(&velocity_post_hook))) {
-        host_log("graphics: refused, 0x%llx is not motion blur's velocity post-pass; it runs with blur off too",
-                 static_cast<unsigned long long>(kVelocityPost));
     }
     if (!install_prologue_hook(image, at(kShadowSetup), kShadowSetupPrologue, sizeof(kShadowSetupPrologue),
                                reinterpret_cast<void*>(&shadow_setup_hook))) {
@@ -1299,6 +1479,76 @@ void resolution_patch(ElfImage* image, bool live) {
     ui_stage_pin(image);
 }
 
+// Motion blur's buffers at a fixed size whatever the render size, as every
+// "Resolution Patch WxH" in Kyo's shadPS4 list has them: the scene context's
+// velocity map pair (+0xce0/+0xd38, made only in its Initialize, sub_26c39f0)
+// at 640x360, and the depth renders the velocity pass tests against
+// (sub_125b140, its one caller in the same function) at 640x360 and 320x180 -
+// the game's own are half and a quarter of the render size. The same bytes as
+// patches/low-res-aux-targets.toml, here so that a player who copies only the
+// new exe over an older folder gets them too: an RTX 5080 log ran from a
+// v0.2.16 folder with no such manifest, and its velocity map was 960x540 at
+// 1080p. Written after the manifests: a site a manifest wrote (that one, the
+// HD Motion Blur ones, Screen Space Reflections, Performance Patch v3) is left
+// as it wrote it. [patches] low-res-aux-targets = false or BBHOST_LOW_RES_AUX=0
+// keeps the game's sizes.
+void aux_targets_baseline(ElfImage* image) {
+    if (const char* e = std::getenv("BBHOST_LOW_RES_AUX"); (e && e[0] == '0') || patch_manifest_off("low-res-aux-targets")) {
+        host_log("graphics: motion blur's buffers at the game's sizes (half and a quarter of the render size)");
+        return;
+    }
+    struct Site {
+        std::uint64_t at;
+        std::uint8_t len;
+        std::uint8_t was[10], now[10];
+    };
+    static const Site kSites[] = {
+        // mov eax, [r15]; shr eax, 1 -> mov eax, 640 (the velocity map's width)
+        {0x26c3de4, 5, {0x41, 0x8b, 0x07, 0xd1, 0xe8}, {0xb8, 0x80, 0x02, 0x00, 0x00}},
+        // mov eax, [r15+4]; shr eax, 1 -> mov eax, 360; nop
+        {0x26c3df0, 6, {0x41, 0x8b, 0x47, 0x04, 0xd1, 0xe8}, {0xb8, 0x68, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx]; shr eax, 1; mov [rsp], eax -> mov dword [rsp], 640
+        {0x125b1a3, 7, {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24}, {0xc7, 0x04, 0x24, 0x80, 0x02, 0x00, 0x00}},
+        // mov eax, [rbx+4]; shr eax, 1; mov [rsp+4], eax -> mov dword [rsp+4], 360
+        {0x125b1aa, 9, {0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04}, {0xc7, 0x44, 0x24, 0x04, 0x68, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx]; shr eax, 2; mov [rsp], eax -> mov dword [rsp], 320
+        {0x125b1d6, 8, {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24}, {0xc7, 0x04, 0x24, 0x40, 0x01, 0x00, 0x00, 0x90}},
+        // mov eax, [rbx+4]; shr eax, 2; mov [rsp+4], eax -> mov dword [rsp+4], 180
+        {0x125b1de, 10, {0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
+         {0xc7, 0x44, 0x24, 0x04, 0xb4, 0x00, 0x00, 0x00, 0x90, 0x90}},
+    };
+    int written = 0, already = 0, owned = 0, refused = 0;
+    std::string owners;
+    for (const Site& s : kSites) {
+        if (const char* o = patch_manifest_owner(s.at, s.len)) {
+            ++owned;
+            if (owners.find(o) == std::string::npos) owners += std::string(owners.empty() ? "" : ", ") + o;
+            continue;
+        }
+        const std::uint64_t at = image->mem.slide + (s.at - kPreferredGuestSlide);
+        auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
+        if (std::memcmp(p, s.now, s.len) == 0) {
+            ++already;
+            continue;
+        }
+        if (std::memcmp(p, s.was, s.len) != 0) {
+            ++refused;
+            continue;
+        }
+        const std::uint64_t lo = at & ~0xfffull, hi = (at + s.len + 0xfff) & ~0xfffull;
+        if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
+            ++refused;
+            continue;
+        }
+        std::memcpy(p, s.now, s.len);
+        guest_protect_rx(&image->mem, lo, hi - lo);
+        ++written;
+    }
+    host_log("graphics: motion blur's buffers - the velocity map and the depth it tests against at 640x360, the quarter-size "
+             "depth at 320x180, at every resolution: %d of 6 sites written, %d already%s%s%s, %d refused (not the game's bytes)",
+             written, already, owned ? ", left to " : "", owned ? owners.c_str() : "", owned ? " where it wrote them" : "", refused);
+}
+
 }  // namespace
 
 bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host,
@@ -1342,6 +1592,7 @@ std::string graphics_glare_report() {
 
 void graphics_patch_install(ElfImage* image) {
     resolution_patch(image, live_resolution_install(image));
+    aux_targets_baseline(image);
     menu_memory_install(image);
     frame_rate_install(image);
     camera_install(image);

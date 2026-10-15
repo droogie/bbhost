@@ -47,6 +47,7 @@ enum class Op : std::uint16_t {
     kCopyImage,          // vkCmdCopyImage
     kDispatchIndirect,   // vkCmdDispatchIndirect
     kMarker,             // AMD's buffer markers around what follows (gpu_write_markers)
+    kPushBuffers,        // vkCmdPushDescriptorSetKHR of storage buffers (a dispatch's)
     kCount
 };
 
@@ -196,6 +197,12 @@ struct DispatchIndirect {
 struct Marker {
     std::uint32_t value, pad;  // gpu_marker_value
 };
+struct PushBuffers {
+    VkPipelineLayout layout;
+    VkPipelineBindPoint bind_point;
+    std::uint32_t set, n, pad;
+    // + std::uint32_t bindings[n], then VkDescriptorBufferInfo[n]
+};
 
 template <class T> constexpr bool kRecordable = std::is_trivially_copyable_v<T> && alignof(T) <= 8;
 static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<Barrier> &&
@@ -203,7 +210,7 @@ static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<Foreig
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&
                   kRecordable<PushConstants> && kRecordable<UpdateSets> && kRecordable<Dispatch> && kRecordable<ClearDepth> &&
-                  kRecordable<CopyImage> && kRecordable<DispatchIndirect> && kRecordable<Marker>,
+                  kRecordable<CopyImage> && kRecordable<DispatchIndirect> && kRecordable<Marker> && kRecordable<PushBuffers>,
               "op records are plain values");
 static_assert(kRecordable<VkMemoryBarrier> && kRecordable<VkBufferMemoryBarrier> && kRecordable<VkImageMemoryBarrier> &&
                   kRecordable<VkBufferCopy> && kRecordable<VkBufferImageCopy> && kRecordable<VkImageSubresourceRange> &&

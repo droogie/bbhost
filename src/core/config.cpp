@@ -162,6 +162,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         if (it != kv.end()) c->setup_always = it->second == "true" || it->second == "1";
     }
     {
+        auto it = kv.find("debug.tooling");
+        if (it != kv.end()) c->tooling = it->second == "true" || it->second == "1";
+    }
+    {
         auto it = kv.find("startup.skip_intro");
         if (it != kv.end()) {
             c->skip_intro = it->second == "true" || it->second == "1";
@@ -729,6 +733,10 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
+    }
+    if (const char* e = std::getenv("BBHOST_TOOLING")) {
+        if (std::strcmp(e, "1") == 0) c.tooling = true;
+        else if (std::strcmp(e, "0") == 0) c.tooling = false;
     }
     if (const char* e = std::getenv("BBHOST_IME")) {
         if (std::strcmp(e, "type") == 0 || std::strcmp(e, "auto") == 0) c.ime_mode = e;

@@ -320,6 +320,7 @@ bool load_orbis_elf(const char* path, ElfImage* image) {
             if (!guest_protect_rx(&image->mem, image->mem.slide + ph[i].p_vaddr, sz)) {
                 return false;
             }
+            guest_mark_executable(&image->mem, image->mem.slide + ph[i].p_vaddr, sz);
         }
     }
     if (tls_gs_mode()) tls_rewrite_report(tls_st);

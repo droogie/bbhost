@@ -1,0 +1,921 @@
+# Performance Patch v3 (Velomap + Camera Blur, Decals On): Kyo's patch for 1.09, from Kyo's shadPS4 list
+# (user/patches/shadPS4/Bloodborne.xml), byte for byte: 192 lines, 1341 bytes.
+#
+# Imported whole at Kyo's request (2026-10-08), to be judged in play. A
+# 2026-10-03 review of it, entry by entry in Binary Ninja, found
+# parts emulator-specific, parts that natively leave SSAO, depth of field and
+# distortion reading stale buffers (the skipped depth and scene copies), and
+# parts it judged harmful (the file cache's access-time skips, a condition
+# wait made a `ret`, a cave calling with a misaligned stack, the assert and
+# DL_PANIC suppression). The light grid's 1x1 job split is bbhost's own
+# already (graphics_patch.cpp keeps its window-sized tiles); the mesh LOD
+# edit at 0x216fc09 overrides PC Graphics' Model detail while it is on.
+# One variant on at a time (group performance-v3): they share 1,295 bytes.
+#
+# Off until turned on: the setup window's Patches tab, or `performance-v3-velomap = true` under
+# [patches] in bbhost.toml, turns it on for the next start.
+[patch]
+name = "performance-v3-velomap"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo)"
+enabled = false
+order = 22
+group = "performance-v3"
+
+[site.s000]
+address = "0x00400170"
+expect = "55 48 89 e5"
+bytes = "90 90 90 90"
+
+[site.s001]
+address = "0x00400194"
+expect = "5d"
+bytes = "90"
+
+[site.s002]
+address = "0x004001ad"
+expect = "5d"
+bytes = "90"
+
+[site.s003]
+address = "0x004001b3"
+expect = "5d"
+bytes = "90"
+
+[site.s004]
+address = "0x004001c0"
+expect = "55 48 89 e5 53 50 48 89 fb e8 62 00 00 00 48 8d 05 4b 71 3e 05 48 8b 38 48 8b 07 48 8b 40 68 48 89 de 48 83 c4 08 5b 5d"
+bytes = "57 e8 6a 00 00 00 48 8d 05 53 71 3e 05 48 8b 38 48 8b 07 5e 48 8b 40 68 ff e0 90 90 90 90 90 90 90 90 90 90 90 90 90 90"
+
+[site.s005]
+address = "0x004001f0"
+expect = "55 48 89 e5 53 50 48 89 fb 48 83 c3 e8 48 89 df e8 2b 00 00 00 48 8d 05 14 71 3e 05 48 8b 38 48 8b 07 48 8b 40 68 48 89 de 48 83 c4 08 5b 5d ff"
+bytes = "48 83 c7 e8 57 e8 36 00 00 00 48 8d 05 1f 71 3e 05 48 8b 38 48 8b 07 5e 48 8b 40 68 ff e0 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90"
+
+[site.s006]
+address = "0x00463190"
+expect = "55 48 89 e5 53 48 83 ec 18 48 8b 1d 40 0a 38 05 48 8b 03 48 89 45 f0 48 8d 7d e0 31 f6 e8 76 b5"
+bytes = "48 83 ec 18 48 89 e7 31 f6 e8 8a b5 b5 02 48 69 04 24 40 42 0f 00 48 03 44 24 08 48 83 c4 18 c3"
+
+[site.s007]
+address = "0x00463200"
+expect = "55 48 89 e5 41 56 53 48 83 ec 20 4c 8b 35 ce 09 38 05 49 8b 06 48 89 45 e8 48 8d 7d d8 31 f6 e8 04 b5 b5 02 48 69 75"
+bytes = "48 83 ec 18 48 89 e7 31 f6 e8 1a b5 b5 02 48 69 04 24 40 42 0f 00 48 03 44 24 08 48 2b 05 ee 66 38 05 48 83 c4 18 c3"
+
+[site.s008]
+address = "0x00463450"
+expect = "55 48 89 e5 53 48 83 ec 18 48 8b 1d 80 07 38 05 48 8b 03 48 89 45 f0 48 8d 7d e0 31 f6 e8 b6 b2 b5 02 48 69 45 e0 40"
+bytes = "48 83 ec 28 31 f6 48 89 e7 e8 ca b2 b5 02 48 69 04 24 40 42 0f 00 48 03 44 24 08 48 89 05 9e 64 38 05 48 83 c4 28 c3"
+
+[site.s009]
+address = "0x0081cc23"
+expect = "48 b8 06 00 00 00 00 00 80 00"
+bytes = "48 b8 08 00 00 00 00 00 80 00"
+
+[site.s010]
+address = "0x00ded443"
+expect = "e8 18 76 bd 01"
+bytes = "90 90 90 90 90"
+
+[site.s011]
+address = "0x00ded470"
+expect = "e8 eb 75 bd 01"
+bytes = "90 90 90 90 90"
+
+[site.s012]
+address = "0x00e73a60"
+expect = "55 48 89"
+bytes = "31 c0 c3"
+
+[site.s013]
+address = "0x00e73aa0"
+expect = "55 48 89"
+bytes = "31 c0 c3"
+
+[site.s014]
+address = "0x00fc96ed"
+expect = "75 13"
+bytes = "eb 13"
+
+[site.s015]
+address = "0x00fc96fd"
+expect = "e8 76 5a ff 01"
+bytes = "90 90 90 90 90"
+
+[site.s016]
+address = "0x00fd342b"
+expect = "41 89 f7"
+bytes = "45 31 ff"
+
+[site.s017]
+address = "0x00fd34bf"
+expect = "c6 44 08 50 01"
+bytes = "c6 44 08 50 00"
+
+[site.s018]
+address = "0x00fe93d1"
+expect = "e8 a2 5d fd 01"
+bytes = "90 90 90 90 90"
+
+[site.s019]
+address = "0x00ff2952"
+expect = "e8 21 c8 fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s020]
+address = "0x00ff2975"
+expect = "e8 fe c7 fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s021]
+address = "0x00ff35c2"
+expect = "e8 b1 bb fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s022]
+address = "0x00ff35e9"
+expect = "e8 8a bb fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s023]
+address = "0x00ff37a2"
+expect = "e8 d1 b9 fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s024]
+address = "0x00ff37c9"
+expect = "e8 aa b9 fc 01"
+bytes = "90 90 90 90 90"
+
+[site.s025]
+address = "0x0125b1a3"
+expect = "8b 03 d1 e8 89 04 24 8b 43 04 d1 e8 89 44 24 04"
+bytes = "c7 04 24 80 02 00 00 c7 44 24 04 68 01 00 00 90"
+
+[site.s026]
+address = "0x0125b1bf"
+expect = "14"
+bytes = "37"
+
+[site.s027]
+address = "0x0125b1d6"
+expect = "8b 03 c1 e8 02 89 04 24 8b 43 04 c1 e8 02 89 44 24 04"
+bytes = "c7 04 24 40 01 00 00 90 c7 44 24 04 b4 00 00 00 90 90"
+
+[site.s028]
+address = "0x0138a540"
+expect = "3c"
+bytes = "2c"
+
+[site.s029]
+address = "0x014485b1"
+expect = "31 f6"
+bytes = "eb 4b"
+
+[site.s030]
+address = "0x0144864f"
+expect = "31 f6"
+bytes = "eb 60"
+
+[site.s031]
+address = "0x014588fc"
+expect = "05 00 00 00"
+bytes = "02 00 00 00"
+
+[site.s032]
+address = "0x01477470"
+expect = "55"
+bytes = "c3"
+
+[site.s033]
+address = "0x014774f0"
+expect = "55"
+bytes = "c3"
+
+[site.s034]
+address = "0x01477fe0"
+expect = "55"
+bytes = "c3"
+
+[site.s035]
+address = "0x01478060"
+expect = "55"
+bytes = "c3"
+
+[site.s036]
+address = "0x014780e0"
+expect = "55"
+bytes = "c3"
+
+[site.s037]
+address = "0x0148ae10"
+expect = "55"
+bytes = "c3"
+
+[site.s038]
+address = "0x0148ae90"
+expect = "55"
+bytes = "c3"
+
+[site.s039]
+address = "0x0148b6a0"
+expect = "55"
+bytes = "c3"
+
+[site.s040]
+address = "0x0148b720"
+expect = "55"
+bytes = "c3"
+
+[site.s041]
+address = "0x0148b7a0"
+expect = "55"
+bytes = "c3"
+
+[site.s042]
+address = "0x01643850"
+expect = "55 48 89 e5 48 63 87 58 01 00 00 48 83 f8 40 73 19 48 8b 4e 08 48 89 c2 48 c1 ea 06 48 8b 4c d1 68 48 0f a3 c1 0f 92 c0 5d c3 e8"
+bytes = "48 63 87 58 01 00 00 48 83 f8 40 73 1b 48 8b 4e 08 48 89 c2 48 c1 ea 06 48 8b 4c d1 68 48 0f a3 c1 0f 92 c0 0f b6 c0 c3 31 c0 c3"
+
+[site.s043]
+address = "0x01643900"
+expect = "55 48 89 e5 83 bf 58 01 00 00 40 73 1c 48 8b 46 08 f6 40 68 04 74 0e 48 8b 42 08 c7 80 fc 00 00 00 00 00 00 40 31 c0"
+bytes = "83 bf 58 01 00 00 40 73 1b 48 8b 46 08 f6 40 68 04 74 11 48 8b 42 08 c7 80 fc 00 00 00 00 00 00 40 31 c0 c3 31 c0 c3"
+
+[site.s044]
+address = "0x0165ab30"
+expect = "55 48 89 e5 83 fe 40 73 1c 48 63 c6 48 8b 4f 08 48 89 c2 48 c1 ea 06 48 8b 4c d1 68 48 0f a3 c1 0f 92 c0 5d c3 e8"
+bytes = "83 fe 40 73 1e 48 63 c6 48 8b 4f 08 48 89 c2 48 c1 ea 06 48 8b 4c d1 68 48 0f a3 c1 0f 92 c0 0f b6 c0 c3 31 c0 c3"
+
+[site.s045]
+address = "0x0165ab60"
+expect = "55 48 89 e5 48 8b 7f 08 e8 a3 72 03 00 48 85 c0 74 0b 48 8b 08 48 89 c7 ff 51 20"
+bytes = "48 8b 7f 08 e8 a7 72 03 00 48 85 c0 74 0a 48 8b 08 48 89 c7 ff 51 20 c3 31 c0 c3"
+
+[site.s046]
+address = "0x01690f20"
+expect = "55 48 89 e5 83 fe 40 73 18 48 63 c6 48 89 c1 48 c1 e9 06 48 8b 4c cf 68 48 0f a3 c1 0f 92 c0 5d c3 e8"
+bytes = "83 fe 40 73 1a 48 63 c6 48 89 c1 48 c1 e9 06 48 8b 4c cf 68 48 0f a3 c1 0f 92 c0 0f b6 c0 c3 31 c0 c3"
+
+[site.s047]
+address = "0x0172b2ca"
+expect = "45 8a a5 8a 00 00 00"
+bytes = "41 b4 01 90 90 90 90"
+
+[site.s048]
+address = "0x019550f1"
+expect = "41 c7 45 58 00 00 c8 41 41 c7 45 5c 00 00 f0 41 41 c7 45 60 cd cc 4c 3e 41 c7 45 64 66 66 a6 3f"
+bytes = "41 c7 45 58 00 00 a0 41 41 c7 45 5c 00 00 c8 41 41 c7 45 60 00 00 a0 40 41 c7 45 64 9a 99 99 3f"
+
+[site.s049]
+address = "0x0195516c"
+expect = "41 c7 85 00 08 00 00 00 00 c8 41 41 c7 85 04 08 00 00 00 00 f0 41 41 c7 85 08 08 00 00 cd cc 4c 3e 41 c7 85 0c 08 00 00 66 66 a6 3f"
+bytes = "41 c7 85 00 08 00 00 00 00 a0 42 41 c7 85 04 08 00 00 00 00 b4 42 41 c7 85 08 08 00 00 00 00 a0 40 41 c7 85 0c 08 00 00 9a 99 99 3f"
+
+[site.s050]
+address = "0x01970003"
+expect = "01 01 01 00"
+bytes = "00 00 00 00"
+
+[site.s051]
+address = "0x01970010"
+expect = "01 01"
+bytes = "00 00"
+
+[site.s052]
+address = "0x0197001a"
+expect = "01 01 01 01"
+bytes = "00 00 00 00"
+
+[site.s053]
+address = "0x01970ca0"
+expect = "01"
+bytes = "00"
+
+[site.s054]
+address = "0x01970cbb"
+expect = "01"
+bytes = "00"
+
+[site.s055]
+address = "0x01970cd6"
+expect = "01"
+bytes = "00"
+
+[site.s056]
+address = "0x01970cf1"
+expect = "01"
+bytes = "00"
+
+[site.s057]
+address = "0x01970d0c"
+expect = "01"
+bytes = "00"
+
+[site.s058]
+address = "0x01970d2f"
+expect = "01"
+bytes = "00"
+
+[site.s059]
+address = "0x01970d4b"
+expect = "01"
+bytes = "00"
+
+[site.s060]
+address = "0x01970d67"
+expect = "01"
+bytes = "00"
+
+[site.s061]
+address = "0x01970d83"
+expect = "01"
+bytes = "00"
+
+[site.s062]
+address = "0x01970d9f"
+expect = "01"
+bytes = "00"
+
+[site.s063]
+address = "0x01bfa58e"
+expect = "05"
+bytes = "02"
+
+[site.s064]
+address = "0x01c31160"
+expect = "bf a0 86 01 00"
+bytes = "bf 90 d0 03 00"
+
+[site.s065]
+address = "0x01d13e1d"
+expect = "c7 40 2c 00 00 20 42"
+bytes = "c7 40 2c 00 00 a0 41"
+
+[site.s066]
+address = "0x01db6000"
+expect = "31 f6"
+bytes = "eb 0d"
+
+[site.s067]
+address = "0x01db60e4"
+expect = "31 f6"
+bytes = "eb 4b"
+
+[site.s068]
+address = "0x01db6517"
+expect = "31 f6"
+bytes = "eb 0d"
+
+[site.s069]
+address = "0x01db65e0"
+expect = "31 f6"
+bytes = "eb 4c"
+
+[site.s070]
+address = "0x0216a963"
+expect = "75 15"
+bytes = "eb 15"
+
+[site.s071]
+address = "0x0216acac"
+expect = "75 15"
+bytes = "eb 15"
+
+[site.s072]
+address = "0x0216fc09"
+expect = "8b 0d 11 81 81 03"
+bytes = "b9 fe ff ff ff 90"
+
+[site.s073]
+address = "0x02196c3a"
+expect = "06 00 00 00"
+bytes = "08 00 00 00"
+
+[site.s074]
+address = "0x0224a709"
+expect = "bf 4d 01 00 00"
+bytes = "bf 4d 01 00 00"
+
+[site.s075]
+address = "0x022dd2c6"
+expect = "c7 40 5c 60 60 60 ff"
+bytes = "c7 40 5c 00 00 00 ff"
+
+[site.s076]
+address = "0x023868f0"
+expect = "bf e8 03 00 00"
+bytes = "bf c8 00 00 00"
+
+[site.s077]
+address = "0x023ce1ed"
+expect = "bf 20 4e 00 00"
+bytes = "bf d0 07 00 00"
+
+[site.s078]
+address = "0x023ce3f5"
+expect = "bf 20 4e 00 00"
+bytes = "bf d0 07 00 00"
+
+[site.s079]
+address = "0x0241ae52"
+expect = "8b 00 8d 48 ce 48 8d 15 9a db 10 03 8b 12"
+bytes = "b8 0e 01 00 00 8d 48 ce ba e0 01 00 00 90"
+
+[site.s080]
+address = "0x02434ada"
+expect = "0f 84 9a 00 00 00 c5 f8 2e c8 0f 87 6b 01 00 00 4c 8d 75 c0 66 90 c5 e2 5d c0 c5 f8 2e c1 0f 86 57 01 00 00 31 f6 4c"
+bytes = "e9 9b 00 00 00 90 51 e8 42 a3 b8 00 59 85 c0 75 15 85 c9 74 11 bf d0 07 00 00 39 f9 0f 42 f9 50 e8 69 b3 b8 00 58 c3"
+
+[site.s081]
+address = "0x02434fe3"
+expect = "74"
+bytes = "eb"
+
+[site.s082]
+address = "0x02435043"
+expect = "74"
+bytes = "eb"
+
+[site.s083]
+address = "0x024350a3"
+expect = "74"
+bytes = "eb"
+
+[site.s084]
+address = "0x02435103"
+expect = "74"
+bytes = "eb"
+
+[site.s085]
+address = "0x02435163"
+expect = "74"
+bytes = "eb"
+
+[site.s086]
+address = "0x024351c3"
+expect = "74"
+bytes = "eb"
+
+[site.s087]
+address = "0x0247f980"
+expect = "85 ff 7e 05 e9 df 04 b4 00 c3 66 0f 1f 44 00 00"
+bytes = "85 ff 7e 0a 81 ff 40 1f 00 00 7f 28 eb 2b c3 90"
+
+[site.s088]
+address = "0x0247f9b4"
+expect = "66 66 66 2e 0f 1f 84 00 00 00 00 00"
+bytes = "bf 40 1f 00 00 e9 aa 04 b4 00 90 90"
+
+[site.s089]
+address = "0x0248bac0"
+expect = "85 ff 7e 05 e9 9f 43 b3 00 c3 66 0f 1f 44 00 00"
+bytes = "85 ff 7e 0a 81 ff 40 1f 00 00 7f 18 eb 1b c3 90"
+
+[site.s090]
+address = "0x0248bae4"
+expect = "66 66 66 2e 0f 1f 84 00 00 00 00 00"
+bytes = "bf 40 1f 00 00 e9 7a 43 b3 00 90 90"
+
+[site.s091]
+address = "0x024b56d2"
+expect = "c7 04 25 00 00 00 00 ba ad de 00"
+bytes = "90 90 90 90 90 90 90 90 90 90 90"
+
+[site.s092]
+address = "0x024bd1c0"
+expect = "bf e8 03 00 00"
+bytes = "bf 64 00 00 00"
+
+[site.s093]
+address = "0x024bdd50"
+expect = "bf e8 03 00 00"
+bytes = "bf 64 00 00 00"
+
+[site.s094]
+address = "0x024cc437"
+expect = "31 f6"
+bytes = "eb 55"
+
+[site.s095]
+address = "0x024cc4cf"
+expect = "31 f6"
+bytes = "eb 55"
+
+[site.s096]
+address = "0x024ccb14"
+expect = "31 f6"
+bytes = "eb 45"
+
+[site.s097]
+address = "0x024ccb68"
+expect = "31 f6"
+bytes = "eb 45"
+
+[site.s098]
+address = "0x024cfb32"
+expect = "bf e8 03 00 00"
+bytes = "bf c8 00 00 00"
+
+[site.s099]
+address = "0x024cfc0f"
+expect = "31 f6"
+bytes = "eb 55"
+
+[site.s100]
+address = "0x024cfc9a"
+expect = "31 f6"
+bytes = "eb 55"
+
+[site.s101]
+address = "0x024d2d90"
+expect = "bf f4 01 00 00"
+bytes = "bf 64 00 00 00"
+
+[site.s102]
+address = "0x024d4859"
+expect = "bf f4 01 00 00"
+bytes = "bf 64 00 00 00"
+
+[site.s103]
+address = "0x024de725"
+expect = "31 f6"
+bytes = "eb 6d"
+
+[site.s104]
+address = "0x024de7d5"
+expect = "31 f6"
+bytes = "eb 6d"
+
+[site.s105]
+address = "0x024dede0"
+expect = "31 f6"
+bytes = "eb 45"
+
+[site.s106]
+address = "0x024dee60"
+expect = "31 f6"
+bytes = "eb 45"
+
+[site.s107]
+address = "0x025629f0"
+expect = "bf e8 80 00 00"
+bytes = "bf e8 80 00 00"
+
+[site.s108]
+address = "0x025843e5"
+expect = "0f 84 3a 01 00 00"
+bytes = "90 90 90 90 90 90"
+
+[site.s109]
+address = "0x02587d91"
+expect = "48 c7 45 b8 00 00 00 00"
+bytes = "c6 03 01 0f 1f 44 00 00"
+
+[site.s110]
+address = "0x02587dc0"
+expect = "48 c7 45 a8 00 00 00 00"
+bytes = "c6 05 f9 ed 51 03 01 90"
+
+[site.s111]
+address = "0x02594aa6"
+expect = "41 8b 8c c4 80 01 00 00 89 8c 24 a0 00 00 00 4d 8d b4 c4 84 01 00 00 41 8b 8c c4 84 01 00 00 89 8c 24 a4 00 00 00 c7 84 24 b0 00 00 00 57 00 00 00 c7 84 24 b4 00 00 00 00 00 00 00 c7 84 24 b8"
+bytes = "41 8d 4d ff 83 f9 7f 77 18 c7 84 24 a0 00 00 00 50 00 00 00 c7 84 24 a4 00 00 00 2d 00 00 00 eb 1e 41 8b 8c c4 80 01 00 00 89 8c 24 a0 00 00 00 41 8b 8c c4 84 01 00 00 89 8c 24 a4 00 00 00 4d"
+
+[site.s112]
+address = "0x02594ae6"
+expect = "00 00 00 00 00 00 00 c7 84 24 a8 00 00 00 3c 00 00 00 c7 84 24 ac 00 00 00 01 00 00 00 49 8b 8c c4 88 01 00 00 48 89 8c 24 bc 00 00 00 c7 84 24 c4 00 00 00 03 00 00 00 c7 84 24 c8 00 00 00 03"
+bytes = "8d b4 c4 84 01 00 00 c6 84 24 b0 00 00 00 57 c7 84 24 a8 00 00 00 3c 00 00 00 c6 84 24 ac 00 00 00 01 49 8b 8c c4 88 01 00 00 48 89 8c 24 bc 00 00 00 c6 84 24 c4 00 00 00 03 c6 84 24 c8 00 00"
+
+[site.s113]
+address = "0x02594b26"
+expect = "00 00 00"
+bytes = "00 03 90"
+
+[site.s114]
+address = "0x02594eb0"
+expect = "8b 43 48 48 8d 0c 40 41 8b 84 cc 80 01 00 00 89 43 28 41 8b 8c cc 84 01 00 00 89 4b 2c 41 80 bc 24 05 01 00 00 00 89 ca 75 66 41 80 bc 24 06 01 00 00 00 89 ca 74 59"
+bytes = "8b 43 48 8d 48 ff 83 f9 7f 77 12 b8 50 00 00 00 89 43 28 b9 2d 00 00 00 89 4b 2c eb 1a 48 8d 0c 40 41 8b 84 cc 80 01 00 00 89 43 28 41 8b 8c cc 84 01 00 00 89 4b 2c"
+
+[site.s115]
+address = "0x02595f89"
+expect = "06 00 00 00"
+bytes = "08 00 00 00"
+
+[site.s116]
+address = "0x02595f8e"
+expect = "06 00 00 00"
+bytes = "08 00 00 00"
+
+[site.s117]
+address = "0x0259b458"
+expect = "44 8b 83 80 02 00 00"
+bytes = "41 b8 08 00 00 00 90"
+
+[site.s118]
+address = "0x025b69a7"
+expect = "bf 40 9c 00 00"
+bytes = "bf d0 07 00 00"
+
+[site.s119]
+address = "0x02606b32"
+expect = "00"
+bytes = "01"
+
+[site.s120]
+address = "0x02606b39"
+expect = "01"
+bytes = "00"
+
+[site.s121]
+address = "0x0261b108"
+expect = "c7 45 b4 06 00 00 00"
+bytes = "c7 45 b4 09 00 00 00"
+
+[site.s122]
+address = "0x02695cb6"
+expect = "c7 83 a8 78 00 00 80 00 00 00 c7 83 ac 78 00 00 80 00 00 00"
+bytes = "c7 83 a8 78 00 00 80 07 00 00 c7 83 ac 78 00 00 38 04 00 00"
+
+[site.s123]
+address = "0x02695cf3"
+expect = "00 00 00 00"
+bytes = "10 00 00 00"
+
+[site.s124]
+address = "0x02695d04"
+expect = "00"
+bytes = "01"
+
+[site.s125]
+address = "0x026a10c0"
+expect = "e8 bb e0 fe ff"
+bytes = "90 90 90 90 90"
+
+[site.s126]
+address = "0x026a2829"
+expect = "e8 52 c9 fe ff"
+bytes = "90 90 90 90 90"
+
+[site.s127]
+address = "0x026a283f"
+expect = "e8 3c c9 fe ff"
+bytes = "90 90 90 90 90"
+
+[site.s128]
+address = "0x026a9579"
+expect = "00 00 00 3f"
+bytes = "00 00 80 3e"
+
+[site.s129]
+address = "0x026b8620"
+expect = "41 b8 06 00 00 00"
+bytes = "41 b8 10 00 00 00"
+
+[site.s130]
+address = "0x026b8634"
+expect = "48 c7 85 88 fe ff ff 00 00 00 00"
+bytes = "41 c7 85 b8 78 00 00 10 00 00 00"
+
+[site.s131]
+address = "0x026b90c5"
+expect = "c7 45 c8 00 01 00 00 c7 45 cc 00 01 00 00"
+bytes = "c7 45 c8 80 07 00 00 c7 45 cc 38 04 00 00"
+
+[site.s132]
+address = "0x026c107a"
+expect = "c7 43 5c 20 30 00 ff"
+bytes = "c7 43 5c 00 00 00 ff"
+
+[site.s133]
+address = "0x026c1084"
+expect = "00"
+bytes = "01"
+
+[site.s134]
+address = "0x026c265d"
+expect = "00"
+bytes = "01"
+
+[site.s135]
+address = "0x026c3de4"
+expect = "41 8b 07 d1 e8"
+bytes = "b8 80 02 00 00"
+
+[site.s136]
+address = "0x026c3df0"
+expect = "41 8b 47 04 d1 e8"
+bytes = "b8 68 01 00 00 90"
+
+[site.s137]
+address = "0x026c4074"
+expect = "0a"
+bytes = "1a"
+
+[site.s138]
+address = "0x026c43ca"
+expect = "e8 51 20 fa ff"
+bytes = "31 c0 0f 1f 00"
+
+[site.s139]
+address = "0x026c45d6"
+expect = "1c"
+bytes = "56"
+
+[site.s140]
+address = "0x026c4649"
+expect = "e8 d2 1d fa ff"
+bytes = "31 c0 0f 1f 00"
+
+[site.s141]
+address = "0x026c4660"
+expect = "01"
+bytes = "00"
+
+[site.s142]
+address = "0x026c46cd"
+expect = "0a"
+bytes = "1a"
+
+[site.s143]
+address = "0x026c4740"
+expect = "e8 db 1c fa ff"
+bytes = "31 c0 0f 1f 00"
+
+[site.s144]
+address = "0x026c4984"
+expect = "1c"
+bytes = "1a"
+
+[site.s145]
+address = "0x026c49ba"
+expect = "1c"
+bytes = "56"
+
+[site.s146]
+address = "0x026c4ac6"
+expect = "0f 85 ba 00 00 00"
+bytes = "90 90 90 90 90 90"
+
+[site.s147]
+address = "0x026c4b6f"
+expect = "0a"
+bytes = "18"
+
+[site.s148]
+address = "0x026c4bf8"
+expect = "0a"
+bytes = "1a"
+
+[site.s149]
+address = "0x026c4c6f"
+expect = "01"
+bytes = "00"
+
+[site.s150]
+address = "0x026c4fd7"
+expect = "01"
+bytes = "00"
+
+[site.s151]
+address = "0x026c5146"
+expect = "01"
+bytes = "00"
+
+[site.s152]
+address = "0x026c5369"
+expect = "c7 40 5c 00 00 00 00"
+bytes = "c7 40 5c 00 00 00 ff"
+
+[site.s153]
+address = "0x02ab86a7"
+expect = "75 0d"
+bytes = "90 90"
+
+[site.s154]
+address = "0x02ab9207"
+expect = "75 0d"
+bytes = "90 90"
+
+[site.s155]
+address = "0x02b15a32"
+expect = "e8 f1 93 4a 00"
+bytes = "e8 a9 f0 91 ff"
+
+[site.s156]
+address = "0x02c0118a"
+expect = "31 f6"
+bytes = "eb 4e"
+
+[site.s157]
+address = "0x02c011eb"
+expect = "31 f6"
+bytes = "eb 4a"
+
+[site.s158]
+address = "0x02c012ca"
+expect = "31 f6 4c 89 ff e8 54 d4 3b 00 48 69 45 c0 40 42 0f 00 48 03"
+bytes = "eb 56 81 ff 80 3e 00 00 7e 05 bf 80 3e 00 00 e9 8a eb 3b 00"
+
+[site.s159]
+address = "0x02c0137d"
+expect = "e8 3e a7 88 ff"
+bytes = "e8 4a ff ff ff"
+
+[site.s160]
+address = "0x02f98d55"
+expect = "bf 80 3e 00 00"
+bytes = "bf 00 7d 00 00"
+
+[site.s161]
+address = "0x02f98d87"
+expect = "bf 80 3e 00 00"
+bytes = "bf 00 7d 00 00"
+
+[site.s162]
+address = "0x04b35024"
+expect = "02 00 00 00 05 00 00 00 1e 00 00 00 64 00 00 00"
+bytes = "1e 00 00 00 1e 00 00 00 1e 00 00 00 1e 00 00 00"
+
+[site.s163]
+address = "0x04d29394"
+expect = "0a d7 a3 3b 0a d7 a3 bb"
+bytes = "0a d7 a3 3b 0a d7 a3 bb"
+
+[site.s164]
+address = "0x05522750"
+expect = "04"
+bytes = "01"
+kind = "data"
+
+[site.s165]
+address = "0x05527b8e"
+expect = "01"
+bytes = "00"
+kind = "data"
+
+[site.s166]
+address = "0x0553ac90"
+expect = "05"
+bytes = "1e"
+kind = "data"
+
+[site.s167]
+address = "0x0553acc8"
+expect = "02"
+bytes = "00"
+kind = "data"
+
+[site.s168]
+address = "0x0553accc"
+expect = "02"
+bytes = "00"
+kind = "data"
+
+[site.s169]
+address = "0x0553acd4"
+expect = "02"
+bytes = "01"
+kind = "data"
+
+[site.s170]
+address = "0x0553ae80"
+expect = "03 00 00 00 03 00 00 00"
+bytes = "01 00 00 00 01 00 00 00"
+kind = "data"
+
+[site.s171]
+address = "0x0553aed0"
+expect = "06 00 00 00"
+bytes = "09 00 00 00"
+kind = "data"
+
+[site.s172]
+address = "0x0553b310"
+expect = "01"
+bytes = "00"
+kind = "data"
+
+[site.s173]
+address = "0x058b0870"
+expect = "00"
+bytes = "01"
+kind = "data"
+
+[site.s174]
+address = "0x05922ca0"
+expect = "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+bytes = "00 00 80 3e 00 00 80 3e 00 00 80 3e 00 00 80 3e"
+kind = "data"
+
+[site.s175]
+address = "0x05929eb4"
+expect = "00 00 00 00"
+bytes = "00 00 80 3e"
+kind = "data"
+
+[site.s176]
+address = "0x05aa6bc0"
+expect = "00"
+bytes = "01"
+kind = "data"

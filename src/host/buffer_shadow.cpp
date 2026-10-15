@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
@@ -177,6 +178,7 @@ std::uint64_t g_room_skips = 0;        // draws read from host memory while refu
 std::uint64_t g_first_refusal_ms = 0;  // the first refusal since the mirrors last started over (0: none)
 std::uint64_t g_last_flush_ms = 0;     // when they last started over
 std::uint64_t g_flushes = 0;           // the mirrors started over at a load
+std::uint64_t g_second_chances = 0;    // dynamic pages given another try at a load (shadow_second_chance_locked)
 std::uint64_t g_flush_refusals = 0, g_flush_held_back = 0, g_flush_gives = 0;  // the counts at the last flush
 VkCommandBuffer g_upload_cmd[kSlots] = {};
 int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
@@ -341,11 +343,41 @@ std::vector<StageChunk> g_stage_held[kSlots];  // each slot's chunks, the last t
 VkDeviceSize g_stage_fill[kSlots] = {};        // bytes used in the slot's last chunk
 std::size_t g_stage_chunks = 0;                // chunks made
 std::atomic<std::uint64_t> g_staged{0}, g_staged_bytes{0}, g_stage_refused{0};
+// One copy of a range for every draw of a submission that reads it. The
+// uploads all run before the submission's first draw, so two copies of one
+// range made for two of its draws read the same bytes; the second draw reads
+// the first one's. An RTX 5080's log copied ~160,000 ranges, 2.7 GB, every
+// 300 flips standing still (9-37 MiB a frame) - on the 3D queue, ahead of the
+// draws, and outside the GPU busy meter's spans (Task Manager's 3D engine at
+// 100% where the meter said 64%). Keyed by the range's place in the import
+// (buffer, offset); a range of the same start no longer than one copied is
+// read from it. BBHOST_STAGE_DEDUP=0: a copy per draw, as before.
+struct StagedRange {
+    VkBuffer buffer = VK_NULL_HANDLE;  // the stage chunk holding it
+    VkDeviceSize offset = 0, bytes = 0;
+};
+struct StageKey {
+    VkBuffer src;
+    VkDeviceSize offset;
+    bool operator==(const StageKey& o) const { return src == o.src && offset == o.offset; }
+};
+struct StageKeyHash {
+    std::size_t operator()(const StageKey& k) const {
+        return std::hash<std::uint64_t>()(reinterpret_cast<std::uint64_t>(k.src) * 0x9e3779b97f4a7c15ull ^ k.offset);
+    }
+};
+std::unordered_map<StageKey, StagedRange, StageKeyHash> g_stage_seen[kSlots];
+std::atomic<std::uint64_t> g_stage_shared{0}, g_stage_shared_bytes{0};
+const bool g_stage_dedup = [] {
+    const char* e = std::getenv("BBHOST_STAGE_DEDUP");
+    return !(e && e[0] == '0');
+}();
 
 void stage_release_slot(int slot) {
     for (const StageChunk& c : g_stage_held[slot]) g_stage_free.push_back(c);
     g_stage_held[slot].clear();
     g_stage_fill[slot] = 0;
+    g_stage_seen[slot].clear();
 }
 
 bool new_stage_chunk(StageChunk& c) {
@@ -397,6 +429,8 @@ VkCommandBuffer upload_cmd_locked() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
+    gpu_checkpoint_cmd(cmd, kGpuMarkSubmission, g.flushes * 4 + 0);
+    busy_upload_begin_locked(g.slots[g.slot], cmd);  // the busy meter counts the uploads too
     stage_release_slot(g.slot);  // the slot's last uploads have run: their staged copies are free
     // Earlier submissions' reads of the mirror finish before these writes.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -441,7 +475,30 @@ void begin_recording(Mirror& m, std::uint64_t stamp) {
 // gigabyte a chunk, and on a Steam Deck (1 GiB of VRAM, 8 GiB of GTT, which
 // every submission's buffers have to fit together) the second one made the
 // submissions fail.
-bool buffer_shadow_on() { return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.integrated && !g.tight; }
+//
+// An integrated GPU with 8 GiB or more of video memory (a Strix Halo's
+// carve-out) takes the mirrors too: only their page tracking says which
+// vertex data the game rewrites, which is copied as its draws record
+// (shadow_snapshot_locked) - read in place, it was the effects flickering
+// whenever the GPU was behind. The meshes then come from the carve-out
+// rather than the imports: on the Radeon 8060S in Kyo's room GPU-bound, 102
+// fps with the mirrors against 105 without, back to back (2026-10-15) - no
+// faster, about 1.7 GiB more of the carve-out in use.
+bool integrated_with_room() {
+    static int known = -1;
+    if (known < 0 && g.mem_props.memoryHeapCount) {
+        VkDeviceSize local = 0;
+        for (std::uint32_t i = 0; i < g.mem_props.memoryHeapCount; ++i) {
+            if (g.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                local = std::max(local, g.mem_props.memoryHeaps[i].size);
+        }
+        known = local >= (8ull << 30) ? 1 : 0;
+    }
+    return known == 1;
+}
+bool buffer_shadow_on() {
+    return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
+}
 
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
@@ -709,6 +766,17 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const VkCommandBuffer cmd = upload_cmd_locked();
     if (!cmd) return false;
     const int slot = g.slot;
+    if (g_stage_dedup) {
+        const auto it = g_stage_seen[slot].find(StageKey{loc.buffer, loc.offset});
+        if (it != g_stage_seen[slot].end() && it->second.bytes >= bytes) {
+            loc.buffer = it->second.buffer;
+            loc.offset = it->second.offset;
+            loc.avail = bytes;
+            bump(g_stage_shared);
+            g_stage_shared_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            return true;
+        }
+    }
     const VkDeviceSize need = (bytes + 255) & ~VkDeviceSize{255};
     if (g_stage_held[slot].empty() || g_stage_fill[slot] + need > kStageChunkBytes) {
         StageChunk c;
@@ -725,12 +793,146 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const StageChunk& c = g_stage_held[slot].back();
     const VkBufferCopy region{loc.offset, g_stage_fill[slot], bytes};
     vkCmdCopyBuffer(cmd, loc.buffer, c.buffer, 1, &region);
+    if (g_stage_dedup) {
+        StagedRange& seen = g_stage_seen[slot][StageKey{loc.buffer, loc.offset}];
+        if (bytes >= seen.bytes) seen = StagedRange{c.buffer, g_stage_fill[slot], bytes};
+    }
     loc.buffer = c.buffer;
     loc.offset = g_stage_fill[slot];
     loc.avail = bytes;
     g_stage_fill[slot] += need;
     bump(g_staged);
     g_staged_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+// ---- copies, taken as the draw records, of vertex data the game rewrites ------
+// A dynamic page holds a ring the game writes on the CPU every frame (effects'
+// and particles' quads, YEBIS's full-screen triangles). Read in place - or
+// staged above, which copies it as the GPU reaches the submission - a draw
+// read it when the GPU got to it: up to 16 submissions on, a frame and a half
+// GPU-bound, by when the game had written later draws' vertices over it. In
+// Kyo's room GPU-bound (BBHOST_VB_RACE=1, 2026-10-15), YEBIS's triangles and
+// the 4 MiB rings of two effect pipelines changed under queued draws - the
+// effects flickering whenever the GPU was behind, on an RTX 2060 as on the
+// 8060S, as the constants did before they were copied as recorded (render.cpp,
+// BBHOST_CB_SNAPSHOT). The bytes the draw reads are copied here on the CPU as
+// it records, into a ring the GPU reads (in video memory the CPU writes when
+// there is some: an integrated GPU's, or a discrete one's BAR), and staged
+// into device memory from there when the ring is in host memory. Memory a GPU
+// write is still to land on is left alone (gpu_writes_pending_locked): its
+// draws read it in the GPU's order. BBHOST_VERTEX_SNAPSHOT=0: as before.
+namespace {
+const bool g_snapshot_on = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_SNAPSHOT");
+    return !(e && e[0] == '0');
+}();
+constexpr VkDeviceSize kSnapRing = 64ull << 20, kSnapSegment = 4ull << 20;
+constexpr VkDeviceSize kSnapMaxBytes = 1ull << 20;
+struct SnapRing {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint8_t* map = nullptr;
+    bool device_local = false, failed = false;
+    VkDeviceSize next = 0;
+    std::uint64_t lap = 1;
+    // The recording that last copied into each segment, and in which lap.
+    std::uint64_t segment_serial[kSnapRing / kSnapSegment] = {};
+    std::uint64_t segment_lap[kSnapRing / kSnapSegment] = {};
+};
+SnapRing g_snap;
+std::atomic<std::uint64_t> g_snapshots{0}, g_snapshot_bytes{0}, g_snapshot_staged{0}, g_snapshot_pending{0};
+
+bool snap_ring_make() {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = kSnapRing;
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &g_snap.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, g_snap.buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // Video memory the CPU writes on an integrated GPU, and on a discrete one
+    // where the rings go there (rings_in_vram); else host memory.
+    std::uint32_t type = UINT32_MAX;
+    if (g.integrated || rings_in_vram()) type = find_memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type != UINT32_MAX) {
+        mai.memoryTypeIndex = type;
+        if (vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) == VK_SUCCESS) g_snap.device_local = true;
+    }
+    if (!g_snap.memory) {
+        mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, visible);
+        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) != VK_SUCCESS) {
+            vkDestroyBuffer(g.device, g_snap.buffer, nullptr);
+            g_snap.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    vkBindBufferMemory(g.device, g_snap.buffer, g_snap.memory, 0);
+    void* p = nullptr;
+    if (vkMapMemory(g.device, g_snap.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
+    g_snap.map = static_cast<std::uint8_t*>(p);
+    host_log("buffer shadow: vertex data the game rewrites is copied as its draws record, into a %llu MiB ring in %s "
+             "(BBHOST_VERTEX_SNAPSHOT=0: read as the GPU reaches it)",
+             static_cast<unsigned long long>(kSnapRing >> 20),
+             g_snap.device_local ? "video memory the CPU writes" : "host memory, staged into video memory per draw");
+    return true;
+}
+}  // namespace
+
+bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes) return false;
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off) || off + bytes > kChunkBytes) return true;  // not told this cheaply
+    const Mirror& m = g_mirrors[chunk];
+    return !m.pages.empty() && any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift));
+}
+
+bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes) return false;
+    // Only a range on a page the game keeps rewriting: a static page the
+    // mirrors had no room for is staged as before, not copied by the CPU at
+    // every draw.
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return false;
+    const Mirror& m = g_mirrors[chunk];
+    if (m.pages.empty() || !any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift)))
+        return false;
+    if (gpu_writes_pending_locked(va, bytes)) {
+        bump(g_snapshot_pending);
+        return false;
+    }
+    if (g_snap.failed || (!g_snap.buffer && !snap_ring_make())) {
+        g_snap.failed = true;
+        return false;
+    }
+    if (g_snap.next + bytes + 256 > kSnapRing) {
+        g_snap.next = 0;
+        ++g_snap.lap;
+    }
+    const VkDeviceSize at = (g_snap.next + 255) & ~VkDeviceSize{255};
+    // A lap round the ring: the draws that read a segment in the lap before
+    // have run before it is written again (nearly always long since).
+    for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
+        if (g_snap.segment_lap[s] != g_snap.lap) {
+            if (g_snap.segment_lap[s]) wait_submission_locked(g_snap.segment_serial[s]);
+            g_snap.segment_lap[s] = g_snap.lap;
+        }
+        g_snap.segment_serial[s] = g.flushes;
+    }
+    std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
+    g_snap.next = at + bytes;
+    bump(g_snapshots);
+    bump(g_snapshot_bytes, bytes);  // not a locked add: it would wait for the copy to drain
+    loc.buffer = g_snap.buffer;
+    loc.offset = at;
+    loc.avail = bytes;
+    // A ring in host memory: the copy staged into device memory for the draw,
+    // from the ring - what the draw read when it recorded.
+    if (!g_snap.device_local && shadow_stage_locked(va, bytes, loc)) bump(g_snapshot_staged);
     return true;
 }
 
@@ -770,7 +972,113 @@ void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::
     if (stale && at + 32 < n) std::snprintf(out + at, n - at, " <= %u STALE", stale);
 }
 
+// GPU writes by 64 KiB page, with the buffer shadow off too: the recording
+// the newest went into. render.cpp copies a constant buffer as its draw is
+// recorded only when no GPU write to its memory is still to land
+// (gpu_writes_pending_locked); landed pages leave the table as it grows.
+// Asked at every constant buffer a draw binds (~3,400 a frame), so both are
+// flat tables - open addressing, one probe as a rule: the std::map of lines
+// and the node map of pages they replace cost the command processor 0.6 ms a
+// frame, the frame rate wherever it rather than the GPU set the pace (Kyo,
+// 2026-10-14: "it feels like we're heavily cpubound"). A small write - a
+// label or a counter, ~280 a frame - goes by 4 KiB page: by 64 KiB, each
+// label's page (beside the game's constants) read as GPU-written for good.
+namespace {
+constexpr unsigned kSmallShift = 12;
+constexpr std::uint64_t kSmallWrite = 256;
+
+// Page number -> the newest recording a GPU write to it went into. Rebuilt
+// with only the writes still to land when it is half full.
+class PageSerials {
+public:
+    void note(std::uint64_t page, std::uint64_t serial) {
+        if ((used_ + 1) * 2 > slots_.size()) rebuild();
+        Slot& s = slots_[find(page + 1)];
+        if (!s.key) {
+            s.key = page + 1;  // 0: an empty slot
+            ++used_;
+        }
+        if (serial > s.serial) s.serial = serial;
+    }
+    bool pending(std::uint64_t page) const {
+        if (!used_) return false;
+        const Slot& s = slots_[find(page + 1)];
+        return s.key && s.serial >= g.completed_submits;
+    }
+    // The latest recording a GPU write over the page was made in (0: none).
+    std::uint64_t latest(std::uint64_t page) const {
+        if (!used_) return 0;
+        const Slot& s = slots_[find(page + 1)];
+        return s.key ? s.serial : 0;
+    }
+
+private:
+    struct Slot {
+        std::uint64_t key = 0, serial = 0;
+    };
+    std::vector<Slot> slots_;
+    std::size_t used_ = 0;
+    unsigned bits_ = 10;
+    std::size_t find(std::uint64_t key) const {
+        const std::size_t mask = slots_.size() - 1;
+        std::size_t i = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> (64 - bits_));
+        while (slots_[i].key && slots_[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+    void rebuild() {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        std::size_t keep = 0;
+        for (const Slot& s : old) keep += s.key && s.serial >= g.completed_submits;
+        while ((keep + 1) * 4 > (std::size_t{1} << bits_)) ++bits_;
+        slots_.assign(std::size_t{1} << bits_, Slot{});
+        used_ = 0;
+        for (const Slot& s : old) {
+            if (!s.key || s.serial < g.completed_submits) continue;
+            slots_[find(s.key)] = s;
+            ++used_;
+        }
+    }
+};
+PageSerials g_gpu_write_pages, g_gpu_write_small;
+}  // namespace
+
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return;
+    const std::uint64_t serial = g.flushes;  // the recording under way
+    if (bytes <= kSmallWrite) {
+        for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) g_gpu_write_small.note(p, serial);
+        return;
+    }
+    const std::uint64_t first = va >> kPageShift, last = (va + bytes - 1) >> kPageShift;
+    if (last - first > (1u << 16)) return;  // 4 GiB: not a write anything makes
+    for (std::uint64_t p = first; p <= last; ++p) g_gpu_write_pages.note(p, serial);
+}
+
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return false;
+    for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+        if (g_gpu_write_pages.pending(p)) return true;
+    }
+    for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
+        if (g_gpu_write_small.pending(p)) return true;
+    }
+    return false;
+}
+
+bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
+    if (!bytes) return false;
+    for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+        if (g_gpu_write_pages.latest(p) >= serial) return true;
+    }
+    for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
+        if (g_gpu_write_small.latest(p) >= serial) return true;
+    }
+    return false;
+}
+
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu) {
+    if (by_gpu) gpu_writes_note_locked(va, bytes);
     if (!buffer_shadow_on() || !bytes) return;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
@@ -1024,6 +1332,57 @@ void flush_mirrors_locked(Gpu::Slot& slot, const char* why) {
 }
 }  // namespace
 
+// A page goes dynamic for good (go_dynamic), but a load hands the game's
+// memory to the next area: a page that held one area's vertex ring can hold
+// the next one's meshes, which then stayed in host memory - every draw of them
+// reading across the bus, or (vertex input) copying its whole record into
+// device memory for itself (shadow_stage_locked). An RTX 4060 laptop's log
+// over ten lamp travels: 143 -> 405 pages dynamic, draws bound from host
+// memory 15-27% -> 44%, the copy a staged draw made ~10 KiB -> ~100 KiB
+// (37 MiB a frame), and the frame rate standing still 77 -> 47 with the GPU
+// less busy (the command processor waiting on the uploads' labels). So at
+// each load every dynamic page is uncopied and unwatched again: a ring is
+// found again within its first few rewrites (kMaxUploads in kUploadWindowMs),
+// a mesh stays in the mirror. BBHOST_SHADOW_SECOND_CHANCE=0: never.
+namespace {
+void shadow_second_chance_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SHADOW_SECOND_CHANCE");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    std::uint64_t pages = 0;
+    for (Mirror& m : g_mirrors) {
+        if (m.pages.empty()) continue;
+        for (std::size_t w = 0; w < m.dyn.size(); ++w) {
+            std::uint64_t bits = m.dyn[w];
+            m.dyn[w] = 0;
+            while (bits) {
+                const std::size_t p = w * 64 + static_cast<std::size_t>(__builtin_ctzll(bits));
+                bits &= bits - 1;
+                if (p >= m.pages.size()) continue;
+                Page& pg = m.pages[p];
+                pg.dynamic = false;
+                pg.valid = false;
+                pg.window_ms = 0;
+                pg.window_uploads = 0;
+                pg.watch = WriteWatch{};
+                pg.alias_watch = WriteWatch{};
+                pg.alias_va = 0;
+                ++pages;
+            }
+        }
+    }
+    if (!pages) return;
+    g_second_chances += pages;
+    static int logs = 0;
+    if (logs++ < 8)
+        host_log("buffer shadow: a load - %llu dynamic page(s) (%llu MiB) copied again when next read, a ring found again by its rewrites "
+                 "(BBHOST_SHADOW_SECOND_CHANCE=0: dynamic for good)",
+                 static_cast<unsigned long long>(pages), static_cast<unsigned long long>((pages * kPageBytes) >> 20));
+}
+}  // namespace
+
 // The mirrors start over at a load that follows a shortage of room: when a
 // loading screen comes up and, since the last one, the live share refused
 // pages, the reserve kept textures out of video memory or the mirrors were
@@ -1044,6 +1403,7 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
     const bool loading = loading_screen_now();
     const bool starts = loading && !was_loading;
     was_loading = loading;
+    if (starts && buffer_shadow_on()) shadow_second_chance_locked();
     if (!on || !g_live || !buffer_shadow_on() || g_given_back || !g_mirror_bytes) {
         if (starts) mid_flushed = false;
         return;
@@ -1109,6 +1469,11 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
                   static_cast<unsigned long long>(g_mirror_bytes >> 20), share, g_given_back ? " (given back: video memory ran short)" : "");
     std::string out = std::string(buf) + h + rr;
+    if (g_second_chances) {
+        char sc[96];
+        std::snprintf(sc, sizeof(sc), "; dynamic pages given another try at a load %llu", static_cast<unsigned long long>(g_second_chances));
+        out += sc;
+    }
     if (g_room_refusals || g_flushes || g_room_skips) {
         char lr[160];
         std::snprintf(lr, sizeof(lr), "; copies refused for want of room %llu (%llu more draws not tried), started over at a load %llu",
@@ -1122,12 +1487,21 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(g_returns));
         out += gr;
     }
-    char st[200];
-    std::snprintf(st, sizeof(st), "; vertex ranges copied for their draw %llu (%.1f MiB), left in host memory %llu, staging chunks %zu (%zu MiB)",
+    char st[288];
+    std::snprintf(st, sizeof(st),
+                  "; vertex ranges copied for their draw %llu (%.1f MiB), read from another draw's copy %llu (%.1f MiB), left in host "
+                  "memory %llu, staging chunks %zu (%zu MiB)",
                   static_cast<unsigned long long>(g_staged.load()), static_cast<double>(g_staged_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_stage_shared.load()), static_cast<double>(g_stage_shared_bytes.load()) / (1 << 20),
                   static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
                   static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
-    return out + st;
+    char sn[192];
+    std::snprintf(sn, sizeof(sn),
+                  "; rewritten vertex ranges copied as recorded %llu (%.1f MiB, %llu staged from host memory), left for a GPU write "
+                  "still to land %llu",
+                  static_cast<unsigned long long>(g_snapshots.load()), static_cast<double>(g_snapshot_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
+    return out + st + sn;
 }
 
 }  // namespace gpu

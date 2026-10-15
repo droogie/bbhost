@@ -37,7 +37,8 @@ def main():
         except (KeyError, ValueError):
             continue
         if t >= start:
-            rows.append({k: float(v) for k, v in kv.items()})
+            # Counters can come with the locale's thousands separator ("1,066.5").
+            rows.append({k: float(v.replace(',', '')) for k, v in kv.items()})
     # Frame statistics lines after the world: one a second.
     fps = []
     busy = []  # ms a second our command buffers kept the GPU busy (host/gpu_busy.cpp)

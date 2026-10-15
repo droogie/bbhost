@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <memory>
@@ -1787,6 +1788,14 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
 std::mutex g_mu;
 Stats g;
 std::unordered_map<std::uint64_t, EmitRec> g_by_packet;  // by emitter write pointer
+// Every emit in order, (write pointer, flip), under g_mu: a record the command
+// processor has not taken kPacketMaxAge flips after its emit never will be - its
+// packet was not a draw or dispatch the CP looks up, or the CP walked past it (the
+// CP runs at most BBHOST_CP_BACKLOG submits, 10, behind). Without the age limit
+// those records stayed until the map passed 2^20 entries: ~2 KiB each, ~20 MiB a
+// minute at 60 FPS, ~2 GiB of the process before the clear.
+constexpr std::uint64_t kPacketMaxAge = 600;
+std::deque<std::pair<std::uint64_t, std::uint64_t>> g_packet_order;
 thread_local GxRec t_last;
 
 // GX UpdateSubresource (0x2568a20: rdi ctx, rsi ?, rdx resource, rcx subresource,
@@ -4691,9 +4700,12 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     if (!wd) wd = wrapper_dispatch(static_cast<Kind>(id), f, caller);
     if (g_gnm_sources) note_source(cb, cmd, end, wd == 2 ? kSourceWrapper : caller);
     if (wd == 2) return 1;
+    // Dispatch records serve only the coverage trace, unlike draw records
+    // which also supply the renderer. Do not retain them outside its window.
+    const bool keep_record = id < kEmitDispatch || id > kEmitDispatchQueue || in_window(flip);
     const bool from_gx = caller >= kGxImmediateLo && caller < kGxImmediateHi && t_last.kind < kEmitAuto;
     GxRecordsPtr records;
-    if (from_gx && g_backend && sample_bindings()) {
+    if (keep_record && from_gx && g_backend && sample_bindings()) {
         GxCostTimer records_timer(kCostRecords);
         records = snapshot_records(t_last);  // after the commit, before the lock
     }
@@ -4711,6 +4723,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         }
         if (end < cmd + 64) ++g.near_end;
     }
+    if (!keep_record) return 0;
     if (g_by_packet.size() > (1u << 20)) g_by_packet.clear();
     EmitRec& e = g_by_packet[cmd];
     e.kind = static_cast<Kind>(id);
@@ -4719,6 +4732,13 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     e.gx = from_gx;
     if (from_gx) e.rec = t_last;
     e.records = std::move(records);
+    g_packet_order.emplace_back(cmd, flip);
+    while (g_packet_order.front().second + kPacketMaxAge < flip) {
+        // Unless the same write pointer was emitted again since (a newer flip).
+        const auto it = g_by_packet.find(g_packet_order.front().first);
+        if (it != g_by_packet.end() && it->second.flip == g_packet_order.front().second) g_by_packet.erase(it);
+        g_packet_order.pop_front();
+    }
     return 0;
 }
 
@@ -6005,7 +6025,7 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
             std::memset(t_native_in.vs_user, 0, sizeof(t_native_in.vs_user));
             std::memset(t_native_in.ps_user, 0, sizeof(t_native_in.ps_user));
         }
-        if (g_native_drawn.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) {
+        if (g_native_drawn.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999 && host_tooling()) {
             std::size_t pending = 0;
             std::string stale;
             {
@@ -6313,7 +6333,7 @@ const GpuDrawInputs* hle_gx_trace_draw(std::uint32_t op, std::uint64_t packet_va
                 changed(kNfUserUnnamed, unnamed_changed);
             }
             t_native_shadow.erase(it);
-            if (g_native_matched.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) report_native();
+            if (g_native_matched.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999 && host_tooling()) report_native();
         }
     }
     if (g_native == 1 && found && e.gx && e.rec.native_id && e.rec.tess) {

@@ -24,13 +24,14 @@
 //    frame time every frame; code immediates and frame counts take the rate's
 //    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
 //    scale its stiffness by (60 dt)^2. The play time adds each frame's
-//    milliseconds with the remainder carried (the game truncates them). The
+//    milliseconds with the remainder carried (the game truncates them), and
+//    the effects step in whole 1/60 s the same way (BBHOST_SFX_STEP). The
 //    follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
 //  - uncapped: the same, with a target of the display's refresh rate with
-//    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
-//    immediates and counts at 120's values.
+//    V-Sync on and none with it off (BBHOST_UNCAPPED_FPS=N sets one, up to
+//    1000); code immediates and counts at 120's values.
 // Above 60 and uncapped flips complete as soon as they are recorded (the game
 // paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,
 // +0x271, +0x272, +0x2c4) are cleared so nothing drops the game back to 30.
@@ -47,6 +48,11 @@ void frame_rate_install(ElfImage* image);
 
 // The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
 int frame_rate_game_fps();
+
+// AtkParam_Pc new or reloaded (engine/params.cpp): at a converted rate the
+// Bloodletter's L2 self-hit gets the reach its frenzy aura needs above 30
+// (frame_rate.cpp, kBloodletterSelfHit).
+void frame_rate_atk_params_loaded();
 
 // Game time against real time (plugins' set_time_scale): 0.5 is half speed,
 // 2 double, clamped to 0.1-4. At 30 the game steps a fixed amount a frame, so
