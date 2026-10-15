@@ -334,6 +334,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
+  src/decomp/sync/adaptive_mutex.cpp
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -432,6 +433,9 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
+  add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
+  target_include_directories(uncapped_limit_test PRIVATE src)
+  add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
   add_executable(tess_lds_test tests/tess_lds_test.cpp src/host/tess_lds.cpp)
   target_include_directories(tess_lds_test PRIVATE src)
   add_test(NAME tess_lds_test COMMAND tess_lds_test)
@@ -450,6 +454,17 @@ if(UNIX)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
+  # The settings' publication and two of its listeners: applied on a change,
+  # never asked for per frame (host/settings_store.h).
+  add_executable(settings_store_test tests/settings_store_test.cpp src/host/shader_patch.cpp)
+  target_include_directories(settings_store_test PRIVATE src)
+  target_link_libraries(settings_store_test PRIVATE Threads::Threads)
+  add_test(NAME settings_store_test COMMAND settings_store_test)
+  add_executable(camera_settings_test tests/camera_settings_test.cpp src/engine/camera.cpp)
+  target_include_directories(camera_settings_test PRIVATE src)
+  target_link_libraries(camera_settings_test PRIVATE Threads::Threads)
+  add_test(NAME camera_settings_test COMMAND camera_settings_test)
+  set_tests_properties(settings_store_test camera_settings_test PROPERTIES TIMEOUT 30)
   add_executable(engine_layout tests/engine_layout.cpp)
   target_include_directories(engine_layout PRIVATE src)
   add_test(NAME engine_layout COMMAND engine_layout)
@@ -487,6 +502,7 @@ if(UNIX)
   bbhost_decomp_test(chalice_ritual)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
+  bbhost_decomp_test(adaptive_mutex)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)

@@ -1,6 +1,7 @@
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
+#include "host/settings_store.h"
 
 #include "host/bindings.h"
 #include "host/overlay.h"
@@ -119,11 +120,12 @@ Setting g_set[kSettingCount] = {
     // reads as 60 (host_options_load).
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off). Applies on the next run.",
+     "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
      false},
-    // What reaches the screen, counted by the presenter (host/window.cpp).
+    // The game's frames a second, counted as they start (host/window.cpp,
+    // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
-     "Frames per second actually presented, in the top right corner.", false},
+     "The game's frames per second, in the top right corner.", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
@@ -693,21 +695,22 @@ void save() {
     host_log("options: saved %s", path.c_str());
 }
 
-// Bumped on every change, for readers that act on a setting live and would
-// rather not look it up by name on every frame (host_opt_serial).
-std::atomic<std::uint64_t> g_serial{1};
-
 // The settings object (host/settings.h): every field from the table, scaled
-// the way its consumer wants it, rebuilt whenever a setting changes.
-std::mutex g_settings_mu;
-HostSettings g_settings;
+// the way its consumer wants it, published again whenever a setting changes
+// (its serial is host_opt_serial) and told to the listeners. Made on first
+// use, so a listener may register from anywhere at any time, and never
+// destroyed: threads still reading it while the process exits read memory
+// that is still there.
+HostSettingsStore& settings_store() {
+    static HostSettingsStore& store = *new HostSettingsStore;
+    return store;
+}
 
 bool on_of(int id) { return reads_on(g_set[id], g_set[id].index); }
 int index_of(int id) { return g_set[id].index; }
 
 void rebuild_settings() {
     HostSettings h;
-    h.serial = g_serial.load(std::memory_order_acquire);
     h.fullscreen = index_of(kWindowMode) == 1;
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
@@ -770,8 +773,7 @@ void rebuild_settings() {
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    g_settings = h;
+    settings_store().publish(h);
 }
 
 void set_index(int id, int index, bool from_file) {
@@ -786,7 +788,6 @@ void set_index(int id, int index, bool from_file) {
         if (index == g_res_prev) g_res_prev = -1;  // back where it started: nothing to ask
     }
     s.index = index;
-    g_serial.fetch_add(1, std::memory_order_release);
     rebuild_settings();
     if (!from_file) {
         g_dirty = true;
@@ -1349,9 +1350,10 @@ void options_panel_frame(float display_w, float display_h) {
 }
 }  // namespace
 
-HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+HostSettings host_settings() { return settings_store().now(); }
+const HostSettings& host_settings_ref() { return settings_store().now(); }
+void host_settings_listen(HostSettingsListener fn) {
+    if (!settings_store().listen(fn)) host_log("options: no room for another settings listener; one consumer will not follow changes");
 }
 
 namespace {
@@ -1377,7 +1379,7 @@ int setting_id(const char* key) {
 
 }  // namespace
 
-std::uint64_t host_opt_serial() { return g_serial.load(std::memory_order_acquire); }
+std::uint64_t host_opt_serial() { return settings_store().now().serial; }
 
 bool host_opt_default_get(const char* key) {
     const int id = setting_id(key);

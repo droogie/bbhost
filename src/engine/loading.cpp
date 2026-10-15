@@ -28,6 +28,7 @@ const bool g_fast_enabled = [] {
 
 std::uint64_t g_slide = 0;
 std::atomic<bool> g_loading{false};
+std::atomic<bool> g_in_world{false};
 std::chrono::steady_clock::time_point g_start;
 
 template <typename T>
@@ -45,6 +46,7 @@ void loading_bind(std::uint64_t slide) {
 }
 
 bool loading_screen_up() { return g_loading.load(std::memory_order_relaxed); }
+bool loading_in_world() { return g_in_world.load(std::memory_order_relaxed); }
 bool loading_fast_now() { return g_fast.load(std::memory_order_relaxed); }
 
 void loading_tick(std::uint64_t flip) {
@@ -56,6 +58,7 @@ void loading_tick(std::uint64_t flip) {
     const std::uint64_t helper = at<std::uint64_t>(guest(kNowLoadingHelper));
     const bool in_game = helper && (at<std::uint8_t>(helper + 0x50) || at<std::uint8_t>(helper + 0x51));
     const bool loading = requested && !in_game;
+    g_in_world.store(in_game, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const bool was = g_loading.exchange(loading, std::memory_order_relaxed);
     if (loading != was) host_gpu_set_loading(loading);  // the memory keeper readies the coming area's memory

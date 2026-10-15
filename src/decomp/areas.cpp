@@ -16,6 +16,7 @@ void decomp_gx_block_reclaim_add();    // gx/block_reclaim.cpp: the resource tab
 void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's memcpy
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
+void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMutex::Lock
 
 void decomp_add_areas() {
     decomp_flag_store_add();
@@ -30,4 +31,5 @@ void decomp_add_areas() {
     decomp_game_memcpy_add();
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();
+    decomp_adaptive_mutex_add();
 }

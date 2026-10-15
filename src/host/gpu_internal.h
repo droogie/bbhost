@@ -256,6 +256,15 @@ struct Gpu {
     // shaderFloat16 and shaderInt16 enabled: the host's own shaders may do f16
     // math (the half-precision FSR 1, fsr.cpp).
     bool has_f16_math = false;
+    // The game's submissions' timeline (Vulkan 1.2 timeline semaphore): each
+    // signals its serial + 1 (Gpu::flushes), so how far the GPU got is one
+    // counter read without the renderer's lock, and a wait for a frame is a
+    // sleep in the driver, not a poll (host_gpu_wait_completed). Null without
+    // timelineSemaphore, or with BBHOST_TIMELINE=0: the slots' fences, polled.
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    // The presenter's own-queue copies' timeline (host_gpu_present_reads_locked):
+    // each signals the value it registered. Made with `timeline`.
+    VkSemaphore present_timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;
@@ -294,6 +303,10 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // The presenter's own-queue copy recorded while this slot was the one
+        // being recorded: its value on Gpu::present_timeline, waited for
+        // before the slot retires (0: none).
+        std::uint64_t present_target = 0;
         // What the submission holds, for the line a wait for it that runs long
         // writes (fence_wait_locked): the draws, dispatches and tessellated
         // draws recorded since the submission before, and the flip.
@@ -963,6 +976,17 @@ extern std::uint32_t g_draw_dummies;
 // neighbours' a few flips after they were recorded.
 constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
+// BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
+// when recorded and again when its submission retires - memory rewritten while
+// the draw waited for the GPU. Caller holds the lock.
+bool vb_race_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes);
+void vb_race_retired_locked(std::uint64_t serial);
+// buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
+// GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
+// land - recorded in a submission that has not retired. Caller holds the lock.
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's

@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
@@ -177,6 +178,7 @@ std::uint64_t g_room_skips = 0;        // draws read from host memory while refu
 std::uint64_t g_first_refusal_ms = 0;  // the first refusal since the mirrors last started over (0: none)
 std::uint64_t g_last_flush_ms = 0;     // when they last started over
 std::uint64_t g_flushes = 0;           // the mirrors started over at a load
+std::uint64_t g_second_chances = 0;    // dynamic pages given another try at a load (shadow_second_chance_locked)
 std::uint64_t g_flush_refusals = 0, g_flush_held_back = 0, g_flush_gives = 0;  // the counts at the last flush
 VkCommandBuffer g_upload_cmd[kSlots] = {};
 int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
@@ -770,7 +772,96 @@ void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::
     if (stale && at + 32 < n) std::snprintf(out + at, n - at, " <= %u STALE", stale);
 }
 
+// GPU writes by 64 KiB page, with the buffer shadow off too: the recording
+// the newest went into. render.cpp copies a constant buffer as its draw is
+// recorded only when no GPU write to its memory is still to land
+// (gpu_writes_pending_locked); landed pages leave the table as it grows.
+// Asked at every constant buffer a draw binds (~3,400 a frame), so both are
+// flat tables - open addressing, one probe as a rule: the std::map of lines
+// and the node map of pages they replace cost the command processor 0.6 ms a
+// frame, the frame rate wherever it rather than the GPU set the pace (Kyo,
+// 2026-10-14: "it feels like we're heavily cpubound"). A small write - a
+// label or a counter, ~280 a frame - goes by 4 KiB page: by 64 KiB, each
+// label's page (beside the game's constants) read as GPU-written for good.
+namespace {
+constexpr unsigned kSmallShift = 12;
+constexpr std::uint64_t kSmallWrite = 256;
+
+// Page number -> the newest recording a GPU write to it went into. Rebuilt
+// with only the writes still to land when it is half full.
+class PageSerials {
+public:
+    void note(std::uint64_t page, std::uint64_t serial) {
+        if ((used_ + 1) * 2 > slots_.size()) rebuild();
+        Slot& s = slots_[find(page + 1)];
+        if (!s.key) {
+            s.key = page + 1;  // 0: an empty slot
+            ++used_;
+        }
+        if (serial > s.serial) s.serial = serial;
+    }
+    bool pending(std::uint64_t page) const {
+        if (!used_) return false;
+        const Slot& s = slots_[find(page + 1)];
+        return s.key && s.serial >= g.completed_submits;
+    }
+
+private:
+    struct Slot {
+        std::uint64_t key = 0, serial = 0;
+    };
+    std::vector<Slot> slots_;
+    std::size_t used_ = 0;
+    unsigned bits_ = 10;
+    std::size_t find(std::uint64_t key) const {
+        const std::size_t mask = slots_.size() - 1;
+        std::size_t i = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> (64 - bits_));
+        while (slots_[i].key && slots_[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+    void rebuild() {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        std::size_t keep = 0;
+        for (const Slot& s : old) keep += s.key && s.serial >= g.completed_submits;
+        while ((keep + 1) * 4 > (std::size_t{1} << bits_)) ++bits_;
+        slots_.assign(std::size_t{1} << bits_, Slot{});
+        used_ = 0;
+        for (const Slot& s : old) {
+            if (!s.key || s.serial < g.completed_submits) continue;
+            slots_[find(s.key)] = s;
+            ++used_;
+        }
+    }
+};
+PageSerials g_gpu_write_pages, g_gpu_write_small;
+}  // namespace
+
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return;
+    const std::uint64_t serial = g.flushes;  // the recording under way
+    if (bytes <= kSmallWrite) {
+        for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) g_gpu_write_small.note(p, serial);
+        return;
+    }
+    const std::uint64_t first = va >> kPageShift, last = (va + bytes - 1) >> kPageShift;
+    if (last - first > (1u << 16)) return;  // 4 GiB: not a write anything makes
+    for (std::uint64_t p = first; p <= last; ++p) g_gpu_write_pages.note(p, serial);
+}
+
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return false;
+    for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+        if (g_gpu_write_pages.pending(p)) return true;
+    }
+    for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
+        if (g_gpu_write_small.pending(p)) return true;
+    }
+    return false;
+}
+
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu) {
+    if (by_gpu) gpu_writes_note_locked(va, bytes);
     if (!buffer_shadow_on() || !bytes) return;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
@@ -1024,6 +1115,57 @@ void flush_mirrors_locked(Gpu::Slot& slot, const char* why) {
 }
 }  // namespace
 
+// A page goes dynamic for good (go_dynamic), but a load hands the game's
+// memory to the next area: a page that held one area's vertex ring can hold
+// the next one's meshes, which then stayed in host memory - every draw of them
+// reading across the bus, or (vertex input) copying its whole record into
+// device memory for itself (shadow_stage_locked). An RTX 4060 laptop's log
+// over ten lamp travels: 143 -> 405 pages dynamic, draws bound from host
+// memory 15-27% -> 44%, the copy a staged draw made ~10 KiB -> ~100 KiB
+// (37 MiB a frame), and the frame rate standing still 77 -> 47 with the GPU
+// less busy (the command processor waiting on the uploads' labels). So at
+// each load every dynamic page is uncopied and unwatched again: a ring is
+// found again within its first few rewrites (kMaxUploads in kUploadWindowMs),
+// a mesh stays in the mirror. BBHOST_SHADOW_SECOND_CHANCE=0: never.
+namespace {
+void shadow_second_chance_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SHADOW_SECOND_CHANCE");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    std::uint64_t pages = 0;
+    for (Mirror& m : g_mirrors) {
+        if (m.pages.empty()) continue;
+        for (std::size_t w = 0; w < m.dyn.size(); ++w) {
+            std::uint64_t bits = m.dyn[w];
+            m.dyn[w] = 0;
+            while (bits) {
+                const std::size_t p = w * 64 + static_cast<std::size_t>(__builtin_ctzll(bits));
+                bits &= bits - 1;
+                if (p >= m.pages.size()) continue;
+                Page& pg = m.pages[p];
+                pg.dynamic = false;
+                pg.valid = false;
+                pg.window_ms = 0;
+                pg.window_uploads = 0;
+                pg.watch = WriteWatch{};
+                pg.alias_watch = WriteWatch{};
+                pg.alias_va = 0;
+                ++pages;
+            }
+        }
+    }
+    if (!pages) return;
+    g_second_chances += pages;
+    static int logs = 0;
+    if (logs++ < 8)
+        host_log("buffer shadow: a load - %llu dynamic page(s) (%llu MiB) copied again when next read, a ring found again by its rewrites "
+                 "(BBHOST_SHADOW_SECOND_CHANCE=0: dynamic for good)",
+                 static_cast<unsigned long long>(pages), static_cast<unsigned long long>((pages * kPageBytes) >> 20));
+}
+}  // namespace
+
 // The mirrors start over at a load that follows a shortage of room: when a
 // loading screen comes up and, since the last one, the live share refused
 // pages, the reserve kept textures out of video memory or the mirrors were
@@ -1044,6 +1186,7 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
     const bool loading = loading_screen_now();
     const bool starts = loading && !was_loading;
     was_loading = loading;
+    if (starts && buffer_shadow_on()) shadow_second_chance_locked();
     if (!on || !g_live || !buffer_shadow_on() || g_given_back || !g_mirror_bytes) {
         if (starts) mid_flushed = false;
         return;
@@ -1109,6 +1252,11 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
                   static_cast<unsigned long long>(g_mirror_bytes >> 20), share, g_given_back ? " (given back: video memory ran short)" : "");
     std::string out = std::string(buf) + h + rr;
+    if (g_second_chances) {
+        char sc[96];
+        std::snprintf(sc, sizeof(sc), "; dynamic pages given another try at a load %llu", static_cast<unsigned long long>(g_second_chances));
+        out += sc;
+    }
     if (g_room_refusals || g_flushes || g_room_skips) {
         char lr[160];
         std::snprintf(lr, sizeof(lr), "; copies refused for want of room %llu (%llu more draws not tried), started over at a load %llu",

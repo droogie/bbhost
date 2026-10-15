@@ -583,7 +583,7 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
     g_focus_ms.store(now_ms(), std::memory_order_relaxed);
     // Nor while a controller is the device in use: its cursor is hidden, and
     // the mouse moving again is what hands it back (host_input_device).
-    if (!host_settings().mouse_menu || host_options_open() || ingame_menu_open() || host_mouse_relative() || g_passive ||
+    if (!host_settings_ref().mouse_menu || host_options_open() || ingame_menu_open() || host_mouse_relative() || g_passive ||
         host_input_device() == InputDevice::Pad) {
         return;
     }

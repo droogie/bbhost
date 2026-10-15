@@ -24,10 +24,10 @@
 // (host/shader_patch.h).
 //
 // All five follow their settings live now (graphics_patch.cpp, "Live"): the
-// bools are written on every renderer as it draws a view, chromatic
-// aberration's 1.0 is rewritten in place, and motion blur and depth of field
-// are shader patches. The render resolution changes live too
-// (engine/live_resolution.h).
+// bools are given to each renderer at its next view after a change (and to a
+// renderer made since), chromatic aberration's 1.0 is rewritten in place, and
+// motion blur and depth of field are shader patches. The render resolution
+// changes live too (engine/live_resolution.h).
 
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +44,11 @@ std::uint64_t engine_scene_view_flip();
 // glare only then; Bloom 0 makes it 0 in every view); empty when no view was
 // recorded.
 std::string graphics_glare_report();
+// A scene context - the renderer whose SSAO and AA bytes the settings write -
+// is being constructed at `ctx` (engine/live_resolution.cpp's constructor
+// hook): its constructor turns both on, so it is given the settings at its
+// next view, even where an earlier context stood at the same address.
+void graphics_scene_context_made(std::uint64_t ctx);
 
 // A hook at a guest function's entry (core/thunk.h's prologue stub): `host`
 // runs with the argument registers first. `prologue` is the `n` (>= 14) bytes

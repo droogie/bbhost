@@ -204,8 +204,13 @@ bool read_pair(VkQueryPool pool, std::uint64_t (&ts)[2]) {
 
 void busy_init_locked() {
     g.busy = false;
-    if (const char* e = std::getenv("BBHOST_GPU_BUSY"); e && e[0] == '0') {
+    const char* e = std::getenv("BBHOST_GPU_BUSY");
+    if (e && e[0] == '0') {
         host_log("gpu: busy meter off (BBHOST_GPU_BUSY=0)");
+        return;
+    }
+    if (!host_tooling() && !(e && e[0] == '1')) {
+        host_log("gpu: busy meter off (tooling off; BBHOST_GPU_BUSY=1 turns it on)");
         return;
     }
     std::uint32_t nq = 0;

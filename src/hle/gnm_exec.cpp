@@ -153,6 +153,68 @@ std::atomic<std::uint64_t> g_wait_timeouts{0};
 std::atomic<std::uint64_t> g_wait_pending{0};  // waits satisfied by a recorded GPU write
 std::atomic<std::uint64_t> g_resyncs{0};       // PM4 walk re-locks
 
+// The CP's own memory writes after a wait it passed on a recorded label.
+// WAIT_REG_MEM need not block for a label the GPU has yet to write: the GPU
+// work after it runs behind the write on the queue (pending_ok). What the CP
+// does to memory itself - a DMA_DATA copy or fill, a WRITE_DATA - is not on
+// that queue: done as it was walked, it landed while the GPU was still up to
+// 16 submissions short of the label the game had put in front of it, over
+// memory the work before the label had yet to read, or copied from memory it
+// had yet to write. That needs the GPU behind, so it showed with the GPU about
+// 100% busy: effects flickering (Kyo, 2026-10-14: "whenever our gpu use is near
+// 100% (at least above 90%) a lot of sfx/vfx flicker"). On the console the CP
+// stalls at the wait, so the write comes after the label. Here the write goes
+// on the GPU's timeline in the recording under way, behind that work
+// (host_gpu_mem_write_ordered), and the command processor walks on. Waiting
+// for the label's submission instead blocked it about once a frame for the
+// whole GPU backlog: an RTX 4060 laptop's session waited 212 s of its ~520 so,
+// 6-21 ms a time, the GPU 61% busy at 47 fps where it had run 77. Only a write
+// that cannot go there still waits: over 64 KiB, into a texture, a render
+// target or a command buffer, or a copy from memory a GPU write has yet to
+// reach (its bytes are not on the CPU yet). BBHOST_CP_DMA_ORDER=0: as walked.
+thread_local std::uint64_t t_cp_writes_need = 0;  // submissions that must have run before the CP writes memory on the CPU (0: none)
+std::atomic<std::uint64_t> g_cp_writes{0}, g_cp_writes_waited{0}, g_cp_writes_wait_us{0}, g_cp_writes_timeline{0};
+
+bool cp_dma_order_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CP_DMA_ORDER");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Whether a CP write here has to come after recorded GPU work still to run.
+bool cp_writes_need_gpu() {
+    if (!cp_dma_order_on() || !t_cp_writes_need) return false;
+    if (host_gpu_submissions_completed() >= t_cp_writes_need) {
+        t_cp_writes_need = 0;
+        return false;
+    }
+    return true;
+}
+
+// The write that could not go on the GPU's timeline: after the label's submission has run.
+void cp_wait_for_label() {
+    const std::uint64_t need = t_cp_writes_need;
+    if (need >= host_gpu_work_needs()) host_gpu_submit();  // the label is in the recording under way
+    const auto t0 = std::chrono::steady_clock::now();
+    GpuPhaseTimer wait_timer(kPhaseWait);
+    if (!host_gpu_timeline()) {
+        host_gpu_flush();  // no timeline to wait on: everything queued, run and waited for
+    } else if (!host_gpu_wait_completed(need, 2'000'000'000ull)) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 4) {
+            host_log("gnm exec: a CP write waited 2 s for submission %llu (%llu done); written anyway",
+                     static_cast<unsigned long long>(need), static_cast<unsigned long long>(host_gpu_submissions_completed()));
+        }
+    }
+    t_cp_writes_need = 0;
+    g_cp_writes_waited.fetch_add(1, std::memory_order_relaxed);
+    g_cp_writes_wait_us.fetch_add(static_cast<std::uint64_t>(
+                                      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+                                  std::memory_order_relaxed);
+}
+
 // Hands a draw to the renderer; BBHOST_TRACE_DRAWS=1 also prints the state.
 void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, int count) {
     static std::atomic<int> logs{0};
@@ -162,6 +224,7 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
 }
 
 void bind_gds_counters(GpuDispatch& d);
+void note_gpu_args(std::uint64_t va, std::size_t bytes);
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -177,6 +240,7 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     d.dim[1] = y;
     d.dim[2] = z;
     d.indirect_va = indirect_va;
+    note_gpu_args(indirect_va, 12);
     d.depth_clear = t_regs.ctx[0x0B];
     d.stencil_clear = t_regs.ctx[0x0A];
     // A dispatch token in shadow mode: this packet is the dispatch it described.
@@ -231,6 +295,7 @@ void native_draw(const GpuDrawInputs* in, const char* kind) {
         // indirect ({count, instances, first index, base vertex, first
         // instance} for an indexed draw, {count, instances, first vertex,
         // first instance} otherwise).
+        note_gpu_args(o->indirect_va, o->indexed ? 20 : 16);
         if (!hle_kernel_va_mapped(o->indirect_va, o->indexed ? 20 : 16)) {
             g_draw_failed.fetch_add(1);
             return;
@@ -306,6 +371,7 @@ void trace_draw(const char* kind, std::uint32_t count, std::uint64_t index_va, s
         d.index_va = index_va;
         d.index_type = t_index_type & 1;
         d.indirect_va = indirect_va;
+        note_gpu_args(indirect_va, 20);
         // Rendering from GX takes the geometry from the call;
         // an index buffer the call cannot place keeps the packet's address.
         const GxDrawObjects* o = d.gx_render ? d.gx_objects : nullptr;
@@ -529,7 +595,8 @@ bool store(std::uint64_t va, const void* src, std::size_t n) {
 // lookup (1.2% of the command processor).
 class PendingLabels {
 public:
-    void set(std::uint64_t va, std::uint32_t value) {
+    // serial: the submission the write is recorded into (host_gpu_mem_write_serial).
+    void set(std::uint64_t va, std::uint32_t value, std::uint64_t serial) {
         if ((used_ + 1) * 2 > slots_.size()) grow();
         Slot& s = slots_[find(va)];
         if (!s.va) {
@@ -537,12 +604,14 @@ public:
             ++used_;
         }
         s.value = value;
+        s.serial = serial;
     }
-    bool get(std::uint64_t va, std::uint32_t& value) const {
+    bool get(std::uint64_t va, std::uint32_t& value, std::uint64_t& serial) const {
         if (slots_.empty()) return false;
         const Slot& s = slots_[find(va)];
         if (!s.va) return false;
         value = s.value;
+        serial = s.serial;
         return true;
     }
     std::size_t size() const { return used_; }
@@ -551,6 +620,7 @@ private:
     struct Slot {
         std::uint64_t va = 0;  // 0: empty (no label lives at 0)
         std::uint32_t value = 0;
+        std::uint64_t serial = 0;
     };
     std::vector<Slot> slots_;
     std::size_t used_ = 0;
@@ -644,6 +714,35 @@ bool overlaps_command_buffer(std::uint64_t va, std::size_t bytes, std::uint64_t*
             return true;
         }
     }
+    return false;
+}
+
+// Before the CP writes `n` bytes at `va` itself: true when they went on the
+// GPU's timeline behind the work a passed wait stands for (done - the caller
+// writes nothing), false when the caller writes them on the CPU now, at once
+// or, when `data` is null or the write could not go there, once the label's
+// submission has run.
+bool cp_write_after_waits(std::uint64_t va, const void* data, std::size_t n) {
+    g_cp_writes.fetch_add(1, std::memory_order_relaxed);
+    if (!cp_writes_need_gpu()) return false;
+    std::uint64_t serial = 0;
+    if (data && !overlaps_command_buffer(va, n, nullptr) && host_gpu_mem_write_ordered(va, data, n, &serial)) {
+        if (n == 4 || n == 8) {
+            // A wait on it later passes on the recorded value, as on a label's.
+            std::lock_guard<std::mutex> lk(g_pending_mu);
+            std::uint32_t lo, hi = 0;
+            std::memcpy(&lo, data, 4);
+            if (n == 8) std::memcpy(&hi, static_cast<const std::uint8_t*>(data) + 4, 4);
+            g_pending_labels.set(va, lo, serial);
+            if (n == 8) g_pending_labels.set(va + 4, hi, serial);
+        }
+        // The CP's writes after this one go behind it too, or wait for it:
+        // written on the CPU before it had run, it would land over them.
+        t_cp_writes_need = std::max(t_cp_writes_need, serial + 1);
+        g_cp_writes_timeline.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    cp_wait_for_label();
     return false;
 }
 
@@ -778,8 +877,8 @@ void cp_write(std::uint64_t va, const void* src, std::size_t n) {
             std::uint32_t lo, hi = 0;
             std::memcpy(&lo, src, 4);
             if (n == 8) std::memcpy(&hi, static_cast<const std::uint8_t*>(src) + 4, 4);
-            g_pending_labels.set(va, lo);
-            if (n == 8) g_pending_labels.set(va + 4, hi);
+            g_pending_labels.set(va, lo, serial);
+            if (n == 8) g_pending_labels.set(va + 4, hi, serial);
         }
         return;
     }
@@ -1028,6 +1127,24 @@ std::atomic<bool> g_any_counter_words{false};
 void note_counter_word(std::uint64_t word) {
     std::lock_guard<std::mutex> lk(g_counter_words_mu);
     if (g_counter_words.size() < 65536 && g_counter_words.insert(word).second) g_any_counter_words.store(true, std::memory_order_relaxed);
+}
+
+// Memory the GPU reads when it runs the work, not when the command processor
+// walks it: an indirect draw's or dispatch's arguments, and memory a
+// counter is copied into on the GPU's timeline. A DMA fill or copy over it
+// later in the stream then goes on the GPU's timeline too (kDmaData), in
+// order with what reads it. Done at once on the CP, it landed up to a slot
+// ring before the GPU had read the earlier frame's counts: GPU particles
+// drawn with the next frame's arguments, or none - effects flickering while
+// the GPU was behind (Kyo, 2026-10-14). A small per-thread memo keeps an
+// address seen once from taking the registry's lock every draw.
+void note_gpu_args(std::uint64_t va, std::size_t bytes) {
+    if (!va || !host_gpu_gds_counters()) return;
+    thread_local std::uint64_t seen[256] = {};
+    std::uint64_t& memo = seen[(va >> 2) & 255];
+    if (memo == va) return;
+    memo = va;
+    for (std::size_t k = 0; k < bytes; k += 4) note_counter_word(va + k);
 }
 
 bool covers_counter_word(std::uint64_t va, std::size_t bytes) {
@@ -1401,7 +1518,13 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         break;
                     }
                 }
-                store(va, &b[3], (n - 3) * 4);
+                const std::size_t bytes = (n - 3) * 4;
+                if (cp_write_after_waits(va, &b[3], bytes)) {
+                    record(va, &b[3], bytes);
+                    g_exec_writes.fetch_add(1);
+                    break;
+                }
+                store(va, &b[3], bytes);
             }
             break;
         }
@@ -1429,6 +1552,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     const bool ok = src_sel == 2 ? host_gpu_counter_fill(dst, b[1], bytes) : host_gpu_counter_copy(dst, gpu_va(b[1], b[2]), bytes);
                     if (ok) {
                         (src_sel == 2 ? g_counter_writes : g_counter_reads).fetch_add(1, std::memory_order_relaxed);
+                        // A count copied out (CopyStructureCount into a draw's
+                        // arguments): its destination now holds a GPU value too.
+                        if (src_sel != 2) note_gpu_args(dst, bytes < 64 ? bytes : 64);
                         break;
                     }
                     static std::atomic<int> logs{0};
@@ -1453,9 +1579,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                             host_log("gnm exec: DMA fill 0x%llx %zu bytes with 0x%08x", static_cast<unsigned long long>(dst), bytes, b[1]);
                         }
                         if (!host_gpu_clear_target(dst, b[1], bytes)) {
-                            auto* d = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(dst));
-                            for (std::size_t i = 0; i < bytes / 4; ++i) {
-                                d[i] = b[1];
+                            // After a passed wait: the words on the GPU's timeline (cp_write_after_waits).
+                            thread_local std::vector<std::uint32_t> words;
+                            const std::uint32_t* data = nullptr;
+                            if (bytes / 4 && bytes <= 65536 && cp_writes_need_gpu()) {
+                                words.assign(bytes / 4, b[1]);
+                                data = words.data();
+                            }
+                            if (!cp_write_after_waits(dst, data, bytes / 4 * 4)) {
+                                auto* d = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(dst));
+                                for (std::size_t i = 0; i < bytes / 4; ++i) {
+                                    d[i] = b[1];
+                                }
                             }
                         }
                     }
@@ -1463,10 +1598,24 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     const std::uint64_t src = gpu_va(b[1], b[2]);
                     warn_if_over_command_buffer("DMA copy", dst, bytes);
                     if (hle_kernel_va_mapped(src, bytes) && hle_kernel_va_mapped(dst, bytes)) {
-                        record(dst, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
+                        // After a passed wait: the bytes on the GPU's timeline
+                        // (cp_write_after_waits) - when they are on the CPU, that
+                        // is: no GPU write to the source is still to land.
+                        thread_local std::vector<std::uint8_t> copied;
+                        const void* data = nullptr;
+                        if (bytes <= 65536 && (dst >= src + bytes || src >= dst + bytes) && cp_writes_need_gpu() &&
+                            !host_gpu_writes_pending(src, bytes)) {
+                            copied.resize(bytes);
+                            host_gpu_read_guest(src, bytes, copied.data());
+                            data = copied.data();
+                        }
+                        const bool on_gpu = cp_write_after_waits(dst, data, bytes);
+                        record(dst, data ? data : reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
                         g_exec_writes.fetch_add(1);
-                        std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)),
-                                     reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
+                        if (!on_gpu) {
+                            std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)),
+                                         reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
+                        }
                     }
                 }
             }
@@ -1542,10 +1691,11 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         // thousands of waits a frame), and submitting for each
                         // one chopped the frame into three-draw command buffers.
                         bool pending_ok = false;
+                        std::uint64_t pending_serial = 0;
                         {
                             std::lock_guard<std::mutex> lk(g_pending_mu);
                             std::uint32_t pv = 0;
-                            if (g_pending_labels.get(va, pv)) {
+                            if (g_pending_labels.get(va, pv, pending_serial)) {
                                 pv &= mask;
                                 switch (fn) {
                                     case 1: pending_ok = pv < ref; break;
@@ -1560,6 +1710,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         }
                         if (pending_ok) {
                             g_wait_pending.fetch_add(1);
+                            // What the CP itself writes after this wait goes
+                            // behind the label's submission (cp_write_after_waits).
+                            t_cp_writes_need = std::max(t_cp_writes_need, pending_serial + 1);
                             break;
                         }
                     }
@@ -1828,6 +1981,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     g_dispatches.fetch_add(1);
                     GpuDispatch dd = *dp;
                     if (dd.indirect_va) {
+                        note_gpu_args(dd.indirect_va, 12);
                         if (!hle_kernel_va_mapped(dd.indirect_va, 12)) break;
                         const auto* a = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(dd.indirect_va));
                         dd.dim[0] = a[0];
@@ -2484,6 +2638,15 @@ std::string hle_gnm_flush_reasons() {
     {
         char buf[64];
         std::snprintf(buf, sizeof(buf), " waits-by-recorded-write:%llu", static_cast<unsigned long long>(g_wait_pending.load()));
+        out += buf;
+    }
+    {
+        // The CP's own writes (DMA_DATA, WRITE_DATA) and those that first
+        // waited for the GPU to reach a label a wait was passed on.
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), " cp-writes:%llu after-label:%llu on the GPU's timeline, %llu waited (%.1f ms)",
+                      static_cast<unsigned long long>(g_cp_writes.load()), static_cast<unsigned long long>(g_cp_writes_timeline.load()),
+                      static_cast<unsigned long long>(g_cp_writes_waited.load()), static_cast<double>(g_cp_writes_wait_us.load()) / 1000.0);
         out += buf;
     }
     for (int op = 0; op < 256; ++op) {

@@ -118,6 +118,10 @@ void host_mouse_set_visible(bool visible);
 // A line of text over the game for `seconds` (plugins' show_message); a new
 // one replaces the last. Any thread.
 void host_message_show(const char* text, float seconds);
+// The FPS counter's sample: a game frame starts (the main loop's frame-time
+// manager, engine/frame_rate.cpp, as its limiter lets the frame go). Nothing
+// but a flag load while the counter is off.
+void host_fps_frame_start();
 // Text entry for the game's IME dialog: while active the window collects
 // typed text in a box over the game, and the box owns the input - the game
 // sees a connected pad with nothing pressed and no pointer, as a PS4 game
@@ -162,6 +166,10 @@ void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.
 bool host_window_pixels(int* w, int* h);
+// `fn` is told the window's pixel size now (if there is a window) and each
+// time it changes - a resize, a fullscreen toggle, a display change - on the
+// window's thread. One listener (the light grid, engine/graphics_patch.cpp).
+void host_window_on_pixels(void (*fn)(int, int));
 // The refresh rate of the display the window is on, in Hz, or 0
 // when there is no window (headless) or the display does not say. The flip
 // clock runs at this rate instead of assuming 59.94 Hz.

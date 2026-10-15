@@ -137,7 +137,32 @@ const bool g_submit_thread_on = [] {
 // the last kForeignSubmit id: published after vkQueueSubmit returned.
 std::atomic<std::uint64_t> g_stream_submitted{0};
 std::atomic<std::uint64_t> g_foreign_submitted{0};
+std::atomic<bool> g_timeline_on{false};  // Gpu::timeline made: set once, before any submission
 constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_presenter's tickets for a kForeignSubmit
+
+// A game submission (`serial` its Gpu::flushes) also signals the timeline
+// with serial + 1: added to `si`'s signals, the binary ones it has keeping
+// their places (their values are ignored), held in this until the submit.
+struct TimelineSignal {
+    VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    VkSemaphore sems[2] = {};
+    std::uint64_t values[2] = {}, wait_values[2] = {};
+    void add(VkSubmitInfo& si, std::uint64_t serial) {
+        if (!g.timeline || serial == ~0ull || si.signalSemaphoreCount > 1 || si.waitSemaphoreCount > 2) return;
+        const std::uint32_t n = si.signalSemaphoreCount;
+        for (std::uint32_t i = 0; i < n; ++i) sems[i] = si.pSignalSemaphores[i];
+        sems[n] = g.timeline;
+        values[n] = serial + 1;
+        si.signalSemaphoreCount = n + 1;
+        si.pSignalSemaphores = sems;
+        ti.signalSemaphoreValueCount = n + 1;
+        ti.pSignalSemaphoreValues = values;
+        ti.waitSemaphoreValueCount = si.waitSemaphoreCount;
+        ti.pWaitSemaphoreValues = si.waitSemaphoreCount ? wait_values : nullptr;
+        ti.pNext = si.pNext;
+        si.pNext = &ti;
+    }
+};
 
 // One job to the queue, under its lock; a failure is kept for the command
 // processor (take_submit_failure_locked).
@@ -154,6 +179,8 @@ void submit_job_now(const SubmitJob& job) {
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &job.signal;
     }
+    TimelineSignal tl;
+    tl.add(si, job.serial);
     VkResult r;
     {
         std::lock_guard<std::mutex> q(g.queue_mu);
@@ -1745,14 +1772,17 @@ bool init_locked() {
         // BBHOST_GPU_CHECKPOINTS=amd turns them on.
         bool want_amd = c.buffer_marker && e && std::strcmp(e, "amd") == 0;
         // Unset, and the last run lost the device (its note beside the
-        // pipeline cache): these starts run with whichever this driver has.
-        // BBHOST_GPU_CHECKPOINTS=0 keeps them off.
+        // pipeline cache): these starts run with whichever this driver has -
+        // buffer markers first where there are any (NVIDIA's drivers have
+        // them too): they land in host memory, readable after the loss, and
+        // NVIDIA's Linux driver returned no checkpoints at all at three
+        // losses (an RTX 2060, 615.71). BBHOST_GPU_CHECKPOINTS=0 keeps them off.
         std::string why;
         if (!e && (c.checkpoints || c.buffer_marker) && take_marked_start(why)) {
-            (c.checkpoints ? want_nv : want_amd) = true;
+            (c.buffer_marker ? want_amd : want_nv) = true;
             host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers (%s), so another loss "
                      "names the draw the GPU was in; BBHOST_GPU_CHECKPOINTS=0 turns them off",
-                     why.c_str(), c.checkpoints ? "NVIDIA's checkpoints" : "AMD's buffer markers");
+                     why.c_str(), c.buffer_marker ? "buffer markers" : "NVIDIA's checkpoints");
         }
         g.has_checkpoints = want_nv || want_amd;
         g_use_buffer_marker = want_amd;
@@ -2170,6 +2200,8 @@ bool init_locked() {
         const char* e = std::getenv("BBHOST_HALF_NATIVE");
         const bool native = q12.shaderFloat16 && p12.shaderRoundingModeRTZFloat16 && p12.shaderDenormPreserveFloat16 && !(e && e[0] == '0');
         if (q12.shaderFloat16) f12.shaderFloat16 = VK_TRUE;
+        if (q12.timelineSemaphore && !(std::getenv("BBHOST_TIMELINE") && std::getenv("BBHOST_TIMELINE")[0] == '0'))
+            f12.timelineSemaphore = VK_TRUE;
         if (supported.shaderInt16) f2.features.shaderInt16 = VK_TRUE;
         g.has_f16_math = q12.shaderFloat16 && supported.shaderInt16;
         gcn::set_native_half_rtz(native);
@@ -2272,6 +2304,19 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (f12.timelineSemaphore) {
+        VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        st.initialValue = 0;
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &st;
+        if (vkCreateSemaphore(g.device, &sci, nullptr, &g.timeline) != VK_SUCCESS) g.timeline = VK_NULL_HANDLE;
+        if (g.timeline && vkCreateSemaphore(g.device, &sci, nullptr, &g.present_timeline) != VK_SUCCESS)
+            g.present_timeline = VK_NULL_HANDLE;
+    }
+    g_timeline_on.store(g.timeline != VK_NULL_HANDLE, std::memory_order_release);
+    host_log("gpu: submissions %s", g.timeline ? "signal a timeline semaphore: completion is read and waited for without the renderer's lock"
+                                              : "are followed by their fences alone (no timeline semaphore, or BBHOST_TIMELINE=0)");
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.family;
@@ -3651,7 +3696,11 @@ void report_checkpoints() {
     if (!get_data) return;
     std::uint32_t n = 0;
     get_data(g.queue, &n, nullptr);
-    if (!n) return;
+    if (!n) {
+        host_log("gpu: the driver kept no checkpoints for the device loss (NVIDIA's Linux driver has given none at three); "
+                 "BBHOST_GPU_CHECKPOINTS=amd names the draw through buffer markers instead");
+        return;
+    }
     std::vector<VkCheckpointDataNV> data(n, {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
     get_data(g.queue, &n, data.data());
     host_log("gpu: %u checkpoint(s) at the device loss (the last work each stage reached):", n);
@@ -4162,6 +4211,34 @@ void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
     g_indirect_recs.push_back({g.flushes, args_va, static_cast<std::uint8_t>(kind), counting});
 }
 
+// The presenter's own-queue copy recorded while a slot was the one being
+// recorded reads what retiring that slot frees: the game's display image, the
+// slot's descriptor sets. It waits on the GPU only for the game's submissions
+// up to its frame, which the slot's fence says are done, so it has run or is
+// about to: a short wait, bounded (5 s) for a submit that never went in.
+// The counter is read and the thread sleeps between reads rather than waiting
+// inside vkWaitSemaphores: on NVIDIA's Windows driver a thread in that wait
+// held the driver's own lock, and the presenter's submit - what signals the
+// value - queued behind it with every other thread's driver call (a 5080 hung
+// at the title in each of a friend's runs, 2026-10-14). The wait is nearly
+// always over at the first read.
+void present_reads_wait(std::uint64_t target) {
+    if (!g.present_timeline || g_device_lost.load(std::memory_order_relaxed)) return;
+    const auto start = std::chrono::steady_clock::now();
+    for (int k = 0;; ++k) {
+        std::uint64_t v = 0;
+        if (vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v) != VK_SUCCESS || v >= target ||
+            g_device_lost.load(std::memory_order_relaxed))
+            return;
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) break;
+        if (k < 64) std::this_thread::yield();
+        else host_sleep_us(250);
+    }
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 4)
+        host_log("gpu: the presenter's copy %llu not done 5 s after its frame; its slot retires anyway", static_cast<unsigned long long>(target));
+}
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -4197,9 +4274,14 @@ void retire_slot_locked(int k) {
         sl.in_flight = false;
         return;
     }
+    if (sl.present_target) {
+        present_reads_wait(sl.present_target);
+        sl.present_target = 0;
+    }
     vkResetFences(g.device, 1, &sl.fence);
     indirect_stats_retired_locked(sl.serial);
     indirect_clamp_retired_locked(sl.serial);
+    vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -4706,9 +4788,18 @@ std::string image_heap_report() {
 //                     tight memory) in play, BBHOST_IMAGE_HEAP_SPARE_LOADING
 //                     (4; 1) during a load; an empty block above that goes
 //                     back after 10 s in play
-//   upload staging    BBHOST_STAGING_FLOOR_MB (256) kept in play, chunks
-//                     over it freed after 30 s; BBHOST_STAGING_RESERVE_MB
-//                     (768; 256) made ready during a load
+//   upload staging    BBHOST_STAGING_FLOOR_MB (256) made at the start;
+//                     BBHOST_STAGING_RESERVE_MB (768; 256) made ready during
+//                     a load and kept in play for the next one, what is over
+//                     it given back while a loading screen is up
+// Staging stays in play because giving it back stalls the frames: each 64 MiB
+// chunk's vkFreeMemory took 22-27 ms on the RTX 4070, and the frame it fell
+// in ran 29-47 ms against 14-17 around it, one every two seconds for the 16 s
+// after every load - after each death, lamp and area change (the frees of
+// image heap blocks, 7-9 ms, show no such frame). The staging made again at
+// the next load cost ~30 ms a chunk of pinning besides. BBHOST_STAGING_RETURN=1
+// gives it back in play as before: down to the floor after 30 s, a chunk
+// every two seconds.
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
 std::atomic<bool> g_loading_screen{false};
@@ -4731,6 +4822,7 @@ void start_memory_reserve() {
     const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", few ? 0 : 1);
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
+    const bool staging_return = env("BBHOST_STAGING_RETURN", 0) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
         // The heap's blocks are of the memory type its first image asked for.
@@ -4806,10 +4898,11 @@ void start_memory_reserve() {
                      static_cast<unsigned long long>(made >> 20), added);
             return;
         }
-        host_log("gpu: memory keeper: image heap spare %llu block(s) in play, %llu during loads; upload staging %llu MiB kept, %llu MiB "
-                 "during loads",
+        host_log("gpu: memory keeper: image heap spare %llu block(s) in play, %llu during loads; upload staging %llu MiB at the start, "
+                 "%llu MiB from a load on%s",
                  static_cast<unsigned long long>(spare_play), static_cast<unsigned long long>(spare_load),
-                 static_cast<unsigned long long>(floor >> 20), static_cast<unsigned long long>(reserve >> 20));
+                 static_cast<unsigned long long>(floor >> 20), static_cast<unsigned long long>(reserve >> 20),
+                 staging_return ? ", given back to the start's in play (BBHOST_STAGING_RETURN=1)" : ", kept in play (BBHOST_STAGING_RETURN=1 gives it back)");
         make_staging(floor);
         auto over_floor_since = std::chrono::steady_clock::time_point{};
         // One piece of memory goes back at a time, two seconds apart: freeing
@@ -4840,10 +4933,32 @@ void start_memory_reserve() {
                 }
             }
             make_blocks(loading ? spare_load : spare_play);
-            if (loading) continue;
-            // In play: empty blocks above the spare go back after 10 s; staging
-            // over the floor for 30 s goes back to it - one block or chunk a
-            // turn, two seconds apart.
+            if (loading) {
+                // Staging over the reserve (chunks the command processor made
+                // in a burst, or one a large upload had to itself) goes back
+                // while the loading screen hides the stall, a chunk a turn.
+                DevBuffer extra;
+                {
+                    std::lock_guard<GpuMutex> lk(g.mu);
+                    if (!staging_return && g.staging_free_bytes > reserve && !g.staging_free.empty()) {
+                        extra = g.staging_free.back();
+                        g.staging_free_bytes -= extra.size;
+                        g.staging_free.pop_back();
+                    }
+                }
+                if (extra.buffer) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    vkDestroyBuffer(g.device, extra.buffer, nullptr);
+                    vkFreeMemory(g.device, extra.memory, nullptr);
+                    host_log("gpu: memory keeper: gave back %llu MiB of upload staging over the load's reserve in %.1f ms, during the load",
+                             static_cast<unsigned long long>(extra.size >> 20),
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                }
+                continue;
+            }
+            // In play: empty blocks above the spare go back after 10 s, one a
+            // turn, two seconds apart (with BBHOST_STAGING_RETURN=1 also
+            // staging over the floor for 30 s, down to it, a chunk a turn).
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
             // Down to the reserve, an empty block goes back at once, spare or
@@ -4868,7 +4983,7 @@ void start_memory_reserve() {
                         break;
                     }
                 }
-                if (g.staging_free_bytes > floor) {
+                if (staging_return && g.staging_free_bytes > floor) {
                     if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
                     if (now - over_floor_since >= std::chrono::seconds(30) && may_give && gone.empty() && !g.staging_free.empty()) {
                         chunks.push_back(g.staging_free.back());
@@ -5239,6 +5354,8 @@ void submit_locked() {
         cur.in_flight = true;
     } else {
         busy_submitted_locked(cur);
+        TimelineSignal tl;
+        tl.add(si, cur.serial);
         const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
@@ -5593,7 +5710,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     const std::string& name = cc->name;
     const std::uint64_t code_hash = cc->hash;
     stamp.to(kDpProgram);
-    {
+    if (host_tooling()) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         ++g_dispatch_census[name];
@@ -5743,6 +5860,18 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         };
         for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
+        // the draws' constants are checked (render.cpp).
+        if (vb_race_on()) {
+            for (const gcn::BufferBinding& b : pl.meta.buffers) {
+                std::uint32_t v[4]{};
+                if (b.written || b.pointer || !resolve_resource(b.path, d.user_data, 4, v)) continue;
+                const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+                const std::uint64_t bytes = std::min<std::uint64_t>(stride ? std::uint64_t{v[2]} * stride : v[2], b.max_dw * 4ull);
+                if (base && bytes && !gpu_writes_pending_locked(base, bytes)) vb_race_note_locked(pl.name.c_str(), base, bytes);
+            }
+        }
         if (pl.meta.gds_counters) {
             for (const GpuDispatch::GdsCounter& c : d.gds) {
                 if (c.word) import_windows(c.word, 4);
@@ -6650,6 +6779,40 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     return true;
 }
 
+bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes || bytes > 65536) return false;
+    if (surfaces_may_cover_locked(va, bytes) || find_render_target(va)) return false;
+    Located loc;
+    if (!locate_range(va, bytes, loc)) return false;
+    DevBuffer staging;
+    VkDeviceSize staging_offset = 0;
+    if (!acquire_staging_locked(staging, bytes, staging_offset)) return false;
+    std::memcpy(staging.map, data, bytes);
+    if (serial) *serial = g.flushes;  // the submission this write is recorded into
+    std::optional<DrawCmds> own;
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    transfer_begin_locked();
+    transfer_order_locked(VK_NULL_HANDLE, 0, loc.buffer, loc.offset, bytes);  // after what the work before reads and writes there
+    VkBufferCopy region{staging_offset, loc.offset, bytes};
+    DrawCmds* c = DrawCmds::open();
+    if (!c || !c->copy_buffer(staging.buffer, loc.buffer, region)) rec().copy_buffer(staging.buffer, loc.buffer, 1, &region);
+    transfer_end_locked();
+    shadow_written_locked(va, bytes, true);  // a constant buffer over it is read in place, behind the write
+    note_pending_write_locked(va, static_cast<const std::uint8_t*>(data), bytes);
+    return true;
+}
+
+void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    read_guest_locked(va, bytes, out);
+}
+
+bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    return gpu_writes_pending_locked(va, bytes);
+}
+
 bool host_gpu_clear_target(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
     return g.ok && render_clear_by_fill_locked(va, bytes, value);
@@ -7076,6 +7239,12 @@ std::uint64_t host_gpu_work_needs() {
 }
 
 std::uint64_t host_gpu_submissions_completed() {
+    if (g_timeline_on.load(std::memory_order_acquire)) {
+        std::uint64_t v = 0;
+        if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
+            return ~0ull;  // nothing more will run: nothing to wait for
+        return v;
+    }
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return ~0ull;  // nothing more will run: nothing to wait for
     std::uint64_t done = g.completed_submits;
@@ -7086,6 +7255,25 @@ std::uint64_t host_gpu_submissions_completed() {
         }
     }
     return done;
+}
+
+void* host_gpu_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.timeline : VK_NULL_HANDLE; }
+void* host_gpu_present_timeline() { return g_timeline_on.load(std::memory_order_acquire) ? g.present_timeline : VK_NULL_HANDLE; }
+std::uint32_t host_gpu_vendor_id() { return g.vendor_id; }
+void host_gpu_present_reads_locked(std::uint64_t target) {
+    if (!g.slot_count) return;
+    Gpu::Slot& sl = g.slots[g.slot];
+    sl.present_target = std::max(sl.present_target, target);
+}
+
+bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
+    if (!g_timeline_on.load(std::memory_order_acquire)) return false;
+    if (g_device_lost.load(std::memory_order_relaxed)) return true;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g.timeline;
+    wi.pValues = &need;
+    return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
 }
 
 void host_gpu_report() {

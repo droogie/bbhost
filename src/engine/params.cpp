@@ -4,6 +4,8 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
+#include "engine/frame_rate.h"
 #include "engine/paramdef.h"
 #include "hle/fs.h"
 #include "log.h"
@@ -238,6 +240,7 @@ void dump_rows(const Table& t) {
 void walk() {
     std::uint64_t repo = 0;
     if (!g_slide || !rd(g_slide + (kRepositorySlot - kPreferredGuestSlide), &repo) || !repo) return;
+    bool attack_table = false;  // AtkParam_Pc new or reloaded: the frame rate's fix goes into it (engine/frame_rate.h)
     for (unsigned slot = 0; slot < kSlots; ++slot) {
         std::int32_t count = 0;
         if (!rd(repo + kSlotsAt + slot * kSlotStride, &count) || count <= 0) continue;
@@ -274,8 +277,11 @@ void walk() {
             }
             apply_override(t);
             dump_rows(t);
+            if (name == "LockCamParam") camera_params_changed(file);  // the camera settings' rows (engine/camera.h)
+            attack_table = attack_table || name == "AtkParam_Pc";
         }
     }
+    if (attack_table) frame_rate_atk_params_loaded();  // after the lock: it looks the row up through params_row
 }
 
 }  // namespace

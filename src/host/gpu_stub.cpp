@@ -55,6 +55,10 @@ void host_gpu_glitch_watch(std::uint64_t, std::uint64_t) {}
 std::uint64_t host_gpu_draw_mark() { return 0; }
 std::uint64_t host_gpu_work_needs() { return 0; }
 std::uint64_t host_gpu_submissions_completed() { return ~0ull; }
+bool host_gpu_wait_completed(std::uint64_t, std::uint64_t) { return false; }
+void* host_gpu_timeline() { return nullptr; }
+void* host_gpu_present_timeline() { return nullptr; }
+void host_gpu_present_reads_locked(std::uint64_t) {}
 void host_gpu_note_shader_created(int, const std::uint8_t*, std::size_t, std::uint64_t) {}
 
 void host_gpu_shadow_cp_write(std::uint64_t, std::size_t) {}

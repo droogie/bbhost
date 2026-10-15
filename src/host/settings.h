@@ -2,9 +2,11 @@
 // screen (F10), the port's rows in the game's System menu and
 // bbhost-options.toml edit by name (host/options.h), read back by every
 // consumer as typed, already-scaled fields. The table in options.cpp is the
-// single source; it rebuilds this snapshot on every change, and a reader
-// takes a copy (host_settings()) whenever host_opt_serial() has moved, or
-// on the frame it needs it - the copy is small and the lock is short.
+// single source; it publishes a new snapshot on every change
+// (host/settings_store.h) and tells the consumers that registered a listener
+// (host_settings_listen), which keep what they act on - so no consumer asks
+// for the settings every frame or view. A reader that wants one now takes the
+// newest snapshot without a lock (host_settings_ref, host_settings).
 //
 // The graphics half is shaped after what DS3 keeps in its CSGraphicsConfig
 // (the released PC binary's RTTI names the class): per-effect switches and
@@ -72,5 +74,14 @@ struct HostSettings {
     bool five_players = true;
 };
 
-// A copy of the current settings.
+// A copy of the current settings (no lock: the snapshot published last).
 HostSettings host_settings();
+// The same without the copy, for a path that reads a field or two: a
+// published snapshot is never written again and is kept for the run, so the
+// reference stays good; the next change publishes another.
+const HostSettings& host_settings_ref();
+// Tells `fn` the current settings at once and then the new ones after every
+// change, on the thread that made it (host/settings_store.h has the rules: be
+// quick, keep what is needed, change nothing). Up to 32 listeners.
+using HostSettingsListener = void (*)(const HostSettings&);
+void host_settings_listen(HostSettingsListener fn);

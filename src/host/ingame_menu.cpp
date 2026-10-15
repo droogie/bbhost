@@ -232,7 +232,7 @@ bool build_frame(VkExtent2D extent) {
     // The pointer over the menu: ImGui draws it last, on top. The host's own
     // (host_overlay_cursor) is drawn under the menu and stands down while it
     // is open; with "Draw the pointer" off the window system's shows instead.
-    io.MouseDrawCursor = host_settings().draw_cursor;
+    io.MouseDrawCursor = host_settings_ref().draw_cursor;
     std::vector<Input> q;
     {
         std::lock_guard<std::mutex> lk(g_mu);

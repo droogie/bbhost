@@ -951,6 +951,8 @@ int main(int argc, char** argv) {
         std::fflush(stderr);
         return 2;
     }
+    g_host_tooling = cfg.tooling;  // log.h: before any of the game's threads
+    if (!cfg.tooling) host_log("tooling off ([debug] tooling, BBHOST_TOOLING): no periodic reports or instrumentation; warnings and errors still logged");
     // Updates (host/updater.h): an older build's update leftover removed, a
     // release build's check begun on a thread of its own (not in a headless
     // run, nor when the setup window has checked).
