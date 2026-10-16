@@ -39,7 +39,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/tess_vertex.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
@@ -660,6 +660,9 @@ if(UNIX)
     add_executable(gcn_lds_window_test tests/gcn_lds_window_test.cpp)
     target_link_libraries(gcn_lds_window_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lds_window_test COMMAND gcn_lds_window_test)
+    add_executable(gcn_tess_vertex_test tests/gcn_tess_vertex_test.cpp)
+    target_link_libraries(gcn_tess_vertex_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_tess_vertex_test COMMAND gcn_tess_vertex_test)
     add_executable(gcn_lift_test tests/gcn_lift_test.cpp)
     target_link_libraries(gcn_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lift_test COMMAND gcn_lift_test)

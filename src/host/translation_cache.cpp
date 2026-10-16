@@ -167,6 +167,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.u32(near_bits);
     h.flag(o.tess_patch_cull);
     h.flag(o.tess_patch_cull_all);
+    h.flag(o.params_vertex_formats);
     h.flag(o.gds_counters);
 }
 

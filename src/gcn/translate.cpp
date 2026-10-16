@@ -3684,7 +3684,8 @@ struct Translator {
         const bool vertex_w3 = (opt.stage == Stage::Vertex && opt.vertex_formats_from_params && !opt.vertex_input.empty()) ||
                                opt.tess_role == TranslateOptions::TessRole::LsCompute ||
                                opt.tess_role == TranslateOptions::TessRole::LsVertex ||  // the control points (kTess*)
-                               (opt.tess_role == TranslateOptions::TessRole::HullTcs && opt.tess_window);  // its user data
+                               (opt.tess_role == TranslateOptions::TessRole::HullTcs && opt.tess_window) ||  // its user data
+                               opt.params_vertex_formats;
         // The domain role also reads what it takes to leave out a patch whose
         // centre is at or behind the camera plane (StageParams::patch_cull_w).
         const bool patch_cull = opt.tess_role == TranslateOptions::TessRole::Domain && opt.tess_patch_cull;

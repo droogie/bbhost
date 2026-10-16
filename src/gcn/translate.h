@@ -364,6 +364,9 @@ struct TranslateOptions {
     // where they care - not all of them do.
     bool tess_patch_cull = false;
     bool tess_patch_cull_all = false;  // a check: leave every patch out
+    // Declare StageParams::vertex_formats even if unread: a domain shader fused
+    // with its LS (gcn/tess_vertex.h) merges params blocks only of one type.
+    bool params_vertex_formats = false;
     // ds_append / ds_consume with GDS set count in the guest word the dispatch
     // binds for each GDS dword (StageParams::gds_counter): GX keeps an
     // append/consume buffer's counter in the word past its records and only
