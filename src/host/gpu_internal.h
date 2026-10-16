@@ -503,6 +503,12 @@ struct Gpu {
     // =2 also charges the time between pairs to what was recorded in it
     // (profile_gap_ns, by recording sites).
     bool profile = false;
+    // 4096 on MoltenVK: past a 32 KiB Metal counter buffer it emulates the
+    // pool, every timestamp the same. Draws past it go untimed.
+    std::uint32_t queries_per_slot = kQueriesPerSlot;
+    // Metal backs 32 pools a device (MoltenVK), past which one is emulated as
+    // above, so a profiled run there keeps fewer slots. 0: no limit.
+    std::uint32_t timestamp_pools = 0;
     bool profile_gaps = false;
     bool profile_passes = false;  // BBHOST_GPU_PROFILE=3: a pair a render pass, not a draw (render.cpp)
     // BBHOST_GPU_PROFILE=3 (or =1 with BBHOST_GPU_PROFILE_STATS=1) where the

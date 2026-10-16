@@ -2011,6 +2011,10 @@ bool init_locked() {
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
     // Required where listed (VUID-VkDeviceCreateInfo-pProperties-04451).
     if (portability) dext.push_back("VK_KHR_portability_subset");
+    if (portability) {
+        g.queries_per_slot = std::min<std::uint32_t>(g.queries_per_slot, 4096);  // Gpu::queries_per_slot
+        g.timestamp_pools = 32;
+    }
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -2406,6 +2410,13 @@ bool init_locked() {
         g.slot_count = std::clamp(std::atoi(e), 2, kSlots);
         host_log("gpu: %d command buffers in flight at most (BBHOST_GPU_SLOTS)", g.slot_count);
     }
+    // Profiled, each slot takes two timestamp pools, the presenter and FSR
+    // one each.
+    if (g.profile && g.timestamp_pools && 2u * g.slot_count + 4 > g.timestamp_pools) {
+        g.slot_count = std::max<int>(2, static_cast<int>(g.timestamp_pools - 4) / 2);
+        host_log("gpu: %d command buffers in flight at most while profiling: the device backs %u timestamp pools", g.slot_count,
+                 g.timestamp_pools);
+    }
     for (int k = 0; k < g.slot_count; ++k) {
         VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cai.commandPool = g.pool;
@@ -2418,7 +2429,7 @@ bool init_locked() {
         if (g.profile) {
             VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = kMaxQueued * kStageSlots * 2;
+            qci.queryCount = g.queries_per_slot;
             if (vkCreateQueryPool(g.device, &qci, nullptr, &g.slots[k].qpool) != VK_SUCCESS) g.profile = false;
             if (g.profile_stats) {
                 VkQueryPoolCreateInfo sci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -2720,9 +2731,9 @@ void begin_recording_locked() {
         occlusion_begin_recording_locked();
         if (g.profile) {
             Gpu::Slot& sl = g.slots[g.slot];
-            rec().reset_query_pool(sl.qpool, 0, kQueriesPerSlot);
+            rec().reset_query_pool(sl.qpool, 0, g.queries_per_slot);
             sl.qreset = true;
-            rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
+            rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, g.queries_per_slot - 2);
             sl.span = true;
         }
     }
@@ -5229,10 +5240,10 @@ void profile_note_site_locked(void* site) {
 void profile_begin_locked(const std::string* name) {
     if (!g.profile) return;
     Gpu::Slot& sl = g.slots[g.slot];
-    if (sl.qnames.size() * 2 + 4 > kQueriesPerSlot) return;  // the last pair is the command-buffer span
+    if (sl.qnames.size() * 2 + 4 > g.queries_per_slot) return;  // the last pair is the command-buffer span
     g_in_profiler = true;
     if (!sl.qreset) {
-        vkCmdResetQueryPool(g_cmd(), sl.qpool, 0, kMaxQueued * kStageSlots * 2);
+        vkCmdResetQueryPool(g_cmd(), sl.qpool, 0, g.queries_per_slot);
         if (g.profile_stats) vkCmdResetQueryPool(g_cmd(), sl.stat_pool, 0, kMaxQueued * kStageSlots);
         sl.qreset = true;
     }
@@ -5267,7 +5278,7 @@ void collect_profile_locked(Gpu::Slot& sl) {
     std::uint64_t span[2] = {};
     bool have_span = false;
     if (g.profile && sl.span) {
-        if (vkGetQueryPoolResults(g.device, sl.qpool, kQueriesPerSlot - 2, 2, sizeof(span), span, 8,
+        if (vkGetQueryPoolResults(g.device, sl.qpool, g.queries_per_slot - 2, 2, sizeof(span), span, 8,
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS &&
             span[1] > span[0]) {
             g.cmdbuf_ns += static_cast<std::uint64_t>((span[1] - span[0]) * g.timestamp_period_ns);
@@ -5377,7 +5388,7 @@ void submit_locked() {
         g.slots[g.slot].tail_gap = g_gap_sites;
         g_gap_sites = {};
         g_in_profiler = true;
-        rec().write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, kQueriesPerSlot - 1);
+        rec().write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, g.queries_per_slot - 1);
         g_in_profiler = false;
     }
     busy_end_locked(g.slots[g.slot]);
