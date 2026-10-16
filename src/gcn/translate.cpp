@@ -3088,6 +3088,8 @@ struct Translator {
     // here each subgroup does that with one atomic in the word, and the
     // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
     // index unique. A dword with no word bound does nothing and returns 0.
+    // First EXEC lane by ballot, not Elect/BroadcastFirst: MoltenVK's two
+    // disagree on the lane when lane 0 is inactive.
     void gds_counter(const Inst& in, std::uint32_t off) {
         if (!gds_member) {
             error(std::string(mnemonic(in)) + " in GDS outside a compute program: no counter to bind");
@@ -3107,13 +3109,15 @@ struct Translator {
         const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
         const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
         const Id result = m.local_variable(p_fn_u32, c_zero_u);
-        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        const Id lsb_lo = m.ext_inst(t_u32, spv::GlslFindILsb, {blo}), lsb_hi = m.ext_inst(t_u32, spv::GlslFindILsb, {bhi});
+        const Id first_lane = sel(ine(blo, c_zero_u), lsb_lo, sel(ine(bhi, c_zero_u), iadd(lsb_hi, cu(32)), c_zero_u));
+        const Id first = band(active, ieq(lane(), first_lane));
         if_then(band(first, bound), [&] {
             const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
             const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
             m.store(result, r);
         });
-        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
+        write_v(in.dst, m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), ld(result), first_lane}));
     }
 
     // ---- images
