@@ -274,6 +274,10 @@ struct GfxPipeline {
     GfxPipeline* lean_variant = nullptr;
     bool lean_building = false;  // a worker is building its no-fallback variant (queue_lean_variant)
     bool building = false;       // a worker is building this pipeline; nothing reads it until handed over
+    // BBHOST_PIPELINE_DEFER: flip at which drawing was deferred (0: never),
+    // and draws skipped since.
+    std::uint64_t defer_flip = 0;
+    std::uint32_t defer_skipped = 0;
     // Per stage: whether the translation lists the images and samplers
     // paths_for does, so the prefetch takes the words the pipeline key
     // resolved (key_stage_matches, checked on the first draw).
@@ -6657,6 +6661,29 @@ const bool g_lean_first = [] {
     const char* e = std::getenv("BBHOST_LEAN_FIRST");
     return !(e && e[0] == '0');
 }();
+// BBHOST_PIPELINE_DEFER (default on with MoltenVK only): in game, the
+// no-fallback variant is built by a worker and its draws are skipped until
+// ready. MoltenVK compiles MSL in vkCreateGraphicsPipelines (up to ~750 ms
+// cold) with no precompile, so building in place stalls; deferred, new objects
+// show a few frames late. Loading screens still build in place: a draw there
+// may be made only once.
+bool pipeline_defer_on() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_PIPELINE_DEFER");
+        return e && *e ? (e[0] == '0' ? 0 : 1) : -1;
+    }();
+    return mode < 0 ? g.moltenvk : mode == 1;
+}
+std::chrono::microseconds pipeline_defer_wait() {
+    static const std::chrono::microseconds wait{[] {
+        const char* e = std::getenv("BBHOST_PIPELINE_DEFER_WAIT_MS");
+        return static_cast<long long>((e && *e ? std::max(0.0, std::atof(e)) : 16.0) * 1000.0);
+    }()};
+    return wait;
+}
+std::uint64_t g_defer_wait_flip = ~0ull;           // under g.mu: the flip g_defer_waited counts for
+std::chrono::microseconds g_defer_waited{0};       // under g.mu
+std::atomic<std::uint64_t> g_defer_queued{0}, g_defer_in_wait{0}, g_defer_pipelines_skipped{0}, g_defer_draws_skipped{0};
 struct LeanBuildJob {
     GfxPipeline* base = nullptr;     // the pipeline the variant belongs to
     GfxPipeline* variant = nullptr;  // its entry in g_gfx, reserved by the command processor
@@ -6678,6 +6705,7 @@ struct LeanBuilders {
     std::condition_variable cv;
     std::deque<std::unique_ptr<LeanBuildJob>> jobs;             // under mu
     std::vector<std::pair<GfxPipeline*, GfxPipeline*>> done;   // (base, variant), under mu
+    std::condition_variable done_cv;                           // a build went to `done` (wait_lean_build_locked)
 };
 std::atomic<bool> g_lean_builds_ready{false};
 std::atomic<std::uint64_t> g_lean_builds_queued{0}, g_lean_builds_done{0};
@@ -6685,7 +6713,9 @@ std::atomic<std::uint64_t> g_lean_builds_queued{0}, g_lean_builds_done{0};
 LeanBuilders& lean_builders() {
     static LeanBuilders* const builders = [] {
         auto* w = new LeanBuilders;  // never destroyed: its threads run until exit
-        for (int i = 0; i < 2; ++i) {
+        // Deferred pipelines don't draw until built, and arrive in bursts.
+        const int threads = pipeline_defer_on() ? 4 : 2;
+        for (int i = 0; i < threads; ++i) {
             std::thread([w] {
                 for (;;) {
                     std::unique_ptr<LeanBuildJob> job;
@@ -6706,6 +6736,7 @@ LeanBuilders& lean_builders() {
                     w->done.emplace_back(j.base, j.variant);
                     g_lean_builds_ready.store(true, std::memory_order_relaxed);
                     g_lean_builds_done.fetch_add(1, std::memory_order_relaxed);
+                    w->done_cv.notify_all();
                 }
             }).detach();
         }
@@ -6766,14 +6797,15 @@ void queue_pipeline_build(GfxPipeline& base, GfxPipeline& variant, const DrawSta
 }
 
 // Under g.mu: reserves the variant's entry and hands the build to a worker.
-void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+GfxPipeline& queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
                         const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
                         const std::string& vs_name, const std::string& ps_name,
                         const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                         const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
                         const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
-    queue_pipeline_build(base, g_gfx[lean_key], s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes,
-                         vertex_input);
+    GfxPipeline& variant = g_gfx[lean_key];
+    queue_pipeline_build(base, variant, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input);
+    return variant;
 }
 
 // Under g.mu: gives finished variants to their base pipelines.
@@ -6792,6 +6824,37 @@ void apply_lean_builds_locked() {
         base->lean_variant = variant;
         base->lean_building = false;
     }
+}
+
+// Under g.mu, held while waiting; bounded by the flip's wait budget unless
+// `until_built`. Returns whether `variant` was built.
+bool wait_lean_build_locked(const GfxPipeline& variant, bool until_built = false) {
+    const std::uint64_t flip = hle_video_flip_count();
+    if (g_defer_wait_flip != flip) {
+        g_defer_wait_flip = flip;
+        g_defer_waited = std::chrono::microseconds{0};
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool done = false;
+    if (until_built || g_defer_waited < pipeline_defer_wait()) {
+        LeanBuilders& w = lean_builders();
+        std::unique_lock<std::mutex> lk(w.mu);
+        const auto built = [&] {
+            for (const auto& [base, v] : w.done) {
+                if (v == &variant) return true;
+            }
+            return false;
+        };
+        if (until_built) {
+            w.done_cv.wait(lk, built);
+            done = true;
+        } else {
+            done = w.done_cv.wait_until(lk, t0 + (pipeline_defer_wait() - g_defer_waited), built);
+        }
+    }
+    g_defer_waited += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0);
+    apply_lean_builds_locked();
+    return done;
 }
 
 // Under g.mu: a native hull pipeline (DrawState::tess_native) built by a
@@ -8335,6 +8398,13 @@ void render_report() {
         if (g_skip_tables) {
             host_log("render: no-fallback variants built on worker threads %llu of %llu queued",
                      static_cast<unsigned long long>(g_lean_builds_done.load()), static_cast<unsigned long long>(g_lean_builds_queued.load()));
+            if (pipeline_defer_on()) {
+                host_log("render: deferred pipelines (BBHOST_PIPELINE_DEFER, wait %lld ms a flip): %llu queued with nothing to draw meanwhile, "
+                         "%llu ready within the wait, %llu shown late (%llu draws skipped)",
+                         static_cast<long long>(pipeline_defer_wait().count() / 1000), static_cast<unsigned long long>(g_defer_queued.load()),
+                         static_cast<unsigned long long>(g_defer_in_wait.load()), static_cast<unsigned long long>(g_defer_pipelines_skipped.load()),
+                         static_cast<unsigned long long>(g_defer_draws_skipped.load()));
+            }
             host_log("render: table read masks computed on worker threads %llu of %llu queued",
                      static_cast<unsigned long long>(g_table_masks_done.load()), static_cast<unsigned long long>(g_table_masks_queued.load()));
             host_log("render: GX draws with user-data tables or blocks left out of the ring %llu (%llu of them); rebuilt for the fallback "
@@ -14689,13 +14759,44 @@ static bool draw_impl(const GpuDraw& d) {
             // A worker builds the variant only while a created fallback can draw
             // meanwhile; otherwise (BBHOST_LEAN_FIRST) it is built here, and the
             // fallback is never created unless a draw lacks a binding.
-            if (g_async_pipelines && pl.pipeline && !g_dump_spirv && !g_token_user_data_check) {
+            const bool async = g_async_pipelines && !g_dump_spirv && !g_token_user_data_check;
+            if (async && pl.pipeline) {
                 queue_lean_variant(pl, lean_key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
                                    ps_sampler_modes, vertex_plan);
+            } else if (async && pipeline_defer_on() && !g_precompile_boost.load(std::memory_order_relaxed)) {
+                // Not ready within the flip's budget: this draw is skipped.
+                const GfxPipeline& variant = queue_lean_variant(pl, lean_key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims,
+                                                                ps_dims, vs_sampler_modes, ps_sampler_modes, vertex_plan);
+                g_defer_queued.fetch_add(1, std::memory_order_relaxed);
+                if (wait_lean_build_locked(variant)) {
+                    g_defer_in_wait.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    pl.defer_flip = std::max<std::uint64_t>(1, hle_video_flip_count());
+                    g_defer_pipelines_skipped.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 pl.lean_variant = &gfx_pipeline(s, lean_key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
                                                 vs_sampler_modes, ps_sampler_modes, true, vertex_plan);
             }
+        }
+        if (!pl.lean_variant && pl.lean_building && pl.defer_flip && g_precompile_boost.load(std::memory_order_relaxed)) {
+            // On a loading screen a draw may be made only once: wait.
+            if (auto v = g_gfx.find(fnv1a("cb-lean", 7, key)); v != g_gfx.end()) wait_lean_build_locked(v->second, true);
+        }
+        if (!pl.lean_variant && pl.lean_building && pl.defer_flip) {
+            ++pl.defer_skipped;
+            g_defer_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (pl.defer_flip && pl.lean_variant) {
+            static int logs = 0;
+            if (logs < 200) {
+                ++logs;
+                host_log("render: deferred pipeline %s draws from flip %llu, %llu flips late (%u draws skipped)", pl.name.c_str(),
+                         static_cast<unsigned long long>(hle_video_flip_count()),
+                         static_cast<unsigned long long>(hle_video_flip_count() - pl.defer_flip), pl.defer_skipped);
+            }
+            pl.defer_flip = 0;
         }
         if (pl.lean_variant) {
             GfxPipeline& lean = *pl.lean_variant;
