@@ -296,6 +296,206 @@ const bool g_census_on = [] {
 }();
 std::unordered_map<void*, std::uint64_t> g_census;  // under g.mu
 
+// BBHOST_ENCODER_STATS=1: the Metal encoders MoltenVK makes of the stream,
+// modelled from the commands replayed (not those recorded in place), and the
+// barriers between them: on MoltenVK each such switch is a GPU wait.
+namespace enc {
+enum Kind { kNone, kRender, kCompute, kBlit, kKinds };
+const bool on = [] {
+    const char* e = std::getenv("BBHOST_ENCODER_STATS");
+    const char* t = std::getenv("BBHOST_ENCODER_TRACE");
+    return (e && e[0] == '1') || (t && *t);
+}();
+const std::uint64_t trace_flip = [] {
+    const char* t = std::getenv("BBHOST_ENCODER_TRACE");
+    return t && *t ? std::strtoull(t, nullptr, 10) : 0ull;
+}();
+std::atomic<std::uint64_t> opened[kKinds][kKinds];  // [the encoder before][the new one]
+std::atomic<std::uint64_t> clears{0}, same_pass{0}, cmdbufs{0}, inplace{0}, draws{0}, empty_pass{0};
+// Barriers replayed, by kind; those with no command since the barrier before
+// (back to back); encoder switches with a barrier between them.
+enum Bar { kBarPass, kBarXferBegin, kBarXferEnd, kBarCopyOrder, kBarMem, kBarImage, kBars };
+std::atomic<std::uint64_t> bars[kBars], bars_b2b{0}, opened_barred[kKinds][kKinds];
+int bars_since = 0;  // since the last command
+std::unordered_map<void*, std::uint64_t> bar_sites;  // Rec::pipeline_barrier's callers (under g.mu)
+// BBHOST_BARRIER_SKIP=mask (measurement only, may draw wrong): the kinds of
+// barrier above, by bit, not recorded.
+const unsigned skip = [] {
+    const char* e = std::getenv("BBHOST_BARRIER_SKIP");
+    return e && *e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0u;
+}();
+int cur = kNone, last = kNone;
+std::uint64_t last_views[10] = {};
+std::uint32_t cur_count = 0;
+std::string trace, cur_what;
+bool traced = false, trace_on = false;
+int trace_cmdbufs = 0;
+inline void bump(std::atomic<std::uint64_t>& c) { c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+// From the first command buffer begun at flip N, 40 command buffers (two frames or so).
+bool tracing() { return trace_on; }
+void trace_cmdbuf() {
+    if (!trace_flip || traced) return;
+    if (!trace_on) {
+        trace_on = hle_video_flip_count() >= trace_flip;
+        return;
+    }
+    if (++trace_cmdbufs >= 40) {
+        traced = true;
+        trace_on = false;
+        host_log("recorder: encoders from flip %llu: %s", static_cast<unsigned long long>(trace_flip), trace.c_str());
+        trace.clear();
+    }
+}
+void close() {
+    if (cur == kNone) return;
+    if (tracing()) {
+        char b[48];
+        std::snprintf(b, sizeof(b), "%c%u", cur == kRender ? 'R' : cur == kCompute ? 'C' : 'B', cur_count);
+        trace += b;
+        trace += cur_what;
+        trace += ' ';
+    }
+    if (cur == kRender && !cur_count) bump(empty_pass);
+    last = cur;
+    cur = kNone;
+}
+void open(int k, const char* what = "") {
+    close();
+    bump(opened[last][k]);
+    if (bars_since) bump(opened_barred[last][k]);
+    bars_since = 0;
+    cur = k;
+    cur_count = 0;
+    cur_what = what;
+}
+// A command that runs in an encoder of kind k (not a render pass's).
+void cmd(int k, char tag) {
+    if (!on) return;
+    if (cur != k) open(k);
+    ++cur_count;
+    bars_since = 0;
+    if (k == kBlit && tracing() && (cur_what.empty() || cur_what.back() != tag)) cur_what += tag;
+}
+void begin_pass(const VkRenderingInfo& ri) {
+    if (!on) return;
+    std::uint64_t v[10] = {};
+    for (std::uint32_t k = 0; k < ri.colorAttachmentCount && k < 8; ++k) v[k] = reinterpret_cast<std::uint64_t>(ri.pColorAttachments[k].imageView);
+    if (ri.pDepthAttachment) v[8] = reinterpret_cast<std::uint64_t>(ri.pDepthAttachment->imageView);
+    v[9] = (static_cast<std::uint64_t>(ri.renderArea.extent.width) << 32) | ri.renderArea.extent.height;
+    const bool same = last == kRender && cur == kNone && std::memcmp(v, last_views, sizeof(v)) == 0;
+    std::memcpy(last_views, v, sizeof(v));
+    if (same) bump(same_pass);
+    char b[32];
+    std::snprintf(b, sizeof(b), "%s@%u", same ? "=" : "", ri.renderArea.extent.width);
+    open(kRender, tracing() ? b : "");
+}
+void end_pass() {
+    if (on) close();
+}
+// A barrier of kind b about to be recorded: false when BBHOST_BARRIER_SKIP drops it.
+bool barrier(int b) {
+    if (on) {
+        bump(bars[b]);
+        if (bars_since++) bump(bars_b2b);
+        if (tracing()) trace += "b";
+    }
+    return !(skip >> b & 1);
+}
+void draw() {
+    if (!on) return;
+    ++cur_count;
+    bars_since = 0;
+    bump(draws);
+}
+void clear() {
+    if (!on) return;
+    open(kRender, "K");
+    bump(clears);
+    close();
+}
+void cmdbuf() {
+    if (!on) return;
+    close();
+    bump(cmdbufs);
+    trace_cmdbuf();
+    if (tracing()) trace += "| ";
+    last = kNone;
+}
+void in_place(void* site) {
+    if (!on) return;
+    close();
+    bump(inplace);
+    if (tracing()) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "X%llx ", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(site) - host_image_base()));
+        trace += b;
+    }
+}
+void report(double flips) {
+    if (!on) return;
+    std::uint64_t n[kKinds] = {};
+    for (int a = 0; a < kKinds; ++a) {
+        for (int b = 0; b < kKinds; ++b) n[b] += opened[a][b].load(std::memory_order_relaxed);
+    }
+    static std::uint64_t ln[kKinds] = {}, lm[kKinds][kKinds] = {}, lc = 0, ls = 0, lb = 0, li = 0, ld = 0, le = 0;
+    const auto per = [flips](std::uint64_t v) { return static_cast<double>(v) / flips; };
+    const auto m = [&](int a, int b) { return per(opened[a][b].load() - lm[a][b]); };
+    char buf[600];
+    std::snprintf(buf, sizeof(buf),
+                  "encoders (model) per flip: render %.1f (clears %.1f, same targets as the pass before %.1f, empty %.1f), compute %.1f, "
+                  "blit %.1f; command buffers %.1f, in place %.1f, draws %.1f; render after render %.1f / compute %.1f / blit %.1f; "
+                  "compute after render %.1f / blit %.1f; blit after render %.1f / compute %.1f",
+                  per(n[kRender] - ln[kRender]), per(clears.load() - lc), per(same_pass.load() - ls), per(empty_pass.load() - le),
+                  per(n[kCompute] - ln[kCompute]), per(n[kBlit] - ln[kBlit]), per(cmdbufs.load() - lb), per(inplace.load() - li),
+                  per(draws.load() - ld), m(kRender, kRender), m(kCompute, kRender), m(kBlit, kRender), m(kRender, kCompute),
+                  m(kBlit, kCompute), m(kRender, kBlit), m(kCompute, kBlit));
+    static std::uint64_t lbar[kBars] = {}, lb2b = 0, lmb[kKinds][kKinds] = {};
+    const auto bm = [&](int a, int b) { return per(opened_barred[a][b].load() - lmb[a][b]); };
+    double nbars = 0;
+    for (int b = 0; b < kBars; ++b) nbars += per(bars[b].load() - lbar[b]);
+    char bb[600];
+    std::snprintf(bb, sizeof(bb),
+                  "barriers per flip %.1f (pass end %.1f, transfer begin %.1f / end %.1f, copy order %.1f, memory %.1f, image %.1f; "
+                  "back to back %.1f); switches across a barrier: render>render %.1f, render>compute %.1f, render>blit %.1f, "
+                  "compute>render %.1f, compute>compute %.1f, compute>blit %.1f, blit>render %.1f, blit>compute %.1f, blit>blit %.1f, "
+                  "from none %.1f",
+                  nbars, per(bars[kBarPass].load() - lbar[kBarPass]), per(bars[kBarXferBegin].load() - lbar[kBarXferBegin]),
+                  per(bars[kBarXferEnd].load() - lbar[kBarXferEnd]), per(bars[kBarCopyOrder].load() - lbar[kBarCopyOrder]),
+                  per(bars[kBarMem].load() - lbar[kBarMem]), per(bars[kBarImage].load() - lbar[kBarImage]), per(bars_b2b.load() - lb2b),
+                  bm(kRender, kRender), bm(kRender, kCompute), bm(kRender, kBlit), bm(kCompute, kRender), bm(kCompute, kCompute),
+                  bm(kCompute, kBlit), bm(kBlit, kRender), bm(kBlit, kCompute), bm(kBlit, kBlit),
+                  bm(kNone, kRender) + bm(kNone, kCompute) + bm(kNone, kBlit));
+    for (int b = 0; b < kBars; ++b) lbar[b] = bars[b].load();
+    lb2b = bars_b2b.load();
+    for (int a = 0; a < kKinds; ++a) {
+        for (int b = 0; b < kKinds; ++b) lmb[a][b] = opened_barred[a][b].load();
+    }
+    for (int a = 0; a < kKinds; ++a) {
+        ln[a] = n[a];
+        for (int b = 0; b < kKinds; ++b) lm[a][b] = opened[a][b].load();
+    }
+    lc = clears.load();
+    ls = same_pass.load();
+    lb = cmdbufs.load();
+    li = inplace.load();
+    ld = draws.load();
+    le = empty_pass.load();
+    host_log("  %s", buf);  // each its own line: past 1 KB host_log cuts
+    host_log("  %s", bb);
+    std::vector<std::pair<void*, std::uint64_t>> v(bar_sites.begin(), bar_sites.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string sites = "barrier sites per flip:";
+    for (std::size_t i = 0; i < v.size() && i < 8; ++i) {
+        char e[64];
+        std::snprintf(e, sizeof(e), " %llx=%.1f", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(v[i].first) - host_image_base()),
+                      per(v[i].second));
+        sites += e;
+    }
+    bar_sites.clear();
+    host_log("  %s", sites.c_str());
+}
+}  // namespace enc
+
 // How long the recorder spins for the next block before it sleeps, in
 // pauses (BBHOST_RECORDER_SPIN, 4000). That rides the few microseconds between
 // a burst's draws. On a Steam Deck 61% of the recorder's time is this loop and
@@ -319,23 +519,29 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         }
         vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(p.writes.size()), p.writes.data(), 0, nullptr);
     }
-    if (p.end_pass) record_end_rendering(cmd, p.end_pass_barrier);
-    if (p.pass_barrier) record_pass_barrier(cmd);
-    if (p.xfer_begin) record_transfer_barrier(cmd, true);
-    for (std::uint32_t k = 0; k < p.ncopies; ++k) {
-        if (p.copy_orders >> k & 1) record_copy_order_barrier(cmd);
-        vkCmdCopyBuffer(cmd, p.copy_src[k], p.copy_dst[k], 1, &p.copies[k]);
+    if (p.end_pass) {
+        record_end_rendering(cmd, p.end_pass_barrier && enc::barrier(enc::kBarPass));
+        enc::end_pass();
     }
-    if (p.xfer_end) record_transfer_barrier(cmd, false);
+    if (p.pass_barrier && enc::barrier(enc::kBarPass)) record_pass_barrier(cmd);
+    if (p.xfer_begin && enc::barrier(enc::kBarXferBegin)) record_transfer_barrier(cmd, true);
+    for (std::uint32_t k = 0; k < p.ncopies; ++k) {
+        if ((p.copy_orders >> k & 1) && enc::barrier(enc::kBarCopyOrder)) record_copy_order_barrier(cmd);
+        vkCmdCopyBuffer(cmd, p.copy_src[k], p.copy_dst[k], 1, &p.copies[k]);
+        enc::cmd(enc::kBlit, 'x');
+    }
+    if (p.xfer_end && enc::barrier(enc::kBarXferEnd)) record_transfer_barrier(cmd, false);
     for (std::uint32_t k = 0; k < p.nregions; ++k) {
         const DrawPacket::RegionCopy& r = p.regions[k];
         record_region_copy(cmd, r.src, r.dst, r.width, r.height, r.dst_initialised);
+        enc::cmd(enc::kBlit, 'r');
     }
     if (p.begin_pass) {
         p.rendering.pColorAttachments = p.colors;
         p.rendering.pDepthAttachment = p.has_depth ? &p.depth_att : nullptr;
         p.rendering.pStencilAttachment = p.has_stencil ? &p.stencil_att : nullptr;
         vkCmdBeginRendering(cmd, &p.rendering);
+        enc::begin_pass(p.rendering);
     }
     if (p.pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
@@ -364,7 +570,10 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
     if (p.index) vkCmdBindIndexBuffer(cmd, p.index_buffer, p.index_offset, p.index_type);
     if (p.vertex_buffers) vkCmdBindVertexBuffers(cmd, 0, p.vertex_buffers, p.vb, p.vb_offset);
     if (p.marker) gpu_write_markers(cmd, p.marker_value);
-    if (p.draw) record_draw_call(cmd, p.call);
+    if (p.draw) {
+        record_draw_call(cmd, p.call);
+        enc::draw();
+    }
 }
 
 // ---- reading records ----
@@ -392,6 +601,7 @@ void replay_block(const Block& b) {
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             const std::uint64_t t0 = host_clock_monotonic_ns();
             vkBeginCommandBuffer(r->cmd, &bi);
+            enc::cmdbuf();
             add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
             break;
         }
@@ -399,6 +609,7 @@ void replay_block(const Block& b) {
             const auto* r = reinterpret_cast<const stream::EndSubmit*>(p);
             const std::uint64_t t0 = host_clock_monotonic_ns();
             vkEndCommandBuffer(r->cmds[r->ncmds - 1]);
+            enc::cmdbuf();
             add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
             add_relaxed(g_stream_stats.endbegin_n, 1);
             // R4: this core's commands are in memory before another thread
@@ -425,14 +636,26 @@ void replay_block(const Block& b) {
             const auto* mem = tail<VkMemoryBarrier>(q, r->nmem);
             const auto* buf = tail<VkBufferMemoryBarrier>(q, r->nbuf);
             const auto* img = tail<VkImageMemoryBarrier>(q, r->nimg);
+            if (!enc::barrier(r->nimg || r->nbuf ? enc::kBarImage : enc::kBarMem)) break;
             vkCmdPipelineBarrier(cmd, r->src, r->dst, r->dep, r->nmem, r->nmem ? mem : nullptr, r->nbuf, r->nbuf ? buf : nullptr, r->nimg,
                                  r->nimg ? img : nullptr);
             break;
         }
-        case Op::kTransferBarrier: record_transfer_barrier(cmd, reinterpret_cast<const stream::Flag*>(p)->value != 0); break;
-        case Op::kCopyOrderBarrier: record_copy_order_barrier(cmd); break;
-        case Op::kPassBarrier: record_pass_barrier(cmd); break;
-        case Op::kEndRendering: record_end_rendering(cmd, reinterpret_cast<const stream::Flag*>(p)->value != 0); break;
+        case Op::kTransferBarrier: {
+            const bool begin = reinterpret_cast<const stream::Flag*>(p)->value != 0;
+            if (enc::barrier(begin ? enc::kBarXferBegin : enc::kBarXferEnd)) record_transfer_barrier(cmd, begin);
+            break;
+        }
+        case Op::kCopyOrderBarrier:
+            if (enc::barrier(enc::kBarCopyOrder)) record_copy_order_barrier(cmd);
+            break;
+        case Op::kPassBarrier:
+            if (enc::barrier(enc::kBarPass)) record_pass_barrier(cmd);
+            break;
+        case Op::kEndRendering:
+            record_end_rendering(cmd, reinterpret_cast<const stream::Flag*>(p)->value != 0 && enc::barrier(enc::kBarPass));
+            enc::end_pass();
+            break;
         case Op::kBeginRendering: {
             const auto* r = reinterpret_cast<const stream::BeginRendering*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
@@ -448,40 +671,47 @@ void replay_block(const Block& b) {
             ri.pDepthAttachment = r->has_depth ? att + r->ncolor : nullptr;
             ri.pStencilAttachment = r->has_stencil ? att + r->ncolor + r->has_depth : nullptr;
             vkCmdBeginRendering(cmd, &ri);
+            enc::begin_pass(ri);
             break;
         }
         case Op::kFill: {
             const auto* r = reinterpret_cast<const stream::Fill*>(p);
             vkCmdFillBuffer(cmd, r->buffer, r->offset, r->size, r->data);
+            enc::cmd(enc::kBlit, 'f');
             break;
         }
         case Op::kCopyBuffer: {
             const auto* r = reinterpret_cast<const stream::CopyBuffer*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdCopyBuffer(cmd, r->src, r->dst, r->n, tail<VkBufferCopy>(q, r->n));
+            enc::cmd(enc::kBlit, 'c');
             break;
         }
         case Op::kCopyBufferToImage: {
             const auto* r = reinterpret_cast<const stream::CopyBufferToImage*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdCopyBufferToImage(cmd, r->buffer, r->image, r->layout, r->n, tail<VkBufferImageCopy>(q, r->n));
+            enc::cmd(enc::kBlit, 'u');
             break;
         }
         case Op::kCopyImageToBuffer: {
             const auto* r = reinterpret_cast<const stream::CopyImageToBuffer*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdCopyImageToBuffer(cmd, r->image, r->layout, r->buffer, r->n, tail<VkBufferImageCopy>(q, r->n));
+            enc::cmd(enc::kBlit, 'd');
             break;
         }
         case Op::kClearColor: {
             const auto* r = reinterpret_cast<const stream::ClearColor*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdClearColorImage(cmd, r->image, r->layout, &r->color, r->n, tail<VkImageSubresourceRange>(q, r->n));
+            enc::clear();
             break;
         }
         case Op::kResetQueries: {
             const auto* r = reinterpret_cast<const stream::Queries*>(p);
             vkCmdResetQueryPool(cmd, r->pool, r->first, r->count);
+            enc::cmd(enc::kBlit, 'q');
             break;
         }
         case Op::kBeginQuery: {
@@ -497,6 +727,7 @@ void replay_block(const Block& b) {
         case Op::kCopyQueryResults: {
             const auto* r = reinterpret_cast<const stream::CopyQueryResults*>(p);
             vkCmdCopyQueryPoolResults(cmd, r->pool, r->first, r->count, r->dst, r->offset, r->stride, r->flags);
+            enc::cmd(enc::kBlit, 'Q');
             break;
         }
         case Op::kTimestamp: {
@@ -548,12 +779,14 @@ void replay_block(const Block& b) {
         case Op::kDispatch: {
             const auto* r = reinterpret_cast<const stream::Dispatch*>(p);
             vkCmdDispatch(cmd, r->x, r->y, r->z);
+            enc::cmd(enc::kCompute, 'D');
             break;
         }
         case Op::kClearDepth: {
             const auto* r = reinterpret_cast<const stream::ClearDepth*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdClearDepthStencilImage(cmd, r->image, r->layout, &r->value, r->n, tail<VkImageSubresourceRange>(q, r->n));
+            enc::clear();
             break;
         }
         case Op::kMarker: {
@@ -564,11 +797,13 @@ void replay_block(const Block& b) {
             const auto* r = reinterpret_cast<const stream::CopyImage*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdCopyImage(cmd, r->src, r->src_layout, r->dst, r->dst_layout, r->n, tail<VkImageCopy>(q, r->n));
+            enc::cmd(enc::kBlit, 'i');
             break;
         }
         case Op::kDispatchIndirect: {
             const auto* r = reinterpret_cast<const stream::DispatchIndirect*>(p);
             vkCmdDispatchIndirect(cmd, r->buffer, r->offset);
+            enc::cmd(enc::kCompute, 'D');
             break;
         }
         case Op::kCount: break;
@@ -798,6 +1033,7 @@ VkCommandBuffer in_place(void* site) {
         recorder_drain();
         if (g_mode == kModeThread) g_inplace_dirty = true;
     }
+    enc::in_place(site);
     return g.cmd_;
 }
 
@@ -937,6 +1173,7 @@ std::string recorder_report() {
                            ull((r_ns - last.retire_ns) / 1000), ull(r_n - last.retires), ull((f_ns - last.fence_ns) / 1000));
     }
     std::string out = buf;
+    if (enc::on) enc::report(flip > last.flip ? static_cast<double>(flip - last.flip) : 1.0);
     if (g_census_on && !g_census.empty()) {
         // The in-place recording sites, the top twelve, as offsets in
         // bbhost's image (tools/gpu_gaps.py --census names them).
@@ -1015,6 +1252,7 @@ void Rec::pipeline_barrier(VkPipelineStageFlags src, VkPipelineStageFlags dst, V
                            const VkMemoryBarrier* mem, std::uint32_t nbuf, const VkBufferMemoryBarrier* buf, std::uint32_t nimg,
                            const VkImageMemoryBarrier* img) {
     if (nimg && g_clears_pending) pending_clears_flush_locked("an image barrier");  // a transition could discard what they clear
+    if (enc::on) ++enc::bar_sites[REC_SITE];
     bool chained = false;
     for (std::uint32_t k = 0; k < nmem; ++k) chained |= mem[k].pNext != nullptr;
     for (std::uint32_t k = 0; k < nbuf; ++k) chained |= buf[k].pNext != nullptr;
