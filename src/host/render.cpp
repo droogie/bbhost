@@ -1974,9 +1974,50 @@ bool relax_contraction_on() {
     return on;
 }
 
+// BBHOST_SPIRV_SALT=<text> (checks): names module-scope variables <text>_<id>
+// so neither the pipeline cache nor Metal's own shader cache (which a fresh
+// data folder leaves warm) hits: a cold-compile run. Names change nothing else.
+std::vector<std::uint32_t> salt_names(const std::vector<std::uint32_t>& in) {
+    static const std::string salt = [] {
+        const char* e = std::getenv("BBHOST_SPIRV_SALT");
+        return std::string(e ? e : "");
+    }();
+    if (salt.empty() || in.size() < 5) return {};
+    std::unordered_set<std::uint32_t> vars;
+    for (std::size_t at = 5; at < in.size();) {
+        const std::uint32_t count = in[at] >> 16, op = in[at] & 0xffff;
+        if (count == 0 || at + count > in.size()) return {};
+        if (op == 59 && count >= 4 && in[at + 3] != 7) vars.insert(in[at + 2]);  // OpVariable, not Function storage
+        at += count;
+    }
+    std::vector<std::uint32_t> out(in.begin(), in.begin() + 5);
+    bool named = false;
+    for (std::size_t at = 5; at < in.size();) {
+        const std::uint32_t count = in[at] >> 16, op = in[at] & 0xffff;
+        // Capability..MemberName: names go after these, before decorations.
+        static const std::unordered_set<std::uint32_t> before = {0, 2, 3, 4, 5, 6, 7, 10, 11, 14, 15, 16, 17, 331};
+        if (!named && !before.count(op)) {
+            named = true;
+            for (const std::uint32_t id : vars) {
+                const std::string name = salt + "_" + std::to_string(id);
+                const std::size_t words = name.size() / 4 + 1;
+                out.push_back(static_cast<std::uint32_t>((2 + words) << 16 | 5));  // OpName
+                out.push_back(id);
+                std::vector<std::uint32_t> text(words, 0);
+                std::memcpy(text.data(), name.data(), name.size());
+                out.insert(out.end(), text.begin(), text.end());
+            }
+        }
+        if (!(op == 5 && count >= 2 && vars.count(in[at + 1]))) out.insert(out.end(), in.begin() + at, in.begin() + at + count);
+        at += count;
+    }
+    return out;
+}
+
 bool make_module(const std::vector<std::uint32_t>& spirv, VkShaderModule& out) {
     std::vector<std::uint32_t> relaxed;
     if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, spv::RelaxStages::Fragment);
+    if (std::vector<std::uint32_t> salted = salt_names(relaxed.empty() ? spirv : relaxed); !salted.empty()) relaxed = std::move(salted);
     const std::vector<std::uint32_t>& words = relaxed.empty() ? spirv : relaxed;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smci.codeSize = words.size() * 4;
