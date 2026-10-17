@@ -9,6 +9,7 @@
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
+#include "host/spirv_relax.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
 
@@ -1952,10 +1953,34 @@ void dump_buffers(const std::string& name, const gcn::TranslateResult& meta, std
     }
 }
 
+// Whether shader modules lose their NoContraction decorations on the way to
+// the driver (spv::relax_contraction). MoltenVK's SPIR-V to MSL conversion
+// makes each decorated op a call to a [[clang::optnone]] helper, which made
+// the pixel shaders 4-20x slower (a clinic frame 132 -> 39 ms at 1080p); other
+// drivers fuse nothing they were told not to, at no cost, so they keep them.
+// Done here rather than in the translator so the translation cache, the
+// lifter's byte-identical checks and every other driver see the same modules
+// as before. BBHOST_NO_CONTRACTION=1 keeps every decoration (an A/B switch).
+bool relax_contraction_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_NO_CONTRACTION");
+        const bool keep = e && e[0] == '1';
+        if (g.moltenvk) {
+            host_log("gpu: NoContraction %s in fragment stages (MoltenVK)%s", keep ? "kept" : "dropped",
+                     keep ? " - BBHOST_NO_CONTRACTION=1" : ", except what feeds FragDepth and discards");
+        }
+        return g.moltenvk && !keep;
+    }();
+    return on;
+}
+
 bool make_module(const std::vector<std::uint32_t>& spirv, VkShaderModule& out) {
+    std::vector<std::uint32_t> relaxed;
+    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, spv::RelaxStages::Fragment);
+    const std::vector<std::uint32_t>& words = relaxed.empty() ? spirv : relaxed;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = spirv.size() * 4;
-    smci.pCode = spirv.data();
+    smci.codeSize = words.size() * 4;
+    smci.pCode = words.data();
     return vkCreateShaderModule(g.device, &smci, nullptr, &out) == VK_SUCCESS;
 }
 
