@@ -17,6 +17,10 @@
 //              the comparison must flag exactly that texel. A perturbed copy of
 //              A's output checks the comparator the same way.
 //   variant    --ps: the same draw with another pixel shader, against A.
+// --bench N: alternating timed batches of N draws, captured modules and variant.
+// --bench-split: a pass per repeat, since a tiler shades an opaque draw repeated
+// in one pass once, plus an empty-pass series to subtract (empty_ms_per_draw).
+// --bench-wall: submit-to-fence time. --bench-batches: how many batches.
 // --specialize: every run's stages take the specialization constants bbhost's
 // optimized relink gives them (render.cpp relink_pipeline): the vertex
 // formats as constants for a vertex shader that reads them from its params,
@@ -56,6 +60,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -624,6 +629,7 @@ struct RunResult {
     // order (StageData::buffer_written).
     std::vector<std::vector<std::uint8_t>> stored;
     double gpu_ms = -1.0;             // RunOptions::timed: GPU time of the draws
+    double wall_ms = -1.0;            // the submission holding the draws, submit to fence (--bench-wall)
 };
 
 struct RunOptions {
@@ -636,6 +642,8 @@ struct RunOptions {
     bool timed = false;        // timestamps around the draws
     bool library = false;      // the pipeline is linked from libraries: independent sets, depth/stencil/cull state set per draw
     bool native = false;       // --native: the game-hull draw's three lifted stages on stage I/O (Replayer::native_pipeline)
+    bool split = false;        // --bench-split: each repeat in a render pass of its own
+    bool nodraw = false;       // --bench-split's empty series: the passes without the draws
     bool ls_set4 = false;      // --ls-set4: the variant's LS binds its constant buffers in set 4 (Replayer::load_ls_set4)
 };
 
@@ -1280,6 +1288,7 @@ public:
             qci.queryCount = 2;
             check(vkCreateQueryPool(dev_.device, &qci, nullptr, &qpool), "vkCreateQueryPool");
         }
+        const auto wall0 = std::chrono::steady_clock::now();
         dev_.submit([&](VkCommandBuffer cmd) {
             if (qpool) vkCmdResetQueryPool(cmd, qpool, 0, 2);
             std::vector<VkRenderingAttachmentInfo> atts;
@@ -1305,6 +1314,8 @@ public:
             ri.pColorAttachments = atts.data();
             if (has_depth_) ri.pDepthAttachment = &depth;
             if (has_stencil_) ri.pStencilAttachment = &depth;
+            // Outside the pass: Apple GPUs time only at encoder boundaries.
+            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
             vkCmdBeginRendering(cmd, &ri);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ro.pipeline);
             const bool set4 = ro.native || ro.ls_set4;
@@ -1370,7 +1381,6 @@ public:
                 if (index_.size < static_cast<VkDeviceSize>(count) * (type == VK_INDEX_TYPE_UINT32 ? 4 : 2)) fail("index blob shorter than the draw");
                 vkCmdBindIndexBuffer(cmd, index_.buffer, 0, type);
             }
-            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
             if (ro.native) {
                 // The game's draw (tessellation.draw): its index range, instances and base vertex.
                 const json::Value& nd = json::member(*tessellation(), "draw");
@@ -1382,12 +1392,17 @@ public:
                 }
             } else {
                 for (std::uint32_t k = 0; k < std::max(ro.repeat, 1u); ++k) {
+                    if (ro.split && k) {
+                        vkCmdEndRendering(cmd);
+                        vkCmdBeginRendering(cmd, &ri);
+                    }
+                    if (ro.nodraw) continue;
                     if (indexed) vkCmdDrawIndexed(cmd, count, instances, 0, base_vertex, 0);
                     else vkCmdDraw(cmd, count, instances, static_cast<std::uint32_t>(base_vertex), 0);
                 }
             }
-            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
             vkCmdEndRendering(cmd);
+            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
             for (Plane& p : planes) {
                 VkBufferImageCopy r{};
                 r.imageSubresource = {p.out.aspect, 0, 0, 1};
@@ -1395,9 +1410,11 @@ public:
                 vkCmdCopyImageToBuffer(cmd, p.image, VK_IMAGE_LAYOUT_GENERAL, p.staging.buffer, 1, &r);
             }
         });
+        const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
 
         RunResult result;
         result.name = ro.name;
+        result.wall_ms = wall_ms;
         if (qpool) {
             std::uint64_t ts[2] = {};
             check(vkGetQueryPoolResults(dev_.device, qpool, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
@@ -1964,13 +1981,16 @@ struct Options {
     bool live = true;
     bool validate = false;
     std::uint32_t bench = 0;  // draws per timed batch
+    int bench_batches = 16;   // --bench-batches N: timed batches per series (after 3 warm-up batches)
+    bool bench_split = false; // --bench-split: one render pass per repeat, and an empty-pass series to subtract
+    bool bench_wall = false;  // --bench-wall: submit-to-fence wall time instead of GPU timestamps
     bool library = false;     // the variant is linked from pipeline libraries (BBHOST_PIPELINE_LIBRARY)
     bool specialize = false;  // every run with the optimized relink's specialization constants
 };
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
-                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N]\n");
+                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N] [--bench-batches N] [--bench-split] [--bench-wall]\n");
     std::exit(2);
 }
 
@@ -1996,6 +2016,9 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--no-live") o.live = false;
         else if (a == "--validate") o.validate = true;
         else if (a == "--bench") o.bench = static_cast<std::uint32_t>(std::strtoul(value().c_str(), nullptr, 10));
+        else if (a == "--bench-batches") o.bench_batches = std::max(1, std::atoi(value().c_str()));
+        else if (a == "--bench-split") o.bench_split = true;
+        else if (a == "--bench-wall") o.bench_wall = true;
         else if (!a.empty() && a[0] == '-') usage();
         else if (o.capture.empty()) o.capture = a;
         else usage();
@@ -2627,18 +2650,21 @@ int replay_main(const Options& o) {
                           "and are not compared; capture/replay builds are not the game's timing runs");
         // Warm-up batches are discarded (pipeline finalisation, caches), and the
         // order alternates so drift over the run favours neither pipeline.
-        constexpr int kWarmup = 3, kBatches = 16;
-        std::vector<double> translated, variant;
+        constexpr int kWarmup = 3;
+        const int kBatches = o.bench_batches;
+        std::vector<double> translated, variant, empty;
         for (int k = 0; k < kWarmup + kBatches; ++k) {
             RunOptions b;
             b.name = "bench";
             b.timed = true;
             b.repeat = o.bench;
+            b.split = o.bench_split;
             const auto time = [&](VkPipeline p, bool native, bool set4) {
                 b.pipeline = p;
                 b.native = native;
                 b.ls_set4 = set4;
-                return r.run(b).gpu_ms / o.bench;
+                const RunResult rr = r.run(b);
+                return (o.bench_wall ? rr.wall_ms : rr.gpu_ms) / o.bench;
             };
             const VkPipeline other = variant_pipeline ? variant_pipeline : native_pipeline;
             const bool other_native = !variant_pipeline && native_pipeline;
@@ -2651,7 +2677,14 @@ int replay_main(const Options& o) {
                 tc = time(captured, false, false);
                 if (other) tv = time(other, other_native, other_set4);
             }
+            double te = 0.0;
+            if (o.bench_split) {
+                b.nodraw = true;
+                te = time(captured, false, false);
+                b.nodraw = false;
+            }
             if (k < kWarmup) continue;
+            if (o.bench_split) empty.push_back(te);
             translated.push_back(tc);
             if (other) variant.push_back(tv);
         }
@@ -2673,6 +2706,10 @@ int replay_main(const Options& o) {
             bench.set("variant_median_ms", median(variant));
             if (!variant_pipeline) bench.set("variant_is_native", true);
             std::printf("  bench: %s %.4f ms per draw\n", variant_pipeline ? "variant" : "native pipeline", median(variant));
+        }
+        if (!empty.empty()) {
+            bench.set("empty_ms_per_draw", series(empty));
+            bench.set("empty_median_ms", median(empty));
         }
         report.set("bench", bench);
     }
