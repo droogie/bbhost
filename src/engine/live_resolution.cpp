@@ -251,8 +251,9 @@ std::vector<std::uint64_t> g_ctxs;  // under g_ctx_mu
 bool g_ctx_untracked = false;       // the destructor is not hooked: leave them be
 std::atomic<int> g_ctx_gone{0};     // taken off by the destructor since the last change
 GUEST_ABI std::int64_t scene_ctx_ctor_hook(std::uint64_t, const std::uint64_t* saved) {
-    std::lock_guard<std::mutex> lk(g_ctx_mu);
     const std::uint64_t c = saved[5];
+    graphics_scene_context_made(c);  // its SSAO and AA given again (engine/graphics_patch.h)
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
     if (std::find(g_ctxs.begin(), g_ctxs.end(), c) == g_ctxs.end()) g_ctxs.push_back(c);
     return 0;
 }

@@ -20,6 +20,13 @@ bool guest_protect_rwx(GuestMemory* mem, std::uint64_t va, std::size_t size);
 // whose pages other writers put back to read-only after their own writes
 // (live resolution's plate sizes share one).
 void guest_keep_writable(GuestMemory* mem, std::uint64_t va);
+// The image's executable segment (core/elf.cpp, once it is sealed): a
+// guest_protect_rw over any of it keeps execute there. The segment holds the
+// read-only data too, and code is written into it - a patch manifest's cave
+// over unused strings (patches/debug-dash.toml) - which a later write of a
+// value on the same page (the debug menu's font paths, a plugin's write) left
+// unexecutable: the game faulted when it next ran the cave.
+void guest_mark_executable(GuestMemory* mem, std::uint64_t va, std::size_t size);
 
 inline void* guest_ptr(const GuestMemory& mem, std::uint64_t va) {
     return static_cast<std::uint8_t*>(mem.base) + (va - mem.slide);

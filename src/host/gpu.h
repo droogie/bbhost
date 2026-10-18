@@ -293,6 +293,19 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes); 
 // host_gpu_mem_write that also reports the submission serial the write is recorded
 // into: it is in memory once host_gpu_completed_submits() is past that serial.
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// A CP write that must land after GPU work already recorded (what the CP writes
+// itself after a wait it passed on a label that work is still to write): on the
+// GPU's timeline in stream order whatever its size, not held back to the end of
+// the command buffer as a small host_gpu_mem_write is, and seen by the reads
+// made while recording. False - the caller waits for the GPU and writes on the
+// CPU - when the range is not imported, is over 64 KiB, or may hold a texture or
+// a render target (their caches follow the CPU's writes).
+bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// Guest memory as the work being recorded now will see it (the CP writes still
+// queued applied on top), and whether a GPU write recorded into a submission
+// that has not run yet covers any of it.
+void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out);
+bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes);
 // Submissions whose fence has retired, in order (trails the GPU: a write may be
 // in memory before this passes its serial).
 std::uint64_t host_gpu_completed_submits();
@@ -508,6 +521,18 @@ void host_gpu_queue_unlock();
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence);
 void host_gpu_queue_lock_only();  // the queue's mutex without waiting for the thread (after host_gpu_wait_submitted)
 void host_gpu_wait_submitted(std::uint64_t ticket);
+// The presenter's own queue (host/window.cpp, BBHOST_PRESENT_OWN_QUEUE): its
+// copy of a frame goes on the second queue and waits there for the game's
+// submissions up to that frame on `host_gpu_timeline()` (the VkSemaphore the
+// game's submissions signal, serial + 1 each; null without one) - not behind
+// everything the game queued since. It signals `host_gpu_present_timeline()`
+// (null without one) with the value it registered, under the renderer's lock,
+// with host_gpu_present_reads_locked: the slot being recorded then does not
+// retire - free the images and descriptor sets the copy may read - before
+// that value is reached.
+void* host_gpu_timeline();
+void* host_gpu_present_timeline();
+void host_gpu_present_reads_locked(std::uint64_t target);
 // How busy the GPU is with our work (gpu_busy.cpp): the union of the time
 // our command buffers - the game's and the presenter's - spent on the GPU,
 // from a timestamp at each one's start and end. Windows' per-process GPU
@@ -539,6 +564,10 @@ std::string host_gpu_busy_report();
 // Submitting whatever the command processor had recorded of the *next* frame
 // broke its render pass and cost a submission on every presented frame.
 bool host_gpu_submit_for_flip(std::uint64_t need);
+// Until the game's submissions a flip needs (host_gpu_work_needs() as it
+// arrived) have been handed to the driver's queue - not run: the presenter's
+// copy on its own queue then waits on the GPU for a value already on its way.
+void host_gpu_wait_work_submitted(std::uint64_t need);
 // The render target the game displays (its VA from sceVideoOutRegisterBuffers)
 // as an image to sample: VkImage, VkFormat, its size; false when the VA is not
 // a drawn render target. Caller holds the renderer's lock (host_gpu_lock) and
@@ -589,6 +618,12 @@ std::uint64_t host_gpu_draw_mark();
 // and how many have (~0 with no GPU to wait for).
 std::uint64_t host_gpu_work_needs();
 std::uint64_t host_gpu_submissions_completed();
+// The GPU's PCI vendor (0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel); 0 before the device is made.
+std::uint32_t host_gpu_vendor_id();
+// Sleeps until `need` submissions have finished (the timeline semaphore) or
+// `timeout_ns` passed: true when they have. False at once without a timeline
+// (the caller polls host_gpu_submissions_completed as before).
+bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns);
 const char* host_present_step(double& seconds);  // window.cpp: what the presenting thread is doing  // BBHOST_STALL_TEST: hold the renderer, as a frame dump does
 // Last few recorded draws, read without the renderer lock: for the watchdog,
 // which runs precisely when some thread is stuck holding it.

@@ -56,12 +56,28 @@ bool program_allows_native_half_rtz(const Program& prog) {
     return true;
 }
 
-bool legacy_mul_min_form() {
+// BBHOST_LEGACY_MUL=plain (a measurement, not a mode to play with): an
+// ordinary multiply, which gives NaN for 0 x inf where GCN gives 0 - what the
+// zero rule's two or three extra instructions cost, as an upper bound.
+bool legacy_mul_plain() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_LEGACY_MUL");
-        return !(e && std::strcmp(e, "select") == 0);
+        return e && std::strcmp(e, "plain") == 0;
     }();
     return on;
+}
+
+namespace {
+std::atomic<bool> g_legacy_mul_select{false};
+}
+void set_legacy_mul_select(bool on) { g_legacy_mul_select.store(on, std::memory_order_relaxed); }
+bool legacy_mul_min_form() {
+    // BBHOST_LEGACY_MUL=min or =select decides; otherwise the device's form.
+    static const int forced = [] {
+        const char* e = std::getenv("BBHOST_LEGACY_MUL");
+        return e && std::strcmp(e, "select") == 0 ? 0 : e && std::strcmp(e, "min") == 0 ? 1 : -1;
+    }();
+    return forced >= 0 ? forced == 1 : !g_legacy_mul_select.load(std::memory_order_relaxed);
 }
 
 spv::Id emit_rtz_half(spv::Module& m, const SpvScalarTypes& t, spv::Id x) {

@@ -1,0 +1,25 @@
+# FXAA2_GS + DLAA_GS: Kyo's 1.09 patch from his shadPS4 list (Bloodborne.xml),
+# byte for byte. Off until turned on (the setup window's Patches tab, or
+# fxaa2-gs-dlaa-gs = true under [patches] in bbhost.toml).
+#
+# The anti-aliasing setup at 0x26a07a6 sets up both YEBIS filters where the
+# game picks one: the block that tested a flag (+0x49 bit 2) and called the
+# one filter's setup (0x12596f0) now calls it for the first, sets its mode
+# words (+9 = 1, +0xc = 0), and sets up the second (0x1258c50, mode +0xc = 3)
+# beside it.
+[patch]
+name = "fxaa2-gs-dlaa-gs"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters"
+enabled = false
+order = 188
+
+[site.setup-a]
+address = "0x026a07a6"
+expect = "41 f6 44 24 49 04 74 26 8b 9d 24 f5 ff ff 49 8d bc 24 c8 1b 00 00 48 8d b5 20 f5 ff ff e8 28 8f bb fe 83 fb 00 75 1b eb 3e"
+bytes = "49 8d 9c 24 c8 1b 00 00 48 89 df 48 8d b5 20 f5 ff ff e8 33 8f bb fe c6 43 09 01 83 63 0c 00 48 89 df ba 34 00 00 00 eb 05"
+
+[site.setup-b]
+address = "0x026a07d4"
+expect = "49 8d bc 24 c8 1b 00 00 48 8d b5 20 f5 ff ff e8 08 8f bb fe 49 8d bc 24 c8 1b 00 00 48 8d b5 60 f7 ff ff ba 34 00 00 00 b9 09 00 00 00 4c 8b 85 78 f1 ff ff e8 43 84 bb fe 41 80 bc 24 d1 1b 00 00 00 41 0f 95 c7"
+bytes = "48 8d b5 60 f7 ff ff b9 09 00 00 00 4c 8b 85 78 f1 ff ff e8 64 84 bb fe c7 43 0c 03 00 00 00 48 89 df 48 8d b5 60 f7 ff ff ba 34 00 00 00 b9 09 00 00 00 4c 8b 85 78 f1 ff ff e8 3d 84 bb fe 41 b7 01 0f 1f 40 00"

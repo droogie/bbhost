@@ -155,7 +155,7 @@ void note_time() {
     std::uint64_t ts[2] = {};
     if (vkGetQueryPoolResults(g.device, g_fsr.queries, 0, 2, sizeof(ts), ts, sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     g_fsr.total_us += static_cast<double>(ts[1] - ts[0]) * g.timestamp_period_ns / 1000.0;
-    if (++g_fsr.frames % 300 == 0) {
+    if (++g_fsr.frames % 300 == 0 && host_tooling()) {
         host_log("present: FSR 1 took %.2f ms of GPU time a frame (%ux%u)", g_fsr.total_us / 300.0 / 1000.0, g_fsr.width, g_fsr.height);
         g_fsr.total_us = 0;
     }

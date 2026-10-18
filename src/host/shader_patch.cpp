@@ -37,22 +37,23 @@ const Patch kPatches[] = {
 };
 constexpr std::size_t kCount = sizeof(kPatches) / sizeof(kPatches[0]);
 
-std::atomic<std::uint64_t> g_seen_serial{0};
 std::atomic<std::uint32_t> g_mask{0};
+
+// The settings' listener: which patches they call for, kept for every draw.
+void settings_changed(const HostSettings& hs) {
+    std::uint32_t m = 0;
+    for (std::size_t i = 0; i < kCount; ++i) {
+        if (!(hs.*(kPatches[i].setting))) m |= 1u << i;
+    }
+    g_mask.store(m, std::memory_order_release);
+}
 
 }  // namespace
 
 std::uint32_t shader_patch_mask() {
-    const std::uint64_t serial = host_opt_serial();
-    if (g_seen_serial.load(std::memory_order_acquire) != serial) {
-        std::uint32_t m = 0;
-        const HostSettings hs = host_settings();
-        for (std::size_t i = 0; i < kCount; ++i) {
-            if (!(hs.*(kPatches[i].setting))) m |= 1u << i;
-        }
-        g_mask.store(m, std::memory_order_release);
-        g_seen_serial.store(serial, std::memory_order_release);
-    }
+    // Listening from the first ask on: told the settings at once, then each change.
+    static const bool listening = (host_settings_listen(&settings_changed), true);
+    (void)listening;
     return g_mask.load(std::memory_order_acquire);
 }
 

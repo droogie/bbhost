@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // The follow camera, from LockCamParam - one row per area's camera setup,
 // which the camera's update (sub_183ac60) reads every frame and eases toward:
 // its distance (camDistTarget), the height it looks at (chrOrgOffset_Y) and
@@ -12,6 +14,13 @@ struct ElfImage;
 // hash has been checked, like every address-based patch.
 void camera_install(ElfImage* image);
 
-// Called for every view (engine/graphics_patch.cpp's render-view hook): finds
-// the table once, then keeps it at the settings.
+// Called for every view (engine/graphics_patch.cpp's render-view hook). It
+// has work only when the settings changed (their listener, registered by
+// camera_install), when the search for the table finished, or when the param
+// repository (re)loaded it: then it finds the table if need be and writes the
+// rows. Otherwise it reads one flag.
 void camera_tick();
+// The param repository's walk (engine/params.cpp) saw LockCamParam loaded or
+// reloaded at `file` (the .param as the game keeps it): the next view writes
+// its rows, if the settings ask for anything.
+void camera_params_changed(std::uint64_t file);

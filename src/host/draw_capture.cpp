@@ -393,6 +393,7 @@ bool vertex_input_json(CaptureSession& s, const CaptureVertexInput& vi, std::uin
         ej.set("vdata", e.vdata);
         ej.set("count", e.count);
         ej.set("w3", json::hex(e.w3));
+        if (e.packed) ej.set("packed", e.packed);  // its components packed in the attribute's dwords (gcn::VertexElement::packed)
         elements.push(ej);
     }
     out.set("elements", elements);

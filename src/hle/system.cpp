@@ -1573,7 +1573,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // screen in gameplay doing nothing, which is not a mode any PC game
         // offers. The setting now only *disables* the behaviour for someone
         // who wants the pad to own the camera.
-        const HostSettings hs = host_settings();
+        const HostSettings& hs = host_settings_ref();  // the snapshot as published: no copy, no lock
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
                           !menu_pointer_in_menu() && !host_text_entry_open();
         // What the follow camera turns by, and whether its own turns as the
@@ -1668,7 +1668,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     const bool typing = host_text_entry_open();
     // The pointer drives the menus only while one is open - otherwise a click
     // in the world would send Circle at whatever the last menu was.
-    if (host_settings().mouse_menu && !host_options_open() && !host_mouse_relative() &&
+    if (host_settings_ref().mouse_menu && !host_options_open() && !host_mouse_relative() &&
         menu_pointer_in_menu()) {
         // Held for a few polls each: a load hitch that skips polls would
         // otherwise drop the press, the same reason the autopress taps hold.

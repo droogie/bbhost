@@ -138,10 +138,24 @@ struct DevBuffer {
     bool in_host = false;
 };
 
+// A compute shader translated with its constant buffers, tables and typed
+// loads read through storage buffers the dispatch pushes (set 1 of
+// Gpu::cs_buffers_layout) and no page-table fallback for them
+// (BBHOST_CS_BUFFERS, gpu.cpp): a dispatch every one of whose buffers binds
+// runs it, any other the pipeline beside it.
+struct ComputeLean {
+    gcn::TranslateResult meta;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool standin = false;  // unoptimized, the optimized one queued (ComputePipeline::standin)
+    std::uint64_t opt_seen = 0;
+};
+
 struct ComputePipeline {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     gcn::TranslateResult meta;
+    std::shared_ptr<ComputeLean> lean;  // null: none (off, nothing to bind, or it failed)
     std::string name;
     bool failed = false;
     // Its pipeline is still in the driver's compiler on a worker, and was not
@@ -256,6 +270,15 @@ struct Gpu {
     // shaderFloat16 and shaderInt16 enabled: the host's own shaders may do f16
     // math (the half-precision FSR 1, fsr.cpp).
     bool has_f16_math = false;
+    // The game's submissions' timeline (Vulkan 1.2 timeline semaphore): each
+    // signals its serial + 1 (Gpu::flushes), so how far the GPU got is one
+    // counter read without the renderer's lock, and a wait for a frame is a
+    // sleep in the driver, not a poll (host_gpu_wait_completed). Null without
+    // timelineSemaphore, or with BBHOST_TIMELINE=0: the slots' fences, polled.
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    // The presenter's own-queue copies' timeline (host_gpu_present_reads_locked):
+    // each signals the value it registered. Made with `timeline`.
+    VkSemaphore present_timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;
@@ -294,6 +317,10 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // The presenter's own-queue copy recorded while this slot was the one
+        // being recorded: its value on Gpu::present_timeline, waited for
+        // before the slot retires (0: none).
+        std::uint64_t present_target = 0;
         // What the submission holds, for the line a wait for it that runs long
         // writes (fence_wait_locked): the draws, dispatches and tessellated
         // draws recorded since the submission before, and the flip.
@@ -335,6 +362,9 @@ struct Gpu {
         // once the slot retired. `busy_written`: this recording wrote both.
         VkQueryPool busy_pool = VK_NULL_HANDLE;
         bool busy_written = false;
+        // The buffer shadow's upload command buffer, which runs just ahead of
+        // this one in the same submission, wrote its start (query 2).
+        bool busy_upload = false;
         // Descriptor sets allocated ahead from this slot's pool, by layout
         // (alloc_set_locked); dropped with the pool's reset.
         std::vector<std::pair<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>> spare_sets;
@@ -359,6 +389,9 @@ struct Gpu {
     std::map<VkBuffer, std::uint32_t> scratch_users;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;         // compute: one set
+    // Compute with its buffers pushed (ComputeLean): set 0 as pipe_layout's,
+    // set 1 cb_push_layout. Null without push descriptors.
+    VkPipelineLayout cs_buffers_layout = VK_NULL_HANDLE;
     VkPipelineLayout gfx_pipe_layout = VK_NULL_HANDLE;     // graphics: set 0 VS, set 1 PS
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
@@ -679,6 +712,19 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
+// A host-visible buffer the CPU writes and shaders read every draw: in video
+// memory the CPU can write on a discrete GPU (rings_in_vram), else as
+// create_dev_buffer(b, size, true). `what` names it in the log.
+bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what);
+bool rings_in_vram();
+// Whether a ring of `bytes` may go in memory type `type` (video memory the CPU
+// writes) by its heap's budget (host/ring_budget.h); logs and counts it as left
+// in host memory when not. `note` gets the heap's numbers for the caller's log.
+bool ring_fits_budget(std::uint32_t type, VkDeviceSize bytes, const char* what, std::string* note);
+// Counts a ring placed in video memory the CPU writes (true) or left in host
+// memory by the budget (false), for rings_placement_report.
+void note_ring_placed(bool vram, VkDeviceSize bytes);
+std::string rings_placement_report();
 std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags want);
 bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, std::string& name);
 // A GX shader creator ran (render.cpp; host_gpu_note_shader_created).
@@ -752,6 +798,15 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
 // GPU writes earlier in this recording, or no room left in the staging chunks.
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// The bytes [va, va+bytes) of a page the game keeps rewriting, copied on the
+// CPU as the draw records into a ring the GPU reads; `loc` becomes the copy.
+// False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
+// GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
+bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// Whether shadow_snapshot_locked may copy any of [va, va+bytes) - a page of it
+// the game rewrites, or a range this cannot tell cheaply - before the caller
+// works out how much of it a draw reads.
+bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
@@ -963,15 +1018,30 @@ extern std::uint32_t g_draw_dummies;
 // neighbours' a few flips after they were recorded.
 constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
+// BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
+// when recorded and again when its submission retires - memory rewritten while
+// the draw waited for the GPU. Caller holds the lock.
+bool vb_race_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes);
+void vb_race_retired_locked(std::uint64_t serial);
+// buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
+// GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
+// land - recorded in a submission that has not retired. Caller holds the lock.
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
+// Whether a GPU write over [va, va+bytes) was recorded in recording `serial` or later.
+bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's
 // optimizer as BBHOST_CS_OPTIMIZE says (gpu.cpp). `standin`: it is the
 // unoptimized one, and the optimized one is being built on a bb-cs-optimize
 // thread under `opt_key`; adopt_optimized_compute swaps it in. `watch`: the
-// name the watchdog lists it under while it compiles.
+// name the watchdog lists it under while it compiles. `layout`: null for
+// Gpu::pipe_layout.
 VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
-                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch);
+                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch,
+                                  VkPipelineLayout layout = VK_NULL_HANDLE);
 // A stand-in's optimized pipeline, when it is built: true when `pipeline` now
 // is it (and `standin` false). Cheap when nothing new was built since `seen`.
 bool adopt_optimized_compute(std::uint64_t opt_key, VkPipeline& pipeline, bool& standin, std::uint64_t& seen);
@@ -994,6 +1064,7 @@ void compute_compiling_report();
 void busy_init_locked();                           // after the slots exist: the query pools, or off
 void busy_begin_locked(Gpu::Slot& sl);             // a recording's first command
 void busy_end_locked(Gpu::Slot& sl);               // its last, before vkEndCommandBuffer
+void busy_upload_begin_locked(Gpu::Slot& sl, VkCommandBuffer cmd);  // the uploads ahead of it: their start
 void busy_submitted_locked(Gpu::Slot& sl);         // it is on its way to the queue
 void busy_retired_locked(Gpu::Slot& sl, bool ok);  // its fence signalled (ok), or it never will
 std::string busy_exit_report();                    // the whole run's line, for host_gpu_report
@@ -1200,9 +1271,16 @@ extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
 void invalidate_rt_views(std::uint64_t base);
 // Marks where the GPU is: on a device loss the driver reports the last
 // checkpoint each queue stage reached, which names the draw that faulted.
-// kind 1 = draw, 2 = dispatch. AMD's markers go through the stream (an op,
-// or a draw's packet: DrawCmds::marker), NVIDIA's checkpoints in place.
+// kind 1 = draw, 2 = dispatch, kGpuMarkSubmission = a submission's edges:
+// index = serial * 4 + 0 its buffer-shadow uploads (they run after the wait
+// for their sparse binds), 1 its recording's start, 2 its recording's end -
+// so a loss between one frame's last draw and the next one's first says
+// whether the GPU was in a submission's tail, its wait or its uploads.
+// AMD's markers go through the stream (an op, or a draw's packet:
+// DrawCmds::marker), NVIDIA's checkpoints in place.
+constexpr unsigned kGpuMarkSubmission = 3;
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
+void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index);
 // AMD's buffer markers: the 32-bit value for a kind and index, and the two
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
@@ -1430,6 +1508,10 @@ public:
     void bind_sets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t n, const VkDescriptorSet* sets,
                    std::uint32_t ndynamic = 0, const std::uint32_t* dynamic = nullptr);
     void push_constants(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* data);
+    // vkCmdPushDescriptorSetKHR of n storage buffers into set `set` (a
+    // dispatch's, ComputeLean).
+    void push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n, const std::uint32_t* bindings,
+                      const VkDescriptorBufferInfo* infos);
     // vkUpdateDescriptorSets at this point of the stream (a set the op
     // stream's earlier commands may still bind in this command buffer).
     void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
@@ -1576,6 +1658,21 @@ bool set_cache_on();
 // than in the stage's set, which the cache then keys without them: with the
 // cache, whenever the device has push descriptors.
 bool cb_push_on();
+// Pushed constant buffers bound at their V# bases, shaders translated with
+// TranslateOptions::cb_bias_zero (render.cpp, BBHOST_CB_EXACT).
+bool cb_exact_bindings();
+// A dispatch's storage buffers (ComputeLean::meta's), resolved as a draw's
+// are - bound where they are, or copied as recorded for memory the game
+// writes on the CPU - into params (cb_valid, biases, strides) and `infos`,
+// one a buffer. The dispatch's own stores must be noted as GPU writes first
+// (gpu_writes_note_locked), so nothing it writes is read from a copy.
+// render.cpp; under g.mu, with the dispatch's recording begun.
+void resolve_dispatch_buffers(const gcn::TranslateResult& meta, const char* name, const std::uint32_t* user, gcn::StageParams& params,
+                              std::vector<VkDescriptorBufferInfo>& infos);
+// BBHOST_PIPELINE_STATS=<name>: whether a compute shader is named, and its
+// pipeline's statistics and disassembly to build/pipeline-stats (render.cpp).
+bool compute_pipeline_stats_wanted(const std::string& name);
+void write_compute_pipeline_stats(VkPipeline p, const std::string& name);
 VkDescriptorType params_descriptor_type();
 // The params descriptor with the cache on (set up with the ring).
 extern VkDescriptorBufferInfo g_params_desc;

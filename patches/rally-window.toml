@@ -1,0 +1,34 @@
+# Rally Window 2x + Stacking (6s before decay): Kyo's patch for 1.09, from Kyo's shadPS4 list
+# (user/patches/shadPS4/Bloodborne.xml), byte for byte: 4 lines, 13 bytes.
+#
+# Off until turned on: the setup window's Patches tab, or `rally-window = true` under
+# [patches] in bbhost.toml, turns it on for the next start.
+[patch]
+name = "rally-window"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Rally Window 2x + Stacking (6s before decay) (Kyo)"
+enabled = false
+gameplay = true
+order = 13
+
+[site.s000]
+address = "0x01e0dbde"
+expect = "00 00 40 40"
+bytes = "00 00 c0 40"
+
+[site.s001]
+address = "0x01e2beaa"
+expect = "41 0f 94 c6"
+bytes = "41 b6 00 90"
+
+[site.s002]
+address = "0x05527b10"
+expect = "00 00 40 40"
+bytes = "00 00 c0 40"
+kind = "data"
+
+[site.s003]
+address = "0x05952d74"
+expect = "00"
+bytes = "01"
+kind = "data"

@@ -31,10 +31,14 @@
 //   device address. That happens before the submission's label writes, so
 //   the counts are there when the game's end-of-pipe fence says the GPU is
 //   done - the PS4's order, with no CPU round trip and nothing predicted.
-//   A dump whose interval holds a query that never became available (AMD's
-//   driver resolves none while the window is unfocused, Kyo #220) is not
-//   written: the block stays as the game zeroed it, not ready, and the game
-//   keeps its own previous answer.
+//   A query not available when the copy runs reads plainly visible, and its
+//   dump is written all the same. AMD's driver resolves none while the
+//   window is unfocused or there is none (Kyo #220; a copy that waits for
+//   them loses the device, headless), and a dump left unwritten kept its
+//   block not ready for good: Bloodborne's GX culling entries stay pending
+//   on such a block and it starts no other test, so one alt-tab, or one
+//   query late, ended the game's culling until the next start - with it on,
+//   slower than off (its occluders still drawn, nothing culled).
 // - Precise counts when the device has occlusionQueryPrecise (the game sets
 //   PERFECT_ZPASS_COUNTS); without it a nonzero result counts as plainly
 //   visible (NVIDIA's unprecise results are 0/1, and one sample read as
@@ -110,8 +114,8 @@ const std::uint32_t g_cap = [] {
 
 // BBHOST_OCCLUSION_WAIT=1 (a diagnostic): the copy of the results waits on
 // the GPU for each query. Off, a query not yet available when the copy runs
-// leaves its dump not ready; on, a query a driver never resolves (AMD's,
-// unfocused) would hang the GPU.
+// reads visible; on, a query a driver never resolves hangs the GPU (AMD's,
+// headless: the device was lost within 20 dumps, 2026-10-14).
 const bool g_wait = [] {
     const char* e = std::getenv("BBHOST_OCCLUSION_WAIT");
     return e && e[0] == '1';
@@ -460,7 +464,7 @@ std::string occlusion_report(bool totals) {
     char buf[1024];
     std::snprintf(buf, sizeof(buf),
                   "occlusion%s: %llu dumps (%llu fake: not imported; %llu lost), %llu queries, %llu unmeasured draws (%llu intervals read visible), %llu resolves "
-                  "(%llu mid-recording); on the GPU %llu dumps written, %llu left not ready (%llu queries unavailable), pairs %llu "
+                  "(%llu mid-recording); on the GPU %llu dumps written, %llu of them read visible for a query not available (%llu queries), pairs %llu "
                   "visible / %llu occluded (%.1f%% occluded); predication: %llu sets (%llu known on the CPU, %llu on the GPU), "
                   "draws %llu skipped on the CPU, %llu GPU-predicated (%llu drawn, %llu skipped, %llu unknown), %llu drawn",
                   totals ? " totals" : "", d(&Counts::dumps), d(&Counts::fake), d(&Counts::lost), d(&Counts::queries),

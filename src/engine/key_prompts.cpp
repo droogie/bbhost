@@ -196,26 +196,28 @@ void label_for(const Tag& t, bool mouse_camera, char* out, std::size_t n) {
     }
 }
 
-// The setting, re-read when anything changed rather than on every call.
+// The two settings the prompts follow, kept by the settings' listener
+// (key_prompts_install registers it), which is told each change: a prompt
+// reads a value, not the settings. They were asked on every call, each call
+// an atomic exchange on one shared word - from the game's worker threads at
+// once, ~1% of each of three EzWorkPool threads in a world profile.
+std::atomic<int> g_prompt_mode{0};
+std::atomic<bool> g_mouse_camera{true};
+
+void settings_changed(const HostSettings& hs) {
+    g_prompt_mode.store(hs.button_prompts, std::memory_order_relaxed);
+    g_mouse_camera.store(hs.mouse_camera, std::memory_order_relaxed);
+}
+
 bool prompts_wanted() {
-    static std::atomic<std::uint64_t> seen{~0ull};
-    static std::atomic<int> mode{0};
-    const std::uint64_t now = host_opt_serial();
-    if (seen.exchange(now) != now) mode.store(host_settings().button_prompts, std::memory_order_relaxed);
-    switch (mode.load(std::memory_order_relaxed)) {
+    switch (g_prompt_mode.load(std::memory_order_relaxed)) {
         case 1: return true;                    // Keyboard
         case 2: return false;                   // Controller
         default: return host_input_device() == InputDevice::KeyboardMouse;  // Auto: the device last used
     }
 }
 
-bool mouse_is_camera() {
-    static std::atomic<std::uint64_t> seen{~0ull};
-    static std::atomic<int> on{1};
-    const std::uint64_t now = host_opt_serial();
-    if (seen.exchange(now) != now) on.store(host_settings().mouse_camera ? 1 : 0, std::memory_order_relaxed);
-    return on.load(std::memory_order_relaxed) != 0;
-}
+bool mouse_is_camera() { return g_mouse_camera.load(std::memory_order_relaxed); }
 
 void note_unknown(const char* tag) {
     const int n = g_seen_n.load(std::memory_order_relaxed);
@@ -704,6 +706,7 @@ void self_check() {
 }  // namespace
 
 void key_prompts_install(ElfImage* image) {
+    host_settings_listen(&settings_changed);
     if (const char* e = std::getenv("BBHOST_KEY_PROMPTS"); e && e[0] == '0') {
         host_log("key prompts: off, the pad's glyphs stay");
         return;

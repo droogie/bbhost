@@ -17,10 +17,10 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 30 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 31 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **151** |
+| **Taken over in all** | **152** |
 | With any code byte changed (including byte patches and redirected calls) | 173; 255 at 60 fps |
 | The game's own code | everything else |
 
@@ -184,6 +184,23 @@ the game's code turning it by the same counts as ours.
 |---|---|---|---|
 | the game's `memcpy` (`sub_2a1a1b0`) | `0x2a1a1b0` | the engine's own memory copy, 1,440 call sites | checked by what it copies |
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
+
+### Sync (`src/decomp/sync/`)
+
+| Function | Address | What it does | Checked |
+|---|---|---|---|
+| `DLAdaptiveMutex::Lock` | `0x24368c0` | Dantelion's spin-then-sleep mutex: take the word when its owner is free, spin for the mutex's budget, then count in as a sleeper on its semaphore until an unlock hands the lock over | threads taking one word with the game's Lock, ours, and either at random per call, released by the game's Unlock, at spin budgets of 0, 2,000 and 200,000 ticks: exclusion, exact counts and a free word at the end (`decomp_adaptive_mutex`) |
+
+Every work pool's queue takes this lock to pop a job (`CSEzWork::ProcessOne`),
+and so do the heaps and the GX layer. The game's spin is a `lock cmpxchg` of
+the word with its own value and an `rdtsc` on every turn, with no `pause`: in
+the world the six character workers spent 60% of their time there, popping
+jobs while the main loop waited ~1.4 ms a frame for them, because each turn
+pulls the word's cache line from the core that holds it and the holder's
+unlock has to win it back. Ours makes the same transitions in the same order
+with the same budget, and spins on a plain load with `pause`, swapping only to
+take the lock or to count itself in. The game's unlock is unchanged, and
+threads using either version share a word.
 
 ### Effects (`src/decomp/sfx/`)
 

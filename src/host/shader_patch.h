@@ -29,8 +29,8 @@
 
 void shader_patch_apply(const std::string& name, std::vector<std::uint32_t>& words);
 
-// Which patches the settings call for now, one bit each; recomputed only when
-// a setting has changed (host_opt_serial), so it is cheap per draw.
+// Which patches the settings call for now, one bit each; kept by a settings
+// listener (host_settings_listen), told each change, so it is one load a draw.
 std::uint32_t shader_patch_mask();
 // Whether a program with this name is one a patch applies to.
 bool shader_patch_touches(const std::string& name);

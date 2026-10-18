@@ -14,10 +14,13 @@
 //   - a query adds its samples (an unprecise device's "some" counts as many);
 //   - an unmeasured draw adds a large count, so any difference spanning it
 //     reads visible, never occluded;
+//   - a query not available when the copy ran counts as plainly visible,
+//     like an unmeasured draw: AMD's driver resolves none while the window
+//     is unfocused or there is none (KyoPS4x #220), and a block left
+//     unwritten stays not ready for good - Bloodborne then never tests an
+//     object again, so one such query ended its culling for the session;
 //   - a dump writes T split over the eight DBs, valid bit set, into guest
-//     memory by device address - unless a query of the interval it closes
-//     never became available, in which case nothing is written and the block
-//     stays as the game left it (zeroed: not ready);
+//     memory by device address - always;
 //   - a predicate reads a block back and writes whether a predicated draw
 //     goes ahead, for VK_EXT_conditional_rendering.
 // One invocation does it all: a submission has a few hundred items, and they
@@ -36,7 +39,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer Words { uint
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer State {
     uint64_t total;  // T
     uint64_t acc;    // samples since the last dump
-    uint bad;        // a query since the last dump was not available
+    uint bad;        // a query since the last dump was not available (read visible)
     uint pad;
     uint counters[12];
 };
@@ -86,6 +89,7 @@ void main() {
             if (available == 0ul) {
                 bad = true;
                 s.counters[kUnavailable] += 1u;
+                acc += kUnmeasured;
             } else {
                 acc += (p.flags & 1u) != 0u && n != 0ul ? kUnmeasured : n;
             }
@@ -94,20 +98,17 @@ void main() {
         } else if (kind == kDump) {
             total += acc;
             acc = 0ul;
-            if (bad) {
-                s.counters[kNotReady] += 1u;
-            } else {
-                const uint pipes = (it.x >> 8) & 0xffu;
-                const uint64_t at = uint64_t(it.y) | (uint64_t(it.z) << 32);
-                Words w = Words(at);
-                const uint64_t share = total / uint64_t(pipes), extra = total % uint64_t(pipes);
-                for (uint k = 0u; k < pipes; ++k) w.v[2u * k] = (share + (uint64_t(k) < extra ? 1ul : 0ul)) | kValid;
-                s.counters[kWritten] += 1u;
-                // The second dump of a Gnm block (at +8): how the pair reads.
-                uint64_t sum;
-                if (((it.x >> 16) & 1u) != 0u && block_samples(at - 8ul, pipes, sum)) {
-                    s.counters[sum != 0ul ? kPairsVisible : kPairsOccluded] += 1u;
-                }
+            if (bad) s.counters[kNotReady] += 1u;  // written, reading visible
+            const uint pipes = (it.x >> 8) & 0xffu;
+            const uint64_t at = uint64_t(it.y) | (uint64_t(it.z) << 32);
+            Words w = Words(at);
+            const uint64_t share = total / uint64_t(pipes), extra = total % uint64_t(pipes);
+            for (uint k = 0u; k < pipes; ++k) w.v[2u * k] = (share + (uint64_t(k) < extra ? 1ul : 0ul)) | kValid;
+            s.counters[kWritten] += 1u;
+            // The second dump of a Gnm block (at +8): how the pair reads.
+            uint64_t sum;
+            if (((it.x >> 16) & 1u) != 0u && block_samples(at - 8ul, pipes, sum)) {
+                s.counters[sum != 0ul ? kPairsVisible : kPairsOccluded] += 1u;
             }
             bad = false;
         } else if (kind == kPredicate) {

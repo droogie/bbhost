@@ -35,6 +35,7 @@
 #include "engine/lua_events.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
+#include "host/plugins.h"
 #include "log.h"
 
 #include <atomic>
@@ -344,6 +345,9 @@ void hle_patch_guest(ElfImage* image) {
         return;
     }
     patch_manifests_apply(image);  // patches/*.toml: skip-intro, fov-uncap, a mod's own
+    // The session's online rules are final now - the plugins loaded before the
+    // eboot, the manifests just applied: plugins_ruleset says them in the log.
+    plugins_ruleset();
     constexpr std::uint64_t kDlPanicElf = 0x20b55b0;
     const std::uint64_t va = image->mem.slide + kDlPanicElf;
     if (va < image->mem.slide || va + 16 > image->mem.slide + image->mem.size) {

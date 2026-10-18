@@ -19,6 +19,10 @@ void loading_bind(std::uint64_t slide);
 void loading_tick(std::uint64_t flip);
 // The last tick's answer: a loading screen is up.
 bool loading_screen_up();
+// The last tick's answer: the in-game update ran (CSNowLoadingHelper +0x50 or
+// +0x51), so a world is loaded and simulated. False at the title, the main
+// menu and a loading screen.
+bool loading_in_world();
 // A loading screen is up, the game runs above 30 (60, 90 or uncapped: its
 // steps follow the frame time through the FPS++ cave) and no Remo cutscene is
 // requested or running: the frame-time manager waits for nothing

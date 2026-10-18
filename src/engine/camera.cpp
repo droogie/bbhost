@@ -26,8 +26,10 @@
 // records (id, data offset at +8), each row 0x20 bytes with camFovY, in
 // degrees, at +0x14. Nothing in the eboot points at it directly - the param
 // repository reaches it through the name table at 0x5755ad0 (LockCamParam is
-// index 0x21) - so it is found once by its type name, in the guest's
-// CPU-readable mappings, off the render thread.
+// index 0x21). engine/params.cpp walks that repository and names the buffer
+// as the game loads it (camera_params_changed); before that - or if it never
+// does - it is found by its type name in the guest's CPU-readable mappings,
+// off the render thread.
 //
 // It turns up twice: direct memory mapped at two addresses. Both are one
 // table, so the copies are told apart by their physical address - scaling
@@ -66,6 +68,52 @@ struct Table {
 std::mutex g_mu;
 std::vector<Table> g_tables;
 std::atomic<int> g_state{0};  // 0 not looked, 1 looking, 2 done
+const Scales kGame{1.0f, 1.0f, 1.0f};
+Scales g_applied = kGame;  // under g_mu: what the rows were last given
+
+// What the settings ask for, kept by their listener (settings_changed), and
+// whether a view has work to do. Set by a change of the three settings, by
+// the search finishing and by the param repository (re)loading the table
+// (camera_params_changed); a view with nothing to do reads this one flag.
+std::mutex g_want_mu;
+Scales g_want = kGame;  // under g_want_mu
+std::atomic<bool> g_pending{false};
+// LockCamParam's file as the param repository holds it - the buffer the
+// camera's update reads - from engine/params.cpp's walk, which sees it as the
+// game loads its tables at boot; 0 until then (the search below stands in).
+std::atomic<std::uint64_t> g_param_file{0};
+
+Table table_at(std::uint8_t* base) {
+    Table t{base, 0, {}, {}};
+    std::uint16_t rows = 0;
+    std::memcpy(&rows, base + kRowCountAt, 2);
+    t.rows = rows;
+    t.orig.assign(rows, Scales{0.0f, 0.0f, 0.0f});
+    t.written.assign(rows, Scales{-1.0f, -1.0f, -1.0f});
+    return t;
+}
+
+// The param repository's buffer is the file, its rows where the records say:
+// checked the way plausible() checks a found one, by reads that cannot fault.
+bool repository_file_ok(const std::uint8_t* base) {
+    std::uint8_t head[kRowsAt];
+    if (!host_read_safe(base, head, sizeof(head)) || std::memcmp(head + kTypeAt, kTypeName, sizeof(kTypeName)) != 0)
+        return false;
+    std::uint16_t rows = 0;
+    std::memcpy(&rows, head + kRowCountAt, 2);
+    if (rows == 0 || rows > 4096) return false;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::uint64_t off = 0;
+        std::uint8_t row[kRowSize];
+        if (!host_read_safe(base + kRowsAt + r * kRowRecord + 8, &off, 8) || off < kRowsAt + rows * kRowRecord ||
+            off > (1u << 20) || !host_read_safe(base + off, row, sizeof(row)))
+            return false;
+        float fov = 0;
+        std::memcpy(&fov, row + kFovAt, 4);
+        if (!(fov > 1.0f && fov < 179.0f)) return false;
+    }
+    return true;
+}
 
 // A header that is the file's, not the name turning up somewhere else.
 bool plausible(const std::uint8_t* base, std::size_t room) {
@@ -105,13 +153,7 @@ void find_tables() {
                 for (std::int64_t ph : phys_seen) alias |= phys >= 0 && ph == phys;
                 if (!alias && plausible(base, static_cast<std::size_t>(end - base))) {
                     phys_seen.push_back(phys);
-                    Table t{base, 0, {}, {}};
-                    std::uint16_t rows = 0;
-                    std::memcpy(&rows, base + kRowCountAt, 2);
-                    t.rows = rows;
-                    t.orig.assign(rows, Scales{0.0f, 0.0f, 0.0f});
-                    t.written.assign(rows, Scales{-1.0f, -1.0f, -1.0f});
-                    found.push_back(std::move(t));
+                    found.push_back(table_at(base));
                 }
             }
             q += sizeof(kTypeName);
@@ -123,14 +165,24 @@ void find_tables() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_tables = std::move(found);
     g_state.store(2, std::memory_order_release);
+    g_pending.store(true, std::memory_order_release);  // the next view writes the rows
 }
 
-// The multipliers the settings object carries (host/settings.h): distance
-// and height 10% a step around the game's own, field of view 5% wider a
-// step, BBHOST_FOV overriding.
+// The settings' listener: the multipliers the settings object carries
+// (host/settings.h) - distance and height 10% a step around the game's own,
+// field of view 5% wider a step, BBHOST_FOV overriding - kept for the next
+// view, which has work only when they moved.
+void settings_changed(const HostSettings& hs) {
+    const Scales k{hs.camera_distance_scale, hs.camera_height_scale, hs.fov_scale};
+    std::lock_guard<std::mutex> lock(g_want_mu);
+    if (k == g_want) return;  // another setting changed
+    g_want = k;
+    g_pending.store(true, std::memory_order_release);
+}
+
 Scales wanted_scales() {
-    const HostSettings hs = host_settings();
-    return Scales{hs.camera_distance_scale, hs.camera_height_scale, hs.fov_scale};
+    std::lock_guard<std::mutex> lock(g_want_mu);
+    return g_want;
 }
 
 }  // namespace
@@ -182,6 +234,15 @@ void camera_install(ElfImage* image) {
     if (std::memcmp(p, kFovNoClamp, sizeof(kFovNoClamp)) != 0) {
         host_log("camera: the field of view stays capped at 48 degrees (patches/fov-uncap.toml not applied)");
     }
+    host_settings_listen(&settings_changed);
+}
+
+void camera_params_changed(std::uint64_t file) {
+    // Loaded, or reloaded (perhaps into a new buffer, while the old one still
+    // reads as the file it was): the next view takes this buffer and writes
+    // its rows. No lock: the param walk calls this under its own.
+    g_param_file.store(file, std::memory_order_release);
+    g_pending.store(true, std::memory_order_release);
 }
 
 void camera_tick() {
@@ -192,18 +253,47 @@ void camera_tick() {
         fov_watch();
         return;
     }
+    // Nothing changed since the rows were written: one load, no lock.
+    if (!g_pending.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+    if (!lock.owns_lock()) return;  // another view is at it; the flag stays for it
+    // Taken before the wish is read: a change made from here on sets it again.
+    if (!g_pending.exchange(false, std::memory_order_acq_rel)) return;
     const Scales k = wanted_scales();
-    static const Scales kGame{1.0f, 1.0f, 1.0f};
-    static Scales applied = kGame;
-    if (k == kGame && applied == kGame) return;
+    if (k == kGame && g_applied == kGame) return;  // nothing wanted, nothing of ours written
+    // The param repository's buffer when it has named one: no search through
+    // guest memory (~7 GiB, seconds of a core). What was written carries over
+    // to it, so a buffer that is memory already written seen at another
+    // address is not scaled twice, while a reload has the game's own values,
+    // which differ from what was written and are taken as the new originals.
+    if (const std::uint64_t file = g_param_file.load(std::memory_order_acquire);
+        file && (g_tables.size() != 1 || reinterpret_cast<std::uint64_t>(g_tables[0].base) != file)) {
+        auto* base = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(file));
+        if (repository_file_ok(base)) {
+            Table t = table_at(base);
+            if (g_tables.size() == 1 && g_tables[0].rows == t.rows) {
+                t.orig = g_tables[0].orig;
+                t.written = g_tables[0].written;
+            }
+            host_log("camera: LockCamParam at 0x%llx, from the param repository (%u rows)",
+                     static_cast<unsigned long long>(file), t.rows);
+            g_tables.clear();
+            g_tables.push_back(std::move(t));
+            g_state.store(2, std::memory_order_release);
+        }
+    }
     int state = g_state.load(std::memory_order_acquire);
     if (state == 0 && g_state.compare_exchange_strong(state, 1)) {
-        std::thread(find_tables).detach();
+        std::thread(find_tables).detach();  // sets the flag again when it is done
         return;
     }
     if (state != 2) return;
-    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
-    if (!lock.owns_lock()) return;
+    if (g_tables.empty()) {
+        // Not loaded when it was looked for: look again at the next change
+        // or when the param repository loads it (camera_params_changed).
+        g_state.store(0, std::memory_order_release);
+        return;
+    }
     for (const Table& t : g_tables) {
         // Still the table it was: a param reload would move it, and writing
         // through the old address would write into whatever took its place.
@@ -211,6 +301,7 @@ void camera_tick() {
             host_log("camera: LockCamParam moved; looking again");
             g_tables.clear();
             g_state.store(0, std::memory_order_release);
+            g_pending.store(true, std::memory_order_release);
             return;
         }
     }
@@ -227,9 +318,9 @@ void camera_tick() {
             }
         }
     }
-    if (k != applied) {
+    if (k != g_applied) {
         host_log("camera: distance x%g, height x%g, field of view x%g (%zu table(s))", k[0], k[1], k[2],
                  g_tables.size());
-        applied = k;
+        g_applied = k;
     }
 }

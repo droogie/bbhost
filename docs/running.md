@@ -201,7 +201,9 @@ bbhost paces the game to the refresh rate of the display its window is on;
 The frame rate is the game's own speed, chosen when it starts (a change
 applies on the next run): 30 is the game as it shipped; 60, 90 and 120 run its
 logic at that rate; Uncapped steps it by the measured frame time (1/240 to 1/30
-s), at the display's refresh rate with V-Sync on and up to 240 fps with it off.
+s), at the display's refresh rate with V-Sync on and up to 240 fps with it off -
+in the world and in character creation: at the title and the main menu V-Sync
+off sets no limit.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -217,7 +219,7 @@ to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
 `BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
 uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
-V-Sync says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+V-Sync says, the menus included, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
 switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
 `square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks

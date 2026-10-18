@@ -1,0 +1,23 @@
+# Aerial Vectors 1/480 fps: Kyo's patch for 1.09, from Kyo's shadPS4 list
+# (user/patches/shadPS4/Bloodborne.xml), byte for byte: 4 lines, 16 bytes.
+#
+# The four floats are the movement controller's momentum, 0.95 a frame on
+# the body's X/Z (chr_motion_physics_update), which bbhost already follows the
+# frame time with at every rate (engine/frame_rate.cpp's redirected loads:
+# 0.95 per 1/30 s). On, the patch's 0.9968 a frame stands at every rate, as
+# on shadPS4: the loads that read it are left reading it.
+#
+# Off until turned on: the setup window's Patches tab, or `aerial-vectors-480 = true` under
+# [patches] in bbhost.toml, turns it on for the next start.
+[patch]
+name = "aerial-vectors-480"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Aerial Vectors 1/480 fps (Kyo)"
+enabled = false
+gameplay = true
+order = 218
+
+[site.s000]
+address = "0x04d0b5b0"
+expect = "33 33 73 3f 33 33 73 3f 33 33 73 3f 33 33 73 3f"
+bytes = "3d 2e 7f 3f 3d 2e 7f 3f 3d 2e 7f 3f 3d 2e 7f 3f"

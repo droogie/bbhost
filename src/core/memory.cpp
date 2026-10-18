@@ -1,8 +1,10 @@
 #include "core/memory.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -125,13 +127,47 @@ bool guest_protect_rx(GuestMemory* mem, std::uint64_t va, std::size_t size) {
     return true;
 }
 
+// The executable segments guest_mark_executable named (host addresses).
+static std::vector<std::pair<std::uintptr_t, std::uintptr_t>> g_exec;
+
+void guest_mark_executable(GuestMemory* mem, std::uint64_t va, std::size_t size) {
+    const auto lo = reinterpret_cast<std::uintptr_t>(guest_ptr(*mem, va));
+    std::lock_guard<std::mutex> lock(g_kept_mu);
+    g_exec.emplace_back(lo, lo + size);
+}
+
+static bool protect_rw_range(void* p, std::size_t size, bool exec) {
+#if defined(_WIN32)
+    return win_protect(p, size, exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE);
+#else
+    return mprotect(p, size, PROT_READ | PROT_WRITE | (exec ? PROT_EXEC : 0)) == 0;
+#endif
+}
+
 bool guest_protect_rw(GuestMemory* mem, std::uint64_t va, std::size_t size) {
     void* p = guest_ptr(*mem, va);
-#if defined(_WIN32)
-    const bool ok = win_protect(p, size, PAGE_READWRITE);
-#else
-    const bool ok = mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
-#endif
+    // Within an executable segment the pages keep execute (guest_mark_executable).
+    const auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + size;
+    constexpr std::uintptr_t kPage = 0xfff;
+    std::uintptr_t elo = 0, ehi = 0;  // the executable part, in whole pages
+    {
+        std::lock_guard<std::mutex> lock(g_kept_mu);
+        for (const auto& [a, b] : g_exec) {
+            if (a < hi && lo < b) {
+                elo = std::max(a, lo) & ~kPage;
+                ehi = (std::min(b, hi) + kPage) & ~kPage;
+                break;
+            }
+        }
+    }
+    bool ok = true;
+    if (ehi <= elo) {
+        ok = protect_rw_range(p, size, false);
+    } else {
+        if (elo > lo) ok = protect_rw_range(p, elo - lo, false);
+        ok = protect_rw_range(reinterpret_cast<void*>(elo), ehi - elo, true) && ok;
+        if (ehi < hi) ok = protect_rw_range(reinterpret_cast<void*>(ehi), hi - ehi, false) && ok;
+    }
     keep_kept_writable(p, size);
     return ok;
 }

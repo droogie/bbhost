@@ -49,7 +49,15 @@ bool native_half_rtz();  // and export_rtz_on()
 // no 16-bit float buffer stores).
 bool program_allows_native_half_rtz(const struct Program& prog);
 // Whether the legacy multiply's zero rule is written as DXVK writes D3D9's,
-// min(|a|, |b|) == 0 (BBHOST_LEGACY_MUL=select: a == 0 || b == 0, as before).
+// min(|a|, |b|) == 0 - Mesa's compiler makes it one v_mul_legacy_f32 - or as
+// a == 0 || b == 0. AMD's own compiler matches neither to its native
+// instruction, and there the select is cheaper: an operand's compare serves
+// every multiply it is in (a normalize's three share the length's), where each
+// min is its own - the main light shader's 741 vector instructions were 711.
+// The host sets the device's form (set_legacy_mul_select: true on AMD's
+// drivers) before any translation; BBHOST_LEGACY_MUL=min or =select forces one.
 bool legacy_mul_min_form();
+void set_legacy_mul_select(bool on);
+bool legacy_mul_plain();  // BBHOST_LEGACY_MUL=plain: a plain multiply (a measurement)
 
 }  // namespace gcn
