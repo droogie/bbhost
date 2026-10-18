@@ -6893,6 +6893,10 @@ void end_pass_for_draw_locked() {
     }
     g_pass.active = false;
     if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering(false)) rec().end_rendering(false);
+    if (g_pass.profiled) {  // its pair closes here too, or the slot's results never become available
+        profile_end_locked();
+        g_pass.profiled = false;
+    }
     for (int t = 0; t < g_pass.ntargets; ++t) g_hazards.written.insert(g_pass.targets[t]);
     g_hazards.owed = true;
     copy_versions_pass_end_locked();
