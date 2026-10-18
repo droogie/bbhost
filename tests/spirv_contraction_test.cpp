@@ -130,6 +130,11 @@ int main() {
         expect(after.count(s.condition) == 1, "a branch condition's value keeps it");
         expect(after.count(s.free) == 0, "a value feeding only a varying loses it");
         expect(st.dropped == before.size() - after.size() && st.kept == after.size(), "the counts add up");
+        if (fragment) {
+            // Discard decisions free: the FragDepth write still pins the branch condition.
+            const std::set<std::uint32_t> free_discards = no_contraction(spv::relax_contraction(s.words, spv::RelaxStages::Graphics, &st, false));
+            expect(free_discards == after, "a pixel shader writing FragDepth keeps its condition with discards free");
+        }
         if (!fragment) {
             // Invariant in place of exact arithmetic.
             const std::vector<std::uint32_t> inv = spv::relax_contraction(s.words, spv::RelaxStages::GraphicsInvariant, &st);
@@ -170,6 +175,44 @@ int main() {
         const std::vector<std::uint32_t> r = relax_contraction(w, RelaxStages::Fragment, &st);
         expect(valid(r), "the relaxed pixel shader is valid");
         expect(no_contraction(r).empty() && st.dropped == 2 && st.kept == 0, "a plain pixel shader loses every NoContraction");
+    }
+    // A pixel shader that discards when x*x + x > 0 and writes no depth: its
+    // condition stays exact only with exact_discards.
+    {
+        using namespace spv;
+        Module m;
+        m.capability(1);
+        m.memory_model(0, 1);
+        const Id f32 = m.type_float(32), v4 = m.type_vector(f32, 4), vd = m.type_void(), b = m.type_bool();
+        const Id in = m.global_variable(m.type_pointer(StorageClass(1), v4), StorageClass(1));
+        m.decorate(in, DecLocation, {0});
+        const Id out = m.global_variable(m.type_pointer(StorageClass(3), v4), StorageClass(3));
+        m.decorate(out, DecLocation, {0});
+        const Id fn = m.begin_function(vd, m.type_function(vd, {}));
+        m.label();
+        const Id v = m.load(v4, in);
+        const Id x = m.emit(OpCompositeExtract, f32, {v, 0});
+        const Id y = m.emit(OpFAdd, f32, {m.emit(OpFMul, f32, {x, x}), x});
+        const Id positive = m.emit(OpFOrdGreaterThan, b, {y, m.const_f32(0.0f)});
+        const Id l_kill = m.fresh(), l_merge = m.fresh();
+        m.emit_void(OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(OpBranchConditional, {positive, l_kill, l_merge});
+        m.label(l_kill);
+        m.emit_void(OpKill, {});
+        m.label(l_merge);
+        m.store(out, v);
+        m.emit_void(OpReturn, {});
+        m.end_function();
+        m.entry_point(EmFragment, fn, "main", {in, out});
+        m.execution_mode(fn, ExOriginUpperLeft);
+        const std::vector<std::uint32_t> w = m.assemble();
+        expect(valid(w), "the discarding pixel shader is valid");
+        RelaxStats st;
+        const std::vector<std::uint32_t> exact = relax_contraction(w, RelaxStages::Fragment, &st);
+        expect(no_contraction(exact).count(y) == 1 && st.kept == 2, "exact discards keep the condition's slice");
+        const std::vector<std::uint32_t> free = relax_contraction(w, RelaxStages::Fragment, &st, false);
+        expect(valid(free), "the relaxed discarding pixel shader is valid");
+        expect(no_contraction(free).empty() && st.dropped == 2 && st.kept == 0, "free discards drop every NoContraction");
     }
     if (failures) return 1;
     std::printf("spirv_contraction_test: ok\n");

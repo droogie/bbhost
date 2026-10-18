@@ -1980,6 +1980,17 @@ spv::RelaxStages relax_contraction_stages() {
     return stages;
 }
 
+// BBHOST_PS_DISCARD_EXACT=1 keeps discard conditions exact. Only a redraw
+// under an EQUAL depth test needs that, none seen so far, and on MoltenVK it
+// costs every alpha-tested shader optnone helpers.
+bool relax_exact_discards() {
+    static const bool exact = [] {
+        const char* e = std::getenv("BBHOST_PS_DISCARD_EXACT");
+        return e && e[0] == '1';
+    }();
+    return exact;
+}
+
 // Whether shader modules lose their NoContraction decorations on the way to
 // the driver (spv::relax_contraction). MoltenVK's SPIR-V to MSL conversion
 // makes each decorated op a call to a [[clang::optnone]] helper, which made
@@ -2001,13 +2012,14 @@ bool relax_contraction_on() {
         const char* e = std::getenv("BBHOST_NO_CONTRACTION");
         const bool keep = e && e[0] == '1';
         if (g.moltenvk) {
-            host_log("gpu: NoContraction %s (MoltenVK)%s", keep ? "kept" : "dropped",
+            host_log("gpu: NoContraction %s (MoltenVK)%s%s", keep ? "kept" : "dropped",
                      keep ? " - BBHOST_NO_CONTRACTION=1"
                           : relax_contraction_stages() == spv::RelaxStages::GraphicsInvariant
-                                ? " in fragment stages, except what feeds FragDepth and discards, and in vertex-pipeline stages, "
+                                ? " in fragment stages, except what feeds FragDepth, and in vertex-pipeline stages, "
                                   "whose Position is Invariant instead"
-                                : " in fragment stages, except what feeds FragDepth and discards; vertex stages exact "
-                                  "(BBHOST_VS_CONTRACTION=1)");
+                                : " in fragment stages, except what feeds FragDepth; vertex stages exact "
+                                  "(BBHOST_VS_CONTRACTION=1)",
+                     relax_exact_discards() ? "; discard decisions exact (BBHOST_PS_DISCARD_EXACT=1)" : "");
         }
         return g.moltenvk && !keep;
     }();
@@ -2056,7 +2068,7 @@ std::vector<std::uint32_t> salt_names(const std::vector<std::uint32_t>& in) {
 
 bool make_module(const std::vector<std::uint32_t>& spirv, VkShaderModule& out) {
     std::vector<std::uint32_t> relaxed;
-    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, relax_contraction_stages());
+    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, relax_contraction_stages(), nullptr, relax_exact_discards());
     if (std::vector<std::uint32_t> salted = salt_names(relaxed.empty() ? spirv : relaxed); !salted.empty()) relaxed = std::move(salted);
     const std::vector<std::uint32_t>& words = relaxed.empty() ? spirv : relaxed;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};

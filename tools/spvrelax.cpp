@@ -1,11 +1,13 @@
 // spvrelax: spv::relax_contraction, as bbhost applies it before MoltenVK.
 //
-//   spvrelax <in.spv> <out.spv> [--graphics | --invariant]
+//   spvrelax <in.spv> <out.spv> [--graphics | --invariant] [--exact-discards]
 //
 // Without either only a fragment stage changes. --graphics: vertex-pipeline
 // stages too, their Position kept exact; --invariant: as bbhost does on
 // MoltenVK, their Position made Invariant instead (RelaxStages::GraphicsInvariant).
-// Prints how many decorations were dropped and kept.
+// --exact-discards: a pixel shader that can discard keeps its branch
+// conditions exact (BBHOST_PS_DISCARD_EXACT=1). Prints how many decorations
+// were dropped and kept.
 #include "host/spirv_relax.h"
 
 #include <cstdio>
@@ -16,7 +18,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: spvrelax <in.spv> <out.spv> [--graphics | --invariant]\n");
+        std::fprintf(stderr, "usage: spvrelax <in.spv> <out.spv> [--graphics | --invariant] [--exact-discards]\n");
         return 2;
     }
     std::ifstream f(argv[1], std::ios::binary);
@@ -28,10 +30,14 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> words(bytes.size() / 4);
     std::memcpy(words.data(), bytes.data(), bytes.size());
     spv::RelaxStages stages = spv::RelaxStages::Fragment;
-    if (argc > 3 && std::strcmp(argv[3], "--graphics") == 0) stages = spv::RelaxStages::Graphics;
-    if (argc > 3 && std::strcmp(argv[3], "--invariant") == 0) stages = spv::RelaxStages::GraphicsInvariant;
+    bool exact_discards = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--graphics") == 0) stages = spv::RelaxStages::Graphics;
+        if (std::strcmp(argv[i], "--invariant") == 0) stages = spv::RelaxStages::GraphicsInvariant;
+        if (std::strcmp(argv[i], "--exact-discards") == 0) exact_discards = true;
+    }
     spv::RelaxStats st;
-    const std::vector<std::uint32_t> out = spv::relax_contraction(words, stages, &st);
+    const std::vector<std::uint32_t> out = spv::relax_contraction(words, stages, &st, exact_discards);
     std::ofstream o(argv[2], std::ios::binary);
     if (!o.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size() * 4))) {
         std::fprintf(stderr, "spvrelax: cannot write %s\n", argv[2]);

@@ -44,7 +44,7 @@ bool writes_memory(std::uint32_t op) {
 
 }  // namespace
 
-std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& words, RelaxStages stages, RelaxStats* stats) {
+std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& words, RelaxStages stages, RelaxStats* stats, bool exact_discards) {
     RelaxStats local;
     RelaxStats& st = stats ? *stats : local;
     st = {};
@@ -205,7 +205,7 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
             for (std::uint32_t k : writers[v]) add_operands(k);
         }
     }
-    if (!fragment || any_watched || discards) {
+    if (!fragment || any_watched || (discards && exact_discards)) {
         for (std::uint32_t c : conditions) add(c);
     }
     while (!work.empty()) {

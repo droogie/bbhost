@@ -26,9 +26,13 @@ struct RelaxStats {
 // Position, ClipDistance or CullDistance outputs, plus every branch and
 // switch condition, so positions stay the same in every pipeline that draws a
 // surface (EQUAL / LEQUAL depth passes); in a fragment stage that writes
-// FragDepth or can discard, the FragDepth writes and every branch and switch
-// condition, so depth and discard decisions are the same too. A module with
-// an OpFunctionCall, or of another stage, comes back unchanged.
-std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& words, RelaxStages stages, RelaxStats* stats = nullptr);
+// FragDepth, the FragDepth writes and every branch and switch condition, so
+// depth decisions are the same too - and with `exact_discards`, in one that
+// can discard, every branch and switch condition, so discard decisions are
+// (a surface drawn again by another pipeline under an EQUAL depth test keeps
+// its holes). A module with an OpFunctionCall, or of another stage, comes
+// back unchanged.
+std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& words, RelaxStages stages, RelaxStats* stats = nullptr,
+                                             bool exact_discards = true);
 
 }  // namespace spv
