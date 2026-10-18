@@ -3,6 +3,9 @@
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "log.h"
+#if defined(__APPLE__)
+#include "core/write_watch.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +35,7 @@ using Clock = std::chrono::steady_clock;
 
 struct ThreadTime {
     std::uint64_t ticks = 0;
+    std::uint64_t sys = 0;  // of ticks, in the kernel (macOS only)
     std::string name;
 };
 
@@ -53,6 +57,7 @@ std::unordered_map<int, ThreadTime> thread_times() {
             thread_info(list[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id), &idn) == KERN_SUCCESS) {
             ThreadTime t;
             t.ticks = (ext.pth_user_time + ext.pth_system_time) / 1000;  // ns -> us
+            t.sys = ext.pth_system_time / 1000;
             t.name = ext.pth_name[0] ? ext.pth_name : "bbhost";
             out.emplace(static_cast<int>(id.thread_id), std::move(t));
         }
@@ -108,7 +113,20 @@ struct State {
     std::unordered_map<int, ThreadTime> threads;
     GpuBusy gpu{};  // host_gpu_busy() when the window opened
     GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_DETAIL=1)
+#if defined(__APPLE__)
+    task_events_info_data_t events{};
+    WriteWatchStats watch{};
+#endif
 };
+
+#if defined(__APPLE__)
+task_events_info_data_t task_events() {
+    task_events_info_data_t e{};
+    mach_msg_type_number_t n = TASK_EVENTS_INFO_COUNT;
+    task_info(mach_task_self(), TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&e), &n);
+    return e;
+}
+#endif
 
 // BBHOST_FRAME_DETAIL=1: the second's draws by how their pixel shader ran,
 // its draw failures by reason, and every flip interval in it, in lines short
@@ -176,6 +194,10 @@ void frame_stats_on_flip() {
         s.threads = thread_times();
         s.gpu = host_gpu_busy();
         if (frame_stats_detail()) s.stats = host_gpu_stats();
+#if defined(__APPLE__)
+        s.events = task_events();
+        s.watch = write_watch_stats();
+#endif
         return;
     }
     s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_flip).count());
@@ -200,6 +222,7 @@ void frame_stats_on_flip() {
     struct Busy {
         double pct;
         std::string name;
+        double sys_pct = 0;
     };
     std::vector<Busy> busy;
     double total = 0;
@@ -208,7 +231,9 @@ void frame_stats_on_flip() {
         const std::uint64_t was = it != s.threads.end() ? it->second.ticks : 0;
         const double pct = 100.0 * static_cast<double>(t.ticks - was) / static_cast<double>(hz) / secs;
         total += pct;
-        if (pct >= 5.0) busy.push_back({pct, t.name + ":" + std::to_string(tid)});
+        const std::uint64_t was_sys = it != s.threads.end() ? it->second.sys : 0;
+        const double sys_pct = 100.0 * static_cast<double>(t.sys - was_sys) / static_cast<double>(hz) / secs;
+        if (pct >= 5.0) busy.push_back({pct, t.name + ":" + std::to_string(tid), sys_pct});
     }
     std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.pct > b.pct; });
     std::string top;
@@ -251,6 +276,24 @@ void frame_stats_on_flip() {
         gpu = gb;
     }
     s.gpu = gpu_now;
+#if defined(__APPLE__)
+    // After the gpu figure, so the patterns that read the line up to it still
+    // hold.
+    {
+        const task_events_info_data_t ev = task_events();
+        const WriteWatchStats ws = write_watch_stats();
+        char mb[256];
+        std::snprintf(mb, sizeof(mb), "; mach: faults %d (cow %d, pageins %d), mach calls %d, unix calls %d, csw %d; "
+                      "write-watch faults %llu, reads %llu; top thread sys %.0f%%",
+                      ev.faults - s.events.faults, ev.cow_faults - s.events.cow_faults, ev.pageins - s.events.pageins,
+                      ev.syscalls_mach - s.events.syscalls_mach, ev.syscalls_unix - s.events.syscalls_unix, ev.csw - s.events.csw,
+                      static_cast<unsigned long long>(ws.faults - s.watch.faults),
+                      static_cast<unsigned long long>(ws.releases - s.watch.releases), busy.empty() ? 0.0 : busy[0].sys_pct);
+        gpu += mb;
+        s.events = ev;
+        s.watch = ws;
+    }
+#endif
     host_log("frames: %.2f s: %zu flips (%.1f/s), displayed %.1f/s, interval avg %.1f p95 %.1f max %.1f ms, %d over 16.7, %d over 33.3; "
              "cpu %.0f%%:%s; main loop waited %.0f ms, slept %.0f ms, file I/O %.0f ms%s%s",
              secs, n, static_cast<double>(n) / secs, displayed, sum / static_cast<double>(n), p95, worst, over16, over33, total,
