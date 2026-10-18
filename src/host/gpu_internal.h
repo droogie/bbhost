@@ -393,6 +393,9 @@ struct Gpu {
     // MoltenVK makes every buffer with a device address resident for each
     // dispatch, so they are kept few.
     bool moltenvk = false;
+    // MoltenVK: a draw whose vertex input takes more slots runs its fetch
+    // shader instead. 0: no limit.
+    std::uint32_t vertex_buffer_room = 0;
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start

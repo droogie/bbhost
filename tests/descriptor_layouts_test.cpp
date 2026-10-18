@@ -170,6 +170,35 @@ int main() {
                "the hull shader as a control stage still reads set 0's params block" + mode);
         expect((gpu::kCbPushStages[0] | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) == gpu::kGfxSetStages[0],
                "the vertex half of set 2 is read by set 0's stages but the control stage" + mode);
+        // The vertex stage: 31 slots less the 8 argument buffers, the pushed
+        // vertex half's 16 and the dynamic offsets leave 6 vertex buffers.
+        expect(gpu::mvk_vertex_buffer_room(cbs) == (push ? 6u : 22u), "MoltenVK leaves a vertex stage 6 vertex buffers (22 unpushed)" + mode);
+    }
+    // MoltenVK's vertex buffer slots: the highest binding + 1, and one for each
+    // attribute at a nonzero offset ending past its stride.
+    {
+        std::vector<VkVertexInputBindingDescription> b;
+        std::vector<VkVertexInputAttributeDescription> a;
+        std::vector<std::uint32_t> bytes;
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            b.push_back({k, 20, VK_VERTEX_INPUT_RATE_VERTEX});
+            a.push_back({k, k, k == 0 ? VK_FORMAT_R32G32B32_UINT : VK_FORMAT_R8G8B8A8_UINT, 0});
+            bytes.push_back(k == 0 ? 12 : 4);
+        }
+        expect(gpu::mvk_vertex_input_slots(b, a, bytes) == 8, "8 bindings take 8 slots");
+        b.resize(6);
+        a.resize(6);
+        bytes.resize(6);
+        expect(gpu::mvk_vertex_input_slots(b, a, bytes) == 6, "6 bindings take 6 slots");
+        // One binding, its attributes at offsets 0, 12 and 16 of a 20-byte
+        // stride: none ends past it. At 18, a 4-byte one does.
+        const std::vector<VkVertexInputBindingDescription> one = {{0, 20, VK_VERTEX_INPUT_RATE_VERTEX}};
+        std::vector<VkVertexInputAttributeDescription> at = {{0, 0, VK_FORMAT_R32G32B32_UINT, 0},
+                                                             {1, 0, VK_FORMAT_R8G8B8A8_UINT, 12},
+                                                             {2, 0, VK_FORMAT_R8G8B8A8_UINT, 16}};
+        expect(gpu::mvk_vertex_input_slots(one, at, {12, 4, 4}) == 1, "attributes within the stride take no slot of their own");
+        at[2].offset = 18;
+        expect(gpu::mvk_vertex_input_slots(one, at, {12, 4, 4}) == 2, "an attribute ending past the stride takes a slot of its own");
     }
     // One sampler short of the old layouts' 64 a stage is enough to go per stage.
     {

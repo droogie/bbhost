@@ -10308,6 +10308,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         std::uint32_t stride;
         VkFormat format;
         std::uint64_t va;
+        std::uint32_t bytes;
     } placed[16];
     p.elements.clear();
     // The device-local copy of each vertex record, once per record: its
@@ -10391,7 +10392,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         ve.count = fe.count;
         ve.w3 = w[3];
         p.elements.push_back(ve);
-        placed[e] = {loc.buffer, loc.offset, stride, fmt, va};
+        placed[e] = {loc.buffer, loc.offset, stride, fmt, va, bytes};
     }
     // Every element reads address + v0 * stride, so elements in one buffer
     // with one stride can share a binding at their lowest offset with the rest
@@ -10426,6 +10427,24 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         return true;
     };
     if (!bind(g_vertex_input == 2)) bind(true);
+    // MoltenVK fails a pipeline with more vertex buffers than Metal has slots
+    // left (mvk_vertex_buffer_room); the fetch shader reads them instead.
+    if (g.vertex_buffer_room) {
+        std::vector<std::uint32_t> bytes(n);
+        for (std::size_t e = 0; e < n; ++e) bytes[e] = placed[e].bytes;
+        const std::uint32_t slots = mvk_vertex_input_slots(p.bindings, p.attributes, bytes);
+        if (slots > g.vertex_buffer_room) {
+            t_vertex_input_refusal = kVsWhySlots;
+            static std::mutex said_mu;  // plan_vertex_input also runs on the LS planning path
+            static std::set<std::uint64_t> said;
+            std::lock_guard<std::mutex> lk(said_mu);
+            if (said.size() < 16 && said.insert(fetch_hash).second) {
+                host_log("render: fetch shader %016llx at 0x%llx kept: its vertex input takes %u of Metal's buffer slots, %u are left for it",
+                         static_cast<unsigned long long>(fetch_hash), static_cast<unsigned long long>(o.fetch_va), slots, g.vertex_buffer_room);
+            }
+            return false;
+        }
+    }
     std::uint64_t h = fnv1a("vertex input", 12);
     h = fnv1a(p.elements.data(), p.elements.size() * sizeof(gcn::VertexElement), h);
     h = fnv1a(p.bindings.data(), p.bindings.size() * sizeof(VkVertexInputBindingDescription), h);

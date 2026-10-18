@@ -2518,6 +2518,12 @@ bool init_locked() {
         }
         host_log("gpu: constant buffers are pushed per draw (set 2); descriptor sets cached by content");
     }
+    if (g.moltenvk) {
+        g.vertex_buffer_room = std::max(1u, mvk_vertex_buffer_room(cbs));
+        host_log("gpu: vertex input up to %u vertex buffers a draw (Metal's %u buffer slots a stage, less MoltenVK's %u argument buffers, "
+                 "the vertex stage's pushed constant buffers and its dynamic offsets); a draw with more runs its fetch shader",
+                 g.vertex_buffer_room, kMetalStageBuffers, kMvkArgumentBuffers);
+    }
     if (g.bindless) {
         VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
         VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -5636,7 +5642,7 @@ const char* host_gpu_vs_why_name(int why) {
     static const char* const names[kVsWhyCount] = {"tessellation (host)", "tessellation (emulated domain)", "no fetch shader",
                                                     "no GX geometry",      "vertex input off",               "the game's own vertex table",
                                                     "another fetch shape", "a missing record",               "no vertex format",
-                                                    "a short stride",      "data outside one buffer"};
+                                                    "a short stride",      "data outside one buffer",        "no Metal buffer slots left"};
     return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
 void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }

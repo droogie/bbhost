@@ -120,6 +120,43 @@ inline std::vector<VkDescriptorSetLayoutBinding> cb_push_bindings(bool per_stage
     return binds;
 }
 
+// Metal gives a stage 31 buffer slots. MoltenVK fills them from the bottom
+// with an argument buffer per descriptor set (8) and every push-set buffer
+// binding naming the stage, from the top with the vertex buffers, and puts
+// its dynamic offsets just under those: a pipeline whose offsets find no free
+// slot fails to build.
+constexpr std::uint32_t kMetalStageBuffers = 31;
+constexpr std::uint32_t kMvkArgumentBuffers = 8;
+
+// Without argument buffers set 0's own buffers take their place, fewer than 8,
+// so the count holds either way.
+inline std::uint32_t mvk_vertex_buffer_room(const std::vector<VkDescriptorSetLayoutBinding>& push_binds) {
+    std::uint32_t used = kMvkArgumentBuffers + 1;  // and the dynamic offsets
+    for (const VkDescriptorSetLayoutBinding& b : push_binds) {
+        const bool buffer = b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                            b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+                            b.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        if (buffer && (b.stageFlags & VK_SHADER_STAGE_VERTEX_BIT)) used += b.descriptorCount;
+    }
+    return used < kMetalStageBuffers ? kMetalStageBuffers - used : 0;
+}
+
+// MoltenVK adds a binding for each attribute at a nonzero offset that ends
+// past its binding's stride. `attribute_bytes[i]` is attribute i's size.
+inline std::uint32_t mvk_vertex_input_slots(const std::vector<VkVertexInputBindingDescription>& bindings,
+                                            const std::vector<VkVertexInputAttributeDescription>& attributes,
+                                            const std::vector<std::uint32_t>& attribute_bytes) {
+    std::uint32_t slots = 0;
+    for (const VkVertexInputBindingDescription& b : bindings) {
+        slots = std::max(slots, b.binding + 1);
+        for (std::size_t i = 0; i < attributes.size() && i < attribute_bytes.size(); ++i) {
+            const VkVertexInputAttributeDescription& a = attributes[i];
+            if (a.binding == b.binding && a.offset && a.offset + attribute_bytes[i] > b.stride) ++slots;
+        }
+    }
+    return slots;
+}
+
 // One set of a pipeline layout. An update-after-bind set (bindless.cpp's
 // global set) answers to the update-after-bind limits instead, which are not
 // checked here.
