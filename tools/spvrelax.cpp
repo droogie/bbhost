@@ -1,8 +1,10 @@
 // spvrelax: spv::relax_contraction, as bbhost applies it before MoltenVK.
 //
-//   spvrelax <in.spv> <out.spv> [--graphics]
+//   spvrelax <in.spv> <out.spv> [--graphics | --invariant]
 //
-// Without --graphics only a fragment stage changes, as bbhost does by default.
+// Without either only a fragment stage changes. --graphics: vertex-pipeline
+// stages too, their Position kept exact; --invariant: as bbhost does on
+// MoltenVK, their Position made Invariant instead (RelaxStages::GraphicsInvariant).
 // Prints how many decorations were dropped and kept.
 #include "host/spirv_relax.h"
 
@@ -14,7 +16,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: spvrelax <in.spv> <out.spv> [--graphics]\n");
+        std::fprintf(stderr, "usage: spvrelax <in.spv> <out.spv> [--graphics | --invariant]\n");
         return 2;
     }
     std::ifstream f(argv[1], std::ios::binary);
@@ -25,9 +27,11 @@ int main(int argc, char** argv) {
     }
     std::vector<std::uint32_t> words(bytes.size() / 4);
     std::memcpy(words.data(), bytes.data(), bytes.size());
-    const bool graphics = argc > 3 && std::strcmp(argv[3], "--graphics") == 0;
+    spv::RelaxStages stages = spv::RelaxStages::Fragment;
+    if (argc > 3 && std::strcmp(argv[3], "--graphics") == 0) stages = spv::RelaxStages::Graphics;
+    if (argc > 3 && std::strcmp(argv[3], "--invariant") == 0) stages = spv::RelaxStages::GraphicsInvariant;
     spv::RelaxStats st;
-    const std::vector<std::uint32_t> out = spv::relax_contraction(words, graphics ? spv::RelaxStages::Graphics : spv::RelaxStages::Fragment, &st);
+    const std::vector<std::uint32_t> out = spv::relax_contraction(words, stages, &st);
     std::ofstream o(argv[2], std::ios::binary);
     if (!o.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size() * 4))) {
         std::fprintf(stderr, "spvrelax: cannot write %s\n", argv[2]);

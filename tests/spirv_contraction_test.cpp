@@ -130,6 +130,19 @@ int main() {
         expect(after.count(s.condition) == 1, "a branch condition's value keeps it");
         expect(after.count(s.free) == 0, "a value feeding only a varying loses it");
         expect(st.dropped == before.size() - after.size() && st.kept == after.size(), "the counts add up");
+        if (!fragment) {
+            // Invariant in place of exact arithmetic.
+            const std::vector<std::uint32_t> inv = spv::relax_contraction(s.words, spv::RelaxStages::GraphicsInvariant, &st);
+            expect(valid(inv), "the invariant-relaxed module is valid");
+            const std::set<std::uint32_t> kept = no_contraction(inv);
+            expect(kept.size() == 1 && kept.count(s.condition) == 1, "invariant scope keeps only the branch condition's");
+            int invariant = 0;
+            for (std::size_t i = 5; i < inv.size(); i += inv[i] >> 16) {
+                if ((inv[i] & 0xffff) == spv::OpDecorate && (inv[i] >> 16) == 3 && inv[i + 2] == spv::DecInvariant) ++invariant;
+            }
+            expect(invariant == 1, "the Position output is decorated Invariant once");
+            expect(spv::relax_contraction(inv, spv::RelaxStages::GraphicsInvariant) == inv, "a second pass changes nothing");
+        }
     }
     // A pixel shader that neither discards nor writes depth loses every decoration.
     {

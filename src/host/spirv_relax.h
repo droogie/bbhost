@@ -8,8 +8,10 @@
 
 namespace spv {
 
-// Which stages relax_contraction() may change.
-enum class RelaxStages { Fragment, Graphics };
+// How a vertex-pipeline stage's Position stays the same across pipelines:
+// Graphics keeps its arithmetic exact; GraphicsInvariant decorates it
+// Invariant instead (MSL [[invariant]]) and leaves a stage writing none alone.
+enum class RelaxStages { Fragment, Graphics, GraphicsInvariant };
 struct RelaxStats {
     std::uint32_t dropped = 0, kept = 0;  // NoContraction decorations removed / left
 };

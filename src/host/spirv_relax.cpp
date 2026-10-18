@@ -2,6 +2,8 @@
 
 #include "gcn/spirv.h"
 
+#include <algorithm>
+
 namespace spv {
 
 namespace {
@@ -62,6 +64,12 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
     int model = -1;
     std::vector<std::uint32_t> builtin(bound, ~0u), pointee(bound, 0), def(bound, ~0u), root(bound, 0), var_type(bound, 0);
     std::vector<std::vector<std::uint32_t>> member_builtins(bound);  // struct type -> its members' BuiltIns
+    // GraphicsInvariant: where Position is declared - variables, and struct
+    // members as (struct, member) - with the instruction to put Invariant after.
+    std::vector<std::pair<std::uint32_t, std::size_t>> position_vars;                       // (variable, instruction)
+    std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> position_members;  // ((struct, member), instruction)
+    std::vector<std::uint8_t> invariant(bound, 0);                                            // variables and structs already Invariant
+    std::vector<std::uint8_t> invariant_member_struct(bound, 0);
     std::vector<std::uint32_t> element(bound, 0);                     // array type -> element type
     std::vector<std::uint32_t> output_vars, conditions;
     bool in_function = false, discards = false;
@@ -75,9 +83,13 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
             continue;
         case OpDecorate:
             if (in.count >= 4 && id_ok(w[1]) && w[2] == DecBuiltIn) builtin[w[1]] = w[3];
+            if (in.count >= 4 && id_ok(w[1]) && w[2] == DecBuiltIn && w[3] == BiPosition) position_vars.push_back({w[1], k});
+            if (in.count >= 3 && id_ok(w[1]) && w[2] == DecInvariant) invariant[w[1]] = 1;
             continue;
         case OpMemberDecorate:
             if (in.count >= 5 && id_ok(w[1]) && w[3] == DecBuiltIn) member_builtins[w[1]].push_back(w[4]);
+            if (in.count >= 5 && id_ok(w[1]) && w[3] == DecBuiltIn && w[4] == BiPosition) position_members.push_back({{w[1], w[2]}, k});
+            if (in.count >= 4 && id_ok(w[1]) && w[3] == DecInvariant) invariant_member_struct[w[1]] = 1;
             continue;
         case OpTypeArray:
         case OpTypeRuntimeArray:
@@ -121,10 +133,38 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
     const bool fragment = model == static_cast<int>(EmFragment);
     const bool graphics = model == static_cast<int>(EmVertex) || model == static_cast<int>(EmTessellationControl) ||
                           model == static_cast<int>(EmTessellationEvaluation) || model == 3 /* Geometry */;
-    if (!fragment && !(graphics && stages == RelaxStages::Graphics)) return words;
+    if (!fragment && !(graphics && (stages == RelaxStages::Graphics || stages == RelaxStages::GraphicsInvariant))) return words;
+    // GraphicsInvariant. A tessellation control stage's Position is no
+    // rasterizer's: left alone.
+    std::vector<std::size_t> add_invariant_after;  // instruction indices
+    std::vector<std::vector<std::uint32_t>> add_invariant;
+    const bool by_invariance = graphics && stages == RelaxStages::GraphicsInvariant;
+    if (by_invariance && model == static_cast<int>(EmTessellationControl)) return words;
+    if (by_invariance) {
+        std::vector<std::uint8_t> output_struct(bound, 0);
+        for (std::uint32_t v : output_vars) {
+            std::uint32_t t = id_ok(var_type[v]) ? pointee[var_type[v]] : 0;
+            for (int depth = 0; depth < 4 && id_ok(t) && element[t]; ++depth) t = element[t];
+            if (id_ok(t)) output_struct[t] = 1;
+        }
+        for (const auto& [v, at] : position_vars) {
+            if (std::find(output_vars.begin(), output_vars.end(), v) == output_vars.end()) continue;
+            add_invariant_after.push_back(at);
+            add_invariant.push_back(invariant[v] ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{3u << 16 | OpDecorate, v, DecInvariant});
+        }
+        for (const auto& [sm, at] : position_members) {
+            if (!output_struct[sm.first]) continue;
+            add_invariant_after.push_back(at);
+            add_invariant.push_back(invariant_member_struct[sm.first]
+                                        ? std::vector<std::uint32_t>{}
+                                        : std::vector<std::uint32_t>{4u << 16 | OpMemberDecorate, sm.first, sm.second, DecInvariant});
+        }
+        if (add_invariant_after.empty()) return words;
+    }
     // The outputs whose writes must stay exact.
     const auto watched = [&](std::uint32_t b) {
-        return fragment ? b == BiFragDepth : (b == BiPosition || b == 3 /* ClipDistance */ || b == 4 /* CullDistance */);
+        if (fragment) return b == BiFragDepth;
+        return (b == BiPosition && !by_invariance) || b == 3 /* ClipDistance */ || b == 4 /* CullDistance */;
     };
     std::vector<std::uint8_t> watched_root(bound, 0);
     bool any_watched = false;
@@ -179,7 +219,8 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
     }
     std::vector<std::uint32_t> out(words.begin(), words.begin() + 5);
     out.reserve(words.size());
-    for (const Inst& in : insts) {
+    for (std::size_t k = 0; k < insts.size(); ++k) {
+        const Inst& in = insts[k];
         const std::uint32_t* w = &words[in.at];
         if (in.op == OpDecorate && in.count == 3 && w[2] == DecNoContraction && id_ok(w[1])) {
             if (!in_slice[w[1]]) {
@@ -189,6 +230,9 @@ std::vector<std::uint32_t> relax_contraction(const std::vector<std::uint32_t>& w
             ++st.kept;
         }
         out.insert(out.end(), w, w + in.count);
+        for (std::size_t j = 0; j < add_invariant_after.size(); ++j) {
+            if (add_invariant_after[j] == k) out.insert(out.end(), add_invariant[j].begin(), add_invariant[j].end());
+        }
     }
     return out;
 }

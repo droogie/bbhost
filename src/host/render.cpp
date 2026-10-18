@@ -1957,6 +1957,14 @@ void dump_buffers(const std::string& name, const gcn::TranslateResult& meta, std
     }
 }
 
+spv::RelaxStages relax_contraction_stages() {
+    static const spv::RelaxStages stages = [] {
+        const char* e = std::getenv("BBHOST_VS_CONTRACTION");
+        return e && e[0] == '1' ? spv::RelaxStages::Fragment : spv::RelaxStages::GraphicsInvariant;
+    }();
+    return stages;
+}
+
 // Whether shader modules lose their NoContraction decorations on the way to
 // the driver (spv::relax_contraction). MoltenVK's SPIR-V to MSL conversion
 // makes each decorated op a call to a [[clang::optnone]] helper, which made
@@ -1965,13 +1973,26 @@ void dump_buffers(const std::string& name, const gcn::TranslateResult& meta, std
 // Done here rather than in the translator so the translation cache, the
 // lifter's byte-identical checks and every other driver see the same modules
 // as before. BBHOST_NO_CONTRACTION=1 keeps every decoration (an A/B switch).
+//
+// Vertex-pipeline stages lose them too (RelaxStages::GraphicsInvariant): their
+// Position output is decorated Invariant instead, which MoltenVK compiles as
+// [[position, invariant]] with preserveInvariance, so a surface drawn by two
+// pipelines (say a depth pass and an EQUAL-tested one) still lands on the same
+// depths. The scene passes' vertex work in the Hunter's Dream went from about
+// 29 to 9 ms a frame at 1080p. BBHOST_VS_CONTRACTION=1 keeps those stages
+// exact (fragment stages only, as before).
 bool relax_contraction_on() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_NO_CONTRACTION");
         const bool keep = e && e[0] == '1';
         if (g.moltenvk) {
-            host_log("gpu: NoContraction %s in fragment stages (MoltenVK)%s", keep ? "kept" : "dropped",
-                     keep ? " - BBHOST_NO_CONTRACTION=1" : ", except what feeds FragDepth and discards");
+            host_log("gpu: NoContraction %s (MoltenVK)%s", keep ? "kept" : "dropped",
+                     keep ? " - BBHOST_NO_CONTRACTION=1"
+                          : relax_contraction_stages() == spv::RelaxStages::GraphicsInvariant
+                                ? " in fragment stages, except what feeds FragDepth and discards, and in vertex-pipeline stages, "
+                                  "whose Position is Invariant instead"
+                                : " in fragment stages, except what feeds FragDepth and discards; vertex stages exact "
+                                  "(BBHOST_VS_CONTRACTION=1)");
         }
         return g.moltenvk && !keep;
     }();
@@ -2020,7 +2041,7 @@ std::vector<std::uint32_t> salt_names(const std::vector<std::uint32_t>& in) {
 
 bool make_module(const std::vector<std::uint32_t>& spirv, VkShaderModule& out) {
     std::vector<std::uint32_t> relaxed;
-    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, spv::RelaxStages::Fragment);
+    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, relax_contraction_stages());
     if (std::vector<std::uint32_t> salted = salt_names(relaxed.empty() ? spirv : relaxed); !salted.empty()) relaxed = std::move(salted);
     const std::vector<std::uint32_t>& words = relaxed.empty() ? spirv : relaxed;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
