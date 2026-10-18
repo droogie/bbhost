@@ -44,7 +44,14 @@ and keyboard instead, pick the Gamepad layout in its controller settings
 - These settings and the account sign-in are kept for this kit alone, so a
   copy of bbhost on a PC keeps its own; the game's paths are shared.
 - The first minutes in a new area compile shaders and can stutter; they are
-  kept, so the next start is smoother.
+  kept, so the next start is smoother. To compile the game's shaders before
+  playing (after an update, say), start bbhost with the setup window
+  (`--setup`, or in Desktop Mode), open its Shaders tab and press Compile
+  shaders now; the window recommends it when the caches are missing or out
+  of date (about 2-3 minutes on the Deck). It can be cancelled; what is
+  done is kept. Without it, the game's HLSL shaders are compiled in the
+  background only while the title and loading screens are up (on the Deck,
+  compiling during play cost ~2 fps), and are used from the start after.
 - **30 or 60 fps**: System, Steam Deck, Frame Rate. 30 fps renders at the
   screen's own 1280x800, the game's own pace and the Deck's default here.
   60 fps renders at 960x600 and bbhost scales the picture up to the screen

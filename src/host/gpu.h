@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 
+struct GxStageRecords;
 struct GpuDispatch {
     std::uint64_t code_va = 0;      // guest VA of the shader program (COMPUTE_PGM_LO/HI)
     std::uint32_t rsrc1 = 0;        // COMPUTE_PGM_RSRC1
@@ -37,10 +38,24 @@ struct GpuDispatch {
         std::uint64_t from = 0;    // kGdsCopy
         std::uint32_t value = 0;   // kGdsSet
         GdsStart start = kGdsKeep;
+        std::uint32_t buffer_id = 0;  // the GX id of the buffer the word belongs to, from a token (0: not known)
     };
     static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
     std::uint32_t gds_base = 0;
     GdsCounter gds[kGdsCounters] = {};
+    // The counters came with the dispatch token, from the engine's objects
+    // (gx_trace.cpp take_cs_counters: each UAV's word and initial count), not
+    // from the DMA_DATA moves through GDS around the dispatch packet.
+    bool gds_from_token = false;
+    // A dispatch token from GX's compute commit: the compute stage's records,
+    // taken at the call from the context's pending state (gx_trace.cpp
+    // snapshot_cs_records). The user data the descriptors name is built from
+    // them when the dispatch runs (the rest stays user_data's); null for a
+    // dispatch from its packet or from another caller.
+    const GxStageRecords* cs_records = nullptr;
+    // The dispatch-token shadow: work out which user-data dwords the program
+    // reads (host_gpu_dispatch_user_reads), to compare only those.
+    bool want_user_reads = false;
 };
 
 // Everything a draw is decoded from, in register encodings. The PM4 path
@@ -192,6 +207,15 @@ struct alignas(64) GxStageRecords {
     // type 7 (a user-data pointer) or 0x14 (a pointer in the extended block)
     // hands the shader, copied at the call when the stage has one.
     bool has_ctx_block = false;
+    // A compute stage's records (a dispatch token's, gx_trace.cpp
+    // snapshot_cs_records): the 32-byte "sampler" records (types 2/3, the
+    // tables of type 9) are its UAVs' (obj_smp, slots 0-7), the sampler
+    // caches (type 4, tables of type 0xa) its samplers' 16-byte records in
+    // smp_cache, the constant buffers its 16 slots - the shader's embedded
+    // buffer at slot 15 - in cb (obj_cb_set's bits), and a type 6 descriptor
+    // is the GDS counter range 0x00200020.
+    bool compute = false;
+    std::uint16_t cs_smp_set = 0;  // compute: the sampler-cache slots smp_cache holds
     // desc[0..ndesc) hashed at the copy, which keys the
     // renderer's binding plans (how each binding reads these records, worked
     // out once per shader rather than at every draw); 0 for no descriptors.
@@ -262,6 +286,35 @@ bool host_gpu_small_vram();
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
 bool host_gpu_dispatch(const GpuDispatch& d);
+// The user-data dwords (bit n: user SGPR n) the program of this thread's last
+// host_gpu_dispatch touches, when it asked (GpuDispatch::want_user_reads) and
+// its pipeline was found; 0xffff otherwise.
+std::uint32_t host_gpu_dispatch_user_reads();
+// Shadow (BBHOST_GX_NATIVE_DISPATCH=1): a dispatch token's compute records
+// (GpuDispatch::cs_records) built into user data, against the register
+// file's at the dispatch packet, over the registers its program reads
+// (read_mask, render.cpp). Plain dwords compare directly; a table, the context
+// block or the extended block by the contents its pointer reaches.
+struct CsUserCompare {
+    int result = 0;     // the builder's result (0: built)
+    bool built = false;
+    std::uint64_t dwords = 0, dwords_differ = 0, units = 0, units_differ = 0, unreadable = 0;
+    int first_bad = -1;  // the first differing plain dword
+    std::uint32_t bad_reg = 0, bad_built = 0;
+    int first_unit_ud = -1;  // the first differing table slot or block dword: its pointer's slot
+    std::uint32_t first_unit_index = 0;
+    std::uint32_t unit_reg[2] = {}, unit_built[2] = {};
+};
+void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out);
+// What the last host_gpu_dispatch on this thread was (BBHOST_CP_CENSUS): a
+// fill or a render-target copy done without a shader, a shader the copy and
+// fill detectors recognised but which still ran (an image or buffer-to-image
+// copy, a fill or copy whose range was not a target's), any other shader, or
+// a dispatch that failed. `program`, when given, gets the program's name.
+enum GpuDispatchClass : std::uint8_t {
+    kDcNone, kDcFill, kDcCopyImage, kDcImageBlit, kDcBufferToImage, kDcFillShader, kDcCopyShader, kDcShader, kDcFailed, kDcClasses
+};
+GpuDispatchClass host_gpu_last_dispatch_class(const char** program = nullptr);
 // Queues one draw.
 bool host_gpu_draw(const GpuDraw& d);
 // Runs queued work and waits for it; call before the command processor
@@ -321,6 +374,11 @@ bool host_gpu_gds_counters();
 // before this point in the stream left (D3D11's CopyStructureCount).
 bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
 bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes);
+// A GX buffer was made over [va, va + bytes) with this D3D11 usage and bind
+// flags: with window imports (BBHOST_IMPORT_WINDOWS=1), when the GPU will read
+// it in place, its windows are imported ahead of their first use on a thread
+// of their own; nothing otherwise. Any thread, any lock.
+void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
@@ -333,6 +391,13 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
 // copy of the bytes taken now and the copy into place waits for the pass's
 // end (BBHOST_COPY_VERSIONS=0: as host_gpu_copy_guest, which it falls back to).
 bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// Copy-backs [0, n) (dst[i] <- src[i], bytes[i]), in order, under one hold of
+// the renderer's lock, as long as each becomes a copy version (a zero-length
+// one is passed over); how many it took. The caller copies the one it stops at
+// on the GPU (host_gpu_copy_guest, as host_gpu_copy_back would). One lock for
+// a token's copies: each release waited for the copy just made to leave the
+// write-combining buffers of the staging memory.
+std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n);
 // A constant window a YEBIS draw reads, given at its token on the command
 // processor's thread (engine/yebis_bind.cpp): written into guest memory by
 // the CPU, and the next draw binds a copy of it taken as it records, so no
@@ -349,7 +414,7 @@ bool host_gpu_clear_target(std::uint64_t va, std::uint32_t value, std::size_t by
 // built for it (base filled in): the image is created and its untile queued
 // now, on the creating thread, so the first bind finds it. False when the
 // cache already has it or could not resolve it.
-bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8]);
+bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen = 0);
 // A fill of [va, va+bytes) with a 16-byte value, from a fill
 // token at its place in the stream - what a recognised fill dispatch did.
 bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear);
@@ -373,7 +438,10 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c);
 // The memory [base, base+bytes) of a resource GX destroyed or the kernel
 // unmapped: its surfaces are retired once the command processor has retired
 // everything submitted up to `after_submitted` (hle_gnm_submitted_total()).
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted);
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// GX mapped the texture whose memory is [base, base + bytes) for the CPU to
+// write: its surfaces upload it again at their next use.
+void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);
 // Copies `bytes` into the host-owned table ring the GPU page
 // table reaches and returns their guest address (0 when no ring could be
 // mapped); a draw token's user data points at tables placed here.
@@ -384,6 +452,55 @@ std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size
 // begins at `base` clears at its next draw to the HTILE word's depth and the
 // stencil, as an HTILE fill does for one with HTILE.
 void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil);
+// GX's ClearRenderTargetView or ClearDepthStencilView, in the view's own
+// terms (a clear token, hle/gx_trace.cpp): the view's registry id and the
+// target words a draw binding that view carries (GpuDrawInputs::color /
+// z_info..htile_base), the view's extent, and the value. The command
+// processor clears the image a draw binding the view would draw into, in
+// stream order - D3D11's Clear*View, which Dark Souls III PC's GX calls.
+struct GpuClearView {
+    bool depth = false;           // a depth-stencil view
+    std::uint32_t view_id = 0;    // gx_object_id of the view (0: not seen made)
+    std::uint32_t extent = 0;     // gx_view_extent: (width << 16) | height, 0 when not known
+    // Colour: CB_COLOR BASE, PITCH, SLICE, VIEW, INFO; the view's own mip,
+    // first slice and slice count; whether CMASK fast clears it (CB_COLOR_INFO
+    // FAST_CLEAR, where GX fills CMASK instead of the surface).
+    std::uint32_t color[5] = {};
+    std::uint32_t mip = 0, first_slice = 0, slices = 1;
+    bool fast_clear = false;
+    float rgba[4] = {};
+    // Depth: DB_Z_INFO, DB_STENCIL_INFO, DB_Z_READ_BASE, DB_DEPTH_SIZE,
+    // DB_DEPTH_VIEW, DB_HTILE_DATA_BASE; D3D11's flags (1 depth, 2 stencil);
+    // the depth and stencil arguments; whether the view has HTILE
+    // (DB_Z_INFO.TILE_SURFACE_ENABLE) and whether its HTILE words leave the
+    // stencil state out (DB_STENCIL_INFO.TILE_STENCIL_DISABLE); the output
+    // merger's depth and stencil clears (ctx+0xb650, +0xb654: what its commit
+    // writes to DB_DEPTH_CLEAR / DB_STENCIL_CLEAR), from which GX's own pass
+    // builds its HTILE word. render.cpp depth_clear_planes says what GX's
+    // clear leaves from these.
+    std::uint32_t z_info = 0, stencil_info = 0, z_read_base = 0, depth_size = 0, depth_view = 0, htile_base = 0;
+    std::uint32_t flags = 0;
+    float depth_value = 0.0f, om_depth = 0.0f;
+    std::uint32_t stencil = 0, om_stencil = 0;
+    bool htile = false, tile_stencil_off = false;
+};
+// What a clear (or, while BBHOST_GX_CLEAR_VIEWS=1 checks, the fill path's
+// clear that follows it) did. `apply` false resolves and reports only.
+struct GpuClearViewResult {
+    const void* image = nullptr;  // the target image, null when none was made yet (apply false)
+    std::uint32_t first_layer = 0, layers = 0;
+    bool created = false;
+};
+bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out = nullptr);
+// Whether the command processor can clear this view (its format has a host
+// form, its words name memory); `why` says why not. Pure: callable at the call.
+bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why);
+// BBHOST_GX_CLEAR_VIEWS=1: the fill tokens that follow a clear token (the
+// method's own work) report what they cleared against what the token
+// resolved, and the exit report counts agreements by kind.
+void host_gpu_clear_view_check_begin(const GpuClearView& c, const GpuClearViewResult& expect);
+void host_gpu_clear_view_check_end();
+std::string host_gpu_clear_view_report();
 // Cumulative counters for per-frame deltas in the flip log.
 struct GpuStats {
     std::uint64_t draws, dispatches, flushes, gpu_us, pipelines, transfers, transfer_batches;
@@ -402,6 +519,8 @@ struct GpuStats {
     // The draws on the host's tessellator (DrawTess): all of them, and those
     // whose evaluation, vertex and control stages ran lifted.
     std::uint64_t draws_tess[6];
+    // Dispatches that ran a shader, and of them those that ran its typed lift.
+    std::uint64_t shader_dispatches, lifted_dispatches;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
 // typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,
@@ -488,6 +607,10 @@ void host_gpu_set_predication(std::uint64_t block, unsigned op, bool draw_if_vis
 std::string host_gpu_occlusion_report();  // the 300-flip line; empty when off
 // The texture image heap's blocks and use (gpu.cpp).
 std::string host_gpu_image_heap_report();
+// The 5-second report's resource lines (host/textures.cpp
+// textures_census_window_locked): the write watch's faults, arms and releases
+// by owner, the texture surfaces by registration, the census of new ones.
+void host_gpu_resources_report();
 // Pixel shaders at wave32 (render.cpp): programs by subgroup size, when any
 // were added since the last call; empty otherwise or with the feature off.
 std::string host_gpu_ps_wave_report();
@@ -503,6 +626,22 @@ void host_gpu_world_reached();
 // queued or running on the precompile workers; 0 otherwise (the window's
 // notice, host/window.cpp).
 std::size_t host_gpu_shader_backlog();
+// The setup window's "Compile shaders now" (host/shader_compile.h): a run
+// with no game that starts the device and compiles every shader the game's
+// bundles hold and the manifests name - translations, lifts, DXC's modules
+// and the driver's pipelines - into the caches, on the same workers the game
+// uses. Set before host_gpu_init.
+void host_gpu_set_compile_session(bool on);
+struct HostShaderCompileProgress {
+    std::uint64_t total = 0, done = 0, failed = 0;
+    std::uint64_t recipes_total = 0, recipes_done = 0;  // pipelines replayed from the manifest and the shipped list
+    bool listed = false, finished = false;
+    std::string reasons;  // one "why xN" a line
+};
+HostShaderCompileProgress host_gpu_compile_progress();
+void host_gpu_compile_cancel();
+// The device in use: "vendor:device:driver:pipelineCacheUUID name".
+std::string host_gpu_device_identity();
 std::string host_gpu_memory_budget_report();
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
@@ -546,6 +685,7 @@ struct GpuBusy {
     std::uint64_t busy_ns = 0;     // the union over both
     std::uint64_t game_ns = 0;     // the game's command buffers alone (their own union)
     std::uint64_t present_ns = 0;  // the presenter's alone
+    std::uint64_t upload_ns = 0;   // the buffer shadow's uploads ahead of the game's command buffers
     std::uint64_t cmdbufs = 0, presents = 0;
 };
 GpuBusy host_gpu_busy();
@@ -640,6 +780,11 @@ void host_gpu_texture_time_us(std::uint64_t out[5]);
 // Graphics pipeline builds on the command processor so far: [0] translation us, [1] shader modules us,
 // [2] vkCreateGraphicsPipelines us, [3] stage translations, [4] stages served by the stage cache.
 void host_gpu_pipeline_time_us(std::uint64_t out[5]);
+// What the command processor's pipeline builds spent in the driver so far, microseconds in [0..5], counts in
+// [6..11]: shader libraries, interface libraries (vertex input, fragment output), links, whole pipelines,
+// descriptor set and pipeline layouts, and waits for a library another thread was building; then compute
+// pipelines a dispatch built itself, microseconds [12] and count [13].
+void host_gpu_pipeline_work(std::uint64_t out[14]);
 // Surfaces and render targets thrown away because their memory changed shape;
 // each costs a full device idle.
 std::uint64_t host_gpu_surface_replacements();

@@ -42,6 +42,12 @@ struct WaveOps {
     std::uint32_t lod_queries = 0;    // image_get_lod: CalculateLevelOfDetailUnclamped
     std::uint32_t helper_queries = 0; // whether a quad holds a live pixel (HelperInvocation + quad reads)
     std::uint32_t discards = 0;       // pixels discarded: EXEC clear at s_endpgm, or a clip distance below 0
+    // compute: a wave's ds_append / ds_consume step in GDS made each
+    // invocation's own (HLSL's IncrementCounter / DecrementCounter, the
+    // lane's rank (v_mbcnt) folded into its slot); and kept, a lane's rank
+    // among a mask's lanes outside that idiom (WavePrefixCountBits)
+    std::uint32_t gds_steps = 0;
+    std::uint32_t lane_ranks = 0;
 };
 
 struct LiftResult {
@@ -75,6 +81,23 @@ LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& opt
 // block or the relink's specialization constant -, the position and params
 // exported with EXEC known set, samples at level 0.
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference);
+
+// Lifts a compute shader of a dispatch (TranslateOptions::stage Compute, no
+// tessellation role) under the same rules, against the translation with the
+// same options - the dispatch's, which binds no buffer: every buffer is read
+// and written through the page table, as the lift then reads and writes it,
+// so the lifted module runs with the descriptor set written for the
+// reference. One invocation is a lane of GCN's wave: its workgroup id and
+// local id as the reference places them in SGPRs and VGPRs, memory accesses
+// as the reference makes them (stores, atomics and image writes where the
+// invocation's EXEC bit is set), loops on EXEC (s_and_b64 exec + an
+// s_cbranch_execz exit) as loops each invocation leaves when its EXEC bit
+// clears. What needs the wave's lanes together - a GDS counter's value, a
+// lane's rank (v_mbcnt) - stays a subgroup operation, as in the reference,
+// and only where the lift's control flow is uniform. Workgroup memory (LDS)
+// is not lifted. Trailing words after a final s_endpgm that no branch reaches
+// (the eboot's own programs carry some) are not part of the program.
+LiftResult lift_compute_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference);
 
 // The stages of a tessellated draw on the host's tessellator, with the LDS the
 // GCN stages pass control points through as stage inputs and outputs.

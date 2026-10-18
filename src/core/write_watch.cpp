@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <cerrno>
 #include <cstdlib>
@@ -37,6 +38,10 @@ std::atomic<Entry*> g_chunks[kChunks];
 // something anywhere was written.
 constexpr unsigned kGroupShift = 8;
 std::atomic<Entry*> g_groups[kChunks];
+// A third: who armed each page (WriteWatch::owner bits, or-ed), for the
+// census of faults and releases by owner. Allocated with the chunk.
+using Owner = std::atomic<std::uint8_t>;
+std::atomic<Owner*> g_owners[kChunks];
 std::mutex g_alloc_mu;
 
 // Sequence numbers: 1 marks a page armed and never written, and every write
@@ -46,6 +51,13 @@ std::atomic<std::uint32_t> g_seq{1};
 // nothing to scan.
 std::atomic<std::uint64_t> g_changes{0};
 std::atomic<std::uint64_t> g_arms{0}, g_faults{0}, g_releases{0}, g_forgets{0}, g_refused{0}, g_ahead_pages{0};
+std::atomic<std::uint64_t> g_faults_by_owner[4] = {}, g_released_by_owner[4] = {}, g_arms_by_owner[4] = {};
+// The fault handler's own time in TSC ticks (no clock call there: it runs on
+// guest threads), converted at the report against the session's elapsed
+// steady time since the first arm; arming's mprotects in ns.
+std::atomic<std::uint64_t> g_fault_ticks{0}, g_arm_ns{0};
+std::atomic<std::uint64_t> g_tsc0{0};
+std::atomic<std::int64_t> g_ns0{0};
 
 const bool g_enabled = [] {
     const char* e = std::getenv("BBHOST_WRITE_WATCH");
@@ -161,6 +173,13 @@ __attribute__((no_stack_protector, always_inline)) inline Entry* entry_of(std::u
     return chunk ? &chunk[page & (kChunkPages - 1)] : nullptr;
 }
 
+__attribute__((no_stack_protector, always_inline)) inline std::uint8_t owner_of(std::uint64_t page) {
+    const std::uint64_t c = page >> kChunkShift;
+    if (c >= kChunks) return 0;
+    Owner* owners = g_owners[c].load(std::memory_order_acquire);
+    return owners ? owners[page & (kChunkPages - 1)].load(std::memory_order_relaxed) & 3 : 0;
+}
+
 // Stores `s` unless the entry already holds a later one: two stamps racing
 // must not leave the earlier.
 __attribute__((no_stack_protector, always_inline)) inline void stamp(Entry& e, std::uint32_t s) {
@@ -197,19 +216,32 @@ bool write_watch_arm_locked(std::uint64_t va, std::size_t len, WriteWatch& w) {
         for (std::uint64_t c = lo >> kChunkShift; c <= hi >> kChunkShift; ++c) {
             if (!g_chunks[c].load(std::memory_order_relaxed)) {
                 g_groups[c].store(new Entry[kChunkPages >> kGroupShift](), std::memory_order_release);
+                g_owners[c].store(new Owner[kChunkPages](), std::memory_order_release);
                 g_chunks[c].store(new Entry[kChunkPages](), std::memory_order_release);
             }
+        }
+        if (!g_tsc0.load(std::memory_order_relaxed)) {
+            g_ns0.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                        std::memory_order_relaxed);
+            g_tsc0.store(__builtin_ia32_rdtsc(), std::memory_order_release);
         }
     }
     // The order that makes the watch sound (see the header): count, then
     // sequence, then protection; the caller reads the memory after.
     const std::uint64_t seen = g_changes.load(std::memory_order_acquire);
     const std::uint32_t armed = g_seq.load(std::memory_order_acquire);
+    const std::uint8_t owner = w.owner & 3;
     for (std::uint64_t p = lo; p <= hi; ++p) {
         std::uint32_t zero = 0;
         entry_of(p)->compare_exchange_strong(zero, 1, std::memory_order_acq_rel);
+        if (owner) g_owners[p >> kChunkShift].load(std::memory_order_relaxed)[p & (kChunkPages - 1)].fetch_or(owner, std::memory_order_relaxed);
     }
-    if (const int err = protect_pages(lo << kPageShift, (hi - lo + 1) << kPageShift, false)) {
+    const auto t_protect = std::chrono::steady_clock::now();
+    const int err = protect_pages(lo << kPageShift, (hi - lo + 1) << kPageShift, false);
+    g_arm_ns.fetch_add(static_cast<std::uint64_t>(
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_protect).count()),
+                       std::memory_order_relaxed);
+    if (err) {
         g_refused.fetch_add(1, std::memory_order_relaxed);
         if (err == ENOMEM) {
             g_arming_off.store(true);
@@ -218,9 +250,10 @@ bool write_watch_arm_locked(std::uint64_t va, std::size_t len, WriteWatch& w) {
         }
         return false;
     }
+    g_arms_by_owner[owner].fetch_add(1, std::memory_order_relaxed);
     if (g_arms.fetch_add(1, std::memory_order_relaxed) == 0) {
-        host_log("write-watch: on - texture memory is write-protected, and a write to it re-uploads the texture "
-                 "on its next use");
+        host_log("write-watch: on - memory the host keeps a copy of (vertex and index data, textures no GX resource "
+                 "holds) is write-protected, and a write to it is copied again at its next use");
     }
     check_mapping_headroom();
     w.armed = armed;
@@ -262,6 +295,7 @@ __attribute__((no_stack_protector)) bool write_watch_on_fault(std::uint64_t addr
     const std::uint64_t page = addr >> kPageShift;
     Entry* e = entry_of(page);
     if (!e || e->load(std::memory_order_acquire) == 0) return false;
+    const std::uint64_t t0 = __builtin_ia32_rdtsc();
     // A writer streaming through protected pages - GX copying a new
     // resource's data into memory dead resources' watches still cover, the
     // engine's parallel copies of a streamed file - faulted once per 4 KiB
@@ -301,12 +335,14 @@ __attribute__((no_stack_protector)) bool write_watch_on_fault(std::uint64_t addr
     for (std::uint64_t k = 1; k <= ahead; ++k) stamp_page(page + k, *entry_of(page + k), s);
     g_changes.fetch_add(1, std::memory_order_acq_rel);
     g_faults.fetch_add(1, std::memory_order_relaxed);
+    g_faults_by_owner[owner_of(page)].fetch_add(1, std::memory_order_relaxed);
     if (ahead) g_ahead_pages.fetch_add(ahead, std::memory_order_relaxed);
     const std::uint32_t n = g_fault_next.fetch_add(1, std::memory_order_relaxed);
     const unsigned slot = n % kFaultRing;
     for (int k = 0; k < kWriteWatchFrame; ++k) g_fault_frame[slot][k].store(frame ? frame[k] : 0, std::memory_order_relaxed);
     g_fault_when[slot].store(n + 1, std::memory_order_relaxed);
     g_fault_addr[slot].store(addr, std::memory_order_release);
+    g_fault_ticks.fetch_add(__builtin_ia32_rdtsc() - t0, std::memory_order_relaxed);
     return true;
 }
 
@@ -474,7 +510,10 @@ __attribute__((no_stack_protector)) bool write_watch_release(void* p, std::size_
             pg = ((pg >> kChunkShift) + 1) * kChunkPages - 1;
             continue;
         }
-        if (e->load(std::memory_order_acquire) != 0) stamp_page(pg, *e, s);
+        if (e->load(std::memory_order_acquire) != 0) {
+            stamp_page(pg, *e, s);
+            g_released_by_owner[owner_of(pg)].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     g_changes.fetch_add(1, std::memory_order_acq_rel);
     g_releases.fetch_add(1, std::memory_order_relaxed);
@@ -524,5 +563,18 @@ WriteWatchStats write_watch_stats() {
     s.forgets = g_forgets.load();
     s.refused = g_refused.load();
     s.ahead_pages = g_ahead_pages.load();
+    for (int k = 0; k < 4; ++k) {
+        s.faults_by_owner[k] = g_faults_by_owner[k].load();
+        s.released_pages_by_owner[k] = g_released_by_owner[k].load();
+        s.arms_by_owner[k] = g_arms_by_owner[k].load();
+    }
+    s.arm_ns = g_arm_ns.load();
+    // TSC ticks to ns over the session since the first arm (invariant TSC).
+    if (const std::uint64_t tsc0 = g_tsc0.load(std::memory_order_acquire)) {
+        const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() -
+                                g_ns0.load(std::memory_order_relaxed);
+        const std::uint64_t ticks = __builtin_ia32_rdtsc() - tsc0;
+        if (ns > 0 && ticks) s.fault_handler_ns = static_cast<std::uint64_t>(static_cast<double>(g_fault_ticks.load()) * static_cast<double>(ns) / static_cast<double>(ticks));
+    }
     return s;
 }

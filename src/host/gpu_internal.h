@@ -112,19 +112,25 @@ inline bool chunk_covers(const Chunk& c, std::uint64_t in, std::uint64_t bytes) 
 }
 // Direct memory is imported a 16 MiB window at a time, when the GPU side
 // first resolves a range in it (a binding, a copy, an untile source, a mirror
-// page), and only inside the span the chunk's GPU-visible mappings cover
-// (gpu_span): the game's CPU-only heaps, the never-allocated tail and the GPU
-// heaps' untouched parts stay out of the driver's pinned memory - what
-// Windows counts as the process's shared GPU memory. A range across windows
-// gets one import of them all. Only with BBHOST_IMPORT_WINDOWS=1 for now (the
-// page-table walks the host does not resolve, gpu.cpp); otherwise each span
-// is imported whole when the mappings are made.
+// page, what a dispatch reads), and only inside the span the chunk's
+// GPU-visible mappings cover (gpu_span): the game's CPU-only heaps, the
+// never-allocated tail and the GPU heaps' untouched parts stay out of the
+// driver's pinned memory - what Windows counts as the process's shared GPU
+// memory. A range across windows gets one import of them all, widened to the
+// whole of every import it overlaps, which it replaces: those retire (their
+// windows and page-table entries move to the new one, and they are freed once
+// the work recorded with them has run), so no page of a chunk is imported
+// twice. An import may run on past its chunk's end into the next chunk's span
+// (kChunkOverlap), so a buffer across the seam lies in one import, as the
+// whole spans' overlap gives. Only with BBHOST_IMPORT_WINDOWS=1 (the counted
+// fallback of the native path, gpu.cpp); otherwise each span is imported whole
+// when the mappings are made.
 constexpr std::uint32_t kImportWindowShift = 24;
 constexpr std::uint32_t kImportWindows = 1u << (gcn::kDmemChunkShift - kImportWindowShift);  // per chunk
 struct DmemChunk {
     std::uint64_t span_lo = 0, span_hi = 0;      // what may be imported (gpu_span); empty: nothing
-    std::vector<std::unique_ptr<Chunk>> imports;  // made on demand, all kept while the game runs
-    Chunk* window[kImportWindows] = {};           // the import that covers each window, the latest made
+    std::vector<std::unique_ptr<Chunk>> imports;  // the live imports (retired ones go to a slot's dead_imports)
+    Chunk* window[kImportWindows] = {};           // the import that covers each window
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
@@ -149,6 +155,7 @@ struct ComputeLean {
     VkPipeline pipeline = VK_NULL_HANDLE;
     bool standin = false;  // unoptimized, the optimized one queued (ComputePipeline::standin)
     std::uint64_t opt_seen = 0;
+    bool lifted = false;  // a lifted program's: the lift of the lean translation (gpu.cpp build_compute_lean)
 };
 
 struct ComputePipeline {
@@ -191,6 +198,17 @@ struct ComputePipeline {
     int img_src_sgpr = -1;       // the source V#'s user SGPR, for buffer_to_image
     bool untraced_stores_logged = false;
     bool gds_overlap_checked = false;     // GDS counters: whether a V# of the program covers a counter word, looked at once
+    // Its module is the program's typed lift (gcn::lift_compute_shader,
+    // BBHOST_LIFT_COMPUTE), not its translation; otherwise why not (empty:
+    // not asked for), and the dispatches that ran it (under g.mu).
+    bool lifted = false;
+    std::string lift_why;
+    std::uint64_t dispatches = 0;
+    // The user-data dwords the translation touches at all (table_slots_read's
+    // `any`), worked out the first time a dispatch asks for it
+    // (GpuDispatch::want_user_reads: the dispatch-token shadow).
+    std::uint32_t user_reads = 0xffff;
+    bool user_reads_known = false;
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
@@ -327,6 +345,7 @@ struct Gpu {
         std::uint64_t held_draws = 0, held_dispatches = 0, held_tess = 0, held_flip = 0;
         bool said_stuck = false;  // that line was written for this submission
         std::vector<DevBuffer> garbage;
+        std::vector<Chunk> dead_imports;  // window imports a merged one replaced (gpu.cpp retire_import_locked)
         std::vector<DevBuffer> staging_chunks;  // the upload staging chunks this slot's uploads are in, each once (Gpu::staging_users)
         std::vector<DevBuffer> scratch_chunks;  // the same for the device-local untile scratch (Gpu::scratch_users)
         // Images (with their memory and views) whose guest memory was
@@ -486,6 +505,9 @@ struct Gpu {
     std::map<std::uint64_t, ComputePipeline> pipelines;
     // Stats
     std::atomic<std::uint64_t> dispatches{0}, failures{0}, translated{0}, dummy_images{0};
+    // Dispatches that ran a shader (not a recognised fill or copy), and of
+    // them those whose module was the program's typed lift.
+    std::atomic<std::uint64_t> shader_dispatches{0}, lifted_dispatches{0};
     std::atomic<std::uint64_t> transfer_batches{0};  // barrier pairs the transfers above needed
     std::atomic<std::uint64_t> rt_replacements{0};   // render targets re-created (each idles the device)
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};
@@ -594,6 +616,23 @@ void stage_manifest_load(const std::string& path);
 void stage_manifest_save(const std::string& path);
 void stage_manifest_save_async(const std::string& path);
 std::string stage_manifest_path();
+// The pipeline manifest (render.cpp PipelineRecipe): <data root>/bbhost/pipeline-manifest.bin.
+void pipeline_manifest_load(const std::string& path, const std::string& list_path);
+void pipeline_manifest_save(const std::string& path);
+void pipeline_manifest_save_async(const std::string& path);
+std::string pipeline_manifest_path();
+// The shader sweep (render.cpp): every shader in the game's bundles compiled
+// into the caches at the first start for this translator and device, the
+// stamp at `stamp_path` (<data root>/bbhost/shader-sweep.txt) saying it ran.
+void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path);
+// The compile session (host_gpu_set_compile_session): set before the device
+// starts; the sweep then takes the bundles' shaders at once, in full.
+inline std::atomic<bool> g_compile_session{false};
+void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
+                              std::string& reasons, std::uint64_t& recipes_total, std::uint64_t& recipes_done);
+void compile_session_cancel();
+// What it has left while the title or a loading screen is up (else 0).
+std::size_t shader_sweep_left();
 // render.cpp: the precompile workers run on half the hardware threads until
 // the first in-game frame and while a loading screen is up, a quarter of them
 // otherwise.
@@ -624,6 +663,10 @@ std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // Copies guest memory as the work being recorded now will see it: the CP writes
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
+// A dispatch token's compute-stage user data from its records (render.cpp):
+// the dwords its descriptors write, tables in the host ring; `set` says
+// which. False when a descriptor is one the builder does not take.
+bool render_cs_user_data_locked(const GxStageRecords& st, std::uint32_t user[16], std::uint16_t* set);
 void defer_destroy(const DevBuffer& b);  // freed once the current command buffer retired
 // Upload staging: `size` bytes placed in a mapped host-visible chunk the current command buffer shares with the ones
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to
@@ -690,6 +733,11 @@ void defer_destroy_private_view(VkImageView view);  // a pass's own view, never 
 // given - so the work goes behind the game's - then holds g.queue_mu.
 void queue_drain();
 std::string submit_thread_report();  // for the hang report
+std::string submit_merge_report();   // the submission thread's jobs and queue submissions so far (recorder report)
+// Writes into write-combined memory the GPU reads (params blocks, constant-
+// buffer snapshots) run to the end of their last 64-byte line (gpu.cpp,
+// BBHOST_WC_LINES).
+extern const bool g_wc_whole_lines;
 struct QueueGuard {
     QueueGuard();
     ~QueueGuard();
@@ -743,7 +791,12 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // The import of direct-memory chunk `chunk` holding [in, in + bytes) (offsets
 // in the chunk), made now when that lies in the chunk's GPU-visible span;
 // nullptr when it does not, or the import failed.
-const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes);
+// With past_end (and window imports) the range may run on into the next
+// chunk's span by up to kChunkOverlap, as one import of this chunk's.
+const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
+// Whether direct memory is imported whole (the default) rather than by window
+// on demand (BBHOST_IMPORT_WINDOWS=1).
+bool imports_whole();
 // The windows guest bytes [va, va + bytes) touch, each imported on its own if
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.
@@ -793,6 +846,11 @@ std::string untile_gpu_report();
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// The same without a host location first: true, `out` the mirror, when the
+// mirrors serve [va, va+bytes) whole (copying what they must); false when it
+// is read from host memory (an import). Window imports bind meshes this way,
+// so their memory needs no import (its copies come through staging).
+bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out);
 // A copy of [va, va+bytes) - `loc`, its import, which the mirrors keep in host
 // memory - made for one draw in device memory, in the same uploads; `loc`
 // becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
@@ -940,10 +998,30 @@ struct RtImage {
     std::uint64_t fill_va = 0;
     std::uint64_t pending_seen = 0;  // g_pending_gen when apply_pending_clear last scanned for it (render.cpp)
     std::size_t fill_bytes = 0;
+    // A clear token's clear not made yet (render.cpp, BBHOST_GX_CLEAR_LAZY):
+    // the next pass that binds the image whole takes it as its load op;
+    // anything else that ends a pass (a copy, a dispatch, a readback, a draw
+    // that samples it, the submission) makes it first.
+    bool view_clear = false;
+    bool view_clear_load = false;  // taken by the pass the current draw begins
+    VkImageAspectFlags view_clear_aspects = 0;
+    VkClearValue view_clear_value{};
+    std::uint32_t view_clear_first = 0, view_clear_count = 0;
     // The flip it was made at, and the flip and the time (steady clock, ms) a
     // draw, a fill or a copy last wrote it: its age and order for the reuse
-    // retire (image_reuse_sweep_locked).
-    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
+    // retire (image_reuse_sweep_locked). last_write numbers the writes (one
+    // counter for every target): what the clear costs compare to tell whether
+    // a draw came between two clears.
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0, last_write = 0;
+    // The submission (hle_gnm_cp_job_seq) that last wrote it, and the
+    // generation of the GX resource it is the image of (0: none known) - it
+    // goes when that resource does (render_retire_generation_locked).
+    std::uint64_t written_seq = 0, gx_gen = 0;
+    // Its resource died (steady ms; 0: alive) with this many submissions
+    // made, and that resource's memory: retired once idle for the reuse idle
+    // time, or taken by the memory's next resource if one draws into it first
+    // or is made over it without data (render_retire_reused_locked).
+    std::uint64_t dead_ms = 0, dead_after = 0, dead_memory = 0;
     // How its image was made, to make it again elsewhere (a target that went
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
@@ -951,6 +1029,28 @@ struct RtImage {
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
+// Lazy clears (render.cpp): a clear token's clear owed to `r` made now, by
+// transfer, before something reads or writes the image; every owed clear
+// (a dispatch, the submission, a frame dump). `why` is what made it, for the
+// exit report.
+enum ViewClearWhy : int {
+    kVcwAttachment,  // a draw binds the image, its pass does not cover it whole
+    kVcwSampled,     // a draw's vertex or pixel stage samples it
+    kVcwTess,        // a tessellated draw (its other stages sample too)
+    kVcwOlder,       // a newer clear of the image does not cover the owed one
+    kVcwClear,       // another clear of the image (the fill path's, DB_RENDER_CONTROL)
+    kVcwCopy,        // a copy reads or writes it
+    kVcwTexture,     // a texture view of it is made (render_target_view, rt_copied_view)
+    kVcwReadback,    // read back to memory
+    kVcwReplaced,    // its image is replaced by another
+    kVcwDispatch,    // a compute dispatch
+    kVcwSubmit,      // the submission
+    kVcwDump,        // a frame dump or capture
+    kVcwOther,
+    kVcwCount
+};
+void view_clear_apply_locked(RtImage& r, int why = kVcwOther);
+void view_clears_flush_locked(int why = kVcwOther);
 // Images over memory the game has given to something newer. On the console a
 // render target, a copy's snapshot or a shader-written texture is only memory:
 // when the game frees it and makes a newer object there, the old contents are
@@ -967,13 +1067,18 @@ std::size_t rt_size_bytes(const RtImage& r);
 void image_reuse_sweep_locked();
 struct ReuseRetired {
     std::uint64_t n = 0, bytes = 0;
+    std::uint64_t dead_n = 0;  // targets and snapshots of a dead GX resource retired once idle (counted apart from n)
 };
 // Each scan goes on from where the last one stopped and stops at `deadline`,
 // so a sweep holds g.mu for a bounded time however many images there are.
+// `address_rule`: whether the rule by a newer object over an idle image's
+// memory applies (BBHOST_IMG_RETIRE_REUSED); the images of dead GX resources
+// (marked by render_retire_generation_locked / retire_surfaces_locked) go once
+// idle either way, unless the memory's next resource wrote them first.
 ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                         std::chrono::steady_clock::time_point deadline);  // render.cpp: targets and snapshots
+                                         std::chrono::steady_clock::time_point deadline, bool address_rule);  // render.cpp: targets and snapshots
 ReuseRetired textures_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                           std::chrono::steady_clock::time_point deadline);  // textures.cpp: shader-written surfaces
+                                           std::chrono::steady_clock::time_point deadline, bool address_rule);  // textures.cpp: shader-written surfaces
 // Whether a target or snapshot made after `after_flip` (other than `self`)
 // covers part of [va, va + bytes).
 bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self);
@@ -1201,6 +1306,54 @@ std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);
 std::uint32_t tsharp_kind(const std::uint32_t* w);
 std::size_t format_bytes_per_pixel(VkFormat format);
 void textures_report();
+// What is resolving textures on this thread (a draw token's kind, "dispatch",
+// "upload token", ...), for the census of surfaces no GX resource covers;
+// set for a scope by ResolveKind (textures.cpp defines it).
+extern thread_local const char* t_resolve_kind;
+// The host image of one GX resource (engine/gx_resources.h: its memory and
+// generation), a render target's, a copy's snapshot's or a texture surface's:
+// what a copy between resources can copy image to image. False when the host
+// has none of that generation there (a surface of another generation, or none).
+struct HostImageRef {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0, layers = 1, levels = 1;
+    bool target = false;         // a render target or snapshot (RtImage), else a texture surface
+    bool depth = false;          // a depth target
+    bool gpu_written = false;    // its image holds what the guest memory does not
+};
+bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out);
+// Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
+// unless 0): retired with it, never handed to a later resource at the same
+// memory (textures.cpp).
+bool res_identity_on();
+// The colour and depth targets and the snapshots in [base, base + bytes)
+// that are generation `gen`'s images: marked dead, and retired by the reuse
+// sweep once idle (render.cpp).
+// A target something wrote in a submission made after `after_submitted` (the
+// count when the resource died) has a newer owner: it stays, and takes the
+// generation of the resource that now holds its memory.
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted);
+struct ResolveKind {
+    const char* prev;
+    explicit ResolveKind(const char* kind) : prev(t_resolve_kind) { t_resolve_kind = kind; }
+    ~ResolveKind() { t_resolve_kind = prev; }
+    ResolveKind(const ResolveKind&) = delete;
+    ResolveKind& operator=(const ResolveKind&) = delete;
+};
+// The 5-second report's resource line(s): the write watch's faults, arms and
+// releases by owner, the hashes, the surfaces by registration and the census
+// of new ones; with BBHOST_RESOURCE_CENSUS=1 also the images whose memory no
+// live GX resource holds (textures.cpp, render.cpp). Under g.mu.
+std::string textures_census_window_locked();
+struct OrphanImages {
+    std::uint64_t n = 0, bytes = 0;            // no live GX resource over any of its memory
+    std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
+    std::uint64_t gone = 0, gone_bytes = 0;    // the image of a GX resource (generation) that is no longer live
+};
+// Colour and depth targets [0], snapshots [1] whose memory no live GX
+// resource covers (render.cpp).
+void render_orphans_locked(OrphanImages out[2]);
 // Drops the descriptor-keyed view memo in textures.cpp: call it wherever an
 // image view, a surface or a render target is created or destroyed, so a
 // remembered descriptor cannot resolve to a view that is gone or stale.
@@ -1227,7 +1380,12 @@ bool tsharp_sample_as_2d(std::uint32_t type, std::uint32_t base_array, std::uint
 // from guest memory at their next use (the periodic content hash is too slow
 // for a texture the game rewrites every frame). Caller holds the GPU lock.
 // Returns how many cached surfaces the range overlaps.
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes);
+// `memory_written`: false for a fill, which reaches images (a target, HTILE,
+// the textures it clears) and never the guest memory, and for a copy made
+// image to image: the surfaces under it are not marked, so nothing hashes
+// their memory for a change that is not there.
+// `source` names the writer for the census of what marks GX textures.
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written = true, const char* source = "other");
 // Whether a cached surface overlaps the range. Caller holds the GPU lock.
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // GX's dynamic-buffer copy-backs as copy versions (gpu.cpp): the bytes
@@ -1243,8 +1401,11 @@ void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
 // that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvPutReasons };
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
+// Whether a pending version's copy into place writes `buffer` (a window import
+// about to retire: its copies go into place first).
+bool copy_versions_name_buffer_locked(VkBuffer buffer);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
@@ -1364,7 +1525,7 @@ std::size_t texture_src_bytes_locked(std::uint64_t base);
 void textures_before_submit();                      // the uploads this submission copies are untiled (their prep pool jobs done)
 void textures_prewait_for_submit();                 // without g.mu: the same wait for the jobs queued so far, so the one under it is short
 // Creation-time upload and destruction (see gpu.h's entry points).
-bool textures_create_ahead_locked(const std::uint32_t* tsharp);
+bool textures_create_ahead_locked(const std::uint32_t* tsharp, std::uint64_t gen = 0);
 bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x,
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes);
 bool textures_copy_image_region_locked(const GpuImageCopy& c);
@@ -1373,7 +1534,14 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 // (rt_image). False when there is no such texture.
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
-void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted);
+void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// The generation of the live GX texture that takes a dead resource's image
+// (0: none, and the image goes): one made without data at the dead
+// resource's memory, or one covering the image [image_base, +image_bytes)
+// whole - the image the address rule kept. A texture made with data has
+// texels of its own (made ahead, or at its first bind).
+std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_base, std::size_t image_bytes);
+void textures_gx_written(std::uint64_t base, std::size_t bytes);  // a texture GX mapped (host_gpu_texture_written)
 void textures_submitted(int slot);                  // the recorded write-backs belong to this submission
 void textures_retired(int slot);                    // that submission completed: copy them to guest memory
 
@@ -1405,6 +1573,13 @@ std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);
+// host_gpu_pipeline_work's graphics part, [0..11].
+void render_pipeline_work(std::uint64_t out[12]);
+// Compute pipelines a dispatch built on the command processor so far: [0] microseconds, [1] count.
+void compute_pipeline_work(std::uint64_t out[2]);
+// A compute pipeline the command processor built for a draw (the host
+// tessellator's LS pass), for the same count.
+void note_cp_compute_build(std::uint64_t us);
 // A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
 // (or into the target there of its shape); a copy one smaller destination long gets the
 // source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy
@@ -1678,6 +1853,9 @@ VkDescriptorType params_descriptor_type();
 extern VkDescriptorBufferInfo g_params_desc;
 // A view is being let go: the cached sets that hold it are dropped. Under g.mu.
 void set_cache_forget_view_locked(VkImageView view);
+// Every cached set is dropped (a buffer they may name is being let go: a
+// retired window import, without push descriptors). Under g.mu.
+void set_cache_drop_all_locked();
 std::string set_cache_report();
 
 }  // namespace gpu

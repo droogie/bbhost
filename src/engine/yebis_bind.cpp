@@ -5,6 +5,7 @@
 #include "hle/modules.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -138,10 +139,24 @@ std::atomic<std::uint64_t> g_stages{0}, g_fallback{0}, g_copies{0}, g_copy_bytes
 std::atomic<std::uint64_t> g_refreshed{0}, g_refresh_bytes{0};
 std::atomic<std::uint64_t> g_mirror_resets{0}, g_arena_lapped{0};
 // The hardware's constant RAM belongs to a queue, and this mirror is one
-// global: if YEBIS ever built from two threads at once they would interleave.
-// Counted rather than assumed.
-std::atomic<std::thread::id> g_builder_thread{};
-std::atomic<std::uint64_t> g_other_thread{0};
+// global: builds that hand over from one thread to another are what one queue
+// sees (YEBIS's first compute pass runs on the thread that starts it, every
+// later one and the draws on the render thread, one state and one array), but
+// two at once would interleave. Counted rather than assumed.
+std::atomic<int> g_building{0};
+std::atomic<std::thread::id> g_last_builder{};
+std::atomic<std::uint64_t> g_handoffs{0}, g_overlapped{0};
+struct Building {
+    Building() {
+        if (g_building.fetch_add(1, std::memory_order_acq_rel) != 0) g_overlapped.fetch_add(1, std::memory_order_relaxed);
+        const std::thread::id me = std::this_thread::get_id();
+        if (g_last_builder.load(std::memory_order_relaxed) != me) {
+            const std::thread::id was = g_last_builder.exchange(me, std::memory_order_relaxed);
+            if (was != std::thread::id{} && was != me) g_handoffs.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    ~Building() { g_building.fetch_sub(1, std::memory_order_acq_rel); }
+};
 std::atomic<std::uint64_t> g_cmp_checked{0}, g_cmp_bad{0};
 std::atomic<std::uint64_t> g_verify_checked{0}, g_verify_bad{0}, g_verify_bytes{0}, g_verify_seen{0}, g_verify_stashed{0};
 std::atomic<std::uint64_t> g_unknown_type[32] = {};
@@ -253,17 +268,11 @@ bool build_stage(std::uint64_t state, int stage, std::uint64_t table, std::uint3
                  bool dry) {
     const std::uint64_t res = rd64(state + 8);
     if (!res || count > 64) return false;
+    const Building building;
     if (res != g_mirror_res) {  // a new array starts from a blank constant RAM, as the hardware's does
         g_mirror_res = res;
         std::memset(g_mirror, 0, sizeof(g_mirror));
         g_mirror_resets.fetch_add(1, std::memory_order_relaxed);
-    }
-    {
-        const std::thread::id me = std::this_thread::get_id();
-        std::thread::id none{};
-        if (!g_builder_thread.compare_exchange_strong(none, me, std::memory_order_relaxed) && none != me) {
-            g_other_thread.fetch_add(1, std::memory_order_relaxed);
-        }
     }
     const std::uint32_t stage_dw = static_cast<std::uint32_t>(stage) * kStageDwords;
 
@@ -401,6 +410,33 @@ bool build_stage(std::uint64_t state, int stage, std::uint64_t table, std::uint3
     return true;
 }
 
+std::uint16_t user_data(std::uint64_t state, int stage, std::uint64_t table, std::uint32_t count, const std::uint64_t* block,
+                        std::uint32_t* user) {
+    const std::uint64_t res = rd64(state + 8);
+    if (!res || count > 64) return 0;
+    const std::uint32_t stage_dw = static_cast<std::uint32_t>(stage) * kStageDwords;
+    std::uint16_t written = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t d = rd32(table + 4ull * i);
+        const std::uint32_t type = d & 0xff, slot = (d >> 8) & 0xff, ud = (d >> 16) & 0xff;
+        const bool wide = ((d >> 24) & 1) != 0;
+        if (ud > 0xf || type > 0x1b) continue;
+        Plain p{};
+        if (plain_of(type, &p)) {
+            const std::uint32_t dwords = std::min<std::uint32_t>(wide && p.wide ? p.wide : p.dwords, 16 - ud);
+            std::memcpy(user + ud, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(res + 4ull * (stage_dw + p.base + slot * p.stride))),
+                        4ull * dwords);
+            written = static_cast<std::uint16_t>(written | (((1u << dwords) - 1) << ud));
+            continue;
+        }
+        if (type == 0x12 || type < 0x13 || ud + 1 > 0xf || !block[i]) continue;  // 0x12: the builder skips it
+        user[ud] = static_cast<std::uint32_t>(block[i]);
+        user[ud + 1] = static_cast<std::uint32_t>(block[i] >> 32);
+        written = static_cast<std::uint16_t>(written | (3u << ud));
+    }
+    return written;
+}
+
 bool add_copy(Work& work, std::uint64_t dst, const void* src, std::uint32_t bytes) {
     if (work.n >= kMaxCopies || bytes > kMaxWindow) return false;
     std::uint64_t seq = 0;
@@ -421,6 +457,29 @@ void run(const Work& work) {
             hle_gnm_cp_write(work.copies[i].dst, g_arena + work.copies[i].at, work.copies[i].bytes);
         }
         g_copy_bytes.fetch_add(work.copies[i].bytes, std::memory_order_relaxed);
+    }
+    g_copies.fetch_add(static_cast<std::uint64_t>(work.n), std::memory_order_relaxed);
+}
+
+std::atomic<std::uint64_t> g_ordered{0}, g_ordered_cpu{0};
+void run_ordered(const Work& work) {
+    const std::uint64_t now = g_arena_seq.load(std::memory_order_relaxed);
+    for (int i = 0; i < work.n; ++i) {
+        if (!g_arena || now - work.copies[i].seq >= kArenaBytes) {
+            g_arena_lapped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const Copy& c = work.copies[i];
+        if (host_gpu_mem_write_ordered(c.dst, g_arena + c.at, c.bytes, nullptr)) {
+            g_ordered.fetch_add(1, std::memory_order_relaxed);
+        } else if (hle_kernel_va_mapped(c.dst, c.bytes)) {
+            // Not on the GPU's timeline (not imported memory): everything
+            // recorded before has run, then the CPU writes it.
+            host_gpu_flush();
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(c.dst)), g_arena + c.at, c.bytes);
+            g_ordered_cpu.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_copy_bytes.fetch_add(c.bytes, std::memory_order_relaxed);
     }
     g_copies.fetch_add(static_cast<std::uint64_t>(work.n), std::memory_order_relaxed);
 }
@@ -490,9 +549,15 @@ void report() {
         }
     }
     if (n) host_log("yebis-bind: rings:%s", rings);
-    if (g_other_thread.load()) {
-        host_log("yebis-bind: %llu stages were built from a second thread - the mirror needs to be per queue",
-                 static_cast<ull>(g_other_thread.load()));
+    if (g_handoffs.load() || g_overlapped.load() || g_mirror_resets.load() > 1) {
+        host_log("yebis-bind: builds handed from one thread to another %llu times, %llu begun while another thread's was "
+                 "running%s; the constant-RAM mirror started blank %llu times (a new resource array)",
+                 static_cast<ull>(g_handoffs.load()), static_cast<ull>(g_overlapped.load()),
+                 g_overlapped.load() ? " - the one mirror needs to be per queue" : "", static_cast<ull>(g_mirror_resets.load()));
+    }
+    if (g_ordered.load() || g_ordered_cpu.load()) {
+        host_log("yebis-bind: dispatch windows on the GPU's timeline %llu, on the CPU after a flush %llu",
+                 static_cast<ull>(g_ordered.load()), static_cast<ull>(g_ordered_cpu.load()));
     }
     if (g_arena_lapped.load()) {
         host_log("yebis-bind: %llu windows were lapped in the arena before the token reached them",

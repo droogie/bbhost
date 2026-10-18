@@ -53,6 +53,10 @@ struct Config {
 const Config& config() {
     static const Config c = [] {
         Config c;
+        // The directory and the first flip serve dispatch captures too
+        // (BBHOST_CAPTURE_DISPATCH), with or without draw captures.
+        if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
+        if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         const char* e = std::getenv("BBHOST_CAPTURE_DRAW");
         if (!e || !*e) return c;
         std::string s(e);
@@ -65,8 +69,6 @@ const Config& config() {
         c.each = s == "*" || c.each_ps;
         c.enabled = !s.empty();
         if (const char* a = std::getenv("BBHOST_CAPTURE_ARMED")) c.armed = a[0] == '1';
-        if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
-        if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         if (const char* n = std::getenv("BBHOST_CAPTURE_COUNT")) c.count = std::max(1, std::atoi(n));
         if (const char* n = std::getenv("BBHOST_CAPTURE_EVERY")) c.every = std::max(1, std::atoi(n));
         return c;
@@ -241,6 +243,17 @@ public:
     bool quiet = false;  // rejected before anything worth reporting
     std::vector<std::uint32_t> indirect_args;  // an indirect draw's arguments as read (captured as a direct draw)
     std::vector<std::uint64_t> pages;          // a dispatch's guest pages, read again after it ran
+    // A dispatch's storage images, read again after it ran (blob id + "-after").
+    struct StorageImage {
+        std::string id;
+        VkImage image = VK_NULL_HANDLE;
+        VkImageAspectFlags aspect = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkImageType type = VK_IMAGE_TYPE_2D;
+        VkExtent3D extent{};
+        std::uint32_t base_level = 0, levels = 1, base_layer = 0, layers = 1;
+    };
+    std::vector<StorageImage> storage_images;
 
     void blob(const std::string& name, const std::uint8_t* data, std::size_t bytes) {
         host_blobs.emplace_back(name, std::vector<std::uint8_t>(data, data + bytes));
@@ -294,6 +307,7 @@ public:
         begin_recording_locked();
         transfer_flush_locked();
         render_end_pass_locked();
+        view_clears_flush_locked(kVcwDump);  // a capture reads what every clear so far made
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -317,6 +331,7 @@ public:
         begin_recording_locked();
         transfer_flush_locked();
         render_end_pass_locked();
+        view_clears_flush_locked(kVcwDump);  // a capture reads what every clear so far made
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1120,6 +1135,7 @@ struct DispatchConfig {
     bool enabled = false;
     std::string prefix;
     int count = 1, every = 1;
+    int each = 0;  // BBHOST_CAPTURE_DISPATCH_EACH: at most this many of one program (0: no limit of its own)
 };
 
 const DispatchConfig& dispatch_config() {
@@ -1131,6 +1147,7 @@ const DispatchConfig& dispatch_config() {
         c.enabled = true;
         if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_COUNT")) c.count = std::max(1, std::atoi(n));
         if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_EVERY")) c.every = std::max(1, std::atoi(n));
+        if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_EACH")) c.each = std::max(0, std::atoi(n));
         return c;
     }();
     return c;
@@ -1138,6 +1155,7 @@ const DispatchConfig& dispatch_config() {
 
 int g_dispatches_captured = 0, g_dispatches_rejected = 0;  // under g.mu
 std::uint64_t g_dispatch_matches = 0;
+std::map<std::string, int> g_dispatch_taken;  // under g.mu: candidates taken by program (DispatchConfig::each)
 
 }  // namespace
 
@@ -1151,7 +1169,10 @@ bool capture_dispatch_candidate(const std::string& program, std::uint64_t flip) 
         if (n && program.compare(0, n, c.prefix, at, n) == 0) any = true;
         at = comma + 1;
     }
-    return any && g_dispatch_matches++ % static_cast<std::uint64_t>(c.every) == 0;
+    if (!any || (c.each && g_dispatch_taken[program] >= c.each)) return false;
+    if (g_dispatch_matches++ % static_cast<std::uint64_t>(c.every) != 0) return false;
+    ++g_dispatch_taken[program];
+    return true;
 }
 
 CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
@@ -1182,6 +1203,7 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
         if (!args[0] || !args[1] || !args[2]) {
             s.quiet = true;  // no work: not a candidate, not a rejection
             --g_dispatch_matches;
+            if (int& taken = g_dispatch_taken[d.pipeline]; taken > 0) --taken;  // nor one of BBHOST_CAPTURE_DISPATCH_EACH's
             return CapturePtr();
         }
         if (args[0] > 65535 || args[1] > 65535 || args[2] > 65535) return reject("its indirect arguments ask past 65535 workgroups a dimension");
@@ -1213,7 +1235,9 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
     pj.set("l1_table_replaced_on_replay", json::hex(d.params.l1_table));
     stage.set("params", pj);
 
-    // Images: sampled ones only (a storage image would be an output too).
+    // Images: the sampled ones are inputs; a storage image is an input and an
+    // output - its contents before the dispatch, and again after it ran
+    // (capture_dispatch_finish_locked), which the replay compares like memory.
     std::map<VkImageView, std::string> image_ids;
     json::Value images = json::Value::make_object();
     json::Value ij = json::Value::make_array();
@@ -1221,7 +1245,6 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
         const gcn::ImageBinding& b = meta.images[k];
         const StageImages::Image& im = d.images->images[k];
         const std::string where = "image binding " + std::to_string(b.binding) + " (" + b.path.str() + ")";
-        if (b.storage) return reject(where + " is a storage image");
         if (!im.resolved || !im.view || im.dim != b.dim || im.arrayed != b.arrayed) return reject(where + " is bound to a dummy image");
         ViewRecord rec;
         if (!describe_view_locked(im.view, rec)) return reject(where + " has a view the texture cache did not record");
@@ -1229,6 +1252,9 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
         resolve_resource(b.path, user, b.r128 ? 4 : 8, words, &ranges);
         std::string id;
         if (auto found = image_ids.find(im.view); found != image_ids.end()) {
+            // One view bound twice: an input twice is one image; a storage
+            // image's view would also be read through its other binding.
+            if (b.storage) return reject(where + " is a storage image bound twice");
             id = found->second;
         } else {
             id = "image" + std::to_string(image_ids.size());
@@ -1248,6 +1274,22 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
             }
             rj.set("blob", id);
             rj.set("subresources", subs);
+            if (b.storage) {
+                rj.set("storage", true);
+                rj.set("after", id + "-after");
+                CaptureSession::StorageImage si;
+                si.id = id;
+                si.image = rec.image;
+                si.aspect = r.aspectMask;
+                si.format = rec.image_info.format;
+                si.type = rec.image_info.imageType;
+                si.extent = rec.image_info.extent;
+                si.base_level = r.baseMipLevel;
+                si.levels = r.levelCount;
+                si.base_layer = r.baseArrayLayer;
+                si.layers = r.layerCount;
+                s.storage_images.push_back(si);
+            }
             images.set(id, rj);
         }
         json::Value bj = json::Value::make_object();
@@ -1256,6 +1298,7 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
         bj.set("dim", b.dim);
         bj.set("arrayed", b.arrayed);
         bj.set("r128", b.r128);
+        bj.set("storage", b.storage);
         bj.set("tsharp", hex_words(im.w, 8));
         bj.set("image", id);
         ij.push(bj);
@@ -1365,6 +1408,15 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
 void capture_dispatch_finish_locked(CapturePtr session) {
     if (!session) return;
     CaptureSession& s = *session;
+    for (const CaptureSession::StorageImage& si : s.storage_images) {
+        json::Value subs = json::Value::make_array();
+        std::string why;
+        if (!s.readback(si.id + "-after", si.image, si.aspect, si.format, si.type, si.extent, si.base_level, si.levels, si.base_layer, si.layers,
+                        subs, why)) {
+            host_log("capture: %s: storage image %s readback after the dispatch failed: %s", s.dir.c_str(), si.id.c_str(), why.c_str());
+            return;
+        }
+    }
     flush_locked();
     std::vector<std::uint8_t> after(s.pages.size() * kPage);
     for (std::size_t k = 0; k < s.pages.size(); ++k) read_guest_locked(s.pages[k], kPage, after.data() + k * kPage);

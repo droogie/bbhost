@@ -45,10 +45,38 @@
  *                                             them again), so the place holds still
  *     dump <name>                             this frame to
  *                                             $BBHOST_MAPVAL_DUMPS/<name>.ppm
+ *     f12 <name>                              an F12 capture of the next frame
+ *                                             (the host logs its folder)
  *     capture <n> [<name>]                    let BBHOST_CAPTURE_DRAW take up to n
  *                                             draws, into
  *                                             $BBHOST_MAPVAL_CAPTURES/<name>; 0 stops
- * (the last two ask the host through BBHOST_TEST_REQUESTS, hle/video.cpp).
+ * (the last two ask the host through BBHOST_TEST_REQUESTS, hle/video.cpp),
+ * and for tools/full_tour.py, which tours every map:
+ *     god [hide]                              the debug menu's Player No Dead
+ *                                             (CHR DBG, 0x593e888) on, and with
+ *                                             "hide" Player Hide (0x593e88e): the
+ *                                             enemies do not notice the player
+ *     turn <n> <s>                            the follow camera through 360
+ *                                             degrees in n headings, s seconds
+ *                                             each (its yaw, ChrExFollowCam
+ *                                             +0x144, and the reset's +0x14c)
+ *     flags <id>=<0|1> ...                    event flags set now (up to 8): the
+ *                                             world's time (9800-9802) before a
+ *                                             travel, say
+ *     flaglog <first> <n>                     log n flags from first as a number
+ *     chalice <map id hex> <slot> <name>      a fixed chalice dungeon: the altar
+ *                                             slot (0-6) holds its map id and is
+ *                                             the one in use, then the lamp travel
+ *                                             to 2902950 enters it
+ *     remo <id> <mode> <skip s> <max s>       a cutscene, as the event scripts'
+ *                                             2002[03] asks for one (0x171a9f0);
+ *                                             Options pressed (the game's skip)
+ *                                             once it has played skip s; done
+ *                                             when it ends or after max s
+ *     movie <id> <skip s> <max s>             a movie, as RequestPlayMovie asks
+ *                                             (0x1734d90), Options after skip s
+ *     exit                                    the run ends the way
+ *                                             BBHOST_EXIT_SECONDS ends one
  * Each step logs what it did with the time, so the dataset script can find
  * the play-log samples of the same seconds. While a warp or kill step runs
  * the player's HP is kept full (the seed stands among enemies).
@@ -100,17 +128,21 @@ static double loading_t0;  /* when the screen came up */
 
 /* --- the tour ------------------------------------------------------------ */
 
-enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE };
+enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12,
+       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT };
+#define MAX_STEPS 4096
 typedef struct {
     int kind;
     char name[64];
     float x, y, z, yaw, hold;
     int team;
     uint32_t block; /* warp into this block (0: the current one) */
-    uint32_t flags[4]; /* travel: event flags turned on before it */
+    uint32_t flags[8]; /* travel: event flags turned on before it; flags: the flags */
+    uint8_t values[8]; /* flags: their values */
     int nflags;
+    uint32_t dungeon; /* chalice: the fixed dungeon's map id (m29_10_90_00: 1d0a5a00) */
 } Step;
-static Step steps[1024];
+static Step steps[MAX_STEPS];
 static int nsteps, cur = -1;
 static double step_t0, last_pos_t, first_seen_t, start_after = 55, last_seen_t;
 static int phase;         /* inside a step */
@@ -129,6 +161,53 @@ static float travel_last[3];
 static double travel_still_t;  /* when the player came to rest for the travel's stillness */
 static double travel_loading;  /* loading-screen seconds within the current travel step */
 static int dump_chrs = 0, want_team = -1;
+static int warp_tries = 10; /* BBHOST_MAPVAL_WARP_TRIES */
+/* BBHOST_MAPVAL_DEADLINE=<s>: that long after the probe loads, a tour still
+ * running skips to its exit step (a harness's lock hold has a limit; the run
+ * still ends with its reports and cache saves). */
+static double deadline_s, loaded_t;
+static int deadline_hit;
+/* A warp onto ground whose collision is not loaded yet drops the player
+ * through the world (Player No Dead does not stop the kill plane under it):
+ * the warp is made again, and after two falls the player goes back to the
+ * last place that held them. */
+static int fall_retries;
+static float good_pos[3];
+static int have_good;
+/* Falling, not standing lower than the navmesh face (a slope, a ledge under
+ * a bridge): the height sampled every 0.25 s, more than 2 m lost in 0.5 s. */
+static float fall_hist[3];
+static int fall_n;
+static double fall_sample_t;
+/* BBHOST_MAPVAL_FLOAT=1: the Havok world's gravity (*(*(*0x593d700 + 0x28) +
+ * 8) + 0x5b0, the vector plugins/mutators scales) held at 0 through a run of
+ * warps, so a player put where the collision has not streamed in yet stays
+ * there and sees the place; back to the game's before a travel, a cutscene, a
+ * movie and the exit. */
+static int float_mode, grav_off;
+static float grav_saved = -9.8f;
+static float* world_gravity(void) {
+    uint64_t sys = 0;
+    if (api->read(0x593d700, &sys, 8) || !ok(sys)) return NULL;
+    uint64_t wrap = rd64(sys + 0x28), world = ok(wrap) ? rd64(wrap + 8) : 0;
+    if (!ok(world)) return NULL;
+    float* v = (float*)(uintptr_t)(world + 0x5b0);
+    if (v[0] != 0.0f || v[2] != 0.0f || !(v[1] <= 0.0f && v[1] > -1000.0f)) return NULL;
+    return v;
+}
+static void gravity_hold(int off, double t) {
+    if (!float_mode || off == grav_off) return;
+    float* v = world_gravity();
+    if (!v) return;
+    if (off) {
+        if (v[1] < 0.0f) grav_saved = v[1];
+        v[1] = 0.0f;
+    } else {
+        v[1] = grav_saved;
+    }
+    grav_off = off;
+    api->log("mapval gravity %.3f %s", t, off ? "held at 0" : "back");
+}
 
 static void load_tour(const char* path) {
     FILE* f = fopen(path, "r");
@@ -137,7 +216,7 @@ static void load_tour(const char* path) {
         return;
     }
     char line[512];
-    while (fgets(line, sizeof line, f) && nsteps < 1024) {
+    while (fgets(line, sizeof line, f) && nsteps < MAX_STEPS) {
         Step s;
         memset(&s, 0, sizeof s);
         char kind[32] = "";
@@ -181,10 +260,44 @@ static void load_tour(const char* path) {
             s.kind = S_QUIET, strcpy(s.name, "quiet"); /* hold: the radius */
         else if (!strcmp(kind, "dump") && sscanf(line, "%*s %63s", s.name) == 1)
             s.kind = S_DUMP;
+        else if (!strcmp(kind, "f12") && sscanf(line, "%*s %63s", s.name) == 1)
+            s.kind = S_F12;
         else if (!strcmp(kind, "capture") && sscanf(line, "%*s %d", &s.team) == 1) {
             s.kind = S_CAPTURE; /* team: the draws */
             if (sscanf(line, "%*s %*d %63s", s.name) != 1) s.name[0] = 0;
         }
+        else if (!strcmp(kind, "god")) {
+            char opt[16] = "";
+            s.kind = S_GOD, strcpy(s.name, "god");
+            s.team = sscanf(line, "%*s %15s", opt) == 1 && !strcmp(opt, "hide");
+        }
+        else if (!strcmp(kind, "turn") && sscanf(line, "%*s %d %f", &s.team, &s.hold) == 2 && s.team > 0)
+            s.kind = S_TURN, strcpy(s.name, "turn");
+        else if (!strcmp(kind, "flags")) {
+            s.kind = S_FLAGS, strcpy(s.name, "flags");
+            const char* q = line + 5;
+            unsigned id = 0, v = 0;
+            int used = 0;
+            while (s.nflags < 8 && sscanf(q, " %u=%u%n", &id, &v, &used) == 2) {
+                s.flags[s.nflags] = id, s.values[s.nflags] = (uint8_t)(v != 0), ++s.nflags;
+                q += used;
+            }
+        }
+        else if (!strcmp(kind, "flaglog") && sscanf(line, "%*s %u %d", &s.flags[0], &s.team) == 2)
+            s.kind = S_FLAGLOG, strcpy(s.name, "flaglog");
+        else if (!strcmp(kind, "chalice") && sscanf(line, "%*s %x %d %63s", &s.dungeon, &s.nflags, s.name) == 3 && s.nflags >= 0 &&
+                 s.nflags < 7) {
+            /* the travel to the dungeon's lamp; nflags: the altar slot */
+            s.kind = S_TRAVEL, s.team = 2902950, s.block = 0x1d000000;
+            s.yaw = (float)s.nflags;
+            s.nflags = 0;
+        }
+        else if (!strcmp(kind, "remo") && sscanf(line, "%*s %d %f %f %f", &s.team, &s.x, &s.y, &s.hold) == 4)
+            s.kind = S_REMO, snprintf(s.name, sizeof s.name, "remo%d", s.team);
+        else if (!strcmp(kind, "movie") && sscanf(line, "%*s %d %f %f", &s.team, &s.y, &s.hold) == 3)
+            s.kind = S_MOVIE, snprintf(s.name, sizeof s.name, "movie%d", s.team);
+        else if (!strcmp(kind, "exit"))
+            s.kind = S_EXIT, strcpy(s.name, "exit");
         else {
             api->log("mapval: bad tour line: %s", line);
             continue;
@@ -391,7 +504,53 @@ static void quiet(float radius, double t) {
     api->log("mapval quiet %.3f %d enemies within %.0f m switched off, %d other characters left", t, off, radius, left);
 }
 
+/* --- for tools/full_tour.py ------------------------------------------------- */
+
+/* The extended follow camera (ChrCamOwner +0x60): +0x144 its yaw, +0x14c the
+ * yaw a reset takes (src/decomp/camera/follow_camera.cpp). */
+static uint64_t ex_follow_cam(void) {
+    uint64_t root = 0;
+    if (api->read(0x593e860, &root, 8) || !ok(root)) return 0;
+    uint64_t owner = rd64(root + 0x2830);
+    return ok(owner) ? rd64(owner + 0x60) : 0;
+}
+static double turn_base;
+static int turn_k = -1;
+
+/* A cutscene plays while bit 0 of byte +0x168 of the remo manager
+ * (*(*0x5940058 + 8)) is set: what the event scripts' wait for one polls
+ * (0x1bb7700). */
+static int remo_playing(void) {
+    uint64_t holder = 0;
+    if (api->read(0x5940058, &holder, 8) || !ok(holder)) return 0;
+    uint64_t man = rd64(holder + 8);
+    return ok(man) ? (*(const volatile uint8_t*)(uintptr_t)(man + 0x168) & 1) : 0;
+}
+static int remo_started, remo_taps;
+static double remo_start_t, remo_tap_t;
+
+/* n event flags from first as one number, the first the top bit (as the game
+ * reads multi-flag values); -1 when one cannot be read. */
+static int64_t flags_value(uint32_t first, int n) {
+    int64_t v = 0;
+    for (int i = 0; i < n; ++i) {
+        int on = 0;
+        if (api->event_flag_get(first + (uint32_t)i, &on)) return -1;
+        v = v << 1 | (on ? 1 : 0);
+    }
+    return v;
+}
+static int flags_write(uint32_t first, int n, uint32_t v) {
+    int bad = 0;
+    for (int i = 0; i < n; ++i) bad += api->event_flag_set(first + (uint32_t)i, (int)((v >> (n - 1 - i)) & 1)) != 0;
+    return bad;
+}
+
 /* --- per frame ------------------------------------------------------------- */
+
+/* The travel's block: a chalice dungeon is all of area 29 (the player can
+ * read as its own map id there). */
+static int in_tour_block(uint32_t b) { return b == tour_block || (tour_block >> 24 == 0x1d && b >> 24 == 0x1d); }
 
 static void begin(int i, double t) {
     Step* s = &steps[i];
@@ -400,7 +559,7 @@ static void begin(int i, double t) {
     phase = 0;
     if ((s->kind == S_WARP || s->kind == S_FALL) && tour_block && !s->block) {
         uint32_t b = 0;
-        if (api->player_block(&b) == 0 && b != tour_block) {
+        if (api->player_block(&b) == 0 && !in_tour_block(b)) {
             /* A death (a kill plane under a navmesh point) respawned the
              * player elsewhere: back to the block's lamp, then this step. */
             /* The same step sending the player out twice (a kill plane
@@ -421,6 +580,10 @@ static void begin(int i, double t) {
         }
     }
     warp_retries = 0;
+    fall_retries = 0;
+    fall_n = 0;
+    if (s->kind == S_WARP) gravity_hold(1, t);
+    else if (s->kind == S_TRAVEL || s->kind == S_REMO || s->kind == S_MOVIE || s->kind == S_EXIT || s->kind == S_FLAGS) gravity_hold(0, t);
     if (s->kind == S_WARP) {
         float v[3] = {s->x, s->y, s->z};
         int r = api->player_warp(s->block, v, s->yaw);
@@ -438,6 +601,15 @@ static void begin(int i, double t) {
         kill_last_warp = 0;
         api->log("mapval step %d kill %.3f radius %.1f", i, t, s->hold);
     } else if (s->kind == S_TRAVEL) {
+        if (s->dungeon) {
+            /* The altar slot in use (9020 + slot on, the others off) holds the
+             * dungeon (94000000 + slot * 100000: its map id, 32 flags, area
+             * byte first): a stage change into area 29 loads it
+             * (plugins/boss_rush does the same). */
+            int slot = (int)s->yaw;
+            int bad = flags_write(9020, 7, 1u << (6 - slot)) + flags_write(94000000u + (uint32_t)slot * 100000u, 32, s->dungeon);
+            api->log("mapval chalice %s %.3f slot %d holds %08x%s", s->name, t, slot, s->dungeon, bad ? " (flags REFUSED)" : "");
+        }
         for (int k = 0; k < s->nflags; ++k) {
             int r = api->event_flag_set(s->flags[k], 1);
             api->log("mapval flag %u on %.3f -> %s", s->flags[k], t, r ? "REFUSED" : "set");
@@ -466,12 +638,57 @@ static void begin(int i, double t) {
         api->log("mapval camera %.3f %s", t, reset_camera() ? "reset" : "unavailable");
     } else if (s->kind == S_QUIET) {
         quiet(s->hold, t);
+    } else if (s->kind == S_GOD) {
+        uint8_t one = 1;
+        int r = api->write(0x593e888, &one, 1);
+        if (s->team) r |= api->write(0x593e88e, &one, 1);
+        api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : "on");
+    } else if (s->kind == S_TURN) {
+        uint64_t cam = ex_follow_cam();
+        turn_k = -1;
+        turn_base = cam ? *(const volatile float*)(uintptr_t)(cam + 0x144) : 0;
+        api->log("mapval turn %.3f %d headings %.1f s each from yaw %.3f%s", t, s->team, s->hold, turn_base, cam ? "" : " (no camera)");
+    } else if (s->kind == S_FLAGS) {
+        for (int k = 0; k < s->nflags; ++k) {
+            int r = api->event_flag_set(s->flags[k], s->values[k]);
+            api->log("mapval flag %u %s %.3f -> %s", s->flags[k], s->values[k] ? "on" : "off", t, r ? "REFUSED" : "set");
+        }
+    } else if (s->kind == S_FLAGLOG) {
+        api->log("mapval flags %u+%d %.3f = %lld", s->flags[0], s->team, t, (long long)flags_value(s->flags[0], s->team));
+    } else if (s->kind == S_REMO) {
+        BbCallRegs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.arg[1] = (uint32_t)s->team;   /* the cutscene: s<area>_<block>_<nnnn> */
+        regs.arg[2] = (uint32_t)(int)s->x; /* its play mode (0: skippable) */
+        regs.arg[3] = 0xffffffffu;
+        regs.arg[4] = 0xffffffffu;
+        regs.arg[5] = 10000; /* the player */
+        int r = api->call_guest(0x171a9f0, &regs);
+        remo_started = 0, remo_taps = 0, remo_tap_t = 0;
+        api->log("mapval remo-request %d %.3f mode %d -> %s (%d)", s->team, t, (int)s->x, r ? "REFUSED" : "queued", (int)(regs.ret & 0xff));
+        if (r) s->hold = 0;
+    } else if (s->kind == S_MOVIE) {
+        BbCallRegs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.arg[1] = (uint32_t)s->team;
+        regs.arg[2] = 1;
+        int r = api->call_guest(0x1734d90, &regs);
+        remo_taps = 0, remo_tap_t = 0;
+        api->log("mapval movie-request %d %.3f -> %s", s->team, t, r ? "REFUSED" : "queued");
+    } else if (s->kind == S_EXIT) {
+        request("exit");
+        api->log("mapval exit %.3f", t);
     } else if (s->kind == S_DUMP) {
         const char* dir = getenv("BBHOST_MAPVAL_DUMPS");
         char line[1100];
         snprintf(line, sizeof line, "dump %s/%s.ppm", dir && *dir ? dir : ".", s->name);
         request(line);
         api->log("mapval dump %s %.3f", s->name, t);
+    } else if (s->kind == S_F12) {
+        char line[160];
+        snprintf(line, sizeof line, "f12 %s", s->name);
+        request(line);
+        api->log("mapval f12 %s %.3f", s->name, t);
     } else if (s->kind == S_CAPTURE) {
         const char* dir = getenv("BBHOST_MAPVAL_CAPTURES");
         char line[1100];
@@ -502,6 +719,16 @@ static void put_next_to(uint64_t chr, double t) {
 
 static void tick(double t) {
     if (cur < 0 || tour_done) return;
+    if (deadline_s > 0 && !deadline_hit && t - loaded_t > deadline_s && steps[cur].kind != S_EXIT) {
+        int j = cur + 1;
+        while (j < nsteps && steps[j].kind != S_EXIT) ++j;
+        deadline_hit = 1;
+        api->log("mapval deadline %.3f after %.0f s: steps %d-%d skipped (from %s)", t, t - loaded_t, cur, j - 1, steps[cur].name);
+        if (j < nsteps) {
+            begin(j, t);
+            return;
+        }
+    }
     Step* s = &steps[cur];
     double el = t - step_t0;
     float p[3], yaw = 0;
@@ -510,7 +737,7 @@ static void tick(double t) {
     int next = 0;
     if (retravel) {
         uint32_t b = 0;
-        int in = have && api->player_block(&b) == 0 && b == tour_block;
+        int in = have && api->player_block(&b) == 0 && in_tour_block(b);
         if (in && !loading && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f) travel_still++;
         else travel_still = 0;
         if (have) memcpy(travel_last, p, sizeof travel_last);
@@ -529,9 +756,34 @@ static void tick(double t) {
     }
     if (s->kind == S_WARP) {
         heal();
+        if (have && t - fall_sample_t >= 0.25) {
+            fall_hist[fall_n++ % 3] = p[1];
+            fall_sample_t = t;
+        }
+        int falling = have && fall_n >= 3 && p[1] < fall_hist[fall_n % 3] - 2.0f;  /* the oldest of the three: ~0.5 s ago */
+        /* with gravity held at 0 nothing falls: a drop is the player put down on the floor under the target */
+        if (have && !loading && el >= 1.2 && p[1] < s->y - 6.0f && falling && !grav_off) {
+            if (fall_retries < 2) {
+                float v[3] = {s->x, s->y, s->z};
+                ++fall_retries;
+                api->player_warp(s->block, v, s->yaw);
+                step_t0 = t; /* the arrival checked again from now */
+                phase = 0;
+                fall_n = 0;
+                api->log("mapval rewarp-fall %s %.3f try %d (at %.3f %.3f %.3f)", s->name, t, fall_retries, p[0], p[1], p[2]);
+                return;
+            }
+            if (fall_retries == 2) {
+                ++fall_retries;
+                api->log("mapval fell %s %.3f at %.3f %.3f %.3f, back to %.3f %.3f %.3f", s->name, t, p[0], p[1], p[2], good_pos[0], good_pos[1],
+                         good_pos[2]);
+                if (have_good) api->player_warp(0, good_pos, 0);
+                next = 1;
+            }
+        }
         /* A warp made while a load is still on screen is dropped: warp
          * again (up to 10 times, 3 s apart) until the player is there. */
-        if (phase == 0 && el >= 1.5 && have && !loading && warp_retries < 10 && hypotf(p[0] - s->x, p[2] - s->z) > 2.5f) {
+        if (phase == 0 && el >= 1.5 && have && !loading && warp_retries < warp_tries && hypotf(p[0] - s->x, p[2] - s->z) > 2.5f) {
             float v[3] = {s->x, s->y, s->z};
             ++warp_retries;
             api->player_warp(s->block, v, s->yaw);
@@ -539,13 +791,18 @@ static void tick(double t) {
             api->log("mapval rewarp %s %.3f try %d (at %.3f %.3f %.3f)", s->name, t, warp_retries, p[0], p[1], p[2]);
             return;
         }
-        if (phase == 0 && el >= 1.5 && have && !loading) {
+        if (phase == 0 && el >= 1.5 && have && !loading && !next) {
             uint32_t b = 0;
             api->player_block(&b);
             api->log("mapval at %s %.3f %08x %.3f %.3f %.3f yaw %.3f", s->name, t, b, p[0], p[1], p[2], yaw);
             phase = 1;
         }
-        if (el >= 1.5 + s->hold) {
+        if (phase == 1 && el >= 1.5 + s->hold && p[1] >= s->y - 6.0f) {
+            memcpy(good_pos, p, sizeof good_pos); /* held: a place to come back to */
+            good_pos[1] += 0.3f;
+            have_good = 1;
+        }
+        if (!next && el >= 1.5 + s->hold) {
             api->log("mapval hold-end %s %.3f %.3f %.3f %.3f", s->name, t, p[0], p[1], p[2]);
             next = 1;
         }
@@ -612,7 +869,7 @@ static void tick(double t) {
         }
     } else if (s->kind == S_TRAVEL) {
         uint32_t b = 0;
-        int in = have && api->player_block(&b) == 0 && b == s->block;
+        int in = have && api->player_block(&b) == 0 && (b == s->block || (s->dungeon && b >> 24 == 0x1d));
         if (in) heal();
         if (in && !loading && fabsf(p[0] - travel_last[0]) + fabsf(p[1] - travel_last[1]) + fabsf(p[2] - travel_last[2]) < 0.05f) {
             if (travel_still++ == 0) travel_still_t = t;
@@ -625,6 +882,9 @@ static void tick(double t) {
         if (travel_still > 90 && t - travel_still_t >= 2.0 && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
             api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s, %.1f s of it loading", s->name, t, b, p[0], p[1], p[2],
                      el, travel_loading);
+            memcpy(good_pos, p, sizeof good_pos);
+            good_pos[1] += 0.3f;
+            have_good = 1;
             next = 1;
         } else if (travel_failed || el > 150) {
             api->log("mapval travel-failed %s %.3f in %08x after %.1f s", s->name, t, b, el);
@@ -649,7 +909,58 @@ static void tick(double t) {
     } else if (s->kind == S_HOLD) {
         heal();
         if (el >= s->hold) next = 1;
-    } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE) {
+    } else if (s->kind == S_TURN) {
+        heal();
+        int k = (int)(el / (s->hold > 0.05f ? s->hold : 0.05f));
+        uint64_t cam = ex_follow_cam();
+        if (k >= s->team || !cam) {
+            next = 1;
+        } else {
+            float yaw = (float)(turn_base + k * 6.283185307179586 / s->team);
+            volatile float* f = (volatile float*)(uintptr_t)cam;
+            if (k != turn_k) {
+                api->log("mapval turn-to %d %.3f yaw %.3f (was %.3f)", k, t, yaw, f[0x144 / 4]);
+                turn_k = k;
+            }
+            f[0x144 / 4] = yaw; /* every frame: the camera's own update would turn it back */
+            f[0x14c / 4] = yaw;
+        }
+    } else if (s->kind == S_REMO) {
+        heal();
+        int playing = remo_playing();
+        if (playing && !remo_started) {
+            remo_started = 1, remo_start_t = t;
+            api->log("mapval remo-start %d %.3f after %.1f s", s->team, t, el);
+        }
+        if (remo_started && !playing) {
+            api->log("mapval remo-end %d %.3f played %.1f s, skip pressed %d times", s->team, t, t - remo_start_t, remo_taps);
+            next = 1;
+        } else if (!remo_started && el > 25) {
+            api->log("mapval remo-none %d %.3f (it did not start)", s->team, t);
+            next = 1;
+        } else if (el > s->hold) {
+            api->log("mapval remo-timeout %d %.3f still playing after %.1f s", s->team, t, el);
+            next = 1;
+        } else if (remo_started && t - remo_start_t >= s->y && t - remo_tap_t >= 3.0 && remo_taps < 4) {
+            /* the game's skip: Options during a cutscene */
+            request("tap options 250");
+            remo_tap_t = t, ++remo_taps;
+            api->log("mapval remo-skip %d %.3f press %d", s->team, t, remo_taps);
+        }
+    } else if (s->kind == S_MOVIE) {
+        heal();
+        if (el > s->hold) {
+            api->log("mapval movie-end %d %.3f after %.1f s, skip pressed %d times", s->team, t, el, remo_taps);
+            next = 1;
+        } else if (el >= s->y && t - remo_tap_t >= 3.0 && remo_taps < 3) {
+            request("tap options 250");
+            remo_tap_t = t, ++remo_taps;
+            api->log("mapval movie-skip %d %.3f press %d", s->team, t, remo_taps);
+        }
+    } else if (s->kind == S_EXIT) {
+        if (el > 30) next = 1; /* the host ends the run before this */
+    } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE ||
+               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG) {
         next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;
@@ -739,6 +1050,13 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     const char* tour = getenv("BBHOST_MAPVAL_TOUR");
     const char* st = getenv("BBHOST_MAPVAL_START");
     if (st && *st) start_after = atof(st);
+    const char* wt = getenv("BBHOST_MAPVAL_WARP_TRIES");
+    if (wt && *wt) warp_tries = atoi(wt);
+    const char* fm = getenv("BBHOST_MAPVAL_FLOAT");
+    float_mode = fm && fm[0] == '1';
+    const char* dl = getenv("BBHOST_MAPVAL_DEADLINE");
+    if (dl && *dl) deadline_s = atof(dl);
+    loaded_t = now_s();
     if (tour && *tour) load_tour(tour);
     a->on_frame(on_frame, 0);
     if (a->size >= offsetof(BbHostApi, on_world_load) + sizeof(a->on_world_load) && a->on_world_load) a->on_world_load(placed, 0);

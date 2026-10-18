@@ -150,6 +150,7 @@ std::mutex g_mu;
 std::unordered_map<std::uint64_t, Entry> g_by_holder;      // under g_mu
 std::map<std::uint64_t, std::uint64_t> g_by_memory;        // memory base -> holder, live entries only
 std::atomic<std::uint64_t> g_write_seq{1};
+std::atomic<std::uint64_t> g_gen_next{1};  // GxResourceInfo::gen
 
 // Counters.
 std::atomic<std::uint64_t> g_created[5] = {}, g_created_with_data[5] = {}, g_created_bytes[5] = {};
@@ -159,6 +160,9 @@ std::atomic<std::uint64_t> g_maps[5][5] = {};  // [resource type][map type]
 std::atomic<std::uint64_t> g_map_unknown{0}, g_map_moved{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
+// New resources made over part of a live one's memory: [old type][new type].
+std::atomic<std::uint64_t> g_overlapped[5][5] = {};
+std::atomic<int> g_overlap_logged{0};
 
 // Object -> id for shader and input-layout objects. Written at
 // creation (rare: area loads) under g_obj_mu, read at every draw on the GX
@@ -171,9 +175,19 @@ struct ObjSlot {
     std::atomic<std::uint32_t> id{0};
     std::atomic<std::uint32_t> extent{0};  // views: gx_view_extent
     std::atomic<std::uint64_t> words{0};   // shader-resource views and samplers: their T#/S# hashed at creation
+    std::atomic<std::uint64_t> gen{0};     // views: their resource's generation (gx_view_gen)
 };
 ObjSlot g_obj[kObjSlots];
 std::mutex g_obj_mu;
+// A view's resource generation by the view's id (gx_view_gen_by_id): what a
+// draw's records name a shader-resource view by. Direct-mapped, written at the
+// view's creation, read lock-free by the command processor.
+constexpr std::uint32_t kIdGenSlots = 1u << 17;
+struct IdGen {
+    std::atomic<std::uint32_t> id{0};
+    std::atomic<std::uint64_t> gen{0};
+};
+IdGen g_id_gen[kIdGenSlots];
 std::atomic<std::uint32_t> g_obj_next{1};
 // No counter on the lookup: six GX threads look up three objects a draw, and
 // a shared one would be a contended line; the renderer counts draws without ids.
@@ -181,10 +195,16 @@ std::atomic<std::uint64_t> g_obj_created{0}, g_obj_recreated{0}, g_obj_full{0};
 std::uint32_t obj_slot(std::uint64_t object) {
     return static_cast<std::uint32_t>(((object >> 3) * 0x9e3779b97f4a7c15ull) >> 47) & (kObjSlots - 1);
 }
-void register_object(std::uint64_t object, std::uint32_t extent = 0, std::uint64_t words = 0) {
+void register_object(std::uint64_t object, std::uint32_t extent = 0, std::uint64_t words = 0, std::uint64_t gen = 0) {
     if (!object) return;
     const std::uint32_t id = g_obj_next.fetch_add(1, std::memory_order_relaxed);
     g_obj_created.fetch_add(1, std::memory_order_relaxed);
+    if (gen) {
+        IdGen& ig = g_id_gen[id & (kIdGenSlots - 1)];
+        ig.id.store(0, std::memory_order_relaxed);
+        ig.gen.store(gen, std::memory_order_relaxed);
+        ig.id.store(id, std::memory_order_release);
+    }
     std::lock_guard<std::mutex> lk(g_obj_mu);
     const std::uint32_t h = obj_slot(object);
     for (std::uint32_t probe = 0; probe < kObjProbes; ++probe) {
@@ -194,6 +214,7 @@ void register_object(std::uint64_t object, std::uint32_t extent = 0, std::uint64
             g_obj_recreated.fetch_add(1, std::memory_order_relaxed);
             s.extent.store(extent, std::memory_order_relaxed);
             s.words.store(words, std::memory_order_relaxed);
+            s.gen.store(gen, std::memory_order_relaxed);
             s.id.store(id, std::memory_order_release);
             return;
         }
@@ -201,6 +222,7 @@ void register_object(std::uint64_t object, std::uint32_t extent = 0, std::uint64
             s.id.store(id, std::memory_order_relaxed);
             s.extent.store(extent, std::memory_order_relaxed);
             s.words.store(words, std::memory_order_relaxed);
+            s.gen.store(gen, std::memory_order_relaxed);
             s.object.store(object, std::memory_order_release);
             return;
         }
@@ -260,6 +282,9 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         !rd(holder + 0x38, &e.info.type) || !rd(holder + 0x39, &e.info.usage)) {
         return;
     }
+    rd(holder + 0x3b, &e.info.bind);
+    e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
+    e.info.created_submit = hle_gnm_submitted_total();
     e.info.id = id & 0xffffff;
     e.info.initial_data = initial_data;
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
@@ -269,6 +294,15 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     g_created_bytes[t].fetch_add(e.info.bytes, std::memory_order_relaxed);
     if (g_rate_log) note_rate(e.info.bytes);
     (void)kind;
+    // With window imports (BBHOST_IMPORT_WINDOWS=1) the memory of a buffer the
+    // GPU reads in place soon is imported ahead, off the command processor;
+    // gpu.cpp picks which by its usage and D3D11 bind flags (+0x3b). Nothing
+    // without window imports.
+    if (e.info.type == 1 && e.info.memory && e.info.bytes) {
+        std::uint8_t bind = 0;
+        rd(holder + 0x3b, &bind);
+        host_gpu_import_prefetch(e.info.memory, e.info.bytes, e.info.usage, bind);
+    }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto old = g_by_holder.find(key); old != g_by_holder.end()) {
@@ -276,6 +310,29 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         g_replaced_holder.fetch_add(1, std::memory_order_relaxed);
         if (auto m = g_by_memory.find(old->second.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
         g_by_holder.erase(old);
+    }
+    if (e.info.memory && e.info.bytes) {
+        // The census: live resources the new one's memory overlaps other than
+        // at its own base (the same base is the reuse below), by the old one's
+        // type - memory the game gave to something new without a destructor
+        // or an unmap the registry saw.
+        auto o = g_by_memory.lower_bound(e.info.memory);
+        if (o != g_by_memory.begin()) --o;
+        for (; o != g_by_memory.end() && o->first < e.info.memory + e.info.bytes; ++o) {
+            if (o->first == e.info.memory || o->second == key) continue;
+            const auto h = g_by_holder.find(o->second);
+            if (h == g_by_holder.end()) continue;
+            const GxResourceInfo& old = h->second.info;
+            if (old.memory + old.bytes <= e.info.memory) continue;
+            g_overlapped[old.type < 5 ? old.type : 0][e.info.type < 5 ? e.info.type : 0].fetch_add(1, std::memory_order_relaxed);
+            if (g_overlap_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                host_log("gx-resources: resource %u (type %u) [0x%llx, +0x%x) made at flip %llu over live resource %u (type %u) [0x%llx, +0x%x) "
+                         "made at flip %llu",
+                         e.info.id, e.info.type, static_cast<unsigned long long>(e.info.memory), e.info.bytes,
+                         static_cast<unsigned long long>(e.created_flip), old.id, old.type, static_cast<unsigned long long>(old.memory), old.bytes,
+                         static_cast<unsigned long long>(old.created_flip));
+            }
+        }
     }
     if (e.info.memory) {
         if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second != key) {
@@ -308,6 +365,7 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
 struct AheadJob {
     std::array<std::uint32_t, 8> tsharp;
     std::uint64_t memory = 0, bytes = 0;
+    std::uint64_t gen = 0;  // the resource's generation: its image, not another's at the same memory
 };
 constexpr std::size_t kAheadQueue = 4096;
 std::mutex g_ahead_mu;
@@ -325,11 +383,12 @@ void ahead_thread() {
             g_ahead_jobs->pop_front();
         }
         // Destroyed while it waited: its memory may be another resource's by now.
-        if (!gx_resource_at(job.memory, std::max<std::uint64_t>(job.bytes, 1), nullptr)) {
+        GxResourceInfo live;
+        if (!gx_resource_at(job.memory, std::max<std::uint64_t>(job.bytes, 1), &live) || live.gen != job.gen) {
             g_ahead_gone.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        if (host_gpu_texture_create_ahead(job.tsharp.data())) {
+        if (host_gpu_texture_create_ahead(job.tsharp.data(), job.gen)) {
             g_ahead_created.fetch_add(1, std::memory_order_relaxed);
             g_ahead_bytes.fetch_add(job.bytes, std::memory_order_relaxed);
         } else {
@@ -353,6 +412,7 @@ void create_ahead(const Entry& e) {
     job.tsharp[1] = (job.tsharp[1] & ~0xffu) | static_cast<std::uint32_t>((e.info.memory >> 40) & 0xff);
     job.memory = e.info.memory;
     job.bytes = e.info.bytes;
+    job.gen = e.info.gen;
     static std::once_flag started;
     std::call_once(started, [] { std::thread(ahead_thread).detach(); });
     {
@@ -382,15 +442,17 @@ void release_pages(std::uint64_t memory, std::uint32_t bytes) {
     if (hi > lo) write_watch_release(reinterpret_cast<void*>(static_cast<std::uintptr_t>(lo)), hi - lo);
 }
 
-void retire_memory(std::uint64_t memory, std::uint32_t bytes) {
+// `gen`: the resource that died (its images go, and only its), or 0 for a
+// range whose resources the registry no longer tells apart (an unmap).
+void retire_memory(std::uint64_t memory, std::uint32_t bytes, std::uint64_t gen) {
     if (!memory || !bytes) return;
     g_retire_queued.fetch_add(1, std::memory_order_relaxed);
     release_pages(memory, bytes);
-    host_gpu_texture_retire(memory, bytes, hle_gnm_submitted_total());
+    host_gpu_texture_retire(memory, bytes, hle_gnm_submitted_total(), gen);
 }
 
 void unregister_holder(std::uint64_t holder) {
-    std::uint64_t memory = 0, buffer_memory = 0;
+    std::uint64_t memory = 0, buffer_memory = 0, gen = 0;
     std::uint32_t bytes = 0, buffer_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -403,6 +465,7 @@ void unregister_holder(std::uint64_t holder) {
         if (it->second.info.type != 1 && it->second.info.alive) {
             memory = it->second.info.memory;
             bytes = it->second.info.bytes;
+            gen = it->second.info.gen;
         } else if (it->second.info.type == 1 && it->second.info.alive) {
             buffer_memory = it->second.info.memory;
             buffer_bytes = it->second.info.bytes;
@@ -410,7 +473,7 @@ void unregister_holder(std::uint64_t holder) {
         if (auto m = g_by_memory.find(it->second.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
         g_by_holder.erase(it);
     }
-    retire_memory(memory, bytes);
+    retire_memory(memory, bytes, gen);
     if (buffer_memory && buffer_bytes) release_pages(buffer_memory, buffer_bytes);
 }
 
@@ -419,22 +482,34 @@ void unregister_holder(std::uint64_t holder) {
 void note_map(std::uint64_t holder, std::uint64_t type) {
     std::uint64_t memory = 0;
     rd(holder + 0x20, &memory);
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_by_holder.find(holder);
-    if (it == g_by_holder.end()) {
-        g_map_unknown.fetch_add(1, std::memory_order_relaxed);
-        return;
+    std::uint64_t texture_memory = 0;
+    std::uint32_t texture_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto it = g_by_holder.find(holder);
+        if (it == g_by_holder.end()) {
+            g_map_unknown.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Entry& e = it->second;
+        const unsigned rt = e.info.type < 5 ? e.info.type : 0, mt = type < 5 ? static_cast<unsigned>(type) : 0;
+        g_maps[rt][mt].fetch_add(1, std::memory_order_relaxed);
+        e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (memory && memory != e.info.memory) {
+            g_map_moved.fetch_add(1, std::memory_order_relaxed);
+            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
+            e.info.memory = memory;
+            g_by_memory[memory] = holder;
+        }
+        if (e.info.type >= 2 && e.info.type <= 4) {
+            texture_memory = e.info.memory;
+            texture_bytes = e.info.bytes;
+        }
     }
-    Entry& e = it->second;
-    const unsigned rt = e.info.type < 5 ? e.info.type : 0, mt = type < 5 ? static_cast<unsigned>(type) : 0;
-    g_maps[rt][mt].fetch_add(1, std::memory_order_relaxed);
-    e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (memory && memory != e.info.memory) {
-        g_map_moved.fetch_add(1, std::memory_order_relaxed);
-        if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
-        e.info.memory = memory;
-        g_by_memory[memory] = holder;
-    }
+    // A texture mapped (none is, in any run so far): the CPU writes it next,
+    // and its image is no longer what its memory holds - the texture cache,
+    // which does not watch a GX resource's memory, is told (host textures).
+    if (texture_memory && texture_bytes) host_gpu_texture_written(texture_memory, texture_bytes);
 }
 
 // The creators: rsi = holder**, rcx = initial data. The holder exists at the return.
@@ -640,7 +715,10 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
                 }
                 g_views[p.type - 1].fetch_add(1, std::memory_order_relaxed);
             }
-            register_object(object, extent, words);
+            // A view's resource, by its holder: what the view's draws name.
+            GxResourceInfo viewed;
+            const std::uint64_t gen = p.type >= 1 && p.type <= 3 && gx_view_resource(object, &viewed) ? viewed.gen : 0;
+            register_object(object, extent, words, gen);
         }
     } else if (p.kind == kTsharp) {
         t_tsharp_valid = p.out && rd(p.out, &t_tsharp);
@@ -784,6 +862,26 @@ std::uint32_t gx_view_extent(std::uint64_t view) {
     return 0;
 }
 
+std::uint64_t gx_view_gen_by_id(std::uint32_t id) {
+    if (!id) return 0;
+    const IdGen& ig = g_id_gen[id & (kIdGenSlots - 1)];
+    if (ig.id.load(std::memory_order_acquire) != id) return 0;
+    const std::uint64_t gen = ig.gen.load(std::memory_order_relaxed);
+    return ig.id.load(std::memory_order_acquire) == id ? gen : 0;
+}
+
+std::uint64_t gx_view_gen(std::uint64_t view) {
+    if (!view) return 0;
+    const std::uint32_t h = obj_slot(view);
+    for (std::uint32_t probe = 0; probe < kObjProbes; ++probe) {
+        const ObjSlot& s = g_obj[(h + probe) & (kObjSlots - 1)];
+        const std::uint64_t o = s.object.load(std::memory_order_acquire);
+        if (o == view) return s.gen.load(std::memory_order_relaxed);
+        if (!o) break;
+    }
+    return 0;
+}
+
 std::uint64_t gx_words_hash(const std::uint8_t* w) {
     std::uint64_t h = 1469598103934665603ull;
     for (int i = 0; i < 32; i += 8) {
@@ -869,7 +967,7 @@ void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
             ++n;
         }
     }
-    retire_memory(va, static_cast<std::uint32_t>(std::min<std::size_t>(len, 0xffffffffu)));
+    retire_memory(va, static_cast<std::uint32_t>(std::min<std::size_t>(len, 0xffffffffu)), 0);
     if (n) {
         g_released_under_holder.fetch_add(n, std::memory_order_relaxed);
         if (g_release_events.fetch_add(1, std::memory_order_relaxed) < 6) {
@@ -892,6 +990,65 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     g_lookup_hits.fetch_add(1, std::memory_order_relaxed);
     if (out) *out = r;
     return true;
+}
+
+bool gx_resource_by_holder(std::uint64_t holder, GxResourceInfo* out) {
+    if (!holder) return false;
+    std::uint64_t memory = 0;
+    const bool have_memory = rd(holder + 0x20, &memory);
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto h = g_by_holder.find(holder);
+    if (h == g_by_holder.end() && have_memory && memory) h = g_by_holder.find(kMemoryKey | memory);
+    if (h == g_by_holder.end() || !h->second.info.alive) return false;
+    if (out) *out = h->second.info;
+    return true;
+}
+
+bool gx_view_resource(std::uint64_t view, GxResourceInfo* out) {
+    std::uint64_t holder = 0;
+    return view && rd(view + 0x08, &holder) && gx_resource_by_holder(holder, out);
+}
+
+bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
+    if (!bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    // Live resources do not overlap each other: the one before the range if
+    // it reaches in, else the first that starts inside it.
+    auto it = g_by_memory.lower_bound(va);
+    const auto take = [&](std::map<std::uint64_t, std::uint64_t>::const_iterator m) {
+        auto h = g_by_holder.find(m->second);
+        if (h == g_by_holder.end()) return false;
+        const GxResourceInfo& r = h->second.info;
+        if (r.memory >= va + bytes || r.memory + r.bytes <= va) return false;
+        if (out) *out = r;
+        return true;
+    };
+    if (it != g_by_memory.begin() && take(std::prev(it))) return true;
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) {
+        if (take(it)) return true;
+    }
+    return false;
+}
+
+std::uint64_t gx_write_seq_now() { return g_write_seq.load(std::memory_order_relaxed); }
+
+std::uint64_t gx_write_seq_overlapping(std::uint64_t va, std::size_t bytes, bool* any_resource) {
+    if (any_resource) *any_resource = false;
+    if (!bytes) return 0;
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::uint64_t seq = 0;
+    auto it = g_by_memory.lower_bound(va);
+    const auto take = [&](std::map<std::uint64_t, std::uint64_t>::const_iterator m) {
+        auto h = g_by_holder.find(m->second);
+        if (h == g_by_holder.end()) return;
+        const GxResourceInfo& r = h->second.info;
+        if (r.memory >= va + bytes || r.memory + r.bytes <= va) return;
+        if (any_resource) *any_resource = true;
+        seq = std::max(seq, r.write_seq);
+    };
+    if (it != g_by_memory.begin()) take(std::prev(it));
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) take(it);
+    return seq;
 }
 
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip) {
@@ -950,6 +1107,19 @@ void gx_resources_report() {
     host_log("gx-resources: Map by resource and type%s unknown holders %llu, memory moved by a map %llu; lookups %llu (%llu hits)",
              maps.empty() ? " none;" : maps.c_str(), static_cast<ull>(g_map_unknown.load()), static_cast<ull>(g_map_moved.load()),
              static_cast<ull>(g_lookups.load()), static_cast<ull>(g_lookup_hits.load()));
+    {
+        std::string ov;
+        for (unsigned a = 0; a < 5; ++a) {
+            for (unsigned b = 0; b < 5; ++b) {
+                if (const ull n = g_overlapped[a][b].load()) {
+                    char buf[96];
+                    std::snprintf(buf, sizeof(buf), " %s over %s %llu;", kType[b], kType[a], n);
+                    ov += buf;
+                }
+            }
+        }
+        host_log("gx-resources: made over part of a live resource's memory:%s", ov.empty() ? " none" : ov.c_str());
+    }
     host_log("gx-resources: shader and input-layout objects created %llu (%llu at an address an earlier one had), not registered (table "
              "full) %llu",
              static_cast<ull>(g_obj_created.load()), static_cast<ull>(g_obj_recreated.load()), static_cast<ull>(g_obj_full.load()));

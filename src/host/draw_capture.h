@@ -19,9 +19,11 @@
 //
 // BBHOST_CAPTURE_DISPATCH=<program prefix>[,<prefix>...]: a compute dispatch
 // the same way, for drawreplay's dispatch mode - its module, params block
-// (the GDS counters' words included), images, and the guest pages its program
-// reaches before and after it ran. BBHOST_CAPTURE_DISPATCH_COUNT (default 1),
-// BBHOST_CAPTURE_DISPATCH_EVERY (default 1), BBHOST_CAPTURE_MIN_FLIP and
+// (the GDS counters' words included), images (a storage image's contents also
+// after it ran), and the guest pages its program reaches before and after it
+// ran. BBHOST_CAPTURE_DISPATCH_COUNT (default 1),
+// BBHOST_CAPTURE_DISPATCH_EVERY (default 1), BBHOST_CAPTURE_DISPATCH_EACH (at
+// most that many of one program; default no limit of its own), BBHOST_CAPTURE_MIN_FLIP and
 // BBHOST_CAPTURE_DIR as for draws. An indirect dispatch whose arguments ask
 // for no work, read after the settle, is passed over.
 #pragma once

@@ -10,10 +10,12 @@
 #include "gcn/container.h"
 #include "gcn/isa.h"
 #include "gcn/lift.h"
+#include "gcn/hlsl.h"
 #include "gcn/translate.h"
 
 #include <spirv-tools/libspirv.hpp>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -3969,8 +3971,396 @@ void run() { cases(); }
 
 }  // namespace vertex_stores
 
+
+// ---- compute shaders (gcn::lift_compute_shader) --------------------------------------
+// Hand-encoded dispatch programs: the lift binds what the translation binds,
+// reads memory through the page table as it does, lifts loops on EXEC, and
+// makes the append idiom (ds_append's wave base + the lane's v_mbcnt rank)
+// each invocation's own counter step; and refuses what it cannot show.
+namespace compute {
+
+struct Asm {
+    std::vector<std::uint32_t> w;
+    std::uint32_t at() const { return static_cast<std::uint32_t>(w.size() * 4); }
+    void sopp(std::uint32_t op, std::int16_t simm = 0) { w.push_back(0xbf800000u | op << 16 | static_cast<std::uint16_t>(simm)); }
+    void branch(std::uint32_t op, std::uint32_t target) { sopp(op, static_cast<std::int16_t>((static_cast<int>(target) - static_cast<int>(at()) - 4) / 4)); }
+    std::size_t forward(std::uint32_t op) {
+        sopp(op);
+        return w.size() - 1;
+    }
+    void land(std::size_t slot) { w[slot] = (w[slot] & 0xffff0000u) | static_cast<std::uint16_t>(w.size() - slot - 1); }
+    void sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc) { w.push_back(0xbe800000u | sdst << 16 | op << 8 | ssrc); }
+    void sop2(std::uint32_t op, std::uint32_t sdst, std::uint32_t s0, std::uint32_t s1) { w.push_back(0x80000000u | op << 23 | sdst << 16 | s1 << 8 | s0); }
+    void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
+    void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
+    void vopc(std::uint32_t op, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(0x7c000000u | op << 17 | vsrc1 << 9 | src0); }
+    void vop3(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t src1) {
+        w.push_back(0xd0000000u | op << 17 | vdst);
+        w.push_back(src0 | src1 << 9);
+    }
+    // buffer_store_dword vdata, vaddr, s[srsrc..+3], 0 offen
+    void store_offen(std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc) {
+        w.push_back(0xe0000000u | 28u << 18 | 1u << 12);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+    }
+    // ds_* vdst, vaddr offset:0 [gds]
+    void ds(std::uint32_t op, std::uint32_t vdst, std::uint32_t vaddr, bool gds, std::uint32_t data0 = 0) {
+        w.push_back(0xd8000000u | op << 18 | (gds ? 1u << 17 : 0u));
+        w.push_back(vdst << 24 | data0 << 8 | vaddr);
+    }
+    void waitcnt() { w.push_back(0xbf8c0000u); }
+    void endpgm() { w.push_back(0xbf810000u); }
+};
+
+constexpr std::uint32_t kV = 256, kC0 = 128, kVcc = 106, kExec = 126, kExecHi = 127, kM0 = 124, kMinus1 = 193;
+constexpr std::uint32_t kEndpgm = 1, kBranch = 2, kExecz = 8, kBarrier = 10;   // SOPP
+constexpr std::uint32_t kSMov = 3, kSMov64 = 4;                                 // SOP1
+constexpr std::uint32_t kSAnd64 = 15;                                            // SOP2
+constexpr std::uint32_t kVMov = 1;                                               // VOP1
+constexpr std::uint32_t kVAddI32 = 37, kVLshlrev = 26;                           // VOP2
+constexpr std::uint32_t kCmpGtI32 = 0x84;                                        // VOPC
+constexpr std::uint32_t kMbcntLo = 0x123, kMbcntHi = 0x124;                      // VOP3
+constexpr std::uint32_t kDsAppend = 62, kDsWrite = 13;                           // DS
+
+// Four user SGPRs (a V# in s[0:3]), the fifth M0's GDS range; v0 the x in the workgroup.
+gcn::TranslateOptions options(std::uint32_t threads = 64) {
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Compute;
+    o.rsrc2 = 5u << 1;
+    o.cs_threads[0] = threads;
+    o.gds_counters = true;
+    return o;
+}
+
+gcn::LiftResult lift(const Asm& a, const gcn::TranslateOptions& o = options()) {
+    const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+    CHECK(p.errors.empty());
+    const gcn::TranslateResult ref = gcn::translate(p, o);
+    if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors.empty() ? "?" : ref.errors[0].c_str());
+    CHECK(ref.ok());
+    return gcn::lift_compute_shader(p, o, ref);
+}
+
+bool lifted_valid(const gcn::LiftResult& r, const char* what) {
+    for (const std::string& why : r.rejections) std::fprintf(stderr, "%s rejected: %s\n", what, why.c_str());
+    if (!r.ok()) return false;
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string msg;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+        if (msg.empty()) msg = m;
+    });
+    if (!tools.Validate(r.spirv.data(), r.spirv.size())) {
+        std::fprintf(stderr, "%s: lifted SPIR-V invalid: %s\n", what, msg.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool proof_has(const gcn::LiftResult& r, const char* text) {
+    for (const std::string& line : r.proof) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    std::fprintf(stderr, "expected a proof line containing \"%s\"\n", text);
+    return false;
+}
+
+std::size_t count_op(const std::vector<std::uint32_t>& spv, std::uint32_t opcode) {
+    std::size_t n = 0;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t len = spv[i] >> 16;
+        if (!len) break;
+        n += (spv[i] & 0xffff) == opcode;
+        i += len;
+    }
+    return n;
+}
+
+// for (i = x; i < 32; i += 64) store i at base + 4 i: a loop on EXEC. With
+// `alike`, i starts at 0 in every lane (every invocation leaves together).
+Asm exec_loop(bool barrier, bool alike = false) {
+    Asm a;
+    a.vop1(kVMov, 1, alike ? kC0 : kV + 0);
+    a.sop1(kSMov64, 6, kExec);
+    const std::uint32_t header = a.at();
+    a.vopc(kCmpGtI32, kC0 + 32, 1);  // v_cmp_gt_i32 vcc, 32, v1
+    a.sop2(kSAnd64, kExec, kExec, kVcc);
+    const std::size_t exit = a.forward(kExecz);
+    a.vop2(kVLshlrev, 2, kC0 + 2, 1);
+    a.store_offen(1, 2, 0);
+    if (barrier) a.sopp(kBarrier);
+    a.vop2(kVAddI32, 1, kC0 + 64, 1);
+    a.branch(kBranch, header);
+    a.land(exit);
+    a.sop1(kSMov64, kExec, 6);
+    a.endpgm();
+    return a;
+}
+
+// The append idiom: rank = v_mbcnt_hi(exec_hi, 0), v_mbcnt_lo(exec_lo, rank);
+// base = ds_append (GDS); store x at base + rank. `misuse`: store the base too.
+Asm append(bool misuse) {
+    Asm a;
+    a.sop1(kSMov, kM0, 4);
+    a.vop3(kMbcntHi, 1, kExecHi, kC0);
+    a.vop3(kMbcntLo, 1, kExec, kV + 1);
+    a.ds(kDsAppend, 2, 0, true);
+    a.waitcnt();
+    if (misuse) {
+        a.vop2(kVLshlrev, 3, kC0 + 2, 2);
+        a.store_offen(2, 3, 0);
+    }
+    a.vop2(kVAddI32, 2, kV + 2, 1);
+    a.vop2(kVLshlrev, 3, kC0 + 2, 2);
+    a.store_offen(0, 3, 0);
+    a.endpgm();
+    return a;
+}
+
+// The decorations a lifted module gives its storage-buffer variables: how
+// many carry DescriptorSet `set` and how many Binding `binding`.
+std::size_t decorated(const std::vector<std::uint32_t>& spv, std::uint32_t decoration, std::uint32_t value) {
+    std::size_t n = 0;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t len = spv[i] >> 16;
+        if (!len) break;
+        if ((spv[i] & 0xffff) == 71 /* OpDecorate */ && len == 4 && spv[i + 2] == decoration && spv[i + 3] == value) ++n;
+        i += len;
+    }
+    return n;
+}
+
+// A lean reference (ComputeLean: cb_ssbo, cb_no_fallback, its buffers in set
+// 1): the lift reads what the reference bound from that storage buffer and
+// walks the rest as the reference does; a store at the V#'s base plus a
+// constant goes through the written binding; with a page-table fallback in
+// the reference the lift refuses.
+gcn::TranslateOptions lean(gcn::TranslateOptions o) {
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.cb_descriptor_set = 1;
+    return o;
+}
+void lean_reference() {
+    {
+        Asm a;
+        a.w.push_back(0xc2040100u);  // s_buffer_load_dword s8, s[0:3], 0x0
+        a.waitcnt();
+        a.vop1(kVMov, 1, 8);  // v_mov_b32 v1, s8
+        a.vop2(kVLshlrev, 2, kC0 + 2, 0);
+        a.store_offen(1, 2, 0);  // at a VGPR offset: walked
+        a.endpgm();
+        const gcn::TranslateOptions o = lean(options());
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        CHECK(ref.buffers.size() == 1);
+        CHECK(ref.buffer_at.count(0) == 1);
+        const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+        CHECK(lifted_valid(r, "lean reference"));
+        CHECK(proof_has(r, "1 scalar and typed loads read from the storage buffer the reference binds"));
+        CHECK(proof_has(r, "reaches it: 0 scalar loads, 0 buffer loads"));  // nothing more read through the page table
+        CHECK(proof_has(r, "1 buffer stores and"));                           // the walked store
+        if (!ref.buffers.empty()) {
+            CHECK(decorated(r.spirv, 34 /* DescriptorSet */, 1) >= 1);
+            CHECK(decorated(r.spirv, 33 /* Binding */, ref.buffers[0].binding) >= 1);
+        }
+        gcn::TranslateOptions f = o;
+        f.cb_no_fallback = false;
+        CHECK(rejected_with(gcn::lift_compute_shader(p, f, gcn::translate(p, f)), "page-table fallback"));
+    }
+    {
+        Asm a;
+        a.vop1(kVMov, 1, kC0 + 5);                                // v_mov_b32 v1, 5
+        a.w.push_back(0xe0000000u | 28u << 18 | 4u);              // buffer_store_dword v1, off, s[0:3], 0 offset:4
+        a.w.push_back(0u | 1u << 8 | 0u << 16 | 128u << 24);
+        a.endpgm();
+        const gcn::TranslateOptions o = lean(options());
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        CHECK(ref.buffers.size() == 1 && ref.buffers[0].written);
+        const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+        CHECK(lifted_valid(r, "lean reference, bound store"));
+        CHECK(proof_has(r, "1 buffer stores through its written binding"));
+        CHECK(proof_has(r, "0 buffer stores and"));  // none through the page table
+        // The walking reference walks it, and the lift with it.
+        const gcn::TranslateResult walk = gcn::translate(p, options());
+        const gcn::LiftResult w = gcn::lift_compute_shader(p, options(), walk);
+        CHECK(lifted_valid(w, "walking reference, the same store"));
+        CHECK(proof_has(w, "1 buffer stores and"));
+    }
+    // Elements at a VGPR index or offset (translate.cpp bound_compute_access):
+    // a typed store of four floats at v0's index, buffer_load_format_x at it,
+    // buffer_atomic_add at index and offset with GLC, a typed load at a VGPR
+    // offset alone (a ranged binding) - each bound in the lean reference, read
+    // and written there by the lift, nothing through the page table.
+    {
+        const auto mtbuf = [](Asm& a, std::uint32_t op, std::uint32_t dfmt, bool idxen, bool offen, std::uint32_t vdata, std::uint32_t vaddr,
+                              std::uint32_t srsrc, std::uint32_t offset12) {
+            a.w.push_back(0xe8000000u | 7u << 23 | dfmt << 19 | op << 16 | (idxen ? 1u << 13 : 0u) | (offen ? 1u << 12 : 0u) | offset12);
+            a.w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+        };
+        const auto mubuf = [](Asm& a, std::uint32_t op, bool idxen, bool offen, bool glc, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc) {
+            a.w.push_back(0xe0000000u | op << 18 | (idxen ? 1u << 13 : 0u) | (offen ? 1u << 12 : 0u) | (glc ? 1u << 14 : 0u));
+            a.w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+        };
+        gcn::TranslateOptions o = lean(options());
+        o.rsrc2 = 9u << 1;  // two V#s: s[0:3] and s[4:7] (and s8)
+        {
+            Asm a;
+            a.vop1(kVMov, 1, kC0 + 1);
+            a.vop1(kVMov, 2, kC0 + 2);
+            a.vop1(kVMov, 3, kC0 + 3);
+            a.vop1(kVMov, 4, kC0 + 4);
+            mtbuf(a, 7, 14, true, false, 1, 0, 0, 16);  // tbuffer_store_format_xyzw v[1:4], v0, s[0:3] idxen offset:16
+            mubuf(a, 0, true, false, false, 5, 0, 4);   // buffer_load_format_x v5, v0, s[4:7] idxen
+            a.waitcnt();
+            a.vop2(kVLshlrev, 6, kC0 + 2, 0);           // v6 = 4 x
+            a.vop1(kVMov, 7, 0);                        // v7 = x: [v7, v8] = index, offset
+            a.vop1(kVMov, 8, kV + 6);
+            mubuf(a, 50, true, true, true, 5, 7, 4);    // buffer_atomic_add v5, v[7:8], s[4:7] idxen offen glc
+            a.waitcnt();
+            mtbuf(a, 0, 4, false, true, 9, 6, 0, 0);    // tbuffer_load_format_x v9, v6, s[0:3] offen: no index
+            a.waitcnt();
+            a.store_offen(9, 6, 4);                     // walked: buffer_store_dword at a VGPR offset of s[4:7]... bound? no: offen
+            a.endpgm();
+            const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+            CHECK(p.errors.empty());
+            const gcn::TranslateResult ref = gcn::translate(p, o);
+            CHECK(ref.ok());
+            if (!ref.ok() && !ref.errors.empty()) std::fprintf(stderr, "lean elements: %s\n", ref.errors[0].c_str());
+            // s[0:3] is read at an index and at an offset alone: the second
+            // binds nothing (cb_stride holds the stride) and walks.
+            CHECK(ref.buffers.size() == 2);
+            bool written = true;
+            for (const gcn::BufferBinding& b : ref.buffers) written = written && b.written;
+            CHECK(written);
+            const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+            CHECK(lifted_valid(r, "lean reference, bound elements"));
+            CHECK(proof_has(r, "3 elements at a VGPR index or offset"));
+            CHECK(count_op(r.spirv, 234) == 1);  // OpAtomicIAdd, on the binding
+            // HLSL: the written bindings as RWByteAddressBuffers, the add as their InterlockedAdd.
+            const gcn::HlslResult h = gcn::emit_hlsl(r.spirv);
+            CHECK(h.ok());
+            CHECK(h.source.find("RWByteAddressBuffer") != std::string::npos);
+            CHECK(h.source.find(".InterlockedAdd(") != std::string::npos);
+        }
+        {
+            Asm a;  // the offset-only typed load alone: a ranged binding
+            a.vop2(kVLshlrev, 6, kC0 + 2, 0);
+            mtbuf(a, 0, 4, false, true, 9, 6, 0, 0);  // tbuffer_load_format_x v9, v6, s[0:3] offen
+            a.waitcnt();
+            mtbuf(a, 4, 4, false, true, 9, 6, 4, 0);  // tbuffer_store_format_x v9, v6, s[4:7] offen
+            a.endpgm();
+            const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+            const gcn::TranslateResult ref = gcn::translate(p, o);
+            CHECK(ref.ok());
+            CHECK(ref.buffers.size() == 2 && ref.buffers[0].ranged && ref.buffers[1].ranged && ref.buffers[1].written && ref.walks.empty());
+            const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+            CHECK(lifted_valid(r, "lean reference, ranged elements"));
+            CHECK(proof_has(r, "2 elements at a VGPR index or offset"));
+            // Walked in the walking reference, and by its lift.
+            gcn::TranslateOptions wo = options();
+            wo.rsrc2 = o.rsrc2;
+            const gcn::TranslateResult walk = gcn::translate(p, wo);
+            CHECK(walk.ok() && walk.buffers.empty());
+            CHECK(lifted_valid(gcn::lift_compute_shader(p, wo, walk), "walking reference, the same elements"));
+        }
+    }
+}
+
+void run() {
+    {
+        const gcn::LiftResult r = lift(exec_loop(false));
+        CHECK(lifted_valid(r, "loop on EXEC"));
+        CHECK(proof_has(r, "on EXEC"));
+        CHECK(proof_has(r, "1 buffer stores"));
+        CHECK(count_op(r.spirv, 246) == 1);  // OpLoopMerge
+    }
+    {
+        // A barrier needs every invocation that entered the loop: this one's
+        // invocations leave at different iterations.
+        const gcn::LiftResult r = lift(exec_loop(true));
+        CHECK(rejected_with(r, "which invocations leave at different iterations"));
+        // ... and this one's leave at the same iteration: the barrier stays.
+        const gcn::LiftResult u = lift(exec_loop(true, true));
+        CHECK(lifted_valid(u, "barrier in a loop every invocation leaves together"));
+        CHECK(proof_has(u, "1 s_barrier"));
+        CHECK(count_op(u.spirv, 224) == 1);  // OpControlBarrier
+    }
+    for (const std::uint32_t threads : {32u, 128u}) {
+        const gcn::LiftResult r = lift(append(false), options(threads));
+        CHECK(lifted_valid(r, "append idiom"));
+        CHECK(r.wave.gds_steps == 1);
+        CHECK(count_op(r.spirv, 339) == 0);  // no OpGroupNonUniformBallot: each invocation steps the counter itself
+        CHECK(count_op(r.spirv, 234) == 1);  // one OpAtomicIAdd
+    }
+    CHECK(rejected_with(lift(append(true)), "used other than added to its lanes' ranks"));
+    {
+        Asm a;  // v_mbcnt_lo of -1: the lane's index, not a rank among a mask's lanes
+        a.vop3(kMbcntLo, 1, kMinus1, kC0);
+        a.vop2(kVLshlrev, 2, kC0 + 2, 1);
+        a.store_offen(1, 2, 0);
+        a.endpgm();
+        CHECK(rejected_with(lift(a), "not a lane mask"));
+    }
+    {
+        Asm a;  // workgroup memory
+        a.ds(kDsWrite, 0, 0, false, 0);
+        a.endpgm();
+        gcn::TranslateOptions o = options();
+        o.rsrc2 |= 1u << 15;  // LDS_SIZE: 128 dwords
+        CHECK(rejected_with(lift(a, o), "LDS (groupshared memory) is not lifted"));
+    }
+    {
+        // s_cbranch_execnz over an s_branch to the end: an early-out lifted
+        // as the region it skips.
+        Asm a;
+        a.vopc(kCmpGtI32, kC0 + 16, kV + 0 - kV);  // placeholder replaced below
+        a.w.pop_back();
+        a.vopc(kCmpGtI32, kC0 + 16, 0);  // v_cmp_gt_i32 vcc, 16, v0
+        a.sop1(36 /* s_and_saveexec_b64 */, 6, kVcc);
+        const std::size_t nz = a.forward(9 /* s_cbranch_execnz */);
+        const std::size_t to_end = a.forward(kBranch);
+        a.land(nz);
+        a.vop2(kVLshlrev, 2, kC0 + 2, 0);
+        a.store_offen(0, 2, 0);
+        a.land(to_end);
+        a.endpgm();
+        const gcn::LiftResult r = lift(a);
+        CHECK(lifted_valid(r, "early-out"));
+        CHECK(proof_has(r, "s_cbranch_execnz"));
+    }
+    // An s_cbranch_execz region: a selection an invocation whose EXEC bit is
+    // clear skips - unless something in it needs the other invocations (a
+    // barrier), when every invocation runs it with its writes masked.
+    for (const bool barrier : {false, true}) {
+        Asm a;
+        a.vopc(kCmpGtI32, kC0 + 16, kV + 0);  // v_cmp_gt_i32 vcc, 16, v0
+        a.sop1(36 /* s_and_saveexec_b64 */, 6, kVcc);
+        const std::size_t skip = a.forward(kExecz);
+        if (barrier) a.sopp(kBarrier);
+        a.vop2(kVLshlrev, 2, kC0 + 2, 0);
+        a.store_offen(0, 2, 0);
+        a.land(skip);
+        a.sop1(kSMov64, kExec, 6);
+        a.endpgm();
+        const gcn::LiftResult r = lift(a);
+        CHECK(lifted_valid(r, barrier ? "region with a barrier" : "region"));
+        const bool branched = std::any_of(r.proof.begin(), r.proof.end(), [](const std::string& line) {
+            return line.find("a selection on the invocation's EXEC bit") != std::string::npos;
+        });
+        CHECK(branched == !barrier);
+        if (barrier) CHECK(proof_has(r, "1 s_barrier"));
+    }
+    lean_reference();
+}
+
+}  // namespace compute
+
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
+    compute::run();
     vertex::run();
     vertex_stores::run();
     control_flow::run();

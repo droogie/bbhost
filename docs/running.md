@@ -36,6 +36,26 @@ folder and the eboot (both are checked as you go), choose the online server
 and account if you want to play online, and press Play. The window writes the
 per-user `bbhost.toml` and starts the game. `bbhost --setup` opens it again.
 
+The game turns its shaders into HLSL and compiles them on your PC in the
+background, so you can play straight away; the first session uses the
+translator's own shaders while that runs, and may stutter a little more than
+later ones the first time it meets each place. To compile before playing -
+after installing or updating bbhost or your graphics driver - open the setup
+window's Shaders tab and press **Compile shaders now**: every shader of the
+game's, the pipelines your earlier sessions drew and those on the list a
+release ships (`pipeline-list.bin`, below), then the first session
+needs no compiling in the background. (The few pipelines a place needs the
+first time you ever visit it are still built then.) The tab shows whether the
+shader caches are up to date for this bbhost and this driver, and the
+compile's progress, time left and any failures; it can be cancelled, and what
+was compiled is kept. When the caches are missing or out of date - a new
+install, a bbhost update that changed the shader translator, a new graphics
+driver - the tab, and a line on the main tab, recommend it with the time it
+is likely to take; it is never forced. The same tab has the Shaders setting
+(HLSL, or Lifted for the translator's own shaders only; also F10 under
+Graphics, and HLSL Shaders in the game's System > PC Graphics).
+`bbhost --compile-shaders` does the same from a terminal.
+
 Without a display (a headless run) bbhost writes a template config instead and
 tells you which paths to fill in.
 
@@ -73,9 +93,20 @@ which `shader-cache-build.txt` names. An update that leaves the translator
 alone keeps them, so it starts as fast as the build before it; one that
 changed the translator throws both away (`gpu: shader caches made by
 translator ..., this is translator ...: cleared`) and builds them again while
-the title and the loading screens are up, from `stage-manifest.bin`, the list
-of the game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them
-anyway. The files are safe to delete: the next start builds them again.
+the title and the loading screens are up, from the two lists beside them,
+which are kept: `stage-manifest.bin`, the shaders the game's draws needed that
+it never creates itself, and `pipeline-manifest.bin`, every graphics pipeline
+a draw created. At each start bbhost builds every pipeline on that list again
+in the background, its shaders, its pipeline libraries and its optimized
+link, so what an earlier run has drawn is not compiled again when it comes
+into view. The lists hold what the game drew, not what bbhost made of it, so
+they outlast translator updates and driver changes: what they build is made
+again from them. A list `pipeline-list.bin` beside `bbhost` (or the one
+`BBHOST_PIPELINE_LIST` names) adds its pipelines to a player's own, so a first
+start has them too; such a list names the game's shaders, the player's own
+bundles supply them. `BBHOST_KEEP_SHADER_CACHE=1` keeps the caches anyway,
+`BBHOST_PIPELINE_MANIFEST=0` leaves the pipeline list out. The files are safe
+to delete: the next start builds them again.
 
 ## Controls
 

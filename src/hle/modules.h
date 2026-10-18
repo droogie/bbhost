@@ -96,6 +96,9 @@ std::uint64_t hle_gnm_cp_backlog();
 // `retired` reaches it.
 std::uint64_t hle_gnm_submitted_total();
 std::uint64_t hle_gnm_retired_total();
+// The submission the calling command-processor thread is walking, numbered as
+// hle_gnm_submitted_total counts them (1 the first); 0 on any other thread.
+std::uint64_t hle_gnm_cp_job_seq();
 std::string hle_gnm_flush_reasons();
 // BBHOST_ARENA_MONITOR=1: per-flip scan of the game's command-arena markers
 // (logs `arena: LOW`). The report carries the arena-wait counts whenever the
@@ -143,6 +146,11 @@ void hle_gnm_find_writes(std::uint64_t va, std::uint64_t bytes, std::uint64_t va
 // game thread's flip request, which may be ahead of them.
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded = false);
 std::uint64_t hle_video_flip_count();
+std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
+// A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the
+// `exit` request of BBHOST_TEST_REQUESTS): the exit reports and the cache
+// saves, then the process ends. main.cpp's pump checks it.
+bool hle_video_test_exit_requested();
 // Since the last call, for the 300-flip report: how late the vblank clock's
 // ticks woke, and how long flips took from queued to shown and to completed.
 std::string hle_video_pacing_window();
@@ -200,6 +208,9 @@ const GpuDrawInputs* hle_gx_trace_draw(std::uint32_t op, std::uint64_t packet_va
                                        std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx,
                                        bool* render);
 void hle_gx_trace_dispatch(std::uint32_t op, std::uint64_t packet_va, std::uint32_t x, std::uint32_t cs_lo);
+// The caller (Binary Ninja address) of the Gnm emitter that wrote the packet
+// at `packet_va`, or 0 when no emitter hook saw it (BBHOST_CP_CENSUS).
+std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va);
 // BBHOST_GX_NATIVE: the CP walked a host-draw token, a NOP whose
 // payload is kGxNativeMagic and a 64-bit id; sh / ctx are its register file.
 // With BBHOST_GX_NATIVE=2 returns the draw's inputs (its GX objects through
@@ -227,6 +238,20 @@ void hle_gx_upload_token(std::uint64_t id);
 // place of its dispatch; the command processor copies image to image.
 constexpr std::uint32_t kGxImageCopyMagic = 0x43494242u;  // "BBIC"
 void hle_gx_image_copy_token(std::uint64_t id);
+// GX's colour and depth-stencil clears (0x2ab4ef0 and 0x2ab5f50, which
+// ClearRenderTargetView and ClearDepthStencilView call and the engine also
+// calls directly) write a clear token, {kGxClearMagic, id low, id high},
+// naming the view (BBHOST_GX_CLEAR_VIEWS); the command processor clears the
+// view's image.
+constexpr std::uint32_t kGxClearMagic = 0x4c434242u;  // "BBCL"
+void hle_gx_clear_token(std::uint64_t id);
+// GX's CopyStructureCount (0x2568be0) writes a count copy token,
+// {kGxCountCopyMagic, id low, id high} (BBHOST_GX_COUNT_COPIES): the
+// destination and the UAV's count word; `check` when the packet still
+// follows (the switch's check mode). The command processor copies the word
+// (hle_gnm_count_copy).
+constexpr std::uint32_t kGxCountCopyMagic = 0x43534242u;  // "BBSC"
+bool hle_gx_count_copy_token(std::uint64_t id, std::uint64_t* dst, std::uint64_t* src, bool* check);
 // A Scaleform HAL draw (0x73e670, 0x73e6b0, 0x73e640)
 // writes a draw token built from the HAL's objects. BBHOST_GX_NATIVE_SCALEFORM=2
 // returns the draw's inputs (its objects through hle_gx_trace_objects) for the
@@ -247,23 +272,37 @@ bool hle_gx_shadow_wanted();
 void hle_gx_wrapper_compare(const GpuDrawInputs& in, std::uint32_t count, std::uint64_t index_va, std::uint32_t index_type,
                             std::uint32_t instances, std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx);
 void hle_gnm_cp_report();  // the command processor's register-file and draw-packet counters, at exit
-// A compute dispatch emitted through the wrapper writes a
-// dispatch token, {kGxDispatchMagic, id low, id high}, built from the
-// wrapper's context state (the compute program and its user data).
-// BBHOST_GX_NATIVE_DISPATCH=2 returns the dispatch for the CP to run; =1
-// (shadow) keeps it for the dispatch packet that follows, which
-// hle_gx_dispatch_check compares against the register file. The default, 0,
-// leaves dispatches to their packets (gx_trace.cpp says why).
+// A compute dispatch emitted through the wrapper writes a dispatch token,
+// {kGxDispatchMagic, id low, id high}, instead of its packet: the compute
+// program, its user data (from GX's compute records, or as its writers set
+// it) and its group counts. BBHOST_GX_NATIVE_DISPATCH=2 (the default)
+// returns the dispatch for the CP to run; =1 (shadow) keeps it for the
+// dispatch packet that follows, which hle_gx_dispatch_check compares against
+// the register file; 0 leaves dispatches to their packets (gx_trace.cpp).
 constexpr std::uint32_t kGxDispatchMagic = 0x53444242u;  // "BBDS"
 struct GpuDispatch;
-// True when dispatches run from their tokens, so the command processor must
-// not also run the dispatch packet.
+// True when dispatches run from their tokens: a dispatch packet that still
+// arrives is one no token was made for, run from the register file (counted).
 bool hle_gx_dispatch_native();
+// True when dispatch tokens are shadowed (BBHOST_GX_NATIVE_DISPATCH=1): the
+// command processor notes which packet wrote each compute user-data slot.
+bool hle_gx_dispatch_shadow();
 const GpuDispatch* hle_gx_dispatch_token(std::uint64_t id);
 bool hle_gx_dispatch_pending();
-// writers: for each of the 16 compute user-data slots, the header of the
-// SET_SH_REG packet that last wrote it and the NOP marker before it (checks).
-void hle_gx_dispatch_check(const GpuDispatch& regs, const std::uint32_t* writers);
+// The packets that last wrote each of the 16 compute user-data slots on this
+// command-processor thread, for the shadow's compare (checks): the SET_SH_REG
+// header and the dword before it (a marker NOP's payload), the packet's
+// address (0: never written), the walked buffer it was in and whether the
+// constant engine's stream walked it; and the dispatch packet's own.
+struct GpuDispatchWriters {
+    std::uint32_t header[16] = {}, marker[16] = {};
+    std::uint64_t packet[16] = {}, buffer[16] = {};
+    bool ce[16] = {};
+    std::uint64_t dispatch_packet = 0, dispatch_buffer = 0;
+};
+// user_reads: the user-data dwords the program reads (its translation's
+// liveness; 0xffff when not known).
+void hle_gx_dispatch_check(const GpuDispatch& regs, const GpuDispatchWriters* writers, std::uint32_t user_reads);
 void hle_gx_scaleform_check(std::uint32_t count, std::uint64_t index_va, std::uint32_t index_type, std::uint32_t instances,
                             std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx);
 void hle_gx_copy_token(std::uint64_t id);
@@ -275,6 +314,17 @@ void hle_gx_copy_token(std::uint64_t id);
 // draw packets begin. Shadow first: the method still runs, and the CP checks
 // that the draw packet after the token is the one the call asked for.
 constexpr std::uint32_t kGxYebisMagic = 0x42595242u;  // "BRYB"
+// GX's pipeline drain as a barrier token (decomp/gx/drain_token.cpp): a
+// two-dword NOP {kGxBarrierMagic} where gx_command_buffer_wait_for_eop wrote
+// its label, end-of-pipe event and wait. The command processor takes it as
+// that wait: what it writes to memory itself after it goes behind the work
+// before it, on the GPU's timeline.
+constexpr std::uint32_t kGxBarrierMagic = 0x52424242u;  // "BBBR"
+// An occlusion query's begin or end as one token (decomp/gx/query_token.cpp):
+// {kGxQueryMagic, block | kind, block >> 32}, kind 0 a begin (the block reset,
+// the counters dumped at it), 1 an end (dumped at block + 8), 2 a dump at the
+// block alone.
+constexpr std::uint32_t kGxQueryMagic = 0x514f4242u;  // "BBOQ"
 struct GxYebisDraw {
     std::uint32_t index_count;
     std::uint64_t index_va;

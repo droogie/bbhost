@@ -1,9 +1,10 @@
 #!/bin/bash
 # Packs the Windows cross build into the zip a Windows machine runs from
 # (docs/building.md), the release's Windows bundle: the exe without its DWARF,
-# a launcher that keeps a log (run-bbhost.bat), a config template with
-# Windows paths, the player's README, and the empty data/, build/ and logs/
-# directories the run writes into. Nothing in it picks a server: bbhost's
+# DXC's release dxcompiler.dll for the HLSL shader path with its licences
+# (tools/fetch_dxc.sh), a launcher that keeps a log (run-bbhost.bat), a config
+# template with Windows paths, the player's README, and the empty data/,
+# build/ and logs/ directories the run writes into. Nothing in it picks a server: bbhost's
 # defaults are the live server's (https://thehuntersdream.com). The
 # unstripped exe is kept beside the zip under the same revision name, for
 # symbolizing a crash report from that machine.
@@ -31,6 +32,21 @@ cp LICENSE "$dir/LICENSE.txt"
 tools/package_plugins.sh "$(dirname "$exe")/plugins" "$dir/plugins"
 llvm-objcopy --strip-debug "$exe" "$dir/bbhost.exe"
 cp "$exe" "$out/$name.debug.exe"
+# The HLSL path's compiler beside the exe, where bbhost looks first.
+tools/fetch_dxc.sh windows "$dir"
+dxc_tag=$(cat third_party/dxc/VERSION)
+# The pipeline list beside the binary, where bbhost reads it at each start and
+# builds every pipeline it names (render.cpp pipeline_manifest_load): the
+# pinned release asset (tools/fetch_pipeline_list.sh), or the local list
+# BBHOST_PACKAGE_PIPELINE_LIST names (a new one under test);
+# BBHOST_PIPELINE_LIST_FETCH=0 leaves it out (a development kit). It names the
+# game's programs by hash and holds none of their code.
+if [ -n "${BBHOST_PACKAGE_PIPELINE_LIST:-}" ]; then
+    python3 tools/pipeline_list.py stats "$BBHOST_PACKAGE_PIPELINE_LIST" > /dev/null
+    cp "$BBHOST_PACKAGE_PIPELINE_LIST" "$dir/pipeline-list.bin"
+elif [ "${BBHOST_PIPELINE_LIST_FETCH:-1}" != 0 ]; then
+    tools/fetch_pipeline_list.sh "$dir"
+fi
 sed -e 's#^app0 = .*#app0 = "C:/Games/CUSA00900"#' \
     -e 's#^eboot = .*#eboot = "./eboot-109-decrypted.bin"#' \
     -e 's#^skip_intro = false#skip_intro = true#' bbhost.example.toml > "$dir/bbhost.example.toml"
@@ -112,6 +128,13 @@ Online
   If summons keep failing with one person, forwarding UDP port 9307 to this
   PC on your router often fixes it. Two PCs in one house: set p2p_addr under
   [online] in the per-user bbhost.toml to each PC's local address.
+
+The shader compiler
+  dxcompiler.dll is the DirectX Shader Compiler $dxc_tag, Microsoft's release
+  unmodified (https://github.com/microsoft/DirectXShaderCompiler, licences
+  in licenses\\dxc). The HLSL shader path (BBHOST_HLSL, off by default)
+  compiles with it; without it that path keeps every shader as it was, and
+  nothing else uses it.
 
 Plugins
   plugins/ holds the official ones, signed by the bbhost release key

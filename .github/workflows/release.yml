@@ -2,7 +2,9 @@
 # tools/ci_windows.sh), the portable Linux tarball (Ubuntu 24.04 with static
 # libstdc++, tools/ci_build.sh + tools/package_linux.sh) and the Steam Deck
 # kit made from it, with the unstripped binaries for symbolizing crash
-# reports. The bundles go to the live server (https://thehuntersdream.com) by
+# reports. Each package carries DXC's release library for the HLSL shader
+# path, its release archive checked against the SHA-256 tools/fetch_dxc.sh
+# pins. The bundles go to the live server (https://thehuntersdream.com) by
 # default, and the playtest kits for the dev server (tools/package_playtest.sh)
 # are never among them: tools/check_release_bundle.sh fails the release
 # otherwise.
@@ -70,6 +72,7 @@ jobs:
       - name: package
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
+          DXC_CACHE: build-ci/prefix/dxc-cache   # the archive tools/ci_build.sh fetched and checked
         run: tools/package_linux.sh build-ci/build/bbhost build/linux
       - uses: actions/upload-artifact@v4
         with:

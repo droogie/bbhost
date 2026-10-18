@@ -23,6 +23,8 @@
 #include <vector>
 
 std::uint32_t host_thread_id() { return 1; }
+void host_thread_set_name(const char*) {}
+void host_thread_background() {}
 
 using namespace gpu;
 
@@ -123,6 +125,8 @@ void run_start(const std::vector<Case>& cases, const std::vector<gcn::TranslateR
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The cache alone: the HLSL path's entries are hlsl_default_test's.
+    setenv("BBHOST_HLSL", "0", 1);
     std::vector<std::string> bundles;
     for (int a = 1; a < argc; ++a) bundles.emplace_back(argv[a]);
     if (bundles.empty()) {

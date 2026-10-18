@@ -356,7 +356,25 @@ const bool g_present_own_queue = !present_env_off("BBHOST_PRESENT_OWN_QUEUE");
 // MAILBOX) slept ~25 ms for each acquired image and showed ~23 frames a second,
 // 558 dropped in a minute ("stuttering like crazy", 2026-10-14).
 // BBHOST_PRESENT_OWN_QUEUE=0: in the renderer's stream.
-bool present_own_queue_on() { return g_present_own_queue; }
+//
+// Except on NVIDIA, where the renderer's stream keeps carrying it unless
+// BBHOST_PRESENT_OWN_QUEUE=1: on an RTX 3070 Ti laptop (Windows, 2026-10-17)
+// the own queue cost 29% at the title (591-603 flips/s against 873-875 in the
+// stream, Uncapped, V-Sync off) and 4% in the world (97.8 against 102.1 fps
+// uncapped at the Central Yharnam lamp), and at 2560x1440 with V-Sync - GPU-
+// bound near 60, where the RTX 2060 stuttered - the stream showed 300 of 300
+// frames on arrival like the own queue (59.0-60.0 fps against 59.9). Known once
+// the device is made; 0 (not yet) is not remembered.
+bool present_own_queue_on() {
+    static int on = -1;
+    if (on >= 0) return on != 0;
+    if (!g_present_own_queue) return false;
+    const std::uint32_t vendor = host_gpu_vendor_id();
+    if (!vendor) return true;
+    const char* e = std::getenv("BBHOST_PRESENT_OWN_QUEUE");
+    on = (e && e[0] == '1') || vendor != 0x10de ? 1 : 0;
+    return on != 0;
+}
 // BBHOST_PRESENT_SUBMIT=1: before its blit the presenter submits whatever the
 // renderer is recording, as it did on every frame. The frame it shows is
 // normally submitted already (the command processor submits each job before
@@ -697,6 +715,8 @@ bool vk_start() {
              present_own_queue_on() && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
                  ? "on the presenter's own queue after its frame alone, once the frame's submissions are in the driver "
                    "(BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
+             : g_present_own_queue && host_gpu_vendor_id() == 0x10de
+                 ? "behind the game's queued work (NVIDIA: BBHOST_PRESENT_OWN_QUEUE=1 for its own queue)"
                  : "behind the game's queued work",
              g_vk.gpu_wait ? "after the frame is done on the GPU (a sleeping wait)" : "at once (the driver waits for the frame)");
     return true;

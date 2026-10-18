@@ -3,7 +3,8 @@
 # from-scratch one on an Arch Linux machine or container: the packages
 # (CI_PACMAN=1), the target's dependencies (tools/win_deps.sh), bbhost.exe
 # cross-built with Clang + the mingw-w64 sysroot (cmake/mingw-toolchain.cmake),
-# and the package (tools/win_package.sh) in build/win.
+# and the package (tools/win_package.sh, with DXC's pinned release library) in
+# build/win.
 #
 #   tools/ci_windows.sh                       deps in build/win-deps, build in build-win
 #   WIN_DEPS_ROOT=... WIN_BUILD=... tools/ci_windows.sh
@@ -16,6 +17,9 @@ if [ "${CI_PACMAN:-0}" = 1 ]; then
         || { tail -20 /tmp/pacman.log; exit 1; }
 fi
 export WIN_DEPS_ROOT=${WIN_DEPS_ROOT:-$SRC/build/win-deps}
+# DXC's release archive (tools/fetch_dxc.sh, which the package step runs) in
+# the dependency prefix the workflow caches.
+export DXC_CACHE=${DXC_CACHE:-$WIN_DEPS_ROOT/prefix/dxc-cache}
 B=${WIN_BUILD:-$SRC/build-win}
 tools/win_deps.sh
 cmake -S "$SRC" -B "$B" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$SRC/cmake/mingw-toolchain.cmake" \

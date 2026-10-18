@@ -29,8 +29,11 @@
 // log read 64% here while Task Manager's 3D engine sat at 100%: its per-draw
 // vertex copies, 9-37 MiB a frame from host memory, ran there - and the
 // start-up one-shots. The uploads go in the same submission just ahead of the
-// game's command buffer, so its span starts at theirs (a third timestamp,
-// written by the uploads).
+// game's command buffer, timed by a third timestamp they write, and count as a
+// source of their own (kUpload): the total is the union of all of them, the
+// game's figure is its command buffers alone, and the frame statistics say
+// the uploads' part (`gpu uploads N ms/s`) - so a build that counts them
+// compares with one that did not.
 // The presenter's blit waits for the swapchain image's semaphore; AMD's,
 // NVIDIA's and Mesa's drivers wait for a submission's semaphores before its
 // command buffers start, so its span does not hold the display's wait - and
@@ -77,7 +80,16 @@ namespace gpu {
 
 namespace {
 
-constexpr int kGame = 0, kPresenter = 1, kSources = 2;
+constexpr int kGame = 0, kPresenter = 1, kUpload = 2, kSources = 3;
+// The buffer shadow's uploads, ahead of the game's command buffer in the same
+// submission: a source of their own, so the game's figure is its command
+// buffers alone (what it was before the uploads were counted, 5d96724) and the
+// uploads have theirs; the union over all of them is what they add together.
+// BBHOST_BUSY_UPLOADS=0 leaves them out (the meter as it was: a measurement).
+const bool g_count_uploads = [] {
+    const char* e = std::getenv("BBHOST_BUSY_UPLOADS");
+    return !(e && e[0] == '0');
+}();
 // Spans held for order before the oldest are counted regardless: about a
 // second of command buffers at 60 frames a second.
 constexpr std::size_t kMaxPending = 1024;
@@ -325,11 +337,11 @@ void busy_retired_locked(Gpu::Slot& sl, bool ok) {
     sl.busy_written = false;
     std::uint64_t ts[2] = {0, 0};
     const bool have = ok && read_pair(sl.busy_pool, ts);
-    if (have && sl.busy_upload) {
+    if (have && sl.busy_upload && g_count_uploads) {
         std::uint64_t up = 0;
         if (vkGetQueryPoolResults(g.device, sl.busy_pool, 2, 1, sizeof(up), &up, sizeof(up), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
             ((up - ts[0]) & g_meter.mask) > (g_meter.mask >> 1)) {  // earlier than the game's start, wrap-aware
-            ts[0] = up;
+            deliver(kUpload, up, ts[0], true);  // the uploads, up to where the game's command buffer starts
         }
     }
     sl.busy_upload = false;
@@ -371,6 +383,7 @@ GpuBusy host_gpu_busy() {
     b.busy_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.busy) * k);
     b.game_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kGame]) * k);
     b.present_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kPresenter]) * k);
+    b.upload_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kUpload]) * k);
     b.cmdbufs = g_meter.spans[kGame];
     b.presents = g_meter.spans[kPresenter];
     return b;
@@ -396,10 +409,11 @@ std::string host_gpu_busy_report() {
         const double ms = static_cast<double>(now.busy_ns - last.busy_ns) / 1e6 / secs;
         char buf[320];
         std::snprintf(buf, sizeof(buf),
-                      "gpu busy: %.1f%% of %.1f s (%.0f ms/s; the game's command buffers %.0f ms/s, the presenter's %.1f ms/s; "
-                      "%llu command buffers, %llu presents; unreadable %llu, merged early %llu)",
+                      "gpu busy: %.1f%% of %.1f s (%.0f ms/s; the game's command buffers %.0f ms/s, the presenter's %.1f ms/s, "
+                      "the buffer shadow's uploads %.1f ms/s%s; %llu command buffers, %llu presents; unreadable %llu, merged early %llu)",
                       ms / 10.0, secs, ms, static_cast<double>(now.game_ns - last.game_ns) / 1e6 / secs,
                       static_cast<double>(now.present_ns - last.present_ns) / 1e6 / secs,
+                      static_cast<double>(now.upload_ns - last.upload_ns) / 1e6 / secs, g_count_uploads ? "" : " (not counted: BBHOST_BUSY_UPLOADS=0)",
                       static_cast<unsigned long long>(now.cmdbufs - last.cmdbufs),
                       static_cast<unsigned long long>(now.presents - last.presents), static_cast<unsigned long long>(unreadable),
                       static_cast<unsigned long long>(early));

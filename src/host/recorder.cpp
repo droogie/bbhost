@@ -195,6 +195,42 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     }
 };
 
+// The lines of a packet every draw writes - its header and vectors, the
+// binds, the pushed constant buffers' first entries, the dynamic state, the
+// geometry and the call - asked for with the intent to write them, for the
+// draw after the one taking a packet now. The ring comes round every 1,024
+// draws, so a packet's lines were last the recorder's and are long cold:
+// written field by field they cost a read for ownership each, in turn, on
+// the command processor. BBHOST_PACKET_PREFETCH=0: not asked for.
+const bool g_packet_prefetch = [] {
+    const char* e = std::getenv("BBHOST_PACKET_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+inline void prefetchw_line(const void* p) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    asm volatile("prefetchw %0" : : "m"(*static_cast<const char*>(p)));
+#else
+    (void)p;
+#endif
+}
+void prefetch_packet_for_write(const DrawPacket& p) {
+    if (!g_packet_prefetch) return;
+    const auto* b = reinterpret_cast<const char*>(&p);
+    const auto line = [](const void* at) { prefetchw_line(at); };
+    // The header, the vectors, the binds and sets, up to the pushes' bindings.
+    for (const char* at = b; at < reinterpret_cast<const char*>(&p.push_binding[0]) + 64; at += 64) line(at);
+    line(&p.push_infos[0]);
+    line(reinterpret_cast<const char*>(&p.push_infos[0]) + 64);
+    line(reinterpret_cast<const char*>(&p.push_infos[0]) + 128);
+    line(&p.viewport);
+    line(&p.stencil_words[0]);
+    line(&p.index);
+    line(&p.vb[0]);
+    line(&p.vb_offset[0]);
+    line(&p.call);
+    line(&p.draw);
+}
+
 // Nothing a pass change must precede is in the packet yet.
 bool before_binds(const DrawPacket& p) {
     return !p.pipeline && !p.library && !p.bind_sets && !p.stage_set_bound && !p.pushes && !p.viewport && !p.scissor && !p.bounds && !p.stencil && !p.blend &&
@@ -1324,6 +1360,8 @@ std::string host_gpu_recorder_report() {
     if (gpu::set_cache_on()) r += "; " + gpu::set_cache_report();
     if (const std::string cv = gpu::copy_versions_report(); !cv.empty()) r += "; " + cv;
     if (const std::string pb = gpu::render_barriers_report(); !pb.empty()) r += "; " + pb;
+    // A line of its own: the recorder's runs past the log's 1 KiB a line.
+    if (const std::string sm = gpu::submit_merge_report(); !sm.empty()) host_log("  %s", sm.c_str());
     return r;
 }
 
@@ -1355,6 +1393,7 @@ void DrawCmds::start(bool deferred) {
     p.number = g_pk_taken++;
     packet_ = &p;
     g_open = this;
+    prefetch_packet_for_write(g_packets[g_pk_taken % kPackets]);
 }
 
 DrawCmds* DrawCmds::open() { return g_open; }

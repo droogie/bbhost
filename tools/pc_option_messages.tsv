@@ -23,6 +23,9 @@
 # the messages their scripts show - the Altar of Despair's rebirth
 # (engine/rebirth_script.h); the help column is unused.
 # A "\n" in the text is a line break.
+# The line help is one line under the rows, cut off where it runs past the
+# dialog (about 130 characters of its font): keep a row's help to 96
+# characters, which tests/menu_assets_test.cpp checks.
 #
 # id	menu text (group 0xc8)	line help (group 0xc9)
 110006	PC Settings	Options added by the PC port.
@@ -30,7 +33,7 @@
 110008	PC Controls	The mouse: camera, sensitivity and the pointer.
 110009	Key Bindings	Keyboard and mouse bindings.
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
-110011	PC Camera	The follow camera: field of view, distance, height, auto-rotation with the mouse, and its tuning above 30 fps.
+110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players. Each needs a restart.
 116000	Vertical Sync	Wait for the display. Off can tear.
@@ -38,7 +41,7 @@
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time (the display's refresh rate with V-Sync on). Applies on the next run.
+116005	Frame Rate	Applies on the next run. 30 is the game's own pace; higher rates run its logic at that rate.
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
@@ -55,6 +58,7 @@
 117006	Shadow Distance	How far sun and moon shadows reach. 0 is the game's own.
 117007	AO Strength	How dark corners and contact get. 5 is the game's own.
 117008	Fog	How thick the haze over distant streets is. 10 is the game's own.
+117009	HLSL Shaders	Requires a restart. On: shaders compiled from HLSL by DXC on this PC. Off: the translator's own.
 120020	PC Effects	
 120000	Bloom	The glow around bright light. 10 is the game's own.
 120001	Vignette	The darkened frame edges some areas use.
@@ -62,11 +66,11 @@
 121020	PC Camera	
 121000	Camera Distance	How far behind the character the camera sits. 5 is the game's own.
 121001	Camera Height	How high above the character the camera looks. 5 is the game's own.
-121002	Mouse Auto-Rotation	Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.
-121003	Camera Tuning	Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.
+121002	Mouse Auto-Rotation	Off: the camera stays where the mouse left it, not swinging behind you. Pads are unaffected.
+121003	Camera Tuning	Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original, the game's own.
 121030	FPS++ (Kyo)	
 121031	Original	
-117004	Resolution	What the game renders at (it shipped at 1920x1080). Wide and 16:10 screens are filled, the HUD kept 16:9 in the middle. Changes at once and asks to be kept - the largest may wait for the next start.
+117004	Resolution	What the game renders at (it shipped at 1920x1080). Changes at once and asks to be kept.
 117010	1280x720
 117011	1600x900
 117012	1920x1080
@@ -109,8 +113,8 @@
 119020	Key Bindings
 122000	Quit Game	Close the game and return to the desktop.
 123020	Steam Deck	
-123000	Frame Rate	30 fps: the screen's own 1280x800. 60 fps: 960x600 upscaled by FSR 1, Model Detail Low. Frame rate: on restart.
-123001	Model Detail	Normal is the game's own. Low and Lowest swap in simpler models sooner and run faster; Full never swaps.
+123000	Frame Rate	30 fps: 1280x800. 60 fps: 960x600 upscaled by FSR 1, Model Detail Low. The rate needs a restart.
+123001	Model Detail	Normal is the game's own. Low and Lowest use simpler models sooner, faster; Full never swaps.
 123030	30 fps	
 123031	60 fps	
 123040	Full	
@@ -118,9 +122,9 @@
 123042	Low	
 123043	Lowest	
 124020	PC Enhancements	
-124001	Hunter's Dream Mirror	Requires a restart. The Dream's mirror opens the appearance editor (the unused "Put on Disguise").
+124001	Hunter's Dream Mirror	Requires a restart. The Dream's mirror opens the appearance editor (the cut "Put on Disguise").
 124002	Rebirth at the Altar	Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.
-124003	Five Players	Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.
+124003	Five Players	Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier, the DLC; all need it.
 920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
 920001	Quit the game and return to the desktop?	
 14000332	Rebirth in the Nightmare	

@@ -9,7 +9,8 @@
 //
 // BBHOST_FRAME_DETAIL=1 (with BBHOST_FRAME_STATS=1): also, after each
 // `frames:` line, a `frame detail:` line with the second's draws by how their
-// pixel shader ran and its draw failures by reason, and `frame intervals ms:`
+// pixel shader ran and its draw failures by reason, one with its dispatches by
+// whether their compute shader ran its lift, and `frame intervals ms:`
 // lines with every interval of that second - what a harness takes exact
 // percentiles of over a window of its own (tools/area_check.py).
 

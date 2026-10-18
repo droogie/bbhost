@@ -88,6 +88,10 @@ struct BufferBinding {
     // and the host binds the guest memory itself - never a copy or snapshot,
     // which would take the stores in its place.
     bool written = false;
+    // Every access at an index through it is a format load that takes its
+    // element at a byte offset (Translator::bound_compute_access): the host
+    // binds it with a stride that is not whole dwords too (a byte table).
+    bool bytes = false;
 };
 // A V#'s range in dwords as GCN checks a buffer load against it, from its
 // words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the
@@ -417,6 +421,20 @@ struct TranslateResult {
     // trace to user data.
     std::vector<ResourcePath> store_buffers;
     std::uint32_t untraced_stores = 0;
+    // The bases the program reads through the page table (the walked loads:
+    // vector memory loads through a V#, typed loads no binding serves, scalar
+    // loads through a V# or a 64-bit pointer): each path once, so the host can
+    // make what they reach GPU-visible before the program runs (window imports,
+    // gpu.cpp host_gpu_dispatch). A pointer's max_dw is the highest dword a
+    // load at a known offset reads past it (0: not known). untraced_reads
+    // counts walked load sites whose base does not trace to user data.
+    struct BufferRead {
+        ResourcePath path;
+        bool pointer = false;
+        std::uint32_t max_dw = 0;
+    };
+    std::vector<BufferRead> read_buffers;
+    std::uint32_t untraced_reads = 0;
     std::uint32_t unnormalized_samples = 0;  // MIMG unorm=1: texel coordinates
     // Page-table walks the shader keeps, by reason (a load's instruction and
     // why it is not a storage-buffer read): sites in the program.

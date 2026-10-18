@@ -1,14 +1,17 @@
 #!/bin/bash
 # Builds what bbhost.exe links against, for the Windows target, from Linux:
-# zlib and SDL3 as static libraries with cmake/mingw-toolchain.cmake,
-# the Vulkan headers from this machine (platform-independent) and wine's
-# import library for vulkan-1.dll as the loader. Everything lands in
+# zlib, SDL3, libcurl, ffmpeg's movie decoders and SPIRV-Tools as static
+# libraries with cmake/mingw-toolchain.cmake, the Vulkan headers from this
+# machine (platform-independent) and wine's import library for vulkan-1.dll
+# as the loader. Everything lands in
 # build/win-deps/prefix, which the host's configure takes as CMAKE_PREFIX_PATH:
 #   tools/win_deps.sh                 (WIN_DEPS_ROOT: elsewhere than build/win-deps)
 #   cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake \
 #         -DCMAKE_PREFIX_PATH=$PWD/build/win-deps/prefix -DCMAKE_BUILD_TYPE=RelWithDebInfo
 #   cmake --build build-win
-# SPIRV-Tools stays out (shader liveness is optional at configure time).
+# SPIRV-Tools: its validator is the HLSL path's for the modules DXC compiles
+# without its own (CMakeLists.txt); the optimizer is built too, for shader
+# liveness, which the Windows build does not take yet.
 set -eu
 cd "$(dirname "$0")/.."
 root=${WIN_DEPS_ROOT:-$PWD/build/win-deps}
@@ -72,6 +75,22 @@ fsrc=$(ls -d "$root/src"/ffmpeg-* | head -1)
 if [ ! -f "$prefix/lib/libavcodec.a" ]; then
   mkdir -p "$root/ffmpeg"
   (cd "$root/ffmpeg" && "$fsrc/configure" --prefix="$prefix" --target-os=mingw64 --arch=x86_64     --cc="clang --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"     --cxx="clang++ --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"     --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --windres=llvm-windres     --ld="clang --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32 -fuse-ld=lld -L$mingw_gcc_dir"     --enable-cross-compile --enable-static --disable-shared --disable-programs --disable-doc --disable-network     --disable-everything --enable-decoder=h264,hevc,aac,mp3 --enable-demuxer=mov,mp3,aac --enable-parser=h264,hevc,aac     --enable-protocol=file --enable-swscale --enable-swresample --disable-avdevice --disable-avfilter     --disable-postproc --disable-debug --extra-cflags="-O2" --pkg-config=false > "$root/ffmpeg-configure.log" 2>&1     && make -j"$(nproc)" > "$root/ffmpeg-build.log" 2>&1 && make install > "$root/ffmpeg-install.log" 2>&1)
+fi
+
+# SPIRV-Tools and the SPIR-V headers it is built from, at the Vulkan SDK's tag
+# (Arch's spirv-tools, which the Linux builds here use): the static validator
+# and optimizer and the headers, nothing else (no executables or tests).
+SPIRV_TAG=${SPIRV_TAG:-vulkan-sdk-1.4.350.0}
+hsrc=$(fetch spirv-headers "https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/$SPIRV_TAG.tar.gz" "SPIRV-Headers-$SPIRV_TAG")
+tsrc=$(fetch spirv-tools "https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/$SPIRV_TAG.tar.gz" "SPIRV-Tools-$SPIRV_TAG")
+if [ ! -f "$prefix/lib/libSPIRV-Tools.a" ] || [ ! -f "$prefix/lib/libSPIRV-Tools-opt.a" ]; then
+  cmake -S "$tsrc" -B "$root/spirv-tools" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$tc" -DCMAKE_BUILD_TYPE=Release \
+    -DSPIRV-Headers_SOURCE_DIR="$hsrc" -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_SKIP_TESTS=ON -DSPIRV_WERROR=OFF \
+    -DSPIRV_TOOLS_BUILD_STATIC=ON > "$root/spirv-tools-configure.log"
+  cmake --build "$root/spirv-tools" --target SPIRV-Tools-static SPIRV-Tools-opt > "$root/spirv-tools-build.log"
+  mkdir -p "$prefix/include/spirv-tools"
+  cp "$tsrc"/include/spirv-tools/*.h "$tsrc"/include/spirv-tools/*.hpp "$prefix/include/spirv-tools/"
+  cp "$root/spirv-tools/source/libSPIRV-Tools.a" "$root/spirv-tools/source/opt/libSPIRV-Tools-opt.a" "$prefix/lib/"
 fi
 
 # Vulkan: the headers are the same on every platform; the loader is wine's

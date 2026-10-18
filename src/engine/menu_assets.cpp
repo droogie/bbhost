@@ -33,7 +33,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 10;  // 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 11;  // 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -783,7 +783,7 @@ Bytes build_option_movie(const Bytes& src) {
         m = add_option_section(m, a);
     };
     section("PCSetting", 116020, 383, 6, 0, {});
-    section("PCGraphics", 117020, 384, 6, 0, {});
+    section("PCGraphics", 117020, 384, 7, 1, {});  // seven rows: one added, the Defaults label below it
     section("PCControls", 118020, 385, 6, 0, {});
     section("PCKeys", 119020, 386, std::nullopt, 2, {});
     section("PCEffects", 120020, 387, 6, 0, {});

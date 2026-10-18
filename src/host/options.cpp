@@ -84,6 +84,7 @@ enum SettingId {
     kFog,
     kModelDetail,
     kResolution,
+    kShaders,
     kSkipLogos,
     kDebugMenu,
     kDebugCamera,
@@ -234,6 +235,14 @@ Setting g_set[kSettingCount] = {
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
      true},
+    // The shaders' form on the GPU (host/translation_cache.h): HLSL is the
+    // lifted shaders printed as HLSL and compiled by DXC on this machine,
+    // taken from the cache while the rest compile behind the game; Lifted is
+    // the lifter's own SPIR-V alone. The same pictures either way.
+    {"shaders", "Shaders", {"HLSL", "Lifted"}, 0,
+     "Requires a restart. HLSL: the game's shaders as HLSL, compiled by DXC on this PC in the background and used from the next start. "
+     "Lifted: the translator's own SPIR-V only.",
+     true},
     {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
     // The old switch for the developers' debug menu, which the Debug Menu
@@ -289,6 +298,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kResolution},
+    {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
@@ -863,8 +873,9 @@ void host_options_load() {
     seed(kResolution, config().resolution);
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
+    seed(kShaders, config().shaders);
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
-                         static_cast<int>(kModelDetail), static_cast<int>(kChangeAppearance),
+                         static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
                          static_cast<int>(kRebirth), static_cast<int>(kFivePlayers)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();

@@ -40,6 +40,9 @@ std::uint32_t host_thread_id();
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
 // SetThreadDescription, which the sampler and debuggers read.
 void host_thread_set_name(const char* name);
+// Puts the calling thread at the lowest priority there is (idle on Windows,
+// nice 19 on Linux), for good: work that must never take a core the game wants.
+void host_thread_background();
 // The largest width and height among the desktop's displays, in physical
 // pixels (each display's current mode). False when the platform does not say
 // (only Windows answers today).

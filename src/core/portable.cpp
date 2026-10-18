@@ -244,6 +244,14 @@ std::vector<HostThreadTime> host_thread_times() {
     return out;
 }
 
+void host_thread_background() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+#else
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+#endif
+}
+
 void host_thread_set_name(const char* name) {
     if (!name || !name[0]) return;
 #if defined(_WIN32)

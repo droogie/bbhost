@@ -8,7 +8,9 @@
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
+#include "host/shader_bundles.h"
 #include "host/translation_cache.h"
+#include "host/options.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -196,23 +198,120 @@ void submit_job_now(const SubmitJob& job) {
     if (job.foreign) g_foreign_submitted.store(job.foreign, std::memory_order_release);
 }
 
+// Game submissions queued behind each other go to the queue as one
+// (BBHOST_SUBMIT_MERGE=<n>, at most n of them, 8; 1 or 0: one by one). The
+// kernel's part of a submission is mostly the buffers it makes resident -
+// every one, since shaders reach memory by address - so on RADV each
+// submission pays for all ~70 dma-buf imports of direct memory again: a Steam
+// Deck's bb-submit was a whole core at the menus, 5 submissions a flip, and
+// the menus waited for it. Jobs queue up here only while the thread is behind,
+// so where submitting is cheap (NVIDIA) nothing changes. A merged submission
+// holds the jobs' command buffers in order (each job's shadow uploads before
+// its own commands, as before) and signals the timeline with the last one's
+// value; the earlier jobs' fences are signalled by fence-only submissions
+// after it (no buffers, so no residency), when everything before them has
+// run - their own work included. A job that waits on a semaphore (a sparse
+// bind) starts a submission; one that signals one (the presenter's) goes on
+// its own.
+const std::uint32_t g_submit_merge = [] {
+    const char* e = std::getenv("BBHOST_SUBMIT_MERGE");
+    const long n = e && *e ? std::strtol(e, nullptr, 10) : 8;
+    return static_cast<std::uint32_t>(std::clamp<long>(n, 1, 16));
+}();
+// BBHOST_TEST_SUBMIT_HOLD_US=<us> (tests): the thread waits this long before it
+// takes the jobs queued, so they queue up and the merged path runs where the
+// queue is otherwise kept empty.
+const std::uint32_t g_submit_hold_us = [] {
+    const char* e = std::getenv("BBHOST_TEST_SUBMIT_HOLD_US");
+    return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+}();
+// Written by the submission thread only (relaxed stores), read by the report.
+std::atomic<std::uint64_t> g_sub_jobs_done{0}, g_sub_queue_submits{0}, g_sub_jobs_merged{0}, g_sub_fence_submits{0};
+
+bool merge_candidate(const SubmitJob& j) { return j.serial != ~0ull && !j.foreign && !j.signal && j.ncmds <= 2; }
+
+void add_relaxed_counter(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) { c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); }
+
+// Jobs [0, n) of `jobs` (n >= 2, every one a merge candidate, only the first
+// waiting on a semaphore) as one queue submission.
+void submit_jobs_merged(const SubmitJob* jobs, std::uint32_t n) {
+    VkCommandBuffer cmds[2 * 16];
+    std::uint32_t ncmds = 0, items = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        for (std::uint32_t k = 0; k < jobs[i].ncmds; ++k) cmds[ncmds++] = jobs[i].cmds[k];
+        items += jobs[i].items;
+    }
+    const SubmitJob& first = jobs[0];
+    const SubmitJob& last = jobs[n - 1];
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = ncmds;
+    si.pCommandBuffers = cmds;
+    if (first.wait) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &first.wait;
+        si.pWaitDstStageMask = &first.wait_stage;
+    }
+    TimelineSignal tl;
+    tl.add(si, last.serial);
+    VkResult r;
+    std::uint32_t fences = 0;
+    {
+        std::lock_guard<std::mutex> q(g.queue_mu);
+        r = vkQueueSubmit(g.queue, 1, &si, last.fence);
+        for (std::uint32_t i = 0; i + 1 < n && r == VK_SUCCESS; ++i) {
+            if (!jobs[i].fence) continue;
+            r = vkQueueSubmit(g.queue, 0, nullptr, jobs[i].fence);
+            ++fences;
+        }
+    }
+    if (r != VK_SUCCESS) {
+        int none = 0;
+        g_sub_failed.compare_exchange_strong(none, static_cast<int>(r));
+        g_sub_failed_items.fetch_add(items);
+    }
+    add_relaxed_counter(g_sub_jobs_merged, n - 1);
+    add_relaxed_counter(g_sub_fence_submits, fences);
+    // Published once every fence of the batch has gone to the queue: a waiter
+    // that sees its serial submitted may wait on its fence (which must not be
+    // used while vkQueueSubmit holds it).
+    g_stream_submitted.store(last.serial + 1, std::memory_order_release);
+}
+
 void submit_thread() {
     host_thread_set_name("bb-submit");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-submit");  // core/host_clock.h
+    SubmitJob jobs[16];
     for (;;) {
-        SubmitJob job;
+        std::uint32_t n = 0;
         {
             std::unique_lock<std::mutex> lk(g_sub_mu);
             g_sub_cv.wait(lk, [] { return !g_sub_jobs.empty(); });
-            job = g_sub_jobs.front();
+            if (g_submit_hold_us) {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(g_submit_hold_us));
+                lk.lock();
+            }
+            jobs[n++] = g_sub_jobs.front();
             g_sub_jobs.pop_front();
+            if (merge_candidate(jobs[0])) {
+                while (n < g_submit_merge && !g_sub_jobs.empty() && merge_candidate(g_sub_jobs.front()) && !g_sub_jobs.front().wait) {
+                    jobs[n++] = g_sub_jobs.front();
+                    g_sub_jobs.pop_front();
+                }
+            }
             g_sub_busy = true;
         }
-        submit_job_now(job);
+        if (n == 1) {
+            submit_job_now(jobs[0]);
+        } else {
+            submit_jobs_merged(jobs, n);
+        }
+        add_relaxed_counter(g_sub_jobs_done, n);
+        add_relaxed_counter(g_sub_queue_submits);
         std::lock_guard<std::mutex> lk(g_sub_mu);
         g_sub_busy = false;
-        g_sub_submitted.store(job.ticket, std::memory_order_release);
-        g_sub_idle.notify_all();  // a drain, or a wait for this ticket
+        g_sub_submitted.store(jobs[n - 1].ticket, std::memory_order_release);
+        g_sub_idle.notify_all();  // a drain, or a wait for these tickets
     }
 }
 
@@ -321,7 +420,29 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
 // memfd's pages instead, 64 MiB at most (the module's size_limit_mb), and a
 // longer span is a sparse buffer with its pieces bound in order, so it keeps
 // one range of device addresses.
-constexpr std::uint64_t kDmabufPiece = 64ull << 20;
+// The pieces are as large as the module allows: every dma-buf is a buffer
+// object the kernel makes resident at every submission (RADV attaches all of
+// them, since shaders reach memory by address), ~60 of them for a Steam
+// Deck's direct memory at the default 64 MiB. A system whose udmabuf takes
+// more (size_limit_mb, a module parameter root can raise) gets fewer, up to
+// 1 GiB each; BBHOST_DMABUF_PIECE_MB asks for less (tests).
+std::uint64_t dmabuf_piece_bytes() {
+    static const std::uint64_t bytes = [] {
+        std::uint64_t mb = 64;
+        if (FILE* f = std::fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+            unsigned long v = 0;
+            if (std::fscanf(f, "%lu", &v) == 1 && v >= 64) mb = std::min<unsigned long>(v, 1024);
+            std::fclose(f);
+        }
+        if (const char* e = std::getenv("BBHOST_DMABUF_PIECE_MB"); e && *e) {
+            const unsigned long v = std::strtoul(e, nullptr, 10);
+            if (v >= 64) mb = std::min<std::uint64_t>(mb, v);
+        }
+        mb &= ~std::uint64_t{63};  // a whole number of 64 MiB: whole pages, and the sparse binding's alignment
+        return mb << 20;
+    }();
+    return bytes;
+}
 
 // [offset, offset + size) of direct memory as one dma-buf import, of a memory
 // type in `bits`. VK_NULL_HANDLE when it cannot be made.
@@ -372,7 +493,8 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
 // buffer bound to one, or a sparse buffer over several. Under the GPU lock,
 // as every use of the renderer's queue is: the sparse binds go on it.
 VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
-    const bool sparse = size > kDmabufPiece;
+    const std::uint64_t piece = dmabuf_piece_bytes();
+    const bool sparse = size > piece;
     if (sparse && !g.dmabuf_sparse) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4)
@@ -392,14 +514,14 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
     // Spans are whole 64 KiB pages, so the pieces meet the binding alignment.
-    if (req.size != size || (sparse && kDmabufPiece % req.alignment)) {
+    if (req.size != size || (sparse && piece % req.alignment)) {
         host_log("gpu: a buffer over %llu bytes of direct memory wants %llu (alignment %llu)", static_cast<unsigned long long>(size),
                  static_cast<unsigned long long>(req.size), static_cast<unsigned long long>(req.alignment));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     std::vector<VkSparseMemoryBind> binds;
-    for (std::uint64_t at = 0; at < size; at += kDmabufPiece) {
-        const std::uint64_t n = std::min(kDmabufPiece, size - at);
+    for (std::uint64_t at = 0; at < size; at += piece) {
+        const std::uint64_t n = std::min(piece, size - at);
         const VkDeviceMemory m = dmabuf_memory(offset + at, n, req.memoryTypeBits);
         if (!m) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
         c.pieces.push_back(m);
@@ -428,11 +550,21 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
 }
 #endif
 
-// Imports [lo, hi) of direct-memory chunk `index` (offsets in the chunk) as a
-// new import of the chunk's. Earlier imports of the same bytes stay alive:
-// descriptor sets and recordings made with them keep working - they map the
-// same host pages.
-Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+// Which path asked for each import (the exit report's import line): a
+// binding or copy resolved through locate(), a device address (the GPU
+// untile, occlusion dumps), what a shader walks (import_windows: dispatches'
+// reads and stores, the LS pass, unbound constant buffers), the prefetch of a
+// GX resource's memory (bb-import), the whole spans.
+enum ImportWho { kIwBinding, kIwAddress, kIwWalk, kIwPrefetch, kIwSpan, kImportWhos };
+thread_local int t_import_who = kIwBinding;
+std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
+std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
+std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
+
+// [lo, hi) of direct-memory chunk `index` (offsets in the chunk; hi may run
+// past its end, into the next chunk's memory) as a new import, not yet in the
+// chunk's list: the driver's slow part, which needs no lock of ours.
+std::unique_ptr<Chunk> make_import(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
     const std::uint64_t offset = index * kChunkBytes + lo;
     if (offset >= g.mirror_size || hi <= lo) {
         return nullptr;
@@ -466,11 +598,21 @@ Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
     c->lo = lo;
     g_import_us.fetch_add(static_cast<std::uint64_t>(us), std::memory_order_relaxed);
     g_import_bytes.fetch_add(size, std::memory_order_relaxed);
+    const int who = t_import_who >= 0 && t_import_who < kImportWhos ? t_import_who : kIwBinding;
+    g_import_who_n[who].fetch_add(1, std::memory_order_relaxed);
+    g_import_who_bytes[who].fetch_add(size, std::memory_order_relaxed);
     if (g_imports_made.fetch_add(1, std::memory_order_relaxed) < 8 || size > (256ull << 20)) {
         host_log("gpu: dmem chunk %u: +%llu MiB, %llu MiB imported at device address 0x%llx in %lld us", index,
                  static_cast<unsigned long long>(lo >> 20), static_cast<unsigned long long>(size >> 20),
                  static_cast<unsigned long long>(c->address), static_cast<long long>(us));
     }
+    return c;
+}
+
+// The same, into the chunk's list of live imports.
+Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+    std::unique_ptr<Chunk> c = make_import(index, lo, hi);
+    if (!c) return nullptr;
     g.dmem[index].imports.push_back(std::move(c));
     return g.dmem[index].imports.back().get();
 }
@@ -496,8 +638,10 @@ void choose_dmem_import() {
         const VkResult d = dmabuf_span(c, 0, 1ull << gcn::kPageShift);
         free_import(c);
         if (d == VK_SUCCESS) {
-            host_log("gpu: the driver refuses direct memory as a host pointer (%d); importing it as dma-bufs (/dev/udmabuf)%s", r,
-                     g.dmabuf_sparse ? "" : ", 64 MiB at most: no sparse binding");
+            host_log("gpu: the driver refuses direct memory as a host pointer (%d); importing it as dma-bufs (/dev/udmabuf) of %llu MiB "
+                     "(udmabuf's size_limit_mb)%s",
+                     r, static_cast<unsigned long long>(dmabuf_piece_bytes() >> 20),
+                     g.dmabuf_sparse ? "" : ", one at most a span: no sparse binding");
             return;
         }
         g.dmem_dmabuf = false;
@@ -583,36 +727,138 @@ QueueGuard::QueueGuard() {
 }
 QueueGuard::~QueueGuard() { g.queue_mu.unlock(); }
 std::string submit_thread_report() { return submit_thread_report_impl(); }
+std::string submit_merge_report() {
+    if (!g_sub_running) return {};
+    const std::uint64_t jobs = g_sub_jobs_done.load(std::memory_order_relaxed), subs = g_sub_queue_submits.load(std::memory_order_relaxed);
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "submissions: %llu jobs in %llu queue submissions, %llu merged into an earlier one (BBHOST_SUBMIT_MERGE=%u), "
+                  "%llu fence-only", static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(subs),
+                  static_cast<unsigned long long>(g_sub_jobs_merged.load(std::memory_order_relaxed)), g_submit_merge,
+                  static_cast<unsigned long long>(g_sub_fence_submits.load(std::memory_order_relaxed)));
+    return buf;
+}
 
-const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+namespace {
+// How far an import of chunk `index` may run: to its span's end, or on past
+// the chunk's end into the next chunk's span by up to kChunkOverlap when that
+// span starts at the next chunk's beginning - a buffer the game placed across
+// the seam then lies in one import, as the whole spans' overlap gives (f26afe4).
+std::uint64_t span_reach(std::uint32_t index) {
+    const DmemChunk& d = g.dmem[index];
+    if (d.span_hi != kChunkBytes || index + 1 >= gcn::kDmemChunks) return d.span_hi;
+    const DmemChunk& n = g.dmem[index + 1];
+    if (n.span_hi <= n.span_lo || n.span_lo != 0) return d.span_hi;
+    return kChunkBytes + std::min<std::uint64_t>(n.span_hi, kChunkOverlap);
+}
+
+// A window import no window names any more: its pages are in the import that
+// replaced it (the window and page-table entries moved there), so it is let go
+// once the work recorded with it has run (the current slot's retirement). What
+// may name its buffer later than that goes first: a copy version's copy into
+// place, the cached descriptor sets (constant buffers in them, without push
+// descriptors - with them they are pushed per draw).
+void retire_import_locked(std::uint32_t index, Chunk* old) {
+    DmemChunk& d = g.dmem[index];
+    const auto it = std::find_if(d.imports.begin(), d.imports.end(), [&](const std::unique_ptr<Chunk>& p) { return p.get() == old; });
+    if (it == d.imports.end()) return;
+    if (copy_versions_name_buffer_locked(old->buffer)) copy_versions_put_in_place_locked(kCvRetired);
+    if (!cb_push_on()) set_cache_drop_all_locked();
+    g_imports_retired.fetch_add(1, std::memory_order_relaxed);
+    g_import_retired_bytes.fetch_add(old->size, std::memory_order_relaxed);
+    g.slots[g.slot].dead_imports.push_back(std::move(*old));
+    d.imports.erase(it);
+}
+
+// The windows of chunk `index` that import `c` covers name it from now on and
+// their guest pages point into it; the imports it replaced whole retire.
+void install_import_locked(std::uint32_t index, Chunk* c) {
+    DmemChunk& d = g.dmem[index];
+    const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+    if (end <= c->lo) return;
+    const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
+    const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    Chunk* replaced[kImportWindows];
+    std::uint32_t nreplaced = 0;
+    for (std::uint32_t w = a; w <= b; ++w) {
+        Chunk* o = d.window[w];
+        if (o && o != c && std::find(replaced, replaced + nreplaced, o) == replaced + nreplaced) replaced[nreplaced++] = o;
+        d.window[w] = c;
+    }
+    map_import_pages_locked(index, *c, c->lo, end);
+    if (nreplaced) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t k = 0; k < nreplaced; ++k) {
+        if (std::find(std::begin(d.window), std::end(d.window), replaced[k]) == std::end(d.window)) retire_import_locked(index, replaced[k]);
+    }
+}
+}  // namespace
+
+const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes, bool past_end) {
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
     if (!bytes) bytes = 1;
-    if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
+    if (g_import_whole) {
+        // The whole spans (imported when the mappings are made): a range their
+        // windows do not cover lies outside every GPU-visible mapping.
+        if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
+        const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+        if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
+        const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
+        const std::uint64_t lo = std::max(d.span_lo, static_cast<std::uint64_t>(w0) << kImportWindowShift);
+        const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
+        bool merged = false;
+        for (std::uint32_t w = w0; w <= w1; ++w) merged |= d.window[w] != nullptr;
+        Chunk* c = import_span(index, lo, hi);
+        if (!c) return nullptr;
+        if (merged) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
+        for (std::uint32_t w = w0; w <= w1; ++w) {
+            // A window another import already held keeps its pages' entries.
+            if (!d.window[w]) {
+                const std::uint64_t wlo = std::max(lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                const std::uint64_t whi = std::min(hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                map_import_pages_locked(index, *c, wlo, whi);
+            }
+            d.window[w] = c;
+        }
+        return c;
+    }
+    // Windows (BBHOST_IMPORT_WINDOWS=1): the whole windows the range touches,
+    // widened to the whole of every import over them, which it replaces.
+    // Past the chunk's end only for a caller that takes the seam's overlap
+    // (past_end: a binding, a device address); any other range - a mirror's
+    // pages above all, which end with the chunk (buffer_shadow.cpp phys_of) -
+    // stays inside the chunk, as with whole imports, also where an import over
+    // the seam would cover it: the mirror's page index ran past its pages,
+    // and its sparse page binds past the end of its buffer, which the driver
+    // refused with a lost device.
+    if (in >= kChunkBytes || (!past_end && bytes > kChunkBytes - in)) return nullptr;
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
     if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
-    if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
-    const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
-    const std::uint64_t lo = std::max(d.span_lo, static_cast<std::uint64_t>(w0) << kImportWindowShift);
-    const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
-    bool merged = false;
-    for (std::uint32_t w = w0; w <= w1; ++w) merged |= d.window[w] != nullptr;
+    const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
+    if (in < d.span_lo || in >= reach || bytes > reach - in) return nullptr;  // not GPU-visible: the sink
+    constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
+    std::uint64_t lo = std::max(d.span_lo, in & ~(kWindow - 1));
+    std::uint64_t hi = std::min(reach, ((in + bytes - 1) | (kWindow - 1)) + 1);
+    for (bool grew = true; grew;) {
+        grew = false;
+        const std::uint32_t a = static_cast<std::uint32_t>(lo >> kImportWindowShift);
+        const std::uint32_t b = static_cast<std::uint32_t>((std::min(hi, kChunkBytes) - 1) >> kImportWindowShift);
+        for (std::uint32_t w = a; w <= b; ++w) {
+            const Chunk* o = d.window[w];
+            if (!o) continue;
+            if (o->lo < lo) lo = o->lo, grew = true;
+            if (o->lo + o->size > hi) hi = o->lo + o->size, grew = true;
+        }
+    }
     Chunk* c = import_span(index, lo, hi);
     if (!c) return nullptr;
-    if (merged) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
-    for (std::uint32_t w = w0; w <= w1; ++w) {
-        // A window another import already held keeps its pages' entries.
-        if (!d.window[w]) {
-            const std::uint64_t wlo = std::max(lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
-            const std::uint64_t whi = std::min(hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
-            map_import_pages_locked(index, *c, wlo, whi);
-        }
-        d.window[w] = c;
-    }
+    install_import_locked(index, c);
     return c;
 }
 
 void import_windows(std::uint64_t va, std::uint64_t bytes) {
+    const int who = t_import_who;
+    t_import_who = kIwWalk;
     const std::uint64_t end = va + bytes;
     for (const GuestMapInfo& mi : g.maps) {
         if (!mi.dmem) continue;
@@ -623,7 +869,141 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
             at += (1ull << kImportWindowShift) - (phys & ((1ull << kImportWindowShift) - 1));  // the next window
         }
     }
+    t_import_who = who;
 }
+
+bool imports_whole() { return g_import_whole; }
+
+// ---- import prefetch (window imports) ----
+// A GX buffer made over GPU-visible direct memory that the GPU reads in place
+// (host_gpu_import_prefetch says which) is read soon after. Its windows are
+// imported on a thread of our own (bb-import) - the driver's slow part, pinning the pages
+// (~0.25 ms a MiB on the RTX 4070), without the renderer's lock, put in place
+// under it - instead of by the binding that first needs them, on the command
+// processor. A run of windows some binding imported meanwhile is dropped (an
+// import is never put over part of another: no page imported twice).
+// BBHOST_IMPORT_PREFETCH=0: imports at the first use only.
+namespace {
+const bool g_prefetch_on = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+struct PrefetchJob {
+    std::uint64_t va = 0, bytes = 0;
+};
+std::mutex g_pf_mu;
+std::condition_variable g_pf_cv;
+std::deque<PrefetchJob> g_pf_jobs;  // under g_pf_mu
+bool g_pf_started = false;          // under g_pf_mu
+std::atomic<std::uint64_t> g_pf_asked{0}, g_pf_known{0}, g_pf_checked{0}, g_pf_imports{0}, g_pf_bytes{0}, g_pf_raced{0},
+    g_pf_dropped{0};
+
+void prefetch_thread() {
+    host_thread_set_name("bb-import");
+    t_import_who = kIwPrefetch;
+    constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
+    // This thread's own view: the mappings (refreshed when they change) and
+    // the windows it has seen imported - an import is only ever replaced by a
+    // larger one, so a window once imported stays so.
+    std::vector<GuestMapInfo> maps;
+    std::uint64_t maps_gen = ~0ull;
+    std::uint64_t known[gcn::kDmemChunks] = {};      // imported (stays so)
+    std::uint64_t invisible[gcn::kDmemChunks] = {};  // outside every GPU-visible span (until the mappings change)
+    struct Run {
+        std::uint32_t chunk;
+        std::uint64_t lo, hi;
+    };
+    std::vector<Run> runs;
+    for (;;) {
+        PrefetchJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_pf_mu);
+            g_pf_cv.wait(lk, [] { return !g_pf_jobs.empty(); });
+            job = g_pf_jobs.front();
+            g_pf_jobs.pop_front();
+        }
+        if (const std::uint64_t gen = hle_kernel_maps_generation(); gen != maps_gen) {
+            maps_gen = gen;
+            maps.clear();
+            hle_kernel_snapshot_maps(maps);
+            std::fill(std::begin(invisible), std::end(invisible), 0);
+        }
+        // The job's windows this thread has not seen imported.
+        bool unknown = false;
+        const std::uint64_t end = job.va + job.bytes;
+        for (const GuestMapInfo& mi : maps) {
+            if (!mi.dmem || mi.phys < 0) continue;
+            const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
+            for (std::uint64_t at = lo; at < hi && !unknown;) {
+                const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + (at - mi.va);
+                const std::uint64_t k = phys >> gcn::kDmemChunkShift;
+                const std::uint32_t w = static_cast<std::uint32_t>((phys & (kChunkBytes - 1)) >> kImportWindowShift);
+                unknown = k < gcn::kDmemChunks && !(((known[k] | invisible[k]) >> w) & 1);
+                at += kWindow - (phys & (kWindow - 1));
+            }
+        }
+        if (!unknown) {
+            g_pf_known.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        g_pf_checked.fetch_add(1, std::memory_order_relaxed);
+        // Under the lock: which of those windows lie in a GPU-visible span and
+        // no import covers yet, as runs of adjacent windows.
+        runs.clear();
+        {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            if (!g.ok || !rebuild_page_tables()) continue;
+            for (const GuestMapInfo& mi : g.maps) {
+                if (!mi.dmem || mi.phys < 0) continue;
+                const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
+                for (std::uint64_t at = lo; at < hi;) {
+                    const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + (at - mi.va);
+                    at += kWindow - (phys & (kWindow - 1));
+                    const std::uint64_t k = phys >> gcn::kDmemChunkShift;
+                    if (k >= gcn::kDmemChunks) continue;
+                    const DmemChunk& d = g.dmem[k];
+                    const std::uint64_t in = phys & (kChunkBytes - 1);
+                    const std::uint32_t w = static_cast<std::uint32_t>(in >> kImportWindowShift);
+                    const std::uint64_t wlo = std::max(d.span_lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                    const std::uint64_t whi = std::min(d.span_hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                    if (wlo >= whi) {  // not GPU-visible
+                        invisible[k] |= 1ull << w;
+                        continue;
+                    }
+                    if (const Chunk* c = d.window[w]; c && chunk_covers(*c, wlo, whi - wlo)) {
+                        known[k] |= 1ull << w;
+                        continue;
+                    }
+                    if (d.window[w]) continue;  // partly imported: the binding that needs the rest widens over it
+                    if (!runs.empty() && runs.back().chunk == k && runs.back().hi == wlo) {
+                        runs.back().hi = whi;
+                    } else {
+                        runs.push_back({static_cast<std::uint32_t>(k), wlo, whi});
+                    }
+                }
+            }
+        }
+        for (const Run& r : runs) {
+            std::unique_ptr<Chunk> c = make_import(r.chunk, r.lo, r.hi);  // the slow part, unlocked
+            if (!c) continue;
+            std::lock_guard<GpuMutex> lock(g.mu);
+            DmemChunk& d = g.dmem[r.chunk];
+            bool taken = false;
+            for (std::uint64_t w = r.lo >> kImportWindowShift; w <= (r.hi - 1) >> kImportWindowShift; ++w) taken |= d.window[w] != nullptr;
+            if (taken) {
+                free_import(*c);  // nothing names it yet
+                g_pf_raced.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            g_pf_imports.fetch_add(1, std::memory_order_relaxed);
+            g_pf_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            d.imports.push_back(std::move(c));
+            install_import_locked(r.chunk, d.imports.back().get());
+            for (std::uint64_t w = r.lo >> kImportWindowShift; w <= (r.hi - 1) >> kImportWindowShift; ++w) known[r.chunk] |= 1ull << w;
+        }
+    }
+}
+}  // namespace
 
 namespace {
 
@@ -945,8 +1325,14 @@ std::uint32_t host_memory_type(std::uint32_t type_bits) {
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
+    // Vertex and index usage too: a draw binds copies made in these buffers as
+    // its vertex or index data - a copy version (GX's copy-back, in staging),
+    // a YEBIS window's copy - and a binding without the usage is invalid
+    // (VUID-vkCmdBindVertexBuffers-pBuffers-00627, seen on lavapipe with
+    // window imports).
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (vkCreateBuffer(g.device, &bci, nullptr, &b.buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(g.device, b.buffer, &req);
@@ -1136,6 +1522,13 @@ std::string stage_manifest_path() {
     return path.substr(0, path.rfind('/') + 1) + "stage-manifest.bin";
 }
 
+// <data root>/bbhost/pipeline-manifest.bin, the same.
+std::string pipeline_manifest_path() {
+    std::string path = pipeline_cache_path();
+    if (path.empty()) return path;
+    return path.substr(0, path.rfind('/') + 1) + "pipeline-manifest.bin";
+}
+
 // <data root>/bbhost/translation-cache.bin (host/translation_cache.h), the same.
 std::string translation_cache_path() {
     std::string path = pipeline_cache_path();
@@ -1243,9 +1636,12 @@ bool rebuild_page_tables() {
             if (overlap && hi == kChunkBytes && k + 1 < gcn::kDmemChunks && gpu_span(maps, k + 1, nlo, nhi) && nlo == 0) {
                 ext = kChunkBytes + std::min<std::uint64_t>(nhi, kChunkOverlap);
             }
+            const int who = t_import_who;
+            t_import_who = kIwSpan;
             if (Chunk* c = import_span(k, lo, ext)) {
                 for (std::uint64_t w = lo >> kImportWindowShift; w <= (hi - 1) >> kImportWindowShift; ++w) d.window[w] = c;
             }
+            t_import_who = who;
         }
     }
     for (const GuestMapInfo& mi : maps) {
@@ -1463,7 +1859,9 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
         const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + off;
         const std::uint32_t chunk = static_cast<std::uint32_t>(phys >> gcn::kDmemChunkShift);
         const std::uint64_t in = phys & (kChunkBytes - 1);
-        const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, kChunkBytes - in}));
+        // Window imports may run on across the seam into the next chunk (span_reach).
+        const std::uint64_t reach = g_import_whole ? kChunkBytes : span_reach(chunk);
+        const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, reach > in ? reach - in : 1}), true);
         if (!c) return out;
         out.buffer = c->buffer;
         out.offset = in - c->lo;
@@ -2680,12 +3078,29 @@ bool init_locked() {
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
     // translator above (they are part of every key).
+    // The Shaders setting (host/options.cpp), before the first lift decides
+    // the HLSL path's mode; BBHOST_HLSL wins over it.
+    hlsl_set_setting(host_opt_index("shaders") != 1);
+    if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
+    hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
     g.ok = true;
     start_submit_thread();
     start_hang_watchdog();
     start_memory_reserve();
     stage_manifest_load(stage_manifest_path());
+    {
+        // A shipped pipeline list beside the executable (tools/pipeline_list.py),
+        // or BBHOST_PIPELINE_LIST's (empty: none).
+        const char* e = std::getenv("BBHOST_PIPELINE_LIST");
+        std::string list = e ? std::string(e) : config_exe_dir() + "/pipeline-list.bin";
+        if (!e && !std::filesystem::exists(list)) list.clear();
+        shader_programs_set_eboot(config().eboot);
+        pipeline_manifest_load(pipeline_manifest_path(), list);
+    }
+    if (const std::string cache = pipeline_cache_path(); !cache.empty()) {
+        shader_sweep_start(cache.substr(0, cache.rfind('/') + 1) + "shader-sweep.txt", config().eboot);
+    }
     return true;
 }
 
@@ -2770,16 +3185,45 @@ void begin_recording_locked() {
     }
 }
 
+// A params block into its slot in the ring, which is write-combined memory,
+// as whole 64-byte lines: a line written in part stays in a write-combining
+// buffer until the next store fence - the draw's publish - which then flushes
+// it in pieces. The slot (kParamsStride) holds the rounded size; the
+// binding's range stays sizeof(StageParams). (A block that is whole lines
+// already, as it is now at 512 bytes, is copied as it is.)
+// BBHOST_WC_LINES=0: the params blocks and the constant-buffer snapshots
+// (render.cpp) written at their exact sizes.
+const bool g_wc_whole_lines = [] {
+    const char* e = std::getenv("BBHOST_WC_LINES");
+    return !(e && e[0] == '0');
+}();
+constexpr std::size_t kParamsLines = (sizeof(gcn::StageParams) + 63) & ~std::size_t{63};
+static_assert(kParamsLines <= kParamsStride, "a params slot holds its block in whole lines");
+void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
+    if constexpr (kParamsLines == sizeof(gcn::StageParams)) {
+        std::memcpy(dst, &params, sizeof(params));
+    } else {
+        if (!g_wc_whole_lines) {
+            std::memcpy(dst, &params, sizeof(params));
+            return;
+        }
+        alignas(64) std::uint8_t lines[kParamsLines];
+        std::memcpy(lines, &params, sizeof(params));
+        std::memset(lines + sizeof(params), 0, kParamsLines - sizeof(params));
+        std::memcpy(dst, lines, kParamsLines);
+    }
+}
+
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
     const std::uint32_t slot = g.queued++;
     const std::uint32_t index = static_cast<std::uint32_t>(g.slot) * kMaxQueued * kStageSlots + slot;
-    std::memcpy(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(index) * kParamsStride, &params, sizeof(params));
+    put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(index) * kParamsStride, params);
     out = {g.ubo, static_cast<VkDeviceSize>(index) * kParamsStride, sizeof(gcn::StageParams)};
     return slot;
 }
 
 void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescriptorBufferInfo& slot) {
-    std::memcpy(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), &params, sizeof(params));
+    put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), params);
 }
 
 // Sets come from the current slot's pool eight at a time: a draw takes two,
@@ -3009,9 +3453,20 @@ bool cs_buffers_on() {
     }();
     return on && g.cb_ssbo && g.cs_buffers_layout != VK_NULL_HANDLE;
 }
+// BBHOST_LIFT_CS_BUFFERS: a lifted compute program's variant with its buffers
+// pushed is the lift of its lean translation (on unless 0; 0: a lifted
+// program has none, and its dispatches walk the page table as before).
+bool cs_lift_buffers_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LIFT_CS_BUFFERS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 // The variant's key for the optimizer (ComputeLean), beside its pipeline's.
 constexpr std::uint64_t kCsBuffersTag = 0xcb55b0f0e5000000ull;
-std::atomic<std::uint64_t> g_cs_lean_built{0}, g_cs_lean_none{0}, g_cs_lean_failed{0}, g_cs_lean_dispatches{0}, g_cs_lean_fallbacks{0};
+std::atomic<std::uint64_t> g_cs_lean_built{0}, g_cs_lean_none{0}, g_cs_lean_failed{0}, g_cs_lean_dispatches{0}, g_cs_lean_fallbacks{0},
+    g_cs_lean_lifted{0}, g_cs_lean_lift_refused{0};
 
 // `buffers`: the ComputeLean translation.
 gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
@@ -3046,10 +3501,11 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
 // binds those from one list for either.
 std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
                                                 const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes,
-                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name) {
-    if (!cs_buffers_on()) return nullptr;
+                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift) {
+    if (!cs_buffers_on() || (lift && !cs_lift_buffers_on())) return nullptr;
     auto lean = std::make_shared<ComputeLean>();
-    lean->meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes, true));
+    const gcn::TranslateOptions lean_options = compute_options(rsrc1, rsrc2, threads, dims, modes, true);
+    lean->meta = translate_cached(prog, lean_options);
     const auto same = [&] {
         const gcn::TranslateResult& m = lean->meta;
         if (m.images.size() != regular.images.size() || m.samplers.size() != regular.samplers.size() || m.gds_counters != regular.gds_counters ||
@@ -3082,6 +3538,24 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     } else if (!same()) {
         why = "images, samplers, counters or LDS differ";
     }
+    // A lifted program's variant is the lift of this translation, which reads
+    // what the translation binds from the pushed buffers and walks the rest
+    // as it does (gcn::lift_compute_shader); refused, the program has none and
+    // keeps its walking lift.
+    if (why.empty() && lift) {
+        hlsl_name_next(name);
+        gcn::LiftResult l = lift_compute_cached(prog, lean_options, lean->meta);
+        if (l.ok()) {
+            lean->meta.spirv = std::move(l.spirv);
+            lean->lifted = true;
+        } else {
+            if (g_cs_lean_lift_refused.fetch_add(1, std::memory_order_relaxed) < 16) {
+                host_log("gpu: compute shader %s: its lean translation's lift was refused (%s); its dispatches walk the page table", name.c_str(),
+                         l.rejections.empty() ? "no module" : l.rejections[0].c_str());
+            }
+            return nullptr;
+        }
+    }
     if (why.empty()) {
         if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
             host_mkdir("build/spv");
@@ -3090,24 +3564,119 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
                 std::fclose(f);
             }
         }
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = lean->meta.spirv.size() * 4;
-        smci.pCode = lean->meta.spirv.data();
-        if (vkCreateShaderModule(g.device, &smci, nullptr, &lean->module) != VK_SUCCESS) why = "shader module";
-    }
-    if (why.empty()) {
-        lean->pipeline = first_compute_pipeline(lean->module, key ^ kCsBuffersTag, name, lean->meta.spirv, lean->standin,
-                                                name + " (buffers pushed)", g.cs_buffers_layout);
-        if (!lean->pipeline) why = "pipeline";
+        // DXC's module of a lift (BBHOST_HLSL) the driver refuses: the lift's
+        // own, as pipeline_for does for the walking lift.
+        for (bool own = false;;) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = lean->meta.spirv.size() * 4;
+            smci.pCode = lean->meta.spirv.data();
+            if (vkCreateShaderModule(g.device, &smci, nullptr, &lean->module) != VK_SUCCESS) {
+                lean->module = VK_NULL_HANDLE;
+                why = "shader module";
+            } else {
+                lean->pipeline = first_compute_pipeline(lean->module, key ^ kCsBuffersTag, name, lean->meta.spirv, lean->standin,
+                                                        name + " (buffers pushed)", g.cs_buffers_layout);
+                if (!lean->pipeline) why = "pipeline";
+            }
+            std::vector<std::uint32_t> lift;
+            if (why.empty() || !lean->lifted || own || !hlsl_lift_of(lean->meta.spirv, lift)) break;
+            if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
+            lean->module = VK_NULL_HANDLE;
+            lean->meta.spirv = std::move(lift);
+            own = true;
+            why.clear();
+        }
     }
     if (!why.empty()) {
         if (g_cs_lean_failed.fetch_add(1, std::memory_order_relaxed) < 16) {
             host_log("gpu: compute shader %s: no variant with its buffers pushed (%s); its dispatches walk the page table", name.c_str(), why.c_str());
         }
+        if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
         return nullptr;
     }
     g_cs_lean_built.fetch_add(1, std::memory_order_relaxed);
+    if (lean->lifted) g_cs_lean_lifted.fetch_add(1, std::memory_order_relaxed);
     return lean;
+}
+
+// BBHOST_LIFT_COMPUTE: compute shaders run as their typed lifts
+// (gcn::lift_compute_shader) - on by default, 0 keeps every compute shader
+// translated (an A/B switch). A program also needs BBHOST_DECOMP to select it
+// ("all", the default; 0 none; a list of program hashes), as the pixel and
+// vertex lifts do (render.cpp decomp_selects). The lift binds what the
+// translation binds - the params block, its images and samplers, the GDS
+// counters - so the dispatch's descriptor set is the same either way; a
+// program the lifter refuses keeps its translation, and the exit report
+// counts those by reason.
+bool compute_lift_selects(const std::string& name) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LIFT_COMPUTE");
+        return !(e && e[0] == '0');
+    }();
+    static const std::pair<bool, std::set<std::string>> selection = [] {
+        std::pair<bool, std::set<std::string>> s{true, {}};
+        const char* e = std::getenv("BBHOST_DECOMP");
+        if (!e || !*e || std::strcmp(e, "all") == 0) return s;
+        s.first = false;
+        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0) return s;  // 1: the pilot pixel shader alone
+        std::string list(e);
+        for (std::size_t at = 0; at <= list.size();) {
+            const std::size_t comma = std::min(list.find(',', at), list.size());
+            if (comma > at) s.second.insert(list.substr(at, comma - at));
+            at = comma + 1;
+        }
+        return s;
+    }();
+    return on && (selection.first || selection.second.count(name) != 0);
+}
+// BBHOST_TEST_HLSL_REFUSE=<n> (checks): every n-th compute pipeline to be made
+// from DXC's module is taken as refused before it is asked for (1: every
+// one), so the rebuild from the lift's own module runs on a driver that
+// refuses none (render.cpp has the same for graphics pipelines).
+bool hlsl_test_refused_compute(const std::vector<std::uint32_t>& spirv) {
+    static const int every = [] {
+        const char* e = std::getenv("BBHOST_TEST_HLSL_REFUSE");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    if (!every || !hlsl_on()) return false;
+    std::vector<std::uint32_t> lift;
+    if (!hlsl_lift_of(spirv, lift)) return false;
+    static std::atomic<std::uint64_t> seen{0};
+    return seen.fetch_add(1, std::memory_order_relaxed) % static_cast<std::uint64_t>(every) == 0;
+}
+
+// The program's lift in place of its translation's SPIR-V, when selected and
+// accepted; `lifted` and `why` (the first rejection, or empty) say which.
+// Every compute program a pipeline was made for, at GX's creation or at a
+// dispatch, by how it runs: empty for its lift, or why it runs translated
+// (compute_lift_report). A program counts as lifted while every pipeline of
+// it is.
+std::mutex g_lift_decided_mu;
+std::map<std::string, std::string> g_lift_decided;
+void note_compute_lift(const std::string& name, bool lifted, const std::string& why) {
+    std::lock_guard<std::mutex> lk(g_lift_decided_mu);
+    std::string& at = g_lift_decided[name];
+    if (!lifted && at.empty()) at = why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : why;
+}
+void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
+                        std::string& why) {
+    lifted = false;
+    why.clear();
+    if (!meta.ok()) return;
+    if (!compute_lift_selects(name)) {
+        note_compute_lift(name, false, why);
+        return;
+    }
+    hlsl_name_next(name);
+    gcn::LiftResult l = lift_compute_cached(prog, o, meta);
+    if (l.ok()) {
+        meta.spirv = std::move(l.spirv);
+        lifted = true;
+        note_compute_lift(name, true, why);
+        return;
+    }
+    why = l.rejections.empty() ? std::string("no module") : l.rejections[0];
+    note_compute_lift(name, false, why);
 }
 
 struct PrecompiledCompute {
@@ -3119,6 +3688,8 @@ struct PrecompiledCompute {
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool standin = false;  // unoptimized, the optimized one queued (first_compute_pipeline)
         std::shared_ptr<ComputeLean> lean;  // build_compute_lean
+        bool lifted = false;   // ComputePipeline::lifted, lift_why
+        std::string lift_why;
         std::uint64_t us = 0;  // translation and compile
     };
     enum State { kQueued, kCompiling, kDone, kFailed };
@@ -3543,6 +4114,9 @@ std::string compute_optimize_window() {
 
 namespace {
 
+// Compute pipelines dispatches built on the command processor (pipeline_for).
+std::atomic<std::uint64_t> g_cp_compute_us{0}, g_cp_compute_n{0};
+
 // A dispatch's first build of a pipeline (under g.mu): take what a worker
 // compiled for the same key, waiting while it builds - but not for ever: a
 // driver can take minutes over one, and the command processor waiting on it
@@ -3625,6 +4199,8 @@ Precompiled take_precompiled_compute(std::uint64_t key, const GpuDispatch& d, co
     pl.pipeline = e.pipeline;
     pl.standin = e.standin;
     pl.lean = std::move(e.lean);
+    pl.lifted = e.lifted;
+    pl.lift_why = std::move(e.lift_why);
     e.failed = true;  // taken
     g_cs_pre.taken += 1;
     if (e.us >= 100000 || waited) {
@@ -3694,37 +4270,80 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     case Precompiled::kBuildHere:
         break;
     }
+    // The dispatch builds it itself: what that costs the command processor
+    // (host_gpu_pipeline_work), however it ends.
+    struct BuildTime {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~BuildTime() {
+            if (t_compute_worker) return;
+            g_cp_compute_us.fetch_add(cs_us_since(t0), std::memory_order_relaxed);
+            g_cp_compute_n.fetch_add(1, std::memory_order_relaxed);
+        }
+    } build_time;
     pl.meta = translate_cached(prog, o);
     if (!pl.meta.ok()) {
         host_log("gpu: shader %s: %s", name.c_str(), pl.meta.errors[0].c_str());
         pl.failed = true;
         return pl;
     }
+    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why);
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
         host_mkdir("build/spv");
-        const std::string path = "build/spv/" + name + "-cs.spv";
+        const std::string path = "build/spv/" + name + (pl.lifted ? "-cs-lifted.spv" : "-cs.spv");
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(pl.meta.spirv.data(), 4, pl.meta.spirv.size(), f);
             std::fclose(f);
         }
         host_log("gpu: creating compute pipeline %s", name.c_str());
     }
-    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = pl.meta.spirv.size() * 4;
-    smci.pCode = pl.meta.spirv.data();
-    if (vkCreateShaderModule(g.device, &smci, nullptr, &pl.module) != VK_SUCCESS) {
-        host_log("gpu: shader %s: module creation failed", name.c_str());
-        pl.failed = true;
-        return pl;
-    }
     const auto t0 = std::chrono::steady_clock::now();
-    pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
-    if (!pl.pipeline) {
-        host_log("gpu: shader %s: pipeline creation failed", name.c_str());
-        pl.failed = true;
-        return pl;
+    bool from_lift = false;  // BBHOST_HLSL: DXC's module was refused, this is the lift's own
+    for (;;) {
+        const char* failed = nullptr;
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = pl.meta.spirv.size() * 4;
+        smci.pCode = pl.meta.spirv.data();
+        if (vkCreateShaderModule(g.device, &smci, nullptr, &pl.module) != VK_SUCCESS) {
+            pl.module = VK_NULL_HANDLE;
+            failed = "module creation";
+        } else if (hlsl_test_refused_compute(pl.meta.spirv)) {
+            failed = "pipeline creation";
+        } else {
+            pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
+            if (!pl.pipeline) failed = "pipeline creation";
+        }
+        if (from_lift) {
+            hlsl_note_refused("a compute pipeline", 1, !failed);
+            from_lift = false;
+        }
+        if (!failed) break;
+        if (!pl.lifted) {
+            host_log("gpu: shader %s: %s failed", name.c_str(), failed);
+            pl.failed = true;
+            return pl;
+        }
+        // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
+        if (std::vector<std::uint32_t> lift; hlsl_lift_of(pl.meta.spirv, lift)) {
+            if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
+            pl.module = VK_NULL_HANDLE;
+            pl.meta.spirv = std::move(lift);
+            from_lift = true;
+            continue;
+        }
+        // The driver refused what the lift built: the translation instead.
+        host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), failed);
+        if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
+        pl.module = VK_NULL_HANDLE;
+        pl.meta = translate_cached(prog, o);
+        pl.lifted = false;
+        pl.lift_why = std::string("the driver refused the lift's ") + failed;
+        note_compute_lift(name, false, pl.lift_why);
     }
-    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name);
+    // A lifted program runs its lift (render/next); ComputeLean, the translation
+    // with its buffers pushed, is the form a translated one runs in, and the
+    // lift of that translation a lifted one's (BBHOST_LIFT_CS_BUFFERS) - its
+    // walking lift when a buffer does not bind.
+    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -3759,6 +4378,16 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
 }
 
 }  // namespace
+
+void note_cp_compute_build(std::uint64_t us) {
+    g_cp_compute_us.fetch_add(us, std::memory_order_relaxed);
+    g_cp_compute_n.fetch_add(1, std::memory_order_relaxed);
+}
+
+void compute_pipeline_work(std::uint64_t out[2]) {
+    out[0] = g_cp_compute_us.load(std::memory_order_relaxed);
+    out[1] = g_cp_compute_n.load(std::memory_order_relaxed);
+}
 
 bool compute_precompile_enabled() {
     static const bool on = [] {
@@ -3825,12 +4454,14 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     // From here every way out marks the entry done: a dispatch may be waiting on it.
     PrecompiledCompute::Entry e;
     std::string why;
-    e.meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes));
+    const gcn::TranslateOptions co = compute_options(rsrc1, rsrc2, threads, dims, modes);
+    e.meta = translate_cached(prog, co);
     if (!e.meta.ok()) why = "translation: " + e.meta.errors[0];
+    if (why.empty()) apply_compute_lift(prog, co, e.meta, name, e.lifted, e.lift_why);
     if (why.empty()) {
         if (const char* env = std::getenv("BBHOST_DUMP_SPIRV"); env && env[0] == '1') {
             host_mkdir("build/spv");
-            const std::string path = "build/spv/" + name + "-cs.spv";
+            const std::string path = "build/spv/" + name + (e.lifted ? "-cs-lifted.spv" : "-cs.spv");
             if (FILE* f = std::fopen(path.c_str(), "wb")) {
                 std::fwrite(e.meta.spirv.data(), 4, e.meta.spirv.size(), f);
                 std::fclose(f);
@@ -3845,12 +4476,6 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
                 std::fclose(f);
             }
         }
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = e.meta.spirv.size() * 4;
-        smci.pCode = e.meta.spirv.data();
-        if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) why = "shader module";
-    }
-    if (why.empty()) {
         // BBHOST_CS_COMPILE_DELAY_MS=<ms> (checks): a compiler that takes that
         // long over every compute pipeline built at creation - the dispatch's
         // bounded wait and the watchdog's line, tried on a fast driver.
@@ -3860,10 +4485,46 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         }();
         if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         t_compute_worker = true;
-        e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
-        if (!e.pipeline) why = "pipeline";
+        bool from_lift = false;  // BBHOST_HLSL: DXC's module was refused, this is the lift's own
+        for (;;) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = e.meta.spirv.size() * 4;
+            smci.pCode = e.meta.spirv.data();
+            if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) {
+                e.module = VK_NULL_HANDLE;
+                why = "shader module";
+            } else if (hlsl_test_refused_compute(e.meta.spirv)) {
+                why = "pipeline";
+            } else {
+                e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
+                if (!e.pipeline) why = "pipeline";
+            }
+            if (from_lift) {
+                hlsl_note_refused("a compute pipeline", 1, why.empty());
+                from_lift = false;
+            }
+            if (why.empty() || !e.lifted) break;
+            // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
+            if (std::vector<std::uint32_t> lift; hlsl_lift_of(e.meta.spirv, lift)) {
+                if (e.module) vkDestroyShaderModule(g.device, e.module, nullptr);
+                e.module = VK_NULL_HANDLE;
+                e.meta.spirv = std::move(lift);
+                from_lift = true;
+                why.clear();
+                continue;
+            }
+            // The driver refused what the lift built: the translation instead.
+            host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), why.c_str());
+            if (e.module) vkDestroyShaderModule(g.device, e.module, nullptr);
+            e.module = VK_NULL_HANDLE;
+            e.meta = translate_cached(prog, co);
+            e.lifted = false;
+            e.lift_why = "the driver refused the lift's " + why;
+            note_compute_lift(name, false, e.lift_why);
+            why.clear();
+        }
     }
-    if (why.empty()) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name);
+    if (why.empty()) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name, e.lifted);  // as in pipeline_for
     e.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     e.done = true;
     e.failed = !why.empty();
@@ -3919,9 +4580,11 @@ void compute_compiling_report() {
 
 void compute_precompile_report() {
     if (cs_buffers_on()) {
-        host_log("gpu: compute shaders with their buffers pushed (BBHOST_CS_BUFFERS): %llu built, %llu with none to push, %llu not built; "
-                 "dispatches %llu with them, %llu walking the page table because one did not bind",
-                 static_cast<unsigned long long>(g_cs_lean_built.load()), static_cast<unsigned long long>(g_cs_lean_none.load()),
+        host_log("gpu: compute shaders with their buffers pushed (BBHOST_CS_BUFFERS): %llu built (%llu of them lifts, BBHOST_LIFT_CS_BUFFERS; "
+                 "%llu lifts refused), %llu with none to push, %llu not built; dispatches %llu with them, %llu walking the page table because "
+                 "one did not bind",
+                 static_cast<unsigned long long>(g_cs_lean_built.load()), static_cast<unsigned long long>(g_cs_lean_lifted.load()),
+                 static_cast<unsigned long long>(g_cs_lean_lift_refused.load()), static_cast<unsigned long long>(g_cs_lean_none.load()),
                  static_cast<unsigned long long>(g_cs_lean_failed.load()), static_cast<unsigned long long>(g_cs_lean_dispatches.load()),
                  static_cast<unsigned long long>(g_cs_lean_fallbacks.load()));
     }
@@ -4636,6 +5299,8 @@ void retire_slot_locked(int k) {
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
+    for (Chunk& c : sl.dead_imports) free_import(c);  // window imports a merged one replaced
+    sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
         vkDestroyBuffer(g.device, b.buffer, nullptr);
         vkFreeMemory(g.device, b.memory, nullptr);
@@ -5602,6 +6267,7 @@ void submit_locked() {
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
+    view_clears_flush_locked(kVcwSubmit);  // the presenter and the next submission's readers see every clear made so far
     stall_test_record_locked();  // BBHOST_TEST_GPU_STALL
     copy_versions_flush_locked();
     // A render target a shortage put in host memory goes back into video
@@ -5774,6 +6440,30 @@ void retire_through_locked(std::uint64_t serial) {
 
 using namespace gpu;
 
+void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
+    if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
+    // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
+    // compute writes, particles), a dynamic one (usage 2: rings the game
+    // rewrites, bound from host memory). A vertex or index buffer (bind 0x1,
+    // 0x2) only without the buffer shadow - with it the mirror serves meshes,
+    // their pages copied through staging. Textures never: their uploads go
+    // through staging too.
+    const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
+    if (!in_place) return;
+    std::lock_guard<std::mutex> lk(g_pf_mu);
+    g_pf_asked.fetch_add(1, std::memory_order_relaxed);
+    if (g_pf_jobs.size() >= 8192) {
+        g_pf_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_pf_jobs.push_back({va, bytes});
+    if (!g_pf_started) {
+        g_pf_started = true;
+        std::thread(prefetch_thread).detach();
+    }
+    g_pf_cv.notify_one();
+}
+
 bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool want_present) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.tried) {
@@ -5847,6 +6537,8 @@ GpuStats host_gpu_stats() {
     for (int i = 0; i < kVsWhyCount; ++i) st.draws_vs_why[i] = g.draws_vs_why[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDrawTessCount; ++i) st.draws_tess[i] = g.draws_tess[i].load(std::memory_order_relaxed);
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
+    st.shader_dispatches = g.shader_dispatches.load(std::memory_order_relaxed);
+    st.lifted_dispatches = g.lifted_dispatches.load(std::memory_order_relaxed);
     return st;
 }
 
@@ -5995,9 +6687,14 @@ const bool g_dispatch_cost = [] {
     const char* e = std::getenv("BBHOST_DISPATCH_COST");
     return e && e[0] == '1';
 }();
-enum DispatchPart { kDpLock, kDpProgram, kDpTables, kDpPaths, kDpPipeline, kDpWork, kDpParts };
+// The rest of the dispatch: its inputs prepared (recognised shapes, images
+// prefetched, imports, the counters' starts), the open render pass and the
+// pending transfers closed, its parameters and descriptor set, its commands
+// recorded, and what it wrote noted (store shadows, writebacks, the barrier).
+enum DispatchPart { kDpLock, kDpProgram, kDpTables, kDpPaths, kDpPipeline, kDpPrepare, kDpFlush, kDpSet, kDpRecord, kDpAfter, kDpParts };
 const char* const kDispatchPartName[kDpParts] = {"lock", "program lookup", "page tables", "paths and dims", "key and pipeline",
-                                                 "the work"};
+                                                 "inputs and counters", "pass end and transfers", "parameters and set", "recording",
+                                                 "what it wrote"};
 // What the dispatches actually are. The whole class is at L0,
 // and slice 2 was worth measuring before building - it turned out mostly done.
 // Counted by shader, and separately the ones that never reach a shader at all
@@ -6018,6 +6715,66 @@ struct DispatchStamp {
         at = now;
     }
 };
+// The compute shaders by how they ran (BBHOST_LIFT_COMPUTE): programs and
+// dispatches lifted, and the rest by why their lift was refused, or not asked
+// for. Takes g.mu (the pipelines' counts).
+std::string compute_lift_report() {
+    // A rejection without the instruction offset it names (as tools/area_check.py strips it).
+    const auto reason_of = [](std::string r) {
+        if (r.size() > 8 && r[6] == ':' && r[7] == ' ') r = r.substr(8);
+        return r;
+    };
+    std::map<std::string, std::string> decided;
+    {
+        std::lock_guard<std::mutex> lk(g_lift_decided_mu);
+        decided = g_lift_decided;
+    }
+    std::lock_guard<GpuMutex> lock(g.mu);
+    std::map<std::string, std::pair<std::set<std::string>, std::uint64_t>> why;  // reason -> programs, dispatches
+    std::map<std::string, std::uint64_t> by_program;                             // dispatched programs' dispatches
+    std::set<std::string> lifted_dispatched;
+    std::uint64_t dispatches = 0, lifted_dispatches = 0;
+    for (const auto& [key, pl] : g.pipelines) {
+        if (pl.failed || pl.name.empty()) continue;
+        by_program[pl.name] += pl.dispatches;
+        dispatches += pl.dispatches;
+        if (pl.lifted) {
+            lifted_dispatches += pl.dispatches;
+            continue;
+        }
+        auto& w = why[reason_of(pl.lift_why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : pl.lift_why)];
+        w.first.insert(pl.name);
+        w.second += pl.dispatches;
+    }
+    std::size_t made_lifted = 0;
+    for (const auto& [name, reason] : decided) {
+        if (reason.empty()) {
+            ++made_lifted;
+        } else if (!by_program.count(name)) {
+            why[reason_of(reason)].first.insert(name);  // made at GX's creation, never dispatched
+        }
+    }
+    for (const auto& [name, n] : by_program) {
+        bool all = true;
+        for (const auto& [reason, w] : why) all = all && !w.first.count(name);
+        if (all) lifted_dispatched.insert(name);
+    }
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "compute shader lifts: %zu of %zu programs lifted (their pipelines made at GX's creation or a dispatch); %zu of %zu "
+                  "dispatched programs, %llu of %llu dispatches ran a lift",
+                  made_lifted, decided.size(), lifted_dispatched.size(), by_program.size(), static_cast<unsigned long long>(lifted_dispatches),
+                  static_cast<unsigned long long>(dispatches));
+    std::string out = buf;
+    for (const auto& [reason, w] : why) {
+        std::string names;
+        for (const std::string& n : w.first) names += (names.empty() ? "" : " ") + n;
+        std::snprintf(buf, sizeof(buf), "; translated (%zu programs, %llu dispatches): ", w.first.size(), static_cast<unsigned long long>(w.second));
+        out += buf + reason + " [" + names + "]";
+    }
+    return out;
+}
+
 void dispatch_cost_report() {
     const std::uint64_t n = g_dispatch_n.load();
     if (!g_dispatch_cost || !n) return;
@@ -6063,7 +6820,31 @@ bool host_gpu_gds_counters() {
     return on;
 }
 
-bool host_gpu_dispatch(const GpuDispatch& d) {
+thread_local std::uint32_t t_dispatch_user_reads = 0xffff;
+std::uint32_t host_gpu_dispatch_user_reads() { return t_dispatch_user_reads; }
+
+// Dispatch tokens from GX's compute commit (GpuDispatch::cs_records): user
+// data built from their records, and those whose records the builder did not
+// take (their user data stays the token's).
+std::atomic<std::uint64_t> g_cs_records_built{0}, g_cs_records_failed{0};
+
+namespace {
+// What the last host_gpu_dispatch on this thread turned out to be, and its
+// program's name (BBHOST_CP_CENSUS sorts the dispatches by it).
+thread_local GpuDispatchClass t_dispatch_class = kDcNone;
+thread_local const std::string* t_dispatch_name = nullptr;
+}  // namespace
+
+GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
+    if (program) *program = t_dispatch_name ? t_dispatch_name->c_str() : "-";
+    return t_dispatch_class;
+}
+
+bool host_gpu_dispatch(const GpuDispatch& d_in) {
+    t_dispatch_user_reads = 0xffff;
+    t_dispatch_class = kDcFailed;
+    t_dispatch_name = nullptr;
+    const ResolveKind resolve_kind("dispatch");
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -6073,6 +6854,22 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     if (!init_locked()) {
         return false;
     }
+    // A token's compute records: the user data its descriptors write, built
+    // as GX's compute commit writes it, the tables in the host ring. The rest
+    // of the user data (dwords no descriptor writes) stays the token's.
+    GpuDispatch built;
+    const GpuDispatch* dp = &d_in;
+    if (d_in.cs_records) {
+        built = d_in;
+        std::uint16_t set = 0;
+        if (render_cs_user_data_locked(*d_in.cs_records, built.user_data, &set)) {
+            g_cs_records_built.fetch_add(1, std::memory_order_relaxed);
+            dp = &built;
+        } else if (g_cs_records_failed.fetch_add(1, std::memory_order_relaxed) < 4) {
+            host_log("gpu: a dispatch token's compute records name a descriptor the builder does not take: its user data is the token's");
+        }
+    }
+    const GpuDispatch& d = *dp;
     const CachedCompute* cc = compute_program_at(d.code_va);
     if (!cc) {
         static std::atomic<int> logs{0};
@@ -6085,6 +6882,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     const std::vector<std::uint32_t>& words = cc->words;
     const std::string& name = cc->name;
     const std::uint64_t code_hash = cc->hash;
+    t_dispatch_name = &cc->name;
     stamp.to(kDpProgram);
     if (host_tooling()) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
@@ -6116,6 +6914,29 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     stamp.to(kDpPaths);
     const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
     ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    t_dispatch_user_reads = 0xffff;
+    if (d.want_user_reads && !pl.failed) {
+        if (!pl.user_reads_known) {
+            // What the program's translation touches, and what the host reads
+            // to bind its resources: each path's root - the descriptor's words
+            // when they sit in user data, the pointer when the path loads
+            // through memory.
+            std::uint32_t tables = 0, any = 0xffff;
+            std::uint32_t reads = table_slots_read(pl.meta, tables, &any) ? (any & 0xffff) : 0xffff;
+            const auto root = [&](const gcn::ResourcePath& p, int words) {
+                if (p.user_sgpr < 0 || p.user_sgpr >= 16) return;
+                const int n = p.immediate ? words : 2;
+                for (int k = 0; k < n && p.user_sgpr + k < 16; ++k) reads |= 1u << (p.user_sgpr + k);
+            };
+            for (const gcn::ImageBinding& b : pl.meta.images) root(b.path, b.r128 ? 4 : 8);
+            for (const gcn::SamplerBinding& b : pl.meta.samplers) root(b.path, 4);
+            for (const gcn::BufferBinding& b : pl.meta.buffers) root(b.path, b.pointer ? 2 : 4);
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) root(p, 4);
+            pl.user_reads = reads;
+            pl.user_reads_known = true;
+        }
+        t_dispatch_user_reads = pl.user_reads;
+    }
     if (pl.failed) {
         g.failures.fetch_add(1);
         return false;
@@ -6130,6 +6951,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     // nothing else.
     if (pl.image_blit) g_dispatch_image_blits.fetch_add(1, std::memory_order_relaxed);
     if (pl.buffer_to_image) g_dispatch_buf_to_image.fetch_add(1, std::memory_order_relaxed);
+    t_dispatch_class = pl.image_blit ? kDcImageBlit : pl.buffer_to_image ? kDcBufferToImage : pl.fill ? kDcFillShader : pl.copy ? kDcCopyShader : kDcShader;
     if (pl.fill) {
         const std::uint32_t* v = &d.user_data[pl.fill_dst_sgpr];
         // V# BASE_ADDRESS is a 40-bit byte address. T#/CB_COLOR are in 256-byte
@@ -6166,12 +6988,13 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
             // Only what lands on a texture or a render target: the rest are
             // buffers, and hundreds a frame would push the history out.
             const bool on_rt = find_render_target(base) != nullptr;
-            if (mark_surfaces_dirty_locked(base, bytes) || on_rt) {
+            if (mark_surfaces_dirty_locked(base, bytes, false) || on_rt) {
                 tex_event(base, bytes, "fill dispatch %s 0x%llx 0x%zx bytes with %g %g %g %g%s", pl.name.c_str(),
                           static_cast<unsigned long long>(base), bytes, rgba[0], rgba[1], rgba[2], rgba[3],
                           on_rt ? " (render target)" : "");
             }
             if (render_handle_fill_locked(base, bytes, rgba, d.depth_clear, d.stencil_clear)) {
+                t_dispatch_class = kDcFill;
                 g.dispatches.fetch_add(1);
                 g_dispatch_fills.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -6207,10 +7030,12 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                      static_cast<unsigned long long>(dst), bytes, stride, find_render_target(src) ? " (render target)" : "");
         }
         hle_gnm_warn_if_command_buffer("copy dispatch", dst, bytes);
-        const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-        if (render_copy_target_locked(src, dst, bytes, "copy dispatch")) {
+        const bool as_image = render_copy_target_locked(src, dst, bytes, "copy dispatch");
+        const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image, "copy dispatch");  // an image copy writes no memory
+        if (as_image) {
             tex_event(dst, bytes, "copy dispatch %s 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image", pl.name.c_str(),
                       static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
+            t_dispatch_class = kDcCopyImage;
             g.dispatches.fetch_add(1);
             g_dispatch_copies.fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -6223,18 +7048,19 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     }
     static thread_local StageImages stage_images;
     prefetch_stage_images(pl.meta, d.user_data, stage_images);
-    // On-demand imports: a dispatch binds no buffers - its shader walks the
-    // page table for every one - so what it reads and writes is imported first.
+    // On-demand imports (window imports): what the dispatch's shader reaches
+    // through the page table is imported before it runs - its stores and its
+    // counter words here, what it reads once the variant that runs is known
+    // (below: the lean one binds its buffers).
+    const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+        std::uint32_t v[4]{};
+        if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
+        const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
+        const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
+        const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
+        if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
+    };
     if (!g_import_whole) {
-        const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
-            std::uint32_t v[4]{};
-            if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
-            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
-            const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
-            const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
-            if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
-        };
-        for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
         // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
         // the draws' constants are checked (render.cpp).
@@ -6338,9 +7164,12 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                      words.empty() ? " none bound" : words.c_str());
         }
     }
+    stamp.to(kDpPrepare);
     transfer_flush_locked();
     render_end_pass_locked();
+    view_clears_flush_locked(kVcwDispatch);  // a compute shader may read or write any image: no clear stays owed past it
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
+    stamp.to(kDpFlush);
     // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so
     // far - the counters' starts too - before this dispatch's set exists, so
     // memory and images hold its inputs.
@@ -6389,6 +7218,27 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
             g_cs_lean_dispatches.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // Window imports: what the variant that runs reads through the page
+    // table - every buffer of the walking one; of the lean one, whose buffers
+    // bound above (a copy as recorded, or a binding's own import), only the
+    // walks left in it (TranslateResult::read_buffers: a V#'s records, a
+    // pointer's dwords up to the highest a load reads, 64 KiB when no load's
+    // offset is known), and its stores.
+    if (!g_import_whole) {
+        const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
+        if (!lean) {
+            for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
+        } else {
+            for (const gcn::ResourcePath& p : lean->meta.store_buffers) import_path(p, false, 16);
+        }
+        for (const gcn::TranslateResult::BufferRead& r : walks.read_buffers) {
+            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+        g_dispatch_read_imports.fetch_add(walks.read_buffers.size(), std::memory_order_relaxed);
+        // A load or store whose base does not trace to user data reaches
+        // memory nothing here imports: counted, the fallback's own reason.
+        if (walks.untraced_reads || walks.untraced_stores) g_dispatch_untraced.fetch_add(1, std::memory_order_relaxed);
+    }
     VkDescriptorBufferInfo ubi{};
     alloc_params_slot_locked(params, ubi);
     VkDescriptorSet set = alloc_set_locked();
@@ -6424,6 +7274,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         args_offset = loc.offset;
         if (!g_render_min) indirect_clamp_locked(loc.buffer, loc.offset, d.indirect_va, name, args_buffer, args_offset);
     }
+    stamp.to(kDpSet);
     rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, lean ? lean->pipeline : pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
     const VkPipelineLayout layout = lean ? g.cs_buffers_layout : g.pipe_layout;
@@ -6460,6 +7311,19 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         cd.translate.set("gds_counters", host_gpu_gds_counters());
         cd.translate.set("exec_known", g.exec_known);
         cd.translate.set("max_lds_bytes", g.max_lds_bytes);
+        cd.translate.set("lifted", pl.lifted);  // the captured module is the program's lift (gcn::lift_compute_shader)
+        {
+            // The image dimensions the pipeline was made with (with the texel
+            // kind in bits 8-9), for a tool to rebuild its options (gcnlift).
+            json::Value dj = json::Value::make_array();
+            for (const auto& [dim, arrayed] : dims) {
+                json::Value e = json::Value::make_array();
+                e.push(dim);
+                e.push(arrayed);
+                dj.push(e);
+            }
+            cd.translate.set("image_dims", dj);
+        }
         capture_session = capture_dispatch_begin_locked(std::move(cd));
     }
     profile_begin_locked(&pl.name);
@@ -6472,6 +7336,12 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
     profile_end_locked();
+    stamp.to(kDpRecord);
+    // The dispatches by how their shader ran (BBHOST_LIFT_COMPUTE): per
+    // pipeline for the exit report, and in all for the second's detail line.
+    ++pl.dispatches;
+    g.shader_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (pl.lifted) g.lifted_dispatches.fetch_add(1, std::memory_order_relaxed);
     // Buffers the shader writes: the buffer shadow's copies of them are stale
     // from here on. A store whose V# the host cannot find is logged; the
     // shadow's verify mode (BBHOST_SHADOW_VERIFY) finds what it changed.
@@ -6574,6 +7444,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
     if (capture_session) capture_dispatch_finish_locked(std::move(capture_session));
+    stamp.to(kDpAfter);
     return true;
 }
 
@@ -6645,6 +7516,23 @@ std::string host_gpu_profile_report() {
         }
         if (!stats.empty()) host_log("gpu profile stats (k per pair: verts/vs/prims/clip-in/clip-out/fs):%s", stats.c_str());
         g.profile_stats_sum.clear();
+    }
+    {
+        // The game's compute programs (a name of eight hex digits) on lines of
+        // their own, every one of them: the line above lists the top entries
+        // and a log line ends at 1 KiB, so the cheap programs fell off it.
+        std::string line;
+        int listed = 0;
+        for (const auto& e : v) {
+            if (e.first.size() != 8 || e.first.find_first_not_of("0123456789abcdef") != std::string::npos) continue;
+            std::snprintf(buf, sizeof(buf), " %s=%.2fms(%llu)", e.first.c_str(), e.second.first / 1e6, static_cast<unsigned long long>(e.second.second));
+            line += buf;
+            if (++listed % 16 == 0) {
+                host_log("gpu profile compute (since the last):%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) host_log("gpu profile compute (since the last):%s", line.c_str());
     }
     g.profile_ns.clear();
     if (g.profile_gaps) {
@@ -6768,6 +7656,7 @@ void host_gpu_save_pipeline_cache() {
     static std::chrono::steady_clock::time_point last{};
     if (!g.ok || g.cache == VK_NULL_HANDLE) return;
     stage_manifest_save_async(stage_manifest_path());
+    pipeline_manifest_save_async(pipeline_manifest_path());
     translation_cache_save_async(translation_cache_path());
     // Compute pipelines the optimizer built count: they join the cache at a save (merge_side_caches).
     const std::uint64_t pipelines = host_gpu_stats().pipelines + compute_optimized_built();
@@ -6821,6 +7710,7 @@ void host_gpu_save_pipeline_cache_at_exit() {
     }
     save_pipeline_cache_now(path, false);  // the flag stays set: no save after this one
     stage_manifest_save(stage_manifest_path());
+    pipeline_manifest_save(pipeline_manifest_path());
     translation_cache_save(translation_cache_path(), true);
 }
 
@@ -6930,6 +7820,14 @@ const bool g_replay_watch = [] {
     const char* e = std::getenv("BBHOST_ARENA_WATCH");
     return e && e[0] == '1';
 }();
+// BBHOST_ARENA_RETIRE_ORDER (on unless 0): a command-arena chunk's retirement
+// waits for the labels written into its chunk before it in the same fills
+// (flush_deferred_writes_locked); counted at exit.
+const bool g_arena_retire_order = [] {
+    const char* e = std::getenv("BBHOST_ARENA_RETIRE_ORDER");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 
 // Replays the fence writes held back by host_gpu_mem_write at the end of the
 // command buffer, in the order the command processor made them.
@@ -6956,22 +7854,66 @@ void flush_deferred_writes_locked() {
     transfer_flush_locked();
     static std::unordered_map<std::uint64_t, std::size_t> last;  // dword -> index of the last write to it
     static std::unordered_set<std::uint64_t> filled;             // dwords filled since the last barrier
-    last.clear();
-    filled.clear();
     const auto& ws = g.deferred_writes;
-    for (std::size_t i = 0; i < ws.size(); ++i) {
-        for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) last[ws[i].va + k] = i;
+    // A submission's few writes (a label or two, at most 8 bytes each) are
+    // compared with each other directly: the maps' node per dword was an
+    // allocation and a free, at every submission (~1.8% of the command
+    // processor at Mensis). Past kSmall the maps, as before.
+    constexpr std::size_t kSmall = 32;
+    const bool small = ws.size() <= kSmall;
+    std::uint64_t filled_small[2 * kSmall];
+    std::size_t nfilled = 0;
+    if (!small) {
+        last.clear();
+        filled.clear();
+        for (std::size_t i = 0; i < ws.size(); ++i) {
+            for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) last[ws[i].va + k] = i;
+        }
     }
+    // Whether a write after the i-th puts a dword at `at`, as `last` keys them.
+    const auto written_later = [&](std::size_t i, std::uint64_t at) {
+        for (std::size_t j = i + 1; j < ws.size(); ++j) {
+            if (at >= ws[j].va && at < ws[j].va + ws[j].bytes && (at - ws[j].va) % 4 == 0) return true;
+        }
+        return false;
+    };
+    // The command-arena chunks filled into since the last barrier.
+    std::uint64_t filled_chunks[8];
+    int nfilled_chunks = 0;
+    bool filled_chunks_lost = false;
     for (std::size_t i = 0; i < ws.size(); ++i) {
         const Gpu::SmallWrite& w = ws[i];
         bool live = false, clash = false;
         for (std::uint32_t k = 0; k < w.bytes; k += 4) {
-            live |= last[w.va + k] == i;
-            clash |= filled.count(w.va + k) != 0;
+            if (small) {
+                live |= !written_later(i, w.va + k);
+                for (std::size_t f = 0; f < nfilled && !clash; ++f) clash = filled_small[f] == w.va + k;
+            } else {
+                live |= last[w.va + k] == i;
+                clash |= filled.count(w.va + k) != 0;
+            }
         }
         if (!live) continue;
         Located loc;
         if (!locate_range(w.va, w.bytes, loc)) continue;
+        // A command-arena chunk's retirement (its marker's 0) hands the chunk
+        // back to the game, which writes new packets into it at once - a
+        // thread waiting for a chunk takes it the moment it reads 0. Fills
+        // with no barrier between them land in any order, so a label written
+        // into that chunk earlier in this batch (an embedded one: YEBIS's
+        // compute utilities wait on theirs) could land after the 0, on top of
+        // the new packets. The hardware's end-of-pipe events retire in order:
+        // the retirement waits for the fills into its chunk before it.
+        std::uint64_t chunk = 0;
+        const bool in_arena = hle_gx_arena_overlap(w.va, w.bytes, &chunk);
+        if (g_arena_retire_order && in_arena && !clash && w.bytes == 8 && hle_gx_arena_marker(w.va)) {
+            bool earlier = filled_chunks_lost;
+            for (int k = 0; k < nfilled_chunks && !earlier; ++k) earlier = filled_chunks[k] == chunk;
+            if (earlier) {
+                clash = true;
+                g_arena_retires_ordered.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (g_replay_watch) {
             std::uint64_t v = 0;
             std::memcpy(&v, w.data, w.bytes < 8 ? w.bytes : 8);
@@ -6986,6 +7928,9 @@ void flush_deferred_writes_locked() {
             rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
             filled.clear();
+            nfilled = 0;
+            nfilled_chunks = 0;
+            filled_chunks_lost = false;
         }
         std::uint32_t d[2] = {0, 0};
         std::memcpy(d, w.data, w.bytes);
@@ -6994,7 +7939,24 @@ void flush_deferred_writes_locked() {
         } else {
             for (std::uint32_t k = 0; k < w.bytes; k += 4) rec().fill_buffer(loc.buffer, loc.offset + k, 4, d[k / 4]);
         }
-        for (std::uint32_t k = 0; k < w.bytes; k += 4) filled.insert(w.va + k);
+        for (std::uint32_t k = 0; k < w.bytes; k += 4) {
+            if (small) {
+                filled_small[nfilled++] = w.va + k;  // at most two dwords a write, kSmall writes
+            } else {
+                filled.insert(w.va + k);
+            }
+        }
+        if (in_arena) {
+            bool known = false;
+            for (int k = 0; k < nfilled_chunks && !known; ++k) known = filled_chunks[k] == chunk;
+            if (!known) {
+                if (nfilled_chunks < 8) {
+                    filled_chunks[nfilled_chunks++] = chunk;
+                } else {
+                    filled_chunks_lost = true;  // more than eight: every retirement after them is ordered
+                }
+            }
+        }
     }
     g.deferred_writes.clear();
 }
@@ -7047,7 +8009,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
             const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + off;
             const std::uint64_t chunk = phys >> gcn::kDmemChunkShift;
             const std::uint64_t in = phys & (kChunkBytes - 1);
-            const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes) : nullptr;
+            const int who = t_import_who;
+            t_import_who = kIwAddress;
+            const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes, true) : nullptr;
+            t_import_who = who;
             return c ? c->address + (in - c->lo) : 0;
         }
         auto it = g.anon_imports.find(mi.va);
@@ -7064,7 +8029,46 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
-std::size_t host_gpu_shader_backlog() { return gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0; }
+void host_gpu_set_compile_session(bool on) {
+    gpu::g_compile_session.store(on);
+    gpu::hlsl_set_inline(on);
+}
+HostShaderCompileProgress host_gpu_compile_progress() {
+    HostShaderCompileProgress p;
+    gpu::compile_session_progress(p.total, p.done, p.failed, p.listed, p.finished, p.reasons, p.recipes_total, p.recipes_done);
+    return p;
+}
+void host_gpu_compile_cancel() { gpu::compile_session_cancel(); }
+std::string host_gpu_device_identity() {
+    using namespace gpu;
+    if (!g.phys) return {};
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    char uuid[2 * VK_UUID_SIZE + 1] = {};
+    for (std::uint32_t k = 0; k < VK_UUID_SIZE; ++k) std::snprintf(uuid + 2 * k, 3, "%02x", props.pipelineCacheUUID[k]);
+    char buf[384];
+    std::snprintf(buf, sizeof(buf), "%08x:%08x:%08x:%s %s", props.vendorID, props.deviceID, props.driverVersion, uuid, props.deviceName);
+    return buf;
+}
+std::size_t host_gpu_shader_backlog() {
+    return (gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0) + gpu::shader_sweep_left();
+}
+
+void host_gpu_resources_report() {
+    std::string r;
+    {
+        std::lock_guard<GpuMutex> lock(g.mu);
+        if (!g.ok) return;
+        r = gpu::textures_census_window_locked();
+    }
+    for (std::size_t at = 0; at < r.size();) {
+        const std::size_t nl = r.find('\n', at);
+        const std::string line = r.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        host_log("  %s", line.c_str() + (line.rfind("  ", 0) == 0 ? 2 : 0));
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
+}
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
@@ -7245,7 +8249,7 @@ bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std
     if (!g.ok || !bytes) return false;
     hle_gnm_warn_if_command_buffer("fill token", va, bytes);
     const bool on_rt = find_render_target(va) != nullptr;
-    if (mark_surfaces_dirty_locked(va, bytes) || on_rt) {
+    if (mark_surfaces_dirty_locked(va, bytes, false) || on_rt) {
         tex_event(va, bytes, "fill token 0x%llx 0x%zx bytes with %g %g %g %g%s", static_cast<unsigned long long>(va), bytes, rgba[0],
                   rgba[1], rgba[2], rgba[3], on_rt ? " (render target)" : "");
     }
@@ -7268,13 +8272,17 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c) {
     return g.ok && textures_copy_image_region_locked(c);
 }
 
-bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8]) {
+bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    return g.ok && textures_create_ahead_locked(tsharp);
+    return g.ok && textures_create_ahead_locked(tsharp, gen);
 }
 
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted) {
-    textures_retire(base, bytes, after_submitted);  // its own lock: callable from the kernel's unmap
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
+    textures_retire(base, bytes, after_submitted, gen);  // its own lock: callable from the kernel's unmap
+}
+
+void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
+    textures_gx_written(base, bytes);  // its own lock, as the retirement's
 }
 
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
@@ -7378,8 +8386,11 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
-    const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-    if (render_copy_target_locked(src, dst, bytes, "copy token")) {
+    // Copied image to image, the guest memory is not written: the surfaces
+    // over it are not marked (mark_surfaces_dirty_locked's memory_written).
+    const bool as_image = render_copy_target_locked(src, dst, bytes, "copy token");
+    const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image, "copy token");
+    if (as_image) {
         tex_event(dst, bytes, "copy token 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image",
                   static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
         g_guest_copy_targets.fetch_add(1, std::memory_order_relaxed);
@@ -7501,6 +8512,13 @@ void copy_versions_put_in_place_locked(int why) {
     copy_versions_flush_locked();
 }
 
+bool copy_versions_name_buffer_locked(VkBuffer buffer) {
+    for (const CopyVersion& v : g_copy_versions) {
+        if (v.canon.buffer == buffer) return true;
+    }
+    return false;
+}
+
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
     if (g_copy_versions.empty() || !bytes) return kCopyVersionNone;
     const CopyVersion* v = copy_version_over(base, bytes);
@@ -7529,8 +8547,8 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     // costs nothing more, and a later transfer of the batch could read it.
     if (!g_copy_versions_mode || (g_copy_versions_mode == 1 && !render_pass_open_locked()) || g.in_transfer) return false;
     const auto refuse = [](int why) {
-        g_cv_refused.fetch_add(1, std::memory_order_relaxed);
-        g_cv_refused_why[why].fetch_add(1, std::memory_order_relaxed);
+        bump(g_cv_refused);
+        bump(g_cv_refused_why[why]);
         return false;
     };
     if (!bytes || bytes > kCopyVersionMax || ((dst | src | bytes) & 3)) return refuse(kCvSize);
@@ -7547,7 +8565,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if (const CopyVersion* v = copy_version_over(src, bytes)) {
         if (src < v->dst || src + bytes > v->dst + v->bytes) return refuse(kCvSource);
         from = static_cast<const std::uint8_t*>(v->copy.map) + (src - v->dst);
-        g_cv_from_version.fetch_add(1, std::memory_order_relaxed);
+        bump(g_cv_from_version);
     }
     CopyVersion v;
     v.dst = dst;
@@ -7557,7 +8575,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     std::memcpy(v.copy.map, from, bytes);
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     copy_version_add(v);
-    g_cv_made.fetch_add(1, std::memory_order_relaxed);
+    bump(g_cv_made);  // not a locked add: that waits for the copy to leave the write-combining buffers
     return true;
 }
 
@@ -7583,7 +8601,7 @@ void copy_versions_flush_locked() {
     std::size_t copies = 0;
     for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
         const CopyVersion& v = *it;
-        mark_surfaces_dirty_locked(v.dst, v.bytes);  // the buffer shadow sees the GPU write
+        mark_surfaces_dirty_locked(v.dst, v.bytes, true, "copy version");  // the buffer shadow sees the GPU write
         const std::uint64_t end = v.dst + v.bytes;
         auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
             const VkBufferCopy region{v.offset + (lo - v.dst), v.canon.offset + (lo - v.dst), hi - lo};
@@ -7627,8 +8645,8 @@ std::string copy_versions_report() {
                   "copy versions: %llu made (%llu read an earlier one), %llu bindings took one, %llu bindings across one's edge, "
                   "%llu copies refused (size %llu, surfaces %llu, targets %llu, not imported %llu, source %llu, other %llu); "
                   "%llu copies into place in %llu batches (%llu versions all overwritten by newer ones), of them early for a binding "
-                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu; %llu transfers waited for an earlier one in "
-                  "their batch",
+                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu; %llu transfers waited "
+                  "for an earlier one in their batch",
                   static_cast<ull>(g_cv_made.load()), static_cast<ull>(g_cv_from_version.load()), static_cast<ull>(g_cv_bound.load()),
                   static_cast<ull>(g_cv_straddled.load()), static_cast<ull>(g_cv_refused.load()), static_cast<ull>(g_cv_refused_why[kCvSize].load()),
                   static_cast<ull>(g_cv_refused_why[kCvSurfaces].load()), static_cast<ull>(g_cv_refused_why[kCvTarget].load()),
@@ -7636,7 +8654,7 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_refused_why[kCvOther].load()), static_cast<ull>(g_cv_copies.load()),
                   static_cast<ull>(g_cv_batches.load()), static_cast<ull>(g_cv_overwritten.load()), static_cast<ull>(g_cv_put[kCvStraddle].load()),
                   static_cast<ull>(g_cv_put[kCvPageTable].load()), static_cast<ull>(g_cv_put[kCvWalks].load()),
-                  static_cast<ull>(g_batch_orders.load()));
+                  static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_batch_orders.load()));
     return b;
 }
 }  // namespace gpu
@@ -7649,6 +8667,16 @@ bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes)
         if (copy_version_make_locked(dst, src, bytes)) return true;
     }
     return host_gpu_copy_guest(dst, src, bytes);
+}
+
+std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return 0;
+    std::size_t i = 0;
+    for (; i < n; ++i) {
+        if (bytes[i] && !copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+    }
+    return i;
 }
 
 std::uint64_t host_gpu_work_needs() {
@@ -7703,6 +8731,45 @@ void host_gpu_report() {
         return;
     }
     {
+        // Guest memory the GPU reaches as imports: how much, made by what, and
+        // with window imports what replaced what and what the prefetch did.
+        std::uint64_t live = 0, flex = 0;
+        std::size_t nlive = 0;
+        {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            for (const DmemChunk& d : g.dmem) {
+                for (const auto& c : d.imports) live += c->size;
+                nlive += d.imports.size();
+            }
+            for (const auto& kv : g.anon_imports) flex += kv.second.size;
+        }
+        using ull = unsigned long long;
+        const auto mib = [](const std::atomic<std::uint64_t>& v) { return static_cast<ull>(v.load() >> 20); };
+        host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
+                 "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
+                 "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
+                 g_import_whole ? "whole spans" : "by window, BBHOST_IMPORT_WINDOWS=1", static_cast<ull>(g_imports_made.load()),
+                 mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
+                 mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),
+                 static_cast<ull>(g_import_who_n[kIwWalk].load()), mib(g_import_who_bytes[kIwWalk]),
+                 static_cast<ull>(g_import_who_n[kIwPrefetch].load()), mib(g_import_who_bytes[kIwPrefetch]),
+                 static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
+                 static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
+                 static_cast<ull>(flex >> 20));
+        if (!g_import_whole) {
+            host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
+                     "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
+                     "(their walks reach what nothing imports for them)",
+                     static_cast<ull>(g_pf_asked.load()), static_cast<ull>(g_pf_known.load()), static_cast<ull>(g_pf_checked.load()),
+                     static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
+                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
+        }
+    }
+    {
+        // Before the census lock: compute_lift_report takes g.mu, and a
+        // dispatch takes the census lock under g.mu (host_gpu_dispatch) -
+        // the other order hung a timed exit with the CP still dispatching.
+        const std::string lift = compute_lift_report();
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         std::vector<std::pair<std::uint64_t, std::string>> by_count;
         for (const auto& [n, c] : g_dispatch_census) by_count.emplace_back(c, n);
@@ -7711,6 +8778,10 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_dispatch_image_blits.load()),
                  static_cast<unsigned long long>(g_dispatch_buf_to_image.load()));
         host_log("gpu: %s", indirect_clamp_report().c_str());
+        host_log("gpu: command-arena chunk retirements that came after a label into their own chunk in the same unordered "
+                 "fills, given a barrier ahead of the marker's 0: %llu",
+                 static_cast<unsigned long long>(g_arena_retires_ordered.load()));
+        host_log("gpu: %s", lift.c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
                  static_cast<unsigned long long>(g_dispatch_shaders.load()), g_dispatch_census.size(),
@@ -7718,6 +8789,11 @@ void host_gpu_report() {
         for (std::size_t k = 0; k < by_count.size() && k < 16; ++k) {
             host_log("gpu:   %8llu %s", static_cast<unsigned long long>(by_count[k].first), by_count[k].second.c_str());
         }
+    }
+    if (const std::uint64_t n = g_cs_records_built.load() + g_cs_records_failed.load()) {
+        host_log("gpu: dispatch tokens with compute records: %llu, user data built from them %llu, not built (the token's kept) %llu",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_cs_records_built.load()),
+                 static_cast<unsigned long long>(g_cs_records_failed.load()));
     }
     if (host_gpu_gds_counters()) {
         host_log("gpu: GDS counters: %llu dispatches counted in bound words, %llu counted in GDS with none bound; %llu counts set and %llu copied "

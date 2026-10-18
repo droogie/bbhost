@@ -1,14 +1,18 @@
 // gcn2spv: translate shaders from From's bundles to SPIR-V and validate them.
 //
-//   gcn2spv --check <bundle.dcx>...          translate + validate every shader
+//   gcn2spv --check <bundle.dcx>...          translate + validate every shader, and lift + validate every
+//                                            compute shader (gcn::lift_compute_shader, the dispatch's options)
 //   gcn2spv <bundle.dcx> <name-substr> [out.spv]   translate matching entries (prints errors, writes the first)
 //   gcn2spv --raw <code.bin> <vs|ps|cs|ls|ds[:level]> <rsrc1> <rsrc2> [fetch.bin] [out.spv]
+//                                            (cs: threads:<x>x<y>x<z> as the dispatch's, and the compute
+//                                            lift is made too - lifted:<out.spv> writes it)
 //                                            a program saved from guest memory (BBHOST_TESS_PROBE's tmp/tess/*.bin):
 //                                            ls = LS as the tessellation compute pass, ds = domain shader as a vertex stage;
 //                                            tri:<window hex> for a triangle patch of 3 with its own LDS window (hs, tes, ls)
 #include "gcn/container.h"
 #include "gcn/half.h"
 #include "gcn/isa.h"
+#include "gcn/lift.h"
 #include "gcn/translate.h"
 
 #include <spirv-tools/libspirv.hpp>
@@ -179,10 +183,15 @@ int main(int argc, char** argv) {
             o.domain_level = stage.size() > 3 ? static_cast<std::uint32_t>(std::atoi(stage.c_str() + 3)) : 1;
         } else o.stage = gcn::Stage::Vertex;
         const char* out = nullptr;
+        std::string lifted_out;
         gcn::Program fetch;
         for (int a = 6; a < argc; ++a) {
             const std::string arg = argv[a];
-            if (arg.rfind("tri:", 0) == 0) {
+            if (arg.rfind("threads:", 0) == 0) {
+                std::sscanf(arg.c_str() + 8, "%ux%ux%u", &o.cs_threads[0], &o.cs_threads[1], &o.cs_threads[2]);
+            } else if (arg.rfind("lifted:", 0) == 0) {
+                lifted_out = arg.substr(7);
+            } else if (arg.rfind("tri:", 0) == 0) {
                 // The game's own hull (the Forbidden Woods' meshes): a
                 // triangle domain, three control points, a window a patch.
                 o.tess_quads = false;
@@ -209,12 +218,31 @@ int main(int argc, char** argv) {
                 std::fclose(f);
             }
         }
-        return r.ok() && v.empty() ? 0 : 1;
+        bool lift_ok = true;
+        if (o.stage == gcn::Stage::Compute && o.tess_role == gcn::TranslateOptions::TessRole::None && r.ok()) {
+            const gcn::LiftResult l = gcn::lift_compute_shader(p, o, r);
+            if (l.ok()) {
+                const std::string lv = validate(l.spirv);
+                std::printf("  compute lift: %zu words, %s\n", l.spirv.size(), lv.empty() ? "valid" : ("INVALID: " + lv).c_str());
+                lift_ok = lv.empty();
+                if (!lifted_out.empty()) {
+                    if (FILE* f = std::fopen(lifted_out.c_str(), "wb")) {
+                        std::fwrite(l.spirv.data(), 4, l.spirv.size(), f);
+                        std::fclose(f);
+                    }
+                }
+            } else {
+                std::printf("  compute lift rejected: %s\n", l.rejections.empty() ? "no module" : l.rejections[0].c_str());
+            }
+        }
+        return r.ok() && v.empty() && lift_ok ? 0 : 1;
     }
     if (std::string(argv[1]) == "--check") {
         std::size_t shaders = 0, translated = 0, valid = 0;
+        std::size_t cs = 0, cs_lifted = 0, cs_lift_valid = 0;
         std::map<std::string, std::size_t> errors;
         std::map<std::string, std::size_t> val_errors;
+        std::map<std::string, std::size_t> cs_rejections, cs_lift_invalid;
         for (int a = 2; a < argc; ++a) {
             std::vector<gcn::BundleEntry> entries;
             if (!load_bundle(argv[a], entries)) return 1;
@@ -240,12 +268,33 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 ++valid;
+                if (h.stage != gcn::Stage::Compute) continue;
+                // The compute lift against the translation it replaces (the
+                // renderer's options: gcn/lift.h lift_compute_shader).
+                ++cs;
+                const gcn::LiftResult l = gcn::lift_compute_shader(p, options_for(h), r);
+                if (!l.ok()) {
+                    std::string key = l.rejections.empty() ? std::string("no module") : l.rejections[0];
+                    if (key.size() > 8 && key[6] == ':') key = key.substr(8);
+                    if (cs_rejections[key]++ == 0) std::printf("first compute lift rejection: %s: %s\n", e.name.c_str(), l.rejections[0].c_str());
+                    continue;
+                }
+                ++cs_lifted;
+                const std::string lv = validate(l.spirv);
+                if (!lv.empty()) {
+                    if (cs_lift_invalid[lv.substr(0, 200)]++ == 0) std::printf("first invalid compute lift: %s: %s\n", e.name.c_str(), lv.c_str());
+                    continue;
+                }
+                ++cs_lift_valid;
             }
         }
         std::printf("shaders=%zu translated=%zu valid=%zu\n", shaders, translated, valid);
+        std::printf("compute shaders=%zu lifted=%zu lift_valid=%zu\n", cs, cs_lifted, cs_lift_valid);
         for (const auto& [k, n] : errors) std::printf("  translate: %-60s x%zu\n", k.c_str(), n);
         for (const auto& [k, n] : val_errors) std::printf("  validate:  %-60s x%zu\n", k.c_str(), n);
-        return valid == shaders ? 0 : 1;
+        for (const auto& [k, n] : cs_rejections) std::printf("  compute lift rejected: %-60s x%zu\n", k.c_str(), n);
+        for (const auto& [k, n] : cs_lift_invalid) std::printf("  compute lift invalid:  %-60s x%zu\n", k.c_str(), n);
+        return valid == shaders && cs_lift_valid == cs_lifted ? 0 : 1;
     }
     std::vector<gcn::BundleEntry> entries;
     if (!load_bundle(argv[1], entries)) return 1;

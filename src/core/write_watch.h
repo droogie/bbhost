@@ -1,7 +1,9 @@
 #pragma once
 
 // Write tracking for guest memory the host keeps a copy of: the texture
-// cache's surfaces. A surface's pages are made read-only when it is uploaded,
+// cache's surfaces that no GX texture holds (a GX texture's changes come
+// through GX itself: host/textures.cpp, by_identity) and the buffer shadow's
+// vertex and index pages. A surface's pages are made read-only when it is uploaded,
 // the first write to one of them faults, and the fault makes that page
 // writable again and records that it was written. The next bind of the
 // surface sees the written page and uploads it again - on the next frame,
@@ -45,9 +47,14 @@
 
 bool write_watch_enabled();
 
+// Who arms a watch: the pages it protects are tagged with it, so the faults
+// and releases they take are counted by owner (write_watch_stats).
+enum : std::uint8_t { kWatchOwnerTexture = 1, kWatchOwnerMirror = 2 };
+
 struct WriteWatch {
     std::uint32_t armed = 0;  // the sequence at arming; 0 when not armed
     std::uint64_t seen = 0;   // the change count at the last check
+    std::uint8_t owner = 0;   // kWatchOwner*, set by the owner before arming
 };
 
 // Protects [va, va+len)'s pages read-only. Called by hle_kernel_write_watch,
@@ -111,5 +118,11 @@ void write_watch_describe(std::uint64_t va, std::size_t len, const WriteWatch& w
 struct WriteWatchStats {
     std::uint64_t arms = 0, faults = 0, releases = 0, forgets = 0, refused = 0;
     std::uint64_t ahead_pages = 0;  // pages a fault released past its own (a streaming writer's)
+    // By the owners that armed the page ([kWatchOwnerTexture], [kWatchOwnerMirror],
+    // [3] both, [0] none recorded): faults, pages a release made writable, arms.
+    std::uint64_t faults_by_owner[4] = {}, released_pages_by_owner[4] = {}, arms_by_owner[4] = {};
+    // Time the fault handler spent in its own work (the page's mprotect
+    // included, the kernel's signal delivery not), and arming's mprotects, ns.
+    std::uint64_t fault_handler_ns = 0, arm_ns = 0;
 };
 WriteWatchStats write_watch_stats();

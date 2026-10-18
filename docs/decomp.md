@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 31 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 54 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
-| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **152** |
-| With any code byte changed (including byte patches and redirected calls) | 173; 255 at 60 fps |
+| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 121 |
+| **Taken over in all** | **179** |
+| With any code byte changed (including byte patches and redirected calls) | 202; 284 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -177,6 +177,34 @@ the game's code turning it by the same counts as ours.
 |---|---|---|---|
 | flush wait (`sub_15d7030`) | `0x15d7030` | the render thread's wait for the GPU to finish a flush | the same condition, yielding the core instead of spinning on it |
 | GX table reclaim (`sub_2aaa860`) | `0x2aaa860` | frees the GX layer's blocks of draw resource tables once the GPU is done with them | the same walk as the game's, plus a wait when a pool runs empty (which used to fail an allocation and black out a frame) |
+| pipeline drain (`gx_command_buffer_wait_for_eop`) | `0x2ab09e0` | makes the GPU wait for the work before (a label, an end-of-pipe event and a wait) | written as a barrier token for the command processor instead, which orders its own writes behind it; the same command buffer read and refilled the same way as the game's version, beside it on test buffers (`decomp_gx_drain_token`) |
+| occlusion query (`gnm_write_occlusion_query`) | `0x1477660` | an occlusion query's begin or end: the block reset, a wait, the counter dumps | written as one query token instead, taken as the renderer's own query; checked in the game by the queries it makes |
+| the Gnm packet writers nothing reads (21, below) | `0x1472ed0`-`0x148b610` | each makes room for one packet, writes it and moves the write pointer | twenty written as nothing by default, `prepareFlip`'s reservation as the game's; writing the game's packet, 420,000 generated cases against the game's own code - every byte of both chunks, the write pointer, the return value and the refill's calls - 0 differences (`decomp_gx_dead_packets`); `BBHOST_DECOMP_COMPARE=1` checks every call the game makes: 7.6 million in a three-place session, 0 differences |
+
+The 21 packet writers (`gx/dead_packets.cpp`) are Gnm's own: the four
+`ACQUIRE_MEM` cache actions (`gnm_acquire_mem_range`, `dcb_acquire_mem`,
+`gnm_compute_acquire_mem_range`, `gnm_compute_acquire_mem`), fifteen
+context-register writers (the multi-sample sample locations, centroid priority
+and configuration, the depth-stencil disable, the blend constants, alpha to
+mask, the scratch ring size, the screen offset, the guard band's two
+adjustments, the instance step rates, the pixel shader's input table, the
+vertex rounding and the line width), the shader prefetch's `DMA_DATA` and
+`prepareFlip`'s room for the console's flip packets. Every draw is a host token
+carrying its own state, the renderer orders its work with Vulkan barriers and
+the flip is bbhost's, so nothing on the host reads those packets: by default
+ours writes nothing for twenty of them and returns the write pointer, the
+address no caller reads (`BBHOST_CP_DEAD_PACKETS=2` returns one no caller could
+follow instead, a check; `=0` writes the game's packets;
+`BBHOST_CP_DEAD_KEEP=<places>` keeps chosen ones writing, by their place in the
+table). The context-register writers write theirs while the command processor
+keeps a register file (its shadow and packet-path modes). `prepareFlip`'s
+reservation writes the game's 64-dword NOP all the same: it changes where a
+frame's command buffer ends in its chunk, and without it the flips settled
+into a jittery pacing more often and Fishing Hamlet missed a refresh every
+3-4 seconds. Over the 12-place tour the game calls the twenty about 31 million
+times: 96.9M dwords of cache actions and 95.3M of context registers the
+command processor no longer walks. As source, each is also where a host
+command can take the packet's place.
 
 ### Memory (`src/decomp/memory/`)
 

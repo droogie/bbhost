@@ -8,6 +8,7 @@
 #include "engine/yebis_bind.h"
 #include "host/frame_stats.h"
 #include "hle/modules.h"
+#include "engine/gx_resources.h"
 #include "host/gpu.h"
 
 #include <atomic>
@@ -24,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
@@ -111,15 +113,22 @@ bool cp_draw_packets() {
     }();
     return v;
 }
-// The dispatch packets run unless the dispatches come from tokens instead.
+// Dispatch packets run from the compute registers. With dispatch tokens
+// (hle_gx_dispatch_native) a dispatch the hooks took writes no packet, so a
+// packet that still arrives is one they left (gx-dispatch's fallbacks by
+// reason) and runs as before. BBHOST_CP_DISPATCH_PACKETS=0 drops them
+// instead, and the command processor keeps no compute registers (checks).
 bool cp_dispatch_packets() {
     static const bool v = [] {
         const char* e = std::getenv("BBHOST_CP_DISPATCH_PACKETS");
-        return (e && e[0] == '1') || !hle_gx_dispatch_native();
+        return !(e && e[0] == '0');
     }();
     return v;
 }
 std::atomic<std::uint64_t> g_dispatch_packets_dropped[2] = {};
+// Dispatch packets run from the register file while dispatches come from
+// their tokens: the fallbacks, direct and indirect.
+std::atomic<std::uint64_t> g_dispatch_fallbacks[2] = {};
 enum DroppedDraw { kDropIndex2, kDropAuto, kDropOffset2, kDropIndirect, kDropIndexIndirect, kDroppedDraws };
 const char* const kDroppedDrawName[kDroppedDraws] = {"DRAW_INDEX_2", "DRAW_INDEX_AUTO", "DRAW_INDEX_OFFSET_2", "DRAW_INDIRECT",
                                                      "DRAW_INDEX_INDIRECT"};
@@ -133,7 +142,9 @@ bool drop_draw_packet(DroppedDraw kind, std::uint32_t count) {
     }
     return true;
 }
-thread_local std::uint32_t t_cs_writers[32] = {};  // checks: per compute user-data slot, the last SET_SH_REG header and the marker before it
+thread_local std::uint64_t t_cb_lo = 0, t_cb_hi = 0;  // the command buffer the walker is in (see defer_if_in_command_buffer)
+thread_local GpuDispatchWriters t_cs_writers;  // checks: per compute user-data slot, the packet that last wrote it
+thread_local bool t_in_ce = false;  // the packet being executed is the constant engine's
 thread_local std::uint64_t t_index_base = 0;
 thread_local std::uint32_t t_index_size = 0;
 thread_local std::uint32_t t_index_type = 0;
@@ -174,6 +185,14 @@ std::atomic<std::uint64_t> g_resyncs{0};       // PM4 walk re-locks
 // reach (its bytes are not on the CPU yet). BBHOST_CP_DMA_ORDER=0: as walked.
 thread_local std::uint64_t t_cp_writes_need = 0;  // submissions that must have run before the CP writes memory on the CPU (0: none)
 std::atomic<std::uint64_t> g_cp_writes{0}, g_cp_writes_waited{0}, g_cp_writes_wait_us{0}, g_cp_writes_timeline{0};
+// A GX pipeline drain's barrier token (decomp/gx/drain_token.cpp) was walked:
+// the wait it stands for - the drain's label, end-of-pipe event and
+// WAIT_REG_MEM, which the wait passed on the recorded label - so what the
+// CP writes itself after it goes behind the work recorded before it, as after
+// any passed wait. The submissions that covers are asked for only when such a
+// write comes (cp_writes_need_gpu): the token itself costs one store.
+thread_local bool t_barrier_pending = false;
+std::atomic<std::uint64_t> g_barrier_tokens{0};
 
 bool cp_dma_order_on() {
     static const bool on = [] {
@@ -185,6 +204,10 @@ bool cp_dma_order_on() {
 
 // Whether a CP write here has to come after recorded GPU work still to run.
 bool cp_writes_need_gpu() {
+    if (t_barrier_pending) {
+        t_barrier_pending = false;
+        if (cp_dma_order_on()) t_cp_writes_need = std::max(t_cp_writes_need, host_gpu_work_needs());
+    }
     if (!cp_dma_order_on() || !t_cp_writes_need) return false;
     if (host_gpu_submissions_completed() >= t_cp_writes_need) {
         t_cp_writes_need = 0;
@@ -224,7 +247,32 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
 }
 
 void bind_gds_counters(GpuDispatch& d);
+void note_counter_given(std::uint64_t word);
 void note_gpu_args(std::uint64_t va, std::size_t bytes);
+// BBHOST_CP_CENSUS=1: the clears and copies still reaching the command
+// processor as packets - each dispatch by what it was and who emitted it, and
+// each DMA_DATA by kind (defined with the packet census below).
+extern const bool g_cp_census;
+void census_dispatch(std::uint64_t packet_va);
+// BBHOST_GX_COUNT_COPIES: GX's CopyStructureCount as a token (gx_trace.cpp
+// native_count_copy): the copy of a UAV's count word, made at the token as
+// the DMA_DATA packet's was; in its check mode the packet that follows is
+// compared with the token.
+struct CountCheck {
+    bool active = false;
+    std::uint64_t dst = 0, src = 0;
+};
+thread_local CountCheck t_count_check;
+std::atomic<std::uint64_t> g_cc_gpu{0}, g_cc_cpu{0}, g_cc_lost{0}, g_cc_same{0}, g_cc_differ{0}, g_cc_no_packet{0};
+void cp_count_copy(std::uint64_t dst, std::uint64_t src);
+enum CensusDma { kCdFillTarget, kCdFillResource, kCdFillMemory, kCdCopyResource, kCdCopy, kCdRegister, kCdGds, kCdCounter, kCdKinds };
+void census_dma(CensusDma kind, std::size_t bytes);
+// The top-level command buffer being walked is a snapshot of the guest's
+// (BBHOST_CP_COPY): where its packets were written, for the emitter lookups.
+thread_local std::uint64_t t_top_snap_lo = 0, t_top_snap_hi = 0, t_top_guest_lo = 0;
+std::uint64_t census_guest_va(std::uint64_t va) {
+    return va >= t_top_snap_lo && va < t_top_snap_hi ? va - t_top_snap_lo + t_top_guest_lo : va;
+}
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -243,21 +291,43 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     note_gpu_args(indirect_va, 12);
     d.depth_clear = t_regs.ctx[0x0B];
     d.stencil_clear = t_regs.ctx[0x0A];
-    // A dispatch token in shadow mode: this packet is the dispatch it described.
-    if (hle_gx_dispatch_pending()) hle_gx_dispatch_check(d, t_cs_writers);
+    // A dispatch token in shadow mode: this packet is the dispatch it
+    // described. Compared once the dispatch has run, whose pipeline says which
+    // user data the program reads (0xffff: not known - not run).
+    struct ShadowCheck {
+        const GpuDispatch* d = nullptr;
+        std::uint32_t reads = 0xffff;
+        ~ShadowCheck() {
+            if (d) hle_gx_dispatch_check(*d, &t_cs_writers, reads);
+        }
+    } shadow;
+    if (hle_gx_dispatch_pending()) {
+        t_cs_writers.dispatch_packet = t_packet_va;
+        t_cs_writers.dispatch_buffer = t_cb_lo;
+        d.want_user_reads = true;
+        shadow.d = &d;
+    }
     if (!cp_dispatch_packets()) {
         if (g_dispatch_packets_dropped[indirect_va ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 4) {
-            host_log("cp: %s %ux%ux%u at flip %llu not run: every dispatch is a token and the register file is not kept "
-                     "(BBHOST_CP_DISPATCH_PACKETS=1 runs it)", kind, x, y, z, static_cast<unsigned long long>(hle_video_flip_count()));
+            host_log("cp: %s %ux%ux%u at flip %llu not run: BBHOST_CP_DISPATCH_PACKETS=0 drops the dispatch packets", kind, x, y, z,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
         }
         return;
+    }
+    if (hle_gx_dispatch_native() && g_dispatch_fallbacks[indirect_va ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 4) {
+        host_log("cp: %s %ux%ux%u of program 0x%llx at flip %llu runs from its packet and the register file: no token was made for it "
+                 "(gx-dispatch: fallbacks by reason)",
+                 kind, x, y, z, static_cast<unsigned long long>(d.code_va), static_cast<unsigned long long>(hle_video_flip_count()));
     }
     g_dispatches.fetch_add(1);
     hle_gx_trace_dispatch(t_packet_op, t_packet_va, x, sh[0x20C]);
     if ((!x || !y || !z) && !indirect_va) return;
     if (!d.threads[0]) return;
     bind_gds_counters(d);
-    if (!host_gpu_dispatch(d)) {
+    const bool ran = host_gpu_dispatch(d);
+    if (shadow.d) shadow.reads = host_gpu_dispatch_user_reads();
+    if (g_cp_census) census_dispatch(census_guest_va(t_packet_va));
+    if (!ran) {
         g_dispatch_failed.fetch_add(1);
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 6) {
@@ -427,6 +497,28 @@ const bool g_exec_cost = [] {
     const char* e = std::getenv("BBHOST_GX_COST");
     return e && std::atoi(e) != 0;
 }();
+// BBHOST_GX_COST: the command processor's time per dispatch, from the packet
+// (or token) to the dispatch handed to the renderer and back: [0] a dispatch
+// packet run from the register file, [1] a dispatch token.
+// The ones over a millisecond (a pipeline built, the page tables made anew)
+// are counted apart, so the rest's average is the steady cost.
+std::atomic<std::uint64_t> g_cp_dispatch_ns[2] = {}, g_cp_dispatch_n[2] = {}, g_cp_dispatch_slow_ns[2] = {}, g_cp_dispatch_slow_n[2] = {};
+struct CpDispatchTimer {
+    int path;
+    std::chrono::steady_clock::time_point t0;
+    explicit CpDispatchTimer(int p) : path(p), t0(g_exec_cost ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~CpDispatchTimer() {
+        if (!g_exec_cost) return;
+        const auto ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_cp_dispatch_ns[path].fetch_add(ns, std::memory_order_relaxed);
+        g_cp_dispatch_n[path].fetch_add(1, std::memory_order_relaxed);
+        if (ns > 1000000) {
+            g_cp_dispatch_slow_ns[path].fetch_add(ns, std::memory_order_relaxed);
+            g_cp_dispatch_slow_n[path].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
 std::atomic<std::uint64_t> g_token_nops{0};  // NOPs that were host-draw tokens (BBHOST_GX_NATIVE)
 std::atomic<std::uint64_t> g_copy_nops{0};   // NOPs that were copy tokens (BBHOST_GX_NATIVE_COPIES)
 std::atomic<std::uint64_t> g_exec_dwords{0};  // dwords of the packets executed, headers included
@@ -529,8 +621,11 @@ void note_arena_write(std::uint64_t va, std::uint64_t value, std::size_t n) {
     }
 }
 
-void record(std::uint64_t va, const void* src, std::size_t n) {
-    host_gpu_shadow_cp_write(va, n);
+// shadow: tell the buffer shadow the CP wrote here; false when the write went
+// through host_gpu_mem_write_serial / _ordered, which told it already (under
+// the renderer's lock, which this would take a second time).
+void record(std::uint64_t va, const void* src, std::size_t n, bool shadow = true) {
+    if (shadow) host_gpu_shadow_cp_write(va, n);
     std::uint64_t v = 0;
     std::memcpy(&v, src, n > 8 ? 8 : n);  // bytes keeps the full extent
     if (g_arena_monitor) {
@@ -663,12 +758,11 @@ const std::uint64_t g_trace_label = [] {
 }();
 std::atomic<std::uint64_t> g_trace_label_writes{0};
 
-// The command buffer the walker is in. The engine reserves its fences *inside*
+// The command buffer the walker is in (t_cb_lo, t_cb_hi). The engine reserves its fences *inside*
 // the command buffer - legal on hardware, where the CP has long since fetched
 // past them by the time the event retires - so writing one while we are still
 // walking would rewrite packets we have not read yet. Those writes are held
 // back and applied when the walk finishes.
-thread_local std::uint64_t t_cb_lo = 0, t_cb_hi = 0;
 struct DeferredWrite {
     std::uint64_t va;
     std::uint64_t value;
@@ -774,9 +868,30 @@ void warn_if_over_command_buffer(const char* what, std::uint64_t va, std::size_t
 
 // Which addresses the CP writes, and which ones a WAIT_REG_MEM gave up on.
 // A fence the game waits for and nobody writes is the shape of the world-load
-// hang, and the pair of these two maps names it.
+// hang, and the pair of these two names it. The writes are counted in a
+// direct-mapped table without a lock - every label goes through here, ~4.5M
+// over the 12-place tour, and a map under a mutex was a fifth of a label's
+// cost; an address another one evicted reads 0, which the hang report says.
+struct WrittenSlot {
+    std::atomic<std::uint64_t> va{0}, count{0};
+};
+constexpr unsigned kWrittenBits = 13;
+WrittenSlot g_written[1u << kWrittenBits];
+inline WrittenSlot& written_slot(std::uint64_t va) { return g_written[((va >> 2) * 0x9e3779b97f4a7c15ull) >> (64 - kWrittenBits)]; }
+inline void note_written_addr(std::uint64_t va) {
+    WrittenSlot& w = written_slot(va);
+    if (w.va.load(std::memory_order_relaxed) != va) {
+        w.va.store(va, std::memory_order_relaxed);
+        w.count.store(1, std::memory_order_relaxed);
+    } else {
+        w.count.store(w.count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+}
+std::uint64_t written_count(std::uint64_t va) {
+    const WrittenSlot& w = written_slot(va);
+    return w.va.load(std::memory_order_relaxed) == va ? w.count.load(std::memory_order_relaxed) : 0;
+}
 std::mutex g_addr_mu;
-std::map<std::uint64_t, std::uint64_t> g_written_addrs;   // address -> writes
 struct WaitInfo {
     std::uint64_t count = 0;
     std::uint32_t ref = 0, mask = 0, fn = 0;
@@ -794,10 +909,7 @@ void note_wait_timeout(std::uint64_t va, std::uint32_t ref, std::uint32_t mask, 
 }
 
 void note_label_write(std::uint64_t va, const void* src, std::size_t n) {
-    {
-        std::lock_guard<std::mutex> lk(g_addr_mu);
-        if (g_written_addrs.size() < 8192) g_written_addrs[va] += 1;
-    }
+    note_written_addr(va);
     if (n != 4 && n != 8) return;
     std::uint64_t v = 0;
     std::memcpy(&v, src, n);
@@ -884,8 +996,8 @@ void cp_write(std::uint64_t va, const void* src, std::size_t n) {
     }
     std::uint64_t serial = 0;
     if (host_gpu_mem_write_serial(va, src, n, &serial)) {
-        record(va, src, n);
-        g_exec_writes.fetch_add(1);
+        record(va, src, n, false);  // the shadow was told, under the lock the write took
+        g_exec_writes.fetch_add(1, std::memory_order_relaxed);
         if (g_arena_monitor) note_arena_queued(va, src, n, serial);
         if (n == 4 || n == 8) {
             std::lock_guard<std::mutex> lk(g_pending_mu);
@@ -1042,7 +1154,9 @@ bool ce_step() {
             return true;
         }
         t_cur_op = op;
+        t_in_ce = true;
         execute_packet(op, b, n, 1);
+        t_in_ce = false;
         return true;
     }
     return false;
@@ -1051,10 +1165,40 @@ bool ce_step() {
 // BBHOST_CP_CENSUS=1: what the command processor still walks,
 // by packet type and dwords, with the NOP payloads (our tokens and Gnmx's
 // markers) told apart by their magic.
-const bool g_cp_census = [] {
+extern const bool g_cp_census = [] {
     const char* e = std::getenv("BBHOST_CP_CENSUS");
     return e && e[0] == '1';
 }();
+std::mutex g_census_dispatch_mu;
+struct DispatchCensusKey {
+    std::uint8_t cls;
+    std::uint64_t caller;
+    std::string program;
+    bool operator<(const DispatchCensusKey& o) const { return std::tie(cls, caller, program) < std::tie(o.cls, o.caller, o.program); }
+};
+std::map<DispatchCensusKey, std::uint64_t> g_census_dispatches;
+std::atomic<std::uint64_t> g_census_dma[kCdKinds] = {}, g_census_dma_bytes[kCdKinds] = {};
+std::map<std::pair<int, std::uint64_t>, std::uint64_t> g_census_dma_callers;  // (kind, emitter caller) -> packets, under g_census_dispatch_mu
+const char* const kDispatchClassName[kDcClasses] = {"none", "fill (no shader)", "render-target copy (no shader)", "image copy shader",
+                                                    "buffer-to-image shader", "fill shader (not a target)", "copy shader (as memory)",
+                                                    "shader", "failed"};
+const char* const kCensusDmaName[kCdKinds] = {"fill clearing a render target", "fill of a GX resource", "fill of other memory",
+                                              "copy into a GX resource", "copy into other memory", "into a register (a prefetch)",
+                                              "through GDS", "counter word"};
+void census_dispatch(std::uint64_t packet_va) {
+    const char* program = nullptr;
+    const GpuDispatchClass cls = host_gpu_last_dispatch_class(&program);
+    const std::uint64_t caller = hle_gx_emitter_caller(packet_va);
+    std::lock_guard<std::mutex> lk(g_census_dispatch_mu);
+    if (g_census_dispatches.size() < 4096) ++g_census_dispatches[{static_cast<std::uint8_t>(cls), caller, program ? program : "-"}];
+}
+void census_dma(CensusDma kind, std::size_t bytes) {
+    g_census_dma[kind].fetch_add(1, std::memory_order_relaxed);
+    g_census_dma_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+    const std::uint64_t caller = hle_gx_emitter_caller(census_guest_va(t_packet_va));
+    std::lock_guard<std::mutex> lk(g_census_dispatch_mu);
+    if (g_census_dma_callers.size() < 1024) ++g_census_dma_callers[{static_cast<int>(kind), caller}];
+}
 std::atomic<std::uint64_t> g_census_packets[0x100] = {}, g_census_dwords[0x100] = {};
 std::mutex g_census_mu;
 std::map<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>> g_census_nops;  // magic -> {packets, dwords}
@@ -1169,6 +1313,28 @@ bool covers_counter_word(std::uint64_t va, std::size_t bytes) {
     return it != g_counter_words.end() && *it < va + bytes;
 }
 
+// A count copy token's copy, as the DMA_DATA packet's was made: a counter
+// word's on the GPU's timeline, where the count is; otherwise on the CP.
+void cp_count_copy(std::uint64_t dst, std::uint64_t src) {
+    if (host_gpu_gds_counters() && covers_counter_word(src, 4) && host_gpu_counter_copy(dst, src, 4)) {
+        g_cc_gpu.fetch_add(1, std::memory_order_relaxed);
+        g_counter_reads.fetch_add(1, std::memory_order_relaxed);
+        // Its destination (a draw's arguments) now holds a GPU value, as the
+        // packet's did (note_gpu_args): a DMA over it later in the stream
+        // goes on the GPU's timeline too.
+        note_gpu_args(dst, 4);
+        return;
+    }
+    if (!hle_kernel_va_mapped(src, 4) || !hle_kernel_va_mapped(dst, 4)) {
+        g_cc_lost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    record(dst, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), 4);
+    g_exec_writes.fetch_add(1);
+    std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), 4);
+    g_cc_cpu.fetch_add(1, std::memory_order_relaxed);
+}
+
 void gds_log_once(std::atomic<int>& n, const char* fmt, unsigned long long a, unsigned long long b = 0) {
     if (n.fetch_add(1, std::memory_order_relaxed) < 4) host_log(fmt, a, b);
 }
@@ -1251,6 +1417,7 @@ void bind_gds_counters(GpuDispatch& d) {
         if (h.kind == GdsHeld::kValue) {
             c.start = GpuDispatch::kGdsSet;
             c.value = h.value;
+            note_counter_given(c.word);
         } else if (h.kind == GdsHeld::kWord && h.word != c.word) {
             c.start = GpuDispatch::kGdsCopy;
             c.from = h.word;
@@ -1264,6 +1431,99 @@ void bind_gds_counters(GpuDispatch& d) {
         any = true;
     }
     if (any) g_gds_dispatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+// BBHOST_GX_TOKEN_COUNTERS: the counters a dispatch token carries from the
+// engine's objects (gx_trace.cpp take_cs_counters): each UAV's word, set to its
+// initial count first or counted on from what it holds. Each GDS dword they
+// take holds that word's count from here, as bind_gds_counters leaves it, so a
+// move through GDS that still arrives folds; the words are counter words.
+//
+// A counter kept from memory (initial count -1) that nothing ever gave a
+// count - no set count at a token, no CP write into the word - counts on from
+// whatever the buffer's memory held: what the Forbidden Woods dispatch of
+// 2da7fe60 copied into its arguments before the moves through GDS were
+// followed (3,176,062,614 workgroups). Counted, and the first few logged with
+// the buffer they belong to.
+std::mutex g_counters_given_mu;
+std::set<std::uint64_t> g_counters_given;  // words a CP write or a set count gave a count, under g_counters_given_mu
+std::set<std::uint64_t> g_counters_given_buffers;  // (word, buffer id) first counted in kept, under g_counters_given_mu
+std::atomic<std::uint64_t> g_tc_adopted{0}, g_tc_kept_unset{0}, g_tc_kept_unset_nonzero{0}, g_tc_check_dispatches{0}, g_tc_check_same{0},
+    g_tc_check_differ{0};
+
+void note_counter_given(std::uint64_t word) {
+    std::lock_guard<std::mutex> lk(g_counters_given_mu);
+    if (g_counters_given.size() < 65536) g_counters_given.insert(word);
+}
+
+void adopt_token_counters(const GpuDispatch& d) {
+    bool any = false;
+    for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+        const GpuDispatch::GdsCounter& c = d.gds[k];
+        if (!c.word) continue;
+        any = true;
+        note_counter_word(c.word);
+        if (d.gds_base + k < kGdsDwords) {
+            GdsHeld& h = t_gds[d.gds_base + k];
+            h.kind = GdsHeld::kWord;
+            h.word = c.word;
+        }
+        const std::uint64_t key = (c.word & 0xffffffffffull) | (static_cast<std::uint64_t>(c.buffer_id) << 40);
+        if (c.start == GpuDispatch::kGdsSet) {
+            std::lock_guard<std::mutex> lk(g_counters_given_mu);
+            if (g_counters_given_buffers.size() < 65536) g_counters_given_buffers.insert(key);
+            continue;
+        }
+        // Kept: the first dispatch to count in a word nothing gave a count -
+        // a word of this buffer: memory reused for a new buffer is a new
+        // counter (GX's resource id names the buffer). From then on the word
+        // holds a count the GPU made, so it is noted given; this is about
+        // the first one.
+        {
+            std::lock_guard<std::mutex> lk(g_counters_given_mu);
+            if (g_counters_given.count(c.word) || g_counters_given_buffers.count(key) || g_counters_given_buffers.size() >= 65536) continue;
+            g_counters_given_buffers.insert(key);
+        }
+        g_tc_kept_unset.fetch_add(1, std::memory_order_relaxed);
+        std::uint32_t now = 0;
+        if (hle_kernel_va_mapped(c.word, 4)) std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(c.word)), 4);
+        if (now) g_tc_kept_unset_nonzero.fetch_add(1, std::memory_order_relaxed);
+        // The first few, and every one that holds something (up to 16):
+        // those count on from what the buffer's memory held.
+        static std::atomic<int> logs_zero{0}, logs_held{0};
+        if (now ? logs_held.fetch_add(1, std::memory_order_relaxed) >= 16 : logs_zero.fetch_add(1, std::memory_order_relaxed) >= 4) continue;
+        host_log("gnm exec: a dispatch of program 0x%llx (%ux%ux%u%s) keeps the counter at 0x%llx (UAV %u) that nothing gave a count: "
+                 "memory holds %u (0x%08x) there%s; flip %llu",
+                 static_cast<unsigned long long>(d.code_va), d.dim[0], d.dim[1], d.dim[2], d.indirect_va ? ", indirect" : "",
+                 static_cast<unsigned long long>(c.word), k, now, now, now > 0xffff ? " - garbage for a count" : "",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    if (any) g_tc_adopted.fetch_add(1, std::memory_order_relaxed);
+}
+
+// BBHOST_GX_TOKEN_COUNTERS=1: the counters bound from the moves through GDS,
+// as before, and the token's compared with them.
+void check_token_counters(GpuDispatch& d) {
+    const GpuDispatch tok = d;
+    for (GpuDispatch::GdsCounter& c : d.gds) c = GpuDispatch::GdsCounter{};
+    d.gds_base = 0;
+    bind_gds_counters(d);
+    g_tc_check_dispatches.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+        const GpuDispatch::GdsCounter& t = tok.gds[k];
+        if (!t.word) continue;
+        const std::uint32_t g = tok.gds_base + k;
+        const GpuDispatch::GdsCounter* p = g >= d.gds_base && g - d.gds_base < GpuDispatch::kGdsCounters ? &d.gds[g - d.gds_base] : nullptr;
+        const bool same = p && p->word == t.word && p->start == t.start && (t.start != GpuDispatch::kGdsSet || p->value == t.value);
+        (same ? g_tc_check_same : g_tc_check_differ).fetch_add(1, std::memory_order_relaxed);
+        if (!same && g_tc_check_differ.load(std::memory_order_relaxed) <= 8) {
+            host_log("gnm exec: program 0x%llx's counter in GDS dword %u: the token's 0x%llx %s %u, the moves' 0x%llx %s %u",
+                     static_cast<unsigned long long>(tok.code_va), g, static_cast<unsigned long long>(t.word),
+                     t.start == GpuDispatch::kGdsSet ? "set to" : "kept", t.value, static_cast<unsigned long long>(p ? p->word : 0),
+                     !p ? "-" : p->start == GpuDispatch::kGdsSet ? "set to" : p->start == GpuDispatch::kGdsCopy ? "copied" : "kept",
+                     p ? p->value : 0u);
+        }
+    }
 }
 
 // DMA_DATA into or out of GDS.
@@ -1316,6 +1576,7 @@ void gds_dma(const std::uint32_t* b, unsigned src_sel, unsigned dst_sel, std::si
                 ok = host_gpu_counter_copy(to, h.word, 4);
             } else if (h.kind == GdsHeld::kValue) {
                 ok = host_gpu_counter_fill(to, h.value, 4);
+                if (ok) note_counter_given(to);
             } else {
                 gds_log_once(unknown_logs, "gnm exec: DMA_DATA out of GDS dword %llu, which nothing loaded, to 0x%llx: dropped",
                              at + k, static_cast<unsigned long long>(to));
@@ -1333,6 +1594,85 @@ void gds_dma(const std::uint32_t* b, unsigned src_sel, unsigned dst_sel, std::si
         return;
     }
     gds_log_once(other_logs, "gnm exec: DMA_DATA from select %llu to select %llu through GDS is not a counter's move: dropped", src_sel, dst_sel);
+}
+
+// An occlusion query's begin: its 128-byte block zeroed on the GPU's timeline,
+// in stream order - after the dumps of the block's last query, before this
+// one's - as the DMA_DATA fill that did it went there behind the barrier
+// before it. The CP's own writes after it go there too (cp_write_after_waits).
+// Where the block is not in imported memory, on the CPU as the fill did.
+std::atomic<std::uint64_t> g_query_tokens[3] = {}, g_query_resets_cpu{0};
+void query_reset(std::uint64_t block) {
+    static const std::uint8_t kZeros[128] = {};
+    std::uint64_t serial = 0;
+    if (host_gpu_mem_write_ordered(block, kZeros, sizeof(kZeros), &serial)) {
+        record(block, kZeros, sizeof(kZeros), false);
+        t_cp_writes_need = std::max(t_cp_writes_need, serial + 1);
+        return;
+    }
+    if (!hle_kernel_va_mapped(block, sizeof(kZeros))) return;
+    g_query_resets_cpu.fetch_add(1, std::memory_order_relaxed);
+    store(block, kZeros, sizeof(kZeros));
+}
+
+// A pixel-pipe counter dump (an occlusion query's begin or end sample) to `va`:
+// the renderer's own occlusion query (host/occlusion.cpp), or, where it cannot
+// place one, the old rising count.
+void zpass_dump(std::uint64_t va, bool zpass_trace) {
+    // The real counters (host/occlusion.cpp): the draws after the
+    // dump are measured by Vulkan occlusion queries and the GPU
+    // writes the counts here once it has run them, before the
+    // labels that follow. Nothing is written now - the game zeroed
+    // the block and reads it as not ready until then.
+    if (host_gpu_zpass_dump(va)) return;
+    // Per pixel pipe: [this sample, the next one], 16 bytes apart.
+    constexpr int kPixelPipes = 8;  // 16 on a Neo; the game reads as many as it wrote
+    constexpr std::uint64_t kValid = 1ull << 63;
+    if (hle_kernel_va_mapped(va, kPixelPipes * 16)) {
+        // BBHOST_ZPASS_COUNT: how many pixels each sample claims
+        // passed, for working out what the game does with them.
+        static const std::uint64_t step = [] {
+            const char* e = std::getenv("BBHOST_ZPASS_COUNT");
+            return e ? std::strtoull(e, nullptr, 0) : 0x2ffffffull;
+        }();
+        static std::atomic<std::uint64_t> counter{0};
+        // Every pipe reports the same count, and a sample is
+        // ahead of the one before it. HLE fake: the pixels a draw
+        // covers are not counted, so a light behind a wall keeps
+        // its glare and the game culls nothing by its queries
+        // (the real counts are host_gpu_zpass_dump's, above).
+        const std::uint64_t now = counter.fetch_add(step, std::memory_order_relaxed) + step;
+        // Only the dump's own words, one per pipe, 16 bytes apart:
+        // the query's end dump lands at block+8 (Gnm's writer,
+        // 0x1477660), and writing a 128-byte image of value/zero
+        // pairs from there zeroed pipes 1-7's begin words and the
+        // 8 bytes after the block. Both readers (GX GetData
+        // 0x256a2f0, YEBIS 0x15db3c0) want bit 63 in all 16 words,
+        // so no query ever completed: GX culling entries stayed
+        // pending and YEBIS's luminance analysis took an
+        // uninitialised count.
+        const std::uint64_t word = now | kValid;
+        for (int i = 0; i < kPixelPipes; ++i) store(va + 16 * static_cast<std::uint64_t>(i), &word, sizeof(word));
+        // With BBHOST_ZPASS_TRACE an end dump (at block+8) prints the
+        // block: a query the game can finish has bit 63 in all 16.
+        if (zpass_trace && (va & 15) == 8) {
+            static std::atomic<int> blocks{0};
+            if (blocks.fetch_add(1) < 12) {
+                const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(va - 8));
+                int valid = 0;
+                for (int i = 0; i < kPixelPipes * 2; ++i) valid += (q[i] & kValid) != 0;
+                host_log("zpass: block 0x%llx: %d of 16 words valid, pipe 0 begin 0x%llx end 0x%llx",
+                         static_cast<unsigned long long>(va - 8), valid, static_cast<unsigned long long>(q[0]),
+                         static_cast<unsigned long long>(q[1]));
+            }
+        }
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) == 0) {
+            host_log("HLE fake: the pixel-pipe counters an occlusion query samples are a rising count, not the pixels drawn "
+                     "(first dump to 0x%llx; BBHOST_OCCLUSION=0, or the block is not in imported memory)",
+                     static_cast<unsigned long long>(va));
+        }
+    }
 }
 
 void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int depth) {
@@ -1375,63 +1715,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     host_log("zpass: event type %u at draw %llu", type, static_cast<unsigned long long>(g_draws.load()));
                 }
             }
-            if (type == kPixelPipeStatDump && index == kEventIndexZpassDone && n >= 3) {
-                const std::uint64_t va = gpu_va(b[1], b[2]);
-                // The real counters (host/occlusion.cpp): the draws after the
-                // dump are measured by Vulkan occlusion queries and the GPU
-                // writes the counts here once it has run them, before the
-                // labels that follow. Nothing is written now - the game zeroed
-                // the block and reads it as not ready until then.
-                if (host_gpu_zpass_dump(va)) break;
-                // Per pixel pipe: [this sample, the next one], 16 bytes apart.
-                constexpr int kPixelPipes = 8;  // 16 on a Neo; the game reads as many as it wrote
-                constexpr std::uint64_t kValid = 1ull << 63;
-                if (hle_kernel_va_mapped(va, kPixelPipes * 16)) {
-                    // BBHOST_ZPASS_COUNT: how many pixels each sample claims
-                    // passed, for working out what the game does with them.
-                    static const std::uint64_t step = [] {
-                        const char* e = std::getenv("BBHOST_ZPASS_COUNT");
-                        return e ? std::strtoull(e, nullptr, 0) : 0x2ffffffull;
-                    }();
-                    static std::atomic<std::uint64_t> counter{0};
-                    // Every pipe reports the same count, and a sample is
-                    // ahead of the one before it. HLE fake: the pixels a draw
-                    // covers are not counted, so a light behind a wall keeps
-                    // its glare and the game culls nothing by its queries
-                    // (the real counts are host_gpu_zpass_dump's, above).
-                    const std::uint64_t now = counter.fetch_add(step, std::memory_order_relaxed) + step;
-                    // Only the dump's own words, one per pipe, 16 bytes apart:
-                    // the query's end dump lands at block+8 (Gnm's writer,
-                    // 0x1477660), and writing a 128-byte image of value/zero
-                    // pairs from there zeroed pipes 1-7's begin words and the
-                    // 8 bytes after the block. Both readers (GX GetData
-                    // 0x256a2f0, YEBIS 0x15db3c0) want bit 63 in all 16 words,
-                    // so no query ever completed: GX culling entries stayed
-                    // pending and YEBIS's luminance analysis took an
-                    // uninitialised count.
-                    const std::uint64_t word = now | kValid;
-                    for (int i = 0; i < kPixelPipes; ++i) store(va + 16 * static_cast<std::uint64_t>(i), &word, sizeof(word));
-                    // With BBHOST_ZPASS_TRACE an end dump (at block+8) prints the
-                    // block: a query the game can finish has bit 63 in all 16.
-                    if (zpass_trace && (va & 15) == 8) {
-                        static std::atomic<int> blocks{0};
-                        if (blocks.fetch_add(1) < 12) {
-                            const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(va - 8));
-                            int valid = 0;
-                            for (int i = 0; i < kPixelPipes * 2; ++i) valid += (q[i] & kValid) != 0;
-                            host_log("zpass: block 0x%llx: %d of 16 words valid, pipe 0 begin 0x%llx end 0x%llx",
-                                     static_cast<unsigned long long>(va - 8), valid, static_cast<unsigned long long>(q[0]),
-                                     static_cast<unsigned long long>(q[1]));
-                        }
-                    }
-                    static std::atomic<int> logs{0};
-                    if (logs.fetch_add(1) == 0) {
-                        host_log("HLE fake: the pixel-pipe counters an occlusion query samples are a rising count, not the pixels drawn "
-                                 "(first dump to 0x%llx; BBHOST_OCCLUSION=0, or the block is not in imported memory)",
-                                 static_cast<unsigned long long>(va));
-                    }
-                }
-            }
+            if (type == kPixelPipeStatDump && index == kEventIndexZpassDone && n >= 3) zpass_dump(gpu_va(b[1], b[2]), zpass_trace);
             break;
         }
         case kSetPredication: {
@@ -1529,13 +1813,14 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     bool ok = true;
                     for (std::size_t k = 0; k + 3 < n && ok; ++k) ok = host_gpu_counter_fill(va + 4 * k, b[3 + k], 4);
                     if (ok) {
+                        for (std::size_t k = 0; k + 3 < n; ++k) note_counter_given(va + 4 * k);
                         g_counter_writes.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
                 }
                 const std::size_t bytes = (n - 3) * 4;
                 if (cp_write_after_waits(va, &b[3], bytes)) {
-                    record(va, &b[3], bytes);
+                    record(va, &b[3], bytes, false);  // host_gpu_mem_write_ordered told the shadow
                     g_exec_writes.fetch_add(1);
                     break;
                 }
@@ -1552,7 +1837,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 const std::size_t bytes = b[5] & 0x1fffffu;
                 const std::uint64_t dst = gpu_va(b[3], b[4]);
                 if (bytes == 0) break;
+                if (t_count_check.active && src_sel != 2 && src_sel != 1 && !((b[5] >> 27) & 1)) {
+                    t_count_check.active = false;
+                    const bool same = t_count_check.dst == dst && t_count_check.src == gpu_va(b[1], b[2]) && bytes == 4;
+                    (same ? g_cc_same : g_cc_differ).fetch_add(1, std::memory_order_relaxed);
+                    if (!same && g_cc_differ.load() <= 8) {
+                        host_log("gnm exec: CopyStructureCount token 0x%llx <- 0x%llx; the packet after it copies 0x%llx <- 0x%llx, %zu bytes",
+                                 static_cast<unsigned long long>(t_count_check.dst), static_cast<unsigned long long>(t_count_check.src),
+                                 static_cast<unsigned long long>(dst), static_cast<unsigned long long>(gpu_va(b[1], b[2])), bytes);
+                    }
+                }
                 if (src_sel == 1 || dst_sel == 1) {
+                    if (g_cp_census) census_dma(kCdGds, bytes);
                     gds_dma(b, src_sel, dst_sel, bytes);
                     break;
                 }
@@ -1561,11 +1857,16 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (logs.fetch_add(1) < 4) host_log("gnm exec: DMA_DATA to select %u (reserved) dropped", dst_sel);
                     break;
                 }
+                // DAS (bit 27 of the command): the destination is a register -
+                // Gnm's shader prefetch reads the program through L2 into one.
+                if (g_cp_census && ((b[5] >> 27) & 1)) census_dma(kCdRegister, bytes);
                 // Into or out of a GDS counter's word: on the GPU's timeline,
                 // where the word's value is (CopyStructureCount, a reset).
                 if (host_gpu_gds_counters() && (covers_counter_word(dst, bytes) || (src_sel != 2 && covers_counter_word(gpu_va(b[1], b[2]), bytes)))) {
                     const bool ok = src_sel == 2 ? host_gpu_counter_fill(dst, b[1], bytes) : host_gpu_counter_copy(dst, gpu_va(b[1], b[2]), bytes);
+                    if (ok && g_cp_census) census_dma(kCdCounter, bytes);
                     if (ok) {
+                        for (std::size_t k = 0; k + 4 <= bytes && k < 64; k += 4) note_counter_given(dst + k);
                         (src_sel == 2 ? g_counter_writes : g_counter_reads).fetch_add(1, std::memory_order_relaxed);
                         // A count copied out (CopyStructureCount into a draw's
                         // arguments): its destination now holds a GPU value too.
@@ -1593,7 +1894,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         if (bytes >= (1u << 20) && logs.fetch_add(1) < 40) {
                             host_log("gnm exec: DMA fill 0x%llx %zu bytes with 0x%08x", static_cast<unsigned long long>(dst), bytes, b[1]);
                         }
-                        if (!host_gpu_clear_target(dst, b[1], bytes)) {
+                        const bool target = host_gpu_clear_target(dst, b[1], bytes);
+                        if (g_cp_census) {
+                            GxResourceInfo info;
+                            census_dma(target ? kCdFillTarget : gx_resource_at(dst, bytes, &info) ? kCdFillResource : kCdFillMemory, bytes);
+                        }
+                        if (!target) {
                             // After a passed wait: the words on the GPU's timeline (cp_write_after_waits).
                             thread_local std::vector<std::uint32_t> words;
                             const std::uint32_t* data = nullptr;
@@ -1611,6 +1917,10 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     }
                 } else if (src_sel == 0 || src_sel == 3) {
                     const std::uint64_t src = gpu_va(b[1], b[2]);
+                    if (g_cp_census && !((b[5] >> 27) & 1)) {
+                        GxResourceInfo info;
+                        census_dma(gx_resource_at(dst, bytes, &info) ? kCdCopyResource : kCdCopy, bytes);
+                    }
                     warn_if_over_command_buffer("DMA copy", dst, bytes);
                     if (hle_kernel_va_mapped(src, bytes) && hle_kernel_va_mapped(dst, bytes)) {
                         // After a passed wait: the bytes on the GPU's timeline
@@ -1777,11 +2087,36 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                                      static_cast<unsigned long long>(va), fn, ref, mask, v);
                             host_log("  packet: %08x %08x %08x %08x %08x %08x depth=%d", b[0], b[1], b[2], b[3], b[4],
                                      n > 5 ? b[5] : 0u, depth);
-                            const std::uint32_t* m = p - 8;
-                            host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3], m[4],
-                                     m[5], m[6], m[7]);
-                            host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4],
-                                     p[5], p[6], p[7]);
+                            // Where it sits, and what came before it in its
+                            // buffer: the packets that set up what it waits on
+                            // (a label, the event that writes it) name its writer.
+                            {
+                                const std::uint64_t at = reinterpret_cast<std::uintptr_t>(b - 1);
+                                const bool inside = at >= t_cb_lo && at < t_cb_hi;  // not a constant-engine packet's
+                                const std::uint64_t from = inside ? std::max(t_cb_lo, at >= 64 ? at - 64 : 0) : at;
+                                char before[16 * 9 + 1] = {};
+                                int len = 0;
+                                for (std::uint64_t p2 = from; p2 < at && len < static_cast<int>(sizeof(before)) - 9; p2 += 4) {
+                                    len += std::snprintf(before + len, sizeof(before) - len, " %08x",
+                                                         *reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(p2)));
+                                }
+                                host_log("  at 0x%llx, +0x%llx into the buffer at 0x%llx (0x%llx bytes); the dwords before it:%s",
+                                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(at - t_cb_lo),
+                                         static_cast<unsigned long long>(t_cb_lo),
+                                         static_cast<unsigned long long>(t_cb_hi - t_cb_lo), len ? before : " none");
+                            }
+                            // Only what is mapped: a wait at the first bytes of
+                            // a mapping (0x100000001 during a load, a malformed
+                            // address) has nothing below it to show.
+                            if (hle_kernel_va_mapped(va - 32, 32)) {
+                                const std::uint32_t* m = p - 8;
+                                host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3],
+                                         m[4], m[5], m[6], m[7]);
+                            }
+                            if (hle_kernel_va_mapped(va, 32)) {
+                                host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3],
+                                         p[4], p[5], p[6], p[7]);
+                            }
                         }
                         // BBHOST_FORCE_LABELS=1 also writes the expected value so CPU
                         // pollers proceed; default leaves the label alone (garbage
@@ -1805,8 +2140,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             break;
         }
         case kSetShReg:
-            // The SH registers stay while the dispatch packets run: a dispatch
-            // takes its program, thread counts and user data from them.
+            // The SH registers stay while dispatch packets can run: a dispatch
+            // from its packet takes its program, thread counts and user data
+            // from them. With dispatch tokens those are only the fallbacks
+            // (gx-dispatch: fallbacks by reason). The graphics stages' are kept
+            // with them as they always were: the tessellation paths still read
+            // a few (render.cpp, d.sh) for a draw without records.
             if (!cp_registers() && !cp_dispatch_packets()) {
                 g_register_dwords_skipped.fetch_add(n, std::memory_order_relaxed);
                 break;
@@ -1816,11 +2155,15 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     t_regs.sh[b[0] + k - 1] = b[k];
                     // Checks: which packet last wrote each compute user-data slot.
                     const std::uint32_t slot = b[0] + static_cast<std::uint32_t>(k) - 1;
-                    if (slot >= 0x240 && slot < 0x250) {
-                        t_cs_writers[2 * (slot - 0x240)] = b[-1];
-                        t_cs_writers[2 * (slot - 0x240) + 1] = t_packet_va >= 8 && hle_kernel_va_mapped(t_packet_va - 8, 8)
-                                                                  ? reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_packet_va - 8))[1]
-                                                                  : 0;
+                    if (slot >= 0x240 && slot < 0x250 && hle_gx_dispatch_shadow()) {
+                        const std::uint32_t i = slot - 0x240;
+                        t_cs_writers.header[i] = b[-1];
+                        t_cs_writers.marker[i] = t_packet_va >= 8 && hle_kernel_va_mapped(t_packet_va - 8, 8)
+                                                     ? reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_packet_va - 8))[1]
+                                                     : 0;
+                        t_cs_writers.packet[i] = t_packet_va;
+                        t_cs_writers.buffer[i] = t_cb_lo;
+                        t_cs_writers.ce[i] = t_in_ce;
                     }
                 }
             }
@@ -1888,10 +2231,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 trace_draw("DRAW_INDEX_OFFSET_2", b[2], t_index_base + static_cast<std::uint64_t>(b[1]) * ((t_index_type & 1) ? 4 : 2));
             }
             break;
-        case kDispatchDirect:
+        case kDispatchDirect: {
             // [0] dim_x, [1] dim_y, [2] dim_z, [3] dispatch_initiator
+            CpDispatchTimer timer(0);
             if (n >= 3) run_dispatch("DISPATCH_DIRECT", b[0], b[1], b[2]);
             break;
+        }
         case kSetBase:
             // [0] base_index[3:0], [1] addr_lo, [2] addr_hi[15:0]. Index 1 is
             // the indirect draw/dispatch argument table.
@@ -1900,6 +2245,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
         case kDispatchIndirect: {
             // [0] byte offset from the SET_BASE table, [1] dispatch_initiator.
             // The dimensions come from memory: {x, y, z}.
+            CpDispatchTimer timer(0);
             if (n < 1 || !t_indirect_base) break;
             const std::uint64_t args = t_indirect_base + b[0];
             if (!hle_kernel_va_mapped(args, 12)) break;
@@ -1939,6 +2285,23 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             break;
         }
         case kNop:
+            // A GX pipeline drain, as a barrier token: the wait it was.
+            if (n >= 1 && b[0] == kGxBarrierMagic) {
+                t_barrier_pending = true;
+                g_barrier_tokens.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            // An occlusion query's begin or end (decomp/gx/query_token.cpp):
+            // a begin's block reset on the GPU's timeline, in stream order
+            // with the dumps around it, then the dump.
+            if (n >= 3 && b[0] == kGxQueryMagic) {
+                const std::uint64_t block = (b[1] & ~7u) | (static_cast<std::uint64_t>(b[2]) << 32);
+                const unsigned kind = b[1] & 3;
+                g_query_tokens[kind < 3 ? kind : 2].fetch_add(1, std::memory_order_relaxed);
+                if (kind == 0) query_reset(block);
+                zpass_dump(kind == 1 ? block + 8 : block, false);
+                break;
+            }
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
@@ -1990,8 +2353,22 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 3 && b[0] == kGxFillMagic) hle_gx_fill_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.ctx);
             if (n >= 3 && b[0] == kGxUploadMagic) hle_gx_upload_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             if (n >= 3 && b[0] == kGxImageCopyMagic) hle_gx_image_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+            if (n >= 3 && b[0] == kGxClearMagic) hle_gx_clear_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+            if (n >= 3 && b[0] == kGxCountCopyMagic) {
+                std::uint64_t dst = 0, src = 0;
+                bool check = false;
+                if (hle_gx_count_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), &dst, &src, &check)) {
+                    if (!check) {
+                        cp_count_copy(dst, src);
+                    } else {
+                        if (t_count_check.active) g_cc_no_packet.fetch_add(1, std::memory_order_relaxed);
+                        t_count_check = CountCheck{true, dst, src};
+                    }
+                }
+            }
             // A dispatch token.
             if (n >= 3 && b[0] == kGxDispatchMagic) {
+                CpDispatchTimer timer(1);
                 if (const GpuDispatch* dp = hle_gx_dispatch_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32))) {
                     g_dispatches.fetch_add(1);
                     GpuDispatch dd = *dp;
@@ -2013,7 +2390,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         }
                     }
                     if (dd.dim[0] && dd.dim[1] && dd.dim[2] && dd.threads[0]) {
-                        bind_gds_counters(dd);
+                        // The counters: from the token (the engine's objects), or
+                        // from the moves through GDS around it (checked against the
+                        // token's when it carries them).
+                        bool token_counters = false;
+                        for (const GpuDispatch::GdsCounter& c : dd.gds) token_counters |= c.word != 0;
+                        if (dd.gds_from_token) {
+                            adopt_token_counters(dd);
+                        } else if (token_counters) {
+                            check_token_counters(dd);
+                        } else {
+                            bind_gds_counters(dd);
+                        }
                         if (!host_gpu_dispatch(dd)) g_dispatch_failed.fetch_add(1);
                     }
                 }
@@ -2269,6 +2657,7 @@ struct Job {
     std::vector<std::pair<const void*, std::size_t>> guest;  // the originals, for the snapshot comparison
     std::function<void()> done;
     std::uint64_t free_event = 0;  // g_arena_free_event when submitted (BBHOST_ARENA_MONITOR)
+    std::uint64_t seq = 0;         // its place among every submission (hle_gnm_submitted_total once it was counted)
 };
 
 std::vector<std::pair<const void*, std::size_t>> snapshot_cbs(const std::vector<std::pair<const void*, std::size_t>>& in,
@@ -2296,6 +2685,10 @@ struct Queue {
 };
 std::mutex g_queues_mu;
 std::atomic<std::uint64_t> g_submitted_total{0}, g_retired_total{0};
+// The submission the calling command-processor thread is walking (Job::seq): a
+// resource whose images something wrote in a submission made after the
+// resource died has a newer owner (host textures' and targets' retirement).
+thread_local std::uint64_t t_cp_job_seq = 0;
 std::unordered_map<int, Queue*> g_queues;
 
 // BBHOST_CPUPROFILE=<file>:<first flip>:<last flip>: sample the graphics
@@ -2385,6 +2778,7 @@ void cp_thread(Queue* q, int id) {
         }
         cpu_profile_tick(profile);
         t_job_free_event = g_arena_monitor ? job.free_event : ~0ull;
+        t_cp_job_seq = job.seq;
         for (const auto& cb : job.cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (const auto& cb : job.ce_cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (std::size_t i = 0; i < job.cbs.size(); ++i) {
@@ -2398,7 +2792,13 @@ void cp_thread(Queue* q, int id) {
                  hle_kernel_va_mapped(reinterpret_cast<std::uintptr_t>(job.ce_cbs[i].first), job.ce_cbs[i].second))) {
                 t_ce_stack.push_back({static_cast<const std::uint32_t*>(job.ce_cbs[i].first), job.ce_cbs[i].second / 4});
             }
+            if (g_cp_census && !job.owned.empty() && i < job.guest.size()) {
+                t_top_snap_lo = reinterpret_cast<std::uintptr_t>(job.cbs[i].first);
+                t_top_snap_hi = t_top_snap_lo + job.cbs[i].second;
+                t_top_guest_lo = reinterpret_cast<std::uintptr_t>(job.guest[i].first);
+            }
             execute_one(job.cbs[i].first, job.cbs[i].second, !job.owned.empty());
+            t_top_snap_lo = t_top_snap_hi = 0;
             // With a snapshot, compare it against guest memory afterwards: if
             // they differ, something rewrote the buffer while we walked it.
             if (!job.owned.empty() && i < job.guest.size() && job.guest[i].first) {
@@ -2597,7 +2997,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     }
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
     ++q->submitted;
-    g_submitted_total.fetch_add(1, std::memory_order_release);
+    q->jobs.back().seq = g_submitted_total.fetch_add(1, std::memory_order_release) + 1;
     q->cv.notify_all();
     // Do not let the game get far ahead of the command processor. On hardware
     // the GPU consumes a command buffer as it is submitted; here a software
@@ -2678,6 +3078,7 @@ std::string hle_gnm_flush_reasons() {
 // Lock-free totals for the texture cache's retirements, which run on the
 // command processor itself (the queue locks may be held there).
 std::uint64_t hle_gnm_submitted_total() { return g_submitted_total.load(std::memory_order_acquire); }
+std::uint64_t hle_gnm_cp_job_seq() { return t_cp_job_seq; }
 std::uint64_t hle_gnm_retired_total() { return g_retired_total.load(std::memory_order_acquire); }
 
 std::uint64_t hle_gnm_cp_backlog() {
@@ -3095,6 +3496,26 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(g_gds_loads.load()), static_cast<unsigned long long>(g_gds_stores_folded.load()),
                  static_cast<unsigned long long>(g_gds_stores_moved.load()), words, static_cast<unsigned long long>(g_counter_reads.load()),
                  static_cast<unsigned long long>(g_counter_writes.load()));
+        if (g_tc_adopted.load() || g_tc_check_dispatches.load()) {
+            host_log("gnm: GPU particle counters from the dispatch tokens (BBHOST_GX_TOKEN_COUNTERS): %llu dispatches counted with them; "
+                     "%llu counter words first counted in kept from memory that nothing gave a count, %llu of them holding something else "
+                     "than 0; checked against the moves through GDS: %llu dispatches, %llu counters the same, %llu differing",
+                     static_cast<unsigned long long>(g_tc_adopted.load()), static_cast<unsigned long long>(g_tc_kept_unset.load()),
+                     static_cast<unsigned long long>(g_tc_kept_unset_nonzero.load()),
+                     static_cast<unsigned long long>(g_tc_check_dispatches.load()), static_cast<unsigned long long>(g_tc_check_same.load()),
+                     static_cast<unsigned long long>(g_tc_check_differ.load()));
+        }
+    }
+    for (int k = 0; k < 2; ++k) {
+        const std::uint64_t n = g_cp_dispatch_n[k].load();
+        if (!n) continue;
+        const std::uint64_t slow = g_cp_dispatch_slow_n[k].load(), slow_ns = g_cp_dispatch_slow_ns[k].load();
+        host_log("gnm: the command processor's time per dispatch %s: %llu, %llu ns each; %llu over a millisecond (%llu ms), the rest %llu ns "
+                 "each (BBHOST_GX_COST)",
+                 k ? "from its token" : "from its packet and the register file", static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(g_cp_dispatch_ns[k].load() / n), static_cast<unsigned long long>(slow),
+                 static_cast<unsigned long long>(slow_ns / 1000000),
+                 static_cast<unsigned long long>(n > slow ? (g_cp_dispatch_ns[k].load() - slow_ns) / (n - slow) : 0));
     }
     host_gpu_report();
     for (int op = 0; op < 256; ++op) {
@@ -3122,7 +3543,7 @@ void hle_gnm_wait_report() {
     std::vector<std::pair<std::uint64_t, WaitInfo>> v(g_timeout_addrs.begin(), g_timeout_addrs.end());
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
     for (std::size_t i = 0; i < v.size() && i < 12; ++i) {
-        const auto it = g_written_addrs.find(v[i].first);
+        const std::uint64_t writes = written_count(v[i].first);
         std::uint32_t now = 0;
         if (hle_kernel_va_mapped(v[i].first, 4)) {
             std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(v[i].first)), 4);
@@ -3130,11 +3551,18 @@ void hle_gnm_wait_report() {
         host_log("  wait 0x%llx gave up %llu time(s) (fn=%u ref=0x%08x mask=0x%08x, value now 0x%08x); CP writes to it: %llu",
                  static_cast<unsigned long long>(v[i].first), static_cast<unsigned long long>(v[i].second.count),
                  v[i].second.fn, v[i].second.ref, v[i].second.mask, now,
-                 static_cast<unsigned long long>(it == g_written_addrs.end() ? 0 : it->second));
+                 static_cast<unsigned long long>(writes));
     }
 }
 
 void hle_gnm_cp_report() {
+    if (g_cc_gpu.load() || g_cc_cpu.load() || g_cc_lost.load() || g_cc_same.load() || g_cc_differ.load() || g_cc_no_packet.load()) {
+        host_log("cp: CopyStructureCount tokens: copied on the GPU's timeline %llu, on the CP %llu, unmapped %llu; checked against the packet "
+                 "after the token: the same %llu, differing %llu, no packet %llu",
+                 static_cast<unsigned long long>(g_cc_gpu.load()), static_cast<unsigned long long>(g_cc_cpu.load()),
+                 static_cast<unsigned long long>(g_cc_lost.load()), static_cast<unsigned long long>(g_cc_same.load()),
+                 static_cast<unsigned long long>(g_cc_differ.load()), static_cast<unsigned long long>(g_cc_no_packet.load()));
+    }
     if (g_cp_census) {
         struct Row {
             std::uint32_t op;
@@ -3182,6 +3610,50 @@ void hle_gnm_cp_report() {
             by_reg += buf;
         }
         host_log("cp-census: context/user-config registers still written (dwords), %zu distinct:%s", regs.size(), by_reg.c_str());
+        std::string dma;
+        for (int k = 0; k < kCdKinds; ++k) {
+            if (const std::uint64_t n = g_census_dma[k].load()) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), " %s %llu (%.1f MiB);", kCensusDmaName[k], static_cast<unsigned long long>(n),
+                              static_cast<double>(g_census_dma_bytes[k].load()) / (1 << 20));
+                dma += buf;
+            }
+        }
+        host_log("cp-census: DMA_DATA by kind:%s", dma.empty() ? " none" : dma.c_str());
+        std::lock_guard<std::mutex> dlk(g_census_dispatch_mu);
+        {
+            std::vector<std::pair<std::uint64_t, std::pair<int, std::uint64_t>>> rows;
+            for (const auto& [k, n] : g_census_dma_callers) rows.push_back({n, k});
+            std::sort(rows.rbegin(), rows.rend());
+            std::string by;
+            for (std::size_t i = 0; i < rows.size() && i < 24; ++i) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), " %s from 0x%llx: %llu;", kCensusDmaName[rows[i].second.first],
+                              static_cast<unsigned long long>(rows[i].second.second), static_cast<unsigned long long>(rows[i].first));
+                by += buf;
+            }
+            host_log("cp-census: DMA_DATA by kind and emitter caller (0: no emitter record):%s", by.empty() ? " none" : by.c_str());
+        }
+        std::vector<std::pair<std::uint64_t, const DispatchCensusKey*>> ds;
+        std::uint64_t by_class[kDcClasses] = {};
+        for (const auto& [k, n] : g_census_dispatches) {
+            ds.push_back({n, &k});
+            by_class[k.cls < kDcClasses ? k.cls : 0] += n;
+        }
+        std::sort(ds.begin(), ds.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
+        std::string classes;
+        for (int k = 0; k < kDcClasses; ++k) {
+            if (!by_class[k]) continue;
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s %llu;", kDispatchClassName[k], static_cast<unsigned long long>(by_class[k]));
+            classes += buf;
+        }
+        host_log("cp-census: dispatch packets run, by what they were:%s", classes.empty() ? " none" : classes.c_str());
+        for (std::size_t i = 0; i < ds.size() && i < 40; ++i) {
+            host_log("cp-census:   %8llu %s, program %s, emitted from 0x%llx", static_cast<unsigned long long>(ds[i].first),
+                     kDispatchClassName[ds[i].second->cls < kDcClasses ? ds[i].second->cls : 0], ds[i].second->program.c_str(),
+                     static_cast<unsigned long long>(ds[i].second->caller));
+        }
     }
     std::string dropped;
     for (int k = 0; k < kDroppedDraws; ++k) {
@@ -3193,17 +3665,28 @@ void hle_gnm_cp_report() {
     }
     host_log("cp: register file %s (%llu dwords of SET_*_REG skipped); draw packets %s%s; dispatch packets %s DISPATCH_DIRECT %llu, "
              "DISPATCH_INDIRECT %llu",
-             cp_registers() ? "kept" : "not kept", static_cast<unsigned long long>(g_register_dwords_skipped.load()),
-             cp_draw_packets() ? "drawn" : "not drawn:", dropped.empty() ? (cp_draw_packets() ? "" : " none") : dropped.c_str(),
-             cp_dispatch_packets() ? "run; dropped" : "not run:", static_cast<unsigned long long>(g_dispatch_packets_dropped[0].load()),
-             static_cast<unsigned long long>(g_dispatch_packets_dropped[1].load()));
+             cp_registers() ? "kept" : cp_dispatch_packets() ? "not kept but for the SH registers" : "not kept",
+             static_cast<unsigned long long>(g_register_dwords_skipped.load()), cp_draw_packets() ? "drawn" : "not drawn:",
+             dropped.empty() ? (cp_draw_packets() ? "" : " none") : dropped.c_str(), cp_dispatch_packets() ? "run; dropped" : "not run:",
+             static_cast<unsigned long long>(g_dispatch_packets_dropped[0].load()), static_cast<unsigned long long>(g_dispatch_packets_dropped[1].load()));
+    if (hle_gx_dispatch_native()) {
+        host_log("cp: dispatches from tokens; dispatch packets run from the register file (fallbacks): DISPATCH_DIRECT %llu, DISPATCH_INDIRECT %llu",
+                 static_cast<unsigned long long>(g_dispatch_fallbacks[0].load()), static_cast<unsigned long long>(g_dispatch_fallbacks[1].load()));
+    }
     std::size_t labels = 0;
     {
         std::lock_guard<std::mutex> lk(g_pending_mu);
         labels = g_pending_labels.size();
     }
-    host_log("cp: label values recorded for the GPU to write, by address: %zu addresses; %llu waits satisfied by one", labels,
-             static_cast<unsigned long long>(g_wait_pending.load()));
+    host_log("cp: label values recorded for the GPU to write, by address: %zu addresses; %llu waits satisfied by one; %llu GX pipeline "
+             "drains walked as barrier tokens", labels, static_cast<unsigned long long>(g_wait_pending.load()),
+             static_cast<unsigned long long>(g_barrier_tokens.load()));
+    if (g_query_tokens[0].load() || g_query_tokens[1].load() || g_query_tokens[2].load()) {
+        host_log("cp: occlusion queries from their tokens: %llu begins (%llu blocks reset on the CPU: not in imported memory), %llu ends, "
+                 "%llu other dumps", static_cast<unsigned long long>(g_query_tokens[0].load()),
+                 static_cast<unsigned long long>(g_query_resets_cpu.load()), static_cast<unsigned long long>(g_query_tokens[1].load()),
+                 static_cast<unsigned long long>(g_query_tokens[2].load()));
+    }
 }
 
 void hle_gnm_label_report() {

@@ -65,12 +65,13 @@ height = 1080
 # The default of F10's Frame rate: 30 (the game's own), 60, 90, 120, or 0 for
 # uncapped; what F10 saves wins over it.
 fps_cap = 30
-# The defaults of three F10 settings, by an entry's name; what F10 or the
+# The defaults of four F10 settings, by an entry's name; what F10 or the
 # game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
 # "1280x800" and "Fullscreen").
 # resolution = "1920x1080"
 # window_mode = "Windowed"
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
+# shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out
 # (it hung the GPU there); "on" lets it in, "off" keeps it out on any card.

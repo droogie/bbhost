@@ -8,6 +8,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
+#include "host/shader_bundles.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
@@ -238,6 +239,10 @@ struct GfxPipeline {
     // the evaluation stage's).
     bool tess_native = false;
     gcn::TranslateResult tess_hs;
+    // BBHOST_HLSL: the words of the native hull's control-stage module, which
+    // a pipeline the driver refuses finds the hull's lift by (DXC's module
+    // then, hlsl_stages_from_lifts); empty with the switch off.
+    std::vector<std::uint32_t> tess_hull_spirv;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
@@ -291,6 +296,14 @@ struct GfxPipeline {
     // `name`, "~fallback" for the variant with the page-table paths, "~walks"
     // for one that still walks.
     std::string profile_name;
+    // The stage cache's keys of its vertex and pixel stages (build_gfx_pipeline),
+    // which the pipeline manifest knows a pipeline by.
+    std::uint64_t vs_key = 0, ps_key = 0;
+    // The pipeline manifest's record of what built it (its inputs, copied at
+    // the build; kept in the manifest once the pipeline is created), and
+    // whether its Vulkan pipeline was the one the manifest built at the start.
+    std::shared_ptr<struct PipelineRecipe> recipe;
+    bool prebuilt = false;
 };
 std::unordered_map<std::uint64_t, GfxPipeline> g_gfx;  // never erased, so references to pipelines stay valid
 std::map<std::uint64_t, std::vector<std::uint32_t>> g_program_cache;  // code va -> words (validated by hash on use)
@@ -722,6 +735,10 @@ void set_cache_insert(std::uint64_t key, const std::vector<std::uint64_t>& mater
 }
 }  // namespace
 
+void set_cache_drop_all_locked() {
+    if (!g_cached_sets.empty()) set_cache_flush();
+}
+
 void set_cache_forget_view_locked(VkImageView view) {
     auto it = g_cached_set_views.find(view);
     if (it == g_cached_set_views.end()) return;
@@ -1067,7 +1084,35 @@ thread_local const char* t_draw_pipeline = nullptr;  // the draw being resolved,
 thread_local bool t_snapshot_cbs = false;
 std::atomic<std::uint64_t> g_sf_cb_snapshots{0};
 thread_local char t_draw_origin[160] = "";             // and where it came from
-void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count);  // below, outside the unnamed namespace
+void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count, bool barrier = true);  // below, outside the unnamed namespace
+// Lazy clears (BBHOST_GX_CLEAR_LAZY, with clear tokens): the images whose
+// clear token's clear is not made yet. The next pass that binds such an image
+// whole takes the clear as its load op (begin_pass); what reads or writes the
+// image first otherwise - a draw that binds it without covering it or samples
+// it, a copy, a texture view, a readback, another clear - makes it before going
+// on, as a transfer clear (view_clear_apply_locked); a dispatch, the
+// submission and a dump make every owed clear (view_clears_flush_locked).
+std::vector<std::uint64_t> g_view_clear_list;  // bases with a pending view clear (some may be stale), under g.mu
+std::uint64_t g_view_clear_list_gen = 1;       // bumped when entries leave g_view_clear_list (appends keep it), under g.mu
+bool g_in_view_flush = false;
+std::uint64_t g_vc_set = 0, g_vc_load = 0, g_vc_transfer = 0, g_vc_merged = 0, g_vc_dropped = 0, g_vc_flushes = 0, g_vc_sampled = 0;  // under g.mu
+std::uint64_t g_vc_merged_planes = 0;  // depth clears joined with an owed one of other planes, under g.mu
+std::uint64_t g_vc_why[kVcwCount] = {}, g_vc_why_bytes[kVcwCount] = {};  // owed clears made by transfer, by what made them; under g.mu
+const char* const kVcwName[kVcwCount] = {"a draw's attachment its pass does not cover whole", "sampled by a draw", "a tessellated draw",
+                                         "an older clear a newer one does not cover", "another clear", "a copy", "a texture view",
+                                         "a readback", "the image replaced", "a dispatch", "the submission", "a dump", "other"};
+// The same by image: owed clears taken as a load op, and made by transfer by
+// what made them (the report's largest by transfer bytes).
+struct ViewClearImage {
+    std::uint64_t load = 0, transfer = 0, transfer_bytes = 0;
+    std::uint64_t why[kVcwCount] = {};
+    std::uint32_t width = 0, height = 0, layers = 0;
+    bool depth = false;
+};
+std::unordered_map<std::uint64_t, ViewClearImage> g_vc_by_image;  // by base, under g.mu
+
+void view_clears_flush_locked(int why);
+void view_clear_apply_locked(RtImage& r, int why);
 
 // RADV (GFX8 to GFX10.3, the Deck's VanGogh among them) compresses a colour
 // target with DCC only when every format it may be viewed in has the
@@ -1275,6 +1320,11 @@ void keep_params(const std::string& name, const gcn::StageParams& params, int st
 }
 std::atomic<std::uint64_t> g_cb_realigned{0}, g_cb_realigned_bytes{0};
 std::atomic<std::uint64_t> g_cb_snapshots{0};  // of them, memory the game writes on the CPU (BBHOST_CB_SNAPSHOT)
+std::atomic<std::uint64_t> g_cb_snapshots_shared{0};  // bindings that took an earlier snapshot of the recording (BBHOST_CB_SNAPSHOT_DEDUPE)
+// BBHOST_CB_SNAPSHOT_DEDUPE=check / =compare: the bindings that found an
+// earlier snapshot of the recording and compared its bytes with the guest's,
+// and how many of those differed.
+std::atomic<std::uint64_t> g_cb_snapshots_compared{0}, g_cb_snapshots_changed{0};
 const bool g_trace = [] {
     const char* e = std::getenv("BBHOST_TRACE_RENDER");
     return e && e[0] == '1';
@@ -1314,6 +1364,10 @@ std::uint64_t g_max_rt_bytes = 0;
 std::unordered_set<std::uint64_t> g_htile_bases;
 
 void destroy_rt_image(RtImage& r) {
+    if (r.view_clear) {
+        r.view_clear = r.view_clear_load = false;
+        ++g_vc_dropped;
+    }
     invalidate_rt_views(r.base);
     defer_destroy_view(r.view);
     for (auto& [layer, view] : r.layer_views) defer_destroy_view(view);
@@ -1386,15 +1440,34 @@ struct PendingHtile {
     std::uint32_t word, stencil_clear;  // the HTILE word (htile_word_depth) and DB_STENCIL_CLEAR at the fill
 };
 std::unordered_map<std::uint64_t, PendingHtile> g_pending_htile;
+std::uint64_t g_pending_htile_gen = 1;  // bumped at every insert and erase of g_pending_htile (under g.mu)
 // The fill's clear values become the target's pending clear; true when one was waiting.
 bool take_pending_htile(std::uint64_t key, RtImage& r) {
+    // The keys that missed since the map last changed: every bound target of
+    // every draw asks again for the same few (its HTILE, its base, the draw's
+    // HTILE) while a fill that met no target stays waiting - a hash lookup
+    // each, 0.7% of the command processor at Mensis.
+    static std::uint64_t miss_key[4] = {}, miss_gen = 0;
+    static unsigned miss_next = 0;
+    if (miss_gen != g_pending_htile_gen) {
+        miss_gen = g_pending_htile_gen;
+        for (std::uint64_t& k : miss_key) k = ~0ull;
+    } else {
+        for (const std::uint64_t k : miss_key) {
+            if (k == key) return false;
+        }
+    }
     const auto it = g_pending_htile.find(key);
-    if (it == g_pending_htile.end()) return false;
+    if (it == g_pending_htile.end()) {
+        miss_key[miss_next++ & 3] = key;
+        return false;
+    }
     r.htile_clear_pending = true;
     const float depth = htile_word_depth(it->second.word);
     std::memcpy(&r.htile_clear_depth, &depth, 4);
     r.htile_clear_stencil = it->second.stencil_clear;
     g_pending_htile.erase(it);
+    ++g_pending_htile_gen;
     return true;
 }
 std::atomic<std::uint64_t> g_fill_pending{0}, g_fill_applied{0};
@@ -1417,10 +1490,22 @@ bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
 // extent learned. target_image() reuses its last answer until then.
 std::uint64_t g_rt_gen = 1;
 
+// Milliseconds of a monotonic clock, for ages of a second and more (the
+// reuse retire's idle times, the once-a-second sweeps). On Linux the kernel's
+// coarse clock - its last tick, no TSC read: rt_written stamps every target
+// of every draw, and the precise clock there was 1% of the command
+// processor at Mensis.
 std::uint64_t steady_ms() {
+#if defined(__linux__)
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000u + static_cast<std::uint64_t>(ts.tv_nsec) / 1000000u;
+#else
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
 }
+std::uint64_t g_rt_writes = 0;  // under g.mu: RtImage::last_write
 // A draw, a fill or a copy wrote the target (the reuse retire's age and order).
 // The time is read again once a flip and every 64 writes: every target of
 // every draw comes here, and the clock was 2.3% of the command processor in
@@ -1434,11 +1519,26 @@ void rt_written(RtImage& r) {
     }
     r.written_flip = f;
     r.written_ms = ms;
+    r.written_seq = hle_gnm_cp_job_seq();
+    r.last_write = ++g_rt_writes;
+}
+// The generation of the live GX texture whose memory a target or snapshot
+// made at `base` starts in (0: none): the target is that resource's image.
+// By its first byte: the target's size as the registers pad it can run past
+// the texture's.
+std::uint64_t rt_resource_gen(std::uint64_t base, std::size_t) {
+    GxResourceInfo r;
+    return gx_resource_at(base, 1, &r) && r.type >= 2 ? r.gen : 0;
 }
 // The reuse retire's bases and when it retired them, to count a target made
 // again at a base it had retired within the idle time - the sign of retiring
 // too early (each such remake costs an allocation and the old contents).
 std::unordered_map<std::uint64_t, std::uint64_t> g_reuse_retired_at;  // under g.mu
+// Bases whose target went with its GX resource, and when: a target made there
+// again within the reuse idle time is counted (g_gen_remade) - the memory's
+// next resource, drawn into soon after (render_retire_generation_locked).
+std::unordered_map<std::uint64_t, std::uint64_t> g_gen_retired_at;  // under g.mu
+std::uint64_t g_gen_remade = 0;                                     // under g.mu
 std::uint64_t g_reuse_remade = 0;                                     // under g.mu
 // BBHOST_IMG_REUSE_IDLE=<s>: how long nothing may have written an image before
 // the reuse retire looks at it (10 s).
@@ -1561,6 +1661,9 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             rt_written(r);
             return &r;
         }
+        // A clear token's clear still owed to the old image goes first: its
+        // pixels may be carried into the new one.
+        if (r.view_clear) view_clear_apply_locked(r, kVcwReplaced);
         g.rt_replacements.fetch_add(1);
         if (r.format == format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
@@ -1692,6 +1795,11 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(created));
     rt_written(created);
     created.created_flip = created.written_flip;
+    created.gx_gen = rt_resource_gen(base, rt_size_bytes(created));
+    if (auto ga = g_gen_retired_at.find(base); ga != g_gen_retired_at.end()) {
+        if (created.written_ms - ga->second < reuse_idle_ms()) ++g_gen_remade;
+        g_gen_retired_at.erase(ga);
+    }
     if (auto ra = g_reuse_retired_at.find(base); ra != g_reuse_retired_at.end()) {
         if (created.written_ms - ra->second < reuse_idle_ms()) {
             if (++g_reuse_remade <= 8) {
@@ -1790,7 +1898,7 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
         RtImage* rt = nullptr;
     };
-    static Memo memo[9];
+    static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
@@ -2714,6 +2822,17 @@ std::uint32_t vertex_format_bytes(std::uint32_t dfmt) {
         default: return 4;
     }
 }
+// The packing (gcn::VertexElement::packed) an attribute's format says its
+// element arrives in: the R16, R32 or R32G32 UINT format pack_vertex_input
+// gives an element of 8- or 16-bit components, where one component a channel
+// is R8G8, R8G8B8A8, R16G16 or R16G16B16A16 (vertex_format); 0 otherwise.
+std::uint32_t vertex_packing_of(std::uint32_t w3, VkFormat format) {
+    const std::uint32_t dfmt = (w3 >> 15) & 0xf, bits = gcn::vertex_packed_bits(dfmt);
+    if (!bits) return 0;
+    const std::uint32_t bytes = vertex_format_bytes(dfmt);  // 2, 4 or 8
+    const VkFormat packed = bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
+    return format == packed ? bits : 0;
+}
 
 // Vulkan vertex input for one GX draw: the translator's elements,
 // the pipeline's bindings and attributes (attribute n is element n, at
@@ -2850,6 +2969,87 @@ bool use_pipeline_library() {
     }();
     return on && g.has_gpl && g_set_layouts;
 }
+// Set on the threads that build pipelines behind the game (the precompile
+// workers, the no-fallback variants' builders); the command processor's builds
+// are the ones a draw waits for.
+thread_local bool t_pipeline_worker = false;
+// On a precompile worker building a recipe of the pipeline manifest:
+// create_gfx_pipeline keeps what it creates for the draws to take, and the
+// build leaves the run's statistics, the stage manifest and the table masks
+// alone (nothing draws with it).
+thread_local bool t_replaying = false;
+// What pipeline builds spend in the driver, by part: the shader libraries
+// (pre-rasterization, fragment shader), the small interface libraries (vertex
+// input, fragment output), links of libraries, whole pipelines (without
+// libraries), descriptor set and pipeline layouts, and the time a build waited
+// for a library another thread was building. The command processor's count
+// for the stall line (host_gpu_pipeline_work_us: what a hitch went to); every
+// thread's per build, for BBHOST_LOG_PIPELINE_BUILDS.
+enum PipelineWork { kWorkShaderLibrary, kWorkInterfaceLibrary, kWorkLink, kWorkWhole, kWorkLayout, kWorkLibraryWait, kWorkCount };
+std::atomic<std::uint64_t> g_cp_work_us[kWorkCount] = {}, g_cp_work_n[kWorkCount] = {};
+thread_local std::uint64_t t_work_us[kWorkCount] = {}, t_work_n[kWorkCount] = {};
+thread_local std::uint64_t t_stage_translations = 0;  // this thread's stage translations, for the build's line
+void note_pipeline_work(PipelineWork w, std::uint64_t us) {
+    t_work_us[w] += us;
+    ++t_work_n[w];
+    if (t_pipeline_worker) return;
+    g_cp_work_us[w].fetch_add(us, std::memory_order_relaxed);
+    g_cp_work_n[w].fetch_add(1, std::memory_order_relaxed);
+}
+std::uint64_t work_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+// BBHOST_LOG_PIPELINE_BUILDS=<ms>: each pipeline build on the command processor
+// that took at least that long (0: every one), with what it spent - the parts
+// above, the stages it translated itself, and the rest (translations, modules,
+// bookkeeping). The outermost build of a thread logs; one inside it adds to it.
+const long g_log_pipeline_builds = [] {
+    const char* e = std::getenv("BBHOST_LOG_PIPELINE_BUILDS");
+    return e && *e ? std::atol(e) : -1L;
+}();
+thread_local int t_build_depth = 0;
+struct PipelineBuildScope {
+    const GfxPipeline& pl;
+    const char* what;
+    bool outer;
+    std::chrono::steady_clock::time_point t0{};
+    std::uint64_t us0[kWorkCount] = {}, n0[kWorkCount] = {}, translations0 = 0;
+    PipelineBuildScope(const GfxPipeline& p, const char* w)
+        : pl(p), what(w), outer(t_build_depth++ == 0 && g_log_pipeline_builds >= 0 && !t_pipeline_worker) {
+        if (!outer) return;
+        t0 = std::chrono::steady_clock::now();
+        std::copy(t_work_us, t_work_us + kWorkCount, us0);
+        std::copy(t_work_n, t_work_n + kWorkCount, n0);
+        translations0 = t_stage_translations;
+    }
+    PipelineBuildScope(const PipelineBuildScope&) = delete;
+    PipelineBuildScope& operator=(const PipelineBuildScope&) = delete;
+    ~PipelineBuildScope() {
+        --t_build_depth;
+        if (!outer) return;
+        const std::uint64_t us = work_us_since(t0);
+        if (us < static_cast<std::uint64_t>(g_log_pipeline_builds) * 1000) return;
+        std::uint64_t du[kWorkCount], dn[kWorkCount], parts = 0;
+        for (int k = 0; k < kWorkCount; ++k) {
+            du[k] = t_work_us[k] - us0[k];
+            dn[k] = t_work_n[k] - n0[k];
+            if (k != kWorkLibraryWait) parts += du[k];
+        }
+        parts += du[kWorkLibraryWait];
+        host_log("render: pipeline build %s%s on the command processor at flip %llu: %.2f ms (%s, %s): shader libraries %llu in %.2f ms, "
+                 "interface libraries %llu in %.2f ms, links %llu in %.2f ms, whole pipelines %llu in %.2f ms, layouts %llu in %.2f ms, "
+                 "waiting for another thread's library %.2f ms; stage translations %llu; the rest %.2f ms",
+                 pl.name.c_str(), pl.lean ? " (no-fallback)" : pl.layout_only ? " (fallback, laid out)" : "",
+                 static_cast<unsigned long long>(hle_video_flip_count()), us / 1000.0, what,
+                 pl.failed ? "failed" : pl.prebuilt ? "built at the start" : pl.library ? "linked" : pl.pipeline ? "whole" : "not created",
+                 static_cast<unsigned long long>(dn[kWorkShaderLibrary]), du[kWorkShaderLibrary] / 1000.0,
+                 static_cast<unsigned long long>(dn[kWorkInterfaceLibrary]), du[kWorkInterfaceLibrary] / 1000.0,
+                 static_cast<unsigned long long>(dn[kWorkLink]), du[kWorkLink] / 1000.0, static_cast<unsigned long long>(dn[kWorkWhole]),
+                 du[kWorkWhole] / 1000.0, static_cast<unsigned long long>(dn[kWorkLayout]), du[kWorkLayout] / 1000.0,
+                 du[kWorkLibraryWait] / 1000.0, static_cast<unsigned long long>(t_stage_translations - translations0),
+                 (us > parts ? us - parts : 0) / 1000.0);
+    }
+};
 std::mutex g_stage_layout_mu;  // pipelines are built on worker threads too
 std::unordered_map<std::uint64_t, VkDescriptorSetLayout> g_stage_set_layouts;  // by binding list, under g_stage_layout_mu
 std::unordered_map<std::uint64_t, VkPipelineLayout> g_stage_pipe_layouts;       // by set layout pair, under g_stage_layout_mu
@@ -2897,7 +3097,10 @@ VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta) {
     lci.bindingCount = static_cast<std::uint32_t>(binds.size());
     lci.pBindings = binds.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout) != VK_SUCCESS) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) {
         host_log("render: descriptor set layout with %zu bindings failed", binds.size());
         return VK_NULL_HANDLE;
     }
@@ -2915,7 +3118,10 @@ VkPipelineLayout stage_pipeline_layout(VkDescriptorSetLayout vs, VkDescriptorSet
     plci.setLayoutCount = g.bindless ? 4 : cb_push_on() ? 3 : 2;  // set 3: the global views and samplers
     plci.pSetLayouts = sets;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    if (vkCreatePipelineLayout(g.device, &plci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreatePipelineLayout(g.device, &plci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_pipe_layouts.emplace(key, layout);
     return layout;
 }
@@ -2931,7 +3137,6 @@ VkPipelineLayout stage_pipeline_layout(VkDescriptorSetLayout vs, VkDescriptorSet
 // and the options that change its translation; stages the cache served are
 // counted as reused (with BBHOST_STAGE_CACHE=0, translations whose key was
 // seen before).
-thread_local bool t_pipeline_worker = false;
 std::atomic<std::uint64_t> g_pl_translate_us{0}, g_pl_module_us{0}, g_pl_create_us{0}, g_pl_stage_translations{0}, g_pl_stage_repeats{0};
 std::mutex g_stage_keys_mu;
 std::unordered_set<std::uint64_t> g_stage_keys;
@@ -2991,6 +3196,7 @@ std::shared_ptr<const CachedStage> cached_stage(std::uint64_t key) {
 }
 
 void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module, bool lifted) {
+    if (lifted) hlsl_tag_stage(key);  // the lift just made on this thread, if its DXC module waits
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;
     entry->module = module;
@@ -3070,6 +3276,19 @@ std::shared_ptr<const gcn::ShaderReflection> reflection_for(const std::string& n
     std::lock_guard<std::mutex> lk(g_reflections_mu);
     const auto it = g_reflections.find(name);
     return it == g_reflections.end() ? nullptr : it->second;
+}
+// A program's reflection from the game's bundles, where GX has not created it
+// yet: a stage built ahead of GX's creation (the pipeline manifest, the stage
+// manifest) then carries the engine's names as the draw's build would, and
+// is the same module - the same libraries, the same driver cache entries.
+void reflection_from_bundle(const std::string& name) {
+    if (!g_shader_names || name.empty() || reflection_for(name)) return;
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_bundle_container(name);
+    if (!c) return;
+    auto r = std::make_shared<gcn::ShaderReflection>();
+    if (!gcn::parse_reflection(*c, *r)) return;
+    std::lock_guard<std::mutex> lk(g_reflections_mu);
+    g_reflections.emplace(name, std::move(r));
 }
 // The engine's names on a lifted stage, where GX created the program.
 void name_stage(gcn::LiftResult& lifted, const gcn::TranslateResult& reference, const std::string& name) {
@@ -3152,10 +3371,17 @@ void record_shader_created(int creator, const std::uint8_t* container, std::size
                 }
             }
         }
-        if (stage == 1 && precompile_enabled() && (precompile_stage_mask() & 2)) {
+        // Only with pipeline libraries: without them a shader alone is a
+        // translation and a module, which the draws used for about half of
+        // the shaders GX creates (950 of 1,987 pixel stages over the 12-place
+        // tour), kept at a cost of 0.7 GiB at every start (and 30 s of
+        // compiles at a first one) against 0.45 s of the command processor's
+        // translations in a first session. The stage and pipeline manifests
+        // make a later start's stages for the draws that need them.
+        if (stage == 1 && precompile_enabled() && use_pipeline_library() && (precompile_stage_mask() & 2)) {
             queue_ps_precompile(name, std::vector<std::uint8_t>(container, container + size));
         }
-        if (stage == 0 && precompile_enabled() && (precompile_stage_mask() & 1)) {
+        if (stage == 0 && precompile_enabled() && use_pipeline_library() && (precompile_stage_mask() & 1)) {
             queue_vs_precompile(name, std::vector<std::uint8_t>(container, container + size));
         }
     }
@@ -3733,6 +3959,24 @@ struct TessHullModule {
 };
 std::mutex g_tess_hull_mu;
 std::unordered_map<std::uint64_t, TessHullModule> g_tess_hull_modules;  // under g_tess_hull_mu
+// The LS and the hull of a tessellated pipeline built off the command
+// processor - the copies queue_native_pipeline made for a worker, or a
+// recipe's (the pipeline manifest) - and the LS's fetch shader for a recipe;
+// null elsewhere. program_at and fetch_program_at are the command processor's.
+thread_local const CachedProgram* t_tess_native_programs[2] = {nullptr, nullptr};
+thread_local const FetchProgram* t_tess_ls_fetch = nullptr;
+// A tessellated draw's LS (0) or hull (1): the copy above, else the program
+// at its address (on the command processor; a recipe's build has no other).
+const CachedProgram* tess_program(const DrawState& s, int which) {
+    if (t_tess_native_programs[which]) return t_tess_native_programs[which];
+    if (t_replaying) return nullptr;
+    return program_at(which ? s.hs_va : s.ls_va);
+}
+const FetchProgram* tess_ls_fetch_program(const DrawState& s) {
+    if (t_tess_ls_fetch) return t_tess_ls_fetch;
+    if (t_replaying || !s.ls_fetch_va) return nullptr;
+    return fetch_program_at(s.ls_fetch_va);
+}
 std::uint64_t tess_hull_key(const DrawState& s, const CachedProgram& hs) {
     const std::uint32_t k[6] = {s.hs_rsrc1, s.hs_rsrc2, s.tess_window, s.tess_control_points,
                                 (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2,
@@ -3741,14 +3985,14 @@ std::uint64_t tess_hull_key(const DrawState& s, const CachedProgram& hs) {
 }
 // The control stage tess_hull_module made for a draw's state, or null.
 std::vector<std::uint32_t> tess_hull_spirv(const DrawState& s) {
-    CachedProgram* hs = program_at(s.hs_va);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!hs) return {};
     std::lock_guard<std::mutex> lk(g_tess_hull_mu);
     const auto it = g_tess_hull_modules.find(tess_hull_key(s, *hs));
     return it == g_tess_hull_modules.end() ? std::vector<std::uint32_t>() : it->second.spirv;
 }
 VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name) {
-    CachedProgram* hs = program_at(s.hs_va);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!hs) return VK_NULL_HANDLE;
     const std::uint64_t key = tess_hull_key(s, *hs);
     std::lock_guard<std::mutex> lk(g_tess_hull_mu);
@@ -3943,6 +4187,420 @@ void manifest_note_hit(std::uint64_t key) {
     if (g_manifest.ready.count(key)) g_manifest.hits.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ---- The pipeline manifest (<data root>/bbhost/pipeline-manifest.bin) ----
+// Every graphics pipeline a draw created, as what built it: the draw state
+// build_gfx_pipeline and create_gfx_pipeline read (registers, the GX state
+// objects' descriptions, the targets' formats), the programs' words, the image
+// dimensions and sampler modes, the vertex input, and the specialization its
+// optimized relink took from its first draw. The next start builds each one
+// again on the precompile workers - its stages, its libraries, the link (or
+// the whole pipeline where there are no libraries) and the relink - so a draw
+// that needs it later finds its Vulkan pipeline made (create_gfx_pipeline
+// takes it by pipeline_content_key): no pipeline is compiled on first sight
+// in an area an earlier run has seen. It holds the game's inputs, not what was
+// built from them, so a new translator or another driver changes nothing in
+// it - the stage translations (the translation cache, by the translator's
+// fingerprint) and the driver's pipelines (its cache, by pipelineCacheUUID)
+// are made again from them at that start, in the background. A recipe that no
+// longer builds is dropped; one no draw took for kRecipeIdleRuns starts is
+// dropped too, and past kRecipeMax recipes or kRecipeMaxBytes the least
+// recently used go first. A tessellated pipeline holds copies of its LS, its
+// hull and the LS's fetch shader too (the build reads those instead of guest
+// memory); the LS's own compute pipeline, for the host-tessellated path, is
+// not recorded. BBHOST_PIPELINE_MANIFEST=0 turns it off; it is off with the
+// pipeline cache (BBHOST_PIPELINE_CACHE=0).
+struct PipelineRecipe {
+    // Copied at the build; the pointers into the run's own objects are set
+    // to the copies below for each build from it (recipe_draw_state).
+    DrawState s;
+    std::uint32_t color_format[8] = {}, depth_format = 0;
+    GxBlendDesc blend{};
+    GxDepthStencilDesc depth{};
+    GxRasterDesc raster{};
+    std::vector<std::uint32_t> vs_words, fetch_words, ps_words;
+    std::string vs_name, ps_name;
+    std::vector<std::pair<std::uint32_t, bool>> vs_dims, ps_dims;
+    std::vector<bool> vs_modes, ps_modes;
+    bool cb_no_fallback = false, layout_only = false;
+    bool has_vertex_input = false;
+    VertexInputPlan vertex_input;  // its elements, bindings, attributes and hash (no buffers)
+    // A tessellated pipeline's LS and hull and the LS's fetch shader, as the
+    // build read them (tess_program; a recipe's build reads these copies).
+    bool has_ls = false, has_hs = false, has_ls_fetch = false;
+    CachedProgram ls, hs;
+    FetchProgram ls_fetch;
+    // The host tessellator's LS passes the recorded pipeline's draws ran,
+    // whose compute pipelines the start builds too (ls_pass_prebuild): each an
+    // LS, its fetch shader, its resource registers and, with the game's hull,
+    // the window and control points (tess_ls_pass_locked's key). One pipeline
+    // draws with several (the game's hull pipeline 62fa34d8+bb10e440 takes six
+    // LS programs over the Forbidden Woods and the Nightmare Frontier); a
+    // tessellated draw whose pass a recipe lacks adds it (recipe_attach_ls_pass).
+    struct LsPassRecord {
+        CachedProgram ls;
+        bool has_fetch = false, hull = false;
+        FetchProgram fetch;
+        std::uint32_t rsrc1 = 0, rsrc2 = 0, window = 0, control_points = 0;
+    };
+    std::vector<LsPassRecord> ls_passes;
+    // The optimized relink's specialization by its first draw (queue_library_relink).
+    bool relink = false;
+    std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
+    std::uint16_t spec_w3_mask[2] = {};
+    // Bookkeeping: the content key it was created under, how many starts'
+    // draws took it, and the last start that did (or recorded it).
+    std::uint64_t key = 0;
+    std::uint32_t uses = 0, last_run = 0;
+    // Its place in the order its last start's draws first took them (created
+    // or found built): a start builds the last start's in that order - the
+    // title's first, then the place the game starts in, then where it went -
+    // and the older ones after, the most recent first, so what is likely
+    // drawn first is built first after many starts too.
+    std::uint32_t order = 0;
+    bool listed = false;  // from a shipped list (pipeline_manifest_load), not this player's own record
+    bool loaded = false;  // read at the start (else recorded in this run)
+};
+// The state a build from `r` reads, its pointers aimed at `formats` and the
+// recipe's descriptions.
+DrawState recipe_draw_state(const PipelineRecipe& r, RtImage formats[9]) {
+    DrawState s = r.s;
+    for (int t = 0; t < 8; ++t) {
+        s.color[t] = nullptr;
+        if (r.color_format[t]) {
+            formats[t].format = static_cast<VkFormat>(r.color_format[t]);
+            s.color[t] = &formats[t];
+        }
+    }
+    s.depth = nullptr;
+    if (r.depth_format) {
+        formats[8].format = static_cast<VkFormat>(r.depth_format);
+        s.depth = &formats[8];
+    }
+    s.gx_blend = r.s.gx_blend ? &r.blend : nullptr;
+    s.gx_depth = r.s.gx_depth ? &r.depth : nullptr;
+    s.gx_raster = r.s.gx_raster ? &r.raster : nullptr;
+    return s;
+}
+bool pipeline_manifest_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_PIPELINE_MANIFEST");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+bool recipe_tessellated(const DrawState& s) { return s.tess_hw || s.domain_level || s.tess_native || s.tess_attrs || s.tess_hull; }
+// A tessellated pipeline's LS fetch shader, where it may be asked for: the
+// recipe's copy, else on the command processor (fetch_program_at is its own).
+const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
+    if (t_tess_ls_fetch || t_replaying) return t_tess_ls_fetch;
+    return t_pipeline_worker || !s.tess_attrs ? nullptr : tess_ls_fetch_program(s);
+}
+// The pipelines a recipe can describe: every one whose tessellation
+// programs, if it has any, can be read where it is built (a worker reads only
+// the copies it was given).
+bool recipe_recordable(const DrawState& s) {
+    if (!recipe_tessellated(s)) return true;
+    return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
+}
+thread_local std::uint64_t t_replay_key = 0;  // the content key create_gfx_pipeline gave the pipeline built from a recipe
+constexpr std::size_t kRecipeMax = 16384;
+constexpr std::uint64_t kRecipeMaxBytes = 64ull << 20;
+constexpr std::uint32_t kRecipeIdleRuns = 16;
+struct PipelineManifest {
+    std::mutex mu;
+    std::unordered_map<std::uint64_t, std::shared_ptr<PipelineRecipe>> by_key;  // under mu
+    std::uint32_t run = 1;  // this start's number (the file's + 1)
+    bool dirty = false;     // under mu
+    // Pipelines built from recipes at this start, by content key; never erased
+    // (their Vulkan pipelines are the draws').
+    std::unordered_map<std::uint64_t, GfxPipeline*> built;  // under mu
+    std::deque<GfxPipeline> pipelines;                      // under mu: the built ones' objects
+    std::atomic<std::uint64_t> loaded{0}, queued{0}, done{0}, failed{0}, relinked{0}, build_us{0}, recorded{0};
+    std::atomic<std::uint64_t> taken{0}, not_ready{0}, layout_differs{0}, unrecordable{0}, dropped{0};
+    std::atomic<std::uint64_t> wait_us{0};
+    std::atomic<std::uint32_t> next_order{0};
+    std::chrono::steady_clock::time_point loaded_at{};
+    std::atomic<bool> done_logged{false};
+    std::atomic<bool> recording{false};  // a manifest file to keep: set when it is read (pipeline_manifest_load)
+};
+PipelineManifest g_pmanifest;
+// A field added to GfxFixedState reaches the Vulkan pipeline: it must join
+// pipeline_content_key below (or a pipeline the start built from a recipe
+// made before it would be taken for draws that differ in it), and what
+// build_gfx_pipeline and create_gfx_pipeline newly read of the draw state must
+// join PipelineRecipe, with recipe_file::kVersion raised.
+#if defined(__GLIBCXX__) && defined(__x86_64__)
+static_assert(sizeof(GfxFixedState) == 184, "a new GfxFixedState field: add it to pipeline_content_key");
+#endif
+// Everything a graphics pipeline's Vulkan creation is made from that is not
+// the run's own handles: its stages (by the stage cache's keys), whether it
+// links from libraries, the geometry shader of a rect list, the vertex input
+// and the fixed state - where it links from libraries only what the libraries
+// take (depth, stencil, cull and front face are set per draw).
+std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, const GfxFixedState& f, const VertexInputPlan* vertex_input,
+                                   bool linked) {
+    struct Head {
+        std::uint64_t vs, ps, vi;
+        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, pad;
+    } h{};
+    h.vs = pl.vs_key;
+    h.ps = pl.ps.module ? pl.ps_key : 0;
+    h.vi = vertex_input ? vertex_input->hash : 0;
+    h.linked = linked ? 1u : 0u;
+    h.gs = pl.gs.module ? 1u : 0u;
+    h.topology = static_cast<std::uint32_t>(f.topology);
+    h.polygon = static_cast<std::uint32_t>(f.polygon_mode);
+    h.clamp = f.depth_clamp && !(linked && g.dynamic_depth_clamp) ? 1u : 0u;
+    h.lean = pl.lean ? 1u : 0u;
+    h.layout_only = pl.layout_only ? 1u : 0u;
+    h.formats_from_params = pl.vs_formats_from_params ? 1u : 0u;
+    h.clip_discard = pl.clip_discard;
+    std::uint64_t k = fnv1a(&h, sizeof(h), 0x9b9e7ac0ffee0001ull);
+    k = fnv1a(f.blends.data(), f.blends.size() * sizeof(VkPipelineColorBlendAttachmentState), k);
+    k = fnv1a(f.color_formats.data(), f.color_formats.size() * sizeof(VkFormat), k);
+    const VkFormat ds[2] = {f.depth_format, f.stencil_format};
+    k = fnv1a(ds, sizeof(ds), k);
+    if (!linked) {
+        struct Rest {
+            std::uint32_t cull, front_face, depth_test, depth_write, bounds, stencil, compare, bias;
+            float bias_constant, bias_clamp, bias_slope;
+            VkStencilOpState front, back;
+        } r{};
+        r.cull = f.cull_mode;
+        r.front_face = static_cast<std::uint32_t>(f.front_face);
+        r.depth_test = f.depth_test;
+        r.depth_write = f.depth_write;
+        r.bounds = f.depth_bounds_test;
+        r.stencil = f.stencil_test;
+        r.compare = static_cast<std::uint32_t>(f.depth_compare);
+        r.bias = f.depth_bias;
+        r.bias_constant = f.bias_constant;
+        r.bias_clamp = f.bias_clamp;
+        r.bias_slope = f.bias_slope;
+        r.front = f.front;
+        r.back = f.back;
+        k = fnv1a(&r, sizeof(r), k ^ 0x7710);
+    }
+    if (recipe_tessellated(s)) {
+        // What the tessellation stages are made from: the draw's state for
+        // them and the programs (their words' hashes).
+        struct Tess {
+            std::uint32_t hw, control_points, attrs, attr_vec4s, ls_rsrc1, ls_rsrc2, hull, hs_rsrc1, hs_rsrc2, window, shape, native, domain_level;
+            float outer[4], inner[2];
+            std::uint32_t constants[12], cb[2];
+            std::uint64_t ls, hs, fetch;
+        } t{};
+        t.hw = s.tess_hw;
+        t.control_points = s.tess_control_points;
+        t.attrs = s.tess_attrs;
+        t.attr_vec4s = s.tess_attr_vec4s;
+        t.ls_rsrc1 = s.ls_rsrc1;
+        t.ls_rsrc2 = s.ls_rsrc2;
+        t.hull = s.tess_hull;
+        t.hs_rsrc1 = s.hs_rsrc1;
+        t.hs_rsrc2 = s.hs_rsrc2;
+        t.window = s.tess_window;
+        t.shape = (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2;
+        t.native = s.tess_native;
+        t.domain_level = s.domain_level;
+        std::memcpy(t.outer, s.tess_outer, sizeof(t.outer));
+        std::memcpy(t.inner, s.tess_inner, sizeof(t.inner));
+        std::memcpy(t.constants, s.tess_constants, sizeof(t.constants));
+        std::memcpy(t.cb, s.tess_cb, sizeof(t.cb));
+        if (const CachedProgram* ls = s.ls_va || t_tess_native_programs[0] ? tess_program(s, 0) : nullptr) t.ls = ls->hash;
+        if (const CachedProgram* hs = s.hs_va || t_tess_native_programs[1] ? tess_program(s, 1) : nullptr) t.hs = hs->hash;
+        if (const FetchProgram* fp = tess_ls_fetch_safe(s)) t.fetch = fp->hash;
+        k = fnv1a(&t, sizeof(t), k ^ 0x7e55ull);
+    }
+    return k ? k : 1;
+}
+// The LS pass of the tessellated draw being drawn (t_tess), into a recipe that
+// lacks it: true when it was added (the manifest is then dirty). Under
+// g_pmanifest.mu for a recipe the manifest holds. Defined with the LS pass.
+bool recipe_attach_ls_pass(PipelineRecipe& r);
+// A recipe's LS passes' compute pipelines, built on this precompile worker
+// unless they are built already (replay_recipe). Defined with the LS pass.
+void ls_pass_prebuild(const PipelineRecipe& r);
+// The LS passes' compute pipelines for the exit report: built from recipes at
+// the start (failed), taken by draws, built by the command processor.
+std::string ls_pass_report();
+
+// At a build (not one from a recipe): what it was built from, for the
+// manifest once its pipeline is created.
+void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+                       const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words, const std::string& vs_name,
+                       const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                       const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                       const std::vector<bool>& ps_modes, bool cb_no_fallback, bool layout_only, const VertexInputPlan* vertex_input) {
+    if (!g_pmanifest.recording.load(std::memory_order_relaxed) || t_replaying) return;
+    if (!recipe_recordable(s)) {
+        pl.recipe.reset();
+        return;
+    }
+    auto r = std::make_shared<PipelineRecipe>();
+    r->s = s;
+    if (recipe_tessellated(s)) {
+        // Copies of the programs the build reads; one it cannot read now
+        // leaves the pipeline unrecorded (its build would fail anyway).
+        const CachedProgram* ls = s.ls_va || t_tess_native_programs[0] ? tess_program(s, 0) : nullptr;
+        const CachedProgram* hs = s.hs_va || t_tess_native_programs[1] ? tess_program(s, 1) : nullptr;
+        if ((s.ls_va && !ls) || (s.hs_va && !hs)) {
+            pl.recipe.reset();
+            return;
+        }
+        if (ls) {
+            r->has_ls = true;
+            r->ls = *ls;
+        }
+        if (hs) {
+            r->has_hs = true;
+            r->hs = *hs;
+        }
+        if (const FetchProgram* fp = tess_ls_fetch_safe(s)) {
+            r->has_ls_fetch = true;
+            r->ls_fetch = *fp;
+        } else if (s.tess_attrs && s.ls_fetch_va) {
+            pl.recipe.reset();
+            return;
+        }
+    }
+    for (int t = 0; t < 8; ++t) r->color_format[t] = s.color[t] ? static_cast<std::uint32_t>(s.color[t]->format) : 0u;
+    r->depth_format = s.depth ? static_cast<std::uint32_t>(s.depth->format) : 0u;
+    if (s.gx_blend) r->blend = *s.gx_blend;
+    if (s.gx_depth) r->depth = *s.gx_depth;
+    if (s.gx_raster) r->raster = *s.gx_raster;
+    r->vs_words = vs_words;
+    r->fetch_words = fetch_words;
+    r->ps_words = ps_words;
+    r->vs_name = vs_name;
+    r->ps_name = ps_name;
+    r->vs_dims = vs_dims;
+    r->ps_dims = ps_dims;
+    r->vs_modes = vs_modes;
+    r->ps_modes = ps_modes;
+    r->cb_no_fallback = cb_no_fallback;
+    r->layout_only = layout_only;
+    if (vertex_input) {
+        r->has_vertex_input = true;
+        r->vertex_input.elements = vertex_input->elements;
+        r->vertex_input.bindings = vertex_input->bindings;
+        r->vertex_input.attributes = vertex_input->attributes;
+        r->vertex_input.hash = vertex_input->hash;
+    }
+    if (recipe_tessellated(s)) recipe_attach_ls_pass(*r);
+    pl.recipe = std::move(r);
+}
+// BBHOST_LOG_NEW_RECIPES=1: each pipeline the manifest had no recipe for, as
+// it is recorded - what tools/full_tour.py counts per map and stop (a test
+// switch; the line is not written otherwise).
+const bool g_log_new_recipes = [] {
+    const char* e = std::getenv("BBHOST_LOG_NEW_RECIPES");
+    return e && e[0] == '1';
+}();
+
+// A pipeline was created (not from a recipe): its recipe joins the manifest,
+// or the one there counts this start's use.
+void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
+    if (!pl.recipe || !key) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    const auto [it, fresh] = g_pmanifest.by_key.try_emplace(key, pl.recipe);
+    if (fresh) {
+        pl.recipe->key = key;
+        pl.recipe->uses = 1;
+        pl.recipe->last_run = g_pmanifest.run;
+        pl.recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t n = g_pmanifest.recorded.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_pmanifest.dirty = true;
+        if (g_log_new_recipes) {
+            host_log("render: pipeline manifest: new recipe %016llx %s+%s%s (%llu in this run) at flip %llu", static_cast<unsigned long long>(key),
+                     pl.recipe->vs_name.c_str(), pl.recipe->ps_name.c_str(), recipe_tessellated(pl.recipe->s) ? " tessellated" : "",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+    } else {
+        pl.recipe = it->second;  // a later relink's specialization goes to the kept one
+        if (recipe_tessellated(it->second->s) && recipe_attach_ls_pass(*it->second)) g_pmanifest.dirty = true;
+        if (it->second->last_run != g_pmanifest.run) {
+            it->second->last_run = g_pmanifest.run;
+            it->second->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+            ++it->second->uses;
+            g_pmanifest.dirty = true;
+        }
+    }
+}
+// Its first draw queued the optimized relink: the specialization that took.
+void recipe_note_relink(const GfxPipeline& pl) {
+    if (!pl.recipe) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    PipelineRecipe& r = *pl.recipe;
+    if (r.relink && !std::memcmp(r.spec_w3, pl.spec_w3, sizeof(r.spec_w3)) && !std::memcmp(r.spec_stride, pl.spec_stride, sizeof(r.spec_stride)) &&
+        !std::memcmp(r.spec_w3_mask, pl.spec_w3_mask, sizeof(r.spec_w3_mask))) {
+        return;
+    }
+    r.relink = true;
+    std::memcpy(r.spec_w3, pl.spec_w3, sizeof(r.spec_w3));
+    std::memcpy(r.spec_stride, pl.spec_stride, sizeof(r.spec_stride));
+    std::memcpy(r.spec_w3_mask, pl.spec_w3_mask, sizeof(r.spec_w3_mask));
+    g_pmanifest.dirty = true;
+}
+// A draw built a stage itself: count it when the shader sweep had compiled it
+// into the caches (defined with the sweep).
+void note_sweep_hit(std::uint64_t key);
+// A draw's pipeline the start built from a recipe: its Vulkan pipeline, its
+// optimized relink and that relink's specialization, taken by `pl`. False
+// when there is none (yet).
+bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
+    GfxPipeline* pre = nullptr;
+    std::shared_ptr<PipelineRecipe> recipe;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (g_pmanifest.built.empty()) return false;
+        const auto it = g_pmanifest.built.find(key);
+        if (it == g_pmanifest.built.end()) {
+            // One the start read but has not built yet (its build still
+            // queued or running), not one this run recorded a moment ago.
+            if (const auto r = g_pmanifest.by_key.find(key); r != g_pmanifest.by_key.end() && r->second->loaded) {
+                g_pmanifest.not_ready.fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        pre = it->second;
+        if (const auto r = g_pmanifest.by_key.find(key); r != g_pmanifest.by_key.end()) recipe = r->second;
+    }
+    if (!pre->pipeline || pre->failed) return false;
+    if (pre->layout != pl.layout) {  // the same stages lay out alike: a pipeline layout made for another set
+        g_pmanifest.layout_differs.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    pl.pipeline = pre->pipeline;
+    pl.library = pre->library;
+    pl.generic = pre->generic;
+    std::memcpy(pl.spec_w3, pre->spec_w3, sizeof(pl.spec_w3));
+    std::memcpy(pl.spec_stride, pre->spec_stride, sizeof(pl.spec_stride));
+    std::memcpy(pl.spec_w3_mask, pre->spec_w3_mask, sizeof(pl.spec_w3_mask));
+    // Relinked at the start, or (no specialization recorded, or the relink
+    // failed) relinked at its first draw as any other.
+    std::copy(pre->relink_libs, pre->relink_libs + 4, pl.relink_libs);
+    pl.relink_formats = pre->relink_formats;
+    std::copy(pre->relink_vertex_formats, pre->relink_vertex_formats + 16, pl.relink_vertex_formats);
+    pl.relink_polygon = pre->relink_polygon;
+    pl.relink_clamp = pre->relink_clamp;
+    pl.relink_pending = pre->relink_pending;
+    pl.prebuilt = true;
+    if (recipe) {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        pl.recipe = recipe;
+        if (recipe_tessellated(recipe->s) && recipe_attach_ls_pass(*recipe)) g_pmanifest.dirty = true;
+        if (recipe->last_run != g_pmanifest.run) {
+            recipe->last_run = g_pmanifest.run;
+            recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+            ++recipe->uses;
+            g_pmanifest.dirty = true;
+        }
+    }
+    g_pmanifest.taken.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // BBHOST_TESS_PATCH_CULL=<clip w>: a patch whose centre is nearer the camera
 // plane than this is not drawn. A camera-facing quad beside or behind the eye
 // has no projection - the clipper turns it into a wedge across the frame, and
@@ -4034,9 +4692,6 @@ void note_vs_precompile_miss(const std::string& name, const VsStageInputs& in);
 // --native replays.
 constexpr std::uint32_t kTessNativeSet = 4, kTessNativeLsParams = 0, kTessNativeHsParams = 1, kTessNativeLsBuffers = 16,
                         kTessNativeHsBuffers = 32;
-// The LS and hull of the native hull pipeline a worker is building
-// (queue_native_pipeline), null elsewhere.
-thread_local const CachedProgram* t_tess_native_programs[2] = {nullptr, nullptr};
 
 // Where a stage reads the tessellation constants (tess_constants_where): the
 // constant buffer's V# in its user SGPRs, or in the extended user data table
@@ -4090,7 +4745,10 @@ VkDescriptorSetLayout tess_native_set_layout(const gcn::TranslateResult& ls, con
     lci.bindingCount = static_cast<std::uint32_t>(binds.size());
     lci.pBindings = binds.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_set_layouts.emplace(key, layout);
     return layout;
 }
@@ -4111,7 +4769,10 @@ VkPipelineLayout tess_native_pipeline_layout(VkDescriptorSetLayout vs, VkDescrip
     plci.setLayoutCount = 5;
     plci.pSetLayouts = sets;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    if (vkCreatePipelineLayout(g.device, &plci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreatePipelineLayout(g.device, &plci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_pipe_layouts.emplace(key, layout);
     return layout;
 }
@@ -4129,8 +4790,8 @@ bool tess_native_first(const std::string& name) {
 bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::string& why) {
     // On a worker, the copies queue_native_pipeline made (program_at is the
     // command processor's); in place, the programs themselves.
-    const CachedProgram* ls = t_tess_native_programs[0] ? t_tess_native_programs[0] : program_at(s.ls_va);
-    const CachedProgram* hs = t_tess_native_programs[1] ? t_tess_native_programs[1] : program_at(s.hs_va);
+    const CachedProgram* ls = tess_program(s, 0);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!ls || !hs) {
         why = "the LS or the hull shader is not a known program";
         return false;
@@ -4167,6 +4828,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         tl.attr_vec4s = s.tess_constants[0] / 16;
         tl.own_params = true;
         tl.params_binding = kTessNativeLsParams;
+        hlsl_name_next(ls->name);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftLs, prog, o, ref, tl);
         const bool first = tess_native_first(ls->name);
         if (!lifted.ok()) {
@@ -4224,6 +4886,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         gcn::TessLift tl = tess_native_lift(s, s.tess_cb[1]);
         tl.own_params = true;
         tl.params_binding = kTessNativeHsParams;
+        hlsl_name_next(hs->name);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftHull, prog, o, ref, tl);
         const bool first = tess_native_first(hs->name);
         if (!lifted.ok()) {
@@ -4244,6 +4907,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
             why = "hull module";
             return false;
         }
+        if (hlsl_on()) pl.tess_hull_spirv = lifted.spirv;
         pl.tess_hs = ref;
         pl.tess_hs.spirv.clear();  // the bindings are what the draws read
         pl.tess_hs.spirv.shrink_to_fit();
@@ -4268,6 +4932,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                 bool cb_no_fallback, const VertexInputPlan* vertex_input, bool create = true, bool layout_only = false) {
     pl.name = vs_name + "+" + ps_name;
     pl.lean = cb_no_fallback;
+    const PipelineBuildScope build_scope(pl, create ? "built" : "laid out");
     // A fallback laid out from its no-fallback stages is built again in place
     // (BBHOST_LAYOUT_FROM_LEAN): what the tessellation stages were lifted to
     // is decided again below.
@@ -4280,6 +4945,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // a draw that has to create it (fallback_for_draw).
     const bool stage_lean = cb_no_fallback || layout_only;
     pl.layout_only = layout_only;
+    recipe_note_build(pl, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes,
+                      cb_no_fallback, layout_only, vertex_input);
     auto fail = [&](const std::string& why) -> GfxPipeline& {
         host_log("render: pipeline %s: %s", pl.name.c_str(), why.c_str());
         pl.failed = true;
@@ -4322,14 +4989,16 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                   &ps_dims, &ps_sampler_modes, &ps_input_map, clip_discard};
         const bool ps_lift = stage_lean && decomp_selects(ps_name);
         const std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
+        pl.ps_key = ps_key;
         const bool ps_cacheable = g_stage_cache_on;
         const std::shared_ptr<const CachedStage> ps_hit = ps_cacheable ? cached_stage(ps_key) : nullptr;
         if (ps_hit) {
             pl.ps.take(ps_hit);
             pl.ps.module = ps_hit->module;
             if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
-            manifest_note_hit(ps_key);
-            if (note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
+            if (!t_replaying) manifest_note_hit(ps_key);
+            if (!t_replaying && !t_pipeline_worker && ps_hit->lifted) hlsl_note_drawn(ps_key);
+            if (!t_replaying && note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
                 const gcn::Program p = gcn::decode(ps_words.data(), ps_words.size());
                 check_precompiled_stage("PS", ps_name, ps_hit->meta, gcn::translate(p, ps_translate_options(ps_in)));
             }
@@ -4338,12 +5007,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!ps_prog.errors.empty()) return fail("PS decode: " + ps_prog.errors[0].what);
             const gcn::TranslateOptions po = ps_translate_options(ps_in);
             pl.ps.fresh() = translate_cached(ps_prog, po);
-            note_stage_translation(1, ps_words, ps_key, stage_lean);
             note_ps_early_tests(ps_words, pl.ps.meta().spirv);
-            note_precompile_miss(ps_name, ps_in);
-            note_image_dims(1, ps_name, ps_prog, pl.ps.meta(), ps_dims);
-            note_first_translation(1, ps_name);
-            {
+            if (!t_replaying) note_sweep_hit(ps_key);
+            if (!t_replaying) {
+                note_stage_translation(1, ps_words, ps_key, stage_lean);
+                note_precompile_miss(ps_name, ps_in);
+                note_image_dims(1, ps_name, ps_prog, pl.ps.meta(), ps_dims);
+                note_first_translation(1, ps_name);
+            }
+            if (!t_replaying) {
                 bool all_2d = true, modes_default = true, map_identity = true;
                 for (const auto& d : ps_dims) all_2d &= (d.first & 0xff) == 1 && !d.second;
                 for (bool m : ps_sampler_modes) modes_default &= !m;
@@ -4360,13 +5032,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 g_pl_translate_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
                 g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
             }
+            ++t_stage_translations;
             if (!g_stage_cache_on) note_stage_key(ps_key);
             if (!pl.ps.meta().ok()) return fail("PS: " + pl.ps.meta().errors[0]);
-            manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
+            if (!t_replaying) manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
             // BBHOST_DECOMP: the no-fallback variant of a selected pixel shader runs
             // its typed lift. The lift declares the translation's bindings, so the
             // descriptor sets are unchanged; a rejection keeps the translation.
             if (ps_lift) {
+                hlsl_name_next(ps_name);
                 gcn::LiftResult lifted = lift_cached(false, ps_prog, po, pl.ps.meta());
                 // BBHOST_LIFT_LISTING=<PS>[,<PS>...]: its lift's listing (the
                 // program with each write's typed value, regions marked) in
@@ -4419,7 +5093,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         if (g_dump_spirv || g_token_user_data_check) {
             table_slots_read(pl.ps.meta(), pl.table_reads[1], &pl.user_reads[1]);
-        } else if (cb_no_fallback && g_skip_tables) {
+        } else if (cb_no_fallback && g_skip_tables && !t_replaying) {
             queue_table_mask(pl, 1, pl.ps);
         }
         dump_spirv(ps_name + variant + (pl.ps.lifted ? "-ps-lifted" : "-ps"), pl.ps.meta().spirv);
@@ -4476,14 +5150,16 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         vs_key = fnv1a(s.tess_constants, sizeof(s.tess_constants), vs_key ^ 0x7e5a71f3ull);
         vs_key = fnv1a(&s.tess_cb[0], sizeof(s.tess_cb[0]), vs_key);
     }
+    pl.vs_key = vs_key;
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
     if (vs_hit) {
         pl.vs.take(vs_hit);
         pl.vs.module = vs_hit->module;
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
-        manifest_note_hit(vs_key);
-        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
+        if (!t_replaying) manifest_note_hit(vs_key);
+        if (!t_replaying && !t_pipeline_worker && vs_hit->lifted) hlsl_note_drawn(vs_key);
+        if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -4497,12 +5173,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         const gcn::TranslateOptions vo = vs_translate_options(vs_in, fetch_words.empty() ? nullptr : &fetch_prog);
         pl.vs.fresh() = translate_cached(vs_prog, vo);
-        note_stage_translation(0, vs_words, vs_key, stage_lean);
-        note_vs_precompile_miss(vs_name, vs_in);
-        note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
-        note_first_translation(0, vs_name);
-        note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
-        {
+        if (!t_replaying) note_sweep_hit(vs_key);
+        if (!t_replaying) {
+            note_stage_translation(0, vs_words, vs_key, stage_lean);
+            note_vs_precompile_miss(vs_name, vs_in);
+            note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
+            note_first_translation(0, vs_name);
+            note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
+        }
+        if (!t_replaying) {
             std::lock_guard<std::mutex> lk(g_stage_variants.mu);
             if (vo.fetch) g_stage_variants.vs_with_fetch += 1;
             if (vs_input) g_stage_variants.vs_with_vertex_input += 1;
@@ -4511,13 +5190,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             g_pl_translate_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
             g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
         }
+        ++t_stage_translations;
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
+        if (!vs_in.tess_window && !t_replaying) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
         if (vs_decomp) {
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_cached(true, vs_prog, vo, pl.vs.meta());
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
@@ -4540,6 +5221,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_lift) {
             gcn::TessLift tl;
             tl.attr_vec4s = s.tess_attr_vec4s;
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tl);
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;
@@ -4563,6 +5245,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_native) {
             // The window's control points and patch constants as the control
             // stage's outputs (gcn::lift_domain_shader, TessLift::window).
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tess_native_lift(s, s.tess_cb[0]));
             if (!lifted.ok()) return fail("native hull pipeline: domain shader " + vs_name + " not lifted: " + lifted.rejections[0]);
             name_stage(lifted, pl.vs.meta(), vs_name);
@@ -4584,7 +5267,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     if (ds_native && !pl.vs.lifted) return fail("native hull pipeline: its domain shader's cached stage is not a lift");
     if (g_dump_spirv || g_token_user_data_check) {
         table_slots_read(pl.vs.meta(), pl.table_reads[0], &pl.user_reads[0]);
-    } else if (cb_no_fallback && g_skip_tables) {
+    } else if (cb_no_fallback && g_skip_tables && !t_replaying) {
         queue_table_mask(pl, 0, pl.vs);
     }
     dump_spirv(vs_name + variant + (pl.vs.lifted ? "-vs-lifted" : "-vs"), pl.vs.meta().spirv);
@@ -4601,8 +5284,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     pl.tess_attrs = s.tess_attrs;
     pl.tess_attr_vec4s = s.tess_attr_vec4s;
     if (pl.tess_attrs) {
-        CachedProgram* ls = program_at(s.ls_va);
-        const FetchProgram* fetch = s.ls_fetch_va ? fetch_program_at(s.ls_fetch_va) : nullptr;
+        const CachedProgram* ls = tess_program(s, 0);
+        const FetchProgram* fetch = tess_ls_fetch_program(s);
         if (!ls || (s.ls_fetch_va && !fetch)) return fail("tessellation LS program");
         // On the vertex input the draw planned for the LS's elements, its lift
         // (gcn::lift_ls_shader) takes them in place of the fetch shader: a key
@@ -4633,6 +5316,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 const gcn::TranslateResult ref = translate_cached(prog, vo);
                 gcn::TessLift tl;
                 tl.attr_vec4s = s.tess_attr_vec4s;
+                hlsl_name_next(ls->name);
                 gcn::LiftResult lifted = ref.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo, ref, tl) : gcn::LiftResult{};
                 static std::mutex logged_mu;
                 static std::set<std::string> logged;
@@ -4661,6 +5345,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     vo4.cb_binding_base = kTessNativeLsBuffers;
                     vo4.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
+                    hlsl_name_next(ls->name);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
                     if (lifted4.ok() && ref4.images.empty() && ref4.samplers.empty()) {
                         name_stage(lifted4, ref4, ls->name);
@@ -4733,7 +5418,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // gcn::lift_constant_hull shows the program is only that: the same
         // factors as the host's own reading of them (hs_constant_factors),
         // nothing else it writes that the evaluation stage reads.
-        if (CachedProgram* hs = (g_lift_tess & kLiftTessHull) && pl.tess_attrs ? program_at(s.hs_va) : nullptr; hs && decomp_selects(hs->name)) {
+        if (const CachedProgram* hs = (g_lift_tess & kLiftTessHull) && pl.tess_attrs ? tess_program(s, 1) : nullptr; hs && decomp_selects(hs->name)) {
             const gcn::Program hprog = gcn::decode(hs->words.data(), hs->words.size());
             const gcn::HullLift lifted = gcn::lift_constant_hull(hprog);
             float host[6] = {};
@@ -4811,19 +5496,38 @@ const bool g_library_trace = [] {
 }();
 thread_local const char* t_library_owner = nullptr;
 
+// What pipeline_library returns for a library it built for the driver's cache
+// only (`keep` false: the shader sweep): not a pipeline, only "it was made".
+const VkPipeline kLibraryWarmed = reinterpret_cast<VkPipeline>(static_cast<std::uintptr_t>(1));
 template <typename Build>
-VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* what, std::size_t words, Build build) {
+VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* what, std::size_t words, Build build, bool keep = true) {
     key = fnv1a(&kind, sizeof(kind), key);
+    if (!keep) {
+        // Into the driver's cache and gone: one this run has (or is building)
+        // is there already.
+        {
+            std::lock_guard<std::mutex> lk(g_libs.mu);
+            if (g_libs.ready.count(key) || g_libs.building.count(key)) return kLibraryWarmed;
+        }
+        const VkPipeline p = build();
+        if (!p) return VK_NULL_HANDLE;
+        vkDestroyPipeline(g.device, p, nullptr);
+        return kLibraryWarmed;
+    }
     {
         std::unique_lock<std::mutex> lk(g_libs.mu);
+        std::chrono::steady_clock::time_point waiting{};
         for (;;) {
             if (auto it = g_libs.ready.find(key); it != g_libs.ready.end()) {
                 g_libs.hits[kind].fetch_add(1, std::memory_order_relaxed);
+                if (waiting != std::chrono::steady_clock::time_point{}) note_pipeline_work(kWorkLibraryWait, work_us_since(waiting));
                 return it->second;
             }
             if (!g_libs.building.count(key)) break;
+            if (waiting == std::chrono::steady_clock::time_point{}) waiting = std::chrono::steady_clock::now();
             g_libs.cv.wait(lk);
         }
+        if (waiting != std::chrono::steady_clock::time_point{}) note_pipeline_work(kWorkLibraryWait, work_us_since(waiting));
         g_libs.building.insert(key);
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -4833,6 +5537,7 @@ VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* wha
     }
     const VkPipeline p = build();
     const std::uint64_t us = pl_us_since(t0);
+    note_pipeline_work(kind == kLibPreRaster || kind == kLibFragment ? kWorkShaderLibrary : kWorkInterfaceLibrary, us);
     if (g_library_trace) host_log("render: library %s %016llx done", what, static_cast<unsigned long long>(key));
     g_libs.us[kind].fetch_add(us, std::memory_order_relaxed);
     g_libs.built[kind].fetch_add(1, std::memory_order_relaxed);
@@ -4983,9 +5688,9 @@ struct TessLibraryStages {
 // params) stays; null keeps every default.
 VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPolygonMode polygon_mode, bool draw_clamp, VkPipelineLayout layout,
                               const VkDescriptorSetLayout set_layouts[2], const TessLibraryStages* tess = nullptr,
-                              const std::uint32_t* vertex_formats = nullptr) {
+                              const std::uint32_t* vertex_formats = nullptr, bool keep = true) {
     const bool depth_clamp = draw_clamp && !g.dynamic_depth_clamp;  // else the draw sets it (DrawLibraryState)
-    if (!vertex_formats) {
+    if (!vertex_formats && keep) {
         const std::uint64_t vs_hash = fnv1a(vs.meta().spirv.data(), vs.meta().spirv.size() * 4);
         const std::uint32_t bit = 1u << ((static_cast<std::uint32_t>(polygon_mode) & 3) * 4 + (depth_clamp ? 2 : 0) + (gs.module ? 1 : 0));
         std::lock_guard<std::mutex> lk(g_pre_raster_states.mu);
@@ -5066,7 +5771,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         gpci.layout = layout;
         VkPipelineRenderingCreateInfo no_formats{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         return create_library(gpci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &no_formats);
-    });
+    }, keep);
 }
 
 // ---- Pixel shaders at wave32 (g.ps_wave, decided in gpu.cpp) ----
@@ -5170,7 +5875,7 @@ std::string ps_wave_census(bool changed_only) {
 // specialization constants (gcn::kCbW3SpecId, gcn::kCbStrideSpecId), for an
 // optimized relink; null keeps the defaults.
 VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule module, VkDescriptorSetLayout ps_set, VkPipelineLayout layout,
-                            const std::uint32_t* w3 = nullptr) {
+                            const std::uint32_t* w3 = nullptr, bool keep = true) {
     std::uint64_t fs_key = fnv1a(meta.spirv.data(), meta.spirv.size() * 4, module ? 1 : 2);
     fs_key = fnv1a(&ps_set, sizeof(ps_set), fs_key);
     if (w3) fs_key = fnv1a(w3, 32 * sizeof(std::uint32_t), fs_key ^ 0x3bec000000000000ull);
@@ -5214,21 +5919,24 @@ VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule mod
             fragment_stage_wave_refused(p != VK_NULL_HANDLE);
         }
         return p;
-    });
+    }, keep);
 }
 
-// ---- per-shader compiles, step 4 (BBHOST_PIPELINE_LIBRARY; BBHOST_PRECOMPILE=0 turns it off) ----
+// ---- per-shader compiles, step 4 (BBHOST_PRECOMPILE=0 turns it off) ----
 // When GX creates a pixel shader, a worker translates it with what its binary
 // says (stage registers, flat inputs from its semantic table, image dimensions
 // predicted from the program, no-fallback, early fragment tests) and compiles
 // its fragment-shader library. A first draw whose stage inputs agree finds the
-// stage and the library ready and only links its pipeline.
+// stage and the library ready and only links its pipeline. Without pipeline
+// libraries (BBHOST_PIPELINE_LIBRARY=0, a driver without fast linking) the
+// stage is made all the same and the library left out: a draw then compiles
+// its whole pipeline, but translates nothing.
 bool precompile_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_PRECOMPILE");
         return !(e && e[0] == '0');
     }();
-    return on && use_pipeline_library();
+    return on;
 }
 struct PrecompileJob {
     std::string name;
@@ -5236,6 +5944,13 @@ struct PrecompileJob {
     int type = 2;             // Shdr type: 1 vertex, 2 pixel, 4 compute (gpu.cpp precompile_compute); 0 an optimized relink
     std::uint64_t flip = 0;   // when GX created it
     std::shared_ptr<const ManifestStage> manifest;  // type 7: a stage from the manifest
+    std::shared_ptr<const PipelineRecipe> recipe;   // type 8: a pipeline from the pipeline manifest
+    // The shader sweep's (types 1, 2, 4 from the game's bundles): into the
+    // caches only, nothing kept in this run (precompile_ps, precompile_vs).
+    bool sweep = false;
+    // Type 1: the vertex shader's clip-varying twin alone, queued behind every
+    // other job by its own compile (Precompiler::later).
+    bool twin = false;
     // An optimized relink (queue_library_relink): the pipeline, its libraries and layout.
     GfxPipeline* relink = nullptr;
     VkPipeline libraries[4] = {};
@@ -5264,6 +5979,11 @@ struct Precompiler {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<PrecompileJob> jobs;                             // under mu
+    // Under mu: what is likely needed rather than certainly - the clip-varying
+    // twins precompile_vs predicts - taken only when `jobs` is empty, so a
+    // start's shaders are ready as soon as they were without them.
+    std::deque<PrecompileJob> later;
+    bool later_logged = false;  // under mu
     std::unordered_map<std::string, int> running;               // under mu: the names a worker is compiling now
     std::unordered_map<std::string, PrecompileRecord> records;  // by pixel-shader name, under mu
     std::unordered_set<std::uint64_t> stage_keys;               // under mu
@@ -5289,7 +6009,7 @@ struct Precompiler {
     std::vector<std::string> vs_not_ready;                      // under mu: the same for vertex shaders
     std::atomic<std::uint64_t> queued{0}, done{0}, failed{0}, translate_us{0}, library_us{0}, stage_hits{0};
     std::uint64_t miss_not_ready = 0, miss_queued = 0, miss_compiling = 0, miss_failed = 0, miss_flat = 0, miss_input_map = 0, miss_eft_on = 0, miss_eft_off = 0, miss_dims = 0, miss_modes = 0, miss_ena = 0,
-                  miss_rsrc = 0, miss_other = 0, miss_lifted = 0;  // under mu
+                  miss_rsrc = 0, miss_other = 0, miss_lifted = 0, miss_clip = 0;  // under mu
     // The workers (precompiler()): `boot` of them until the first in-game
     // frame and while a loading screen is up, `steady` otherwise; those past
     // `limit` wait on park_cv.
@@ -5299,13 +6019,15 @@ struct Precompiler {
     // moment, for the "idle" line: how long the start's compiles took.
     bool busy = false;                                       // under mu
     std::chrono::steady_clock::time_point busy_since{};     // under mu
-    std::uint64_t burst_jobs = 0, burst_type[8] = {};        // under mu
+    std::uint64_t burst_jobs = 0, burst_type[9] = {};        // under mu
     int idle_logs = 0;                                       // under mu
 };
 void precompile_ps(Precompiler& w, const PrecompileJob& job);
 void precompile_vs(Precompiler& w, const PrecompileJob& job);
 void precompile_manifest(const ManifestStage& m);
 void relink_pipeline(Precompiler& w, const PrecompileJob& job);
+void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe);
+void sweep_limit_update();
 // Parallel compiles at the start (Kyo's parallel preload, done natively): GX
 // creates its ~3,000 vertex and pixel shaders, and the manifest brings a few
 // hundred more, before the first in-game frame - while the game mostly loads -
@@ -5315,6 +6037,7 @@ void relink_pipeline(Precompiler& w, const PrecompileJob& job);
 // host_gpu_world_reached).
 std::atomic<bool> g_precompile_boost{true};
 std::atomic<Precompiler*> g_precompiler{nullptr};
+std::atomic<std::uint64_t> g_precompile_jobs_done{0};  // the compile session's progress
 const auto g_process_start = std::chrono::steady_clock::now();
 Precompiler& precompiler() {
     static Precompiler* const p = [] {
@@ -5340,6 +6063,25 @@ Precompiler& precompiler() {
         }
         host_log("render: precompile workers: %d until the first in-game frame and while loading, %d in game "
                  "(BBHOST_PRECOMPILE_BOOT_THREADS, BBHOST_PRECOMPILE_THREADS)", w->boot, w->steady);
+        hlsl_set_busy_probe([]() -> bool {
+            // On an integrated GPU, whose chip and power budget the CPU
+            // shares (the Steam Deck), compiling beside the world cost ~2 fps
+            // and a long frame almost every second of it (the GPU's clock fell
+            // from ~1.4 to ~1.17 GHz): there bb-hlsl compiles only before the
+            // first in-game frame and on loading screens.
+            // BBHOST_HLSL_IN_WORLD=1 lets it run in the world on any GPU, =0
+            // holds it there on any.
+            static const bool in_world = [] {
+                const char* e = std::getenv("BBHOST_HLSL_IN_WORLD");
+                if (e && (e[0] == '0' || e[0] == '1') && !e[1]) return e[0] == '1';
+                return !g.integrated;
+            }();
+            if (!in_world && !g_precompile_boost.load()) return true;
+            Precompiler* p = g_precompiler.load();
+            if (!p) return false;
+            std::lock_guard<std::mutex> lk(p->mu);
+            return !p->jobs.empty() || !p->running.empty();
+        });
         for (int i = 0; i < w->boot; ++i) {
             std::thread([w, i] {
                 t_pipeline_worker = true;
@@ -5352,15 +6094,27 @@ Precompiler& precompiler() {
                             if (i >= w->limit) {
                                 // A wake-up meant for a worker under the limit
                                 // goes on to one.
-                                if (!w->jobs.empty()) w->cv.notify_one();
+                                if (!w->jobs.empty() || !w->later.empty()) w->cv.notify_one();
                                 w->park_cv.wait(lk, [w, i] { return i < w->limit; });
                                 continue;
                             }
-                            if (!w->jobs.empty()) break;
+                            if (!w->jobs.empty() || !w->later.empty()) break;
                             w->cv.wait(lk);
                         }
-                        job = std::move(w->jobs.front());
-                        w->jobs.pop_front();
+                        if (!w->jobs.empty()) {
+                            job = std::move(w->jobs.front());
+                            w->jobs.pop_front();
+                        } else {
+                            job = std::move(w->later.front());
+                            w->later.pop_front();
+                            if (!w->later_logged) {
+                                w->later_logged = true;
+                                host_log("render: precompile workers: every shader queued so far taken, %.1f s after start (flip %llu); "
+                                         "%zu predicted variants behind them (BBHOST_PREDICT_VARIANTS)",
+                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count(),
+                                         static_cast<unsigned long long>(hle_video_flip_count()), w->later.size() + 1);
+                            }
+                        }
                         ++w->running[job.name];
                         if (!w->busy) {
                             w->busy = true;
@@ -5370,6 +6124,11 @@ Precompiler& precompiler() {
                         }
                     }
                     while (!g.ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    // The HLSL compiles behind the game take what earlier
+                    // starts drew before what GX only created.
+                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 0 ? kHlslLaneManifest
+                              : job.twin || job.sweep                         ? kHlslLaneLater
+                                                                              : kHlslLaneCreated);
                     if (job.type == 4) {
                         precompile_compute(job.name, job.container, job.flip);
                     } else if (job.type == 1) {
@@ -5378,14 +6137,17 @@ Precompiler& precompiler() {
                         relink_pipeline(*w, job);
                     } else if (job.type == 7) {
                         precompile_manifest(*job.manifest);
+                    } else if (job.type == 8) {
+                        replay_recipe(*w, job.recipe);
                     } else {
                         precompile_ps(*w, job);
                     }
+                    g_precompile_jobs_done.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
-                    ++w->burst_type[job.type & 7];
-                    if (w->busy && w->jobs.empty() && w->running.empty()) {
+                    ++w->burst_type[job.type >= 0 && job.type <= 8 ? job.type : 2];
+                    if (w->busy && w->jobs.empty() && w->later.empty() && w->running.empty()) {
                         w->busy = false;
                         // How long a run of compiles took the workers, wall
                         // time: the start's is what parallel compiles and the
@@ -5393,9 +6155,10 @@ Precompiler& precompiler() {
                         if (w->burst_jobs >= 32 && w->idle_logs < 16) {
                             ++w->idle_logs;
                             const auto now = std::chrono::steady_clock::now();
-                            host_log("render: precompile workers idle: %llu jobs (manifest %llu, pixel %llu, vertex %llu, compute %llu, relinks %llu) "
-                                     "in %.2f s on %d workers; %.1f s after start, flip %llu",
-                                     static_cast<unsigned long long>(w->burst_jobs), static_cast<unsigned long long>(w->burst_type[7]),
+                            host_log("render: precompile workers idle: %llu jobs (pipelines %llu, manifest %llu, pixel %llu, vertex %llu, compute %llu, "
+                                     "relinks %llu) in %.2f s on %d workers; %.1f s after start, flip %llu",
+                                     static_cast<unsigned long long>(w->burst_jobs), static_cast<unsigned long long>(w->burst_type[8]),
+                                     static_cast<unsigned long long>(w->burst_type[7]),
                                      static_cast<unsigned long long>(w->burst_type[2]), static_cast<unsigned long long>(w->burst_type[1]),
                                      static_cast<unsigned long long>(w->burst_type[4]), static_cast<unsigned long long>(w->burst_type[0]),
                                      std::chrono::duration<double>(now - w->busy_since).count(), w->limit,
@@ -5457,6 +6220,7 @@ void precompile_boost_update(const char* why) {
     }
     if (to > from) w->park_cv.notify_all();
     if (from != to) host_log("render: precompile workers %d -> %d (%s); %zu jobs waiting", from, to, why, waiting);
+    sweep_limit_update();
 }
 
 // BBHOST_LIBRARY_RELINK: after a fast link, a worker links the same libraries
@@ -5520,6 +6284,7 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
         pl.spec_w3_mask[0] = job.w3_mask[0];
         pl.spec_w3_mask[1] = job.w3_mask[1];
     }
+    recipe_note_relink(pl);
     // BBHOST_RELINK_W3_LOG=1: what each relink's indexed loads had.
     static const bool w3_log = [] {
         const char* e = std::getenv("BBHOST_RELINK_W3_LOG");
@@ -5546,7 +6311,8 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
     w.relinks_queued.fetch_add(1, std::memory_order_relaxed);
     w.cv.notify_one();
 }
-void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
+// The optimized relink a job describes, built here; null when it failed.
+VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     VkPipeline libraries[4];
     std::copy(job.libraries, job.libraries + 4, libraries);
@@ -5596,8 +6362,13 @@ void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
     w.relink_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     if (!ok) {
         w.relinks_failed.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return VK_NULL_HANDLE;
     }
+    return p;
+}
+void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
+    const VkPipeline p = relink_build(w, job);
+    if (!p) return;
     {
         std::lock_guard<std::mutex> lk(w.mu);
         w.relinked.emplace_back(job.relink, p);
@@ -5634,12 +6405,161 @@ void apply_relinks_locked() {
         g_relinks_ready.store(true, std::memory_order_relaxed);
     }
 }
+// A recipe from the pipeline manifest (job type 8): its pipeline built as the
+// draw that recorded it built it - stages, libraries, the link or the whole
+// pipeline, then the optimized relink with the specialization that draw gave
+// it - and kept, by its content key, for the draw that needs it.
+}  // namespace
+}  // namespace gpu
+namespace {
+void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
+}  // namespace
+namespace gpu {
+namespace {
+void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe) {
+    const PipelineRecipe& r = *recipe;
+    const auto t0 = std::chrono::steady_clock::now();
+    GfxPipeline* pl = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (g_pmanifest.built.count(r.key)) {
+            g_pmanifest.done.fetch_add(1, std::memory_order_relaxed);  // built already, under the key another recipe moved to
+            return;
+        }
+        pl = &g_pmanifest.pipelines.emplace_back();
+    }
+    RtImage formats[9];
+    const DrawState s = recipe_draw_state(r, formats);
+    // The recorded vertex input as this build's draws plan theirs (a list or a
+    // manifest from another build: replan_recorded_vertex_input).
+    VertexInputPlan planned;
+    if (r.has_vertex_input) {
+        planned = r.vertex_input;
+        replan_recorded_vertex_input(planned, r.s.tess_native);
+    }
+    const VertexInputPlan* vi = r.has_vertex_input ? &planned : nullptr;
+    reflection_from_bundle(r.vs_name);
+    reflection_from_bundle(r.ps_name);
+    if (r.has_ls) reflection_from_bundle(r.ls.name);
+    if (r.has_hs) reflection_from_bundle(r.hs.name);
+    // Whether the pixel shader can discard, learnt as its compile at creation
+    // learns it (precompile_ps): its key's early fragment tests follow that
+    // (ps_early_tests_matter), and a draw later in the run asks with it known.
+    // Built before the shader's own compile, the pipeline took the other key.
+    if (!r.ps_words.empty() && ps_early_tests_matter(r.ps_words) < 0) {
+        const gcn::Program prog = gcn::decode(r.ps_words.data(), r.ps_words.size());
+        if (prog.errors.empty()) {
+            gcn::TranslateOptions o;
+            o.stage = gcn::Stage::Pixel;
+            o.rsrc1 = r.s.ps_rsrc1;
+            o.rsrc2 = r.s.ps_rsrc2;
+            note_ps_early_tests(r.ps_words, translate_cached(prog, o).spirv);
+        }
+    }
+    t_replaying = true;
+    t_replay_key = 0;
+    t_library_owner = r.vs_name.c_str();
+    t_tess_native_programs[0] = r.has_ls ? &r.ls : nullptr;
+    t_tess_native_programs[1] = r.has_hs ? &r.hs : nullptr;
+    t_tess_ls_fetch = r.has_ls_fetch ? &r.ls_fetch : nullptr;
+    build_gfx_pipeline(*pl, s, r.vs_words, r.fetch_words, r.ps_words, r.vs_name, r.ps_name, r.vs_dims, r.ps_dims, r.vs_modes, r.ps_modes,
+                       r.cb_no_fallback, vi, false, r.layout_only);
+    bool ok = !pl->failed && create_gfx_pipeline(*pl, s, vi, r.fetch_words.size());
+    const std::uint64_t key = t_replay_key;
+    t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
+    t_tess_ls_fetch = nullptr;
+    t_library_owner = nullptr;
+    t_replaying = false;
+    ok = ok && key != 0 && pl->pipeline;
+    // The host tessellator's LS passes the recorded draws ran: their compute
+    // pipelines too, or a draw builds them on the command processor.
+    if (ok) ls_pass_prebuild(r);
+    // Relinked here, with its first draw's specialization, so the draw takes
+    // the optimized pipeline at once.
+    if (ok && pl->library && pl->relink_pending && r.relink && g_library_relink) {
+        PrecompileJob job;
+        job.type = 0;
+        job.relink = pl;
+        std::copy(pl->relink_libs, pl->relink_libs + 4, job.libraries);
+        job.layout = pl->layout;
+        job.specialize_formats = pl->relink_formats;
+        std::copy(pl->relink_vertex_formats, pl->relink_vertex_formats + 16, job.vertex_formats);
+        job.polygon_mode = pl->relink_polygon;
+        job.depth_clamp = pl->relink_clamp;
+        std::memcpy(job.w3, r.spec_w3, sizeof(job.w3));
+        std::memcpy(job.stride, r.spec_stride, sizeof(job.stride));
+        std::memcpy(job.w3_mask, r.spec_w3_mask, sizeof(job.w3_mask));
+        std::memcpy(pl->spec_w3, r.spec_w3, sizeof(pl->spec_w3));
+        std::memcpy(pl->spec_stride, r.spec_stride, sizeof(pl->spec_stride));
+        std::memcpy(pl->spec_w3_mask, r.spec_w3_mask, sizeof(pl->spec_w3_mask));
+        w.relinks_queued.fetch_add(1, std::memory_order_relaxed);
+        if (const VkPipeline p = relink_build(w, job)) {
+            if (pl->spec_w3_mask[0] | pl->spec_w3_mask[1]) {
+                pl->generic = pl->pipeline;  // spec_w3_matches
+            } else {
+                vkDestroyPipeline(g.device, pl->pipeline, nullptr);  // the fast-linked one: no draw has recorded it, none will
+            }
+            pl->pipeline = p;
+            pl->relink_pending = false;
+            w.relinks_done.fetch_add(1, std::memory_order_relaxed);
+            w.relinks_adopted.fetch_add(1, std::memory_order_relaxed);
+            g_pmanifest.relinked.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    g_pmanifest.build_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    std::size_t left = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (ok) {
+            g_pmanifest.built.emplace(key, pl);
+            if (key != r.key) {
+                // The same inputs make another pipeline in this build (the
+                // draw path changed): kept under what it makes now.
+                auto it = g_pmanifest.by_key.find(r.key);
+                if (it != g_pmanifest.by_key.end()) {
+                    std::shared_ptr<PipelineRecipe> moved = it->second;
+                    g_pmanifest.by_key.erase(it);
+                    moved->key = key;
+                    g_pmanifest.by_key.emplace(key, std::move(moved));
+                    g_pmanifest.dirty = true;
+                }
+            }
+        } else {
+            g_pmanifest.by_key.erase(r.key);  // not kept: the running build cannot make it
+            g_pmanifest.dirty = true;
+        }
+        (ok ? g_pmanifest.done : g_pmanifest.failed).fetch_add(1, std::memory_order_relaxed);
+        left = g_pmanifest.queued.load() - g_pmanifest.done.load() - g_pmanifest.failed.load();
+    }
+    if (!ok) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) host_log("render: pipeline manifest: %s+%s no longer builds; dropped", r.vs_name.c_str(), r.ps_name.c_str());
+    }
+    if (left == 0 && !g_pmanifest.done_logged.exchange(true)) {
+        host_log("render: pipeline manifest: %llu pipelines built from it (%llu relinked) and %llu failed, %.1f s after it was read "
+                 "(%.1f s of worker time)",
+                 static_cast<unsigned long long>(g_pmanifest.done.load()), static_cast<unsigned long long>(g_pmanifest.relinked.load()),
+                 static_cast<unsigned long long>(g_pmanifest.failed.load()),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_pmanifest.loaded_at).count(),
+                 g_pmanifest.build_us.load() / 1e6);
+    }
+}
+
 // A translation error without its offset and detail, as a failure reason.
 std::string translation_error_kind(const std::string& e) {
     std::string k = e.size() > 8 && e[6] == ':' ? e.substr(8) : e;
     if (const std::size_t p = k.find(" ("); p != std::string::npos) k.resize(p);
     return "translation: " + k;
 }
+// The shader sweep's results (shader_sweep_start).
+struct SweepStats {
+    std::atomic<std::uint64_t> queued{0}, done{0}, skipped{0}, failed{0}, us{0}, eboot{0}, bundles{0};
+    std::mutex mu;
+    std::map<std::string, std::uint64_t> fail_reasons;  // under mu
+    std::unordered_set<std::uint64_t> keys;              // under mu: the stage keys it compiled (and their twins)
+    std::atomic<std::uint64_t> draw_hits{0};             // stages a draw built that it had compiled into the caches
+};
+SweepStats g_sweep_stats;
 // BBHOST_EFT_TWINS: see precompile_ps.
 const bool g_eft_twins = [] {
     const char* e = std::getenv("BBHOST_EFT_TWINS");
@@ -5650,11 +6570,27 @@ std::atomic<std::uint64_t> g_eft_twins_built{0};
 void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto give_up = [&](const std::string& why) {
+        if (job.sweep) {  // a sweep's failure is its own: GX's compile of the shader says the same
+            g_sweep_stats.failed.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.fail_reasons["PS " + why] += 1;
+            return;
+        }
         w.failed.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(w.mu);
         w.records[job.name].failed = true;
         w.fail_reasons[why] += 1;
     };
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            if (w.records.count(job.name)) {  // GX created it first: compiled as it was
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        reflection_from_bundle(job.name);  // the names GX's creation would give its lift
+    }
     const std::vector<std::uint8_t>& c = job.container;
     gcn::ShaderCode code;
     std::size_t shdr = 0;
@@ -5676,7 +6612,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     paths_options.rsrc2 = regs[5];
     // Its SPIR-V is read too: whether the program can discard (note_ps_early_tests).
     const gcn::TranslateResult paths = translate_cached(prog, paths_options);  // resource paths and the inputs read
-    offer_paths(code.words, paths);
+    if (!job.sweep) offer_paths(code.words, paths);
     PrecompileRecord rec;
     rec.rsrc1 = regs[4];
     rec.rsrc2 = regs[5];
@@ -5705,7 +6641,11 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
                            &rec.dims, &rec.modes, &rec.input_map};
     const bool lift = decomp_selects(job.name);
     const std::uint64_t key = lift_key(ps_stage_key(in), lift);
-    const bool cacheable = g_stage_cache_on;
+    if (job.sweep && g_stage_cache_on && cached_stage(key)) {  // built this run already
+        g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool cacheable = g_stage_cache_on && !job.sweep;
     ShaderStage stage;
     if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
         stage.take(hit);
@@ -5716,6 +6656,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
         note_ps_early_tests(code.words, stage.meta().spirv);
         if (lift) {
+            hlsl_name_next(job.name);
             gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
             name_stage(lifted, stage.meta(), job.name);
             if (lifted.ok()) {
@@ -5727,16 +6668,26 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!job.sweep) w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
+    const bool libraries = use_pipeline_library();  // without them the stage alone (precompile_enabled)
     const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries (build_gfx_pipeline)
-    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
+    const VkPipelineLayout layout = set && libraries ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
     dump_spirv("precompile-" + job.name, stage.meta().spirv);
     t_library_owner = job.name.c_str();
-    const VkPipeline library = layout ? fragment_library(stage.meta(), stage.module, set, layout) : VK_NULL_HANDLE;
+    const VkPipeline library = !libraries ? kLibraryWarmed
+                               : layout   ? fragment_library(stage.meta(), stage.module, set, layout, nullptr, !job.sweep)
+                                          : VK_NULL_HANDLE;
     t_library_owner = nullptr;
-    w.library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
-    if (!library) return give_up("fragment-shader library");
+    if (!job.sweep) w.library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
+    // A sweep's module served its library build only.
+    const auto drop_module = [&] {
+        if (job.sweep && stage.module) vkDestroyShaderModule(g.device, stage.module, nullptr);
+    };
+    if (!library) {
+        drop_module();
+        return give_up("fragment-shader library");
+    }
     // BBHOST_EFT_TWINS (on unless 0): a program that discards is compiled for
     // early fragment tests, the variant the draws without depth writes (the
     // lights) ask for - and a draw of it with depth or stencil writes then
@@ -5762,12 +6713,23 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
             if (ok && cacheable) cache_stage(twin_key, twin, twin_module, stage.lifted);
         }
         t_library_owner = job.name.c_str();
-        ok = ok && fragment_library(twin, twin_module, set, layout) != VK_NULL_HANDLE;
+        ok = ok && (!libraries || fragment_library(twin, twin_module, set, layout, nullptr, !job.sweep) != VK_NULL_HANDLE);
         t_library_owner = nullptr;
         // Uncached, the module served the library build only.
         if (!have && !cacheable && twin_module) vkDestroyShaderModule(g.device, twin_module, nullptr);
-        if (ok) g_eft_twins_built.fetch_add(1, std::memory_order_relaxed);
-        else twin_key = 0;
+        if (ok && !job.sweep) g_eft_twins_built.fetch_add(1, std::memory_order_relaxed);
+        if (!ok) twin_key = 0;
+    }
+    if (job.sweep) {
+        drop_module();
+        {
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.keys.insert(key);
+            if (twin_key) g_sweep_stats.keys.insert(twin_key);
+        }
+        g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+        g_sweep_stats.us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+        return;
     }
     {
         std::lock_guard<std::mutex> lk(w.mu);
@@ -5835,11 +6797,14 @@ void precompile_manifest(const ManifestStage& m) {
         stage.take(hit);
         stage.module = hit->module;
     } else if (ok) {
+        if (m.lift) reflection_from_bundle(m.name);  // the names the draw's build gives the lift
         if (m.stage) {
             const gcn::TranslateOptions options = ps_translate_options(m.ps_inputs());
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
+                hlsl_name_next(m.name);
                 gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), m.name);
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
@@ -5852,8 +6817,10 @@ void precompile_manifest(const ManifestStage& m) {
             if (stage.meta().ok() && m.lift) {
                 gcn::TessLift tl;
                 tl.attr_vec4s = m.tess_attr_vec4s;
+                hlsl_name_next(m.name);
                 gcn::LiftResult lifted = m.tess_hw ? lift_tess_cached(TranslationUse::kLiftDomain, prog, options, stage.meta(), tl)
                                                    : lift_cached(true, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), m.name);
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.lifted = true;
@@ -5863,7 +6830,7 @@ void precompile_manifest(const ManifestStage& m) {
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
         if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    if (ok && !m.tess_hw && !m.domain_level) {
+    if (ok && !m.tess_hw && !m.domain_level && use_pipeline_library()) {
         const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
         const VkDescriptorSetLayout sets[2] = {set, set};
         const VkPipelineLayout layout = set ? stage_pipeline_layout(set, set) : VK_NULL_HANDLE;
@@ -5891,14 +6858,49 @@ void precompile_manifest(const ManifestStage& m) {
 // input, with elements from its input table (location = entry, VGPR =
 // register, components) and formats from the params block, and its
 // pre-rasterization library with fill mode, no depth clamp and no geometry shader.
+// BBHOST_PREDICT_VARIANTS (on unless 0): the vertex shaders compiled at
+// creation also cover the two kinds of draw a creation used to miss: one with
+// no vertex inputs (its draws read only the vertex and instance indices, with
+// no fetch shader and no vertex input), and the clip-varying twin of one that
+// writes clip distances. Such a shader (866 of the game's 1,663) is drawn with
+// its distances written to an output instead, for the pixel stage to discard
+// by (TranslateOptions::kVsOutCntlClipVarying), wherever the draw has a pixel
+// shader: the twin is compiled at the location the pair then uses, the first
+// past every param the vertex shader exports (a pixel shader reading past
+// those has the draw build its own). Draws without a pixel shader keep the
+// plain one. The twins (719 on a cold start, 40 s of compiles on a desktop
+// NVIDIA driver) wait behind every other job (Precompiler::later), so the
+// start's own shaders are not later for them on a CPU with few cores.
+const bool g_predict_variants = [] {
+    const char* e = std::getenv("BBHOST_PREDICT_VARIANTS");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_vs_clip_twins{0}, g_vs_fetchless{0};
+
 void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto give_up = [&](const std::string& why) {
+        if (job.sweep) {
+            g_sweep_stats.failed.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.fail_reasons["VS " + why] += 1;
+            return;
+        }
         w.vs_failed.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(w.mu);
         w.vs_records[job.name].failed = true;
         w.fail_reasons["VS " + why] += 1;
     };
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            if (w.vs_records.count(job.name)) {
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        reflection_from_bundle(job.name);
+    }
     const std::vector<std::uint8_t>& c = job.container;
     gcn::ShaderCode code;
     std::size_t shdr = 0;
@@ -5909,7 +6911,13 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     std::memcpy(regs, c.data() + shdr + 16, sizeof(regs));
     const std::size_t base = shdr + 16;
     const std::size_t inputs = c[base + 0x24], input_table = base + 0x28 + static_cast<std::size_t>(c[base + 3]) * 4;
-    if (inputs == 0) return give_up("no vertex inputs");
+    const bool fetchless = inputs == 0 && g_predict_variants;
+    if (inputs == 0 && !fetchless) return give_up("no vertex inputs");
+    // Without pipeline libraries a draw's vertex shader takes its elements'
+    // formats as constants (build_gfx_pipeline's vs_formats_from_params), which
+    // only the draw's vertex buffers give: nothing to make ahead but the ones
+    // with no vertex inputs.
+    if (!use_pipeline_library() && !fetchless) return give_up("formats are the draw's without pipeline libraries");
     if (inputs > 16 || input_table + inputs * 4 > c.size()) return give_up("an input table past 16 entries or the container");
     Precompiler::VsRecord rec;
     for (std::size_t k = 0; k < inputs; ++k) {
@@ -5934,53 +6942,428 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     paths_options.rsrc1 = rec.rsrc1;
     paths_options.rsrc2 = rec.rsrc2;
     const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
-    offer_paths(code.words, paths);
+    if (!job.sweep && !job.twin) offer_paths(code.words, paths);
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) rec.dims.emplace_back(p.dim, p.arrayed);
     rec.modes.assign(paths.samplers.size(), false);
     static const std::vector<std::uint32_t> no_fetch;
-    const VsStageInputs in{&code.words, &no_fetch, rec.rsrc1, rec.rsrc2, rec.out_cntl, &rec.elements, true, true, &rec.dims, &rec.modes};
     const bool lift = !g_vs_dispatcher && decomp_selects(job.name);  // as build_gfx_pipeline's vs_decomp
-    const std::uint64_t key = lift_key(vs_stage_key(in), lift);
-    const bool cacheable = g_stage_cache_on;
-    ShaderStage stage;
-    if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
-        stage.take(hit);
-        stage.module = hit->module;
-    } else {
-        const gcn::TranslateOptions options = vs_translate_options(in, nullptr);
-        stage.fresh() = translate_cached(prog, options);
-        if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
-        // The lift runs here as well, so a shader compiled at creation is the
-        // same stage the draw wants and is not thrown away for it.
-        if (lift) {
-            gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-            name_stage(lifted, stage.meta(), job.name);
-            if (lifted.ok()) {
-                stage.fresh().spirv = std::move(lifted.spirv);
-                stage.lifted = true;
+    const bool cacheable = g_stage_cache_on && !job.sweep;
+    // One variant: its stage (translation, lift, module) and its
+    // pre-rasterization library. False when it could not be made (`why`).
+    const auto build = [&](std::uint32_t out_cntl, std::uint64_t& key, std::string& why) {
+        const VsStageInputs in{&code.words, &no_fetch, rec.rsrc1,  rec.rsrc2, out_cntl,   fetchless ? nullptr : &rec.elements,
+                               !fetchless,  true,      &rec.dims, &rec.modes};
+        key = lift_key(vs_stage_key(in), lift);
+        if (job.sweep && g_stage_cache_on && cached_stage(key)) return true;  // built this run already
+        const auto tb = std::chrono::steady_clock::now();
+        ShaderStage stage;
+        if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
+            stage.take(hit);
+            stage.module = hit->module;
+        } else {
+            const gcn::TranslateOptions options = vs_translate_options(in, nullptr);
+            stage.fresh() = translate_cached(prog, options);
+            if (!stage.meta().ok()) {
+                why = translation_error_kind(stage.meta().errors[0]);
+                return false;
+            }
+            // The lift runs here as well, so a shader compiled at creation is the
+            // same stage the draw wants and is not thrown away for it.
+            if (lift) {
+                hlsl_name_next(job.name);
+                gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), job.name);
+                if (lifted.ok()) {
+                    stage.fresh().spirv = std::move(lifted.spirv);
+                    stage.lifted = true;
+                }
+            }
+            dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
+            if (!make_module(stage.meta().spirv, stage.module)) {
+                why = "shader module";
+                return false;
+            }
+            if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
+        }
+        if (!job.sweep) w.vs_translate_us.fetch_add(pl_us_since(tb), std::memory_order_relaxed);
+        const auto t1 = std::chrono::steady_clock::now();
+        const bool libraries = use_pipeline_library();  // without them the stage alone (precompile_enabled)
+        const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
+        const VkPipelineLayout layout = libraries ? stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout) : VK_NULL_HANDLE;
+        const ShaderStage no_gs;
+        t_library_owner = job.name.c_str();
+        const VkPipeline library =
+            !libraries ? kLibraryWarmed
+            : layout   ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets, nullptr, nullptr, !job.sweep)
+                       : VK_NULL_HANDLE;
+        t_library_owner = nullptr;
+        if (job.sweep && stage.module) vkDestroyShaderModule(g.device, stage.module, nullptr);  // it served the library build only
+        if (!job.sweep) w.vs_library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
+        if (!library) {
+            why = "pre-rasterization library";
+            return false;
+        }
+        return true;
+    };
+    std::uint64_t key = 0, twin = 0;
+    std::string why;
+    if (!job.twin && !build(rec.out_cntl, key, why)) return give_up(why);
+    // The clip-varying twin (g_predict_variants), as build_gfx_pipeline's
+    // vs_out_cntl makes it for a draw with a pixel shader. A draw needs the
+    // shader as it is first, if ever the twin, so the twin is a job of its own
+    // behind every other (Precompiler::later): a start's shaders are ready as
+    // soon as they were without it. The sweep's, already behind them, here.
+    const std::uint32_t oc = rec.out_cntl;
+    if (g_predict_variants && g_clip_varying && (oc & (1u << 22)) && (oc & 0xf) && !(oc & 0xfff0) && !(oc & (1u << 23))) {
+        int used = -1;
+        for (const gcn::Inst& in : prog.insts) {
+            if (in.enc == gcn::Enc::EXP && in.tgt >= 32 && in.tgt < 64) used = std::max(used, static_cast<int>(in.tgt) - 32);
+        }
+        const std::uint32_t location = static_cast<std::uint32_t>(used + 1);
+        if (location <= 29 && !job.twin && !job.sweep) {
+            PrecompileJob later;
+            later.name = job.name;
+            later.container = job.container;
+            later.type = 1;
+            later.flip = job.flip;
+            later.twin = true;
+            {
+                std::lock_guard<std::mutex> lk(w.mu);
+                w.later.push_back(std::move(later));
+            }
+            w.cv.notify_one();
+        } else if (location <= 29) {
+            const std::uint32_t varying =
+                oc | gcn::TranslateOptions::kVsOutCntlClipVarying | location << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
+            std::string twin_why;
+            if (build(varying, twin, twin_why)) {
+                if (!job.sweep) g_vs_clip_twins.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                twin = 0;
             }
         }
-        dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
-        if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
-    const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
-    const VkPipelineLayout layout = stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout);
-    const ShaderStage no_gs;
-    t_library_owner = job.name.c_str();
-    const VkPipeline library = layout ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) : VK_NULL_HANDLE;
-    t_library_owner = nullptr;
-    w.vs_library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
-    if (!library) return give_up("pre-rasterization library");
+    if (job.twin) {
+        if (twin) {
+            std::lock_guard<std::mutex> lk(w.mu);
+            w.vs_stage_keys.insert(twin);
+        }
+        return;
+    }
+    if (fetchless && !job.sweep) g_vs_fetchless.fetch_add(1, std::memory_order_relaxed);
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.keys.insert(key);
+            if (twin) g_sweep_stats.keys.insert(twin);
+        }
+        g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+        g_sweep_stats.us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(w.mu);
         w.vs_records[job.name] = std::move(rec);
         w.vs_stage_keys.insert(key);
+        if (twin) w.vs_stage_keys.insert(twin);
     }
     w.vs_done.fetch_add(1, std::memory_order_relaxed);
 }
+// ---- The shader sweep: every shader in the game's bundles, at the first start ----
+// GX creates a shader when the game loads what uses it, and the precompile
+// workers compile it then (precompile_ps, precompile_vs, precompile_compute):
+// some 3,000 at the start, then each area's at its first load - into the
+// translation cache and the driver's pipeline cache, so that a later start's
+// compile of the same shader is two cache lookups. The sweep compiles every
+// vertex, pixel and compute shader in the bundles the same way at the first
+// start (the first for this translator and device: shader-sweep.txt beside
+// the caches says which made it), so that an area's first load finds its
+// shaders in the caches too. On threads of its own (bb-sweep) at the lowest
+// priority, behind every job of the precompile workers: as many as those have
+// while the title or a loading screen is up, one in game. It keeps nothing in
+// the run - each module and library goes once the driver has made it - and its
+// translations join the translation cache only while that has room
+// (translation_cache_bounded). Only with pipeline libraries, whose shader
+// libraries are what it compiles. BBHOST_SHADER_SWEEP=1 runs it (once for a
+// translator and device), =2 at every start; off otherwise (shader_sweep_start).
+struct Sweeper {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<PrecompileJob> jobs;  // under mu
+    int limit = 1, threads = 0, running = 0;  // under mu
+    bool listed = false, finished = false;   // under mu
+    std::uint64_t total = 0;                 // under mu: shaders listed
+    std::chrono::steady_clock::time_point started{};
+    std::string stamp_path, stamp, eboot_path;
+};
+Sweeper g_sweeper;
+std::atomic<bool> g_sweep_on{false};
+std::atomic<bool> g_sweep_cancel{false};  // compile_session_cancel
+int sweep_limit_now() {
+    Precompiler* w = g_precompiler.load();
+    const int boot = w ? w->boot : 1;
+    return g_precompile_boost.load() ? std::max(1, boot) : 1;
+}
+void sweep_limit_update() {
+    if (!g_sweep_on.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        g_sweeper.limit = std::min(g_sweeper.threads, sweep_limit_now());
+    }
+    g_sweeper.cv.notify_all();
+}
+// The stamp: what made the sweep and that it ran to its end.
+std::string sweep_stamp() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    char uuid[2 * VK_UUID_SIZE + 1] = {};
+    for (std::uint32_t k = 0; k < VK_UUID_SIZE; ++k) std::snprintf(uuid + 2 * k, 3, "%02x", props.pipelineCacheUUID[k]);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "translator %s\ndevice %08x:%08x:%08x:%s\n", translator_fingerprint(), props.vendorID, props.deviceID,
+                  props.driverVersion, uuid);
+    return buf;
+}
+void sweep_thread(int index) {
+    host_thread_set_name("bb-sweep");
+    // The compile session (host_gpu_set_compile_session) is what the player
+    // asked for and waits on: its threads run at the normal priority, and what
+    // it compiles is the cache's whole purpose, so it is not bounded.
+    const bool session = g_compile_session.load();
+    if (!session) host_thread_background();
+    t_pipeline_worker = true;
+    hlsl_lane(kHlslLaneLater);
+    translation_cache_bounded(!session);
+    if (index == 0) {
+        // The list, made here rather than at the device's start: reading the
+        // bundles takes a moment.
+        // The eboot's own first - GX never creates them, so nothing else
+        // compiles them before a draw - then the bundles' (GX creates the
+        // game's at the start, and compiles them then: what is left of them
+        // is the debug bundle's).
+        // The compile session takes the bundles the game creates its shaders
+        // from (not the debug menu's), and the eboot's own only through the
+        // manifests (what a draw has used): of its ~5,400 a tour draws ~80.
+        const std::vector<BundleShader> own = session ? std::vector<BundleShader>{} : eboot_shaders(g_sweeper.eboot_path);
+        std::vector<BundleShader> all = shader_bundles_list();
+        if (session) all.erase(std::remove_if(all.begin(), all.end(), [](const BundleShader& b) { return b.debug; }), all.end());
+        std::deque<PrecompileJob> jobs;
+        std::unordered_set<std::string> listed;
+        for (const std::vector<BundleShader>* set : {&own, static_cast<const std::vector<BundleShader>*>(&all)}) {
+            for (const int type : {4, 2, 1}) {  // compute first (few, slow to compile), then pixel, then vertex
+                for (const BundleShader& b : *set) {
+                    if (b.type != type || !listed.insert(b.name).second) continue;
+                    PrecompileJob job;
+                    job.name = b.name;
+                    job.container = *b.container;
+                    job.type = type;
+                    job.sweep = true;
+                    jobs.push_back(std::move(job));
+                    (set == &own ? g_sweep_stats.eboot : g_sweep_stats.bundles).fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        host_log("render: shader sweep: %zu of the eboot's own shaders, then the bundles' (%s): %zu vertex, pixel and compute shaders to "
+                 "compile into the caches", static_cast<std::size_t>(g_sweep_stats.eboot.load()), shader_bundles_summary().c_str(), jobs.size());
+        {
+            std::lock_guard<std::mutex> lk(g_sweeper.mu);
+            if (g_sweep_cancel.load()) jobs.clear();  // cancelled before the list was made
+            g_sweeper.total = jobs.size();
+            g_sweeper.jobs = std::move(jobs);
+            g_sweeper.listed = true;
+        }
+        g_sweep_stats.queued.store(g_sweeper.total);
+        g_sweeper.cv.notify_all();
+    }
+    for (;;) {
+        PrecompileJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_sweeper.mu);
+            g_sweeper.cv.wait(lk, [index] { return g_sweeper.listed && (g_sweeper.jobs.empty() || index < g_sweeper.limit); });
+            if (g_sweeper.jobs.empty()) {
+                if (g_sweeper.running == 0 && !g_sweeper.finished) {
+                    g_sweeper.finished = true;
+                    std::ofstream(g_sweeper.stamp_path, std::ios::trunc)
+                        << g_sweeper.stamp << "shaders " << g_sweeper.total << " compiled " << g_sweep_stats.done.load() << " skipped "
+                        << g_sweep_stats.skipped.load() << " failed " << g_sweep_stats.failed.load() << "\n";
+                    host_log("render: shader sweep: done, %llu compiled into the caches, %llu compiled by the game first, %llu failed; %.1f s "
+                             "after it started (%.1f s of its threads' time)",
+                             static_cast<unsigned long long>(g_sweep_stats.done.load()), static_cast<unsigned long long>(g_sweep_stats.skipped.load()),
+                             static_cast<unsigned long long>(g_sweep_stats.failed.load()),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - g_sweeper.started).count(),
+                             g_sweep_stats.us.load() / 1e6);
+                }
+                return;  // the thread's work is done
+            }
+            job = std::move(g_sweeper.jobs.front());
+            g_sweeper.jobs.pop_front();
+            ++g_sweeper.running;
+        }
+        // Behind the precompile workers: what the game created, the manifests,
+        // the relinks go first.
+        Precompiler& w = precompiler();
+        for (;;) {
+            bool idle;
+            {
+                std::lock_guard<std::mutex> lk(w.mu);
+                idle = w.jobs.empty() && w.later.empty();
+            }
+            if (idle && g.ok) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (job.type == 4) {
+            if (compute_precompile_enabled() && note_compute_created(job.name, 0)) {
+                precompile_compute(job.name, job.container, 0);
+                g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (job.type == 1) {
+            precompile_vs(w, job);
+        } else {
+            precompile_ps(w, job);
+        }
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        --g_sweeper.running;
+        if (g_sweeper.jobs.empty() && g_sweeper.running == 0) g_sweeper.cv.notify_all();
+    }
+}
+}  // namespace
+
+// At the end of device init: the sweep, if this translator and device have
+// not run it to its end here yet.
+void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path) {
+    // Off unless asked for: GX creates every shader of the game's bundles at
+    // the start (the debug bundle's aside), and those are compiled then; what
+    // is left - the eboot's ~5,400 own, of which a twelve-place tour draws 83,
+    // and the debug bundle's - costs minutes of compiles and the caches'
+    // room for few draws. The pipeline and stage manifests cover what a draw
+    // needed, from the second start on.
+    const char* e = std::getenv("BBHOST_SHADER_SWEEP");
+    const bool session = g_compile_session.load();
+    if (!session && !(e && (e[0] == '1' || e[0] == '2'))) return;
+    const bool force = session || e[0] == '2';
+    // Without pipeline libraries the compile session still makes every stage:
+    // translations, lifts and DXC's modules, for the caches.
+    if (!precompile_enabled() || (!use_pipeline_library() && !session) || stamp_path.empty()) {
+        if (force) host_log("render: shader sweep: not without pipeline libraries and the shader caches");
+        return;
+    }
+    const std::string stamp = sweep_stamp();
+    {
+        std::ifstream in(stamp_path);
+        const std::string have((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!force && have.compare(0, stamp.size(), stamp) == 0) return;  // done before, by this translator on this device
+    }
+    Precompiler& w = precompiler();
+    const int threads = std::max(1, w.boot);
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        g_sweeper.stamp_path = stamp_path;
+        g_sweeper.stamp = stamp;
+        g_sweeper.eboot_path = eboot_path;
+        g_sweeper.threads = threads;
+        g_sweeper.started = std::chrono::steady_clock::now();
+    }
+    g_sweep_on.store(true);
+    sweep_limit_update();
+    if (session)
+        host_log("render: shader sweep (the compile session): the bundles' shaders into the caches, on %d bb-sweep threads, behind the "
+                 "precompile workers' manifests", threads);
+    else
+        host_log("render: shader sweep: the eboot's own shaders and the bundles' into the caches, on %d bb-sweep threads at the lowest "
+                 "priority (one in game), behind the precompile workers (BBHOST_SHADER_SWEEP)", threads);
+    for (int i = 0; i < threads; ++i) std::thread(sweep_thread, i).detach();
+}
+namespace {
+void note_sweep_hit(std::uint64_t key) {
+    if (!g_sweep_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+    if (g_sweep_stats.keys.count(key)) g_sweep_stats.draw_hits.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
+// The compile session's progress (host_gpu_compile_progress): the sweep's
+// shaders and the precompile workers' jobs (the manifests' stages and
+// pipelines, run before the sweep's), done and in all.
+void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
+                              std::string& reasons, std::uint64_t& recipes_total, std::uint64_t& recipes_done) {
+    const std::uint64_t pre_done = g_precompile_jobs_done.load();
+    // The precompile workers' queue with the predictions behind it: the
+    // session waits for both, and for the pipelines the manifests replay -
+    // the player's own and the shipped list's (pipeline_manifest_load).
+    std::uint64_t pre_left = precompile_backlog();
+    if (Precompiler* w = g_precompiler.load()) {
+        std::lock_guard<std::mutex> lk(w->mu);
+        pre_left += w->later.size();
+    }
+    recipes_total = g_pmanifest.queued.load();
+    recipes_done = g_pmanifest.done.load() + g_pmanifest.failed.load();
+    std::uint64_t sweep_total = 0, sweep_left = 0;
+    bool sweep_finished = false;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        listed = g_sweeper.listed;
+        sweep_total = g_sweeper.total;
+        sweep_left = g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running);
+        sweep_finished = g_sweeper.listed && sweep_left == 0;
+    }
+    total = sweep_total + pre_done + pre_left;
+    // What the sweep finished (a cancel drops the rest without doing it).
+    const std::uint64_t sweep_did = g_sweep_stats.done.load() + g_sweep_stats.skipped.load() + g_sweep_stats.failed.load();
+    done = std::min(sweep_did, sweep_total) + pre_done;
+    (void)sweep_left;
+    failed = g_sweep_stats.failed.load();
+    finished = (sweep_finished || !g_sweep_on.load()) && pre_left == 0;
+    std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+    for (const auto& [why, n] : g_sweep_stats.fail_reasons) reasons += why + " x" + std::to_string(n) + "\n";
+}
+// Cancel: what the sweep has not begun is dropped; what runs ends.
+void compile_session_cancel() {
+    g_sweep_cancel.store(true);
+    // The manifests' and the list's pipelines not begun, and the predictions,
+    // are dropped too: they only warm the caches.
+    if (Precompiler* w = g_precompiler.load()) {
+        std::lock_guard<std::mutex> lk(w->mu);
+        w->jobs.clear();
+        w->later.clear();
+    }
+    std::lock_guard<std::mutex> lk(g_sweeper.mu);
+    g_sweeper.jobs.clear();
+    g_sweeper.cv.notify_all();
+}
+
+// What the sweep has left, while the title or a loading screen is up (the
+// "Building shaders" line); 0 in game, where it goes on on one thread.
+std::size_t shader_sweep_left() {
+    if (!g_sweep_on.load() || !g_precompile_boost.load()) return 0;
+    std::lock_guard<std::mutex> lk(g_sweeper.mu);
+    return g_sweeper.listed ? g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running) : 0;
+}
+
+namespace {
+
+void shader_sweep_report() {
+    if (!g_sweep_on.load()) return;
+    std::string reasons;
+    {
+        std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+        for (const auto& [why, n] : g_sweep_stats.fail_reasons) reasons += " " + why + " x" + std::to_string(n) + ";";
+    }
+    std::size_t left = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        left = g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running);
+    }
+    host_log("render: shader sweep: %llu of %llu shaders (%llu the eboot's own, %llu the bundles') compiled into the caches (%.1f s of its "
+             "threads' time), %llu compiled by the game first, %llu failed, %zu left; stages a draw built that it had compiled %llu; "
+             "%llu translations left out of the full translation cache%s%s",
+             static_cast<unsigned long long>(g_sweep_stats.done.load()), static_cast<unsigned long long>(g_sweep_stats.queued.load()),
+             static_cast<unsigned long long>(g_sweep_stats.eboot.load()), static_cast<unsigned long long>(g_sweep_stats.bundles.load()),
+             g_sweep_stats.us.load() / 1e6, static_cast<unsigned long long>(g_sweep_stats.skipped.load()),
+             static_cast<unsigned long long>(g_sweep_stats.failed.load()), left, static_cast<unsigned long long>(g_sweep_stats.draw_hits.load()),
+             static_cast<unsigned long long>(translation_cache_bounded_left_out()), reasons.empty() ? "" : "; failed by reason:", reasons.c_str());
+}
+
 bool note_vs_precompile_hit(std::uint64_t vs_key) {  // true: a stage compiled at creation
     if (!precompile_enabled()) return false;
     Precompiler& w = precompiler();
@@ -6084,6 +7467,7 @@ void note_precompile_miss(const std::string& name, const PsStageInputs& in) {
     else if (r.modes != *in.modes) ++w.miss_modes;
     else if (r.ps_input_ena != in.ps_input_ena) ++w.miss_ena;
     else if (r.rsrc1 != in.rsrc1 || r.rsrc2 != in.rsrc2) ++w.miss_rsrc;
+    else if (in.clip_discard) ++w.miss_clip;  // the clip varying's discard, which only the pair decides
     else ++w.miss_other;
 }
 namespace manifest_file {
@@ -6188,11 +7572,395 @@ bool read(Reader& r, ManifestStage& m) {
 }
 }  // namespace manifest_file
 
+namespace recipe_file {
+constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
+constexpr std::uint32_t kVersion = 3;  // 2: tessellated pipelines; 3: the host tessellator's LS passes (a 2 is read as well)
+using manifest_file::Reader;
+using manifest_file::Writer;
+// What made the file: the translator and the device, for the report (the
+// recipes are the game's inputs, so neither invalidates them).
+struct Origin {
+    std::string translator;
+    std::uint32_t vendor = 0, device = 0, driver = 0;
+    std::uint8_t uuid[VK_UUID_SIZE] = {};
+    bool libraries = false;
+};
+void write_origin(Writer& w, const Origin& o) {
+    w.u32(static_cast<std::uint32_t>(o.translator.size()));
+    w.out.insert(w.out.end(), o.translator.begin(), o.translator.end());
+    w.u32(o.vendor);
+    w.u32(o.device);
+    w.u32(o.driver);
+    w.out.insert(w.out.end(), o.uuid, o.uuid + VK_UUID_SIZE);
+    w.u8(o.libraries ? 1 : 0);
+}
+bool read_origin(Reader& r, Origin& o) {
+    const std::uint32_t n = r.count(1);
+    if (!r.ok) return false;
+    o.translator.assign(reinterpret_cast<const char*>(r.p), n);
+    r.p += n;
+    o.vendor = r.u32();
+    o.device = r.u32();
+    o.driver = r.u32();
+    for (std::uint8_t& b : o.uuid) b = r.u8();
+    o.libraries = r.u8() != 0;
+    return r.ok;
+}
+void str(Writer& w, const std::string& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    w.out.insert(w.out.end(), v.begin(), v.end());
+}
+bool str(Reader& r, std::string& v) {
+    const std::uint32_t n = r.count(1);
+    if (!r.ok) return false;
+    v.assign(reinterpret_cast<const char*>(r.p), n);
+    r.p += n;
+    return true;
+}
+template <typename T>
+void pod(Writer& w, const T& v) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&v);
+    w.out.insert(w.out.end(), b, b + sizeof(T));
+}
+template <typename T>
+void pod(Reader& r, T& v) {
+    if (static_cast<std::size_t>(r.end - r.p) < sizeof(T)) {
+        r.ok = false;
+        return;
+    }
+    std::memcpy(&v, r.p, sizeof(T));
+    r.p += sizeof(T);
+}
+void words(Writer& w, const std::vector<std::uint32_t>& v) { w.u32s(v); }
+void words(Reader& r, std::vector<std::uint32_t>& v) {
+    v.resize(r.count(4));
+    for (std::uint32_t& x : v) x = r.u32();
+}
+void dims(Writer& w, const std::vector<std::pair<std::uint32_t, bool>>& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    for (const auto& d : v) {
+        w.u32(d.first);
+        w.u8(d.second ? 1 : 0);
+    }
+}
+void dims(Reader& r, std::vector<std::pair<std::uint32_t, bool>>& v) {
+    v.resize(r.count(5));
+    for (auto& d : v) {
+        d.first = r.u32();
+        d.second = r.u8() != 0;
+    }
+}
+void modes(Writer& w, const std::vector<bool>& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    for (bool b : v) w.u8(b ? 1 : 0);
+}
+void modes(Reader& r, std::vector<bool>& v) {
+    v.resize(r.count(1));
+    for (std::size_t k = 0; k < v.size(); ++k) v[k] = r.u8() != 0;
+}
+// One recipe, its byte length first (a reader skips what it cannot read).
+void write(Writer& out, const PipelineRecipe& rc) {
+    Writer w;
+    const DrawState& s = rc.s;
+    w.u32((rc.cb_no_fallback ? 1u : 0u) | (rc.layout_only ? 2u : 0u) | (rc.has_vertex_input ? 4u : 0u) | (rc.relink ? 8u : 0u) |
+          (s.gx_blend ? 16u : 0u) | (s.gx_depth ? 32u : 0u) | (s.gx_raster ? 64u : 0u) | (s.rect ? 128u : 0u));
+    pod(w, rc.key);
+    w.u32(rc.uses);
+    w.u32(rc.last_run);
+    w.u32(rc.order);
+    for (std::uint32_t v : {s.vs_rsrc1, s.vs_rsrc2, s.ps_rsrc1, s.ps_rsrc2, s.prim, static_cast<std::uint32_t>(s.topo), s.depth_control,
+                            s.stencil_control, s.su_sc_mode, s.clip_cntl, s.vte_cntl, s.ps_input_ena, s.ps_in_control, s.vs_out_cntl,
+                            s.cb_shader_mask, s.ps_col_format, s.gx_ids[0], s.gx_ids[1], s.gx_ids[2]}) {
+        w.u32(v);
+    }
+    pod(w, s.program_fp);
+    for (std::uint32_t v : s.color_mask) w.u32(v);
+    for (std::uint32_t v : s.blend) w.u32(v);
+    for (std::uint32_t v : s.ps_input_cntl) w.u32(v);
+    for (std::uint32_t v : rc.color_format) w.u32(v);
+    w.u32(rc.depth_format);
+    pod(w, rc.blend);
+    pod(w, rc.depth);
+    pod(w, rc.raster);
+    words(w, rc.vs_words);
+    words(w, rc.fetch_words);
+    words(w, rc.ps_words);
+    str(w, rc.vs_name);
+    str(w, rc.ps_name);
+    dims(w, rc.vs_dims);
+    dims(w, rc.ps_dims);
+    modes(w, rc.vs_modes);
+    modes(w, rc.ps_modes);
+    const VertexInputPlan& vi = rc.vertex_input;
+    w.u32(static_cast<std::uint32_t>(vi.elements.size()));
+    for (const gcn::VertexElement& e : vi.elements) {
+        w.u32(e.location);
+        w.u32(e.vdata);
+        w.u32(e.count);
+        w.u32(e.w3);
+    }
+    w.u32(static_cast<std::uint32_t>(vi.bindings.size()));
+    for (const VkVertexInputBindingDescription& b : vi.bindings) {
+        w.u32(b.binding);
+        w.u32(b.stride);
+        w.u32(static_cast<std::uint32_t>(b.inputRate));
+    }
+    w.u32(static_cast<std::uint32_t>(vi.attributes.size()));
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        w.u32(a.location);
+        w.u32(a.binding);
+        w.u32(static_cast<std::uint32_t>(a.format));
+        w.u32(a.offset);
+    }
+    pod(w, vi.hash);
+    pod(w, rc.spec_w3);
+    pod(w, rc.spec_stride);
+    pod(w, rc.spec_w3_mask);
+    // Tessellation: the draw state for it, then the programs (a list names the
+    // LS and the hull as it names the others: flags 1024 and 2048).
+    w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
+          (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
+          (!rc.ls_passes.empty() ? 1024u : 0u));
+    for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
+                            static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
+        w.u32(v);
+    }
+    pod(w, s.tess_outer);
+    pod(w, s.tess_inner);
+    pod(w, s.tess_constants);
+    pod(w, s.tess_cb);
+    for (const CachedProgram* cp : {rc.has_ls ? &rc.ls : nullptr, rc.has_hs ? &rc.hs : nullptr}) {
+        if (!cp) continue;
+        words(w, cp->words);
+        str(w, cp->name);
+        w.u32(static_cast<std::uint32_t>(cp->fetch_sgpr));
+    }
+    if (rc.has_ls_fetch) words(w, rc.ls_fetch.words);
+    if (!rc.ls_passes.empty()) {
+        // The LS passes (version 3, flag 1024): a count, then each one's
+        // flags (1: its LS named, as a list names programs), registers, LS
+        // and the fetch shader's words when it has one.
+        w.u32(static_cast<std::uint32_t>(rc.ls_passes.size()));
+        for (const PipelineRecipe::LsPassRecord& p : rc.ls_passes) {
+            w.u32(0u);
+            for (std::uint32_t v : {p.rsrc1, p.rsrc2, p.hull ? 1u : 0u, p.window, p.control_points}) w.u32(v);
+            words(w, p.ls.words);
+            str(w, p.ls.name);
+            w.u32(static_cast<std::uint32_t>(p.ls.fetch_sgpr));
+            w.u32(p.has_fetch ? 1u : 0u);
+            if (p.has_fetch) words(w, p.fetch.words);
+        }
+    }
+    out.u32(static_cast<std::uint32_t>(w.out.size()));
+    out.out.insert(out.out.end(), w.out.begin(), w.out.end());
+}
+bool read(Reader& in, PipelineRecipe& rc) {
+    const std::uint32_t n = in.count(1);
+    if (!in.ok) return false;
+    Reader r{in.p, in.p + n};
+    in.p += n;
+    DrawState& s = rc.s;
+    const std::uint32_t f = r.u32();
+    rc.cb_no_fallback = f & 1;
+    rc.layout_only = f & 2;
+    rc.has_vertex_input = f & 4;
+    rc.relink = f & 8;
+    s.rect = f & 128;
+    pod(r, rc.key);
+    rc.uses = r.u32();
+    rc.last_run = r.u32();
+    rc.order = r.u32();
+    std::uint32_t topo = 0;
+    for (std::uint32_t* v : {&s.vs_rsrc1, &s.vs_rsrc2, &s.ps_rsrc1, &s.ps_rsrc2, &s.prim, &topo, &s.depth_control, &s.stencil_control,
+                             &s.su_sc_mode, &s.clip_cntl, &s.vte_cntl, &s.ps_input_ena, &s.ps_in_control, &s.vs_out_cntl, &s.cb_shader_mask,
+                             &s.ps_col_format, &s.gx_ids[0], &s.gx_ids[1], &s.gx_ids[2]}) {
+        *v = r.u32();
+    }
+    s.topo = static_cast<VkPrimitiveTopology>(topo);
+    pod(r, s.program_fp);
+    for (std::uint32_t& v : s.color_mask) v = r.u32();
+    for (std::uint32_t& v : s.blend) v = r.u32();
+    for (std::uint32_t& v : s.ps_input_cntl) v = r.u32();
+    for (std::uint32_t& v : rc.color_format) v = r.u32();
+    rc.depth_format = r.u32();
+    pod(r, rc.blend);
+    pod(r, rc.depth);
+    pod(r, rc.raster);
+    // Only whether they are set is read (recipe_draw_state aims them at the copies).
+    s.gx_blend = (f & 16) ? &rc.blend : nullptr;
+    s.gx_depth = (f & 32) ? &rc.depth : nullptr;
+    s.gx_raster = (f & 64) ? &rc.raster : nullptr;
+    // A list (tools/pipeline_list.py) gives a program by its name, word count
+    // and hash instead of its words: the words come from the game's own files
+    // (its bundles, or the eboot for the eboot's own), patched as the game's
+    // draws read them, and must hash the same.
+    const bool vs_ref = f & 256, ps_ref = f & 512;
+    std::uint32_t vs_count = 0, ps_count = 0;
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    if (vs_ref) {
+        vs_count = r.u32();
+        pod(r, vs_hash);
+    } else {
+        words(r, rc.vs_words);
+    }
+    words(r, rc.fetch_words);
+    if (ps_ref) {
+        ps_count = r.u32();
+        pod(r, ps_hash);
+    } else {
+        words(r, rc.ps_words);
+    }
+    if (!str(r, rc.vs_name) || !str(r, rc.ps_name)) return false;
+    const auto from_bundle = [](const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+        const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+        gcn::ShaderCode code;
+        if (!c || !gcn::shader_code(*c, code)) return false;
+        shader_patch_apply(name, code.words);
+        if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
+        out = std::move(code.words);
+        return true;
+    };
+    if (vs_ref && !from_bundle(rc.vs_name, vs_count, vs_hash, rc.vs_words)) return false;
+    if (ps_ref && !from_bundle(rc.ps_name, ps_count, ps_hash, rc.ps_words)) return false;
+    dims(r, rc.vs_dims);
+    dims(r, rc.ps_dims);
+    modes(r, rc.vs_modes);
+    modes(r, rc.ps_modes);
+    VertexInputPlan& vi = rc.vertex_input;
+    vi.elements.resize(r.count(16));
+    for (gcn::VertexElement& e : vi.elements) {
+        e.location = r.u32();
+        e.vdata = r.u32();
+        e.count = r.u32();
+        e.w3 = r.u32();
+    }
+    vi.bindings.resize(r.count(12));
+    for (VkVertexInputBindingDescription& b : vi.bindings) {
+        b.binding = r.u32();
+        b.stride = r.u32();
+        b.inputRate = static_cast<VkVertexInputRate>(r.u32());
+    }
+    vi.attributes.resize(r.count(16));
+    for (VkVertexInputAttributeDescription& a : vi.attributes) {
+        a.location = r.u32();
+        a.binding = r.u32();
+        a.format = static_cast<VkFormat>(r.u32());
+        a.offset = r.u32();
+    }
+    // The file keeps no VertexElement::packed; the attribute's format says it
+    // (vertex_packing_of). Without it a pipeline whose elements arrived packed
+    // was made again at the start with their descriptors unpacked - the relink's
+    // specialization included - so its vertex shader took the packed dwords
+    // one component a channel: every such draw's vertices torn apart.
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        if (a.location < vi.elements.size()) vi.elements[a.location].packed = vertex_packing_of(vi.elements[a.location].w3, a.format);
+    }
+    pod(r, vi.hash);
+    pod(r, rc.spec_w3);
+    pod(r, rc.spec_stride);
+    pod(r, rc.spec_w3_mask);
+    const std::uint32_t tf = r.u32();
+    s.tess_hw = tf & 1;
+    s.tess_attrs = tf & 2;
+    s.tess_hull = tf & 4;
+    s.tess_quads = tf & 8;
+    s.tess_cw = tf & 16;
+    s.tess_native = tf & 32;
+    rc.has_ls = tf & 64;
+    rc.has_hs = tf & 128;
+    rc.has_ls_fetch = tf & 256;
+    std::uint32_t spacing = 0;
+    for (std::uint32_t* v : {&s.tess_control_points, &s.tess_attr_vec4s, &s.ls_rsrc1, &s.ls_rsrc2, &s.hs_rsrc1, &s.hs_rsrc2, &s.tess_window, &spacing,
+                             &s.domain_level}) {
+        *v = r.u32();
+    }
+    s.tess_spacing = static_cast<int>(spacing);
+    pod(r, s.tess_outer);
+    pod(r, s.tess_inner);
+    pod(r, s.tess_constants);
+    pod(r, s.tess_cb);
+    const bool ls_ref = f & 1024, hs_ref = f & 2048;
+    for (CachedProgram* cp : {rc.has_ls ? &rc.ls : nullptr, rc.has_hs ? &rc.hs : nullptr}) {
+        if (!cp) continue;
+        const bool ref = cp == &rc.ls ? ls_ref : hs_ref;
+        std::uint32_t count = 0;
+        std::uint64_t hash = 0;
+        if (ref) {
+            count = r.u32();
+            pod(r, hash);
+        } else {
+            words(r, cp->words);
+        }
+        if (!str(r, cp->name)) return false;
+        cp->fetch_sgpr = static_cast<int>(r.u32());
+        if (ref && !from_bundle(cp->name, count, hash, cp->words)) return false;
+        cp->hash = fnv1a(cp->words.data(), cp->words.size() * 4);
+        std::memset(cp->head, 0, sizeof(cp->head));
+    }
+    if (rc.has_ls_fetch) {
+        words(r, rc.ls_fetch.words);
+        rc.ls_fetch.hash = fnv1a(rc.ls_fetch.words.data(), rc.ls_fetch.words.size() * 4);
+    }
+    // The LS passes (flag 1024): a count, then each one's flags (1: its LS
+    // named), registers, LS and the fetch shader's words when it has one.
+    const std::uint32_t passes = (tf & 1024) ? r.count(28) : 0u;
+    for (std::uint32_t k = 0; k < passes && r.ok; ++k) {
+        PipelineRecipe::LsPassRecord p;
+        const bool ref = (r.u32() & 1u) != 0;
+        std::uint32_t hull = 0;
+        for (std::uint32_t* v : {&p.rsrc1, &p.rsrc2, &hull, &p.window, &p.control_points}) *v = r.u32();
+        p.hull = hull != 0;
+        std::uint32_t count = 0;
+        std::uint64_t hash = 0;
+        if (ref) {
+            count = r.u32();
+            pod(r, hash);
+        } else {
+            words(r, p.ls.words);
+        }
+        if (!str(r, p.ls.name)) return false;
+        p.ls.fetch_sgpr = static_cast<int>(r.u32());
+        if (ref && !from_bundle(p.ls.name, count, hash, p.ls.words)) return false;
+        p.ls.hash = fnv1a(p.ls.words.data(), p.ls.words.size() * 4);
+        std::memset(p.ls.head, 0, sizeof(p.ls.head));
+        p.has_fetch = r.u32() != 0;
+        if (p.has_fetch) {
+            words(r, p.fetch.words);
+            p.fetch.hash = fnv1a(p.fetch.words.data(), p.fetch.words.size() * 4);
+        }
+        rc.ls_passes.push_back(std::move(p));
+    }
+    // The addresses the build tests for a program are the run's that recorded
+    // it; the recipe's build takes the copies (tess_program).
+    if (!rc.has_ls) s.ls_va = 0;
+    if (!rc.has_hs) s.hs_va = 0;
+    if (!rc.has_ls_fetch) s.ls_fetch_va = 0;
+    return r.ok && r.p == r.end && !rc.vs_words.empty() && rc.key != 0;
+}
+}  // namespace recipe_file
+
 void precompile_report() {
     compute_optimize_report();
     compute_precompile_report();
     translation_cache_report();
     if (const std::string r = ps_wave_census(false); !r.empty()) host_log("render: %s", r.c_str());
+    shader_sweep_report();
+    if (pipeline_manifest_on()) {
+        std::size_t kept = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            kept = g_pmanifest.by_key.size();
+        }
+        host_log("render: pipeline manifest: %llu pipelines from earlier runs, %llu built at start (%.1f s of worker time, %llu relinked), "
+                 "%llu failed and dropped; pipeline builds that took one %llu (one recorded but not built yet %llu, another layout %llu); "
+                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; %s",
+                 static_cast<unsigned long long>(g_pmanifest.loaded.load()), static_cast<unsigned long long>(g_pmanifest.done.load()),
+                 g_pmanifest.build_us.load() / 1e6, static_cast<unsigned long long>(g_pmanifest.relinked.load()),
+                 static_cast<unsigned long long>(g_pmanifest.failed.load()), static_cast<unsigned long long>(g_pmanifest.taken.load()),
+                 static_cast<unsigned long long>(g_pmanifest.not_ready.load()), static_cast<unsigned long long>(g_pmanifest.layout_differs.load()),
+                 static_cast<unsigned long long>(g_pmanifest.recorded.load()), kept,
+                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), ls_pass_report().c_str());
+    }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -6206,6 +7974,9 @@ void precompile_report() {
                  static_cast<unsigned long long>(w.relinks_w3.load()), static_cast<unsigned long long>(w.relink_spec_failed.load()),
                  static_cast<unsigned long long>(g_spec_w3_misses.load()), static_cast<unsigned long long>(g_spec_w3_draws.load()));
     }
+    host_log("render: vertex shaders compiled at creation: %llu clip-varying twins and %llu without vertex inputs among them "
+             "(BBHOST_PREDICT_VARIANTS)", static_cast<unsigned long long>(g_vs_clip_twins.load()),
+             static_cast<unsigned long long>(g_vs_fetchless.load()));
     host_log("render: vertex shaders compiled at creation: %llu queued, %llu done, %llu failed (translate %.1f s, libraries %.1f s); "
              "pipeline builds that found the stage ready %llu; no-fallback translations it did not serve: never queued %llu, still queued %llu, "
              "being compiled %llu, failed %llu, "
@@ -6246,7 +8017,8 @@ void precompile_report() {
     if (!reasons.empty()) host_log("render: pixel shaders not compiled at creation, by reason:%s", reasons.c_str());
     host_log("render: pixel shaders compiled at creation: %llu queued, %llu done (%llu early-fragment-tests twins beside them), %llu failed, %zu waiting (translate %.1f s, libraries %.1f s); "
              "draws that found the stage ready %llu; draw translations it did not serve: never queued %llu, still queued %llu, being compiled %llu, failed %llu, flat inputs %llu, input map %llu, "
-             "early fragment tests (draw with %llu, without %llu), image dims %llu, sampler modes %llu, input enable %llu, resource registers %llu, other %llu, "
+             "early fragment tests (draw with %llu, without %llu), image dims %llu, sampler modes %llu, input enable %llu, resource registers %llu, "
+             "clip discard %llu, other %llu, "
              "(of them lifted %llu); no record:%s",
              static_cast<unsigned long long>(w.queued.load()), static_cast<unsigned long long>(w.done.load()),
              static_cast<unsigned long long>(g_eft_twins_built.load()),
@@ -6255,7 +8027,8 @@ void precompile_report() {
              static_cast<unsigned long long>(w.miss_queued), static_cast<unsigned long long>(w.miss_compiling),
              static_cast<unsigned long long>(w.miss_failed), static_cast<unsigned long long>(w.miss_flat), static_cast<unsigned long long>(w.miss_input_map), static_cast<unsigned long long>(w.miss_eft_on), static_cast<unsigned long long>(w.miss_eft_off),
              static_cast<unsigned long long>(w.miss_dims), static_cast<unsigned long long>(w.miss_modes), static_cast<unsigned long long>(w.miss_ena),
-             static_cast<unsigned long long>(w.miss_rsrc), static_cast<unsigned long long>(w.miss_other), static_cast<unsigned long long>(w.miss_lifted),
+             static_cast<unsigned long long>(w.miss_rsrc), static_cast<unsigned long long>(w.miss_clip), static_cast<unsigned long long>(w.miss_other),
+             static_cast<unsigned long long>(w.miss_lifted),
              names.c_str());
 }
 
@@ -6326,6 +8099,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     gpci.layout = pl.layout;
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+    note_pipeline_work(kWorkLink, pl_us_since(t0));
     g_libs.link_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     g_libs.links.fetch_add(1, std::memory_order_relaxed);
     pl.library = ok;
@@ -6346,9 +8120,94 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     return ok;
 }
 
+// ---- BBHOST_HLSL: a pipeline the driver refuses with DXC's modules ----
+// is built again with its stages' lifts' own modules (translation_cache.h
+// hlsl_lift_of): the draw is never lost to the switch. Each such stage is made
+// once, from the lift DXC's module was compiled from, and shared by every
+// pipeline that needs it - kept for good, as the stage cache's are, since the
+// pipelines and their relinks go on using it. A stage whose DXC module a
+// driver refused once takes its lift's at once in the pipelines after.
+std::mutex g_hlsl_lift_stages_mu;
+std::unordered_map<std::uint64_t, std::shared_ptr<const CachedStage>> g_hlsl_lift_stages;  // by the words of DXC's module
+// The lift's stage for `meta`, a stage whose module is DXC's; null when it is
+// not DXC's (or its lift is not to be had). `make`: build it when it is not
+// made yet; without, only one an earlier refusal made.
+std::shared_ptr<const CachedStage> hlsl_lift_stage(const gcn::TranslateResult& meta, bool make) {
+    const std::uint64_t key = fnv1a(meta.spirv.data(), meta.spirv.size() * 4);
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+        if (const auto it = g_hlsl_lift_stages.find(key); it != g_hlsl_lift_stages.end()) return it->second;
+        if (!make) return nullptr;
+    }
+    std::vector<std::uint32_t> lift;
+    if (!hlsl_lift_of(meta.spirv, lift)) return nullptr;
+    auto entry = std::make_shared<CachedStage>();
+    entry->meta = meta;  // DXC's module declares the lift's bindings and interface: the same translation
+    entry->meta.spirv = std::move(lift);
+    entry->lifted = true;
+    if (!make_module(entry->meta.spirv, entry->module)) return nullptr;
+    std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+    const auto [it, fresh] = g_hlsl_lift_stages.emplace(key, entry);
+    if (!fresh) vkDestroyShaderModule(g.device, entry->module, nullptr);  // another thread made it first
+    return it->second;
+}
+// Swaps the stages of `pl` that hold DXC's modules for their lifts': every
+// such stage with `make`, else those an earlier refusal already rebuilt. How
+// many it swapped (0: none, so a refusal is the pipeline's own).
+int hlsl_stages_from_lifts(GfxPipeline& pl, bool make) {
+    if (!hlsl_on()) return 0;
+    if (!make) {
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+        if (g_hlsl_lift_stages.empty()) return 0;
+    }
+    int swapped = 0;
+    for (ShaderStage* st : {&pl.vs, &pl.ps, &pl.tess_ls}) {
+        if (!st->module || !st->lifted) continue;  // a translation's module is never DXC's
+        if (const std::shared_ptr<const CachedStage> lift = hlsl_lift_stage(st->meta(), make)) {
+            st->take(lift);
+            st->module = lift->module;
+            ++swapped;
+        }
+    }
+    // A native hull's control stage, a module of its own with its words beside it.
+    if (pl.tess_tcs && !pl.tess_hull_spirv.empty()) {
+        gcn::TranslateResult hull;
+        hull.spirv = pl.tess_hull_spirv;
+        if (const std::shared_ptr<const CachedStage> lift = hlsl_lift_stage(hull, make)) {
+            pl.tess_tcs = lift->module;
+            pl.tess_hull_spirv.clear();
+            ++swapped;
+        }
+    }
+    if (!make && swapped) hlsl_note_lift_again(swapped);
+    return swapped;
+}
+// BBHOST_TEST_HLSL_REFUSE=<n> (checks): every n-th pipeline created while a
+// stage held DXC's module is taken as refused (1: every one), so the rebuild
+// from the lifts' modules runs on a driver that refuses none of them.
+bool hlsl_test_refused(const GfxPipeline& pl) {
+    static const int every = [] {
+        const char* e = std::getenv("BBHOST_TEST_HLSL_REFUSE");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    if (!every || !hlsl_on()) return false;
+    bool dxc = false;
+    for (const ShaderStage* st : {&pl.vs, &pl.ps, &pl.tess_ls}) {
+        std::vector<std::uint32_t> lift;
+        if (st->module && st->lifted && hlsl_lift_of(st->meta().spirv, lift)) dxc = true;
+    }
+    if (pl.tess_tcs && !pl.tess_hull_spirv.empty()) {
+        std::vector<std::uint32_t> lift;
+        if (hlsl_lift_of(pl.tess_hull_spirv, lift)) dxc = true;
+    }
+    static std::atomic<std::uint64_t> seen{0};
+    return dxc && seen.fetch_add(1, std::memory_order_relaxed) % static_cast<std::uint64_t>(every) == 0;
+}
+
 // The Vulkan pipeline of a translated and laid-out GfxPipeline, from any draw
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
+    const PipelineBuildScope build_scope(pl, "created");
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -6365,20 +8224,27 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         pl.failed = true;
         return false;
     }
-    if (pl.tess_hw) {
-        // The host's own tessellator. The control points are
-        // already in the buffer the LS compute pass wrote, so the vertex stage
-        // carries nothing and the control stage only the hull shader's
-        // factors; `pl.vs` holds the domain shader, which is the evaluation
-        // stage.
-        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
-        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
-        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
-    } else {
-        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
-    }
-    if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
-    if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    // BBHOST_HLSL: stages whose DXC module a driver refused before take their
+    // lift's module now, not after another refusal.
+    hlsl_stages_from_lifts(pl, false);
+    const auto collect_stages = [&] {
+        stages.clear();
+        if (pl.tess_hw) {
+            // The host's own tessellator. The control points are
+            // already in the buffer the LS compute pass wrote, so the vertex stage
+            // carries nothing and the control stage only the hull shader's
+            // factors; `pl.vs` holds the domain shader, which is the evaluation
+            // stage.
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
+            stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
+            stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
+        } else {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
+        }
+        if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
+        if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    };
+    collect_stages();
     // Pixel shaders at wave32: built whole, the fragment stage is given its
     // subgroup size here (linked, in its library: fragment_library).
     // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
@@ -6399,6 +8265,17 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     const GfxFixedState f = fixed_state(s);
+    // The pipeline manifest: a pipeline the start built from a recipe is
+    // taken as it is; one built here goes into the manifest for the next.
+    const std::uint64_t content_key = g_pmanifest.recording.load(std::memory_order_relaxed) && recipe_recordable(s)
+                                          ? pipeline_content_key(pl, s, f, vertex_input, linked)
+                                          : 0;
+    t_replay_key = t_replaying ? content_key : 0;
+    if (content_key && !t_replaying && take_prebuilt(pl, content_key)) {
+        t_library_owner = owner;
+        g.gfx_pipelines.fetch_add(1);
+        return true;
+    }
     ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -6455,17 +8332,53 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     gpci.pDynamicState = &dsi;
     gpci.layout = pl.layout ? pl.layout : g.gfx_pipe_layout;
     const auto t0 = std::chrono::steady_clock::now();
+    // A whole pipeline, without libraries: the driver compiles every stage.
+    const auto create_whole = [&] {
+        const auto w0 = std::chrono::steady_clock::now();
+        const bool ok = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+        note_pipeline_work(kWorkWhole, work_us_since(w0));
+        return ok;
+    };
     if (g_dump_spirv) host_log("render: creating pipeline %s", pl.name.c_str());
     // The host tessellator's pipelines link from libraries like the rest: built
     // whole, each took ~1.6 ms from a warm cache (50-165 ms cold), 14 of them in
     // the frame after a fight, and left the draw after it to set every dynamic
     // value again.
     bool created = linked ? link_gfx_pipeline(pl, f, vertex_input)
-                          : vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                          : create_whole();
     if (!created && ps_sized) {
         fragment_stage_unsized(stages.back());
-        created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+        created = create_whole();
         fragment_stage_wave_refused(created);
+    }
+    if (created && hlsl_test_refused(pl)) {
+        vkDestroyPipeline(g.device, pl.pipeline, nullptr);
+        pl.pipeline = VK_NULL_HANDLE;
+        pl.relink_pending = false;
+        created = false;
+    }
+    // BBHOST_HLSL: refused while stages held DXC's modules - built again with
+    // their lifts' own, and counted by what was being built.
+    if (!created) {
+        if (const int swapped = hlsl_stages_from_lifts(pl, true)) {
+            if (linked) {
+                created = link_gfx_pipeline(pl, f, vertex_input);
+            } else {
+                collect_stages();
+                gpci.stageCount = static_cast<std::uint32_t>(stages.size());
+                gpci.pStages = stages.data();
+                ps_wave = {};
+                const bool sized = pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
+                created = create_whole();
+                if (!created && sized) {
+                    fragment_stage_unsized(stages.back());
+                    created = create_whole();
+                    fragment_stage_wave_refused(created);
+                }
+            }
+            hlsl_note_refused(linked ? "a graphics pipeline from libraries" : pl.tess_hw ? "a tessellated graphics pipeline" : "a graphics pipeline",
+                              swapped, created);
+        }
     }
     t_library_owner = owner;
     if (!created) {
@@ -6473,6 +8386,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         pl.failed = true;
         return false;
     }
+    if (content_key && !t_replaying) recipe_note_created(pl, content_key);
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     // Slow driver compiles, with what might make them slow: the stages'
@@ -6834,6 +8748,19 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (s.color[t]->view_clear && s.color[t]->view_clear_load) {
+            // A clear token's clear as the load op (the draw checked it covers the pass).
+            RtImage& r = *s.color[t];
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            a.clearValue = r.view_clear_value;
+            if (r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB) {
+                std::swap(a.clearValue.color.float32[0], a.clearValue.color.float32[2]);  // as clear_image_locked does
+            }
+            r.view_clear = r.view_clear_load = false;
+            ++g_vc_load;
+            ++g_vc_by_image[r.base].load;
+            ++g_clears;
+        }
         colors.push_back(a);
         if (!extent.width || s.color[t]->width < extent.width) extent.width = s.color[t]->width;
         if (!extent.height || s.color[t]->height < extent.height) extent.height = s.color[t]->height;
@@ -6847,6 +8774,21 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         stencil = depth;
+        if (s.depth->view_clear && s.depth->view_clear_load) {
+            RtImage& r = *s.depth;
+            if (r.view_clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                depth.clearValue = r.view_clear_value;
+            }
+            if (r.view_clear_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                stencil.clearValue = r.view_clear_value;
+            }
+            r.view_clear = r.view_clear_load = false;
+            ++g_vc_load;
+            ++g_vc_by_image[r.base].load;
+            ++g_clears;
+        }
         if (!extent.width || s.depth->width < extent.width) extent.width = s.depth->width;
         if (!extent.height || s.depth->height < extent.height) extent.height = s.depth->height;
     }
@@ -6890,6 +8832,7 @@ std::uint64_t pass_key(const DrawState& s) {
 }
 
 void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r, kVcwClear);  // an owed clear is older than this one
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 12) {
         host_log("render: DB_RENDER_CONTROL clear of 0x%llx: depth=%d (%g) stencil=%d (%u)", static_cast<unsigned long long>(r.base),
@@ -7562,7 +9505,8 @@ std::size_t rt_bytes_per_pixel(const RtImage& r) { return format_bytes_per_pixel
 // Recognised fill shader: the whole image is this constant. The V# byte count
 // is the tiled allocation, often a few rows larger (or a 1024² slice) than
 // width*height*bpp of the unpadded image, so there is no size check here.
-void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer = 0, std::uint32_t layer_count = ~0u) {
+void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer = 0, std::uint32_t layer_count = ~0u, bool barrier) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r, kVcwClear);  // an owed clear is older than this one
     if (r.base == g_order_target && hle_video_flip_count() >= 2000 && g_order_logs.load() < 120) {
         g_order_logs.fetch_add(1);
         host_log("order: CLEAR 0x%llx rgba=%.3f %.3f %.3f %.3f", static_cast<unsigned long long>(r.base), rgba[0], rgba[1], rgba[2],
@@ -7595,10 +9539,12 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         v.float32[3] = rgba[3];
         rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     }
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     g_clears.fetch_add(1);
 }
 
@@ -7766,6 +9712,10 @@ bool render_clear_target_locked(std::uint64_t va, std::size_t bytes, const float
 }
 
 
+// BBHOST_GX_CLEAR_VIEWS=1: what the fill path did with a clear being checked
+// against its clear token (defined with host_gpu_clear_view).
+void ccheck_note(const RtImage* r, bool cleared, std::uint32_t first, std::uint32_t count, const float* rgba, float depth, std::uint32_t stencil);
+
 bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t word, std::uint32_t depth_clear, std::uint32_t stencil_clear) {
     bool any = false;
     if (!g_htile_bases.count(va)) return false;  // no depth target's HTILE was ever here
@@ -7778,6 +9728,7 @@ bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil_clear;
+        ccheck_note(&r, false, 0, r.layers, nullptr, depth, stencil_clear);
         if (r.htile_clear_depth != depth_clear) {
             if (g_htile_fill_register_lag.fetch_add(1, std::memory_order_relaxed) < 8) {
                 host_log("render: HTILE fill 0x%llx at flip %llu clears to %g (word %08x) while DB_DEPTH_CLEAR still holds %08x",
@@ -7881,11 +9832,13 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
             const float depth = htile_word_depth(word);
             std::memcpy(&r->htile_clear_depth, &depth, 4);
             r->htile_clear_stencil = stencil_clear;
+            ccheck_note(r, false, 0, r->layers, nullptr, depth, stencil_clear);
             return true;
         }
         std::uint32_t first = 0, count = 0;
         fill_layers(*r, va, bytes, first, count);
         if (count) {
+            ccheck_note(r, true, first, count, rgba, 0.0f, 0);
             clear_image_locked(*r, rgba, first, count);
             note_fill_last(*r, va, bytes, rgba);
             g_fill_applied.fetch_add(1);
@@ -7901,6 +9854,7 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     std::uint32_t word = 0;
     std::memcpy(&word, &rgba[0], 4);
     if (render_htile_fill_locked(va, bytes, word, depth_clear, stencil_clear)) return true;
+    ccheck_note(nullptr, false, 0, 0, rgba, 0.0f, 0);
     // No target: a texture under it takes the fill (textures_fill_surfaces_locked).
     // It still waits for a target placed there later, as before.
     if (g_fill_textures) textures_fill_surfaces_locked(va, bytes, rgba);
@@ -7911,6 +9865,7 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     ++g_pending_gen;
     g_pending_clear_max = std::max(g_pending_clear_max, pc.bytes);
     g_pending_htile[va] = PendingHtile{word, stencil_clear};
+    ++g_pending_htile_gen;
     g_fill_pending.fetch_add(1);
     tex_event(va, bytes, "fill 0x%llx 0x%zx bytes with %g %g %g %g pending (no image yet)", static_cast<unsigned long long>(va), bytes,
               rgba[0], rgba[1], rgba[2], rgba[3]);
@@ -8412,6 +10367,7 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(made));
     rt_written(made);
     made.created_flip = made.written_flip;
+    made.gx_gen = rt_resource_gen(dst_base, rt_size_bytes(made));
     bump_view_epoch();
     return &made;
 }
@@ -8421,6 +10377,9 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
 // made for it, else through a buffer. False when that buffer could not be
 // made.
 bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    // Clears owed to either image go first (lazy clears).
+    if (src.view_clear) view_clear_apply_locked(src, kVcwCopy);
+    if (dst.view_clear) view_clear_apply_locked(dst, kVcwCopy);
     const bool from_depth = src.depth;
     rt_written(dst);
     begin_recording_locked();
@@ -8995,6 +10954,16 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
     return true;
 }
 
+// The command processor's pipeline work so far, by part (PipelineWork):
+// microseconds in out[0..5], counts in out[6..11].
+void render_pipeline_work(std::uint64_t out[12]) {
+    static_assert(2 * kWorkCount == 12, "host_gpu_pipeline_work's layout");
+    for (int k = 0; k < kWorkCount; ++k) {
+        out[k] = g_cp_work_us[k].load(std::memory_order_relaxed);
+        out[kWorkCount + k] = g_cp_work_n[k].load(std::memory_order_relaxed);
+    }
+}
+
 void render_pipeline_time_us(std::uint64_t out[5]) {
     out[0] = g_pl_translate_us.load();
     out[1] = g_pl_module_us.load();
@@ -9030,7 +10999,104 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
     return scan(g_rts) || scan(g_snapshots);
 }
 
-ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0, g_gen_adopted = 0;  // under g.mu
+std::uint64_t g_gen_dead_marked = 0;  // under g.mu: targets and snapshots whose resource died, waiting out the idle time
+std::uint64_t g_gen_taken_next = 0;   // under g.mu: taken by the texture made over their memory without data (gx_successor_gen)
+
+// A target or snapshot whose GX resource died goes once it has been idle for
+// the reuse idle time, unless the memory's next resource takes it first: at
+// an area load the game destroys its targets and makes textures at the same
+// memory again, which draw into these images within seconds - or only fill
+// them and copy from them, as the Hunter's Nightmare does with two a frame -
+// and so keep them (taken by the new resource, as on the console the memory
+// is), rather than each being retired and made again cleared. Retired under
+// a texture that only fills and copies, the fills fell to the textures and
+// the copies to the memory underneath, which the fills never reach.
+void retire_target_locked(std::map<std::uint64_t, RtImage>::iterator it, bool snapshot) {
+    RtImage& r = it->second;
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) {
+        host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired with its GX resource (generation %llu)",
+                 snapshot ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+                 static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20), static_cast<unsigned long long>(r.gx_gen));
+    }
+    ++g_gen_retired_targets;
+    g_gen_retired_bytes += r.memory.size;
+    if (!snapshot) {
+        if (g_gen_retired_at.size() > 65536) g_gen_retired_at.clear();
+        g_gen_retired_at[r.base] = steady_ms();
+    }
+    tex_event(r.base, rt_size_bytes(r), "%s 0x%llx %ux%u format %d retired with its GX resource (generation %llu)",
+              snapshot ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+              static_cast<int>(r.format), static_cast<unsigned long long>(r.gx_gen));
+    // The unpadded extent learned at the address stays: a view-less pass
+    // (YEBIS's, the wrapper's) that makes a target there again sizes it by it.
+    textures_drop_rt_regions_locked(it->first);
+    destroy_rt_image(r);
+}
+
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted) {
+    (void)bytes;
+    for (int k = 0; k < 2; ++k) {
+        std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
+        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes; ++it) {
+            RtImage& r = it->second;
+            if (r.gx_gen != gen) continue;
+            if (r.written_seq > after_submitted) {
+                // Drawn into by a submission made after its resource died: the
+                // memory's newer resource took it over (same base and shape).
+                r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
+                ++g_gen_kept_written;
+                continue;
+            }
+            if (const std::uint64_t next = gx_successor_gen(base, r.base, rt_size_bytes(r))) {
+                r.gx_gen = next;
+                ++g_gen_taken_next;
+                continue;
+            }
+            r.dead_ms = steady_ms();
+            r.dead_after = after_submitted;
+            r.dead_memory = base;
+            ++g_gen_dead_marked;
+        }
+    }
+}
+
+std::uint64_t dead_targets_waiting_locked() {
+    std::uint64_t n = 0;
+    for (const auto* m : {&g_rts, &g_snapshots}) {
+        for (const auto& [base, r] : *m) n += r.dead_ms != 0;
+    }
+    return n;
+}
+
+void render_orphans_locked(OrphanImages out[2]) {
+    out[0] = out[1] = OrphanImages{};
+    for (int k = 0; k < 2; ++k) {
+        for (const auto& [base, r] : k ? g_snapshots : g_rts) {
+            if (!r.image) continue;
+            if (r.gx_gen) {
+                GxResourceInfo live;
+                if (!gx_resource_at(base, 1, &live) || live.gen != r.gx_gen) {
+                    ++out[k].gone;
+                    out[k].gone_bytes += r.memory.size;
+                }
+            }
+            const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
+            if (gx_resource_at(base, span, nullptr)) continue;
+            if (gx_resource_overlapping(base, span, nullptr)) {
+                ++out[k].partial;
+                out[k].partial_bytes += r.memory.size;
+            } else {
+                ++out[k].n;
+                out[k].bytes += r.memory.size;
+            }
+        }
+    }
+}
+
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline,
+                                         bool address_rule) {
     ReuseRetired out;
     static std::uint64_t cursor_rts = 0, cursor_snapshots = 0;  // the next base each scan looks at
     bool stopped = false;
@@ -9044,8 +11110,35 @@ ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idl
                 return;
             }
             RtImage& r = it->second;
+            if (r.dead_ms && res_identity_on()) {
+                // Its GX resource died (render_retire_generation_locked).
+                if (r.written_seq > r.dead_after) {
+                    // Drawn into since by the memory's next resource: its now.
+                    r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
+                    r.dead_ms = 0;
+                    ++g_gen_adopted;
+                    ++it;
+                    continue;
+                }
+                if (const std::uint64_t next = gx_successor_gen(r.dead_memory, r.base, rt_size_bytes(r))) {
+                    // Made over its memory without data since: that texture's.
+                    r.gx_gen = next;
+                    r.dead_ms = 0;
+                    ++g_gen_taken_next;
+                    ++it;
+                    continue;
+                }
+                if (r.dead_ms + idle_ms <= now_ms) {
+                    retire_target_locked(it, snapshots);
+                    it = m.erase(it);
+                    out.dead_n += 1;
+                    continue;
+                }
+                ++it;
+                continue;
+            }
             const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
-            if (r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
+            if (!address_rule || r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
                 (!gx_resource_newer_overlapping(r.base, span, r.written_flip) &&
                  !render_target_newer_overlapping_locked(r.base, span, r.written_flip, &r))) {
                 ++it;
@@ -9070,7 +11163,7 @@ ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idl
     };
     sweep(g_rts, false, cursor_rts);
     sweep(g_snapshots, true, cursor_snapshots);
-    if (out.n) {
+    if (out.n || out.dead_n) {
         ++g_rt_gen;
         bump_view_epoch();
     }
@@ -9087,7 +11180,10 @@ void image_reuse_sweep_locked() {
         const char* e = std::getenv("BBHOST_IMG_RETIRE_REUSED");
         return !(e && e[0] == '0');
     }();
-    if (!on) return;
+    // BBHOST_IMG_RETIRE_REUSED=0 leaves out the address rule (a newer object
+    // over an idle image's memory); the targets of dead GX resources
+    // (BBHOST_RES_IDENTITY) still go once idle.
+    if (!on && !res_identity_on()) return;
     static std::uint64_t last = 0;
     const std::uint64_t now = steady_ms();
     if (now - last < 1000) return;
@@ -9099,9 +11195,11 @@ void image_reuse_sweep_locked() {
     static bool textures_first = false;
     textures_first = !textures_first;
     ReuseRetired t, x;
-    if (textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
-    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline);
-    if (!textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    // Textures go by the address rule alone (a dead resource's image goes when
+    // its retirement runs, or to the memory's next texture).
+    if (textures_first && on) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
+    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
+    if (!textures_first && on) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
     const std::uint64_t us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     ++g_reuse_sweeps;
@@ -9114,10 +11212,18 @@ void image_reuse_sweep_locked() {
 }
 
 std::string image_reuse_report_locked() {
-    char buf[320];
+    char buf[640];
     std::snprintf(buf, sizeof(buf),
+                  "targets and snapshots retired with their GX resource once idle %llu (%llu MiB), kept as drawn after it died %llu (by the "
+                  "time it died %llu, later %llu), taken by a texture made over their memory without data %llu, waiting %llu, targets made "
+                  "again there within the idle time %llu; "
                   "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
                   "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
+                  static_cast<unsigned long long>(g_gen_retired_targets), static_cast<unsigned long long>(g_gen_retired_bytes >> 20),
+                  static_cast<unsigned long long>(g_gen_kept_written + g_gen_adopted), static_cast<unsigned long long>(g_gen_kept_written),
+                  static_cast<unsigned long long>(g_gen_adopted), static_cast<unsigned long long>(g_gen_taken_next),
+                  static_cast<unsigned long long>(dead_targets_waiting_locked()),
+                  static_cast<unsigned long long>(g_gen_remade),
                   static_cast<unsigned long long>(g_reuse_targets.n), static_cast<unsigned long long>(g_reuse_targets.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_textures.n), static_cast<unsigned long long>(g_reuse_textures.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_remade), static_cast<unsigned long long>(g_reuse_sweeps),
@@ -9136,6 +11242,10 @@ std::string host_gpu_target_copy_report() {
     return g.ok ? render_target_copy_report() : std::string();
 }
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) { render_pipeline_time_us(out); }
+void host_gpu_pipeline_work(std::uint64_t out[14]) {
+    render_pipeline_work(out);
+    compute_pipeline_work(out + 12);
+}
 
 // Dynamic state already recorded into the command buffer being built. Every
 // graphics pipeline declares the same dynamic set, and that state lasts for the
@@ -9264,7 +11374,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         bool shape = true;
         if (b.indexed) {
             const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
-            shape = stride != 0 && stride % 4 == 0;
+            shape = stride != 0 && (stride % 4 == 0 || b.bytes);  // a byte table: BufferBinding::bytes
             // BBHOST_CB_RECORDS=1 (with BBHOST_ROBUST=1): bind exactly the V#'s
             // records, not the larger of that and the shader's highest dword.
             // GCN bounds-checks a buffer load against num_records and returns
@@ -9316,9 +11426,19 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             version = kCopyVersionNone;
         }
         bool in_window = false;  // loc is a window's copy (a capture reads its guest bytes)
+        // Window imports (BBHOST_IMPORT_WINDOWS=1): memory the game writes on
+        // the CPU, which the draw takes as a snapshot copied as it records
+        // (BBHOST_CB_SNAPSHOT, below), is read by the CPU alone - no import.
+        static const bool snapshots_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        bool copy_only = false;
         if (outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+            copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
+                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes);
+            if (!copy_only) loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
         if (resolved && !base && bytes <= g.sink.size) {  // a null V#'s stride does not matter: every read lands in the sink page
@@ -9330,9 +11450,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             params.cb_valid |= 1u << i;
             params.cb_bias_dw[i] = 0;
             outcome = kBound;
-        } else if (loc.buffer) {
-            const VkDeviceSize start = exact ? loc.offset : loc.offset & ~(g.ssbo_align - 1);
-            const VkDeviceSize bias = loc.offset - start;
+        } else if (loc.buffer || copy_only) {
+            // (copy_only: no import - the snapshot below copies the guest bytes;
+            // the base's place in an alignment step is the binding's would-be bias.)
+            const VkDeviceSize binding_off = loc.buffer ? loc.offset : (base & (g.ssbo_align - 1));
+            const VkDeviceSize start = exact ? binding_off : binding_off & ~(g.ssbo_align - 1);
+            const VkDeviceSize bias = binding_off - start;
             outcome = kTooLong;
             // BBHOST_CB_ALIGN16=1: refuse a binding whose base is not a whole
             // number of vec4s into the bound range, and let it take the page
@@ -9417,8 +11540,78 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
-                if (scratch.map) {
-                    if (scratch_next + bytes + 256 > kScratch) {
+                // The same buffer snapshotted again within one recording - a
+                // command buffer, the walk of one submission of the game's -
+                // binds the copy its first snapshot made: the game wrote the
+                // frame's values before it submitted, and on the console every
+                // draw of the submission reads the memory as it stands when the
+                // GPU runs it, so all of them see one state. (Copying again
+                // could only pick up the next frame's values, which the game
+                // may already be writing.) Whole-ring snapshots only - not the
+                // pushed ones (`exact`), each bound where its own copy is; the
+                // copy stays where it is for the rest of the lap (segment_serial).
+                // BBHOST_CB_SNAPSHOT_DEDUPE=0: each binding copies its own.
+                // =check: shares as by default, but first compares the copy
+                // with the guest's bytes now and counts those that changed
+                // since (the report's "changed"); =compare: shares only a copy
+                // whose bytes still match, and copies again otherwise. Both
+                // read the write-combined ring back: slow, for checks.
+                enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
+                static const int dedupe = [] {
+                    const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
+                    if (!e || !*e) return int{kDedupeOn};
+                    if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
+                    if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
+                    return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
+                }();
+                struct SnapMemo {
+                    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
+                };
+                static SnapMemo snap_memo[1024];
+                SnapMemo* memo = nullptr;
+                // Pushed (`exact`), each draw's ranges go into the command
+                // buffer anyway: the snapshot is bound where it is.
+                const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
+                if (dedupe && whole_ring && scratch.map) {
+                    memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
+                    bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
+                    if (share && dedupe >= kDedupeCheck) {
+                        const bool same = std::memcmp(static_cast<const std::uint8_t*>(scratch.map) + memo->at,
+                                                      reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes) == 0;
+                        bump(g_cb_snapshots_compared);
+                        if (!same) {
+                            bump(g_cb_snapshots_changed);
+                            static std::atomic<int> told{0};
+                            if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                                host_log("render: a constant buffer snapshotted again in recording %llu changed since its first copy: "
+                                         "0x%llx, %llu bytes", static_cast<unsigned long long>(g.record_serial),
+                                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+                            if (dedupe == kDedupeCompare) share = false;
+                        }
+                    }
+                    if (share) {
+                        info = VkDescriptorBufferInfo{scratch.buffer, 0, kScratch};
+                        params.cb_valid |= 1u << i;
+                        params.cb_bias_dw[i] = static_cast<std::uint32_t>(memo->at / 4);
+                        outcome = kBound;
+                        if (host_tooling()) bump(g_cb_snapshots_shared);
+                    }
+                }
+                if (scratch.map && outcome != kBound) {
+                    // The ring is write-combined memory: a copy whose last line
+                    // is partly written leaves that line in a write-combining
+                    // buffer, flushed in pieces at the next store fence (the
+                    // draw's publish). So the copy runs on to the end of its
+                    // last 64-byte line, from the guest bytes after the buffer
+                    // when they lie in the same 4 KiB page (they are mapped);
+                    // what a draw binds and reads stays `bytes`.
+                    // BBHOST_WC_LINES=0: exactly the buffer's bytes.
+                    VkDeviceSize copy_bytes = bytes;
+                    if (g_wc_whole_lines) {
+                        const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
+                        if (((base + bytes - 1) >> 12) == ((base + lines - 1) >> 12)) copy_bytes = lines;
+                    }
+                    if (scratch_next + copy_bytes + 256 > kScratch) {
                         scratch_next = 0;
                         ++scratch_lap;
                     }
@@ -9426,7 +11619,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // A lap round the ring (~0.4 s of copies GPU-bound): the
                     // draws that read a segment's copies in the lap before have
                     // run before it is written again (at once, nearly always).
-                    for (VkDeviceSize s = at / kScratchSegment; s <= (at + bytes - 1) / kScratchSegment; ++s) {
+                    for (VkDeviceSize s = at / kScratchSegment; s <= (at + copy_bytes - 1) / kScratchSegment; ++s) {
                         if (segment_lap[s] != scratch_lap) {
                             if (segment_lap[s]) wait_submission_locked(segment_serial[s]);
                             segment_lap[s] = scratch_lap;
@@ -9434,18 +11627,17 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         segment_serial[s] = g.flushes;
                     }
                     std::memcpy(static_cast<std::uint8_t*>(scratch.map) + at,
-                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes);
+                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), copy_bytes);
                     // (A snapshot's range holds no copy-back: the lookup above said so.)
                     if (!snapshot) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
-                    scratch_next = at + bytes;
+                    scratch_next = at + copy_bytes;
                     // A snapshot binds the whole ring and is found by its
                     // dword bias: one descriptor for all of them. Bound at its
                     // own offset, every snapshot was a descriptor set never
                     // seen before - written for each draw, 17% of the frame
                     // rate GPU-bound.
-                    // Pushed (`exact`), each draw's ranges go into the command
-                    // buffer anyway: the snapshot is bound where it is.
-                    const bool whole = !exact && snapshot && g.ssbo_max_range >= kScratch;
+                    const bool whole = whole_ring;
+                    if (memo) *memo = SnapMemo{base, bytes, at, g.record_serial, scratch_lap};
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
@@ -9552,6 +11744,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                      static_cast<unsigned long long>(g_cb_realigned.load()),
                      static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
                      static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
+            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
+                     "compared with the guest's bytes %llu, changed since the copy %llu",
+                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()),
+                     static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
+                     static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
         }
     }
 }
@@ -10123,8 +12320,24 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     struct RecordShadow {
         const std::uint32_t* w;
         Located whole;
+        bool snapped = false;  // whole is the record's snapshot (shadow_snapshot_locked)
     } shadows[16];
     std::size_t n_shadows = 0;
+    // The bytes the draw reads of record `w` (its stride, its whole extent
+    // `record_bytes`): up to its last vertex's furthest element, the whole
+    // extent when the last vertex is not known.
+    const auto draw_read_bytes = [&](const std::uint32_t* w, std::uint32_t stride, std::uint64_t record_bytes) -> std::uint64_t {
+        if (std::int64_t last = 0; draw_last_vertex(last)) {
+            std::uint64_t elem_end = 0;
+            for (std::size_t k = 0; k < n; ++k) {
+                const std::uint32_t* wk = o.vtx_rec[els[k].slot];
+                if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
+                    elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
+            }
+            return std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
+        }
+        return record_bytes;
+    };
     for (std::size_t e = 0; e < n; ++e) {
         const FetchElement& fe = els[e];
         if (!((o.vtx_valid >> fe.slot) & 1)) {
@@ -10150,10 +12363,39 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         // In one of the draw's CPU-written windows (YEBIS, host_gpu_draw_window):
         // the copy taken as the draw records, never the ring slot, which the
         // CPU may rewrite for a draw sixteen on before this one runs.
-        bool windowed = false;
+        bool windowed = false, mirrored = false, snapped = false;
+        Located snap;  // snapped: the record's snapshot
         if (version != kCopyVersionInside) {
             windowed = !t_draw_windows.empty() && draw_window_locked(va, need, loc);
-            if (!windowed) loc = locate(va, need);
+            if (!windowed && !imports_whole()) {
+                // Window imports: the record from the buffer shadow's mirror
+                // when it serves it whole (its pages copied through staging),
+                // so mesh data needs no import; on pages the game rewrites,
+                // its snapshot - the CPU's copy of what the draw reads, made
+                // as it records (shadow_snapshot_locked), which the record's
+                // other elements share - so no import either; an import only
+                // otherwise.
+                const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+                Located m;
+                if (record_bytes >= fe.offset + bytes && shadow_mirror_locked(va - fe.offset, record_bytes, m)) {
+                    loc = {m.buffer, m.offset + fe.offset, m.avail - fe.offset};
+                    mirrored = true;
+                } else if (version == kCopyVersionNone && record_bytes >= fe.offset + bytes) {
+                    const RecordShadow* had = nullptr;
+                    for (std::size_t k = 0; k < n_shadows; ++k) {
+                        if (std::memcmp(shadows[k].w, w, 12) == 0) had = &shadows[k];
+                    }
+                    if (had ? had->snapped
+                            : shadow_snapshot_maybe_locked(va - fe.offset, record_bytes) &&
+                                  shadow_snapshot_locked(va - fe.offset, draw_read_bytes(w, stride, record_bytes), snap)) {
+                        if (had) snap = had->whole;
+                        // (avail: the draw reads no further than the snapshot holds)
+                        loc = {snap.buffer, snap.offset + fe.offset, need};
+                        snapped = true;
+                    }
+                }
+            }
+            if (!windowed && !mirrored && !snapped) loc = locate(va, need);
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
         if (!loc.buffer || loc.avail < need) {
@@ -10186,19 +12428,17 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             const auto read_bytes = [&]() -> std::uint64_t {
                 if (read_known) return read_bytes_memo;
                 read_known = true;
-                if (std::int64_t last = 0; draw_last_vertex(last)) {
-                    std::uint64_t elem_end = 0;
-                    for (std::size_t k = 0; k < n; ++k) {
-                        const std::uint32_t* wk = o.vtx_rec[els[k].slot];
-                        if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
-                            elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
-                    }
-                    read_bytes_memo = std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
-                }
+                read_bytes_memo = draw_read_bytes(w, stride, record_bytes);
                 return read_bytes_memo;
             };
             bool in_place = false;
-            if (windowed) {
+            if (mirrored) {
+                ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
+            } else if (snapped) {
+                ns.whole = snap;  // the snapshot already (window imports)
+                ns.snapped = true;
+                bump(g_vertex_snapshot_records);
+            } else if (windowed) {
                 bump(g_vertex_window_records);
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
@@ -10304,7 +12544,7 @@ const bool g_vertex_pack = [] {
     const char* e = std::getenv("BBHOST_VERTEX_PACK");
     return !(e && e[0] == '0');
 }();
-void pack_vertex_input(VertexInputPlan& p) {
+void pack_vertex_input(VertexInputPlan& p, bool ask_usable = true) {
     bool any = false;
     for (VkVertexInputAttributeDescription& a : p.attributes) {
         if (a.location >= p.elements.size() || a.binding >= p.bindings.size()) continue;
@@ -10314,12 +12554,34 @@ void pack_vertex_input(VertexInputPlan& p) {
         const std::uint32_t bytes = vertex_format_bytes(dfmt);  // 2, 4 or 8
         const VkFormat f = bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
         const VkDeviceSize align = bytes == 2 ? 2 : 4;  // the packed format's component
-        if ((p.offset[a.binding] + a.offset) % align || p.bindings[a.binding].stride % align || !vertex_format_usable(f)) continue;
+        if ((p.offset[a.binding] + a.offset) % align || p.bindings[a.binding].stride % align || (ask_usable && !vertex_format_usable(f))) continue;
         a.format = f;
         el.packed = bits;
         any = true;
     }
     if (any) p.hash = vertex_plan_hash(p);
+}
+// A recipe's vertex input as this build's draws plan theirs (replay_recipe).
+// A draw here packs the elements pack_vertex_input packs, and the plan's
+// identity hash covers the elements' struct, which perf/next2 grew by
+// VertexElement::packed: a recipe recorded by a build without the packing (a
+// list, or a manifest from before) kept a plan and a hash no draw here
+// computes, and its pipeline was built for nothing. Such a recipe - its
+// recorded hash not this build's hash of its plan - is replanned: packed where
+// a draw would pack, the bindings taken as aligned (their offsets are not
+// recorded; the game's vertex buffers are), the hash made again, so it builds
+// the pipeline the draws look up. A recipe this build recorded is left as it
+// went in (a draw whose binding was not aligned kept its elements unpacked).
+// On a precompile worker: the packed formats are not asked about
+// (vertex_format_usable's answers are kept under g.mu), since R16_UINT,
+// R32_UINT and R32G32_UINT are vertex formats every Vulkan device must have.
+void replan_recorded_vertex_input(VertexInputPlan& p, bool tess_native) {
+    if (vertex_plan_hash(p) == p.hash) return;
+    if (g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
+        gcn::vertex_formats_from_params_supported(p.elements)) {
+        pack_vertex_input(p, false);
+    }
+    p.hash = vertex_plan_hash(p);
 }
 
 // The record a resource slot's pending-state object gives for a descriptor
@@ -10334,6 +12596,18 @@ thread_local const std::uint32_t* t_tess_constants = nullptr;
 const std::uint8_t* gx_object_record(const GxStageRecords& st, std::uint32_t type, std::uint32_t slot) {
     if (t_tess_constants && slot == 0x13 && (type == 0x5 || type == 0x12 || type == 0xb)) {
         return reinterpret_cast<const std::uint8_t*>(t_tess_constants);
+    }
+    if (st.compute) {
+        // A compute stage (GxStageRecords::compute): UAVs in obj_smp, the
+        // sampler caches in smp_cache, sixteen constant buffers in cb.
+        switch (type) {
+            case 0x4: case 0x11: case 0xa:
+                return slot < 16 && ((st.cs_smp_set >> slot) & 1) ? st.smp_cache + static_cast<std::size_t>(slot) * 16 : nullptr;
+            case 0x5: case 0x12: case 0xb:
+                return slot < 16 && ((st.obj_cb_set >> slot) & 1) ? st.cb + static_cast<std::size_t>(slot) * 16 : nullptr;
+            default:
+                break;
+        }
     }
     switch (type) {
         case 0x0: case 0xd: case 0x1: case 0xe: case 0x8:
@@ -10503,7 +12777,10 @@ GxUserResult build_gx_user_data(const GxStageRecords& st, GxUserData& out, std::
                     break;
                 }
                 case 0x6: case 0x13: {
-                    const std::uint32_t w = 0x20;
+                    // GX's draw commit writes 0x20; its compute commit the
+                    // GDS counter range, base 0x20 and eight counters, which
+                    // the particle programs move into M0 for ds_append/consume.
+                    const std::uint32_t w = st.compute ? 0x00200020u : 0x20u;
                     if (!(in_ext ? put_ext(off, &w, 1, true) : put_user(off, &w, 1))) return kUserSlot;
                     break;
                 }
@@ -10739,15 +13016,680 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil;
+        ccheck_note(&r, false, 0, r.layers, nullptr, depth, stencil);
         any = true;
     }
-    if (!any) g_pending_htile[base] = PendingHtile{word, stencil};
+    if (!any) {
+        ccheck_note(nullptr, false, 0, 0, nullptr, htile_word_depth(word), stencil);
+        g_pending_htile[base] = PendingHtile{word, stencil};
+        ++g_pending_htile_gen;
+    }
+}
+
+// ---- clear tokens: GX's Clear*View in the view's own terms ----------------
+namespace {
+// What a clear token resolves to: the image a draw binding the view would
+// draw into, found exactly as the draw finds it (target_image, from the same
+// words), and the layers the view covers. `create` false only looks.
+RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint32_t* first, std::uint32_t* count) {
+    if (!c.depth) {
+        const std::uint32_t* w = c.color;
+        const CbInfo info = CbInfo::from(w[4]);
+        if (!w[0] || info.format == 0) return nullptr;
+        const VkFormat fmt = cb_format(info);
+        if (fmt == VK_FORMAT_UNDEFINED) return nullptr;
+        const std::uint32_t pitch = ((w[1] & 0x7ff) + 1) * 8;
+        const std::uint32_t slice_px = ((w[2] & 0x3fffff) + 1) * 64;
+        const std::uint32_t padded_h = pitch ? slice_px / pitch : 0;
+        if (!pitch || !padded_h) return nullptr;
+        // As a draw takes them (CB_COLOR*_VIEW: SLICE_START, SLICE_MAX; a
+        // LINEAR_GENERAL target keeps the low address byte in SLICE_START).
+        const bool linear_general = ((w[4] >> 7) & 1) != 0;
+        const std::uint64_t base = (static_cast<std::uint64_t>(w[0]) << 8) | (linear_general ? (w[3] & 0xff) : 0u);
+        const std::uint32_t layers = ((w[3] >> 13) & 0x7ff) + 1;
+        const std::uint32_t slice_start = linear_general ? 0 : std::min(w[3] & 0x7ff, layers - 1);
+        *first = slice_start;
+        *count = layers - slice_start;
+        if (!create) {
+            RtImage* r = pick_rt(base);
+            return r && !r->depth ? r : nullptr;
+        }
+        return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent);
+    }
+    const VkFormat df = db_format(c.z_info, c.stencil_info);
+    if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
+    const std::uint32_t w = ((c.depth_size & 0x7ff) + 1) * 8;
+    const std::uint32_t h = (((c.depth_size >> 11) & 0x7ff) + 1) * 8;
+    const std::uint64_t dbase = static_cast<std::uint64_t>(c.z_read_base) << 8;
+    const std::uint32_t layers = ((c.depth_view >> 13) & 0x7ff) + 1;
+    const std::uint32_t slice_start = std::min(c.depth_view & 0x7ff, layers - 1);
+    *first = slice_start;
+    *count = layers - slice_start;
+    if (!create) {
+        auto it = g_rts.find(dbase);
+        return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
+    }
+    const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent);
+    if (r) {
+        // What a draw binding the view learns about its HTILE, so fills of
+        // that HTILE from anywhere else still find the target.
+        const std::uint64_t htile = static_cast<std::uint64_t>(c.htile_base) << 8;
+        r->htile = htile;
+        if (htile) g_htile_bases.insert(htile);
+        if (!g_pending_htile.empty()) take_pending_htile(htile, *r);
+    }
+    return r;
+}
+
+// Depth and stencil cleared over layers [first, first + count).
+void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval, std::uint32_t first, std::uint32_t count,
+                               bool barrier = true) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r, kVcwClear);  // an owed clear is older than this one
+    begin_recording_locked();
+    render_end_pass_locked();
+    ensure_initialised(r);
+    first = std::min(first, r.layers - 1);
+    VkImageSubresourceRange range{0, 0, 1, first, std::min(count, r.layers - first)};
+    if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!range.aspectMask) return;
+    const VkClearDepthStencilValue v{dval, sval & 0xff};
+    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    if (barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    g_clears.fetch_add(1);
+}
+
+}  // namespace
+
+namespace gpu {
+// A pending view clear made now, by transfer (lazy clears); `barrier` false
+// leaves the barrier after it to the caller (a flush makes one for all).
+void view_clear_apply_barrier_locked(RtImage& r, bool barrier, int why) {
+    if (!r.view_clear) return;
+    r.view_clear = r.view_clear_load = false;
+    ++g_vc_transfer;
+    why = why >= 0 && why < kVcwCount ? why : kVcwOther;
+    ++g_vc_why[why];
+    {
+        const std::size_t bpp = r.depth ? (r.format == VK_FORMAT_D16_UNORM ? 2 : 4) : rt_bytes_per_pixel(r);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(r.width) * r.height * bpp * std::max(1u, r.view_clear_count);
+        g_vc_why_bytes[why] += bytes;
+        ViewClearImage& vi = g_vc_by_image[r.base];
+        ++vi.transfer;
+        vi.transfer_bytes += bytes;
+        ++vi.why[why];
+        vi.width = r.width;
+        vi.height = r.height;
+        vi.layers = r.layers;
+        vi.depth = r.depth;
+    }
+    const bool saved = g_in_view_flush;
+    g_in_view_flush = true;
+    if (!r.depth) {
+        float rgba[4];
+        std::memcpy(rgba, r.view_clear_value.color.float32, sizeof(rgba));
+        clear_image_locked(r, rgba, r.view_clear_first, r.view_clear_count, barrier);
+    } else {
+        clear_depth_layers_locked(r, (r.view_clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0,
+                                  (r.view_clear_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0, r.view_clear_value.depthStencil.depth,
+                                  r.view_clear_value.depthStencil.stencil, r.view_clear_first, r.view_clear_count, barrier);
+    }
+    g_in_view_flush = saved;
+}
+void view_clear_apply_locked(RtImage& r, int why) { view_clear_apply_barrier_locked(r, true, why); }
+
+// Every pending view clear not taken by the pass being begun, by transfer,
+// with one barrier after them all.
+void view_clears_flush_locked(int why) {
+    if (g_in_view_flush) return;
+    std::vector<std::uint64_t> list;
+    list.swap(g_view_clear_list);
+    ++g_view_clear_list_gen;
+    std::vector<std::uint64_t> kept;
+    bool made = false;
+    for (const std::uint64_t base : list) {
+        auto it = g_rts.find(base);
+        if (it == g_rts.end() || !it->second.view_clear) continue;
+        if (it->second.view_clear_load) {
+            kept.push_back(base);
+            continue;
+        }
+        view_clear_apply_barrier_locked(it->second, false, why);
+        made = true;
+    }
+    if (made) {
+        ++g_vc_flushes;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    for (const std::uint64_t base : kept) g_view_clear_list.push_back(base);
+}
+}  // namespace gpu
+
+namespace {
+// Clear tokens: run, and images they made; by kind: colour, colour that
+// GX would fast clear through CMASK, depth with HTILE, depth without.
+enum ClearViewKind { kCvRtv, kCvRtvFast, kCvDsvHtile, kCvDsv, kCvKinds };
+const char* const kClearViewKindName[kCvKinds] = {"colour", "colour (CMASK fast clear)", "depth with HTILE", "depth without HTILE"};
+int clear_view_kind(const GpuClearView& c) { return c.depth ? (c.htile ? kCvDsvHtile : kCvDsv) : (c.fast_clear ? kCvRtvFast : kCvRtv); }
+std::uint64_t g_cv_run[kCvKinds] = {}, g_cv_made[kCvKinds] = {}, g_cv_none[kCvKinds] = {}, g_cv_aspects[kCvKinds] = {};  // under g.mu
+
+// The planes a depth clear token clears, and their values: what GX's
+// ClearDepthStencilView (0x2ab5f50) leaves, which is not D3D11's flags (1
+// depth, 2 stencil) alone. With HTILE it fills the HTILE words whatever the
+// flags ask, so the depth reads as the output merger's depth clear (the
+// DB_DEPTH_CLEAR its commit writes); where those words hold the stencil
+// state too (TILE_STENCIL_DISABLE clear) the same fill marks the stencil
+// cleared (SMem 0) to the output merger's stencil clear (DB_STENCIL_CLEAR), so
+// there a depth-only clear clears the stencil as well. Its quad pass draws
+// only what HTILE does not cover: the stencil, to the argument, where the
+// HTILE words leave the stencil out and the flags ask; and for a view with no
+// HTILE, each plane the flags ask for, to the arguments.
+struct DepthClearPlanes {
+    bool depth = false, stencil = false;
+    float depth_value = 0.0f;
+    std::uint32_t stencil_value = 0;
+};
+DepthClearPlanes depth_clear_planes(const GpuClearView& c) {
+    DepthClearPlanes p;
+    if (c.htile) {
+        p.depth = true;
+        p.depth_value = c.om_depth;
+        p.stencil = !c.tile_stencil_off || (c.flags & 2);
+        p.stencil_value = c.tile_stencil_off ? c.stencil : c.om_stencil;
+    } else {
+        p.depth = (c.flags & 1) != 0;
+        p.depth_value = c.depth_value;
+        p.stencil = (c.flags & 2) != 0;
+        p.stencil_value = c.stencil;
+    }
+    p.stencil_value &= 0xff;
+    return p;
+}
+// Depth clear tokens whose planes are not their flags': the stencil cleared
+// with the depth by HTILE, the depth by HTILE on a stencil-only clear; and the
+// depth-only clears of HTILE words without the stencil state, whose stencil
+// the fill path cleared too (it cleared both planes at every HTILE fill).
+std::uint64_t g_cv_stencil_by_htile = 0, g_cv_depth_by_htile = 0, g_cv_stencil_kept = 0;  // under g.mu
+// What the clears cost: the bytes they write, the passes they had to end, and
+// the clears of an image no draw had bound since its last clear; by image.
+std::uint64_t g_cv_bytes[kCvKinds] = {}, g_cv_pass_ends[kCvKinds] = {}, g_cv_again[kCvKinds] = {};  // under g.mu
+struct ClearCost {
+    std::uint64_t clears = 0, bytes = 0, again = 0, last_write = 0;
+    std::uint32_t width = 0, height = 0, layers = 0;
+    int kind = 0;
+};
+std::unordered_map<std::uint64_t, ClearCost> g_cv_by_image;  // by base, under g.mu
+
+// BBHOST_GX_CLEAR_VIEWS=1: the fill path's clear checked against the token.
+// The token resolves (without making an image) and the fill token the
+// method writes next reports here what it did with the same clear.
+enum ClearCheckOutcome {
+    kCoSame,             // the same image, layers and value
+    kCoSameLayers,       // the same image and value, other layers
+    kCoSameValue,        // the same image, another value
+    kCoBothNone,         // no image yet either way (the fill waits for one)
+    kCoFillMissed,       // the token's image exists; the fill path left it as it was
+    kCoFillOther,        // the fill path cleared or marked another image
+    kCoViewNone,         // no image for the view; the fill path found one
+    kCoNoFill,           // no fill followed the token
+    kCoOutcomes
+};
+const char* const kClearCheckName[kCoOutcomes] = {"same image, layers and value", "same image and value, other layers", "same image, other value",
+                                                  "no image either way", "fill path left the image as it was", "fill path cleared another image",
+                                                  "no image for the view, the fill path found one", "no fill followed"};
+struct ClearCheck {
+    bool active = false;
+    GpuClearView view;
+    GpuClearViewResult expect;
+};
+ClearCheck g_ccheck;                                     // under g.mu
+std::uint64_t g_ccheck_counts[kCvKinds][kCoOutcomes] = {};  // under g.mu
+std::uint64_t g_ccheck_logged_by[kCvKinds][kCoOutcomes] = {};  // under g.mu
+
+// Depth views cleared while no image held them, for the report: whether one
+// was made there later (a draw bound the view) or never.
+std::map<std::uint64_t, std::pair<std::uint64_t, GpuClearView>> g_ccheck_imageless;  // base -> (clears, the view), under g.mu
+
+void ccheck_count(int outcome, const char* what) {
+    const int kind = clear_view_kind(g_ccheck.view);
+    ++g_ccheck_counts[kind][outcome];
+    if (outcome == kCoBothNone && g_ccheck.view.depth) {
+        const std::uint64_t base = static_cast<std::uint64_t>(g_ccheck.view.z_read_base) << 8;
+        if (g_ccheck_imageless.size() < 64 || g_ccheck_imageless.count(base)) {
+            auto& e = g_ccheck_imageless[base];
+            ++e.first;
+            e.second = g_ccheck.view;
+        }
+    }
+    if (outcome != kCoSame && outcome != kCoBothNone && g_ccheck_logged_by[kind][outcome]++ < 6) {
+        const GpuClearView& c = g_ccheck.view;
+        host_log("render: clear check (%s, view %u): %s - %s; token image %p layers %u+%u; %s", kClearViewKindName[kind], c.view_id,
+                 kClearCheckName[outcome], what, g_ccheck.expect.image, g_ccheck.expect.first_layer, g_ccheck.expect.layers,
+                 c.depth ? ("depth " + std::to_string(c.depth_value) + " (output merger " + std::to_string(c.om_depth) + ") stencil " +
+                            std::to_string(c.stencil) + " flags " + std::to_string(c.flags))
+                               .c_str()
+                         : ("rgba " + std::to_string(c.rgba[0]) + " " + std::to_string(c.rgba[1]) + " " + std::to_string(c.rgba[2]) + " " +
+                            std::to_string(c.rgba[3]))
+                               .c_str());
+    }
+}
+
+}  // namespace
+
+namespace gpu {
+// The fill path's outcome for the clear being checked: `r` the image it
+// cleared now (`cleared`) or marked to clear at its next draw, null when it
+// left the fill pending; the layers and the value it used.
+void ccheck_note(const RtImage* r, bool cleared, std::uint32_t first, std::uint32_t count, const float* rgba, float depth, std::uint32_t stencil) {
+    if (!g_ccheck.active) return;
+    g_ccheck.active = false;
+    const void* want = g_ccheck.expect.image;
+    char what[160];
+    std::snprintf(what, sizeof(what), "fill path image %p %s, layers %u+%u", static_cast<const void*>(r),
+                  !r ? "none (pending)" : cleared ? "cleared" : "marked for its next draw", first, count);
+    if (!want && !r) return ccheck_count(kCoBothNone, what);
+    if (!want) return ccheck_count(kCoViewNone, what);
+    if (!r) return ccheck_count(kCoFillMissed, what);
+    if (r != want) return ccheck_count(kCoFillOther, what);
+    const GpuClearView& c = g_ccheck.view;
+    bool same_value;
+    if (c.depth) {
+        // The fill path's depth is the HTILE word's 14 bits; exact for 0 and 1.
+        const DepthClearPlanes p = depth_clear_planes(c);
+        same_value = std::fabs(depth - p.depth_value) <= 1.0f / 16383.0f && (!p.stencil || (stencil & 0xff) == p.stencil_value);
+    } else {
+        same_value = rgba && std::memcmp(rgba, c.rgba, sizeof(c.rgba)) == 0;
+    }
+    if (!same_value) return ccheck_count(kCoSameValue, what);
+    const bool same_layers = c.depth || (first == g_ccheck.expect.first_layer && count == g_ccheck.expect.layers);
+    ccheck_count(same_layers ? kCoSame : kCoSameLayers, what);
+}
+}  // namespace gpu
+
+bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why) {
+    if (c.depth) {
+        if (!c.z_read_base) return *why = "no depth surface", false;
+        if (db_format(c.z_info, c.stencil_info) == VK_FORMAT_UNDEFINED) return *why = "depth format", false;
+        return true;
+    }
+    const CbInfo info = CbInfo::from(c.color[4]);
+    if (!c.color[0]) return *why = "no colour surface", false;
+    if (info.format == 0 || cb_format(info) == VK_FORMAT_UNDEFINED) return *why = "colour format", false;
+    if (!(((c.color[1] & 0x7ff) + 1) * 8) || !(((c.color[2] & 0x3fffff) + 1) * 64)) return *why = "pitch", false;
+    return true;
+}
+
+bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (!g.ok) return false;
+    const int kind = clear_view_kind(c);
+    std::uint32_t first = 0, count = 0;
+    const std::size_t before = g_rts.size();
+    // Only an image that is already there is cleared: a view no draw has
+    // bound yet keeps its clear the fill path's way (below) - the textures
+    // over its memory take it and it waits there for the first draw that
+    // makes the image - instead of an image made now, which samplers would
+    // then read in place of those textures. (Views the game clears and
+    // never draws into stay that way: two 64x64 depth views ~200 times a
+    // second in the world.)
+    RtImage* r = clear_view_target_locked(c, false, &first, &count);
+    if (r && apply) r = clear_view_target_locked(c, true, &first, &count);
+    if (out) {
+        out->image = r;
+        out->first_layer = first;
+        out->layers = count;
+        out->created = apply && g_rts.size() > before;
+    }
+    if (!apply) return r != nullptr;
+    if (!r) {
+        // No image for the view yet: the fill path's way, by address - a fill
+        // of the view's slices (the textures there take it; a target made
+        // there later starts with it), or for a depth view the depth clear
+        // its first draw makes.
+        ++g_cv_none[kind];
+        if (!c.depth) {
+            const std::uint32_t pitch = ((c.color[1] & 0x7ff) + 1) * 8;
+            const std::uint32_t slice_px = ((c.color[2] & 0x3fffff) + 1) * 64;
+            const VkFormat fmt = cb_format(CbInfo::from(c.color[4]));
+            const std::uint64_t slice_bytes = static_cast<std::uint64_t>(slice_px) * format_bytes_per_pixel(fmt);
+            const std::uint64_t base = static_cast<std::uint64_t>(c.color[0]) << 8;
+            (void)pitch;
+            render_handle_fill_locked(base + slice_bytes * first, slice_bytes * std::max(1u, count), c.rgba, 0, 0);
+        } else {
+            const DepthClearPlanes p = depth_clear_planes(c);
+            const auto scaled = static_cast<std::uint32_t>(std::floor(p.depth_value * 16383.0f));
+            g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, p.stencil_value};
+            ++g_pending_htile_gen;
+        }
+        return true;
+    }
+    ++g_cv_run[kind];
+    if (g_rts.size() > before) ++g_cv_made[kind];
+    {
+        const std::size_t bpp = r->depth ? (r->format == VK_FORMAT_D16_UNORM ? 2 : 4) : rt_bytes_per_pixel(*r);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(r->width) * r->height * bpp * std::max(1u, std::min(count, r->layers));
+        g_cv_bytes[kind] += bytes;
+        if (g_pass.active) ++g_cv_pass_ends[kind];
+        ClearCost& cc = g_cv_by_image[r->base];
+        // rt_written stamps an image at every draw that binds it (target_image)
+        // and at this clear: unchanged since the last clear, no draw came between.
+        if (cc.clears && cc.last_write == r->last_write) {
+            ++cc.again;
+            ++g_cv_again[kind];
+        }
+        ++cc.clears;
+        cc.bytes += bytes;
+        cc.width = r->width;
+        cc.height = r->height;
+        cc.layers = r->layers;
+        cc.kind = kind;
+    }
+    static const bool lazy = [] {
+        const char* e = std::getenv("BBHOST_GX_CLEAR_LAZY");
+        return !(e && e[0] == '0');
+    }();
+    if (lazy) {
+        // Owed until the image is next used (render.cpp, lazy clears): an
+        // older clear of it that this one does not cover is made first.
+        VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        DepthClearPlanes planes;
+        if (c.depth) {
+            planes = depth_clear_planes(c);
+            const bool has_stencil = r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM;
+            aspects = 0;
+            if (planes.depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (planes.stencil && has_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (planes.depth && !(c.flags & 1)) ++g_cv_depth_by_htile;
+            if (planes.stencil && has_stencil && !(c.flags & 2)) ++g_cv_stencil_by_htile;
+            if (c.htile && has_stencil && !planes.stencil) ++g_cv_stencil_kept;
+            if (aspects != (has_stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT)) ++g_cv_aspects[kind];
+            if (!aspects) return true;
+            if (r->htile_clear_pending) {  // an older HTILE clear from the fill path goes first
+                r->htile_clear_pending = false;
+                float dval;
+                std::memcpy(&dval, &r->htile_clear_depth, 4);
+                clear_depth_layers_locked(*r, true, true, dval, r->htile_clear_stencil, 0, r->layers);
+            }
+        }
+        first = std::min(first, r->layers - 1);
+        count = std::min(std::max(count, 1u), r->layers - first);
+        // A depth clear of the same layers as the owed one, of other planes
+        // (the depth alone after both): one clear of both planes, each to
+        // the value its newest clear gave it.
+        VkClearDepthStencilValue ds{planes.depth_value, planes.stencil_value};
+        if (r->view_clear) {
+            const bool layers_cover = first <= r->view_clear_first && first + count >= r->view_clear_first + r->view_clear_count;
+            const bool covers = (aspects & r->view_clear_aspects) == r->view_clear_aspects && layers_cover;
+            if (covers) {
+                ++g_vc_merged;
+            } else if (c.depth && first == r->view_clear_first && count == r->view_clear_count) {
+                if (!(aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) ds.depth = r->view_clear_value.depthStencil.depth;
+                if (!(aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) ds.stencil = r->view_clear_value.depthStencil.stencil;
+                aspects |= r->view_clear_aspects;
+                ++g_vc_merged_planes;
+            } else {
+                view_clear_apply_locked(*r, kVcwOlder);
+            }
+        }
+        if (!r->view_clear) g_view_clear_list.push_back(r->base);
+        r->view_clear = true;
+        r->view_clear_load = false;
+        r->view_clear_aspects = aspects;
+        r->view_clear_first = first;
+        r->view_clear_count = count;
+        if (c.depth) {
+            r->view_clear_value.depthStencil = ds;
+        } else {
+            std::memcpy(r->view_clear_value.color.float32, c.rgba, sizeof(c.rgba));
+            note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
+        }
+        ++g_vc_set;
+        rt_written(*r);
+        g_cv_by_image[r->base].last_write = r->last_write;
+        return true;
+    }
+    if (!c.depth) {
+        clear_image_locked(*r, c.rgba, first, count);
+        note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
+        rt_written(*r);
+        g_cv_by_image[r->base].last_write = r->last_write;
+        return true;
+    }
+    // An HTILE clear an earlier fill left for this target's next draw is
+    // older than this one: it goes first.
+    if (r->htile_clear_pending) {
+        r->htile_clear_pending = false;
+        float dval;
+        std::memcpy(&dval, &r->htile_clear_depth, 4);
+        clear_depth_layers_locked(*r, true, true, dval, r->htile_clear_stencil, 0, r->layers);
+    }
+    const DepthClearPlanes planes = depth_clear_planes(c);
+    const bool has_stencil = r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM;
+    if (planes.depth && !(c.flags & 1)) ++g_cv_depth_by_htile;
+    if (planes.stencil && has_stencil && !(c.flags & 2)) ++g_cv_stencil_by_htile;
+    if (c.htile && has_stencil && !planes.stencil) ++g_cv_stencil_kept;
+    if (!planes.depth || (has_stencil && !planes.stencil)) ++g_cv_aspects[kind];
+    clear_depth_layers_locked(*r, planes.depth, planes.stencil, planes.depth_value, planes.stencil_value, first, count);
+    rt_written(*r);
+    g_cv_by_image[r->base].last_write = r->last_write;
+    return true;
+}
+
+void host_gpu_clear_view_check_begin(const GpuClearView& c, const GpuClearViewResult& expect) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (g_ccheck.active) ccheck_count(kCoNoFill, "another clear token came first");
+    g_ccheck.active = true;
+    g_ccheck.view = c;
+    g_ccheck.expect = expect;
+}
+
+void host_gpu_clear_view_check_end() {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (g_ccheck.active) ccheck_count(kCoNoFill, "the walk moved on");
+    g_ccheck.active = false;
+}
+
+std::string host_gpu_clear_view_report() {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    std::string out;
+    for (int k = 0; k < kCvKinds; ++k) {
+        if (!g_cv_run[k] && !g_cv_none[k]) continue;
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, no image yet so by address %llu, one aspect only %llu);", kClearViewKindName[k],
+                      static_cast<unsigned long long>(g_cv_run[k]), static_cast<unsigned long long>(g_cv_made[k]),
+                      static_cast<unsigned long long>(g_cv_none[k]), static_cast<unsigned long long>(g_cv_aspects[k]));
+        out += buf;
+    }
+    std::string checks;
+    for (int k = 0; k < kCvKinds; ++k) {
+        std::string row;
+        for (int o = 0; o < kCoOutcomes; ++o) {
+            if (!g_ccheck_counts[k][o]) continue;
+            row += " " + std::string(kClearCheckName[o]) + " " + std::to_string(g_ccheck_counts[k][o]) + ",";
+        }
+        if (!row.empty()) checks += " [" + std::string(kClearViewKindName[k]) + ":" + row + "]";
+    }
+    if (g_cv_run[kCvDsvHtile] || g_cv_run[kCvDsv]) {
+        host_log("render: depth clear tokens as GX leaves them (HTILE's fill whatever the flags): %llu cleared the stencil with the depth "
+                 "(HTILE words with the stencil state, a depth-only clear), %llu the depth on a stencil-only clear; %llu depth-only "
+                 "clears of HTILE words without the stencil state kept a stencil the fill path cleared",
+                 static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
+                 static_cast<unsigned long long>(g_cv_stencil_kept));
+    }
+    if (g_vc_set) {
+        host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "
+                 "samples the image; %llu batches), covered by a later clear %llu, joined with a later clear of other planes %llu, "
+                 "dropped with their image %llu",
+                 static_cast<unsigned long long>(g_vc_set), static_cast<unsigned long long>(g_vc_load),
+                 static_cast<unsigned long long>(g_vc_transfer), static_cast<unsigned long long>(g_vc_sampled),
+                 static_cast<unsigned long long>(g_vc_flushes), static_cast<unsigned long long>(g_vc_merged),
+                 static_cast<unsigned long long>(g_vc_merged_planes), static_cast<unsigned long long>(g_vc_dropped));
+        std::string why;
+        for (int w = 0; w < kVcwCount; ++w) {
+            if (!g_vc_why[w]) continue;
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), " %s %llu (%.1f GiB);", kVcwName[w], static_cast<unsigned long long>(g_vc_why[w]),
+                          static_cast<double>(g_vc_why_bytes[w]) / (1ull << 30));
+            why += buf;
+        }
+        host_log("render: lazy clears made by transfer, by what made them:%s", why.c_str());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> order;
+        for (const auto& [base, vi] : g_vc_by_image) order.push_back({vi.transfer_bytes, base});
+        std::sort(order.rbegin(), order.rend());
+        std::string images;
+        for (std::size_t i = 0; i < order.size() && i < 12; ++i) {
+            const ViewClearImage& vi = g_vc_by_image[order[i].second];
+            std::string whys;
+            for (int w = 0; w < kVcwCount; ++w) {
+                if (vi.why[w]) whys += (whys.empty() ? "" : ", ") + std::string(kVcwName[w]) + " " + std::to_string(vi.why[w]);
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " 0x%llx %ux%u x%u%s: load op %llu, transfer %llu (%.1f GiB: ", static_cast<unsigned long long>(order[i].second),
+                          vi.width, vi.height, vi.layers, vi.depth ? " depth" : "", static_cast<unsigned long long>(vi.load),
+                          static_cast<unsigned long long>(vi.transfer), static_cast<double>(vi.transfer_bytes) / (1ull << 30));
+            images += buf + whys + ");";
+        }
+        host_log("render: lazy clears by image, the most made by transfer:%s", images.c_str());
+    }
+    if (g_cv_by_image.size()) {
+        std::string cost;
+        for (int k = 0; k < kCvKinds; ++k) {
+            if (!g_cv_run[k]) continue;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " %s %.1f GiB written, %llu passes ended, %llu cleared again with no draw between;", kClearViewKindName[k],
+                          static_cast<double>(g_cv_bytes[k]) / (1ull << 30), static_cast<unsigned long long>(g_cv_pass_ends[k]),
+                          static_cast<unsigned long long>(g_cv_again[k]));
+            cost += buf;
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+        for (const auto& [base, cc] : g_cv_by_image) top.push_back({cc.bytes, base});
+        std::sort(top.rbegin(), top.rend());
+        std::string images;
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+            const ClearCost& cc = g_cv_by_image[top[i].second];
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " 0x%llx %ux%u x%u (%s) %llu clears, %.1f GiB, %llu again;", static_cast<unsigned long long>(top[i].second),
+                          cc.width, cc.height, cc.layers, kClearViewKindName[cc.kind], static_cast<unsigned long long>(cc.clears),
+                          static_cast<double>(cc.bytes) / (1ull << 30), static_cast<unsigned long long>(cc.again));
+            images += buf;
+        }
+        host_log("render: clear tokens' cost:%s largest by bytes:%s", cost.c_str(), images.c_str());
+    }
+    std::string imageless;
+    for (const auto& [base, e] : g_ccheck_imageless) {
+        const GpuClearView& c = e.second;
+        auto it = g_rts.find(base);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), " 0x%llx x%llu (z_info %08x stencil_info %08x size %08x view %08x extent %ux%u: %s);",
+                      static_cast<unsigned long long>(base), static_cast<unsigned long long>(e.first), c.z_info, c.stencil_info, c.depth_size,
+                      c.depth_view, c.extent >> 16, c.extent & 0xffff,
+                      it == g_rts.end() ? "no image now" : it->second.depth ? "a depth image now" : "a colour image now");
+        imageless += buf;
+    }
+    if (!imageless.empty()) host_log("render: depth views cleared with no image there:%s", imageless.c_str());
+    return "clear tokens:" + (out.empty() ? std::string(" none;") : out) + (checks.empty() ? "" : " checked against the fill path:" + checks);
 }
 
 std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) {
     if (!data || !bytes || !align || (align & (align - 1))) return 0;
     std::lock_guard<GpuMutex> lk(g.mu);
     return ring_place(static_cast<const std::uint8_t*>(data), bytes, align < 8 ? 8 : align);
+}
+
+// A dispatch's compute-stage user data from its records (GxStageRecords::
+// compute), as GX's compute commit writes it: records and constants in the
+// user SGPRs, tables, the context block and the extended block placed in the
+// host ring. Under g.mu.
+bool gpu::render_cs_user_data_locked(const GxStageRecords& st, std::uint32_t user[16], std::uint16_t* set) {
+    GxUserData u;
+    if (build_gx_user_data(st, u) != kUserBuilt) return false;
+    for (int k = 0; k < 16; ++k) {
+        if ((u.set >> k) & 1) user[k] = u.user[k];
+    }
+    *set = u.set;
+    return true;
+}
+
+// Shadow: the user data a dispatch's records build against what the register
+// file holds at its packet, over the registers the program reads - records
+// and constants dword by dword, a table, the context block or the extended
+// block by what its pointer reaches.
+void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    GxUserData u;
+    out = CsUserCompare{};
+    out.result = static_cast<int>(build_gx_user_data(st, u));
+    if (out.result != kUserBuilt) return;
+    out.built = true;
+    std::uint32_t pointers = 0;
+    for (int i = 0; i < u.nranges; ++i) pointers |= 3u << u.ranges[i].ud;
+    // The context block's pointer is not a range: its two dwords are found by
+    // the descriptor (type 7) and compared by content below.
+    std::uint32_t ctx_block_ud = 0xff;
+    for (std::uint32_t i = 0; i < st.ndesc && i < 64; ++i) {
+        if ((st.desc[i] & 0xff) == 0x7) ctx_block_ud = (st.desc[i] >> 8) & 0xff;
+    }
+    if (ctx_block_ud < 15) pointers |= 3u << ctx_block_ud;
+    for (unsigned k = 0; k < 16; ++k) {
+        if (!((read_mask >> k) & 1) || !((u.set >> k) & 1) || ((pointers >> k) & 1)) continue;
+        ++out.dwords;
+        if (reg[k] != u.user[k]) {
+            ++out.dwords_differ;
+            if (out.first_bad < 0) {
+                out.first_bad = static_cast<int>(k);
+                out.bad_reg = reg[k];
+                out.bad_built = u.user[k];
+            }
+        }
+    }
+    const auto unit = [&](std::uint64_t guest, std::uint64_t host, std::uint32_t bytes, int ud, std::uint32_t index) {
+        ++out.units;
+        std::uint8_t a[0xc0] = {};
+        if (!guest || !hle_kernel_va_mapped(guest, bytes)) {
+            ++out.unreadable;
+            return;
+        }
+        read_guest_locked(guest, bytes, a);
+        if (std::memcmp(a, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(host)), bytes) != 0) {
+            ++out.units_differ;
+            if (out.first_unit_ud < 0) {
+                out.first_unit_ud = ud;
+                out.first_unit_index = index;
+                std::memcpy(out.unit_reg, a, 8);
+                std::memcpy(out.unit_built, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(host)), 8);
+            }
+        }
+    };
+    for (int i = 0; i < u.nranges; ++i) {
+        const GxUserData::Range& r = u.ranges[i];
+        if (!((read_mask >> r.ud) & 3)) continue;  // a pointer the program does not read
+        const std::uint64_t guest = static_cast<std::uint64_t>(reg[r.ud]) | (static_cast<std::uint64_t>(reg[r.ud + 1]) << 32);
+        if (r.slots) {
+            for (std::uint32_t s = 0; s < 64; ++s) {
+                if ((r.slots >> s) & 1) unit(guest + static_cast<std::uint64_t>(s) * r.stride, r.va + static_cast<std::uint64_t>(s) * r.stride, r.stride, r.ud, s);
+            }
+        } else {
+            for (std::uint32_t k = 0; k < r.count; ++k) {
+                const std::uint32_t e = r.first + k;
+                if ((u.ext_set[e >> 6] >> (e & 63)) & 1) unit(guest + 4ull * k, r.va + 4ull * k, 4, r.ud, e);
+            }
+        }
+    }
+    if (ctx_block_ud < 15 && ((read_mask >> ctx_block_ud) & 3)) {
+        const std::uint64_t guest = static_cast<std::uint64_t>(reg[ctx_block_ud]) | (static_cast<std::uint64_t>(reg[ctx_block_ud + 1]) << 32);
+        const std::uint64_t host = static_cast<std::uint64_t>(u.user[ctx_block_ud]) | (static_cast<std::uint64_t>(u.user[ctx_block_ud + 1]) << 32);
+        if (host) unit(guest, host, 0xc0, static_cast<int>(ctx_block_ud), 0);
+    }
 }
 
 
@@ -11267,6 +14209,13 @@ std::uint64_t g_tess_lds_next = 0;
 
 struct TessDraw {
     std::uint32_t count = 0, level = 1;
+    // The LS pass tess_ls_pass_locked ran for it (the compute pipeline's
+    // inputs), for the recipe of the pipeline that draws it; lsp_cp_built:
+    // the command processor built its compute pipeline for this draw.
+    bool lsp_used = false, lsp_cp_built = false;
+    const CachedProgram* lsp_ls = nullptr;
+    const FetchProgram* lsp_fetch = nullptr;
+    std::uint32_t lsp_rsrc1 = 0, lsp_rsrc2 = 0;
     // Drawn by the host's tessellator, with the hull shader's own
     // factors, instead of the topology the domain prologue invents.
     bool hw = false;
@@ -11824,6 +14773,142 @@ bool tess_hull_constants_locked(const GpuDraw& d, TessDraw& t) {
     return true;
 }
 
+// ---- The host tessellator's LS pass: its compute pipelines ----
+// One per LS program, fetch shader, resource registers and (with the game's
+// hull) window and control points. Built on the command processor at a draw's
+// first sight, or at the start from a recipe that recorded the pass
+// (ls_pass_prebuild), whichever comes first: the cache is shared, and a
+// pipeline once made is never destroyed (dispatches recorded with it keep it).
+struct LsPipe {
+    bool failed = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool standin = false;  // unoptimized until bb-cs-optimize has built it (first_compute_pipeline)
+    std::uint64_t opt_seen = 0;
+    gcn::TranslateResult meta;
+    std::string name;
+    bool prebuilt = false;  // made from a recipe at the start
+};
+struct LsPassInputs {
+    const CachedProgram* ls = nullptr;
+    const FetchProgram* fetch = nullptr;
+    std::uint32_t rsrc1 = 0, rsrc2 = 0;
+    bool hull = false;
+    std::uint32_t window = 0, control_points = 0;
+};
+constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
+std::mutex g_ls_pipes_mu;
+std::unordered_map<std::uint64_t, std::shared_ptr<LsPipe>> g_ls_pipes;  // under g_ls_pipes_mu
+std::atomic<std::uint64_t> g_ls_pipes_prebuilt{0}, g_ls_pipes_prebuilt_failed{0}, g_ls_pipes_taken{0}, g_ls_pipes_cp_built{0};
+std::uint64_t ls_pipe_key(const LsPassInputs& in) {
+    const std::uint64_t fetch_hash = in.fetch ? in.fetch->hash : 0;
+    const std::uint32_t rs[4] = {in.rsrc1, in.rsrc2, in.hull ? in.window : 0u, in.hull ? in.control_points : 0u};
+    return fnv1a(rs, sizeof(rs), fnv1a(&fetch_hash, 8, in.ls->hash ^ 0x15c0ull));
+}
+// The pipeline itself, with no lock held: the LS translated as a compute
+// shader that runs the fetch shader's loads, its module, the pipeline.
+std::shared_ptr<LsPipe> ls_pipe_build(const LsPassInputs& in, std::uint64_t key) {
+    auto pl = std::make_shared<LsPipe>();
+    pl->name = in.ls->name + "-ls";
+    const gcn::Program prog = gcn::decode(in.ls->words.data(), in.ls->words.size());
+    gcn::Program fprog;
+    if (in.fetch) fprog = gcn::decode(in.fetch->words.data(), in.fetch->words.size());
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Compute;
+    o.tess_role = gcn::TranslateOptions::TessRole::LsCompute;
+    o.rsrc1 = in.rsrc1;
+    o.rsrc2 = in.rsrc2;
+    o.cs_threads[0] = 64;
+    o.fetch = in.fetch ? &fprog : nullptr;
+    o.exec_known = g.exec_known;
+    o.tess_lds_bound = tess_lds_bound();
+    if (in.hull) {
+        o.tess_window = in.window;
+        o.tess_patch_control_points = in.control_points;
+    }
+    pl->meta = translate_cached(prog, o);
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (!prog.errors.empty() || !pl->meta.ok()) {
+        host_log("render: tessellation LS %s: %s", pl->name.c_str(),
+                 !prog.errors.empty() ? prog.errors[0].what.c_str() : pl->meta.errors[0].c_str());
+        pl->failed = true;
+    } else if (!make_module(pl->meta.spirv, module)) {
+        pl->failed = true;
+    } else {
+        dump_spirv(pl->name, pl->meta.spirv);
+        pl->pipeline = first_compute_pipeline(module, key ^ kLsOptimizeTag, pl->name, pl->meta.spirv, pl->standin, pl->name);
+        if (!pl->pipeline) pl->failed = true;
+        vkDestroyShaderModule(g.device, module, nullptr);
+    }
+    return pl;
+}
+// Declared with the pipeline manifest (gpu's own namespace, where the recipes are).
+}  // namespace
+namespace gpu {
+namespace {
+std::string ls_pass_report() {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "the tessellator's LS passes: %llu compute pipelines built from recipes at the start (%llu failed), %llu of them taken by draws, "
+                  "%llu built by the command processor",
+                  static_cast<unsigned long long>(g_ls_pipes_prebuilt.load()), static_cast<unsigned long long>(g_ls_pipes_prebuilt_failed.load()),
+                  static_cast<unsigned long long>(g_ls_pipes_taken.load()), static_cast<unsigned long long>(g_ls_pipes_cp_built.load()));
+    return buf;
+}
+constexpr std::size_t kLsPassesMax = 16;  // a recipe's LS passes kept at most
+bool recipe_attach_ls_pass(PipelineRecipe& r) {
+    if (!t_tess || !t_tess->lsp_used || !t_tess->lsp_ls || r.ls_passes.size() >= kLsPassesMax) return false;
+    const TessDraw& t = *t_tess;
+    const std::uint64_t fetch_hash = t.lsp_fetch ? t.lsp_fetch->hash : 0;
+    for (const PipelineRecipe::LsPassRecord& p : r.ls_passes) {
+        if (p.ls.hash == t.lsp_ls->hash && (p.has_fetch ? p.fetch.hash : 0) == fetch_hash && p.rsrc1 == t.lsp_rsrc1 && p.rsrc2 == t.lsp_rsrc2 &&
+            p.hull == t.hull && (!t.hull || (p.window == t.window && p.control_points == t.control_points))) {
+            return false;  // this pass is in it already
+        }
+    }
+    PipelineRecipe::LsPassRecord p;
+    p.ls = *t.lsp_ls;
+    p.has_fetch = t.lsp_fetch != nullptr;
+    if (t.lsp_fetch) p.fetch = *t.lsp_fetch;
+    p.rsrc1 = t.lsp_rsrc1;
+    p.rsrc2 = t.lsp_rsrc2;
+    p.hull = t.hull;
+    p.window = t.hull ? t.window : 0u;
+    p.control_points = t.hull ? t.control_points : 0u;
+    r.ls_passes.push_back(std::move(p));
+    return true;
+}
+void ls_pass_prebuild(const PipelineRecipe& r) {
+    std::vector<PipelineRecipe::LsPassRecord> passes;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);  // a draw may add a pass meanwhile (recipe_attach_ls_pass)
+        passes = r.ls_passes;
+    }
+    for (const PipelineRecipe::LsPassRecord& p : passes) {
+        if (p.ls.words.empty()) continue;
+        LsPassInputs in;
+        in.ls = &p.ls;
+        in.fetch = p.has_fetch ? &p.fetch : nullptr;
+        in.rsrc1 = p.rsrc1;
+        in.rsrc2 = p.rsrc2;
+        in.hull = p.hull;
+        in.window = p.window;
+        in.control_points = p.control_points;
+        const std::uint64_t key = ls_pipe_key(in);
+        {
+            std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+            if (g_ls_pipes.count(key)) continue;
+        }
+        std::shared_ptr<LsPipe> pl = ls_pipe_build(in, key);
+        pl->prebuilt = true;
+        (pl->failed ? g_ls_pipes_prebuilt_failed : g_ls_pipes_prebuilt).fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        g_ls_pipes.emplace(key, std::move(pl));  // a draw's build that came first stays
+    }
+}
+}  // namespace
+}  // namespace gpu
+namespace {
+
 bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     const GpuDrawInputs* plan_gx = tess_gx(d);
     t.hw = tess_hw_locked(t);
@@ -12003,55 +15088,45 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         return true;
     }
 
-    struct LsPipe {
-        bool failed = false;
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        bool standin = false;  // unoptimized until bb-cs-optimize has built it (first_compute_pipeline)
-        std::uint64_t opt_seen = 0;
-        gcn::TranslateResult meta;
-        std::string name;
-    };
-    static std::unordered_map<std::uint64_t, LsPipe> pipes;
-    const std::uint64_t fetch_hash = fetch ? fetch->hash : 0;
-    const std::uint32_t rs[4] = {rsrc1, rsrc2, t.hull ? t.window : 0u, t.hull ? t.control_points : 0u};
-    const std::uint64_t key = fnv1a(rs, sizeof(rs), fnv1a(&fetch_hash, 8, ls->hash ^ 0x15c0ull));
-    LsPipe& pl = pipes[key];
-    constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
-    if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
-    if (!pl.pipeline && !pl.failed) {
-        pl.name = ls->name + "-ls";
-        const gcn::Program prog = gcn::decode(ls->words.data(), ls->words.size());
-        gcn::Program fprog;
-        if (fetch) fprog = gcn::decode(fetch->words.data(), fetch->words.size());
-        gcn::TranslateOptions o;
-        o.stage = gcn::Stage::Compute;
-        o.tess_role = gcn::TranslateOptions::TessRole::LsCompute;
-        o.rsrc1 = rsrc1;
-        o.rsrc2 = rsrc2;
-        o.cs_threads[0] = 64;
-        o.fetch = fetch ? &fprog : nullptr;
-        o.exec_known = g.exec_known;
-        o.tess_lds_bound = tess_lds_bound();
-        if (t.hull) {
-            o.tess_window = t.window;
-            o.tess_patch_control_points = t.control_points;
-        }
-        pl.meta = translate_cached(prog, o);
-        VkShaderModule module = VK_NULL_HANDLE;
-        if (!prog.errors.empty() || !pl.meta.ok()) {
-            host_log("render: tessellation LS %s: %s", pl.name.c_str(),
-                     !prog.errors.empty() ? prog.errors[0].what.c_str() : pl.meta.errors[0].c_str());
-            pl.failed = true;
-        } else if (!make_module(pl.meta.spirv, module)) {
-            pl.failed = true;
-        } else {
-            dump_spirv(pl.name, pl.meta.spirv);
-            pl.pipeline = first_compute_pipeline(module, key ^ kLsOptimizeTag, pl.name, pl.meta.spirv, pl.standin, pl.name);
-            if (!pl.pipeline) pl.failed = true;
-            vkDestroyShaderModule(g.device, module, nullptr);
-            host_log("render: tessellation LS %s%s (%zu images)", pl.name.c_str(), pl.failed ? " failed" : " ready", pl.meta.images.size());
-        }
+    LsPassInputs lin;
+    lin.ls = ls;
+    lin.fetch = fetch;
+    lin.rsrc1 = rsrc1;
+    lin.rsrc2 = rsrc2;
+    lin.hull = t.hull;
+    lin.window = t.window;
+    lin.control_points = t.control_points;
+    const std::uint64_t key = ls_pipe_key(lin);
+    std::shared_ptr<LsPipe> plp;
+    {
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        if (const auto it = g_ls_pipes.find(key); it != g_ls_pipes.end()) plp = it->second;
     }
+    if (!plp) {
+        struct BuildTime {  // the stall line's compute pipelines
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~BuildTime() { note_cp_compute_build(work_us_since(t0)); }
+        } build_time;
+        std::shared_ptr<LsPipe> built = ls_pipe_build(lin, key);
+        host_log("render: tessellation LS %s%s (%zu images)", built->name.c_str(), built->failed ? " failed" : " ready", built->meta.images.size());
+        g_ls_pipes_cp_built.fetch_add(1, std::memory_order_relaxed);
+        t.lsp_cp_built = true;
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        plp = g_ls_pipes.emplace(key, std::move(built)).first->second;  // one a worker finished meanwhile stays
+    } else if (plp->prebuilt && !plp->failed) {
+        static std::mutex seen_mu;
+        static std::unordered_set<std::uint64_t> seen;  // first takes only
+        std::lock_guard<std::mutex> lk(seen_mu);
+        if (seen.insert(key).second) g_ls_pipes_taken.fetch_add(1, std::memory_order_relaxed);
+    }
+    LsPipe& pl = *plp;
+    if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
+    // The pass this draw ran, for the recipe of the pipeline that draws it.
+    t.lsp_used = true;
+    t.lsp_ls = ls;
+    t.lsp_fetch = fetch;
+    t.lsp_rsrc1 = rsrc1;
+    t.lsp_rsrc2 = rsrc2;
     if (pl.failed) return false;
     // Room for every control point and the invocations past the count
     // (which write slack slots), at the larger of the LS's and the domain
@@ -12190,6 +15265,23 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         g_tess_lds_uses[g_tess_lds_next++ % kTessLdsUses] = {g_draw_rec_next, t.lds_address, bytes, t.hull ? t.window : 0u};
     }
     if (t.hull && !tess_hull_constants_locked(d, t)) return false;
+    if (!imports_whole()) {
+        // Window imports: the LS pass walks the page table for everything it
+        // reads and stores, so those windows (and the draw's indices) first.
+        const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+            std::uint32_t v[4]{};
+            if (!resolve_resource(path, user, pointer ? 2 : 4, v)) return;
+            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
+            const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
+            const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
+            if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
+        };
+        for (const gcn::TranslateResult::BufferRead& r : pl.meta.read_buffers) {
+            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+        for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        if (d.index_va) import_windows(d.index_va, static_cast<std::uint64_t>(t.count) * (d.index_type == 1 ? 4 : 2) + 64);
+    }
 
     static thread_local StageImages images;
     prefetch_stage_images(pl.meta, user, images);
@@ -12589,6 +15681,7 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
 }
 
 bool host_gpu_draw(const GpuDraw& d) {
+    const ResolveKind resolve_kind(d.gx_token ? (d.gx_token_kind ? d.gx_token_kind : "token draw") : "packet draw");
     // The windows given since the last draw are this one's (host_gpu_draw_window).
     t_draw_windows.swap(t_given_windows);
     t_given_windows.clear();
@@ -13349,6 +16442,26 @@ static bool draw_impl(const GpuDraw& d) {
             for (std::uint64_t m = st->obj_tex_set; m; m &= m - 1) texture_view_by_id_prefetch(st->obj_tex_id[__builtin_ctzll(m)]);
         }
     }
+    // And the constant buffers' first lines, which the snapshots copy a few
+    // microseconds on (resolve_stage_buffers): written by the game on other
+    // cores, they were a miss each as the copy reached them. A prefetch of a
+    // bad address is harmless. BBHOST_CB_PREFETCH=0: not asked for.
+    static const bool cb_prefetch = [] {
+        const char* e = std::getenv("BBHOST_CB_PREFETCH");
+        return !(e && e[0] == '0');
+    }();
+    if (cb_prefetch) {
+        for (const GxStageRecords* st : gx_stage) {
+            if (!st) continue;
+            for (std::uint32_t m = st->obj_cb_set; m; m &= m - 1) {
+                std::uint32_t rec[3];
+                std::memcpy(rec, st->obj_cb + __builtin_ctz(m) * 16, sizeof(rec));
+                const std::uint64_t va = rec[0] | (static_cast<std::uint64_t>(rec[1] & 0xfff) << 32);
+                const std::uint64_t bytes = std::min<std::uint64_t>(static_cast<std::uint64_t>(rec[2]) * 16, 256);
+                for (std::uint64_t off = 0; off < bytes; off += 64) __builtin_prefetch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + off)));
+            }
+        }
+    }
     // With binding plans the index is only a reset: the few resolutions left
     // outside the plans scan the descriptors, and a recycled record set must
     // not find the last draw's index.
@@ -13465,6 +16578,14 @@ static bool draw_impl(const GpuDraw& d) {
                                    vs_sampler_modes, ps_sampler_modes, tess_native, vertex_plan, tess_native || !lean_first, layout_only);
     pipeline_timer.next(kPhaseBind);
     if (tess_native && (pl.failed || !pl.tess_native || !pl.pipeline)) return tess_native_refuse("its native pipeline was not built");
+    // An LS pass the command processor had to build for this draw (no recipe
+    // held it) joins the recipe of the pipeline drawing it: a take or a build
+    // adds only the first draw's pass, and one pipeline meets several (the
+    // start builds every recipe's passes into the one cache the draws share).
+    if (t_tess && t_tess->lsp_cp_built && !pl.building && !pl.failed) {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (pl.recipe && recipe_attach_ls_pass(*pl.recipe)) g_pmanifest.dirty = true;
+    }
     if (pl.failed) {
         draw_failed(kFailPipeline);
         // Which pipelines, once each: the exit report only counts them.
@@ -14991,6 +18112,120 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    if (!g_view_clear_list.empty()) {
+        // Lazy clears: an attachment of this draw's pass that owes a clear
+        // token's clear takes it as the pass's load op when the pass covers
+        // it whole (that one layer, the render area its size); every other
+        // owed clear is made now, before the draw reads anything.
+        std::uint32_t ew = 0, eh = 0;  // the render area, as begin_pass works it out
+        const auto extent_of = [&](const RtImage* r) {
+            if (!r) return;
+            ew = ew ? std::min(ew, r->width) : r->width;
+            eh = eh ? std::min(eh, r->height) : r->height;
+        };
+        for (int t = 0; t < 8; ++t) extent_of(s.color[t]);
+        extent_of(s.depth);
+        bool load = false;
+        const auto take = [&](RtImage* r, std::uint32_t layer) {
+            if (!r || !r->view_clear) return;
+            if (r->width == ew && r->height == eh && r->view_clear_first == layer && r->view_clear_count == 1) {
+                r->view_clear_load = true;
+                load = true;
+            }
+        };
+        for (int t = 0; t < 8; ++t) take(s.color[t], s.color_layer[t]);
+        take(s.depth, s.depth_layer);
+        // The owed clears this draw reads go now: an attachment that cannot
+        // take its clear as the load op, and an image its vertex or pixel
+        // stage samples (a T# whose memory lies in the image's); a
+        // tessellated draw, whose other stages sample too, makes them all.
+        // The rest stay owed past this pass.
+        const bool all = s.tess_hw || s.domain_level;
+        bool made = false;
+        // The draw's sampled images' bases, worked out once - for the first
+        // owed clear that is not an attachment - rather than for each.
+        std::uint64_t sampled[64];
+        std::size_t nsampled = 0;
+        bool sampled_known = false, sampled_all = false;
+        const auto know_sampled = [&] {
+            sampled_known = true;
+            for (int st = 0; st < 2; ++st) {
+                for (const StageImages::Image& im : stage_images[st].images) {
+                    if (im.resolved && nsampled < 64) sampled[nsampled++] = tsharp_base(im.w);
+                }
+            }
+            sampled_all = nsampled < 64;  // else (more than fit): the scan below as it was
+        };
+        // The list's targets as g_rts holds them, found once for each entry
+        // while no target is made, dropped or replaced (g_rt_gen, which
+        // target_image's memo relies on too): a map lookup for every entry at
+        // every draw was 2.7% of the command processor at the Central Yharnam
+        // lamp.
+        static std::vector<RtImage*> rts;
+        static std::uint64_t rts_gen = 0, rts_list = 0;
+        if (rts_gen != g_rt_gen || rts_list != g_view_clear_list_gen || rts.size() > g_view_clear_list.size()) {
+            rts.clear();
+            rts_gen = g_rt_gen;
+            rts_list = g_view_clear_list_gen;
+        }
+        for (std::size_t i = rts.size(); i < g_view_clear_list.size(); ++i) {
+            auto it = g_rts.find(g_view_clear_list[i]);
+            rts.push_back(it == g_rts.end() ? nullptr : &it->second);
+        }
+        for (std::size_t i = 0; i < g_view_clear_list.size(); ++i) {
+            RtImage* rp = rts_gen == g_rt_gen ? rts[i] : nullptr;
+            if (rts_gen != g_rt_gen) {  // a clear made below changed the targets: look the rest up
+                auto it = g_rts.find(g_view_clear_list[i]);
+                rp = it == g_rts.end() ? nullptr : &it->second;
+            }
+            if (!rp || !rp->view_clear || rp->view_clear_load) continue;
+            RtImage& r = *rp;
+            bool read = all;
+            int why = kVcwTess;
+            for (int t = 0; t < 8 && !read; ++t) read = s.color[t] == &r;
+            read = read || s.depth == &r;
+            if (read && !all) why = kVcwAttachment;
+            if (!read) {
+                const std::uint64_t end = r.base + std::max<std::size_t>(rt_size_bytes(r), 1);
+                if (!sampled_known) know_sampled();
+                if (sampled_all) {
+                    for (std::size_t k = 0; k < nsampled; ++k) {
+                        if (sampled[k] >= r.base && sampled[k] < end) {
+                            read = true;
+                            why = kVcwSampled;
+                            ++g_vc_sampled;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int st = 0; st < 2 && !read; ++st) {
+                        for (const StageImages::Image& im : stage_images[st].images) {
+                            if (!im.resolved) continue;
+                            const std::uint64_t b = tsharp_base(im.w);
+                            if (b >= r.base && b < end) {
+                                read = true;
+                                why = kVcwSampled;
+                                ++g_vc_sampled;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!read) continue;
+            view_clear_apply_barrier_locked(r, false, why);
+            made = true;
+        }
+        if (made) {
+            ++g_vc_flushes;
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        // A pass with these targets already open began before the clear.
+        if (load && g_pass.active) render_end_pass_locked();
+    }
     g_pass_profile_name = &bind_pl->profile_name;
     begin_pass(s, pass_key(s), sample_hazard);
     draw_stamp.to(kRenderCostPass);
@@ -15263,7 +18498,8 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
         Located loc;
         const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
-        if (version != kCopyVersionInside) {
+        // (Window imports: the mirror first, so the indices need no import.)
+        if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
         }
@@ -15655,6 +18891,25 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         r.tex0 = r.tex[0];
+        // The next draw's entry, asked for with the intent to write: the ring
+        // (16,384 entries, 8 MiB) is far larger than the caches, so each of an
+        // entry's lines was a read for ownership from memory as the fields
+        // were written. BBHOST_PACKET_PREFETCH=0: not asked for.
+        static const bool prefetch_next = [] {
+            const char* e = std::getenv("BBHOST_PACKET_PREFETCH");
+            return !(e && e[0] == '0');
+        }();
+        if (prefetch_next) {
+            const auto* next = reinterpret_cast<const char*>(&g_draw_recs[g_draw_rec_next % kDrawRecs]);
+            const auto* line = reinterpret_cast<const char*>(reinterpret_cast<std::uintptr_t>(next) & ~std::uintptr_t{63});
+            for (; line < next + sizeof(DrawRec); line += 64) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+                asm volatile("prefetchw %0" : : "m"(*line));
+#else
+                __builtin_prefetch(line, 1);
+#endif
+            }
+        }
     }
     if (g_trace) {
         static std::atomic<int> logs{0};
@@ -15962,6 +19217,7 @@ struct TargetPixels {
     std::uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool depth = false;
+    bool stencil = false;  // the stencil plane of a depth target (one byte a texel)
     std::size_t bpp = 0;
     std::vector<std::uint8_t> px;
     // F12: the texels stay in their host-cached staging buffer, which the
@@ -15971,6 +19227,7 @@ struct TargetPixels {
 };
 
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out);
+bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out);
 void take_target_pixels(DevBuffer& staging, TargetPixels& t);
 bool write_target_image(const TargetPixels& t);
 }  // namespace
@@ -16469,6 +19726,7 @@ std::string image_beside(const std::string& stem, const char* kind, std::uint64_
 bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_targets) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return false;
+    view_clears_flush_locked(kVcwDump);  // what the dump reads holds every clear made so far
     flush_locked();
     // BBHOST_DUMP_ALL=1 keeps the default window of recorded draws;
     // BBHOST_DUMP_ALL=<n> lists the last n, up to the ring size, which is what
@@ -16625,6 +19883,28 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
             if (it == g_rts.end() || it->second.depth || !it->second.initialised) continue;
             add(it->second, image_beside(stem, "rt", base, ext));
         }
+        // BBHOST_F12_DEPTH=1: the depth targets the recorded draws used too,
+        // their depth ("dpt") and stencil ("stn") planes, layer 0.
+        static const bool f12_depth = [] {
+            const char* e = std::getenv("BBHOST_F12_DEPTH");
+            return e && e[0] == '1';
+        }();
+        if (f12_depth) {
+            std::set<std::uint64_t> depths;
+            const std::uint64_t first = g_draw_rec_next > kDrawRecs ? g_draw_rec_next - kDrawRecs : 0;
+            for (std::uint64_t i = first; i < g_draw_rec_next; ++i) {
+                if (const std::uint64_t d = g_draw_recs[i % kDrawRecs].depth) depths.insert(d);
+            }
+            for (std::uint64_t base : depths) {
+                auto it = g_rts.find(base);
+                if (it == g_rts.end() || !it->second.depth || !it->second.initialised) continue;
+                add(it->second, image_beside(stem, "dpt", base, ext));
+                Pending q;
+                q.t = std::make_unique<TargetPixels>();
+                q.t->path = image_beside(stem, "stn", base, ext);
+                if (record_stencil_readback(it->second, q.staging, *q.t)) pending.push_back(std::move(q));
+            }
+        }
         auto disp = g_rts.find(display_va);
         const bool have_display = disp != g_rts.end() && disp->second.initialised;
         if (have_display) add(disp->second, path ? path : "build/f12.ppm");
@@ -16773,6 +20053,7 @@ namespace {
 // Records the copy of r into a new host-visible staging buffer; the caller
 // flushes once for all of them and takes the bytes (take_target_pixels).
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
+    if (r.view_clear) view_clear_apply_locked(r, kVcwReadback);
     const bool depth = r.depth;
     if (depth && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
     out.width = r.width;
@@ -16785,6 +20066,26 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     render_end_pass_locked();
     VkBufferImageCopy region{};
     region.imageSubresource = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {r.width, r.height, 1};
+    vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
+    return true;
+}
+
+// The stencil plane of a depth target with one, layer 0 (F12 with BBHOST_F12_DEPTH).
+bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
+    if (!r.depth || r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D16_UNORM) return false;
+    if (r.view_clear) view_clear_apply_locked(r, kVcwReadback);
+    out.width = r.width;
+    out.height = r.height;
+    out.format = r.format;
+    out.depth = false;
+    out.stencil = true;
+    out.bpp = 1;
+    if (!create_dev_buffer(staging, (static_cast<std::uint64_t>(r.width) * r.height + 3) & ~3ull, true, true)) return false;
+    begin_recording_locked();
+    render_end_pass_locked();
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
     region.imageExtent = {r.width, r.height, 1};
     vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
     return true;
@@ -16844,7 +20145,16 @@ bool write_target_image(const TargetPixels& t) {
                 row[x * 3 + 0] = tone8(f11(v));
                 row[x * 3 + 1] = tone8(f11(v >> 11));
                 row[x * 3 + 2] = tone8(f10(v >> 22));
-            } else if (fmt == VK_FORMAT_R32_SFLOAT || t.depth) {
+            } else if (t.stencil) {
+                row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = static_cast<std::uint8_t>(p[0] * 17);
+            } else if (t.depth) {
+                // Depth near 1 is where a scene's detail is: 1 - d stretched.
+                float fv;
+                std::memcpy(&fv, p, 4);
+                note_float(0, fv);
+                const float v = std::clamp((1.0f - fv) * 32.0f, 0.0f, 1.0f);
+                row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = static_cast<std::uint8_t>(std::sqrt(v) * 255.0f + 0.5f);
+            } else if (fmt == VK_FORMAT_R32_SFLOAT) {
                 float fv;
                 std::memcpy(&fv, p, 4);
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = tone8(fv);
@@ -16859,6 +20169,33 @@ bool write_target_image(const TargetPixels& t) {
         return false;
     }
     host_log("render: wrote %s (%ux%u, format %d)", t.path.c_str(), t.width, t.height, fmt);
+    if (t.depth || t.stencil) {
+        // What the picture leaves out: the depth range, or the stencil values used.
+        const std::size_t n = static_cast<std::size_t>(t.width) * t.height;
+        if (t.stencil) {
+            std::uint64_t hist[256] = {};
+            for (std::size_t i = 0; i < n; ++i) ++hist[t.data()[i]];
+            std::string used;
+            for (int v = 0; v < 256; ++v) {
+                if (hist[v]) used += " " + std::to_string(v) + ":" + std::to_string(hist[v]);
+            }
+            host_log("render: %s stencil values (value:texels):%s", t.path.c_str(), used.c_str());
+        } else {
+            double sum = 0;
+            std::uint64_t at_one = 0, at_zero = 0;
+            float lo = 1e30f;
+            for (std::size_t i = 0; i < n; ++i) {
+                float v;
+                std::memcpy(&v, t.data() + i * 4, 4);
+                sum += v;
+                lo = std::min(lo, v);
+                at_one += v == 1.0f;
+                at_zero += v == 0.0f;
+            }
+            host_log("render: %s depth: min %g max %g mean %.6f, texels at 1 %llu, at 0 %llu", t.path.c_str(), lo, fmax[0], n ? sum / n : 0.0,
+                     static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
+        }
+    }
     if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
@@ -16971,6 +20308,215 @@ void stage_manifest_save(const std::string& path) {
     }
     if (ok) std::filesystem::rename(tmp, path, ec);
     if (!ok || ec) host_log("render: saving the stage manifest to %s failed", path.c_str());
+}
+
+// The pipeline manifest (see PipelineRecipe), read at the end of device init
+// after the stage manifest: each recipe goes to the precompile workers, the
+// most recently used first, behind the stage manifest's stages and ahead of
+// what GX creates. Without pipeline libraries too: there the whole pipelines
+// it builds are what a draw would compile.
+// One recipe file: this player's manifest or a shipped list. False when it is
+// not one this build reads.
+bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::Origin& origin,
+                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::uint32_t& unread) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    manifest_file::Reader r{data.data(), data.data() + data.size()};
+    const std::uint32_t magic = data.size() >= 12 ? r.u32() : 0, version = data.size() >= 12 ? r.u32() : 0;
+    if (magic != recipe_file::kMagic || (version != recipe_file::kVersion && version != 2)) {
+        if (!data.empty()) host_log("render: pipeline manifest: %s is not one this build reads", path.c_str());
+        return false;
+    }
+    run = r.u32();
+    if (!recipe_file::read_origin(r, origin)) return false;
+    const std::uint32_t n = r.u32();
+    for (std::uint32_t k = 0; k < n && k < kRecipeMax && r.ok; ++k) {
+        auto rc = std::make_shared<PipelineRecipe>();
+        if (recipe_file::read(r, *rc)) {
+            rc->loaded = true;
+            recipes.push_back(std::move(rc));
+        } else {
+            ++unread;
+        }
+    }
+    return true;
+}
+
+// The pipeline manifest (see PipelineRecipe), read at the end of device init
+// after the stage manifest: each recipe goes to the precompile workers, the
+// most recently used first, behind the stage manifest's stages and ahead of
+// what GX creates. Without pipeline libraries too: there the whole pipelines
+// it builds are what a draw would compile. A shipped list (`list_path`: one
+// tools/pipeline_list.py made, read where it exists) adds the recipes this
+// player's manifest lacks, behind those: a first start has them too.
+void pipeline_manifest_load(const std::string& path, const std::string& list_path) {
+    if (!pipeline_manifest_on() || path.empty()) return;
+    g_pmanifest.loaded_at = std::chrono::steady_clock::now();
+    g_pmanifest.recording.store(true);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    recipe_file::Origin ours;
+    ours.translator = translator_fingerprint();
+    ours.vendor = props.vendorID;
+    ours.device = props.deviceID;
+    ours.driver = props.driverVersion;
+    std::memcpy(ours.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+    ours.libraries = use_pipeline_library();
+    std::uint32_t run = 0, unread = 0;
+    recipe_file::Origin theirs = ours;
+    std::vector<std::shared_ptr<PipelineRecipe>> recipes;
+    const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
+    // The last start's in the order its draws first took them, which this
+    // start's draws likely follow, then the older ones, the most recent first.
+    std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->order < b->order;
+    });
+    std::size_t own = 0, listed = 0, list_unread = 0;
+    std::vector<std::shared_ptr<PipelineRecipe>> queue;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        g_pmanifest.run = run + 1;
+        g_pmanifest.next_order.store(0);  // this start's order of first use (recipe_note_created, take_prebuilt)
+        for (const auto& rc : recipes) {
+            if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+        }
+        if (unread) g_pmanifest.dirty = true;
+        own = queue.size();
+    }
+    if (!list_path.empty()) {
+        std::uint32_t list_run = 0, bad = 0;
+        recipe_file::Origin list_origin;
+        std::vector<std::shared_ptr<PipelineRecipe>> list;
+        if (read_recipe_file(list_path, list_run, list_origin, list, bad)) {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
+            for (auto& rc : list) {
+                rc->listed = true;
+                rc->uses = 0;
+                rc->last_run = 0;
+                if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+            }
+            listed = queue.size() - own;
+            list_unread = bad;
+        }
+    }
+    g_pmanifest.loaded.store(queue.size());
+    g_pmanifest.queued.store(queue.size());
+    if (!queue.empty()) {
+        Precompiler& w = precompiler();
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            for (const auto& rc : queue) {
+                PrecompileJob job;
+                job.name = rc->vs_name + "+" + rc->ps_name;
+                job.type = 8;
+                job.recipe = rc;
+                w.jobs.push_back(std::move(job));
+            }
+        }
+        w.cv.notify_all();
+    }
+    const bool same_translator = theirs.translator == ours.translator;
+    const bool same_device = theirs.vendor == ours.vendor && theirs.device == ours.device && theirs.driver == ours.driver &&
+                             !std::memcmp(theirs.uuid, ours.uuid, VK_UUID_SIZE);
+    std::string list_note;
+    if (listed || list_unread) {
+        list_note = "; " + std::to_string(listed) + " more from the list " + list_path +
+                    (list_unread ? " (" + std::to_string(list_unread) + " of its entries not in this game's bundles or unreadable)" : "");
+    }
+    host_log("render: pipeline manifest: %zu pipelines from earlier runs (run %u)%s queued for their build%s%s%s%s", own, g_pmanifest.run,
+             list_note.c_str(), unread ? (", " + std::to_string(unread) + " unreadable dropped").c_str() : "",
+             !have_own || same_translator ? "" : "; recorded with another translator: every stage is translated again",
+             !have_own || same_device ? "" : "; recorded on another device or driver: the driver compiles them all again",
+             !have_own || theirs.libraries == ours.libraries ? "" : ours.libraries ? "; recorded without pipeline libraries" : "; recorded with pipeline libraries");
+}
+
+// The whole manifest, when recipes were recorded or used since the last
+// write: the recipes no draw took for kRecipeIdleRuns starts left out, then
+// past kRecipeMax or kRecipeMaxBytes the least recently used.
+void pipeline_manifest_save(const std::string& path) {
+    if (!pipeline_manifest_on() || path.empty()) return;
+    static std::mutex writing;
+    std::lock_guard<std::mutex> wl(writing);
+    // With their use as it stood under the lock: a draw may take one while
+    // they are sorted, and the sort needs values that hold still.
+    struct Kept {
+        std::shared_ptr<PipelineRecipe> rc;
+        std::uint32_t last_run, uses;
+    };
+    std::vector<Kept> keep;
+    std::uint32_t run = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (!g_pmanifest.dirty) return;
+        g_pmanifest.dirty = false;
+        run = g_pmanifest.run;
+        for (const auto& [key, rc] : g_pmanifest.by_key) {
+            if (rc->last_run + kRecipeIdleRuns < run) continue;
+            if (rc->listed && rc->last_run != run) continue;  // the list has it: the player's own file keeps only what was used
+            keep.push_back({rc, rc->last_run, rc->uses});
+        }
+    }
+    std::sort(keep.begin(), keep.end(), [](const Kept& a, const Kept& b) {
+        return a.last_run != b.last_run ? a.last_run > b.last_run : a.uses > b.uses;
+    });
+    manifest_file::Writer body;
+    std::uint32_t count = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);  // the relink's specialization may change under a draw
+        for (const Kept& k : keep) {
+            const std::size_t before = body.out.size();
+            recipe_file::write(body, *k.rc);
+            if (count + 1 > kRecipeMax || body.out.size() > kRecipeMaxBytes) {
+                body.out.resize(before);
+                g_pmanifest.dropped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            ++count;
+        }
+    }
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    recipe_file::Origin ours;
+    ours.translator = translator_fingerprint();
+    ours.vendor = props.vendorID;
+    ours.device = props.deviceID;
+    ours.driver = props.driverVersion;
+    std::memcpy(ours.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+    ours.libraries = use_pipeline_library();
+    manifest_file::Writer out;
+    out.u32(recipe_file::kMagic);
+    out.u32(recipe_file::kVersion);
+    out.u32(run);
+    recipe_file::write_origin(out, ours);
+    out.u32(count);
+    out.out.insert(out.out.end(), body.out.begin(), body.out.end());
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const std::string tmp = path + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(out.out.data()), static_cast<std::streamsize>(out.out.size()));
+        ok = static_cast<bool>(f);
+    }
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) host_log("render: saving the pipeline manifest to %s failed", path.c_str());
+}
+
+void pipeline_manifest_save_async(const std::string& path) {
+    static std::atomic<bool> saving{false};
+    if (!pipeline_manifest_on() || path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (!g_pmanifest.dirty) return;
+    }
+    if (saving.exchange(true)) return;
+    std::thread([path] {
+        pipeline_manifest_save(path);
+        saving.store(false);
+    }).detach();
 }
 
 // With every 300-flip report, on a thread of its own: a stage recorded is

@@ -246,6 +246,8 @@ constexpr std::uint32_t kGfxChromaticAberration = 117003;
 constexpr std::uint32_t kGfxResolution = 117004;
 constexpr std::uint32_t kGfxMotionBlur = 117005;
 constexpr std::uint32_t kGfxShadowDistance = 117006, kGfxAoStrength = 117007, kGfxFog = 117008;
+// HLSL Shaders (the Shaders setting: HLSL or Lifted), read at the next start.
+constexpr std::uint32_t kGfxShaders = 117009;
 constexpr std::uint32_t kFxBloom = 120000, kFxVignette = 120001, kFxSaturation = 120002;
 constexpr std::uint32_t kRowFrameCap = 116005;
 // The section title, StaticText_116020 in the generated movie.
@@ -487,6 +489,10 @@ struct Toggle {
     std::uint32_t id;   // its label and line help, in the port's own block
     std::uint8_t value;
     std::uint8_t last;  // what was pushed, so a poll acts only on a change
+    // The row's On is the setting's first value rather than its "on" - HLSL
+    // Shaders' On is the Shaders setting's HLSL, whose second value, Lifted,
+    // is what host_opt_get reads as on.
+    bool invert = false;
 };
 // PC Settings. The two pointer rows it had moved to PC Controls, beside the
 // rest of the mouse.
@@ -508,11 +514,13 @@ struct Slider {
 };
 
 // PC Graphics: the scene - anti-aliasing, ambient occlusion and its strength
-// (engine/graphics_patch.h), how far shadows reach, how thick the fog is, and
-// the resolution.
+// (engine/graphics_patch.h), the shaders' form (HLSL Shaders, read at the next
+// start: host/translation_cache.h), how far shadows reach, how thick the fog
+// is, and the resolution.
 Toggle g_graphics[] = {
     {"anti_alias", kGfxAntiAlias, 1, 0xff},
     {"ssao", kGfxSsao, 1, 0xff},
+    {"shaders", kGfxShaders, 1, 0xff, true},
 };
 constexpr int kGraphicsCount = static_cast<int>(sizeof(g_graphics) / sizeof(g_graphics[0]));
 // 5 is the area's own occlusion, 0 none, 10 twice as dark.
@@ -641,12 +649,12 @@ void seed_deck() {
 // changed it since - so each section seeds its values when it opens, and the
 // poll then pushes only what the player changes.
 void seed(Toggle& t) {
-    t.value = host_opt_get(t.key) ? 1 : 0;
+    t.value = host_opt_get(t.key) != t.invert ? 1 : 0;
     t.last = t.value;
 }
 
 // What the row's Defaults restores: the setting as it ships.
-std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) ? 1 : 0; }
+std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) != t.invert ? 1 : 0; }
 
 void seed(Slider& s) {
     const int i = host_opt_index(s.key);
@@ -667,7 +675,7 @@ void push(Slider& s) {
 void push(Toggle& t) {
     if (t.value == t.last) return;
     t.last = t.value;
-    host_opt_set(t.key, t.value != 0);
+    host_opt_set(t.key, (t.value != 0) != t.invert);
     host_log("pc-options: %s %s from the System menu", t.key, t.value ? "on" : "off");
 }
 
@@ -694,11 +702,14 @@ void seed_controls() {
 // above the key guide. The Defaults row has a slot of its own besides these:
 // the donor's label slot (char 100), right after the section's last row.
 constexpr int kSectionSlots = 6, kKeysSlots = 8;
+// PC Graphics has one slot more (its seventh row, HLSL Shaders): the generator
+// adds it as it adds Key Bindings' two, and moves the Defaults label below it.
+constexpr int kGraphicsSlots = 7;
 
 // The port's rows: its toggles plus the frame-cap pick list, and in the
 // graphics section its toggles plus the resolution list.
 constexpr int kRowCount = kToggleCount + 1;
-static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kSectionSlots && kControlsRows <= kSectionSlots &&
+static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "

@@ -2,9 +2,10 @@
 # Packs a Linux build into the tarball another Linux machine runs from, the
 # counterpart of tools/win_package.sh: the binary without its DWARF, the patch
 # manifests it applies (patches/, looked for next to the binary), the plugin
-# header, the example config, a README with what the machine must have, a
-# launcher that keeps a log file, and the empty data/, logs/ and build/ (frame
-# dumps) the run writes into: the release's Linux bundle. Nothing in it picks
+# header, the example config, DXC's release library for the HLSL shader path
+# with its licences (tools/fetch_dxc.sh), a README with what the machine must
+# have, a launcher that keeps a log file, and the empty data/, logs/ and
+# build/ (frame dumps) the run writes into: the release's Linux bundle. Nothing in it picks
 # a server: bbhost's defaults are the live server's (https://thehuntersdream.com).
 # The unstripped binary is kept beside the tarball under the same revision
 # name, for symbolizing a crash report from that machine.
@@ -37,6 +38,21 @@ objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-d
 chmod +x "$dir/bbhost"
 cp "$bin" "$out/$name.debug"
 cp bbhost.example.toml "$dir/bbhost.example.toml"
+# The HLSL path's compiler beside the binary, where bbhost looks first.
+tools/fetch_dxc.sh linux "$dir"
+dxc_tag=$(cat third_party/dxc/VERSION)
+# The pipeline list beside the binary, where bbhost reads it at each start and
+# builds every pipeline it names (render.cpp pipeline_manifest_load): the
+# pinned release asset (tools/fetch_pipeline_list.sh), or the local list
+# BBHOST_PACKAGE_PIPELINE_LIST names (a new one under test);
+# BBHOST_PIPELINE_LIST_FETCH=0 leaves it out (a development kit). It names the
+# game's programs by hash and holds none of their code.
+if [ -n "${BBHOST_PACKAGE_PIPELINE_LIST:-}" ]; then
+    python3 tools/pipeline_list.py stats "$BBHOST_PACKAGE_PIPELINE_LIST" > /dev/null
+    cp "$BBHOST_PACKAGE_PIPELINE_LIST" "$dir/pipeline-list.bin"
+elif [ "${BBHOST_PIPELINE_LIST_FETCH:-1}" != 0 ]; then
+    tools/fetch_pipeline_list.sh "$dir"
+fi
 
 # What the binary still loads from the system, from its own dynamic section,
 # so the README cannot drift from the build.
@@ -95,6 +111,12 @@ You need
 
 Built static: libstdc++ ($glibcxx), SDL3, ffmpeg (movie decoders only),
 SPIRV-Tools.
+
+libdxcompiler.so beside it is the DirectX Shader Compiler $dxc_tag, Microsoft's
+release unmodified (https://github.com/microsoft/DirectXShaderCompiler,
+licences in licenses/dxc): the HLSL shader path (BBHOST_HLSL, off by default)
+compiles with it, and it loads the system's libstdc++.so.6 (GCC 11 or newer).
+Without it that path keeps every shader as it was; nothing else uses it.
 
 Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run

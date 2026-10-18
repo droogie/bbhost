@@ -3,7 +3,9 @@
 # from-scratch Linux build on a stock Ubuntu 24.04: the packages, the Vulkan
 # headers (24.04's 1.3.275 are older than the renderer's), SDL3 and the movie
 # decoders of ffmpeg built static into a prefix as tools/linux_portable_build.sh
-# does, then bbhost, its tools and its tests, and ctest. No game files: the
+# does, then bbhost, its tools and its tests, and ctest - the HLSL printer's
+# test compiling with the DXC the packages carry (tools/fetch_dxc.sh, its
+# release checked against the pinned SHA-256 on every run). No game files: the
 # tests that read them skip (tests/test_app0.h).
 #
 #   tools/ci_build.sh                 everything, in build-ci/
@@ -93,6 +95,11 @@ if [ ! -f "$P/lib/libavcodec.a" ]; then
     sed -i 's/ -latomic/ -l:libatomic.a/' "$P"/lib/pkgconfig/*.pc
 fi
 
+# DXC's release library, as the packages carry it: kept in the prefix, checked
+# against its pins every run.
+DXC_CACHE=$P/dxc-cache tools/fetch_dxc.sh linux "$P/dxc" > "$W/dxc.log" 2>&1 || { cat "$W/dxc.log"; exit 1; }
+tail -1 "$W/dxc.log"
+
 # bbhost, its tools and tests.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig
 static=""
@@ -104,5 +111,7 @@ cmake -S "$SRC" -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
 cmake --build "$W/build" -j"$JOBS" 2>&1 | tee "$W/bbhost-build.log" | grep -E "error|warning: unused|FAILED" | head -40 || true
 [ "${PIPESTATUS[0]}" = 0 ] || { echo "build failed (log: $W/bbhost-build.log)"; exit 1; }
-(cd "$W/build" && ctest --output-on-failure)
+# BBHOST_HLSL_DXC: tests/gcn_hlsl_test.cpp compiles every lift with that DXC
+# and fails when it does not load.
+(cd "$W/build" && BBHOST_HLSL_DXC="$P/dxc/libdxcompiler.so" ctest --output-on-failure)
 echo "ci build: $W/build/bbhost"

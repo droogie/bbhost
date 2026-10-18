@@ -119,6 +119,27 @@ int main() {
     CHECK(!write_watch_on_fault(va + 12 * kPage, true));  // never armed
     CHECK(!write_watch_on_fault(va + kPage, false));       // a read
 
+    // Faults and releases are counted by who armed the page.
+    {
+        const WriteWatchStats s0 = write_watch_stats();
+        WriteWatch t, mw;
+        t.owner = kWatchOwnerTexture;
+        mw.owner = kWatchOwnerMirror;
+        CHECK(write_watch_arm_locked(va + 10 * kPage, kPage, t));   // page 10: a texture's
+        CHECK(write_watch_arm_locked(va + 11 * kPage, kPage, mw));  // page 11: a mirror's
+        page(10)[0] = 1;
+        page(11)[0] = 1;
+        const WriteWatchStats s1 = write_watch_stats();
+        CHECK(s1.faults_by_owner[kWatchOwnerTexture] == s0.faults_by_owner[kWatchOwnerTexture] + 1);
+        CHECK(s1.faults_by_owner[kWatchOwnerMirror] == s0.faults_by_owner[kWatchOwnerMirror] + 1);
+        CHECK(s1.arms_by_owner[kWatchOwnerTexture] == s0.arms_by_owner[kWatchOwnerTexture] + 1);
+        CHECK(s1.arms_by_owner[kWatchOwnerMirror] == s0.arms_by_owner[kWatchOwnerMirror] + 1);
+        CHECK(write_watch_arm_locked(va + 10 * kPage, kPage, t));
+        CHECK(write_watch_release(const_cast<std::uint8_t*>(page(10)), kPage));
+        const WriteWatchStats s2 = write_watch_stats();
+        CHECK(s2.released_pages_by_owner[kWatchOwnerTexture] == s1.released_pages_by_owner[kWatchOwnerTexture] + 1);
+    }
+
     // The property: a writer hammers one page while the checker arms, reads,
     // and checks. Whenever the check says clean, the page still holds what
     // was read after arming - and no increment is lost to a retried fault.

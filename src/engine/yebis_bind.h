@@ -73,6 +73,13 @@ void note_fallback();
 bool build_stage(std::uint64_t state, int stage, std::uint64_t table, std::uint32_t count, std::uint64_t* block, Work& work,
                  bool dry = false);
 
+// The user data a stage's table gives its shader, as sub_15f9190 writes it
+// (user-data slots 0-15): a plain descriptor's record dwords out of the stage's
+// array, the others' addresses from `block` (what build_stage resolved). The
+// slots it wrote, as a mask.
+std::uint16_t user_data(std::uint64_t state, int stage, std::uint64_t table, std::uint32_t count, const std::uint64_t* block,
+                        std::uint32_t* user);
+
 // One more deferred write, for a payload the guest would have carried inside a
 // WRITE_DATA packet: a copy is taken now, written at the token. False when the
 // draw has no room left for it.
@@ -81,6 +88,9 @@ bool add_copy(Work& work, std::uint64_t dst, const void* src, std::uint32_t byte
 // The windows, written where the descriptors are read: on the command-processor
 // thread, at the draw's token.
 void run(const Work& work);
+// The same for a dispatch, which reads guest memory where the GPU runs it: the
+// windows go on the GPU's timeline in stream order, before it.
+void run_ordered(const Work& work);
 
 // Compare mode: what a stage predicted, against what the guest builder left.
 void compare(int stage, const std::uint64_t* mine, const std::uint64_t* theirs, std::uint32_t count);

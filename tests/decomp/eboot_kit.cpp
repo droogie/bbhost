@@ -255,6 +255,7 @@ __attribute__((weak)) std::uint64_t g_decomp_slide = eboot_kit::kBase;
 __attribute__((weak)) std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }
 __attribute__((weak)) void decomp_add(const DecompFunction&) {}
 __attribute__((weak)) bool decomp_comparing() { return false; }
+__attribute__((weak)) int decomp_placed(const char*) { return 0; }
 
 // What the loader binds imports with (core/imports.h), for a test: traps.
 std::string lookup_nid_name(std::string_view nid) { return std::string(nid); }

@@ -37,7 +37,16 @@
 // (the GDS counters the dispatch counted in) must match exactly; a buffer it
 // stores through may hold its records in another order - an append buffer's
 // order is the order its subgroups' atomics landed - and is compared as the
-// multiset of its records; every other byte of every page exactly.
+// multiset of its records; every other byte of every page exactly. --cs
+// FILE.spv: the dispatch again with another compute module (the lift against
+// a captured translation, or the reverse), against A by the same rules.
+// --cs-buffers FILE.json (gcnlift --lean's lean-buffers.json): the variant is
+// a lean module, which reads storage buffers the renderer binds: each
+// binding's V# or pointer resolved from the captured user data and pages and
+// bound over the pages it covers, with its bias, stride and valid bit in a
+// params block of its own (render.cpp resolve_stage_buffers). --cs-base
+// FILE.spv: A and B run this module instead of the captured one (the walking
+// translation today's translator makes, gcnlift's reference.spv).
 //
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
 #include "core/sha256.h"
@@ -510,6 +519,35 @@ void upload(Device& dev, const Image& img, VkImageAspectFlags aspect, const std:
         transition(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     });
     dev.destroy(staging);
+}
+
+// The subresources `subs` of an image in GENERAL layout, back to the host in
+// the blob's layout (the image stays in GENERAL).
+std::vector<std::uint8_t> download(Device& dev, const Image& img, VkImageAspectFlags aspect, const std::vector<Subresource>& subs) {
+    std::uint64_t total = 0;
+    for (const Subresource& s : subs) total = std::max(total, s.offset + s.bytes);
+    Buffer staging = dev.buffer(std::max<std::uint64_t>(total, 4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::vector<VkBufferImageCopy> regions;
+    for (const Subresource& s : subs) {
+        VkBufferImageCopy r{};
+        r.bufferOffset = s.offset;
+        r.imageSubresource = {aspect, s.level, s.layer, 1};
+        r.imageExtent = {s.w, s.h, s.d};
+        regions.push_back(r);
+    }
+    dev.submit([&](VkCommandBuffer cmd) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, static_cast<std::uint32_t>(regions.size()), regions.data());
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    });
+    std::vector<std::uint8_t> out(static_cast<const std::uint8_t*>(staging.map), static_cast<const std::uint8_t*>(staging.map) + total);
+    dev.destroy(staging);
+    return out;
 }
 
 VkImageCreateInfo image_info_from(const json::Value& j) {
@@ -1900,6 +1938,9 @@ struct Options {
     fs::path ls;   // a tessellated draw's vertex stage
     fs::path hs;   // a tessellated draw's control stage
     fs::path native;  // gcnlift --native's folder: a game-hull draw's three stages on stage I/O
+    fs::path cs;      // a dispatch capture's variant compute module
+    fs::path cs_base;     // a dispatch capture's module for A and B in place of the captured one
+    fs::path cs_buffers;  // gcnlift --lean's lean-buffers.json: the variant binds these storage buffers
     fs::path ls_set4;  // gcnlift --ls's ls-set4.json: the --ls variant binds its constant buffers in set 4
     bool live = true;
     bool validate = false;
@@ -1910,7 +1951,9 @@ struct Options {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
-                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N]\n");
+                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--cs FILE.spv] [--cs-base FILE.spv] [--cs-buffers FILE.json] [--library] "
+                         "[--specialize] [--no-live] [--validate] "
+                         "[--bench N]\n");
     std::exit(2);
 }
 
@@ -1926,6 +1969,9 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--atol") o.tol.atol = std::strtod(value().c_str(), nullptr);
         else if (a == "--rtol") o.tol.rtol = std::strtod(value().c_str(), nullptr);
         else if (a == "--ps") o.ps = value();
+        else if (a == "--cs") o.cs = value();
+        else if (a == "--cs-base") o.cs_base = value();
+        else if (a == "--cs-buffers") o.cs_buffers = value();
         else if (a == "--vs" || a == "--ds") o.vs = value();
         else if (a == "--ls") o.ls = value();
         else if (a == "--native") o.native = value();
@@ -1959,6 +2005,21 @@ public:
         std::uint64_t reordered = 0;  // written ranges equal only as record multisets
     };
 
+    // A storage image the dispatch writes: reset to its captured contents
+    // before each run and read back after it, the run's output with the pages.
+    struct Storage {
+        std::string id;
+        Image img;
+        VkImageAspectFlags aspect = 0;
+        std::vector<Subresource> subs;
+        std::string before, after;  // blob names
+    };
+    // One run's output: the guest pages and each storage image's contents.
+    struct Output {
+        std::vector<std::uint8_t> pages;
+        std::vector<std::vector<std::uint8_t>> images;
+    };
+
     DispatchReplayer(const Capture& cap, Device& dev) : cap_(cap), dev_(dev) {
         const json::Value& d = json::member(cap_.m, "dispatch");
         const auto& g = json::arr(d, "groups");
@@ -1979,10 +2040,14 @@ public:
         build_pipeline();
     }
     ~DispatchReplayer() {
+        if (variant_pipeline_) vkDestroyPipeline(dev_.device, variant_pipeline_, nullptr);
+        if (variant_module_) vkDestroyShaderModule(dev_.device, variant_module_, nullptr);
+        dev_.destroy(variant_params_);
         if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
         if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
         for (auto& [id, v] : views_) vkDestroyImageView(dev_.device, v, nullptr);
         for (auto& [id, img] : images_) dev_.destroy(img);
+        for (Storage& st : storage_) dev_.destroy(st.img);
         if (pool_) vkDestroyDescriptorPool(dev_.device, pool_, nullptr);
         if (layout_) vkDestroyPipelineLayout(dev_.device, layout_, nullptr);
         if (set_layout_) vkDestroyDescriptorSetLayout(dev_.device, set_layout_, nullptr);
@@ -1994,10 +2059,127 @@ public:
         for (auto& [i, t] : l2_) dev_.destroy(t);
     }
 
-    // The guest pages after one run from the captured inputs.
-    std::vector<std::uint8_t> run(bool sentinel) {
+    // --cs-base: A's (and B's, the sentinel run's) module in place of the captured one.
+    void base(const std::vector<std::uint32_t>& words) {
+        if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
+        if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
+        pipeline_ = VK_NULL_HANDLE;
+        module_ = VK_NULL_HANDLE;
+        make_pipeline(words, module_, pipeline_, "base");
+    }
+
+    // --cs-buffers: the variant's storage buffers, bound as the renderer's
+    // resolve_stage_buffers binds a lean dispatch's (gpu.cpp
+    // resolve_dispatch_buffers): the V# (or pointer) from its path over the
+    // captured user data and pages; a null one to the sink page; the range
+    // the shader may read - max_dw dwords, a V# read by index its records
+    // (count x stride, the stride in cb_stride), one read at a run-time
+    // offset its range (in cb_stride) - over the captured pages, which must
+    // hold it whole and in order; the bias of the base inside the device's
+    // offset alignment in cb_bias_dw. Empty, or why a binding cannot be made
+    // (the renderer would run the walking pipeline then).
+    std::string variant_buffers(const json::Value& lean) {
+        gcn::StageParams sp = params_host_;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(dev_.phys, &props);
+        const VkDeviceSize align = std::max<VkDeviceSize>(4, props.limits.minStorageBufferOffsetAlignment);
+        struct Bound {
+            std::uint32_t binding;
+            VkDescriptorBufferInfo info;
+        };
+        std::vector<Bound> bound;
+        const auto& list = json::arr(lean, "buffers");
+        if (list.size() > 16) return "more than 16 buffers";
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const json::Value& b = list[i];
+            const bool pointer = json::flag(b, "pointer"), indexed = json::flag(b, "indexed"), ranged = json::flag(b, "ranged");
+            const std::string what = "buffer " + std::to_string(i) + " (" + json::str(json::member(b, "path"), "text") + ")";
+            std::uint32_t words[4] = {};
+            if (!resolve(json::member(b, "path"), pointer ? 2 : indexed || ranged ? 4 : 2, words)) return what + ": not in the captured user data or pages";
+            VkDeviceSize bytes = static_cast<VkDeviceSize>(json::u32(b, "max_dw")) * 4;
+            if (indexed) {
+                const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
+                const json::Value* by = b.find("bytes");
+                const bool byte_table = by && by->type == json::Value::Type::Bool && by->boolean;  // BufferBinding::bytes
+                if (!stride || (stride % 4 && !byte_table)) return what + ": a stride the binding cannot index";
+                bytes = std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
+                sp.cb_stride[i] = stride;
+                sp.cb_w3[i] = words[3];
+            }
+            if (ranged) {
+                const std::uint64_t range_dw = gcn::vsharp_range_dwords(words[1], words[2]);
+                bytes = std::max<VkDeviceSize>(bytes, range_dw * 4);
+                sp.cb_stride[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(range_dw, 0xffffffffu));
+            }
+            bytes = std::max<VkDeviceSize>(bytes, 4);
+            const std::uint64_t hi = pointer ? words[1] : (words[1] & 0xff);
+            const std::uint64_t va = static_cast<std::uint64_t>(words[0]) | (hi << 32);
+            VkDescriptorBufferInfo info{};
+            if (!va) {
+                if (bytes > kPage) return what + ": a null V# longer than the sink page";
+                info = {sink_.buffer, 0, bytes};
+                sp.cb_bias_dw[i] = 0;
+            } else {
+                if (va & 3) return what + ": a base not on a dword";
+                const std::uint64_t first = va & ~(kPage - 1), last = (va + bytes - 1) & ~(kPage - 1);
+                const auto it = std::lower_bound(page_vas_.begin(), page_vas_.end(), first);
+                if (it == page_vas_.end() || *it != first) return what + ": the capture lacks its first page";
+                const std::size_t idx = static_cast<std::size_t>(it - page_vas_.begin());
+                std::size_t k = 0;
+                for (std::uint64_t pg = first; pg <= last; pg += kPage, ++k) {
+                    if (idx + k >= page_vas_.size() || page_vas_[idx + k] != pg) return what + ": the capture lacks a page it covers";
+                }
+                const VkDeviceSize off = static_cast<VkDeviceSize>(idx) * kPage + (va - first);
+                const VkDeviceSize start = off & ~(align - 1);
+                info = {pages_.buffer, start, off - start + bytes};
+                sp.cb_bias_dw[i] = static_cast<std::uint32_t>((off - start) / 4);
+            }
+            sp.cb_valid |= 1u << i;
+            bound.push_back({json::u32(b, "binding"), info});
+        }
+        variant_params_ = dev_.buffer((sizeof(gcn::StageParams) + 255) & ~std::size_t{255}, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        std::memcpy(variant_params_.map, &sp, sizeof(sp));
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = pool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &set_layout_;
+        check(vkAllocateDescriptorSets(dev_.device, &dai, &variant_set_), "vkAllocateDescriptorSets (variant)");
+        write_set(variant_set_, variant_params_);
+        std::vector<VkWriteDescriptorSet> writes;
+        for (const Bound& x : bound) {
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = variant_set_;
+            w.dstBinding = x.binding;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &x.info;
+            writes.push_back(w);
+        }
+        if (!writes.empty()) vkUpdateDescriptorSets(dev_.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        variant_bound_ = bound.size();
+        return {};
+    }
+    std::size_t variant_bound() const { return variant_bound_; }
+
+    // A second pipeline from another compute module (--cs), on the same layout.
+    void variant(const std::vector<std::uint32_t>& words) {
+        VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mci.codeSize = words.size() * 4;
+        mci.pCode = words.data();
+        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &variant_module_), "vkCreateShaderModule (variant)");
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.layout = layout_;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = variant_module_;
+        ci.stage.pName = "main";
+        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &variant_pipeline_), "vkCreateComputePipelines (variant)");
+    }
+    // The guest pages and storage images after one run from the captured inputs.
+    Output run(bool sentinel, bool with_variant = false) {
         const auto& start = before();
         if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
+        for (Storage& st : storage_) upload(dev_, st.img, st.aspect, cap_.blob(st.before), st.subs, VK_IMAGE_LAYOUT_GENERAL);
         auto* sink = static_cast<std::uint32_t*>(sink_.map);
         for (std::uint64_t k = 0; k < kPage / 4; ++k) sink[k] = sentinel ? sentinel_word(k) : 0u;
         dev_.submit([&](VkCommandBuffer cmd) {
@@ -2005,18 +2187,67 @@ public:
             mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
+                                    nullptr);
             vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
         });
         const auto* p = static_cast<const std::uint8_t*>(pages_.map);
-        return std::vector<std::uint8_t>(p, p + page_vas_.size() * kPage);
+        Output out;
+        out.pages.assign(p, p + page_vas_.size() * kPage);
+        for (Storage& st : storage_) out.images.push_back(download(dev_, st.img, st.aspect, st.subs));
+        return out;
     }
 
-    const std::vector<std::uint8_t>& live() const { return cap_.blob(json::str(json::member(cap_.m, "memory"), "after")); }
+    // --bench: the dispatch from the captured inputs, `repeat` times in one
+    // submission (each repeat from the pages as the last left them: the
+    // counters and append buffers keep moving, as a run of frames would),
+    // with GPU timestamps around the dispatches only; milliseconds a dispatch.
+    double time_dispatches(bool with_variant, std::uint32_t repeat) {
+        if (!dev_.timestamp_period_ns) fail("timing needs timestamp queries, which this queue lacks");
+        const auto& start = before();
+        if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
+        for (Storage& st : storage_) upload(dev_, st.img, st.aspect, cap_.blob(st.before), st.subs, VK_IMAGE_LAYOUT_GENERAL);
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = 2;
+        VkQueryPool qpool = VK_NULL_HANDLE;
+        check(vkCreateQueryPool(dev_.device, &qci, nullptr, &qpool), "vkCreateQueryPool");
+        dev_.submit([&](VkCommandBuffer cmd) {
+            vkCmdResetQueryPool(cmd, qpool, 0, 2);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
+                                    nullptr);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+            for (std::uint32_t k = 0; k < repeat; ++k) {
+                vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            }
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
+        });
+        std::uint64_t ts[2] = {};
+        check(vkGetQueryPoolResults(dev_.device, qpool, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+              "vkGetQueryPoolResults");
+        vkDestroyQueryPool(dev_.device, qpool, nullptr);
+        return ts[1] > ts[0] ? static_cast<double>(ts[1] - ts[0]) * dev_.timestamp_period_ns / 1e6 / repeat : 0.0;
+    }
+
+    Output live() const {
+        Output out;
+        out.pages = cap_.blob(json::str(json::member(cap_.m, "memory"), "after"));
+        for (const Storage& st : storage_) out.images.push_back(cap_.blob(st.after));
+        return out;
+    }
+    std::size_t storage_images() const { return storage_.size(); }
     const std::vector<std::uint8_t>& before() const { return cap_.blob(json::str(json::member(cap_.m, "memory"), "blob")); }
 
     // `bytes` of guest memory at `va` out of a pages image; false where a page was not captured.
@@ -2040,6 +2271,21 @@ public:
         return w;
     }
 
+    // x against y: storage images exactly, then the pages.
+    Difference compare(const Output& x, const Output& y) const {
+        Difference d = compare(x.pages, y.pages);
+        for (std::size_t k = 0; k < storage_.size(); ++k) {
+            if (k >= x.images.size() || k >= y.images.size() || x.images[k] != y.images[k]) {
+                std::size_t diff = 0;
+                if (k < x.images.size() && k < y.images.size() && x.images[k].size() == y.images[k].size()) {
+                    for (std::size_t i = 0; i < x.images[k].size(); ++i) diff += x.images[k][i] != y.images[k][i];
+                }
+                d.same = false;
+                d.what += "storage image " + storage_[k].id + ": " + std::to_string(diff) + " bytes differ; ";
+            }
+        }
+        return d;
+    }
     // x against y: counters exactly, written ranges as record multisets (a
     // counter word inside one compared on its own), every other byte exactly.
     Difference compare(const std::vector<std::uint8_t>& x, const std::vector<std::uint8_t>& y) const {
@@ -2133,7 +2379,9 @@ private:
             page_vas_.push_back(va);
         }
         if (!std::is_sorted(page_vas_.begin(), page_vas_.end())) fail("the capture's pages are not in order");
-        if (blob.size() != page_vas_.size() * kPage || live().size() != blob.size()) fail("memory blobs do not hold one 64 KiB block per page");
+        if (blob.size() != page_vas_.size() * kPage || cap_.blob(json::str(json::member(cap_.m, "memory"), "after")).size() != blob.size()) {
+            fail("memory blobs do not hold one 64 KiB block per page");
+        }
         pages_ = dev_.buffer(std::max<std::uint64_t>(blob.size(), kPage), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         sink_ = dev_.buffer(kPage, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         sink_l2_ = dev_.buffer(gcn::kL2Entries * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -2177,10 +2425,14 @@ private:
         plci.setLayoutCount = 1;
         plci.pSetLayouts = &set_layout_;
         check(vkCreatePipelineLayout(dev_.device, &plci, nullptr, &layout_), "vkCreatePipelineLayout");
-        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32}};
+        // Two sets: A's, and the variant's when it binds storage buffers (--cs-buffers).
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+                                              {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gcn::kMaxBuffers}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1;
-        dpci.poolSizeCount = 2;
+        dpci.maxSets = 2;
+        dpci.poolSizeCount = 4;
         dpci.pPoolSizes = sizes;
         check(vkCreateDescriptorPool(dev_.device, &dpci, nullptr, &pool_), "vkCreateDescriptorPool");
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -2192,12 +2444,32 @@ private:
 
     void build_images() {
         for (const auto& [id, res] : json::member(cap_.m, "images").object) {
-            const VkImageCreateInfo ici = image_info_from(json::member(res, "image"));
+            VkImageCreateInfo ici = image_info_from(json::member(res, "image"));
+            const json::Value* st = res.find("storage");
+            const bool storage = st && st->type == json::Value::Type::Bool && st->boolean;
+            if (storage) {
+                // The game's storage view may name another format of the
+                // image (an sRGB texture written as UNORM): extended usage.
+                ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+                if (ici.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ici.flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            }
             Image img = dev_.image(ici);
-            images_[id] = img;
             const json::Value& view = json::member(res, "view");
             upload(dev_, img, json::u32(view, "aspect"), cap_.blob(json::str(res, "blob")), subresources_from(json::member(res, "subresources")),
                    VK_IMAGE_LAYOUT_UNDEFINED);
+            if (storage) {
+                Storage s;
+                s.id = id;
+                s.img = img;
+                s.aspect = json::u32(view, "aspect");
+                s.subs = subresources_from(json::member(res, "subresources"));
+                s.before = json::str(res, "blob");
+                s.after = json::str(res, "after");
+                storage_.push_back(s);
+                storage_ids_.insert(id);
+            } else {
+                images_[id] = img;
+            }
             VkImageViewCreateInfo vci = view_info_from(view, img.image);
             VkImageView v = VK_NULL_HANDLE;
             check(vkCreateImageView(dev_.device, &vci, nullptr, &v), ("vkCreateImageView " + id).c_str());
@@ -2212,12 +2484,20 @@ private:
         gcn::StageParams sp{};
         std::memcpy(&sp, params.data(), params.size());
         sp.l1_table = l1_.address;
+        params_host_ = sp;
         params_ = dev_.buffer((sizeof(gcn::StageParams) + 255) & ~std::size_t{255}, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         std::memcpy(params_.map, &sp, sizeof(sp));
+        write_set(set_, params_);
+        make_pipeline(words_of(cap_.blob(json::str(stage, "spirv")), "the compute module"), module_, pipeline_, "");
+    }
+
+    // A set's params block and the captured images, as A's set has them.
+    void write_set(VkDescriptorSet set, const Buffer& params) {
+        const json::Value& stage = json::member(cap_.m, "stage");
         std::vector<VkWriteDescriptorSet> writes;
-        VkDescriptorBufferInfo ubi{params_.buffer, 0, sizeof(gcn::StageParams)};
+        VkDescriptorBufferInfo ubi{params.buffer, 0, sizeof(gcn::StageParams)};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = set_;
+        w.dstSet = set;
         w.dstBinding = gcn::kBindingParams;
         w.descriptorCount = 1;
         w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -2231,26 +2511,64 @@ private:
             if (it == views_.end()) fail("an image binding names an image the capture lacks");
             infos.push_back({VK_NULL_HANDLE, it->second, VK_IMAGE_LAYOUT_GENERAL});
             VkWriteDescriptorSet iw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            iw.dstSet = set_;
+            iw.dstSet = set;
             iw.dstBinding = json::u32(b, "binding");
             iw.descriptorCount = 1;
-            iw.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            iw.descriptorType = storage_ids_.count(json::str(b, "image")) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             iw.pImageInfo = &infos.back();
             writes.push_back(iw);
         }
         vkUpdateDescriptorSets(dev_.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        const std::vector<std::uint32_t> words = words_of(cap_.blob(json::str(stage, "spirv")), "the compute module");
+    }
+    void make_pipeline(const std::vector<std::uint32_t>& words, VkShaderModule& module, VkPipeline& pipeline, const std::string& what) {
         VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mci.codeSize = words.size() * 4;
         mci.pCode = words.data();
-        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &module_), "vkCreateShaderModule");
+        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &module), ("vkCreateShaderModule" + (what.empty() ? "" : " (" + what + ")")).c_str());
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.layout = layout_;
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = module_;
+        ci.stage.module = module;
         ci.stage.pName = "main";
-        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline_), "vkCreateComputePipelines");
+        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline),
+              ("vkCreateComputePipelines" + (what.empty() ? "" : " (" + what + ")")).c_str());
+    }
+
+    // `ndw` dwords at a guest address from the captured pages (before the dispatch).
+    bool read_guest(std::uint64_t va, int ndw, std::uint32_t* out) const {
+        const auto& blob = before();
+        for (int k = 0; k < ndw; ++k) {
+            const std::uint64_t a = va + static_cast<std::uint64_t>(k) * 4;
+            const auto it = std::lower_bound(page_vas_.begin(), page_vas_.end(), a & ~(kPage - 1));
+            if (it == page_vas_.end() || *it != (a & ~(kPage - 1))) return false;
+            std::memcpy(&out[k], blob.data() + static_cast<std::size_t>(it - page_vas_.begin()) * kPage + (a & (kPage - 1)), 4);
+        }
+        return true;
+    }
+    // A resource path (gcnlift --lean's lean-buffers.json) over the captured
+    // user data and pages, as the renderer's resolve_resource_impl walks it.
+    bool resolve(const json::Value& path, int ndw, std::uint32_t* out) const {
+        const int us = static_cast<int>(json::num(path, "user_sgpr"));
+        if (us < 0 || us + 1 >= 16) return false;
+        const std::uint32_t* user = params_host_.user_sgpr;
+        if (json::flag(path, "immediate")) {
+            if (us + ndw > 16) return false;
+            std::memcpy(out, user + us, static_cast<std::size_t>(ndw) * 4);
+            return true;
+        }
+        const auto base_of = [](const std::uint32_t* w, bool vsharp) {
+            return vsharp ? (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32))
+                          : (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1]) << 32));
+        };
+        std::uint32_t cur[4] = {user[us], user[us + 1], us + 2 < 16 ? user[us + 2] : 0u, us + 3 < 16 ? user[us + 3] : 0u};
+        for (const json::Value& st : json::arr(path, "loads")) {
+            const std::uint64_t addr = base_of(cur, json::flag(st, "vsharp")) + static_cast<std::uint64_t>(json::u32(st, "offset_dw")) * 4;
+            if (!read_guest(addr, 4, cur)) return false;
+        }
+        const std::uint64_t addr = base_of(cur, json::flag(path, "final_vsharp")) +
+                                   static_cast<std::uint64_t>(static_cast<std::int64_t>(json::num(path, "final_offset_dw"))) * 4;
+        return read_guest(addr, ndw, out);
     }
 
     const Capture& cap_;
@@ -2260,12 +2578,18 @@ private:
     std::map<std::uint32_t, Buffer> l2_;
     std::map<std::string, Image> images_;
     std::map<std::string, VkImageView> views_;
+    std::set<std::string> storage_ids_;
+    std::vector<Storage> storage_;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
-    VkShaderModule module_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkShaderModule module_ = VK_NULL_HANDLE, variant_module_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE, variant_pipeline_ = VK_NULL_HANDLE;
+    gcn::StageParams params_host_{};                // A's params block as the replay gives it
+    VkDescriptorSet variant_set_ = VK_NULL_HANDLE;  // --cs-buffers: the variant's set
+    Buffer variant_params_;
+    std::size_t variant_bound_ = 0;
     std::uint32_t groups_[3] = {1, 1, 1};
     std::vector<std::uint64_t> counters_;
     std::vector<Written> written_;
@@ -2278,12 +2602,32 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     std::printf("drawreplay: dispatch %s (%s, flip %llu) on %s\n", o.capture.string().c_str(), json::str(identity, "pipeline").c_str(),
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
     DispatchReplayer r(cap, dev);
+    if (!o.cs_base.empty()) r.base(words_of(read_file(o.cs_base), "the base compute module"));
+    if (!o.cs.empty()) r.variant(words_of(read_file(o.cs), "the variant compute module"));
+    if (!o.cs_buffers.empty()) {
+        const std::vector<std::uint8_t> text = read_file(o.cs_buffers);
+        json::Value lean;
+        std::string error;
+        if (!json::parse(std::string(text.begin(), text.end()), lean, error)) fail(o.cs_buffers.string() + ": " + error);
+        const std::string why = r.variant_buffers(lean);
+        if (!why.empty()) {
+            std::printf("  the variant's buffers cannot be bound: %s\n", why.c_str());
+            return 3;
+        }
+        std::printf("  the variant binds %zu storage buffers\n", r.variant_bound());
+    }
     const auto a = r.run(false);
     const auto b = r.run(false);
     const auto sentinel = r.run(true);
     const auto ab = r.compare(a, b);
     const auto live = r.compare(a, r.live());
     const auto sv = r.compare(a, sentinel);
+    DispatchReplayer::Difference av;
+    DispatchReplayer::Output v;
+    if (!o.cs.empty()) {
+        v = r.run(false, true);
+        av = r.compare(a, v);
+    }
     json::Value report = json::Value::make_object();
     report.set("schema", "bbhost-dispatch-replay");
     report.set("version", 1);
@@ -2301,11 +2645,11 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
         json::Value cj = json::Value::make_object();
         cj.set("word", va);
         cj.set("before", r.word(r.before(), c));
-        cj.set("replay", r.word(a, c));
-        cj.set("live", r.word(r.live(), c));
+        cj.set("replay", r.word(a.pages, c));
+        cj.set("live", r.word(r.live().pages, c));
         counters.push(cj);
-        std::printf("  counter %s: %u before, %u after the replay, %u after the game's dispatch\n", va, r.word(r.before(), c), r.word(a, c),
-                    r.word(r.live(), c));
+        std::printf("  counter %s: %u before, %u after the replay, %u after the game's dispatch\n", va, r.word(r.before(), c), r.word(a.pages, c),
+                    r.word(r.live().pages, c));
     }
     report.set("counters", counters);
     const auto verdict = [](const DispatchReplayer::Difference& d, const char* rule) {
@@ -2321,7 +2665,46 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     comparisons.set("A_vs_live", verdict(live, "the replay against the pages the game's own dispatch left"));
     comparisons.set("A_vs_sentinel",
                     verdict(sv, "the sink page full of sentinel words must change nothing: the program reads no page the capture lacks"));
+    if (!o.cs.empty()) {
+        json::Value vj = verdict(av, "the variant module from the captured inputs against A: counters exactly, written ranges as record multisets, "
+                                     "every other byte exactly");
+        vj.set("bytes_identical", a.pages == v.pages && a.images == v.images);
+        vj.set("module", o.cs.string());
+        comparisons.set("A_vs_variant", vj);
+    }
     report.set("comparisons", comparisons);
+    if (o.bench) {
+        // The captured module and the variant in alternating batches of
+        // o.bench dispatches; warm-up batches discarded; medians.
+        constexpr int kWarmup = 3, kBatches = 16;
+        std::vector<double> captured_ms, variant_ms;
+        for (int k = 0; k < kWarmup + kBatches; ++k) {
+            double tc = 0.0, tv = 0.0;
+            if (!o.cs.empty() && k % 2) {
+                tv = r.time_dispatches(true, o.bench);
+                tc = r.time_dispatches(false, o.bench);
+            } else {
+                tc = r.time_dispatches(false, o.bench);
+                if (!o.cs.empty()) tv = r.time_dispatches(true, o.bench);
+            }
+            if (k < kWarmup) continue;
+            captured_ms.push_back(tc);
+            if (!o.cs.empty()) variant_ms.push_back(tv);
+        }
+        const auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : v[v.size() / 2];
+        };
+        json::Value bench = json::Value::make_object();
+        bench.set("dispatches_per_batch", o.bench);
+        bench.set("captured_median_ms", median(captured_ms));
+        std::printf("  bench: captured module %.4f ms a dispatch (median of %zu batches of %u)\n", median(captured_ms), captured_ms.size(), o.bench);
+        if (!variant_ms.empty()) {
+            bench.set("variant_median_ms", median(variant_ms));
+            std::printf("  bench: variant %.4f ms a dispatch\n", median(variant_ms));
+        }
+        report.set("bench", bench);
+    }
     const auto say = [](const char* what, const DispatchReplayer::Difference& d) {
         std::printf("  %s: %s%s%s\n", what, d.same ? "same" : "DIFFERENT", d.what.empty() ? "" : " - ", d.what.c_str());
     };
@@ -2329,10 +2712,38 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     say("A vs B", ab);
     say("A vs live", live);
     say("A vs sentinel sink", sv);
-    const bool pass = ab.same && live.same && sv.same;
+    if (!o.cs.empty()) {
+        say("A vs variant", av);
+        if (av.same) {
+            std::printf("  A vs variant: %s\n", a.pages == v.pages && a.images == v.images ? "byte-identical" : "the same records, some in another order");
+        }
+        for (std::uint64_t c : r.counters()) std::printf("  counter 0x%llx: %u in the variant\n", static_cast<unsigned long long>(c), r.word(v.pages, c));
+    }
+    // --no-live (tools/lift_verify.py): the game's own output is reported but
+    // not required - another device rounds its floating point its own way,
+    // and an append buffer's records follow the order its counter steps
+    // landed on the GPU, which a records-as-multiset compare cannot undo when
+    // a record depends on its slot.
+    const bool pass = ab.same && (live.same || !o.live) && sv.same;
+    json::Value overall = json::Value::make_object();
+    overall.set("replay_deterministic", ab.same);
+    overall.set("matches_live", o.live ? json::Value(live.same) : json::Value("not checked"));
+    overall.set("sentinel_sink_left_output_unchanged", sv.same);
+    overall.set("pass", pass);
+    report.set("verdict", overall);
     report.set("pass", pass);
     const std::string text = json::dump(report);
     write_file(out / "report.json", reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    // The runs' outputs, for a closer look at a difference: the guest pages in
+    // the capture's page order (as its memory-after blob) and each storage image.
+    const auto dump = [&](const char* run, const DispatchReplayer::Output& x) {
+        write_file(out / (std::string(run) + "-memory.bin"), x.pages.data(), x.pages.size());
+        for (std::size_t k = 0; k < x.images.size(); ++k) {
+            write_file(out / (std::string(run) + "-image" + std::to_string(k) + ".bin"), x.images[k].data(), x.images[k].size());
+        }
+    };
+    dump("A", a);
+    if (!o.cs.empty()) dump("variant", v);
     std::printf("%s: %s\n", (out / "report.json").string().c_str(), pass ? "pass" : "FAIL");
     return pass ? 0 : 1;
 }

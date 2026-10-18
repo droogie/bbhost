@@ -25,15 +25,27 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/hlsl.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
 target_link_libraries(gcndis PRIVATE gcn)
 find_library(SPIRV_TOOLS_LIB SPIRV-Tools)
+# The headers: the system's on Linux, the dependency prefix's in the Windows
+# cross build (tools/win_deps.sh), where the toolchain searches only the
+# sysroot and the prefix.
+find_path(SPIRV_TOOLS_INCLUDE_DIR spirv-tools/libspirv.hpp)
+if(SPIRV_TOOLS_LIB AND NOT SPIRV_TOOLS_INCLUDE_DIR)
+  set(SPIRV_TOOLS_LIB "")
+endif()
 if(SPIRV_TOOLS_LIB)
+  include_directories(SYSTEM ${SPIRV_TOOLS_INCLUDE_DIR})
   add_executable(gcn2spv tools/gcn2spv.cpp)
   target_link_libraries(gcn2spv PRIVATE gcn ${SPIRV_TOOLS_LIB})
+  # The lifted shaders as HLSL, compiled with DXC (loaded at run time) and checked.
+  find_package(Threads REQUIRED)
+  add_executable(gcn2hlsl tools/gcn2hlsl.cpp src/host/dxc.cpp)
+  target_link_libraries(gcn2hlsl PRIVATE gcn ${SPIRV_TOOLS_LIB} ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
 
@@ -265,16 +277,35 @@ if(Vulkan_FOUND)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
-                                src/host/shader_patch.cpp src/host/translation_cache.cpp)
+                                src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  # The SPIR-V validator: the HLSL path validates the modules DXC compiled
+  # without its own validator (a sample's run-time offset; host/translation_cache.cpp).
+  # Without it those keep the lift.
+  if(SPIRV_TOOLS_LIB)
+    target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_LIB})
+  endif()
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
-  # optimizer; without it every table is built.
+  # optimizer; without it every table is built. Not in the Windows build yet,
+  # though its prefix has the optimizer: it has not been run there.
   target_sources(bbhost PRIVATE src/host/shader_liveness.cpp)
   find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt)
-  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB)
+  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB AND NOT WIN32)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()
+  # gcn2hlsl --sweep: each module built into the renderer's pipelines on a
+  # device, for the driver's verdict (tools/pipeline_probe.h).
+  if(TARGET gcn2hlsl)
+    target_sources(gcn2hlsl PRIVATE tools/pipeline_probe.cpp)
+    target_compile_definitions(gcn2hlsl PRIVATE GCN2HLSL_HAVE_VULKAN=1)
+    target_link_libraries(gcn2hlsl PRIVATE Vulkan::Vulkan)
+  endif()
+  # The HLSL path against the lift on random inputs (run it on lavapipe).
+  add_executable(hlsl_equiv tools/hlsl_equiv.cpp src/host/dxc.cpp)
+  target_include_directories(hlsl_equiv PRIVATE src)
+  target_link_libraries(hlsl_equiv PRIVATE gcn Vulkan::Vulkan ${CMAKE_DL_LIBS})
   # Offline replay of BBHOST_CAPTURE_DRAW captures.
   add_executable(drawreplay tools/drawreplay.cpp src/core/sha256.cpp)
   target_include_directories(drawreplay PRIVATE src)
@@ -302,7 +333,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_include_directories(imgui PUBLIC third_party/imgui)
   target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
   target_compile_options(imgui PRIVATE -w)
-  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/plugin_ui.cpp)
+  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/plugin_ui.cpp src/host/shader_compile.cpp)
   target_link_libraries(bbhost PRIVATE imgui)
   set_source_files_properties(src/host/window.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
@@ -331,6 +362,9 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/camera/follow_camera.cpp
   src/decomp/gx/flush_wait.cpp
   src/decomp/gx/block_reclaim.cpp
+  src/decomp/gx/drain_token.cpp
+  src/decomp/gx/query_token.cpp
+  src/decomp/gx/dead_packets.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -385,6 +419,8 @@ if(UNIX)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
     add_test(NAME area_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/area_check_test.py)
     add_test(NAME lift_verify_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lift_verify_test.py)
+    add_test(NAME pipeline_list_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pipeline_list_test.py)
+    add_test(NAME full_tour_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/full_tour_test.py)
     # The Debug Menu plugin's English against the 1.09 eboot: skipped without
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
@@ -461,6 +497,10 @@ if(UNIX)
   add_executable(ring_budget_test tests/ring_budget_test.cpp)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
+  # The buffer shadow's page copies grow a run only where both ends meet.
+  add_executable(copy_runs_test tests/copy_runs_test.cpp)
+  target_include_directories(copy_runs_test PRIVATE src)
+  add_test(NAME copy_runs_test COMMAND copy_runs_test)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
@@ -513,6 +553,8 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(adaptive_mutex)
+  bbhost_decomp_test(gx_drain_token)
+  bbhost_decomp_test(gx_dead_packets SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
@@ -575,12 +617,32 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
-  target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
+  target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
   add_test(NAME translation_cache_test COMMAND translation_cache_test)
   set_tests_properties(translation_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # The HLSL default (translation_cache.cpp, which it includes): compiles
+  # behind the game, their lanes, the dump and edited HLSL; synthetic shaders,
+  # skipped without DXC.
+  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  target_include_directories(hlsl_default_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(hlsl_default_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
+  add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
+  add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
+  set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # The PC options' generated menu assets (engine/menu_assets.cpp, which it
+  # includes) against the game's option movie and message bundles.
+  add_executable(menu_assets_test tests/menu_assets_test.cpp)
+  target_include_directories(menu_assets_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(menu_assets_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME menu_assets_test COMMAND menu_assets_test)
+  set_tests_properties(menu_assets_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # The setup window's "Compile shaders now" recommendation (host/shader_compile.h).
+  add_executable(shader_compile_advice_test tests/shader_compile_advice_test.cpp)
+  target_include_directories(shader_compile_advice_test PRIVATE src)
+  add_test(NAME shader_compile_advice_test COMMAND shader_compile_advice_test)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
@@ -608,6 +670,10 @@ if(UNIX)
     target_link_libraries(gcn_names_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_names_test COMMAND gcn_names_test)
     set_tests_properties(gcn_names_test PROPERTIES SKIP_RETURN_CODE 77)
+    # The HLSL printer on synthetic lifts; compiled by DXC where it is installed.
+    add_executable(gcn_hlsl_test tests/gcn_hlsl_test.cpp src/host/dxc.cpp)
+    target_link_libraries(gcn_hlsl_test PRIVATE gcn ${SPIRV_TOOLS_LIB} ${CMAKE_DL_LIBS})
+    add_test(NAME gcn_hlsl_test COMMAND gcn_hlsl_test)
     if(Vulkan_FOUND)
       add_executable(gcn_sampling_test tests/gcn_sampling_test.cpp)
       target_link_libraries(gcn_sampling_test PRIVATE gcn ${SPIRV_TOOLS_LIB} Vulkan::Vulkan)

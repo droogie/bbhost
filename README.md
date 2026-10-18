@@ -92,8 +92,10 @@ Known issues:
 - A new GPU particle system's counter can start uninitialized; bbhost clamps
   such a dispatch to nothing rather than hang.
 - Slow poison runs twice as fast at 60 fps.
-- A new area compiles its pipelines on first sight, which can cause short
-  hitches the first time it is visited.
+- The first time bbhost ever draws an area, some of its pipelines compile
+  when they first come into view, which can cause short hitches. Every
+  pipeline drawn is remembered, and later starts build them all again while
+  the title is up, so what has been seen before does not compile again.
 - About one in four first summons fail and have to be repeated.
 - The cause of a GPU hang reported on an AMD RX 580 (Polaris) under Windows is
   not yet known.

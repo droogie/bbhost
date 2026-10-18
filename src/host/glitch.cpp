@@ -905,6 +905,7 @@ void record_locked(std::uint64_t display_va, std::uint64_t flip, std::uint64_t m
     begin_recording_locked();
     transfer_flush_locked();
     render_end_pass_locked();
+    view_clears_flush_locked(kVcwDump);  // the display it reads holds every clear made so far
     run_chain_locked(g_cmd(), image, w, h, f.thumb, &f.full);
     f.flip = flip;
     f.serial = g.flushes;

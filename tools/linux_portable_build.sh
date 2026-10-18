@@ -20,6 +20,11 @@
 #   tools/linux_portable_build.sh            -> build-linux-portable/build/bbhost
 #                                               (and plugins/, the official ones
 #                                               tools/package_linux.sh packs)
+#   PORTABLE_TARGETS="gcn2hlsl" tools/linux_portable_build.sh
+#                                            more targets built the same way:
+#                                            gcn2hlsl, the HLSL sweep a Steam
+#                                            Deck or another machine runs
+#                                            (tools/package_hlsl_sweep.sh)
 #
 # LINUX_ROOTFS is where the Ubuntu tree goes (default
 # build-linux-portable/rootfs). It must be on a local filesystem that keeps
@@ -74,7 +79,7 @@ if [ "${1:-}" != --inside ]; then
         mount --rbind /sys "$R/sys"
         mkdir -p "$R/src" && mount --bind "$SRC" "$R/src"
         exec chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" \
+            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" PORTABLE_TARGETS="${PORTABLE_TARGETS:-}" \
             bash /src/tools/linux_portable_build.sh --inside
     ' sh "$ROOTFS" "$SRC"
 fi
@@ -133,6 +138,6 @@ cmake -S /src -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -fuse-ld=lld" \
     -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -fuse-ld=lld" > "$W/bbhost-configure.log"
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
-cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
+cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
     || { grep -E "error|undefined" "$W/bbhost-build.log" | head -30; exit 1; }
 echo "portable build: $W/build/bbhost"
