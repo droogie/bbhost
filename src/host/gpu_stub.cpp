@@ -37,7 +37,10 @@ bool host_gpu_gds_counters() { return false; }
 bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}
-bool host_gpu_copy_guest(std::uint64_t, std::uint64_t, std::size_t) { return false; }
+void host_gpu_gx_buffer_made(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t, std::uint64_t) {}
+void host_gpu_gx_buffer_mapped_own(std::uint64_t, std::uint64_t, std::uint64_t) {}
+void host_gpu_gx_buffer_gone(std::uint64_t, std::uint64_t) {}
+bool host_gpu_copy_guest(std::uint64_t, std::uint64_t, std::size_t, std::uint64_t, std::uint64_t) { return false; }
 bool host_gpu_copy_back(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 std::size_t host_gpu_copy_backs(const std::uint64_t*, const std::uint64_t*, const std::uint64_t*, std::size_t) { return 0; }
 bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return false; }
@@ -84,6 +87,11 @@ std::string host_gpu_occlusion_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
 void host_gpu_resources_report() {}
 void host_gpu_texture_written(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_handed(std::uint64_t, std::size_t, int) {}
+bool host_gpu_shadow_hands_out() { return false; }
+void host_gpu_shadow_gx_settled(std::uint64_t, std::size_t) {}
 std::string host_gpu_target_copy_report() { return {}; }
 std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }

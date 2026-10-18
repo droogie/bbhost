@@ -4743,9 +4743,10 @@ private:
         }
     }
     // ds_append / ds_consume in GDS (translate.cpp gds_counter, the
-    // reference's TranslateOptions::gds_counters): the counter is the guest
-    // word the dispatch binds for the GDS dword at M0[15:0] + offset
-    // (StageParams::gds_counter, from gds_base); none bound, nothing counts.
+    // reference's TranslateOptions::gds_counters): the counter is the word
+    // the dispatch binds for the GDS dword at M0[15:0] + offset
+    // (StageParams::gds_counter, from gds_base), by its device address, not
+    // walked through the page table; none bound, nothing counts.
     // GCN adds or takes the wave's EXEC lanes in one step and hands every
     // lane the counter from before (its base); the shader adds the lane's
     // rank among EXEC's lanes (v_mbcnt) for its slot - HLSL's
@@ -4784,13 +4785,13 @@ private:
         ++res.wave.gds_steps;
         const std::size_t index = static_cast<std::size_t>(&in - prog.insts.data());
         if (vgpr_unread_after(index, 256 + in.dst)) {
-            where_exec_value(run, [&] { return m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step}); });
+            where_exec_value(run, [&] { return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step}); });
             ++gds_lane_ops;
             note += std::string(" ") + (append ? "+1" : "-1") + " per invocation (value unread)";
             return;
         }
         const Id own = where_exec_value(run, [&] {
-            return m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step});
+            return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step});
         });
         Val b = word(own);
         b.wave_part = append ? 1 : 2;

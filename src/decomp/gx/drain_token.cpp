@@ -30,6 +30,7 @@
 #include "decomp/guest.h"
 
 #include "hle/modules.h"
+#include "host/host_lists.h"
 #include "log.h"
 
 #include <atomic>
@@ -75,6 +76,7 @@ DECOMP_LEAF void gx_drain_token(u64 cb, u32 event, u32 cache) {
     store<u32>(wp, 0xc0001000u);  // NOP, one dword of body
     store<u32>(wp + 4, kGxBarrierMagic);
     store<u64>(cb + 0x10, wp + 8);
+    host_lists::note(cb, wp, 0x10);
     g_tokens.fetch_add(1, std::memory_order_relaxed);
 }
 

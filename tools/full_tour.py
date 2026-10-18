@@ -247,13 +247,32 @@ def do_inventory(args):
 
 # --- stops -----------------------------------------------------------------------
 
-def navmesh_faces(app0, block, tools):
-    """The block's navmesh face centroids in the MSB's frame (the warps' frame),
-    via the worldmap module (its Havok reader and MSB transform)."""
-    import numpy as np
+NAVMESH_NEEDS = ("the worldmap navmesh module: a folder holding a worldmap package with navmesh.py (faces(data): the polygons of a "
+                 "Havok 2014 navmesh packfile) and msb.py (MSB, part_matrix), as tools/mapval_blocks.py takes it (MAPVAL_NAVMESH_TOOLS); "
+                 "give it with --navmesh-tools")
+
+
+def navmesh_module(tools):
+    """(navmesh, MSB, part_matrix) from the worldmap package under tools, or an
+    error naming what is missing. Only `plan` needs it, for the blocks' stops."""
+    if not tools:
+        return None, "plan needs " + NAVMESH_NEEDS
     sys.path.insert(0, str(tools))
-    from worldmap import navmesh  # noqa: E402
-    from worldmap.msb import MSB, part_matrix  # noqa: E402
+    try:
+        import numpy  # noqa: F401
+        from worldmap import navmesh  # noqa: E402
+        from worldmap.msb import MSB, part_matrix  # noqa: E402
+    except ImportError as e:
+        return None, "plan needs %s - %s under %s: %s" % (NAVMESH_NEEDS, "numpy" if "numpy" in str(e) else "worldmap", tools, e)
+    return (navmesh, MSB, part_matrix), None
+
+
+def navmesh_faces(app0, block, nav):
+    """The block's navmesh face centroids in the MSB's frame (the warps' frame),
+    via the worldmap module (its Havok reader and MSB transform): nav is
+    navmesh_module's (navmesh, MSB, part_matrix)."""
+    import numpy as np
+    navmesh, MSB, part_matrix = nav
     root = Path(app0) / "dvdroot_ps4" / "map"
     msb = MSB((root / "mapstudio" / (block + ".msb.dcx")).read_bytes())
     path = root / block / (block + ".nvmhktbnd.dcx")
@@ -324,6 +343,10 @@ def item_estimate(it):
 
 
 def do_plan(args):
+    nav, why = navmesh_module(args.navmesh_tools)
+    if not nav:
+        print("full_tour: " + why, file=sys.stderr)
+        return 2
     import numpy as np
     app0 = args.app0
     rng = random.Random(args.seed)
@@ -344,7 +367,7 @@ def do_plan(args):
     for b in MAIN_BLOCKS:
         if args.blocks and b not in args.blocks.split(","):
             continue
-        pts = navmesh_faces(app0, b, args.navmesh_tools)
+        pts = navmesh_faces(app0, b, nav)
         parts = msb_parts(app0, b)
         pts = anchored(pts, parts, args.anchor)
         picks = spread(pts, args.radius, args.max_stops, rng, min_n=args.min_stops)
@@ -548,9 +571,9 @@ def merge_union(union, manifest):
         origin = origin or o
         run = max(run, r)
         for rc in recipes:
-            have = merged.get(rc.key)
+            have = merged.get((rc.compute, rc.key))
             if have is None or rc.last_run > have.last_run:
-                merged[rc.key] = rc
+                merged[(rc.compute, rc.key)] = rc
     tmp = str(union) + ".new"
     pipeline_list.write_file(tmp, run, origin, list(merged.values()))
     os.replace(tmp, union)
@@ -1362,10 +1385,31 @@ def recipe_ranks(run_dirs):
     return ranks
 
 
+R_CS_HERE = re.compile(r"\] gpu: compute pipelines built at the dispatch instead: .*?;((?: \S+ \([^)]*\);)*)")
+
+
+def built_at_dispatch(run_dirs):
+    """The compute programs the chunks' dispatches had to build themselves
+    (gpu.cpp's exit line, its notes): the ones nothing else precompiles."""
+    names = set()
+    for runs in run_dirs:
+        for log in sorted(Path(runs).glob("c*/run.log")):
+            for m in R_CS_HERE.finditer(log.read_text(errors="replace")):
+                names.update(re.findall(r" (\S+) \(", m.group(1)))
+    return names
+
+
 def do_list(args):
     runs = [Path(r) for r in args.runs]
     union = runs[-1] / "union-manifest.bin"
     run, origin, recipes = pipeline_list.read_file(union)
+    # The compute records the dispatches had to build (a union recorded before
+    # recipe_note_compute kept to those holds the ones GX's creation compiles
+    # too, which only crowd the start).
+    here = built_at_dispatch(runs)
+    computes = [rc for rc in recipes if rc.compute]
+    if here and computes:
+        recipes = [rc for rc in recipes if not rc.compute or rc.name in here]
     progs = pipeline_list.bundle_programs(args.app0)
     if not progs:
         print("full_tour: no shader bundles under %s" % args.app0, file=sys.stderr)
@@ -1390,18 +1434,20 @@ def do_list(args):
     unknown = 0
     if args.order == "story":
         far = (len(STORY) + 1, 0)
-        def where(rc):
-            return ranks.get(rc.key, far)
-        unknown = sum(1 for rc in out if rc.key not in ranks)
+        def where(rc):  # the compute records first: few, and mostly the title's
+            return (-1, rc.order) if rc.compute else ranks.get(rc.key, far)
+        unknown = sum(1 for rc in out if not rc.compute and rc.key not in ranks)
         out.sort(key=where)
         for k, rc in enumerate(out):
             rc.order = k  # bbhost builds a list's records in this order (pipeline_manifest_load)
     pipeline_list.write_file(args.out, 0, origin, out)
     size = Path(args.out).stat().st_size
-    fetch_bytes = sum(len(rc.fetch or b"") + len(rc.ls_fetch or b"") + sum(len(e["fetch"] or b"") for e in rc.lsps) for rc in out)
-    print("%s: %d of %d pipelines (%.1f KiB; programs named, %d as the game's files have them, %d as bbhost patches them; "
-          "%.1f KiB of fetch shaders' words); order %s%s" % (args.out, len(out), len(recipes), size / 1024.0, plain, patched, fetch_bytes / 1024.0,
-                                                           args.order, " (%d not found in the logs, last)" % unknown if unknown else ""))
+    fetch_bytes = sum(len(rc.fetch or b"") + len(rc.ls_fetch or b"") + sum(len(e["fetch"] or b"") for e in rc.lsps) for rc in out if not rc.compute)
+    computes = sum(1 for rc in out if rc.compute)
+    print("%s: %d of %d pipelines, %d of them compute (%.1f KiB; programs named, %d as the game's files have them, %d as bbhost patches them; "
+          "%.1f KiB of fetch shaders' words); order %s%s" % (args.out, len(out), len(recipes), computes, size / 1024.0, plain, patched,
+                                                           fetch_bytes / 1024.0, args.order,
+                                                           " (%d not found in the logs, last)" % unknown if unknown else ""))
     for why, n in left.most_common():
         print("  left out: %d with %s" % (n, why))
     return 0
@@ -1415,7 +1461,9 @@ def main(argv=None):
     p.add_argument("--out")
     p = sub.add_parser("plan")
     p.add_argument("--app0", required=True)
-    p.add_argument("--navmesh-tools", required=True, type=Path, help="the folder holding the worldmap module (navmesh.py, msb.py)")
+    p.add_argument("--navmesh-tools", type=Path, default=os.environ.get("MAPVAL_NAVMESH_TOOLS") or None,
+                   help="the folder holding the worldmap navmesh module (navmesh.py, msb.py); default $MAPVAL_NAVMESH_TOOLS. "
+                        "Only plan reads it, for the blocks' stops")
     p.add_argument("--out", required=True)
     p.add_argument("--blocks", help="only these blocks (comma list)")
     p.add_argument("--radius", type=float, default=60.0)

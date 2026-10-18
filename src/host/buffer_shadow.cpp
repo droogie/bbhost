@@ -76,7 +76,15 @@ constexpr std::uint32_t kPagesPerChunk = static_cast<std::uint32_t>(kChunkBytes 
 // such as a compute shader's store through the GPU page table.
 const bool g_verify = [] {
     const char* e = std::getenv("BBHOST_SHADOW_VERIFY");
-    return e && e[0] == '1';
+    return e && (e[0] == '1' || e[0] == '2');
+}();
+// BBHOST_SHADOW_VERIFY=2: told pages are write-watched as well (their faults
+// change nothing but the census's - BBHOST_RESOURCE_CENSUS=1 - which classes
+// them as told and lists their writers): who writes the pages GX's calls
+// tell, the writes the calls tell and those they do not.
+const bool g_verify_watch_told = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_VERIFY");
+    return e && e[0] == '2';
 }();
 std::uint64_t g_verify_cursor = 0, g_verify_checked = 0, g_verify_stale = 0;
 // Verify mode: each page's contents when copied, so a stale page's report
@@ -102,6 +110,22 @@ struct Page {
     std::uint64_t gpu_written = 0;    // the recording a GPU write over it was recorded in (0: none)
     std::uint64_t hash = 0;           // BBHOST_SHADOW_VERIFY: its contents when copied
     std::uint64_t gx_seq = 0;         // BBHOST_RESOURCE_CENSUS: the GX registry's write sequence when copied
+    // Told (BBHOST_SHADOW_GX): GX buffers cover the page whole and GX never
+    // handed any of it out, so the CPU writes it only in a creation, which
+    // tells the mirror (host_gpu_shadow_gx_write) - the page is not
+    // write-watched. told_seq is g_told_seq when it was copied; gx_written
+    // the sequence of the newest such write over it, gx_submit the
+    // submissions made when that was asked.
+    bool told = false;
+    std::uint64_t told_seq = 0, gx_written = 0, gx_submit = 0;
+    // Told and copied while a renamed copy over it was still outstanding
+    // (handed out, not yet written back by GX): its CPU writes may not have
+    // ended, so the copy holds for its recording only.
+    bool provisional = false;
+    std::uint16_t provisional_run = 0;  // copies in a row made so
+    // BBHOST_SHADOW_VERIFY: the bytes of it draws bound since its copy, as
+    // offsets in the page - a change outside them is no draw's.
+    std::uint32_t read_lo = ~0u, read_hi = 0;
     bool valid = false;               // the mirror holds it (or will, once this submission's copies run)
     bool dynamic = false;             // bound from the import from now on (rewritten, unwatchable)
 };
@@ -383,6 +407,21 @@ const bool g_stage_dedup = [] {
     const char* e = std::getenv("BBHOST_STAGE_DEDUP");
     return !(e && e[0] == '0');
 }();
+// BBHOST_STAGE_CENSUS=1: the ranges staged for their draw since the last
+// report, by bytes, with why their pages are in host memory - [0] a page
+// bound from host memory for good (dynamic), [1] a page a GPU write left
+// unmirrored, [2] a page not valid otherwise (refused, never copied) - and
+// the GX resource they lie in.
+const bool g_stage_census = [] {
+    const char* e = std::getenv("BBHOST_STAGE_CENSUS");
+    return e && e[0] == '1';
+}();
+struct StageStat {
+    std::uint64_t bytes = 0, copies = 0, record = 0;
+    int why = -1;
+};
+std::unordered_map<std::uint64_t, StageStat> g_stage_stats;  // by the range's start, under g.mu
+std::uint64_t g_stage_why_bytes[4] = {};
 
 void stage_release_slot(int slot) {
     for (const StageChunk& c : g_stage_held[slot]) g_stage_free.push_back(c);
@@ -462,6 +501,119 @@ const bool g_map_census = [] {
 }();
 std::atomic<std::uint64_t> g_written_by_gx{0}, g_written_not_gx{0}, g_written_no_resource{0};
 
+// BBHOST_SHADOW_GX=0: every page write-watched, as before. Otherwise the
+// mirrors go by what GX's own calls say of the memory (the watch's faults
+// land on the game's threads, a fault per 4 KiB page each time a mirrored
+// ring or pool is written - 97.6% of them, the census found, on the memory of
+// GX's renamed copies):
+//   - GX's dynamic buffers are written through renamed copies from the
+//     context's upload pool: a Map hands one out (types 3 and 4) and the CPU
+//     writes it until the context's map resolves, which copies it back to
+//     the buffer on the GPU (0x2aadf50 / 0x2ad1090 through 0x2ab2810 and
+//     0x2ab2670), or until a later discard Map of the buffer in the same
+//     context frees it. A page with renamed copies on it is told
+//     (host_gpu_shadow_gx_handed, _settled), not watched: a hand-out
+//     invalidates it, and while a copy over it is outstanding - handed out,
+//     neither written back nor freed - a copy of the page holds for its
+//     recording only. Once the copies are done, the page's copy holds until
+//     the next hand-out (BBHOST_SHADOW_HANDED=0: watched as before). What
+//     else the pool holds - constant buffers' copies (their Maps and every
+//     dynamic UpdateSubresource), the draw tables the commits copy in - is
+//     written without a word, and no draw reads it as vertex data;
+//   - a page GX buffers cover whole changes only when a creation writes it
+//     (host_gpu_shadow_gx_write): told, not watched;
+//   - the rest - memory no GX buffer covers whole: the engine's own rings,
+//     YEBIS's, Scaleform's - stays watched.
+const bool g_shadow_gx = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_GX");
+    return !(e && e[0] == '0');
+}();
+const bool g_shadow_handed = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_HANDED");
+    return g_shadow_gx && !(e && e[0] == '0');
+}();
+struct GxWrite {
+    std::uint64_t va, bytes, submit;
+    int kind;  // kGxWrite, or 1 + a hand-out's kind (host_gpu_shadow_gx_handed)
+};
+// A write; a GX resource made over the range (a write, and no longer handed
+// out); a renamed copy GX wrote back or freed (no longer outstanding).
+constexpr int kGxWrite = 0, kGxCreate = 8, kGxSettle = 10;
+// What GX handed the CPU to write (host_gpu_shadow_gx_handed): a bit per 4 KiB
+// of direct memory by physical address - [kHandMap] the renamed copies Maps
+// hand out and, with the census, [kHandPool] the upload pool's blocks,
+// [kHandRing] ring allocations and [kHandYebis] the memory YEBIS's discard
+// Maps rename its resources into.
+enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandYebis = 3, kHandKinds = 4 };
+constexpr std::uint64_t kHand4k = (std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> 12;
+std::vector<std::uint64_t> g_hand_bits[kHandKinds];  // under g.mu, made at the first hand-out
+std::uint64_t g_hand_pages[kHandKinds] = {};         // 4 KiB pages marked
+std::uint64_t g_map_in_pool = 0, g_map_in_ring = 0;  // Map hand-outs whose first page the pool / ring had handed out
+std::uint64_t g_handed_dynamic = 0;                  // told pages that stayed unsettled too long, to host memory
+// The renamed copies handed out and not yet written back, by physical start
+// (under g.mu): the pages over them are unsettled.
+struct Outstanding {
+    std::uint64_t end = 0, since_ms = 0;
+};
+std::map<std::uint64_t, Outstanding> g_outstanding;
+std::uint64_t g_outstanding_most = 0, g_settled = 0, g_settle_unmatched = 0, g_aged_out = 0, g_provisional_copies = 0, g_handed_invalid = 0;
+constexpr std::uint64_t kOutstandingAgeMs = 10000;  // a copy left out longer was written back unseen (a resolve not hooked)
+constexpr std::uint16_t kMaxProvisionalRun = 64;     // copies in a row a page may take unsettled before host memory serves it
+// A page under GX's renamed copies is copied again at every hand-out over its
+// copy - a no-overwrite Map's notice spans the whole copy, though the CPU
+// appends to part of it - without the faults and arming a watched page's
+// copy costs; on the snapshot path every draw of it would cost the command
+// processor a copy as recorded. So it goes to host memory only past
+// kMaxUploadsHanded copies in the window (3 a second), not 4.
+constexpr std::uint32_t kMaxUploadsHanded = 24;
+std::uint64_t g_made_over_handed = 0;                // GX resources made over memory GX had handed out
+// Whether renamed copies were ever on the 64 KiB page p of chunk `chunk` (the
+// 16 bits of one word). The census's kinds do not count.
+bool page_handed(std::uint32_t chunk, std::uint32_t p) {
+    const std::uint64_t i = ((std::uint64_t{chunk} << gcn::kDmemChunkShift) | (std::uint64_t{p} << kPageShift)) >> 12;
+    if (i >= kHand4k || g_hand_bits[kHandMap].empty()) return false;
+    return ((g_hand_bits[kHandMap][i >> 6] >> (i & 63)) & 0xffff) != 0;
+}
+// Whether a renamed copy over the page is outstanding.
+bool page_unsettled(std::uint32_t chunk, std::uint32_t p) {
+    if (g_outstanding.empty()) return false;
+    const std::uint64_t lo = (std::uint64_t{chunk} << gcn::kDmemChunkShift) | (std::uint64_t{p} << kPageShift), hi = lo + kPageBytes;
+    auto it = g_outstanding.lower_bound(hi);
+    if (it == g_outstanding.begin()) return false;
+    --it;
+    return it->second.end > lo;
+}
+std::atomic<std::uint64_t> g_hand_dropped{0};  // hand-outs the full queue had no room for
+bool handed(unsigned k, std::uint64_t phys) {
+    const std::uint64_t i = phys >> 12;
+    return i < kHand4k && !g_hand_bits[k].empty() && (g_hand_bits[k][i >> 6] >> (i & 63) & 1);
+}
+std::mutex g_gx_writes_mu;
+std::vector<GxWrite> g_gx_writes;  // under g_gx_writes_mu
+std::atomic<bool> g_gx_writes_pending{false}, g_gx_writes_overflow{false};
+constexpr std::size_t kGxWritesMax = 1u << 16;
+std::uint64_t g_told_seq = 0;  // under g.mu: one a drained write
+std::atomic<std::uint64_t> g_gx_records{0};
+std::uint64_t g_told_copies = 0, g_watched_partial = 0, g_watched_none = 0, g_told_invalid = 0, g_told_held = 0, g_told_overflows = 0,
+              g_told_unmapped = 0;
+std::uint64_t g_verify_stale_told = 0, g_verify_stale_told_read = 0;
+
+// The newest GX write over a told page is one its copy predates, and the
+// submission walked now was made after that write was asked for (the CPU has
+// written by the time a submission that draws it is made; one made before
+// the Map draws what was there, and keeps the copy it has).
+bool told_written(Page& pg, bool count) {
+    if (pg.gx_written <= pg.told_seq) return false;
+    const std::uint64_t job = hle_gnm_cp_job_seq();
+    const std::uint64_t now = job ? job : hle_gnm_submitted_total();
+    if (now > pg.gx_submit) {
+        if (count) ++g_told_invalid;
+        return true;
+    }
+    if (count) ++g_told_held;
+    return false;
+}
+
 // Written since its copy, through the CPU view or the GPU alias.
 bool written(Page& pg) {
     bool w = write_watch_dirty(pg.va, pg.bytes, pg.watch) != 0;
@@ -472,6 +624,12 @@ bool written(Page& pg) {
         (!any ? g_written_no_resource : seq > pg.gx_seq ? g_written_by_gx : g_written_not_gx).fetch_add(1, std::memory_order_relaxed);
     }
     return w;
+}
+
+bool page_written(Page& pg) {
+    if (!pg.told) return written(pg);
+    if (pg.provisional) return true;  // its copy held for the recording it was made in
+    return told_written(pg, true);
 }
 
 void go_dynamic(Mirror& m, std::uint32_t p, std::uint64_t va, const char* why) {
@@ -491,6 +649,353 @@ void begin_recording(Mirror& m, std::uint64_t stamp) {
     std::fill(m.ok.begin(), m.ok.end(), 0);
     std::fill(m.gpu.begin(), m.gpu.end(), 0);
     m.ok_stamp = stamp;
+}
+
+// Direct memory's GPU alias (hle/kernel.cpp map_gpu_alias): kGpuDmemBase +
+// the physical address, which GX may hand out from a Map.
+constexpr std::uint64_t kGpuDmemBase = 0xFF00000000ull;
+
+// The GX writes asked for since the last drain (host_gpu_shadow_gx_write),
+// onto the pages of the mirrors under them: each page takes the write's
+// sequence and submission count, and leaves this recording's checked set.
+void invalidate_all_told(std::uint64_t seq, std::uint64_t submit) {
+    for (Mirror& m : g_mirrors) {
+        if (m.pages.empty()) continue;
+        for (Page& pg : m.pages) {
+            if (!pg.told) continue;
+            pg.gx_written = seq;
+            pg.gx_submit = submit;
+        }
+        std::fill(m.ok.begin(), m.ok.end(), 0);
+    }
+}
+
+// Guest VA -> physical address of direct memory, through the GPU alias or the
+// snapshot of mappings, with how far the mapping goes on from there.
+bool phys_at(std::uint64_t va, std::uint64_t& phys, std::uint64_t& span) {
+    if (va >= kGpuDmemBase && va < kGpuDmemBase + (1ull << 32)) {
+        phys = va - kGpuDmemBase;
+        span = kGpuDmemBase + (1ull << 32) - va;
+        return true;
+    }
+    for (const GuestMapInfo& x : g.maps) {
+        if (va >= x.va && va < x.va + x.len) {
+            if (!x.dmem || x.phys < 0) return false;
+            phys = static_cast<std::uint64_t>(x.phys) + (va - x.va);
+            span = x.va + x.len - va;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A hand-out: its 4 KiB pages marked. A renamed copy a Map hands out also
+// invalidates the mirror pages over it - told pages for the submissions
+// after the hand-out, watched ones at their next check - and stays
+// outstanding until GX writes it back or frees it (settle_locked).
+// The 4 KiB bits [i0, i1] of `bits` set (`set`) or cleared, a word at a time;
+// returns how many changed. A hand-out spans its whole buffer - megabytes for
+// a particle ring, thousands of hand-outs a second on the command processor.
+std::uint64_t mark_bits(std::vector<std::uint64_t>& bits, std::uint64_t i0, std::uint64_t i1, bool set) {
+    std::uint64_t changed = 0;
+    i1 = std::min(i1, kHand4k - 1);
+    for (std::uint64_t w = i0 >> 6; i0 <= i1 && w <= i1 >> 6; ++w) {
+        std::uint64_t mask = ~0ull;
+        if (w == i0 >> 6) mask &= ~0ull << (i0 & 63);
+        if (w == i1 >> 6) mask &= ~0ull >> (63 - (i1 & 63));
+        std::uint64_t& word = bits[w];
+        const std::uint64_t flip = (set ? ~word : word) & mask;
+        changed += static_cast<std::uint64_t>(__builtin_popcountll(flip));
+        word = set ? word | mask : word & ~mask;
+    }
+    return changed;
+}
+
+void mark_handed_locked(const GxWrite& w) {
+    const unsigned k = static_cast<unsigned>(w.kind - 1);
+    if (k >= kHandKinds) return;
+    if (g_hand_bits[k].empty()) g_hand_bits[k].assign(kHand4k / 64, 0);
+    if (k == kHandMap && g_map_census) {
+        std::uint64_t phys = 0, span = 0;
+        if (phys_at(w.va, phys, span)) {
+            g_map_in_pool += handed(kHandPool, phys);
+            g_map_in_ring += handed(kHandRing, phys);
+        }
+    }
+    const bool act = k == kHandMap && g_shadow_handed;
+    const std::uint64_t seq = act ? ++g_told_seq : 0;
+    std::uint64_t first_phys = ~0ull, first_span = 0;
+    std::uint64_t va = w.va;
+    const std::uint64_t end = w.va + w.bytes;
+    while (va < end) {
+        std::uint64_t phys = 0, span = 0;
+        if (!phys_at(va, phys, span)) {
+            va = (va | 0xfff) + 1;
+            continue;
+        }
+        const std::uint64_t seg = std::min(end - va, span);
+        if (first_phys == ~0ull) {
+            first_phys = phys;
+            first_span = seg;
+        }
+        g_hand_pages[k] += mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, true);
+        if (act) {
+            for (std::uint64_t at = phys & ~(kPageBytes - 1); at < phys + seg; at += kPageBytes) {
+                Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
+                if (m.pages.empty()) continue;
+                const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
+                Page& pg = m.pages[p];
+                if (pg.valid) ++g_handed_invalid;
+                pg.gx_written = seq;
+                pg.gx_submit = w.submit;
+                m.ok[p >> 6] &= ~(1ull << (p & 63));
+            }
+        }
+        va += seg;
+    }
+    if (!act || first_phys == ~0ull) return;
+    Outstanding& o = g_outstanding[first_phys];
+    o.end = std::max(o.end, first_phys + first_span);
+    o.since_ms = now_ms();
+    g_outstanding_most = std::max<std::uint64_t>(g_outstanding_most, g_outstanding.size());
+}
+
+// GX wrote renamed copies in [w.va, +w.bytes) back to their buffers, or freed
+// them: their CPU writes are over, and the pages under them settle. Copies left outstanding
+// past kOutstandingAgeMs were written back unseen (by a resolve these hooks
+// miss) and settle too, counted.
+void settle_locked(const GxWrite& w) {
+    std::uint64_t phys = 0, span = 0;
+    bool matched = false;
+    if (!g_outstanding.empty() && phys_at(w.va, phys, span)) {
+        const std::uint64_t lo = phys, hi = phys + std::min<std::uint64_t>(w.bytes, span);
+        auto it = g_outstanding.lower_bound(lo);
+        if (it != g_outstanding.begin() && std::prev(it)->second.end > lo) --it;
+        while (it != g_outstanding.end() && it->first < hi) {
+            it = g_outstanding.erase(it);
+            matched = true;
+        }
+    }
+    ++(matched ? g_settled : g_settle_unmatched);
+}
+
+// Once a second: renamed copies outstanding past kOutstandingAgeMs settle.
+void age_outstanding_locked() {
+    static std::uint64_t swept_ms = 0;
+    static std::uint32_t calls = 0;
+    if (g_outstanding.empty() || (++calls & 4095) != 0) return;  // a clock read a draw would be the CP's
+    const std::uint64_t now = now_ms();
+    if (now - swept_ms < 1000) return;
+    swept_ms = now;
+    for (auto it = g_outstanding.begin(); it != g_outstanding.end();) {
+        if (now - it->second.since_ms > kOutstandingAgeMs) {
+            it = g_outstanding.erase(it);
+            ++g_aged_out;
+        } else {
+            ++it;
+        }
+    }
+}
+
+// A GX resource made over [w.va, +w.bytes): the memory is the resource's, no
+// longer what GX hands out to be rewritten (the allocators may share it).
+void clear_handed_locked(const GxWrite& w) {
+    bool any = false;
+    std::uint64_t va = w.va;
+    const std::uint64_t end = w.va + w.bytes;
+    while (va < end) {
+        std::uint64_t phys = 0, span = 0;
+        if (!phys_at(va, phys, span)) {
+            va = (va | 0xfff) + 1;
+            continue;
+        }
+        const std::uint64_t seg = std::min(end - va, span);
+        for (unsigned k = 0; k < kHandKinds; ++k) {
+            if (g_hand_bits[k].empty()) continue;
+            const std::uint64_t n = mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, false);
+            g_hand_pages[k] -= n;
+            any |= n != 0;
+        }
+        va += seg;
+    }
+    if (any && g_made_over_handed++ < 4)
+        host_log("buffer shadow: a GX resource made over memory GX had handed out to be rewritten: [0x%llx, +0x%llx)",
+                 static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes));
+}
+
+void drain_gx_writes_locked() {
+    age_outstanding_locked();
+    if (!g_gx_writes_pending.load(std::memory_order_acquire)) return;
+    std::vector<GxWrite> writes;
+    {
+        std::lock_guard<std::mutex> lk(g_gx_writes_mu);
+        writes.swap(g_gx_writes);
+        g_gx_writes_pending.store(false, std::memory_order_relaxed);
+    }
+    if (g_gx_writes_overflow.exchange(false, std::memory_order_acq_rel)) {
+        // More writes than the queue keeps came between two drains: every
+        // told page is copied again before it is read.
+        ++g_told_overflows;
+        invalidate_all_told(++g_told_seq, hle_gnm_submitted_total());
+    }
+    for (const GxWrite& w : writes) {
+        if (w.kind == kGxCreate) {
+            clear_handed_locked(w);
+            if (!g_shadow_gx) continue;
+        } else if (w.kind == kGxSettle) {
+            settle_locked(w);
+            continue;
+        } else if (w.kind != kGxWrite) {
+            mark_handed_locked(w);
+            continue;
+        }
+        const std::uint64_t seq = ++g_told_seq;
+        std::uint64_t va = w.va;
+        const std::uint64_t end = w.va + w.bytes;
+        while (va < end) {
+            // The physical span of [va, end) in one mapping and one chunk.
+            std::uint64_t phys = 0, seg = 0;
+            if (va >= kGpuDmemBase && va < kGpuDmemBase + (1ull << 32)) {
+                phys = va - kGpuDmemBase;
+                seg = end - va;
+            } else {
+                const GuestMapInfo* mi = nullptr;
+                for (const GuestMapInfo& x : g.maps) {
+                    if (va >= x.va && va < x.va + x.len) {
+                        mi = &x;
+                        break;
+                    }
+                }
+                if (!mi) {
+                    // No longer mapped (an unmap's range) or never in the
+                    // snapshot: the physical pages it named are unknown, so
+                    // every told page is copied again before it is read.
+                    ++g_told_unmapped;
+                    invalidate_all_told(seq, w.submit);
+                    break;
+                }
+                if (!mi->dmem || mi->phys < 0) {
+                    // Not direct memory: nothing a mirror holds; on to the next page.
+                    va = (va | (kPageBytes - 1)) + 1;
+                    continue;
+                }
+                phys = static_cast<std::uint64_t>(mi->phys) + (va - mi->va);
+                seg = std::min(end, mi->va + mi->len) - va;
+            }
+            const std::uint64_t chunk = phys >> gcn::kDmemChunkShift;
+            const std::uint64_t off = phys & (kChunkBytes - 1);
+            seg = std::min<std::uint64_t>(seg, kChunkBytes - off);
+            if (chunk < gcn::kDmemChunks && !g_mirrors[chunk].pages.empty()) {
+                Mirror& m = g_mirrors[chunk];
+                for (std::uint64_t p = off >> kPageShift; p <= (off + seg - 1) >> kPageShift; ++p) {
+                    Page& pg = m.pages[p];
+                    pg.gx_written = seq;
+                    pg.gx_submit = w.submit;
+                    m.ok[p >> 6] &= ~(1ull << (p & 63));
+                }
+            }
+            va += seg;
+        }
+    }
+}
+
+// BBHOST_RESOURCE_CENSUS=1: the write faults on mirror pages, by what GX says
+// of the 4 KiB page each hit, and the writers behind each kind - whether GX's
+// calls could tell the mirrors of the writes the watch now catches. Taken at
+// each report from the faults since the last (the ring holds 16384).
+// A fault's class: what covers its 4 KiB (GX buffers whole, a GX resource in
+// part, a texture or buffer of YEBIS's own device, a Scaleform texture,
+// nothing) times what handed it out (a Map, the upload pool, the ring,
+// nothing GX said), as owner * (kHandKinds + 1) + handed.
+constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 6, kFaultClasses = kFaultOwners * kFaultHanders;
+const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "Scaleform's", "nobody's",
+                                                "a told page's (BBHOST_SHADOW_VERIFY=2)"};
+const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "YEBIS's discard Maps hand out",
+                                                    "nothing GX hands out"};
+std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
+std::uint64_t g_fault_class[kFaultClasses] = {};
+std::unordered_map<std::uint64_t, std::uint64_t> g_fault_writers[kFaultClasses];
+
+void census_faults_locked() {
+    if (!g_map_census) return;
+    constexpr int kMax = 16384;
+    static std::vector<std::uint64_t> addrs(kMax), pcs(kMax);
+    static std::vector<std::uint8_t> owners(kMax);
+    std::uint64_t newest = g_fault_census_seq;
+    const int n = write_watch_faults_since(g_fault_census_seq, addrs.data(), pcs.data(), owners.data(), kMax, &newest);
+    g_fault_census_seq = newest;
+    for (int i = 0; i < n; ++i) {
+        if (!(owners[i] & kWatchOwnerMirror)) {
+            ++g_fault_census_other;
+            continue;
+        }
+        const std::uint64_t page = addrs[i] & ~0xfffull;
+        std::uint64_t phys = 0, span = 0;
+        const bool known = phys_at(page, phys, span);
+        unsigned by = kHandKinds;
+        for (unsigned k : {kHandMap, kHandPool, kHandYebis, kHandRing}) {
+            if (known && handed(k, phys)) {
+                by = k;
+                break;
+            }
+        }
+        const int mw = gx_middleware_at(page, 0x1000);
+        bool told_page = false;
+        if (known && g_verify_watch_told) {
+            const Mirror& tm = g_mirrors[phys >> gcn::kDmemChunkShift];
+            if (!tm.pages.empty()) told_page = tm.pages[(phys & (kChunkBytes - 1)) >> kPageShift].told;
+        }
+        const unsigned gx = told_page                                      ? 5
+                            : gx_buffers_cover(page, 0x1000)                 ? 0
+                            : gx_resource_overlapping(page, 0x1000, nullptr) ? 1
+                            : mw                                             ? 1 + static_cast<unsigned>(mw)
+                                                                             : 4;
+        const unsigned c = gx * kFaultHanders + by;
+        ++g_fault_class[c];
+        auto& w = g_fault_writers[c];
+        if (w.size() < 4096 || w.count(pcs[i])) ++w[pcs[i]];
+    }
+}
+
+// The census on lines of its own (a log line holds 1024 bytes, which the
+// shadow's report fills by itself): the faults by class at every report, and
+// every twelfth (about a minute) each class with its four first writers.
+const char* const kFaultGxCode[kFaultOwners] = {"gx-buffers", "gx-part", "yebis", "scaleform", "nobody", "told"};
+const char* const kFaultHandCode[kFaultHanders] = {"map", "pool", "ring", "yebis-rename", "none"};
+void log_fault_census() {
+    static unsigned calls = 0;
+    std::string line;
+    for (unsigned c = 0; c < kFaultClasses; ++c) {
+        if (!g_fault_class[c]) continue;
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s %s/%s %llu", line.empty() ? "" : ",", kFaultGxCode[c / kFaultHanders], kFaultHandCode[c % kFaultHanders],
+                      static_cast<unsigned long long>(g_fault_class[c]));
+        line += buf;
+    }
+    host_log("  buffer shadow census: mirror write faults by memory owner/hander:%s; other pages' faults %llu; 4 KiB pages handed out: by "
+             "Maps %llu (in pool memory %llu, in ring memory %llu), by the upload pool %llu, by the ring %llu, by YEBIS's renames %llu; GX "
+             "resources made over handed-out memory %llu",
+             line.empty() ? " none" : line.c_str(), static_cast<unsigned long long>(g_fault_census_other),
+             static_cast<unsigned long long>(g_hand_pages[kHandMap]), static_cast<unsigned long long>(g_map_in_pool),
+             static_cast<unsigned long long>(g_map_in_ring), static_cast<unsigned long long>(g_hand_pages[kHandPool]),
+             static_cast<unsigned long long>(g_hand_pages[kHandRing]), static_cast<unsigned long long>(g_hand_pages[kHandYebis]),
+             static_cast<unsigned long long>(g_made_over_handed));
+    if (calls++ % 12 != 0) return;
+    for (unsigned c = 0; c < kFaultClasses; ++c) {
+        if (!g_fault_class[c]) continue;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(g_fault_writers[c].begin(), g_fault_writers[c].end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string w;
+        for (std::size_t k = 0; k < top.size() && k < (c / kFaultHanders == 5 ? 16u : 6u); ++k) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s0x%llx x%llu", k ? ", " : "", static_cast<unsigned long long>(top[k].first ? gx_guest_to_bn(top[k].first) : 0),
+                          static_cast<unsigned long long>(top[k].second));
+            w += buf;
+        }
+        host_log("  buffer shadow census: %s/%s (%s memory %s): %llu faults; writers %s", kFaultGxCode[c / kFaultHanders],
+                 kFaultHandCode[c % kFaultHanders], kFaultGxName[c / kFaultHanders], kFaultHandName[c % kFaultHanders],
+                 static_cast<unsigned long long>(g_fault_class[c]), w.c_str());
+    }
 }
 
 }  // namespace
@@ -528,17 +1033,29 @@ bool buffer_shadow_on() {
 
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
+    if (twin_covers_locked(va, bytes)) return;  // a GX buffer's device-local twin: already device memory, its guest bytes stale
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
     if (!phys_of(va, bytes, chunk, off, &map_lo, &map_hi)) return;
     Mirror* m = mirror_for(chunk);
     if (!m) return;
+    drain_gx_writes_locked();
     const std::uint64_t stamp = g.record_serial + 1;
     const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift);
     const std::uint32_t p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
+    if (g_verify) {
+        for (std::uint32_t p = p0; p <= p1; ++p) {
+            Page& pg = m->pages[p];
+            const std::uint64_t page_lo = static_cast<std::uint64_t>(p) << kPageShift;
+            const std::uint32_t lo = static_cast<std::uint32_t>(std::max(off, page_lo) - page_lo);
+            const std::uint32_t hi = static_cast<std::uint32_t>(std::min(off + bytes, page_lo + kPageBytes) - page_lo);
+            pg.read_lo = std::min(pg.read_lo, lo);
+            pg.read_hi = std::max(pg.read_hi, hi);
+        }
+    }
     {
         const std::uint32_t span = p1 - p0 + 1;
         ++g_span_hist[span == 1 ? 0 : span <= 4 ? 1 : span <= 16 ? 2 : span <= 64 ? 3 : span <= 256 ? 4 : 5];
@@ -579,6 +1096,17 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // a run that cannot be armed whole is left to the loop, a page at a time.
     thread_local std::vector<std::uint8_t> prearmed;  // per page of [p0, p1]: 1 view armed, 2 alias armed
     prearmed.assign(p1 - p0 + 1, 0);
+    // Per page of [p0, p1] that this call copies: 1 told (GX buffers cover
+    // it, not watched), 2 watched; 0 not decided here.
+    thread_local std::vector<std::uint8_t> told_class;
+    told_class.assign(p1 - p0 + 1, 0);
+    const auto page_told = [&](std::uint32_t p) {
+        const std::uint64_t page_va = va - (off - (static_cast<std::uint64_t>(p) << kPageShift));
+        const std::uint64_t lo = std::max(page_va, map_lo), hi = std::min(page_va + kPageBytes, map_hi);
+        if (!g_shadow_gx) return false;
+        if (page_handed(chunk, p)) return g_shadow_handed;
+        return gx_buffers_cover(lo, hi - lo);
+    };
     {
         const auto arm_run = [&](std::uint32_t a, std::uint32_t b) {  // pages [a, b)
             if (b - a < 2) return;  // one page: the loop's own arming is the same work
@@ -611,15 +1139,23 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             if (pg.valid && pg.checked != stamp) {
                 pg.checked = stamp;
                 ++g_page_checks;
-                if (written(pg)) pg.valid = false;
+                if (page_written(pg)) pg.valid = false;
             }
             if (pg.valid) {  // nothing to copy: the run ends before it
                 arm_run(run, p);
                 run = p + 1;
                 continue;
             }
+            // Told of its writes by GX: not armed, and it ends a run of watched pages.
+            told_class[p - p0] = page_told(p) ? 1 : 2;
             const std::uint32_t uploads = t - pg.window_ms >= kUploadWindowMs ? 0 : pg.window_uploads;
-            if (uploads + 1 > kMaxUploads) break;  // the loop sends it to host memory and stops there
+            const std::uint32_t limit = told_class[p - p0] == 1 && page_handed(chunk, p) ? kMaxUploadsHanded : kMaxUploads;
+            if (!pg.provisional && uploads + 1 > limit) break;  // the loop sends it to host memory and stops there
+            if (pg.provisional && pg.provisional_run + 1 >= kMaxProvisionalRun) break;
+            if (told_class[p - p0] == 1) {
+                arm_run(run, p);
+                run = p + 1;
+            }
         }
         arm_run(run, p);
     }
@@ -673,7 +1209,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             if (pg.checked != stamp) {
                 pg.checked = stamp;
                 ++g_page_checks;
-                if (written(pg)) pg.valid = false;
+                if (page_written(pg)) pg.valid = false;
             }
             if (pg.valid) {
                 m->ok[p >> 6] |= 1ull << (p & 63);
@@ -687,23 +1223,57 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             pg.window_ms = t;
             pg.window_uploads = 0;
         }
-        if (++pg.window_uploads > kMaxUploads) {
+        // A copy again for an outstanding renamed copy is not a rewrite; a page
+        // that stays unsettled copy after copy goes to host memory too.
+        if (pg.provisional) {
+            if (++pg.provisional_run >= kMaxProvisionalRun) {
+                go_dynamic(*m, p, page_va, "stays under renamed copies GX does not write back");
+                ++g_handed_dynamic;
+                flush();
+                bump(g_imports);
+                return;
+            }
+        } else if (++pg.window_uploads > (g_shadow_handed && page_handed(chunk, p) ? kMaxUploadsHanded : kMaxUploads)) {
             go_dynamic(*m, p, page_va, "keeps being rewritten");
             flush();
             bump(g_imports);
             return;
         }
         // Watched from before the copy reads it: a write after that marks it
-        // again rather than going unseen. Only the part in this mapping.
+        // again rather than going unseen. Only the part in this mapping. A
+        // page GX buffers cover is told of its writes instead (told_written).
         const std::uint64_t lo = std::max(page_va, map_lo), hi = std::min(page_va + kPageBytes, map_hi);
-        pg.watch.owner = pg.alias_watch.owner = kWatchOwnerMirror;
-        if (!(prearmed[p - p0] & 1) && !hle_kernel_write_watch(lo, hi - lo, pg.watch)) {
-            go_dynamic(*m, p, page_va, "cannot be write-watched");
-            flush();
-            bump(g_imports);
-            return;
+        const bool told = told_class[p - p0] ? told_class[p - p0] == 1 : page_told(p);
+        if (told && !g_verify_watch_told) {
+            pg.watch = WriteWatch{};
+            pg.alias_watch = WriteWatch{};
+            pg.alias_va = 0;
+            ++g_told_copies;
+        } else if (told) {
+            // Watched for the census only (BBHOST_SHADOW_VERIFY=2): told all the same.
+            ++g_told_copies;
+            pg.watch = WriteWatch{};
+            pg.watch.owner = kWatchOwnerMirror;
+            if (!(prearmed[p - p0] & 1)) hle_kernel_write_watch(lo, hi - lo, pg.watch);
+            pg.alias_watch = WriteWatch{};
+            pg.alias_va = 0;
+        } else {
+            if (g_shadow_gx) ++(gx_resource_overlapping(lo, hi - lo, nullptr) ? g_watched_partial : g_watched_none);
+            pg.watch.owner = pg.alias_watch.owner = kWatchOwnerMirror;
+            if (!(prearmed[p - p0] & 1) && !hle_kernel_write_watch(lo, hi - lo, pg.watch)) {
+                go_dynamic(*m, p, page_va, "cannot be write-watched");
+                flush();
+                bump(g_imports);
+                return;
+            }
+            if (!(prearmed[p - p0] & 2)) pg.alias_va = hle_kernel_write_watch_alias(lo, hi - lo, pg.alias_watch);
         }
-        if (!(prearmed[p - p0] & 2)) pg.alias_va = hle_kernel_write_watch_alias(lo, hi - lo, pg.alias_watch);
+        pg.told = told;
+        pg.told_seq = g_told_seq;
+        const bool provisional = told && g_shadow_handed && page_unsettled(chunk, p);
+        if (!provisional) pg.provisional_run = 0;
+        pg.provisional = provisional;
+        if (provisional) ++g_provisional_copies;
         if (!cmd && !(cmd = upload_cmd_locked())) {
             pg.watch = WriteWatch{};
             pg.alias_watch = WriteWatch{};
@@ -740,6 +1310,10 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         if (g_verify) {
             const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(lo));
             pg.hash = fnv1a(src, hi - lo);
+            // This draw's bytes in the page; later draws add theirs.
+            const std::uint64_t page_lo = static_cast<std::uint64_t>(p) << kPageShift;
+            pg.read_lo = static_cast<std::uint32_t>(std::max(off, page_lo) - page_lo);
+            pg.read_hi = static_cast<std::uint32_t>(std::min(off + bytes, page_lo + kPageBytes) - page_lo);
             g_verify_copies[(std::uint64_t{chunk} << 32) | p].assign(src, src + (hi - lo));
         }
         m->ok[p >> 6] |= 1ull << (p & 63);
@@ -820,7 +1394,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 // mirror the GPU will read stale. Pure: `write_watch_dirty` only memoises a
 // clean answer, and a written watch stays written until it is armed again.
 bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
-    if (!buffer_shadow_on() || !bytes || !g.sink.buffer) return false;
+    if (!buffer_shadow_on() || !bytes || !g.sink.buffer || twin_covers_locked(va, bytes)) return false;
     // A stand-in host location: shadow_locate_locked replaces it with the
     // mirror when the mirror serves the range, and leaves it otherwise.
     Located probe{g.sink.buffer, 0, bytes};
@@ -831,7 +1405,7 @@ bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
 }
 
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes) return false;
+    if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes || twin_covers_locked(va, bytes)) return false;
     if (bytes > kStageMaxBytes) {
         bump(g_stage_refused);
         return false;
@@ -881,6 +1455,21 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const StageChunk& c = g_stage_held[slot].back();
     const VkBufferCopy region{loc.offset, g_stage_fill[slot], bytes};
     vkCmdCopyBuffer(cmd, loc.buffer, c.buffer, 1, &region);
+    if (g_stage_census) {
+        StageStat& st = g_stage_stats[va];
+        if (st.why < 0) {
+            st.why = 3;
+            for (std::uint64_t p = off >> kPageShift; p <= (off + bytes - 1) >> kPageShift; ++p) {
+                const Page& pg = m.pages[p];
+                const int w = pg.dynamic ? 0 : (!pg.valid && pg.gpu_written) ? 1 : !pg.valid ? 2 : 3;
+                st.why = std::min(st.why, w);
+            }
+        }
+        st.bytes += bytes;
+        ++st.copies;
+        st.record = std::max<std::uint64_t>(st.record, bytes);
+        g_stage_why_bytes[st.why] += bytes;
+    }
     if (g_stage_dedup) {
         StagedRange& seen = g_stage_seen[slot][StageKey{loc.buffer, loc.offset}];
         if (bytes >= seen.bytes) seen = StagedRange{c.buffer, g_stage_fill[slot], bytes};
@@ -975,7 +1564,7 @@ bool snap_ring_make() {
 }  // namespace
 
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes) return false;
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || twin_covers_locked(va, bytes)) return false;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0;
     if (!phys_of(va, bytes, chunk, off) || off + bytes > kChunkBytes) return true;  // not told this cheaply
@@ -984,7 +1573,7 @@ bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
 }
 
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes) return false;
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes || twin_covers_locked(va, bytes)) return false;
     // Only a range on a page the game keeps rewriting: a static page the
     // mirrors had no room for is staged as before, not copied by the CPU at
     // every draw.
@@ -1054,7 +1643,7 @@ void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::
     std::uint32_t stale = 0;
     for (std::uint32_t p = p0; p <= p1 && at + 48 < n; ++p) {
         Page& pg = m->pages[p];
-        const bool w = pg.valid && written(pg);
+        const bool w = pg.valid && (pg.told ? pg.gx_written > pg.told_seq : written(pg));
         if (pg.valid && pg.checked == stamp && w) ++stale;
         at += static_cast<std::size_t>(std::snprintf(out + at, n - at, "%s%u:%s%s%s%s", at ? " " : "", p,
                                                      pg.dynamic ? "host" : pg.valid ? "mirror" : "uncopied",
@@ -1104,6 +1693,9 @@ public:
         const Slot& s = slots_[find(page + 1)];
         return s.key ? s.serial : 0;
     }
+    // The newest serial a rebuild let go of (landed writes leave the table):
+    // latest() cannot answer for a recording at or before it.
+    std::uint64_t dropped() const { return dropped_; }
 
 private:
     struct Slot {
@@ -1111,6 +1703,7 @@ private:
     };
     std::vector<Slot> slots_;
     std::size_t used_ = 0;
+    std::uint64_t dropped_ = 0;
     unsigned bits_ = 10;
     std::size_t find(std::uint64_t key) const {
         const std::size_t mask = slots_.size() - 1;
@@ -1127,7 +1720,11 @@ private:
         slots_.assign(std::size_t{1} << bits_, Slot{});
         used_ = 0;
         for (const Slot& s : old) {
-            if (!s.key || s.serial < g.completed_submits) continue;
+            if (!s.key) continue;
+            if (s.serial < g.completed_submits) {
+                dropped_ = std::max(dropped_, s.serial);
+                continue;
+            }
             slots_[find(s.key)] = s;
             ++used_;
         }
@@ -1158,6 +1755,8 @@ bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
     }
     return false;
 }
+
+std::uint64_t gpu_writes_dropped_locked() { return std::max(g_gpu_write_pages.dropped(), g_gpu_write_small.dropped()); }
 
 bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
     if (!bytes) return false;
@@ -1202,6 +1801,7 @@ namespace {
 // Pages valid for a while (checked in an earlier recording, so their copy has
 // run) whose memory no longer hashes as it did when copied.
 void verify_batch_locked() {
+    drain_gx_writes_locked();
     const std::uint64_t stamp = g.record_serial + 1;
     for (std::uint32_t chunk = 0; chunk < gcn::kDmemChunks; ++chunk) {
         Mirror& m = g_mirrors[chunk];
@@ -1214,10 +1814,27 @@ void verify_batch_locked() {
             if (!hle_kernel_va_mapped(pg.va, pg.bytes)) continue;
             ++g_verify_checked;
             if (fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pg.va)), pg.bytes) == pg.hash) continue;
-            if (written(pg)) continue;  // a write the next check will see anyway
+            if (pg.told ? pg.gx_written > pg.told_seq : written(pg)) continue;  // a write the next check will see anyway
+            if (pg.told && pg.provisional) continue;  // copied again at the next recording, outstanding renamed copies over it
+            bool read_changed = !pg.told;  // a watched page's change is one either way
+            if (pg.told) {
+                ++g_verify_stale_told;
+                // Of the told page's bytes, did a draw bind any that changed?
+                auto vc = g_verify_copies.find((std::uint64_t{chunk} << 32) | p);
+                if (vc != g_verify_copies.end() && vc->second.size() == pg.bytes && pg.read_lo < pg.read_hi) {
+                    const auto* now = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(pg.va));
+                    const std::uint32_t lo = std::min<std::uint32_t>(pg.read_lo, static_cast<std::uint32_t>(pg.bytes));
+                    const std::uint32_t hi = std::min<std::uint32_t>(pg.read_hi, static_cast<std::uint32_t>(pg.bytes));
+                    read_changed = lo < hi && std::memcmp(now + lo, vc->second.data() + lo, hi - lo) != 0;
+                }
+                if (read_changed) ++g_verify_stale_told_read;
+            }
+            if (pg.told && !read_changed) continue;  // changed in bytes no draw bound since the copy (the pool's draw tables)
             if (g_verify_stale++ < 32) {
-                host_log("buffer shadow: VERIFY: page 0x%llx changed with no write this cache saw (chunk %u)",
-                         static_cast<unsigned long long>(page_va), chunk);
+                host_log("buffer shadow: VERIFY: %s page 0x%llx changed with no write this cache saw (chunk %u)%s", pg.told ? "told" : "watched",
+                         static_cast<unsigned long long>(page_va), chunk, pg.told ? ", in bytes draws bound" : "");
+                if (pg.told)
+                    host_log("buffer shadow: VERIFY:   draws bound [+0x%x, +0x%x) of it since its copy", pg.read_lo, pg.read_hi);
                 hle_kernel_mappings_of(pg.va);  // logs each address the page is mapped at
                 auto it = g_verify_copies.find((std::uint64_t{chunk} << 32) | p);
                 if (it != g_verify_copies.end() && it->second.size() == pg.bytes) {
@@ -1265,6 +1882,8 @@ void verify_batch_locked() {
     }
 }
 }  // namespace
+
+VkCommandBuffer shadow_upload_cmd_locked() { return upload_cmd_locked(); }
 
 // The copies this recording made, ended; submit_locked runs them first.
 VkCommandBuffer shadow_end_uploads_locked() {
@@ -1445,7 +2064,8 @@ void shadow_second_chance_locked() {
     }();
     if (!on) return;
     std::uint64_t pages = 0;
-    for (Mirror& m : g_mirrors) {
+    for (std::uint32_t c = 0; c < gcn::kDmemChunks; ++c) {
+        Mirror& m = g_mirrors[c];
         if (m.pages.empty()) continue;
         for (std::size_t w = 0; w < m.dyn.size(); ++w) {
             std::uint64_t bits = m.dyn[w];
@@ -1602,12 +2222,68 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
     out += st;
     out += sn;
+    if (g_stage_census && !g_stage_stats.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;  // bytes, va
+        for (const auto& [va, stt] : g_stage_stats) top.push_back({stt.bytes, va});
+        std::sort(top.rbegin(), top.rend());
+        static const char* const kWhy[4] = {"dynamic", "GPU-written", "not mirrored", "mirrored?"};
+        host_log("buffer shadow: stage census since the last report: %zu ranges; MiB by why: dynamic %.0f, GPU-written %.0f, not mirrored %.0f, "
+                 "mirrored? %.0f",
+                 g_stage_stats.size(), g_stage_why_bytes[0] / 1048576.0, g_stage_why_bytes[1] / 1048576.0, g_stage_why_bytes[2] / 1048576.0,
+                 g_stage_why_bytes[3] / 1048576.0);
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+            const StageStat& stt = g_stage_stats[top[i].second];
+            GxResourceInfo info;
+            const bool res = gx_resource_at(top[i].second, 1, &info);
+            host_log("buffer shadow: stage census:   0x%llx %llu B x%llu = %.0f MiB (%s)%s%llx +%u bind 0x%x usage %u", static_cast<unsigned long long>(top[i].second),
+                     static_cast<unsigned long long>(stt.record), static_cast<unsigned long long>(stt.copies), stt.bytes / 1048576.0,
+                     kWhy[stt.why < 0 ? 3 : stt.why], res ? (info.type == 1 ? " in GX buffer 0x" : " in GX texture 0x") : " in no GX resource 0x",
+                     static_cast<unsigned long long>(res ? info.memory : 0), res ? info.bytes : 0, res ? info.bind : 0, res ? info.usage : 0);
+        }
+        g_stage_stats.clear();
+        std::fill(std::begin(g_stage_why_bytes), std::end(g_stage_why_bytes), 0);
+    }
+    // What GX's calls told the mirrors, on a line of its own (the report
+    // fills one).
+    if (g_shadow_gx) {
+        char gx[900];
+        std::snprintf(gx, sizeof(gx),
+                      "told by GX's calls (BBHOST_SHADOW_GX): renamed copies%s outstanding now %zu (most %llu), written back %llu (no "
+                      "outstanding copy there %llu), aged out %llu; told copies made while one was outstanding %llu, valid pages a hand-out "
+                      "invalidated %llu, pages that stayed unsettled to host memory %llu; resources made over handed-out memory %llu; "
+                      "%llu page copies told and not watched, watched instead %llu (GX buffers cover them in part) + %llu (none), GX writes "
+                      "%llu, told pages invalidated by them %llu (kept for a submission made before the write %llu)%s",
+                      g_shadow_handed ? "" : " (BBHOST_SHADOW_HANDED=0: watched)", g_outstanding.size(),
+                      static_cast<unsigned long long>(g_outstanding_most), static_cast<unsigned long long>(g_settled),
+                      static_cast<unsigned long long>(g_settle_unmatched), static_cast<unsigned long long>(g_aged_out),
+                      static_cast<unsigned long long>(g_provisional_copies), static_cast<unsigned long long>(g_handed_invalid),
+                      static_cast<unsigned long long>(g_handed_dynamic), static_cast<unsigned long long>(g_made_over_handed),
+                      static_cast<unsigned long long>(g_told_copies), static_cast<unsigned long long>(g_watched_partial),
+                      static_cast<unsigned long long>(g_watched_none), static_cast<unsigned long long>(g_gx_records.load()),
+                      static_cast<unsigned long long>(g_told_invalid), static_cast<unsigned long long>(g_told_held),
+                      g_told_overflows || g_told_unmapped ? "; every told page copied again after a queue overflow or an unmapped range" : "");
+        std::string told = gx;
+        if (const std::uint64_t dropped = g_hand_dropped.load()) {
+            char hd[96];
+            std::snprintf(hd, sizeof(hd), "; hand-outs the full queue dropped %llu", static_cast<unsigned long long>(dropped));
+            told += hd;
+        }
+        if (g_verify) {
+            char vt[96];
+            std::snprintf(vt, sizeof(vt), "; stale told pages %llu (in bytes draws bound %llu)", static_cast<unsigned long long>(g_verify_stale_told),
+                          static_cast<unsigned long long>(g_verify_stale_told_read));
+            told += vt;
+        }
+        host_log("  buffer shadow, %s", told.c_str());
+    }
     if (g_map_census) {
-        char mc[200];
-        std::snprintf(mc, sizeof(mc), "; pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on none %llu",
-                      static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
-                      static_cast<unsigned long long>(g_written_no_resource.load()));
-        out += mc;
+        drain_gx_writes_locked();
+        census_faults_locked();
+        log_fault_census();
+        host_log("  buffer shadow census: pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on "
+                 "none %llu",
+                 static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
+                 static_cast<unsigned long long>(g_written_no_resource.load()));
     }
     return out;
 }
@@ -1617,6 +2293,75 @@ std::string shadow_report() {
 std::string host_gpu_shadow_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
     return gpu::shadow_report();
+}
+
+void host_gpu_shadow_gx_write(std::uint64_t va, std::size_t bytes) {
+    using namespace gpu;
+    if (!g_shadow_gx || !va || !bytes) return;
+    g_gx_records.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_gx_writes_mu);
+    if (g_gx_writes.size() >= kGxWritesMax) {
+        g_gx_writes_overflow.store(true, std::memory_order_release);
+    } else {
+        g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), kGxWrite});
+    }
+    g_gx_writes_pending.store(true, std::memory_order_release);
+}
+
+void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes) {
+    using namespace gpu;
+    if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
+    if (g_shadow_gx) g_gx_records.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_gx_writes_mu);
+    if (g_gx_writes.size() >= kGxWritesMax) {
+        g_gx_writes_overflow.store(true, std::memory_order_release);
+    } else {
+        g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), kGxCreate});
+    }
+    g_gx_writes_pending.store(true, std::memory_order_release);
+}
+
+bool host_gpu_shadow_hands_out() { return gpu::g_shadow_handed; }
+
+void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
+    using namespace gpu;
+    if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
+    const unsigned k = static_cast<unsigned>(kind);
+    if (k >= kHandKinds) return;
+    // The census's hand-outs come in runs through the same pages (a ring, a
+    // pool's blocks): one record per span of 4 KiB pages a thread repeats.
+    // A renamed copy's is never skipped - the same memory handed out again
+    // after a write-back is outstanding again.
+    thread_local std::uint64_t last_lo[kHandKinds] = {~0ull, ~0ull, ~0ull, ~0ull}, last_hi[kHandKinds] = {};
+    const std::uint64_t lo = va & ~0xfffull, hi = (va + bytes + 0xfff) & ~0xfffull;
+    if (k != kHandMap && lo >= last_lo[k] && hi <= last_hi[k]) return;
+    std::lock_guard<std::mutex> lk(g_gx_writes_mu);
+    if (g_gx_writes.size() >= kGxWritesMax) {
+        // No room: told pages under it may be written unseen, so every told
+        // page is copied again before it is read (and the pages go to host
+        // memory at a later hand-out of the same memory).
+        g_hand_dropped.fetch_add(1, std::memory_order_relaxed);
+        if (g_shadow_handed) g_gx_writes_overflow.store(true, std::memory_order_release);
+    } else {
+        g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), static_cast<int>(k) + 1});
+        last_lo[k] = lo;
+        last_hi[k] = hi;
+    }
+    g_gx_writes_pending.store(true, std::memory_order_release);
+}
+
+void host_gpu_shadow_gx_settled(std::uint64_t va, std::size_t bytes) {
+    using namespace gpu;
+    if (!g_shadow_handed || !va || !bytes) return;
+    std::lock_guard<std::mutex> lk(g_gx_writes_mu);
+    if (g_gx_writes.size() >= kGxWritesMax) {
+        // No room: the copy stays outstanding until it ages out - its pages
+        // are copied again at each recording until then, which is safe.
+        g_hand_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), kGxSettle});
+    g_gx_writes_pending.store(true, std::memory_order_release);
 }
 
 void host_gpu_shadow_cp_write(std::uint64_t va, std::size_t bytes) {

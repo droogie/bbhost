@@ -1015,6 +1015,8 @@ void hle_video_set_game_pace(int fps) {
     }
 }
 
+int hle_video_game_pace() { return g_game_pace.load(std::memory_order_relaxed); }
+
 void hle_video_set_fps_cap(int fps) {
     // The game's pace is chosen when it starts (engine/frame_rate.h): its
     // steps are converted for that rate, so capping it lower now would slow

@@ -2038,6 +2038,26 @@ public:
         build_layout();
         build_images();
         build_pipeline();
+        // A capture made since the GDS counters went by device address says
+        // so; its own module then takes them as such.
+        const json::Value* by_address = json::member(cap_.m, "translate").find("gds_by_address");
+        if (by_address && by_address->type == json::Value::Type::Bool && by_address->boolean) counters_to_device();
+    }
+    // StageParams::gds_counter names each counter word by its device address
+    // (a module translated or lifted since 2026-10-17: gcn's gds_counter); the
+    // capture holds the guest words, put here on this replay's own pages. A
+    // module rebuilt by today's tools (--cs-base, --cs) takes them so too.
+    void counters_to_device() {
+        if (counters_device_ || counters_.empty()) return;
+        counters_device_ = true;
+        for (std::uint64_t& w : params_host_.gds_counter) {
+            if (!w) continue;
+            const std::uint64_t page = w & ~(kPage - 1);
+            const auto it = std::lower_bound(page_vas_.begin(), page_vas_.end(), page);
+            w = it != page_vas_.end() && *it == page ? pages_.address + static_cast<std::uint64_t>(it - page_vas_.begin()) * kPage + (w & (kPage - 1))
+                                                     : 0;
+        }
+        std::memcpy(params_.map, &params_host_, sizeof(params_host_));
     }
     ~DispatchReplayer() {
         if (variant_pipeline_) vkDestroyPipeline(dev_.device, variant_pipeline_, nullptr);
@@ -2061,6 +2081,7 @@ public:
 
     // --cs-base: A's (and B's, the sentinel run's) module in place of the captured one.
     void base(const std::vector<std::uint32_t>& words) {
+        counters_to_device();
         if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
         if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
         pipeline_ = VK_NULL_HANDLE;
@@ -2160,6 +2181,8 @@ public:
         return {};
     }
     std::size_t variant_bound() const { return variant_bound_; }
+    bool counters_on_device() const { return counters_device_; }
+    bool has_counters() const { return !counters_.empty(); }
 
     // A second pipeline from another compute module (--cs), on the same layout.
     void variant(const std::vector<std::uint32_t>& words) {
@@ -2592,6 +2615,7 @@ private:
     std::size_t variant_bound_ = 0;
     std::uint32_t groups_[3] = {1, 1, 1};
     std::vector<std::uint64_t> counters_;
+    bool counters_device_ = false;  // params_host_.gds_counter holds device addresses (counters_to_device)
     std::vector<Written> written_;
 };
 
@@ -2603,7 +2627,13 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
     DispatchReplayer r(cap, dev);
     if (!o.cs_base.empty()) r.base(words_of(read_file(o.cs_base), "the base compute module"));
-    if (!o.cs.empty()) r.variant(words_of(read_file(o.cs), "the variant compute module"));
+    if (!o.cs.empty()) {
+        // A module built by today's tools takes the counters by device
+        // address; the captured one of an older capture walks for them, so
+        // the two cannot share the params block - A must be rebuilt too.
+        if (!r.counters_on_device() && r.has_counters()) fail("this capture's own module walks for its GDS counters: give --cs-base, rebuilt as the variant was");
+        r.variant(words_of(read_file(o.cs), "the variant compute module"));
+    }
     if (!o.cs_buffers.empty()) {
         const std::vector<std::uint8_t> text = read_file(o.cs_buffers);
         json::Value lean;

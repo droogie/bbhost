@@ -18,7 +18,11 @@
 #include "core/tally.h"
 #include "core/thunk.h"
 #include "decomp/decomp.h"
+#include "decomp/gx/constant_engine.h"
 #include "decomp/gx/dead_packets.h"
+#include "decomp/gx/dma.h"
+#include "host/cb_proof.h"
+#include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "engine/gx_resources.h"
@@ -861,7 +865,35 @@ std::vector<GxDrawRecords*>* const g_records_free = new std::vector<GxDrawRecord
 // Trivially destructible, so records released during thread exit still find it.
 thread_local GxDrawRecords* t_records_cache[2 * kRecordsBatch] = {};
 thread_local unsigned t_records_cached = 0;
+// BBHOST_GX_PACKED_RECORDS (decided at start, by the frame rate; 0 or 1
+// forces it): 1 packs a native draw's records at the call - each stage's first line, then only what
+// its bits and counts say is set, back to back, at the front of a pooled set
+// instead of spread over the set's ~28 KB - and the command processor unpacks
+// them into a set of its own, which stays in its caches from draw to draw, so
+// every reader stays as it is; the token lookahead asks for the packed bytes in
+// one run, without first reading each stage's header to find the set slots.
+// 2 also keeps the records as they were and compares the unpacked ones with
+// them at every draw (the readers then read the unpacked ones).
+// Measured (10-18, one hold, A B A B at --fps 120): 669 bytes a draw against
+// the ~28 KB set; the command processor 0.5-0.7 ms a flip faster at Mensis'
+// 1,270 draws, Central Yharnam and Old Yharnam within their spread. Round 6's
+// gate at 60 fps: the GX workers 7-9 points of a core busier together for it,
+// and nothing gained - a paced frame does not wait for the command processor.
+// So by default it packs only where the command processor limits the frame
+// rate: Uncapped, 90 and 120 (the game's pace, hle_video_game_pace, chosen
+// before the trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
+int g_packed_records = 0;
+// The set a GX thread snapshots a draw into before packing it: the same set
+// draw after draw, so in its caches, where a pooled set comes back cold.
+thread_local GxDrawRecords* t_gx_scratch = nullptr;
+GxDrawRecords* pooled_records_raw();
 GxRecordsPtr new_records() {
+    // Default-initialized, as `new GxDrawRecords` was: counts and slot bits
+    // cleared, the large arrays left as they are.
+    return GxRecordsPtr(new (pooled_records_raw()) GxDrawRecords);
+}
+// A pooled set's memory, not constructed (a packed set is written over its front).
+GxDrawRecords* pooled_records_raw() {
     if (!t_records_cached) {
         std::lock_guard<std::mutex> lk(g_records_mu);
         const auto n = static_cast<unsigned>(std::min<std::size_t>(g_records_free->size(), kRecordsBatch));
@@ -873,20 +905,24 @@ GxRecordsPtr new_records() {
     if (t_records_cached) {
         raw = t_records_cache[--t_records_cached];
         // The next draw's set: its stage headers, which the constructor and
-        // the snapshot write first, asked for now (a pooled set is cold).
+        // the snapshot write first, asked for now (a pooled set is cold) - or
+        // the front a packed set is written into.
         if (t_records_cached) {
             const auto* next = reinterpret_cast<const char*>(t_records_cache[t_records_cached - 1]);
-            for (int k = 0; k < kGxRecords; ++k) prefetch_for_write(next + offsetof(GxDrawRecords, stage) + k * sizeof(GxStageRecords));
+            if (g_packed_records) {
+                for (int off = 0; off < 512; off += 64) prefetch_for_write(next + off);
+            } else {
+                for (int k = 0; k < kGxRecords; ++k) prefetch_for_write(next + offsetof(GxDrawRecords, stage) + k * sizeof(GxStageRecords));
+            }
         }
     } else {
         raw = ::operator new(sizeof(GxDrawRecords), std::align_val_t{alignof(GxDrawRecords)});
         g_records_new.fetch_add(1, std::memory_order_relaxed);
     }
-    // Default-initialized, as `new GxDrawRecords` was: counts and slot bits
-    // cleared, the large arrays left as they are.
-    return GxRecordsPtr(new (raw) GxDrawRecords);
+    return static_cast<GxDrawRecords*>(raw);
 }
 void GxRecordsRelease::operator()(GxDrawRecords* p) const noexcept {
+    if (p == t_gx_scratch) return;  // the GX thread's own set, never pooled
     if (t_records_cached == 2 * kRecordsBatch) {
         std::lock_guard<std::mutex> lk(g_records_mu);
         for (unsigned i = kRecordsBatch; i < 2 * kRecordsBatch; ++i) {
@@ -1343,7 +1379,9 @@ shaders_done:
         const std::uint64_t rtv = rd64(s + 0x4e0 + 8 * static_cast<std::uint64_t>(t));
         if (!rtv) continue;
         for (int k = 0; k < 5; ++k) in.color[t][k] = rd32(rtv + 0x10 + 4 * static_cast<std::uint64_t>(k));
-        in.color_extent[t] = gx_view_extent(rtv);
+        std::uint64_t gen = 0;
+        in.color_extent[t] = gx_view_extent_gen(rtv, &gen);
+        in.color_gen[t] = static_cast<std::uint32_t>(gen);
     }
     const std::uint64_t ds = r.ds ? r.ds : guest(kDefaultDepthStencil);
     in.depth_control = rd32(ds);
@@ -1360,7 +1398,9 @@ shaders_done:
         // (0x14739b0) packs it after the eight register-0x10 words.
         in.depth_view = rd32(r.dsv + 0x30);
         in.htile_base = rd32(r.dsv + 0x34);
-        in.depth_extent = gx_view_extent(r.dsv);
+        std::uint64_t gen = 0;
+        in.depth_extent = gx_view_extent_gen(r.dsv, &gen);
+        in.depth_gen = static_cast<std::uint32_t>(gen);
     }
 
     // Rasterizer (0x2ad3370), with the masks the Gnm setters apply.
@@ -1517,7 +1557,142 @@ constexpr std::size_t kShaderInfos = 256;
 thread_local ShaderInfo* t_shader_infos = nullptr;
 Tally<2> g_shader_info;  // [0] records from the cache, [1] read from the object
 
-GxRecordsPtr snapshot_records(const GxRec& r) {
+// BBHOST_GX_PACKED_RECORDS: a draw's records packed into the front of a
+// pooled set - a 16-byte head, then per stage its first line (counts, masks,
+// slot bits, desc_fp: everything the constructor clears), its descriptors,
+// and the set slots' records in slot order (views and their ids, samplers -
+// an empty slot's default too -, constant buffers), the context block when it
+// has one, the proof's and the cost check's handles when set. What a stage's
+// bits and counts do not cover is not in it; no reader looks there.
+constexpr std::uint32_t kPackedMagic = 0x44524b50;  // "PKRD"
+struct PackedHead {
+    std::uint32_t magic;
+    std::uint32_t bytes;  // head included
+    std::uint8_t stages;  // the first `stages` are packed; the rest are empty
+    std::uint8_t pad[7];
+};
+static_assert(sizeof(PackedHead) == 16);
+static_assert(offsetof(GxStageRecords, desc) == 64, "a stage's first line is what the bits and counts are");
+constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 16 + 0xc0 + 2 * 14 * 8);
+static_assert(kPackedMax <= sizeof(GxDrawRecords));
+std::atomic<std::uint64_t> g_packed_draws{0}, g_packed_bytes{0}, g_packed_most{0};
+
+std::uint32_t pack_records(const GxDrawRecords& src, int stages, void* dst) {
+    auto* const base = static_cast<std::uint8_t*>(dst);
+    std::uint8_t* p = base + sizeof(PackedHead);
+    const auto put = [&p](const void* from, std::size_t n) {
+        std::memcpy(p, from, n);
+        p += n;
+    };
+    for (int k = 0; k < stages; ++k) {
+        const GxStageRecords& s = src.stage[k];
+        put(&s, 64);
+        put(s.desc, std::min<std::uint32_t>(s.ndesc, 64) * 4u);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(s.obj_tex + __builtin_ctzll(m) * 32, 32);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(&s.obj_tex_id[__builtin_ctzll(m)], 4);
+        for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) put(s.obj_smp + __builtin_ctz(m) * 32, 32);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        if (s.has_ctx_block) put(s.ctx_block, sizeof(s.ctx_block));
+        for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) put(&s.cb_proof[__builtin_ctz(m)], 8);
+        for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) put(&s.cb_hash[__builtin_ctz(m)], 8);
+    }
+    const PackedHead head{kPackedMagic, static_cast<std::uint32_t>(p - base), static_cast<std::uint8_t>(stages), {}};
+    std::memcpy(base, &head, sizeof(head));
+    return head.bytes;
+}
+
+// The command processor's set the packed records are unpacked into: the same
+// set draw after draw (a draw holds it until hle_gx_native_release, and a
+// command processor draws one at a time), so its lines stay in its caches.
+thread_local GxDrawRecords* t_cp_unpacked = nullptr;
+const GxDrawRecords* unpack_records(const void* packed) {
+    const auto* const base = static_cast<const std::uint8_t*>(packed);
+    PackedHead head;
+    std::memcpy(&head, base, sizeof(head));
+    if (head.magic != kPackedMagic) return static_cast<const GxDrawRecords*>(packed);  // (not packed: as it is)
+    if (!t_cp_unpacked) t_cp_unpacked = new GxDrawRecords;
+    GxDrawRecords& out = *t_cp_unpacked;
+    const std::uint8_t* p = base + sizeof(PackedHead);
+    const auto get = [&p](void* to, std::size_t n) {
+        std::memcpy(to, p, n);
+        p += n;
+    };
+    for (int k = 0; k < kGxRecords; ++k) {
+        GxStageRecords& s = out.stage[k];
+        if (k >= head.stages) {
+            std::memset(static_cast<void*>(&s), 0, 64);  // as constructed: no counts, no bits
+            continue;
+        }
+        get(&s, 64);
+        get(s.desc, std::min<std::uint32_t>(s.ndesc, 64) * 4u);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(s.obj_tex + __builtin_ctzll(m) * 32, 32);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(&s.obj_tex_id[__builtin_ctzll(m)], 4);
+        for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) get(s.obj_smp + __builtin_ctz(m) * 32, 32);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        if (s.has_ctx_block) get(s.ctx_block, sizeof(s.ctx_block));
+        for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) get(&s.cb_proof[__builtin_ctz(m)], 8);
+        for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) get(&s.cb_hash[__builtin_ctz(m)], 8);
+    }
+    return &out;
+}
+
+// BBHOST_GX_PACKED_RECORDS=2: the unpacked records against the records as
+// they were made, field by field where the bits and counts say a reader
+// looks (which is everything a reader reads).
+enum PackedField { kPfHeader, kPfDesc, kPfTex, kPfTexId, kPfSmp, kPfCb, kPfCtx, kPfProof, kPfHash, kPackedFields };
+const char* const kPackedFieldName[kPackedFields] = {"stage headers", "descriptors", "views", "view ids", "samplers",
+                                                     "constant buffers", "context blocks", "proof handles", "cost hashes"};
+std::atomic<std::uint64_t> g_packed_compared{0}, g_packed_differ[kPackedFields] = {};
+void compare_unpacked(const GxDrawRecords& made, const GxDrawRecords& got) {
+    g_packed_compared.fetch_add(1, std::memory_order_relaxed);
+    bool seen[kPackedFields] = {};
+    const auto differ = [&](PackedField f) {
+        if (seen[f]) return;
+        seen[f] = true;
+        g_packed_differ[f].fetch_add(1, std::memory_order_relaxed);
+    };
+    for (int k = 0; k < kGxRecords; ++k) {
+        const GxStageRecords& a = made.stage[k];
+        const GxStageRecords& b = got.stage[k];
+        if (std::memcmp(&a, &b, 64) != 0) {
+            differ(kPfHeader);
+            continue;
+        }
+        if (std::memcmp(a.desc, b.desc, std::min<std::uint32_t>(a.ndesc, 64) * 4u) != 0) differ(kPfDesc);
+        for (std::uint64_t m = a.obj_tex_set; m; m &= m - 1) {
+            const int j = __builtin_ctzll(m);
+            if (std::memcmp(a.obj_tex + j * 32, b.obj_tex + j * 32, 32) != 0) differ(kPfTex);
+            if (a.obj_tex_id[j] != b.obj_tex_id[j]) differ(kPfTexId);
+        }
+        for (std::uint32_t m = a.obj_smp_set; m; m &= m - 1) {
+            if (std::memcmp(a.obj_smp + __builtin_ctz(m) * 32, b.obj_smp + __builtin_ctz(m) * 32, 32) != 0) differ(kPfSmp);
+        }
+        for (std::uint32_t m = a.obj_smp_default; m; m &= m - 1) {
+            if (std::memcmp(a.obj_smp + __builtin_ctz(m) * 32, b.obj_smp + __builtin_ctz(m) * 32, 16) != 0) differ(kPfSmp);
+        }
+        for (std::uint32_t m = a.obj_cb_set; m; m &= m - 1) {
+            if (std::memcmp(a.obj_cb + __builtin_ctz(m) * 16, b.obj_cb + __builtin_ctz(m) * 16, 16) != 0) differ(kPfCb);
+        }
+        if (a.has_ctx_block && std::memcmp(a.ctx_block, b.ctx_block, sizeof(a.ctx_block)) != 0) differ(kPfCtx);
+        for (std::uint32_t m = a.cb_proofed; m; m &= m - 1) {
+            if (a.cb_proof[__builtin_ctz(m)] != b.cb_proof[__builtin_ctz(m)]) differ(kPfProof);
+        }
+        for (std::uint32_t m = a.cb_hashed; m; m &= m - 1) {
+            if (a.cb_hash[__builtin_ctz(m)] != b.cb_hash[__builtin_ctz(m)]) differ(kPfHash);
+        }
+    }
+}
+
+// The packed records' lines, asked for in one run: no header to read first.
+void prefetch_packed(const void* packed, std::uint32_t bytes) {
+    const auto* p = static_cast<const char*>(packed);
+    for (std::uint32_t off = 0; off < bytes; off += 64) __builtin_prefetch(p + off);
+}
+
+// `scratch` (BBHOST_GX_PACKED_RECORDS, from native_draw_call): into this
+// thread's own set, which is packed into a pooled one where the draw is
+// stored; the pointer's release leaves it alone.
+GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     struct Arrays {
         std::uint64_t tex, smp, cache, cb, ext;
     };
@@ -1526,7 +1701,12 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
     GxRecordsPtr out;
     {
         GxCostTimer timer(kCostRecAlloc);
-        out = new_records();
+        if (scratch) {
+            if (!t_gx_scratch) t_gx_scratch = new GxDrawRecords;
+            out = GxRecordsPtr(new (t_gx_scratch) GxDrawRecords);
+        } else {
+            out = new_records();
+        }
     }
     static thread_local unsigned hash_count = 0;
     const bool hash_cbs = g_gx_cost_enabled && (hash_count++ % 16) == 0;
@@ -1702,6 +1882,7 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
     // The objects sit in a few heaps: the last mapped range one was found in
     // answers the next one without the kernel's map list.
     std::uint64_t mapped_lo = 0, mapped_hi = 0, readable_lo = 0, readable_hi = 0;
+    std::uint64_t proof_lo = 0, proof_hi = 0;  // BBHOST_CB_RECORD_PROOF: the buffers' memory, the same way
     const auto object = [&](std::uint64_t slot_va, std::uint64_t bytes) -> std::uint64_t {
         const std::uint64_t obj = rd64(slot_va);
         if (!obj) return 0;
@@ -1812,6 +1993,30 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
             s.obj_cb_set |= 1u << cbs[i].j;
         }
         stamp.to(kCostRecCb);
+        // BBHOST_CB_RECORD_PROOF: each buffer's bytes as they are at the call,
+        // which the command processor compares with what it binds
+        // (host/cb_proof.h). The buffer object says what it is: a dynamic
+        // one (+0x3b bit 2) read through this context's renamed copy or at
+        // its own address (+0x20), else a static buffer (type +0x38 == 1).
+        if (cb_proof::g_on) {
+            const std::uint64_t flip = hle_video_flip_count(), completed = host_gpu_completed_submits_seen();
+            for (int i = 0; i < ncb; ++i) {
+                const std::uint64_t obj = cbs[i].key - 0x18, addr = cbs[i].addr;
+                const std::uint32_t bytes = std::min<std::uint32_t>(((cbs[i].size + 15) >> 4) * 16, cb_proof::kMaxCopy);
+                if (!addr || !bytes || !((addr >= proof_lo && addr + bytes <= proof_hi) || hle_kernel_va_mapped_in(addr, bytes, &proof_lo, &proof_hi)))
+                    continue;
+                std::uint8_t type = 0, flags = 0;
+                safe_read(obj + 0x38, &type, 1);
+                safe_read(obj + 0x3b, &flags, 1);
+                const cb_proof::Kind kind = (flags & 4) ? (addr != rd64(obj + 0x20) ? cb_proof::kRenamed : cb_proof::kDynamicOwn)
+                                            : type == 1 ? cb_proof::kStatic
+                                                        : cb_proof::kOtherObject;
+                if (const std::uint64_t h = cb_proof::record(addr, bytes, kind, flip, completed, obj)) {
+                    s.cb_proof[cbs[i].j] = h;
+                    s.cb_proofed = static_cast<std::uint16_t>(s.cb_proofed | (1u << cbs[i].j));
+                }
+            }
+        }
         // BBHOST_GX_COST: the constant buffers' contents at the call.
         if (hash_cbs) {
             for (int j = 0; j < 14; ++j) {
@@ -1988,6 +2193,7 @@ std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNat
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), token, sizeof(token));
     const std::uint64_t next = cmd + sizeof(token);
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof(next));
+    host_lists::note(cb, cmd, 0x10);
     if (magic == kGxNativeMagic) g_native_tokens.add();
     return id;
 }
@@ -2004,6 +2210,10 @@ struct NativeDraw {
     alignas(64) GpuDrawInputs in;
     alignas(16) GxDrawObjects objects;
     GxRecordsPtr records;
+    // BBHOST_GX_PACKED_RECORDS: the packed records' size (the lookahead asks
+    // for that many bytes), and with =2 the packed ones beside `records`.
+    std::uint32_t records_bytes = 0;
+    GxRecordsPtr packed;
     // The call, for the report on tokens that never came back (the
     // overflow map's entries only; a slot leaves them as they are).
     std::uint64_t ret = 0, ctx = 0;
@@ -2235,7 +2445,7 @@ std::uint64_t records_signature(const GxDrawRecords& rec) {
 bool native_draw_call(GxRec& r) {
     GxCostTimer timer(kCostNative);
     GxCostStamp stamp;
-    GxRecordsPtr records = snapshot_records(r);
+    GxRecordsPtr records = snapshot_records(r, g_packed_records == 1);
     stamp.to(kCostNativeRecords);
     IneligibleWhy why = kWhyRecords;
     if (!native_eligible(r, records.get(), &why)) {
@@ -2308,6 +2518,26 @@ bool native_draw_call(GxRec& r) {
     int free_state = 0;
     GxDrawObjects objects;
     build_objects(r, objects);
+    // BBHOST_GX_PACKED_RECORDS: the records packed into a pooled set, after
+    // everything on this thread that reads them; =1 hands the command
+    // processor only those (this thread's own set goes back to being its own),
+    // =2 both.
+    std::uint32_t records_bytes = 0;
+    GxRecordsPtr packed;
+    if (g_packed_records && records) {
+        GxRecordsPtr block(pooled_records_raw());
+        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader) ? 4 : 2, block.get());
+        g_packed_draws.fetch_add(1, std::memory_order_relaxed);
+        g_packed_bytes.fetch_add(records_bytes, std::memory_order_relaxed);
+        for (std::uint64_t most = g_packed_most.load(std::memory_order_relaxed);
+             records_bytes > most && !g_packed_most.compare_exchange_weak(most, records_bytes, std::memory_order_relaxed);) {
+        }
+        if (g_packed_records == 1) {
+            records = std::move(block);
+        } else {
+            packed = std::move(block);
+        }
+    }
     if (slot.state.compare_exchange_strong(free_state, 1, std::memory_order_acquire)) {
         // Plain stores: the previous draw on this thread asked for these lines
         // (prefetch_next_slot), and the release below orders them before the
@@ -2317,6 +2547,8 @@ bool native_draw_call(GxRec& r) {
         slot.draw.in = r.in;
         slot.draw.objects = objects;
         slot.draw.records = std::move(records);
+        slot.draw.records_bytes = records_bytes;
+        slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
         prefetch_next_slot();
@@ -2328,6 +2560,8 @@ bool native_draw_call(GxRec& r) {
         d.in = r.in;
         d.objects = objects;
         d.records = std::move(records);
+        d.records_bytes = records_bytes;
+        d.packed = std::move(packed);
         d.ret = r.ret;
         d.ctx = r.ctx;
         d.kind = r.kind;
@@ -2474,7 +2708,15 @@ struct GuestCopy {
     std::uint64_t src;
     std::uint64_t bytes;
     bool back = false;  // a renamed dynamic buffer copied back to its own address (host_gpu_copy_back)
+    // A whole texture copied (CopyResource): the generations of the textures
+    // whose memory the copy starts at, 0 for anything else (host_gpu_copy_guest).
+    std::uint64_t src_gen = 0, dst_gen = 0;
 };
+// The live GX texture whose memory starts at `va` and covers `bytes`: its generation, or 0.
+std::uint64_t whole_texture_gen(std::uint64_t va, std::uint64_t bytes) {
+    GxResourceInfo r;
+    return gx_resource_at(va, bytes, &r) && r.memory == va && r.type >= 2 ? r.gen : 0;
+}
 std::mutex g_copies_mu;
 std::unordered_map<std::uint64_t, std::vector<GuestCopy>> g_copies;  // by token id, until the CP walks the token
 // BBHOST_CP_CENSUS: GX's buffer-copy passes by kind and caller (CopyResource,
@@ -2499,6 +2741,20 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 // usage, source, usage, size) is one such copy, and CopyResource's. Both
 // shaders copy size >> 2 whole dwords.
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
+    // The sources are renamed copies GX writes back (or CopyResource's
+    // source): the CPU is done with them, which the buffer shadow's mirrors
+    // over them wait for (host_gpu_shadow_gx_settled) - but for a constant
+    // buffer's, which the shadow never heard of.
+    if (kind == kCopyBuffers) {
+        const std::uint64_t entries = f[2];
+        const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
+        for (std::uint32_t i = 0; entries && i < count; ++i) {
+            const std::uint64_t e = entries + 0x18ull * i;
+            if (!gx_constant_buffer_at(rd64(e))) host_gpu_shadow_gx_settled(rd64(e + 8), rd32(e + 0x10));
+        }
+    } else if (!gx_constant_buffer_at(f[4])) {
+        host_gpu_shadow_gx_settled(f[2], f[0] & 0xffffffffull);
+    }
     if (!g_native_copies || g_native != 2 || g_backend != 1) return 0;
     if (!(g_copy_kinds & (kind == kCopyBuffers ? 1 : 2))) return 0;
     const std::uint64_t cb = f[5];
@@ -2513,7 +2769,14 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
             copies.push_back({rd64(e), rd64(e + 8), (rd32(e + 0x10) >> 2) * 4ull, true});
         }
     } else {
-        copies.push_back({f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4});
+        GuestCopy one{f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4};
+        // CopyResource of two textures reaches here as their memory: name both,
+        // so the command processor copies their images by identity.
+        if (const std::uint64_t sg = whole_texture_gen(one.src, one.bytes)) {
+            one.src_gen = sg;
+            one.dst_gen = whole_texture_gen(one.dst, one.bytes);
+        }
+        copies.push_back(one);
     }
     if (g_copy_calls.fetch_add(1, std::memory_order_relaxed) < 8) {
         host_log("gx-copy: %s from 0x%llx: %zu copies, first 0x%llx -> 0x%llx, %llu bytes", kKindName[kind], static_cast<ull>(bn(f[6])),
@@ -2682,6 +2945,7 @@ bool clear_rtv_view(const std::uint64_t* f) {
     c.slices = rd32(rt + 0x3c);
     c.fast_clear = (rd32(rt + 0x10) >> 13) & 1;  // CB_COLOR_INFO.FAST_CLEAR: what 0x1486d60 reads
     c.extent = clear_view_extent(view, res, c.mip);
+    c.gen = static_cast<std::uint32_t>(gx_view_gen(view));
     if (!safe_read(value, c.rgba, sizeof(c.rgba))) return false;
     // A CMASK fast clear ignores the value on the console: the tiles read as
     // the clear words GX keeps per bound slot (ctx+0xb658, 0x2ad1f80). Said
@@ -2726,6 +2990,7 @@ bool clear_dsv_view(const std::uint64_t* f) {
     std::memcpy(&c.om_stencil, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ctx + 0xb654)), 4);
     c.om_stencil &= 0xff;
     c.extent = clear_view_extent(view, res, 0);
+    c.gen = static_cast<std::uint32_t>(gx_view_gen(view));
     // GX's own pass builds HTILE from the output merger's depth clear, and
     // its quad (no HTILE) writes the argument.
     if (c.htile && c.om_depth != c.depth_value) g_cv_depth_differs.fetch_add(1, std::memory_order_relaxed);
@@ -3016,6 +3281,11 @@ std::uint64_t native_copy_texture(const std::uint64_t* f) {
     if (((c.src_tsharp[1] >> 20) & 0x3ff) != ((c.dst_tsharp[1] >> 20) & 0x3ff)) {
         g_icopy_format.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    {
+        GxResourceInfo ri;
+        if (gx_resource_at(d.memory, 1, &ri) && ri.memory == d.memory) c.dst_gen = ri.gen;
+        if (gx_resource_at(s.memory, 1, &ri) && ri.memory == s.memory) c.src_gen = ri.gen;
     }
     c.dst_mip = dst_sub % d.mips;
     c.dst_layer = dst_sub / d.mips;
@@ -3881,6 +4151,12 @@ std::uint8_t state_packet_dwords(Kind id) {
         case kSetUserData: return 6;
         case kSetIndexBuffer: return 3;
         case kSetNumInstances: case kSetIndexSize: return 2;
+        case kSetCs: case kSetCsQueue: return 25;
+        case kSetBase: return 4;
+        case kCsUd4: case kCsUdN: return 8;
+        case kCsUd8: case kCsUd8b: return 12;
+        case kCsUd1: return 5;
+        case kCsUdPtr: return 6;
         default: return 3;
     }
 }
@@ -3895,6 +4171,14 @@ bool skip_state_packets() {
     }();
     return v;
 }
+
+// The compute stage's packets - its program, its user data and the indirect
+// arguments' base - go too when every dispatch is a token and the dead
+// packets are on (hle_gx_trace_arm sets it): the tokens carry all three, from
+// the hooks' records, and a dispatch that falls back to its packet writes
+// their image before it (write_cs_image).
+bool g_cs_packets_dead = false;
+std::atomic<std::uint64_t> g_cs_images{0}, g_cs_images_failed{0};
 
 // True when this setter's packet is dead: the host reads none of it.
 bool suppressible(Kind id, std::uint32_t stage) {
@@ -3920,7 +4204,17 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
     const std::uint64_t cb = f[5];
     if (!cb) return 0;
     const auto u32 = [&](int i) { return static_cast<std::uint32_t>(f[i]); };
+    // A compute-stage packet not written: the setter returns what the game's
+    // returns on success - SetCsShader the Gnm driver's 0, the others the
+    // write pointer (their packet's address) - though no caller reads it.
+    const auto suppress_cs = [&]() -> std::uint64_t {
+        if (!g_cs_packets_dead) return 0;
+        g_state_packets_skipped[id].fetch_add(1, std::memory_order_relaxed);
+        const_cast<std::uint64_t*>(f)[-1] = id == kSetCs || id == kSetCsQueue ? 0 : rd64(cb + 0x10);
+        return 1;
+    };
     const auto suppress = [&](std::uint32_t stage) -> std::uint64_t {
+        if (stage == 0 && (id == kUd4a || id == kUd8 || id == kUd4b || id == kUd1 || id == kUdPtr || id == kSetUserData)) return suppress_cs();
         if (!skip_state_packets() || !suppressible(id, stage)) return 0;
         g_state_packets_skipped[id].fetch_add(1, std::memory_order_relaxed);
         return 1;
@@ -3931,13 +4225,13 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
         case kUd1: note_user_value(cb, u32(4), u32(3), f[2], 1); return suppress(u32(4));
         case kUdPtr: note_user_value(cb, u32(4), u32(3), f[2], 2); return suppress(u32(4));
         case kSetUserData: note_user_data(cb, u32(4), u32(3), f[2], u32(1)); return suppress(u32(4));
-        // The compute-typed writers: (cb, sgpr, ...) for stage 0. Never suppressed.
-        case kCsUdN: note_user_data(cb, 0, u32(4), f[3], u32(2)); return 0;
-        case kCsUd8: note_user_data(cb, 0, u32(4), f[3], 4); return 0;
-        case kCsUd4: note_user_data(cb, 0, u32(4), f[3], 4); return 0;
-        case kCsUd1: note_user_value(cb, 0, u32(4), f[3], 1); return 0;
-        case kCsUdPtr: note_user_value(cb, 0, u32(4), f[3], 2); return 0;
-        case kCsUd8b: note_user_data(cb, 0, u32(4), f[3], 8); return 0;
+        // The compute-typed writers: (cb, sgpr, ...) for stage 0.
+        case kCsUdN: note_user_data(cb, 0, u32(4), f[3], u32(2)); return suppress_cs();
+        case kCsUd8: note_user_data(cb, 0, u32(4), f[3], 4); return suppress_cs();
+        case kCsUd4: note_user_data(cb, 0, u32(4), f[3], 4); return suppress_cs();
+        case kCsUd1: note_user_value(cb, 0, u32(4), f[3], 1); return suppress_cs();
+        case kCsUdPtr: note_user_value(cb, 0, u32(4), f[3], 2); return suppress_cs();
+        case kCsUd8b: note_user_data(cb, 0, u32(4), f[3], 8); return suppress_cs();
         default: break;
     }
     // The state setters: the guest reads below happen before the lock.
@@ -4028,8 +4322,8 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
             break;
         }
         case kSetIndxOffset: wrapper_state(cb).indx_offset = u32(4); break;
-        case kSetCs: case kSetCsQueue: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; break;
-        case kSetBase: wrapper_state(cb).indirect_base = f[4] & ~7ull; break;
+        case kSetCs: case kSetCsQueue: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; return suppress_cs();
+        case kSetBase: wrapper_state(cb).indirect_base = f[4] & ~7ull; return suppress_cs();
         case kSetIndexBuffer: wrapper_state(cb).index_base = f[4]; break;
         default: break;
     }
@@ -4624,6 +4918,7 @@ bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* wh
     s.compute = true;
     s.ndesc = 0;
     s.cb_hashed = 0;
+    s.cb_proofed = 0;
     s.obj_tex_set = 0;
     s.obj_smp_set = 0;
     s.obj_cb_set = 0;
@@ -4845,6 +5140,55 @@ void refuse_dispatch(DsRefusal why, std::uint64_t caller) {
     std::lock_guard<std::mutex> lk(g_ds_mu);
     if (g_ds_refused_callers.size() < 64 || g_ds_refused_callers.count(caller)) ++g_ds_refused_callers[caller];
 }
+// A dispatch that falls back to its packet while the compute stage's packets
+// are not written (g_cs_packets_dead): their image, written before the
+// dispatch's packet as the register file would have had it - the program
+// from its command buffer's last SetCsShader, the user data as this thread's
+// compute writers wrote it in call order, and for an indirect dispatch the
+// arguments' base. SET_SH_REG and SET_BASE as Gnm writes them.
+void write_cs_image(std::uint64_t cb, const ComputeWrapperState* w, bool indirect) {
+    if (!g_cs_packets_dead) return;
+    std::uint32_t pk[48];
+    std::size_t n = 0;
+    const auto sh = [&](std::uint32_t reg, const std::uint32_t* v, std::uint32_t count) {
+        pk[n++] = 0xC0007602u | (count << 16);
+        pk[n++] = reg;
+        for (std::uint32_t k = 0; k < count; ++k) pk[n++] = v[k];
+    };
+    if (w && w->cs_gnm) {
+        std::uint32_t regs[7];
+        if (safe_read(w->cs_gnm + 8, regs, sizeof regs)) {
+            sh(0x20c, regs, 2);      // COMPUTE_PGM_LO/HI
+            sh(0x212, regs + 2, 2);  // COMPUTE_PGM_RSRC1/2
+            sh(0x207, regs + 4, 3);  // COMPUTE_NUM_THREAD_X/Y/Z
+        }
+    }
+    sh(0x240, t_cs_user.user, 16);   // COMPUTE_USER_DATA_0..15
+    if (indirect && w && w->indirect_base) {
+        pk[n++] = (rd32(cb + 0x28) & 2) | 0xC0021100u;  // SET_BASE, the indirect arguments' table
+        pk[n++] = 1;
+        pk[n++] = static_cast<std::uint32_t>(w->indirect_base) & 0xfffffff8u;
+        pk[n++] = static_cast<std::uint32_t>(w->indirect_base >> 32) & 0xffu;
+    }
+    std::uint64_t cmd = rd64(cb + 0x10), end = rd64(cb + 0x8);
+    if (cmd && end >= cmd && (end - cmd) / 4 < n) {
+        const std::uint64_t fn = rd64(cb + 0x18), arg = rd64(cb + 0x20);
+        const bool refilled = fn && (hle_call_guest<std::int64_t>(reinterpret_cast<void*>(static_cast<std::uintptr_t>(fn)), cb, n, arg,
+                                                                   (end - cmd) / 4) & 0xff);
+        cmd = rd64(cb + 0x10);
+        end = rd64(cb + 0x8);
+        if (!refilled) cmd = 0;
+    }
+    if (!cmd || end < cmd || (end - cmd) / 4 < n) {
+        g_cs_images_failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), pk, n * 4);
+    const std::uint64_t next = cmd + n * 4;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof next);
+    g_cs_images.fetch_add(1, std::memory_order_relaxed);
+}
+
 constexpr std::uint64_t kYebisDispatchSite = 0x15fbd4a;  // yebis_gnm_dispatch's call of the dispatch emitter returns here
 void check_yebis_dispatch(const std::uint32_t* user, std::uint32_t loaded);
 int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
@@ -4857,10 +5201,12 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     const ComputeWrapperState* w = wrapper_compute_copy(cb, w_copy) ? &w_copy : nullptr;
     if (!w || !w->cs_gnm) {
         refuse_dispatch(kDsRefNoProgram, caller);
+        write_cs_image(cb, w, kind == kEmitDispatchIndirect);
         return 0;
     }
     if (kind == kEmitDispatchIndirect && !w->indirect_base) {
         refuse_dispatch(kDsRefNoBase, caller);
+        write_cs_image(cb, w, true);
         return 0;
     }
     if (g_ud_trace) {
@@ -4938,6 +5284,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
             g_ds_records.erase(id);
         }
         refuse_dispatch(kDsRefNotWritten, caller);
+        write_cs_image(cb, w, kind == kEmitDispatchIndirect);
         return 0;
     }
     {
@@ -5276,6 +5623,11 @@ void report_state_packets() {
     }
     host_log("gx-state: %llu state packets not written (about %llu dwords, %.1f MiB): %s", static_cast<ull>(calls), static_cast<ull>(dwords),
              static_cast<double>(dwords) * 4 / (1 << 20), by_kind.c_str());
+    if (g_cs_packets_dead) {
+        host_log("gx-state: dispatches that fell back to their packet with the compute stage's image written before it: %llu (%llu with "
+                 "no room for it)",
+                 static_cast<ull>(g_cs_images.load()), static_cast<ull>(g_cs_images_failed.load()));
+    }
     std::uint64_t dead_calls = 0, dead_dwords = 0;
     std::string dead_by;
     for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
@@ -6215,6 +6567,23 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     }
     g_slide = mem->slide;
     g_image_size = mem->size;
+    {
+        const int pace = hle_video_game_pace();
+        const char* e = std::getenv("BBHOST_GX_PACKED_RECORDS");
+        g_packed_records = e && e[0] ? std::atoi(e) : (pace == 0 || pace > 60) ? 1 : 0;
+        if (e && e[0]) {
+            host_log("gx-native: a draw's records %s (BBHOST_GX_PACKED_RECORDS=%d)", g_packed_records ? "packed at the call" : "handed over as the sparse set",
+                     g_packed_records);
+        } else if (g_packed_records) {
+            host_log("gx-native: a draw's records packed at the call: the game runs %s, where the command processor limits the frame rate "
+                     "(BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
+                     pace ? (pace == 90 ? "at 90" : "at 120") : "uncapped");
+        } else {
+            host_log("gx-native: a draw's records handed over as the sparse set: the game is paced at %d, where packing costs the GX threads "
+                     "more than it saves the command processor (BBHOST_GX_PACKED_RECORDS=1: packed)",
+                     pace > 0 ? pace : 30);
+        }
+    }
     void* host = thunk_wrap(reinterpret_cast<void*>(&gx_hook));
     void* page = host_page_alloc(0x10000, true);  // a stub of up to ~230 bytes per hook (with the xmm save)
     if (!page) {
@@ -6225,7 +6594,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
-        if (id == kEmitDma && !g_cp_census_hooks) continue;
+        if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;
         const Hook& h = kHooks[id];
@@ -6313,6 +6682,18 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         const bool context_dead = on && skip_state_packets();
         const std::uint64_t keep = gnm_dead_keep_mask(std::getenv("BBHOST_CP_DEAD_KEEP"));
         gnm_dead_writers_configure(on ? dead : GnmDeadMode::kWrite, context_dead ? dead : GnmDeadMode::kWrite, keep);
+        // The compute stage's program, user data and indirect base: with
+        // every dispatch a token, which carries them.
+        g_cs_packets_dead = context_dead && g_native_dispatch == 2 && g_native == 2;
+        host_log("gx: the compute stage's packets (its program, user data and indirect base) are %s",
+                 g_cs_packets_dead ? "not written: every dispatch is a token, and a fallback writes their image before its packet"
+                                   : "written");
+        // The constant engine's: nothing dumps its RAM while YEBIS's tables
+        // come from its own state (its binder and its compute passes ours)
+        // and Gnmx's draws are tokens (decomp/gx/constant_engine.cpp).
+        const bool ce_dead = g_cs_packets_dead && yebis_bind::mode() == 1 && g_yebis_dispatch == 2 && g_native_yebis == 5;
+        gnm_ce_configure(ce_dead);
+        host_log("gx: the constant engine's packets are %s", ce_dead ? "not written: nothing dumps its RAM" : "written");
         std::size_t ours = 0, nothing = 0, kept = 0;
         for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
             if (!gnm_dead_writer_placed(i)) continue;
@@ -6329,32 +6710,21 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     }
     // BBHOST_GX_TOKEN_COUNTERS=2: the counters ride in the dispatch tokens, so
     // the DMA_DATA moves through GDS around a counting dispatch are not
-    // written - the commit's load (0x2acc30f) and the post's store (0x2acd08c)
-    // are each one call of the DMA writer 0x1473e60 whose result nothing reads,
-    // and become a five-byte NOP. Only with every compute-commit dispatch a
-    // token with its records (the defaults), which is what carries them.
-    if (g_token_counters == 2 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1 && g_ds_records_mode && !g_cp_writers) {
-        struct CallSite {
-            std::uint64_t va;
-            std::uint8_t call[5];
-        };
-        static constexpr CallSite kGdsMoves[] = {{0x2acc30f, {0xe8, 0x4c, 0x7b, 0x9a, 0xfe}}, {0x2acd08c, {0xe8, 0xcf, 0x6d, 0x9a, 0xfe}}};
-        int nopped = 0;
-        for (const CallSite& s : kGdsMoves) {
-            const std::uint64_t va = g_slide + (s.va - kPreferredGuestSlide);
-            if (va < mem->slide || va + 5 > mem->slide + mem->size) continue;
-            auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
-            if (std::memcmp(p, s.call, 5) != 0) continue;
-            const std::uint64_t lo = va & ~0xfffull, hi = (va + 5 + 0xfff) & ~0xfffull;
-            if (!guest_protect_rwx(mem, lo, hi - lo)) continue;
-            static constexpr std::uint8_t kNop5[5] = {0x0f, 0x1f, 0x44, 0x00, 0x00};
-            std::memcpy(p, kNop5, 5);
-            guest_protect_rx(mem, lo, hi - lo);
-            ++nopped;
+    // written - the commit's load and the post's store, each one call of the
+    // DMA writer whose result nothing reads, which is ours
+    // (decomp/gx/dma.cpp) and writes nothing for those two callers. Only with
+    // every compute-commit dispatch a token with its records (the defaults),
+    // which is what carries them. With the CP census, the writer notes each
+    // packet's caller for it.
+    {
+        const bool gds_dead = g_token_counters == 2 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1 && g_ds_records_mode;
+        gnm_dma_configure(gds_dead, g_cp_census_hooks);
+        g_gds_moves_nopped = gds_dead && gnm_dma_placed();
+        if (gds_dead) {
+            host_log("gx: GPU particle counters in the dispatch tokens: the 2 moves through GDS %s (BBHOST_GX_TOKEN_COUNTERS=1 writes "
+                     "them and checks the tokens against them)",
+                     g_gds_moves_nopped ? "not written (the DMA writer is ours)" : "written: the DMA writer is the game's");
         }
-        host_log("gx: GPU particle counters in the dispatch tokens: %d of 2 moves through GDS not written (BBHOST_GX_TOKEN_COUNTERS=1 "
-                 "writes them and checks the tokens against them)", nopped);
-        g_gds_moves_nopped = nopped == 2;
     }
     g_active = hooked > 0;
     host_log("gx: %d of %d hooks armed; trace %s (flips %llu-%llu), backend mode %d", hooked, static_cast<int>(kKinds),
@@ -6682,7 +7052,9 @@ void hle_gx_copy_token(std::uint64_t id) {
         const GuestCopy& c = copies[i++];
         ++ranges;
         bytes += c.bytes;
-        if (!c.bytes || (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes))) continue;
+        if (!c.bytes ||
+            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen)))
+            continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),
                      static_cast<ull>(c.dst), static_cast<ull>(c.bytes));
@@ -7166,10 +7538,26 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
             // slots that are set. They were written on the recording thread and
             // are just as cold; whichever phase of the draw touched them first
             // paid for them one at a time.
-            if (const GxDrawRecords* rec = draw->records.get()) prefetch_records(*rec);
+            if (const GxDrawRecords* rec = draw->records.get()) {
+                if (g_packed_records == 1) {
+                    prefetch_packed(rec, draw->records_bytes);
+                } else {
+                    prefetch_records(*rec);
+                }
+            }
         }
         t_native_slot = slot;
-        draw->objects.records = draw->records.get();
+        // BBHOST_GX_PACKED_RECORDS: the readers read the records unpacked
+        // into this thread's own set (=2: and checked against the made ones).
+        if (g_packed_records == 1 && draw->records) {
+            draw->objects.records = unpack_records(draw->records.get());
+        } else if (g_packed_records == 2 && draw->records && draw->packed) {
+            const GxDrawRecords* unpacked = unpack_records(draw->packed.get());
+            compare_unpacked(*draw->records, *unpacked);
+            draw->objects.records = unpacked;
+        } else {
+            draw->objects.records = draw->records.get();
+        }
         t_native_objects = &draw->objects;
         GpuDrawInputs& t_native_in = draw->in;
         // A token draw takes nothing from the register file.
@@ -7371,6 +7759,15 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                      static_cast<ull>(g_native_ineligible.load()), static_cast<ull>(g_native_late.load()),
                      static_cast<ull>(g_native_unmatched.load()), static_cast<ull>(g_native_failed.load()),
                      static_cast<ull>(g_native_overflow.load()));
+            if (g_packed_records) {
+                const std::uint64_t n = g_packed_draws.load();
+                std::string differ;
+                for (int f = 0; f < kPackedFields; ++f) appendf(differ, " %s %llu;", kPackedFieldName[f], static_cast<ull>(g_packed_differ[f].load()));
+                host_log("gx-native: records packed at the call (BBHOST_GX_PACKED_RECORDS=%d): %llu draws, %.0f bytes a draw on average, "
+                         "%llu at most; compared with the records as made after unpacking: %llu draws, differing:%s",
+                         g_packed_records, static_cast<ull>(n), n ? static_cast<double>(g_packed_bytes.load()) / static_cast<double>(n) : 0.0,
+                         static_cast<ull>(g_packed_most.load()), static_cast<ull>(g_packed_compared.load()), differ.c_str());
+            }
             host_log("gx-native: stage records' shader fields from the per-shader cache %llu, read from the object %llu; inputs' "
                      "shader linkage from the per-thread cache %llu, worked out %llu (checked %llu, differing %llu)",
                      static_cast<ull>(g_shader_info.load(0)), static_cast<ull>(g_shader_info.load(1)), static_cast<ull>(g_link_info.load(0)),
@@ -7701,6 +8098,10 @@ void hle_gx_native_prefetch(std::uint64_t id, bool next) {
     }
     if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return;
     if (const GxDrawRecords* rec = slot.draw.records.get()) {
+        if (g_packed_records == 1) {
+            prefetch_packed(rec, slot.draw.records_bytes);  // its size is in the slot: nothing to read first
+            return;
+        }
         for (const GxStageRecords& s : rec->stage) __builtin_prefetch(&s);  // the headers the bit masks below are read from
         prefetch_records(*rec);
     }
@@ -7711,19 +8112,23 @@ void hle_gx_native_release() {
     if (NativeSlot* slot = t_native_slot) {
         t_native_slot = nullptr;
         slot->draw.records.reset();  // back to the pool here, as before, not on a recording thread
+        slot->draw.packed.reset();
         slot->state.store(0, std::memory_order_release);
         g_native_slot_pending.add(~0ull);
     } else {
         t_native_overflow.records.reset();
+        t_native_overflow.packed.reset();
     }
 }
 std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    for (std::uint64_t d = 0; d <= 64; d += 4) {
-        const auto it = g_by_packet.find(packet_va - d);
-        if (it != g_by_packet.end()) return bn(it->second.ret);
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        for (std::uint64_t d = 0; d <= 64; d += 4) {
+            const auto it = g_by_packet.find(packet_va - d);
+            if (it != g_by_packet.end()) return bn(it->second.ret);
+        }
     }
-    return 0;
+    return gnm_dma_caller(packet_va);  // a DMA_DATA packet from our writer
 }
 
 void hle_gx_trace_dispatch(std::uint32_t op, std::uint64_t packet_va, std::uint32_t x, std::uint32_t cs_lo) {

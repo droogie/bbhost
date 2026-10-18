@@ -13,6 +13,7 @@
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
 
+#include "host/cb_proof.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
@@ -418,6 +419,13 @@ const int g_vertex_input = [] {
 std::atomic<std::uint64_t> g_vertex_input_draws{0}, g_vertex_input_kept{0}, g_vertex_tables_read{0};
 std::atomic<std::uint64_t> g_vertex_tables_with_input{0};  // vertex-input draws whose vertex shader still reads the table
 std::atomic<std::uint64_t> g_vertex_staged_records{0};  // plan_vertex_input: records copied into device memory for their draw
+// plan_vertex_input: records in host memory whose extent stopped at the end of
+// their GX buffer, and of those the ones the mirrors then kept (BBHOST_VERTEX_CLAMP).
+std::atomic<std::uint64_t> g_vertex_records_clamped{0}, g_vertex_clamped_mirrored{0};
+const bool g_vertex_clamp = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_CLAMP");
+    return !(e && e[0] == '0');
+}();
 std::atomic<std::uint64_t> g_vertex_snapshot_records{0};  // plan_vertex_input: records the game rewrites, copied as recorded
 std::atomic<std::uint64_t> g_vertex_window_records{0};  // plan_vertex_input: records read from the draw's window copy
 std::atomic<std::uint64_t> g_vertex_input_no_gx_draws{0}, g_vertex_input_no_gx_kept{0};  // BBHOST_VERTEX_INPUT_NO_GX
@@ -979,7 +987,7 @@ bool draw_last_vertex(std::int64_t& last) {
             v.last = v.base + v.count - 1;
         } else {
             const std::uint64_t ib = static_cast<std::uint64_t>(v.count) * (v.index_type ? 4u : 2u);
-            if (hle_kernel_va_mapped(v.index_va, ib) && !gpu_writes_pending_locked(v.index_va, ib)) {
+            if (hle_kernel_va_mapped(v.index_va, ib) && !gpu_writes_pending_locked(v.index_va, ib) && !twin_covers_locked(v.index_va, ib)) {
                 std::uint32_t hi = 0;
                 if (v.index_type) {
                     const auto* p = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(v.index_va));
@@ -1587,8 +1595,49 @@ std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint
 
 void copy_layers_locked(const RtImage& from, RtImage& to);
 
+// A draw's or a clear's target named by its view's resource generation
+// (GpuDrawInputs::color_gen / depth_gen, GpuClearView::gen; 0: not known).
+// The image at the target's base is that resource's from the draw on - the
+// resource drew into it - whatever the address rule had made it: no
+// resource's, a dead resource's waiting out the idle time
+// (render_retire_generation_locked), or another's the registry gave it when
+// the image was made. That waited for the reuse sweep or the old resource's
+// death before, and a copy by resource (host_image_by_resource_locked) in
+// between missed the image. BBHOST_RT_DRAW_GEN=0: the generations are
+// counted, not used.
+const bool g_rt_draw_gen = [] {
+    const char* e = std::getenv("BBHOST_RT_DRAW_GEN");
+    return !(e && e[0] == '0');
+}();
+// Under g.mu: targets found already that generation's; taken from no
+// generation, a dead resource's, another live resource's; images made for a
+// generation, of them ones the registry would have given another; target
+// lookups with no generation, by what asked: [0] a native draw whose view
+// was not seen made, [1] YEBIS's draws, [2] Scaleform's, [3] packet draws,
+// [4] a clear token whose view was not seen made.
+std::uint64_t g_draw_gen_same = 0, g_draw_gen_taken[3] = {}, g_draw_gen_made = 0, g_draw_gen_made_other = 0, g_draw_gen_none[5] = {};
+void rt_take_generation(RtImage& r, std::uint32_t gen) {
+    if (!gen) return;
+    if (static_cast<std::uint32_t>(r.gx_gen) == gen) {
+        ++g_draw_gen_same;
+        return;
+    }
+    const int why = !r.gx_gen ? 0 : r.dead_ms ? 1 : 2;
+    ++g_draw_gen_taken[why];
+    static int logs = 0;
+    if (logs++ < 12) {
+        host_log("render: %s target 0x%llx %ux%u format %d drawn as generation %u's, %s%llu", r.depth ? "depth" : "colour",
+                 static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format), gen,
+                 why == 0 ? "no resource's before" : why == 1 ? "a dead resource's before: generation " : "another live resource's before: generation ",
+                 static_cast<unsigned long long>(why ? r.gx_gen : 0));
+    }
+    if (!g_rt_draw_gen) return;
+    r.gx_gen = gen;
+    r.dead_ms = r.dead_after = r.dead_memory = 0;
+}
+
 RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std::uint32_t height, bool depth,
-                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0) {
+                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0, std::uint32_t gen = 0) {
     // An image this one replaces whose last write was a fill (RtImage::
     // fill_last): the new image starts with that fill if it covers it. The
     // blood layers' small targets move between sizes as well as between sRGB
@@ -1637,6 +1686,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             RtImage& kept = (g_rts[base] = std::move(promoted));
             g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(kept));
             rt_written(kept);
+            rt_take_generation(kept, gen);
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
@@ -1659,6 +1709,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
             rt_written(r);
+            rt_take_generation(r, gen);
             return &r;
         }
         // A clear token's clear still owed to the old image goes first: its
@@ -1796,6 +1847,11 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     rt_written(created);
     created.created_flip = created.written_flip;
     created.gx_gen = rt_resource_gen(base, rt_size_bytes(created));
+    if (gen) {
+        ++g_draw_gen_made;
+        if (static_cast<std::uint32_t>(created.gx_gen) != gen) ++g_draw_gen_made_other;
+        if (g_rt_draw_gen) created.gx_gen = gen;
+    }
     if (auto ga = g_gen_retired_at.find(base); ga != g_gen_retired_at.end()) {
         if (created.written_ms - ga->second < reuse_idle_ms()) ++g_gen_remade;
         g_gen_retired_at.erase(ga);
@@ -1891,17 +1947,19 @@ std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws 
 
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
-        std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
+        std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0, res_gen = 0;
         RtImage* rt = nullptr;
     };
     static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
-        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
+        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
+        m.res_gen == res_gen) {
+        if (res_gen) ++g_draw_gen_same;
         apply_pending_clear(*m.rt);
         rt_written(*m.rt);
         return m.rt;
@@ -1960,8 +2018,8 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     } else {
         ++g_extent_guessed;
     }
-    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, rt};
+    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, res_gen);
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, res_gen, rt};
     return rt;
 }
 
@@ -4306,9 +4364,27 @@ thread_local std::uint64_t t_replay_key = 0;  // the content key create_gfx_pipe
 constexpr std::size_t kRecipeMax = 16384;
 constexpr std::uint64_t kRecipeMaxBytes = 64ull << 20;
 constexpr std::uint32_t kRecipeIdleRuns = 16;
+// A compute pipeline a dispatch used (gpu.cpp recipe_note_compute): built at
+// the dispatch - a shader GX never created through the hook, or one whose
+// bound images differ from the creation's guess - or taken from one compiled
+// at creation. What its key (compute_key) was made from, so a start builds it
+// on a precompile worker (precompile_compute_recorded) before the dispatch
+// asks: the title's own compute shaders included, which nothing else does on a
+// first start. A list names the program by hash, as it names the others.
+struct ComputeRecipe {
+    std::uint64_t key = 0;  // compute_key at the dispatch
+    std::string name;
+    std::vector<std::uint32_t> words;
+    std::uint32_t rsrc1 = 0, rsrc2 = 0, threads[3] = {};
+    std::vector<std::pair<std::uint32_t, bool>> dims;
+    std::vector<bool> modes;
+    std::uint32_t uses = 0, last_run = 0, order = 0;
+    bool listed = false;  // from a shipped list
+};
 struct PipelineManifest {
     std::mutex mu;
     std::unordered_map<std::uint64_t, std::shared_ptr<PipelineRecipe>> by_key;  // under mu
+    std::unordered_map<std::uint64_t, std::shared_ptr<ComputeRecipe>> compute;  // under mu: by compute_key
     std::uint32_t run = 1;  // this start's number (the file's + 1)
     bool dirty = false;     // under mu
     // Pipelines built from recipes at this start, by content key; never erased
@@ -4318,6 +4394,7 @@ struct PipelineManifest {
     std::atomic<std::uint64_t> loaded{0}, queued{0}, done{0}, failed{0}, relinked{0}, build_us{0}, recorded{0};
     std::atomic<std::uint64_t> taken{0}, not_ready{0}, layout_differs{0}, unrecordable{0}, dropped{0};
     std::atomic<std::uint64_t> wait_us{0};
+    std::atomic<std::uint64_t> compute_loaded{0}, compute_built{0}, compute_failed{0}, compute_recorded{0};
     std::atomic<std::uint32_t> next_order{0};
     std::chrono::steady_clock::time_point loaded_at{};
     std::atomic<bool> done_logged{false};
@@ -4527,6 +4604,46 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         }
     }
 }
+}  // namespace
+// A dispatch's compute pipeline (gpu.cpp pipeline_for): one it built itself
+// joins the manifest when the manifest lacks it; one it took counts the
+// record's use, where there is a record.
+void recipe_note_compute(const std::string& name, const std::vector<std::uint32_t>& words, std::uint64_t key, std::uint32_t rsrc1,
+                         std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                         const std::vector<bool>& modes, bool built_here) {
+    if (!g_pmanifest.recording.load(std::memory_order_relaxed) || words.empty()) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    if (!built_here && !g_pmanifest.compute.count(key)) return;
+    std::shared_ptr<ComputeRecipe>& c = g_pmanifest.compute[key];
+    if (c) {
+        if (c->last_run != g_pmanifest.run) {
+            c->last_run = g_pmanifest.run;
+            c->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+            c->uses += 1;
+            g_pmanifest.dirty = true;
+        }
+        return;
+    }
+    c = std::make_shared<ComputeRecipe>();
+    c->key = key;
+    c->name = name;
+    c->words = words;
+    c->rsrc1 = rsrc1;
+    c->rsrc2 = rsrc2;
+    std::copy(threads, threads + 3, c->threads);
+    c->dims = dims;
+    c->modes = modes;
+    c->uses = 1;
+    c->last_run = g_pmanifest.run;
+    c->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+    g_pmanifest.dirty = true;
+    const std::uint64_t n = g_pmanifest.compute_recorded.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_log_new_recipes) {
+        host_log("render: pipeline manifest: new compute recipe %016llx %s (%llu in this run) at flip %llu", static_cast<unsigned long long>(key),
+                 name.c_str(), static_cast<unsigned long long>(n), static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+namespace {
 // Its first draw queued the optimized relink: the specialization that took.
 void recipe_note_relink(const GfxPipeline& pl) {
     if (!pl.recipe) return;
@@ -5945,6 +6062,7 @@ struct PrecompileJob {
     std::uint64_t flip = 0;   // when GX created it
     std::shared_ptr<const ManifestStage> manifest;  // type 7: a stage from the manifest
     std::shared_ptr<const PipelineRecipe> recipe;   // type 8: a pipeline from the pipeline manifest
+    std::shared_ptr<const ComputeRecipe> compute;   // type 9: a compute pipeline from the pipeline manifest
     // The shader sweep's (types 1, 2, 4 from the game's bundles): into the
     // caches only, nothing kept in this run (precompile_ps, precompile_vs).
     bool sweep = false;
@@ -6126,7 +6244,7 @@ Precompiler& precompiler() {
                     while (!g.ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     // The HLSL compiles behind the game take what earlier
                     // starts drew before what GX only created.
-                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 0 ? kHlslLaneManifest
+                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 9 || job.type == 0 ? kHlslLaneManifest
                               : job.twin || job.sweep                         ? kHlslLaneLater
                                                                               : kHlslLaneCreated);
                     if (job.type == 4) {
@@ -6139,6 +6257,11 @@ Precompiler& precompiler() {
                         precompile_manifest(*job.manifest);
                     } else if (job.type == 8) {
                         replay_recipe(*w, job.recipe);
+                    } else if (job.type == 9) {
+                        const ComputeRecipe& c = *job.compute;
+                        (precompile_compute_recorded(c.name, c.words, c.rsrc1, c.rsrc2, c.threads, c.dims, c.modes) ? g_pmanifest.compute_built
+                                                                                                                     : g_pmanifest.compute_failed)
+                            .fetch_add(1, std::memory_order_relaxed);
                     } else {
                         precompile_ps(*w, job);
                     }
@@ -6146,7 +6269,7 @@ Precompiler& precompiler() {
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
-                    ++w->burst_type[job.type >= 0 && job.type <= 8 ? job.type : 2];
+                    ++w->burst_type[job.type == 9 ? 4 : job.type >= 0 && job.type <= 8 ? job.type : 2];
                     if (w->busy && w->jobs.empty() && w->later.empty() && w->running.empty()) {
                         w->busy = false;
                         // How long a run of compiles took the workers, wall
@@ -7574,7 +7697,9 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 3;  // 2: tessellated pipelines; 3: the host tessellator's LS passes (a 2 is read as well)
+constexpr std::uint32_t kVersion = 4;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records (2 and 3 read as well)
+// A record's flags: a compute record (ComputeRecipe) rather than a pipeline's.
+constexpr std::uint32_t kComputeRecord = 1u << 30;
 using manifest_file::Reader;
 using manifest_file::Writer;
 // What made the file: the translator and the device, for the report (the
@@ -7754,6 +7879,18 @@ void write(Writer& out, const PipelineRecipe& rc) {
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
+// A program a list names (tools/pipeline_list.py: name, word count, hash):
+// its words from the game's own files - its bundles, or the eboot for the
+// eboot's own - patched as the game's draws read them; they must hash the same.
+bool program_from_game(const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+    gcn::ShaderCode code;
+    if (!c || !gcn::shader_code(*c, code)) return false;
+    shader_patch_apply(name, code.words);
+    if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
+    out = std::move(code.words);
+    return true;
+}
 bool read(Reader& in, PipelineRecipe& rc) {
     const std::uint32_t n = in.count(1);
     if (!in.ok) return false;
@@ -7811,15 +7948,7 @@ bool read(Reader& in, PipelineRecipe& rc) {
         words(r, rc.ps_words);
     }
     if (!str(r, rc.vs_name) || !str(r, rc.ps_name)) return false;
-    const auto from_bundle = [](const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
-        const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
-        gcn::ShaderCode code;
-        if (!c || !gcn::shader_code(*c, code)) return false;
-        shader_patch_apply(name, code.words);
-        if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
-        out = std::move(code.words);
-        return true;
-    };
+    const auto from_bundle = &program_from_game;
     if (vs_ref && !from_bundle(rc.vs_name, vs_count, vs_hash, rc.vs_words)) return false;
     if (ps_ref && !from_bundle(rc.ps_name, ps_count, ps_hash, rc.ps_words)) return false;
     dims(r, rc.vs_dims);
@@ -7937,6 +8066,58 @@ bool read(Reader& in, PipelineRecipe& rc) {
     if (!rc.has_ls_fetch) s.ls_fetch_va = 0;
     return r.ok && r.p == r.end && !rc.vs_words.empty() && rc.key != 0;
 }
+// A compute record: the flags (kComputeRecord; 256 when a list names the
+// program), key and use as a pipeline's record has them, the program, the
+// resource registers, the thread counts and the images and samplers its key
+// was made from.
+void write(Writer& out, const ComputeRecipe& c) {
+    Writer w;
+    w.u32(kComputeRecord);
+    pod(w, c.key);
+    w.u32(c.uses);
+    w.u32(c.last_run);
+    w.u32(c.order);
+    words(w, c.words);
+    str(w, c.name);
+    for (std::uint32_t v : {c.rsrc1, c.rsrc2, c.threads[0], c.threads[1], c.threads[2]}) w.u32(v);
+    dims(w, c.dims);
+    modes(w, c.modes);
+    out.u32(static_cast<std::uint32_t>(w.out.size()));
+    out.out.insert(out.out.end(), w.out.begin(), w.out.end());
+}
+bool read(Reader& in, ComputeRecipe& c) {
+    const std::uint32_t n = in.count(1);
+    if (!in.ok) return false;
+    Reader r{in.p, in.p + n};
+    in.p += n;
+    const std::uint32_t f = r.u32();
+    if (!(f & kComputeRecord)) return false;
+    pod(r, c.key);
+    c.uses = r.u32();
+    c.last_run = r.u32();
+    c.order = r.u32();
+    std::uint32_t count = 0;
+    std::uint64_t hash = 0;
+    if (f & 256) {
+        count = r.u32();
+        pod(r, hash);
+    } else {
+        words(r, c.words);
+    }
+    if (!str(r, c.name)) return false;
+    for (std::uint32_t* v : {&c.rsrc1, &c.rsrc2, &c.threads[0], &c.threads[1], &c.threads[2]}) *v = r.u32();
+    dims(r, c.dims);
+    modes(r, c.modes);
+    if ((f & 256) && !program_from_game(c.name, count, hash, c.words)) return false;
+    return r.ok && !c.words.empty();
+}
+// Whether the record at the reader is a compute record (its flags, past its length).
+bool next_is_compute(const Reader& r) {
+    std::uint32_t f = 0;
+    if (r.end - r.p < 8) return false;
+    std::memcpy(&f, r.p + 4, 4);
+    return (f & kComputeRecord) != 0;
+}
 }  // namespace recipe_file
 
 void precompile_report() {
@@ -7953,13 +8134,16 @@ void precompile_report() {
         }
         host_log("render: pipeline manifest: %llu pipelines from earlier runs, %llu built at start (%.1f s of worker time, %llu relinked), "
                  "%llu failed and dropped; pipeline builds that took one %llu (one recorded but not built yet %llu, another layout %llu); "
-                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; %s",
+                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; compute pipelines: %llu from records built at the start "
+                 "(%llu not: failed, or built first by another), %llu recorded in this run; %s",
                  static_cast<unsigned long long>(g_pmanifest.loaded.load()), static_cast<unsigned long long>(g_pmanifest.done.load()),
                  g_pmanifest.build_us.load() / 1e6, static_cast<unsigned long long>(g_pmanifest.relinked.load()),
                  static_cast<unsigned long long>(g_pmanifest.failed.load()), static_cast<unsigned long long>(g_pmanifest.taken.load()),
                  static_cast<unsigned long long>(g_pmanifest.not_ready.load()), static_cast<unsigned long long>(g_pmanifest.layout_differs.load()),
                  static_cast<unsigned long long>(g_pmanifest.recorded.load()), kept,
-                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), ls_pass_report().c_str());
+                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), static_cast<unsigned long long>(g_pmanifest.compute_built.load()),
+                 static_cast<unsigned long long>(g_pmanifest.compute_failed.load()),
+                 static_cast<unsigned long long>(g_pmanifest.compute_recorded.load()), ls_pass_report().c_str());
     }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
@@ -9892,6 +10076,7 @@ std::string render_fill_stats() {
 
 void render_report() {
     host_log("%s", gx_state_report().c_str());
+    cb_proof::report();
     if (const std::string b = bindless_report(); !b.empty()) host_log("render: %s", b.c_str());
     if (g_binding_plans) {
         host_log("render: GX stages whose user data was not built (the no-fallback variant touches none, every binding from the "
@@ -10217,9 +10402,12 @@ void render_report() {
                  static_cast<unsigned long long>(g_vertex_input_draws.load()), static_cast<unsigned long long>(g_vertex_input_kept.load()),
                  static_cast<unsigned long long>(g_vertex_tables_with_input.load()), static_cast<unsigned long long>(g_vertex_tables_read.load()));
         host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu; "
-                 "records the game rewrites, copied as their draw recorded %llu",
+                 "records the game rewrites, copied as their draw recorded %llu; records whose V# runs past their GX buffer, stopped at "
+                 "its end %llu (mirrored then %llu)%s",
                  static_cast<unsigned long long>(g_vertex_staged_records.load()),
-                 static_cast<unsigned long long>(g_vertex_snapshot_records.load()));
+                 static_cast<unsigned long long>(g_vertex_snapshot_records.load()),
+                 static_cast<unsigned long long>(g_vertex_records_clamped.load()),
+                 static_cast<unsigned long long>(g_vertex_clamped_mirrored.load()), g_vertex_clamp ? "" : " (BBHOST_VERTEX_CLAMP=0)");
         host_log("render: draws without GX geometry with vertex input from their fetch shader's table %llu, fetch shader kept %llu; "
                  "vertex records read from the draw's window copy %llu",
                  static_cast<unsigned long long>(g_vertex_input_no_gx_draws.load()), static_cast<unsigned long long>(g_vertex_input_no_gx_kept.load()),
@@ -11090,6 +11278,10 @@ void render_orphans_locked(OrphanImages out[2]) {
             } else {
                 ++out[k].n;
                 out[k].bytes += r.memory.size;
+                if (const int mw = gx_middleware_at(base, span)) {
+                    ++(mw == 1 ? out[k].yebis : out[k].scaleform);
+                    (mw == 1 ? out[k].yebis_bytes : out[k].scaleform_bytes) += r.memory.size;
+                }
             }
         }
     }
@@ -11209,6 +11401,22 @@ void image_reuse_sweep_locked() {
     g_reuse_targets.bytes += t.bytes;
     g_reuse_textures.n += x.n;
     g_reuse_textures.bytes += x.bytes;
+}
+
+std::string draw_gen_report_locked() {
+    using ull = unsigned long long;
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "targets by the generation of the resource their view was made of%s: found that resource's %llu, taken from no resource "
+                  "%llu, from a dead resource %llu, from another live resource %llu; made for it %llu (the registry's guess another %llu); "
+                  "lookups with no generation: native draws whose view was not seen made %llu, YEBIS's %llu, Scaleform's %llu, packet "
+                  "draws %llu, clears whose view was not seen made %llu",
+                  g_rt_draw_gen ? "" : " (BBHOST_RT_DRAW_GEN=0: counted only)", static_cast<ull>(g_draw_gen_same),
+                  static_cast<ull>(g_draw_gen_taken[0]), static_cast<ull>(g_draw_gen_taken[1]), static_cast<ull>(g_draw_gen_taken[2]),
+                  static_cast<ull>(g_draw_gen_made), static_cast<ull>(g_draw_gen_made_other), static_cast<ull>(g_draw_gen_none[0]),
+                  static_cast<ull>(g_draw_gen_none[1]), static_cast<ull>(g_draw_gen_none[2]), static_cast<ull>(g_draw_gen_none[3]),
+                  static_cast<ull>(g_draw_gen_none[4]));
+    return buf;
 }
 
 std::string image_reuse_report_locked() {
@@ -11346,6 +11554,35 @@ bool draw_window_locked(std::uint64_t base, std::uint64_t bytes, Located& out) {
     return false;
 }
 
+// BBHOST_CB_RECORD_PROOF (host/cb_proof.h): the bytes a binding is about to
+// be copied from or read in place, against the copy its draw's records took at
+// the GX call - for the bindings that come from the records' constant-buffer
+// slots; the rest are counted as having none - and whether a GPU write still
+// to complete at the call was noted on the range since. Nothing bound changes.
+void cb_proof_binding(const GxStageRecords* gx, const GxStagePlan* plan, std::size_t i, std::uint64_t base, std::uint64_t bytes,
+                      cb_proof::Path path) {
+    if (!gx) {
+        cb_proof::note_uncopied(path, false, t_snapshot_cbs);
+        return;
+    }
+    const GxBindingPlan* p = plan && i < plan->buffers.size() ? &plan->buffers[i] : nullptr;
+    if (!p || p->source != GxBindingPlan::kCb || p->slot >= 14 || !((gx->cb_proofed >> p->slot) & 1)) {
+        cb_proof::note_uncopied(path, true, false);
+        return;
+    }
+    cb_proof::Difference diff;
+    const cb_proof::Outcome o = cb_proof::check(gx->cb_proof[p->slot], base, bytes, path, &diff);
+    if (o != cb_proof::kSame && o != cb_proof::kChanged) return;
+    // A GPU write noted on the range that had not completed by the call -
+    // recorded in a submission at or past the ones completed then - or the
+    // tables having let go of writes that recent, when they cannot say.
+    const bool since_call = gpu_wrote_since_locked(base, bytes, diff.completed);
+    const bool dropped_since = !since_call && gpu_writes_dropped_locked() >= diff.completed;
+    // (latest() answers 0 for a page with none: ask from submission 1.)
+    const bool any = since_call || (o == cb_proof::kChanged && gpu_wrote_since_locked(base, bytes, 1));
+    cb_proof::note_result(diff, o, path, t_draw_pipeline, hle_video_flip_count(), since_call, dropped_since, any, base, bytes);
+}
+
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
 // through a storage buffer over the V#'s imported memory. The range starts at
 // the V# base aligned down to minStorageBufferOffsetAlignment and the shader
@@ -11437,8 +11674,16 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         if (outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
-                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes);
-            if (!copy_only) loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
+            if (!copy_only) {
+                // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
+                const ImportSite site(b.written                         ? "a shader's buffer, stored to"
+                                      : imports_whole() || !import_census_on() ? "a shader's buffer, read"
+                                      : bytes > (1u << 20)              ? "a shader's buffer, read (over 1 MiB)"
+                                      : gpu_writes_pending_locked(base, bytes) ? "a shader's buffer, read (a GPU write pending)"
+                                                                        : "a shader's buffer, read (not copied)");
+                loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+            }
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
         if (resolved && !base && bytes <= g.sink.size) {  // a null V#'s stride does not matter: every read lands in the sink page
@@ -11486,6 +11731,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // the draw is recorded - a snapshot of the bytes, so a later CPU
             // write to that memory cannot reach a draw still in flight.
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
+            // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
+            // in place, the twin; its guest bytes are stale, so no copy of them.
+            const bool twin = twin_covers_locked(base, bytes);
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
                 bump(g_sf_cb_snapshots);
@@ -11514,10 +11762,20 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 return !(e && e[0] == '0');
             }();
             bool snapshot = false;
-            if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written &&
+            if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written && !twin &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
+            }
+            if (cb_proof::g_on) {
+                const cb_proof::Path path = b.written                         ? cb_proof::kPathStored
+                                            : in_window                       ? cb_proof::kPathWindow
+                                            : version != kCopyVersionNone     ? cb_proof::kPathVersion
+                                            : snapshot                        ? cb_proof::kPathSnapshot
+                                            : realign                         ? cb_proof::kPathRealigned
+                                            : gpu_writes_pending_locked(base, bytes) ? cb_proof::kPathGpuPending
+                                                                              : cb_proof::kPathInPlace;
+                cb_proof_binding(gx, plan, i, base, bytes, path);
             }
             if (glitch_watching_draw()) {
                 glitch_watch_read_locked(base, bytes);
@@ -11528,7 +11786,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                          b.pointer ? ", a pointer" : "");
                 realign = realign || glitch_snapshot_draw();  // BBHOST_GLITCH_SNAPSHOT: the bytes as recorded
             }
-            if (b.written) realign = false;  // stores go to the guest memory, never to a copy
+            if (b.written || twin) realign = false;  // stores go to the guest memory (or its twin), never to a copy
             static DevBuffer scratch;
             static VkDeviceSize scratch_next = 0;
             constexpr VkDeviceSize kScratch = 64ull << 20, kScratchSegment = 4ull << 20;
@@ -11701,14 +11959,18 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 note_arena_read(kArenaConstants, base, bytes);
                 // The draw writes this memory as it runs: no mirror copy made in
                 // this recording serves it as vertex or index data before that.
-                if (b.written) shadow_written_locked(base, bytes, true);
+                // (A live twin takes the stores: guest memory is not written.)
+                if (b.written && !twin_holds_live_locked(base, bytes)) shadow_written_locked(base, bytes, true);
             }
         }
         if (outcome != kBound) {
             // The shader walks the page table over the V#'s range: its windows
             // imported, and any copy-back still in its copy put in place first.
             if (base && copy_version_lookup_locked(base, bytes, nullptr) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvPageTable);
-            if (base) import_windows(base, std::min<std::uint64_t>(bytes, 64ull << 20));
+            if (base) {
+                const ImportSite site("a shader's buffer it walks to (not bound)");
+                import_windows(base, std::min<std::uint64_t>(bytes, 64ull << 20));
+            }
             // Logged once per binding and outcome, 32 at most. A binding the
             // stage's user data was not built for (the no-fallback variant does
             // not read it) fails here at every draw, so what was logged is
@@ -12357,6 +12619,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
+        std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
         Located loc;
         const int version = copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
@@ -12395,10 +12658,27 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     }
                 }
             }
-            if (!windowed && !mirrored && !snapped) loc = locate(va, need);
+            if (!windowed && !mirrored && !snapped) {
+                const std::uint64_t rec_va = va - fe.offset, rec_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+                const ImportSite site(imports_whole() || !import_census_on()        ? "a vertex buffer"
+                                      : version != kCopyVersionNone                ? "a vertex buffer (a copy version straddled)"
+                                      : gpu_writes_pending_locked(rec_va, rec_bytes) ? "a vertex buffer (a GPU write pending)"
+                                                                                   : "a vertex buffer (neither mirrored nor snapshotted)");
+                // A record whose extent runs on into a GX buffer kept as a
+                // device-local twin (BBHOST_GX_TWINS=1) - a V# with more records
+                // than its buffer holds: the bytes the draw reads, when known,
+                // which stop short of it (else the twin is let go, or inside a
+                // pass its part is read from guest memory as it stands).
+                if (twins_on() && twin_candidate_straddles(va, need)) {
+                    if (std::int64_t last = 0; draw_last_vertex(last) && last >= 0) {
+                        placed_need = std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
+                    }
+                }
+                loc = locate(va, placed_need);
+            }
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
-        if (!loc.buffer || loc.avail < need) {
+        if (!loc.buffer || loc.avail < placed_need) {
             t_vertex_input_refusal = kVsWhyPlacement;
             return keep("vertex data not within one imported buffer");
         }
@@ -12412,7 +12692,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         if (!rs) {
             const std::uint64_t record_va = va - fe.offset;
-            const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+            std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
@@ -12443,6 +12723,26 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
+                // A record whose V# counts on past the end of the GX buffer it
+                // starts in - its records counted from the buffer's start
+                // though the base is an offset into it (five 582 KB records of
+                // one immutable mesh at Astral Clocktower, each a vertex
+                // element 4 bytes on): its draws read within the buffer, and
+                // the extent stops at the buffer's end. Whatever lies after it
+                // - another buffer's ring the game rewrites, as the run's
+                // placement has it - kept the whole record in host memory, and
+                // each draw staged all of it (0.2-18 GB a 15-s window there,
+                // run to run). BBHOST_VERTEX_CLAMP=0: the V#'s extent.
+                if (ns.whole.buffer == loc.buffer && g_vertex_clamp) {
+                    const std::uint64_t end = gx_buffer_end(record_va);
+                    if (end && end - record_va < record_bytes) {
+                        record_bytes = end - record_va;
+                        bump(g_vertex_records_clamped);
+                        ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
+                        shadow_locate_locked(record_va, record_bytes, ns.whole);
+                        if (ns.whole.buffer != loc.buffer) bump(g_vertex_clamped_mirrored);
+                    }
+                }
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
                     // A ring the game rewrites: the bytes as the draw records
                     // (shadow_snapshot_locked); otherwise staged as the GPU
@@ -13028,6 +13328,12 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
 
 // ---- clear tokens: GX's Clear*View in the view's own terms ----------------
 namespace {
+// The clear's view's resource generation for its target lookup, counted when
+// not known (rt_take_generation).
+std::uint32_t clear_gen(const GpuClearView& c) {
+    if (!c.gen) ++g_draw_gen_none[4];
+    return c.gen;
+}
 // What a clear token resolves to: the image a draw binding the view would
 // draw into, found exactly as the draw finds it (target_image, from the same
 // words), and the layers the view covers. `create` false only looks.
@@ -13055,7 +13361,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
             return r && !r->depth ? r : nullptr;
         }
         return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
-                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent);
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c));
     }
     const VkFormat df = db_format(c.z_info, c.stencil_info);
     if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
@@ -13071,7 +13377,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
         return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
     }
     const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
-    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent);
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c));
     if (r) {
         // What a draw binding the view learns about its HTILE, so fills of
         // that HTILE from anywhere else still find the target.
@@ -15268,6 +15574,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     if (!imports_whole()) {
         // Window imports: the LS pass walks the page table for everything it
         // reads and stores, so those windows (and the draw's indices) first.
+        const ImportSite site("the LS pass");
         const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
             std::uint32_t v[4]{};
             if (!resolve_resource(path, user, pointer ? 2 : 4, v)) return;
@@ -15821,6 +16128,15 @@ bool host_gpu_draw(const GpuDraw& d) {
     return tess_draw_one(d, t);
 }
 
+// A draw target's resource generation for its lookup (rt_take_generation),
+// counted by what the draw is when not known.
+std::uint32_t target_gen(const GpuDraw& d, std::uint32_t gen) {
+    if (gen) return gen;
+    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
+    ++g_draw_gen_none[!d.gx_token ? 3 : kind && std::strcmp(kind, "yebis") == 0 ? 1 : kind && std::strcmp(kind, "scaleform") == 0 ? 2 : 0];
+    return 0;
+}
+
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
@@ -16029,7 +16345,8 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint32_t layers = ((c[3] >> 13) & 0x7ff) + 1;
         const std::uint32_t slice_start = linear_general ? 0 : std::min(c[3] & 0x7ff, layers - 1);
         s.color[t] = target_image(t, base, fmt, pitch, padded_h, scissor_right, scissor_bottom, false, layers,
-                                  static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t]);
+                                  static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t],
+                                  target_gen(d, in.color_gen[t]));
         s.color_layer[t] = slice_start;
         if (layers > 1) {
             static std::set<std::uint64_t> logged;
@@ -16106,7 +16423,7 @@ static bool draw_impl(const GpuDraw& d) {
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent);
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen));
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;
@@ -18096,7 +18413,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (copy_versions_pending_locked() &&
         ((d.index_va && copy_version_lookup_locked(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2),
                                                    nullptr) == kCopyVersionStraddles) ||
-         (d.indirect_va && copy_version_lookup_locked(d.indirect_va, 20, nullptr) == kCopyVersionStraddles))) {
+         (d.indirect_va && copy_version_lookup_locked(d.indirect_va, d.index_va ? 20 : 16, nullptr) == kCopyVersionStraddles))) {
         copy_versions_put_in_place_locked(kCvStraddle);
     }
     // Lazy pass barriers: what this draw samples against the targets written
@@ -18500,6 +18817,7 @@ static bool draw_impl(const GpuDraw& d) {
         const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
         // (Window imports: the mirror first, so the indices need no import.)
         if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
+            const ImportSite site("an index buffer");
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
         }
@@ -18545,10 +18863,16 @@ static bool draw_impl(const GpuDraw& d) {
     }
     if (!g.profile_passes) profile_begin_locked(&bind_pl->profile_name);
     if (d.indirect_va) {
-        if (g_import_audit) audit_range(d.indirect_va, 20, kUseIndex);
+        // What the GPU reads: five dwords for an indexed draw, four otherwise
+        // (a 16-byte argument buffer is not read past its end).
+        const std::uint64_t args_bytes = d.index_va ? 20 : 16;
+        if (g_import_audit) audit_range(d.indirect_va, args_bytes, kUseIndex);
         Located loc;
-        const int version = copy_version_lookup_locked(d.indirect_va, 20, &loc);  // a straddle ended the pass above
-        if (version != kCopyVersionInside) loc = locate(d.indirect_va, 20);
+        const int version = copy_version_lookup_locked(d.indirect_va, args_bytes, &loc);  // a straddle ended the pass above
+        if (version != kCopyVersionInside) {
+            const ImportSite site("a draw's indirect arguments");
+            loc = locate(d.indirect_va, args_bytes);
+        }
         if (!loc.buffer) {
             if (!g.profile_passes) profile_end_locked();
             static std::atomic<int> logs{0};
@@ -20318,13 +20642,14 @@ void stage_manifest_save(const std::string& path) {
 // One recipe file: this player's manifest or a shipped list. False when it is
 // not one this build reads.
 bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::Origin& origin,
-                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::uint32_t& unread) {
+                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::vector<std::shared_ptr<ComputeRecipe>>& computes,
+                      std::uint32_t& unread) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     manifest_file::Reader r{data.data(), data.data() + data.size()};
     const std::uint32_t magic = data.size() >= 12 ? r.u32() : 0, version = data.size() >= 12 ? r.u32() : 0;
-    if (magic != recipe_file::kMagic || (version != recipe_file::kVersion && version != 2)) {
+    if (magic != recipe_file::kMagic || version < 2 || version > recipe_file::kVersion) {
         if (!data.empty()) host_log("render: pipeline manifest: %s is not one this build reads", path.c_str());
         return false;
     }
@@ -20332,6 +20657,15 @@ bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::
     if (!recipe_file::read_origin(r, origin)) return false;
     const std::uint32_t n = r.u32();
     for (std::uint32_t k = 0; k < n && k < kRecipeMax && r.ok; ++k) {
+        if (recipe_file::next_is_compute(r)) {
+            auto c = std::make_shared<ComputeRecipe>();
+            if (recipe_file::read(r, *c)) {
+                computes.push_back(std::move(c));
+            } else {
+                ++unread;
+            }
+            continue;
+        }
         auto rc = std::make_shared<PipelineRecipe>();
         if (recipe_file::read(r, *rc)) {
             rc->loaded = true;
@@ -20366,7 +20700,8 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     std::uint32_t run = 0, unread = 0;
     recipe_file::Origin theirs = ours;
     std::vector<std::shared_ptr<PipelineRecipe>> recipes;
-    const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
+    std::vector<std::shared_ptr<ComputeRecipe>> computes;
+    const bool have_own = read_recipe_file(path, run, theirs, recipes, computes, unread);
     // The last start's in the order its draws first took them, which this
     // start's draws likely follow, then the older ones, the most recent first.
     std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
@@ -20374,12 +20709,16 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     });
     std::size_t own = 0, listed = 0, list_unread = 0;
     std::vector<std::shared_ptr<PipelineRecipe>> queue;
+    std::vector<std::shared_ptr<ComputeRecipe>> compute_queue;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         g_pmanifest.run = run + 1;
         g_pmanifest.next_order.store(0);  // this start's order of first use (recipe_note_created, take_prebuilt)
         for (const auto& rc : recipes) {
             if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+        }
+        for (const auto& c : computes) {
+            if (g_pmanifest.compute.emplace(c->key, c).second) compute_queue.push_back(c);
         }
         if (unread) g_pmanifest.dirty = true;
         own = queue.size();
@@ -20388,7 +20727,8 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         std::uint32_t list_run = 0, bad = 0;
         recipe_file::Origin list_origin;
         std::vector<std::shared_ptr<PipelineRecipe>> list;
-        if (read_recipe_file(list_path, list_run, list_origin, list, bad)) {
+        std::vector<std::shared_ptr<ComputeRecipe>> list_computes;
+        if (read_recipe_file(list_path, list_run, list_origin, list, list_computes, bad)) {
             std::lock_guard<std::mutex> lk(g_pmanifest.mu);
             std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
             for (auto& rc : list) {
@@ -20397,16 +20737,33 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
                 rc->last_run = 0;
                 if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
             }
+            std::stable_sort(list_computes.begin(), list_computes.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
+            for (auto& c : list_computes) {
+                c->listed = true;
+                c->uses = 0;
+                c->last_run = 0;
+                if (g_pmanifest.compute.emplace(c->key, c).second) compute_queue.push_back(c);
+            }
             listed = queue.size() - own;
             list_unread = bad;
         }
     }
     g_pmanifest.loaded.store(queue.size());
     g_pmanifest.queued.store(queue.size());
-    if (!queue.empty()) {
+    g_pmanifest.compute_loaded.store(compute_queue.size());
+    if (!queue.empty() || !compute_queue.empty()) {
         Precompiler& w = precompiler();
         {
             std::lock_guard<std::mutex> lk(w.mu);
+            // The compute records first: few, and most are the title's, which
+            // dispatches them in its first seconds.
+            for (const auto& c : compute_queue) {
+                PrecompileJob job;
+                job.name = c->name;
+                job.type = 9;
+                job.compute = c;
+                w.jobs.push_back(std::move(job));
+            }
             for (const auto& rc : queue) {
                 PrecompileJob job;
                 job.name = rc->vs_name + "+" + rc->ps_name;
@@ -20425,6 +20782,7 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         list_note = "; " + std::to_string(listed) + " more from the list " + list_path +
                     (list_unread ? " (" + std::to_string(list_unread) + " of its entries not in this game's bundles or unreadable)" : "");
     }
+    if (!compute_queue.empty()) list_note += "; " + std::to_string(compute_queue.size()) + " compute pipelines ahead of them (their records)";
     host_log("render: pipeline manifest: %zu pipelines from earlier runs (run %u)%s queued for their build%s%s%s%s", own, g_pmanifest.run,
              list_note.c_str(), unread ? (", " + std::to_string(unread) + " unreadable dropped").c_str() : "",
              !have_own || same_translator ? "" : "; recorded with another translator: every stage is translated again",
@@ -20446,6 +20804,7 @@ void pipeline_manifest_save(const std::string& path) {
         std::uint32_t last_run, uses;
     };
     std::vector<Kept> keep;
+    std::vector<std::shared_ptr<ComputeRecipe>> keep_compute;
     std::uint32_t run = 0;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
@@ -20457,7 +20816,14 @@ void pipeline_manifest_save(const std::string& path) {
             if (rc->listed && rc->last_run != run) continue;  // the list has it: the player's own file keeps only what was used
             keep.push_back({rc, rc->last_run, rc->uses});
         }
+        for (const auto& [key, c] : g_pmanifest.compute) {
+            if (c->last_run + kRecipeIdleRuns < run || (c->listed && c->last_run != run)) continue;  // as the pipelines'
+            keep_compute.push_back(c);
+        }
     }
+    std::sort(keep_compute.begin(), keep_compute.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->order < b->order;
+    });
     std::sort(keep.begin(), keep.end(), [](const Kept& a, const Kept& b) {
         return a.last_run != b.last_run ? a.last_run > b.last_run : a.uses > b.uses;
     });
@@ -20473,6 +20839,10 @@ void pipeline_manifest_save(const std::string& path) {
                 g_pmanifest.dropped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            ++count;
+        }
+        for (const auto& c : keep_compute) {
+            recipe_file::write(body, *c);
             ++count;
         }
     }

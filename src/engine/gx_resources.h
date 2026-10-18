@@ -62,9 +62,24 @@ void gx_resources_install(ElfImage* image);
 std::uint64_t gx_resources_create_failures();
 // The live resource whose memory covers [va, va + bytes), if any.
 bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// Whether live GX buffers (type 1) cover every byte of [va, va + bytes): the
+// CPU writes such memory through GX's Map or a creation with data, which the
+// buffer shadow's mirrors are told of (host_gpu_shadow_gx_write).
+bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes);
+// The end of the live GX buffer whose memory holds `va` (0: none) - how far a
+// vertex record that starts in it can be read (render.cpp's records whose
+// V# counts past the buffer).
+std::uint64_t gx_buffer_end(std::uint64_t va);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// BBHOST_RESOURCE_CENSUS=1: whether a live texture or buffer YEBIS's own
+// device made (1) or a Scaleform texture's plane (2) - not GX's - holds any
+// of [va, va + bytes); 0 for neither, and without the census.
+int gx_middleware_at(std::uint64_t va, std::size_t bytes);
+// Whether the live GX buffer whose memory starts at `memory` is a constant
+// buffer (bind flags exactly 4): its renamed copies hold constants only.
+bool gx_constant_buffer_at(std::uint64_t memory);
 // The registry's write sequence now (bumped by every creation with data and
 // every Map), and the latest of the live resources overlapping [va, va +
 // bytes) (0: none overlaps) - whether GX wrote any of them since a moment
@@ -122,6 +137,8 @@ std::uint64_t gx_view_gen(std::uint64_t view);
 // The same by the view's id (gx_object_id: what a draw's records carry), for
 // the command processor; 0 when not known.
 std::uint64_t gx_view_gen_by_id(std::uint32_t id);
+// gx_view_extent and gx_view_gen in one lookup: a draw's targets take both.
+std::uint32_t gx_view_extent_gen(std::uint64_t view, std::uint64_t* gen);
 // Shader-resource views (0x25669a0) and samplers (0x2565b40)
 // are registered too, with their T# (at +0x10) or S# (at +0x0) hashed at
 // creation (gx_words_hash of the 32 bytes). The id of `object` and that hash.

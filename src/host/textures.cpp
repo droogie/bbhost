@@ -1139,6 +1139,11 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
                      static_cast<unsigned long long>(head[3]));
         }
     }
+    // A texture over a GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1;
+    // not seen in the census): the twin is copied back and let go, so guest
+    // memory serves the buffer from here on - this upload still reads what
+    // the CPU sees now, counted.
+    if (twins_on() && twin_covers_locked(sf.base, sf.total_src)) twins_release_locked(sf.base, sf.total_src, 1);
     const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(sf.base));
     DevBuffer staging;
     auto t_part = std::chrono::steady_clock::now();
@@ -1163,6 +1168,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     if (!imports_whole() && !staged_src) g_staged_src_pending.fetch_add(1, std::memory_order_relaxed);
     DevBuffer src_stage;
     VkDeviceSize src_stage_off = 0;
+    const ImportSite site("a texture's source");
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
         (staged_src || guest_device_address(sf.base, sf.total_src))) {
         if (staged_src) {
@@ -2426,6 +2432,25 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
     return render_target_view(la.img, w, 0, 1, false);
 }
 
+// Whether the target `rt` at `addr` is generation `gen`'s image: 0 already
+// (or no generation to go by), 1 taken now, -1 another resource's. Taken when
+// something drew into it after that resource was made - a draw that names no
+// view (YEBIS's, the wrapper's) leaves a re-created resource's target with
+// its predecessor's generation, though it draws for the memory's live
+// resource - or when that resource was made over it without data (the memory
+// carries over on the console; gx_successor_gen's rule). Made with texels of
+// its own and not drawn into since, the resource is its surface.
+std::atomic<std::uint64_t> g_alias_taken{0}, g_alias_other_gen{0};  // binds: taken, not aliased
+int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
+    if (!gen || !copy_by_resource_on() || static_cast<std::uint32_t>(rt.gx_gen) == static_cast<std::uint32_t>(gen)) return 0;
+    GxResourceInfo live;
+    if (!gx_resource_at(addr, 1, &live) || static_cast<std::uint32_t>(live.gen) != static_cast<std::uint32_t>(gen)) return -1;
+    if (live.initial_data && rt.written_seq <= live.created_submit) return -1;
+    rt.gx_gen = live.gen;
+    rt.dead_ms = rt.dead_after = rt.dead_memory = 0;
+    return 1;
+}
+
 // `expect_gen`: the generation of the resource the binding names (its
 // shader-resource view's, gx_view_gen_by_id), or 0: a surface found at the
 // base that is another generation's image, while the registry says the
@@ -2450,6 +2475,17 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     auto alias_rt = [&](std::uint64_t addr) -> VkImageView {
         RtImage* rt = find_render_target(addr);
         if (!rt || !rt->initialised || storage) return VK_NULL_HANDLE;
+        // By identity: a target that is another resource's image (a dead one's
+        // waiting out the idle time) is the bound resource's only if that was
+        // made over it without data (target_taken_by); made with texels of
+        // its own, those are read (its surface), not the old target's pixels.
+        if (const int taken = target_taken_by(*rt, addr, expect_gen)) {
+            if (taken < 0) {
+                g_alias_other_gen.fetch_add(1, std::memory_order_relaxed);
+                return VK_NULL_HANDLE;
+            }
+            g_alias_taken.fetch_add(1, std::memory_order_relaxed);
+        }
         // A cube T# over its target samples the faces as layers (the render
         // target is layered when the game draws faces through CB_COLOR*_VIEW);
         // an arrayed T# samples its slice range.
@@ -3358,9 +3394,32 @@ struct CopySide {
     RtImage* rt = nullptr;
 };
 
-bool copy_side_locked(const std::uint32_t* w, CopySide& out) {
+// A copy-image token's side by its resource's identity (GpuImageCopy::
+// src_gen / dst_gen, 0: not known): a target at its memory that is another
+// resource's - a dead one's still waiting out the idle time - is that
+// resource's image only if the side's resource was made over it without data
+// (on the console the memory carries over: it takes the target, as
+// gx_successor_gen does); made with texels of its own, the side is its
+// surface. [0] its own target, [1] its own surface or one made for it, [2] a
+// dead resource's target taken, [3] another resource's target not used, [4]
+// no generation known.
+std::atomic<std::uint64_t> g_copy_side_by[5] = {};
+bool copy_side_locked(const std::uint32_t* w, CopySide& out, std::uint64_t gen = 0) {
     const std::uint64_t base = tsharp_base(w);
-    if (RtImage* rt = find_render_target(base); rt && rt->initialised) {
+    RtImage* rt = find_render_target(base);
+    if (rt && rt->initialised && gen && copy_by_resource_on() && static_cast<std::uint32_t>(rt->gx_gen) != static_cast<std::uint32_t>(gen)) {
+        if (target_taken_by(*rt, base, gen) > 0) {
+            g_copy_side_by[2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            rt = nullptr;
+            g_copy_side_by[3].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (rt && rt->initialised) {
+        g_copy_side_by[gen ? 0 : 4].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_copy_side_by[gen ? 1 : 4].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (rt && rt->initialised) {
         out.image = rt->image;
         out.format = rt->format;
         out.width = rt->width;
@@ -3372,7 +3431,7 @@ bool copy_side_locked(const std::uint32_t* w, CopySide& out) {
     }
     bool dims_ok = true, arrayed = false;
     std::uint32_t dim = 0;
-    const VkImageView v = texture_view_uncached(w, false, dims_ok, dim, arrayed, false, false);
+    const VkImageView v = texture_view_uncached(w, false, dims_ok, dim, arrayed, false, false, copy_by_resource_on() ? gen : 0);
     auto it = g_surfaces.find(base);
     if (v == VK_NULL_HANDLE || it == g_surfaces.end() || it->second.failed || !it->second.image) return false;
     Surface& sf = it->second;
@@ -3463,11 +3522,11 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
                       static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), c.src_mip, c.src_layer, why);
         }
     };
-    if (!copy_side_locked(c.src_tsharp, src)) {
+    if (!copy_side_locked(c.src_tsharp, src, c.src_gen)) {
         g_image_copy_no_src.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (!copy_side_locked(c.dst_tsharp, dst)) {
+    if (!copy_side_locked(c.dst_tsharp, dst, c.dst_gen)) {
         g_image_copy_no_dst.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -3544,6 +3603,127 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     g_image_copies.fetch_add(1, std::memory_order_relaxed);
     g_image_copy_texels.fetch_add(static_cast<std::uint64_t>(c.w) * c.h, std::memory_order_relaxed);
     return true;
+}
+
+// A GX texture copied whole as memory (CopyResource reaches the command
+// processor as a byte copy, gx_trace.cpp native_copy) whose source's image
+// holds what its memory does not - a surface a shader or a copy wrote: the
+// source resource's image (its generation's) is copied image to image into
+// the destination resource's - its target if the host draws into one, else
+// its surface, made for its generation if need be - instead of copying the
+// stale memory under it. 1: copied; 0: not this case (the caller copies a
+// target's image or the memory, as before); `why` says which of the counted
+// reasons when 0.
+std::atomic<std::uint64_t> g_res_copies[8] = {};
+const char* const kResCopyName[8] = {"copied image to image", "no source image of its generation", "source not written by the GPU",
+                                     "no destination resource", "no destination image", "shapes differ", "formats differ", "no renderer"};
+int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std::uint64_t dst, std::uint64_t dst_gen) {
+    const auto out = [](int why) {
+        g_res_copies[why].fetch_add(1, std::memory_order_relaxed);
+        return why == 0 ? 1 : 0;
+    };
+    auto si = g_surfaces.find(src);
+    if (si == g_surfaces.end() || si->second.failed || !si->second.image || si->second.gx_gen != src_gen) return out(1);
+    Surface& from = si->second;
+    if (!from.gpu_written) return out(2);
+    if (!dst_gen) return out(3);
+    VkImage to_image = VK_NULL_HANDLE;
+    VkFormat to_format = VK_FORMAT_UNDEFINED;
+    std::uint32_t to_w = 0, to_h = 0, to_levels = 1, to_layers = 1;
+    Surface* to_surface = nullptr;
+    RtImage* to_rt = nullptr;
+    if (RtImage* rt = find_render_target(dst);
+        rt && rt->image && !rt->depth &&
+        (static_cast<std::uint32_t>(rt->gx_gen) == static_cast<std::uint32_t>(dst_gen) || target_taken_by(*rt, dst, dst_gen) > 0)) {
+        to_rt = rt;
+        to_image = rt->image;
+        to_format = rt->format;
+        to_w = rt->width;
+        to_h = rt->height;
+        to_layers = rt->layers;
+    } else {
+        std::uint32_t t[8];
+        if (!gx_resource_tsharp(dst, t)) return out(3);
+        bool dims_ok = true, arrayed = false;
+        std::uint32_t dim = 0;
+        texture_view_uncached(t, false, dims_ok, dim, arrayed, false, false, dst_gen);
+        auto di = g_surfaces.find(dst);
+        if (di == g_surfaces.end() || di->second.failed || !di->second.image || di->second.gx_gen != dst_gen) return out(4);
+        to_surface = &di->second;
+        to_image = to_surface->image;
+        to_format = to_surface->format;
+        to_w = to_surface->width;
+        to_h = to_surface->height;
+        to_levels = static_cast<std::uint32_t>(to_surface->levels.size());
+        to_layers = to_surface->type == 10 ? 1 : to_surface->layers;
+    }
+    if (to_w != from.width || to_h != from.height) return out(5);
+    // vkCmdCopyImage between size-compatible formats: the same, or the same
+    // bytes per texel with no compression on either side.
+    if (to_format != from.format) {
+        const std::size_t to_esize = to_rt ? format_bytes_per_pixel(to_rt->format) : to_surface->esize;
+        if (to_esize != from.esize || from.block != 1 || (to_surface && to_surface->block != 1)) return out(6);
+    } else if (to_rt && from.block != 1) {
+        return out(6);
+    }
+    if (to_rt && to_rt->view_clear) view_clear_apply_locked(*to_rt, kVcwCopy);  // its owed clear first, as any copy into a target
+    const std::uint32_t levels = std::min<std::uint32_t>(to_levels, static_cast<std::uint32_t>(std::max<std::size_t>(from.levels.size(), 1)));
+    const std::uint32_t layers = std::min(to_layers, from.type == 10 ? 1u : from.layers);
+    begin_recording_locked();
+    render_end_pass_locked();
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    std::vector<VkImageCopy> regions;
+    for (std::uint32_t l = 0; l < levels; ++l) {
+        VkImageCopy r{};
+        r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers};
+        r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers};
+        r.extent = {std::max(1u, from.width >> l), std::max(1u, from.height >> l), 1};
+        regions.push_back(r);
+    }
+    vkCmdCopyImage(g_cmd(), from.image, VK_IMAGE_LAYOUT_GENERAL, to_image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()),
+                   regions.data());
+    {
+        // The first of each source and destination pair, to know what moves this way.
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;  // under g.mu
+        if (seen.size() < 24 && seen.emplace(src, dst).second)
+            host_log("texture: resource copy 0x%llx -> 0x%llx at flip %llu: %ux%u format %d, %u level(s) %u layer(s), into its %s (generation %llu "
+                     "-> %llu)",
+                     static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), static_cast<unsigned long long>(hle_video_flip_count()),
+                     from.width, from.height, static_cast<int>(from.format), levels, layers, to_rt ? "target" : "surface",
+                     static_cast<unsigned long long>(src_gen), static_cast<unsigned long long>(dst_gen));
+    }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (to_rt) {
+        to_rt->initialised = true;
+        to_rt->fill_last = false;
+        tex_event(dst, static_cast<std::uint64_t>(to_w) * to_h * 4, "resource copy into target 0x%llx %ux%u from texture 0x%llx (generation %llu): image to image",
+                  static_cast<unsigned long long>(dst), to_w, to_h, static_cast<unsigned long long>(src), static_cast<unsigned long long>(src_gen));
+    } else {
+        surface_written(*to_surface);
+        if (!to_surface->gpu_written) {
+            to_surface->gpu_written = true;
+            to_surface->watched = false;
+        }
+        tex_event(dst, to_surface->total_src, "resource copy into 0x%llx %ux%u from 0x%llx (generation %llu): image to image, %u level(s), %u layer(s)",
+                  static_cast<unsigned long long>(dst), to_w, to_h, static_cast<unsigned long long>(src), static_cast<unsigned long long>(src_gen),
+                  levels, layers);
+    }
+    return out(0);
+}
+
+std::string textures_resource_copy_report() {
+    std::string s;
+    for (int k = 0; k < 8; ++k) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "%s%s %llu", k ? ", " : "", kResCopyName[k], static_cast<unsigned long long>(g_res_copies[k].load()));
+        s += b;
+    }
+    return s;
 }
 
 // Surfaces of a resource whose memory is gone: retired once the command
@@ -4295,7 +4475,16 @@ void forget_view_locked(VkImageView view) { g_view_records.erase(view); }
 
 bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out) {
     if (!memory || !gen) return false;
-    if (const RtImage* r = find_render_target(memory); r && r->image && r->gx_gen == gen) {
+    RtImage* r = find_render_target(memory);
+    if (r && (!r->image || (static_cast<std::uint32_t>(r->gx_gen) != static_cast<std::uint32_t>(gen) && target_taken_by(*r, memory, gen) <= 0)))
+        r = nullptr;
+    const auto si = g_surfaces.find(memory);
+    const Surface* sf = si != g_surfaces.end() && !si->second.failed && si->second.image && si->second.gx_gen == gen ? &si->second : nullptr;
+    // Both the resource's: the one the GPU wrote last holds what its memory
+    // would (a shader's store into the surface after the target's draws, or
+    // draws after the store).
+    if (r && sf && sf->gpu_written && sf->written_seq > r->written_seq) r = nullptr;
+    if (r) {
         if (out) {
             *out = HostImageRef{};
             out->image = r->image;
@@ -4309,18 +4498,16 @@ bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, Host
         }
         return true;
     }
-    const auto it = g_surfaces.find(memory);
-    if (it == g_surfaces.end() || it->second.failed || !it->second.image || it->second.gx_gen != gen) return false;
-    const Surface& sf = it->second;
+    if (!sf) return false;
     if (out) {
         *out = HostImageRef{};
-        out->image = sf.image;
-        out->format = sf.format;
-        out->width = sf.width;
-        out->height = sf.height;
-        out->layers = sf.type == 10 ? 1 : sf.layers;
-        out->levels = static_cast<std::uint32_t>(sf.levels.size());
-        out->gpu_written = sf.gpu_written;
+        out->image = sf->image;
+        out->format = sf->format;
+        out->width = sf->width;
+        out->height = sf->height;
+        out->layers = sf->type == 10 ? 1 : sf->layers;
+        out->levels = static_cast<std::uint32_t>(sf->levels.size());
+        out->gpu_written = sf->gpu_written;
     }
     return true;
 }
@@ -4430,6 +4617,10 @@ std::string textures_census_window_locked() {
             } else {
                 ++o.n;
                 o.bytes += sf.memory.size;
+                if (const int mw = gx_middleware_at(sf.base, span)) {
+                    ++(mw == 1 ? o.yebis : o.scaleform);
+                    (mw == 1 ? o.yebis_bytes : o.scaleform_bytes) += sf.memory.size;
+                }
             }
         }
         char l3[600];
@@ -4452,6 +4643,18 @@ std::string textures_census_window_locked() {
                       static_cast<ull>(rt[1].gone_bytes >> 20), static_cast<ull>(tex[0].gone), static_cast<ull>(tex[0].gone_bytes >> 20),
                       static_cast<ull>(tex[1].gone), static_cast<ull>(tex[1].gone_bytes >> 20));
         out += std::string("\n  ") + l4;
+        char l5[480];
+        std::snprintf(l5, sizeof(l5),
+                      "resources: of those on memory no GX resource holds, on YEBIS's own textures and buffers / on Scaleform's textures: targets "
+                      "%llu (%llu MiB) / %llu (%llu MiB), snapshots %llu (%llu MiB) / %llu (%llu MiB), shader-written textures %llu (%llu MiB) / "
+                      "%llu (%llu MiB), other textures %llu (%llu MiB) / %llu (%llu MiB)",
+                      static_cast<ull>(rt[0].yebis), static_cast<ull>(rt[0].yebis_bytes >> 20), static_cast<ull>(rt[0].scaleform),
+                      static_cast<ull>(rt[0].scaleform_bytes >> 20), static_cast<ull>(rt[1].yebis), static_cast<ull>(rt[1].yebis_bytes >> 20),
+                      static_cast<ull>(rt[1].scaleform), static_cast<ull>(rt[1].scaleform_bytes >> 20), static_cast<ull>(tex[0].yebis),
+                      static_cast<ull>(tex[0].yebis_bytes >> 20), static_cast<ull>(tex[0].scaleform), static_cast<ull>(tex[0].scaleform_bytes >> 20),
+                      static_cast<ull>(tex[1].yebis), static_cast<ull>(tex[1].yebis_bytes >> 20), static_cast<ull>(tex[1].scaleform),
+                      static_cast<ull>(tex[1].scaleform_bytes >> 20));
+        out += std::string("\n  ") + l5;
     }
     return out;
 }
@@ -4517,6 +4720,13 @@ void textures_report() {
              static_cast<unsigned long long>(g_region_uploads.load()), static_cast<unsigned long long>(g_region_bytes.load() >> 20),
              static_cast<unsigned long long>(g_region_created.load()), static_cast<unsigned long long>(g_region_no_surface.load()),
              static_cast<unsigned long long>(g_region_out_of_range.load()));
+    host_log("texture: copy-image tokens' sides by their resources: their own target %llu, their own surface %llu, a dead resource's target "
+             "taken (made over it without data) %llu, another resource's target not used %llu, no generation %llu; binds of a view whose "
+             "memory holds another resource's target: taken (made over it without data) %llu, not aliased %llu",
+             static_cast<unsigned long long>(g_copy_side_by[0].load()), static_cast<unsigned long long>(g_copy_side_by[1].load()),
+             static_cast<unsigned long long>(g_copy_side_by[2].load()), static_cast<unsigned long long>(g_copy_side_by[3].load()),
+             static_cast<unsigned long long>(g_copy_side_by[4].load()), static_cast<unsigned long long>(g_alias_taken.load()),
+             static_cast<unsigned long long>(g_alias_other_gen.load()));
     host_log("texture: copy-image tokens: copies %llu (%llu Mtexels; from a render target %llu, into one %llu), refused: no source %llu, "
              "no destination %llu, formats %llu, range %llu",
              static_cast<unsigned long long>(g_image_copies.load()), static_cast<unsigned long long>(g_image_copy_texels.load() >> 20),

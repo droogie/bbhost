@@ -78,6 +78,15 @@ fps_cap = 30
 # OBS's Window Capture records bbhost without it. (Windows only.)
 # obs_capture = "auto"
 
+[gpu]
+# The game's memory the GPU reaches: imported whole at the start (false, the
+# default), or a 16 MB window at a time as something first needs it (true):
+# far less memory pinned for the driver and a start a few seconds sooner, at a
+# little more work while new windows come in. The Steam Deck kit's toml sets
+# true (its shared memory stays under the driver's budget). BBHOST_IMPORT_WINDOWS=0
+# or 1 overrides this setting.
+# import_windows = false
+
 [startup]
 # Bloodborne 1.09: skip FromSoftware, Japan Studio and SCE logos, and the
 # "Exit Game may not have been selected" warning after closing the window.

@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 54 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 71 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 121 |
-| **Taken over in all** | **179** |
-| With any code byte changed (including byte patches and redirected calls) | 202; 284 at 60 fps |
+| **Taken over in all** | **196** |
+| With any code byte changed (including byte patches and redirected calls) | 217; 299 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -180,6 +180,9 @@ the game's code turning it by the same counts as ours.
 | pipeline drain (`gx_command_buffer_wait_for_eop`) | `0x2ab09e0` | makes the GPU wait for the work before (a label, an end-of-pipe event and a wait) | written as a barrier token for the command processor instead, which orders its own writes behind it; the same command buffer read and refilled the same way as the game's version, beside it on test buffers (`decomp_gx_drain_token`) |
 | occlusion query (`gnm_write_occlusion_query`) | `0x1477660` | an occlusion query's begin or end: the block reset, a wait, the counter dumps | written as one query token instead, taken as the renderer's own query; checked in the game by the queries it makes |
 | the Gnm packet writers nothing reads (21, below) | `0x1472ed0`-`0x148b610` | each makes room for one packet, writes it and moves the write pointer | twenty written as nothing by default, `prepareFlip`'s reservation as the game's; writing the game's packet, 420,000 generated cases against the game's own code - every byte of both chunks, the write pointer, the return value and the refill's calls - 0 differences (`decomp_gx_dead_packets`); `BBHOST_DECOMP_COMPARE=1` checks every call the game makes: 7.6 million in a three-place session, 0 differences |
+| the Gnm label, wait, inline-data, predication, indirect-buffer and counter writers (12, below) | `0x1473b80`-`0x148b430` | each makes room for one packet - a label when the work before it is done, a wait, data written inline, predication on an occlusion result, the compute ring's call of a command buffer, the draw engine's side of the constant engine's counters - writes it and moves the write pointer | the game's packets, written the same; 240,000 generated cases against the game's own code - every byte of both chunks, the command buffer and its flags, the return value and the refill's calls - 0 differences (`decomp_gx_labels`); `BBHOST_DECOMP_COMPARE=1` checks every call the game makes: 1.3 million in a three-place session (four of the nine called), 0 differences |
+| the DMA_DATA writer (`gnm_dma_data`) | `0x1473e60` | the command processor moving or filling memory: GX's buffer copies and fills, the GPU particles' counter moves through GDS, Gnmx's, YEBIS's and Toolkit's | the game's packet, except for the two moves through GDS around a counting dispatch while the counters ride in the dispatch tokens: those write nothing (they were two five-byte NOPs at their calls); 20,000 generated cases against the game's own code, 0 differences, and the two moves' calls checked to be the writer's (`decomp_gx_dma`) |
+| the constant engine's writers (`gnm_ce_reserve_const_ram`, `gnm_ce_wait_on_de_counter_diff`, `gnm_ce_increment_ce_counter`, `gnm_ce_dump_const_ram`) | `0x15fd190`-`0x15fd3e0` | the constant command buffer's packets: its RAM written (reserved for the caller to fill), its counters stepped, its RAM dumped into memory | nothing dumps that RAM (YEBIS's tables come from its own state, Gnmx's draws are tokens), so with the dead packets on the first three write nothing - the reserve answers a scratch area for the payload - and the dump, written always, is counted if it ever comes; writing the game's packets, 80,000 generated cases against the game's own code, 0 differences (`decomp_gx_constant_engine`) |
 
 The 21 packet writers (`gx/dead_packets.cpp`) are Gnm's own: the four
 `ACQUIRE_MEM` cache actions (`gnm_acquire_mem_range`, `dcb_acquire_mem`,
@@ -205,6 +208,25 @@ into a jittery pacing more often and Fishing Hamlet missed a refresh every
 times: 96.9M dwords of cache actions and 95.3M of context registers the
 command processor no longer walks. As source, each is also where a host
 command can take the packet's place.
+
+The twelve writers in `gx/labels.cpp` carry every completion the game asks the
+GPU for and every wait it has the GPU make: the end-of-pipe and end-of-shader
+labels (`gnm_write_end_of_pipe_event`, `gnm_write_end_of_shader_event`) that
+GX's block pools and command arena, its Map and queries, YEBIS's drains,
+Scaleform's fences and the flip are written with, the compute command buffer's
+release (`gnm_dispatch_write_release_mem`, the compute ring's retirement), the
+two `WAIT_REG_MEM` writers (`gnm_wait_reg_mem`, `gnm_dispatch_wait_reg_mem`,
+the same code in the draw and compute command buffers), the two `WRITE_DATA`
+writers (`gnm_write_data_inline`, `gnm_write_data_inline_l2`) and
+`SET_PREDICATION` set and cleared with the command buffer's predication flag
+(`gnm_set_predication`, `gnm_clear_predication`), and the compute ring's call
+of each command buffer it runs (`gnm_dispatch_write_indirect_buffer`), and the
+draw engine's side of the constant engine's counters
+(`gnm_increment_de_counter`, `gnm_wait_on_ce_counter`). They write the game's
+packets: the command processor walks them, and records each label as a GPU
+write of the label's memory. As source, each is where a label or a wait
+becomes a command of the command buffer's own host list - the step that lets
+the command processor stop walking the game's command buffers.
 
 ### Memory (`src/decomp/memory/`)
 

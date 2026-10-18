@@ -288,6 +288,7 @@ constexpr unsigned kFaultRing = 16384;
 std::atomic<std::uint64_t> g_fault_addr[kFaultRing];
 std::atomic<std::uint64_t> g_fault_frame[kFaultRing][kWriteWatchFrame];
 std::atomic<std::uint64_t> g_fault_when[kFaultRing];  // the fault's sequence number
+std::atomic<std::uint8_t> g_fault_owner[kFaultRing];  // who armed the page (kWatchOwner*)
 std::atomic<std::uint32_t> g_fault_next{0};
 
 __attribute__((no_stack_protector)) bool write_watch_on_fault(std::uint64_t addr, bool is_write, const std::uint64_t* frame) {
@@ -341,6 +342,7 @@ __attribute__((no_stack_protector)) bool write_watch_on_fault(std::uint64_t addr
     const unsigned slot = n % kFaultRing;
     for (int k = 0; k < kWriteWatchFrame; ++k) g_fault_frame[slot][k].store(frame ? frame[k] : 0, std::memory_order_relaxed);
     g_fault_when[slot].store(n + 1, std::memory_order_relaxed);
+    g_fault_owner[slot].store(owner_of(page), std::memory_order_relaxed);
     g_fault_addr[slot].store(addr, std::memory_order_release);
     g_fault_ticks.fetch_add(__builtin_ia32_rdtsc() - t0, std::memory_order_relaxed);
     return true;
@@ -403,6 +405,30 @@ int write_watch_fault_writers(std::uint64_t* pcs, std::uint64_t* callers, std::u
         counts[n] = w.n;
         ++n;
     }
+    return n;
+}
+
+int write_watch_faults_since(std::uint64_t since, std::uint64_t* addrs, std::uint64_t* pcs, std::uint8_t* owners, int max,
+                             std::uint64_t* newest) {
+    const auto guest = [](std::uint64_t a) { return a > 0x10000 && a < 0x100000000000ull; };
+    std::uint64_t top = since;
+    int n = 0;
+    for (unsigned i = 0; i < kFaultRing && n < max; ++i) {
+        const std::uint64_t a = g_fault_addr[i].load(std::memory_order_acquire);
+        const std::uint64_t w = g_fault_when[i].load(std::memory_order_relaxed);
+        if (!a || w <= since) continue;
+        std::uint64_t pc = 0;
+        for (int k = 0; k < kWriteWatchFrame && !pc; ++k) {
+            const std::uint64_t f = g_fault_frame[i][k].load(std::memory_order_relaxed);
+            if (guest(f)) pc = f;
+        }
+        addrs[n] = a;
+        pcs[n] = pc;
+        owners[n] = g_fault_owner[i].load(std::memory_order_relaxed);
+        ++n;
+        top = std::max(top, w);
+    }
+    if (newest) *newest = top;
     return n;
 }
 

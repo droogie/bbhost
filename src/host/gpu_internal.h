@@ -784,6 +784,21 @@ bool compute_precompile_enabled();
 bool note_compute_created(const std::string& name, std::uint64_t flip);
 void precompile_compute(const std::string& name, const std::vector<std::uint8_t>& container, std::uint64_t created_flip);
 void compute_precompile_report();
+// The pipeline manifest's compute records (render.cpp): a compute pipeline a
+// dispatch had to build itself (built_here: a shader GX never created through
+// the hook, or one whose bound images differ from the creation's guess) with
+// what its key was made from, so a start builds it before the dispatch; a
+// dispatch that took one (built_here false) only counts the record's use - the
+// shaders GX creates are compiled at their creation already.
+void recipe_note_compute(const std::string& name, const std::vector<std::uint32_t>& words, std::uint64_t key, std::uint32_t rsrc1,
+                         std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                         const std::vector<bool>& modes, bool built_here);
+// On a precompile worker: a compute record's pipeline, as precompile_compute
+// builds one from a container but with the record's images and samplers.
+// False when it failed (or another build had its key).
+bool precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
+                                 const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                                 const std::vector<bool>& modes);
 // Where guest bytes [va, va + bytes) are, in imported memory: one buffer
 // holds them all (imported now when they are direct memory the GPU may reach),
 // avail bytes of it from the offset. A null buffer otherwise.
@@ -801,6 +816,17 @@ bool imports_whole();
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.
 void import_windows(std::uint64_t va, std::uint64_t bytes);
+// The path whose locate() or import_windows() is under way (a vertex buffer,
+// a label's write, a copy token...), for the exit report's census of what
+// still takes window imports: set for the call's length, nullptr outside one.
+extern thread_local const char* t_import_site;
+struct ImportSite {
+    const char* prev;
+    explicit ImportSite(const char* site) : prev(t_import_site) { t_import_site = site; }
+    ~ImportSite() { t_import_site = prev; }
+    ImportSite(const ImportSite&) = delete;
+    ImportSite& operator=(const ImportSite&) = delete;
+};
 // BBHOST_IMPORT_AUDIT=1 (gpu.cpp): counts the GPU side's resolutions per guest
 // mapping - kind 0 locate, 1 a device address, 2 a vertex/index mirror source.
 extern const bool g_import_audit;
@@ -812,6 +838,38 @@ void audit_range(std::uint64_t va, std::uint64_t bytes, ImportUse use);
 // The device address of guest bytes when they lie in one imported mapping,
 // else 0 (gpu.cpp).
 VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes);
+// locate() without the GX buffers' device-local twins: guest memory's import.
+Located locate_guest(std::uint64_t va, std::uint64_t bytes);
+// GX buffers the GPU writes, as device resources (BBHOST_GX_TWINS=1; gpu.cpp,
+// gx twins). twin_locate_locked: [va, va + bytes) inside one - `out` the twin
+// (made and filled from guest memory at its first use), `address` its device
+// address when asked; false: guest memory serves it. twin_covers_locked: the
+// range overlaps a live twin, whose guest bytes are stale - no CPU copy of
+// them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
+// walk, 1 a texture) reaches them - copied back and let go.
+bool twins_on();
+bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
+int twins_level();  // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies write
+bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
+bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
+bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
+bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
+void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site);  // logs a few imports over a candidate's kind
+// A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
+// with BBHOST_GX_TWINS=2 the GX buffer it lies in becomes a candidate.
+void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes);
+void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
+// [va, va + bytes) is read by the CPU (an occlusion block): twins over it are
+// copied back and let go, and candidates over it let go before they are made.
+void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes);
+void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen);
+void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen);
+std::string twins_report();
+// The buffer shadow's command buffer for this recording's uploads, run before
+// the recording's own work (buffer_shadow.cpp upload_cmd_locked).
+VkCommandBuffer shadow_upload_cmd_locked();
 // A PS4 tiled texture level untiled on the GPU into linear elements
 // (gpu_untile.cpp, shaders/untile.comp), recorded into the current command
 // buffer outside a render pass. `mode` 0 linear, 1 1D tiled thin, 2 2D tiled
@@ -1086,6 +1144,8 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
 void textures_drop_rt_regions_locked(std::uint64_t base);
 // The reuse retire's line for the 5-second report.
 std::string image_reuse_report_locked();
+// The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
+std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's
@@ -1136,6 +1196,12 @@ void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
 bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
 // Whether a GPU write over [va, va+bytes) was recorded in recording `serial` or later.
 bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
+// The newest recording whose GPU writes the tables above have let go of
+// (they keep only writes still to land when they fill): gpu_wrote_since_locked
+// cannot answer for a serial at or before it.
+std::uint64_t gpu_writes_dropped_locked();
+// g.completed_submits as last stored, for readers without the lock (gpu.cpp).
+extern std::atomic<std::uint64_t> g_completed_submits_seen;
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's
@@ -1323,6 +1389,14 @@ struct HostImageRef {
     bool gpu_written = false;    // its image holds what the guest memory does not
 };
 bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out);
+// A GX texture copied whole as memory whose source surface a shader or copy
+// wrote: copied image to image into the destination resource's target or
+// surface (textures.cpp). 1 copied, 0 not that case (counted by reason).
+int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std::uint64_t dst, std::uint64_t dst_gen);
+std::string textures_resource_copy_report();
+// BBHOST_COPY_BY_RESOURCE (on unless 0, and with BBHOST_RES_IDENTITY): copies
+// and texture binds take a target by its resource's generation (gpu.cpp).
+bool copy_by_resource_on();
 // Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
 // unless 0): retired with it, never handed to a later resource at the same
 // memory (textures.cpp).
@@ -1350,6 +1424,8 @@ struct OrphanImages {
     std::uint64_t n = 0, bytes = 0;            // no live GX resource over any of its memory
     std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
     std::uint64_t gone = 0, gone_bytes = 0;    // the image of a GX resource (generation) that is no longer live
+    std::uint64_t yebis = 0, yebis_bytes = 0;  // of `n`, on memory YEBIS's own device made (BBHOST_RESOURCE_CENSUS)
+    std::uint64_t scaleform = 0, scaleform_bytes = 0;  // of `n`, on a Scaleform texture's (the same)
 };
 // Colour and depth targets [0], snapshots [1] whose memory no live GX
 // resource covers (render.cpp).
@@ -1401,11 +1477,15 @@ void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
 // that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutReasons };
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
 // Whether a pending version's copy into place writes `buffer` (a window import
 // about to retire: its copies go into place first).
 bool copy_versions_name_buffer_locked(VkBuffer buffer);
+// The same for [lo, hi) of `buffer` (a GX twin's slice about to be let go).
+bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi);
+// Whether a pending version's destination overlaps guest [lo, hi).
+bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.

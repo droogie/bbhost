@@ -87,6 +87,13 @@ struct GpuDrawInputs {
     // not known), which the registers give only padded; and the depth view's.
     std::uint32_t color_extent[8] = {};
     std::uint32_t depth_extent = 0;
+    // The generation of the resource each target's view was made of
+    // (gx_view_gen; 0: not known - the view not seen made, or no view: a
+    // packet draw, YEBIS's, Scaleform's): the image a draw finds at the
+    // target's base is that resource's from the draw on (render.cpp
+    // target_image). A session makes far fewer than 2^32 resources.
+    std::uint32_t color_gen[8] = {};
+    std::uint32_t depth_gen = 0;
     std::uint32_t blend[8] = {};         // CB_BLENDn_CONTROL
     float blend_const[4] = {};           // CB_BLEND_RED..ALPHA
     std::uint32_t depth_control = 0, stencil_control = 0, stencil_ref = 0, stencil_ref_bf = 0;
@@ -196,6 +203,8 @@ struct alignas(64) GxStageRecords {
     // BBHOST_GX_COST: which constant buffers' contents were hashed at the call
     // (cb_hash).
     std::uint16_t cb_hashed = 0;
+    // BBHOST_CB_RECORD_PROOF: which were copied at the call (cb_proof).
+    std::uint16_t cb_proofed = 0;
     // The shader object's resource masks (+0x0, +0x8, +0x10), which give the
     // commit's tables their slot ranges: textures 0-63 and 64-127; sampler
     // caches in bits 0-15, constant buffers 16-35, samplers 36-51.
@@ -243,6 +252,9 @@ struct alignas(64) GxStageRecords {
     // record (engine/gx_resources.h; 0 when not registered). A view's T# never
     // changes after it is made, so the id stands for the record.
     std::uint32_t obj_tex_id[64];
+    // BBHOST_CB_RECORD_PROOF: each obj_cb buffer's copy taken at the call
+    // (host/cb_proof.h handles), valid by cb_proofed.
+    std::uint64_t cb_proof[14];
 };
 static_assert(offsetof(GxStageRecords, desc) <= 64, "what the constructor clears is one line");
 struct GxDrawRecords {
@@ -362,6 +374,9 @@ bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes);
 // Submissions whose fence has retired, in order (trails the GPU: a write may be
 // in memory before this passes its serial).
 std::uint64_t host_gpu_completed_submits();
+// The same without the GPU lock, as last stored (it may trail by a retirement):
+// for a recording thread that must not wait on the renderer.
+std::uint64_t host_gpu_completed_submits_seen();
 // BBHOST_ARENA_WATCH: logs where va resolves and which recent deferred writes carried value.
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value);
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes);
@@ -379,13 +394,28 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
 // it in place, its windows are imported ahead of their first use on a thread
 // of their own; nothing otherwise. Any thread, any lock.
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind);
+// A GX buffer was made over [memory, memory + bytes) with this usage, these
+// bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
+// GPU writes (usage default, unordered-access bind) gets a device-local twin
+// at its first GPU use (gpu.cpp, gx twins). Any thread, any lock.
+void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+// A Map of that buffer handed out its own memory: the CPU writes it in place
+// (gx twins keep no device-local copy of it).
+void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t bytes, std::uint64_t gen);
+// That buffer was destroyed (gx twins drop its device-local copy).
+void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
 // destination's; otherwise records buffer copies in command order, split where
 // either range crosses imports. False when a piece cannot be located or source
 // and destination share bytes.
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// src_gen / dst_gen: the generations of the GX textures the copy moves whole
+// (a CopyResource), 0 when it is not one: the source is then copied as its
+// resource's image when the host holds one (textures_copy_resource_locked,
+// the render-target path for a target), and the memory copy stays the
+// fallback.
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0);
 // A GX dynamic buffer's renamed bytes copied back to its own address (a copy
 // token's batched copies): inside a render pass, the draws after it read a
 // copy of the bytes taken now and the copy into place waits for the pass's
@@ -433,6 +463,9 @@ struct GpuImageCopy {
     std::uint32_t src_mip, src_layer, src_x, src_y;
     std::uint32_t dst_mip, dst_layer, dst_x, dst_y;
     std::uint32_t w, h;
+    // The two resources' generations at the call (0: not known): a side whose
+    // image at its memory is another resource's is not used (textures.cpp).
+    std::uint64_t src_gen = 0, dst_gen = 0;
 };
 bool host_gpu_copy_image_region(const GpuImageCopy& c);
 // The memory [base, base+bytes) of a resource GX destroyed or the kernel
@@ -442,6 +475,29 @@ void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_
 // GX mapped the texture whose memory is [base, base + bytes) for the CPU to
 // write: its surfaces upload it again at their next use.
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);
+// A CPU write GX makes over a buffer's memory - a creation's initial data -
+// or memory that stops being a buffer's: the buffer shadow invalidates the
+// mirror pages over it (they are not write-watched when GX buffers cover
+// them). Any thread, no lock held.
+void host_gpu_shadow_gx_write(std::uint64_t va, std::size_t bytes);
+// A GX resource was made over [va, va + bytes): a write as above, and memory
+// GX no longer hands out to be rewritten. Any thread, no lock held.
+void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes);
+// Memory GX handed the CPU to write without a call to say when it is done:
+// the renamed copy a buffer Map hands out (kind 0, written until GX writes it
+// back or frees it) or, under BBHOST_RESOURCE_CENSUS, an upload pool's block
+// (1), a ring allocation (2) and the memory a YEBIS discard Map renames a
+// resource into (3). Any thread, no lock held.
+void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind);
+// Whether the buffer shadow acts on kind-0 hand-outs (BBHOST_SHADOW_GX and
+// BBHOST_SHADOW_HANDED on): the registry then tells it of each allocation the
+// ring allocator makes in place of the ring's whole renamed copy.
+bool host_gpu_shadow_hands_out();
+// GX writes a renamed copy in [va, va + bytes) back to its buffer (a map
+// resolve's copy, gx_trace's 0x2ab2810 / 0x2ab2670 hooks) or frees it (a
+// later discard Map of its buffer in the same context): the CPU's writes to
+// it are over. Any thread, no lock held.
+void host_gpu_shadow_gx_settled(std::uint64_t va, std::size_t bytes);
 // Copies `bytes` into the host-owned table ring the GPU page
 // table reaches and returns their guest address (0 when no ring could be
 // mapped); a draw token's user data points at tables placed here.
@@ -462,6 +518,7 @@ struct GpuClearView {
     bool depth = false;           // a depth-stencil view
     std::uint32_t view_id = 0;    // gx_object_id of the view (0: not seen made)
     std::uint32_t extent = 0;     // gx_view_extent: (width << 16) | height, 0 when not known
+    std::uint32_t gen = 0;        // gx_view_gen: the view's resource's generation, 0 when not known
     // Colour: CB_COLOR BASE, PITCH, SLICE, VIEW, INFO; the view's own mip,
     // first slice and slice count; whether CMASK fast clears it (CB_COLOR_INFO
     // FAST_CLEAR, where GX fills CMASK instead of the surface).

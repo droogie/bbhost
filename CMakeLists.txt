@@ -146,12 +146,15 @@ add_executable(bbhost
   src/hle/video.cpp
   src/hle/gnm.cpp
   src/hle/gnm_exec.cpp
+  src/host/host_lists.cpp
+  src/host/cb_proof.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
   src/hle/http.cpp
   src/hle/ajm.cpp
   src/hle/system.cpp
+  src/host/label_landing.cpp
 )
 
 target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
@@ -365,6 +368,9 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/drain_token.cpp
   src/decomp/gx/query_token.cpp
   src/decomp/gx/dead_packets.cpp
+  src/decomp/gx/labels.cpp
+  src/decomp/gx/dma.cpp
+  src/decomp/gx/constant_engine.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -372,6 +378,8 @@ set(BBHOST_DECOMP_SOURCES
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+# The host lists record from decomp leaves, on the game's threads with the game's FS.
+set_source_files_properties(src/host/host_lists.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The follow camera's step is the game's own AVX, intrinsic for intrinsic
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
@@ -553,8 +561,24 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(adaptive_mutex)
-  bbhost_decomp_test(gx_drain_token)
+  bbhost_decomp_test(gx_drain_token SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_dead_packets SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_labels SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_dma SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_constant_engine SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
+  add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
+  target_include_directories(host_lists_test PRIVATE src include)
+  target_compile_options(host_lists_test PRIVATE -fno-stack-protector)
+  target_link_libraries(host_lists_test PRIVATE pthread)
+  add_test(NAME host_lists_test COMMAND host_lists_test)
+  set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
+  add_executable(cb_proof_test tests/cb_proof_test.cpp)
+  target_include_directories(cb_proof_test PRIVATE src include)
+  target_link_libraries(cb_proof_test PRIVATE pthread)
+  add_test(NAME cb_proof_test COMMAND cb_proof_test)
+  set_tests_properties(cb_proof_test PROPERTIES ENVIRONMENT "BBHOST_CB_RECORD_PROOF=1")
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
@@ -567,6 +591,12 @@ if(UNIX)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
   add_test(NAME at9_test COMMAND at9_test)
   set_tests_properties(at9_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Labels written by the host once their submission has run, a counter for the GPU (tests/label_landing_test.cpp).
+  add_executable(label_landing_test tests/label_landing_test.cpp src/core/portable.cpp)
+  target_include_directories(label_landing_test PRIVATE src include)
+  target_link_libraries(label_landing_test PRIVATE pthread)
+  add_test(NAME label_landing_test COMMAND label_landing_test)
+  set_tests_properties(label_landing_test PROPERTIES ENVIRONMENT "BBHOST_LABEL_LANDING=1")
   if(SDL3_FOUND)
     # Audio output lifetimes under concurrent writes, on SDL's dummy driver.
     add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/core/portable.cpp)

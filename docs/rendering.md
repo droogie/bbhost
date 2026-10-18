@@ -23,7 +23,13 @@ engine's own objects - its shaders, vertex layout, state descriptions,
 textures and constant buffers - and leaves a small token in the command
 buffer. When the command processor reaches the token, the draw is built from
 those inputs. No packet is decoded and no register file is consulted for a
-draw.
+draw. At Uncapped, 90 and 120, where the command processor limits the frame
+rate, the draw's resource records travel packed - each stage's header and
+only the slots it sets, a few hundred bytes - and the command processor
+unpacks them into a set of its own; at 30 and 60 the GX threads hand over the
+whole sparse set, which costs them less CPU, and a paced frame does not wait
+for the command processor (`BBHOST_GX_PACKED_RECORDS=1` or `=0` forces
+either).
 
 **Compute dispatches** are tokens too. A dispatch through GX's compute
 commit - the GPU particles, the tone-map and depth-of-field look-up tables -
@@ -48,10 +54,32 @@ constant update engine). GX's pipeline drains are barrier tokens: the CP's own
 writes after one go behind the work before it, with no label and no wait.
 Occlusion queries are tokens from GX's Begin and End, measured by the
 renderer's own queries. The packets nothing on the host reads - the cache
-flushes, the context registers, the shader prefetches - are not written at
-all (`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
+flushes, the context registers, the shader prefetches, the compute stage's
+registers (a dispatch token carries them, and a fallback writes them before
+its packet), the constant engine's counters - are not written at all
+(`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
 calls: a clear names its view, and is made as the next pass's load op, or as a
 transfer clear when something reads the image first.
+
+**Host command lists.** What the command processor acts on in those buffers -
+the tokens, labels and waits, which our versions of Gnm's packet writers write -
+can be recorded as it is written, a list per chunk of command buffer, so that a
+submitted range reaches the command processor as its list's packets instead
+of all its bytes (`BBHOST_HOST_LISTS=1`, the default; a range no list covers
+is walked, counted by reason; `=0` walks every range as before, `=2` records
+the lists and checks them against the walk, range by range).
+
+**Labels.** A submission carries its labels, and a thread of the host's,
+`bb-labels`, writes them into guest memory in the order the command processor
+made them once the timeline semaphore says the submission has run: the
+queue's order holds without barriers between fills, and a label's memory
+needs no import. A submission counts as completed for the rest of bbhost only
+once its labels are in memory, and the command arena's acquire, waiting for a
+chunk, looks again as each label lands. The thread waits in the driver, or
+polls on Windows (`BBHOST_LABEL_WAIT`), where NVIDIA's driver holds its lock
+through that wait; there the labels are still GPU fills at the end of their
+submission's command buffer unless `BBHOST_LABEL_LANDING=1` (`=0` keeps the
+fills anywhere).
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
@@ -111,8 +139,9 @@ page-table walk. GCN's loops that run until every lane's execution bit
 clears become structured per-invocation loops, a block GCN branches over
 where no lane needs it becomes a selection an invocation skips where its own
 bit is clear, and the GPU particles' wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
-from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
-needs subgroup operations. A barrier is accepted only where every invocation
+from `v_mbcnt`) becomes one atomic add per invocation, on the counter word
+the dispatch hands over by its device address, so no compute lift needs
+subgroup operations or the page table for it. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
 translated. A compute shader reads its constant buffers, tables and typed
@@ -138,8 +167,25 @@ only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
 over several windows replaces the ones it covers, so no page is imported
 twice, and a dispatch imports what its shader reads and stores. It is off by
-default: the work under way moves each of those uses off guest memory, and
-windows are then only the fallback for what is not moved yet.
+default (`gpu.import_windows` in the config turns it on too): the work under
+way moves each of those uses off guest memory, and windows are then only the
+fallback for what is not moved yet. The Steam Deck kit turns it on: there the
+memory shared with the GPU stays under the driver's budget and the start is
+about 3 s sooner, at the same frame rate (its device-local twins, below, stay
+off: on an APU they are the same memory plus copies). One such move,
+off while it is measured: `BBHOST_GX_TWINS=1` keeps the GX buffers the GPU
+writes - particle state, append buffers and their counters, arguments a
+dispatch fills - in device memory, as a copy made at the buffer's first GPU
+use that every GPU use reads and writes from then on; nothing copies their
+guest bytes on the CPU after that, and anything that would read them from
+guest memory (a page-table walk, a texture over one) has the copy written
+back first. `BBHOST_GX_TWINS=2` adds the buffers GX writes with GPU copies:
+a dynamic buffer's renamed bytes written back to its own address, a constant
+buffer's update (a world has about 3,800 of them, 4 MB, kept in shared
+device-memory blocks). With window imports a copy's source the CPU wrote is
+copied through upload staging, as copy versions' bytes are, rather than read
+through an import. The exit report lists what still reads or writes guest
+memory in place, by the path that asked.
 Textures are detiled on the GPU. A texture's image, a render target's and a
 copy's belong to the GX resource they were made for, by that resource's
 generation: GX's own calls change them - the resource's creation, upload and
@@ -148,9 +194,18 @@ resource is destroyed, so memory the game gives to a new resource with texels
 of its own never hands it the old image. A target, or an image only shaders
 wrote, goes instead to a texture the game makes over the same memory without
 data, as the console's memory carries it over: the game re-creates its targets
-at an area load and may only clear and copy from them. Only what GX does not
-create - YEBIS's and Scaleform's own textures, and the device-local copies of
-vertex and index data - is still noticed by write-protecting its pages.
+at an area load and may only clear and copy from them. YEBIS's and
+Scaleform's own textures are known the same way, from those libraries' own
+creation and release calls, and their writes from their own Map, update and
+unmap calls. The device-local copies of vertex and index data are told what
+changed by GX's calls as well: the renamed copy a Map hands out is copied
+again until GX writes it back or frees it, and a creation with data marks the
+memory it fills. Only memory no call tells of - the engine's own rings outside
+GX, YEBIS's buffers - is still noticed by write-protecting its pages.
+A draw names its targets' resource generations, so the image at a target's
+base is the drawing resource's from its first draw; copies and texture binds
+take a target there only if it is their resource's - drawn since the
+resource was made, or the resource made over it without data.
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
@@ -178,9 +233,9 @@ path at all:
 | Clears and target copies | native: tokens from GX's calls, in the view's terms |
 | Occlusion queries | native: tokens from GX's calls, measured by the renderer's own queries |
 | Pipeline drains | native: barrier tokens from GX's calls |
-| Labels and fences the game waits on | emulated: written by the command processor on the GPU's timeline |
+| Labels and fences the game waits on | emulated: recorded by the command processor, written by the host once their submission has run (GPU fills on Windows for now) |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
-| Resource identity | GX's resources by their objects and generations; what GX does not create (YEBIS's and Scaleform's textures, vertex and index copies) by address, with write tracking |
+| Resource identity | GX's, YEBIS's and Scaleform's textures by their objects and generations; vertex and index copies told by GX's Map calls; memory no call tells of (YEBIS's buffers, the engine's own rings) by address, with write tracking |
 
 ## Shader lifting
 
@@ -399,9 +454,9 @@ the default, and nothing waits on DXC:
 
 ## What comes next
 
-- The rest of resource identity: the device-local copies of vertex and index
-  data told what changed by GX's Map calls, and the textures YEBIS and
-  Scaleform make known by their own creation calls, so write tracking can go.
+- Copies of textures a compute pass wrote, made image to image
+  (`BBHOST_COPY_BY_RESOURCE=2`): today they copy the memory under them, which
+  the GPU's writes never reach.
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.

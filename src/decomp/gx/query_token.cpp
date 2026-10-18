@@ -25,6 +25,7 @@
 #include "decomp/guest.h"
 
 #include "hle/modules.h"
+#include "host/host_lists.h"
 #include "log.h"
 
 #include <atomic>
@@ -68,6 +69,7 @@ DECOMP_LEAF void gx_query_token(u64 cb, u32 kind, u64 block) {
     store<u32>(wp + 8, static_cast<u32>(block & ~7ull) | k);
     store<u32>(wp + 12, static_cast<u32>(block >> 32));
     store<u64>(cb + 0x10, wp + 16);
+    host_lists::note(cb, wp, 0x10);
 }
 
 namespace {

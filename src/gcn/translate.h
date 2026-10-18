@@ -502,9 +502,10 @@ struct StageParams {
         // [0..4] as the draw's control points instead (kTess*).
         std::uint32_t vertex_formats[16];
         // TranslateOptions::gds_counters, a compute dispatch (no vertex input):
-        // the guest address of the word each of GDS dwords gds_base.. counts
-        // in, 0 for none - its ds_append / ds_consume then do nothing and
-        // return 0.
+        // the device address of the word each of GDS dwords gds_base.. counts
+        // in (the host's: the guest word's place in its import or in a
+        // device-local copy of its buffer), 0 for none - its ds_append /
+        // ds_consume then do nothing and return 0.
         std::uint64_t gds_counter[8];
     };
     // TessRole::Domain: the row of the domain shader's projection that gives

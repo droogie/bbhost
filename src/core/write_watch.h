@@ -88,6 +88,14 @@ std::uint64_t write_watch_fault_seq();  // the count of faults so far
 // write in a host leaf, its guest caller) and the guest address after it.
 // Returns how many distinct pairs were written to pcs/callers/counts.
 int write_watch_fault_writers(std::uint64_t* pcs, std::uint64_t* callers, std::uint32_t* counts, int max);
+// The faults after the first `since` (write_watch_fault_seq counts them) the
+// ring still holds, in no order: each one's address, the first guest address
+// of its frame and the owners of the page it hit. Up to `max`; returns how
+// many, and in *newest the count the answer reaches (the next call's
+// `since`). For a census of what the faulting writes hit, taken more often
+// than the ring wraps.
+int write_watch_faults_since(std::uint64_t since, std::uint64_t* addrs, std::uint64_t* pcs, std::uint8_t* owners, int max,
+                             std::uint64_t* newest);
 
 #if defined(_WIN32)
 // Installs the vectored exception handler that asks write_watch_on_fault.

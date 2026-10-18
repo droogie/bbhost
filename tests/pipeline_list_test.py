@@ -105,15 +105,42 @@ class PipelineListTest(unittest.TestCase):
         out, left, _plain, _patched = pl.make_list([pl.Recipe().parse(body)], progs, fetch_words=False)
         self.assertEqual((len(out), sum(left.values())), (0, 1))  # --no-fetch-words leaves it out
 
+    def test_compute_record(self):
+        """Version 4: a compute record (its program, registers, threads, images
+        and samplers) reads and writes back as it was, sits beside pipelines in
+        one file, and a list names its program like the others."""
+        cs = struct.pack("<4I", 11, 12, 13, 14)
+        body = struct.pack("<IQIII", pl.COMPUTE_RECORD, 0xC0FFEE, 2, 7, 3) + struct.pack("<I", len(cs) // 4) + cs + pl.wstr("0000cccc") + \
+            struct.pack("<5I", 0x2C0041, 0x90, 64, 1, 1) + struct.pack("<I", 2) + struct.pack("<IB", 1, 0) + struct.pack("<IB", 2, 1) + \
+            struct.pack("<I", 1) + bytes([1])
+        c = pl.parse_record(body)
+        self.assertTrue(c.compute)
+        self.assertEqual((c.key, c.name, c.prog, len(c.dims), len(c.modes)), (0xC0FFEE, "0000cccc", cs, 10, 1))
+        self.assertEqual(c.body(), body)
+        vs, ps = struct.pack("<3I", 1, 2, 3), struct.pack("<2I", 7, 8)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "m.bin"
+            pl.write_file(path, 4, ORIGIN, [recipe(1, 4, vs, ps), pl.parse_record(body)])
+            _, _, recs = pl.read_file(path)
+            self.assertEqual([r.compute for r in recs], [False, True])
+            progs = {"0000aaaa": vs, "0000bbbb": ps, "0000cccc": cs}
+            out, left, plain, _patched = pl.make_list(recs, progs)
+            self.assertEqual((len(out), sum(left.values()), plain), (2, 0, 3))
+            listed = pl.parse_record(out[1].body())
+            self.assertEqual((listed.prog, listed.ref, listed.flags & pl.VS_REF), (None, (4, pl.fnv1a(cs)), pl.VS_REF))
+            out, left, _p, _q = pl.make_list([pl.parse_record(body)], {"0000aaaa": vs})
+            self.assertEqual((len(out), sum(left.values())), (0, 1))  # a program no file holds
+
     def test_versions_agree(self):
         """The record format pipeline_list.py writes is the one bbhost writes
-        (render.cpp recipe_file::kVersion), and the one the pinned list is."""
+        (render.cpp recipe_file::kVersion); the pinned list's is one both read."""
         src = (ROOT / "src" / "host" / "render.cpp").read_text()
         at = src.index("namespace recipe_file {")
         version = int(src[at:at + 400].split("kVersion = ")[1].split(";")[0])
         self.assertEqual(version, pl.VERSION)
         fetch = (ROOT / "tools" / "fetch_pipeline_list.sh").read_text()
-        self.assertIn("LIST_FORMAT=%d\n" % pl.VERSION, fetch)
+        pinned = int(fetch.split("\nLIST_FORMAT=")[1].split("\n")[0])
+        self.assertIn(pinned, pl.READS)
 
 
 if __name__ == "__main__":

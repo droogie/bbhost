@@ -20,6 +20,10 @@ a list carries them as the manifest does (the owner accepted that on
 2026-10-17, so tessellated pipelines are listed too); --no-fetch-words leaves
 those records out instead. A tessellated record may also carry the host
 tessellator's LS passes (version 3): each LS is named like the other programs.
+Version 4 adds compute records: a dispatch's compute pipeline (its program,
+named the same way in a list, its resource registers, thread counts and the
+images and samplers its key was made from), which a start builds before the
+dispatch - the title's own compute shaders among them.
 
   pipeline_list.py stats <file>...
   pipeline_list.py merge --out <manifest> <manifest>...
@@ -40,8 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shaderbnd  # noqa: E402
 
 MAGIC = 0x4D504242  # "BBPM"
-VERSION = 3  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes
-READS = (2, 3)
+VERSION = 4  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes;
+#             4: compute records (ComputeRecipe)
+READS = (2, 3, 4)
+COMPUTE_RECORD = 1 << 30  # a record's flags: a compute record
 VS_REF, PS_REF, LS_REF, HS_REF = 256, 512, 1024, 2048
 TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES = 64, 128, 256, 1024
 HAS_VERTEX_INPUT, RELINK = 4, 8
@@ -112,8 +118,44 @@ def program_bytes(words, ref):
     return w32(len(words) // 4) + words
 
 
+class ComputeRecipe:
+    """A compute record (version 4, render.cpp ComputeRecipe): flags, key and
+    use as a pipeline's record has them, the program (named in a list: flag
+    256), its name, resource registers and thread counts, and the images and
+    samplers its key was made from - kept as bytes."""
+    compute = True
+
+    def parse(self, body):
+        r = Reader(body)
+        self.flags = r.u32()
+        self.key = r.u64()
+        self.uses = r.u32()
+        self.last_run = r.u32()
+        self.order = r.u32()
+        self.prog, self.ref = program(r, self.flags & VS_REF)
+        self.name = r.str()
+        self.regs = r.take(5 * 4)  # rsrc1, rsrc2, threads x y z
+        self.dims = r.take(5 * r.u32())  # (dim, arrayed) each
+        self.modes = r.take(r.u32())
+        if r.p != r.end:
+            raise ValueError("a compute record longer than its fields")
+        return self
+
+    def body(self):
+        return b"".join([w32(self.flags), struct.pack("<Q", self.key), w32(self.uses), w32(self.last_run), w32(self.order),
+                         program_bytes(self.prog, self.ref), wstr(self.name), self.regs, w32(len(self.dims) // 5), self.dims,
+                         w32(len(self.modes)), self.modes])
+
+
+def parse_record(body):
+    """A record of either kind, by its flags."""
+    flags = struct.unpack_from("<I", body, 0)[0] if len(body) >= 4 else 0
+    return (ComputeRecipe() if flags & COMPUTE_RECORD else Recipe()).parse(body)
+
+
 class Recipe:
     """One record, kept as the bytes around its programs so it is written back as it was."""
+    compute = False
 
     def parse(self, body):
         r = Reader(body)
@@ -195,7 +237,7 @@ def read_file(path):
     recipes = []
     for _ in range(r.u32()):
         n = r.u32()
-        recipes.append(Recipe().parse(r.take(n)))
+        recipes.append(parse_record(r.take(n)))
     return run, origin, recipes
 
 
@@ -272,22 +314,26 @@ def eboot_programs(eboot):
     return out
 
 
-def describe(path, run, origin, recipes):
+def describe(path, run, origin, records):
+    recipes = [rc for rc in records if not rc.compute]
+    computes = [c for c in records if c.compute]
     names = Counter()
     for rc in recipes:
         names[rc.vs_name] += 1
         names[rc.ps_name] += 1
+    for c in computes:
+        names[c.name] += 1
     words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) + len(rc.ls or b"") + len(rc.hs or b"") + len(rc.ls_fetch or b"")
-                for rc in recipes)
-    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated, %d with LS passes), "
-          "%d programs by name; "
+                for rc in recipes) + sum(len(c.prog or b"") for c in computes)
+    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated, %d with LS passes) "
+          "and %d compute pipelines, %d programs by name; "
           "%.1f KiB of program words; made by translator %s on device %04x:%04x driver %08x%s" % (
               path, run, len(recipes), sum(1 for rc in recipes if rc.flags & RELINK),
               sum(1 for rc in recipes if rc.flags & HAS_VERTEX_INPUT), sum(1 for rc in recipes if rc.tess_flags & 1 or rc.tess_flags & 32),
-              sum(1 for rc in recipes if rc.lsps),
+              sum(1 for rc in recipes if rc.lsps), len(computes),
               len(names), words / 1024.0, origin["translator"][:12],
               origin["vendor"], origin["device"], origin["driver"], ", with pipeline libraries" if origin["libraries"] else ", whole pipelines"))
-    used = Counter(rc.uses for rc in recipes)
+    used = Counter(rc.uses for rc in records)
     print("  starts that used each: %s" % ", ".join("%d: %d" % (k, used[k]) for k in sorted(used)))
 
 
@@ -297,6 +343,21 @@ def make_list(recipes, progs, eboot_given=True, fetch_words=True):
     out, left = [], Counter()
     plain = patched = 0
     for rc in recipes:
+        if rc.compute:
+            if rc.prog is not None and rc.name not in progs:
+                left["a compute program neither the bundles nor the eboot hold" if eboot_given else
+                     "a compute program the bundles do not hold (the eboot's own: give --eboot)"] += 1
+                continue
+            if rc.prog is not None:
+                if progs[rc.name] == rc.prog:
+                    plain += 1
+                else:
+                    patched += 1
+                rc.flags |= VS_REF
+                rc.ref, rc.prog = (len(rc.prog) // 4, fnv1a(rc.prog)), None
+            rc.uses = rc.last_run = 0
+            out.append(rc)
+            continue
         if rc.vs_name not in progs or (rc.ps is not None and rc.ps and rc.ps_name not in progs):
             left["a program neither the bundles nor the eboot hold" if eboot_given else
                  "a program the bundles do not hold (the eboot's own: give --eboot)"] += 1
@@ -370,9 +431,9 @@ def main():
             origin = origin or o
             run = max(run, r)
             for rc in recipes:
-                have = merged.get(rc.key)
+                have = merged.get((rc.compute, rc.key))
                 if have is None or rc.last_run > have.last_run:
-                    merged[rc.key] = rc
+                    merged[(rc.compute, rc.key)] = rc
         recipes = list(merged.values())
         if args.cmd == "merge":
             write_file(args.out, run, origin, recipes)
@@ -399,9 +460,13 @@ def main():
         progs.setdefault(name, code)
     ok = bad = patched = 0
     for rc in recipes:
-        refs = [(rc.flags & flag, ref, name) for flag, ref, name in
-                ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name), (HS_REF, rc.hs_ref, rc.hs_name))]
-        refs += [(e["prog"] is None, e["ref"], e["name"]) for e in rc.lsps]
+        if rc.compute:
+            refs = [(rc.prog is None, rc.ref, rc.name)]
+        else:
+            refs = [(rc.flags & flag, ref, name) for flag, ref, name in
+                    ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name),
+                     (HS_REF, rc.hs_ref, rc.hs_name))]
+            refs += [(e["prog"] is None, e["ref"], e["name"]) for e in rc.lsps]
         for named, ref, name in refs:
             if not named:
                 continue
@@ -412,8 +477,9 @@ def main():
                 ok += 1
             else:
                 patched += 1
-    print("%s: %d pipelines; program references: %d match the game's files, %d differ (bbhost's shader patches, checked at its start), "
-          "%d not in these files" % (args.file, len(recipes), ok, patched, bad))
+    print("%s: %d pipelines and %d compute pipelines; program references: %d match the game's files, %d differ (bbhost's shader patches, "
+          "checked at its start), %d not in these files" % (args.file, sum(1 for rc in recipes if not rc.compute),
+                                                            sum(1 for rc in recipes if rc.compute), ok, patched, bad))
     return 1 if bad else 0
 
 

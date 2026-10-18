@@ -23,10 +23,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 LIST_REPO=droogie/bbhost
-LIST_TAG=pipeline-list-v1
+LIST_TAG=pipeline-list-v2
 LIST_ASSET=pipeline-list.bin
-LIST_SHA256=
-LIST_FORMAT=3
+LIST_SHA256=97dd746c94eceaefe84d4b6c60a50b3ad33a4688c7500a660f617212cddca5c4
+LIST_FORMAT=4
 
 fail() { echo "fetch_pipeline_list: $*" >&2; exit 1; }
 url=https://github.com/$LIST_REPO/releases/download/$LIST_TAG/$LIST_ASSET

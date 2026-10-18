@@ -48,6 +48,7 @@ struct Fixture {
     VkBuffer guest{};
     VkDeviceMemory guest_mem{};
     std::uint8_t* guest_map{};
+    VkDeviceAddress guest_base{};  // the page's device address: what a GDS counter word is named by (StageParams::gds_counter)
     // A constant buffer bound as a storage buffer at binding 112 (the
     // translator's cb_binding_base): what the renderer binds over a V#.
     VkBuffer cb{};
@@ -120,6 +121,7 @@ struct Fixture {
         std::memset(guest_map, 0, kGuestBytes);
         VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; dai.buffer = guest;
         const VkDeviceAddress base = vkGetBufferDeviceAddress(device, &dai);
+        guest_base = base;
         auto* l2 = reinterpret_cast<std::uint64_t*>(guest_map + kGuestL2);
         for (std::uint32_t i = 0; i < gcn::kL2Entries; ++i) l2[i] = base;
         auto* l1 = reinterpret_cast<std::uint64_t*>(guest_map + kGuestL1);
@@ -257,8 +259,9 @@ struct Fixture {
         params->user_sgpr[12] = 0x200020;
         params->gds_base = 8;
         std::memset(params->gds_counter, 0, sizeof(params->gds_counter));
-        params->gds_counter[0] = word0;
-        params->gds_counter[1] = word1;
+        // By device address, as the host hands them over (no page-table walk).
+        params->gds_counter[0] = word0 ? guest_base + (word0 & 0xffff) : 0;
+        params->gds_counter[1] = word1 ? guest_base + (word1 & 0xffff) : 0;
         std::memset(guest_map + (kMarks & 0xffff), 0, kMaxMarks * 4);
     }
     void record_counter_dispatch(const CounterPipeline& cp, std::uint32_t groups, bool indirect = false) {

@@ -687,7 +687,13 @@ struct Translator {
     // 64-bit scalar ops on (lo,hi) pairs via u64.
     Id pair64(Id lo, Id hi) { return make_u64(lo, hi); }
 
-    // Physical storage buffer access.
+    // Physical storage buffer access. host_ptr: a dword at a device address
+    // the host handed over (a GDS counter's word, StageParams::gds_counter),
+    // with no walk of the page table.
+    Id host_ptr(Id host_u64) {
+        const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host_u64});
+        return m.access_chain(p_psb_u32, block, {c_zero_u});
+    }
     Id guest_ptr(Id guest_u64) {
         const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, guest_u64});
         const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host});
@@ -3250,8 +3256,10 @@ struct Translator {
     }
 
     // ds_append / ds_consume in GDS (TranslateOptions::gds_counters): the
-    // counter is the guest word the dispatch bound for the GDS dword at
-    // M0[15:0] + offset (M0[31:16] is the range's size). GCN adds or takes a
+    // counter is the word the dispatch bound for the GDS dword at M0[15:0] +
+    // offset (M0[31:16] is the range's size), by its device address - the
+    // host's, not the guest's: the word may live in a device-local copy of
+    // its buffer, which the page table does not reach. GCN adds or takes a
     // wave's active lanes at once and gives every lane the value from before;
     // here each subgroup does that with one atomic in the word, and the
     // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
@@ -3278,7 +3286,7 @@ struct Translator {
         const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
         if_then(band(first, bound), [&] {
             const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
-            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
+            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
             m.store(result, r);
         });
         write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));

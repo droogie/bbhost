@@ -175,6 +175,7 @@ void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented
 // 30 and 60 cap the flips at that rate; above 60 and uncapped complete them at once.
 // A frame rate set after that applies on the next run.
 void hle_video_set_game_pace(int fps);
+int hle_video_game_pace();  // the pace hle_video_set_game_pace was given; -1 before it is
 void hle_video_set_loading_uncapped(bool on);  // flips complete at once while a loading screen is up (engine/loading.cpp)
 std::uint64_t hle_video_loading_unshown();      // loading flips completed without being shown, so far (video.cpp)
 void hle_dialog_set_default_name(const char* name, bool type_in_window);  // IME text (player.name) and whether to type it

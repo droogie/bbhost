@@ -8,6 +8,8 @@
 #include "engine/yebis_bind.h"
 #include "host/frame_stats.h"
 #include "hle/modules.h"
+#include "host/host_lists.h"
+#include "host/label_landing.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
 
@@ -1959,7 +1961,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 const std::uint64_t va = gpu_va(b[0], b[1]);
                 const std::size_t dw = b[2] & 0xfffffu;
                 if (hle_kernel_va_mapped(va, dw * 4)) {
+                    if (host_lists::g_mode == 2) host_lists::shadow_push(va, dw * 4);
                     execute(reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(va)), dw, depth + 1);
+                    if (host_lists::g_mode == 2) host_lists::shadow_pop();
                 }
             }
             break;
@@ -2523,6 +2527,7 @@ void execute(const std::uint32_t* cb, std::size_t dwords, int depth) {
             const std::uint32_t op = (hdr >> 8) & 0xff;
             const std::size_t n = ((hdr >> 16) & 0x3fff) + 1;
             t_cur_op = op;
+            if (host_lists::g_mode == 2) host_lists::shadow_packet(reinterpret_cast<std::uintptr_t>(cb + i), op, cb + i + 1, n);
             if (!g_exec_cost) {
                 execute_packet(op, cb + i + 1, n, depth);
             } else {
@@ -2658,6 +2663,8 @@ struct Job {
     std::function<void()> done;
     std::uint64_t free_event = 0;  // g_arena_free_event when submitted (BBHOST_ARENA_MONITOR)
     std::uint64_t seq = 0;         // its place among every submission (hle_gnm_submitted_total once it was counted)
+    // BBHOST_HOST_LISTS=2: each range's part of its host list, taken at the submission.
+    std::vector<host_lists::Taken> lists{};
 };
 
 std::vector<std::pair<const void*, std::size_t>> snapshot_cbs(const std::vector<std::pair<const void*, std::size_t>>& in,
@@ -2797,7 +2804,14 @@ void cp_thread(Queue* q, int id) {
                 t_top_snap_hi = t_top_snap_lo + job.cbs[i].second;
                 t_top_guest_lo = reinterpret_cast<std::uintptr_t>(job.guest[i].first);
             }
+            const bool shadow = host_lists::g_mode == 2 && job.cbs[i].first && job.cbs[i].second >= 4;
+            if (shadow) {
+                host_lists::shadow_begin(i < job.lists.size() ? &job.lists[i] : nullptr, reinterpret_cast<std::uintptr_t>(job.cbs[i].first),
+                                         job.cbs[i].second,
+                                         i < job.guest.size() ? reinterpret_cast<std::uintptr_t>(job.guest[i].first) : 0);
+            }
             execute_one(job.cbs[i].first, job.cbs[i].second, !job.owned.empty());
+            if (shadow) host_lists::shadow_end();
             t_top_snap_lo = t_top_snap_hi = 0;
             // With a snapshot, compare it against guest memory afterwards: if
             // they differ, something rewrote the buffer while we walked it.
@@ -2985,15 +2999,56 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         const char* e = std::getenv("BBHOST_CP_COPY");
         return !(e && e[0] == '0');
     }();
-    if (copy_cbs) {
+    // BBHOST_HOST_LISTS=2: each range's part of its host list, taken here,
+    // where the range is complete and its chunk cannot be written again yet.
+    std::vector<host_lists::Taken> lists{};
+    if (host_lists::g_mode == 2) {
+        lists.resize(cbs.size());
+        for (std::size_t k = 0; k < cbs.size(); ++k) {
+            if (cbs[k].first && cbs[k].second >= 4) host_lists::take(reinterpret_cast<std::uintptr_t>(cbs[k].first), cbs[k].second, &lists[k]);
+        }
+    }
+    if (copy_cbs && host_lists::g_mode == 1 && !g_cp_census) {
+        // BBHOST_HOST_LISTS=1 (the handoff): each range as the packets its
+        // host list holds - our tokens, the labels, the waits, the calls -
+        // copied out in order, instead of all its bytes; the data and markers
+        // between them stay behind. A range without a list it can trust
+        // (host_lists::hand_over says why) is copied whole and walked as
+        // before. Not with the census, which maps what it walks back to the
+        // game's buffers.
+        Job job;
+        job.guest = cbs;
+        host_lists::Taken taken;
+        for (std::size_t k = 0; k < cbs.size(); ++k) {
+            const auto& cb = cbs[k];
+            if (cb.first && cb.second >= 4) {
+                const std::uint64_t va = reinterpret_cast<std::uintptr_t>(cb.first);
+                std::vector<std::uint8_t> packets;
+                host_lists::take(va, cb.second, &taken);
+                if (host_lists::hand_over(va, cb.second, taken, &packets)) {
+                    job.owned.push_back(std::move(packets));
+                    job.cbs.emplace_back(job.owned.back().data(), job.owned.back().size());
+                    job.guest[k].first = nullptr;  // not the game's bytes: nothing to compare after the walk
+                    continue;
+                }
+            }
+            const std::vector<std::pair<const void*, std::size_t>> one{cb};
+            job.cbs.push_back(snapshot_cbs(one, job.owned)[0]);
+        }
+        job.ce_cbs = snapshot_cbs(ce_cbs, job.owned);
+        job.done = std::move(done);
+        q->jobs.push_back(std::move(job));
+    } else if (copy_cbs) {
         Job job;
         job.cbs = snapshot_cbs(cbs, job.owned);
         job.ce_cbs = snapshot_cbs(ce_cbs, job.owned);
         job.guest = cbs;
         job.done = std::move(done);
+        job.lists = std::move(lists);
         q->jobs.push_back(std::move(job));
     } else {
         q->jobs.push_back(Job{cbs, ce_cbs, {}, {}, std::move(done)});
+        q->jobs.back().lists = std::move(lists);
     }
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
     ++q->submitted;
@@ -3212,6 +3267,7 @@ void note_arena_extent(const std::uint64_t* allocator) {
     const std::uint64_t chunk_bytes = allocator[1] * 8;
     g_arena_extents[n] = {id, allocator[3], allocator[3] + allocator[2] * chunk_bytes, chunk_bytes};
     g_arena_extent_count.store(n + 1);
+    host_lists::note_arena(allocator[3], chunk_bytes, allocator[2]);
     // BBHOST_ARENA_WATCH=1: a thread that scans this arena's markers every
     // 2 ms and logs each one that becomes anything but 0, 1 or 2, with what
     // it was before and where the frame and the host GPU were. The protocol
@@ -3353,6 +3409,7 @@ GUEST_ABI int hle_gx_arena_acquire(std::uint64_t* allocator, std::uint64_t* out)
                 if (__sync_bool_compare_and_swap(marker, std::uint64_t{0}, std::uint64_t{1})) {
                     allocator[4] = idx;
                     *out = base + idx * chunk * 8;
+                    host_lists::chunk_handed_out(*out, chunk * 8);
                     if (g_arena_monitor) note_arena_handed_out(*out);
                     return 0;
                 }
@@ -3368,7 +3425,13 @@ GUEST_ABI int hle_gx_arena_acquire(std::uint64_t* allocator, std::uint64_t* out)
     const auto start = std::chrono::steady_clock::now();
     do {
         host_gpu_submit();  // the completions the CP has recorded go to the GPU
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (label_landing::on()) {
+            // The retirement's 0 is a label the host writes once its
+            // submission has run (label_landing.h): look again when one lands.
+            label_landing::wait_landed_past(label_landing::landed(), std::chrono::milliseconds(1));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         status = scan();
     } while (status != 0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(10));
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
@@ -3556,6 +3619,7 @@ void hle_gnm_wait_report() {
 }
 
 void hle_gnm_cp_report() {
+    host_lists::report();
     if (g_cc_gpu.load() || g_cc_cpu.load() || g_cc_lost.load() || g_cc_same.load() || g_cc_differ.load() || g_cc_no_packet.load()) {
         host_log("cp: CopyStructureCount tokens: copied on the GPU's timeline %llu, on the CP %llu, unmapped %llu; checked against the packet "
                  "after the token: the same %llu, differing %llu, no packet %llu",
