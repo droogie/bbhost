@@ -81,7 +81,8 @@ struct HostThreadTime {
 std::vector<HostThreadTime> host_thread_times();
 // Sleeps for about `usec` microseconds: usleep on Linux; on Windows a
 // high-resolution waitable timer (Sleep's granularity is the 15.6 ms system
-// tick without timeBeginPeriod, and the guest's polling loops sleep 100 us).
+// tick without timeBeginPeriod, and the guest's polling loops sleep 100 us);
+// macOS: a kqueue timer, as usleep wakes up to a quarter of the sleep late.
 void host_sleep_us(std::uint64_t usec);
 // Sleeps until `t` on the steady clock through host_sleep_us. Use these, not
 // std::this_thread::sleep_for/sleep_until, for anything under a millisecond:

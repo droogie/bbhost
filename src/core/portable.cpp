@@ -36,6 +36,7 @@
 #include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/event.h>
 #endif
 
 bool host_mkdir(const char* path) {
@@ -357,6 +358,36 @@ void host_sleep_us(std::uint64_t usec) {
         }
     }
     Sleep(static_cast<DWORD>((usec + 999) / 1000));
+#elif defined(__APPLE__)
+    // usleep's timer leeway wakes a non-real-time thread up to a quarter of
+    // the sleep late, which breaks frame pacing; a NOTE_CRITICAL kqueue timer
+    // has none. One kqueue per sleeping thread.
+    static const bool precise = [] {
+        const char* e = std::getenv("BBHOST_PRECISE_SLEEP");
+        const bool on = !(e && e[0] == '0');
+        host_log("timing: host sleeps on %s", on ? "a kqueue timer with NOTE_CRITICAL, without the system's leeway (BBHOST_PRECISE_SLEEP=0: usleep)"
+                                                 : "usleep, up to a quarter of the sleep late (BBHOST_PRECISE_SLEEP=0)");
+        return on;
+    }();
+    struct Queue {
+        int fd = precise ? kqueue() : -1;
+        ~Queue() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    static thread_local const Queue queue;
+    const int kq = queue.fd;
+    if (usec > 0 && kq >= 0) {
+        struct kevent64_s ev;
+        EV_SET64(&ev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS | NOTE_CRITICAL, static_cast<std::int64_t>(usec), 0, 0, 0);
+        struct kevent64_s fired;
+        if (kevent64(kq, &ev, 1, &fired, 1, 0, nullptr) == 1) return;
+        // Interrupted: disarm, or a later sleep gets this event.
+        EV_SET64(&ev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, 0, 0, 0);
+        kevent64(kq, &ev, 1, nullptr, 0, 0, nullptr);
+        return;
+    }
+    usleep(static_cast<useconds_t>(usec));
 #else
     usleep(static_cast<useconds_t>(usec));
 #endif
