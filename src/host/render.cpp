@@ -351,6 +351,20 @@ const std::string* g_pass_profile_name = nullptr;  // the profile name of the dr
 // read of a target this tracking does not see (a T# whose base is inside the
 // target rather than at it, or an image bound another way), which the
 // validation layer cannot see through the bindless set either.
+// Off on macOS too. Each barrier there is a wait between Metal encoders, and in
+// Central Yharnam (M1 Pro, 1080p) the 120 pass-end barriers a frame went down
+// to 72 and the frame from 36.9 to 35.4 ms; but once vertex stages lost their
+// NoContraction the frame stopped being GPU-bound there, and lazy, full and no
+// barriers at all all ran 35.2 ms, so the gain no longer pays the risk. Metal does
+// not order these reads for us: MoltenVK 1.4's MVK_CONFIG_USE_MTLHEAP
+// defaults to "where safe", which on Apple GPUs puts images in MTLHeaps, and
+// a missed barrier showed as whole white frames (below).
+// A draw that samples a target of the pass still open, and goes into another
+// pass, ends that pass in begin_pass after its own sample check: the check
+// must count the open pass's targets as written too. Without that, every
+// post-processing chain (YEBIS, bloom: each pass sampling the one before)
+// read its input with no barrier, and at the Tomb of Oedon lamp 7 of 580
+// frames came out white (0 of 550 with it, 0 of 400 with BBHOST_PASS_BARRIERS=0).
 struct PassHazards {
     bool owed = false;
     std::unordered_set<std::uint64_t> written;  // attachment bases written since the last barrier
@@ -359,7 +373,8 @@ struct PassHazards {
 PassHazards g_hazards;
 const bool g_lazy_barriers = [] {
     const char* e = std::getenv("BBHOST_PASS_BARRIERS");
-    return e && std::strcmp(e, "lazy") == 0;
+    if (e && *e) return std::strcmp(e, "lazy") == 0;
+    return false;
 }();
 std::atomic<std::uint64_t> g_barriers_paid{0}, g_barriers_skipped{0}, g_barriers_mid_pass{0};
 
@@ -15084,19 +15099,26 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // Lazy pass barriers: what this draw samples against the targets written
     // since the last barrier, and noted for the passes after it.
+    // The open pass's targets count as written: begin_pass ends it only after
+    // this check, so sampling one from another pass needs the barrier.
     bool sample_hazard = false;
+    const std::uint64_t draw_pass_key = pass_key(s);
     if (g_lazy_barriers) {
+        const bool other_pass = g_pass.active && g_pass.key != draw_pass_key;
         for (int st = 0; st < 2; ++st) {
             for (const StageImages::Image& im : stage_images[st].images) {
                 if (!im.resolved) continue;
                 const std::uint64_t base = tsharp_base(im.w);
                 if (g_hazards.owed && g_hazards.written.count(base)) sample_hazard = true;
+                if (other_pass && !sample_hazard) {
+                    for (int t = 0; t < g_pass.ntargets; ++t) sample_hazard = sample_hazard || g_pass.targets[t] == base;
+                }
                 g_hazards.sampled.insert(base);
             }
         }
     }
     g_pass_profile_name = &bind_pl->profile_name;
-    begin_pass(s, pass_key(s), sample_hazard);
+    begin_pass(s, draw_pass_key, sample_hazard);
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
     // translated shader shows up as a hang in vkCmdBindPipeline rather than in
