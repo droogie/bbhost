@@ -21,7 +21,13 @@ void decomp_gx_dma_add();              // gx/dma.cpp: the Gnm DMA_DATA writer
 void decomp_gx_constant_engine_add();  // gx/constant_engine.cpp: the Gnm constant-engine writers
 void decomp_gx_draw_add();             // gx/draw.cpp: GX's draw, dispatch and commit methods, the post-draw, the buffer's flush
 void decomp_gx_command_list_add();     // gx/command_list.cpp: GX's command lists finished and executed, a segment to the GPU
+void decomp_gx_present_add();          // gx/present.cpp: the swap chain's present - the frame's end and its pacing
+void decomp_gnmx_cue_add();            // gnmx/cue.cpp: Gnmx's constant update engine around the flip pass's draw
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
+void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
+void decomp_yebis_ppfx_add();          // yebis/ppfx.cpp: PPFX's entry points - the post-processing chain as one call
+void decomp_yebis_ppfx_setters_add();  // yebis/ppfx_setters.cpp: PPFX's parameter setters - each frame's post-processing parameters
+void decomp_yebis_clear_add();         // yebis/clear.cpp: ClearRenderTargetView and its compute clear
 void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's memcpy
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
@@ -45,7 +51,13 @@ void decomp_add_areas() {
     decomp_gx_constant_engine_add();
     decomp_gx_draw_add();
     decomp_gx_command_list_add();
+    decomp_gx_present_add();
+    decomp_gnmx_cue_add();
     decomp_yebis_gnm_add();
+    decomp_yebis_context_add();
+    decomp_yebis_ppfx_add();
+    decomp_yebis_ppfx_setters_add();
+    decomp_yebis_clear_add();
     decomp_game_memcpy_add();
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();

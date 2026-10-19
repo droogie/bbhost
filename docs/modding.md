@@ -165,11 +165,30 @@ state objects - so the hooks speak its terms.
   which target, and what read it later. A plugin can name the passes,
   capture a pass's targets, run a pass of its own between two of the game's
   (an effect after the scene and before the menus), or leave one out.
+- **Per frame.** Called where a frame ends, in the swap chain's present:
+  how many frames the game may run ahead of the display (two display
+  buffers, so at most two flips in flight) and what it waits for before it
+  hands a frame over are decided there. A plugin can run a pass of its own
+  over the final image, capture it, or pace frames another way.
+- **Per post-processing parameter.** Called as the game hands each frame's
+  post-processing parameters to YEBIS, the post-process library, before the
+  chain runs: PPFX's 69 setters ([decomp.md](decomp.md#yebis-srcdecompyebis)),
+  for the scene's projections and luminance scale, auto exposure, tone
+  mapping, chromatic aberration, the colour matrix (colour grading), the
+  glare (bloom), light shafts, depth of field and auto focus, motion blur,
+  the feedback (afterimage) and post-process antialiasing. The callback sees
+  each value as the game set it for that frame and can change it before
+  YEBIS takes it: turn an effect off, scale the bloom, move the focus,
+  change the grading.
 
 Hooks cost nothing while no plugin registers one. A registered one runs for
 every draw on the engine's render threads, so it must be fast, thread-safe
-and never wait. YEBIS's post-processing passes are covered where they reach
-Gnm; the Scaleform menus and the flip are not, until that code is source too.
+and never wait. YEBIS's post-processing passes are covered as the D3D11
+calls its own context takes (the targets each pass binds, its draws, its
+flushes) and where they reach Gnm, the whole chain as the two calls the
+engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`), and its
+parameters as the setters the game hands them through; the Scaleform menus
+are not, until that code is source too.
 
 ## Text
 

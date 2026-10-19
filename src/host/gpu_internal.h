@@ -810,8 +810,16 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // chunk's span by up to kChunkOverlap, as one import of this chunk's.
 const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
 // Whether direct memory is imported whole (the default) rather than by window
-// on demand (BBHOST_IMPORT_WINDOWS=1).
-bool imports_whole();
+// on demand (BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows in the config).
+// Decided once - at the GPU's start, or at an earlier first ask - and read
+// inline after that: the command processor asks dozens of times a draw (a
+// call to a function-local static was 1.2-1.5% of bb-cp0 at 60 fps).
+extern std::atomic<signed char> g_imports_whole;  // -1 until decided, then 1 or 0
+bool imports_whole_decide();
+inline bool imports_whole() {
+    const signed char v = g_imports_whole.load(std::memory_order_relaxed);
+    return v >= 0 ? v != 0 : imports_whole_decide();
+}
 // The windows guest bytes [va, va + bytes) touch, each imported on its own if
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.

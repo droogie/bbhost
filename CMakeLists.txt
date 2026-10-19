@@ -373,7 +373,13 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/constant_engine.cpp
   src/decomp/gx/draw.cpp
   src/decomp/gx/command_list.cpp
+  src/decomp/gx/present.cpp
+  src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
+  src/decomp/yebis/context.cpp
+  src/decomp/yebis/ppfx.cpp
+  src/decomp/yebis/ppfx_setters.cpp
+  src/decomp/yebis/clear.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -571,7 +577,13 @@ if(UNIX)
   bbhost_decomp_test(gx_constant_engine SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_draw SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_command_list)
+  bbhost_decomp_test(gx_present)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(yebis_context SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(yebis_ppfx)
+  bbhost_decomp_test(yebis_ppfx_setters)
+  bbhost_decomp_test(gnmx_cue)
+  bbhost_decomp_test(yebis_clear)
   # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
   add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
   target_include_directories(host_lists_test PRIVATE src include)

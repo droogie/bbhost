@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 96 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 189 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
-| **Taken over in all** | **210** |
-| With any code byte changed (including byte patches and redirected calls) | 231; 313 at 60 fps |
+| **Taken over in all** | **303** |
+| With any code byte changed (including byte patches and redirected calls) | 324; 406 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -190,6 +190,7 @@ the game's code turning it by the same counts as ours.
 | FinishCommandList (`gx_finish_command_list`, `gx_finish_command_list_impl`) | `0x2ad5850`, `0x256aca0` | a deferred context's recorded spans taken into an `ID3D11CommandList`, with the targets around them; the context's caches made unknown, its compute state cleared unless kept | 40,000 generated cases against the game's own code for the ten - the calls and their arguments, what the submissions hold, the pages freed, the memory, the return values - and nine deliberate mistakes caught (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
 | ExecuteCommandList(s) (`gx_execute_command_list`, `gx_context_execute_command_list`, `gx_execute_command_lists`, `gx_context_execute_command_lists`) | `0x25679a0`, `0x256a7d0`, `0x25679e0`, `0x256a980` | on the immediate context: the deferred passes a list's first targets owe run, the list's spans submitted (one list) or put into the context's own stream (the frame's batches of up to 72), the targets each list ended with taken as bound, the lists emptied and their pages freed | the same test (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
 | a segment to the GPU (`gx_command_buffer_close_segment`), and the frame's last with the flip (`gx_command_buffer_flip`, `gx_command_buffer_close_segment_and_flip`, `gx_submit_segment_and_flip`) | `0x2ab0b00`, `0x2aafb30`, `0x2ab0ce0`, `0x2ab0e30` | a command buffer's segment submitted (`sceGnmSubmitCommandBuffers`), after the compute ring's waits when the buffer starts afresh; for the flip, room made for the system's flip packets first, and the segment submitted with the flip (`sceGnmSubmitAndFlipCommandBuffers`, then `sceGnmSubmitDone`) | the same test (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
+| the swap chain's present (`gx_swap_chain_present`, `gx_swap_chain_present_frame`) | `0x2ad5dd0`, `0x2ad6e50` | the frame's end on the render thread and its pacing: at most as many flips in flight as there are display buffers (two) - VideoOut's flip status asked and, while the flip that many back has not completed, a wait on the flip event queue - then the display buffer's address, the output merger's end of frame and the copy to the display buffer, the last segment submitted with the flip (mode 2 for a sync interval of 0, 1 otherwise), the count stepped, the block pools' releases taken back, the context's state reset | 10,000 generated cases against the game's own code, VideoOut's status, the event wait and the thread query bound to the test and scripted - the calls, the swap chain and the context, the return value - and three deliberate mistakes caught (`decomp_gx_present`); in the game at three places, on against off: frames right, 60 fps, the command processor and CPU inside the run-to-run spread |
 
 The 21 packet writers (`gx/dead_packets.cpp`) are Gnm's own: the four
 `ACQUIRE_MEM` cache actions (`gnm_acquire_mem_range`, `dcb_acquire_mem`,
@@ -253,7 +254,7 @@ cut), the span queue and the command list with the targets around it - are
 named in `gx/command_list.h`.
 
 **The plugin surface these open (design - the plugin API does not have it
-yet).** Two kinds of hooks, both costing nothing until a plugin asks:
+yet).** Four kinds of hooks, all costing nothing until a plugin asks:
 
 - *Per command*: a callback as one of GX's methods is entered, before the
   trace, on the thread that records the call (a GX worker for a deferred
@@ -277,27 +278,59 @@ yet).** Two kinds of hooks, both costing nothing until a plugin asks:
   passes: a plugin can name passes, capture one pass's targets, insert a pass
   of its own between two lists (an effect after the scene, before the UI),
   or leave one out. The segment's close is where host commands could go to
-  the GPU between two of the game's, and the flip's submit, once a frame, is
-  where a frame ends.
+  the GPU between two of the game's.
+- *Per frame*: a callback in the swap chain's present, where the frame ends:
+  before its last segment goes with the flip (a pass over the final image, a
+  capture) and around the wait that keeps the game at most two frames ahead
+  of the display (another pacing).
+- *Per post-processing parameter*: a callback in PPFX's parameter setters
+  (YEBIS, below), which the flip pass calls with every frame's parameters
+  before it runs the chain - the scene's projections and luminance scale,
+  auto exposure, tone mapping, chromatic aberration, the colour matrix, the
+  glare, light shafts, depth of field and auto focus, motion blur, the
+  feedback and antialiasing. It sees each value as the game set it for the
+  frame and can change it before YEBIS takes it: an effect left out, the
+  bloom scaled, the focus moved.
 
 The callbacks would run on the GX threads, so they must be thread-safe and
 must not block; the cost is one call through the host's thunk per command
 (about 10 ns measured on Linux) plus what the callback does. YEBIS's
-post-process passes are covered at its Gnm wrappers (below); Scaleform's menus
-and the flip's passes are not yet.
+post-process passes are covered at its D3D11-shaped context, its Gnm
+wrappers and PPFX's two entry points, and its parameters at PPFX's setters
+(below); Scaleform's menus and the flip pass's own draw are not yet.
 
 ### YEBIS (`src/decomp/yebis/`)
 
-YEBIS is the post-process library under the engine's PPFX layer: tone
-mapping, glare, depth of field, motion blur, colour grading. Its draws and
-dispatches reach Gnm through three wrappers.
+YEBIS is the post-process library the engine's post-processing goes through
+(its `ppfx.cpp` layer): tone mapping, glare, depth of field, motion blur,
+colour grading. On the console it keeps a D3D11-shaped device context of its
+own - the D3D11 device context of its Gnm shim - whose vtable (`0x570a380`)
+holds `ID3D11DeviceContext`'s 115 methods in their order and 18 of YEBIS's
+own; YEBIS's effects call it as they would call D3D11, and it turns each call
+into Gnm work through three wrappers.
 
 | Function | Address | What it does | Checked |
 |---|---|---|---|
 | YEBIS's Gnm draws and dispatch (`yebis_gnm_draw_index`, `yebis_gnm_draw_auto`, `yebis_gnm_dispatch`) | `0x15fbc40`, `0x15fbb50`, `0x15fbd10` | a pass's draw - the prep (its last two arguments into two user-data slots), the commit (every stage's shader, resources and user data), Gnm's draw packet, the post-draw - or its compute dispatch the same way | the indexed draw and the dispatch hand the call to the GX trace first, as its hooks did (YEBIS's passes become tokens built from YEBIS's own state); writer callers, as GX's methods are; 12,000 generated cases against the game's own code - the calls, the frame handed to the trace, the writers' return addresses (`decomp_yebis_gnm`) |
+| YEBIS's context: OMSetRenderTargets, the draw and dispatch prologues, DrawIndexed, Draw, DrawIndexedInstanced, DrawInstanced, Dispatch, DispatchIndirect, Flush, YEBIS's two flushes of its own, the three waits (`yebis_context_om_set_render_targets`, `yebis_context_prepare_draw`, `yebis_context_prepare_dispatch`, `yebis_context_draw_indexed`, `yebis_context_draw`, `yebis_context_draw_indexed_instanced`, `yebis_context_draw_instanced`, `yebis_context_dispatch`, `yebis_context_dispatch_indirect`, `yebis_context_flush`, `yebis_context_flush_to`, `yebis_context_wait_flush`, `yebis_wait_compute`, `yebis_wait_pixels`, `yebis_wait_dispatch`) | `0x15d74c0`, `0x15d7400`, `0x2e433a0`, `0x2e40880`, `0x2e408e0`, `0x2e40aa0`, `0x2e40b40`, `0x2e410b0`, `0x2e410f0`, `0x15d99e0`, `0x15d9ab0`, `0x15d9b70`, `0x15e8e20`, `0x15ebc20`, `0x15ebc90` | the context's slots 33, 12, 13, 20, 21, 41, 42, 111, 131 and 132 and what they call: the colour and depth targets bound, with YEBIS's own hazard tracking - a target bound again after a draw since the last drain costs a drain (an end-of-pipe label, a wait for it, the caches written back) before anything draws into it; the state a draw needs written in its prologue; a dispatch after a draw waits for the pixel shaders, one after a dispatch and a draw after a dispatch for the compute shaders; a flush submits YEBIS's command buffers and starts the ring's next | 30,000 generated cases against the game's own code, 2,000 a function - the calls and their arguments, every byte of the context, the views, their textures, the command buffer's header and the drain's label, the return value - and nine deliberate mistakes caught (`decomp_yebis_context`); `BBHOST_DECOMP_COMPARE=1` checks OMSetRenderTargets call by call: 81,034 calls at three places, 0 differences (289,977 left to the game's alone: a view's first bind, which puts it on its owner's list, or a drain); in the game at three places, all fifteen on against off: frames right, 60 fps, the command processor and CPU inside the run-to-run spread |
+| PPFX's entry points (`ppfxBindFramebuffer`, `ppfxApplyEffects`) | `0xfb68f0`, `0xfb6980` | the engine's whole post-processing chain as two calls: the frame's colour and depth handed to YEBIS's single post effect, then every effect run (tone mapping, glare, depth of field, motion blur, colour grading); a failure printed with YEBIS's debug output on, and a failed ApplyEffects asserts | 10,000 generated cases against the game's own code - the calls and their arguments, the result - and two deliberate mistakes caught (`decomp_yebis_ppfx`); in the game at three places, on against off: frames right, 60 fps, the command processor and CPU inside the run-to-run spread |
+| PPFX's parameter setters (69: `ppfx_set_render_scene_luminance_scale`, `ppfx_set_auto_exposure_*` (6), `ppfx_set_tonemap_parameters`, `ppfx_set_chromatic_aberration_enable`, `ppfx_initialize_matrix`, `ppfx_multiply_matrix_*` (4), `ppfx_set_glare_parameters`, `ppfx_set_glare_bloom_num_levels`, `ppfx_set_active_light_shaft`, `ppfx_set_light_shaft_source_enable`, `ppfx_set_auto_focus_*` (6), `ppfx_set_depth_of_field_edge_quality`, `ppfx_set_depth_of_field_depth_remap_lut_parameters`, `ppfx_set_motion_blur_enable`, `ppfx_set_feedback_enable`, `ppfx_set_antialias_enable`, and 40 the binary gives no name for, `ppfx_sub_<address>`; the source file lists each with the fields it sets) | `0xfb2710`-`0xfb45c0` | each frame's post-processing parameters as the flip pass hands them to YEBIS's single post effect, in its order: each entry passes its arguments to the effect's method of the same parameters (five write their one field in place), so every value the game sets for a frame passes through ours, where a hook can read it or change it; the methods stay the game's. The flip pass's first argument to each, its PPFX context, is left unread, as the game's entries leave it | 138,000 generated cases against the game's own entries, 2,000 an entry - the method reached, the effect, each integer argument in the width the method reads, the floats' bits, the result; the five stores' bytes - and six deliberate mistakes caught (`decomp_yebis_ppfx_setters`); in the game on lavapipe at Central Yharnam (189 of 189 functions ours, frame right) and in four runs on the GPU at Central Yharnam and Mensis, uncapped: frames right, 0 draw failures; no run without them - each costs the game's entry a jump, at most 69 times a frame |
+| YEBIS's ClearRenderTargetView and its compute clear (`yebis_context_clear_render_target_view`, `yebis_clear_target_compute`, `yebis_compute_clear`) | `0x2e41320`, `0x15e8e90`, `0x15e8930` | slot 50: a target with a fast-clear mask cleared by YEBIS's fast clear and its slot's clear colour (8-bit unorm: floor(c * 256), 255 for exactly 1); any other by a compute pass - the shader for the texture's type, the colour in a 16-byte constant buffer, a dispatch per mip level and array slice, the wait for the compute shaders, the context's shader, texture and constant buffer put back | 9,000 generated cases against the game's own code - the calls and their arguments, the context, the texture - and three deliberate mistakes caught (`decomp_yebis_clear`); in the game at three places, on against off: frames right, 60 fps, the command processor and CPU inside the run-to-run spread |
 
-As source, each of YEBIS's passes is seen as a command with its context, the
-post-process chain's side of the per-command plugin surface above.
+As source, each of YEBIS's passes is seen as D3D11 calls - which targets it
+binds, what it draws, where it flushes - and as a command with its context at
+the wrappers: the post-process chain's side of the per-command plugin surface
+above, at the granularity Dark Souls III's D3D11 renderer has.
+
+### Gnmx (`src/decomp/gnmx/`)
+
+Gnmx is the console SDK's graphics context over Gnm; the flip pass
+(`0x25d5f80`) draws its full-screen pass through one, once a frame, and
+submits that context's command buffer itself.
+
+| Function | Address | What it does | Checked |
+|---|---|---|---|
+| the constant update engine's pre-draw flush and post-draw (`gnmx_cue_pre_draw`, `gnmx_cue_post_draw`) | `0x1492e80`, `0x1493150` | before the draw: the pixel shader's input table when a shader changed, each stage in use (pixel and vertex, the geometry pair or the hull pair when the engine's flags say) prefetched and its dirty resources applied, the global table written, the constant and draw engines' counters (the constant engine's wait undone when nothing used it); after it, the draw engine's counter | 10,000 generated cases against the game's own code - the calls and their arguments, every byte of the engine - and three deliberate mistakes caught (`decomp_gnmx_cue`); in the game at three places, on against off: frames right, 60 fps, the command processor and CPU inside the run-to-run spread |
 
 ### Memory (`src/decomp/memory/`)
 
@@ -451,11 +484,17 @@ argument bits the original tests, the floating-point operations in their order
 
 ## Next
 
-- **The other writers outside GX**: Gnmx's pre-draw flush and submits, YEBIS's
-  drains and compute utilities (the labels, waits and embedded data around its
-  passes), PPFX's cache actions and the flip's label and wait - each a small
-  surface for its subsystem's mods (post-processing chains, the HUD, frame
-  pacing).
+- **The other writers outside GX**: the flip pass itself (`0x25d5f80`, one
+  large function: each frame's post-processing parameters handed to PPFX, its
+  Gnmx draw, its label and wait and its submit inline) - its two natural hook
+  points, PPFX's entry points and the swap chain's present, are source, and
+  so are the parameter setters it calls. YEBIS's own submissions (`0x15faff0`,
+  `0x15fb220`, `0x15fb2c0` and the list they build, `0x15fb070`) and Gnmx's
+  lightweight context's submit (`0x149bc90`, Scaleform's and two engine
+  paths') are left as they are: nothing in the sessions checked showed them
+  running - YEBIS's flushes, the only callers of its submission, never wrote
+  their labels in the writers' census, nor did Scaleform's path into Gnmx's -
+  so as source they would open no surface.
 
 - **Items in and out**: `EquipGameData::AddItem`, through which every item
   enters the inventory (it creates item instances, so a compare must follow the
