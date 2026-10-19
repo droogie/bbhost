@@ -1,7 +1,7 @@
 // The guest's low windows on macOS (core/mac_vm.h), held by bbhost's own
 // image from the moment the process exists: a zero-fill section, which costs
 // no memory and no file space. bbhost is linked at 0x10000 without ASLR, so
-// the section starts just past its data (about 26 MiB today) and covers the
+// the section starts just past its data (some tens of MiB in) and covers the
 // direct memory window at 4 GiB and the eboot's at 0x300000000; Rosetta 2's
 // own regions, which take the first free address at or above 4 GiB before
 // main runs, land above it.

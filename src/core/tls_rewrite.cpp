@@ -11,7 +11,6 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <pthread.h>
-#include <cstdio>
 #endif
 
 namespace {
@@ -29,8 +28,8 @@ const std::uint32_t kSlot = [] {
     pthread_key_t key = 0;
     const int e = pthread_key_create(&key, nullptr);
     if (e != 0 || key >= kTsdSlotCount) {
-        std::fprintf(stderr, "[bbhost] tls: no pthread key for the guest's TCB (error %d, key %lu of %u)\n", e,
-                     static_cast<unsigned long>(key), kTsdSlotCount);
+        host_log("tls: no pthread key for the guest's TCB (error %d, key %lu of %u)", e,
+                 static_cast<unsigned long>(key), kTsdSlotCount);
         std::abort();
     }
     static const char probe = 0;
@@ -39,11 +38,10 @@ const std::uint32_t kSlot = [] {
     asm volatile("movq %%gs:(%1), %0" : "=r"(seen) : "r"(static_cast<std::uint64_t>(key) * 8));
     pthread_setspecific(key, nullptr);
     if (seen != &probe) {
-        std::fprintf(stderr,
-                     "[bbhost] tls: pthread key %lu does not read back at gs:0x%lx (%p, want %p); this macOS keeps "
-                     "its TSD elsewhere and the guest's TLS cannot work\n",
-                     static_cast<unsigned long>(key), static_cast<unsigned long>(key) * 8, seen,
-                     static_cast<const void*>(&probe));
+        host_log("tls: pthread key %lu does not read back at gs:0x%lx (%p, want %p); this macOS keeps its TSD "
+                 "elsewhere and the guest's TLS cannot work",
+                 static_cast<unsigned long>(key), static_cast<unsigned long>(key) * 8, seen,
+                 static_cast<const void*>(&probe));
         std::abort();
     }
     return static_cast<std::uint32_t>(key);

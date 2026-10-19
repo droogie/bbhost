@@ -43,9 +43,9 @@ bool guest_alloc(GuestMemory* mem, std::uint64_t slide, std::size_t size) {
     }
 #elif defined(__APPLE__)
     // The preferred slide when it is free, else the window kernel.cpp holds
-    // for the image (core/mac_vm.h): bbhost's own code is at 0x400000 on
-    // macOS, so a run's guest addresses are those of a Windows run that fell
-    // back. Anywhere is left for a process without the windows (a test's);
+    // for the image (core/mac_vm.h): bbhost's own image, from 0x10000,
+    // covers 0x400000 on macOS, so a run's guest addresses are those of a
+    // Windows run that fell back. Anywhere is left for a process without the windows (a test's);
     // every address-based patch converts through the real slide.
     const std::size_t round = (size + 0xfff) & ~std::size_t(0xfff);
     constexpr int kFlags = MAP_PRIVATE | MAP_ANONYMOUS;

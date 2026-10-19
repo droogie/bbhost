@@ -65,7 +65,7 @@ constexpr std::uint64_t kDmemVaBase = 0x100000000ull;
 constexpr std::uint64_t kGpuDmemBase = 0xFF00000000ull;
 constexpr std::uint64_t kGnmVaMask = 0xFFFFFFFFFFull;
 // Windows: where the image goes when its preferred slide is taken (memory.cpp);
-// macOS: where it always goes, bbhost's own image being at 0x400000 there
+// macOS: where it always goes, bbhost's own image covering 0x400000 there
 // (core/mac_vm.h).
 constexpr std::uint64_t kImageFallbackBase = 0x300000000ull;
 constexpr std::uint64_t kPage = 0x4000;  // Orbis page

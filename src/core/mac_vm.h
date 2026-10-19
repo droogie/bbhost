@@ -22,9 +22,14 @@
 // which pages are still placeholders: no bookkeeping beside it.
 //
 // The eboot's image goes to 0x300000000, where Windows puts it when 0x400000
-// is taken (core/memory.cpp): bbhost's own code is at 0x400000 here. Stubs
-// that must be within a rel32 of the game's code come from the windows'
-// unused space (mac_vm_map_near).
+// is taken (core/memory.cpp): bbhost's own image, from 0x10000, covers
+// 0x400000 here. Stubs that must be within a rel32 of the game's code come
+// from the windows' unused space (mac_vm_map_near).
+//
+// The price of the low, fixed image: a guest access through a near-null
+// pointer (0x10000 up to the end of bbhost's data, some tens of MiB) reads
+// bbhost's image, and a write past its code lands in its data, where the
+// console would fault.
 //
 // Nothing here exists on Linux or Windows.
 #pragma once
