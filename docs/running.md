@@ -24,8 +24,8 @@ Both must come from a copy of the game you own.
 
 And a PC with:
 
-- x86-64 Windows 10/11 or Linux, or a Mac with macOS 15 or later (in
-  progress: see [macOS](#macos) below)
+- x86-64 Windows 10/11 or Linux, or an Apple Silicon Mac with macOS 15 or
+  later and 16 GB of RAM (see [macOS](#macos) below)
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
 - 16 GB of RAM and 8 GB of video memory are recommended; 6 GB NVIDIA cards
   play at 1080p too
@@ -197,15 +197,30 @@ and every press acts twice. `tools/steamdeck/STEAMDECK.md` has the setup.
 
 ## macOS
 
-The macOS port is new: it builds and passes its tests, but the game has not
-been played on it yet, so expect it not to get far. Reports are welcome.
+The macOS port plays the game at about 28-30 fps on an M1 Pro at 1080p (30 is
+the game's cap), with some pop-in the first time an area or an enemy appears:
+new pipelines are built on worker threads instead of freezing the game, and
+what they draw shows up a few frames late. Reports are welcome.
 
 bbhost for macOS is an x86_64 program. On Apple Silicon Rosetta 2 runs it, and
 the game's code with it; if Rosetta is not installed,
-`softwareupdate --install-rosetta --agree-to-license` installs it. It needs macOS 15
-or later, the first whose Rosetta runs the AVX instructions the game uses.
-Vulkan goes through MoltenVK, which translates it to Metal; the package
+`softwareupdate --install-rosetta --agree-to-license` installs it. It needs
+macOS 15 or later, the first whose Rosetta runs the AVX instructions the game
+uses. Vulkan goes through MoltenVK, which translates it to Metal; the package
 carries MoltenVK and the Vulkan loader, so nothing else is installed.
+
+Both layers cost speed. Rosetta translates the game's code to arm64 as it
+runs, and MoltenVK translates every shader to Metal's and compiles it when a
+pipeline is built. In the places measured a frame takes 33-37 ms at 1080p, so
+the 60 fps and higher settings cannot be held.
+
+It has been tried on one Mac only, an M1 Pro with 16 GB, on macOS 27. It needs
+16 GB of RAM: about 4.8 GiB stays pinned, so a Mac with 8 GB will most likely
+fail. Other Apple Silicon chips and macOS 15 and 26 are untested. An Intel Mac
+should run bbhost without Rosetta, but that is untested too.
+
+macOS asks for permission when the game files are kept in Documents, Desktop
+or Downloads; allow it, or keep the dump in a folder outside them.
 
 The package is a zip, `bbhost-mac-<version>.zip`. It is signed ad hoc, not
 with an Apple Developer ID, and not notarized (that needs a paid Apple

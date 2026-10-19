@@ -58,16 +58,20 @@ target while editing; `tools/win_tests.sh` builds and runs the low-level host
 tests (calling-convention thunks, TLS, `setjmp`/`longjmp`, `va_list`) under
 wine.
 
-## macOS (in progress)
+## macOS
 
-The macOS build compiles, links and passes its tests, but the game has not
-yet been played on it: treat it as work in progress.
+The macOS build plays the game at about 28-30 fps on an M1 Pro at 1080p (30 is
+the game's cap), with some pop-in the first time an area or an enemy appears
+(new pipelines are built on worker threads instead of freezing the game).
 
 bbhost on macOS is an x86_64 program. The game's code is x86-64 and runs in
 bbhost's own process, so on Apple Silicon Rosetta 2 runs the whole of it; an
-Intel Mac runs it directly. It needs **macOS 15 or later**: the game uses AVX
-and AVX2, which Rosetta runs from macOS 15 on. bbhost checks the instructions
-it needs at start and stops with a message when one is missing.
+Intel Mac should run it directly, which is untested. It needs **macOS 15 or
+later**: the game uses AVX and AVX2, which Rosetta runs from macOS 15 on, and
+the build targets macOS 15.0 (CMake sets the deployment target). bbhost checks
+the instructions it needs at start and stops with a message when one is
+missing. It has been built and run on an Apple M1 Pro with 16 GB only, and
+needs that much memory: about 4.8 GiB stays pinned.
 
 Requirements:
 
@@ -86,15 +90,16 @@ tools/build_macos.sh       # everything, in build-macos/; the result is build-ma
 CI_CMAKE_ARGS=-DBBHOST_RELEASE=ON tools/build_macos.sh   # a release build
 ```
 
-The script fetches CMake and Ninja when there are none, builds the pinned
-Vulkan headers, SDL3 and ffmpeg's movie decoders static for x86_64 into
-`build-macos/prefix`, then bbhost, its tools and its tests, and runs ctest
-(`CI_TESTS=0` skips it). It does not use Homebrew: an Apple Silicon Mac's
-Homebrew installs arm64 libraries, which an x86_64 program cannot link; a
-second, x86_64 Homebrew under `/usr/local` is a setup of its own; and Homebrew
-refuses to build from source on a macOS newer than its Xcode (macOS 27 with
-Xcode 16.2 here). Every dependency is pinned in the script instead, as
-`tools/ci_build.sh` does on Linux.
+The script fetches CMake, Ninja and pkg-config (pkgconf) when there are none,
+builds the pinned Vulkan headers, SDL3 and ffmpeg's movie decoders static for
+x86_64 into `build-macos/prefix`, then bbhost, its tools and its tests, and
+runs ctest (`CI_TESTS=0` skips it). It does not use Homebrew, and ignores an
+`/opt/homebrew` prefix: an Apple Silicon Mac's Homebrew installs arm64
+libraries, which an x86_64 program cannot link; a second, x86_64 Homebrew
+under `/usr/local` is a setup of its own; and Homebrew refuses to build from
+source on a macOS newer than its Xcode. Every dependency is pinned in the
+script instead, as `tools/ci_build.sh` does on Linux. A release build
+(`-DBBHOST_RELEASE=ON`) stops at configure when ffmpeg is missing.
 
 The build tree runs as it is: bbhost finds the SDK's loader by its rpath, and
 the loader finds MoltenVK and the validation layer through the manifests CMake
@@ -152,7 +157,8 @@ anywhere else, or that carries a playtest kit.
 `.github/workflows/build.yml` runs `tools/ci_build.sh` (a Linux build from
 scratch on Ubuntu 24.04, with the tests) and `tools/build_macos.sh` (the
 x86_64 build on an Apple Silicon runner, its tests run by Rosetta, after
-`tools/ci_macos_setup.sh` installs Rosetta and the Vulkan SDK) on every push
-and pull request; the release workflow builds the Windows cross build and
-every package for each pull request too. The macOS jobs (`tests-macos`,
-`package-macos`) are not yet among the checks master's ruleset requires.
+`tools/ci_macos_setup.sh` installs Rosetta and the Vulkan SDK, checking the
+SDK's download against a pinned SHA-256) on every push and pull request; the
+release workflow builds the Windows cross build and every package for each
+pull request too. The macOS jobs (`tests-macos`, `package-macos`) are not yet
+among the checks master's ruleset requires.

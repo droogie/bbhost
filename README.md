@@ -70,9 +70,12 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 
 The game is playable on Windows and Linux: the world, its bosses and online
 sessions. The macOS port (an x86_64 build that Rosetta 2 runs on Apple
-Silicon, Vulkan through MoltenVK, macOS 15 or later) builds and passes its
-tests, but the game has not been played on it yet. What runs on native code
-and what is still emulated:
+Silicon, Vulkan through MoltenVK, macOS 15 or later) is playable too: about
+28-30 fps on an M1 Pro at 1080p, where 30 is the game's cap, with some pop-in
+the first time an area or an enemy appears, because new pipelines are built on
+worker threads instead of freezing the game. It has been tried on that one Mac
+only, and needs 16 GB of RAM ([running.md](docs/running.md#macos)). What runs
+on native code and what is still emulated:
 
 | Part | State |
 |---|---|
