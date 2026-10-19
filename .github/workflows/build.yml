@@ -51,9 +51,7 @@ jobs:
       - name: Rosetta 2 and the Vulkan SDK
         run: tools/ci_macos_setup.sh
       - name: build and test
-        # The runner's Homebrew is arm64: none of its libraries can go into
-        # an x86_64 bbhost.
-        run: CI_CMAKE_ARGS="-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew" tools/build_macos.sh
+        run: tools/build_macos.sh
       - name: logs on failure
         if: failure()
         run: tail -n 80 build-macos/*.log || true

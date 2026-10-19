@@ -110,9 +110,9 @@ if [ ! -f "$P/lib/libavcodec.a" ]; then
         || { tail -20 "$W/ffmpeg-configure.log" "$W/ffmpeg-build.log"; exit 1; }
 fi
 
-# bbhost, its tools and tests.
+# /opt/homebrew is ignored: its libraries are arm64.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig
-cmake -S "$SRC" -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_OSX_ARCHITECTURES=$ARCH \
+cmake -S "$SRC" -B "$W/build" -G Ninja -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_OSX_ARCHITECTURES=$ARCH \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET -DCMAKE_PREFIX_PATH="$P;$VULKAN_SDK" -DCMAKE_CXX_FLAGS="-idirafter $VULKAN_SDK/include" -DVulkan_INCLUDE_DIR="$P/include" -DVulkan_LIBRARY="$VULKAN_SDK/lib/libvulkan.1.dylib" \
     ${CI_CMAKE_ARGS:-} > "$W/bbhost-configure.log" \
     || { tail -30 "$W/bbhost-configure.log"; exit 1; }

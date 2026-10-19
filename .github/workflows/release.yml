@@ -143,9 +143,7 @@ jobs:
       - name: Rosetta 2 and the Vulkan SDK
         run: tools/ci_macos_setup.sh
       - name: build
-        # The runner's Homebrew is arm64: none of its libraries can go into
-        # an x86_64 bbhost.
-        run: CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew" tools/build_macos.sh
+        run: CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/build_macos.sh
       - name: package
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
