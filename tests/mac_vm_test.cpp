@@ -93,6 +93,8 @@ int main() {
     expect(mac_vm_map(at(top), 0x10000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace) == at(top), "the window's last pages");
     void* b = mac_vm_map_near(top, top + 0x10000, 0x1000, kRw);
     expect(b && addr(b) + 0x1000 <= top && top + 0x10000 - addr(b) < 0x80000000ull, "a stub page below the range");
+    expect(!mac_vm_map_near(lo, hi, 0x80000000ull, kRw), "a stub longer than a rel32 reaches");
+    expect(!mac_vm_map_near(lo, hi, ~0ull, kRw), "a stub longer than the address space");
     // Out of reach of any window: none.
     expect(!mac_vm_map_near(0x20000000000ull, 0x20000001000ull, 0x1000, kRw), "a stub page out of the windows' reach");
 

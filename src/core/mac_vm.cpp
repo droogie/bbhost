@@ -159,7 +159,7 @@ bool mac_vm_unmap(void* at, std::uint64_t len) {
 
 void* mac_vm_map_near(std::uint64_t lo, std::uint64_t hi, std::uint64_t len, int prot) {
     len = page_up(len);
-    if (!len || hi < lo) return nullptr;
+    if (!len || len > kReach || hi < lo) return nullptr;  // (page_up wraps a huge len to 0)
     // Starts from which every byte of [lo, hi) reaches every byte of the
     // range, and back.
     const std::uint64_t lowest = hi > kReach ? page_up(hi - kReach) : kPage;

@@ -533,6 +533,7 @@ bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::u
 }
 
 bool host_readable(std::uint64_t addr, std::size_t len) {
+    if (addr + len < addr) return false;  // past the end of the address space
     for (std::uint64_t at = addr; at < addr + len;) {
         mach_vm_address_t a = at;
         mach_vm_size_t size = 0;
