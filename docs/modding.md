@@ -141,6 +141,36 @@ Things to know:
 - **Don't share the files.** They are generated from the game's own shaders,
   so they stay on your machine and are never published.
 
+## Draw and frame hooks (planned)
+
+Not in the plugin API yet: this is the design that GX's draw methods and
+command lists, now source ([decomp.md](decomp.md#gx-srcdecompgx)), make
+possible. GX is the engine's Direct3D 11 layer - the game names the
+interfaces it emulates, `ID3D11DeviceContext`, `ID3D11CommandList` and the
+state objects - so the hooks speak its terms.
+
+- **Per draw and dispatch.** Called as the game issues each draw, dispatch or
+  state commit, before bbhost takes it, on the thread that records it. The
+  callback sees the call - its kind and arguments - and the state it draws
+  with as the engine's objects: the shaders (named as the shader dump and the
+  HLSL overrides name them), the textures and buffers bound, the render
+  targets and depth target, the blend, depth-stencil and rasterizer states.
+  It can let the draw go as it is, drop it, change what it draws with
+  (another shader, texture or blend state, for that draw), or issue draws of
+  its own next to it. One state object can also be swapped for every draw at
+  once, where the output merger applies it.
+- **Per pass.** Called as a recording thread finishes a command list and as
+  the frame executes the lists, in order. Each list carries the targets it
+  began and ended with, so in order they are the frame's passes: what wrote
+  which target, and what read it later. A plugin can name the passes,
+  capture a pass's targets, run a pass of its own between two of the game's
+  (an effect after the scene and before the menus), or leave one out.
+
+Hooks cost nothing while no plugin registers one. A registered one runs for
+every draw on the engine's render threads, so it must be fast, thread-safe
+and never wait. YEBIS's post-processing passes are covered where they reach
+Gnm; the Scaleform menus and the flip are not, until that code is source too.
+
 ## Text
 
 Message banks (`msg/<lang>/*.msgbnd.dcx`, FMG files) are read through the mods

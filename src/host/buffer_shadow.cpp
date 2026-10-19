@@ -385,8 +385,11 @@ std::atomic<std::uint64_t> g_staged{0}, g_staged_bytes{0}, g_stage_refused{0};
 // 300 flips standing still (9-37 MiB a frame) - on the 3D queue, ahead of the
 // draws, and outside the GPU busy meter's spans (Task Manager's 3D engine at
 // 100% where the meter said 64%). Keyed by the range's place in the import
-// (buffer, offset); a range of the same start no longer than one copied is
-// read from it. BBHOST_STAGE_DEDUP=0: a copy per draw, as before.
+// (buffer, offset) and ordered, so a range inside one copied - of the same
+// start, or a later one (a mesh whose vertex elements are records of their
+// own, their bases a few bytes apart over the same bytes: four to eight
+// copies of one range a draw at Astral Clocktower) - is read from it.
+// BBHOST_STAGE_DEDUP=0: a copy per draw, as before.
 struct StagedRange {
     VkBuffer buffer = VK_NULL_HANDLE;  // the stage chunk holding it
     VkDeviceSize offset = 0, bytes = 0;
@@ -395,13 +398,12 @@ struct StageKey {
     VkBuffer src;
     VkDeviceSize offset;
     bool operator==(const StageKey& o) const { return src == o.src && offset == o.offset; }
-};
-struct StageKeyHash {
-    std::size_t operator()(const StageKey& k) const {
-        return std::hash<std::uint64_t>()(reinterpret_cast<std::uint64_t>(k.src) * 0x9e3779b97f4a7c15ull ^ k.offset);
+    bool operator<(const StageKey& o) const {
+        return src != o.src ? reinterpret_cast<std::uintptr_t>(src) < reinterpret_cast<std::uintptr_t>(o.src) : offset < o.offset;
     }
 };
-std::unordered_map<StageKey, StagedRange, StageKeyHash> g_stage_seen[kSlots];
+std::map<StageKey, StagedRange> g_stage_seen[kSlots];
+std::atomic<std::uint64_t> g_stage_inside{0};  // of the shared, ranges read from a copy that starts before them
 std::atomic<std::uint64_t> g_stage_shared{0}, g_stage_shared_bytes{0};
 const bool g_stage_dedup = [] {
     const char* e = std::getenv("BBHOST_STAGE_DEDUP");
@@ -1429,14 +1431,22 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!cmd) return false;
     const int slot = g.slot;
     if (g_stage_dedup) {
-        const auto it = g_stage_seen[slot].find(StageKey{loc.buffer, loc.offset});
-        if (it != g_stage_seen[slot].end() && it->second.bytes >= bytes) {
-            loc.buffer = it->second.buffer;
-            loc.offset = it->second.offset;
-            loc.avail = bytes;
-            bump(g_stage_shared);
-            g_stage_shared_bytes.fetch_add(bytes, std::memory_order_relaxed);
-            return true;
+        // The copy that starts at or before the range, in the same import:
+        // read from it when it reaches the range's end.
+        auto& seen_map = g_stage_seen[slot];
+        auto it = seen_map.upper_bound(StageKey{loc.buffer, loc.offset});
+        if (it != seen_map.begin()) {
+            --it;
+            const VkDeviceSize into = loc.offset - it->first.offset;
+            if (it->first.src == loc.buffer && it->second.bytes >= into + bytes) {
+                loc.buffer = it->second.buffer;
+                loc.offset = it->second.offset + into;
+                loc.avail = bytes;
+                bump(g_stage_shared);
+                if (into) bump(g_stage_inside);
+                g_stage_shared_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                return true;
+            }
         }
     }
     const VkDeviceSize need = (bytes + 255) & ~VkDeviceSize{255};
@@ -2206,12 +2216,13 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(g_returns));
         out += gr;
     }
-    char st[288];
+    char st[384];
     std::snprintf(st, sizeof(st),
-                  "; vertex ranges copied for their draw %llu (%.1f MiB), read from another draw's copy %llu (%.1f MiB), left in host "
-                  "memory %llu, staging chunks %zu (%zu MiB)",
+                  "; vertex ranges copied for their draw %llu (%.1f MiB), read from another draw's copy %llu (%.1f MiB; %llu inside one "
+                  "starting before them), left in host memory %llu, staging chunks %zu (%zu MiB)",
                   static_cast<unsigned long long>(g_staged.load()), static_cast<double>(g_staged_bytes.load()) / (1 << 20),
                   static_cast<unsigned long long>(g_stage_shared.load()), static_cast<double>(g_stage_shared_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_stage_inside.load()),
                   static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
                   static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
     char sn[192];

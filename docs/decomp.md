@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 71 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 96 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
-| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 121 |
-| **Taken over in all** | **196** |
-| With any code byte changed (including byte patches and redirected calls) | 217; 299 at 60 fps |
+| Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
+| **Taken over in all** | **210** |
+| With any code byte changed (including byte patches and redirected calls) | 231; 313 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -183,6 +183,13 @@ the game's code turning it by the same counts as ours.
 | the Gnm label, wait, inline-data, predication, indirect-buffer and counter writers (12, below) | `0x1473b80`-`0x148b430` | each makes room for one packet - a label when the work before it is done, a wait, data written inline, predication on an occlusion result, the compute ring's call of a command buffer, the draw engine's side of the constant engine's counters - writes it and moves the write pointer | the game's packets, written the same; 240,000 generated cases against the game's own code - every byte of both chunks, the command buffer and its flags, the return value and the refill's calls - 0 differences (`decomp_gx_labels`); `BBHOST_DECOMP_COMPARE=1` checks every call the game makes: 1.3 million in a three-place session (four of the nine called), 0 differences |
 | the DMA_DATA writer (`gnm_dma_data`) | `0x1473e60` | the command processor moving or filling memory: GX's buffer copies and fills, the GPU particles' counter moves through GDS, Gnmx's, YEBIS's and Toolkit's | the game's packet, except for the two moves through GDS around a counting dispatch while the counters ride in the dispatch tokens: those write nothing (they were two five-byte NOPs at their calls); 20,000 generated cases against the game's own code, 0 differences, and the two moves' calls checked to be the writer's (`decomp_gx_dma`) |
 | the constant engine's writers (`gnm_ce_reserve_const_ram`, `gnm_ce_wait_on_de_counter_diff`, `gnm_ce_increment_ce_counter`, `gnm_ce_dump_const_ram`) | `0x15fd190`-`0x15fd3e0` | the constant command buffer's packets: its RAM written (reserved for the caller to fill), its counters stepped, its RAM dumped into memory | nothing dumps that RAM (YEBIS's tables come from its own state, Gnmx's draws are tokens), so with the dead packets on the first three write nothing - the reserve answers a scratch area for the payload - and the dump, written always, is counted if it ever comes; writing the game's packets, 80,000 generated cases against the game's own code, 0 differences (`decomp_gx_constant_engine`) |
+| GX's draw, dispatch and commit methods (`gx_immediate_draw`, `gx_immediate_draw_indexed`, `gx_immediate_draw_instanced`, `gx_immediate_draw_indexed_instanced`, `gx_immediate_draw_instanced_indirect`, `gx_immediate_draw_indexed_instanced_indirect`, `gx_context_commit`, `gx_immediate_dispatch`, `gx_immediate_dispatch_indirect`) | `0x25695c0`-`0x2569ba0` | `ID3D11DeviceContext`'s Draw\*, Dispatch\* and a commit without a draw, as GX has them: the output-merger, input-assembly and rasterizer flushes, the command buffer's flush, the commit of the shaders' user data and tables, Gnm's draw or dispatch packets, the post-draw, the flush again | each first hands the call to the GX trace, as its prologue hooks did - a draw it takes whole becomes a host-draw token and nothing more runs; otherwise the game's calls in the game's order. 18,000 generated cases against the game's own code: the calls and their arguments, the frame handed to the trace, and the return address each draw and dispatch writer is called from, which the trace knows a GX method's packets by (`decomp_gx_draw`) |
+| the output-merger flush (`gx_flush_output_merger`) | `0x2ad2230` | the deferred passes of targets no longer bound (the fast-clear eliminate, the depth decompress), then the blend, depth-stencil, stencil-reference and depth-bounds state written where it differs from what the context last wrote (the blend constants compared as floats) | 10,000 generated cases - the calls, the floats' bits, the block - and five deliberate mistakes caught; `BBHOST_DECOMP_COMPARE=1` with `BBHOST_GX_NATIVE_FLUSHES=1` (draws taken whole skip the flushes by default): 2,667,388 calls at three places, 0 differences (97,484 left to the game's alone: a deferred clear due, or too little room) |
+| the post-draw (`gx_post_draw`) | `0x2acbd50` | the flushes' dirty bits folded into the flags the next commit reads; the multi-VGT parameter and the GS mode put back | 10,000 generated cases; `BBHOST_DECOMP_COMPARE=1`: 2,764,861 calls at three places, 0 differences |
+| the command buffer's flush (`gx_command_buffer_flush`) | `0x2aaf700` | what every GX operation ends with: the write pointer noted, and for a context recording into an arena chunk the segment closed - the release nodes handed back, the queued chunks retired, a fresh start | 10,000 generated cases (6,994 closing a segment); `BBHOST_DECOMP_COMPARE=1`: 21,035,589 calls at three places, 0 differences (the 170 that closed a segment left to the game's alone) |
+| FinishCommandList (`gx_finish_command_list`, `gx_finish_command_list_impl`) | `0x2ad5850`, `0x256aca0` | a deferred context's recorded spans taken into an `ID3D11CommandList`, with the targets around them; the context's caches made unknown, its compute state cleared unless kept | 40,000 generated cases against the game's own code for the ten - the calls and their arguments, what the submissions hold, the pages freed, the memory, the return values - and nine deliberate mistakes caught (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
+| ExecuteCommandList(s) (`gx_execute_command_list`, `gx_context_execute_command_list`, `gx_execute_command_lists`, `gx_context_execute_command_lists`) | `0x25679a0`, `0x256a7d0`, `0x25679e0`, `0x256a980` | on the immediate context: the deferred passes a list's first targets owe run, the list's spans submitted (one list) or put into the context's own stream (the frame's batches of up to 72), the targets each list ended with taken as bound, the lists emptied and their pages freed | the same test (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
+| a segment to the GPU (`gx_command_buffer_close_segment`), and the frame's last with the flip (`gx_command_buffer_flip`, `gx_command_buffer_close_segment_and_flip`, `gx_submit_segment_and_flip`) | `0x2ab0b00`, `0x2aafb30`, `0x2ab0ce0`, `0x2ab0e30` | a command buffer's segment submitted (`sceGnmSubmitCommandBuffers`), after the compute ring's waits when the buffer starts afresh; for the flip, room made for the system's flip packets first, and the segment submitted with the flip (`sceGnmSubmitAndFlipCommandBuffers`, then `sceGnmSubmitDone`) | the same test (`decomp_gx_command_list`); in the game every frame's lists, segments and flip, at three places: frames right, 60 fps, CPU inside the run-to-run spread |
 
 The 21 packet writers (`gx/dead_packets.cpp`) are Gnm's own: the four
 `ACQUIRE_MEM` cache actions (`gnm_acquire_mem_range`, `dcb_acquire_mem`,
@@ -227,6 +234,70 @@ packets: the command processor walks them, and records each label as a GPU
 write of the label's memory. As source, each is where a label or a wait
 becomes a command of the command buffer's own host list - the step that lets
 the command processor stop walking the game's command buffers.
+
+GX's methods (`gx/draw.cpp`) are where the game says what it draws, in
+Direct3D 11's terms - the binary names the interfaces it emulates on the
+console (`ID3D11DeviceContext`, `ID3D11CommandList`, `ID3D11BlendState` and
+the rest). Before they were source, the GX trace saw each call through a hook
+at the method's entry; now each method hands the call to the trace itself,
+with the same frame. The trace tells a GX method's packets from everyone
+else's by the return address of the Gnm writer that writes them, so the
+methods - and YEBIS's wrappers, below - share a section of their own
+(`__start`/`__stop` bounds on ELF, grouped sections on COFF) and a return
+address inside it is read as the game's from the same function
+(`decomp_gx::game_return`). A deferred context's draws end in
+a command list, and the immediate context executes the lists in order
+(`gx/command_list.cpp`); the objects that carry the work across - the span
+(a segment of a command buffer, as its eight-qword header stood when it was
+cut), the span queue and the command list with the targets around it - are
+named in `gx/command_list.h`.
+
+**The plugin surface these open (design - the plugin API does not have it
+yet).** Two kinds of hooks, both costing nothing until a plugin asks:
+
+- *Per command*: a callback as one of GX's methods is entered, before the
+  trace, on the thread that records the call (a GX worker for a deferred
+  context, the render thread for the immediate one). It gets the call as GX
+  objects - the kind and its arguments (counts, starts, instances, base
+  vertex, an indirect draw's argument buffer and offset), the context, and
+  the pending state as Direct3D 11 objects: the shaders, the shader-resource,
+  render-target, depth-stencil and unordered-access views, the constant
+  buffers, the input layout, the vertex and index buffers, the blend,
+  depth-stencil and rasterizer states, each with the ids the shader dump and
+  the HLSL overrides use. It can let the call run, skip it, change the
+  pending state for it (another shader, texture or state object, written
+  where the flushes read it, so the same draw goes out with them), or add
+  calls of its own on the same context. The output-merger flush, as source,
+  is where a state object can be swapped for every draw at once, as it is
+  applied.
+- *Per command list*: callbacks at FinishCommandList (a deferred context's
+  list complete: its spans, the targets it began and ended with) and at
+  ExecuteCommandList(s) (the immediate context taking the lists, in order).
+  The lists in order, with the targets each wrote, are the frame as a graph of
+  passes: a plugin can name passes, capture one pass's targets, insert a pass
+  of its own between two lists (an effect after the scene, before the UI),
+  or leave one out. The segment's close is where host commands could go to
+  the GPU between two of the game's, and the flip's submit, once a frame, is
+  where a frame ends.
+
+The callbacks would run on the GX threads, so they must be thread-safe and
+must not block; the cost is one call through the host's thunk per command
+(about 10 ns measured on Linux) plus what the callback does. YEBIS's
+post-process passes are covered at its Gnm wrappers (below); Scaleform's menus
+and the flip's passes are not yet.
+
+### YEBIS (`src/decomp/yebis/`)
+
+YEBIS is the post-process library under the engine's PPFX layer: tone
+mapping, glare, depth of field, motion blur, colour grading. Its draws and
+dispatches reach Gnm through three wrappers.
+
+| Function | Address | What it does | Checked |
+|---|---|---|---|
+| YEBIS's Gnm draws and dispatch (`yebis_gnm_draw_index`, `yebis_gnm_draw_auto`, `yebis_gnm_dispatch`) | `0x15fbc40`, `0x15fbb50`, `0x15fbd10` | a pass's draw - the prep (its last two arguments into two user-data slots), the commit (every stage's shader, resources and user data), Gnm's draw packet, the post-draw - or its compute dispatch the same way | the indexed draw and the dispatch hand the call to the GX trace first, as its hooks did (YEBIS's passes become tokens built from YEBIS's own state); writer callers, as GX's methods are; 12,000 generated cases against the game's own code - the calls, the frame handed to the trace, the writers' return addresses (`decomp_yebis_gnm`) |
+
+As source, each of YEBIS's passes is seen as a command with its context, the
+post-process chain's side of the per-command plugin surface above.
 
 ### Memory (`src/decomp/memory/`)
 
@@ -379,6 +450,12 @@ argument bits the original tests, the floating-point operations in their order
    noise).
 
 ## Next
+
+- **The other writers outside GX**: Gnmx's pre-draw flush and submits, YEBIS's
+  drains and compute utilities (the labels, waits and embedded data around its
+  passes), PPFX's cache actions and the flip's label and wait - each a small
+  surface for its subsystem's mods (post-processing chains, the HUD, frame
+  pacing).
 
 - **Items in and out**: `EquipGameData::AddItem`, through which every item
   enters the inventory (it creates item instances, so a compare must follow the

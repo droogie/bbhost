@@ -205,7 +205,11 @@ GX, YEBIS's buffers - is still noticed by write-protecting its pages.
 A draw names its targets' resource generations, so the image at a target's
 base is the drawing resource's from its first draw; copies and texture binds
 take a target there only if it is their resource's - drawn since the
-resource was made, or the resource made over it without data.
+resource was made, or the resource made over it without data. A whole
+texture copied from one a shader or a copy wrote is copied image to image,
+so the copy carries what the GPU wrote (`BBHOST_COPY_BY_RESOURCE=1` copies
+the memory under it instead, which the GPU's writes never reach; `=0` goes by
+addresses).
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
@@ -454,9 +458,6 @@ the default, and nothing waits on DXC:
 
 ## What comes next
 
-- Copies of textures a compute pass wrote, made image to image
-  (`BBHOST_COPY_BY_RESOURCE=2`): today they copy the memory under them, which
-  the GPU's writes never reach.
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.

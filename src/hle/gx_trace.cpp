@@ -21,6 +21,7 @@
 #include "decomp/gx/constant_engine.h"
 #include "decomp/gx/dead_packets.h"
 #include "decomp/gx/dma.h"
+#include "decomp/gx/draw.h"
 #include "host/cb_proof.h"
 #include "host/host_lists.h"
 #include "engine/addr.h"
@@ -199,6 +200,14 @@ struct Hook {
 #define BB_PUSH4_ECX 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xce
 #define BB_PUSH2_ESI 0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08
 #define BB_YEBIS_DRAW 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x41, 0x89, 0xf7
+// GX's immediate methods as decomp/gx/draw.cpp numbers them: the kind it
+// hands gx_hook is the hook id the stub over the game's method handed.
+constexpr bool same_kind(Kind ours, decomp_gx::MethodKind theirs) { return static_cast<std::uint64_t>(ours) == static_cast<std::uint64_t>(theirs); }
+static_assert(same_kind(kDraw, decomp_gx::kGxDraw) && same_kind(kDrawIndexed, decomp_gx::kGxDrawIndexed) &&
+              same_kind(kDrawInstanced, decomp_gx::kGxDrawInstanced) && same_kind(kDrawIndexedInstanced, decomp_gx::kGxDrawIndexedInstanced) &&
+              same_kind(kDrawIndirect, decomp_gx::kGxDrawInstancedIndirect) &&
+              same_kind(kDrawIndexedIndirect, decomp_gx::kGxDrawIndexedInstancedIndirect) && same_kind(kCommit, decomp_gx::kGxCommit) &&
+              same_kind(kDispatch, decomp_gx::kGxDispatch) && same_kind(kDispatchIndirect, decomp_gx::kGxDispatchIndirect));
 const Hook kHooks[kKinds] = {
     {0x25696c0, 14, {BB_PUSH6, 0x50}},                    // push rbp .. push rbx; push rax
     {0x2569780, 14, {BB_PUSH6, 0x50}},
@@ -5918,7 +5927,10 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         return 1;
     }
     if (id == kDepthStencilClearPass) return native_clear_pass(f);
-    const std::uint64_t ret = f[6];
+    // A writer called from GX's methods as ours (decomp/gx/draw.cpp) has the
+    // game's return address from the method here, as the range checks and
+    // the compute commit's callers below know it.
+    const std::uint64_t ret = decomp_gx::game_return(f[6]);
     const std::uint64_t flip = hle_video_flip_count();
     if (id < kEmitAuto) {
         GxRec& r = t_last;
@@ -6590,6 +6602,13 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         host_log("gx: stub page allocation failed; trace off");
         return;
     }
+    // GX's immediate methods and YEBIS's Gnm wrappers on the decomp list call
+    // it themselves (decomp/gx/draw.cpp, decomp/yebis/gnm.cpp); no stub goes
+    // over one that is placed.
+    decomp_gx::g_yebis_draw_kind = kYebisDraw;
+    decomp_gx::g_yebis_dispatch_kind = kYebisDispatch;
+    decomp_gx::g_yebis_dispatch_hooked = g_yebis_dispatch != 0;
+    decomp_gx::g_gx_hook_entry = host;
     auto* c = static_cast<std::uint8_t*>(page);
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
@@ -6597,6 +6616,9 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;
+        if (id <= kDispatchIndirect && decomp_placed(decomp_gx::kMethodNames[id]) == 1) continue;  // ours, which calls gx_hook
+        if (id == kYebisDraw && decomp_placed("yebis_gnm_draw_index") == 1) continue;
+        if (id == kYebisDispatch && decomp_placed("yebis_gnm_dispatch") == 1) continue;
         const Hook& h = kHooks[id];
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
         if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
