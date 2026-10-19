@@ -59,6 +59,11 @@
 #include <algorithm>
 #include <string>
 #include <utility>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include "core/portable.h"
 
 namespace gpu {
 
@@ -213,6 +218,97 @@ std::size_t g_last_map = 0;  // g.maps index of the last hit
 
 std::atomic<std::uint64_t> g_hits{0}, g_uploads{0}, g_upload_bytes{0}, g_dynamic{0}, g_imports{0}, g_gpu_written{0};
 std::atomic<std::uint64_t> g_staged_pages{0};  // window imports: page copies taken through upload staging
+
+// ---- Window imports: the staged page copies on threads of their own ----
+// A mirror page copied through upload staging is a 64 KiB memcpy, and an
+// area's arrival takes thousands of them in its first recordings (8,552 at
+// Mensis, 534 MiB): done inline that was ~100 ms of the command processor in
+// the first world frames, the arrival stalls window imports added (whole
+// imports have the GPU copy from the import instead). Now the command
+// processor records the staging -> mirror copy as before and hands the
+// memcpy to these threads, which run it while it records on;
+// shadow_end_uploads_locked, which ends the recording's upload commands
+// before their submission, takes whatever no thread has yet and waits for
+// the rest. BBHOST_SHADOW_COPY_THREADS=N (default 3); 0 copies inline.
+class StagedCopies {
+public:
+    static StagedCopies& get() {
+        static StagedCopies pool;
+        return pool;
+    }
+    bool on() const { return threads_ > 0; }
+    void push(void* dst, const void* src, std::size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queue_.push_back({dst, src, bytes});
+            ++pending_;
+        }
+        cv_.notify_one();
+    }
+    // Every copy handed over so far is done (the command processor, before a
+    // submission reads the staging).
+    void finish() {
+        std::uint64_t ran = 0;
+        for (;;) {
+            Job j;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (queue_.empty()) break;
+                j = queue_.front();
+                queue_.pop_front();
+            }
+            std::memcpy(j.dst, j.src, j.bytes);
+            ++ran;
+            done_one();
+        }
+        if (ran) inline_runs_.fetch_add(ran, std::memory_order_relaxed);
+        std::unique_lock<std::mutex> lk(mu_);
+        if (pending_) waits_.fetch_add(1, std::memory_order_relaxed);
+        done_cv_.wait(lk, [this] { return pending_ == 0; });
+    }
+    std::uint64_t inline_runs() const { return inline_runs_.load(std::memory_order_relaxed); }
+    std::uint64_t waits() const { return waits_.load(std::memory_order_relaxed); }
+    unsigned threads() const { return threads_; }
+
+private:
+    struct Job {
+        void* dst = nullptr;
+        const void* src = nullptr;
+        std::size_t bytes = 0;
+    };
+    StagedCopies() {
+        const char* e = std::getenv("BBHOST_SHADOW_COPY_THREADS");
+        threads_ = e && *e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 3u;
+        for (unsigned i = 0; i < threads_; ++i) {
+            std::thread([this, i] {
+                char name[16];
+                std::snprintf(name, sizeof(name), "bb-pagecopy%u", i);
+                host_thread_set_name(name);
+                for (;;) {
+                    Job j;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_.wait(lk, [this] { return !queue_.empty(); });
+                        j = queue_.front();
+                        queue_.pop_front();
+                    }
+                    std::memcpy(j.dst, j.src, j.bytes);
+                    done_one();
+                }
+            }).detach();
+        }
+    }
+    void done_one() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (--pending_ == 0) done_cv_.notify_all();
+    }
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
+    std::deque<Job> queue_;
+    std::size_t pending_ = 0;
+    unsigned threads_ = 0;
+    std::atomic<std::uint64_t> inline_runs_{0}, waits_{0};
+};
 std::atomic<std::uint64_t> g_staged_pending{0};  // ... and pages left in host memory for a GPU write still to land
 std::uint64_t g_page_checks = 0, g_invalid_cp = 0, g_invalid_gpu = 0;
 std::uint64_t g_span_hist[6] = {};  // calls by pages spanned: 1, 2-4, 5-16, 17-64, 65-256, more
@@ -1294,10 +1390,14 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 bump(g_imports);
                 return;
             }
-            std::memcpy(sb.map,  // the placement's own map (staged_at is its offset in the buffer, for the copy)
-                        static_cast<const std::uint8_t*>(g.mirror) + static_cast<std::uint64_t>(chunk) * kChunkBytes +
-                            (static_cast<std::uint64_t>(p) << kPageShift),
-                        kPageBytes);
+            // The placement's own map (staged_at is its offset in the buffer, for the copy).
+            const void* page_src = static_cast<const std::uint8_t*>(g.mirror) + static_cast<std::uint64_t>(chunk) * kChunkBytes +
+                                   (static_cast<std::uint64_t>(p) << kPageShift);
+            if (StagedCopies::get().on()) {
+                StagedCopies::get().push(sb.map, page_src, kPageBytes);  // done before the submission (shadow_end_uploads_locked)
+            } else {
+                std::memcpy(sb.map, page_src, kPageBytes);
+            }
             if (sb.buffer != src_buffer) {
                 flush();
                 src_buffer = sb.buffer;
@@ -1897,6 +1997,9 @@ VkCommandBuffer shadow_upload_cmd_locked() { return upload_cmd_locked(); }
 
 // The copies this recording made, ended; submit_locked runs them first.
 VkCommandBuffer shadow_end_uploads_locked() {
+    // The staged pages' copies this recording handed to the copy threads are
+    // in staging before its submission reads them.
+    if (StagedCopies::get().on()) StagedCopies::get().finish();
     if (g_verify) verify_batch_locked();
     if (g_upload_slot != g.slot) return VK_NULL_HANDLE;
     const VkCommandBuffer cmd = g_upload_cmd[g.slot];
@@ -2164,7 +2267,7 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
 std::string shadow_report() {
     std::uint64_t resident = 0;
     for (std::uint32_t c = 0; c < gcn::kDmemChunks; ++c) resident += g_mirrors[c].resident_pages;
-    char buf[384];
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
                   "buffer shadow: %llu binds from device memory, %llu page copies (%.1f MiB), %llu from host memory; %llu pages "
                   "dynamic, %llu GPU writes over them; %llu page checks; invalidations %llu by the CP and %llu by the GPU",
@@ -2180,9 +2283,13 @@ std::string shadow_report() {
         std::strncat(buf, v, sizeof(buf) - std::strlen(buf) - 1);
     }
     if (const std::uint64_t staged = g_staged_pages.load()) {
-        char v[160];
-        std::snprintf(v, sizeof(v), "; %llu page copies through staging (window imports), %llu pages waiting for a GPU write",
-                      static_cast<unsigned long long>(staged), static_cast<unsigned long long>(g_staged_pending.load()));
+        char v[256];
+        const StagedCopies& sc = StagedCopies::get();
+        std::snprintf(v, sizeof(v),
+                      "; %llu page copies through staging (window imports; %u copy threads, %llu copied by the command processor at a "
+                      "submission, %llu submissions waited), %llu pages waiting for a GPU write",
+                      static_cast<unsigned long long>(staged), sc.threads(), static_cast<unsigned long long>(sc.inline_runs()),
+                      static_cast<unsigned long long>(sc.waits()), static_cast<unsigned long long>(g_staged_pending.load()));
         std::strncat(buf, v, sizeof(buf) - std::strlen(buf) - 1);
     }
     char h[160];

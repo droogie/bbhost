@@ -32,6 +32,7 @@ void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's me
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
 void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMutex::Lock
+void decomp_ez_work_add();             // sync/ez_work.cpp: CSEzWork::ProcessOne - the work pools' job pop, and their node caches
 
 void decomp_add_areas() {
     decomp_flag_store_add();
@@ -62,4 +63,5 @@ void decomp_add_areas() {
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();
     decomp_adaptive_mutex_add();
+    decomp_ez_work_add();
 }

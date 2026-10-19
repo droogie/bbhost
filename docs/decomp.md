@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 189 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 190 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
-| **Taken over in all** | **303** |
-| With any code byte changed (including byte patches and redirected calls) | 324; 406 at 60 fps |
+| **Taken over in all** | **304** |
+| With any code byte changed (including byte patches and redirected calls) | 325; 407 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -344,6 +344,7 @@ submits that context's command buffer itself.
 | Function | Address | What it does | Checked |
 |---|---|---|---|
 | `DLAdaptiveMutex::Lock` | `0x24368c0` | Dantelion's spin-then-sleep mutex: take the word when its owner is free, spin for the mutex's budget, then count in as a sleeper on its semaphore until an unlock hands the lock over | threads taking one word with the game's Lock, ours, and either at random per call, released by the game's Unlock, at spin budgets of 0, 2,000 and 200,000 ticks: exclusion, exact counts and a free word at the end (`decomp_adaptive_mutex`) |
+| `NS_SPRJ::CSEzWork::ProcessOne` | `0x2432370` | a work pool's job pop: under the pool's queue lock, unlink the first node of its job list and free it; after the lock, run the job and settle it - its group's countdown and reference count, then by its kind nothing, the finished list and its event, or its own destruction - as the game's does; and the first time it sees a pool whose job list allocates from the engine's general allocator, it gives that list a node cache (below) | 20,000 generated pools against the game's own code - empty, one to five jobs, a count that disagrees with the list, jobs of every kind, groups at every countdown and reference count - the calls and their arguments in order, the memory, the result, six deliberate mistakes caught (`decomp_ez_work`); the cache through the game's own Enqueue, Append, ProcessOne, DeleteCompleted and ~CSEzWork against the same sequences without it - 3,000 generated pools, runs past its cap, lists on another heap - the same jobs run, destroyed and freed in the same order, the same lists after every step, every block back in its heap exactly once, only ever called under the pool's lock, eight deliberate mistakes caught (`decomp_ez_node_cache`); in the game (Central Yharnam and Cathedral Ward, uncapped and at 60 fps, the cache off and on in turn): all but the first thousand nodes from the caches, the queue lock's waits 2.5-3.5 down to 1.35-2.2 ms a frame, the heap's lock taken half as often, the character workers 9-13 points of a core lower at 60 fps, the main loop 0.35-0.55 ms shorter and 4-6% more frames uncapped |
 
 Every work pool's queue takes this lock to pop a job (`CSEzWork::ProcessOne`),
 and so do the heaps and the GX layer. The game's spin is a `lock cmpxchg` of
@@ -355,6 +356,27 @@ unlock has to win it back. Ours makes the same transitions in the same order
 with the same budget, and spins on a plain load with `pause`, swapping only to
 take the lock or to count itself in. The game's unlock is unchanged, and
 threads using either version share a word.
+
+The pop itself held that lock longer than it needed: every push of a job
+allocates its list node (0x18 bytes, `CSEzWorkList::Append`, `0x2432780`) and
+every pop frees one, both under the queue lock and both through the engine's
+general allocator, whose heap takes a lock of its own. At Central Yharnam the
+character pool pushes some 375 jobs a frame, and with the heap's free inside
+the queue lock's hold 46-47% of that lock's takes found it held and its
+threads waited 3-3.5 ms a frame. Freeing the node after the unlock only moved
+the convoy onto the heap's lock, which then met the pool's whole churn. So
+ours gives each pool a cache of its own nodes: the first time it sees a pool
+whose job list allocates from the general allocator, it puts a stand-in in the
+list's allocator slot - that allocator object copied, its aligned alloc and
+its free replaced - which keeps up to 1,024 freed nodes and gives them back to
+the list's pushes, passing anything else on. Every alloc and free on a pool's
+job list happens under that pool's queue lock, or in its destructor, so the
+cache needs no lock of its own; the destructor frees the list's sentinel last,
+through the slot, and the cache gives its nodes back to the heap then.
+`BBHOST_EZ_NODE_CACHE=0` leaves the pools' lists as they were. The workers
+still meet on the queue lock - 41-43% of its takes find it held, against
+46-47% - but wait 35-60% less, and spend 43-53% of their time spinning
+instead of ~60%.
 
 ### Effects (`src/decomp/sfx/`)
 
@@ -495,6 +517,14 @@ argument bits the original tests, the floating-point operations in their order
   running - YEBIS's flushes, the only callers of its submission, never wrote
   their labels in the writers' census, nor did Scaleform's path into Gnmx's -
   so as source they would open no surface.
+
+- **GX's command lists resolved where they are finished**: with
+  FinishCommandList and ExecuteCommandList(s) as source, each list's draws
+  could be resolved and recorded into Vulkan secondary command buffers on the
+  thread that finished it, the command processor only checking and stitching
+  the lists in order. The design note in [rendering](rendering.md#resolving-draws-where-their-command-lists-are-finished-a-design-note)
+  says what it could take off the command processor, what must stay serial,
+  its risks, and why it waits for a faster main loop.
 
 - **Items in and out**: `EquipGameData::AddItem`, through which every item
   enters the inventory (it creates item instances, so a compare must follow the

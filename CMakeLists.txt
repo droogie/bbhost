@@ -384,6 +384,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
   src/decomp/sync/adaptive_mutex.cpp
+  src/decomp/sync/ez_work.cpp
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -570,6 +571,8 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(adaptive_mutex)
+  bbhost_decomp_test(ez_work)
+  bbhost_decomp_test(ez_node_cache)
   bbhost_decomp_test(gx_drain_token SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_dead_packets SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_labels SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)

@@ -468,6 +468,68 @@ the default, and nothing waits on DXC:
 - Editable source beyond replacing one stage's HLSL: edits read again while
   the game runs.
 
+### Resolving draws where their command lists are finished (a design note)
+
+The command processor limits the uncapped frame rate at the heaviest scenes -
+at Nightmare of Mensis about 11 ms of its CPU a flip for 1,270 draws, against
+8.4-8.75 ms for 913 at Central Yharnam - and the next large step for it would
+be to stop visiting draws: each GX command list's draws resolved, and recorded
+into Vulkan secondary command buffers, on the thread or pool that finished it
+(GX's FinishCommandList and ExecuteCommandList(s) are source,
+`src/decomp/gx/command_list.cpp`), the command processor checking each list
+against what ran before it and stitching the lists in order. It is not being
+built yet; the reasoning, as measured on the development machine:
+
+- **Recording is already off the command processor.** `bb-record` replays its
+  packets, ~2.3 ms of work a flip at Mensis. Secondary command buffers as such
+  would spread work that is not on the critical path; what costs the command
+  processor is resolving each draw.
+- **Moving pieces of it to the GX call does not help.** Two experiments did:
+  a draw's CPU-written constant buffers copied at the call, and each stage's
+  key bindings (its T#s' words, image types and views, its samplers' modes)
+  resolved there. Both were correct and neither shortened the command
+  processor, while the GX threads paid 0.5-1.5 ms a flip for them. Its cost is
+  reading each draw's data - 116-135 last-level cache misses a draw, a quarter
+  of them its lookahead's prefetches of what the GX threads wrote - and a piece
+  moved to the call is replaced by reading what the call wrote. Only a command
+  processor that no longer visits each draw gains.
+- **What could leave it.** Of its time at Mensis ~19% does not depend on the
+  order of execution (pipeline keys, vertex formats, user data, the token
+  lookahead, building packets), ~16% needs only a check per list (the buffer
+  shadow's placements, texture views), ~22% must stay in order (copy tokens
+  and copy-backs, the packet walk with its labels and waits, render targets
+  and passes, the GPU-write tracking and copy versions, tessellation,
+  submission), and the draw path's own code, ~42%, goes with whichever of these
+  it serves. Keeping the serial work (~1.4 ms) and adding a check, the barriers
+  and an execute per list, 7-9 ms a flip could leave it, realistically 4-6.
+- **What has to stay serial.** Labels and waits (a list splits at each wait,
+  and the draws after it are resolved only once the command processor has
+  passed it), the submission and flip order, copies and dispatches between
+  lists, the buffer shadow's imports, GPU-write tables and copy versions (each
+  list's read ranges checked against the GPU writes and imports since it was
+  resolved), and render targets - their surfaces, layouts, clears and
+  barriers, which go only between secondary command buffers, so a list splits
+  at every target change, barrier, clear, copy or wait.
+- **Why it waits.** The main loop's own frame is ~10.1 ms at both places, so
+  at Mensis the command processor needs only ~1 ms less to stop limiting it
+  (+10-12% there), and every millisecond after that shows nothing until the
+  main loop is faster; Central Yharnam is limited by the main loop already. A
+  paced frame rate gains nothing, the CPU time moves to other threads rather
+  than shrinking, and a four-core machine has no spare thread for it. It is
+  the step after the main loop is under ~8-9 ms.
+- **Its risks.** State that changes between a list's finish and its
+  execution - the command processor runs about a frame behind: streaming,
+  area entry, render-to-texture within a frame, resolution changes - which
+  needs a mode that resolves both ways and counts disagreements;
+  dynamic-rendering inheritance per secondary; descriptor and command pools
+  per thread, alive until their submission retires; the pipeline cache and
+  its compiles from many threads; resolving on the GX workers would lengthen
+  the barrier the main loop waits in for their jobs; the drivers' cost for
+  hundreds of secondaries a frame; and the tools that assume the command
+  processor resolves each draw (F12 captures, `tools/glitch_hunt.sh`,
+  `BBHOST_GX_COST`, `drawreplay`). Its first step would be a compact command
+  per draw, built at the GX call in place of the token's sparse records.
+
 ## Tools
 
 | Tool | What it does |
