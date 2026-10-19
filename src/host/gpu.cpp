@@ -2406,6 +2406,10 @@ bool init_locked() {
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.family;
     vkCreateCommandPool(g.device, &pci, nullptr, &g.pool);
+    // MoltenVK's pool allocators keep every temporary buffer they made
+    // (tessellation's among them), so the pool grows with the slots in
+    // flight: with 16, a 16 GB Mac swapped.
+    if (g.moltenvk) g.slot_count = 8;
     if (const char* e = std::getenv("BBHOST_GPU_SLOTS"); e && *e) {
         g.slot_count = std::clamp(std::atoi(e), 2, kSlots);
         host_log("gpu: %d command buffers in flight at most (BBHOST_GPU_SLOTS)", g.slot_count);
