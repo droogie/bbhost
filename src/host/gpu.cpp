@@ -12,6 +12,7 @@
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/translation_cache.h"
+#include "host/vk_portability.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -1622,29 +1623,6 @@ bool small_vram(const Candidate& c) {
     return start_vram_free(c) < (7680ull << 20);
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
-
-// macOS: MoltenVK is a portability driver - Vulkan over Metal, with what Metal
-// lacks left out and listed (VK_KHR_portability_subset) - and the loader shows
-// such a driver's devices only to an instance that asks for them, with
-// VK_KHR_portability_enumeration and its flag. Every instance bbhost makes on
-// macOS asks; a loader too old to know the extension shows them anyway.
-void portability_enumeration(VkInstanceCreateInfo& ici, std::vector<const char*>& exts) {
-#if defined(__APPLE__)
-    std::uint32_t n = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> props(n);
-    if (n) vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
-    for (std::uint32_t i = 0; i < n; ++i) {
-        if (std::strcmp(props[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != 0) continue;
-        exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-        break;
-    }
-#else
-    (void)ici;
-    (void)exts;
-#endif
-}
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,

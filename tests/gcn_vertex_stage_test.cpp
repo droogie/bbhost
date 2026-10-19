@@ -20,6 +20,7 @@
 #include "gcn/isa.h"
 #include "gcn/spirv.h"
 #include "gcn/translate.h"
+#include "host/vk_portability.h"
 
 #include <spirv-tools/libspirv.hpp>
 #include <vulkan/vulkan.h>
@@ -262,22 +263,14 @@ struct Device {
     }
 
     bool init() {
-        std::uint32_t n = 0;
-        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
-        std::vector<VkExtensionProperties> ie(n);
-        vkEnumerateInstanceExtensionProperties(nullptr, &n, ie.data());
-        bool portability = false;
-        for (const VkExtensionProperties& e : ie) portability |= std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
-        const char* exts[] = {VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME};
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_2;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
-        if (portability) {
-            ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-            ici.enabledExtensionCount = 1;
-            ici.ppEnabledExtensionNames = exts;
-        }
+        std::vector<const char*> exts;
+        gpu::portability_enumeration(ici, exts);
+        ici.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
+        ici.ppEnabledExtensionNames = exts.data();
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
         std::uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);

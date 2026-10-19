@@ -51,6 +51,7 @@
 #include "core/sha256.h"
 #include "gcn/translate.h"
 #include "host/descriptor_layouts.h"
+#include "host/vk_portability.h"
 #include "replay/compare.h"
 #include "replay/json.h"
 
@@ -273,17 +274,7 @@ public:
         }
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
-        // A portability driver (MoltenVK) is listed only to an instance that
-        // asks for it, where the loader offers the extension.
-        std::uint32_t nie = 0;
-        vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
-        std::vector<VkExtensionProperties> iprops(nie);
-        vkEnumerateInstanceExtensionProperties(nullptr, &nie, iprops.data());
-        for (const VkExtensionProperties& e : iprops) {
-            if (std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != 0) continue;
-            exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-            ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-        }
+        gpu::portability_enumeration(ici, exts);
         ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
         ici.ppEnabledLayerNames = layers.data();
         ici.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());

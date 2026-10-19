@@ -2,6 +2,7 @@
 // SPIR-V validity. No game files are needed. Exit 77 if no suitable Vulkan
 // device is available.
 #include "gcn/translate.h"
+#include "host/vk_portability.h"
 #include <spirv-tools/libspirv.hpp>
 #include <vulkan/vulkan.h>
 #include <array>
@@ -761,15 +762,9 @@ struct Fixture {
     bool init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_2;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
-        // A portability driver (MoltenVK) is listed only to an instance that
-        // asks for it, where the loader offers the extension.
-        uint32_t ni = 0; vkEnumerateInstanceExtensionProperties(nullptr, &ni, nullptr);
-        std::vector<VkExtensionProperties> ie(ni); vkEnumerateInstanceExtensionProperties(nullptr, &ni, ie.data());
-        const char* portability_enumeration = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
-        for (const VkExtensionProperties& e : ie) if (std::strcmp(e.extensionName, portability_enumeration) == 0) {
-            ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-            ici.enabledExtensionCount = 1; ici.ppEnabledExtensionNames = &portability_enumeration;
-        }
+        std::vector<const char*> iext;
+        gpu::portability_enumeration(ici, iext);
+        ici.enabledExtensionCount = static_cast<uint32_t>(iext.size()); ici.ppEnabledExtensionNames = iext.data();
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
         uint32_t count = 0; check(vkEnumeratePhysicalDevices(instance, &count, nullptr));
         std::vector<VkPhysicalDevice> devices(count);
