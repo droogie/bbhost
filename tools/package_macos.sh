@@ -189,16 +189,19 @@ the PS4's system libraries answered by bbhost and its graphics recompiled for
 Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE); the
 source is at https://github.com/droogie/bbhost.
 
-The macOS port is new and experimental: it builds and passes its tests, but
-the game has not been played on a Mac yet. Expect it not to get far, and
-please report what happens.
+The macOS port is new and experimental. The game is playable: about 28 to
+30 frames a second on an M1 Pro at 1080p (30 is the game's own cap), with
+some pop-in the first time an area or an enemy appears. Please report what
+happens.
 
 You need
-  - macOS 15 or later. On Apple Silicon, Rosetta 2 runs bbhost (an x86_64
-    program) and the game's code with it; macOS 15 is the first whose Rosetta
-    runs the AVX instructions the game uses. If Rosetta is not installed:
+  - macOS 15 or later on Apple Silicon (tested on an M1 Pro only; Intel Macs
+    are untested). Rosetta 2 runs bbhost (an x86_64 program) and the game's
+    code with it; macOS 15 is the first whose Rosetta runs the AVX
+    instructions the game uses. If Rosetta is not installed:
         softwareupdate --install-rosetta --agree-to-license
-    An Intel Mac runs it directly.
+  - 16 GB of memory: about 4.8 GiB stays pinned while the game runs, so a
+    Mac with 8 GB will likely fail.
   - Nothing else to install: Vulkan runs on Metal through MoltenVK, which is
     in lib/ with the Vulkan loader.
   - The eboot.bin of the game's 1.09 update, decrypted to an ELF (SHA-256
@@ -218,6 +221,9 @@ Setup
   Terminal). The first time, the setup window opens: pick the game folder
   and the decrypted eboot with the Browse buttons (each turns green when it
   is right), then Play. ./run-bbhost.command --setup opens it again.
+  When the game dump is kept in Documents, Desktop or Downloads, macOS asks
+  for permission to read it the first time: allow it, or keep the dump
+  somewhere else.
 
   The settings, the F10 settings and your account sign-in are kept in
   ~/Library/Application Support/bbhost, saves and caches in its data/
