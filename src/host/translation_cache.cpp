@@ -181,6 +181,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.flag(o.tess_patch_cull);
     h.flag(o.tess_patch_cull_all);
     h.flag(o.gds_counters);
+    if (o.gs_role != gcn::TranslateOptions::GsRole::None) h.u32(0x6510u | static_cast<std::uint32_t>(o.gs_role));  // other stages' keys as they were
 }
 
 // ---- an entry: the TranslateResult, every field ----
@@ -1430,6 +1431,33 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     for (const std::uint32_t v : {tess.control_points, tess.ls_stride, tess.cp_stride, tess.patch_constants, tess.params_binding}) h.u32(v);
     h.str(tess.constants_path);
     for (const std::uint32_t v : tess.constants) h.u32(v);
+    const Key key{h.a, h.b};
+    gcn::LiftResult l = lift_through_cache(key, lift);
+    hlsl_stage(l, &key, &o);
+    return l;
+}
+
+gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
+                               const gcn::GsLift& gs) {
+    const auto lift = [&] {
+        return use == TranslationUse::kLiftEs ? gcn::lift_es_shader(prog, o, reference, gs) : gcn::lift_gs_shader(prog, o, reference, gs);
+    };
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
+        gcn::LiftResult l = lift();
+        hlsl_stage(l, nullptr, &o);
+        return l;
+    }
+    KeyHasher h;
+    h.str(g_tc.switches);
+    h.u32(static_cast<std::uint32_t>(use));
+    hash_program(h, prog);
+    hash_options(h, o);
+    for (const std::uint32_t v : {gs.es_dwords, gs.max_vertices, gs.vertex_dwords, gs.out_prim}) h.u32(v);
+    h.u32(static_cast<std::uint32_t>(gs.copy.size()));
+    for (const gcn::GsCopyOut& c : gs.copy) {
+        h.u32(static_cast<std::uint32_t>(c.target) | static_cast<std::uint32_t>(c.comp) << 8 | (c.constant ? 1u << 16 : 0u));
+        h.u32(c.value);
+    }
     const Key key{h.a, h.b};
     gcn::LiftResult l = lift_through_cache(key, lift);
     hlsl_stage(l, &key, &o);

@@ -109,7 +109,10 @@ builds those as well. Compute pipelines are recorded too (version 4): each
 one a dispatch used, with the images and samplers its key was made from, so
 the start builds them first - the title's own compute shaders among them,
 which the game never creates through the hook bbhost compiles at, so nothing
-else builds them before their first dispatch.
+else builds them before their first dispatch. The GPU particles'
+geometry-shader pipelines are recorded too (version 5): the record carries
+the export shader and the GS's copy shader beside the GS, and a list names
+the copy shader by its GS's container, which holds it after its first footer.
 
 ## What the report counts
 

@@ -86,10 +86,19 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
         return VK_FALSE;
     }
     g_validation_messages.fetch_add(1, std::memory_order_relaxed);
-    static std::atomic<int> logs{0};
-    if (logs.fetch_add(1) < 40) {
-        host_log("vk validation: %s", data && data->pMessage ? data->pMessage : "?");
+    // Each message id twice, up to 200 ids: a run's first 40 messages were
+    // often one id's repeats, which hid every later kind.
+    static std::mutex mu;
+    static std::map<std::string, int> seen;
+    const std::string id = data && data->pMessageIdName ? data->pMessageIdName : "";
+    bool log = false;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = seen.find(id);
+        if (it != seen.end()) log = it->second++ < 2;
+        else if (seen.size() < 200) log = (seen[id] = 1) != 0;
     }
+    if (log) host_log("vk validation: %s", data && data->pMessage ? data->pMessage : "?");
     return VK_FALSE;
 }
 

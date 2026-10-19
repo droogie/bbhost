@@ -106,6 +106,7 @@
 #include "gcn/wave.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -180,6 +181,9 @@ constexpr int kKeyM0 = 124;
 constexpr int kKeyScc = 1000;
 constexpr int kKeyExec = 1001;
 constexpr int kKeyVcc = 1002;
+// GsLift's GSVS array: the invocation's emit counter, a register of the lift's
+// own so that ifs join it as they join the program's.
+constexpr int kKeyGsCount = 1003;
 // A spill cell (gcn/wave.h): the scalar a v_writelane_b32 parked in lane L of
 // VGPR N, kept as a register of its own.
 constexpr int kKeyCell = 4096;
@@ -227,6 +231,11 @@ struct Region {
 };
 
 bool is_branch(const Inst& in) { return in.enc == Enc::SOPP && (in.op == 2 || (in.op >= 4 && in.op <= 9)); }
+
+// GsLift: the most dwords an ES ring vertex (the geometry stage's inputs a
+// vertex: maxGeometryInputComponents is 64 on AMD's drivers) and a GSVS
+// vertex may hold.
+constexpr std::uint32_t kEsgsDwords = 64, kGsvsDwords = 64;
 
 // A module's outputs as TranslateResult reports a vertex stage's: the
 // locations of its Output variables, its ClipDistance array's length (0:
@@ -296,8 +305,9 @@ public:
     // found coming back to the header with a value lanes may hold differently;
     // the others that enter a loop alike are taken to stay alike, as scalars are.
     Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r, const LoopPhis& loop_phis = {}, const LoopPhis& loop_inexact = {},
-           const TessLift* tess_lift = nullptr, const LoopPhis& loop_nonuniform = {})
-        : prog(p), opt(o), ref(r), tess(tess_lift), lane_phi_hints(loop_phis), inexact_hints(loop_inexact), nonuniform_hints(loop_nonuniform) {}
+           const TessLift* tess_lift = nullptr, const LoopPhis& loop_nonuniform = {}, const GsLift* gs_lift = nullptr)
+        : prog(p), opt(o), ref(r), tess(tess_lift), gs(gs_lift), lane_phi_hints(loop_phis), inexact_hints(loop_inexact),
+          nonuniform_hints(loop_nonuniform) {}
     LoopPhis more_lane_phis;  // set when a lift failed only because a lane mask needs a phi
     LoopPhis more_inexact;    // ... or because helper lanes came back around a loop less exact than they left
     LoopPhis more_nonuniform;  // ... or because a VGPR came back to a loop header holding values lanes may not hold alike
@@ -327,6 +337,13 @@ private:
     bool tess_ls() const { return tess && opt.tess_role == TranslateOptions::TessRole::LsVertex; }
     bool tess_ds() const { return tess && opt.tess_role == TranslateOptions::TessRole::DomainTes; }
     bool tess_hs() const { return tess && opt.tess_role == TranslateOptions::TessRole::HullTcs; }
+    // A draw's export shader or geometry shader on stage I/O (lift.h GsLift), or null.
+    const GsLift* gs = nullptr;
+    bool gs_es() const { return gs && opt.gs_role == TranslateOptions::GsRole::EsVertex; }
+    bool gs_geom() const { return gs && opt.gs_role == TranslateOptions::GsRole::Geometry; }
+    // Words tracked in their affine form (Val::sym): a tessellation stage's LDS
+    // addresses, the geometry shader's ESGS ring offsets.
+    bool sym_on() const { return tess || gs_geom(); }
     // TessLift::window: the game's own hull's patch window as stage I/O.
     bool window() const { return tess && tess->window; }
     // A stage that exports a position and params: a vertex shader, or the
@@ -364,6 +381,9 @@ private:
     std::map<std::uint32_t, Id> in_location_vars;  // PS: location -> the Input vec4 there (attr)
     Id in_frag_coord = 0, in_front_facing = 0, in_vertex_index = 0, in_instance_index = 0, out_pos = 0, in_helper = 0;
     Id in_tess_coord = 0, in_invocation_id = 0;
+    // GsLift: the ring vertex - the ES's output, the GS's input (es_gs[1][..]
+    // for a point) - and the GS's primitive id.
+    Id es_gs = 0, in_primitive_id = 0;
     // TessLift::window: the hull's outputs and the domain shader's inputs -
     // the output control points (uvec4[control points][cp_stride / 16]) and
     // the patch constants (uvec4[patch_constants], Patch) - and the
@@ -462,6 +482,10 @@ private:
     std::size_t descriptor_loads = 0;
     bool descriptor(const Val& v) const { return !v.constant && v.kind == Kind::Word && descriptor_words.count(v.id) != 0; }
     void reject_descriptor_read(const Val& v) {
+        if (ring_words.count(v.id)) {
+            reject("a ring's V# is read as data (the lift's rings are its stages' inputs and outputs)");
+            return;
+        }
         const std::uint32_t at = descriptor_words.at(v.id);
         const Inst* load = inst_at(at);
         reject("data from a scalar load the reference walks the page table for (only its descriptors are lifted): " +
@@ -550,6 +574,37 @@ private:
         }
         if (opt.tess_role != TranslateOptions::TessRole::None && !tess_ls() && !tess_ds() && !tess_hs()) {
             reject("a tessellation stage is lifted only as the LS on vertex input, the hull as the control stage or the domain shader as the evaluation stage");
+        }
+        if (opt.gs_role != TranslateOptions::GsRole::None && !gs_es() && !gs_geom()) {
+            reject("a geometry-shader role is lifted only as the ES or the GS, with their GsLift");
+        }
+        if (gs) {
+            if (opt.gs_role == TranslateOptions::GsRole::None) reject("a GsLift without a geometry-shader role");
+            if (opt.stage != Stage::Vertex || opt.tess_role != TranslateOptions::TessRole::None)
+                reject("the ES and the GS lift with a vertex stage's options and no tessellation role");
+            if (!opt.vertex_input.empty()) reject("the ES and the GS are lifted without vertex input");
+            if (opt.vs_out_cntl) reject("PA_CL_VS_OUT_CNTL is set for the ES or the GS (their copy shader's is what draws)");
+            if (!gs->es_dwords || gs->es_dwords > kEsgsDwords) {
+                reject("an ES ring vertex of " + std::to_string(gs->es_dwords) + " dwords (1-" + std::to_string(kEsgsDwords) +
+                       ": the geometry stage's inputs a vertex)");
+            }
+            if (gs_geom()) {
+                if (!gs->max_vertices || gs->max_vertices > 256) reject("a GS of " + std::to_string(gs->max_vertices) + " vertices (1-256)");
+                if (gs->out_prim != 1 && gs->out_prim != 2) {
+                    reject("a GS whose output primitive is " + std::to_string(gs->out_prim) + " (line and triangle strips are lifted)");
+                }
+                if (gs->copy.empty()) reject("a GS without its copy shader's exports");
+                if (!gs->vertex_dwords || gs->vertex_dwords > kGsvsDwords) {
+                    reject("a GSVS vertex of " + std::to_string(gs->vertex_dwords) + " dwords (1-" + std::to_string(kGsvsDwords) + ")");
+                }
+                for (const GsCopyOut& c : gs->copy) {
+                    if (c.comp > 3 || (c.target != 12 && (c.target < 32 || c.target >= 64)) || (!c.constant && c.value >= gs->vertex_dwords)) {
+                        reject("a copy-shader export the lift does not take (target " + std::to_string(c.target) + ", component " +
+                               std::to_string(c.comp) + ")");
+                        break;
+                    }
+                }
+            }
         }
         if (tess && !window() && !opt.tess_lds_attributes) reject("a tessellation stage is lifted with its control point as stage attributes or in a hull's window");
         if (tess_hs() && !window()) reject("only the game's own hull (a window a patch) is lifted as a control stage");
@@ -741,6 +796,7 @@ private:
             return cf(0.0f);
         }
         if (descriptor(v)) reject_descriptor_read(v);
+        if (ring_offset_read(v)) return cf(0.0f);
         if (v.constant) return cf(std::bit_cast<float>(v.bits));
         if (auto it = to_float.find(v.id); it != to_float.end()) return it->second;
         const Id r = m.emit(spv::OpBitcast, t_f32, {v.id});
@@ -751,6 +807,7 @@ private:
     Id as_u(const Val& v) {
         if (v.wave_part) reject_wave_part(v);
         if (descriptor(v)) reject_descriptor_read(v);
+        if (ring_offset_read(v)) return cu(0);
         if (v.kind == Kind::Word) return v.id;
         if (v.kind == Kind::Lane) {
             reject("a lane mask is used as a number");
@@ -1015,6 +1072,23 @@ private:
             if (!in_tess_coord) in_tess_coord = builtin(m.type_pointer(spv::ScInput, t_v3f), spv::BiTessCoord);
             return flt(extract(t_f32, m.load(t_v3f, in_tess_coord), static_cast<std::uint32_t>(key - 256)));
         }
+        if (key >= 256 && gs_geom()) {
+            // As GCN fills a GS's VGPRs for a point: v0 the ES vertex's offset
+            // in the ESGS ring (ring_offset), v2 the primitive's id, v7 the
+            // instance (VGT_GS_INSTANCE_CNT 0: one); v1 and v3-v6 are the
+            // offsets of vertices a point does not have.
+            if (key == 256) return ring_offset();
+            if (key == 258) {
+                if (!in_primitive_id) in_primitive_id = builtin(p_in_u32, spv::BiPrimitiveId);
+                return word(m.load(t_u32, in_primitive_id));
+            }
+            if (key == 257 || (key >= 259 && key <= 262)) {  // offsets of vertices a point does not have: never data, nothing to address
+                Val v = ring_offset();
+                v.sym = false;
+                return v;
+            }
+            return word_const(0);
+        }
         if (key >= 256 && opt.stage == Stage::Vertex) {
             // The vertex index in v0, the instance index in v1 up to VGPR_COMP_CNT (translate.cpp, run()).
             const int comp = static_cast<int>((opt.rsrc1 >> 24) & 3);
@@ -1249,6 +1323,27 @@ private:
             note += " v" + std::to_string(idx) + (e.set ? (v.kind == Kind::Float ? ":f32" : ":u32") : ":masked-off");
             return;
         }
+        if (gs_geom()) {
+            const auto it = reg.find(key);
+            const Val cur = it != reg.end() ? it->second : initial_value(key);
+            if (!cur.constant && ring_offsets.count(cur.id)) {
+                // Over a ring offset: GCN keeps the offset where EXEC is clear,
+                // which the lift never computes with - the register holds the
+                // value written, exact only where EXEC is set (as a spill's
+                // register below), and a read that needs it elsewhere rejects.
+                if (!v.constant && ring_offsets.count(v.id)) {
+                    reject("v" + std::to_string(idx) + ": a ring offset written under a varying EXEC");
+                    return;
+                }
+                const Where at = meet(read, Where{true, Exact{false, e}});
+                reg[key] = v;
+                reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
+                partial[key] = at.at;
+                note_result(reg[key]);
+                note += " v" + std::to_string(idx) + ":exact-under-exec";
+                return;
+            }
+        }
         if (poisoned.count(key)) {
             // The VGPR's lanes hold words a v_writelane_b32 put there (a spill
             // the program has read back), or what each lane held before: where
@@ -1304,7 +1399,7 @@ private:
         } else {
             reg[key] = word(m.emit(spv::OpSelect, t_u32, {e.id, as_u(v), as_u(old)}));
         }
-        if (tess && sym_holds(v, e)) {  // TessLift: the written word's form, where EXEC is set
+        if (sym_on() && sym_holds(v, e)) {  // TessLift, GsLift: the written word's form, where EXEC is set
             reg[key].sym = true;
             reg[key].sym_base = v.sym_base;
             reg[key].sym_coef = v.sym_coef;
@@ -1867,7 +1962,8 @@ private:
 
     // ---- affine words (Val::sym, TessLift) -------------------------------------------
     // Invocations a word may differ between: a hull's control points, else 1.
-    std::uint32_t sym_invocations() const { return tess_hs() ? std::max<std::uint32_t>(1, tess->control_points) : 1u; }
+    // A GS's ring offsets: the offset itself (coef 1), as two.
+    std::uint32_t sym_invocations() const { return tess_hs() ? std::max<std::uint32_t>(1, tess->control_points) : gs_geom() ? 2u : 1u; }
     std::vector<Val> sym_masks;  // Val::sym_where
     std::uint32_t sym_where_of(const Val& e) {
         if (e.constant && e.set) return 0;
@@ -2018,9 +2114,10 @@ private:
     }
 
     void valu(const Inst& in) {
+        if (gs_geom() && ring_offset_arith(in)) return;
         // TessLift: the operands as they were, for the result's affine form.
         std::vector<Val> sym_ops;
-        if (tess && (in.enc == Enc::VOP2 || in.enc == Enc::VOP3)) {
+        if (sym_on() && (in.enc == Enc::VOP2 || in.enc == Enc::VOP3)) {
             std::uint32_t probe = 0;
             if (int_op(in, 0, 0, 0, probe)) {
                 sym_ops.push_back(peek(in.src0, in));
@@ -2441,7 +2538,10 @@ private:
                 pending.clear();
             }
             return;
-        case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22: return;
+        case 16:  // s_sendmsg: a GS's emit, cut and done (gs_message); nothing in another stage
+            if (gs_geom()) gs_message(in);
+            return;
+        case 13: case 14: case 15: case 17: case 19: case 20: case 21: case 22: return;
         default: reject(std::string("unsupported ") + mnemonic(in));
         }
     }
@@ -3002,6 +3102,7 @@ private:
             }
             ++cs_bound_loads;
         }
+        if (gs && ring_descriptor_load(in)) return;
         const auto site = ref.buffer_at.find(in.offset);
         if (count && site == ref.buffer_at.end()) return descriptor_load(in, count);
         if (!count || site == ref.buffer_at.end() || site->second >= buffer_vars.size()) {
@@ -3437,6 +3538,7 @@ private:
             reject(std::string(mnemonic(in)) + ": the reference binds it in a shape the lift does not take");
             return;
         }
+        if (gs && ring_access(in)) return;
         if (in.op < 28 || in.op > 31) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
@@ -4261,6 +4363,10 @@ private:
             reject("an export in the LS, whose output is its LDS writes");
             return;
         }
+        if (gs) {
+            reject("an export in the ES or the GS, which write their rings (the copy shader exports)");
+            return;
+        }
         if (!open_loops.empty()) {
             reject("export inside a loop");
             return;
@@ -4467,6 +4573,410 @@ private:
         m.emit_void(spv::OpBranch, {l_merge});
         cur_label = m.label(l_merge);
     }
+    // ---- GsLift: the rings as stage I/O -----------------------------------------------
+    // The ES vertex's offset in the ESGS ring (the GS's v0), which the lift
+    // knows only as its own vertex's: an OpUndef it never computes with (as_u
+    // and as_f refuse it), in its affine form (Val::sym) one unit an offset.
+    std::set<Id> ring_offsets;
+    Val ring_offset() {
+        Id undef;
+        {
+            EntryScope entry(m);
+            undef = m.emit(spv::OpUndef, t_u32, {});
+        }
+        ring_offsets.insert(undef);
+        Val v = word(undef);
+        v.sym = true;
+        v.sym_base = 0;
+        v.sym_coef = 1;
+        return v;
+    }
+    bool ring_offset_read(const Val& v) {
+        if (v.constant || !ring_offsets.count(v.id)) return false;
+        reject("an input vertex's ring offset (the GS's v0; v1 and v3-v6 a point has none of) is used as a number, not to address the ring");
+        return true;
+    }
+    // Integer arithmetic on a ring offset (v_lshlrev_b32 v0, 2, v0 makes its
+    // byte address): another ring offset in its affine form. Not on one: false.
+    bool ring_offset_arith(const Inst& in) {
+        if (in.enc != Enc::VOP1 && in.enc != Enc::VOP2 && in.enc != Enc::VOP3) return false;
+        std::vector<Val> ops{peek(in.src0, in)};
+        if (in.enc != Enc::VOP1) {
+            ops.push_back(peek(in.src1, in));
+            if (in.enc == Enc::VOP3 && in.op >= 0x140 && in.op < 0x160) ops.push_back(peek(in.src2, in));
+        }
+        if (std::none_of(ops.begin(), ops.end(), [&](const Val& v) { return !v.constant && ring_offsets.count(v.id); })) return false;
+        if (in.enc == Enc::VOP1 && in.op == 1) {  // v_mov_b32: the same offset
+            write_v(in.dst, ops[0]);
+            note += " v" + std::to_string(in.dst) + ":ring offset";
+            return true;
+        }
+        // No carry (v_add_i32, v_sub_i32, v_subrev_i32 write one), no modifier.
+        const bool carry = (in.enc == Enc::VOP2 && in.op >= 37 && in.op <= 39) || (in.enc == Enc::VOP3 && in.op >= 0x125 && in.op <= 0x127);
+        std::uint32_t probe = 0, base = 0, coef = 0;
+        if (in.enc == Enc::VOP1 || carry || (in.enc == Enc::VOP3 && (in.abs || in.neg || in.omod || in.clamp)) || !int_op(in, 0, 0, 0, probe) ||
+            !sym_eval(ops, [&](const std::vector<std::uint32_t>& x, std::uint32_t& r) {
+                return int_op(in, x[0], x.size() > 1 ? x[1] : 0, x.size() > 2 ? x[2] : 0, r);
+            }, base, coef)) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "an instruction") + " computes with the ES vertex's ring offset other than as an address the lift follows");
+            return true;
+        }
+        Val v = ring_offset();
+        v.sym_base = base;
+        v.sym_coef = coef;
+        write_v(in.dst, v);
+        note += " v" + std::to_string(in.dst) + ":ring offset";
+        return true;
+    }
+    // The rings' V#s, as Gnm puts them in the global table the user data's
+    // s[0:1] points at (dword 8 the ESGS write ring, 12 its read, 16 the GSVS
+    // write ring): four words each, never read as data (descriptor_words);
+    // the accesses through them are the stages' inputs and outputs
+    // (ring_access). Not one: false.
+    enum Ring : std::uint8_t { kRingEsgsWrite = 1, kRingEsgsRead = 2, kRingGsvsWrite = 3 };
+    struct RingWord {
+        std::uint8_t ring = 0, word = 0;
+    };
+    std::map<Id, RingWord> ring_words;
+    std::size_t ring_descriptors = 0;
+    bool ring_descriptor_load(const Inst& in) {
+        if (in.op != 2 || !in.imm_flag || in.src0 != 0) return false;  // s_load_dwordx4 s[n:n+3], s[0:1], imm
+        const std::uint8_t ring = gs_es() ? (in.imm == 8 ? kRingEsgsWrite : 0) : (in.imm == 12 ? kRingEsgsRead : in.imm == 16 ? kRingGsvsWrite : 0);
+        if (!ring) return false;
+        if (peek(0, in).id != initial_value(0).id || peek(1, in).id != initial_value(1).id) {
+            reject("a ring's V# loaded through s[0:1] after the program wrote them (not the user data's table)");
+            return true;
+        }
+        Pending p{in.sdst, {}};
+        const std::size_t mark = note.size();
+        for (int k = 0; k < 4; ++k) {
+            Id undef;
+            {
+                EntryScope entry(m);
+                undef = m.emit(spv::OpUndef, t_u32, {});
+            }
+            descriptor_words[undef] = in.offset;
+            ring_words[undef] = {ring, static_cast<std::uint8_t>(k)};
+            write_scalar(static_cast<std::uint16_t>(in.sdst + k), word(undef));
+            p.values.push_back(word(undef));
+        }
+        note.resize(mark);
+        note += " " + operand_name(in.sdst, 0, 4) +
+                (ring == kRingEsgsWrite ? ":ESGS write ring" : ring == kRingEsgsRead ? ":ESGS read ring" : ":GSVS write ring");
+        pending.push_back(std::move(p));
+        ++ring_descriptors;
+        return true;
+    }
+    // A buffer access through a ring's V#: the ES's stores into the ESGS ring
+    // (es_ring_store), the GS's loads from it (gs_ring_load) and its stores
+    // into the GSVS ring (gs_ring_store). Not through a ring: false.
+    std::size_t es_ring_stores = 0, gs_ring_loads = 0, gs_ring_stores = 0;
+    bool ring_access(const Inst& in) {
+        const Val w0 = peek(in.srsrc, in);
+        const auto first = w0.constant ? ring_words.end() : ring_words.find(w0.id);
+        if (first == ring_words.end()) return false;
+        const char* name = mnemonic(in) ? mnemonic(in) : "a buffer instruction";
+        for (int k = 0; k < 4; ++k) {
+            const Val wk = peek(static_cast<std::uint16_t>(in.srsrc + k), in);
+            const auto it = wk.constant ? ring_words.end() : ring_words.find(wk.id);
+            if (it == ring_words.end() || it->second.ring != first->second.ring || it->second.word != k) {
+                reject(std::string(name) + ": its V# is not one ring's four words in order");
+                return true;
+            }
+        }
+        if (!open_loops.empty()) {
+            reject(std::string(name) + " through a ring inside a loop is not lifted");
+            return true;
+        }
+        if (in.idxen || in.addr64 || in.tfe || in.lds) {
+            reject(std::string(name) + ": a ring access with an index, a 64-bit address, TFE or LDS");
+            return true;
+        }
+        const Val so = read(in.soffset, in);
+        if (!so.constant) {
+            reject(std::string(name) + ": a ring access at an SGPR offset the lift does not know");
+            return true;
+        }
+        const std::uint32_t at = so.bits + in.offset12;
+        switch (first->second.ring) {
+        case kRingEsgsWrite: es_ring_store(in, at); break;
+        case kRingEsgsRead: gs_ring_load(in, at); break;
+        default: gs_ring_store(in, at); break;
+        }
+        return true;
+    }
+    // ES: buffer_store_dword* at soffset + offset 4 * k: dwords k.. of the vertex.
+    void es_ring_store(const Inst& in, std::uint32_t at) {
+        if (!gs_es() || in.op < 28 || in.op > 31 || in.offen) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the ESGS write ring is written by the ES with buffer_store_dword* at constant offsets only");
+            return;
+        }
+        const std::uint32_t n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
+        if (at % 4 || at / 4 + n > gs->es_dwords) {
+            reject("an ESGS ring store at byte " + std::to_string(at) + ": not dwords of the ES's " + std::to_string(gs->es_dwords));
+            return;
+        }
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        std::vector<Id> words;
+        for (std::uint32_t j = 0; j < n; ++j) words.push_back(as_u(value(256 + in.vdata + static_cast<int>(j))));
+        const Id p_out_u32 = m.type_pointer(spv::ScOutput, t_u32);
+        where_exec(e, [&] {
+            for (std::uint32_t j = 0; j < n; ++j) {
+                const std::uint32_t k = at / 4 + j;
+                m.store(m.access_chain(p_out_u32, es_gs, {cu(k / 4), cu(k % 4)}), words[j]);
+            }
+        });
+        es_ring_stores += n;
+        note += " es_gs[" + std::to_string(at / 4) + "]";
+    }
+    // GS: buffer_load_dword at the vertex's own offset (v0 << 2) and soffset +
+    // offset 256 * k: dword k of its ES vertex, es_gs[0][k / 4][k % 4].
+    std::map<std::uint32_t, Id> es_gs_loads;  // loaded once, in the entry block
+    void gs_ring_load(const Inst& in, std::uint32_t at) {
+        if (!gs_geom() || in.op != 12 || !in.offen) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the ESGS read ring is read by the GS with buffer_load_dword at its vertex's offset only");
+            return;
+        }
+        const Val a = peek(static_cast<std::uint16_t>(256 + in.vaddr), in);
+        if (a.constant || !ring_offsets.count(a.id) || !sym_holds(a, current_exec()) || a.sym_base != 0 || a.sym_coef != 4) {
+            reject("an ESGS ring load at an address other than its vertex's own (v0 << 2)");
+            return;
+        }
+        if (at % 256 || at / 256 >= gs->es_dwords) {
+            reject("an ESGS ring load at byte " + std::to_string(at) + ": not a dword of the ES's " + std::to_string(gs->es_dwords));
+            return;
+        }
+        const std::uint32_t k = at / 256;
+        Id& v = es_gs_loads[k];
+        if (!v) {
+            EntryScope entry(m);
+            v = m.load(t_u32, m.access_chain(m.type_pointer(spv::ScInput, t_u32), es_gs, {cu(0), cu(k / 4), cu(k % 4)}));
+        }
+        inst_uniform = false;  // per primitive
+        write_v(in.vdata, word(v));
+        ++gs_ring_loads;
+        note += " es_gs[0][" + std::to_string(k) + "]";
+    }
+    // GS: buffer_store_dword at soffset + offset 4 * (max_vertices * d + v):
+    // dword d of the vertex in slot v, kept with the EXEC it was made under
+    // for the emit of that slot (gs_emit).
+    struct GsvsStore {
+        Val value, exec;
+    };
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<GsvsStore>> gsvs;  // (slot, dword) -> its stores, in order
+    void gs_ring_store(const Inst& in, std::uint32_t at) {
+        if (!gs_geom() || in.op != 28 || (in.offen && !gsvs_array)) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the GSVS write ring is written by the GS with buffer_store_dword only");
+            return;
+        }
+        if (gsvs_array) return gs_ring_store_array(in, at);
+        const std::uint32_t e_at = at / 4, d = e_at / gs->max_vertices, v = e_at % gs->max_vertices;
+        if (at % 4 || d >= kGsvsDwords) {
+            reject("a GSVS ring store at byte " + std::to_string(at) + ": not a dword of a vertex");
+            return;
+        }
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        const Val data = value(256 + in.vdata);
+        if (!exact_in(where_reg(256 + in.vdata), e)) {
+            reject("a GSVS store of a value the lift may hold differently from GCN where EXEC is set");
+            return;
+        }
+        gsvs[{v, d}].push_back({data, e});
+        ++gs_ring_stores;
+        note += " gsvs[" + std::to_string(v) + "][" + std::to_string(d) + "]";
+    }
+    // s_sendmsg in the GS: GS emit (stream 0), cut, emit and cut; GS done.
+    struct GsEmit {
+        Val exec;
+        std::uint32_t slot = 0;
+    };
+    std::vector<GsEmit> gs_emits;
+    std::size_t gs_cuts = 0;
+    void gs_message(const Inst& in) {
+        const std::uint32_t imm = static_cast<std::uint32_t>(in.imm) & 0xffff, msg = imm & 0xf, op = (imm >> 4) & 3, stream = (imm >> 8) & 3;
+        if (msg == 3) return;  // GS done: the primitive's vertices are all out
+        if (msg != 2 || stream != 0) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "s_sendmsg 0x%x: only stream 0's GS emit and cut and GS done are lifted", imm);
+            reject(buf);
+            return;
+        }
+        if (!open_loops.empty()) {
+            reject("a GS emit or cut inside a loop");
+            return;
+        }
+        if (op == 0) return;
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        if (op & 2) gs_emit(e);
+        if (op & 1) {
+            where_exec(e, [&] { m.emit_void(spv::OpEndPrimitive, {}); });
+            ++gs_cuts;
+            note += " cut";
+        }
+    }
+    // No invocation has both bits set: one holds a mask the other holds the negation of.
+    bool disjoint(const Val& a, const Val& b) const {
+        if ((a.constant && !a.set) || (b.constant && !b.set)) return true;
+        if (a.constant || b.constant) return false;
+        std::vector<Id> ca{a.id}, cb{b.id};
+        if (const auto it = conjuncts.find(a.id); it != conjuncts.end()) ca.insert(ca.end(), it->second.begin(), it->second.end());
+        if (const auto it = conjuncts.find(b.id); it != conjuncts.end()) cb.insert(cb.end(), it->second.begin(), it->second.end());
+        for (const Id x : ca) {
+            for (const Id y : cb) {
+                if (negated(lane(x), lane(y))) return true;
+            }
+        }
+        return false;
+    }
+    // The emit of the invocation's next vertex: slot n for its nth emit, as
+    // GCN's emit counter gives it - known when each earlier emit was made by
+    // every invocation emitting here or by none of them - its outputs the
+    // copy shader's, each dword the last store into the slot every one of
+    // those invocations made.
+    void gs_emit(const Val& e) {
+        if (gsvs_array) return gs_emit_array(e);
+        std::uint32_t slot = 0;
+        for (const GsEmit& p : gs_emits) {
+            if (disjoint(p.exec, e)) continue;
+            if (!implies(e, p.exec)) {
+                reject("a GS emit whose invocations made different numbers of emits before it: the slot GCN's emit counter gives is not known");
+                return;
+            }
+            ++slot;
+        }
+        if (slot >= gs->max_vertices) {
+            reject("an emit of vertex " + std::to_string(slot) + ", past the GS's " + std::to_string(gs->max_vertices));
+            return;
+        }
+        std::map<std::uint8_t, std::array<Id, 4>> outs;
+        for (const GsCopyOut& c : gs->copy) {
+            const auto [it, fresh] = outs.try_emplace(c.target);
+            if (fresh) it->second.fill(cf(0.0f));
+            if (c.constant) {
+                it->second[c.comp] = cf(std::bit_cast<float>(c.value));
+                continue;
+            }
+            const GsvsStore* store = nullptr;
+            if (const auto st = gsvs.find({slot, c.value}); st != gsvs.end()) {
+                for (auto s = st->second.rbegin(); s != st->second.rend(); ++s) {
+                    if (disjoint(s->exec, e)) continue;
+                    if (implies(e, s->exec)) store = &*s;
+                    break;
+                }
+            }
+            if (!store) {
+                reject("an emit of vertex " + std::to_string(slot) + ": dword " + std::to_string(c.value) +
+                       " the copy shader exports was not stored into its slot by every invocation emitting it");
+                return;
+            }
+            it->second[c.comp] = as_f(store->value);
+        }
+        std::vector<std::pair<std::vector<Id>, std::array<Id, 4>>> stores;  // the outputs' variables, made before the branch
+        for (const auto& [t, comps] : outs) stores.push_back({t == 12 ? std::vector<Id>{out_position()} : param_outputs(t - 32), comps});
+        where_exec(e, [&] {
+            for (const auto& [vars, comps] : stores) {
+                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+                for (const Id var : vars) m.store(var, v4);
+            }
+            m.emit_void(spv::OpEmitVertex, {});
+        });
+        gs_emits.push_back({e, slot});
+        note += " emit " + std::to_string(slot);
+    }
+
+    // ---- GsLift: the GSVS ring as an array ------------------------------------------
+    // A GS that stores into the GSVS ring at a VGPR offset - the program's own
+    // vertex counter, a byte offset it steps after each emit and clamps past
+    // the last vertex to an address the ring's range drops - keeps the ring as
+    // GCN does: an array of max_vertices * vertex_dwords words in the
+    // invocation (element d * max_vertices + v), each store at the element its
+    // address names (dropped past the array), each emit reading the slot its
+    // emit counter names - the invocation's emits so far, stepped where it
+    // emits, as GCN's VGT counts them - and nothing past max_vertices.
+    Id gsvs_array = 0;
+    std::uint32_t gsvs_elements = 0;
+    std::size_t gs_dynamic_stores = 0;
+    void gs_ring_model() {
+        // The array where a store is at a VGPR offset, or an emit lies in an
+        // if's arm (the slots after it depend on the arm, which the stores'
+        // EXEC does not show).
+        bool dynamic = false;
+        for (const Inst& in : prog.insts) {
+            dynamic = dynamic || (in.enc == Enc::MUBUF && in.op >= 28 && in.op <= 31 && in.offen);
+            if (in.enc == Enc::SOPP && in.op == 16 && (in.imm & 0x2f) == 0x22) {
+                for (const Construct& c : constructs) dynamic = dynamic || (in.offset > c.branch && in.offset < c.join);
+            }
+        }
+        if (!dynamic) return;
+        reg[kKeyGsCount] = word_const(0);
+        gsvs_elements = gs->max_vertices * gs->vertex_dwords;
+        gsvs_array = m.local_variable(m.type_pointer(spv::ScFunction, m.type_array(t_u32, cu(gsvs_elements))));
+        m.name(gsvs_array, "gsvs");
+    }
+    void gs_ring_store_array(const Inst& in, std::uint32_t at) {
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        const Val data = value(256 + in.vdata);
+        if (!exact_in(where_reg(256 + in.vdata), e)) {
+            reject("a GSVS store of a value the lift may hold differently from GCN where EXEC is set");
+            return;
+        }
+        const Id word_v = as_u(data);
+        Id element = cu(at >> 2), fits = 0;
+        if (in.offen) {
+            const Val a = value(256 + in.vaddr);
+            if (!exact_in(where_reg(256 + in.vaddr), e)) {
+                reject("a GSVS store at an offset the lift may hold differently from GCN where EXEC is set");
+                return;
+            }
+            element = ibin(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(at), as_u(a)), cu(2));
+            fits = m.emit(spv::OpULessThan, t_bool, {element, cu(gsvs_elements)});
+            ++gs_dynamic_stores;
+        } else if ((at >> 2) >= gsvs_elements) {
+            return;  // past the ring: dropped
+        }
+        const Id p_fn_u32 = m.type_pointer(spv::ScFunction, t_u32);
+        const Val where = fits ? band(e, lane(fits)) : e;
+        where_exec(where, [&] { m.store(m.access_chain(p_fn_u32, gsvs_array, {element}), word_v); });
+        ++gs_ring_stores;
+        note += in.offen ? " gsvs[offset]" : " gsvs[" + std::to_string(at >> 2) + "]";
+    }
+    void gs_emit_array(const Val& e) {
+        const Id count = as_u(reg.at(kKeyGsCount));
+        std::map<std::uint8_t, std::array<Id, 4>> outs;
+        std::vector<std::pair<std::vector<Id>, std::uint8_t>> vars;
+        for (const GsCopyOut& c : gs->copy) {
+            if (outs.try_emplace(c.target).second) vars.push_back({c.target == 12 ? std::vector<Id>{out_position()} : param_outputs(c.target - 32), c.target});
+        }
+        const Id p_fn_u32 = m.type_pointer(spv::ScFunction, t_u32);
+        const Id fits = m.emit(spv::OpULessThan, t_bool, {count, cu(gs->max_vertices)});
+        where_exec(band(e, lane(fits)), [&] {
+            for (auto& [t, comps] : outs) comps.fill(cf(0.0f));
+            for (const GsCopyOut& c : gs->copy) {
+                if (c.constant) {
+                    outs[c.target][c.comp] = cf(std::bit_cast<float>(c.value));
+                    continue;
+                }
+                const Id element = ibin(spv::OpIAdd, cu(c.value * gs->max_vertices), count);
+                outs[c.target][c.comp] = m.emit(spv::OpBitcast, t_f32, {m.load(t_u32, m.access_chain(p_fn_u32, gsvs_array, {element}))});
+            }
+            for (const auto& [vs, t] : vars) {
+                const std::array<Id, 4>& comps = outs[t];
+                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+                for (const Id var : vs) m.store(var, v4);
+            }
+            m.emit_void(spv::OpEmitVertex, {});
+        });
+        // The counter steps where the invocation emits.
+        const Val next = word(ibin(spv::OpIAdd, count, cu(1)));
+        reg[kKeyGsCount] = e.constant ? (e.set ? next : reg.at(kKeyGsCount)) : word(m.emit(spv::OpSelect, t_u32, {e.id, next.id, count}));
+        gs_emits.push_back({e, 0});
+        note += " emit (slot from the counter)";
+    }
+
     // ---- TessLift::window: the patch's window as stage I/O ------------------------------
     // Inputs [0, in_end): control point a / ls_stride, as the LS wrote it;
     // outputs [in_end, out_end): the hull's control point (a - in_end) /
@@ -5049,7 +5559,7 @@ private:
             // TessLift: a scalar integer operation of constants is a constant (Val::sym).
             std::vector<Val> sym_ops;
             std::uint32_t probe = 0;
-            if (tess && scalar_int_op(in, 0, 0, probe)) {
+            if (sym_on() && scalar_int_op(in, 0, 0, probe)) {
                 if (in.enc == Enc::SOP2) {
                     sym_ops.push_back(peek(in.src0, in));
                     sym_ops.push_back(peek(in.src1, in));
@@ -5059,7 +5569,7 @@ private:
             }
             if (in.enc == Enc::SOP2) sop2(in);
             else sopk(in);
-            if (tess && res.rejections.empty() && (in.enc == Enc::SOP2 ? !sym_ops.empty() : in.op == 15 || in.op == 16)) sym_scalar(in, sym_ops);
+            if (sym_on() && res.rejections.empty() && (in.enc == Enc::SOP2 ? !sym_ops.empty() : in.op == 15 || in.op == 16)) sym_scalar(in, sym_ops);
             break;
         }
         case Enc::SOPC: sopc(in); break;
@@ -5212,8 +5722,9 @@ private:
             if (in.op >= 4) return false;
             rd_pair(in.srsrc);  // the V# the reference traced to its binding
             return true;
-        case Enc::MUBUF:  // buffer stores (a vertex shader's, a hull's factor stores): the V# and offset are read
-            if (compute() ? !(in.op <= 15 || (in.op >= 24 && in.op <= 31) || in.op == 50 || in.op == 112 || in.op == 113) : (in.op < 24 || in.op > 31)) {
+        case Enc::MUBUF:  // buffer stores (a vertex shader's, a hull's factor stores; a GS's ring loads): the V# and offset are read
+            if (compute() ? !(in.op <= 15 || (in.op >= 24 && in.op <= 31) || in.op == 50 || in.op == 112 || in.op == 113)
+                          : (in.op < 24 || in.op > 31) && !(gs_geom() && in.op == 12)) {
                 return false;
             }
             rd_pair(in.srsrc);
@@ -7435,11 +7946,24 @@ private:
             }
         }
 
+        if (gs) {
+            // GsLift: the ring vertex, the ES's output and the GS's input (one vertex: a point).
+            const Id t_slots = m.type_array(t_v4u, cu((gs->es_dwords + 3) / 4));
+            if (gs_es()) {
+                es_gs = m.global_variable(m.type_pointer(spv::ScOutput, t_slots), spv::ScOutput);
+            } else {
+                es_gs = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_slots, cu(1))), spv::ScInput);
+            }
+            m.decorate(es_gs, spv::DecLocation, {0});
+            m.name(es_gs, "es_gs");
+            interface.push_back(es_gs);
+        }
         if (compute()) declare_guest_memory();
         fn_main = m.begin_function(t_void, m.type_function(t_void, {}));
         m.name(fn_main, "main");
         cur_label = m.label();
         if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
+        if (gs_geom()) gs_ring_model();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set
         // ... and GCN's helper lanes with theirs clear, until whole-quad mode.
         // A vertex shader has none (it takes no whole-quad mode, sop1).
@@ -7603,6 +8127,25 @@ private:
             m.capability(spv::CapTessellation);
             m.entry_point(spv::EmTessellationControl, fn_main, "main", interface);
             m.execution_mode(fn_main, spv::ExOutputVertices, {window_layout().n});
+            if (native_rtz) {
+                m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
+                m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
+            }
+            return;
+        }
+        if (gs_geom()) {
+            // The geometry stage: a point in, the copy shader's strip out.
+            if (gs_emits.empty()) {
+                cur = prog.insts.back().offset;
+                reject("the GS emits no vertex");
+                return;
+            }
+            m.capability(spv::CapGeometry);
+            m.entry_point(spv::EmGeometry, fn_main, "main", interface);
+            m.execution_mode(fn_main, spv::ExInputPoints);
+            m.execution_mode(fn_main, spv::ExInvocations, {1});
+            m.execution_mode(fn_main, gs->out_prim == 1 ? spv::ExOutputLineStrip : spv::ExOutputTriangleStrip);
+            m.execution_mode(fn_main, spv::ExOutputVertices, {gs->max_vertices});
             if (native_rtz) {
                 m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
                 m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
@@ -7799,6 +8342,25 @@ private:
                        std::to_string(w.spill_lanes) + " spill-lane moves; semantic, kept - " + std::to_string(w.quad_swizzles) +
                        " quad swizzles, " + std::to_string(w.implicit_lod) + " implicit-LOD samples, " + std::to_string(w.lod_queries) +
                        " LOD queries, " + std::to_string(w.helper_queries) + " live-quad queries, " + std::to_string(w.discards) + " discards");
+        if (gs_es()) {
+            head.push_back(std::to_string(es_ring_stores) + " dwords stored into the ESGS ring at constant offsets: the es_gs output (" +
+                           std::to_string(gs->es_dwords) + " dwords a vertex, its ring V# never read as data); nothing exported");
+        }
+        if (gs_geom()) {
+            std::string emits = std::to_string(gs_emits.size()) + " emits and " + std::to_string(gs_cuts) + " cuts, each where EXEC is set, ";
+            if (gsvs_array) {
+                emits += "the GSVS ring an array of " + std::to_string(gsvs_elements) + " words in the invocation (" + std::to_string(gs_ring_stores) +
+                         " stores, " + std::to_string(gs_dynamic_stores) + " of them at a VGPR offset, each at the element its address names, "
+                         "none past the array), every emit reading the slot of the invocation's emit counter (its emits so far, stepped where it "
+                         "emits; none past " + std::to_string(gs->max_vertices) + ")";
+            } else {
+                emits += std::to_string(gs_ring_stores) + " GSVS ring stores at constant offsets into " + std::to_string(gs->max_vertices) +
+                         " slots, every emit's slot its emit counter's (each earlier emit made by all of its invocations or by none) and every "
+                         "dword the copy shader exports the last store into that slot all of them made";
+            }
+            head.push_back(std::to_string(gs_ring_loads) + " ESGS ring loads, each at the vertex's own offset (v0 << 2, never read as data): "
+                           "es_gs[0]; " + emits);
+        }
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }
 };
@@ -7807,7 +8369,7 @@ private:
 
 namespace {
 LiftResult lift_stage(Stage stage, const Program& program, const TranslateOptions& options, const TranslateResult& reference,
-                      const TessLift* tess = nullptr) {
+                      const TessLift* tess = nullptr, const GsLift* gs = nullptr) {
     if (options.stage != stage) {
         LiftResult wrong;
         wrong.rejections.push_back(stage == Stage::Pixel         ? "the options are not a pixel shader's"
@@ -7824,7 +8386,7 @@ LiftResult lift_stage(Stage stage, const Program& program, const TranslateOption
     // is inexact at the header on the next attempt.
     Lifter::LoopPhis phis, inexact, nonuniform;
     for (int attempt = 0;; ++attempt) {
-        Lifter l(program, options, reference, phis, inexact, tess, nonuniform);
+        Lifter l(program, options, reference, phis, inexact, tess, nonuniform, gs);
         LiftResult r = l.run();
         const std::size_t before = phis.size() + inexact.size() + nonuniform.size();
         phis.insert(l.more_lane_phis.begin(), l.more_lane_phis.end());
@@ -7927,6 +8489,163 @@ LiftResult lift_domain_shader(const Program& program, const TranslateOptions& op
         return wrong;
     }
     return lift_stage(Stage::TessEval, program, options, reference, &tess);
+}
+
+bool parse_gs_copy(const Program& copy, std::uint32_t max_vertices, std::vector<GsCopyOut>& out, std::string& why) {
+    out.clear();
+    const auto fail = [&](const Inst* in, const std::string& w) {
+        why = (in ? hex_offset(in->offset) + ": " : std::string()) + w;
+        out.clear();
+        return false;
+    };
+    if (!copy.errors.empty()) return fail(nullptr, "the copy shader has decode errors");
+    if (!max_vertices) return fail(nullptr, "a GS of no vertices");
+    const std::uint32_t stride = 64 * max_vertices;  // bytes between a vertex's dwords in the GSVS ring
+    std::map<int, std::uint32_t> sgpr;                 // SGPRs holding a known constant
+    struct Reg {
+        bool constant = false;
+        std::uint32_t value = 0;  // the dword loaded, or the constant
+    };
+    std::map<int, Reg> vgpr;
+    int ring = -1, address = -1, stream = -1;  // the GSVS read ring's first SGPR; v0 << 2; s2 >> 24
+    bool stream_test = false;
+    std::uint32_t end_at = 0;  // the stream test's target
+    std::set<std::pair<int, int>> exported;
+    const auto inline_const = [](std::uint16_t code, std::uint32_t& v) {
+        if (code >= 128 && code <= 192) return v = code - 128u, true;
+        if (code >= 193 && code <= 208) return v = static_cast<std::uint32_t>(-static_cast<int>(code - 192)), true;
+        static const float kHalf[8] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
+        if (code >= 240 && code <= 247) return v = std::bit_cast<std::uint32_t>(kHalf[code - 240]), true;
+        return false;
+    };
+    for (const Inst& in : copy.insts) {
+        if (end_at && in.offset >= end_at) {
+            if (in.offset == end_at && in.enc == Enc::SOPP && in.op == 1) break;
+            return fail(&in, "an instruction where the stream test lands other than s_endpgm");
+        }
+        const char* name = mnemonic(in) ? mnemonic(in) : "an unknown instruction";
+        switch (in.enc) {
+        case Enc::SOPP:
+            if (in.op == 0 || in.op == 12) break;  // s_nop, s_waitcnt
+            if (in.op == 1) return fail(&in, "s_endpgm before the stream test's target");
+            if (in.op == 4 && stream_test && !end_at) {  // s_cbranch_scc0 past stream 0's code
+                end_at = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOP1:
+            if (in.op == 3 && in.dst == kVccHi) break;  // s_mov_b32 vcc_hi: the compiler's note
+            if (in.op == 3 && in.dst < 104) {
+                std::uint32_t v = 0;
+                if (in.src0 == kLiteral) sgpr[in.dst] = in.literal;
+                else if (inline_const(in.src0, v)) sgpr[in.dst] = v;
+                else return fail(&in, "s_mov_b32 of a register");
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOPK:
+            if (in.op == 0 && in.dst < 104) {  // s_movk_i32
+                sgpr[in.dst] = static_cast<std::uint32_t>(in.imm);
+                break;
+            }
+            if (in.op == 9 && in.dst == stream && (in.imm & 0xffff) == 0) {  // s_cmpk_eq_u32 the stream, 0
+                stream_test = true;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOP2:
+            if (in.op == 32 && in.src0 == 2 && in.src1 == 128 + 24 && in.dst < 104) {  // s_lshr_b32 sN, s2, 24: the stream
+                stream = in.dst;
+                sgpr.erase(in.dst);
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SMRD:
+            if (in.op == 2 && in.imm_flag && in.src0 == 0 && in.imm == 32 && ring < 0) {  // the GSVS read ring from the global table
+                ring = in.sdst;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not the GSVS read ring's V#");
+        case Enc::VOP2:
+            if (in.op == 26 && in.src0 == 130 && in.src1 == 256 && address < 0) {  // v_lshlrev_b32 vN, 2, v0
+                address = in.dst;
+                vgpr.erase(in.dst);
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::VOP1:
+            if (in.op == 1) {  // v_mov_b32 vN, constant
+                std::uint32_t v = 0;
+                if (in.src0 == kLiteral) v = in.literal;
+                else if (!inline_const(in.src0, v)) return fail(&in, "v_mov_b32 of a register");
+                vgpr[in.dst] = {true, v};
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::MUBUF: {
+            if (!end_at) return fail(&in, "a GSVS ring load before the stream test");
+            if (in.op != 12 || !in.offen || in.idxen || in.addr64 || in.lds || in.tfe || in.srsrc != ring || ring < 0 || in.vaddr != address || address < 0)
+                return fail(&in, std::string(name) + " is not a buffer_load_dword of the GSVS ring at the vertex's offset");
+            std::uint32_t so = 0;
+            if (in.soffset < 104) {
+                const auto it = sgpr.find(in.soffset);
+                if (it == sgpr.end()) return fail(&in, "a GSVS ring load at an SGPR offset not known");
+                so = it->second;
+            } else if (!inline_const(in.soffset, so)) {
+                return fail(&in, "a GSVS ring load at an offset not known");
+            }
+            const std::uint32_t at = so + in.offset12;
+            if (at % stride || at / stride >= kGsvsDwords) return fail(&in, "a GSVS ring load at byte " + std::to_string(at) + ": not a vertex's dword");
+            vgpr[in.vdata] = {false, at / stride};
+            break;
+        }
+        case Enc::EXP: {
+            if (!end_at) return fail(&in, "an export before the stream test");
+            if (in.tgt != 12 && (in.tgt < 32 || in.tgt >= 64)) return fail(&in, "an export of target " + std::to_string(in.tgt) + " (pos0 and params are lifted)");
+            if (in.compr) return fail(&in, "a compressed export");
+            for (std::uint8_t c = 0; c < 4; ++c) {
+                if (!exported.insert({in.tgt, c}).second) return fail(&in, "a component exported twice");
+                GsCopyOut o;
+                o.target = in.tgt;
+                o.comp = c;
+                if (!((in.dmask >> c) & 1)) {
+                    o.constant = true;  // as the lift's exports: a disabled component is 0
+                } else {
+                    const auto it = vgpr.find(in.vsrc[c]);
+                    if (it == vgpr.end()) return fail(&in, "an exported v" + std::to_string(in.vsrc[c]) + " that holds neither a GSVS dword nor a constant");
+                    o.constant = it->second.constant;
+                    o.value = it->second.value;
+                }
+                out.push_back(o);
+            }
+            break;
+        }
+        default:
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        }
+    }
+    if (!end_at) return fail(nullptr, "no stream test (s2 >> 24 against 0) over the exports");
+    if (!exported.count({12, 0})) return fail(nullptr, "no position export");
+    why.clear();
+    return true;
+}
+
+LiftResult lift_es_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs) {
+    if (options.gs_role != TranslateOptions::GsRole::EsVertex) {
+        LiftResult wrong;
+        wrong.rejections.push_back("the options are not the ES's as a vertex stage");
+        return wrong;
+    }
+    return lift_stage(Stage::Vertex, program, options, reference, nullptr, &gs);
+}
+
+LiftResult lift_gs_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs) {
+    if (options.gs_role != TranslateOptions::GsRole::Geometry) {
+        LiftResult wrong;
+        wrong.rejections.push_back("the options are not the GS's as a geometry stage");
+        return wrong;
+    }
+    return lift_stage(Stage::Vertex, program, options, reference, nullptr, &gs);
 }
 
 HullLift lift_constant_hull(const Program& program) {

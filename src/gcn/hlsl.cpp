@@ -62,7 +62,8 @@ void result_shape(std::uint16_t op, bool in_function, bool& has_type, bool& has_
     case kOpTypeForwardPointer: case spv::OpFunctionEnd: case spv::OpStore: case kOpCopyMemory: case spv::OpSelectionMerge:
     case spv::OpLoopMerge: case spv::OpBranch: case spv::OpBranchConditional: case spv::OpSwitch: case spv::OpKill: case spv::OpReturn:
     case spv::OpReturnValue: case spv::OpUnreachable: case spv::OpControlBarrier: case spv::OpMemoryBarrier: case spv::OpImageWrite:
-    case spv::OpDemoteToHelperInvocation: case kOpTerminateInvocation: case spv::OpAtomicStore:
+    case spv::OpDemoteToHelperInvocation: case kOpTerminateInvocation: case spv::OpAtomicStore: case spv::OpEmitVertex:
+    case spv::OpEndPrimitive:
         return;
     case spv::OpExtInstImport: case kOpString: case spv::OpLabel:
         has_id = true;
@@ -232,6 +233,7 @@ private:
         std::vector<std::uint32_t> params;
         std::map<std::uint32_t, Block> blocks;
         std::uint32_t first_block = 0;
+        std::vector<std::uint32_t> locals;           // function-local variables (a GS's GSVS ring), declared at its top
         std::map<std::uint32_t, std::size_t> preds;  // block -> branches into it
         std::string name, text;                      // its HLSL name; the printed body with its declarations
     };
@@ -475,7 +477,13 @@ private:
                 cur = nullptr;
                 break;
             case kOpLine: case kOpNoLine: break;
-            case spv::OpVariable: fail("a function-local variable");
+            case spv::OpVariable:
+                // A function-local array (a GS's GSVS ring, gcn/lift.h GsLift), declared at the top of its function.
+                if (cur->label != f.first_block) fail("a function-local variable outside the first block");
+                if (in.a.size() != 1 || in.a[0] != spv::ScFunction) fail("a function-local variable with an initializer");
+                var_type[in.id] = in.type;
+                f.locals.push_back(in.id);
+                break;
             default: cur->body.push_back(&in); break;
             }
         }
@@ -683,7 +691,9 @@ private:
     bool early_tests = false;
     std::string tess_domain;                // [domain(...)] of a domain shader
     std::vector<std::uint32_t> tess_modes;  // spacing, winding, point mode
-    std::uint32_t output_vertices = 0;      // a hull's OutputVertices
+    std::uint32_t output_vertices = 0;      // a hull's OutputVertices; a geometry shader's
+    std::string gs_input, gs_stream_type;   // a geometry shader's input primitive and output stream
+    std::uint32_t gs_input_vertices = 0;
     std::uint32_t local_size[3] = {0, 0, 0};  // a compute shader's [numthreads]
     bool hv202x = false;                      // vk::BufferPointer (an atomic on a raw address) needs -HV 202x
     std::vector<std::uint32_t> float_modes;   // DenormPreserve, RoundingModeRTZ for 16-bit floats, in the lift's order
@@ -724,6 +734,7 @@ private:
         case spv::EmTessellationEvaluation: profile = "ds_6_6"; break;
         case spv::EmTessellationControl: profile = "hs_6_6"; break;
         case spv::EmGLCompute: profile = "cs_6_6"; break;
+        case spv::EmGeometry: profile = "gs_6_6"; break;
         default: fail("execution model " + std::to_string(exec_model));
         }
         for (const std::uint32_t c : capabilities) {
@@ -732,6 +743,7 @@ private:
             case spv::CapGroupNonUniformQuad: case spv::CapDerivativeControl: case spv::CapSampled1D: case spv::CapImage1D: case spv::CapTessellation:
             case spv::CapSampledCubeArray: case spv::CapImageCubeArray: case spv::CapStorageImageReadWithoutFormat:
             case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended: case spv::CapPhysicalStorageBufferAddresses:
+            case spv::CapGeometry:
                 break;
             // A lift for a device that rounds halves itself (gcn/half.h
             // native_half_rtz): Float16 comes with the half types DXC is given
@@ -759,6 +771,14 @@ private:
             case spv::ExOutputVertices:
                 if (m.size() < 3) fail("OutputVertices without a count");
                 output_vertices = m[2];
+                break;
+            // A geometry shader: its input primitive, output strip and invocations.
+            case spv::ExInputPoints: gs_input = "point"; gs_input_vertices = 1; break;
+            case spv::ExInputLines: gs_input = "line"; gs_input_vertices = 2; break;
+            case spv::ExOutputTriangleStrip: gs_stream_type = "TriangleStream"; break;
+            case spv::ExOutputLineStrip: gs_stream_type = "LineStream"; break;
+            case spv::ExInvocations:
+                if (m.size() < 3 || m[2] != 1) fail("a geometry shader of more than one invocation");
                 break;
             case spv::ExLocalSize:
                 if (m.size() < 5) fail("LocalSize without three sizes");
@@ -804,6 +824,11 @@ private:
             }
         }
         for (const std::uint32_t v : var_order) global(v);
+        for (Function& f : functions) {
+            for (const std::uint32_t v : f.locals) global_names[v] = unique(names.count(v) ? names.at(v) : "local");
+        }
+        if (exec_model == spv::EmGeometry && (gs_input.empty() || gs_stream_type.empty() || !output_vertices))
+            fail("a geometry shader without its input primitive, output strip or vertex count");
         for (Function& f : functions) {
             if (f.id == entry_fn) continue;
             f.name = unique(names.count(f.id) ? names.at(f.id) : "fn" + std::to_string(f.id));
@@ -1258,6 +1283,14 @@ private:
             return;
         }
         case spv::OpAtomicIAdd: return atomic(in);
+        case spv::OpEmitVertex:
+            if (exec_model != spv::EmGeometry) fail("OpEmitVertex outside a geometry shader");
+            line("gs_emit_vertex(gs_stream);");
+            return;
+        case spv::OpEndPrimitive:
+            if (exec_model != spv::EmGeometry) fail("OpEndPrimitive outside a geometry shader");
+            line("gs_stream.RestartStrip();");
+            return;
         case spv::OpImageWrite: {
             const auto hd = handles.find(in.a.at(0));
             if (hd == handles.end() || !hd->second.image_var) fail("an image write to an image that is not a loaded variable");
@@ -1444,7 +1477,8 @@ private:
             handles[in.id] = h;
             return;
         }
-        if (pt.sc != spv::ScUniform && pt.sc != spv::ScInput && pt.sc != spv::ScOutput) fail("an access chain into storage class " + std::to_string(pt.sc));
+        if (pt.sc != spv::ScUniform && pt.sc != spv::ScInput && pt.sc != spv::ScOutput && pt.sc != spv::ScFunction)
+            fail("an access chain into storage class " + std::to_string(pt.sc));
         h.kind = Handle::Kind::Lvalue;
         h.lvalue = global_names.at(base);
         std::size_t first = 1;
@@ -2316,6 +2350,7 @@ private:
     // A function's phis and the values a use outside their scope reaches, declared at its top.
     std::string declarations(const Function& f) {
         std::string top;
+        for (const std::uint32_t v : f.locals) top += "    " + declare(type(var_type.at(v)).elem, global_names.at(v)) + ";\n";
         for (const Ins& in : f.ins) {
             if (!in.id || !in.type || in.op == spv::OpFunctionParameter) continue;
             const bool phi = in.op == spv::OpPhi;
@@ -2373,6 +2408,60 @@ private:
         return s;
     }
 
+    // A geometry shader (gcn/lift.h GsLift): the statics as other stages',
+    // the per-vertex inputs from the entry point's input array, the
+    // primitive's id, and each OpEmitVertex the outputs' statics appended to
+    // the stream (gs_emit_vertex), each OpEndPrimitive its RestartStrip.
+    std::string assemble_geometry() {
+        std::string s, vertex_struct, out_struct, copy_in, copy_out, params;
+        for (const StageVar& v : stage_vars) {
+            s += "static " + declare(v.pointee, v.name) + ";\n";
+            if (v.patch || v.invariant) fail("a patch or invariant variable in a geometry shader");
+            if (v.input && v.location >= 0) {
+                // Each vertex's: the module's array of them, one member of a vertex.
+                const Type& at = type(v.pointee);
+                if (at.k != TK::Array || at.count != gs_input_vertices) fail("a geometry shader input that is not an array of its primitive's vertices");
+                vertex_struct += "    [[vk::location(" + std::to_string(v.location) + ")]] " + v.interp + declare(at.elem, v.name) + " : IN" +
+                                 std::to_string(v.location) + ";\n";
+                for (std::uint32_t k = 0; k < at.count; ++k)
+                    copy_in += "    " + v.name + "[" + std::to_string(k) + "] = gs_in[" + std::to_string(k) + "]." + v.name + ";\n";
+                continue;
+            }
+            if (v.input && v.builtin == spv::BiPrimitiveId) {
+                params += ", " + declare(v.pointee, "si_" + v.name) + " : SV_PrimitiveID";
+                copy_in += "    " + v.name + " = si_" + v.name + ";\n";
+                continue;
+            }
+            if (v.input) fail("a geometry shader input HLSL has no place for");
+            if (type(v.pointee).k == TK::Array) fail("an array output of a geometry shader");
+            std::string sem, attr;
+            if (v.location >= 0) {
+                attr = "[[vk::location(" + std::to_string(v.location) + ")]] ";
+                sem = "OUT" + std::to_string(v.location);
+            } else if (v.builtin == spv::BiPosition) {
+                sem = "SV_Position";
+            } else {
+                fail("built-in output " + std::to_string(v.builtin) + " of a geometry shader");
+            }
+            out_struct += "    " + attr + v.interp + declare(v.pointee, v.name) + " : " + sem + ";\n";
+            copy_out += "    so." + v.name + " = " + v.name + ";\n";
+        }
+        if (vertex_struct.empty()) fail("a geometry shader without per-vertex inputs");
+        if (out_struct.empty()) fail("a geometry shader without outputs");
+        const std::string stream = "inout " + gs_stream_type + "<StageOutput> gs_stream";
+        s += "\nstruct GsVertex {\n" + vertex_struct + "};\nstruct StageOutput {\n" + out_struct + "};\n\n";
+        s += "void gs_emit_vertex(" + stream + ") {\n    StageOutput so;\n" + copy_out + "    gs_stream.Append(so);\n}\n\n";
+        s += helper_functions() + "void lifted_main(" + stream + ") {\n" + body_text + "}\n\n";
+        s += float_mode_attributes();
+        s += "[maxvertexcount(" + std::to_string(output_vertices) + ")]\n";
+        s += "void main(" + gs_input + " GsVertex gs_in[" + std::to_string(gs_input_vertices) + "]" + params + ", " + stream + ") {\n";
+        s += float_mode_calls();
+        s += copy_in;
+        s += "    lifted_main(gs_stream);\n}\n";
+        if (uses_half) arguments.push_back("-enable-16bit-types");
+        return s;
+    }
+
     std::string assemble() {
         for (const Function& f : functions) {
             if (f.id == entry_fn) body_text = f.text;  // lifted_main's, declarations included
@@ -2391,6 +2480,7 @@ private:
 
         if (exec_model == spv::EmTessellationControl) return s + assemble_hull();
         if (exec_model == spv::EmGLCompute) return s + assemble_compute();
+        if (exec_model == spv::EmGeometry) return s + assemble_geometry();
 
         // Stage variables: statics, filled from and written to the entry point's.
         const bool tes = exec_model == spv::EmTessellationEvaluation;

@@ -15,15 +15,35 @@
 // Nothing dumps constant RAM any more: YEBIS's resource tables come from its
 // own state (engine/yebis_bind), and Gnmx's draws are tokens, whose predraw
 // flush - the dump - never runs. So with the dead packets on, every dispatch
-// and draw a token and YEBIS's binder ours (hle_gx_trace_arm), the two
-// counters write nothing and return the write pointer. The reserve writes the
-// game's packet always: its payload is the guest's memory in the constant
-// command buffer, whose address the constant update engine keeps per chunk
-// and fills over several calls, and draws read the bytes there - a host
-// scratch area in its place (one, for every reservation) washed the world
-// out, the fog and the lights reading through it. The dump writes the game's
-// packet always too, and a dump while the counters write nothing is counted
-// and logged - its table would be stale.
+// and draw a token and YEBIS's binder ours (hle_gx_trace_arm), the counter
+// step writes nothing and returns the write pointer.
+//
+// The wait writes the game's packet always: its callers rewind over it. Each
+// of the five - Gnmx's pre-draw (0x1492e80, the flip pass's) and pre-dispatch
+// (0x1493180), the Gnm context's pre-draw (0x148cb70), YEBIS's commit of a
+// draw (0x15f9720) and of a dispatch (0x15f9d20) - copies the command
+// buffer's header right after the wait and, when the draw left the constant
+// engine unused, writes a two-dword NOP through the copy 8 bytes below its
+// write pointer: over the wait. A wait written as nothing (from PR #149 on)
+// put that NOP over whatever lay below it: the last two dwords of a
+// reservation's payload, or, in an empty constant command buffer, the heap
+// block's header in front of it - the flip pass's two contexts are
+// back-to-back blocks, and a live resize's YEBIS shutdown crashed in free
+// (0x24859c7). The counters the wait compares are never stepped while so
+// (this step, the draw engine's - decomp/gx/labels.cpp - and the only other
+// constant-engine step, 0x15fd1e0, which nothing reachable calls), so it
+// never holds the constant engine (gnm_exec's ce_step). No other writer that
+// writes nothing has a caller that moves the write pointer back, reads what
+// the writer returned, keeps the write pointer across the call or writes
+// through a copy of the command buffer (decomp/gx/dead_packets.cpp).
+//
+// The reserve writes the game's packet always: its payload is the guest's
+// memory in the constant command buffer, whose address the constant update
+// engine keeps per chunk and fills over several calls, and draws read the
+// bytes there - a host scratch area in its place (one, for every
+// reservation) washed the world out, the fog and the lights reading through
+// it. The dump writes the game's packet always too, and a dump while the
+// counters write nothing is counted and logged - its table would be stale.
 //
 // Each is the game's function as source, instruction for instruction (the
 // reserve's checks of offset and size, the room check on the low 32 bits of
@@ -47,6 +67,13 @@
 #include <vector>
 
 using namespace decomp;
+
+#ifdef DECOMP_CE_MUTANTS
+extern int g_ce_mutant;
+#define CE_MUTANT(n) (g_ce_mutant == (n))
+#else
+#define CE_MUTANT(n) false
+#endif
 
 namespace {
 
@@ -73,7 +100,7 @@ const CeWriter kTable[kWriters] = {
 
 // Set by gnm_ce_configure; read by the leaves.
 u8 g_dead = 0;
-std::atomic<u64> g_written_nothing[kWriters] = {}, g_dumps_while_dead{0};
+std::atomic<u64> g_steps_not_written{0}, g_waits_while_dead{0}, g_dumps_while_dead{0};
 
 using Refill = GUEST_ABI u64 (*)(u64 cb, u32 dwords, u64 arg, u64 room);
 
@@ -165,14 +192,14 @@ DECOMP_LEAF u64 gnm_ce_reserve_const_ram(u64 cb, u32 offset, u32 dwords) {
 }
 DECOMP_LEAF u64 gnm_ce_wait_on_de_counter_diff(u64 cb, u32 diff) {
     if (g_dead) {
-        g_written_nothing[kWaitDiff].fetch_add(1, std::memory_order_relaxed);
-        return load<u64>(cb + 0x10);
+        if (CE_MUTANT(1)) return load<u64>(cb + 0x10);  // written as nothing, as PR #149 had it
+        g_waits_while_dead.fetch_add(1, std::memory_order_relaxed);
     }
-    return w_wait_diff(cb, diff);
+    return w_wait_diff(cb, diff);  // the game's packet whatever the mode: its callers NOP over it (above)
 }
 DECOMP_LEAF u64 gnm_ce_increment_ce_counter(u64 cb) {
     if (g_dead) {
-        g_written_nothing[kIncrementCe].fetch_add(1, std::memory_order_relaxed);
+        g_steps_not_written.fetch_add(1, std::memory_order_relaxed);
         return load<u64>(cb + 0x10);
     }
     return w_increment_ce(cb);
@@ -281,9 +308,10 @@ void report() {
         host_log("decomp: the constant engine's writers write the game's packets");
         return;
     }
-    host_log("decomp: the constant engine's counters not written - nothing dumps its RAM: %llu waits on the draw engine, %llu counter "
-             "steps (its RAM writes are the game's packets); constant RAM dumps while so: %llu",
-             static_cast<ull>(g_written_nothing[kWaitDiff].load()), static_cast<ull>(g_written_nothing[kIncrementCe].load()),
+    host_log("decomp: the constant engine's counter steps not written - nothing dumps its RAM: %llu steps; its waits on the draw engine "
+             "(%llu, which the game NOPs over when a draw leaves the engine unused) and its RAM writes are the game's packets; constant RAM "
+             "dumps while so: %llu",
+             static_cast<ull>(g_steps_not_written.load()), static_cast<ull>(g_waits_while_dead.load()),
              static_cast<ull>(g_dumps_while_dead.load()));
 }
 

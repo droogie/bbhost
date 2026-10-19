@@ -5,10 +5,11 @@
 // and out of the reserve's and the dump's ranges - ours writing the game's
 // packets must leave everything as the game's leaves it: the return value,
 // the command buffer object, both chunks and the refill's calls. Then what
-// bbhost runs them with when nothing dumps constant RAM: the wait's and the
-// counter's packets not written, the reserve's and the dump's written as the
-// game's (the reserve's payload is guest memory callers keep and draws read),
-// the dump counted.
+// bbhost runs them with when nothing dumps constant RAM: the counter's packet
+// not written, the wait's, the reserve's and the dump's written as the game's
+// (the wait's callers NOP over it - tests/decomp/gnmx_cue_ccb_test.cpp - and
+// the reserve's payload is guest memory callers keep and draws read), the
+// dump counted.
 // And the entries hold the instructions written against. Skips without the
 // 1.09 eboot.
 #include "decomp/gx/constant_engine.cpp"
@@ -159,9 +160,9 @@ int main(int argc, char** argv) {
             if (i == kDump) {
                 if (r != game_ret || std::memcmp(&g_mem, &g_game, sizeof g_mem) != 0 || g_dumps_while_dead.load() != dumps + 1)
                     fail(i, t, "the dump not written or not counted");
-            } else if (i == kReserve) {
+            } else if (i == kReserve || i == kWaitDiff) {
                 if (r != game_ret || std::memcmp(&g_mem, &g_game, sizeof g_mem) != 0 || g_calls != game_calls)
-                    fail(i, t, "the reserve not written as the game's");
+                    fail(i, t, i == kReserve ? "the reserve not written as the game's" : "the wait not written as the game's");
             } else {
                 if (std::memcmp(&g_mem, &g_saved, sizeof g_mem) != 0 || !g_calls.empty()) fail(i, t, "written while not written");
                 if (r != load<u64>(cb() + 0x10)) fail(i, t, "the value returned while not written");

@@ -244,6 +244,11 @@ struct GfxPipeline {
     // a pipeline the driver refuses finds the hull's lift by (DXC's module
     // then, hlsl_stages_from_lifts); empty with the switch off.
     std::vector<std::uint32_t> tess_hull_spirv;
+    // A geometry-shader pipeline (DrawState::gs, gs_draw): `vs` the GS's lift
+    // as the geometry stage, this the ES's as the vertex stage, its params
+    // and buffers in set 4 (tess_set_layout); built whole, never a library.
+    bool gs_native = false;
+    ShaderStage gs_es;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
@@ -831,6 +836,14 @@ std::atomic<std::uint64_t> g_tess_hull_draws{0}, g_tess_hull_patches{0};
 // which went on through the LS pass, and those that went through it while a
 // worker built their native pipeline (queue_native_pipeline).
 std::atomic<std::uint64_t> g_tess_native_refusals{0}, g_tess_native_waits{0};
+// Draws that bind a geometry shader (gs_draw): drawn with their GS as its own
+// pipeline; the attempts refused, by reason (which then went as VS/PS); and
+// every one drawn as VS/PS - refused, or BBHOST_GX_GS=0 - by its GS program
+// and ES, which draws nothing (the ES exports no position).
+std::atomic<std::uint64_t> g_gs_drawn{0};
+std::mutex g_gs_mu;
+std::map<std::string, std::uint64_t> g_gs_refused, g_gs_as_vs;  // under g_gs_mu
+std::set<std::string> g_gs_pipelines;                           // under g_gs_mu: the GS pipelines built, by name
 // TranslateOptions::tess_lds_bound for every stage that reads or writes the
 // buffer standing in for LDS: each access checked against its patch's window
 // or the region the LS pass gave the draw, 0 read and the write dropped past
@@ -2400,6 +2413,16 @@ struct DrawState {
     bool tess_native = false;
     std::uint32_t tess_constants[12] = {};
     std::uint32_t tess_cb[2] = {};
+    // A draw that binds a geometry shader, as a pipeline of its own (gs_draw,
+    // GpuDrawInputs::gs): vs_* are then the GS's - the stage whose outputs the
+    // pixel shader reads, which binds set 0 - and the ES is the pipeline's
+    // vertex stage, its params block and buffers in set 4 (kTessNativeSet,
+    // as a native hull pipeline's LS), its user data from its GX records.
+    bool gs = false;
+    std::uint64_t es_va = 0, gs_copy_va = 0;
+    std::uint32_t es_rsrc1 = 0, es_rsrc2 = 0;
+    std::uint32_t es_user[16] = {};
+    std::uint32_t gs_out_prim = 0, gs_vertex_dwords = 0, gs_max_vertices = 0, gs_es_dwords = 0;
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool rect = false;
     // attachments
@@ -2480,6 +2503,15 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
         k.ls_fetch_va = s.ls_fetch_va;
         k.ls_rsrc1 = s.ls_rsrc1;
         k.ls_rsrc2 = s.ls_rsrc2;
+    }
+    if (s.gs) {  // a geometry-shader draw has no tessellation: its ES, copy shader and ring shapes in those members
+        k.tess_attrs |= 4u;
+        k.ls_va = s.es_va;
+        k.ls_rsrc1 = s.es_rsrc1;
+        k.ls_rsrc2 = s.es_rsrc2;
+        k.hs_va = s.gs_copy_va;
+        k.tess_window = s.gs_max_vertices;
+        k.tess_shape = s.gs_out_prim | s.gs_vertex_dwords << 8 | s.gs_es_dwords << 16;
     }
     if (s.gx_blend) {
         std::memcpy(k.state, s.gx_ids, sizeof(s.gx_ids));  // the state objects stand for the registers they were encoded into
@@ -4030,6 +4062,14 @@ const CachedProgram* tess_program(const DrawState& s, int which) {
     if (t_replaying) return nullptr;
     return program_at(which ? s.hs_va : s.ls_va);
 }
+// A geometry-shader pipeline's ES (0) and copy shader (1), as tess_program:
+// a worker's copies (queue_gs_pipeline), else the programs themselves.
+thread_local const CachedProgram* t_gs_programs[2] = {nullptr, nullptr};
+const CachedProgram* gs_program(const DrawState& s, int which) {
+    if (t_gs_programs[which]) return t_gs_programs[which];
+    if (t_replaying || t_pipeline_worker) return nullptr;
+    return program_at(which ? s.gs_copy_va : s.es_va);
+}
 const FetchProgram* tess_ls_fetch_program(const DrawState& s) {
     if (t_tess_ls_fetch) return t_tess_ls_fetch;
     if (t_replaying || !s.ls_fetch_va) return nullptr;
@@ -4301,6 +4341,10 @@ struct PipelineRecipe {
         std::uint32_t rsrc1 = 0, rsrc2 = 0, window = 0, control_points = 0;
     };
     std::vector<LsPassRecord> ls_passes;
+    // A geometry-shader pipeline's ES and copy shader, as the build read them
+    // (gs_program; a recipe's build reads these copies).
+    bool has_gs = false;
+    CachedProgram gs_es, gs_copy;
     // The optimized relink's specialization by its first draw (queue_library_relink).
     bool relink = false;
     std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
@@ -4357,6 +4401,7 @@ const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
 // programs, if it has any, can be read where it is built (a worker reads only
 // the copies it was given).
 bool recipe_recordable(const DrawState& s) {
+    if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
 }
@@ -4458,6 +4503,14 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
         r.back = f.back;
         k = fnv1a(&r, sizeof(r), k ^ 0x7710);
     }
+    if (s.gs) {
+        // A geometry-shader pipeline's ES (the GS and its copy shader are in vs_key).
+        const CachedProgram* es = gs_program(s, 0);
+        const std::uint64_t es_hash = es ? es->hash : 0;
+        const std::uint32_t es_regs[3] = {s.es_rsrc1, s.es_rsrc2, s.gs_es_dwords};
+        k = fnv1a(&es_hash, sizeof(es_hash), k ^ 0x65e5);
+        k = fnv1a(es_regs, sizeof(es_regs), k);
+    }
     if (recipe_tessellated(s)) {
         // What the tessellation stages are made from: the draw's state for
         // them and the programs (their words' hashes).
@@ -4540,6 +4593,17 @@ void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<st
             pl.recipe.reset();
             return;
         }
+    }
+    if (s.gs) {
+        const CachedProgram* es = gs_program(s, 0);
+        const CachedProgram* copy = gs_program(s, 1);
+        if (!es || !copy) {
+            pl.recipe.reset();
+            return;
+        }
+        r->has_gs = true;
+        r->gs_es = *es;
+        r->gs_copy = *copy;
     }
     for (int t = 0; t < 8; ++t) r->color_format[t] = s.color[t] ? static_cast<std::uint32_t>(s.color[t]->format) : 0u;
     r->depth_format = s.depth ? static_cast<std::uint32_t>(s.depth->format) : 0u;
@@ -4894,6 +4958,124 @@ VkPipelineLayout tess_native_pipeline_layout(VkDescriptorSetLayout vs, VkDescrip
     return layout;
 }
 
+// ---- geometry-shader pipelines (DrawState::gs) -----------------------------------
+// A draw that binds a geometry shader (the effects' GPU particles: an ES, a GS
+// with its copy shader, a PS) as an ordinary pipeline: the ES lifted as the
+// vertex stage, its ESGS ring dwords its outputs; the GS lifted as the
+// geometry stage, reading them as inputs and writing what its copy shader
+// exports (gcn/lift.h GsLift); the PS as it is. The GS keeps the vertex slot's
+// sets (0, with the pixel shader's 1 and the shared 2 and 3) - its outputs are
+// what the pixel shader reads -, and the ES reads its params block and
+// constant buffers from set 4, as a native hull pipeline's LS: params at 0,
+// buffers from 16.
+
+// The GsLift a geometry-shader draw's stages lift with: its ring shapes, and
+// its copy shader's exports (gcn::parse_gs_copy).
+bool gs_lift_for(const DrawState& s, gcn::GsLift& gl, std::string& why) {
+    const CachedProgram* copy = gs_program(s, 1);
+    if (!copy) {
+        why = "its copy shader is not a known program";
+        return false;
+    }
+    gl.es_dwords = s.gs_es_dwords;
+    gl.max_vertices = s.gs_max_vertices;
+    gl.vertex_dwords = s.gs_vertex_dwords;
+    gl.out_prim = s.gs_out_prim;
+    const gcn::Program cp = gcn::decode(copy->words.data(), copy->words.size());
+    std::string w;
+    if (!gcn::parse_gs_copy(cp, gl.max_vertices, gl.copy, w)) {
+        why = "its copy shader " + copy->name + ": " + w;
+        return false;
+    }
+    return true;
+}
+
+// Set 4's layout for a geometry-shader pipeline's ES: its params block and buffers.
+VkDescriptorSetLayout gs_es_set_layout(const gcn::TranslateResult& es) {
+    std::lock_guard<std::mutex> lk(g_stage_layout_mu);
+    std::vector<VkDescriptorSetLayoutBinding> binds;
+    binds.push_back({kTessNativeLsParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
+    for (const gcn::BufferBinding& b : es.buffers) binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+    std::uint64_t key = 0x65e5e7ull;
+    for (const VkDescriptorSetLayoutBinding& b : binds) {
+        key = fnv1a(&b.binding, sizeof(b.binding), key);
+        key = fnv1a(&b.descriptorType, sizeof(b.descriptorType), key);
+    }
+    if (const auto it = g_stage_set_layouts.find(key); it != g_stage_set_layouts.end()) return it->second;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = static_cast<std::uint32_t>(binds.size());
+    lci.pBindings = binds.data();
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
+    g_stage_set_layouts.emplace(key, layout);
+    return layout;
+}
+
+// A geometry-shader pipeline's ES: lifted as the vertex stage with its own
+// params and buffers in set 4, or the pipeline is not built (`why`).
+bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
+    const CachedProgram* es = gs_program(s, 0);
+    if (!es) {
+        why = "its ES is not a known program";
+        return false;
+    }
+    gcn::GsLift gl;
+    if (!gs_lift_for(s, gl, why)) return false;
+    const gcn::Program prog = gcn::decode(es->words.data(), es->words.size());
+    if (!prog.errors.empty()) {
+        why = "ES decode: " + prog.errors[0].what;
+        return false;
+    }
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Vertex;
+    o.bindless = g.bindless;
+    o.rsrc1 = s.es_rsrc1;
+    o.rsrc2 = s.es_rsrc2;
+    o.exec_known = g.exec_known;
+    o.descriptor_set = kTessNativeSet;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
+    o.cb_binding_base = kTessNativeLsBuffers;
+    o.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
+    const gcn::TranslateResult ref = translate_cached(prog, o);
+    if (!ref.ok()) {
+        why = "ES " + es->name + ": " + ref.errors[0];
+        return false;
+    }
+    if (!ref.images.empty() || !ref.samplers.empty()) {
+        why = "ES " + es->name + " binds images";
+        return false;
+    }
+    gcn::TranslateOptions eo = o;
+    eo.gs_role = gcn::TranslateOptions::GsRole::EsVertex;
+    hlsl_name_next(es->name);
+    gcn::LiftResult lifted = lift_gs_cached(TranslationUse::kLiftEs, prog, eo, ref, gl);
+    if (!lifted.ok()) {
+        why = "ES " + es->name + " not lifted: " + lifted.rejections[0];
+        return false;
+    }
+    name_stage(lifted, ref, es->name);
+    pl.gs_es.fresh() = ref;
+    pl.gs_es.fresh().spirv = std::move(lifted.spirv);
+    pl.gs_es.lifted = true;
+    dump_spirv(pl.name + "-gs-es", pl.gs_es.meta().spirv);
+    if (!make_module(pl.gs_es.meta().spirv, pl.gs_es.module)) {
+        why = "ES module";
+        return false;
+    }
+    pl.tess_set_layout = gs_es_set_layout(pl.gs_es.meta());
+    if (!pl.tess_set_layout) {
+        why = "set 4's layout";
+        return false;
+    }
+    pl.gs_native = true;
+    return true;
+}
+
 // The first time each program's lift for a native hull pipeline is decided.
 bool tess_native_first(const std::string& name) {
     static std::mutex mu;
@@ -5054,6 +5236,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // (BBHOST_LAYOUT_FROM_LEAN): what the tessellation stages were lifted to
     // is decided again below.
     pl.tess_native = false;
+    pl.gs_native = false;
     pl.tess_set_layout = VK_NULL_HANDLE;
     pl.tess_ls.lifted = false;
     pl.tess_hull_lifted = false;
@@ -5234,7 +5417,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // command-processor compiles for no compile saved.
     // A native hull pipeline's vertex input is its LS's: the domain shader in
     // the vertex slot is translated as the ring path's is, without any.
-    const VertexInputPlan* const vs_input = s.tess_native ? nullptr : vertex_input;
+    const VertexInputPlan* const vs_input = s.tess_native || s.gs ? nullptr : vertex_input;
     const bool vs_formats_from_params = vs_input && g_vertex_format_params && use_pipeline_library() &&
                                         gcn::vertex_formats_from_params_supported(vs_input->elements);
     pl.vs_formats_from_params = vs_formats_from_params;
@@ -5254,7 +5437,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // that calls no fetch shader at all (its inputs are the vertex and
     // instance indices), outside tessellation.
     const bool vs_fetchless = fetch_words.empty() && !s.tess_hw && !s.domain_level;
-    const bool vs_decomp = stage_lean && (vertex_input || vs_fetchless) && !s.tess_hw && !s.domain_level && !g_vs_dispatcher && decomp_selects(vs_name);
+    const bool vs_decomp = stage_lean && (vertex_input || vs_fetchless) && !s.tess_hw && !s.domain_level && !s.gs && !g_vs_dispatcher &&
+                           decomp_selects(vs_name);
     // A domain shader on the host's tessellator, its control point as stage
     // attributes: lifted as the evaluation stage (gcn::lift_domain_shader).
     const bool ds_lift = stage_lean && s.tess_hw && s.tess_attrs && (g_lift_tess & kLiftTessDomain) && decomp_selects(vs_name);
@@ -5262,10 +5446,20 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // window's tessellation constants and where they are read are the lift's.
     const bool ds_native = s.tess_native;
     if (ds_native && !stage_lean) return fail("a native hull pipeline with the page-table fallback");
-    std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp || ds_lift || ds_native);
+    // A geometry-shader pipeline lifts its GS as the geometry stage or is not
+    // built: its outputs are its copy shader's.
+    const bool gs_lift = s.gs;
+    if (gs_lift && !stage_lean) return fail("a geometry-shader pipeline with the page-table fallback");
+    std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp || ds_lift || ds_native || gs_lift);
     if (ds_native) {
         vs_key = fnv1a(s.tess_constants, sizeof(s.tess_constants), vs_key ^ 0x7e5a71f3ull);
         vs_key = fnv1a(&s.tess_cb[0], sizeof(s.tess_cb[0]), vs_key);
+    }
+    if (gs_lift) {
+        const CachedProgram* copy = gs_program(s, 1);
+        const std::uint32_t shape[5] = {s.gs_out_prim, s.gs_vertex_dwords, s.gs_max_vertices, s.gs_es_dwords, 0x65};
+        vs_key = fnv1a(shape, sizeof(shape), vs_key ^ 0x65111f7ull);
+        vs_key = fnv1a(copy ? &copy->hash : &s.gs_copy_va, sizeof(std::uint64_t), vs_key);
     }
     pl.vs_key = vs_key;
     const bool vs_cacheable = g_stage_cache_on;
@@ -5276,7 +5470,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
         if (!t_replaying) manifest_note_hit(vs_key);
         if (!t_replaying && !t_pipeline_worker && vs_hit->lifted) hlsl_note_drawn(vs_key);
-        if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
+        if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native && !gs_lift) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -5296,7 +5490,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             note_vs_precompile_miss(vs_name, vs_in);
             note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
             note_first_translation(0, vs_name);
-            note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
+            if (!gs_lift) note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
         }
         if (!t_replaying) {
             std::lock_guard<std::mutex> lk(g_stage_variants.mu);
@@ -5310,7 +5504,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         ++t_stage_translations;
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window && !t_replaying) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
+        if (!vs_in.tess_window && !gs_lift && !t_replaying) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
@@ -5380,8 +5574,29 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             pl.vs.fresh().spirv = std::move(lifted.spirv);
             pl.vs.lifted = true;
         }
+        if (gs_lift) {
+            // The GS as the geometry stage on its copy shader's exports
+            // (gcn::lift_gs_shader), against its translation as a vertex stage.
+            gcn::GsLift gl;
+            std::string why;
+            if (!gs_lift_for(s, gl, why)) return fail("geometry shader " + vs_name + ": " + why);
+            gcn::TranslateOptions go = vo;
+            go.gs_role = gcn::TranslateOptions::GsRole::Geometry;
+            hlsl_name_next(vs_name);
+            gcn::LiftResult lifted = lift_gs_cached(TranslationUse::kLiftGs, vs_prog, go, pl.vs.meta(), gl);
+            if (!lifted.ok()) return fail("geometry shader " + vs_name + " not lifted: " + lifted.rejections[0]);
+            name_stage(lifted, pl.vs.meta(), vs_name);
+            if (tess_native_first(vs_name)) {
+                host_log("render: geometry shader %s lifted as the geometry stage (%zu words; translated %zu; copy shader at 0x%llx, %u vertices)",
+                         vs_name.c_str(), lifted.spirv.size(), pl.vs.meta().spirv.size(), static_cast<unsigned long long>(s.gs_copy_va),
+                         s.gs_max_vertices);
+            }
+            pl.vs.fresh().spirv = std::move(lifted.spirv);
+            pl.vs.lifted = true;
+        }
     }
     if (ds_native && !pl.vs.lifted) return fail("native hull pipeline: its domain shader's cached stage is not a lift");
+    if (gs_lift && !pl.vs.lifted) return fail("geometry-shader pipeline: its GS's cached stage is not a lift");
     if (g_dump_spirv || g_token_user_data_check) {
         table_slots_read(pl.vs.meta(), pl.table_reads[0], &pl.user_reads[0]);
     } else if (cb_no_fallback && g_skip_tables && !t_replaying) {
@@ -5394,6 +5609,17 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!make_module(pl.vs.meta().spirv, pl.vs.module)) return fail("VS module");
         if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
         if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module, pl.vs.lifted);
+    }
+    if (gs_lift) {
+        std::string why;
+        if (!build_gs_es_stage(pl, s, why)) return fail("geometry-shader pipeline: " + why);
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        if (g_gs_pipelines.insert(pl.name).second) {
+            host_log("render: geometry-shader pipeline %s: ES 0x%llx as the vertex stage (%u ring dwords), GS as the geometry stage (%u vertices of %u "
+                     "dwords, %s), copy shader at 0x%llx", pl.name.c_str(), static_cast<unsigned long long>(s.es_va), s.gs_es_dwords,
+                     s.gs_max_vertices, s.gs_vertex_dwords, s.gs_out_prim == 1 ? "line strips" : "triangle strips",
+                     static_cast<unsigned long long>(s.gs_copy_va));
+        }
     }
     // The LS as the pipeline's own vertex stage, so the control
     // point reaches the evaluation stage through the pipeline and no compute
@@ -6585,11 +6811,14 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     t_tess_native_programs[0] = r.has_ls ? &r.ls : nullptr;
     t_tess_native_programs[1] = r.has_hs ? &r.hs : nullptr;
     t_tess_ls_fetch = r.has_ls_fetch ? &r.ls_fetch : nullptr;
+    t_gs_programs[0] = r.has_gs ? &r.gs_es : nullptr;
+    t_gs_programs[1] = r.has_gs ? &r.gs_copy : nullptr;
     build_gfx_pipeline(*pl, s, r.vs_words, r.fetch_words, r.ps_words, r.vs_name, r.ps_name, r.vs_dims, r.ps_dims, r.vs_modes, r.ps_modes,
                        r.cb_no_fallback, vi, false, r.layout_only);
     bool ok = !pl->failed && create_gfx_pipeline(*pl, s, vi, r.fetch_words.size());
     const std::uint64_t key = t_replay_key;
     t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
+    t_gs_programs[0] = t_gs_programs[1] = nullptr;
     t_tess_ls_fetch = nullptr;
     t_library_owner = nullptr;
     t_replaying = false;
@@ -7697,7 +7926,8 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 4;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records (2 and 3 read as well)
+constexpr std::uint32_t kVersion = 5;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records; 5: geometry-shader
+                                       // pipelines (flag 4096: their ES and copy shader); 2-4 read as well
 // A record's flags: a compute record (ComputeRecipe) rather than a pipeline's.
 constexpr std::uint32_t kComputeRecord = 1u << 30;
 using manifest_file::Reader;
@@ -7845,7 +8075,7 @@ void write(Writer& out, const PipelineRecipe& rc) {
     // LS and the hull as it names the others: flags 1024 and 2048).
     w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
           (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
-          (!rc.ls_passes.empty() ? 1024u : 0u));
+          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u));
     for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
                             static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
         w.u32(v);
@@ -7876,6 +8106,20 @@ void write(Writer& out, const PipelineRecipe& rc) {
             if (p.has_fetch) words(w, p.fetch.words);
         }
     }
+    if (rc.has_gs) {
+        // A geometry-shader pipeline (version 5, flag 4096): flags (1 its ES
+        // named, 2 its copy shader named: a list's), the ES's registers, the
+        // rings' shapes and the programs' addresses, then the ES and the copy
+        // shader as the others are.
+        w.u32(0u);
+        for (std::uint32_t v : {s.es_rsrc1, s.es_rsrc2, s.gs_out_prim, s.gs_vertex_dwords, s.gs_max_vertices, s.gs_es_dwords}) w.u32(v);
+        pod(w, s.es_va);
+        pod(w, s.gs_copy_va);
+        for (const CachedProgram* cp : {&rc.gs_es, &rc.gs_copy}) {
+            words(w, cp->words);
+            str(w, cp->name);
+        }
+    }
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
@@ -7889,6 +8133,33 @@ bool program_from_game(const std::string& name, std::uint32_t count, std::uint64
     shader_patch_apply(name, code.words);
     if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
     out = std::move(code.words);
+    return true;
+}
+// A geometry shader's copy shader a list names (by its container's name, as
+// its footer names it): the program after the container's first footer, as
+// long as its own footer says, patched as the GS's would be.
+bool copy_program_from_game(const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+    gcn::ShaderCode code;
+    if (!c || !gcn::shader_code(*c, code)) return false;
+    const std::vector<std::uint8_t>& d = *c;
+    const std::size_t at = code.footer + 0x1c;
+    std::size_t second = 0;
+    for (std::size_t i = at; i + 28 <= d.size(); i += 4) {
+        if (std::memcmp(d.data() + i, "OrbShdr", 7) == 0) {
+            second = i;
+            break;
+        }
+    }
+    if (!second) return false;
+    std::uint32_t lenfield;
+    std::memcpy(&lenfield, d.data() + second + 8, 4);
+    const std::size_t length = lenfield >> 8;
+    if (!length || length % 4 || at + length > second) return false;
+    std::vector<std::uint32_t> w(length / 4);
+    std::memcpy(w.data(), d.data() + at, length);
+    if (w.size() != count || fnv1a(w.data(), w.size() * 4) != hash) return false;
+    out = std::move(w);
     return true;
 }
 bool read(Reader& in, PipelineRecipe& rc) {
@@ -8058,6 +8329,32 @@ bool read(Reader& in, PipelineRecipe& rc) {
             p.fetch.hash = fnv1a(p.fetch.words.data(), p.fetch.words.size() * 4);
         }
         rc.ls_passes.push_back(std::move(p));
+    }
+    // A geometry-shader pipeline (version 5, flag 4096).
+    if (tf & 4096) {
+        const std::uint32_t gf = r.u32();
+        for (std::uint32_t* v : {&s.es_rsrc1, &s.es_rsrc2, &s.gs_out_prim, &s.gs_vertex_dwords, &s.gs_max_vertices, &s.gs_es_dwords}) *v = r.u32();
+        pod(r, s.es_va);
+        pod(r, s.gs_copy_va);
+        for (CachedProgram* cp : {&rc.gs_es, &rc.gs_copy}) {
+            const bool ref = cp == &rc.gs_es ? (gf & 1) : (gf & 2);
+            std::uint32_t count = 0;
+            std::uint64_t hash = 0;
+            if (ref) {
+                count = r.u32();
+                pod(r, hash);
+            } else {
+                words(r, cp->words);
+            }
+            if (!str(r, cp->name)) return false;
+            if (ref && !(cp == &rc.gs_es ? from_bundle(cp->name, count, hash, cp->words) : copy_program_from_game(cp->name, count, hash, cp->words)))
+                return false;
+            cp->hash = fnv1a(cp->words.data(), cp->words.size() * 4);
+            cp->fetch_sgpr = -1;
+            std::memset(cp->head, 0, sizeof(cp->head));
+        }
+        s.gs = true;
+        rc.has_gs = true;
     }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
@@ -8422,10 +8719,14 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
             stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
             stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
             stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
+        } else if (pl.gs_native) {
+            // A geometry-shader pipeline: the ES the vertex stage, `vs` the GS.
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.gs_es.module);
+            stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.vs.module);
         } else {
             stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
         }
-        if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
+        if (pl.gs.module && !pl.gs_native) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
         if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
     };
     collect_stages();
@@ -8434,14 +8735,14 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
     // buffers) is built whole: its layout has a set past the shared ones,
     // which the fragment library a pixel shader shares does not.
-    const bool linked = use_pipeline_library() && pl.layout && !pl.tess_set_layout;
+    const bool linked = use_pipeline_library() && pl.layout && !pl.tess_set_layout && !pl.gs_native;
     const char* const owner = t_library_owner;
     t_library_owner = pl.name.c_str();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ps_wave{};
     const bool ps_sized = !linked && pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    if (vertex_input) {  // Vulkan vertex input
+    if (vertex_input && !pl.gs_native) {  // Vulkan vertex input (a geometry-shader pipeline's ES reads its buffers itself)
         vi.vertexBindingDescriptionCount = static_cast<std::uint32_t>(vertex_input->bindings.size());
         vi.pVertexBindingDescriptions = vertex_input->bindings.data();
         vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(vertex_input->attributes.size());
@@ -8730,6 +9031,9 @@ struct LeanBuildJob {
     // (program_at is its own) for build_tess_native_stages on the worker.
     bool tess_programs = false;
     CachedProgram tess_ls, tess_hs;
+    // A geometry-shader pipeline's ES and copy shader, copied the same way.
+    bool gs_programs = false;
+    CachedProgram gs_es, gs_copy;
 };
 struct LeanBuilders {
     std::mutex mu;
@@ -8757,9 +9061,12 @@ LeanBuilders& lean_builders() {
                     t_pipeline_worker = true;
                     t_tess_native_programs[0] = j.tess_programs ? &j.tess_ls : nullptr;
                     t_tess_native_programs[1] = j.tess_programs ? &j.tess_hs : nullptr;
+                    t_gs_programs[0] = j.gs_programs ? &j.gs_es : nullptr;
+                    t_gs_programs[1] = j.gs_programs ? &j.gs_copy : nullptr;
                     build_gfx_pipeline(*j.variant, j.s, j.vs_words, j.fetch_words, j.ps_words, j.vs_name, j.ps_name, j.vs_dims, j.ps_dims,
                                        j.vs_modes, j.ps_modes, true, j.has_vertex_input ? &j.vertex_input : nullptr);
                     t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
+                    t_gs_programs[0] = t_gs_programs[1] = nullptr;
                     std::lock_guard<std::mutex> lk(w->mu);
                     w->done.emplace_back(j.base, j.variant);
                     g_lean_builds_ready.store(true, std::memory_order_relaxed);
@@ -8780,12 +9087,18 @@ void queue_pipeline_build(GfxPipeline& base, GfxPipeline& variant, const DrawSta
                           const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                           const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
                           const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input,
-                          const CachedProgram* tess_ls = nullptr, const CachedProgram* tess_hs = nullptr) {
+                          const CachedProgram* tess_ls = nullptr, const CachedProgram* tess_hs = nullptr,
+                          const CachedProgram* gs_es = nullptr, const CachedProgram* gs_copy = nullptr) {
     auto job = std::make_unique<LeanBuildJob>();
     if (tess_ls && tess_hs) {
         job->tess_programs = true;
         job->tess_ls = *tess_ls;
         job->tess_hs = *tess_hs;
+    }
+    if (gs_es && gs_copy) {
+        job->gs_programs = true;
+        job->gs_es = *gs_es;
+        job->gs_copy = *gs_copy;
     }
     job->base = &base;
     job->variant = &variant;
@@ -8865,6 +9178,23 @@ void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vec
     GfxPipeline& entry = g_gfx[key];
     queue_pipeline_build(entry, entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input,
                          program_at(s.ls_va), program_at(s.hs_va));
+}
+// Under g.mu: a geometry-shader pipeline (DrawState::gs) built by a worker the
+// same way - its lifts and its compile off the command processor, no stall at
+// its first sight; until the worker is done its draws go as VS/PS (gs_draw).
+// False where its programs are not known (the draw is refused).
+bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<std::uint32_t>& vs_words, const std::vector<std::uint32_t>& ps_words,
+                       const std::string& vs_name, const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                       const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                       const std::vector<bool>& ps_modes) {
+    const CachedProgram* es = program_at(s.es_va);
+    const CachedProgram* copy = program_at(s.gs_copy_va);
+    if (!es || !copy) return false;
+    static const std::vector<std::uint32_t> no_fetch;
+    GfxPipeline& entry = g_gfx[key];
+    queue_pipeline_build(entry, entry, s, vs_words, no_fetch, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, nullptr, nullptr, nullptr,
+                         es, copy);
+    return true;
 }
 
 // ---- pass management ------------------------------------------------------------
@@ -10201,6 +10531,18 @@ void render_report() {
                  static_cast<unsigned long long>(g_tess_hull_draws.load()), static_cast<unsigned long long>(g_tess_hull_patches.load()),
                  tess_lds_bound() ? "bounded to their window and region (BBHOST_TESS_LDS_BOUND=0: unchecked)"
                                   : "unchecked (BBHOST_TESS_LDS_BOUND=0)");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        if (g_gs_drawn.load() || !g_gs_refused.empty() || !g_gs_as_vs.empty()) {
+            std::string refused, as_vs;
+            for (const auto& [why, n] : g_gs_refused) refused += (refused.empty() ? "" : ", ") + why + " x" + std::to_string(n);
+            for (const auto& [prog, n] : g_gs_as_vs) as_vs += (as_vs.empty() ? "" : ", ") + prog + " x" + std::to_string(n);
+            host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused: %s; drawn as VS/PS (nothing "
+                     "drawn), by program: %s",
+                     static_cast<unsigned long long>(g_gs_drawn.load()), g_gs_pipelines.size(), refused.empty() ? "none" : refused.c_str(),
+                     as_vs.empty() ? "none" : as_vs.c_str());
+        }
     }
     host_log("render: targets re-created in another format: %llu with their pixels carried over, %llu with them lost (another size "
              "or texel size), %llu of those starting with the fill their old image had last taken; new targets nothing "
@@ -14600,6 +14942,33 @@ bool tess_native_refuse(const char* why, bool this_draw_only = false) {
 }
 // Its native pipeline is being built (queue_native_pipeline): this draw
 // takes the LS pass, and the programs are not held against it.
+// Geometry-shader draws (gs_draw): draw_impl is drawing one as its own
+// pipeline, and its answer - why it refused, nothing of the draw recorded.
+thread_local bool t_gs_draw = false;
+thread_local const char* t_gs_refusal = nullptr;
+bool gs_refuse(const char* why) {
+    t_gs_refusal = why;
+    return false;
+}
+// The program a draw's geometry-shader object runs, by name (under g.mu).
+std::string gs_program_name(const GxDrawObjects& o, const GpuDrawInputs* in) {
+    std::uint64_t va = 0;
+    if (in && in->gs) {
+        va = (static_cast<std::uint64_t>(in->gs_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(in->gs_pgm[0]) << 8);
+    } else if (o.shader[3] && hle_kernel_va_mapped(o.shader[3] + 0x100, 8)) {
+        const std::uint64_t gnm = *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(o.shader[3] + 0x100));
+        if (gnm && hle_kernel_va_mapped(gnm + 8, 8)) {
+            const auto* r = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(gnm + 8));
+            va = (static_cast<std::uint64_t>(r[1] & 0xff) << 40) | (static_cast<std::uint64_t>(r[0]) << 8);
+        }
+    }
+    const CachedProgram* cp = va ? program_at(va) : nullptr;
+    if (cp) return cp->name;
+    char b[32];
+    std::snprintf(b, sizeof(b), "0x%llx", static_cast<unsigned long long>(va));
+    return b;
+}
+
 bool tess_native_wait() {
     tess_native_refuse("its native pipeline is being built", true);
     t_tess_native_pending = true;
@@ -16006,7 +16375,26 @@ bool host_gpu_draw(const GpuDraw& d) {
             if (d.gx) g_token_with_gx.fetch_add(1, std::memory_order_relaxed);
             if (d.gx && d.gx->tess) g_token_tess.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!(gi ? gi->stages & 0x7 : d.ctx[0x2d5] & 0x7)) return draw_impl(d);
+        if (!(gi ? gi->stages & 0x7 : d.ctx[0x2d5] & 0x7)) {
+            // A draw that binds a geometry shader (BBHOST_GX_GS): as a pipeline
+            // of its own, or - refused (a stage the lift does not take, a
+            // buffer that does not bind) - as GX's VS and PS, as before.
+            if (d.gx && d.gx_render && !d.gx_partial && d.gx->gs && d.gx_objects && d.gx_objects->shader[3]) {
+                t_gs_draw = true;
+                t_gs_refusal = nullptr;
+                const bool ok = draw_impl(d);
+                t_gs_draw = false;
+                const char* const why = t_gs_refusal;
+                t_gs_refusal = nullptr;
+                if (!why) {
+                    g_gs_drawn.fetch_add(1, std::memory_order_relaxed);
+                    return ok;
+                }
+                std::lock_guard<std::mutex> lk(g_gs_mu);
+                if (g_gs_refused[why]++ == 0) host_log("render: a draw that binds a geometry shader goes as VS/PS: %s", why);
+            }
+            return draw_impl(d);
+        }
     }
     g.draw_calls.fetch_add(1, std::memory_order_relaxed);
     static const bool tess_on = [] {  // BBHOST_TESS=0: tessellated draws are skipped, as before 2026-09-19
@@ -16234,6 +16622,23 @@ static bool draw_impl(const GpuDraw& d) {
     s.ps_rsrc2 = in.ps_pgm[3];
     std::memcpy(s.vs_user, in.vs_user, sizeof(s.vs_user));
     std::memcpy(s.ps_user, in.ps_user, sizeof(s.ps_user));
+    // A draw that binds a geometry shader, drawn as its own pipeline
+    // (gs_draw): the GS in the vertex slot, the ES the pipeline's vertex stage.
+    if (t_gs_draw && in.gs && !t_tess) {
+        s.gs = true;
+        s.es_va = s.vs_va;
+        s.es_rsrc1 = s.vs_rsrc1;
+        s.es_rsrc2 = s.vs_rsrc2;
+        s.vs_va = (static_cast<std::uint64_t>(in.gs_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(in.gs_pgm[0]) << 8);
+        s.vs_rsrc1 = in.gs_pgm[2];
+        s.vs_rsrc2 = in.gs_pgm[3];
+        s.gs_copy_va = (static_cast<std::uint64_t>(in.gs_copy_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(in.gs_copy_pgm[0]) << 8);
+        s.gs_out_prim = in.gs_out_prim;
+        s.gs_vertex_dwords = in.gs_vertex_dwords;
+        s.gs_max_vertices = in.gs_max_vertices;
+        s.gs_es_dwords = in.gs_es_dwords;
+        std::memset(s.vs_user, 0, sizeof(s.vs_user));  // the GS's, from its records
+    }
     // A tessellated draw's patches become triangles (draw_tessellated), unless
     // the host's own tessellator draws them, when they stay a patch list.
     s.prim = t_tess ? (t_tess->hw ? 9u : 4u) : in.prim;
@@ -16532,6 +16937,11 @@ static bool draw_impl(const GpuDraw& d) {
     s.vs_out_cntl = in.vs_out_cntl;
     s.program_fp = in.program_fp;
     std::memcpy(s.ps_input_cntl, in.ps_input_cntl, sizeof(s.ps_input_cntl));
+    if (s.gs) {  // the pixel shader reads the copy shader's outputs: the GS's in the lift
+        s.vs_out_cntl = in.gs_vs_out_cntl;
+        s.program_fp = 0;  // the draw's fingerprint is the ES's linkage
+        std::memcpy(s.ps_input_cntl, in.gs_ps_input_cntl, sizeof(s.ps_input_cntl));
+    }
     std::memcpy(s.vport, in.vport, sizeof(s.vport));
     bool any_color = false;
     for (int t = 0; t < 8; ++t) any_color |= s.color[t] != nullptr;
@@ -16581,7 +16991,7 @@ static bool draw_impl(const GpuDraw& d) {
     // else by code address.
     const FetchProgram* fetch = nullptr;  // the fetch shader, when the VS takes one
     const GxDrawObjects* ids = d.gx && d.gx_render && !d.gx_partial ? d.gx_objects : nullptr;
-    CachedProgram* vs_cp = program_for(ids ? ids->vs_prog_id : 0, s.vs_va);
+    CachedProgram* vs_cp = program_for(ids && !s.gs ? ids->vs_prog_id : 0, s.vs_va);
     if (!vs_cp) {
         draw_failed(kFailVsProgram);
         return false;
@@ -16604,6 +17014,13 @@ static bool draw_impl(const GpuDraw& d) {
     if (s.ps_va && !ps_cp) {
         draw_failed(kFailPsProgram);
         return false;
+    }
+    if (!s.gs && d.gx_objects && d.gx_objects->shader[3]) {
+        // A draw that binds a geometry shader, drawn as GX's VS and PS: its ES
+        // exports no position, so nothing of it is drawn. By GS program.
+        const std::string key = gs_program_name(*d.gx_objects, d.gx) + " with ES " + vs_cp->name;
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        if (g_gs_as_vs[key]++ == 0) host_log("render: a draw that binds geometry shader %s is drawn as VS/PS", key.c_str());
     }
     const std::vector<std::uint32_t>& vs_words = vs_cp->words;
     const std::string& vs_name = vs_cp->name;
@@ -16741,7 +17158,7 @@ static bool draw_impl(const GpuDraw& d) {
     }();
     t_snapshot_cbs = sf_snapshot && d.gx_token && d.gx_token_kind && std::strcmp(d.gx_token_kind, "scaleform") == 0;
     const GxDrawRecords* gx_records = d.gx && d.gx_render && d.gx_objects ? d.gx_objects->records : nullptr;
-    const GxStageRecords* gx_stage[2] = {gx_records ? &gx_records->stage[0] : nullptr, gx_records ? &gx_records->stage[1] : nullptr};
+    const GxStageRecords* gx_stage[2] = {gx_records ? &gx_records->stage[s.gs ? kGxRecordGs : 0] : nullptr, gx_records ? &gx_records->stage[1] : nullptr};
     if (glitch_on()) {
         std::snprintf(t_draw_origin, sizeof(t_draw_origin), "%s token, gx inputs %s, gx_render %s, objects %s, records %s, partial %s, "
                       "called at flip %llu (now %llu)",
@@ -16889,12 +17306,25 @@ static bool draw_impl(const GpuDraw& d) {
         }
         if (built && built->building) return tess_native_wait();
     }
-    const bool layout_only = !tess_native && lean_first && g_layout_from_lean && !gfx_lookup(key);
+    // A geometry-shader pipeline is its own no-fallback variant, lifted: built by
+    // a worker (queue_gs_pipeline), the draw going as VS/PS until it is.
+    const bool gs_native = s.gs;
+    if (gs_native) {
+        GfxPipeline* const built = gfx_lookup(key);
+        if (!built && g_async_pipelines && !g_dump_spirv && !g_token_user_data_check) {
+            if (!queue_gs_pipeline(key, s, vs_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes))
+                return gs_refuse("its ES or copy shader is not a known program");
+            return gs_refuse("its pipeline is being built");
+        }
+        if (built && built->building) return gs_refuse("its pipeline is being built");
+    }
+    const bool layout_only = !tess_native && !gs_native && lean_first && g_layout_from_lean && !gfx_lookup(key);
     if (layout_only) g_fallbacks_deferred.fetch_add(1, std::memory_order_relaxed);
-    GfxPipeline& pl = gfx_pipeline(s, key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
-                                   vs_sampler_modes, ps_sampler_modes, tess_native, vertex_plan, tess_native || !lean_first, layout_only);
+    GfxPipeline& pl = gfx_pipeline(s, key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes,
+                                   tess_native || gs_native, vertex_plan, tess_native || gs_native || !lean_first, layout_only);
     pipeline_timer.next(kPhaseBind);
     if (tess_native && (pl.failed || !pl.tess_native || !pl.pipeline)) return tess_native_refuse("its native pipeline was not built");
+    if (gs_native && (pl.failed || !pl.gs_native || !pl.pipeline)) return gs_refuse("its pipeline was not built");
     // An LS pass the command processor had to build for this draw (no recipe
     // held it) joins the recipe of the pipeline drawing it: a take or a build
     // adds only the first draw's pass, and one pipeline meets several (the
@@ -18127,6 +18557,44 @@ static bool draw_impl(const GpuDraw& d) {
         for (std::size_t i = 0; i < lm.buffers.size(); ++i) put(lm.buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ls_first + i);
         for (std::size_t i = 0; i < hm.buffers.size(); ++i) put(hm.buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, hs_first + i);
     }
+    // A geometry-shader pipeline's set 4: the ES's params block and constant
+    // buffers, its user data from its GX records (GX's VS's, slot 0) over what
+    // the draw's inputs hold. Every buffer of its three stages binds, or the
+    // draw goes as VS/PS (gs_draw).
+    if (pl.gs_native) {
+        if (!all_bound) return gs_refuse("a constant buffer of its GS or pixel shader does not bind");
+        const GxStageRecords* es_rec = gx_records ? &gx_records->stage[0] : nullptr;
+        GxUserData eu;
+        if (!es_rec || build_gx_user_data(*es_rec, eu, ~0u) != kUserBuilt) return gs_refuse("its ES's user data is not built from its records");
+        const gcn::TranslateResult& em = pl.gs_es.meta();
+        gcn::StageParams ep{};
+        ep.l1_table = g.l1.address;
+        for (int k = 0; k < 16; ++k) ep.user_sgpr[k] = (eu.set >> k) & 1 ? eu.user[k] : in.vs_user[k];
+        std::memcpy(s.es_user, ep.user_sgpr, sizeof(s.es_user));
+        const std::size_t es_first = buffer_infos.size();
+        resolve_stage_buffers(em, ep.user_sgpr, ep, buffer_infos);
+        if (!every_buffer_bound(ep, em)) return gs_refuse("a constant buffer of its ES does not bind");
+        tess_set = alloc_set_locked(pl.tess_set_layout);
+        if (!tess_set) return gs_refuse("no descriptor set for its ES");
+        set4_pl = &pl;
+        VkDescriptorBufferInfo eubi{};
+        alloc_params_slot_locked(ep, eubi);
+        tess_set_offsets[0] = static_cast<std::uint32_t>(eubi.offset);
+        tess_set_dynamic = set_cache_on() ? 1 : 0;
+        const std::size_t params_at = buffer_infos.size();
+        buffer_infos.push_back(set_cache_on() ? g_params_desc : eubi);  // dynamic: the offset above selects the block
+        const auto put = [&](std::uint32_t binding, VkDescriptorType type, std::size_t info) {
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = tess_set;
+            w.dstBinding = binding;
+            w.descriptorCount = 1;
+            w.descriptorType = type;
+            w.pBufferInfo = &buffer_infos[info];
+            writes.push_back(w);
+        };
+        put(kTessNativeLsParams, params_descriptor_type(), params_at);
+        for (std::size_t i = 0; i < em.buffers.size(); ++i) put(em.buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, es_first + i);
+    }
     // From here the draw's descriptor writes and commands go to the recorder
     // thread (recorder.cpp), except while something that must see them in
     // place is on: NVIDIA's checkpoints, GPU profiling, a draw capture. AMD's
@@ -18146,7 +18614,7 @@ static bool draw_impl(const GpuDraw& d) {
     // page-table fallback, where the driver can drop the walks and the V#
     // loads that only fed them. Same bindings, so the sets written above fit.
     GfxPipeline* bind_pl = &pl;
-    if (g.cb_lean && any_buffers && all_bound && !pl.tess_native) {  // a native hull pipeline is its own
+    if (g.cb_lean && any_buffers && all_bound && !pl.tess_native && !pl.gs_native) {  // a native hull or geometry-shader pipeline is its own
         if (!pl.lean_variant && !pl.lean_building) {
             const std::uint64_t lean_key = fnv1a("cb-lean", 7, key);
             // A worker builds the variant only while a created fallback can draw
@@ -20457,6 +20925,15 @@ bool write_target_image(const TargetPixels& t) {
                     note_float(k, half_to_float(h[k]));
                     row[x * 3 + k] = tone8(half_to_float(h[k]));
                 }
+            } else if (fmt == VK_FORMAT_R16G16_SFLOAT) {
+                // Two channels (the water wave target): red and green.
+                std::uint16_t h[2];
+                std::memcpy(h, p, 4);
+                for (int k = 0; k < 2; ++k) {
+                    note_float(k, half_to_float(h[k]));
+                    row[x * 3 + k] = tone8(half_to_float(h[k]));
+                }
+                row[x * 3 + 2] = 0;
             } else if (fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
                 std::uint32_t v;
                 std::memcpy(&v, p, 4);
@@ -20520,7 +20997,7 @@ bool write_target_image(const TargetPixels& t) {
                      static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
         }
     }
-    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
                  static_cast<unsigned long long>(finf[2]), static_cast<unsigned long long>(fnan[0]),

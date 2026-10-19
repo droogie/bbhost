@@ -77,6 +77,20 @@ struct GpuDrawInputs {
     std::uint32_t ls_hs_config = 0;  // VGT_LS_HS_CONFIG
     std::uint32_t tf_param = 0;      // VGT_TF_PARAM
     std::uint32_t hos_max = 0, hos_min = 0;
+    // A draw that binds a geometry shader (BBHOST_GX_GS, gcn/lift.h GsLift),
+    // from its GX objects: `gs` says the rest of these are set. vs_* and the
+    // PS linkage above stay the ES's - what the draw is drawn with where the
+    // GS's pipeline is not made (today's VS/PS) - and these are the GS's: its
+    // stage registers, its copy shader's program and PA_CL_VS_OUT_CNTL, the
+    // PS inputs linked to the copy shader's outputs (as GX links them to a
+    // VS's), its output primitive, GSVS vertex size and most vertices, and
+    // the ES's ring vertex size. Its records are stage[kGxRecordGs].
+    bool gs = false;
+    std::uint32_t gs_pgm[4] = {};       // SPI_SHADER_PGM_LO/HI/RSRC1/RSRC2_GS
+    std::uint32_t gs_copy_pgm[2] = {};  // the copy shader's SPI_SHADER_PGM_LO/HI_VS
+    std::uint32_t gs_vs_out_cntl = 0;
+    std::uint32_t gs_ps_input_cntl[32] = {};
+    std::uint32_t gs_out_prim = 0, gs_vertex_dwords = 0, gs_max_vertices = 0, gs_es_dwords = 0;
     std::uint32_t prim = 0;              // VGT_PRIMITIVE_TYPE
     std::uint32_t target_mask = 0;       // CB_TARGET_MASK
     std::uint32_t cb_shader_mask = 0;    // CB_SHADER_MASK
@@ -268,10 +282,12 @@ struct GxDrawRecords {
     // [3] the hull shader of a tessellated draw: the Forbidden Woods' meshes
     // run the game's own hull (3 control points, computed factors), which
     // needs its user data - its tessellation constants - built like the LS's.
+    // In a draw that binds a geometry shader (GpuDrawInputs::gs), which has
+    // no hull, [3] is the GS's (kGxRecordGs) and [0] stays GX's VS's - the ES.
     GxStageRecords stage[4];
 };
 constexpr int kGxRecords = 4;
-constexpr int kGxRecordSet0 = 0, kGxRecordPixel = 1, kGxRecordLs = 2, kGxRecordHs = 3;
+constexpr int kGxRecordSet0 = 0, kGxRecordPixel = 1, kGxRecordLs = 2, kGxRecordHs = 3, kGxRecordGs = 3;
 
 // Creates the Vulkan instance/device. `instance_exts` are extra instance
 // extensions (the window's surface extensions); `want_present` adds the

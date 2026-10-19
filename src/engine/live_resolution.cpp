@@ -667,6 +667,41 @@ bool install_scene_both_sides() {
     return true;
 }
 
+// ---- WaterWaveTarget at the render size -----------------------------------------
+//
+// A scene context that draws water (+0x48 bit 15) makes its wave target in
+// Initialize (sub_26c39f0) - the object at +0xf50 (sub_2666890: an R16G16
+// float texture, GX format 0x22, one mip; the texture at +0xf68 is the one
+// the debug list names WaterWaveTarget) - at half the context's size (shr
+// esi, 1 / shr edx, 1 at 0x26c4f5a) over the context's half-size depth
+// (+0x2520). Each frame it is cleared to 0.5 (no offset), the effects' water
+// ripples (GXFfxtexture quads, depth tested, not written) are drawn into it,
+// and the water surfaces (GXFlver_WaterBumpTri) read it at their screen
+// positions - so at half size the ripples came out at half the picture's
+// sharpness. Here it is made at the context's own size over its full-size
+// depth (+0x150), which every other full-size target of the context takes;
+// Initialize runs again at each live change, so it follows the resolution as
+// they do. It costs 3 bytes a pixel more (6 MiB at 1920x1080).
+// BBHOST_WATER_WAVE_FULL=0 keeps the game's half size.
+constexpr std::uint64_t kWaterWaveSite = 0x26c4f5a;
+constexpr std::uint8_t kWaterWaveGame[11] = {0xd1, 0xee, 0xd1, 0xea, 0x4d, 0x8b, 0x85, 0x20, 0x25, 0x00, 0x00};  // shr esi; shr edx; mov r8, [r13+0x2520]
+constexpr std::uint8_t kWaterWaveFull[11] = {0x66, 0x90, 0x66, 0x90, 0x4d, 0x8b, 0x85, 0x50, 0x01, 0x00, 0x00};  // nop; nop; mov r8, [r13+0x150]
+
+bool g_water_wave_full = false;  // install_water_wave_full() went in
+bool install_water_wave_full() {
+    if (const char* e = std::getenv("BBHOST_WATER_WAVE_FULL"); e && e[0] == '0') {
+        host_log("resolution: the water wave target keeps the game's half size (BBHOST_WATER_WAVE_FULL=0)");
+        return false;
+    }
+    if (std::memcmp(guest_ptr(g_image->mem, guest(kWaterWaveSite)), kWaterWaveGame, sizeof(kWaterWaveGame)) != 0) {
+        host_log("resolution: the scene context's water wave target code is not as expected; it keeps the game's half size");
+        return false;
+    }
+    if (!code_write(kWaterWaveSite, kWaterWaveFull, sizeof(kWaterWaveFull))) return false;
+    host_log("resolution: the water wave target is made at the render size");
+    return g_water_wave_full = true;
+}
+
 // ---- DefDepthStencil at the render size -----------------------------------------
 //
 // The GX init makes DefDepthStencil (the output entry's +0x70) at the size
@@ -1040,7 +1075,10 @@ std::uint64_t g_live_max_px = ~0ull;  // the most pixels a live change may have
 std::uint64_t gfx_heap_more_mib(std::uint64_t px) {
     if (px <= kPx1080) return 0;
     const double mp = static_cast<double>(px - kPx1080) / 1e6;
-    const auto mib = static_cast<std::uint64_t>(std::ceil((270.0 * mp + 256.0) / 64.0)) * 64;
+    // The full-size water wave target (R16G16 float, install_water_wave_full)
+    // costs 3 bytes a pixel more than the game's quarter.
+    const double per_mp = 270.0 + (g_water_wave_full ? 3.0 : 0.0);
+    const auto mib = static_cast<std::uint64_t>(std::ceil((per_mp * mp + 256.0) / 64.0)) * 64;
     return std::max(mib, kFitsInDmemMiB);
 }
 
@@ -1130,6 +1168,7 @@ bool live_resolution_install(ElfImage* image) {
         max_h = std::min<std::uint32_t>(max_h, 1080);
     }
     const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
+    install_water_wave_full();  // at any size, live changes or not (before the heap's size, which counts it)
     grow_gfx_heap(image, !live ? start_px : live_px);
     if (tight)
         host_log("resolution: live changes up to %.1f million pixels, the GPU's memory is tight (larger sizes apply at the next start)",

@@ -130,11 +130,20 @@ int main() {
     const Ps x = make_ps({1, 0, 2, 3}), y = make_ps({2, 1, 0, 3}), z = make_ps({3, 2, 1, 0});
     hlsl_lane(kHlslLaneCreated);
     (void)lift_cached(false, x.prog, x.o, x.ref);  // taken at once, waiting for the start
-    for (int i = 0; i < 100; ++i) {
-        std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
-        if (g_hlsl_behind.jobs[kHlslLaneCreated].empty()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Until bb-hlsl has taken x, which the busy probe then holds: the lanes
+    // below are only what the test says once it has. The queue's lock is held
+    // to look, never across the sleep - sleeping with it kept a worker that
+    // had not run before the first look from ever taking x (a loaded CI
+    // runner), and the checks below then found x still queued.
+    bool x_taken = false;
+    for (int i = 0; i < 6000 && !x_taken; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
+            x_taken = g_hlsl_behind.jobs[kHlslLaneCreated].empty() && g_hlsl_behind.waiting == 0;
+        }
+        if (!x_taken) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    CHECK(x_taken);
     (void)lift_cached(false, y.prog, y.o, y.ref);
     hlsl_tag_stage(0x1234);  // the stage cache's key for y's stage
     hlsl_lane(kHlslLaneDrawn);

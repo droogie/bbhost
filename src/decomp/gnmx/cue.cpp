@@ -8,10 +8,11 @@
 // out before a draw; around the draw:
 //
 //   - the pre-draw: the constant command buffer waits for the draw engine
-//     (WAIT_ON_DE_COUNTER_DIFF, written as nothing: the constant engine is
-//     dead, decomp/gx/constant_engine.cpp); the pixel shader's input table
-//     written when the pixel or vertex shader changed (the table the vertex
-//     shader's outputs and the pixel shader's inputs make, or one given);
+//     (WAIT_ON_DE_COUNTER_DIFF, the game's packet in every mode: the NOP
+//     below goes over it, decomp/gx/constant_engine.cpp); the pixel
+//     shader's input table written when the pixel or vertex shader changed
+//     (the table the vertex shader's outputs and the pixel shader's inputs
+//     make, or one given);
 //     for each stage in use - Gnm's stages 1 and 2 (pixel, vertex), 3 and 4
 //     (geometry, export) under the engine's flag 0x20, 5 and 6 (hull, local)
 //     under flag 1 - the shader's prefetch and its dirty resources
@@ -127,7 +128,7 @@ DECOMP_LEAF void gnmx_cue_pre_draw(u64 cue) {
         game_function<One>(kCeIncrement)(load<u64>(cue + kCcb));
         game_function<One>(kDeWaitOnCe)(load<u64>(cue + kDcb));
     }
-    if (!load<u8>(cue + kCeUsed)) {
+    if (!load<u8>(cue + kCeUsed) && !MUTANT(4)) {
         ccb[2] -= MUTANT(2) ? 4 : 8;
         game_function<Two>(kNop)(reinterpret_cast<u64>(ccb), 2);
     }

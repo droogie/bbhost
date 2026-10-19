@@ -34,7 +34,7 @@ namespace gpu {
 // SPIR-V and the result has none, taken from the cache or not. The lifts'
 // entries are kept under uses of their own (lift_cached).
 enum class TranslationUse : std::uint8_t { kStage = 0, kPaths = 1, kLiftPixel = 2, kLiftVertex = 3, kLiftLs = 4, kLiftDomain = 5, kLiftHull = 6,
-                                           kLiftCompute = 7, kHlsl = 8 };
+                                           kLiftCompute = 7, kHlsl = 8, kLiftEs = 9, kLiftGs = 10 };
 
 // gcn::translate through the cache.
 gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o,
@@ -53,6 +53,10 @@ gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::Transla
 // kLiftDomain) the same way, keyed on its TessLift too.
 gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
                                  const gcn::TessLift& tess);
+// A geometry-shader draw's ES (kLiftEs, gcn::lift_es_shader) or GS (kLiftGs,
+// gcn::lift_gs_shader) the same way, keyed on its GsLift too.
+gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
+                               const gcn::GsLift& gs);
 
 // HLSL, on by default: every lift lift_cached, lift_compute_cached and
 // lift_tess_cached return is printed as HLSL (gcn/hlsl.h) and compiled by DXC

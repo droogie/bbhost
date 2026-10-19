@@ -23,7 +23,11 @@ tessellator's LS passes (version 3): each LS is named like the other programs.
 Version 4 adds compute records: a dispatch's compute pipeline (its program,
 named the same way in a list, its resource registers, thread counts and the
 images and samplers its key was made from), which a start builds before the
-dispatch - the title's own compute shaders among them.
+dispatch - the title's own compute shaders among them. Version 5 adds
+geometry-shader pipelines (the GPU particles: their ES and their GS's copy
+shader beside the GS, which is the record's vertex program); a list names the
+ES like the others, and the copy shader by its GS's container, which holds it
+after its first footer.
 
   pipeline_list.py stats <file>...
   pipeline_list.py merge --out <manifest> <manifest>...
@@ -44,12 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shaderbnd  # noqa: E402
 
 MAGIC = 0x4D504242  # "BBPM"
-VERSION = 4  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes;
-#             4: compute records (ComputeRecipe)
-READS = (2, 3, 4)
+VERSION = 5  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes;
+#             4: compute records (ComputeRecipe); 5: geometry-shader pipelines (their ES and copy shader)
+READS = (2, 3, 4, 5)
 COMPUTE_RECORD = 1 << 30  # a record's flags: a compute record
 VS_REF, PS_REF, LS_REF, HS_REF = 256, 512, 1024, 2048
-TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES = 64, 128, 256, 1024
+TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES, TESS_GS = 64, 128, 256, 1024, 4096
+GS_ES_REF, GS_COPY_REF = 1, 2  # a geometry-shader section's own flags
 HAS_VERTEX_INPUT, RELINK = 4, 8
 GX_BLEND, GX_DEPTH, GX_RASTER = 66, 16, 20  # sizeof GxBlendDesc, GxDepthStencilDesc, GxRasterDesc
 BUNDLES = ("gxshader.shaderbnd.dcx", "gxrenderershader.shaderbnd.dcx", "gxposteffect.shaderbnd.dcx", "gxgui.shaderbnd.dcx",
@@ -204,6 +209,18 @@ class Recipe:
                 name, sgpr = r.str(), r.u32()
                 fetch = r.words() if r.u32() else None
                 self.lsps.append({"regs": regs, "prog": prog, "ref": pref, "name": name, "sgpr": sgpr, "fetch": fetch})
+        # A geometry-shader pipeline (version 5, flag 4096): its own flags, the
+        # ES's registers and the rings' shapes (6 words), the programs'
+        # addresses (2 x 8 bytes), then the ES and the copy shader.
+        self.gs = None
+        if self.tess_flags & TESS_GS:
+            gflags = r.u32()
+            regs = r.take(6 * 4 + 16)
+            es, es_ref = program(r, gflags & GS_ES_REF)
+            es_name = r.str()
+            copy, copy_ref = program(r, gflags & GS_COPY_REF)
+            copy_name = r.str()
+            self.gs = {"regs": regs, "es": es, "es_ref": es_ref, "es_name": es_name, "copy": copy, "copy_ref": copy_ref, "copy_name": copy_name}
         if r.p != r.end:
             raise ValueError("a record longer than its fields")
         return self
@@ -223,6 +240,11 @@ class Recipe:
             for e in self.lsps:
                 out += [w32(1 if e["prog"] is None else 0), e["regs"], program_bytes(e["prog"], e["ref"]), wstr(e["name"]), w32(e["sgpr"])]
                 out.append(w32(1) + w32(len(e["fetch"]) // 4) + e["fetch"] if e["fetch"] is not None else w32(0))
+        if self.tess_flags & TESS_GS:
+            g = self.gs
+            gflags = (GS_ES_REF if g["es"] is None else 0) | (GS_COPY_REF if g["copy"] is None else 0)
+            out += [w32(gflags), g["regs"], program_bytes(g["es"], g["es_ref"]), wstr(g["es_name"]), program_bytes(g["copy"], g["copy_ref"]),
+                    wstr(g["copy_name"])]
         return b"".join(out)
 
 
@@ -282,6 +304,34 @@ def bundle_programs(app0):
     return out
 
 
+def copy_programs(app0):
+    """name -> code words of each geometry shader's copy shader in the game's
+    bundles (render.cpp copy_program_from_game): the program after the
+    container's first footer, as long as its own (second) footer says."""
+    out = {}
+    for b in BUNDLES:
+        path = Path(app0) / "dvdroot_ps4" / "shader" / b
+        if not path.is_file():
+            continue
+        plain = shaderbnd.dcx_decompress(path.read_bytes())
+        for name, size, off, ident, flags in shaderbnd.bnd4_entries(plain):
+            c = plain[off:off + size]
+            s = c.find(b"Shdr")
+            first = c.find(b"OrbShdr", s) if s >= 0 else -1
+            if first < 0:
+                continue
+            second = c.find(b"OrbShdr", first + 0x1C)
+            if second < 0 or second + 20 > len(c):
+                continue
+            key = "%08x" % struct.unpack_from("<I", c, first + 16)[0]
+            length = struct.unpack_from("<I", c, second + 8)[0] >> 8
+            at = first + 0x1C
+            if key in out or length == 0 or length % 4 or at + length > second:
+                continue
+            out[key] = c[at:at + length]
+    return out
+
+
 def eboot_programs(eboot):
     """name -> code words of the shader containers the eboot carries itself
     (host/shader_bundles.cpp eboot_shaders: a 'Shdr' header of a vertex, pixel
@@ -323,23 +373,27 @@ def describe(path, run, origin, records):
         names[rc.ps_name] += 1
     for c in computes:
         names[c.name] += 1
-    words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) + len(rc.ls or b"") + len(rc.hs or b"") + len(rc.ls_fetch or b"")
+    words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) + len(rc.ls or b"") + len(rc.hs or b"") + len(rc.ls_fetch or b"") +
+                (len(rc.gs["es"] or b"") + len(rc.gs["copy"] or b"") if rc.gs is not None else 0)
                 for rc in recipes) + sum(len(c.prog or b"") for c in computes)
-    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated, %d with LS passes) "
+    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated, %d with LS passes, "
+          "%d with a geometry shader) "
           "and %d compute pipelines, %d programs by name; "
           "%.1f KiB of program words; made by translator %s on device %04x:%04x driver %08x%s" % (
               path, run, len(recipes), sum(1 for rc in recipes if rc.flags & RELINK),
               sum(1 for rc in recipes if rc.flags & HAS_VERTEX_INPUT), sum(1 for rc in recipes if rc.tess_flags & 1 or rc.tess_flags & 32),
-              sum(1 for rc in recipes if rc.lsps), len(computes),
+              sum(1 for rc in recipes if rc.lsps), sum(1 for rc in recipes if rc.gs is not None), len(computes),
               len(names), words / 1024.0, origin["translator"][:12],
               origin["vendor"], origin["device"], origin["driver"], ", with pipeline libraries" if origin["libraries"] else ", whole pipelines"))
     used = Counter(rc.uses for rc in records)
     print("  starts that used each: %s" % ", ".join("%d: %d" % (k, used[k]) for k in sorted(used)))
 
 
-def make_list(recipes, progs, eboot_given=True, fetch_words=True):
+def make_list(recipes, progs, eboot_given=True, fetch_words=True, copies=None):
     """The list records: each program named by its footer hash, count and hash
-    instead of its words. (out, left Counter, plain, patched)."""
+    instead of its words; a geometry-shader record's copy shader by its GS's
+    container (`copies`, copy_programs). (out, left Counter, plain, patched)."""
+    copies = copies or {}
     out, left = [], Counter()
     plain = patched = 0
     for rc in recipes:
@@ -370,6 +424,10 @@ def make_list(recipes, progs, eboot_given=True, fetch_words=True):
                 any(e["prog"] is not None and e["name"] not in progs for e in rc.lsps):
             left["a tessellation program neither the bundles nor the eboot hold"] += 1
             continue
+        if rc.gs is not None and ((rc.gs["es"] is not None and rc.gs["es_name"] not in progs) or
+                                  (rc.gs["copy"] is not None and rc.gs["copy_name"] not in copies)):
+            left["a geometry shader's ES or copy shader the bundles do not hold"] += 1
+            continue
         for prog, name in ((rc.vs, rc.vs_name), (rc.ps, rc.ps_name)):
             if prog:
                 if progs[name] == prog:
@@ -394,6 +452,10 @@ def make_list(recipes, progs, eboot_given=True, fetch_words=True):
         for e in rc.lsps:
             if e["prog"] is not None:
                 e["ref"], e["prog"] = (len(e["prog"]) // 4, fnv1a(e["prog"])), None
+        if rc.gs is not None:
+            for k in ("es", "copy"):
+                if rc.gs[k] is not None:
+                    rc.gs[k + "_ref"], rc.gs[k] = (len(rc.gs[k]) // 4, fnv1a(rc.gs[k])), None
         rc.uses = rc.last_run = 0
         out.append(rc)
     return out, left, plain, patched
@@ -445,7 +507,7 @@ def main():
             return 2
         for name, code in eboot_programs(args.eboot).items():
             progs.setdefault(name, code)
-        out, left, plain, patched = make_list(recipes, progs, bool(args.eboot), not args.no_fetch_words)
+        out, left, plain, patched = make_list(recipes, progs, bool(args.eboot), not args.no_fetch_words, copy_programs(args.app0))
         write_file(args.out, 0, origin, out)
         size = Path(args.out).stat().st_size
         print("%s: %d of %d pipelines (%.1f KiB, no program words: %d programs as the game's files have them, %d as bbhost patches them)" % (
@@ -456,6 +518,7 @@ def main():
 
     run, origin, recipes = read_file(args.file)
     progs = bundle_programs(args.app0)
+    copies = copy_programs(args.app0)
     for name, code in eboot_programs(args.eboot).items():
         progs.setdefault(name, code)
     ok = bad = patched = 0
@@ -467,10 +530,12 @@ def main():
                     ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name),
                      (HS_REF, rc.hs_ref, rc.hs_name))]
             refs += [(e["prog"] is None, e["ref"], e["name"]) for e in rc.lsps]
+            if rc.gs is not None:
+                refs += [(rc.gs["es"] is None, rc.gs["es_ref"], rc.gs["es_name"]), (rc.gs["copy"] is None, rc.gs["copy_ref"], "copy:" + rc.gs["copy_name"])]
         for named, ref, name in refs:
             if not named:
                 continue
-            code = progs.get(name)
+            code = copies.get(name[5:]) if name.startswith("copy:") else progs.get(name)
             if code is None:
                 bad += 1
             elif len(code) // 4 == ref[0] and fnv1a(code) == ref[1]:

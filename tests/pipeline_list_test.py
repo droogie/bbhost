@@ -131,6 +131,29 @@ class PipelineListTest(unittest.TestCase):
             out, left, _p, _q = pl.make_list([pl.parse_record(body)], {"0000aaaa": vs})
             self.assertEqual((len(out), sum(left.values())), (0, 1))  # a program no file holds
 
+    def test_gs_record(self):
+        """Version 5: a geometry-shader record (its ES and copy shader after the
+        tessellation state) reads and writes back as it was, and a list names
+        the ES like the other programs and the copy shader by its GS's
+        container."""
+        vs, ps, es, copy = (struct.pack("<2I", 1, 2), struct.pack("<I", 3), struct.pack("<3I", 4, 5, 6), struct.pack("<2I", 7, 8))
+        rc = recipe(11, 1, vs, ps)
+        tess = struct.pack("<I", pl.TESS_GS) + bytes(9 * 4 + 16 + 8 + 48 + 8)
+        section = struct.pack("<I", 0) + struct.pack("<6I", 0xc0044, 0x18, 2, 28, 8, 28) + struct.pack("<2Q", 0x2192d6900, 0x2192da000) + \
+            struct.pack("<I", 3) + es + pl.wstr("0000eeee") + struct.pack("<I", 2) + copy + pl.wstr("0000aaaa")
+        body = rc.body()[:-len(rc.tess)] + tess + section
+        rc = pl.Recipe().parse(body)
+        self.assertEqual((rc.gs["es"], rc.gs["es_name"], rc.gs["copy"], rc.gs["copy_name"]), (es, "0000eeee", copy, "0000aaaa"))
+        self.assertEqual(rc.body(), body)
+        progs = {"0000aaaa": vs, "0000bbbb": ps, "0000eeee": es}
+        out, left, _plain, _patched = pl.make_list([rc], progs, copies={"0000aaaa": copy})
+        self.assertEqual((len(out), sum(left.values())), (1, 0))
+        listed = pl.Recipe().parse(out[0].body())
+        self.assertEqual((listed.gs["es"], listed.gs["es_ref"], listed.gs["copy"], listed.gs["copy_ref"]),
+                         (None, (3, pl.fnv1a(es)), None, (2, pl.fnv1a(copy))))
+        out, left, _plain, _patched = pl.make_list([pl.Recipe().parse(body)], progs)
+        self.assertEqual((len(out), sum(left.values())), (0, 1))  # a copy shader no container holds
+
     def test_versions_agree(self):
         """The record format pipeline_list.py writes is the one bbhost writes
         (render.cpp recipe_file::kVersion); the pinned list's is one both read."""

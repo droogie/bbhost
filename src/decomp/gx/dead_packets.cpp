@@ -41,7 +41,12 @@
 // by default is nothing (GnmDeadMode, set by hle_gx_trace_arm): no room asked
 // for, no packet, the write pointer returned as the address - which no caller
 // reads (the poison check: every one returning an address no caller can
-// follow, 12 places without a fault). BBHOST_CP_DEAD_KEEP=<places> keeps
+// follow, 12 places without a fault). Nor does a caller move the write
+// pointer back after one, write below a write pointer it reads again, keep
+// the write pointer across the call or write through a copy of the command
+// buffer (their 159 call sites read in the binary): a writer whose packet
+// its caller rewinds over cannot write nothing - the constant engine's wait
+// (decomp/gx/constant_engine.cpp). BBHOST_CP_DEAD_KEEP=<places> keeps
 // chosen ones writing. As source, each is also where a host command can be
 // recorded in the packet's place.
 //

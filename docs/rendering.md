@@ -56,8 +56,10 @@ Occlusion queries are tokens from GX's Begin and End, measured by the
 renderer's own queries. The packets nothing on the host reads - the cache
 flushes, the context registers, the shader prefetches, the compute stage's
 registers (a dispatch token carries them, and a fallback writes them before
-its packet), the constant engine's counters - are not written at all
-(`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
+its packet), the counter steps between the constant and draw engines - are
+not written at all (`BBHOST_CP_DEAD_PACKETS`). The constant engine's wait is:
+the game writes a NOP over it when a draw leaves the engine unused, so a
+writer whose packet its caller rewinds over or edits cannot write nothing. Clears and copies come as tokens from GX's own
 calls: a clear names its view, and is made as the next pass's load op, or as a
 transfer clear when something reads the image first.
 
@@ -122,14 +124,36 @@ instead of holding them). There are two compilers:
 
 All 13,394 vertex, pixel and compute shaders in the game's bundles translate
 to valid SPIR-V (`gcn2spv --check`). Domain, hull and local shaders run on the
-host GPU's own tessellation stages; no geometry or export shader has been seen
-in use. The lifter takes those too: the particles' local, hull and domain
+host GPU's own tessellation stages, and the GPU particles' export and
+geometry shaders on its vertex and geometry stages. The lifter takes those
+too: the particles' local, hull and domain
 shaders, whose one control point travels as stage attributes, and the game's
 own hull draws (the Forbidden Woods' meshes, every hull in the bundles), whose
 local, hull and domain shaders become one native pipeline - the LDS they pass
 patches through turned into stage inputs and outputs, the game's patch list
 drawn as it is, with no compute pass in front. `BBHOST_LIFT_TESS=0` keeps every
 tessellation stage translated.
+
+The GPU particles - the effects' standard particles, their sparks and the
+wandering visions - draw a point a particle through an export shader, a
+geometry shader and the copy shader the geometry shader's container carries.
+On the PS4 the export shader writes each point's attributes to a ring in
+memory, the geometry shader reads them there and writes its vertices to a
+second ring, and the copy shader exports those to the rasterizer. The lifter
+makes the export shader the pipeline's vertex stage, its ring stores its
+outputs, and the geometry shader its geometry stage on a point: its ring
+loads are the point's inputs, its stores and emits the vertices, and a
+vertex's outputs what the copy shader exports of its dwords. Neither ring
+exists on the host. A geometry shader that stores at an offset its compiler
+counts per lane (the standard particles') keeps that ring as an array in the
+invocation. The pipeline is built on the pipeline workers, so a system draws
+from the frame its pipeline is ready, and is recorded with its two extra
+programs in the stage manifest (format 5) for the next start. A geometry
+shader the lift refuses is drawn as before, as its export and pixel shaders,
+which draw nothing; the exit report counts those draws by program and the
+refusals by reason. `BBHOST_GX_GS=0` draws every one that way. Vicar Amelia's
+room draws ~37,500 particles a frame; on an RTX 4070 they cost nothing
+measurable (uncapped, 72.2 fps with them against 71.8 without).
 
 A compute shader is lifted against its dispatch's translation and binds
 exactly what that binds - the parameter block with the page table, the images
@@ -230,6 +254,7 @@ path at all:
 |---|---|
 | Draws | native: built from the engine's objects at a token |
 | Tessellated draws | native: host tessellation stages; the game's hull draws one lifted pipeline each |
+| Geometry-shader draws (the GPU particles) | native: the host's geometry stage, the PS4's two rings as stage inputs and outputs |
 | Post-processing (YEBIS) | native resource building; the game's shaders |
 | Menus (Scaleform) | native draw building from the HAL |
 | Fills and copies without a shader | recognised and performed directly |
@@ -250,6 +275,7 @@ Every shader the game creates goes through the lifter. One it refuses is transla
 | Pixel | 3,206 of 3,209 | 100% | FXAA3HQ, which needs a whole-wave proof; two debug shaders whose result depends on how the PS4 packs pixels into waves (no exact PC form). None is drawn at the 12 places. |
 | Vertex | all 10,116 | 100% | - |
 | Tessellation: local, hull, domain | all; the 141 mesh hull sets as native pipelines | 100% | - |
+| Geometry, with its export shader | the effects' 4 particle geometry shaders of their 7; none of the models' 1,694 | 100% once its pipeline is built (the first sight of each goes as before) | The models' geometry shaders (cube-map depth, a face a layer) and the effects' two array shaders write a layer, which the lift does not take; the effects' point sprite reads its vertices through a fetch shader. None is drawn at the 12 places. |
 | Compute | all 38 in the bundles, and the 6 of the executable's own (GX's and YEBIS's) that the 12 places dispatch | 100% of dispatches | The executable carries 24 more, lifted when first dispatched; none is dispatched at the 12 places. |
 
 A draw whose setup the lifter hasn't seen still falls back to the translator. The exit report counts those by reason, and `BBHOST_LIFT_TESS` and the other switches turn the lifted paths off for comparison.
@@ -467,6 +493,39 @@ the default, and nothing waits on DXC:
   the GPU writes held by the host; the whole import then goes.
 - Editable source beyond replacing one stage's HLSL: edits read again while
   the game runs.
+
+### Window imports and the textures' sources (a design note)
+
+The game's GPU-visible memory can be imported a 16 MB window at a time
+(`BBHOST_IMPORT_WINDOWS=1`, or `import_windows = true` under `[gpu]`) instead
+of whole. About 1.0-1.3 GB stays imported instead of 5 GB, the driver spends
+0.27 s importing instead of 1.27 s (RTX 4070), and the command processor's
+time in play is the same. The Steam Deck kit uses it. On the desktop it waits
+on the area arrivals, measured at Central Yharnam, Cathedral Ward, the Hunter's
+Nightmare, Laurence's staircase, Lumenwood and Astral:
+
+- With windows, three copies the GPU made from the whole import became CPU
+  copies into upload staging: the buffer shadow's mirror pages (8,552 pages,
+  534 MB at Nightmare of Mensis' arrival), copy tokens' sources (about 2 GB a
+  run), and texture uploads' tiled bytes (copied by the prep pool besides being
+  hashed).
+- The first hitch after a load (130-160 ms) was the mirror pages, copied on
+  the command processor. On threads of their own (`bb-pagecopy`,
+  `BBHOST_SHADOW_COPY_THREADS`) that first frame came back to whole imports'
+  42-62 ms.
+- What is left are copies a submission needs at once. The command processor
+  waits for the texture preps whose staged sources the next submission reads:
+  350-450 waits and 150-180 ms a run, against about 45 and 4 ms with whole
+  imports; more prep threads do not shorten it. It also waits for copy
+  tokens' sources copied just before a submission. Window mode then counts
+  one to three more arrival stalls a place than whole imports, and 32-36 a
+  12-place tour against 25.
+- The remedy is to let the GPU read those sources again: windows imported
+  ahead of the upload, off the command processor, at the GX resource's
+  creation (as the import prefetch does for buffers), and retired once idle so
+  that the imports stay near a gigabyte, with staging only where no window is
+  there yet. It belongs to the step that makes GX textures Vulkan images at
+  their creation, which removes most of these imports anyway.
 
 ### Resolving draws where their command lists are finished (a design note)
 

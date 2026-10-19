@@ -3,6 +3,7 @@
 #pragma once
 
 // hle_gx_trace_arm, before any of the game's code runs: whether the
-// constant engine's packets are written (false: the constant RAM writes and
-// the two counters write nothing - nothing dumps that RAM).
+// constant engine's counter step is written (true: it writes nothing -
+// nothing dumps that RAM; its wait, RAM writes and dumps are the game's
+// packets in every mode).
 void gnm_ce_configure(bool dead);

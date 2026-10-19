@@ -179,4 +179,61 @@ HullLift lift_constant_hull(const Program& program);
 // EXEC bit is set.
 LiftResult lift_hull_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const TessLift& tess);
 
+// The stages of a draw that binds a geometry shader (the effects' GPU
+// particles), as Vulkan's vertex and geometry stages. On GCN GX's VS is an
+// export shader (ES) that writes each vertex to the ESGS ring, the GS reads a
+// primitive's vertices there and writes the vertices it emits to the GSVS
+// ring, and a copy shader the GS carries reads those back and exports them
+// (position and params). On the host the ES is the vertex stage, writing its
+// ring dwords as outputs, and the GS the geometry stage, reading them as
+// inputs and writing what the copy shader would export:
+//   ES (lift_es_shader, GsRole::EsVertex): buffer_store_dword* through the
+//     global table's ESGS write ring (the V# s_load_dwordx4 reads at dword 8
+//     of the table the user data's s[0:1] points at) at soffset + offset =
+//     4 * k writes dword k of the vertex - `es_gs` uvec4[(es_dwords + 3) / 4]
+//     at location 0, component k % 4 of slot k / 4. It exports nothing.
+//   GS (lift_gs_shader, GsRole::Geometry, point primitives): buffer_load_dword
+//     through the ESGS read ring (table dword 12) at the vertex's offset
+//     (v0 << 2) and soffset + offset = 256 * k reads dword k of it
+//     (`es_gs[0][k / 4]`); buffer_store_dword through the GSVS write ring
+//     (table dword 16) at soffset + offset = 4 * (max_vertices * d + v) writes
+//     dword d of the vertex in slot v. s_sendmsg GS emit (0x22) emits the
+//     invocation's next vertex - slot n for its nth, as GCN's emit counter
+//     has it - with the outputs `copy` makes of that slot's dwords; GS cut
+//     (0x12) ends the strip; GS done (0x03) nothing. Both only where the
+//     invocation's EXEC bit is set. One invocation is a lane of GCN's wave:
+//     one primitive. Where every GSVS store is at a constant offset and the
+//     lift shows each emit's slot (each earlier emit made by all of its
+//     invocations or by none), the vertex is the stores' values themselves;
+//     otherwise (a store at a VGPR offset: the program's own vertex counter)
+//     the ring is an array of max_vertices * vertex_dwords words in the
+//     invocation, written at the address each store computes and read at the
+//     emit counter's slot, which the lift counts as GCN does. Either way the
+//     emit takes its slot as it is then: GCN's copy shader reads it after the
+//     GS, the same for a program that stores into no slot it has emitted.
+// Both lift against the translation of the same program as a vertex stage,
+// for their other bindings (the particles' buffers, the GS's constants);
+// ring V#s and the vertex offset are never data (as_u and as_f refuse them).
+struct GsCopyOut {
+    std::uint8_t target = 12;  // 12 the position, 32 + n param n
+    std::uint8_t comp = 0;     // 0-3
+    bool constant = false;     // `value` the component's bits; otherwise GSVS dword `value` of the vertex
+    std::uint32_t value = 0;
+};
+struct GsLift {
+    std::uint32_t es_dwords = 0;     // the ES's ring vertex size in dwords (its Gnm structure's word 7)
+    std::uint32_t max_vertices = 0;  // the GS's most vertices a primitive (VGT_GS_MAX_VERT_OUT, word 13)
+    std::uint32_t vertex_dwords = 0;  // a GSVS vertex's dwords (the stream's export size, word 9)
+    std::uint32_t out_prim = 2;      // VGT_GS_OUT_PRIM_TYPE (word 7): 1 line strip, 2 triangle strip
+    std::vector<GsCopyOut> copy;     // from parse_gs_copy: every component it exports, in export order
+};
+// The copy shader's exports as GsCopyOut: buffer_load_dword through the GSVS
+// read ring (table dword 32) at the vertex's offset (v0 << 2) and soffset +
+// offset = 64 * max_vertices * d loads dword d, and each export's components
+// name the registers loaded, or a constant moved into one (stream 0: the
+// stream test's fall-through). False, with `why`, for any other shape.
+bool parse_gs_copy(const Program& copy, std::uint32_t max_vertices, std::vector<GsCopyOut>& out, std::string& why);
+LiftResult lift_es_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs);
+LiftResult lift_gs_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs);
+
 }  // namespace gcn

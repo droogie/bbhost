@@ -338,6 +338,14 @@ struct TranslateOptions {
     //   point, so gl_VertexIndex is what the workgroup arithmetic gave.
     enum class TessRole : std::uint8_t { None, LsCompute, Domain, HullTcs, DomainTes, LsVertex };
     TessRole tess_role = TessRole::None;
+    // A draw that binds a geometry shader (lift.h GsLift): GX's VS is then an
+    // export shader whose outputs go to the ESGS ring (EsVertex: the
+    // pipeline's vertex stage, each ring dword an output) and its GS reads
+    // them there and writes its vertices to the GSVS ring (Geometry: the
+    // pipeline's geometry stage). Both keep stage Vertex for the reference
+    // translation, which only names their bindings.
+    enum class GsRole : std::uint8_t { None, EsVertex, Geometry };
+    GsRole gs_role = GsRole::None;
     std::uint32_t domain_level = 1;
     // VGT_LS_HS_CONFIG and VGT_TF_PARAM, for the host stages.
     std::uint32_t tess_patch_control_points = 1;

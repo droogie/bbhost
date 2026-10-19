@@ -319,6 +319,16 @@ int g_backend = 0;     // BBHOST_GX_BACKEND: 1 draws from GX inputs, 2 compares 
 // what the draw's own packets write, which a draw without packets must take
 // from GX.
 int g_native = 0;
+// BBHOST_GX_GS (on; =0 off): a draw that binds a geometry-shader object (the
+// effects' GPU particles) carries its GS - its stage registers, copy shader,
+// PS linkage and records (GpuDrawInputs::gs, kGxRecordGs) - for the renderer
+// to draw it with the ES as the vertex stage and the GS as the geometry stage
+// (render.cpp gs_draw). Off, such a draw goes as before: GX's VS (the ES) and
+// PS, which draws nothing - the ES exports no position.
+const bool g_gx_gs = [] {
+    const char* e = std::getenv("BBHOST_GX_GS");
+    return !(e && e[0] == '0');
+}();
 // Token ids: every GX worker takes one a draw, so the counter has its line to
 // itself; the per-draw statistics are Tallies (core/tally.h).
 alignas(64) std::atomic<std::uint64_t> g_native_next{0};
@@ -1375,6 +1385,48 @@ bool build_inputs(const GxRec& r, GpuDrawInputs& in, bool allow_tess = false) {
         }
     }
 shaders_done:
+    // BBHOST_GX_GS: a draw that binds a geometry shader (st[3]) keeps its VS
+    // (the ES) and PS fields as they are - what it is drawn with where the
+    // GS's pipeline is not made - and carries the GS's, from its Gnm GsShader
+    // (+0x100): +8 the GS's stage registers, +0x1c VGT_GS_OUT_PRIM_TYPE,
+    // +0x24 the stream's vertex size in dwords, +0x34 VGT_GS_MAX_VERT_OUT,
+    // and at +0x40 its copy shader's VsShader (+8 its program, +0x18
+    // PA_CL_VS_OUT_CNTL, its output semantics as a VS's); the ES's ring vertex
+    // size from its EsShader (+0x1c); and the PS's inputs linked to the copy
+    // shader's outputs as GX links them to a VS's (above).
+    if (g_gx_gs && r.st[3].shader && !tess && r.st[4].shader) {
+        const std::uint64_t gs_gnm = rd64(r.st[3].shader + 0x100), es_gnm = rd64(r.st[0].shader + 0x100), ps_gnm = rd64(r.st[4].shader + 0x100);
+        if (gs_gnm && es_gnm && ps_gnm) {
+            in.gs = true;
+            for (int i = 0; i < 4; ++i) in.gs_pgm[i] = rd32(gs_gnm + 8 + 4 * static_cast<std::uint64_t>(i));
+            in.gs_out_prim = rd32(gs_gnm + 0x1c);
+            in.gs_vertex_dwords = rd32(gs_gnm + 0x24);
+            in.gs_max_vertices = rd32(gs_gnm + 0x34);
+            const std::uint64_t copy = gs_gnm + 0x40;
+            in.gs_copy_pgm[0] = rd32(copy + 8);
+            in.gs_copy_pgm[1] = rd32(copy + 0xc);
+            in.gs_vs_out_cntl = rd32(copy + 8 + 0x18);
+            in.gs_es_dwords = rd32(es_gnm + 0x1c);
+            const auto u8 = [](std::uint64_t va) { return rd32(va) & 0xff; };
+            const std::uint64_t vs_out = copy + ((static_cast<std::uint64_t>(u8(copy + 0x24)) + u8(copy + 3)) << 2) + 0x28;
+            const std::uint32_t vs_outs = u8(copy + 0x25);
+            const std::uint64_t ps_in = ps_gnm + (static_cast<std::uint64_t>(u8(ps_gnm + 3)) << 2) + 0x3c;
+            const std::uint32_t count = std::min<std::uint32_t>(u8(ps_gnm + 0x38), 32);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const std::uint32_t word = rd32(ps_in + 2 * static_cast<std::uint64_t>(i)) & 0xffff;
+                std::uint32_t reg = 0x20;
+                for (std::uint32_t j = 0; j < vs_outs; ++j) {
+                    if (u8(vs_out + 2 * static_cast<std::uint64_t>(j)) == (word & 0xff)) {
+                        reg = u8(vs_out + 2 * static_cast<std::uint64_t>(j) + 1);
+                        break;
+                    }
+                }
+                in.gs_ps_input_cntl[i] = (((word >> 7) & 0x1e0) | reg) & 0x3f;
+                in.gs_ps_input_cntl[i] |= ((word >> 8) & 3) << 8;
+                in.gs_ps_input_cntl[i] |= (((word >> 12) | (word >> 10)) & 1) << 10;
+            }
+        }
+    }
     const std::uint32_t topology = rd32(s + 0x8);
     if (topology > 0x29) return false;
     in.prim = rd32(guest(kTopologyTable) + 4 * static_cast<std::uint64_t>(topology));
@@ -1725,10 +1777,13 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     // bindings are none. Slot 2 is only filled for those draws.
     const bool tess = r.st[1].shader || r.st[2].shader;
     const int set0_stage = tess && r.st[2].shader ? 2 : 0;
-    const int stage_of[kGxRecords] = {set0_stage, 4, 0, 1};
+    // BBHOST_GX_GS: a draw that binds a geometry shader has its GS's in
+    // slot 3 (kGxRecordGs; it has no hull), slot 2 unused.
+    const bool gs = g_gx_gs && !tess && r.st[3].shader;
+    const int stage_of[kGxRecords] = {set0_stage, 4, 0, gs ? 3 : 1};
     const std::uint64_t shaders[kGxRecords] = {r.st[set0_stage].shader, r.st[4].shader, tess ? r.st[0].shader : 0,
-                                               tess ? r.st[1].shader : 0};
-    const int nrec = tess ? 4 : 2;
+                                               tess ? r.st[1].shader : gs ? r.st[3].shader : 0};
+    const int nrec = tess || gs ? 4 : 2;
     // The pending state's slot objects for each stage (group: samplers [16]
     // at +0, SRVs [128] at +0x80, constant buffers [14] at +0x480).
     std::uint64_t groups[kGxRecords];
@@ -2535,7 +2590,7 @@ bool native_draw_call(GxRec& r) {
     GxRecordsPtr packed;
     if (g_packed_records && records) {
         GxRecordsPtr block(pooled_records_raw());
-        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader) ? 4 : 2, block.get());
+        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader || (g_gx_gs && r.st[3].shader)) ? 4 : 2, block.get());
         g_packed_draws.fetch_add(1, std::memory_order_relaxed);
         g_packed_bytes.fetch_add(records_bytes, std::memory_order_relaxed);
         for (std::uint64_t most = g_packed_most.load(std::memory_order_relaxed);
@@ -5976,9 +6031,10 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
                 else if (!tess_native && (r.st[1].shader || r.st[2].shader)) g_native_skipped.add(1, kSkipTess);
                 else if (!r.in_ok) g_native_skipped.add(1, kSkipInputs);
                 if (r.st[3].shader && g_gs_object_draws.fetch_add(1, std::memory_order_relaxed) < 6) {
-                    host_log("gx-native: %s from 0x%llx binds a geometry-shader object 0x%llx (VS 0x%llx, PS 0x%llx); drawn as VS/PS%s",
+                    host_log("gx-native: %s from 0x%llx binds a geometry-shader object 0x%llx (VS 0x%llx, PS 0x%llx)%s%s",
                              kKindName[r.kind], static_cast<ull>(bn(r.ret)), static_cast<ull>(r.st[3].shader), static_cast<ull>(r.st[0].shader),
-                             static_cast<ull>(r.st[4].shader), r.indirect_va ? ", indirect" : "");
+                             static_cast<ull>(r.st[4].shader), r.indirect_va ? ", indirect" : "",
+                             r.in.gs ? "; it carries the GS (BBHOST_GX_GS)" : "; drawn as VS/PS");
                 }
             }
             // The tessellated draws are the packet path. With
@@ -6710,12 +6766,14 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         host_log("gx: the compute stage's packets (its program, user data and indirect base) are %s",
                  g_cs_packets_dead ? "not written: every dispatch is a token, and a fallback writes their image before its packet"
                                    : "written");
-        // The constant engine's: nothing dumps its RAM while YEBIS's tables
-        // come from its own state (its binder and its compute passes ours)
-        // and Gnmx's draws are tokens (decomp/gx/constant_engine.cpp).
+        // The constant engine's counter steps: nothing dumps its RAM while
+        // YEBIS's tables come from its own state (its binder and its compute
+        // passes ours) and Gnmx's draws are tokens. Its waits stay the game's
+        // packets - their callers NOP over them (decomp/gx/constant_engine.cpp).
         const bool ce_dead = g_cs_packets_dead && yebis_bind::mode() == 1 && g_yebis_dispatch == 2 && g_native_yebis == 5;
         gnm_ce_configure(ce_dead);
-        host_log("gx: the constant engine's packets are %s", ce_dead ? "not written: nothing dumps its RAM" : "written");
+        host_log("gx: the constant engine's counter steps are %s",
+                 ce_dead ? "not written (nothing dumps its RAM); its waits, RAM writes and dumps are written" : "written, as all its packets");
         std::size_t ours = 0, nothing = 0, kept = 0;
         for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
             if (!gnm_dead_writer_placed(i)) continue;

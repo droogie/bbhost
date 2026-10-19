@@ -43,7 +43,7 @@ enum Op : std::uint16_t {
     OpShiftRightArithmetic = 195, OpShiftLeftLogical = 196, OpBitwiseOr = 197, OpBitwiseXor = 198,
     OpBitwiseAnd = 199, OpNot = 200, OpBitFieldInsert = 201, OpBitFieldSExtract = 202,
     OpBitFieldUExtract = 203, OpBitReverse = 204, OpBitCount = 205, OpDPdx = 207, OpDPdy = 208,
-    OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicLoad = 227, OpAtomicStore = 228,
+    OpEmitVertex = 218, OpEndPrimitive = 219, OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicLoad = 227, OpAtomicStore = 228,
     OpAtomicExchange = 229, OpAtomicCompareExchange = 230, OpAtomicIIncrement = 232,
     OpAtomicIDecrement = 233, OpAtomicIAdd = 234, OpAtomicISub = 235, OpAtomicSMin = 236,
     OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239, OpAtomicAnd = 240, OpAtomicOr = 241,
@@ -74,7 +74,7 @@ enum Capability : std::uint32_t {
     CapImageCubeArray = 34, CapDemoteToHelperInvocation = 5379, CapPhysicalStorageBufferAddresses = 5347,
     CapTessellation = 3, CapSampledImageArrayDynamicIndexing = 29, CapStorageImageArrayDynamicIndexing = 31,
     CapRuntimeDescriptorArray = 5302, CapDenormPreserve = 4464, CapRoundingModeRTZ = 4468,
-    CapGroupNonUniformQuad = 68,
+    CapGroupNonUniformQuad = 68, CapGeometry = 2,
 };
 
 enum StorageClass : std::uint32_t {
@@ -99,7 +99,7 @@ enum BuiltIn : std::uint32_t {
 };
 
 enum ExecutionModel : std::uint32_t {
-    EmVertex = 0, EmTessellationControl = 1, EmTessellationEvaluation = 2, EmFragment = 4, EmGLCompute = 5,
+    EmVertex = 0, EmTessellationControl = 1, EmTessellationEvaluation = 2, EmGeometry = 3, EmFragment = 4, EmGLCompute = 5,
 };
 enum ExecutionMode : std::uint32_t {
     ExOriginUpperLeft = 7, ExEarlyFragmentTests = 9, ExDepthReplacing = 12, ExLocalSize = 17,
@@ -107,6 +107,9 @@ enum ExecutionMode : std::uint32_t {
     ExSpacingEqual = 1, ExSpacingFractionalEven = 2, ExSpacingFractionalOdd = 3,
     ExVertexOrderCw = 4, ExVertexOrderCcw = 5, ExPointMode = 27,
     ExTriangles = 22, ExQuads = 24, ExIsolines = 25, ExOutputVertices = 26,
+    // Geometry: the input primitive, the output strip type and the invocations a primitive.
+    // (OutputPoints is 27, which ExPointMode above holds: a GS that emits points is not lifted.)
+    ExInvocations = 0, ExInputPoints = 19, ExInputLines = 20, ExOutputLineStrip = 28, ExOutputTriangleStrip = 29,
     // SPIR-V 1.4 float controls: operand the bit width they apply to.
     ExDenormPreserve = 4459, ExRoundingModeRTZ = 4463,
 };
