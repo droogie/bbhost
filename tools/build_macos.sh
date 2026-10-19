@@ -1,7 +1,7 @@
 #!/bin/bash
 # The macOS build: bbhost as an x86_64 program, which Rosetta 2 runs on Apple
 # Silicon (the game's code is x86-64 and runs as it is, as on a PC). The
-# counterpart of tools/ci_build.sh: cmake and ninja when they are missing,
+# counterpart of tools/ci_build.sh: cmake, ninja and pkg-config when they are missing,
 # then the Vulkan headers, SDL3 and the movie decoders of ffmpeg built static
 # for x86_64 into a prefix, then bbhost, its tools and its tests, and ctest.
 #
@@ -26,6 +26,8 @@ SDL_TAG=${SDL_TAG:-release-3.4.16}
 FFMPEG_VER=${FFMPEG_VER:-7.1.1}
 CMAKE_VER=${CMAKE_VER:-4.4.4}
 NINJA_VER=${NINJA_VER:-1.13.2}
+PKGCONF_VER=3.0.9
+PKGCONF_SHA256=6ab2d3b8087dcf500e34003a6a8934dca55d0a3d6066aeafb03c352db3e68bfd
 JOBS=$(sysctl -n hw.ncpu)
 ARCH=x86_64
 # As CMakeLists.txt; otherwise SDL3 and ffmpeg get the build machine's version.
@@ -39,10 +41,13 @@ mkdir -p "$W/src" "$P" "$T/bin"
 echo "$MACOSX_DEPLOYMENT_TARGET" > "$P/deployment-target"
 export PATH=$T/bin:$PATH
 
-fetch() {  # fetch NAME URL DIR-GLOB
+fetch() {  # fetch NAME URL DIR-GLOB [SHA-256]
     if ! ls -d "$W/src"/$3 > /dev/null 2>&1; then
         echo "fetching $1"
         curl -sSL -m 600 -o "$W/src/$1.tar" "$2"
+        if [ -n "${4:-}" ] && ! echo "$4  $W/src/$1.tar" | shasum -a 256 -c --status; then
+            echo "$1: the download's SHA-256 is not $4"; rm -f "$W/src/$1.tar"; exit 1
+        fi
         tar xf "$W/src/$1.tar" -C "$W/src"
         rm -f "$W/src/$1.tar"
     fi
@@ -58,6 +63,14 @@ if ! command -v ninja > /dev/null; then
     curl -sSL -m 300 -o "$W/src/ninja.zip" "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VER/ninja-mac.zip"
     unzip -qo "$W/src/ninja.zip" -d "$T/bin"
     rm -f "$W/src/ninja.zip"
+fi
+# CMake finds ffmpeg through pkg-config, which macOS lacks.
+if ! command -v pkg-config > /dev/null; then
+    fetch pkgconf "https://distfiles.ariadne.space/pkgconf/pkgconf-$PKGCONF_VER.tar.xz" "pkgconf-$PKGCONF_VER" "$PKGCONF_SHA256"
+    (cd "$W/src/pkgconf-$PKGCONF_VER" && ./configure --prefix="$W/pkgconf" --disable-shared > "$W/pkgconf.log" 2>&1 \
+        && make -j"$JOBS" >> "$W/pkgconf.log" 2>&1 && make install >> "$W/pkgconf.log" 2>&1) \
+        || { tail -20 "$W/pkgconf.log"; exit 1; }
+    ln -sf "$W/pkgconf/bin/pkgconf" "$T/bin/pkg-config"
 fi
 
 # The SDK's headers are searched last, after the prefix's pinned ones.
