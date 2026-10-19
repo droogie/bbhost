@@ -42,9 +42,10 @@
 # package-macos (and build.yml's tests-macos) are not among them, and while
 # the macOS port is new they cannot fail a run: their jobs continue on error,
 # and package-all runs when Linux and Windows have packaged, leaving the macOS
-# zip and executables out when package-macos failed. Once they have passed on
-# the runners for a while they are to become required checks (a change to the
-# ruleset, for the maintainers) and package-all to wait for them again.
+# zip and plugins out when package-macos failed or its zip does not pass the
+# checks. Once they have passed on the runners for a while they are to become
+# required checks (a change to the ruleset, for the maintainers) and
+# package-all to wait for them again.
 #
 # The debug menu's font (engine/debug_menu.h) is the Debug Menu plugin's own,
 # made from public-domain fonts (plugins/debug_menu): nothing is fetched.
@@ -181,20 +182,12 @@ jobs:
           tools/package_steamdeck.sh dist/linux/*.tar.gz dist/steamdeck
           mkdir -p dist/release dist/x
           cp dist/windows/* dist/linux/* dist/steamdeck/* dist/release/
-          # macOS's package only when package-macos made one (it may fail for now).
-          if [ -d dist/macos ]; then cp dist/macos/* dist/release/; fi
           # The stripped executables out of the packages, named the same in every release.
           w=$(ls dist/windows/bbhost-win-*.zip); v=$(basename "$w" .zip); v=${v#bbhost-win-}
           unzip -q -j "$w" "bbhost-win-$v/bbhost.exe" -d dist/x
           mv dist/x/bbhost.exe dist/release/bbhost.exe
           tar xzf dist/linux/bbhost-linux-$v.tar.gz -C dist/x "bbhost-linux-$v/bbhost"
           install -m 755 "dist/x/bbhost-linux-$v/bbhost" dist/release/bbhost
-          m=dist/macos/bbhost-mac-$v.zip
-          if [ -f "$m" ]; then
-            unzip -q "$m" "bbhost-mac-$v/plugins/*" -d dist/x
-          else
-            echo "no macOS package (package-macos failed): the release goes out without it"
-          fi
           # The official plugins, signed in the packages, as assets of their own:
           # the plugin manager's "Get the latest official plugins" fetches
           # bbhost-plugin-<name>-windows.dll / -linux.so / -macos.so and their .sig.
@@ -203,18 +196,32 @@ jobs:
           for f in dist/x/bbhost-win-$v/plugins/*.dll; do
             [ -f "$f" ] || continue; n=$(basename "$f" .dll)
             cp "$f" "dist/release/bbhost-plugin-$n-windows.dll"
-            [ -f "$f.sig" ] && cp "$f.sig" "dist/release/bbhost-plugin-$n-windows.dll.sig"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/release/bbhost-plugin-$n-windows.dll.sig"; fi
           done
           for f in dist/x/bbhost-linux-$v/plugins/*.so; do
             [ -f "$f" ] || continue; n=$(basename "$f" .so)
             cp "$f" "dist/release/bbhost-plugin-$n-linux.so"
-            [ -f "$f.sig" ] && cp "$f.sig" "dist/release/bbhost-plugin-$n-linux.so.sig"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/release/bbhost-plugin-$n-linux.so.sig"; fi
           done
-          for f in dist/x/bbhost-mac-$v/plugins/*.so; do
+      - name: the macOS assets
+        # Checked aside, so a missing or bad macOS package is left out.
+        continue-on-error: true
+        run: |
+          w=$(ls dist/windows/bbhost-win-*.zip); v=$(basename "$w" .zip); v=${v#bbhost-win-}
+          m=dist/macos/bbhost-mac-$v.zip
+          if [ ! -f "$m" ]; then echo "no macOS package (package-macos failed): the release goes out without it"; exit 0; fi
+          rm -rf dist/mac dist/xm; mkdir -p dist/mac dist/xm
+          cp dist/macos/* dist/mac/
+          unzip -q "$m" "bbhost-mac-$v/plugins/*" -d dist/xm
+          for f in dist/xm/bbhost-mac-$v/plugins/*.so; do
             [ -f "$f" ] || continue; n=$(basename "$f" .so)
-            cp "$f" "dist/release/bbhost-plugin-$n-macos.so"
-            [ -f "$f.sig" ] && cp "$f.sig" "dist/release/bbhost-plugin-$n-macos.so.sig"
+            cp "$f" "dist/mac/bbhost-plugin-$n-macos.so"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/mac/bbhost-plugin-$n-macos.so.sig"; fi
           done
+          tools/check_release_bundle.sh dist/mac
+          mv dist/mac/* dist/release/
+      - name: the checksums
+        run: |
           (cd dist/release && sha256sum * > SHA256SUMS)
           ls -la dist/release
       - uses: actions/upload-artifact@v4
