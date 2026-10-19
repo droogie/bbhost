@@ -73,6 +73,19 @@ if otool -L "$dir/bbhost" | awk 'NR > 1 { print $1 }' | grep -vE '^(/usr/lib/|/S
     echo "bbhost links a library the package does not carry (above)"; exit 1
 fi
 
+# A Mach-O built for a newer macOS than the minimum won't load on it.
+min_macos=15.0
+for f in "$dir/bbhost" "$dir/lib/"*.dylib "$dir/plugins/"*.so; do
+    [ -f "$f" ] || continue
+    v=$(otool -arch x86_64 -l "$f" | awk '/LC_BUILD_VERSION/ { b = 1 } b && $1 == "minos" { print $2; exit }
+                                          /LC_VERSION_MIN_MACOSX/ { m = 1 } m && $1 == "version" { print $2; exit }')
+    [ -n "$v" ] || { echo "$f: no minimum macOS version in it"; exit 1; }
+    if [ "$(printf '%s\n%s\n' "$v" "$min_macos" | sort -V | tail -1)" != "$min_macos" ]; then
+        echo "$f needs macOS $v, newer than the $min_macos the package supports (MACOSX_DEPLOYMENT_TARGET)"; exit 1
+    fi
+    echo "  minos $v  ${f#"$dir"/}"
+done
+
 for f in "$dir/lib/"*.dylib; do codesign --force --sign - "$f" 2>/dev/null; done
 codesign --force --sign - --entitlements tools/macos/bbhost.entitlements "$dir/bbhost"
 codesign --verify --strict "$dir/bbhost"

@@ -28,7 +28,15 @@ CMAKE_VER=${CMAKE_VER:-4.4.4}
 NINJA_VER=${NINJA_VER:-1.13.2}
 JOBS=$(sysctl -n hw.ncpu)
 ARCH=x86_64
+# As CMakeLists.txt; otherwise SDL3 and ffmpeg get the build machine's version.
+export MACOSX_DEPLOYMENT_TARGET=15.0
+# A prefix built for another minimum is built again.
+if [ -d "$P/lib" ] && [ "$(cat "$P/deployment-target" 2>/dev/null)" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+    echo "the prefix was built for another macOS than $MACOSX_DEPLOYMENT_TARGET; building it again"
+    rm -rf "$P"
+fi
 mkdir -p "$W/src" "$P" "$T/bin"
+echo "$MACOSX_DEPLOYMENT_TARGET" > "$P/deployment-target"
 export PATH=$T/bin:$PATH
 
 fetch() {  # fetch NAME URL DIR-GLOB
@@ -73,7 +81,7 @@ if [ ! -f "$P/lib/libSDL3.a" ]; then
     fetch sdl3 "https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL_TAG.tar.gz" 'SDL-*'
     s=$(ls -d "$W"/src/SDL-* | head -1)
     cmake -S "$s" -B "$W/sdl3" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
-        -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+        -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=OFF -DSDL_STATIC=ON \
         -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         > "$W/sdl3-configure.log"
     cmake --build "$W/sdl3" > "$W/sdl3-build.log"
@@ -105,7 +113,7 @@ fi
 # bbhost, its tools and tests.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig
 cmake -S "$SRC" -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_OSX_ARCHITECTURES=$ARCH \
-    -DCMAKE_PREFIX_PATH="$P;$VULKAN_SDK" -DCMAKE_CXX_FLAGS="-idirafter $VULKAN_SDK/include" -DVulkan_INCLUDE_DIR="$P/include" -DVulkan_LIBRARY="$VULKAN_SDK/lib/libvulkan.1.dylib" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET -DCMAKE_PREFIX_PATH="$P;$VULKAN_SDK" -DCMAKE_CXX_FLAGS="-idirafter $VULKAN_SDK/include" -DVulkan_INCLUDE_DIR="$P/include" -DVulkan_LIBRARY="$VULKAN_SDK/lib/libvulkan.1.dylib" \
     ${CI_CMAKE_ARGS:-} > "$W/bbhost-configure.log" \
     || { tail -30 "$W/bbhost-configure.log"; exit 1; }
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true

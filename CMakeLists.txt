@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
+# Rosetta 2 runs AVX from macOS 15 on. Must precede project().
+if(CMAKE_HOST_APPLE)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "oldest macOS bbhost runs on")
+endif()
 project(bbhost LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
