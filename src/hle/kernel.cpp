@@ -280,6 +280,19 @@ int host_prot(int sce_prot) {
 
 enum class Fix { None, Exact, NoReplace };
 
+#if defined(__APPLE__)
+// macOS: mmap through the guest's windows, which are placeholders
+// (core/mac_vm.h) that a fixed mapping takes and an unmapping gives back;
+// macOS has no MAP_FIXED_NOREPLACE.
+void* mac_map(void* hint, std::uint64_t len, int sce_prot, int flags, int fd, std::uint64_t offset, Fix fix) {
+    const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
+                             : fix == Fix::Exact     ? MacVmPlace::Exact
+                             : fix == Fix::NoReplace ? MacVmPlace::NoReplace
+                                                     : MacVmPlace::Anywhere;
+    return mac_vm_map(hint, len, host_prot(sce_prot), flags, fd, offset, place);
+}
+#endif
+
 // Anonymous host memory. `Fix::Exact` replaces whatever is at hint (guest
 // asked for MAP_FIXED on a range it owns); `Fix::NoReplace` fails instead of
 // clobbering host memory (addresses we computed ourselves).
@@ -299,14 +312,7 @@ void* host_map_anon(void* hint, std::uint64_t len, int sce_prot, Fix fix) {
     if (sce_prot == 0) return win_vm_place(hint, round, place, kGnmVaMask);
     return win_vm_alloc(hint, round, static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #elif defined(__APPLE__)
-    // macOS: the guest's windows are placeholders (core/mac_vm.h), which a
-    // fixed mapping takes and an unmapping gives back; macOS has no
-    // MAP_FIXED_NOREPLACE.
-    const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
-                             : fix == Fix::Exact     ? MacVmPlace::Exact
-                             : fix == Fix::NoReplace ? MacVmPlace::NoReplace
-                                                     : MacVmPlace::Anywhere;
-    return mac_vm_map(hint, len, host_prot(sce_prot), MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0, place);
+    return mac_map(hint, len, sce_prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0, fix);
 #else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     if (hint && fix == Fix::Exact) {
@@ -342,11 +348,7 @@ void* host_map_dmem(void* hint, std::uint64_t len, int sce_prot, Fix fix, std::i
     return win_vm_map(g_dmem_map, hint, round, static_cast<std::uint64_t>(phys),
                       static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #elif defined(__APPLE__)
-    const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
-                             : fix == Fix::Exact     ? MacVmPlace::Exact
-                             : fix == Fix::NoReplace ? MacVmPlace::NoReplace
-                                                     : MacVmPlace::Anywhere;
-    return mac_vm_map(hint, len, host_prot(sce_prot), MAP_SHARED, g_dmem_fd, static_cast<std::uint64_t>(phys), place);
+    return mac_map(hint, len, sce_prot, MAP_SHARED, g_dmem_fd, static_cast<std::uint64_t>(phys), fix);
 #else
     int flags = MAP_SHARED;
     if (hint && fix == Fix::Exact) {

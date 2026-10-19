@@ -278,9 +278,11 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     constexpr std::size_t kPages = 0x2000, kMaskAt = 0x1000;
     void* page = mac_vm_map_near(at, at + sizeof(kCaCopyBytes), kPages, PROT_READ | PROT_WRITE);
     if (!page) return false;
+    const auto drop = [&] { mac_vm_unmap(page, kPages); };
 #else
     void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return false;
+    const auto drop = [&] { munmap(page, 0x1000); };
 #endif
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
@@ -306,11 +308,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     c[18] = 0xe9;
     if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
-#if defined(__APPLE__)
-        mac_vm_unmap(page, kPages);
-#else
-        munmap(page, 0x1000);
-#endif
+        drop();
         return false;
     }
     std::memcpy(c + 8, &to_mask, 4);
@@ -324,11 +322,7 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
         g_ca_mask = nullptr;
-#if defined(__APPLE__)
-        mac_vm_unmap(page, kPages);
-#else
-        munmap(page, 0x1000);
-#endif
+        drop();
         return false;
     }
     p[0] = 0xe9;  // jmp stub

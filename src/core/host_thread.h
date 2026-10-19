@@ -6,7 +6,6 @@
 
 #if defined(__APPLE__)
 #include <pthread.h>
-#include <unistd.h>
 
 #include <atomic>
 #include <cstddef>
@@ -21,6 +20,8 @@
 class HostThread {
 public:
     static constexpr std::size_t kStack = std::size_t{8} << 20;  // glibc's default (the stack limit)
+    // A size that is not a whole number of pages is refused (EINVAL).
+    static_assert(kStack % 16384 == 0, "the stack size must be whole pages");
 
     HostThread() noexcept = default;
     template <class F, class... A>
@@ -31,9 +32,7 @@ public:
         };
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        // A size that is not a whole number of pages is refused (EINVAL).
-        const auto page = static_cast<std::size_t>(getpagesize());
-        pthread_attr_setstacksize(&attr, (kStack + page - 1) / page * page);
+        pthread_attr_setstacksize(&attr, kStack);
         auto* arg = new std::shared_ptr<State>(st);
         const int e = pthread_create(&th_, &attr, entry, arg);
         pthread_attr_destroy(&attr);
