@@ -14,6 +14,13 @@ bin=${1:-build-macos/build/bbhost}
 out=${2:-build/mac}
 [ -x "$bin" ] || { echo "no binary at $bin (tools/build_macos.sh builds it)"; exit 1; }
 [ "$(uname)" = Darwin ] || { echo "package_macos.sh runs on macOS (codesign, dsymutil)"; exit 1; }
+# Plugin signatures are Ed25519, which LibreSSL can't make: fail early.
+if [ -n "${RELEASE_SIGNING_KEY:-}${RELEASE_SIGNING_KEY_FILE:-}" ] \
+    && ! openssl version 2>/dev/null | grep -qE '^OpenSSL [3-9]'; then
+    echo "signing the plugins needs OpenSSL 3, and openssl here is $(openssl version 2>/dev/null || echo missing):"
+    echo "  brew install openssl@3; export PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\""
+    exit 1
+fi
 rev=$(git -c core.excludesFile=/dev/null rev-parse --short HEAD 2>/dev/null || echo unknown)
 if tag=$(git -c core.excludesFile=/dev/null describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null); then
     rev=$tag
