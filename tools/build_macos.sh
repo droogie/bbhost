@@ -32,10 +32,15 @@ JOBS=$(sysctl -n hw.ncpu)
 ARCH=x86_64
 # As CMakeLists.txt; otherwise SDL3 and ffmpeg get the build machine's version.
 export MACOSX_DEPLOYMENT_TARGET=15.0
-# A prefix built for another minimum is built again.
+# Rebuild a cached prefix made elsewhere (its .pc files name that path) or for
+# another minimum, from clean build dirs (make would keep ffmpeg's objects).
+if [ -f "$P/lib/pkgconfig/libavcodec.pc" ] && ! grep -q "^prefix=$P\$" "$P/lib/pkgconfig/libavcodec.pc"; then
+    echo "the cached prefix was made in another directory ($(sed -n 's/^prefix=//p' "$P/lib/pkgconfig/libavcodec.pc")); building it again"
+    rm -rf "$P" "$W/sdl3" "$W/ffmpeg"
+fi
 if [ -d "$P/lib" ] && [ "$(cat "$P/deployment-target" 2>/dev/null)" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
     echo "the prefix was built for another macOS than $MACOSX_DEPLOYMENT_TARGET; building it again"
-    rm -rf "$P"
+    rm -rf "$P" "$W/sdl3" "$W/ffmpeg"
 fi
 mkdir -p "$W/src" "$P" "$T/bin"
 echo "$MACOSX_DEPLOYMENT_TARGET" > "$P/deployment-target"
