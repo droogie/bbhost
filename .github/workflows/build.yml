@@ -52,6 +52,18 @@ jobs:
         run: tools/ci_macos_setup.sh
       - name: build and test
         run: tools/build_macos.sh
+      - name: start without a game
+        # Checks start-up under Rosetta 2 (AVX, guest windows). With no
+        # config, bbhost writes one and exits 2.
+        run: |
+          export HOME="$RUNNER_TEMP/no-config"
+          mkdir -p "$HOME"
+          rc=0
+          build-macos/build/bbhost --headless > "$RUNNER_TEMP/start.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/start.log"
+          grep -q 'mac-vm: guest windows .* held' "$RUNNER_TEMP/start.log" || { echo "the guest's windows were not held"; exit 1; }
+          grep -q '^\[bbhost\] cpu: AVX, AVX2' "$RUNNER_TEMP/start.log" || { echo "Rosetta 2 does not run AVX here"; exit 1; }
+          [ "$rc" = 2 ] || { echo "bbhost exited with $rc, not 2 (no game configured)"; exit 1; }
       - name: logs on failure
         if: failure()
         run: tail -n 80 build-macos/*.log || true
