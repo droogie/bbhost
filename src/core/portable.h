@@ -51,10 +51,10 @@ void host_thread_fit_name(const char* name, char (&out)[16]);
 // Where this executable is loaded: code addresses minus this are what
 // addr2line takes (the link addresses, PIE's start at 0). macOS: for atos -l.
 std::uintptr_t host_image_base();
-#if defined(__APPLE__)
-// macOS: this executable's path, symbolic links resolved (_NSGetExecutablePath
-// and realpath), or empty - where Linux reads /proc/self/exe.
+// This executable's path, or empty. Windows: in the ANSI code page the C
+// library's file calls take; macOS: symbolic links resolved.
 std::string host_exe_path();
+#if defined(__APPLE__)
 // macOS: the loaded image (this executable or a library) one of whose
 // segments holds addr - an executable segment when code_only - with its path
 // and where its Mach-O header is loaded (addr minus that is what atos -l

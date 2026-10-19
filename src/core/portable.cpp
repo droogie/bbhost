@@ -489,6 +489,12 @@ void host_page_guard(void* p, std::size_t size) {
 #if defined(_WIN32)
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__ImageBase); }
+
+std::string host_exe_path() {
+    char buf[4096];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    return n == 0 || n >= sizeof(buf) ? std::string() : std::string(buf, n);
+}
 #elif defined(__APPLE__)
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&_mh_execute_header); }
 
@@ -545,4 +551,10 @@ bool host_readable(std::uint64_t addr, std::size_t len) {
 #else
 extern "C" char __executable_start;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__executable_start); }
+
+std::string host_exe_path() {
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string();
+}
 #endif

@@ -59,15 +59,14 @@ void set_lines(const std::string& status, const std::string& detail) {
 
 fs::path exe_path() {
 #if defined(_WIN32)
+    // The wide name: host_exe_path's is in the ANSI code page, which may not
+    // spell the path, and libstdc++ reads a narrow fs::path as UTF-8.
     std::wstring buf(32768, L'\0');
     const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
     buf.resize(n);
     return fs::path(buf);
-#elif defined(__APPLE__)
-    return fs::path(host_exe_path());
 #else
-    std::error_code ec;
-    return fs::read_symlink("/proc/self/exe", ec);
+    return fs::path(host_exe_path());
 #endif
 }
 

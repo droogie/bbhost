@@ -85,8 +85,8 @@ std::vector<std::string> symbolize(const std::vector<void*>& addrs) {
     }
 #elif !defined(_WIN32)
     // Our own path: in the child, /proc/self/exe would be addr2line.
-    char exe[4096] = {};
-    if (readlink("/proc/self/exe", exe, sizeof(exe) - 1) <= 0) return out;
+    const std::string exe = host_exe_path();
+    if (exe.empty()) return out;
     std::string cmd = std::string("addr2line -f -C -e '") + exe + "'";
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(&__executable_start);
     for (void* a : addrs) {

@@ -207,31 +207,14 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
 std::map<std::string, std::string> g_values;  // the config file's raw values, for config_value
 
 std::string exe_dir() {
+    std::string p = host_exe_path();
 #if defined(_WIN32)
-    char buf[4096];
-    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return ".";
-    std::string p(buf, n);
     for (char& ch : p) {
         if (ch == '\\') ch = '/';
     }
-    const std::size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-#elif defined(__APPLE__)
-    const std::string p = host_exe_path();
-    const std::size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-#else
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) {
-        return ".";
-    }
-    buf[n] = 0;
-    std::string p(buf);
-    std::size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? "." : p.substr(0, slash);
 #endif
+    const std::size_t slash = p.find_last_of('/');
+    return slash == std::string::npos ? "." : p.substr(0, slash);
 }
 
 bool file_exists(const std::string& p) {
