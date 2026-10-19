@@ -49,7 +49,7 @@ export PATH=$T/bin:$PATH
 fetch() {  # fetch NAME URL DIR-GLOB [SHA-256]
     if ! ls -d "$W/src"/$3 > /dev/null 2>&1; then
         echo "fetching $1"
-        curl -sSL -m 600 -o "$W/src/$1.tar" "$2"
+        curl -fsSL -m 600 -o "$W/src/$1.tar" "$2"
         if [ -n "${4:-}" ] && ! echo "$4  $W/src/$1.tar" | shasum -a 256 -c --status; then
             echo "$1: the download's SHA-256 is not $4"; rm -f "$W/src/$1.tar"; exit 1
         fi
@@ -65,7 +65,7 @@ if ! command -v cmake > /dev/null; then
 fi
 if ! command -v ninja > /dev/null; then
     echo "fetching ninja"
-    curl -sSL -m 300 -o "$W/src/ninja.zip" "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VER/ninja-mac.zip"
+    curl -fsSL -m 300 -o "$W/src/ninja.zip" "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VER/ninja-mac.zip"
     unzip -qo "$W/src/ninja.zip" -d "$T/bin"
     rm -f "$W/src/ninja.zip"
 fi

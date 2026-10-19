@@ -4,7 +4,10 @@
 # workflows cache ~/VulkanSDK keyed on this file.
 #   tools/ci_macos_setup.sh
 set -eu
-VULKAN_SDK_VERSION=${VULKAN_SDK_VERSION:-1.4.363.0}
+# Its libraries ship in the package, so the download is checked against
+# LunarG's hash (https://vulkan.lunarg.com/sdk/sha/<version>/mac/vulkan_sdk.zip.json).
+VULKAN_SDK_VERSION=1.4.363.0
+VULKAN_SDK_SHA256=163431e0203c8215286a17cf393643ce6b951f77d1b4f74ab30821a1f0beb09b
 root=$HOME/VulkanSDK/$VULKAN_SDK_VERSION
 
 if [ "$(uname -m)" = arm64 ] && ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
@@ -17,6 +20,8 @@ if [ ! -f "$root/macOS/lib/libMoltenVK.dylib" ]; then
     work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
     echo "fetching the Vulkan SDK $VULKAN_SDK_VERSION"
     curl -fsSL -m 1200 -o "$work/sdk.zip" "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/mac/vulkan_sdk.zip"
+    echo "$VULKAN_SDK_SHA256  $work/sdk.zip" | shasum -a 256 -c --status \
+        || { echo "the Vulkan SDK download's SHA-256 is not $VULKAN_SDK_SHA256"; exit 1; }
     unzip -q "$work/sdk.zip" -d "$work/sdk"
     app=$(ls -d "$work"/sdk/*.app | head -1)
     "$app/Contents/MacOS/$(basename "$app" .app)" --root "$root" --accept-licenses --default-answer \
