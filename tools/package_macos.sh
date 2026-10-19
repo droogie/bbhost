@@ -52,6 +52,10 @@ cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE"
 cp bbhost.example.toml "$dir/bbhost.example.toml"
 cp tools/macos/Apache-2.0.txt "$dir/licenses/Apache-2.0.txt"
+cp tools/macos/cereal-LICENSE.txt "$dir/licenses/cereal-LICENSE.txt"
+cp third_party/imgui/LICENSE.txt "$dir/licenses/imgui-LICENSE.txt"
+cp third_party/libatrac9/LICENSE "$dir/licenses/LibAtrac9-LICENSE.txt"
+cp third_party/monocypher/LICENCE.md "$dir/licenses/Monocypher-LICENCE.txt"
 tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 
 # dsymutil before strip: it follows the debug map to the object files.
@@ -98,9 +102,13 @@ codesign --force --sign - --entitlements tools/macos/bbhost.entitlements "$dir/b
 codesign --verify --strict "$dir/bbhost"
 
 # The licenses of what the package carries that is not bbhost's.
-# The SDK's VERSIONS.txt names the revision each was built from.
-rev_of() { grep -m1 "KhronosGroup/$1.git" "$sdk/../VERSIONS.txt" 2>/dev/null | cut -d' ' -f1 || true; }
-mvk=$(rev_of MoltenVK); ldr=$(rev_of Vulkan-Loader)
+# The SDK's VERSIONS.txt names the revision each was built from; the versions
+# of SDL3 and ffmpeg are tools/build_macos.sh's.
+rev_of() { grep -m1 "/$1.git" "$sdk/../VERSIONS.txt" 2>/dev/null | cut -d' ' -f1 || true; }
+mvk=$(rev_of MoltenVK); ldr=$(rev_of Vulkan-Loader); spvc=$(rev_of SPIRV-Cross)
+dep_ver() { sed -n "s/^$1=.*:-\(.*\)}\$/\1/p" tools/build_macos.sh; }
+sdl=$(dep_ver SDL_TAG); ffv=$(dep_ver FFMPEG_VER)
+[ -n "$sdl" ] && [ -n "$ffv" ] || { echo "no SDL_TAG or FFMPEG_VER in tools/build_macos.sh"; exit 1; }
 cat > "$dir/licenses/README.txt" <<EOF
 bbhost is under the GNU GPL, version 3 or later (../LICENSE). This package also
 carries, from the LunarG Vulkan SDK $sdkver:
@@ -109,16 +117,38 @@ carries, from the LunarG Vulkan SDK $sdkver:
                            Copyright The Brenwill Workshop Ltd.
                            Apache License 2.0 (Apache-2.0.txt).
                            Source: https://github.com/KhronosGroup/MoltenVK${mvk:+ at $mvk}
+                           It has built in:
+                           - SPIRV-Cross, copyright Arm Limited and others,
+                             Apache License 2.0 (Apache-2.0.txt).
+                             Source: https://github.com/KhronosGroup/SPIRV-Cross${spvc:+ at $spvc}
+                           - cereal, copyright Randolph Voorhies and Shane
+                             Grant, BSD 3-Clause (cereal-LICENSE.txt).
+                             Source: https://github.com/USCiLab/cereal
   lib/libvulkan.1.dylib    The Vulkan loader.
                            Copyright The Khronos Group Inc., Valve Corporation
                            and LunarG, Inc.
                            Apache License 2.0 (Apache-2.0.txt).
                            Source: https://github.com/KhronosGroup/Vulkan-Loader${ldr:+ at $ldr}
 
-bbhost itself is built with SDL3 (zlib license), ffmpeg's movie decoders
-(LGPL 2.1 or later), LibAtrac9 (MIT), Dear ImGui (MIT) and Monocypher
-(BSD-2-Clause or CC0) linked in; their sources and licenses are named in
-bbhost's repository, https://github.com/droogie/bbhost.
+MoltenVK's, SPIRV-Cross's and the loader's LICENSE files are each the text
+of Apache-2.0.txt.
+
+bbhost itself has linked in:
+
+  SDL3                     zlib license.
+                           Source: https://github.com/libsdl-org/SDL, tag $sdl
+  ffmpeg $ffv             Its movie decoders only (h264, hevc, aac, mp3),
+                           built as static libraries in ffmpeg's LGPL
+                           configuration: GNU LGPL, version 2.1 or later.
+                           Source: https://ffmpeg.org/releases/ffmpeg-$ffv.tar.xz
+                           (the configure options are in bbhost's
+                           tools/build_macos.sh).
+  LibAtrac9                MIT (LibAtrac9-LICENSE.txt).
+  Dear ImGui               MIT (imgui-LICENSE.txt).
+  Monocypher               BSD-2-Clause or CC0 (Monocypher-LICENCE.txt).
+
+bbhost's source, with those of LibAtrac9, Dear ImGui and Monocypher, is at
+https://github.com/droogie/bbhost.
 EOF
 
 cat > "$dir/run-bbhost.command" <<'EOF'
@@ -208,7 +238,8 @@ Reporting a problem
   game while it shows, then zip the logs/f12-<date>-<time> folder the log
   names and send it with the log.
 
-Licenses: LICENSE (bbhost), licenses/ (MoltenVK and the Vulkan loader).
+Licenses: LICENSE (bbhost), licenses/ (what bbhost is built with, and
+MoltenVK and the Vulkan loader; licenses/README.txt says which is which).
 EOF
 
 # ditto keeps modes and signatures intact.
