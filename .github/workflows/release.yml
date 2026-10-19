@@ -24,10 +24,9 @@
 # cancels the run still going.
 #
 # The bare executables the publish job adds keep the same names in every
-# release - bbhost.exe, bbhost (Linux) and bbhost-macos - so a shortcut or a
-# launcher entry (a Steam non-Steam game) keeps working when one is replaced
-# by the next. bbhost-macos runs from a macOS package's folder, which holds
-# the Vulkan loader and MoltenVK it loads (renamed bbhost there).
+# release - bbhost.exe and bbhost (Linux) - so a shortcut or a launcher entry
+# (a Steam non-Steam game) keeps working when one is replaced by the next.
+# macOS has none: its bbhost needs the package's lib/, so the zip is the update.
 # SHA256SUMS lists them with the packages, signed with the release key
 # (SHA256SUMS.sig, made with the RELEASE_SIGNING_KEY secret; a tag without the
 # secret fails rather than publish unsigned). bbhost itself (src/host/updater.h)
@@ -192,8 +191,7 @@ jobs:
           install -m 755 "dist/x/bbhost-linux-$v/bbhost" dist/release/bbhost
           m=dist/macos/bbhost-mac-$v.zip
           if [ -f "$m" ]; then
-            unzip -q "$m" "bbhost-mac-$v/bbhost" "bbhost-mac-$v/plugins/*" -d dist/x
-            install -m 755 "dist/x/bbhost-mac-$v/bbhost" dist/release/bbhost-macos
+            unzip -q "$m" "bbhost-mac-$v/plugins/*" -d dist/x
           else
             echo "no macOS package (package-macos failed): the release goes out without it"
           fi

@@ -30,8 +30,9 @@ done < <(find "$work" -name bbhost.example.toml)
 while IFS= read -r f; do
     if tr -d '\r' < "$f" | grep -E '^[^r#].*--config|^bbhost\.exe .*--config'; then fail "${f#"$work"/} passes a config"; fi
 done < <(find "$work" -name 'run-bbhost.bat')
-# What a first start writes (core/config.cpp's template), in each executable.
-for b in "$d"/bbhost "$d"/bbhost.exe "$d"/bbhost-macos; do
+# What a first start writes (core/config.cpp's template), in each executable
+# (macOS's only in its package).
+for b in "$d"/bbhost "$d"/bbhost.exe "$work"/m*/bbhost-mac-*/bbhost; do
     [ -f "$b" ] || continue
     s=$(strings -a "$b")
     for want in 'host = "thehuntersdream.com"' 'scheme = "https"' 'verify_tls = true' 'require_account = true' \

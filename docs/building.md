@@ -139,13 +139,13 @@ The release workflow (`.github/workflows/release.yml`) builds the Windows,
 Linux, Steam Deck and macOS packages from a `v*` tag, signs `SHA256SUMS` and
 the official plugins with the release key, and publishes the release that
 bbhost's update check looks for. The bare executables it attaches are named
-the same in every release (`bbhost.exe`, `bbhost` for Linux and
-`bbhost-macos`), so a shortcut or a Steam entry pointing at one keeps working
-when it is replaced; `bbhost-macos` runs from a macOS package's folder, which
-holds the Vulkan loader and MoltenVK. The packages pick no
-server, so they play on the live server (`https://thehuntersdream.com`),
-bbhost's default; `tools/check_release_bundle.sh` fails a release whose
-packages would go anywhere else, or that carries a playtest kit.
+the same in every release (`bbhost.exe`, and `bbhost` for Linux), so a
+shortcut or a Steam entry pointing at one keeps working when it is replaced;
+macOS has none, since its bbhost runs only from its package's folder, beside
+the Vulkan loader and MoltenVK. The packages pick no server, so they play on
+the live server (`https://thehuntersdream.com`), bbhost's default;
+`tools/check_release_bundle.sh` fails a release whose packages would go
+anywhere else, or that carries a playtest kit.
 
 ## Continuous integration
 
