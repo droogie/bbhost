@@ -128,6 +128,14 @@ void* mac_vm_map(void* at, std::uint64_t len, int prot, int flags, int fd, std::
     return p == MAP_FAILED ? nullptr : p;
 }
 
+bool mac_vm_in_window(std::uint64_t at, std::uint64_t len) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const Window& w : g_windows) {
+        if (at >= w.lo && at < w.hi && len <= w.hi - at) return true;
+    }
+    return false;
+}
+
 bool mac_vm_unmap(void* at, std::uint64_t len) {
     const auto a = reinterpret_cast<std::uint64_t>(at);
     const std::uint64_t end = a + len;

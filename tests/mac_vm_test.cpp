@@ -41,6 +41,13 @@ int main() {
     }
     expect(!mac_vm_reserve(kWin + 0x10000000, 0x1000), "a second reservation over the window succeeded");
 
+    expect(mac_vm_in_window(kWin, kWinLen), "the whole window is in it");
+    expect(mac_vm_in_window(kWin + 0x200000, 0x1000), "a page in the window is in it");
+    expect(!mac_vm_in_window(kWin - 0x1000, 0x2000), "a range straddling the window's start is in it");
+    expect(!mac_vm_in_window(kWin + kWinLen - 0x1000, 0x2000), "a range straddling the window's end is in it");
+    expect(!mac_vm_in_window(kWin + 0x1000, ~0ull), "a range wrapping past the address space is in it");
+    expect(!mac_vm_in_window(0x20000000000ull, 0x1000), "a page outside the windows is in one");
+
     // NoReplace takes placeholders, once.
     const std::uint64_t a = kWin + 0x200000;
     void* p = mac_vm_map(at(a), 0x20000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace);

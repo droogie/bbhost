@@ -56,12 +56,16 @@ bool mac_vm_reserve(std::uint64_t base, std::uint64_t len);
 
 enum class MacVmPlace { Anywhere, Exact, NoReplace };
 
-// mmap that keeps the windows. Exact: MAP_FIXED at `at` (the caller owns the
-// range). NoReplace: at `at` only when every page there is a placeholder, or
+// mmap that keeps the windows. Exact: MAP_FIXED at `at`, which replaces
+// whatever is there, the host's own memory too: the caller owns the range
+// (in a window, mac_vm_in_window, or a mapping of its own). NoReplace: at `at` only when every page there is a placeholder, or
 // every page is free (then as a hint, which the kernel takes when it can);
 // fails otherwise. Anywhere: `at` as a hint. `flags` as for mmap, without
 // MAP_FIXED. Returns the address or nullptr.
 void* mac_vm_map(void* at, std::uint64_t len, int prot, int flags, int fd, std::uint64_t offset, MacVmPlace place);
+
+// Every byte of [at, at+len) lies in one window.
+bool mac_vm_in_window(std::uint64_t at, std::uint64_t len);
 
 // Unmaps [at, at+len): what lies in a window becomes placeholders again,
 // the rest is unmapped.

@@ -284,7 +284,32 @@ enum class Fix { None, Exact, NoReplace };
 // macOS: mmap through the guest's windows, which are placeholders
 // (core/mac_vm.h) that a fixed mapping takes and an unmapping gives back;
 // macOS has no MAP_FIXED_NOREPLACE.
+//
+// An Exact mapping is MAP_FIXED, which replaces whatever is there, and the
+// host lives next to the guest's addresses: bbhost's image from 0x10000,
+// Rosetta 2's regions and the dylibs above the low window; a mapping over
+// Rosetta's pages hangs the process. So the guest gets one only in a window
+// or over mappings of its own (g_maps); anything else fails as a mapping
+// that cannot be placed.
+bool guest_owns(std::uint64_t lo, std::uint64_t len) {
+    if (mac_vm_in_window(lo, len)) return true;
+    std::lock_guard<std::mutex> lock(g_dmem_mu);
+    for (std::uint64_t p = lo; p - lo < len;) {
+        const auto r = std::find_if(g_maps.begin(), g_maps.end(),
+                                    [&](const MappedRegion& m) { return p >= m.start && p - m.start < m.len; });
+        if (r == g_maps.end()) return false;
+        p = r->start + r->len;
+    }
+    return true;
+}
+
 void* mac_map(void* hint, std::uint64_t len, int sce_prot, int flags, int fd, std::uint64_t offset, Fix fix) {
+    if (hint && fix == Fix::Exact && !guest_owns(reinterpret_cast<std::uint64_t>(hint), len)) {
+        host_log("mac-vm: fixed guest mapping at %p len 0x%llx refused: outside the guest windows and the guest's own "
+                 "mappings",
+                 hint, static_cast<unsigned long long>(len));
+        return nullptr;
+    }
     const MacVmPlace place = !hint                  ? MacVmPlace::Anywhere
                              : fix == Fix::Exact     ? MacVmPlace::Exact
                              : fix == Fix::NoReplace ? MacVmPlace::NoReplace
