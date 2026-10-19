@@ -153,9 +153,10 @@ These are for test runs and off by default.
 
 | Switch | What it does |
 |---|---|
+| `BBHOST_FRAME_STATS=1` | logs a `frames:` line each second: flips, frame intervals, the busiest threads and the GPU's busy time. On macOS the line ends with the second's Mach event counts: the task's page faults (copy-on-write and page-ins among them), Mach and BSD calls and context switches, the write watch's faults and released reads, and the share of the busiest thread's time spent in the kernel. With the exception server's share in the cpu list, they tell a write-watch fault storm from faults Rosetta handles on its own, as when code pages are written |
 | `BBHOST_FRAME_DETAIL=1` | with `BBHOST_FRAME_STATS=1`: after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
 | `BBHOST_TEST_WARP=1` | lets plugins move the player (the probe) |
-| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
+| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, `dumpseq <prefix> <n>` (the next n flips, 30 without n, each written to `<prefix>-<flip>.ppm`, for finding a one-frame flicker: a frame that differs from both neighbours while they agree), a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
 

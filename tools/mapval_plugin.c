@@ -19,6 +19,8 @@
  *                                             to 1, the player next to it
  *                                             facing it until it dies (the
  *                                             driver presses attack)
+ *     fight <s> <radius> [x y z]              as kill for <s> seconds, the enemy's
+ *                                             HP left, the player's kept full
  *     falldeath <name> <x> <y> <z> <height>   HP to 1, dropped from height
  *                                             above the point: a death there
  *     travel <return point> <block hex> <name> [<event flag>...]
