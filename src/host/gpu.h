@@ -400,6 +400,7 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
 // GDS counters (gcn::TranslateOptions::gds_counters; BBHOST_GDS_COUNTERS=0
 // turns them off, and GDS is dropped as before).
 bool host_gpu_gds_counters();
+bool host_gpu_gds_subgroup();  // BBHOST_GDS_SUBGROUP: the lift's GDS counters a subgroup at a time (TranslateOptions::gds_subgroup)
 // A copy out of or a fill of a counter word, on the GPU's timeline: the word
 // is the GPU's, as GX's GDS was, and its value is the one the dispatches
 // before this point in the stream left (D3D11's CopyStructureCount).

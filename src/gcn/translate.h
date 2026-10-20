@@ -409,6 +409,16 @@ struct TranslateOptions {
     // BBHOST_GDS_COUNTERS=0), GDS is taken for LDS and each lane is handed its
     // rank on top, as before.
     bool gds_counters = true;
+    // The lift's GDS counters (lift.cpp gds_counter): one atomic a subgroup -
+    // an elected invocation adds the active invocations' count and each takes
+    // the base plus (append) or minus (consume) its rank among them, as GCN
+    // steps the counter once a wave - rather than one atomic an invocation.
+    // The counter word lives where the game's buffer does (imported memory on
+    // a discrete GPU): a word every invocation of a particle pass stepped
+    // went across the bus once each, in turn (CS_VFX_StandardParticle, ~8 ms
+    // a frame for Vicar Amelia's ~37,500 particles). The host's
+    // BBHOST_GDS_SUBGROUP=0 keeps an atomic an invocation.
+    bool gds_subgroup = true;
 };
 
 struct TranslateResult {

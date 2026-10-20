@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 struct SysvVaList {
     std::uint32_t gp_offset;
@@ -36,6 +37,8 @@ double sysv_va_fp(SysvVaList* ap);
 // UTF-16 and are narrowed as ASCII.
 int sysv_vsnprintf(char* out, std::size_t n, const char* fmt, SysvVaList* ap);
 int sysv_vfprintf(std::FILE* f, const char* fmt, SysvVaList* ap);
+// The text printf would write, as a string (the console's repeat filter takes it: hle/guest_console.h).
+std::string sysv_vformat(const char* fmt, SysvVaList* ap);
 // UTF-16 output, native multibyte %s/%c, UTF-16 %ls/%lc; counts code units.
 // Unlike snprintf, truncation returns -1, leaving a terminated prefix.
 int sysv_vswprintf(char16_t* out, std::size_t n, const char16_t* fmt, SysvVaList* ap);

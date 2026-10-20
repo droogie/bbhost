@@ -745,6 +745,10 @@ private:
             case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended: case spv::CapPhysicalStorageBufferAddresses:
             case spv::CapGeometry:
                 break;
+            // Ballots, counted (WaveActiveCountBits, WavePrefixCountBits), and
+            // WaveReadLaneFirst: the GDS counters stepped a subgroup at a time.
+            // A ballot read any other way is not printed (Printer::ballots).
+            case spv::CapGroupNonUniformBallot: break;
             // A lift for a device that rounds halves itself (gcn/half.h
             // native_half_rtz): Float16 comes with the half types DXC is given
             // (-enable-16bit-types), DenormPreserve and RoundingModeRTZ with
@@ -1047,6 +1051,11 @@ private:
     std::set<std::uint32_t> hoisted;
     std::set<std::uint32_t> printed_blocks;
     std::map<std::uint32_t, Handle> handles;
+    // OpGroupNonUniformBallot results, by their predicate: HLSL counts a
+    // ballot's bits in one intrinsic (WaveActiveCountBits, WavePrefixCountBits)
+    // and has no other use of one here (the lift's GDS counters, a subgroup at
+    // a time); read any other way, the stage is not printed.
+    std::map<std::uint32_t, std::uint32_t> ballots;
     std::map<std::uint32_t, std::pair<std::string, std::string>> parts;  // a struct value's two members (carry ops)
 
     void line(const std::string& s) {
@@ -1104,9 +1113,13 @@ private:
         if (const auto c = consts.find(v); c != consts.end()) return const_expr(v);
         if (const auto g = global_names.find(v); g != global_names.end()) return g->second;
         if (handles.count(v)) fail("a handle used as a value");
+        if (ballots.count(v)) fail("a subgroup ballot read otherwise than counted");
         if (parts.count(v)) fail("a struct value used whole");
         use(v);
         return value_name(v);
+    }
+    void subgroup_scope(std::uint32_t scope) {
+        if (!consts.count(scope) || const_bits(consts.at(scope)) != spv::ScopeSubgroup) fail("a subgroup operation of another scope");
     }
     std::string const_expr(std::uint32_t v) {
         const Const& c = consts.at(v);
@@ -1768,6 +1781,27 @@ private:
         case spv::OpBitCount: return define(in, back("countbits(" + as(in.a.at(0), 'u') + ")", 'u'));
         case spv::OpDPdx: return define(in, "ddx(" + ref(in.a.at(0)) + ")");
         case spv::OpDPdy: return define(in, "ddy(" + ref(in.a.at(0)) + ")");
+        case spv::OpGroupNonUniformBallot: {
+            subgroup_scope(in.a.at(0));
+            ballots[in.id] = in.a.at(1);
+            return;
+        }
+        case spv::OpGroupNonUniformBallotBitCount: {
+            subgroup_scope(in.a.at(0));
+            const auto b = ballots.find(in.a.at(2));
+            if (b == ballots.end()) fail("a ballot count of no ballot");
+            const std::uint32_t group_op = in.a.at(1);
+            if (group_op != spv::GroupOperationReduce && group_op != spv::GroupOperationExclusiveScan) fail("a ballot count of another group operation");
+            return define(in, back(std::string(group_op == spv::GroupOperationReduce ? "WaveActiveCountBits(" : "WavePrefixCountBits(") + ref(b->second) + ")", 'u'));
+        }
+        case spv::OpGroupNonUniformElect: {
+            subgroup_scope(in.a.at(0));
+            return define(in, "WaveIsFirstLane()");
+        }
+        case spv::OpGroupNonUniformBroadcastFirst: {
+            subgroup_scope(in.a.at(0));
+            return define(in, "WaveReadLaneFirst(" + ref(in.a.at(1)) + ")");
+        }
         case spv::OpGroupNonUniformQuadBroadcast: {
             if (!consts.count(in.a.at(0)) || const_bits(consts.at(in.a[0])) != spv::ScopeSubgroup) fail("a quad operation of another scope");
             return define(in, "QuadReadLaneAt(" + ref(in.a.at(1)) + ", " + as(in.a.at(2), 'u') + ")");

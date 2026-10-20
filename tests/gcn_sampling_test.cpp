@@ -1,9 +1,11 @@
 // Execute synthetic GCN on Vulkan: check sampled and stored values, not just
 // SPIR-V validity. No game files are needed. Exit 77 if no suitable Vulkan
 // device is available.
+#include "gcn/lift.h"
 #include "gcn/translate.h"
 #include <spirv-tools/libspirv.hpp>
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -216,6 +218,14 @@ struct Fixture {
         VkPipeline pipeline{};
         gcn::TranslateResult result;
     };
+    // The counter programs as which module: the translation (its GDS step a
+    // subgroup at a time), or the lift with an atomic an invocation or a
+    // subgroup (TranslateOptions::gds_subgroup).
+    enum class Path { kTranslation, kLiftInvocation, kLiftSubgroup };
+    Path path = Path::kTranslation;
+    static const char* path_name(Path p) {
+        return p == Path::kTranslation ? "translation" : p == Path::kLiftInvocation ? "lift, an atomic an invocation" : "lift, an atomic a subgroup";
+    }
     CounterPipeline counter_pipeline(const std::vector<std::uint32_t>& words, std::uint32_t threads, bool gds_counters = true) {
         const gcn::Program prog = gcn::decode(words.data(), words.size());
         if (!prog.errors.empty()) throw std::runtime_error("counter program: " + prog.errors[0].what);
@@ -224,15 +234,26 @@ struct Fixture {
         o.rsrc2 = 13 << 1;
         o.cs_threads[0] = threads;
         o.gds_counters = gds_counters;
+        o.gds_subgroup = path == Path::kLiftSubgroup;
         CounterPipeline cp;
         cp.result = gcn::translate(prog, o);
         if (!cp.result.ok()) throw std::runtime_error(cp.result.errors[0]);
+        std::vector<std::uint32_t> spirv = cp.result.spirv;
+        if (path != Path::kTranslation && gds_counters) {
+            const gcn::LiftResult l = gcn::lift_compute_shader(prog, o, cp.result);
+            if (!l.ok()) throw std::runtime_error("counter program not lifted: " + (l.rejections.empty() ? std::string("?") : l.rejections[0]));
+            spirv = l.spirv;
+            // The step it was asked for: an elected invocation's atomic a subgroup, or none.
+            std::size_t elects = 0;
+            for (std::size_t k = 5; k < spirv.size(); k += std::max<std::uint32_t>(1, spirv[k] >> 16)) elects += (spirv[k] & 0xffff) == 333;  // OpGroupNonUniformElect
+            if ((elects != 0) != (path == Path::kLiftSubgroup)) throw std::runtime_error("the lift's GDS step is not the one asked for");
+        }
         spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_2);
         validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr, "%s\n", msg); });
-        if (!validator.Validate(cp.result.spirv)) throw std::runtime_error("invalid SPIR-V");
+        if (!validator.Validate(spirv)) throw std::runtime_error("invalid SPIR-V");
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        mi.codeSize = cp.result.spirv.size() * 4;
-        mi.pCode = cp.result.spirv.data();
+        mi.codeSize = spirv.size() * 4;
+        mi.pCode = spirv.data();
         check(vkCreateShaderModule(device, &mi, nullptr, &cp.module));
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.layout = pipeline_layout;
@@ -308,8 +329,8 @@ struct Fixture {
         bool ok = cp.result.gds_counters == 1 && guest_u32(kCounterA) == start + counting && guest_u32(kCounterB) == 777 &&
                   marks_once(start, start + counting, why);
         if (cp.result.gds_counters != 1) why = std::to_string(cp.result.gds_counters) + " GDS counter sites, expected 1";
-        std::printf("%s ds_append gds offset:%u, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u), other %u%s%s\n",
-                    ok ? "PASS" : "FAIL", off, threads, groups, counting, start, what, guest_u32(kCounterA), start + counting, guest_u32(kCounterB),
+        std::printf("%s [%s] ds_append gds offset:%u, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u), other %u%s%s\n",
+                    ok ? "PASS" : "FAIL", path_name(path), off, threads, groups, counting, start, what, guest_u32(kCounterA), start + counting, guest_u32(kCounterB),
                     why.empty() ? "" : "; ", why.c_str());
         destroy(cp);
         (void)total;
@@ -331,8 +352,8 @@ struct Fixture {
         submit();
         std::string why;
         const bool ok = guest_u32(kCounterA) == start - counting && guest_u32(kCounterB) == 777 && marks_once(start - counting, start, why);
-        std::printf("%s ds_consume gds, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u)%s%s\n", ok ? "PASS" : "FAIL",
-                    threads, groups, counting, start, what, guest_u32(kCounterA), start - counting, why.empty() ? "" : "; ", why.c_str());
+        std::printf("%s [%s] ds_consume gds, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u)%s%s\n", ok ? "PASS" : "FAIL",
+                    path_name(path), threads, groups, counting, start, what, guest_u32(kCounterA), start - counting, why.empty() ? "" : "; ", why.c_str());
         destroy(cp);
         return ok;
     }
@@ -1016,17 +1037,24 @@ int main() try {
     // EXEC partly off; M0's base plus the offset picking the word; consume's
     // values from before; an unbound dword; the counter into indirect
     // arguments on the GPU's timeline.
-    ok &= f.run_gds_append(32, 1, Fixture::Lanes::kAll, 0, 4, 0, "one subgroup");
-    ok &= f.run_gds_append(256, 1, Fixture::Lanes::kAll, 0, 4, 10, "several subgroups");
-    ok &= f.run_gds_append(256, 8, Fixture::Lanes::kAll, 0, 4, 3, "several workgroups");
-    ok &= f.run_gds_append(64, 4, Fixture::Lanes::kOdd, 0, 4, 1, "the odd lanes only");
-    ok &= f.run_gds_append(128, 2, Fixture::Lanes::kBelow, 45, 4, 0, "the first 45 lanes of each group");
-    ok &= f.run_gds_append(64, 2, Fixture::Lanes::kAll, 0, 0, 100, "offset 0: the first word");
-    ok &= f.run_gds_consume(256, 1, 256, 300, "every lane");
-    ok &= f.run_gds_consume(64, 4, 37, 200, "37 lanes of each group");
-    ok &= f.run_gds_unbound();
-    ok &= f.run_counter_to_args(1, 37);
-    ok &= f.run_counter_to_args(16, 64);
+    // Each as the translation and as the lift - an atomic an invocation, and
+    // one a subgroup (TranslateOptions::gds_subgroup): the same counts, each
+    // slot of the range handed out once, whichever.
+    for (const Fixture::Path p : {Fixture::Path::kTranslation, Fixture::Path::kLiftInvocation, Fixture::Path::kLiftSubgroup}) {
+        f.path = p;
+        ok &= f.run_gds_append(32, 1, Fixture::Lanes::kAll, 0, 4, 0, "one subgroup");
+        ok &= f.run_gds_append(256, 1, Fixture::Lanes::kAll, 0, 4, 10, "several subgroups");
+        ok &= f.run_gds_append(256, 8, Fixture::Lanes::kAll, 0, 4, 3, "several workgroups");
+        ok &= f.run_gds_append(64, 4, Fixture::Lanes::kOdd, 0, 4, 1, "the odd lanes only");
+        ok &= f.run_gds_append(128, 2, Fixture::Lanes::kBelow, 45, 4, 0, "the first 45 lanes of each group");
+        ok &= f.run_gds_append(64, 2, Fixture::Lanes::kAll, 0, 0, 100, "offset 0: the first word");
+        ok &= f.run_gds_consume(256, 1, 256, 300, "every lane");
+        ok &= f.run_gds_consume(64, 4, 37, 200, "37 lanes of each group");
+        ok &= f.run_gds_unbound();
+        ok &= f.run_counter_to_args(1, 37);
+        ok &= f.run_counter_to_args(16, 64);
+    }
+    f.path = Fixture::Path::kTranslation;
     ok &= f.run_gds_off();
     return ok ? 0 : 1;
 } catch (const std::exception& e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

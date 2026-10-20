@@ -135,6 +135,7 @@ add_executable(bbhost
   src/host/foreign_hooks.cpp
   src/hle/runtime.cpp
   src/hle/libc.cpp
+  src/hle/guest_console.cpp
   src/hle/sysv_va.cpp
   src/hle/pthread.cpp
   src/hle/sync.cpp
@@ -383,6 +384,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
+  src/decomp/sfx/step_gate.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
 )
@@ -424,6 +426,13 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET libc_errno_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME libc_errno_test COMMAND libc_errno_test)
+add_executable(guest_console_test tests/guest_console_test.cpp src/hle/guest_console.cpp)
+target_include_directories(guest_console_test PRIVATE src)
+target_compile_features(guest_console_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME guest_console_test COMMAND guest_console_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
@@ -490,6 +499,9 @@ if(UNIX)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
+  add_executable(sfx_schedule_test tests/sfx_schedule_test.cpp)
+  target_include_directories(sfx_schedule_test PRIVATE src)
+  add_test(NAME sfx_schedule_test COMMAND sfx_schedule_test)
   add_executable(tess_lds_test tests/tess_lds_test.cpp src/host/tess_lds.cpp)
   target_include_directories(tess_lds_test PRIVATE src)
   add_test(NAME tess_lds_test COMMAND tess_lds_test)
@@ -570,6 +582,7 @@ if(UNIX)
   bbhost_decomp_test(chalice_ritual)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
+  bbhost_decomp_test(sfx_step_gate)
   bbhost_decomp_test(adaptive_mutex)
   bbhost_decomp_test(ez_work)
   bbhost_decomp_test(ez_node_cache)

@@ -837,9 +837,9 @@ std::atomic<std::uint64_t> g_tess_hull_draws{0}, g_tess_hull_patches{0};
 // worker built their native pipeline (queue_native_pipeline).
 std::atomic<std::uint64_t> g_tess_native_refusals{0}, g_tess_native_waits{0};
 // Draws that bind a geometry shader (gs_draw): drawn with their GS as its own
-// pipeline; the attempts refused, by reason (which then went as VS/PS); and
-// every one drawn as VS/PS - refused, or BBHOST_GX_GS=0 - by its GS program
-// and ES, which draws nothing (the ES exports no position).
+// pipeline; the attempts refused, by reason (not drawn); and every one drawn
+// as VS/PS - BBHOST_GX_GS=0 - by its GS program and ES, which draws nothing
+// (the ES exports no position).
 std::atomic<std::uint64_t> g_gs_drawn{0};
 std::mutex g_gs_mu;
 std::map<std::string, std::uint64_t> g_gs_refused, g_gs_as_vs;  // under g_gs_mu
@@ -9181,7 +9181,7 @@ void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vec
 }
 // Under g.mu: a geometry-shader pipeline (DrawState::gs) built by a worker the
 // same way - its lifts and its compile off the command processor, no stall at
-// its first sight; until the worker is done its draws go as VS/PS (gs_draw).
+// its first sight; until the worker is done its draws are not drawn (gs_draw).
 // False where its programs are not known (the draw is refused).
 bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<std::uint32_t>& vs_words, const std::vector<std::uint32_t>& ps_words,
                        const std::string& vs_name, const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
@@ -10538,8 +10538,8 @@ void render_report() {
             std::string refused, as_vs;
             for (const auto& [why, n] : g_gs_refused) refused += (refused.empty() ? "" : ", ") + why + " x" + std::to_string(n);
             for (const auto& [prog, n] : g_gs_as_vs) as_vs += (as_vs.empty() ? "" : ", ") + prog + " x" + std::to_string(n);
-            host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused: %s; drawn as VS/PS (nothing "
-                     "drawn), by program: %s",
+            host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused, not drawn: %s; drawn as VS/PS "
+                     "(nothing drawn; BBHOST_GX_GS=0), by program: %s",
                      static_cast<unsigned long long>(g_gs_drawn.load()), g_gs_pipelines.size(), refused.empty() ? "none" : refused.c_str(),
                      as_vs.empty() ? "none" : as_vs.c_str());
         }
@@ -16377,8 +16377,12 @@ bool host_gpu_draw(const GpuDraw& d) {
         }
         if (!(gi ? gi->stages & 0x7 : d.ctx[0x2d5] & 0x7)) {
             // A draw that binds a geometry shader (BBHOST_GX_GS): as a pipeline
-            // of its own, or - refused (a stage the lift does not take, a
-            // buffer that does not bind) - as GX's VS and PS, as before.
+            // of its own, or - refused (its pipeline still being built, a
+            // stage the lift does not take, a buffer that does not bind) - not
+            // at all. As GX's VS and PS, as before, it would draw nothing (the
+            // ES exports no position) and only store the ES's ring through a
+            // buffer from a V# in the draw's tables, wherever those point by
+            // then. BBHOST_GX_GS=0 draws every one that way.
             if (d.gx && d.gx_render && !d.gx_partial && d.gx->gs && d.gx_objects && d.gx_objects->shader[3]) {
                 t_gs_draw = true;
                 t_gs_refusal = nullptr;
@@ -16391,7 +16395,8 @@ bool host_gpu_draw(const GpuDraw& d) {
                     return ok;
                 }
                 std::lock_guard<std::mutex> lk(g_gs_mu);
-                if (g_gs_refused[why]++ == 0) host_log("render: a draw that binds a geometry shader goes as VS/PS: %s", why);
+                if (g_gs_refused[why]++ == 0) host_log("render: a draw that binds a geometry shader is not drawn: %s", why);
+                return true;
             }
             return draw_impl(d);
         }
@@ -17307,7 +17312,7 @@ static bool draw_impl(const GpuDraw& d) {
         if (built && built->building) return tess_native_wait();
     }
     // A geometry-shader pipeline is its own no-fallback variant, lifted: built by
-    // a worker (queue_gs_pipeline), the draw going as VS/PS until it is.
+    // a worker (queue_gs_pipeline), the draw not drawn until it is.
     const bool gs_native = s.gs;
     if (gs_native) {
         GfxPipeline* const built = gfx_lookup(key);
@@ -18560,7 +18565,7 @@ static bool draw_impl(const GpuDraw& d) {
     // A geometry-shader pipeline's set 4: the ES's params block and constant
     // buffers, its user data from its GX records (GX's VS's, slot 0) over what
     // the draw's inputs hold. Every buffer of its three stages binds, or the
-    // draw goes as VS/PS (gs_draw).
+    // draw is not drawn (gs_draw).
     if (pl.gs_native) {
         if (!all_bound) return gs_refuse("a constant buffer of its GS or pixel shader does not bind");
         const GxStageRecords* es_rec = gx_records ? &gx_records->stage[0] : nullptr;
@@ -20905,14 +20910,23 @@ bool write_target_image(const TargetPixels& t) {
     // finite value and how many texels are infinite or NaN.
     float fmax[3] = {0.f, 0.f, 0.f};
     std::uint64_t finf[3] = {}, fnan[3] = {};
+    // BBHOST_F12_NAN=1 (a diagnostic): a texel with a NaN channel is magenta.
+    static const bool nan_magenta = [] {
+        const char* e = std::getenv("BBHOST_F12_NAN");
+        return e && e[0] == '1';
+    }();
+    bool texel_nan = false;
     auto note_float = [&](int k, float v) {
-        if (std::isnan(v)) ++fnan[k];
-        else if (std::isinf(v)) ++finf[k];
+        if (std::isnan(v)) {
+            ++fnan[k];
+            texel_nan = true;
+        } else if (std::isinf(v)) ++finf[k];
         else fmax[k] = std::max(fmax[k], v);
     };
     std::vector<std::uint8_t> row(static_cast<std::size_t>(t.width) * 3);
     for (std::uint32_t y = 0; y < t.height; ++y) {
         for (std::uint32_t x = 0; x < t.width; ++x) {
+            texel_nan = false;
             const std::uint8_t* p = t.data() + (static_cast<std::size_t>(y) * t.width + x) * t.bpp;
             if (rgba8) {
                 row[x * 3 + 0] = bgra ? p[2] : p[0];
@@ -20958,9 +20972,15 @@ bool write_target_image(const TargetPixels& t) {
             } else if (fmt == VK_FORMAT_R32_SFLOAT) {
                 float fv;
                 std::memcpy(&fv, p, 4);
+                note_float(0, fv);
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = tone8(fv);
             } else {
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = p[0];
+            }
+            if (nan_magenta && texel_nan) {
+                row[x * 3 + 0] = 255;
+                row[x * 3 + 1] = 0;
+                row[x * 3 + 2] = 255;
             }
         }
         f.row(row.data());
@@ -20997,7 +21017,8 @@ bool write_target_image(const TargetPixels& t) {
                      static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
         }
     }
-    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+        (fmt == VK_FORMAT_R32_SFLOAT && !t.depth)) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
                  static_cast<unsigned long long>(finf[2]), static_cast<unsigned long long>(fnan[0]),

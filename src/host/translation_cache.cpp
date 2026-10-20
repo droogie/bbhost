@@ -181,6 +181,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.flag(o.tess_patch_cull);
     h.flag(o.tess_patch_cull_all);
     h.flag(o.gds_counters);
+    if (o.gds_subgroup) h.u32(0x6d51u);  // the lift's GDS counters a subgroup at a time (lift.cpp gds_counter)
     if (o.gs_role != gcn::TranslateOptions::GsRole::None) h.u32(0x6510u | static_cast<std::uint32_t>(o.gs_role));  // other stages' keys as they were
 }
 

@@ -25,8 +25,13 @@
 //    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
 //    scale its stiffness by (60 dt)^2. The play time adds each frame's
 //    milliseconds with the remainder carried (the game truncates them), and
-//    the effects step in whole 1/60 s the same way (BBHOST_SFX_STEP). The
-//    follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
+//    the effects - the lamps' flicker among them - and the wind on grass and
+//    trees step in whole 1/30 s the same way, 30 times a second as at 30, the
+//    frames between holding what the effects count in updates
+//    (decomp/sfx/step_gate.cpp, BBHOST_SFX_GATE; [video] effect_steps or
+//    BBHOST_SFX_STEP: 60 for the effects in whole 1/60 s and the wind by the
+//    frame's time, frame for both by the frame's time).
+//    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
 //  - uncapped: the same, with a target of the display's refresh rate with

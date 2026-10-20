@@ -153,6 +153,12 @@ bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows) and
 `run-bbhost.sh` (Linux) write each session's log to `logs/`. A bug report is
 most useful with that log attached.
 
+The game's own prints go to the console too. A line it prints over and over
+(YEBIS's depth-of-field error in parts of Cainhurst comes every frame) is
+written once, then as a count every ten seconds while it keeps coming and at
+exit: "the game printed this N more times". `BBHOST_GUEST_PRINTS=all` writes
+every line as it comes.
+
 ## Troubleshooting
 
 **The eboot is refused.** It is not the 1.09 build. Use the update's
@@ -186,7 +192,10 @@ the rendering bugs found so far. The images are PPM, which costs nothing to
 write; `BBHOST_F12_PNG=1` writes PNG instead, which any image viewer opens, a
 fifth of the size on disk, written over a few seconds in the background.
 `BBHOST_F12_TEXTURES=1` adds every texture the frame sampled, and the game
-pauses while it writes them.
+pauses while it writes them. `BBHOST_F12_NAN=1` paints every texel of a
+float target with a NaN channel magenta, so a black blob that is a NaN shows
+where it is; the log counts each float target's NaN and infinite texels
+either way.
 
 **Black or broken image in the world, or slow on a card with little video
 memory.** bbhost follows the driver's video memory budget as the game runs:
@@ -241,7 +250,21 @@ grass, the camera's easing, momentum, fades - follow it, so the game runs at
 the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
-120). Above 60 and Uncapped the game paces itself
+120). The effects - fire, lamps', candles' and braziers' flicker, blood,
+magic, every effect the game's effect manager runs - and the wind that sways
+grass and trees step in whole 1/30 s above 30, as many times a second as at
+30 (every other frame at 60, every fourth at 120), the flicker and the sway
+keeping the cadence the game has at 30. The frames between whole steps still
+run the effects' update, so effects follow what they ride on and are drawn
+every frame, but with what the game counts in updates held for the next
+whole step - a node's state, its emissions and the definitions its
+conditions pick, the controllers, a light's flicker phase
+(`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
+Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
+with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
+instead (60 updates a second above 60) and the wind by the frame's time;
+`frame` steps both by the frame's time; `BBHOST_SFX_STEP=30|60|frame`
+overrides the setting. Above 60 and Uncapped the game paces itself
 and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
 them a second; a rate the machine cannot hold runs slower than real time in
 the few places that count frames.
@@ -259,7 +282,13 @@ a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
 still, as a variable-refresh display or a busy scene makes it.
 `BBHOST_FIXED_TICK=<address>:<bytes>[,...]` (a test switch, same rates) runs
 a game function as a 30 Hz tick - once every other frame at 60, and so on, with
-the remainder carried - for logic that counts frames (`engine/frame_tick.h`). The start of the log says which rate
+the remainder carried - for logic that counts frames (`engine/frame_tick.h`). `BBHOST_SFX_SIM_FPS=N`
+(a test switch, 30-1000, with effect steps 30 or 60) lays out the effects'
+whole steps as at N fps whatever the frame's time - the carry grows 1/N a
+frame - so a renderer far below N (lavapipe) runs the cadence N has, 1/30, 0,
+1/30, 0 ... at 60 with whole 1/30 s steps; the rest of the game keeps the
+frame's time (1/30 s a frame below 30 fps), so the effects run N/30 times
+slower than it. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).

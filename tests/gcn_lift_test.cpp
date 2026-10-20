@@ -4289,11 +4289,24 @@ void run() {
         CHECK(count_op(u.spirv, 224) == 1);  // OpControlBarrier
     }
     for (const std::uint32_t threads : {32u, 128u}) {
+        // The default (TranslateOptions::gds_subgroup): an elected invocation's
+        // atomic for the subgroup's count, each invocation its rank among them.
         const gcn::LiftResult r = lift(append(false), options(threads));
         CHECK(lifted_valid(r, "append idiom"));
         CHECK(r.wave.gds_steps == 1);
-        CHECK(count_op(r.spirv, 339) == 0);  // no OpGroupNonUniformBallot: each invocation steps the counter itself
+        CHECK(count_op(r.spirv, 333) == 1);  // OpGroupNonUniformElect
+        CHECK(count_op(r.spirv, 339) == 2);  // OpGroupNonUniformBallot: the count and the rank
+        CHECK(count_op(r.spirv, 342) == 2);  // OpGroupNonUniformBallotBitCount
+        CHECK(count_op(r.spirv, 338) == 1);  // OpGroupNonUniformBroadcastFirst: the base
         CHECK(count_op(r.spirv, 234) == 1);  // one OpAtomicIAdd
+        // gds_subgroup off: each invocation steps the counter itself.
+        gcn::TranslateOptions each = options(threads);
+        each.gds_subgroup = false;
+        const gcn::LiftResult e = lift(append(false), each);
+        CHECK(lifted_valid(e, "append idiom, an atomic an invocation"));
+        CHECK(count_op(e.spirv, 339) == 0);  // no OpGroupNonUniformBallot
+        CHECK(count_op(e.spirv, 333) == 0);
+        CHECK(count_op(e.spirv, 234) == 1);  // one OpAtomicIAdd
     }
     CHECK(rejected_with(lift(append(true)), "used other than added to its lanes' ranks"));
     {

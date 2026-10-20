@@ -436,6 +436,30 @@ public:
         return b;
     }
 
+    // Device-local, device-addressable, not mapped: filled and read by copies.
+    Buffer device_buffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+        Buffer b;
+        b.size = std::max<VkDeviceSize>(size, 4);
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = b.size;
+        bci.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        check(vkCreateBuffer(device, &bci, nullptr, &b.buffer), "vkCreateBuffer");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device, b.buffer, &req);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &flags;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device, &mai, nullptr, &b.memory), "vkAllocateMemory (device-local buffer)");
+        check(vkBindBufferMemory(device, b.buffer, b.memory, 0), "vkBindBufferMemory");
+        VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bai.buffer = b.buffer;
+        b.address = vkGetBufferDeviceAddress(device, &bai);
+        return b;
+    }
+
     void destroy(Buffer& b) {
         if (b.buffer) vkDestroyBuffer(device, b.buffer, nullptr);
         if (b.memory) vkFreeMemory(device, b.memory, nullptr);
@@ -1947,13 +1971,21 @@ struct Options {
     std::uint32_t bench = 0;  // draws per timed batch
     bool library = false;     // the variant is linked from pipeline libraries (BBHOST_PIPELINE_LIBRARY)
     bool specialize = false;  // every run with the optimized relink's specialization constants
+    // A dispatch capture's memory placement, for timing where its memory lives
+    // (the game's guest memory is host memory imported into the device, as the
+    // replay's pages are by default): --counters-local counts each GDS counter
+    // in a device-local word of its own, copied in from the pages before each
+    // dispatch and back after it; --pages-local puts all the pages in
+    // device-local memory, filled and read back by copies.
+    bool counters_local = false;
+    bool pages_local = false;
 };
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
                          "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--cs FILE.spv] [--cs-base FILE.spv] [--cs-buffers FILE.json] [--library] "
                          "[--specialize] [--no-live] [--validate] "
-                         "[--bench N]\n");
+                         "[--bench N] [--counters-local] [--pages-local]\n");
     std::exit(2);
 }
 
@@ -1982,6 +2014,8 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--no-live") o.live = false;
         else if (a == "--validate") o.validate = true;
         else if (a == "--bench") o.bench = static_cast<std::uint32_t>(std::strtoul(value().c_str(), nullptr, 10));
+        else if (a == "--counters-local") o.counters_local = true;
+        else if (a == "--pages-local") o.pages_local = true;
         else if (!a.empty() && a[0] == '-') usage();
         else if (o.capture.empty()) o.capture = a;
         else usage();
@@ -2020,7 +2054,7 @@ public:
         std::vector<std::vector<std::uint8_t>> images;
     };
 
-    DispatchReplayer(const Capture& cap, Device& dev) : cap_(cap), dev_(dev) {
+    DispatchReplayer(const Capture& cap, Device& dev, bool pages_local = false) : cap_(cap), dev_(dev), pages_local_(pages_local) {
         const json::Value& d = json::member(cap_.m, "dispatch");
         const auto& g = json::arr(d, "groups");
         if (g.size() != 3) fail("dispatch groups must have three members");
@@ -2073,6 +2107,8 @@ public:
         if (set_layout_) vkDestroyDescriptorSetLayout(dev_.device, set_layout_, nullptr);
         dev_.destroy(params_);
         dev_.destroy(pages_);
+        dev_.destroy(staging_);
+        dev_.destroy(ctr_words_);
         dev_.destroy(sink_);
         dev_.destroy(sink_l2_);
         dev_.destroy(l1_);
@@ -2198,27 +2234,104 @@ public:
         ci.stage.pName = "main";
         check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &variant_pipeline_), "vkCreateComputePipelines (variant)");
     }
+    // --counters-local: each GDS counter counts in a device-local word of its
+    // own (256 bytes apart), its start copied in from the pages before every
+    // dispatch and its count copied back after it - as a renderer would count
+    // in a device-local slot over a guest word that lives in host memory. A and
+    // the variant both (a variant's own params block copies A's).
+    void counters_local() {
+        if (!counters_device_) fail("--counters-local: this capture's module walks for its GDS counters (give --cs-base)");
+        std::map<std::uint64_t, VkDeviceSize> slot_of;  // a word's offset in the pages -> its slot
+        for (const std::uint64_t w : params_host_.gds_counter) {
+            if (w) slot_of.emplace(w - pages_.address, static_cast<VkDeviceSize>(slot_of.size()) * 256);
+        }
+        if (slot_of.empty()) fail("--counters-local: the dispatch counts in no word the capture holds");
+        ctr_words_ = dev_.device_buffer(slot_of.size() * 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        for (std::uint64_t& w : params_host_.gds_counter) {
+            if (w) w = ctr_words_.address + slot_of.at(w - pages_.address);
+        }
+        for (const auto& [off, slot] : slot_of) {
+            ctr_in_.push_back({off, slot, 4});
+            ctr_out_.push_back({slot, off, 4});
+        }
+        std::memcpy(params_.map, &params_host_, sizeof(params_host_));
+    }
+    std::size_t local_counters() const { return ctr_in_.size(); }
+
+    // The pages as the host writes and reads them: mapped, or (--pages-local)
+    // the staging buffer copied to and from the device-local pages.
+    void* pages_map() const { return pages_local_ ? staging_.map : pages_.map; }
+    void pages_in(VkCommandBuffer cmd) const {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        if (!pages_local_) return;
+        const VkBufferCopy all{0, 0, static_cast<VkDeviceSize>(page_vas_.size()) * kPage};
+        vkCmdCopyBuffer(cmd, staging_.buffer, pages_.buffer, 1, &all);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+    }
+    void pages_out(VkCommandBuffer cmd) const {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        if (pages_local_) {
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+            const VkBufferCopy all{0, 0, static_cast<VkDeviceSize>(page_vas_.size()) * kPage};
+            vkCmdCopyBuffer(cmd, pages_.buffer, staging_.buffer, 1, &all);
+        }
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr,
+                             0, nullptr);
+    }
+    // One dispatch, with --counters-local's copies around it.
+    void dispatch_once(VkCommandBuffer cmd) const {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        if (!ctr_in_.empty()) {
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+            vkCmdCopyBuffer(cmd, pages_.buffer, ctr_words_.buffer, static_cast<std::uint32_t>(ctr_in_.size()), ctr_in_.data());
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
+        if (!ctr_out_.empty()) {
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            vkCmdCopyBuffer(cmd, ctr_words_.buffer, pages_.buffer, static_cast<std::uint32_t>(ctr_out_.size()), ctr_out_.data());
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+        }
+    }
+
     // The guest pages and storage images after one run from the captured inputs.
     Output run(bool sentinel, bool with_variant = false) {
         const auto& start = before();
-        if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
+        if (!start.empty()) std::memcpy(pages_map(), start.data(), start.size());
         for (Storage& st : storage_) upload(dev_, st.img, st.aspect, cap_.blob(st.before), st.subs, VK_IMAGE_LAYOUT_GENERAL);
         auto* sink = static_cast<std::uint32_t*>(sink_.map);
         for (std::uint64_t k = 0; k < kPage / 4; ++k) sink[k] = sentinel ? sentinel_word(k) : 0u;
         dev_.submit([&](VkCommandBuffer cmd) {
-            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            pages_in(cmd);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
                                     nullptr);
-            vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            dispatch_once(cmd);
+            pages_out(cmd);
         });
-        const auto* p = static_cast<const std::uint8_t*>(pages_.map);
+        const auto* p = static_cast<const std::uint8_t*>(pages_map());
         Output out;
         out.pages.assign(p, p + page_vas_.size() * kPage);
         for (Storage& st : storage_) out.images.push_back(download(dev_, st.img, st.aspect, st.subs));
@@ -2228,11 +2341,12 @@ public:
     // --bench: the dispatch from the captured inputs, `repeat` times in one
     // submission (each repeat from the pages as the last left them: the
     // counters and append buffers keep moving, as a run of frames would),
-    // with GPU timestamps around the dispatches only; milliseconds a dispatch.
+    // with GPU timestamps around the dispatches only (and --counters-local's
+    // copies around each); milliseconds a dispatch.
     double time_dispatches(bool with_variant, std::uint32_t repeat) {
         if (!dev_.timestamp_period_ns) fail("timing needs timestamp queries, which this queue lacks");
         const auto& start = before();
-        if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
+        if (!start.empty()) std::memcpy(pages_map(), start.data(), start.size());
         for (Storage& st : storage_) upload(dev_, st.img, st.aspect, cap_.blob(st.before), st.subs, VK_IMAGE_LAYOUT_GENERAL);
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -2241,16 +2355,15 @@ public:
         check(vkCreateQueryPool(dev_.device, &qci, nullptr, &qpool), "vkCreateQueryPool");
         dev_.submit([&](VkCommandBuffer cmd) {
             vkCmdResetQueryPool(cmd, qpool, 0, 2);
-            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            pages_in(cmd);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
                                     nullptr);
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+            // After the pages' copy (--pages-local) has finished, not while it runs.
+            vkCmdWriteTimestamp(cmd, pages_local_ ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             for (std::uint32_t k = 0; k < repeat; ++k) {
-                vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
+                dispatch_once(cmd);
                 mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                 mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -2405,7 +2518,12 @@ private:
         if (blob.size() != page_vas_.size() * kPage || cap_.blob(json::str(json::member(cap_.m, "memory"), "after")).size() != blob.size()) {
             fail("memory blobs do not hold one 64 KiB block per page");
         }
-        pages_ = dev_.buffer(std::max<std::uint64_t>(blob.size(), kPage), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (pages_local_) {
+            pages_ = dev_.device_buffer(std::max<std::uint64_t>(blob.size(), kPage), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staging_ = dev_.buffer(std::max<std::uint64_t>(blob.size(), kPage), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } else {
+            pages_ = dev_.buffer(std::max<std::uint64_t>(blob.size(), kPage), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
         sink_ = dev_.buffer(kPage, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         sink_l2_ = dev_.buffer(gcn::kL2Entries * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         l1_ = dev_.buffer(gcn::kL1Entries * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -2596,8 +2714,12 @@ private:
 
     const Capture& cap_;
     Device& dev_;
+    bool pages_local_ = false;  // --pages-local: pages_ is device-local, filled and read through staging_
     std::vector<std::uint64_t> page_vas_;
     Buffer pages_, sink_, sink_l2_, l1_, params_;
+    Buffer staging_;   // --pages-local: the pages as the host writes and reads them
+    Buffer ctr_words_;  // --counters-local: the GDS counters' device-local words
+    std::vector<VkBufferCopy> ctr_in_, ctr_out_;  // pages_ -> ctr_words_ and back, a word each
     std::map<std::uint32_t, Buffer> l2_;
     std::map<std::string, Image> images_;
     std::map<std::string, VkImageView> views_;
@@ -2625,8 +2747,14 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     dev.init(json::str(identity, "device"), o.validate);
     std::printf("drawreplay: dispatch %s (%s, flip %llu) on %s\n", o.capture.string().c_str(), json::str(identity, "pipeline").c_str(),
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
-    DispatchReplayer r(cap, dev);
+    DispatchReplayer r(cap, dev, o.pages_local);
     if (!o.cs_base.empty()) r.base(words_of(read_file(o.cs_base), "the base compute module"));
+    if (o.counters_local) r.counters_local();
+    if (o.pages_local || o.counters_local) {
+        std::printf("  placement: pages in %s memory, GDS counters %s\n", o.pages_local ? "device-local" : "host-visible",
+                    o.counters_local ? ("in " + std::to_string(r.local_counters()) + " device-local word(s) of their own, copied in and out around each dispatch").c_str()
+                                     : "in their words on the pages");
+    }
     if (!o.cs.empty()) {
         // A module built by today's tools takes the counters by device
         // address; the captured one of an older capture walks for them, so
@@ -2668,6 +2796,10 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     json::Value groups = json::Value::make_array();
     for (int k = 0; k < 3; ++k) groups.push(g[k]);
     report.set("groups", groups);
+    json::Value placement = json::Value::make_object();
+    placement.set("pages", o.pages_local ? "device-local" : "host-visible");
+    placement.set("counters", o.counters_local ? "device-local words of their own" : "on the pages");
+    report.set("placement", placement);
     json::Value counters = json::Value::make_array();
     for (std::uint64_t c : r.counters()) {
         char va[24];

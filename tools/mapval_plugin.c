@@ -52,10 +52,11 @@
  *                                             $BBHOST_MAPVAL_CAPTURES/<name>; 0 stops
  * (the last two ask the host through BBHOST_TEST_REQUESTS, hle/video.cpp),
  * and for tools/full_tour.py, which tours every map:
- *     god [hide]                              the debug menu's Player No Dead
+ *     god [hide|off]                          the debug menu's Player No Dead
  *                                             (CHR DBG, 0x593e888) on, and with
  *                                             "hide" Player Hide (0x593e88e): the
- *                                             enemies do not notice the player
+ *                                             enemies do not notice the player;
+ *                                             "off": both off again
  *     turn <n> <s>                            the follow camera through 360
  *                                             degrees in n headings, s seconds
  *                                             each (its yaw, ChrExFollowCam
@@ -68,6 +69,11 @@
  *                                             slot (0-6) holds its map id and is
  *                                             the one in use, then the lamp travel
  *                                             to 2902950 enters it
+ *     bits <first> <n> <hex>                  n event flags from first written as
+ *                                             one number, the first flag its top
+ *                                             bit (as the game reads them): a Root
+ *                                             dungeon's altar slot, say, before its
+ *                                             chalice step
  *     remo <id> <mode> <skip s> <max s>       a cutscene, as the event scripts'
  *                                             2002[03] asks for one (0x171a9f0);
  *                                             Options pressed (the game's skip)
@@ -129,7 +135,7 @@ static double loading_t0;  /* when the screen came up */
 /* --- the tour ------------------------------------------------------------ */
 
 enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12,
-       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT };
+       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS };
 #define MAX_STEPS 4096
 typedef struct {
     int kind;
@@ -269,7 +275,7 @@ static void load_tour(const char* path) {
         else if (!strcmp(kind, "god")) {
             char opt[16] = "";
             s.kind = S_GOD, strcpy(s.name, "god");
-            s.team = sscanf(line, "%*s %15s", opt) == 1 && !strcmp(opt, "hide");
+            if (sscanf(line, "%*s %15s", opt) == 1) s.team = !strcmp(opt, "hide") ? 1 : !strcmp(opt, "off") ? 2 : 0;
         }
         else if (!strcmp(kind, "turn") && sscanf(line, "%*s %d %f", &s.team, &s.hold) == 2 && s.team > 0)
             s.kind = S_TURN, strcpy(s.name, "turn");
@@ -285,6 +291,9 @@ static void load_tour(const char* path) {
         }
         else if (!strcmp(kind, "flaglog") && sscanf(line, "%*s %u %d", &s.flags[0], &s.team) == 2)
             s.kind = S_FLAGLOG, strcpy(s.name, "flaglog");
+        else if (!strcmp(kind, "bits") && sscanf(line, "%*s %u %d %x", &s.flags[0], &s.team, &s.dungeon) == 3 && s.team > 0 &&
+                 s.team <= 32)
+            s.kind = S_BITS, strcpy(s.name, "bits"); /* flags[0]: the first flag, team: how many, dungeon: the value */
         else if (!strcmp(kind, "chalice") && sscanf(line, "%*s %x %d %63s", &s.dungeon, &s.nflags, s.name) == 3 && s.nflags >= 0 &&
                  s.nflags < 7) {
             /* the travel to the dungeon's lamp; nflags: the altar slot */
@@ -639,10 +648,10 @@ static void begin(int i, double t) {
     } else if (s->kind == S_QUIET) {
         quiet(s->hold, t);
     } else if (s->kind == S_GOD) {
-        uint8_t one = 1;
-        int r = api->write(0x593e888, &one, 1);
-        if (s->team) r |= api->write(0x593e88e, &one, 1);
-        api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : "on");
+        uint8_t v = s->team == 2 ? 0 : 1;
+        int r = api->write(0x593e888, &v, 1);
+        if (s->team) r |= api->write(0x593e88e, &v, 1);
+        api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : v ? "on" : "off");
     } else if (s->kind == S_TURN) {
         uint64_t cam = ex_follow_cam();
         turn_k = -1;
@@ -655,6 +664,10 @@ static void begin(int i, double t) {
         }
     } else if (s->kind == S_FLAGLOG) {
         api->log("mapval flags %u+%d %.3f = %lld", s->flags[0], s->team, t, (long long)flags_value(s->flags[0], s->team));
+    } else if (s->kind == S_BITS) {
+        int bad = flags_write(s->flags[0], s->team, s->dungeon);
+        api->log("mapval bits %u+%d %.3f = %08x%s (reads %08x)", s->flags[0], s->team, t, s->dungeon, bad ? " REFUSED" : "",
+                 (uint32_t)flags_value(s->flags[0], s->team));
     } else if (s->kind == S_REMO) {
         BbCallRegs regs;
         memset(&regs, 0, sizeof regs);
@@ -878,8 +891,11 @@ static void tick(double t) {
         }
         if (have) memcpy(travel_last, p, sizeof travel_last);
         /* In the block with the loading screen gone, and still for ~3 s (90
-         * frames at 30 fps, and 2 s however fast the frames come). */
-        if (travel_still > 90 && t - travel_still_t >= 2.0 && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
+         * frames at 30 fps, and 2 s however fast the frames come) - or, where
+         * frames come slower than ~7 a second (lavapipe: a chalice dungeon
+         * draws one frame in ~2 s), still for 12 s over at least 8 frames. */
+        int still = (travel_still > 90 && t - travel_still_t >= 2.0) || (travel_still > 8 && t - travel_still_t >= 12.0);
+        if (still && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
             api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s, %.1f s of it loading", s->name, t, b, p[0], p[1], p[2],
                      el, travel_loading);
             memcpy(good_pos, p, sizeof good_pos);
@@ -960,7 +976,7 @@ static void tick(double t) {
     } else if (s->kind == S_EXIT) {
         if (el > 30) next = 1; /* the host ends the run before this */
     } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE ||
-               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG) {
+               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG || s->kind == S_BITS) {
         next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;

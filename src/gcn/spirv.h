@@ -114,6 +114,7 @@ enum ExecutionMode : std::uint32_t {
     ExDenormPreserve = 4459, ExRoundingModeRTZ = 4463,
 };
 enum Scope : std::uint32_t { ScopeDevice = 1, ScopeWorkgroup = 2, ScopeSubgroup = 3, ScopeInvocation = 4 };
+enum GroupOperation : std::uint32_t { GroupOperationReduce = 0, GroupOperationInclusiveScan = 1, GroupOperationExclusiveScan = 2 };
 enum MemorySemantics : std::uint32_t {
     MsNone = 0, MsAcquire = 2, MsRelease = 4, MsAcquireRelease = 8, MsUniformMemory = 0x40,
     MsWorkgroupMemory = 0x100, MsImageMemory = 0x800,

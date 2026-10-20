@@ -143,10 +143,21 @@ class Area:
     gives). `flags`: event flags turned on before the travel's load reads
     them - the doors in front of two arenas, as the boss rush opens them."""
 
-    def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=(), stand=None):
+    def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=(), stand=None, chalice=None, looks=(),
+                 enemies=False):
         self.id, self.name, self.block, self.return_point, self.fog, self.dlc = ident, name, block, return_point, fog, dlc
         self.flags = tuple(flags)
         self.stand = tuple(stand) if stand else None
+        # A chalice dungeon the place enters through an altar slot (CHALICE_SLOT's fields), the lamp travel to 2902950.
+        self.chalice = dict(chalice) if chalice else None
+        # More views after the place's own dumps, without a travel: (name, x, y, z, facing in degrees[, how]) in the
+        # MSB's frame, each warped to and dumped as <place>-<name>. `how`: {"dumps": n} dumps a timeline of n frames,
+        # <place>-<name>-1..n, "gap" seconds apart (a thing that fades in and out); {"f12": True} takes an F12 there
+        # after them when the run asks for one (--f12-looks).
+        self.looks = tuple(tuple(l[:5]) + (dict(l[5]) if len(l) > 5 else {},) for l in looks)
+        # The place's enemies are part of what it shows: none switched off (no quiet), the player hidden from them and
+        # kept alive (the probe's "god hide") while there, and both undone ("god off") before the next place.
+        self.enemies = bool(enemies)
 
     def block_hex(self):
         a, b, c, d = (int(x) for x in self.block[1:].split("_"))
@@ -169,7 +180,10 @@ class Area:
         v = self.view()
         return {"id": self.id, "name": self.name, "block": self.block, "return_point": self.return_point, "dlc": self.dlc,
                 "fog": list(self.fog) if self.fog else None, "stand": list(self.stand) if self.stand else None,
-                "view": [round(c, 4) for c in v] if v else None, "flags": list(self.flags)}
+                "view": [round(c, 4) for c in v] if v else None, "flags": list(self.flags),
+                "chalice": dict(self.chalice) if self.chalice else None,
+                "looks": [list(l[:5]) + ([l[5]] if l[5] else []) for l in self.looks],
+                "enemies": self.enemies}
 
 
 AREAS = (
@@ -203,8 +217,64 @@ AREAS = (
     # comes within 7 m of it.
     Area("laurence-staircase", "Hunter's Nightmare: the staircase up to the Nightmare Grand Cathedral", "m34_00_00_00", 3402950,
          stand=(-462.9, 1530.7, -313.47, -150.0), dlc=True),
+    # The GPU particles' places, after the twelve so their travels stay as they were. Vicar Amelia's room from the fog
+    # wall at the top of the stairs, facing in: the heaviest particle simulation measured. The Cleric Beast's arena:
+    # the same particles with a steadier window. Logarius' Seat on Cainhurst's roof: the snow; a fresh arrival plays
+    # the castle's cutscene over the window, so its numbers are noisy.
+    Area("vicar-amelia", "Grand Cathedral: Vicar Amelia's room", "m24_00_00_00", 2402950,
+         fog=(51.51, 35.71, 311.57, -150.0)),
+    Area("cleric-beast", "Central Yharnam bridge: the Cleric Beast's arena", "m24_01_00_00", 2412951,
+         fog=(-154.14, -27.02, 35.16, -135.0)),
+    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat", "m25_00_00_00", 2502951),
 )
-AREA_BY_ID = {a.id: a for a in AREAS}
+
+# Places a run names by id but "all" leaves out. A Root chalice dungeon from a player's glyph enters through an altar
+# slot the probe fills before the lamp travel (CHALICE_SLOT); its layout is its map id's own pre-built map, its enemies
+# come from the config and the rituals' features. aynbgu4m (the owner's, 10-19): layer 1's main room has water on the
+# floor and a ghostly enemy, and some floor renders wrong. The FormData the glyph names: map 0x1D140001 (m29_20_00_01),
+# config 6200 (Central Pthumerian Labyrinth, depth 2), features 36, 50, 60, 77, 11; the 64-bit id and the params block
+# are not in it.
+EXTRA_AREAS = (
+    Area("chalice-aynbgu4m", "Central Pthumerian Labyrinth, glyph aynbgu4m: layer 1", "m29_00_00_00", 2902950,
+         chalice={"slot": 6, "map_id": 0x1D140001, "id64": 2423, "config": 6200, "features": (36, 50, 60, 77, 11),
+                  "params": (0x00300002, 0x1)},
+         # m29_20_00_01's layer 1, from its MSB and a lavapipe look round 18 spots (10-19): the
+         # square room the most enemies stand in (x 100-122, z 45-66, floor y ~31), from its middle facing north - its
+         # floor's puddles (the pieces' WaterInteraction material) drawn black on lavapipe, a pale Labyrinth Watcher;
+         # then the room's south side, the long hall (x ~78), whose floor has the same puddles, and the Evil Labyrinth
+         # Spirit (c3120_0000 at 53.5, 38.3, -39.8 on the raised floor west of the hall, facing north), the ghostly
+         # enemy that fades in and out: from 6.8 m north of it on its floor, facing it, a timeline of frames and an F12.
+         stand=(110.5, 33.0, 52.0, 180.0), enemies=True,
+         looks=(("room-south", 110.5, 33.0, 52.0, 0.0), ("hall", 78.0, 33.5, -42.0, 180.0),
+                ("spirit", 53.5, 39.0, -33.0, 0.0, {"dumps": 5, "gap": 2.5, "f12": True}))),
+)
+AREA_BY_ID = {a.id: a for a in AREAS + EXTRA_AREAS}
+
+# An altar slot n is event flags from 94000000 + n * 100000, read as 32-bit numbers with the first flag the top bit
+# (sub_17cfd80): +0x000 the map id, +0x020 / +0x040 a 64-bit id (low, high; sub_1eb2a40), +0x080 the dungeon's config
+# id (sub_231f720 looks it up), +0x0A0 nine ritual (material, feature) pairs 0x40 apart (sub_1eb3070), +0x3E0 a
+# 48-byte params block as twelve words (the stage change, sub_1d28680, copies it).
+CHALICE_SLOT = {"base": 94000000, "stride": 100000, "id64": 0x20, "config": 0x80, "rituals": 0xA0, "params": 0x3E0}
+
+
+def chalice_lines(a):
+    """The probe's steps that fill a chalice place's altar slot, then its travel (the probe's chalice step: the slot in
+    use, its map id, the lamp travel to 2902950)."""
+    c, k = a.chalice, CHALICE_SLOT
+    base = k["base"] + c["slot"] * k["stride"]
+    lines = ["bits %d 32 %08x" % (base + k["id64"], c.get("id64", 0) & 0xffffffff),
+             "bits %d 32 %08x" % (base + k["id64"] + 0x20, (c.get("id64", 0) >> 32) & 0xffffffff),
+             "bits %d 32 %08x" % (base + k["config"], c["config"])]
+    features = list(c.get("features", ()))
+    for i in range(9):
+        material, feature = (0, features[i]) if i < len(features) else (0xffffffff, 0xffffffff)
+        lines.append("bits %d 32 %08x" % (base + k["rituals"] + i * 0x40, material))
+        lines.append("bits %d 32 %08x" % (base + k["rituals"] + i * 0x40 + 0x20, feature))
+    params = list(c.get("params", ()))
+    for i in range(12):
+        lines.append("bits %d 32 %08x" % (base + k["params"] + i * 0x20, params[i] if i < len(params) else 0))
+    lines.append("chalice %08x %d %s" % (c["map_id"], c["slot"], a.id))
+    return lines
 
 
 def pick_areas(spec):
@@ -215,9 +285,10 @@ def pick_areas(spec):
     for word in (w.strip() for w in spec.split(",")):
         if not word:
             continue
-        hits = [a for a in AREAS if a.id == word] or [a for a in AREAS if a.id.startswith(word)]
+        known = AREAS + EXTRA_AREAS
+        hits = [a for a in known if a.id == word] or [a for a in known if a.id.startswith(word)]
         if len(hits) != 1:
-            raise ValueError("area %r: %s" % (word, "ambiguous" if hits else "unknown") + " (have %s)" % ", ".join(a.id for a in AREAS))
+            raise ValueError("area %r: %s" % (word, "ambiguous" if hits else "unknown") + " (have %s)" % ", ".join(a.id for a in known))
         if hits[0] in out:
             raise ValueError("area %s is listed twice" % hits[0].id)
         out.append(hits[0])
@@ -236,19 +307,29 @@ def tour(areas, opts, kind):
     Each place starts with its travel - the step a failed travel skips to the
     next of - so the log splits into places at the travel lines."""
     lines = ["# area_check %s pass: %d places" % (kind, len(areas))]
+    godded = False
     for a in areas:
         lines.append("# %s: %s" % (a.id, a.name))
-        lines.append(" ".join(["travel %d %s %s" % (a.return_point, a.block_hex(), a.id)] + ["%d" % f for f in a.flags]))
+        if a.chalice:
+            lines.extend(chalice_lines(a))
+        else:
+            lines.append(" ".join(["travel %d %s %s" % (a.return_point, a.block_hex(), a.id)] + ["%d" % f for f in a.flags]))
+        if godded and not a.enemies:
+            lines.append("god off")  # again after the travel: a failed travel skips the last place's own
+        godded = a.enemies
+        quiet = opts["quiet"] > 0 and not a.enemies
+        if a.enemies:
+            lines.append("god hide")
         v = a.view()
         if v:
             lines.append("warp %s:view %.3f %.3f %.3f %.4f 1.0" % (a.id, *v))
-        if opts["quiet"] > 0:
+        if quiet:
             lines.append("quiet %.0f" % opts["quiet"])
         lines.append("camera")
         lines.append("mark %s:arrived" % a.id)
         if kind == "perf":
             lines.append("hold %.1f" % opts["settle"])
-            if opts["quiet"] > 0:
+            if quiet:
                 lines.append("quiet %.0f" % opts["quiet"])
             lines.append("mark %s:measure" % a.id)
             lines.append("hold %.1f" % opts["measure"])
@@ -258,12 +339,29 @@ def tour(areas, opts, kind):
                     lines.append("hold %.1f" % opts["dump_gap"])
                 lines.append("dump %s-%s" % (a.id, chr(ord("a") + k)))
             lines.append("hold 1.0")
+            for name, x, y, z, deg, how in a.looks:
+                lines.append("warp %s:%s %.3f %.3f %.3f %.4f 1.0" % (a.id, name, x, y, z, math.radians(deg)))
+                lines.append("camera")
+                lines.append("hold %.1f" % opts["dump_gap"])
+                n = int(how.get("dumps", 1))
+                if n <= 1:
+                    lines.append("dump %s-%s" % (a.id, name))
+                for k in range(n if n > 1 else 0):
+                    if k:
+                        lines.append("hold %.1f" % float(how.get("gap", opts["dump_gap"])))
+                    lines.append("dump %s-%s-%d" % (a.id, name, k + 1))
+                lines.append("hold 1.0")
+                if how.get("f12") and opts.get("f12_looks"):
+                    lines.append("f12 %s-%s" % (a.id, name))
+                    lines.append("hold 3.0")
         else:
             lines.append("hold %.1f" % opts["capture_settle"])
             lines.append("capture %d %s" % (opts["captures"], a.id))
             lines.append("mark %s:capture" % a.id)
             lines.append("hold %.1f" % opts["capture_window"])
             lines.append("capture 0")
+        if a.enemies:
+            lines.append("god off")
         lines.append("mark %s:end" % a.id)
     lines.append("wait 2")
     return "\n".join(lines) + "\n"
@@ -321,6 +419,14 @@ def pass_settings(pass_dir, areas, opts, kind):
     return s
 
 
+def look_seconds(look, opts):
+    """An extra view's holds: the warp's settle, its timeline, and an F12 (writing its images stalls the game ~1 min)."""
+    how = look[5]
+    n = max(1, int(how.get("dumps", 1)))
+    return opts["dump_gap"] + 3 + (n - 1) * float(how.get("gap", opts["dump_gap"])) + (
+        63 if how.get("f12") and opts.get("f12_looks") else 0)
+
+
 def pass_budget(areas, opts, kind):
     """Seconds the pass may take: the start, then per place the probe's own
     limits (a travel gives up after 150 s, a warp after ten 3 s tries) and the
@@ -328,7 +434,8 @@ def pass_budget(areas, opts, kind):
     per = 150 + 35 + 10
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * (opts["dump_gap"] + 2) + 3 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"] + 60)
-    return 300 + opts["start"] + per * len(areas) + 60
+    looks = sum(look_seconds(l, opts) + 30 for a in areas for l in a.looks) if kind == "perf" else 0
+    return 300 + opts["start"] + per * len(areas) + looks + 60
 
 
 def estimate(areas, opts, kind):
@@ -336,7 +443,8 @@ def estimate(areas, opts, kind):
     per = 25 + (3 if any(a.view() for a in areas) else 0)
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * opts["dump_gap"] + 1 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"])
-    return 60 + opts["start"] + per * len(areas)
+    looks = sum(look_seconds(l, opts) for a in areas for l in a.looks) if kind == "perf" else 0
+    return 60 + opts["start"] + per * len(areas) + looks
 
 
 # --- the log --------------------------------------------------------------------
@@ -1593,6 +1701,12 @@ def check_areas(areas, app0):
             if blk != a.block:
                 r["problems"].append("row %d is in %s, not %s" % (a.return_point, blk, a.block))
         path = Path(app0) / "dvdroot_ps4" / "map" / "mapstudio" / (a.block + ".msb.dcx")
+        if a.chalice:
+            # A chalice dungeon's layout is its map id's: mapstudio/m29_BB_RR_00/m29_BB_RR_VV.msb.dcx.
+            m = a.chalice["map_id"]
+            parts4 = (m >> 24 & 0xff, m >> 16 & 0xff, m >> 8 & 0xff, m & 0xff)
+            path = (Path(app0) / "dvdroot_ps4" / "map" / "mapstudio" / ("m%02d_%02d_%02d_00" % parts4[:3]) /
+                    ("m%02d_%02d_%02d_%02d.msb.dcx" % parts4))
         if not path.is_file():
             r["problems"].append("no layout %s" % path.name)
         elif a.fog or a.stand:
@@ -1902,7 +2016,7 @@ def resolve_options(args):
                  "fps": args.fps, "captures": args.captures, "capture_window": args.capture_window,
                  "pipeline_cache": args.pipeline_cache == "seed", "p2p_port": args.p2p_port, "width": args.width,
                  "height": args.height, "env": args.env, "keep_data": args.keep_data, "keep_captures": args.keep_captures,
-                 "numa_node": numa, "seed": str(seed)})
+                 "numa_node": numa, "seed": str(seed), "f12_looks": args.f12_looks})
     if opts["measure"] < 5 or opts["settle"] < 0 or opts["dumps"] < 0 or opts["dumps"] > 8 or opts["captures"] < 0:
         raise ValueError("--measure must be 5 s or more, --settle and --captures not negative, --dumps 0-8")
     return areas, {"app0": str(Path(app0).resolve()), "eboot": str(Path(eboot).resolve())}, opts
@@ -2115,6 +2229,8 @@ def add_run_options(p):
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--env", action="append", default=[], metavar="BBHOST_NAME=VALUE", help="another setting for the game (repeatable)")
     p.add_argument("--keep-data", action="store_true", help="keep each pass's copy of the seed")
+    p.add_argument("--f12-looks", action="store_true",
+                   help="take an F12 at each extra view that asks for one (with --env BBHOST_F12_TEXTURES=1 for its textures)")
     p.add_argument("--keep-captures", action="store_true", help="keep captures whose lift was shown identical (~50 MB each)")
     p.add_argument("--dry-run", action="store_true", help="check and prepare everything, start nothing")
 

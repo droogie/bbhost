@@ -148,10 +148,13 @@ exists on the host. A geometry shader that stores at an offset its compiler
 counts per lane (the standard particles') keeps that ring as an array in the
 invocation. The pipeline is built on the pipeline workers, so a system draws
 from the frame its pipeline is ready, and is recorded with its two extra
-programs in the stage manifest (format 5) for the next start. A geometry
-shader the lift refuses is drawn as before, as its export and pixel shaders,
-which draw nothing; the exit report counts those draws by program and the
-refusals by reason. `BBHOST_GX_GS=0` draws every one that way. Vicar Amelia's
+programs in the stage manifest (format 5) for the next start. A draw the
+path refuses - its pipeline still being built, or a geometry shader the lift
+does not take - is not drawn: as its export and pixel shaders, as before, it
+would draw nothing and only store the export shader's ring through a buffer
+its draw's tables name. The exit report counts the refusals by reason.
+`BBHOST_GX_GS=0` draws every one as before, the exit report counting those
+draws by program. Vicar Amelia's
 room draws ~37,500 particles a frame; on an RTX 4070 they cost nothing
 measurable (uncapped, 72.2 fps with them against 71.8 without).
 
@@ -163,9 +166,12 @@ page-table walk. GCN's loops that run until every lane's execution bit
 clears become structured per-invocation loops, a block GCN branches over
 where no lane needs it becomes a selection an invocation skips where its own
 bit is clear, and the GPU particles' wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
-from `v_mbcnt`) becomes one atomic add per invocation, on the counter word
-the dispatch hands over by its device address, so no compute lift needs
-subgroup operations or the page table for it. A barrier is accepted only where every invocation
+from `v_mbcnt`) becomes one atomic add per subgroup, as GCN steps the counter
+once a wave and as the translation does: an elected invocation adds the count
+of the invocations stepping together and each takes the base plus (append)
+or minus (consume) its rank among them, on the counter word the dispatch
+hands over by its device address, with no page-table walk
+(`BBHOST_GDS_SUBGROUP=0` keeps an atomic an invocation). A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
 translated. A compute shader reads its constant buffers, tables and typed
@@ -206,7 +212,17 @@ guest memory (a page-table walk, a texture over one) has the copy written
 back first. `BBHOST_GX_TWINS=2` adds the buffers GX writes with GPU copies:
 a dynamic buffer's renamed bytes written back to its own address, a constant
 buffer's update (a world has about 3,800 of them, 4 MB, kept in shared
-device-memory blocks). With window imports a copy's source the CPU wrote is
+device-memory blocks). The GPU particles' buffers alone are kept that way by
+default on a discrete GPU (`BBHOST_PARTICLE_TWINS`: `0` keeps them in guest
+memory, `1` makes them twins on any GPU): a buffer becomes one once a
+dispatch that counts in GDS binds it - its records, and whatever else that
+dispatch reads and stores - from the next command buffer on; the counter
+words, past the records, stay in guest memory. In guest memory the particle
+update read and wrote its 176-byte records across the bus at about 0.2 µs a
+particle: 7.4 ms of an RTX 4070 a frame in Vicar Amelia's room (73 fps
+uncapped at 1080p), against 0.14 ms as twins (161 fps). An integrated GPU's
+device memory is the host's own, so there they stay in guest memory, as they
+do under a capture. With window imports a copy's source the CPU wrote is
 copied through upload staging, as copy versions' bytes are, rather than read
 through an import. The exit report lists what still reads or writes guest
 memory in place, by the path that asked.
@@ -275,7 +291,7 @@ Every shader the game creates goes through the lifter. One it refuses is transla
 | Pixel | 3,206 of 3,209 | 100% | FXAA3HQ, which needs a whole-wave proof; two debug shaders whose result depends on how the PS4 packs pixels into waves (no exact PC form). None is drawn at the 12 places. |
 | Vertex | all 10,116 | 100% | - |
 | Tessellation: local, hull, domain | all; the 141 mesh hull sets as native pipelines | 100% | - |
-| Geometry, with its export shader | the effects' 4 particle geometry shaders of their 7; none of the models' 1,694 | 100% once its pipeline is built (the first sight of each goes as before) | The models' geometry shaders (cube-map depth, a face a layer) and the effects' two array shaders write a layer, which the lift does not take; the effects' point sprite reads its vertices through a fetch shader. None is drawn at the 12 places. |
+| Geometry, with its export shader | the effects' 4 particle geometry shaders of their 7; none of the models' 1,694 | 100% once its pipeline is built (its draws until then are not drawn) | The models' geometry shaders (cube-map depth, a face a layer) and the effects' two array shaders write a layer, which the lift does not take; the effects' point sprite reads its vertices through a fetch shader. None is drawn at the 12 places. |
 | Compute | all 38 in the bundles, and the 6 of the executable's own (GX's and YEBIS's) that the 12 places dispatch | 100% of dispatches | The executable carries 24 more, lifted when first dispatched; none is dispatched at the 12 places. |
 
 A draw whose setup the lifter hasn't seen still falls back to the translator. The exit report counts those by reason, and `BBHOST_LIFT_TESS` and the other switches turn the lifted paths off for comparison.

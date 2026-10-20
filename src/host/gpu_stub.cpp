@@ -34,6 +34,7 @@ bool host_gpu_mem_write(std::uint64_t, const void*, std::size_t) { return false;
 bool host_gpu_mem_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 bool host_gpu_mem_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_gds_counters() { return false; }
+bool host_gpu_gds_subgroup() { return true; }
 bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}

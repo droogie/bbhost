@@ -585,6 +585,8 @@ int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value
     o.rsrc1 = static_cast<std::uint32_t>(json::as_u64(json::member(tr, "rsrc1"), "rsrc1"));
     o.rsrc2 = static_cast<std::uint32_t>(json::as_u64(json::member(tr, "rsrc2"), "rsrc2"));
     o.gds_counters = json::flag(tr, "gds_counters");
+    // A capture from before the subgroup step was an atomic an invocation.
+    o.gds_subgroup = json::flag(tr, "gds_subgroup");
     o.exec_known = json::flag(tr, "exec_known");
     o.max_lds_bytes = json::u32(tr, "max_lds_bytes");
     const auto& threads = json::arr(d, "threads");

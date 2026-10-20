@@ -5267,8 +5267,13 @@ private:
     // the same slots, given out in another order, as GCN's waves themselves
     // take no fixed order. The base is kept apart (Val::wave_part) until it
     // meets its rank (combine_wave_parts), any other read of it rejects; a
-    // value nothing reads leaves the VGPR alone. No subgroup operation: it
-    // holds inside loops invocations leave at different iterations too.
+    // value nothing reads leaves the VGPR alone. With
+    // TranslateOptions::gds_subgroup (the default) the stepping invocations
+    // step it once a subgroup - one atomic for their count, each its own
+    // slot from the base and its rank among them, as GCN once a wave - which
+    // holds for whichever invocations run it together, inside loops
+    // invocations leave at different iterations too; without it, an atomic
+    // an invocation.
     void gds_counter(const Inst& in) {
         const char* name = mnemonic(in) ? mnemonic(in) : "a GDS counter";
         if (!opt.gds_counters || !gds_member) {
@@ -5294,15 +5299,38 @@ private:
         const Id step = cu(append ? 1u : 0xffffffffu);
         ++res.wave.gds_steps;
         const std::size_t index = static_cast<std::size_t>(&in - prog.insts.data());
+        const auto add = [&](Id amount) {
+            return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), amount});
+        };
+        // TranslateOptions::gds_subgroup: inside the guard only the stepping
+        // invocations run; one of them adds their count, every one takes the
+        // base it got plus (append) or minus (consume) its rank among them -
+        // GCN's step a wave, a subgroup at a time. Each run of invocations
+        // that steps together (a subgroup, or the part of it a branch let in)
+        // gets a range of its own, so the slots stay unique and dense whatever
+        // the subgroup's size, and in another order across them as before.
+        const auto subgroup_step = [&](bool want_own) -> Id {
+            subgroup_caps();
+            const auto count = [&](std::uint32_t op) {
+                const Id ballot = m.emit(spv::OpGroupNonUniformBallot, t_v4u, {cu(spv::ScopeSubgroup), m.const_bool(true)});
+                return m.emit(spv::OpGroupNonUniformBallotBitCount, t_u32, {cu(spv::ScopeSubgroup), op, ballot});  // the operation a literal
+            };
+            const Id n = count(spv::GroupOperationReduce);
+            const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            const Id got = where_exec_value(lane(first), [&] { return add(append ? n : ibin(spv::OpISub, cu(0), n)); });
+            if (!want_own) return got;
+            const Id rank = count(spv::GroupOperationExclusiveScan);
+            const Id base = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), got});
+            return ibin(append ? spv::OpIAdd : spv::OpISub, base, rank);
+        };
+        const char* const how = opt.gds_subgroup ? " per subgroup" : " per invocation";
         if (vgpr_unread_after(index, 256 + in.dst)) {
-            where_exec_value(run, [&] { return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step}); });
+            where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(false) : add(step); });
             ++gds_lane_ops;
-            note += std::string(" ") + (append ? "+1" : "-1") + " per invocation (value unread)";
+            note += std::string(" ") + (append ? "+1" : "-1") + how + " (value unread)";
             return;
         }
-        const Id own = where_exec_value(run, [&] {
-            return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), step});
-        });
+        const Id own = where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(true) : add(step); });
         Val b = word(own);
         b.wave_part = append ? 1 : 2;
         b.part_mask = e.constant ? 0 : e.id;
@@ -5311,7 +5339,7 @@ private:
         inst_uniform = false;
         write_v(in.dst, b);
         ++gds_lane_ops;
-        note += std::string(" ") + (append ? "+1" : "-1") + " per invocation (its own slot)";
+        note += std::string(" ") + (append ? "+1" : "-1") + how + " (its own slot)";
     }
     // The append idiom's two parts added together (v_add_i32 base, rank;
     // v_sub_i32 / v_subrev_i32 base - rank for a consume): the invocation's

@@ -16,6 +16,7 @@
 #include "hle/modules.h"
 #include "hle/platform.h"
 #include "hle/sysv_va.h"
+#include "hle/guest_console.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -197,19 +198,34 @@ GUEST_ABI std::uint64_t hle_strtoumax(const char* s, char** end, int base) {
 // The printf family walks the guest's own va_list (hle/sysv_va.h): the
 // v-entries get the guest's pointer, the variadic ones are asm shims
 // (SYSV_VA_ENTRY, after this namespace) that build one from the registers.
-GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return bb::libc::print_file(stdout, fmt, ap); }
+// stdout and stderr are the console: what the game prints there goes through
+// the repeat filter (hle/guest_console.h: a line in a loop once, then a
+// count); a file as before.
+bool console(FILE* f) { return f == stdout || f == stderr; }
+int print_console_or_file(FILE* f, const char* fmt, SysvVaList* ap) {
+    if (!console(f)) return bb::libc::print_file(f, fmt, ap);
+    const std::string s = sysv_vformat(fmt, ap);
+    bb::guest_console::write(f, s.data(), s.size());
+    return static_cast<int>(s.size());
+}
+GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return print_console_or_file(stdout, fmt, ap); }
 GUEST_ABI int hle_vsnprintf(char* b, std::uint64_t n, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, n, fmt, ap);
 }
 GUEST_ABI int hle_vsprintf(char* b, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, ~std::size_t(0), fmt, ap);
 }
-GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return bb::libc::print_file(f ? f : stdout, fmt, ap); }
+GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return print_console_or_file(f ? f : stdout, fmt, ap); }
 GUEST_ABI int hle_puts(const char* s) {
-    return bb::libc::file_result(stdout, [&] { return std::puts(s); }, bb::libc::write_access);
+    std::string line(s ? s : "");
+    line += '\n';
+    bb::guest_console::write(stdout, line.data(), line.size());
+    return 0;
 }
 GUEST_ABI int hle_putchar(int c) {
-    return bb::libc::file_result(stdout, [&] { return std::putchar(c); }, bb::libc::write_access);
+    const char ch = static_cast<char>(c);
+    bb::guest_console::write(stdout, &ch, 1);
+    return static_cast<unsigned char>(ch);
 }
 GUEST_ABI void hle_perror(const char* s) { bb::libc::print_error(stderr, s); }
 
@@ -262,13 +278,20 @@ GUEST_ABI FILE* hle_freopen(const char* path, const char* mode, FILE* f) {
     return bb::libc::reopen_file(host.c_str(), mode ? mode : "r", f);
 }
 GUEST_ABI int hle_fclose(FILE* f) { return f ? bb::libc::close_file(f) : 0; }
-GUEST_ABI int hle_fflush(FILE* f) { return libc_result(std::fflush(f)); }
+GUEST_ABI int hle_fflush(FILE* f) {
+    if (f && console(f)) bb::guest_console::flush(f);  // the thread's unfinished line
+    return libc_result(std::fflush(f));
+}
 GUEST_ABI std::uint64_t hle_fread(void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
     return bb::libc::file_result(f, [&] {
         return write_watch_fread(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
     }, bb::libc::read_access);
 }
 GUEST_ABI std::uint64_t hle_fwrite(const void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
+    if (console(f)) {
+        bb::guest_console::write(f, static_cast<const char*>(p), static_cast<std::size_t>(sz * n));
+        return sz ? n : 0;
+    }
     return bb::libc::file_result(f, [&] {
         return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
     }, bb::libc::write_access);
@@ -287,8 +310,21 @@ GUEST_ABI int hle_fgetc(FILE* f) { return bb::libc::file_result(f, [&] { return 
 GUEST_ABI int hle_getc(FILE* f) { return bb::libc::file_result(f, [&] { return std::getc(f); }, bb::libc::read_access); }
 GUEST_ABI int hle_ungetc(int c, FILE* f) { return std::ungetc(c, f); }
 GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return bb::libc::file_result(f, [&] { return std::fgets(s, n, f); }, bb::libc::read_access); }
-GUEST_ABI int hle_fputc(int c, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputc(c, f); }, bb::libc::write_access); }
-GUEST_ABI int hle_fputs(const char* s, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputs(s, f); }, bb::libc::write_access); }
+GUEST_ABI int hle_fputc(int c, FILE* f) {
+    if (console(f)) {
+        const char ch = static_cast<char>(c);
+        bb::guest_console::write(f, &ch, 1);
+        return static_cast<unsigned char>(ch);
+    }
+    return bb::libc::file_result(f, [&] { return std::fputc(c, f); }, bb::libc::write_access);
+}
+GUEST_ABI int hle_fputs(const char* s, FILE* f) {
+    if (console(f)) {
+        bb::guest_console::write(f, s, std::strlen(s));
+        return 0;
+    }
+    return bb::libc::file_result(f, [&] { return std::fputs(s, f); }, bb::libc::write_access);
+}
 GUEST_ABI int hle_fgetpos(FILE* f, bb::libc::Fpos* p) { return libc_result(bb::libc::get_position(f, p)); }
 GUEST_ABI int hle_setvbuf(FILE* f, char* b, int m, std::uint64_t n) {
     const int host_mode = bb::libc::buffer_mode(m);

@@ -464,6 +464,8 @@ int sysv_vsnprintf(char* out, std::size_t n, const char* fmt, SysvVaList* ap) {
     return static_cast<int>(s.size());
 }
 
+std::string sysv_vformat(const char* fmt, SysvVaList* ap) { return format(fmt, ap); }
+
 int sysv_vfprintf(std::FILE* f, const char* fmt, SysvVaList* ap) {
     const std::string s = format(fmt, ap);
     if (std::fwrite(s.data(), 1, s.size(), f) != s.size()) return -1;

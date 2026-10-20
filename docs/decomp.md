@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 190 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 192 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
-| **Taken over in all** | **304** |
-| With any code byte changed (including byte patches and redirected calls) | 325; 407 at 60 fps |
+| **Taken over in all** | **306** |
+| With any code byte changed (including byte patches and redirected calls) | 327; 409 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -384,6 +384,8 @@ instead of ~60%.
 |---|---|---|---|
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code; 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips; 426 calls compared in a world session: 0 differences |
+| effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 4 mutants caught |
+| FFX light module update (`sub_131e660`) | `0x131e660` | a light effect's colour, radius, place and flicker; on such a frame with its flicker phase and blend held | 40,000 generated modules against the game's own run with the two held; 3 mutants caught |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -395,6 +397,18 @@ its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
 community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
 those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
+
+The other two are the effects' frames between whole steps. Above 30 fps with
+effect steps 30, the default (`docs/running.md`), the effect manager runs its
+whole update every frame - a frame between whole 1/30 s steps with a step of
+0 - so effects follow what they ride on and their render data is fresh. The
+game's effects count part of their lives in updates, though: a node's state
+edges, its emissions and the definitions its conditions pick move once an
+update, and a light's flicker phase adds its age every call. On such a frame
+(bbhost's, not the game's own still frame) the instance update runs only its
+nodes' containers and the light module runs as the game's with its phase
+rate and its blend held; every other frame, and a creation's pre-roll, is
+the game's code.
 
 ### Replaced outside the list
 

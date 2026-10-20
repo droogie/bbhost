@@ -857,7 +857,18 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 // walk, 1 a texture) reaches them - copied back and let go.
 bool twins_on();
 bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
-int twins_level();  // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies write
+// BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies
+// write; 3 the GPU particles' buffers alone (BBHOST_PARTICLE_TWINS: on a
+// discrete GPU unless set); -1 until the device is chosen.
+int twins_level();
+// The device is chosen: level 3 on a discrete GPU (or BBHOST_PARTICLE_TWINS=1),
+// else 0 - unless BBHOST_GX_TWINS set it.
+void twins_decide(bool discrete);
+// Level 3: a dispatch that counts in GDS binds [va...]: the candidate holding
+// va is armed when the next recording begins (twins_arm_wanted_locked, from
+// begin_recording_locked), its twin made at that recording's first use.
+void twins_want_locked(std::uint64_t va);
+void twins_arm_wanted_locked();
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
