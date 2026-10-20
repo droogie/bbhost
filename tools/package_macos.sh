@@ -101,9 +101,6 @@ for f in "$dir/lib/"*.dylib; do codesign --force --sign - "$f" 2>/dev/null; done
 codesign --force --sign - --entitlements tools/macos/bbhost.entitlements "$dir/bbhost"
 codesign --verify --strict "$dir/bbhost"
 
-# The licenses of what the package carries that is not bbhost's.
-# The SDK's VERSIONS.txt names the revision each was built from; the versions
-# of SDL3 and ffmpeg are tools/build_macos.sh's.
 rev_of() { grep -m1 "/$1.git" "$sdk/../VERSIONS.txt" 2>/dev/null | cut -d' ' -f1 || true; }
 mvk=$(rev_of MoltenVK); ldr=$(rev_of Vulkan-Loader); spvc=$(rev_of SPIRV-Cross)
 dep_ver() { sed -n "s/^$1=.*:-\(.*\)}\$/\1/p" tools/build_macos.sh; }

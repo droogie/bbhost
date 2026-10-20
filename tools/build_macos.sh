@@ -1,13 +1,8 @@
 #!/bin/bash
-# The macOS build: bbhost as an x86_64 program, which Rosetta 2 runs on Apple
-# Silicon (the game's code is x86-64 and runs as it is, as on a PC). The
-# counterpart of tools/ci_build.sh: cmake, ninja and pkg-config when they are missing,
-# then the Vulkan headers, SDL3 and the movie decoders of ffmpeg built static
-# for x86_64 into a prefix, then bbhost, its tools and its tests, and ctest.
-#
-# The Vulkan loader and MoltenVK come from the LunarG Vulkan SDK (universal
-# binaries): VULKAN_SDK, or the newest ~/VulkanSDK/<version>/macOS. The SDK's
-# KosmicKrisp driver is arm64 only, so an x86_64 bbhost uses MoltenVK.
+# The macOS build (x86_64, run by Rosetta 2), counterpart of tools/ci_build.sh:
+# static x86_64 deps into a prefix, then bbhost, its tools and tests, and ctest.
+# Vulkan comes from the LunarG SDK: VULKAN_SDK, or the newest ~/VulkanSDK/*/macOS.
+# MoltenVK, since the SDK's KosmicKrisp driver is arm64 only.
 #
 #   tools/build_macos.sh              everything, in build-macos/
 #   CI_WORK=/somewhere tools/build_macos.sh
@@ -106,10 +101,8 @@ if [ ! -f "$P/lib/libSDL3.a" ]; then
     cmake --install "$W/sdl3" > /dev/null
 fi
 
-# ffmpeg, only the movie decoders (tools/win_deps.sh has the reasons), static,
-# cross-compiled for x86_64, without X11 (configure finds a Homebrew one through
-# pkg-config and links bbhost to it). Without nasm the decoders' x86 assembly is left
-# out (slower movies, not wrong ones).
+# ffmpeg: movie decoders only (tools/win_deps.sh says why). No X11: configure
+# would find Homebrew's and link bbhost to it. No nasm: slower, not wrong.
 if [ ! -f "$P/lib/libavcodec.a" ]; then
     fetch ffmpeg "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" 'ffmpeg-*'
     f=$(ls -d "$W"/src/ffmpeg-* | head -1)

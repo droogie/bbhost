@@ -1,6 +1,4 @@
-// core/mac_vm.cpp: the guest's windows on macOS - placeholders taken by fixed
-// mappings and given back by unmapping, free space taken only when free, and
-// stub pages found within a rel32 of a range.
+// core/mac_vm.cpp: the guest's address windows on macOS.
 #include "core/mac_vm.h"
 
 #include <cstdint>
@@ -31,9 +29,7 @@ constexpr int kRw = PROT_READ | PROT_WRITE;
 }  // namespace
 
 int main() {
-    // A window where bbhost has its high one (free in any new process), and a
-    // second made the way the image's reservation is: memory of the process
-    // taken over.
+    // bbhost's high window: free in any new process.
     constexpr std::uint64_t kWin = kMacVmHighBase, kWinLen = 0x100000000ull;
     if (!mac_vm_reserve(kWin, kWinLen)) {
         std::printf("mac_vm_test: cannot reserve [0x%llx, +4 GiB)\n", static_cast<unsigned long long>(kWin));
@@ -48,7 +44,6 @@ int main() {
     expect(!mac_vm_in_window(kWin + 0x1000, ~0ull), "a range wrapping past the address space is in it");
     expect(!mac_vm_in_window(0x20000000000ull, 0x1000), "a page outside the windows is in one");
 
-    // NoReplace takes placeholders, once.
     const std::uint64_t a = kWin + 0x200000;
     void* p = mac_vm_map(at(a), 0x20000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace);
     expect(p == at(a), "NoReplace on placeholders");
@@ -57,10 +52,8 @@ int main() {
            "NoReplace over a mapping succeeded");
     expect(!mac_vm_map(at(a - 0x1000), 0x2000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace),
            "NoReplace straddling a mapping succeeded");
-    // Exact replaces.
     void* q = mac_vm_map(at(a + 0x10000), 0x1000, kRw, kAnon, -1, 0, MacVmPlace::Exact);
     expect(q == at(a + 0x10000) && static_cast<std::uint8_t*>(q)[0] == 0, "Exact over a mapping");
-    // An unmapping gives placeholders back, part of a mapping as well.
     expect(mac_vm_unmap(at(a + 0x8000), 0x8000), "unmapping part of a mapping");
     expect(mac_vm_map(at(a + 0x8000), 0x8000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace) == at(a + 0x8000),
            "NoReplace where a part was unmapped");
@@ -68,7 +61,7 @@ int main() {
     expect(mac_vm_unmap(at(a), 0x20000), "unmapping");
     expect(mac_vm_map(at(a), 0x20000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace) == at(a), "NoReplace after unmapping");
 
-    // A file mapping (direct memory is one) at a placeholder.
+    // Direct memory is a file mapping.
     char name[32];
     std::snprintf(name, sizeof(name), "/bb-macvm-test-%d", static_cast<int>(getpid()));
     shm_unlink(name);
@@ -95,22 +88,19 @@ int main() {
     expect(b && addr(b) + 0x1000 <= top && top + 0x10000 - addr(b) < 0x80000000ull, "a stub page below the range");
     expect(!mac_vm_map_near(lo, hi, 0x80000000ull, kRw), "a stub longer than a rel32 reaches");
     expect(!mac_vm_map_near(lo, hi, ~0ull, kRw), "a stub longer than the address space");
-    // Out of reach of any window: none.
     expect(!mac_vm_map_near(0x20000000000ull, 0x20000001000ull, 0x1000, kRw), "a stub page out of the windows' reach");
 
-    // Free space outside the windows: taken when free, and unmapped for good.
     const std::uint64_t free_at = 0x20000000000ull;
     void* g = mac_vm_map(at(free_at), 0x4000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace);
     expect(g == at(free_at), "NoReplace on free space");
     expect(!mac_vm_map(at(free_at), 0x1000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace), "NoReplace over it again");
     expect(mac_vm_unmap(g, 0x4000), "unmapping outside the windows");
     expect(!mac_vm_map_near(free_at, free_at + 0x1000, 0x1000, kRw), "an unmapping outside the windows left placeholders");
-    // Memory of the process's own, not ours: refused.
     static char own[0x4000];
     const std::uint64_t own_page = (addr(own) + 0xfff) & ~0xfffull;
     expect(!mac_vm_map(at(own_page), 0x1000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace), "NoReplace over the process's data");
 
-    // Adopting memory the process has (the image's reservation) as a window.
+    // As the image's reservation is adopted.
     void* r = mmap(nullptr, 0x100000, kRw, kAnon, -1, 0);
     expect(r != MAP_FAILED && mac_vm_adopt(addr(r), addr(r) + 0x100000), "adopting");
     expect(mac_vm_map(static_cast<std::uint8_t*>(r) + 0x4000, 0x1000, kRw, kAnon, -1, 0, MacVmPlace::NoReplace) ==

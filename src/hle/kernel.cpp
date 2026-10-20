@@ -65,8 +65,7 @@ constexpr std::uint64_t kDmemVaBase = 0x100000000ull;
 constexpr std::uint64_t kGpuDmemBase = 0xFF00000000ull;
 constexpr std::uint64_t kGnmVaMask = 0xFFFFFFFFFFull;
 // Windows: where the image goes when its preferred slide is taken (memory.cpp);
-// macOS: where it always goes, bbhost's own image covering 0x400000 there
-// (core/mac_vm.h).
+// macOS: always, as bbhost's own image covers 0x400000.
 constexpr std::uint64_t kImageFallbackBase = 0x300000000ull;
 constexpr std::uint64_t kPage = 0x4000;  // Orbis page
 
@@ -281,16 +280,9 @@ int host_prot(int sce_prot) {
 enum class Fix { None, Exact, NoReplace };
 
 #if defined(__APPLE__)
-// macOS: mmap through the guest's windows, which are placeholders
-// (core/mac_vm.h) that a fixed mapping takes and an unmapping gives back;
-// macOS has no MAP_FIXED_NOREPLACE.
-//
-// An Exact mapping is MAP_FIXED, which replaces whatever is there, and the
-// host lives next to the guest's addresses: bbhost's image from 0x10000,
-// Rosetta 2's regions and the dylibs above the low window; a mapping over
-// Rosetta's pages hangs the process. So the guest gets one only in a window
-// or over mappings of its own (g_maps); anything else fails as a mapping
-// that cannot be placed.
+// Host memory (bbhost's image, Rosetta 2's regions, dylibs) sits next to the
+// guest's windows and MAP_FIXED over Rosetta's pages hangs the process, so an
+// Exact mapping must land in a window or on the guest's own g_maps.
 bool guest_owns(std::uint64_t lo, std::uint64_t len) {
     if (mac_vm_in_window(lo, len)) return true;
     std::lock_guard<std::mutex> lock(g_dmem_mu);

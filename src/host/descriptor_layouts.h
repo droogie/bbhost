@@ -1,17 +1,13 @@
 #pragma once
-// The descriptor set layouts gpu.cpp makes at device creation, as binding
-// lists, and a pipeline layout made of them held to a device's limits - apart
-// from the device, so tests/descriptor_layouts_test.cpp can check every one
-// against MoltenVK's limits on a machine without a GPU.
+// gpu.cpp's descriptor set layouts, apart from the device so
+// tests/descriptor_layouts_test.cpp can check them against MoltenVK's limits
+// without a GPU.
 //
-// A device's per-stage limits count a binding in every stage its stageFlags
-// name. Every binding is VK_SHADER_STAGE_ALL, so each graphics stage counts
-// both stage sets: 64 samplers a stage against MoltenVK's 16, and the pushed
-// constant buffers' 32 storage buffers against its 31. There
-// (old_layouts_over_limits, on MoltenVK) the layouts are per stage instead:
-// each graphics binding names the stages that read it (kGfxSetStages), and a
-// shared set declares no more samplers than a stage may bind. Every other
-// driver keeps them as they are; gpu.cpp says when they are over its limits.
+// A per-stage limit counts a binding in every stage its stageFlags name:
+// VK_SHADER_STAGE_ALL puts 64 samplers in each stage against MoltenVK's 16.
+// Where old_layouts_over_limits says so, bindings name only the stages that
+// read them (kGfxSetStages) and a shared set declares no more samplers than
+// a stage may bind.
 
 #include "gcn/translate.h"
 
@@ -25,24 +21,17 @@
 
 namespace gpu {
 
-// The images, samplers and storage images a shared set declares (a stage's
-// bindings from gcn::kBindingImage0, kBindingSampler0 and kBindingStorageImage0).
+// The images, samplers and storage images a shared set declares.
 constexpr std::uint32_t kMaxImages = 32;
 
-// The stages that read each graphics set. Set 0 is the vertex shader's: the
-// vertex stage, or in a tessellated draw the domain shader's evaluation stage
-// and the hull shader's control stage (which reads its params block); the
-// rect-list geometry shader reads none of it but is a pre-rasterization stage
-// like them. Set 1 is the pixel shader's. The pushed constant buffers (set 2)
-// follow the same split, but for the control stage (kCbPushStages): the
-// vertex stage's bindings from 112, the pixel stage's from 128.
+// Set 0 is the vertex shader's (and the domain and hull shaders'; the rect-list
+// geometry shader reads none of it but is pre-rasterization), set 1 the pixel
+// shader's.
 constexpr VkShaderStageFlags kGfxSetStages[2] = {
     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
         VK_SHADER_STAGE_GEOMETRY_BIT,
     VK_SHADER_STAGE_FRAGMENT_BIT};
 
-// The stages that read graphics set `set` (0 or 1): every stage, as the
-// layouts are, or with `per_stage` its own (kGfxSetStages).
 inline VkShaderStageFlags gfx_set_stages(bool per_stage, int set) { return per_stage ? kGfxSetStages[set] : VK_SHADER_STAGE_ALL; }
 
 // Not the control stage, which reads no constant buffer through a binding:
@@ -51,16 +40,11 @@ inline VkShaderStageFlags gfx_set_stages(bool per_stage, int set) { return per_s
 constexpr VkShaderStageFlags kCbPushStages[2] = {kGfxSetStages[0] & ~VkShaderStageFlags(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT),
                                                  kGfxSetStages[1]};
 
-// The samplers a shared set declares: kMaxImages, or with `per_stage` as many
-// as the device binds a stage where that is fewer (MoltenVK: 16, Metal's own
-// limit).
+// MoltenVK binds 16 samplers a stage (Metal's limit).
 inline std::uint32_t shared_set_samplers(bool per_stage, std::uint32_t max_per_stage_samplers) {
     return per_stage ? std::min(kMaxImages, max_per_stage_samplers) : kMaxImages;
 }
 
-// The shared set: the params block, kMaxImages sampled and storage images,
-// `samplers` samplers, and with `buffers` the constant buffers (when they are
-// not pushed), each read by `stages`.
 inline std::vector<VkDescriptorSetLayoutBinding> shared_set_bindings(VkDescriptorType params, std::uint32_t samplers, bool buffers,
                                                                      VkShaderStageFlags stages) {
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -76,11 +60,7 @@ inline std::vector<VkDescriptorSetLayoutBinding> shared_set_bindings(VkDescripto
     return binds;
 }
 
-// A graphics stage's own set (render.cpp stage_set_layout, BBHOST_SET_LAYOUTS):
-// the params block and the bindings its translation declares - not the images
-// and samplers under bindless (set 3's), and the constant buffers only with
-// `buffers` (when they are not pushed) - in binding order, each read by
-// `stages`.
+// A graphics stage's own set (render.cpp stage_set_layout).
 inline std::vector<VkDescriptorSetLayoutBinding> stage_set_bindings(const gcn::TranslateResult& meta, VkDescriptorType params, bool buffers,
                                                                     VkShaderStageFlags stages) {
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -157,18 +137,13 @@ inline std::uint32_t mvk_vertex_input_slots(const std::vector<VkVertexInputBindi
     return slots;
 }
 
-// One set of a pipeline layout. An update-after-bind set (bindless.cpp's
-// global set) answers to the update-after-bind limits instead, which are not
-// checked here.
+// An update-after-bind set answers to other limits, not checked here.
 struct LayoutSet {
     const std::vector<VkDescriptorSetLayoutBinding>* binds = nullptr;
     bool update_after_bind = false;
 };
 
-// What of a pipeline layout made of `sets` is over the device's limits - each
-// stage's descriptors of each kind against maxPerStageDescriptor* and
-// maxPerStageResources, and the layout's totals against maxDescriptorSet* -
-// or empty where it is within them.
+// What is over the device's limits; empty where all fits.
 inline std::string layout_over_limits(const std::vector<LayoutSet>& sets, const VkPhysicalDeviceLimits& l) {
     struct Counts {
         std::uint32_t samplers = 0, uniform = 0, uniform_dynamic = 0, storage = 0, storage_dynamic = 0, sampled = 0, storage_images = 0,
@@ -237,10 +212,8 @@ inline std::string layout_over_limits(const std::vector<LayoutSet>& sets, const 
     return out;
 }
 
-// What of the layouts as they are - the compute layout, and the graphics one
-// with both stage sets and (`push`) the pushed constant buffers, every binding
-// in every stage - is over the device's limits; empty where they fit, and the
-// device keeps them. Bindless only takes bindings out of the stage sets.
+// The layouts with every binding in every stage; empty where the device takes
+// them. Bindless only takes bindings out, so it is left out.
 inline std::string old_layouts_over_limits(VkDescriptorType params, bool push, const VkPhysicalDeviceLimits& l) {
     const std::vector<VkDescriptorSetLayoutBinding> shared = shared_set_bindings(params, kMaxImages, !push, VK_SHADER_STAGE_ALL);
     const std::vector<VkDescriptorSetLayoutBinding> cbs = push ? cb_push_bindings(false) : std::vector<VkDescriptorSetLayoutBinding>{};

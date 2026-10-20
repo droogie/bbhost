@@ -39,13 +39,8 @@
 # The jobs' checks - package-linux, package-windows and package-all (the Steam
 # Deck kit, the updater's executables and the bundle check), with build.yml's
 # tests - are the ones master's ruleset requires before a pull request merges.
-# package-macos (and build.yml's tests-macos) are not among them, and while
-# the macOS port is new they cannot fail a run: their jobs continue on error,
-# and package-all runs when Linux and Windows have packaged, leaving the macOS
-# zip and plugins out when package-macos failed or its zip does not pass the
-# checks. Once they have passed on the runners for a while they are to become
-# required checks (a change to the ruleset, for the maintainers) and
-# package-all to wait for them again.
+# package-macos and tests-macos are not, and continue on error while the port
+# is new: a failed macOS package is left out of the release.
 #
 # The debug menu's font (engine/debug_menu.h) is the Debug Menu plugin's own,
 # made from public-domain fonts (plugins/debug_menu): nothing is fetched.

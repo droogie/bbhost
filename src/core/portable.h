@@ -55,13 +55,9 @@ std::uintptr_t host_image_base();
 // library's file calls take; macOS: symbolic links resolved.
 std::string host_exe_path();
 #if defined(__APPLE__)
-// macOS: the loaded image (this executable or a library) one of whose
-// segments holds addr - an executable segment when code_only - with its path
-// and where its Mach-O header is loaded (addr minus that is what atos -l
-// takes with the header's link address). dyld's image list, for what Linux
-// asks dl_iterate_phdr; false for any address outside them, the guest's
-// included. (bbhost's data segment holds the guest's low windows,
-// core/mac_vm.h: for an address there only a code lookup says false.)
+// macOS: the loaded image with a segment (executable when code_only) holding
+// addr: its path and Mach-O header address. bbhost's data segment holds the
+// guest's low windows (core/mac_vm.h), so only code_only rejects those.
 bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base);
 // macOS: [addr, addr+len) is mapped readable. Fault- and lock-free, so the
 // fault handler may ask; Rosetta 2's stacks can't be told by address.

@@ -2,12 +2,9 @@
 //
 //   spvrelax <in.spv> <out.spv> [--graphics | --invariant] [--exact-discards]
 //
-// Without either only a fragment stage changes. --graphics: vertex-pipeline
-// stages too, their Position kept exact; --invariant: as bbhost does on
-// MoltenVK, their Position made Invariant instead (RelaxStages::GraphicsInvariant).
-// --exact-discards: a pixel shader that can discard keeps its branch
-// conditions exact (BBHOST_PS_DISCARD_EXACT=1). Prints how many decorations
-// were dropped and kept.
+// Default: fragment stages only. --graphics: vertex stages too, Position kept
+// exact; --invariant: Position made Invariant instead, as bbhost does on
+// MoltenVK. --exact-discards: as BBHOST_PS_DISCARD_EXACT=1.
 #include "host/spirv_relax.h"
 
 #include <cstdio>

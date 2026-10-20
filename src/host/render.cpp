@@ -351,20 +351,10 @@ const std::string* g_pass_profile_name = nullptr;  // the profile name of the dr
 // read of a target this tracking does not see (a T# whose base is inside the
 // target rather than at it, or an image bound another way), which the
 // validation layer cannot see through the bindless set either.
-// Off on macOS too. Each barrier there is a wait between Metal encoders, and in
-// Central Yharnam (M1 Pro, 1080p) the 120 pass-end barriers a frame went down
-// to 72 and the frame from 36.9 to 35.4 ms; but once vertex stages lost their
-// NoContraction the frame stopped being GPU-bound there, and lazy, full and no
-// barriers at all all ran 35.2 ms, so the gain no longer pays the risk. Metal does
-// not order these reads for us: MoltenVK 1.4's MVK_CONFIG_USE_MTLHEAP
-// defaults to "where safe", which on Apple GPUs puts images in MTLHeaps, and
-// a missed barrier showed as whole white frames (below).
-// A draw that samples a target of the pass still open, and goes into another
-// pass, ends that pass in begin_pass after its own sample check: the check
-// must count the open pass's targets as written too. Without that, every
-// post-processing chain (YEBIS, bloom: each pass sampling the one before)
-// read its input with no barrier, and at the Tomb of Oedon lamp 7 of 580
-// frames came out white (0 of 550 with it, 0 of 400 with BBHOST_PASS_BARRIERS=0).
+// Off on macOS too: no measurable gain there, and Metal does not order these
+// reads (MoltenVK puts images in MTLHeaps), so a missed barrier is a white
+// frame. begin_pass's sample check must count the open pass's targets as
+// written, or post-processing chains read their input with no barrier.
 struct PassHazards {
     bool owed = false;
     std::unordered_set<std::uint64_t> written;  // attachment bases written since the last barrier
@@ -1991,22 +1981,13 @@ bool relax_exact_discards() {
     return exact;
 }
 
-// Whether shader modules lose their NoContraction decorations on the way to
-// the driver (spv::relax_contraction). MoltenVK's SPIR-V to MSL conversion
-// makes each decorated op a call to a [[clang::optnone]] helper, which made
-// the pixel shaders 4-20x slower (a clinic frame 132 -> 39 ms at 1080p); other
-// drivers fuse nothing they were told not to, at no cost, so they keep them.
-// Done here rather than in the translator so the translation cache, the
-// lifter's byte-identical checks and every other driver see the same modules
-// as before. BBHOST_NO_CONTRACTION=1 keeps every decoration (an A/B switch).
-//
-// Vertex-pipeline stages lose them too (RelaxStages::GraphicsInvariant): their
-// Position output is decorated Invariant instead, which MoltenVK compiles as
-// [[position, invariant]] with preserveInvariance, so a surface drawn by two
-// pipelines (say a depth pass and an EQUAL-tested one) still lands on the same
-// depths. The scene passes' vertex work in the Hunter's Dream went from about
-// 29 to 9 ms a frame at 1080p. BBHOST_VS_CONTRACTION=1 keeps those stages
-// exact (fragment stages only, as before).
+// MoltenVK makes each NoContraction op a [[clang::optnone]] helper call
+// (pixel shaders 4-20x slower), so its modules drop the decoration; other
+// drivers keep it for free. Done here, not in the translator, so the
+// translation cache and the lifter's checks see unchanged modules.
+// Vertex-pipeline stages get an Invariant Position instead, so two pipelines
+// drawing one surface still agree on depth. BBHOST_NO_CONTRACTION=1 keeps
+// every decoration; BBHOST_VS_CONTRACTION=1 keeps vertex stages exact.
 bool relax_contraction_on() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_NO_CONTRACTION");
@@ -4431,9 +4412,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // No point size for tessellated rect lists: MoltenVK draws nothing when
     // the vertex stage writes one.
     if (s.rect && rect_list_path() == RectPath::kTessellation) vs_out_cntl &= ~(1u << 16);
-    // A domain shader as the evaluation stage writes one only where the
-    // device lets that stage (Gpu::has_tess_geom_point_size).
-    // As one vertex stage (DrawState::tess_vtx) it is the same domain shader, translated the same.
+    // Nor for a domain shader where the device forbids it
+    // (Gpu::has_tess_geom_point_size); fused, it is translated the same.
     if ((s.tess_hw || s.tess_vtx) && !g.has_tess_geom_point_size) vs_out_cntl &= ~(1u << 16);
     VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
                         vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,

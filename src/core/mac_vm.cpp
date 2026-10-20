@@ -18,8 +18,7 @@ namespace {
 using ull = unsigned long long;
 
 constexpr std::uint64_t kPage = 0x1000;
-// A placeholder's tag in the kernel's map: one of the sixteen kept for
-// applications (vmmap shows it as "Memory Tag 255").
+// Marks placeholders; vmmap shows "Memory Tag 255".
 constexpr int kTag = VM_MEMORY_APPLICATION_SPECIFIC_16;
 // A rel32's reach, less a page so a stub's own length stays inside it.
 constexpr std::uint64_t kReach = 0x7fff0000ull;
@@ -32,8 +31,7 @@ std::vector<Window> g_windows;  // set at start, never shrinks
 
 std::uint64_t page_up(std::uint64_t a) { return (a + kPage - 1) & ~(kPage - 1); }
 
-// The kernel's map entry holding `at`, or the first one above it; false when
-// there is none.
+// The map entry holding `at`, or the next one above; false when none.
 struct Region {
     std::uint64_t lo, hi;
     bool placeholder;
@@ -64,8 +62,7 @@ bool placeholders(std::uint64_t at, std::uint64_t len) {
     return true;
 }
 
-// [at, at+len) as placeholders: over what is there (replace), or only where
-// nothing is (then it fails when anything is).
+// Without `replace`, fails when anything is mapped there.
 bool place(std::uint64_t at, std::uint64_t len, bool replace) {
     if (replace) {
         return mmap(reinterpret_cast<void*>(at), len, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, VM_MAKE_TAG(kTag), 0) !=
@@ -116,9 +113,8 @@ void* mac_vm_map(void* at, std::uint64_t len, int prot, int flags, int fd, std::
     } else if (place_as == MacVmPlace::Exact) {
         p = mmap(at, len, prot, flags | MAP_FIXED, fd, static_cast<off_t>(offset));
     } else {
-        // Placeholders are ours to map over. Free space is made placeholders
-        // first, which fails when anything is there, so nothing is replaced
-        // that was not ours.
+        // Free space becomes placeholders first, which fails if anything is
+        // there, so only our placeholders get replaced.
         std::lock_guard<std::mutex> lock(g_mu);
         const bool ours = placeholders(a, len);
         if (!ours && !place(a, len, false)) return nullptr;
@@ -142,8 +138,7 @@ bool mac_vm_unmap(void* at, std::uint64_t len) {
     std::lock_guard<std::mutex> lock(g_mu);
     bool ok = true;
     for (std::uint64_t p = a; p < end;) {
-        // The piece up to the next window edge: inside a window, placeholders
-        // again; outside, unmapped.
+        // Up to the next window edge.
         const Window* in = nullptr;
         std::uint64_t next = end;
         for (const Window& w : g_windows) {
@@ -160,8 +155,7 @@ bool mac_vm_unmap(void* at, std::uint64_t len) {
 void* mac_vm_map_near(std::uint64_t lo, std::uint64_t hi, std::uint64_t len, int prot) {
     len = page_up(len);
     if (!len || len > kReach || hi < lo) return nullptr;  // (page_up wraps a huge len to 0)
-    // Starts from which every byte of [lo, hi) reaches every byte of the
-    // range, and back.
+    // Starts within rel32 reach of all of [lo, hi), both ways.
     const std::uint64_t lowest = hi > kReach ? page_up(hi - kReach) : kPage;
     const std::uint64_t highest = (lo + kReach - len) & ~(kPage - 1);
     const auto take = [&](std::uint64_t a) -> void* {

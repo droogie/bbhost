@@ -1,22 +1,7 @@
-// The vertex stage on a device without the subgroup built-ins there or
-// without geometry shaders - MoltenVK has neither.
-//
-// TranslateOptions::lane_from_scan works the lane out from an exclusive add
-// and a ballot instead of reading SubgroupLocalInvocationId; the SPIR-V must
-// validate and read no such built-in, and the module without the option still
-// reads it. make_rect_tess_shaders draws a RECTLIST through the tessellator;
-// both of its stages must validate for any interface.
-//
-// Then, on a Vulkan device (MoltenVK is found through portability
-// enumeration), the shaders run. Points from a translated vertex shader whose
-// colours come from a compare's mask bit, an EXEC-masked write and the lane's
-// count must come out per vertex for every wave size, with the lane from the
-// scan and - where the device lists the vertex stage - from the built-in.
-// Rectangles from a translated vertex shader must cover exactly the
-// parallelogram v0 v1 v2 span, with the varying the same affine function of
-// the position over it, and be culled exactly when the triangle v0 v1 v2 is:
-// through the tessellation stages and, where the device has one, the
-// geometry shader. Without a device only the SPIR-V is checked.
+// The vertex stage without the subgroup built-ins there or geometry shaders,
+// as on MoltenVK: lane_from_scan must read no SubgroupLocalInvocationId and
+// make_rect_tess_shaders must validate. On a device, translated points and
+// rectangles must also draw right on every path it has.
 #include "gcn/isa.h"
 #include "gcn/spirv.h"
 #include "gcn/translate.h"

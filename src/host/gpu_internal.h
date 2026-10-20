@@ -228,9 +228,7 @@ struct Gpu {
     bool has_mirror_clamp = false;
     // False where the portability subset lacks samplerMipLodBias (MoltenVK).
     bool sampler_lod_bias = true;
-    // VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers (MoltenVK: 16): the
-    // shared sets declare no more (shared_set_samplers), and a stage whose
-    // translation names more is not built (stage_fits_device).
+    // maxPerStageDescriptorSamplers (MoltenVK: 16); see stage_fits_device.
     std::uint32_t max_stage_samplers = kMaxImages;
     std::uint32_t subgroup_stages = 0;    // VkPhysicalDeviceSubgroupProperties::supportedStages
     // Pixel shaders at wave32 (gcn/wave.h):
@@ -413,18 +411,13 @@ struct Gpu {
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
     // BBHOST_BINDLESS=1 (bindless.cpp): graphics stages read
     // images and samplers from one global set (set 3); their own sets hold the
-    // params block alone. gfx_set_layouts are the graphics stage sets' shared
-    // layouts, set 0's and set 1's: set_layout's bindings, or the params block
-    // alone when bindless - one layout, set_layout itself without bindless,
-    // or with per_stage_sets two, each read by its own stages (kGfxSetStages).
+    // params block alone. gfx_set_layouts are set 0's and set 1's: set_layout's
+    // bindings, or the params block alone when bindless; two layouts only with
+    // per_stage_sets.
     bool bindless = false;
     VkDescriptorSetLayout gfx_set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    // The descriptor layouts per stage (descriptor_layouts.h): only on MoltenVK,
-    // where the layouts as they are - every binding in every stage - are over
-    // the device's per-stage limits (old_layouts_over_limits). The
-    // graphics sets' bindings, the pushed constant buffers' and every
-    // pipeline's own sets then name only the stages that read them, and the
-    // shared sets declare no more samplers than a stage may bind.
+    // Bindings name only the stages that read them: on MoltenVK, whose
+    // per-stage limits are too low otherwise (descriptor_layouts.h).
     bool per_stage_sets = false;
     VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
     VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
@@ -1629,10 +1622,8 @@ extern VkDescriptorBufferInfo g_params_desc;
 void set_cache_forget_view_locked(VkImageView view);
 std::string set_cache_report();
 
-// Whether a translated stage's bindings fit the device's per-stage limits: its
-// samplers against max_stage_samplers (gpu.cpp). Where they do not, the stage
-// is said once by `name` and its pipeline is not built - its layout would be
-// over the device's limit, or (a shared set) without the binding at all.
+// False (said once) when the stage names more samplers than
+// max_stage_samplers: its pipeline is not built.
 bool stage_fits_device(const gcn::TranslateResult& meta, const std::string& name);
 
 }  // namespace gpu

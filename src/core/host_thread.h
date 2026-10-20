@@ -19,8 +19,8 @@
 
 class HostThread {
 public:
-    static constexpr std::size_t kStack = std::size_t{8} << 20;  // glibc's default (the stack limit)
-    // A size that is not a whole number of pages is refused (EINVAL).
+    static constexpr std::size_t kStack = std::size_t{8} << 20;
+    // Partial pages are refused (EINVAL).
     static_assert(kStack % 16384 == 0, "the stack size must be whole pages");
 
     HostThread() noexcept = default;

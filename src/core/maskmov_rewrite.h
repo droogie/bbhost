@@ -27,8 +27,7 @@ std::size_t maskmov_emit_stub(const std::uint8_t* region, std::size_t region_len
 // The region's first five bytes become a jump to `stub`, the rest int3.
 bool maskmov_patch(std::uint8_t* region, std::size_t region_len, std::uint64_t from, std::uint64_t stub);
 
-// Under Rosetta 2 (BBHOST_MASKMOV=0 leaves the sites as they are; =1 does
-// it on an Intel Mac too, for testing). Never on Linux or Windows.
+// Under Rosetta 2; BBHOST_MASKMOV=0 disables it, =1 forces it on Intel Macs.
 bool maskmov_rewrite_wanted();
 
 struct MaskmovRewriteStats {
