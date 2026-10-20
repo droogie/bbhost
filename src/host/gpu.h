@@ -595,6 +595,9 @@ struct GpuStats {
     std::uint64_t draws_tess[6];
     // Dispatches that ran a shader, and of them those that ran its typed lift.
     std::uint64_t shader_dispatches, lifted_dispatches;
+    // Draws whose pixel shader discards by the vertex stage's clip distances at
+    // entry (TranslateOptions::kVsOutCntlClipVarying).
+    std::uint64_t draws_clip_discard;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
 // typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,

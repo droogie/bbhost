@@ -1438,6 +1438,13 @@ private:
     }
     Id attr(int a) {
         if (auto it = attr_loads.find(a); it != attr_loads.end()) return it->second;
+        // GCN's default constant where the input map gives it (translate.cpp
+        // in_value): no input variable.
+        if (const std::uint8_t entry = static_cast<std::size_t>(a) < opt.ps_input_map.size() ? opt.ps_input_map[a] : static_cast<std::uint8_t>(a);
+            TranslateOptions::ps_input_is_default(entry)) {
+            const Id rgb = m.const_f32((entry & 3) >= 2 ? 1.0f : 0.0f), alpha = m.const_f32((entry & 1) ? 1.0f : 0.0f);
+            return attr_loads[a] = m.const_composite(t_v4f, {rgb, rgb, rgb, alpha});
+        }
         Id var;
         if (auto it = in_params.find(a); it != in_params.end()) {
             var = it->second;
@@ -4494,6 +4501,7 @@ private:
     std::size_t swizzles = 0, block_swizzles = 0;  // block_swizzles: inside a whole-quad block over a varying EXEC
     Id quad_right = 0, quad_bottom = 0;  // this invocation's column and row in its quad
     void quad_caps() {
+        if (!subgroup_ops_in(opt)) reject("a quad operation in a stage the device runs no subgroup operations in");
         m.capability(spv::CapGroupNonUniform);
         m.capability(spv::CapGroupNonUniformQuad);
     }
@@ -5183,6 +5191,7 @@ private:
     // and ifs take one arm in every lane).
     std::size_t gds_lane_ops = 0, wave_ranks = 0, ranks_folded = 0, first_lane_reads = 0;
     void subgroup_caps() {
+        if (!subgroup_ops_in(opt)) reject("a subgroup operation in a stage the device runs none in");
         m.capability(spv::CapGroupNonUniform);
         m.capability(spv::CapGroupNonUniformBallot);
     }
@@ -5323,14 +5332,17 @@ private:
             const Id base = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), got});
             return ibin(append ? spv::OpIAdd : spv::OpISub, base, rank);
         };
-        const char* const how = opt.gds_subgroup ? " per subgroup" : " per invocation";
+        // A stage without subgroup operations (gcn::subgroup_ops_in) steps an
+        // invocation at a time.
+        const bool per_subgroup = opt.gds_subgroup && subgroup_ops_in(opt);
+        const char* const how = per_subgroup ? " per subgroup" : " per invocation";
         if (vgpr_unread_after(index, 256 + in.dst)) {
-            where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(false) : add(step); });
+            where_exec_value(run, [&] { return per_subgroup ? subgroup_step(false) : add(step); });
             ++gds_lane_ops;
             note += std::string(" ") + (append ? "+1" : "-1") + how + " (value unread)";
             return;
         }
-        const Id own = where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(true) : add(step); });
+        const Id own = where_exec_value(run, [&] { return per_subgroup ? subgroup_step(true) : add(step); });
         Val b = word(own);
         b.wave_part = append ? 1 : 2;
         b.part_mask = e.constant ? 0 : e.id;
@@ -7116,6 +7128,8 @@ private:
                 {
                     EntryScope entry(m);
                     helper = m.load(t_bool, in_helper);
+                    // A pixel the clip prologue demoted is a helper from the start (clip_cut).
+                    if (clip_cut) helper = m.emit(spv::OpLogicalOr, t_bool, {helper, clip_cut});
                 }
                 const Id covered = m.emit(spv::OpLogicalNot, t_bool, {helper});
                 const Id kept = g.constant ? (g.set ? covered : m.const_bool(false)) : m.emit(spv::OpLogicalAnd, t_bool, {g.id, covered});
@@ -7727,22 +7741,43 @@ private:
     // stage wrote at the clip location is negative is discarded before anything
     // runs, where the clipper would have cut it out of the triangle; the others
     // run the program as they would have.
+    // With gcn::clip_demote (the default where the device has the feature) the
+    // pixel becomes a helper invocation instead (OpDemoteToHelperInvocation),
+    // as the clipper leaves a pixel it cut out of a quad's triangle: it still
+    // computes the values its quad's derivatives take, where an ended
+    // invocation leaves them undefined - garbage mips along every clip edge on
+    // drivers that end it (AMD's, Intel's). The helper-lane query counts it a
+    // helper from the start (clip_cut), as GCN's coverage would.
     bool clip_discard = false;
+    Id clip_cut = 0;  // the pixel the clip distances cut out (with clip_demote)
     void clip_discard_prologue() {
         const Id var = m.global_variable(p_in_v4f, spv::ScInput);
         m.decorate(var, spv::DecLocation, {opt.ps_clip_location()});
         m.name(var, "clip_distances");
         interface.push_back(var);
-        const Id d = m.load(t_v4f, var);
+        const bool demote = clip_demote();
         Id out = m.const_bool(false);
-        for (std::uint32_t k = 0; k < std::min<std::uint32_t>(opt.ps_clip_count(), 4); ++k) {
-            out = m.emit(spv::OpLogicalOr, t_bool, {out, m.emit(spv::OpFOrdLessThan, t_bool, {extract(t_f32, d, k), cf(0.0f)})});
+        {
+            // In the entry block, ahead of everything the helper query reads.
+            EntryScope entry(m);
+            const Id d = m.load(t_v4f, var);
+            for (std::uint32_t k = 0; k < std::min<std::uint32_t>(opt.ps_clip_count(), 4); ++k) {
+                out = m.emit(spv::OpLogicalOr, t_bool, {out, m.emit(spv::OpFOrdLessThan, t_bool, {extract(t_f32, d, k), cf(0.0f)})});
+            }
         }
         const Id l_kill = m.fresh(), l_on = m.fresh();
         m.emit_void(spv::OpSelectionMerge, {l_on, 0u});
         m.emit_void(spv::OpBranchConditional, {out, l_kill, l_on});
         m.label(l_kill);
-        m.emit_void(spv::OpKill, {});
+        if (demote) {
+            m.capability(spv::CapDemoteToHelperInvocation);
+            m.extension("SPV_EXT_demote_to_helper_invocation");
+            m.emit_void(spv::OpDemoteToHelperInvocation, {});
+            m.emit_void(spv::OpBranch, {l_on});
+            clip_cut = out;
+        } else {
+            m.emit_void(spv::OpKill, {});
+        }
         cur_label = m.label(l_on);
         clip_discard = true;
         ++res.wave.discards;

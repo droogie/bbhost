@@ -3060,6 +3060,14 @@ std::string texture_view_by_id_report() {
     return buf;
 }
 
+bool sampler_fixes_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SAMPLER_FIXES");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     // The last sampler made for these words, in front of the map (samplers
     // are never destroyed).
@@ -3080,12 +3088,14 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
         m.sampler = it->second;
         return it->second;
     }
-    auto address = [](std::uint32_t c) {
+    // BBHOST_SAMPLER_FIXES: mirror-once only where the device enabled it.
+    const bool fixes = sampler_fixes_on();
+    auto address = [fixes](std::uint32_t c) {
         switch (c & 7) {
         case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 2: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 3: return !fixes || g.mirror_clamp ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         }
@@ -3109,6 +3119,14 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     std::int32_t bias = static_cast<std::int32_t>(s[2] & 0x3fff);
     if (bias & 0x2000) bias -= 0x4000;
     sci.mipLodBias = static_cast<float>(bias) / 256.0f;
+    if (fixes) {
+        // Vulkan's limits on the LOD state (GCN takes any): the bias within
+        // maxSamplerLodBias, and maxLod not below minLod - a sampler without
+        // mipmaps (maxLod 0.25 above) whose MIN_LOD is past it keeps its base
+        // level, as GCN's MIP_FILTER none does.
+        sci.mipLodBias = std::clamp(sci.mipLodBias, -g.max_lod_bias, g.max_lod_bias);
+        if (sci.maxLod < sci.minLod) sci.minLod = sci.maxLod;
+    }
     // The comparison only applies to samplers the shader uses with
     // image_sample_c* (Vulkan needs compareEnable for Dref ops and forbids it
     // for plain sampling); DEPTH_COMPARE_FUNC gives the function.
@@ -3473,19 +3491,24 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
     }
     begin_recording_locked();
     render_end_pass_locked();
-    auto barrier = [](VkImage img, VkImageLayout from, VkAccessFlags src_access, VkAccessFlags dst_access) {
+    // The target's barriers cover all of it: the caller counts it initialised,
+    // so a layer or level left UNDEFINED here would stay so while it is used
+    // as GENERAL (BBHOST_LAYOUT_FIXES=0: its first layer and level, as before).
+    const bool whole = render_layout_fixes();
+    auto barrier = [whole](VkImage img, VkImageLayout from, VkAccessFlags src_access, VkAccessFlags dst_access, bool all = false) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = from;
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = img;
-        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.subresourceRange = all && whole ? VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
+                                          : VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b.srcAccessMask = src_access;
         b.dstAccessMask = dst_access;
         vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     };
     barrier(sf.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    barrier(target, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    barrier(target, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT, true);
     VkImageCopy r{};
     r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     r.dstSubresource = r.srcSubresource;
@@ -3494,7 +3517,8 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
     // Transfers too: the game's clear of the new target (a fill) can come next.
     barrier(target, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            true);
     tex_event(base, sf.total_src, "render target 0x%llx %ux%u takes the texels a shader stored there", static_cast<unsigned long long>(base),
               width, height);
     if (g_rt_from_surface.fetch_add(1, std::memory_order_relaxed) < 12) {
@@ -3617,6 +3641,15 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
 std::atomic<std::uint64_t> g_res_copies[8] = {};
 const char* const kResCopyName[8] = {"copied image to image", "no source image of its generation", "source not written by the GPU",
                                      "no destination resource", "no destination image", "shapes differ", "formats differ", "no renderer"};
+bool render_layout_fixes() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LAYOUT_FIXES");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+std::atomic<std::uint64_t> g_layout_fixed[4] = {};
+
 int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std::uint64_t dst, std::uint64_t dst_gen) {
     const auto out = [](int why) {
         g_res_copies[why].fetch_add(1, std::memory_order_relaxed);
@@ -3671,6 +3704,21 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     const std::uint32_t layers = std::min(to_layers, from.type == 10 ? 1u : from.layers);
     begin_recording_locked();
     render_end_pass_locked();
+    if (to_rt && !to_rt->initialised && render_layout_fixes()) {
+        // A target nothing has made GENERAL yet (BBHOST_RT_ZERO=0, or grown
+        // from one that held nothing): all of it, before the copy uses it in
+        // that layout (render.cpp ensure_initialised), or its untouched levels
+        // and layers would stay UNDEFINED once it counts as initialised.
+        VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.image = to_rt->image;
+        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        ib.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+        g_layout_fixed[0].fetch_add(1, std::memory_order_relaxed);
+    }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;

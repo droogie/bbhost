@@ -116,12 +116,16 @@ gcn::TranslateOptions pixel_options(const json::Value& m) {
     o.early_fragment_tests = json::flag(tr, "early_fragment_tests");
     o.debug_ps = static_cast<int>(json::u64(tr, "debug_ps"));
     const json::Value& cntl = json::member(reg, "ps_input_cntl");
+    // Captures made before the default inputs (BBHOST_PS_INPUT_DEFAULTS) read
+    // register 0's location for them.
+    const json::Value* defaults = tr.find("ps_input_defaults");
+    const bool use_defaults = defaults && defaults->type == json::Value::Type::Bool && defaults->boolean;
     for (std::size_t k = 0; k < 32; ++k) {
         const std::uint32_t c = word_at(cntl, k, "ps_input_cntl");
         if ((c >> 10) & 1) o.ps_flat_mask |= 1u << k;
         // Input k is read at the location of the register the input map names
         // (render.cpp ps_input_locations); the vertex shader writes register r at r.
-        o.ps_input_map.push_back(static_cast<std::uint8_t>(c & 0x1f));
+        o.ps_input_map.push_back(gcn::ps_input_map_entry(c, use_defaults));
     }
     o.ps_clip_discard = clip_discard(tr);
     return o;

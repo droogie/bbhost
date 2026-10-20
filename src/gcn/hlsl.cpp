@@ -299,8 +299,10 @@ private:
         switch (in.op) {
         case spv::OpCapability: capabilities.insert(in.a.at(0)); break;
         case spv::OpExtension:
-            // A compute lift's raw addresses (vk::RawBufferLoad / vk::BufferPointer in HLSL).
-            if (str_operand(in.a, 0) != "SPV_KHR_physical_storage_buffer") fail("extension " + str_operand(in.a, 0));
+            // A compute lift's raw addresses (vk::RawBufferLoad / vk::BufferPointer in HLSL),
+            // and the clip prologue's demote (gcn::clip_demote), declared with its instruction.
+            if (str_operand(in.a, 0) != "SPV_KHR_physical_storage_buffer" && str_operand(in.a, 0) != "SPV_EXT_demote_to_helper_invocation")
+                fail("extension " + str_operand(in.a, 0));
             break;
         case spv::OpExtInstImport:
             if (str_operand(in.a, 0) != "GLSL.std.450") fail("extended instruction set " + str_operand(in.a, 0));
@@ -754,6 +756,8 @@ private:
             // (-enable-16bit-types), DenormPreserve and RoundingModeRTZ with
             // the execution modes that need them (float_modes).
             case spv::CapFloat16: case spv::CapDenormPreserve: case spv::CapRoundingModeRTZ: break;
+            // The clip prologue's demote: declared on the inline instruction (OpDemoteToHelperInvocation below).
+            case spv::CapDemoteToHelperInvocation: break;
             default: fail("capability " + std::to_string(c));
             }
         }
@@ -1296,6 +1300,18 @@ private:
             return;
         }
         case spv::OpAtomicIAdd: return atomic(in);
+        case spv::OpDemoteToHelperInvocation:
+            // The clip prologue's (gcn::clip_demote): as inline SPIR-V with its
+            // capability and extension. HLSL's discard stays OpKill (its own
+            // DXC lowering), which the lift's other discards are.
+            if (exec_model != spv::EmFragment) fail("a demote outside a pixel shader");
+            if (helper_keys.insert("spv_demote_to_helper").second) {
+                helper_decls.push_back("[[vk::ext_capability(" + std::to_string(spv::CapDemoteToHelperInvocation) +
+                                       " /* DemoteToHelperInvocation */)]] [[vk::ext_extension(\"SPV_EXT_demote_to_helper_invocation\")]] "
+                                       "[[vk::ext_instruction(" + std::to_string(spv::OpDemoteToHelperInvocation) + ")]] void spv_demote_to_helper();");
+            }
+            line("spv_demote_to_helper();");
+            return;
         case spv::OpEmitVertex:
             if (exec_model != spv::EmGeometry) fail("OpEmitVertex outside a geometry shader");
             line("gs_emit_vertex(gs_stream);");

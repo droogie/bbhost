@@ -1418,6 +1418,7 @@ void each_frame(const SprjFlipper* f) {
                 sfx_schedule::next(g_sfx_carry, g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step), g_sfx_steps_a_second);
             put<float>(g_sfx_step_va, sf.seconds);
             decomp_sfx_gate_frame(g_sfx_gate && sf.whole == 0);
+            decomp_sfx_step_frame(sf.whole == 0);
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));

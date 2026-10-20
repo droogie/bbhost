@@ -162,6 +162,41 @@ gcn::LiftResult lift_ps(const std::vector<std::uint32_t>& words, std::uint32_t d
     return gcn::lift_pixel_shader(p, o, ref);
 }
 
+// The clip prologue (TranslateOptions::ps_clip_discard): with
+// gcn::clip_demote its pixel is demoted to a helper - printed as the inline
+// instruction with its capability and extension, which DXC keeps - and
+// without, ended by discard (OpKill), as every other discard is.
+void clip_prologue() {
+    Asm a;
+    a.sop1(4, 2, kExec);  // s[2:3] = the coverage
+    a.wqm();
+    a.interp(2, 0, 0);    // v2 = attr0.x
+    a.swizzle(3, 2, 0x8000u | 1u | 0u << 2 | 3u << 4 | 2u << 6);  // the horizontal neighbour's
+    a.w.push_back(0xbf8c007fu);  // s_waitcnt lgkmcnt(0)
+    a.sop1(4, kExec, 2);
+    a.exp_mrt0(3);
+    a.w.push_back(kEndpgm);
+    for (const bool demote : {true, false}) {
+        gcn::set_clip_demote(demote);
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        CHECK(p.errors.empty());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Pixel;
+        o.rsrc2 = 16u << 1;
+        o.ps_input_ena = 2;
+        o.descriptor_set = 1;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.ps_clip_discard = 1u | 1u << 8;  // clip distance 0, at location 1
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        through_hlsl(gcn::lift_pixel_shader(p, o, ref), demote ? "clip prologue, demoted" : "clip prologue, discarded",
+                     demote ? std::vector<std::string>{"spv_demote_to_helper();", "SPV_EXT_demote_to_helper_invocation"}
+                            : std::vector<std::string>{"discard;"});
+    }
+    gcn::set_clip_demote(false);
+}
+
 // ---- the programs ------------------------------------------------------------------
 void swizzles() {
     // Whole-quad mode, v2 = attr0.x, v3 = a quad-mode swizzle of it, exported.
@@ -647,6 +682,7 @@ int main() {
     cndmask();
     samples_and_loops();
     vertex_invariant();
+    clip_prologue();
     native_half_rtz();
     std::printf("gcn_hlsl_test: %d lifts printed, %d compiled by DXC%s\n", g_printed, g_compiled, g_have_dxc ? "" : " (no DXC)");
     if (g_failures) {

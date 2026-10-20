@@ -27,8 +27,12 @@ void* yebis_settings();
 // goes to both, `off` and `off - 0x68`, and the port does not have to know
 // which one the renderer reads.
 constexpr std::uint32_t kYebisMotionBlurDof = 0xe0;   // and depth of field: one pass, one flag
-constexpr std::uint32_t kYebisDofQuality = 0x110;     // 0..7
-constexpr std::uint32_t kYebisGlareQuality = 0x114;   // 0..12
+// The two qualities in sub_25fcf20's order: "GlareQuality" (0..7), then
+// "DepthOfFieldQuality" (0..12) - the one YEBIS picks its depth-of-field
+// preset by when the context is made, and with it the edge qualities
+// CPostEffect::SetDepthOfFieldEdgeQuality accepts.
+constexpr std::uint32_t kYebisGlareQuality = 0x110;   // 0..7
+constexpr std::uint32_t kYebisDofQuality = 0x114;     // 0..12
 constexpr std::uint32_t kYebisLightShaft = 0xf8;
 constexpr std::uint32_t kYebisColorGrading = 0x108;
 constexpr std::uint32_t kYebisLensDistortion = 0xd4;

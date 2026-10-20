@@ -222,7 +222,11 @@ update read and wrote its 176-byte records across the bus at about 0.2 µs a
 particle: 7.4 ms of an RTX 4070 a frame in Vicar Amelia's room (73 fps
 uncapped at 1080p), against 0.14 ms as twins (161 fps). An integrated GPU's
 device memory is the host's own, so there they stay in guest memory, as they
-do under a capture. With window imports a copy's source the CPU wrote is
+do under a capture. Every buffer binding asks the twins first; one that meets
+no twin and no armed buffer - nearly all of a frame's - is answered from a
+sorted list of their ranges' union instead of two map walks
+(`BBHOST_TWIN_FAST_MISS`: `0` walks the maps for every lookup, `check` does
+both and counts any answer that differs in the exit report). With window imports a copy's source the CPU wrote is
 copied through upload staging, as copy versions' bytes are, rather than read
 through an import. The exit report lists what still reads or writes guest
 memory in place, by the path that asked.
@@ -253,6 +257,15 @@ addresses).
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
+A colour target a draw writes no channel of - its write mask, the game's cut to
+what the pixel shader exports, is empty - gets no blend state either. The game
+leaves blending on for targets a shader does not export: the G-buffer's puddle
+decals export six of the seven targets bound and blend into the seventh too,
+and the effects' soft sprites export one of two. The shader's output for such a
+target is undefined and Vulkan writes nothing through an empty mask, so the
+state is dead where a driver honours the mask; a driver may blend the undefined
+output in anyway, and with the state zeroed there is nothing to blend
+(`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
 
 **Native passes.** Several parts of the frame no longer run the game's GPU
 path at all:

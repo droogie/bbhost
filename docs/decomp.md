@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 192 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 195 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
-| **Taken over in all** | **306** |
-| With any code byte changed (including byte patches and redirected calls) | 327; 409 at 60 fps |
+| **Taken over in all** | **309** |
+| With any code byte changed (including byte patches and redirected calls) | 330; 412 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -384,8 +384,10 @@ instead of ~60%.
 |---|---|---|---|
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code; 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips; 426 calls compared in a world session: 0 differences |
-| effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 4 mutants caught |
+| effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items - with a dead node kept for the next whole step to free | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 5 mutants caught |
 | FFX light module update (`sub_131e660`) | `0x131e660` | a light effect's colour, radius, place and flicker; on such a frame with its flicker phase and blend held | 40,000 generated modules against the game's own run with the two held; 3 mutants caught |
+| wobble motion updates (`sub_2e89d10`, `sub_2e8e430`, `sub_2e896f0`) | `0x2e89d10`, `0x2e8e430`, `0x2e896f0` | an effect motion that turns its direction by a random angle every few updates (motion classes `0x570e6d0`, `0x570e690`, `0x570e8d0`) and, for `0x570e690`, lags toward what it follows by a factor an update; on such a frame only its base motion runs - no count, re-roll or lerp | 40,000 generated motions against the game's own code (its base motions and the effects' random numbers the test's); 4 mutants caught |
+| GPU particle record update (`sub_2cbcf50`) | `0x2cbcf50` | a GPU particle system's record taking an item - its time chain (the previous time = the time, the time += the item's step) and its type's update; for type `0x2713`, whose sizes and colours are curves read at the elapsed time (in its update and its draw), on any frame between whole steps (the gate on or off) the record keeps its previous time and the type its five values, so both read the last whole step's elapsed time and values, as on every frame at 30 | 40,000 generated records with the game's own type `0x2713` update under test curves against the game's own code (ordinary values, then special ones); 6 mutants caught |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -408,7 +410,21 @@ update, and a light's flicker phase adds its age every call. On such a frame
 (bbhost's, not the game's own still frame) the instance update runs only its
 nodes' containers and the light module runs as the game's with its phase
 rate and its blend held; every other frame, and a creation's pre-roll, is
-the game's code.
+the game's code. A node a container update marked dead (state 3, its last
+render items out) waits on such a frame for the next whole step's update to
+free it, as at 30, where the next update comes 1/30 s later: freed at once,
+its effect ended up to one step early. The wobble motions count their own
+updates, in the container calls such a frame still makes: every few updates
+they turn their direction by two angles from the effects' random numbers,
+and one of them lags toward what it follows by a factor an update. On such
+a frame they run only their base motion, so they turn and close in 30 times
+a second at any frame rate, as at 30, not once a frame. One GPU particle type,
+`0x2713`, reads its sizes and colours from curves at the elapsed time of its
+record's last item - a step's, 1/30 s at 30, and 0 on a frame between whole
+steps, with the gate on or off - in its update and again in its draw, so
+wherever a curve is not flat over that range they took turns between two
+values every frame; on every frame between whole steps its record keeps its
+last whole step's elapsed time and values instead, as at 30.
 
 ### Replaced outside the list
 

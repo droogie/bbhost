@@ -258,7 +258,8 @@ keeping the cadence the game has at 30. The frames between whole steps still
 run the effects' update, so effects follow what they ride on and are drawn
 every frame, but with what the game counts in updates held for the next
 whole step - a node's state, its emissions and the definitions its
-conditions pick, the controllers, a light's flicker phase
+conditions pick, the controllers, a light's flicker phase, a wobbling
+motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
 with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s

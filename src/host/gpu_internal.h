@@ -223,6 +223,8 @@ struct Located {
 struct Gpu {
     std::uint32_t max_lds_bytes = 32 * 1024;  // maxComputeSharedMemorySize
     float max_anisotropy = 16.0f;             // maxSamplerAnisotropy
+    float max_lod_bias = 15.0f;               // maxSamplerLodBias
+    bool mirror_clamp = false;                // samplerMirrorClampToEdge, enabled
     bool in_transfer = false;                 // a coalesced run of guest-memory transfers is open
     // Fence writes held back to the end of the command buffer (see
     // host_gpu_mem_write): recording them inline broke the render pass and
@@ -480,6 +482,12 @@ struct Gpu {
     std::map<std::uint32_t, VkImage> dummy_dim_images;
     std::map<std::uint32_t, VkDeviceMemory> dummy_dim_mem;
     std::map<std::uint32_t, VkImageView> dummy_dim_views;
+    // 1x1 D32_SFLOAT images at the far plane, by (dim << 1) | arrayed (2D, 2D
+    // array, cube, cube array): what a depth-compare binding samples where its
+    // colour view cannot compare (depth_dummy_view_for).
+    std::map<std::uint32_t, VkImage> dummy_depth_images;
+    std::map<std::uint32_t, VkDeviceMemory> dummy_depth_mem;
+    std::map<std::uint32_t, VkImageView> dummy_depth_views;
     VkSampler dummy_sampler = VK_NULL_HANDLE;
     // Constant buffers as storage buffers (TranslateOptions::cb_ssbo, BBHOST_CB_SSBO=0 to turn off):
     // the buffer bound where a V# could not be, and the device limits for binding one.
@@ -513,6 +521,7 @@ struct Gpu {
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};
     // The draws by how their pixel shader ran (DrawPs, gpu.h), beside `draws`.
     std::atomic<std::uint64_t> draws_ps[4] = {};
+    std::atomic<std::uint64_t> draws_clip_discard{0};  // GpuStats::draws_clip_discard
     std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
     std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
     std::atomic<std::uint64_t> draws_tess[6] = {};     // the host tessellator's draws by lifted stages (DrawTess)
@@ -990,6 +999,13 @@ void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, st
 // A 1x1 view matching a binding's (spv::Dim, arrayed), for when the T# gives
 // nothing usable. Never null for a dimension the translator can emit.
 VkImageView dummy_view_for(std::uint32_t dim, bool arrayed, bool zero = false);
+// BBHOST_COMPARE_GUARD (on unless 0): a depth-compare binding that resolves to a
+// colour view whose format the device cannot compare in (VkFormatProperties3's
+// SAMPLED_IMAGE_DEPTH_COMPARISON, which lavapipe's R32F lacks) samples
+// a far-plane depth dummy of its shape instead; `view` where the device compares
+// in its format, has no such dummy, or the guard is off. tsharp: the binding's T#.
+VkImageView compare_guard_view(VkImageView view, const std::uint32_t* tsharp, std::uint32_t dim, bool arrayed);
+extern std::atomic<std::uint64_t> g_compare_guarded;
 
 // Guest memory as the translated shaders reach it (draw capture): the host
 // bytes and guest address behind a storage-buffer binding over imported
@@ -1166,6 +1182,12 @@ std::string image_reuse_report_locked();
 // The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
 std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// BBHOST_LAYOUT_FIXES (on unless 0; textures.cpp): a target's every layer and
+// level leaves UNDEFINED before it is used as GENERAL - a copy into a target
+// nothing has made GENERAL yet, a target carried from a texture - which
+// g_layout_fixed[0] counts the first kind of.
+bool render_layout_fixes();
+extern std::atomic<std::uint64_t> g_layout_fixed[4];
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's
 // delta colour compression (render.cpp).
@@ -1382,6 +1404,11 @@ std::string texture_view_by_id_report();
 // larger than the caches; a draw asks for its views' entries together).
 void texture_view_by_id_prefetch(std::uint32_t id);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
+// BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
+// what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
+// MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
+// maxSamplerLodBias.
+bool sampler_fixes_on();
 // spv::Dim of a T# type as the translator is told it: DimCube for a cube, which
 // the translator then declares, and texture_view binds, as a 2D array of faces.
 std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);
@@ -1731,6 +1758,20 @@ struct StreamTestCounts {
 };
 StreamTestCounts stream_test_counts();
 extern std::atomic<std::uint64_t> g_validation_messages;  // gpu.cpp: what BBHOST_VK_VALIDATE=1's layer reported
+// BBHOST_VK_VALIDATE=1's census (gpu.cpp): an object named for the layer's
+// messages - a draw's pipeline by its programs - and, for the messages that
+// name none (a pipeline's creation), what the thread is building while a
+// ValidationScope lives. Both cost a branch with the layer off.
+bool validation_on();
+void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name);
+extern thread_local const char* t_validation_scope;
+struct ValidationScope {
+    const char* prev;
+    explicit ValidationScope(const char* what) : prev(t_validation_scope) { t_validation_scope = what; }
+    ~ValidationScope() { t_validation_scope = prev; }
+    ValidationScope(const ValidationScope&) = delete;
+    ValidationScope& operator=(const ValidationScope&) = delete;
+};
 
 // Flushes this core's write-combining buffers. AMD's Windows driver records
 // into write-combined memory, and a release store does not order those
@@ -1912,6 +1953,11 @@ DrawCmds* draw_packet_early_locked();
 // The barrier render_end_pass_locked records after vkCmdEndRendering.
 void record_end_rendering(VkCommandBuffer cmd, bool barrier = true);
 void record_pass_barrier(VkCommandBuffer cmd);  // what makes a pass's attachment writes visible to everything after
+// BBHOST_BARRIER_MASKS (on unless 0; gpu.cpp): the barriers after a pass, a
+// dispatch and the tessellation LS pass name every access that can follow -
+// shader stores before a pass ends, vertex fetch and attachments after a
+// dispatch, the tessellation stages after the LS pass.
+bool barrier_masks_fixed();
 // A transfer batch's barrier: into the transfer stage (`begin`), or out of it.
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin);
 // Inside a batch: the transfers recorded before it finish before the ones after.

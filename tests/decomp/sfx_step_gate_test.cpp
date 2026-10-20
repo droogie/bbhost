@@ -3,10 +3,11 @@
 //   - a node on a held frame (node_held) against the game's node update,
 //     0x2c4df80: the same container calls, step adds and answer for a node
 //     whose update changes nothing else (a staged node staying in state 3, a
-//     plain one whose conditions pick no new definition, a dead one, an
-//     inactive one), and for a node in a state whose update would move it
-//     (2, 6, 7, 5, 0) the same container call with its state, emission and
-//     definition fields left as they were;
+//     plain one whose conditions pick no new definition, an inactive one),
+//     for a dead one the game's answer of 0 (free it) against ours of 1 (kept
+//     for the next whole step), neither touching it, and for a node in a
+//     state whose update would move it (2, 6, 7, 5, 0) the same container
+//     call with its state, emission and definition fields left as they were;
 //   - the instance update, 0x2c4ff30: ours on a frame not held against the
 //     game's (the trampoline's place); on a held frame against the game's
 //     with its node update node_held and its controllers recorded - the same
@@ -17,6 +18,20 @@
 //     put back - every byte of the module and of its GX light, every call -
 //     the phase +0x30 and +0x110 unchanged; not held, or a pre-roll's call,
 //     the game's as it is;
+//   - the wobble motions' updates, 0x2e89d10, 0x2e8e430 and 0x2e896f0: not
+//     held (or on the game's own still frame) ours against the game's - the
+//     same calls and every byte of the motion, its node, the parent and the
+//     FX RNG; held, one call of the base motion with the same arguments and
+//     nothing else touched - no count, no re-roll, no draw, no lerp;
+//   - a GPU particle system's record taking an item, 0x2cbcf50, with the game's
+//     own GPU particle type 0x2713 update (0x12e81b0) under test curves: not a
+//     frame between whole steps (whatever the gate), or another type, or an
+//     item with a step, or a record whose elapsed time is already 0, or the
+//     game's own still frame, ours against the game's - every byte of the
+//     record and its type; between whole steps, the gate on or off, the game's
+//     call with the record's previous time +0x24 and the type's sizes +0x1c /
+//     +0x20 and colours +0x50..+0x7f put back - every other byte the game's,
+//     and the elapsed time the type's draw then reads the last whole step's;
 // and each of the source's mutants caught. Skips without the 1.09 eboot.
 #define DECOMP_SFX_STEP_GATE_MUTANTS
 int g_sfx_gate_mutant = 0;
@@ -24,6 +39,7 @@ int g_sfx_gate_mutant = 0;
 
 #include "eboot_kit.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -184,7 +200,11 @@ int check_nodes(int cases) {
         std::memcpy(after_ours.data(), reinterpret_cast<void*>(n), 0x100);
         bool ok;
         std::string why;
-        if (kind != 4) {
+        if (kind == 2) {
+            // dead: the game's says free it (0); ours keeps it for the next whole step (1); neither calls or writes
+            ok = r_game == 0 && calls_game.empty() && after_game == before && r_ours == 1 && calls_ours.empty() && after_ours == before;
+            if (!ok) why = r_ours != 1 ? "a dead node's answer (freed on a held frame)" : "a dead node";
+        } else if (kind != 4) {
             ok = r_game == r_ours && same_calls(calls_game, calls_ours) && after_game == after_ours;
             if (!ok) why = r_game != r_ours ? "answer" : !same_calls(calls_game, calls_ours) ? "calls" : "memory";
         } else {
@@ -497,13 +517,223 @@ int check_lights(int cases, u64 sfx, u64 preroll_ctx) {
     return bad;
 }
 
+// --- the wobble motions --------------------------------------------------------
+
+// The base motions (0x2e866f0, 0x2e8bfd0) seen by their call, and the FX RNG
+// (0x2c6d580) as a state of the test's: what the motions draw comes from it.
+GUEST_ABI void stub_base_a(u64 motion, u64 node, const float* step, u64 local) { rec(10, motion, node, local, 0, *step); }
+GUEST_ABI void stub_base_b(u64 motion, u64 node, const float* step, u64 local) { rec(11, motion, node, local, 0, *step); }
+alignas(16) u8 g_rng_state[0x20];
+GUEST_ABI u64 stub_fx_rng() { return reinterpret_cast<u64>(g_rng_state); }
+
+using MotionUpdate = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64 local);
+
+// kind 0: 0x2e89d10 (count +0x6c, period +0x68, curve +0x60); 1: 0x2e8e430
+// (+0x7c, +0x78, +0x70); 2: 0x2e896f0 (the follow, then 0x2e89d10's work).
+int check_wobbles(int cases, u64 sfx) {
+    static const u64 kAddr[] = {kWobbleA, kWobbleB, kWobbleFollow};
+    static const MotionFn kOurs[] = {&sfx_wobble_a, &sfx_wobble_b, &sfx_wobble_follow};
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const int kind = g_rng.range(0, 2);
+        const u64 motion = block(0x100), n = block(0x100), parent = block(0x100), local = block(0x40);
+        for (int k = 0; k < 0x100; k += 4) {
+            store<float>(motion + k, value(-2, 2));
+            store<float>(n + k, value(-50, 50));
+            store<float>(parent + k, value(-50, 50));
+        }
+        for (int k = 0; k < 0x40; k += 4) store<float>(local + k, value(-2, 2));
+        store<float>(n + 0x7c, value(0, 10));  // the node's time, which the curves read
+        const u64 count = kind == 1 ? 0x7c : 0x6c, period = count - 4, curve_at_ = kind == 1 ? 0x70 : 0x60;
+        const u32 per = static_cast<u32>(g_rng.range(1, 6));
+        store<u32>(motion + period, per);
+        store<u32>(motion + count, static_cast<u32>(g_rng.range(0, static_cast<int>(per))));  // often at the period's end
+        store<u64>(motion + curve_at_, g_rng.chance(0.85) ? curve() : 0);
+        if (kind == 2) {
+            // the follow: the parent node (node+0x60) or none, the parent seen last (+0xa0), its rows kept at +0x70..+0x9f,
+            // the factor's curve (+0xa8) or the default factor (+0xb0)
+            store<u64>(n + 0x60, g_rng.chance(0.85) ? parent : 0);
+            store<u64>(motion + 0xa0, g_rng.chance(0.7) ? parent : 0);
+            if (g_rng.chance(0.3)) {
+                for (int k = 0; k < 0x30; k += 4) store<u32>(motion + 0x70 + k, load<u32>(parent + 0x20 + k));  // the parent did not move
+            }
+            store<u64>(motion + 0xa8, g_rng.chance(0.6) ? curve() : 0);
+            store<float>(motion + 0xb0, value(0, 1));
+        }
+        for (int k = 0; k < 0x20; k += 4) store<u32>(reinterpret_cast<u64>(g_rng_state) + k, g_rng.u32() | 1);
+        // held, the game's own still frame, or not held
+        const int frame = g_rng.range(0, 3);  // 0, 1 held; 2 the game's still frame; 3 not held
+        decomp_sfx_gate_frame(frame != 3);
+        store<u32>(sfx + 0x8c, frame == 2 ? 1u : 0u);
+        const bool held_frame = frame <= 1;
+        const float step = held_frame ? 0.0f : value(0, 0.1f);
+
+        auto snap = [&]() {
+            std::vector<u8> s(0x100 * 3 + 0x40 + 0x20);
+            std::memcpy(s.data(), reinterpret_cast<void*>(motion), 0x100);
+            std::memcpy(s.data() + 0x100, reinterpret_cast<void*>(n), 0x100);
+            std::memcpy(s.data() + 0x200, reinterpret_cast<void*>(parent), 0x100);
+            std::memcpy(s.data() + 0x300, reinterpret_cast<void*>(local), 0x40);
+            std::memcpy(s.data() + 0x340, g_rng_state, 0x20);
+            return s;
+        };
+        auto put = [&](const std::vector<u8>& s) {
+            std::memcpy(reinterpret_cast<void*>(motion), s.data(), 0x100);
+            std::memcpy(reinterpret_cast<void*>(n), s.data() + 0x100, 0x100);
+            std::memcpy(reinterpret_cast<void*>(parent), s.data() + 0x200, 0x100);
+            std::memcpy(reinterpret_cast<void*>(local), s.data() + 0x300, 0x40);
+            std::memcpy(g_rng_state, s.data() + 0x340, 0x20);
+        };
+        const std::vector<u8> before = snap();
+        float s1 = step, s2 = step;
+        g_calls.clear();
+        eboot_kit::fn<MotionUpdate>(kAddr[kind])(motion, n, &s1, local);
+        const std::vector<Call> calls_game = g_calls;
+        const std::vector<u8> after_game = snap();
+        put(before);
+        g_calls.clear();
+        kOurs[kind](motion, n, &s2, local);
+        const std::vector<Call> calls_ours = g_calls;
+        const std::vector<u8> after_ours = snap();
+        bool ok;
+        if (!held_frame) {
+            ok = same_calls(calls_game, calls_ours) && after_game == after_ours;
+        } else {
+            // the base motion once, with the same arguments, and nothing else: no count, re-roll, draw or lerp
+            const int base = kind == 1 ? 11 : 10;
+            ok = calls_ours.size() == 1 && calls_ours[0].what == base && calls_ours[0].a == motion && calls_ours[0].b == n &&
+                 calls_ours[0].c == local && calls_ours[0].step == bits(step) && after_ours == before;
+        }
+        if (!ok && ++bad <= 6 && !g_quiet)
+            std::printf("wobble case %d (kind %d, frame %d, count %u of %u): %s differs\n", c, kind, frame, load<u32>(motion + count), per,
+                        held_frame ? "the held frame" : "the game's frame");
+        put(before);
+    }
+    decomp_sfx_gate_frame(false);
+    store<u32>(sfx + 0x8c, 0u);
+    return bad;
+}
+
+// --- the GPU particle type 0x2713's record ---------------------------------------
+
+// Test curves for the type's definition (vtable +0x58: (curve, node, &time) -> the value at it, a vector;
+// +0x90: (curve, node) -> its largest value): a + b t in each lane, the lanes apart.
+GUEST_ABI __m128 curve_2713(u64 curve, u64, const float* t) {
+    const float a = load<float>(curve + 8), b = load<float>(curve + 12);
+    return _mm_set_ps(a + 3 * b * *t, a + 2 * b * *t, a - b * *t, a + b * *t);
+}
+GUEST_ABI float curve_2713_max(u64 curve, u64) { return std::fabs(load<float>(curve + 8)) + std::fabs(load<float>(curve + 12)); }
+alignas(64) u8 g_curve_2713_vt[0xa0];
+GUEST_ABI u64 stub_scratch_mark() { return 0; }
+GUEST_ABI void stub_scratch_release(u64) {}
+// Another GPU particle type's update (vtable +0x10: (&bounds, type, record +0x10, buffer)): its bounds, nothing else.
+GUEST_ABI void stub_other_type(u64 out, u64, u64, u64) { std::memset(reinterpret_cast<void*>(out), 0, 32); }
+alignas(64) u8 g_other_type_vt[0x40];
+
+struct Record {
+    u64 record, item, type;
+};
+Record make_record(bool type_2713) {
+    Record r;
+    r.record = block(0x80);
+    r.item = block(0x70);
+    r.type = block(0xb0);
+    const u64 def = block(0xe0), counts = block(0x20), node = block(0x100);
+    store<u64>(r.type, type_2713 ? game_address(kGxType2713) : reinterpret_cast<u64>(g_other_type_vt));
+    store<u64>(r.type + 8, def);
+    for (const u64 off : {0x48ull, 0x58ull, 0x88ull, 0x98ull, 0xa8ull}) {
+        const u64 c = block(0x20);
+        store<u64>(c, reinterpret_cast<u64>(g_curve_2713_vt));
+        store<float>(c + 8, value(0, 2));
+        store<float>(c + 12, g_rng.chance(0.3) ? 0.0f : value(-20, 20));  // flat now and then: no change to see
+        store<u64>(def + off, c);
+    }
+    for (int k = 0x1c; k < 0xa0; k += 4) store<float>(r.type + k, value(-1, 2));
+    store<u64>(r.record + 8, r.type);
+    store<u64>(r.record + 0x10, node);
+    store<u64>(r.record + 0x18, counts);  // +8 = 0: no buffers
+    const float t = value(0, 50);
+    store<float>(r.record + 0x28, t);
+    // the last item's elapsed time: a whole step's, or 0 (the record just made, or a zero step last)
+    store<float>(r.record + 0x24, g_rng.chance(0.8) ? t - 1.0f / 30.0f : t);
+    for (int k = 0; k < 0x60; k += 4) store<float>(r.item + k, value(-3, 3));
+    store<float>(r.item + 0x60, g_rng.chance(0.8) ? 0.0f : 1.0f / 30.0f);
+    return r;
+}
+std::vector<u8> record_bytes(const Record& r) {
+    std::vector<u8> v(0x80 + 0xb0);
+    std::memcpy(v.data(), reinterpret_cast<void*>(r.record), 0x80);
+    std::memcpy(v.data() + 0x80, reinterpret_cast<void*>(r.type), 0xb0);
+    return v;
+}
+void put_record(const Record& r, const std::vector<u8>& v) {
+    std::memcpy(reinterpret_cast<void*>(r.record), v.data(), 0x80);
+    std::memcpy(reinterpret_cast<void*>(r.type), v.data() + 0x80, 0xb0);
+}
+
+int check_records(int cases, u64 sfx) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    int bad = 0, held_cases = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const bool type_2713 = g_rng.chance(0.8), held_frame = g_rng.chance(0.7), still = g_rng.chance(0.1);
+        const Record r = make_record(type_2713);
+        store<u32>(sfx + 0x8c, still ? 1u : 0u);
+        const std::vector<u8> before = record_bytes(r);
+        // the game's
+        game(r.record, r.item);
+        const std::vector<u8> theirs = record_bytes(r);
+        put_record(r, before);
+        // ours: on any frame between whole steps, the gate on or off
+        decomp_sfx_gate_frame(held_frame && g_rng.chance(0.5));
+        decomp_sfx_step_frame(held_frame);
+        sfx_gx_record_update(r.record, r.item);
+        decomp_sfx_step_frame(false);
+        decomp_sfx_gate_frame(false);
+        const std::vector<u8> ours = record_bytes(r);
+        const bool takes = type_2713 && held_frame && !still && load<float>(r.item + 0x60) == 0.0f &&
+                           load<u32>(reinterpret_cast<u64>(before.data()) + 0x24) != load<u32>(reinterpret_cast<u64>(before.data()) + 0x28);
+        const char* why = nullptr;
+        if (!takes) {
+            if (ours != theirs) why = "not held: the game's";
+        } else {
+            ++held_cases;
+            // the record's previous time and the type's five values as before, every other byte the game's
+            std::vector<u8> want = theirs;
+            std::memcpy(want.data() + 0x24, before.data() + 0x24, 4);
+            std::memcpy(want.data() + 0x80 + 0x1c, before.data() + 0x80 + 0x1c, 8);
+            std::memcpy(want.data() + 0x80 + 0x50, before.data() + 0x80 + 0x50, 0x30);
+            if (ours != want) why = "held: the previous time and the five values kept, the rest the game's";
+            // the draw's elapsed time: the last whole step's
+            float pa, ca, pb, cb;
+            std::memcpy(&pa, ours.data() + 0x24, 4);
+            std::memcpy(&ca, ours.data() + 0x28, 4);
+            std::memcpy(&pb, before.data() + 0x24, 4);
+            std::memcpy(&cb, before.data() + 0x28, 4);
+            if (!why && bits(ca - pa) != bits(cb - pb)) why = "held: the elapsed time the draw reads";
+        }
+        put_record(r, before);
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("record case %d (type 0x2713 %d, held %d, still %d, step %g): %s differs\n", c, type_2713, held_frame, still,
+                        load<float>(r.item + 0x60), why);
+    }
+    store<u32>(sfx + 0x8c, 0u);
+    if (!g_quiet) std::printf("decomp_sfx_step_gate: %d GPU particle record cases (%d held for type 0x2713), %d differ\n", cases, held_cases, bad);
+    return bad;
+}
+
 }  // namespace
 
 int main() {
     eboot_kit::load("decomp_sfx_step_gate");
     if (std::memcmp(eboot_kit::at(0x2c4ff30), kInstanceEntry, sizeof kInstanceEntry) != 0 ||
-        std::memcmp(eboot_kit::at(0x131e660), kLightEntry, sizeof kLightEntry) != 0) {
-        std::printf("decomp_sfx_step_gate: the two entries are not where the gate expects them\n");
+        std::memcmp(eboot_kit::at(0x131e660), kLightEntry, sizeof kLightEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kWobbleA), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kWobbleB), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kWobbleFollow), kFollowEntry, sizeof kFollowEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kGxRecordUpdate), kGxRecordEntry, sizeof kGxRecordEntry) != 0) {
+        std::printf("decomp_sfx_step_gate: the six entries are not where the gate expects them\n");
         return 1;
     }
     // The singletons: SprjSfx (its still-frame word +0x8c), the node pool, and
@@ -528,6 +758,10 @@ int main() {
     eboot_kit::stub(0x12a2500, reinterpret_cast<const void*>(&stub_light_params));
     g_game_light = eboot_kit::at(0x131e660);
     g_game_instance = eboot_kit::at(0x2c4ff30);
+    g_game_wobble_a = eboot_kit::at(kWobbleA);
+    g_game_wobble_b = eboot_kit::at(kWobbleB);
+    g_game_wobble_follow = eboot_kit::at(kWobbleFollow);
+    g_game_gx_record = eboot_kit::at(kGxRecordUpdate);
 
     constexpr int kCases = 20000;
     int bad = 0, total = 0;
@@ -543,7 +777,7 @@ int main() {
     // node_held's mutants against the game's own node update, while it is still there.
     int missed = 0;
     g_quiet = true;
-    for (const int m : {2, 3}) {
+    for (const int m : {2, 3, 8}) {
         g_sfx_gate_mutant = m;
         g_rng.specials = false;
         if (!check_nodes(2000)) {
@@ -583,6 +817,50 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 7 mutants caught\n", 7 - missed);
+    // The wobble motions last: their base motions and the FX RNG the test's from here.
+    eboot_kit::stub(kWobbleABase, reinterpret_cast<const void*>(&stub_base_a));
+    eboot_kit::stub(kWobbleBBase, reinterpret_cast<const void*>(&stub_base_b));
+    eboot_kit::stub(0x2c6d580, reinterpret_cast<const void*>(&stub_fx_rng));
+    g_quiet = false;
+    g_rng.specials = false;
+    int wbad = check_wobbles(kCases, sfx);
+    g_rng.specials = true;
+    wbad += check_wobbles(kCases, sfx);
+    std::printf("decomp_sfx_step_gate: %d wobble motion cases (ordinary values, then special ones), %d differ\n", 2 * kCases, wbad);
+    if (wbad) return 1;
+    g_quiet = true;
+    for (const int m : {1, 9, 10, 11, 12}) {
+        g_sfx_gate_mutant = m;
+        g_rng.specials = false;
+        if (!check_wobbles(2000, sfx)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the wobble motions\n", m);
+            if (m != 1) ++missed;  // 1 is the instances' and lights' to catch; here only a second look
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    // The GPU particle type 0x2713's record last: the scratch allocator the record update brackets its work with
+    // stubbed, the type's curves the test's.
+    store<u64>(reinterpret_cast<u64>(g_curve_2713_vt) + 0x58, reinterpret_cast<u64>(&curve_2713));
+    store<u64>(reinterpret_cast<u64>(g_curve_2713_vt) + 0x90, reinterpret_cast<u64>(&curve_2713_max));
+    store<u64>(reinterpret_cast<u64>(g_other_type_vt) + 0x10, reinterpret_cast<u64>(&stub_other_type));
+    eboot_kit::stub(0x247d5b0, reinterpret_cast<const void*>(&stub_scratch_mark));
+    eboot_kit::stub(0x247d5f0, reinterpret_cast<const void*>(&stub_scratch_release));
+    g_quiet = false;
+    g_rng.specials = false;
+    int rbad = check_records(kCases, sfx);
+    g_rng.specials = true;
+    rbad += check_records(kCases, sfx);
+    if (rbad) return 1;
+    g_quiet = true;
+    for (const int m : {13, 14, 15, 16, 17, 18}) {
+        g_sfx_gate_mutant = m;
+        g_rng.specials = false;
+        if (!check_records(2000, sfx)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the GPU particle records\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    std::printf("decomp_sfx_step_gate: %d of 18 mutants caught\n", 18 - missed);
     return missed ? 1 : 0;
 }

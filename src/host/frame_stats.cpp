@@ -106,9 +106,11 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
              why.c_str());
     std::uint64_t vs[kDrawVsCount];
     for (int i = 0; i < kDrawVsCount; ++i) vs[i] = now.draws_vs[i] - was.draws_vs[i];
-    host_log("frame detail: vertex shader lifted %llu, translated %llu, fetch shader or tessellation %llu, fallback %llu",
+    host_log("frame detail: vertex shader lifted %llu, translated %llu, fetch shader or tessellation %llu, fallback %llu; pixel shader "
+             "discarding by clip distances %llu",
              static_cast<unsigned long long>(vs[kDrawVsLifted]), static_cast<unsigned long long>(vs[kDrawVsTranslated]),
-             static_cast<unsigned long long>(vs[kDrawVsOther]), static_cast<unsigned long long>(vs[kDrawVsFallback]));
+             static_cast<unsigned long long>(vs[kDrawVsOther]), static_cast<unsigned long long>(vs[kDrawVsFallback]),
+             static_cast<unsigned long long>(now.draws_clip_discard - was.draws_clip_discard));
     std::uint64_t ts[kDrawTessCount];
     for (int i = 0; i < kDrawTessCount; ++i) ts[i] = now.draws_tess[i] - was.draws_tess[i];
     if (ts[kDrawTess]) {

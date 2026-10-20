@@ -218,6 +218,24 @@ class TourTest(unittest.TestCase):
         # A tour without such a place has no god steps.
         self.assertNotIn("god", ac.tour(ac.pick_areas("central-yharnam,moonside-lake"), dict(ac.DEFAULTS), "perf"))
 
+    def test_rom_water_place(self):
+        """Rom's arena in the lake's water: moonside-lake's travel and doors, the
+        warp down into the water, the enemies kept, and the feet view with the
+        camera held looking down (released before the god step is undone)."""
+        a = ac.AREA_BY_ID["rom-water"]
+        self.assertNotIn(a, ac.AREAS)
+        self.assertTrue(a.enemies)
+        lines = ac.tour([a], dict(ac.DEFAULTS, f12_looks=True), "perf").splitlines()
+        self.assertEqual(lines[2:5], ["travel 3202950 20000000 rom-water 13200040 13200120", "god hide",
+                                      "warp rom-water:view -508.000 -270.500 378.000 1.0210 1.0"])
+        self.assertFalse([l for l in lines if l.startswith("quiet")])
+        w = lines.index(next(l for l in lines if l.startswith("warp rom-water:feet ")))
+        self.assertEqual(lines[w + 1:w + 3], ["camera", "pitch 0.9000"])
+        self.assertLess(lines.index("f12 rom-water-feet"), lines.index("pitch off"))
+        self.assertLess(lines.index("pitch off"), lines.index("god off"))
+        self.assertEqual(len([l for l in lines if l.startswith("dump rom-water-arena-")]), 5)
+        self.assertNotIn("pitch", ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS), "perf"))
+
     def test_capture_tour_and_settings(self):
         areas = ac.pick_areas("hunters-nightmare")
         opts = dict(ac.DEFAULTS, pipeline_cache=True, env=[])
@@ -241,6 +259,22 @@ class TourTest(unittest.TestCase):
         self.assertEqual(ac.pass_settings(Path("/r"), areas, dict(opts, env=["BBHOST_X=1"]), "perf")["BBHOST_X"], "1")
         # No presses at fixed times: the title is passed with menutap requests (launch).
         self.assertNotIn("BBHOST_AUTOPRESS", perf)
+
+    def test_travel_limit(self):
+        """AREA_TRAVEL_S reaches the probe (BBHOST_MAPVAL_TRAVEL_S) and the pass budget; --env's value wins."""
+        areas = ac.pick_areas("central-yharnam")
+        opts = dict(ac.DEFAULTS, pipeline_cache=True, env=[])
+        with mock.patch.dict(ac.os.environ, {}, clear=False):
+            ac.os.environ.pop("AREA_TRAVEL_S", None)
+            self.assertNotIn("BBHOST_MAPVAL_TRAVEL_S", ac.pass_settings(Path("/r"), areas, opts, "perf"))
+            self.assertEqual(ac.travel_seconds(opts), 150)
+            base = ac.pass_budget(areas, opts, "perf")
+            ac.os.environ["AREA_TRAVEL_S"] = "600"
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, opts, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "600")
+            self.assertEqual(ac.pass_budget(areas, opts, "perf"), base + 450)
+            given = dict(opts, env=["BBHOST_MAPVAL_TRAVEL_S=1500"])
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, given, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "1500")
+            self.assertEqual(ac.travel_seconds(given), 1500)
 
     def test_title_taps_until_the_world(self):
         """launch() asks for the menus' confirm button until the world's first

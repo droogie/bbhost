@@ -593,25 +593,31 @@ const float* g_ca_amount = nullptr;
 // banks on the graphics manager (+0x5970..+0x59c8) by two ids the renderer
 // holds (from +0x2a78 and +0x2ae0, blended by a float from +0x2b48 - but not
 // in bank order, so the table below has them pair by pair), and a bank that
-// has no entry for an id answers with the default it carries at +0x2d8.
+// has no entry for an id - nor for bank 1's id 0, which the lookup tries next
+// - answers with the built-in entry it carries. That entry is at a different
+// place in each bank: the lookup's last `add r15, N` before it returns says
+// where (+0x1f0 Setting Info, +0x230 Dof, +0x2d8 Tone Map ...), and the
+// Setting Info's - DepthOfFieldQuality 1 - is how a view can end up with a
+// depth-of-field context that refuses its area's edge quality.
 // Logged when the ids change. The banks follow the GPARAM's groups: +0x5968
 // SSAO, +0x5970 Setting Info, +0x5978 Tone Map, +0x5980 Bloom, +0x5988
 // LightShaft, +0x5990 Dof, +0x5998 Anti-Alias, +0x59a0 MotionBlur, +0x59a8
 // FeedBackBlur, +0x59b0 ColorGrading, +0x59d0 ShadowParam.
 struct BankLookup {
-    std::uint32_t bank;    // on the manager
-    std::uint64_t lookup;  // the function sub_269e990 calls for it
-    std::uint32_t a, b;    // the renderer's two ids for it
-    std::uint32_t weight;  // and the float that blends them
+    std::uint32_t bank;      // on the manager
+    std::uint64_t lookup;    // the function sub_269e990 calls for it
+    std::uint32_t a, b;      // the renderer's two ids for it
+    std::uint32_t weight;    // and the float that blends them
+    std::uint32_t fallback;  // its built-in entry, what an id it has no entry for gets
 };
 // Pairs as sub_269e990 makes them - the ids are not in bank order.
 const BankLookup kBanks[12] = {
-    {0x5970, 0x25fe970, 0x2a78, 0x2ae0, 0x2b48}, {0x5978, 0x26044a0, 0x2a80, 0x2ae8, 0x2b4c},
-    {0x5980, 0x25e62d0, 0x2a90, 0x2af8, 0x2b54}, {0x5988, 0x25f68b0, 0x2ac0, 0x2b28, 0x2b6c},
-    {0x5990, 0x25ef2e0, 0x2a88, 0x2af0, 0x2b50}, {0x5998, 0x25e14c0, 0x2ab0, 0x2b18, 0x2b64},
-    {0x59a0, 0x25fa460, 0x2aa8, 0x2b10, 0x2b60}, {0x59a8, 0x25f2b90, 0x2aa0, 0x2b08, 0x2b5c},
-    {0x59b0, 0x25ea1e0, 0x2a98, 0x2b00, 0x2b58}, {0x59b8, 0x127b3b0, 0x2ac8, 0x2b30, 0x2b70},
-    {0x59c0, 0x1274bd0, 0x2ad0, 0x2b38, 0x2b74}, {0x59c8, 0x127dad0, 0x2ad8, 0x2b40, 0x2b78},
+    {0x5970, 0x25fe970, 0x2a78, 0x2ae0, 0x2b48, 0x1f0}, {0x5978, 0x26044a0, 0x2a80, 0x2ae8, 0x2b4c, 0x2d8},
+    {0x5980, 0x25e62d0, 0x2a90, 0x2af8, 0x2b54, 0x2d0}, {0x5988, 0x25f68b0, 0x2ac0, 0x2b28, 0x2b6c, 0x210},
+    {0x5990, 0x25ef2e0, 0x2a88, 0x2af0, 0x2b50, 0x230}, {0x5998, 0x25e14c0, 0x2ab0, 0x2b18, 0x2b64, 0x168},
+    {0x59a0, 0x25fa460, 0x2aa8, 0x2b10, 0x2b60, 0x190}, {0x59a8, 0x25f2b90, 0x2aa0, 0x2b08, 0x2b5c, 0x160},
+    {0x59b0, 0x25ea1e0, 0x2a98, 0x2b00, 0x2b58, 0x5a0}, {0x59b8, 0x127b3b0, 0x2ac8, 0x2b30, 0x2b70, 0x140},
+    {0x59c0, 0x1274bd0, 0x2ad0, 0x2b38, 0x2b74, 0x1f0}, {0x59c8, 0x127dad0, 0x2ad8, 0x2b40, 0x2b78, 0x1c0},
 };
 std::uint64_t g_slide = 0;
 
@@ -713,23 +719,22 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
         return e && e[0] == '1';
     }();
     if (!on || !mgr || !r) return;
-    // Once: every bank-like slot's built-in default entry (bank + 0x2d8), to
-    // tell the banks apart by their fields.
+    // Once: each bank's built-in entry, the one a missing id gets.
     static bool dumped = false;
     std::uint64_t probe_id = 0;
     std::memcpy(&probe_id, r + 0x2a80, 8);
     if (!dumped && static_cast<std::uint32_t>(probe_id) != 0xffffffffu) {
         dumped = true;
-        for (std::uint32_t off = 0x5930; off <= 0x59f8; off += 8) {
+        for (const BankLookup& bk : kBanks) {
             std::uint64_t bank = 0;
-            std::memcpy(&bank, mgr + off, 8);
-            if (!bank || !hle_kernel_va_mapped(bank + 0x2d8, 0x60)) {
-                host_log("drawparam: slot +0x%x = %p (not a bank)", off, reinterpret_cast<void*>(static_cast<std::uintptr_t>(bank)));
+            std::memcpy(&bank, mgr + bk.bank, 8);
+            if (!bank || !hle_kernel_va_mapped(bank + bk.fallback, 0x60)) {
+                host_log("drawparam: slot +0x%x = %p (not a bank)", bk.bank, reinterpret_cast<void*>(static_cast<std::uintptr_t>(bank)));
                 continue;
             }
-            const auto* q = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(bank + 0x2d8));
+            const auto* q = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(bank + bk.fallback));
             char line[400];
-            int n = std::snprintf(line, sizeof(line), "drawparam: slot +0x%x default:", off);
+            int n = std::snprintf(line, sizeof(line), "drawparam: slot +0x%x default (+0x%x):", bk.bank, bk.fallback);
             for (int k = 0; k < 20 && n < 380; ++k) {
                 float f;
                 std::memcpy(&f, &q[k], 4);
@@ -761,7 +766,8 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
         const std::uint64_t ea = hle_call_guest<std::uint64_t>(fn, bank, r + kBanks[b].a);
         const std::uint64_t eb = hle_call_guest<std::uint64_t>(fn, bank, r + kBanks[b].b);
         ++logs;
-        if (ea && ea != bank + 0x2d8) {
+        const std::uint64_t fallback = bank + kBanks[b].fallback;
+        if (ea && ea != fallback) {
             const auto* q = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(ea));
             host_log("drawparam:   entry %p: %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x %08x",
                      reinterpret_cast<const void*>(q), q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10],
@@ -769,8 +775,8 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
         }
         host_log("drawparam: bank +0x%x (%p): A %08x:%08x -> %s, B %08x:%08x -> %s, weight %g", kBanks[b].bank,
                  reinterpret_cast<void*>(static_cast<std::uintptr_t>(bank)), static_cast<unsigned>(ida),
-                 static_cast<unsigned>(ida >> 32), ea == bank + 0x2d8 ? "DEFAULT" : "entry",
-                 static_cast<unsigned>(idb), static_cast<unsigned>(idb >> 32), eb == bank + 0x2d8 ? "DEFAULT" : "entry",
+                 static_cast<unsigned>(ida >> 32), ea == fallback ? "DEFAULT" : "entry",
+                 static_cast<unsigned>(idb), static_cast<unsigned>(idb >> 32), eb == fallback ? "DEFAULT" : "entry",
                  w);
     }
 }

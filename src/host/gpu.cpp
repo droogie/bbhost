@@ -12,6 +12,7 @@
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
 #include "host/translation_cache.h"
+#include "host/twin_filter.h"
 #include "host/options.h"
 
 #include "gcn/container.h"
@@ -79,26 +80,101 @@ const bool g_render_min = [] {
 std::vector<std::string> g_instance_exts;
 bool g_want_present = false;
 
+// The validation census (BBHOST_VK_VALIDATE=1): every message id counted, with
+// its first message, when it came first and last, and what it was about - the
+// names of the objects it named (a draw's pipeline is named by its programs,
+// vk_debug_name) and what the thread was building (ValidationScope) - for the
+// exit report's lines (host_gpu_report). The layer's own limit of ten messages
+// an id hides the counts: run with VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT=0.
+struct ValidationId {
+    std::uint64_t count = 0;
+    double first_s = 0, last_s = 0;
+    std::uint32_t severities = 0, types = 0;
+    std::string first;                            // the first message
+    std::map<std::string, std::uint64_t> about;   // the first 24 subjects, each counted
+    std::uint64_t about_other = 0;                // messages about a subject past those
+    std::unordered_set<std::string> subjects;     // every subject, up to 4096, for the count of them
+};
+std::mutex g_validation_mu;
+std::map<std::string, ValidationId> g_validation_ids;  // under g_validation_mu
+const auto g_validation_t0 = std::chrono::steady_clock::now();
+PFN_vkSetDebugUtilsObjectNameEXT g_set_object_name = nullptr;  // with the layer
+
+const char* vk_object_type_name(VkObjectType t) {
+    switch (t) {
+    case VK_OBJECT_TYPE_PIPELINE: return "pipeline";
+    case VK_OBJECT_TYPE_SHADER_MODULE: return "module";
+    case VK_OBJECT_TYPE_COMMAND_BUFFER: return "cmd";
+    case VK_OBJECT_TYPE_IMAGE: return "image";
+    case VK_OBJECT_TYPE_IMAGE_VIEW: return "view";
+    case VK_OBJECT_TYPE_BUFFER: return "buffer";
+    case VK_OBJECT_TYPE_DESCRIPTOR_SET: return "set";
+    case VK_OBJECT_TYPE_PIPELINE_LAYOUT: return "layout";
+    case VK_OBJECT_TYPE_DEVICE_MEMORY: return "memory";
+    case VK_OBJECT_TYPE_SAMPLER: return "sampler";
+    case VK_OBJECT_TYPE_QUEUE: return "queue";
+    case VK_OBJECT_TYPE_DEVICE: return "device";
+    default: return "object";
+    }
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                              VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                              VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data,
                                               void*) {
     if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         return VK_FALSE;
     }
     g_validation_messages.fetch_add(1, std::memory_order_relaxed);
+    std::string id = data && data->pMessageIdName ? data->pMessageIdName : "";
+    if (id.empty()) id = "id " + std::to_string(data ? data->messageIdNumber : 0);
+    // Its subject: the named objects (pipelines, by their programs), else what
+    // the thread was building.
+    std::string subject, objects;
+    for (std::uint32_t i = 0; data && i < data->objectCount; ++i) {
+        const VkDebugUtilsObjectNameInfoEXT& o = data->pObjects[i];
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s%s 0x%llx", objects.empty() ? "" : ", ", vk_object_type_name(o.objectType),
+                      static_cast<unsigned long long>(o.objectHandle));
+        objects += b;
+        if (o.pObjectName && *o.pObjectName) {
+            objects += std::string(" \"") + o.pObjectName + "\"";
+            if (o.objectType == VK_OBJECT_TYPE_PIPELINE || o.objectType == VK_OBJECT_TYPE_SHADER_MODULE || subject.empty()) {
+                subject += (subject.empty() ? "" : " ") + std::string(o.pObjectName);
+            }
+        }
+    }
+    if (subject.empty() && t_validation_scope) subject = std::string("building ") + t_validation_scope;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_validation_t0).count();
     // Each message id twice, up to 200 ids: a run's first 40 messages were
     // often one id's repeats, which hid every later kind.
-    static std::mutex mu;
-    static std::map<std::string, int> seen;
-    const std::string id = data && data->pMessageIdName ? data->pMessageIdName : "";
     bool log = false;
     {
-        std::lock_guard<std::mutex> lk(mu);
-        const auto it = seen.find(id);
-        if (it != seen.end()) log = it->second++ < 2;
-        else if (seen.size() < 200) log = (seen[id] = 1) != 0;
+        std::lock_guard<std::mutex> lk(g_validation_mu);
+        auto it = g_validation_ids.find(id);
+        if (it == g_validation_ids.end()) {
+            if (g_validation_ids.size() >= 2000) return VK_FALSE;  // counted in g_validation_messages alone
+            it = g_validation_ids.emplace(id, ValidationId{}).first;
+            it->second.first_s = now;
+            it->second.first = data && data->pMessage ? data->pMessage : "?";
+        }
+        ValidationId& v = it->second;
+        log = v.count < 2 && g_validation_ids.size() <= 200;
+        ++v.count;
+        v.last_s = now;
+        v.severities |= static_cast<std::uint32_t>(severity);
+        v.types |= types;
+        if (!subject.empty()) {
+            if (auto a = v.about.find(subject); a != v.about.end()) ++a->second;
+            else if (v.about.size() < 24) v.about.emplace(subject, 1);
+            else ++v.about_other;
+            if (v.subjects.size() < 4096) v.subjects.insert(subject);
+        }
     }
-    if (log) host_log("vk validation: %s", data && data->pMessage ? data->pMessage : "?");
+    if (log) {
+        // The objects and the scope first: host_log keeps 1 KiB of a line.
+        host_log("vk validation: [%s%s%s] %s", objects.c_str(), t_validation_scope ? "; building " : "", t_validation_scope ? t_validation_scope : "",
+                 data && data->pMessage ? data->pMessage : "?");
+    }
     return VK_FALSE;
 }
 
@@ -798,6 +874,61 @@ void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t 
 }
 }  // namespace
 
+thread_local const char* t_validation_scope = nullptr;
+bool validation_on() { return g_validate; }
+void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name) {
+    if (!g_validate || !g_set_object_name || !handle || !name || !g.device) return;
+    VkDebugUtilsObjectNameInfoEXT ni{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+    ni.objectType = type;
+    ni.objectHandle = handle;
+    ni.pObjectName = name;
+    g_set_object_name(g.device, &ni);
+}
+
+// The census's lines in the exit report, the most frequent id first: its
+// count, when it came, the first message without the spec's quotation, and
+// what it was about (host_log keeps a line to 1 KiB: one line each).
+void log_validation_census() {
+    if (!g_validate) return;
+    std::vector<std::pair<std::string, ValidationId>> ids;
+    {
+        std::lock_guard<std::mutex> lk(g_validation_mu);
+        ids.assign(g_validation_ids.begin(), g_validation_ids.end());
+    }
+    std::sort(ids.begin(), ids.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    host_log("gpu: validation census: %llu messages (warnings and errors), %zu ids", static_cast<unsigned long long>(g_validation_messages.load()),
+             ids.size());
+    for (const auto& [id, v] : ids) {
+        std::string first = v.first;
+        if (const std::size_t at = first.find("The Vulkan spec states"); at != std::string::npos) first.resize(at);
+        while (!first.empty() && (first.back() == '\n' || first.back() == ' ')) first.pop_back();
+        for (char& c : first) {
+            if (c == '\n') c = ' ';
+        }
+        host_log("gpu:   %llu x %s (%s%s; %.0f-%.0f s; %zu%s subjects)", static_cast<unsigned long long>(v.count), id.c_str(),
+                 (v.severities & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "error" : "warning",
+                 (v.types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) ? ", performance" : "", v.first_s, v.last_s, v.subjects.size(),
+                 v.subjects.size() >= 4096 ? "+" : "");
+        for (std::size_t at = 0; at < first.size() && at < 2400; at += 900) host_log("gpu:     %s", first.substr(at, 900).c_str());
+        if (v.about.empty()) continue;
+        std::vector<std::pair<std::uint64_t, std::string>> about;
+        for (const auto& [s, n] : v.about) about.emplace_back(n, s);
+        std::sort(about.rbegin(), about.rend());
+        std::string line;
+        for (const auto& [n, s] : about) {
+            char b[64];
+            std::snprintf(b, sizeof(b), " (%llu);", static_cast<unsigned long long>(n));
+            if (line.size() + s.size() + 24 > 900) {
+                host_log("gpu:     about:%s", line.c_str());
+                line.clear();
+            }
+            line += " " + s + b;
+        }
+        if (v.about_other) line += " others " + std::to_string(v.about_other);
+        if (!line.empty()) host_log("gpu:     about:%s", line.c_str());
+    }
+}
+
 // Waits until the submission thread has submitted everything it was given -
 // and, first, until the recorder has handed over every submission in the
 // blocks published so far (the command stream's kEndSubmit and
@@ -1209,9 +1340,25 @@ const Chunk* import_anon(std::uint64_t va, std::uint64_t len) {
     return &(g.anon_imports[va] = c);
 }
 
+// BBHOST_DUMMY_CLEAR (on unless 0): the shaped dummies below hold opaque black,
+// as the 2D one does, and a zero variant each for an invalid T#, instead of
+// whatever their memory held: a missing cube, array or 3D texture sampled
+// whatever a driver's allocation had (zeros on NVIDIA, garbage elsewhere).
+const bool g_dummy_clear = [] {
+    const char* e = std::getenv("BBHOST_DUMMY_CLEAR");
+    return !(e && e[0] == '0');
+}();
+// BBHOST_TEST_DUMMIES=1 (tests): every dummy image is read back once made and
+// its texels checked against what it should hold (check_dummies; the line
+// "gpu: dummy images checked: ..."). They are made copyable for it.
+const bool g_test_dummies = [] {
+    const char* e = std::getenv("BBHOST_TEST_DUMMIES");
+    return e && e[0] == '1';
+}();
 // The 2D dummy above covers most bindings; shaders also declare 1D, 3D, cube
 // and arrayed images, and Vulkan requires the view type to match exactly. Make
-// a 1x1 image for each so no declared binding is ever left unwritten.
+// a 1x1 image for each so no declared binding is ever left unwritten, cleared
+// to opaque black (key (dim << 1) | arrayed) and to zero (the same | 0x100).
 void create_dim_dummies() {
     struct Kind {
         std::uint32_t dim;
@@ -1230,16 +1377,116 @@ void create_dim_dummies() {
         {3, true, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
     };
     for (const Kind& k : kinds) {
+        for (int variant = 0; variant < (g_dummy_clear ? 2 : 1); ++variant) {
+            VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.flags = k.flags;
+            ici.imageType = k.type;
+            ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ici.extent = {1, 1, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = k.layers;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | (g_dummy_clear ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u) |
+                        (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImage image = VK_NULL_HANDLE;
+            if (vkCreateImage(g.device, &ici, nullptr, &image) != VK_SUCCESS) continue;
+            VkMemoryRequirements req{};
+            vkGetImageMemoryRequirements(g.device, image, &req);
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) {
+                vkDestroyImage(g.device, image, nullptr);
+                continue;
+            }
+            vkBindImageMemory(g.device, image, mem, 0);
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = image;
+            vci.viewType = k.view;
+            vci.format = ici.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, k.layers};
+            VkImageView view = VK_NULL_HANDLE;
+            if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) {
+                vkDestroyImage(g.device, image, nullptr);
+                vkFreeMemory(g.device, mem, nullptr);
+                continue;
+            }
+            // GENERAL, the layout the descriptors claim, with the texel the
+            // 2D dummies hold: opaque black, or zero for an invalid T#.
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(g_cmd(), &bi);
+            ++g.record_serial;  // dynamic state recorded so far is gone
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = vci.subresourceRange;
+            b.dstAccessMask = g_dummy_clear ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dummy_clear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &b);
+            if (g_dummy_clear) {
+                const VkClearColorValue texel{{0.0f, 0.0f, 0.0f, variant ? 0.0f : 1.0f}};
+                vkCmdClearColorImage(g_cmd(), image, VK_IMAGE_LAYOUT_GENERAL, &texel, 1, &vci.subresourceRange);
+                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            }
+            vkEndCommandBuffer(g_cmd());
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &g.cmd_;
+            vkResetFences(g.device, 1, &g.fence);
+            {
+                QueueGuard queue;
+                vkQueueSubmit(g.queue, 1, &si, g.fence);
+            }
+            vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
+            const std::uint32_t key = (k.dim << 1) | (k.arrayed ? 1u : 0u) | (variant ? 0x100u : 0u);
+            g.dummy_dim_images[key] = image;
+            g.dummy_dim_mem[key] = mem;
+            g.dummy_dim_views[key] = view;
+        }
+    }
+}
+
+// The far-plane depth dummies (Gpu::dummy_depth_views): D32_SFLOAT where the
+// device samples it with a comparison, cleared to 1.0, GENERAL.
+void create_depth_dummies() {
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D32_SFLOAT, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return;
+    struct Kind {
+        std::uint32_t dim;
+        bool arrayed;
+        VkImageViewType view;
+        std::uint32_t layers;
+        VkImageCreateFlags flags;
+    };
+    static const Kind kinds[] = {
+        {1, false, VK_IMAGE_VIEW_TYPE_2D, 1, 0},
+        {1, true, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0},
+        {3, false, VK_IMAGE_VIEW_TYPE_CUBE, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
+        {3, true, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
+    };
+    for (const Kind& k : kinds) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.flags = k.flags;
-        ici.imageType = k.type;
-        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_D32_SFLOAT;
         ici.extent = {1, 1, 1};
         ici.mipLevels = 1;
         ici.arrayLayers = k.layers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImage image = VK_NULL_HANDLE;
         if (vkCreateImage(g.device, &ici, nullptr, &image) != VK_SUCCESS) continue;
@@ -1259,16 +1506,13 @@ void create_dim_dummies() {
         vci.image = image;
         vci.viewType = k.view;
         vci.format = ici.format;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, k.layers};
+        vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, k.layers};
         VkImageView view = VK_NULL_HANDLE;
         if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) {
             vkDestroyImage(g.device, image, nullptr);
             vkFreeMemory(g.device, mem, nullptr);
             continue;
         }
-        // Undefined contents are fine for a binding the shader should not be
-        // reading; what matters is that the descriptor is defined. Move it to
-        // GENERAL so the layout matches what the descriptor claims.
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(g_cmd(), &bi);
@@ -1279,9 +1523,14 @@ void create_dim_dummies() {
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = image;
         b.subresourceRange = vci.subresourceRange;
-        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &b);
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        const VkClearDepthStencilValue far{1.0f, 0};
+        vkCmdClearDepthStencilImage(g_cmd(), image, VK_IMAGE_LAYOUT_GENERAL, &far, 1, &vci.subresourceRange);
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         vkEndCommandBuffer(g_cmd());
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
@@ -1294,10 +1543,90 @@ void create_dim_dummies() {
         vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
         vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
         const std::uint32_t key = (k.dim << 1) | (k.arrayed ? 1u : 0u);
-        g.dummy_dim_images[key] = image;
-        g.dummy_dim_mem[key] = mem;
-        g.dummy_dim_views[key] = view;
+        g.dummy_depth_images[key] = image;
+        g.dummy_depth_mem[key] = mem;
+        g.dummy_depth_views[key] = view;
     }
+}
+
+// BBHOST_TEST_DUMMIES=1: each dummy image's every layer read back and checked -
+// the 2D and shaped colour ones opaque black (0, 0, 0, 255) or, the zero
+// variants, all zero; the depth ones 1.0.
+void check_dummies() {
+    struct One {
+        VkImage image;
+        std::uint32_t layers;
+        bool depth;
+        std::uint32_t want;  // the texel's bits
+        std::string what;
+    };
+    std::vector<One> all = {{g.dummy_image, 1, false, 0xff000000u, "2D"}, {g.dummy_zero_image, 1, false, 0u, "2D zero"}};
+    for (const auto& [key, image] : g.dummy_dim_images) {
+        const std::uint32_t dim = (key & 0xff) >> 1;
+        all.push_back({image, dim == 3 ? 6u : 1u, false, (key & 0x100) ? 0u : 0xff000000u,
+                       "dim " + std::to_string(dim) + ((key & 1) ? " array" : "") + ((key & 0x100) ? " zero" : "")});
+    }
+    for (const auto& [key, image] : g.dummy_depth_images) {
+        all.push_back({image, (key >> 1) == 3 ? 6u : 1u, true, 0x3f800000u, "depth dim " + std::to_string(key >> 1) + ((key & 1) ? " array" : "")});
+    }
+    std::uint32_t texels = 0;
+    for (const One& o : all) texels += o.layers;
+    DevBuffer rb;
+    if (!create_dev_buffer(rb, texels * 4, true, true)) {
+        host_log("gpu: dummy images checked: no readback buffer");
+        return;
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g_cmd(), &bi);
+    ++g.record_serial;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    std::uint32_t at = 0;
+    for (const One& o : all) {
+        for (std::uint32_t l = 0; l < o.layers; ++l, ++at) {
+            VkBufferImageCopy c{};
+            c.bufferOffset = at * 4;
+            c.imageSubresource = {static_cast<VkImageAspectFlags>(o.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, l, 1};
+            c.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(g_cmd(), o.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &c);
+        }
+    }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    vkEndCommandBuffer(g_cmd());
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd_;
+    vkResetFences(g.device, 1, &g.fence);
+    {
+        QueueGuard queue;
+        vkQueueSubmit(g.queue, 1, &si, g.fence);
+    }
+    vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(g.device, 1, &g.fence);
+    std::uint32_t wrong = 0;
+    std::string first;
+    at = 0;
+    for (const One& o : all) {
+        for (std::uint32_t l = 0; l < o.layers; ++l, ++at) {
+            std::uint32_t got;
+            std::memcpy(&got, static_cast<const std::uint8_t*>(rb.map) + at * 4, 4);
+            if (got == o.want) continue;
+            ++wrong;
+            if (first.empty()) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "; first: %s layer %u holds %08x, not %08x", o.what.c_str(), l, got, o.want);
+                first = b;
+            }
+        }
+    }
+    host_log("gpu: dummy images checked: %zu images, %u texels, %u wrong%s", all.size(), texels, wrong, first.c_str());
+    vkDestroyBuffer(g.device, rb.buffer, nullptr);
+    vkFreeMemory(g.device, rb.memory, nullptr);
 }
 
 bool create_dummy_resources() {
@@ -1309,7 +1638,8 @@ bool create_dummy_resources() {
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(g.device, &ici, nullptr, &g.dummy_image) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
@@ -1392,6 +1722,8 @@ bool create_dummy_resources() {
     vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
     create_dim_dummies();
+    create_depth_dummies();
+    if (g_test_dummies) check_dummies();
     return true;
 }
 
@@ -2452,10 +2784,14 @@ bool init_locked() {
         if (create) {
             VkDebugUtilsMessengerCreateInfoEXT mci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
             mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+            // Performance too: the best-practices checks' warnings
+            // (VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES=1) come as that type.
+            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
             mci.pfnUserCallback = debug_callback;
             create(g.instance, &mci, nullptr, &g.messenger);
         }
+        g_set_object_name = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(vkGetInstanceProcAddr(g.instance, "vkSetDebugUtilsObjectNameEXT"));
         host_log("gpu: validation layer enabled");
     }
     bool has_swapchain = false;
@@ -2564,6 +2900,7 @@ bool init_locked() {
     host_log("gpu: stage interface limits: vertex outputs %u, geometry outputs %u, fragment inputs %u components",
              props.limits.maxVertexOutputComponents, props.limits.maxGeometryOutputComponents, props.limits.maxFragmentInputComponents);
     g.max_anisotropy = props.limits.maxSamplerAnisotropy;
+    g.max_lod_bias = props.limits.maxSamplerLodBias;
     g.ssbo_align = props.limits.minStorageBufferOffsetAlignment ? props.limits.minStorageBufferOffsetAlignment : 1;
     g.ssbo_max_range = props.limits.maxStorageBufferRange;
     // BBHOST_CB_SSBO=0: constant buffers stay on the page-table path. =1: they
@@ -2602,6 +2939,25 @@ bool init_locked() {
     // the EXEC mask. Tessellation is the one commonly left out, and the host's
     // tessellator needs to know rather than find out from a driver crash.
     g.subgroup_stages = subp.supportedStages;
+    // The translator and the lifter emit subgroup operations only in those
+    // stages, and only with the basic, ballot and shuffle operations there:
+    // elsewhere an invocation runs as a wave of its own (gcn::subgroup_ops_in).
+    // Lavapipe has them in fragment and compute shaders alone, and its vertex
+    // stages - the host tessellator's LS, the particles' export shaders - took
+    // ballots the validation layer refuses (VUID-RuntimeSpirv-None-06343).
+    // BBHOST_SUBGROUP_GATE=0: every stage, as before.
+    {
+        const VkSubgroupFeatureFlags need = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+        const char* e = std::getenv("BBHOST_SUBGROUP_GATE");
+        const bool gate = !(e && e[0] == '0');
+        const std::uint32_t stages = !gate ? 0x7fffffffu : (subp.supportedOperations & need) == need ? subp.supportedStages : 0u;
+        gcn::set_subgroup_stages(stages);
+        if (gate && (stages & 0x3f) != 0x3f) {
+            host_log("gpu: subgroup operations in the stages 0x%x only (operations 0x%x): the others' shaders run each invocation as a wave of "
+                     "its own (BBHOST_SUBGROUP_GATE=0: every stage)",
+                     stages, subp.supportedOperations);
+        }
+    }
     {
         // Shader-level compile paths: D3D11 titles compile
         // each stage once when it is created and keep state separate; these are
@@ -2841,6 +3197,15 @@ bool init_locked() {
         vkGetPhysicalDeviceFeatures2(g.phys, &qf);
         g.cache_control = q13.pipelineCreationCacheControl == VK_TRUE;
         f13.pipelineCreationCacheControl = q13.pipelineCreationCacheControl;
+        // Also required by Vulkan 1.3: a pixel the clip distances cut out
+        // (TranslateOptions::kVsOutCntlClipVarying) becomes a helper of its
+        // quad, as the PS4's clipper leaves it, rather than ending - the quad's
+        // derivatives need it (gcn::set_clip_demote). BBHOST_CLIP_DEMOTE=0:
+        // OpKill, as before.
+        const char* e = std::getenv("BBHOST_CLIP_DEMOTE");
+        const bool demote = q13.shaderDemoteToHelperInvocation == VK_TRUE && !(e && e[0] == '0');
+        if (demote) f13.shaderDemoteToHelperInvocation = VK_TRUE;
+        gcn::set_clip_demote(demote);
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;
@@ -2955,6 +3320,13 @@ bool init_locked() {
         if (q12.shaderFloat16) f12.shaderFloat16 = VK_TRUE;
         if (q12.timelineSemaphore && !(std::getenv("BBHOST_TIMELINE") && std::getenv("BBHOST_TIMELINE")[0] == '0'))
             f12.timelineSemaphore = VK_TRUE;
+        // GCN's MIRROR_ONCE_LAST_TEXEL is Vulkan's MIRROR_CLAMP_TO_EDGE, which
+        // a sampler may name only with this feature on (textures.cpp
+        // sampler_for falls back to MIRRORED_REPEAT without it).
+        if (q12.samplerMirrorClampToEdge && sampler_fixes_on()) {
+            f12.samplerMirrorClampToEdge = VK_TRUE;
+            g.mirror_clamp = true;
+        }
         if (supported.shaderInt16) f2.features.shaderInt16 = VK_TRUE;
         g.has_f16_math = q12.shaderFloat16 && supported.shaderInt16;
         gcn::set_native_half_rtz(native);
@@ -3494,10 +3866,38 @@ VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout) {
     return sets[0];
 }
 
+std::atomic<std::uint64_t> g_compare_guarded{0};
+VkImageView compare_guard_view(VkImageView view, const std::uint32_t* t, std::uint32_t dim, bool arrayed) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_COMPARE_GUARD");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return view;
+    // R32F (DATA_FORMAT 4, NUM_FORMAT 7: the shadow maps' T#s) where the
+    // device compares in it keeps its view; anything else is no depth format.
+    static const bool r32f_compares = [] {
+        VkFormatProperties3 f3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        f2.pNext = &f3;
+        vkGetPhysicalDeviceFormatProperties2(g.phys, VK_FORMAT_R32_SFLOAT, &f2);
+        return (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+    }();
+    const bool r32f = ((t[1] >> 20) & 0x3f) == 4 && ((t[1] >> 26) & 0xf) == 7;
+    if (r32f && r32f_compares) return view;
+    const auto it = g.dummy_depth_views.find((dim << 1) | (arrayed ? 1u : 0u));
+    if (it == g.dummy_depth_views.end()) return view;
+    g_compare_guarded.fetch_add(1, std::memory_order_relaxed);
+    return it->second;
+}
+
 VkImageView dummy_view_for(std::uint32_t dim, bool arrayed, bool zero) {
     if (zero && dim == 1 && !arrayed && g.dummy_zero_view) return g.dummy_zero_view;
     if (dim == 1 && !arrayed) return g.dummy_view;
-    auto it = g.dummy_dim_views.find((dim << 1) | (arrayed ? 1u : 0u));
+    const std::uint32_t key = (dim << 1) | (arrayed ? 1u : 0u);
+    if (zero) {  // an invalid T#'s zeros, where the shape has them (create_dim_dummies)
+        if (const auto z = g.dummy_dim_views.find(key | 0x100u); z != g.dummy_dim_views.end()) return z->second;
+    }
+    auto it = g.dummy_dim_views.find(key);
     return it == g.dummy_dim_views.end() ? VK_NULL_HANDLE : it->second;
 }
 
@@ -4105,6 +4505,7 @@ VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string&
                                                      : 0;
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r;
+    const ValidationScope validation(watch.c_str());
     if (how == CsBuild::kOptimizedCached) {
         r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);  // VK_PIPELINE_COMPILE_REQUIRED: not there
     } else if (own_cache != VK_NULL_HANDLE) {
@@ -4114,6 +4515,7 @@ VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string&
         CompilingScope compiling(watch, spirv);
         r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);
     }
+    if (r == VK_SUCCESS) vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(p), watch.c_str());
     return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
 }
 
@@ -6927,6 +7329,7 @@ GpuStats host_gpu_stats() {
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     st.shader_dispatches = g.shader_dispatches.load(std::memory_order_relaxed);
     st.lifted_dispatches = g.lifted_dispatches.load(std::memory_order_relaxed);
+    st.draws_clip_discard = g.draws_clip_discard.load(std::memory_order_relaxed);
     return st;
 }
 
@@ -7904,9 +8307,13 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     // What follows may also take indirect arguments a shader wrote (the
     // particles' counter passes write the next dispatch's) or copy out of
-    // memory it wrote (a counter, into the arguments).
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
-                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    // memory it wrote (a counter, into the arguments) - and fetch vertices
+    // from a buffer it wrote, or draw into or copy over an image it stored
+    // (BBHOST_BARRIER_MASKS: every access; =0 the narrower set, which left
+    // vertex fetch, attachments and transfer writes out).
+    mb.dstAccessMask = barrier_masks_fixed() ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                                             : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
+                                                   VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
@@ -8340,13 +8747,10 @@ std::atomic<std::uint64_t> g_twin_armed{0};
 // Level 3: the armed candidates' ranges (memory -> end), under g.mu - a filter
 // in front of the candidates' lock, so a binding that meets none of them (most
 // of a frame's) costs one lookup in a short map. It holds every armed
-// candidate's range, perhaps more (one let go or gone since).
-std::map<std::uint64_t, std::uint64_t> g_twin_armed_ranges;
-bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) {
-    auto it = g_twin_armed_ranges.upper_bound(va);
-    if (it != g_twin_armed_ranges.begin() && va < std::prev(it)->second) return true;
-    return it != g_twin_armed_ranges.end() && it->first < va + bytes;
-}
+// candidate's range, perhaps more (one let go or gone since). Its inserts and
+// erases move its shape, as the live twins' do: the miss filter's rebuild.
+twins::ShapedMap<std::uint64_t> g_twin_armed_ranges;
+bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) { return twins::ranges_meet(g_twin_armed_ranges, va, bytes); }
 // Its range out of the filter, unless an armed candidate (a newer resource's)
 // still holds that memory. Not under g_twin_cand_mu (it takes it).
 void twin_armed_forget_locked(std::uint64_t memory);
@@ -8363,7 +8767,7 @@ struct Twin {
     int block = -1;
     DevBuffer own;
 };
-std::map<std::uint64_t, Twin> g_twin_live;  // by memory, under g.mu
+twins::ShapedMap<Twin> g_twin_live;  // by memory, under g.mu (inserts and erases move its shape: twin_filter.h)
 enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
     g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_edge_ended_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
@@ -8578,6 +8982,47 @@ void twins_drop_cpu_mapped_locked() {
     }
     for (const std::uint64_t memory : gone) twin_drop_locked(memory, false, kTwinGoneCpuMapped);
 }
+// A drop the next lookup must make first: a gone resource's twin
+// (twins_drain_gone_locked) or a CPU-mapped one (twins_drop_cpu_mapped_locked)
+// - exactly when either of those does any work.
+bool twins_drop_pending_locked() {
+    return g_twin_gone_n.load(std::memory_order_acquire) != g_twin_gone_seen ||
+           (g_twin_cpu_mapped_n.load(std::memory_order_relaxed) != g_twin_cpu_mapped_seen && !g_twin_live.empty());
+}
+// The miss filter (twin_filter.h): the live twins' and armed ranges' union,
+// under g.mu. A lookup that meets none of it has the answer the maps would
+// give it - no live twin, refused by the armed filter - without walking them.
+// BBHOST_TWIN_FAST_MISS=0: every lookup walks the maps, as before; =check:
+// both, each "no" of the filter checked against the maps' (the exit report
+// counts any that differ).
+enum { kFastMissOff, kFastMissOn, kFastMissCheck };
+const int g_twin_fast_miss = [] {
+    const char* e = std::getenv("BBHOST_TWIN_FAST_MISS");
+    if (e && e[0] == '0') return int{kFastMissOff};
+    if (e && std::strcmp(e, "check") == 0) return int{kFastMissCheck};
+    return int{kFastMissOn};
+}();
+twins::MissFilter g_twin_filter;
+std::uint64_t g_twin_filter_misses = 0, g_twin_filter_checked = 0, g_twin_filter_wrong = 0;  // under g.mu
+// [va, va + bytes) meets no live twin and no armed range (bytes > 0).
+bool twin_filter_misses_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (g_twin_fast_miss == kFastMissOff) return false;
+    g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
+    if (g_twin_filter.meets(va, bytes)) return false;
+    ++g_twin_filter_misses;
+    if (g_twin_fast_miss == kFastMissCheck) {
+        ++g_twin_filter_checked;
+        if (twins::live_meets(g_twin_live, va, bytes) || twins::ranges_meet(g_twin_armed_ranges, va, bytes)) {
+            if (++g_twin_filter_wrong <= 8) {
+                host_log("gpu: twins: the miss filter said 0x%llx + 0x%llx meets nothing, and the maps disagree (%zu spans, %zu live, %zu armed)",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes), g_twin_filter.spans(), g_twin_live.size(),
+                         g_twin_armed_ranges.size());
+            }
+            return false;  // the maps' answer, as without the filter
+        }
+    }
+    return true;
+}
 }  // namespace
 
 bool twins_on() { return g_twins.load(std::memory_order_relaxed) != 0; }
@@ -8617,7 +9062,7 @@ void twins_arm_wanted_locked() {
     for (const std::uint64_t memory : g_twin_want) {
         if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end() && !c->second.armed && !c->second.let_go) {
             c->second.armed = true;
-            g_twin_armed_ranges[memory] = memory + c->second.bytes;
+            g_twin_armed_ranges.assign(memory, memory + c->second.bytes);
             g_twin_armed.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -8626,6 +9071,10 @@ void twins_arm_wanted_locked() {
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    // Level 3 (the particle twins), no drop pending: a range that meets no live
+    // twin and no armed range is refused below by the armed filter, after both
+    // walks - answered here from the filter instead.
+    if (g_twins.load(std::memory_order_relaxed) == 3 && !twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;
     twins_drain_gone_locked();
     twins_drop_cpu_mapped_locked();
     // Inside a live twin (the common case): served without the candidates'
@@ -8783,6 +9232,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    if (!twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
     // A twin whose buffer died is dropped first (its memory may be a CPU ring
     // now, which must keep its copies): the registry tells (twins_buffer_gone).
     twins_drain_gone_locked();
@@ -8796,6 +9246,7 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
 
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    if (twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
     auto it = g_twin_live.upper_bound(va);
     if (it == g_twin_live.begin()) return false;
     --it;
@@ -8804,7 +9255,8 @@ bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
 
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
-    if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;  // (callers hold g.mu)
+    if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
+        return false;  // (callers hold g.mu)
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     auto it = g_twin_cand.upper_bound(va);
     if (it != g_twin_cand.begin()) {
@@ -8882,7 +9334,8 @@ void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const c
 
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
-    if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;  // (callers hold g.mu)
+    if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
+        return false;  // (callers hold g.mu)
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     auto it = g_twin_cand.upper_bound(va);
     if (it == g_twin_cand.begin()) return false;
@@ -8919,11 +9372,15 @@ std::string twins_report() {
         cands = g_twin_cand.size();
         cpu_mapped = g_twin_cpu_mapped.size();
     }
+    std::uint64_t filter_misses = 0, filter_checked = 0, filter_wrong = 0, filter_builds = 0;
+    std::size_t filter_spans = 0;
     {
         std::lock_guard<GpuMutex> lock(g.mu);  // the command processor may still be making twins
         live = g_twin_live.size();
         live_bytes = g_twin_live_bytes;
         blocks = g_twin_blocks.size();
+        filter_misses = g_twin_filter_misses, filter_checked = g_twin_filter_checked, filter_wrong = g_twin_filter_wrong;
+        filter_builds = g_twin_filter.builds(), filter_spans = g_twin_filter.spans();
     }
     using ull = unsigned long long;
     char mode[96];
@@ -8947,7 +9404,21 @@ std::string twins_report() {
                   static_cast<ull>(g_twin_edge_ended_pass.load()), static_cast<ull>(g_twin_edge_in_pass.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneTexture].load()), static_cast<ull>(g_twin_gone[kTwinGoneDead].load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneFill].load()), static_cast<ull>(cpu_mapped), static_cast<ull>(g_twin_cpu_mapped_n.load()));
-    return b;
+    std::string out = b;
+    // The miss filter (twin_filter.h): lookups it answered without walking the maps.
+    char f[300];
+    if (g_twin_fast_miss == kFastMissOff) {
+        std::snprintf(f, sizeof(f), "; miss filter off (BBHOST_TWIN_FAST_MISS=0)");
+    } else {
+        std::snprintf(f, sizeof(f), "; miss filter: %llu lookups answered from %zu spans (%llu builds)", static_cast<ull>(filter_misses), filter_spans,
+                      static_cast<ull>(filter_builds));
+        if (g_twin_fast_miss == kFastMissCheck) {
+            const std::size_t at = std::strlen(f);
+            std::snprintf(f + at, sizeof(f) - at, ", each checked against the maps: %llu checked, %llu differ", static_cast<ull>(filter_checked),
+                          static_cast<ull>(filter_wrong));
+        }
+    }
+    return out + f;
 }
 
 void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen) {
@@ -9146,6 +9617,14 @@ void transfer_flush_locked() {
     // Into the open packet when it can take it (a draw's, before its pass).
     DrawCmds* c = DrawCmds::open();
     if (!c || !c->transfer_end()) rec().transfer_barrier(false);
+}
+
+bool barrier_masks_fixed() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_BARRIER_MASKS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
 }
 
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin) {
@@ -10066,6 +10545,7 @@ void host_gpu_report() {
     if (!g.tried) {
         return;
     }
+    log_validation_census();
     {
         // Guest memory the GPU reaches as imports: how much, made by what, and
         // with window imports what replaced what and what the prefetch did.

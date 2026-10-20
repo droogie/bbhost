@@ -252,6 +252,13 @@ struct TranslateOptions {
     std::uint32_t ps_clip_count() const { return ps_clip_discard & 0xff; }
     std::uint32_t ps_clip_location() const { return (ps_clip_discard >> 8) & 31; }
     std::vector<std::uint8_t> ps_input_map;  // PS attr n -> VS param location (SPI_PS_INPUT_CNTL_n.OFFSET); empty = identity
+    // An entry kPsInputDefault | v: the input is GCN's default constant
+    // SPI_PS_INPUT_CNTL_n.DEFAULT_VAL v - (0,0,0,0), (0,0,0,1), (1,1,1,0) or
+    // (1,1,1,1) - which the hardware gives an input whose OFFSET has bit 5 (no
+    // vertex output carries its semantic), instead of an input variable: no
+    // vertex output writes one, and Vulkan leaves such an input undefined.
+    static constexpr std::uint8_t kPsInputDefault = 0x40;
+    static bool ps_input_is_default(std::uint8_t entry) { return (entry & kPsInputDefault) != 0; }
     // Vertex stage with link_outputs: output location k carries param register
     // output_links[k] (kNoLink: nothing), so a pixel shader reads its input k at
     // location k whatever vertex shader it runs with, and the pairing
@@ -420,6 +427,45 @@ struct TranslateOptions {
     // BBHOST_GDS_SUBGROUP=0 keeps an atomic an invocation.
     bool gds_subgroup = true;
 };
+
+// The Vulkan shader stages (VkShaderStageFlagBits) that may run subgroup
+// operations: VkPhysicalDeviceSubgroupProperties::supportedStages where the
+// device has the basic, ballot and shuffle operations (none where it lacks
+// one), set once by the host before its first translation, as
+// set_native_half_rtz; every stage until then. A translation for a stage
+// outside it runs each invocation as a wave of its own - lane 0, EXEC and the
+// comparisons' masks its one bit, a ballot that bit, a shuffle, broadcast or
+// election the invocation itself - which is what a 64-lane wave split across
+// smaller subgroups already is, taken to one lane; a lift takes no subgroup
+// operation there (its GDS counters step an invocation at a time, a lane rank
+// is refused). Part of every translation's key where it applies
+// (translation_cache.cpp), so a device with them everywhere keeps its keys.
+void set_subgroup_stages(std::uint32_t vk_stages);
+std::uint32_t subgroup_stages();
+// A pixel shader's discard by the vertex stage's clip distances
+// (TranslateOptions::ps_clip_discard) demotes the pixel to a helper invocation
+// (OpDemoteToHelperInvocation) where the device has the feature - as the
+// PS4's clipper leaves a pixel it cut out of a quad's triangle, a helper whose
+// values the quad's derivatives still take - rather than ending it with
+// OpKill, after which the derivatives of a quad the clip edge crosses are
+// undefined (drivers that end such an invocation take them from whatever its
+// registers held). Set once by the host before its first translation, as
+// set_subgroup_stages; off until then. Part of a clip-discarding translation's
+// key (translation_cache.cpp).
+void set_clip_demote(bool on);
+bool clip_demote();
+// The Vulkan stage a translation or lift with these options runs in.
+std::uint32_t vk_stage_of(const TranslateOptions& o);
+inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }
+
+// The ps_input_map entry of an input whose SPI_PS_INPUT_CNTL_n is `cntl`: the
+// param register OFFSET names (bits 0-4) or, with `defaults`, GCN's default
+// constant where OFFSET has bit 5 (TranslateOptions::kPsInputDefault |
+// DEFAULT_VAL, bits 8-9).
+inline std::uint8_t ps_input_map_entry(std::uint32_t cntl, bool defaults) {
+    if (defaults && (cntl & 0x20)) return static_cast<std::uint8_t>(TranslateOptions::kPsInputDefault | ((cntl >> 8) & 3));
+    return static_cast<std::uint8_t>(cntl & 0x1f);
+}
 
 struct TranslateResult {
     std::vector<std::uint32_t> spirv;

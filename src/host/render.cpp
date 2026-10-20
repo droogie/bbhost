@@ -8,10 +8,12 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
+#include "host/masked_blend.h"
 #include "host/shader_bundles.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
+#include "host/vertex_plan.h"
 
 #include "host/cb_proof.h"
 #include "host/draw_capture.h"
@@ -107,11 +109,29 @@ VkFormat cb_format(const CbInfo& i) {
     }
 }
 
+// A Z_16 target with stencil is D24_UNORM_S8_UINT where the device can make
+// that a depth attachment, and D32_SFLOAT_S8_UINT where it cannot (AMD's
+// drivers have no D24S8): a format the device lacks is no target at all.
+// BBHOST_DEPTH_FORMAT_CHECK=0: D24S8 everywhere, as before.
+VkFormat z16_stencil_format() {
+    static const VkFormat f = [] {
+        const char* e = std::getenv("BBHOST_DEPTH_FORMAT_CHECK");
+        if (e && e[0] == '0') return VK_FORMAT_D24_UNORM_S8_UINT;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((fp.optimalTilingFeatures & need) == need) return VK_FORMAT_D24_UNORM_S8_UINT;
+        host_log("render: no D24_UNORM_S8_UINT depth attachments on this device: Z_16 targets with stencil are D32_SFLOAT_S8_UINT");
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }();
+    return f;
+}
+
 VkFormat db_format(std::uint32_t z_info, std::uint32_t stencil_info) {
     const std::uint32_t zf = z_info & 3;
     const bool stencil = (stencil_info & 1) != 0;
     if (zf == 0) return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_UNDEFINED;
-    if (zf == 1) return stencil ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D16_UNORM;
+    if (zf == 1) return stencil ? z16_stencil_format() : VK_FORMAT_D16_UNORM;
     return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
 }
 
@@ -2709,7 +2729,19 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     }
 }
 
+// BBHOST_MASKED_BLEND (host/masked_blend.h), on unless 0: a colour target a
+// draw writes no channel of gets no blend state. What the last fixed_state on
+// this thread zeroed - targets whose state it changed, and of those, the ones
+// the game blended into - for create_gfx_pipeline's count.
+const bool g_masked_blend = [] {
+    const char* e = std::getenv("BBHOST_MASKED_BLEND");
+    return !(e && e[0] == '0');
+}();
+thread_local std::uint32_t t_masked_blend_changed = 0, t_masked_blend_blending = 0;
+std::atomic<std::uint64_t> g_masked_blend_pipelines{0}, g_masked_blend_blending{0};
+
 GfxFixedState fixed_state(const DrawState& s) {
+    t_masked_blend_changed = t_masked_blend_blending = 0;
     GfxFixedState f;
     fixed_raster_depth(s, f);
     const bool stencil_aspect = s.depth && s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM;
@@ -2760,7 +2792,13 @@ GfxFixedState fixed_state(const DrawState& s) {
         // The target's write mask where the pixel shader exports (draw_impl
         // makes it from either source; they agree on every draw compared).
         b.colorWriteMask = s.color_mask[t] & 0xf;
-        f.blends.push_back(b);
+        // None of it written: no blend state either (masked_blend_state).
+        const VkPipelineColorBlendAttachmentState kept = masked_blend_state(b, g_masked_blend);
+        if (std::memcmp(&kept, &b, sizeof(b)) != 0) {
+            ++t_masked_blend_changed;
+            if (b.blendEnable) ++t_masked_blend_blending;
+        }
+        f.blends.push_back(kept);
         f.color_formats.push_back(s.color[t]->format);
         f.color_slots.push_back(t);
     }
@@ -2883,35 +2921,7 @@ void report_gx_state_compare() {
              static_cast<unsigned long long>(g_gs_bypass), static_cast<unsigned long long>(g_gs_biased));
 }
 
-// Vulkan vertex input: the unsigned format that holds a V# data
-// format's raw components (packed formats as one dword), so the vertex shader
-// converts them as the fetch shader did; UNDEFINED for unknown formats.
-VkFormat vertex_format(std::uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: return VK_FORMAT_R8_UINT;
-        case 3: return VK_FORMAT_R8G8_UINT;
-        case 10: return VK_FORMAT_R8G8B8A8_UINT;
-        case 2: return VK_FORMAT_R16_UINT;
-        case 5: return VK_FORMAT_R16G16_UINT;
-        case 12: return VK_FORMAT_R16G16B16A16_UINT;
-        case 4: return VK_FORMAT_R32_UINT;
-        case 11: return VK_FORMAT_R32G32_UINT;
-        case 13: return VK_FORMAT_R32G32B32_UINT;
-        case 14: return VK_FORMAT_R32G32B32A32_UINT;
-        case 6: case 7: case 8: case 9: return VK_FORMAT_R32_UINT;
-        default: return VK_FORMAT_UNDEFINED;
-    }
-}
-std::uint32_t vertex_format_bytes(std::uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: return 1;
-        case 2: case 3: return 2;
-        case 11: case 12: return 8;
-        case 13: return 12;
-        case 14: return 16;
-        default: return 4;
-    }
-}
+// vertex_format and vertex_format_bytes: host/vertex_plan.h.
 // The packing (gcn::VertexElement::packed) an attribute's format says its
 // element arrives in: the R16, R32 or R32G32 UINT format pack_vertex_input
 // gives an element of 8- or 16-bit components, where one component a channel
@@ -3102,10 +3112,11 @@ struct PipelineBuildScope {
     const GfxPipeline& pl;
     const char* what;
     bool outer;
+    const ValidationScope validation;  // BBHOST_VK_VALIDATE=1: the layer's messages while it builds are about it
     std::chrono::steady_clock::time_point t0{};
     std::uint64_t us0[kWorkCount] = {}, n0[kWorkCount] = {}, translations0 = 0;
     PipelineBuildScope(const GfxPipeline& p, const char* w)
-        : pl(p), what(w), outer(t_build_depth++ == 0 && g_log_pipeline_builds >= 0 && !t_pipeline_worker) {
+        : pl(p), what(w), outer(t_build_depth++ == 0 && g_log_pipeline_builds >= 0 && !t_pipeline_worker), validation(p.name.c_str()) {
         if (!outer) return;
         t0 = std::chrono::steady_clock::now();
         std::copy(t_work_us, t_work_us + kWorkCount, us0);
@@ -3764,14 +3775,25 @@ void check_precompiled_stage(const char* stage, const std::string& name, const g
                  cached.samplers.size(), again.samplers.size(), cached.buffers.size(), again.buffers.size(), checked.load());
     }
 }
+// BBHOST_PS_INPUT_DEFAULTS (on unless 0): a pixel-shader input whose
+// SPI_PS_INPUT_CNTL OFFSET has bit 5 - no vertex output carries its semantic,
+// so GX gave it 0x20 - reads GCN's DEFAULT_VAL constant, as the PS4 does,
+// instead of the location of register 0, which the vertex stage may not write:
+// an input no output writes is undefined in Vulkan (NVIDIA reads zeros, AMD and
+// lavapipe whatever the location held). =0 reads register 0's location again.
+const bool g_ps_input_defaults = [] {
+    const char* e = std::getenv("BBHOST_PS_INPUT_DEFAULTS");
+    return !(e && e[0] == '0');
+}();
 // A pixel shader's input locations (TranslateOptions::ps_input_map), up to the
-// last input it reads: `registers[k]` for inputs it reads, k for the others.
+// last input it reads: `registers[k]` (SPI_PS_INPUT_CNTL_k, or a register
+// predicted from its semantic) for inputs it reads, k for the others.
 std::vector<std::uint8_t> ps_input_locations(std::uint32_t read_inputs, const std::uint32_t* registers) {
     std::vector<std::uint8_t> map;
     for (std::uint32_t k = 0; k < 32; ++k) {
         if (!((read_inputs >> k) & 1)) continue;
         while (map.size() < k) map.push_back(static_cast<std::uint8_t>(map.size()));
-        map.push_back(static_cast<std::uint8_t>(registers[k] & 0x1f));
+        map.push_back(gcn::ps_input_map_entry(registers[k], g_ps_input_defaults));
     }
     return map;
 }
@@ -3932,6 +3954,15 @@ void note_precompile_miss(const std::string& name, const PsStageInputs& in);
 // A vertex shader's stage translation (step 6d), as PsStageInputs: a draw fills
 // it from the draw state, and per-shader compiles from the shader's binary
 // (elements from its input table, registers from its register block).
+// BBHOST_VERTEX_KEY_PACKING (on unless 0): a vertex shader stage with constant
+// formats is keyed by how its elements arrive (packed or one component a
+// channel), and a recorded vertex input is replanned as this run's draws plan
+// theirs, unpacked where they do not pack (replan_recorded_vertex_input).
+// =0: as before, a packed recipe's stage shared with unpacked draws.
+const bool g_vertex_key_packing = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_KEY_PACKING");
+    return !(e && e[0] == '0');
+}();
 struct VsStageInputs {
     const std::vector<std::uint32_t>* words;
     const std::vector<std::uint32_t>* fetch_words;  // translated only without vertex input
@@ -3957,7 +3988,14 @@ std::uint64_t vs_stage_key(const VsStageInputs& in) {
     key = fnv1a(vk, sizeof(vk), key);
     if (in.elements) {
         for (const gcn::VertexElement& el : *in.elements) {
-            const std::uint32_t e[4] = {el.location, el.vdata, el.count, in.formats_from_params ? 0u : el.w3};
+            // Constant formats are the element's word 3 and how it arrives
+            // (vertex_stage_key_word): a translation that takes an element
+            // packed reads its attribute's dwords apart, and on a draw that
+            // gives it one component a channel it decodes garbage - a recipe
+            // recorded packed and replayed where draws do not pack (formats as
+            // constants: no pipeline libraries, BBHOST_VERTEX_FORMAT_PARAMS=0)
+            // put such a stage under the unpacked draws' key.
+            const std::uint32_t e[4] = {el.location, el.vdata, el.count, vertex_stage_key_word(el, in.formats_from_params, g_vertex_key_packing)};
             key = fnv1a(e, sizeof(e), key);
         }
     }
@@ -5222,6 +5260,78 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
 
 // Translates a pipeline's stages and creates their layouts; with `create`,
 // its Vulkan pipeline too (create_gfx_pipeline).
+// The locations of a module's Input (storage class 1) or Output (3)
+// variables that are not built-ins, sorted.
+std::vector<std::uint32_t> module_locations(const std::vector<std::uint32_t>& w, std::uint32_t storage) {
+    std::set<std::uint32_t> vars;
+    std::map<std::uint32_t, std::uint32_t> location;
+    for (std::size_t i = 5; i < w.size();) {
+        const std::uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (n == 0 || i + n > w.size()) break;
+        const std::uint32_t* a = &w[i + 1];
+        if (op == 59 && n >= 4 && a[2] == storage) vars.insert(a[1]);  // OpVariable
+        if (op == 71 && n >= 4 && a[1] == 30) location[a[0]] = a[2];   // OpDecorate Location
+        i += n;
+    }
+    std::vector<std::uint32_t> out;
+    for (const std::uint32_t v : vars) {
+        if (const auto l = location.find(v); l != location.end()) out.push_back(l->second);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+// The pixel shader's inputs no output of the stage before it writes: a value
+// Vulkan leaves undefined (NVIDIA reads 0, other drivers what the location
+// last held), where GCN reads SPI_PS_INPUT_CNTL's DEFAULT_VAL for an input
+// whose OFFSET has bit 5 (no vertex output with its semantic). Counted by
+// whether the input map asked for the default, for the exit report.
+std::atomic<std::uint64_t> g_unwritten_inputs_default{0}, g_unwritten_inputs_register{0}, g_unwritten_input_pipelines{0};
+// Depth-compare texture binds by what they resolve to: [0] a depth target, [1]
+// a colour target, [2] a snapshot of one, [3] a texture (stage_image_views).
+std::atomic<std::uint64_t> g_compare_binds[4] = {};
+// Pipelines whose pixel shader discards by the vertex stage's clip distances
+// at entry (TranslateOptions::kVsOutCntlClipVarying) - before any implicit-LOD
+// sample, where the PS4's clipper left those pixels helper lanes of their
+// quads: counted and the first named, for the exit report.
+std::atomic<std::uint64_t> g_clip_discard_pipelines{0};
+void note_clip_discard_pipeline(const std::string& name, std::uint32_t clip_discard) {
+    g_clip_discard_pipelines.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+        host_log("render: pipeline %s: its pixel shader discards where clip distances 0-%u are negative, at entry", name.c_str(), (clip_discard & 0xff) - 1);
+    }
+}
+void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
+    if (pl.ps.meta().spirv.empty() || pl.vs.meta().spirv.empty() || s.tess_hw || s.gs || s.rect) return;
+    const std::vector<std::uint32_t> outs = module_locations(pl.vs.meta().spirv, 3), ins = module_locations(pl.ps.meta().spirv, 1);
+    std::string missing;
+    std::uint32_t defaults = 0, registers = 0;
+    for (const std::uint32_t l : ins) {
+        if (std::binary_search(outs.begin(), outs.end(), l)) continue;
+        // The inputs read at l, and their SPI_PS_INPUT_CNTL.
+        for (const std::uint32_t k : pl.ps.meta().ps_inputs) {
+            if (k >= 32 || (s.ps_input_cntl[k] & 0x1f) != l) continue;
+            const bool dflt = (s.ps_input_cntl[k] & 0x20) != 0;
+            ++(dflt ? defaults : registers);
+            char b[80];
+            std::snprintf(b, sizeof(b), "%s input %u at %u (cntl %03x%s)", missing.empty() ? "" : ",", k, l, s.ps_input_cntl[k] & 0x7ff,
+                          dflt ? ", the default" : "");
+            missing += b;
+        }
+    }
+    if (missing.empty()) return;
+    g_unwritten_input_pipelines.fetch_add(1, std::memory_order_relaxed);
+    g_unwritten_inputs_default.fetch_add(defaults, std::memory_order_relaxed);
+    g_unwritten_inputs_register.fetch_add(registers, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 40) {
+        std::string vs_outs;
+        for (const std::uint32_t l : outs) vs_outs += (vs_outs.empty() ? "" : ",") + std::to_string(l);
+        host_log("render: pipeline %s: pixel-shader inputs no vertex output writes:%s; the vertex stage writes {%s}", pl.name.c_str(),
+                 missing.c_str(), vs_outs.c_str());
+    }
+}
+
 GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
                                 const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
                                 const std::string& vs_name, const std::string& ps_name,
@@ -5422,6 +5532,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                         gcn::vertex_formats_from_params_supported(vs_input->elements);
     pl.vs_formats_from_params = vs_formats_from_params;
     pl.clip_discard = clip_discard;
+    if (clip_discard) note_clip_discard_pipeline(pl.name, clip_discard);
     pl.tess_hw = s.tess_hw;
     pl.tess_control_points = s.tess_control_points;
     const std::uint32_t vs_out_cntl =
@@ -5817,6 +5928,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     } else if (pl.tess_set_layout) {
         return fail("a tessellation pipeline with a set 4 needs per-stage set layouts (BBHOST_SET_LAYOUTS=0)");
     }
+    note_unwritten_ps_inputs(pl, s);
     if (create && !create_gfx_pipeline(pl, s, vertex_input, fetch_words.size())) pl.failed = true;
     return pl;
 }
@@ -6746,6 +6858,7 @@ void apply_relinks_locked() {
         }
         if (pl->spec_w3_mask[0] | pl->spec_w3_mask[1]) pl->generic = pl->pipeline;  // spec_w3_matches
         pl->pipeline = pipeline;
+        vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pipeline), pl->name.c_str());
         w.relinks_adopted.fetch_add(1, std::memory_order_relaxed);
     }
     if (!later.empty()) {
@@ -6852,6 +6965,7 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
                 vkDestroyPipeline(g.device, pl->pipeline, nullptr);  // the fast-linked one: no draw has recorded it, none will
             }
             pl->pipeline = p;
+            vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(p), pl->name.c_str());
             pl->relink_pending = false;
             w.relinks_done.fetch_add(1, std::memory_order_relaxed);
             w.relinks_adopted.fetch_add(1, std::memory_order_relaxed);
@@ -8761,6 +8875,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         g.gfx_pipelines.fetch_add(1);
         return true;
     }
+    if (t_masked_blend_changed) {  // built here: one whose blend state BBHOST_MASKED_BLEND zeroed for a target
+        g_masked_blend_pipelines.fetch_add(1, std::memory_order_relaxed);
+        if (t_masked_blend_blending) g_masked_blend_blending.fetch_add(1, std::memory_order_relaxed);
+    }
     ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -8872,6 +8990,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         return false;
     }
     if (content_key && !t_replaying) recipe_note_created(pl, content_key);
+    vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pl.pipeline), pl.name.c_str());  // the layer's draw messages name it
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     // Slow driver compiles, with what might make them slow: the stages'
@@ -9869,9 +9988,12 @@ void record_end_rendering(VkCommandBuffer cmd, bool barrier) {
 }
 
 void record_pass_barrier(VkCommandBuffer cmd) {
-    // Attachment writes must be visible to later shader reads / blits.
+    // Attachment writes must be visible to later shader reads / blits - and
+    // the pass's shader stores (the particles' vertex stages, pixel shaders'
+    // UAVs) to what follows, a dispatch or a copy (BBHOST_BARRIER_MASKS).
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       (barrier_masks_fixed() ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
                          nullptr);
@@ -10404,7 +10526,30 @@ std::string render_fill_stats() {
     return buf;
 }
 
+// Cross-vendor checks (the state Vulkan leaves to the implementation): what
+// the renderer met of each, for the exit report.
+void cross_vendor_report() {
+    using ull = unsigned long long;
+    host_log("render: pixel-shader inputs no vertex output writes: %llu pipelines, %llu inputs SPI_PS_INPUT_CNTL gives the default "
+             "value and %llu at a register the vertex stage does not write",
+             static_cast<ull>(g_unwritten_input_pipelines.load()), static_cast<ull>(g_unwritten_inputs_default.load()),
+             static_cast<ull>(g_unwritten_inputs_register.load()));
+    host_log("render: depth-compare texture binds: %llu a depth target, %llu a colour target, %llu a snapshot of a target, %llu a texture",
+             static_cast<ull>(g_compare_binds[0].load()), static_cast<ull>(g_compare_binds[1].load()), static_cast<ull>(g_compare_binds[2].load()),
+             static_cast<ull>(g_compare_binds[3].load()));
+    host_log("render: depth-compare texture binds given the far-plane depth dummy (BBHOST_COMPARE_GUARD): %llu",
+             static_cast<ull>(g_compare_guarded.load()));
+    host_log("render: pipelines whose pixel shader discards by clip distances at entry (built for draws or from the manifest): %llu",
+             static_cast<ull>(g_clip_discard_pipelines.load()));
+    host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
+             "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
+             "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
+             g_ps_input_defaults ? "on" : "off", gcn::subgroup_stages(), barrier_masks_fixed() ? "on" : "off", render_layout_fixes() ? "on" : "off",
+             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off");
+}
+
 void render_report() {
+    cross_vendor_report();
     host_log("%s", gx_state_report().c_str());
     cb_proof::report();
     if (const std::string b = bindless_report(); !b.empty()) host_log("render: %s", b.c_str());
@@ -11366,16 +11511,24 @@ void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre,
             // What a depth-compare binding resolves to, once a base: a depth
             // target compares natively; anything in R32F (a colour target, a
             // snapshot of a depth target, a texture) does not on every driver.
+            // Every bind counted by kind for the exit report.
             static std::set<std::uint64_t> said;
             const std::uint64_t base = tsharp_base(w);
+            const auto rt = g_rts.find(base);
+            const auto sn = rt == g_rts.end() ? g_snapshots.find(base) : g_snapshots.end();
+            const int kind = rt != g_rts.end() ? (rt->second.depth ? 0 : 1) : sn != g_snapshots.end() ? 2 : 3;
+            g_compare_binds[kind].fetch_add(1, std::memory_order_relaxed);
             if (said.size() < 16 && said.insert(base).second) {
-                const auto rt = g_rts.find(base);
-                const auto sn = g_snapshots.find(base);
+                static const char* const kinds[4] = {"a depth target", "a colour target", "a snapshot of a target", "a texture"};
                 host_log("render: %s binding %u compares against 0x%llx: %s", pipeline_name ? pipeline_name : "?", b.binding,
-                         static_cast<unsigned long long>(base),
-                         rt != g_rts.end() ? (rt->second.depth ? "a depth target" : "a colour target")
-                                           : sn != g_snapshots.end() ? "a snapshot of a target" : "a texture");
+                         static_cast<unsigned long long>(base), kinds[kind]);
             }
+            // A texture the device cannot compare in - an R32F shadow map's T#
+            // over memory no depth target has drawn yet, at the first world
+            // load - samples the far plane instead, which Vulkan defines
+            // (compare_guard_view). Targets and snapshots hold drawn depth and
+            // keep their views (none met yet: the counts above).
+            if (kind == 3) view = compare_guard_view(view, w, b.dim, b.arrayed);
         }
         if (!view) {
             // A binding the shader reads that resolves to nothing is a black
@@ -13217,12 +13370,24 @@ void pack_vertex_input(VertexInputPlan& p, bool ask_usable = true) {
 // On a precompile worker: the packed formats are not asked about
 // (vertex_format_usable's answers are kept under g.mu), since R16_UINT,
 // R32_UINT and R32G32_UINT are vertex formats every Vulkan device must have.
+// A run whose draws do not pack (formats as constants: without pipeline
+// libraries, BBHOST_VERTEX_FORMAT_PARAMS=0 or BBHOST_VERTEX_PACK=0) takes a
+// recorded plan's packed elements apart again, one component a channel, as its
+// draws plan them (unpack_vertex_attributes): built packed, the recipe made a
+// pipeline no draw takes, and - before its stage was keyed by the packing - put
+// a vertex shader that reads packed dwords under the key of draws that give it
+// one component a channel (broken geometry wherever a shipped list or an
+// earlier session's manifest replayed on such a run).
 void replan_recorded_vertex_input(VertexInputPlan& p, bool tess_native) {
-    if (vertex_plan_hash(p) == p.hash) return;
-    if (g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
-        gcn::vertex_formats_from_params_supported(p.elements)) {
-        pack_vertex_input(p, false);
+    const bool draws_pack = g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
+                            gcn::vertex_formats_from_params_supported(p.elements);
+    if (!draws_pack && g_vertex_key_packing) {
+        unpack_vertex_attributes(p.elements, p.attributes);  // host/vertex_plan.h
+        p.hash = vertex_plan_hash(p);
+        return;
     }
+    if (vertex_plan_hash(p) == p.hash) return;
+    if (draws_pack) pack_vertex_input(p, false);
     p.hash = vertex_plan_hash(p);
 }
 
@@ -14173,6 +14338,11 @@ std::string host_gpu_clear_view_report() {
                  "clears of HTILE words without the stencil state kept a stencil the fill path cleared",
                  static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
                  static_cast<unsigned long long>(g_cv_stencil_kept));
+    }
+    if (g_masked_blend_pipelines.load()) {
+        host_log("render: %llu pipelines built with a blend state for a colour target they write no channel of, zeroed (%llu of them "
+                 "blending into it; BBHOST_MASKED_BLEND=0 keeps the game's)",
+                 static_cast<unsigned long long>(g_masked_blend_pipelines.load()), static_cast<unsigned long long>(g_masked_blend_blending.load()));
     }
     if (g_vc_set) {
         host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "
@@ -16016,7 +16186,13 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    // The ring is read by the vertex stage, or with the host's tessellator by
+    // its control and evaluation stages (BBHOST_BARRIER_MASKS).
+    const VkPipelineStageFlags readers =
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | (barrier_masks_fixed() && g.has_tessellation ? VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                                                                                                    VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
+                                                                                              : 0u);
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, 0, 1, &mb, 0, nullptr, 0, nullptr);
     // BBHOST_TESS_DEBUG=4: where each patch of a draw lands on the screen,
     // to find the one that fills the frame. The domain shader builds a world
     // position out of the patch's three rows and the domain coordinate -
@@ -18868,6 +19044,7 @@ static bool draw_impl(const GpuDraw& d) {
         cd.translate.set("vs_lifted", bind_pl->vs.lifted);
         cd.translate.set("vertex_formats_from_params", bind_pl->vs_formats_from_params);
         cd.translate.set("link_by_register", true);  // gcnlift: identity output links, pixel-shader inputs at SPI_PS_INPUT_CNTL's registers
+        cd.translate.set("ps_input_defaults", g_ps_input_defaults);  // gcnlift: OFFSET bit 5 reads DEFAULT_VAL (gcn::ps_input_map_entry)
         cd.translate.set("vertex_input", use_vertex_input);
         cd.translate.set("vs_out_cntl", json::hex(s.vs_out_cntl));  // with the vertex_input elements, what gcnlift needs for the VS
         // The clip varying (TranslateOptions::kVsOutCntlClipVarying): the pixel
@@ -19024,9 +19201,10 @@ static bool draw_impl(const GpuDraw& d) {
     // pipeline creation. Name it before binding so a hung log says which.
     if (!bind_pl->bound_once && host_tooling()) {
         bind_pl->bound_once = true;
-        const std::string bind_note = bind_pl == &pl ? std::string()
-                                                     : std::string(", no fallback") + (bind_pl->vs.lifted ? ", lifted VS" : "") +
-                                                           (bind_pl->ps.lifted ? ", lifted PS" : "");
+        std::string bind_note = bind_pl == &pl ? std::string()
+                                               : std::string(", no fallback") + (bind_pl->vs.lifted ? ", lifted VS" : "") +
+                                                     (bind_pl->ps.lifted ? ", lifted PS" : "");
+        if (bind_pl->clip_discard) bind_note += ", its pixel shader discarding by clip distances";  // note_clip_discard_pipeline
         host_log("render: first bind of pipeline %s (storage-buffer constants: VS %zu, PS %zu%s)", pl.name.c_str(),
                  pl.vs.meta().buffers.size(), pl.ps.meta().buffers.size(), bind_note.c_str());
         // BBHOST_PIPELINE_STATS: the console's own register counts beside the
@@ -19386,6 +19564,7 @@ static bool draw_impl(const GpuDraw& d) {
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
+    if (bind_pl->clip_discard) bump(g.draws_clip_discard);
     const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
     if (bind_pl->tess_hw) {

@@ -166,16 +166,31 @@ struct QuadRun {
     std::string error;
     std::array<float, 4> out{};
 };
-QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, const std::array<float, 4>& attr0) {
+//
+// `clip` (with a clip-discarding shader, TranslateOptions::ps_clip_discard):
+// each invocation's clip distance 0 at the clip location, and the prologue's
+// one selection run per invocation - OpKill ending the invocation as AMD's and
+// Intel's drivers do (what its registers hold afterwards is garbage, which
+// its quad neighbours' quad operations read), OpDemoteToHelperInvocation
+// making it a helper that runs on and writes nothing.
+QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, const std::array<float, 4>& attr0,
+                 const std::array<float, 4>* clip = nullptr, std::uint32_t clip_location = 0) {
     QuadRun run;
     using Vec = std::array<std::uint32_t, 4>;
     std::map<std::uint32_t, std::array<Vec, 4>> val;  // id -> per-invocation value
     std::map<std::uint32_t, std::uint32_t> constants, builtin, location, storage;
+    std::map<std::uint32_t, Vec> composites;  // OpConstantComposite of up to four scalar constants
     std::map<std::uint32_t, std::array<float, 4>> outputs;
     const auto fail = [&](const std::string& why) {
         run.error = why;
         return run;
     };
+    // The prologue's selection: the invocations it takes into its block, and
+    // what became of them there.
+    std::array<bool, 4> dead{}, helper{}, taken{};
+    std::uint32_t taken_label = 0, merge_label = 0;
+    bool in_taken = false;
+    constexpr std::uint32_t kGarbage = 0x7fc0dead;  // an ended invocation's registers
     bool in_body = false;
     for (std::size_t i = 5; i < spv.size();) {
         const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
@@ -189,14 +204,25 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
             continue;
         case 59: storage[a[1]] = a[2]; continue;  // OpVariable
         case 43: constants[a[1]] = a[2]; continue;  // OpConstant (low word)
+        case 44: {                                  // OpConstantComposite
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = constants.count(a[k]) ? constants[a[k]] : 0;
+            composites[a[1]] = v;
+            continue;
+        }
         case 41: constants[a[1]] = 1; continue;     // OpConstantTrue
         case 42: constants[a[1]] = 0; continue;     // OpConstantFalse
-        case 248: in_body = true; continue;         // OpLabel
+        case 248:                                   // OpLabel
+            in_body = true;
+            in_taken = taken_label && a[0] == taken_label;
+            if (merge_label && a[0] == merge_label) taken_label = merge_label = 0;
+            continue;
         default: break;
         }
         if (!in_body) continue;  // types, names, capabilities, the entry point
         const auto get = [&](std::uint32_t id, int lane) -> Vec {
             if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            if (const auto c = composites.find(id); c != composites.end()) return c->second;
             return val[id][static_cast<std::size_t>(lane)];
         };
         const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
@@ -206,6 +232,10 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
                 if (builtin.count(a[2]) && builtin[a[2]] == 15) {  // FragCoord at the pixel's centre
                     const float x = x0 + static_cast<float>(l & 1) + 0.5f, y = y0 + static_cast<float>(l >> 1) + 0.5f;
                     val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(x), std::bit_cast<std::uint32_t>(y), 0, 0};
+                } else if (builtin.count(a[2]) && builtin[a[2]] == 23) {  // HelperInvocation: none at the start
+                    val[a[1]][static_cast<std::size_t>(l)] = {0, 0, 0, 0};
+                } else if (clip && storage[a[2]] == 1 && location.count(a[2]) && location[a[2]] == clip_location) {
+                    val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>((*clip)[static_cast<std::size_t>(l)]), 0, 0, 0};
                 } else if (storage[a[2]] == 1 && location.count(a[2]) && location[a[2]] == 0) {
                     val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(attr0[static_cast<std::size_t>(l)]), 0, 0, 0};
                 } else {
@@ -215,7 +245,30 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
             break;
         case 62:  // OpStore
             if (storage[a[0]] != 3 || !location.count(a[0]) || location[a[0]] != 0) return fail("a store to something other than mrt0");
-            for (int l = 0; l < 4; ++l) outputs[0][static_cast<std::size_t>(l)] = f(get(a[1], l)[0]);
+            for (int l = 0; l < 4; ++l) {
+                if (dead[static_cast<std::size_t>(l)] || helper[static_cast<std::size_t>(l)]) continue;  // ended, or a helper: no output
+                outputs[0][static_cast<std::size_t>(l)] = f(get(a[1], l)[0]);
+            }
+            break;
+        case 247: break;  // OpSelectionMerge
+        case 250:         // OpBranchConditional: the prologue's selection
+            if (taken_label) return fail("a second selection");
+            for (int l = 0; l < 4; ++l) taken[static_cast<std::size_t>(l)] = get(a[0], l)[0] != 0;
+            taken_label = a[1];
+            merge_label = a[2];
+            break;
+        case 249: break;  // OpBranch (to the merge)
+        case 252:         // OpKill: the invocations in the selection end; their registers are garbage from here
+            if (!in_taken) return fail("a kill outside the prologue's selection");
+            for (int l = 0; l < 4; ++l) {
+                if (!taken[static_cast<std::size_t>(l)]) continue;
+                dead[static_cast<std::size_t>(l)] = true;
+                for (auto& [id, lanes] : val) lanes[static_cast<std::size_t>(l)] = {kGarbage, kGarbage, kGarbage, kGarbage};
+            }
+            break;
+        case 5380:  // OpDemoteToHelperInvocation: helpers, running on
+            if (!in_taken) return fail("a demote outside the prologue's selection");
+            for (int l = 0; l < 4; ++l) helper[static_cast<std::size_t>(l)] = helper[static_cast<std::size_t>(l)] || taken[static_cast<std::size_t>(l)];
             break;
         case 81:  // OpCompositeExtract
             for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {get(a[2], l)[a[3]], 0, 0, 0};
@@ -270,6 +323,15 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
         }
         case 253: case 56: break;  // OpReturn, OpFunctionEnd
         default: return fail("unsupported opcode " + std::to_string(op));
+        }
+        // An ended invocation computes nothing more: whatever its registers held.
+        const bool has_result = op == 61 || op == 80 || op == 81 || op == 124 || op == 129 || op == 131 || op == 133 || op == 156 ||
+                                op == 166 || op == 167 || op == 168 || op == 169 || op == 184 || op == 186 || op == 197 || op == 198 ||
+                                op == 199 || op == 365 || op == 366;
+        if (has_result) {
+            for (int l = 0; l < 4; ++l) {
+                if (dead[static_cast<std::size_t>(l)]) val[a[1]][static_cast<std::size_t>(l)] = {kGarbage, kGarbage, kGarbage, kGarbage};
+            }
         }
     }
     if (!outputs.count(0)) return fail("mrt0 is not written");
@@ -564,6 +626,115 @@ bool has_u32_constant(const std::vector<std::uint32_t>& spv, std::uint32_t value
     }
     return false;
 }
+// Input variables (not built-ins) with a Location: what a vertex output must
+// write for the input to be defined.
+std::size_t located_inputs(const std::vector<std::uint32_t>& spv) {
+    std::set<std::uint32_t> inputs, located;
+    for (std::size_t i = 5; i < spv.size() && (spv[i] >> 16);) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (op == 59 && n >= 4 && spv[i + 3] == 1) inputs.insert(spv[i + 2]);  // OpVariable Input
+        if (op == 71 && n >= 4 && spv[i + 2] == 30) located.insert(spv[i + 1]);  // OpDecorate Location
+        i += n;
+    }
+    std::size_t count = 0;
+    for (const std::uint32_t v : inputs) count += located.count(v);
+    return count;
+}
+
+// An input the input map gives GCN's default (SPI_PS_INPUT_CNTL OFFSET bit 5:
+// no vertex output carries its semantic) reads DEFAULT_VAL's constant in the
+// translation and the lift - no input variable, which no vertex output would
+// write - and the map entry comes from SPI_PS_INPUT_CNTL as the renderer
+// builds it (gcn::ps_input_map_entry).
+void default_inputs() {
+    using O = gcn::TranslateOptions;
+    CHECK(gcn::ps_input_map_entry(0x020, true) == O::kPsInputDefault);
+    CHECK(gcn::ps_input_map_entry(0x320, true) == (O::kPsInputDefault | 3));
+    CHECK(gcn::ps_input_map_entry(0x523, true) == (O::kPsInputDefault | 1));  // FLAT_SHADE ignored; OFFSET 0x23 has bit 5
+    CHECK(gcn::ps_input_map_entry(0x020, false) == 0);                         // BBHOST_PS_INPUT_DEFAULTS=0: register 0's location
+    CHECK(gcn::ps_input_map_entry(0x305, true) == 5);                          // a register: its location, DEFAULT_VAL unused
+    const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+    for (std::uint32_t chan : {0u, 3u}) {
+        std::vector<std::uint32_t> w = {vintrp(0, 2, 0, chan, 0), vintrp(1, 2, 0, chan, 1)};  // v2 = attr0.<chan>
+        export_mrt0(w, 2, 2, 2, 2);
+        w.push_back(kEndpgm);
+        for (std::uint32_t v = 0; v < 4; ++v) {
+            gcn::TranslateOptions o = synthetic_options();
+            o.ps_input_map = {static_cast<std::uint8_t>(O::kPsInputDefault | v)};
+            const Lifted l = lift_words(w, o);
+            for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "default input %u: rejected: %s\n", v, why.c_str());
+            CHECK(l.ref.ok() && l.lift.ok());
+            if (!l.ref.ok() || !l.lift.ok()) continue;
+            CHECK(spirv_valid(l.ref.spirv) && spirv_valid(l.lift.spirv));
+            CHECK(located_inputs(l.ref.spirv) == 0 && located_inputs(l.lift.spirv) == 0);
+            CHECK(l.ref.ps_inputs.empty());
+            const float want = chan == 3 ? static_cast<float>(v & 1) : v >= 2 ? 1.0f : 0.0f;
+            const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr);
+            if (!r.ok) std::fprintf(stderr, "default input %u, channel %u: %s\n", v, chan, r.error.c_str());
+            CHECK(r.ok);
+            for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+                if (r.out[k] != want) {
+                    std::fprintf(stderr, "default input %u, channel %u: lane %zu read %g, expected %g\n", v, chan, k, r.out[k], want);
+                    ++g_failures;
+                }
+            }
+        }
+        // The old reading (register 0's location): an input variable at 0, read as the vertex stage left it.
+        gcn::TranslateOptions o = synthetic_options();
+        o.ps_input_map = {gcn::ps_input_map_entry(0x020, false)};
+        const Lifted l = lift_words(w, o);
+        CHECK(l.lift.ok() && located_inputs(l.lift.spirv) == 1 && located_inputs(l.ref.spirv) == 1);
+        if (chan == 0 && l.lift.ok()) {
+            const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr);
+            CHECK(r.ok && r.out[0] == attr[0] && r.out[3] == attr[3]);
+        }
+    }
+}
+
+// The clip prologue (TranslateOptions::ps_clip_discard) and a quad
+// derivative across the clip edge: a pixel the clip distance cuts out reads,
+// on the PS4, as a helper lane of its quad - the clipper left it out of the
+// triangle, its quad's other pixels still take its values. With
+// gcn::clip_demote the translation and the lift demote it to a helper
+// invocation, and its neighbour's quad read gets its value; ended by OpKill
+// (as before), the neighbour reads whatever the ended invocation's registers
+// held on drivers that end it (the interpreter models AMD's and Intel's: a
+// garbage word).
+void clip_demote() {
+    std::vector<std::uint32_t> w;
+    wqm_prologue(w);                                // whole-quad mode, v2 = attr0.x
+    swizzle(w, 3, 2, 0x8000u | 1u | 0u << 2 | 3u << 4 | 2u << 6);  // v3 = the horizontal neighbour's v2: lanes 1 0 3 2
+    push(w, {sopp(12, 0xc07f), sop1(kMovB64, kExec, 2)});
+    export_mrt0(w, 3, 3, 3, 3);
+    w.push_back(kEndpgm);
+    gcn::TranslateOptions o = synthetic_options();
+    o.ps_clip_discard = 1u | 1u << 8;  // clip distance 0, at location 1
+    const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+    const std::array<float, 4> clip = {1.0f, -1.0f, 1.0f, 1.0f};  // the clip edge crosses the quad: lane 1 cut out
+    for (const bool demote : {true, false}) {
+        gcn::set_clip_demote(demote);
+        const Lifted l = lift_words(w, o);
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "clip demote %d: rejected: %s\n", demote ? 1 : 0, why.c_str());
+        CHECK(l.ref.ok() && l.lift.ok());
+        if (!l.ref.ok() || !l.lift.ok()) continue;
+        CHECK(spirv_valid(l.ref.spirv) && spirv_valid(l.lift.spirv));
+        CHECK(count_op(l.lift.spirv, 5380) == (demote ? 1u : 0u) && count_op(l.ref.spirv, 5380) == (demote ? 1u : 0u));  // OpDemoteToHelperInvocation
+        CHECK(count_op(l.lift.spirv, 252) == (demote ? 0u : 1u));                                                        // OpKill
+        const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr, &clip, 1);
+        if (!r.ok) std::fprintf(stderr, "clip demote %d: %s\n", demote ? 1 : 0, r.error.c_str());
+        CHECK(r.ok);
+        if (!r.ok) continue;
+        // The pixels drawn: lane 0 takes its cut-out neighbour's value, 2 and 3 each other's.
+        CHECK(r.out[2] == attr[3] && r.out[3] == attr[2]);
+        if (demote) {
+            CHECK(r.out[0] == attr[1]);
+        } else {
+            CHECK(r.out[0] != attr[1]);  // the ended invocation's garbage
+        }
+    }
+    gcn::set_clip_demote(false);
+}
+
 void packed_exports() {
     for (const bool varying : {false, true}) {
         std::vector<std::uint32_t> w = {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1), vop1(kVMov, 3, kZero)};
@@ -3722,7 +3893,34 @@ void clip_discard() {
     CHECK(clip_input && !early);
 }
 
+// A device without subgroup operations in vertex shaders (lavapipe;
+// gcn::set_subgroup_stages): the translation runs each invocation as a wave of
+// one - no subgroup instruction, capability or lane built-in - and the lift,
+// which takes none here, is unchanged.
+void subgroup_gate() {
+    const std::vector<std::uint32_t> words = program();
+    const gcn::TranslateOptions o = options(0, 0, true);
+    const Lifted all = lift_vs(words, o);
+    gcn::set_subgroup_stages(0x30);  // fragment and compute, as lavapipe
+    const Lifted gated = lift_vs(words, o);
+    gcn::set_subgroup_stages(0x7fffffffu);
+    CHECK(all.ref.ok() && gated.ref.ok());
+    CHECK(count_op(all.ref.spirv, 339) > 0);  // the EXEC mask's OpGroupNonUniformBallot
+    for (std::uint32_t op = 333; op <= 366; ++op) CHECK(count_op(gated.ref.spirv, op) == 0);
+    std::size_t lane_builtins = 0, group_caps = 0;
+    for (std::size_t i = 5; i < gated.ref.spirv.size() && (gated.ref.spirv[i] >> 16);) {
+        const std::uint32_t n = gated.ref.spirv[i] >> 16, op = gated.ref.spirv[i] & 0xffff;
+        if (op == 71 && n >= 4 && gated.ref.spirv[i + 2] == 11 && gated.ref.spirv[i + 3] == 41) ++lane_builtins;  // BuiltIn SubgroupLocalInvocationId
+        if (op == 17 && n >= 2 && gated.ref.spirv[i + 1] >= 61 && gated.ref.spirv[i + 1] <= 68) ++group_caps;      // OpCapability GroupNonUniform*
+        i += n;
+    }
+    CHECK(lane_builtins == 0 && group_caps == 0);
+    CHECK(spirv_valid(gated.ref.spirv));
+    CHECK(all.lift.ok() && gated.lift.ok() && all.lift.spirv == gated.lift.spirv);
+}
+
 void run() {
+    subgroup_gate();
     formats();
     clip_distances();
     clip_discard();
@@ -4307,6 +4505,19 @@ void run() {
         CHECK(count_op(e.spirv, 339) == 0);  // no OpGroupNonUniformBallot
         CHECK(count_op(e.spirv, 333) == 0);
         CHECK(count_op(e.spirv, 234) == 1);  // one OpAtomicIAdd
+        // A device without subgroup operations in compute shaders
+        // (gcn::set_subgroup_stages): the default's lift steps an invocation at
+        // a time, and the translation runs each invocation as a wave of one.
+        gcn::set_subgroup_stages(0x1f);
+        const gcn::LiftResult g = lift(append(false), options(threads));
+        const Asm ap = append(false);
+        const gcn::TranslateResult t = gcn::translate(gcn::decode(ap.w.data(), ap.w.size()), options(threads));
+        gcn::set_subgroup_stages(0x7fffffffu);
+        CHECK(lifted_valid(g, "append idiom without subgroup operations"));
+        CHECK(count_op(g.spirv, 339) == 0 && count_op(g.spirv, 333) == 0 && count_op(g.spirv, 338) == 0);
+        CHECK(count_op(g.spirv, 234) == 1);
+        CHECK(t.ok() && spirv_valid(t.spirv));
+        for (std::uint32_t op = 333; op <= 366; ++op) CHECK(count_op(t.spirv, op) == 0);  // no OpGroupNonUniform*
     }
     CHECK(rejected_with(lift(append(true)), "used other than added to its lanes' ranks"));
     {
@@ -4379,6 +4590,8 @@ int main(int argc, char** argv) {
     control_flow::run();
     cndmask_modifiers();
     packed_exports();
+    default_inputs();
+    clip_demote();
     synthetic_swizzles();
     swizzles_in_blocks();
     swizzles_and_loops();

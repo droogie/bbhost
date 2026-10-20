@@ -153,7 +153,8 @@ class Area:
         # More views after the place's own dumps, without a travel: (name, x, y, z, facing in degrees[, how]) in the
         # MSB's frame, each warped to and dumped as <place>-<name>. `how`: {"dumps": n} dumps a timeline of n frames,
         # <place>-<name>-1..n, "gap" seconds apart (a thing that fades in and out); {"f12": True} takes an F12 there
-        # after them when the run asks for one (--f12-looks).
+        # after them when the run asks for one (--f12-looks); {"pitch": radians} holds the camera's pitch for the view
+        # (positive looks down: the water at the player's feet).
         self.looks = tuple(tuple(l[:5]) + (dict(l[5]) if len(l) > 5 else {},) for l in looks)
         # The place's enemies are part of what it shows: none switched off (no quiet), the player hidden from them and
         # kept alive (the probe's "god hide") while there, and both undone ("god off") before the next place.
@@ -247,6 +248,18 @@ EXTRA_AREAS = (
          stand=(110.5, 33.0, 52.0, 180.0), enemies=True,
          looks=(("room-south", 110.5, 33.0, 52.0, 0.0), ("hall", 78.0, 33.5, -42.0, 180.0),
                 ("spirit", 53.5, 39.0, -33.0, 0.0, {"dumps": 5, "gap": 2.5, "f12": True}))),
+    # The owner's report (10-19): rendering wrong in Rom's arena while standing in the water. The arena is Moonside
+    # Lake's shallow water below Byrgenwerth's balcony (m32_00_00_00's MSB: the floor at y -271.2, Rom - c5100_0000
+    # "白痴の蜘蛛" - at -534.4, 361.8, the lamp the fight leaves at -510.9, 370.4); the travel is moonside-lake's
+    # (Byrgenwerth's lamp, its doors open), then the warp down into the water 8 m from that lamp, facing Rom; Rom and
+    # her children stay in (enemies: the player hidden and kept alive). Views: the same way as a timeline, the cliff
+    # and Byrgenwerth behind, and the water at the player's feet (the camera held looking down) as a timeline with an
+    # F12 when the run asks for one.
+    Area("rom-water", "Byrgenwerth: Moonside Lake, Rom's arena - in the lake's water", "m32_00_00_00", 3202950,
+         flags=(13200040, 13200120), stand=(-508.0, -270.5, 378.0, 58.5), enemies=True,
+         looks=(("arena", -508.0, -270.5, 378.0, 58.5, {"dumps": 5, "gap": 2.5}),
+                ("cliff", -508.0, -270.5, 378.0, -105.0),
+                ("feet", -508.0, -270.5, 378.0, 58.5, {"pitch": 0.9, "dumps": 5, "gap": 2.5, "f12": True}))),
 )
 AREA_BY_ID = {a.id: a for a in AREAS + EXTRA_AREAS}
 
@@ -342,6 +355,8 @@ def tour(areas, opts, kind):
             for name, x, y, z, deg, how in a.looks:
                 lines.append("warp %s:%s %.3f %.3f %.3f %.4f 1.0" % (a.id, name, x, y, z, math.radians(deg)))
                 lines.append("camera")
+                if "pitch" in how:
+                    lines.append("pitch %.4f" % float(how["pitch"]))
                 lines.append("hold %.1f" % opts["dump_gap"])
                 n = int(how.get("dumps", 1))
                 if n <= 1:
@@ -354,6 +369,8 @@ def tour(areas, opts, kind):
                 if how.get("f12") and opts.get("f12_looks"):
                     lines.append("f12 %s-%s" % (a.id, name))
                     lines.append("hold 3.0")
+                if "pitch" in how:
+                    lines.append("pitch off")
         else:
             lines.append("hold %.1f" % opts["capture_settle"])
             lines.append("capture %d %s" % (opts["captures"], a.id))
@@ -416,7 +433,21 @@ def pass_settings(pass_dir, areas, opts, kind):
         if not sep or not name.startswith("BBHOST_") or name in s:
             raise ValueError("--env takes BBHOST_NAME=VALUE and must not override the run's own settings: %s" % item)
         s[name] = value
+    if "BBHOST_MAPVAL_TRAVEL_S" not in s and os.environ.get("AREA_TRAVEL_S"):
+        s["BBHOST_MAPVAL_TRAVEL_S"] = os.environ["AREA_TRAVEL_S"]
     return s
+
+
+def travel_seconds(opts):
+    """How long the probe lets a travel take: BBHOST_MAPVAL_TRAVEL_S given with
+    --env, else AREA_TRAVEL_S from the environment (passed on to the probe),
+    else the probe's own 150. A slow renderer (lavapipe, two games on the box)
+    needs more."""
+    for item in opts.get("env", []):
+        name, _, value = item.partition("=")
+        if name == "BBHOST_MAPVAL_TRAVEL_S" and value:
+            return float(value)
+    return float(os.environ.get("AREA_TRAVEL_S") or 150)
 
 
 def look_seconds(look, opts):
@@ -429,9 +460,9 @@ def look_seconds(look, opts):
 
 def pass_budget(areas, opts, kind):
     """Seconds the pass may take: the start, then per place the probe's own
-    limits (a travel gives up after 150 s, a warp after ten 3 s tries) and the
-    holds."""
-    per = 150 + 35 + 10
+    limits (a travel gives up after travel_seconds, a warp after ten 3 s tries)
+    and the holds."""
+    per = travel_seconds(opts) + 35 + 10
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * (opts["dump_gap"] + 2) + 3 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"] + 60)
     looks = sum(look_seconds(l, opts) + 30 for a in areas for l in a.looks) if kind == "perf" else 0

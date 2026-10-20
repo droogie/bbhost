@@ -608,12 +608,29 @@ if(UNIX)
   target_link_libraries(host_lists_test PRIVATE pthread)
   add_test(NAME host_lists_test COMMAND host_lists_test)
   set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The blend state of a colour target a draw writes no channel of (tests/masked_blend_test.cpp).
+  add_executable(masked_blend_test tests/masked_blend_test.cpp)
+  target_include_directories(masked_blend_test PRIVATE src)
+  add_test(NAME masked_blend_test COMMAND masked_blend_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)
   target_link_libraries(cb_proof_test PRIVATE pthread)
   add_test(NAME cb_proof_test COMMAND cb_proof_test)
   set_tests_properties(cb_proof_test PROPERTIES ENVIRONMENT "BBHOST_CB_RECORD_PROOF=1")
+  # The twins' miss filter against the map walks it stands in for, without the GPU (tests/twin_filter_test.cpp;
+  # twin_filter_test --bench times the miss path both ways).
+  add_executable(twin_filter_test tests/twin_filter_test.cpp)
+  target_include_directories(twin_filter_test PRIVATE src)
+  add_test(NAME twin_filter_test COMMAND twin_filter_test)
+  # A pipeline recipe recorded where draws pack their vertex elements, replayed where they do not
+  # (host/vertex_plan.h; tests/vertex_plan_test.cpp).
+  if(TARGET Vulkan::Headers)
+    add_executable(vertex_plan_test tests/vertex_plan_test.cpp)
+    target_include_directories(vertex_plan_test PRIVATE src)
+    target_link_libraries(vertex_plan_test PRIVATE Vulkan::Headers)
+    add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
+  endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
