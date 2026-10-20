@@ -1,6 +1,7 @@
 #include "core/thunk.h"
 #include <unordered_set>
 
+#include "core/asm_sym.h"
 #include "core/tls_rewrite.h"
 
 #include "hle/guest_fs.h"
@@ -22,7 +23,9 @@
 #else
 #include <pthread.h>
 #include <signal.h>
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -135,7 +138,7 @@ std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* c, std::uint64_t id, void* 
 
 namespace {
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 // Linux >= 5.9 exposes FSGSBASE to user mode; wrfsbase is a few cycles
 // instead of a syscall per HLE call. Probed once from the aux vector.
 const bool g_fsgsbase = (getauxval(AT_HWCAP2) & HWCAP2_FSGSBASE) != 0;
@@ -159,8 +162,8 @@ inline void* get_fs() {
     return reinterpret_cast<void*>(v);
 }
 #else
-// Windows: the guest reads its TCB through GS (core/tls_rewrite.h), FS is
-// never touched, and the slot is the process's own TLS slot.
+// Windows and macOS: the guest reads its TCB through GS (core/tls_rewrite.h),
+// FS is never touched, and the slot is the process's own TLS slot.
 constexpr bool g_fsgsbase = false;
 inline void set_fs(void*) {}
 inline void* get_fs() { return nullptr; }
@@ -173,7 +176,9 @@ inline void* get_fs() { return nullptr; }
 constexpr std::size_t kHostStack = 1u << 20;
 constexpr std::size_t kHostGuard = 0x1000;
 thread_local std::uint8_t* t_host_stack = nullptr;
+#if defined(__linux__)
 thread_local std::uint8_t* t_guest_teb = nullptr;  // GS mode: the TEB stand-in
+#endif
 #if defined(_WIN32)
 // Windows dispatches an exception only while rsp lies inside the TEB's
 // stack limits, so the switch to the host stack moves those limits with it
@@ -206,7 +211,7 @@ void host_stack_free() {
 extern "C" GUEST_ABI void hle_fs_host() {
     // GS mode: FS is glibc's (or Windows' own) throughout; nothing to switch.
     if (tls_gs_mode()) return;
-#if !defined(_WIN32)
+#if defined(__linux__)
     GuestTcb* tcb = nullptr;
     asm volatile("mov %%fs:0, %0" : "=r"(tcb));
     if (tcb && tcb->self == tcb && tcb->magic == kTcbMagic && tcb->host_fs) {
@@ -511,153 +516,151 @@ hle_call_guest6:
     .cfi_endproc
 )");
 #else
-asm(R"(
-    .text
-    .globl hle_thunk_common
-    .type hle_thunk_common,@function
-hle_thunk_common:
-    .cfi_startproc
-    push %rbp
-    .cfi_def_cfa_offset 16
-    .cfi_offset %rbp, -16
-    mov %rsp, %rbp
-    .cfi_def_cfa_register %rbp
-    push %r12
-    .cfi_offset %r12, -24
-    push %rbx
-    .cfi_offset %rbx, -32
-    sub $192, %rsp
-    mov %rdi, 0(%rsp)
-    mov %rsi, 8(%rsp)
-    mov %rdx, 16(%rsp)
-    mov %rcx, 24(%rsp)
-    mov %r8, 32(%rsp)
-    mov %r9, 40(%rsp)
-    mov %rax, 48(%rsp)
-    mov %r11, 56(%rsp)
-    movdqa %xmm0, 64(%rsp)
-    movdqa %xmm1, 80(%rsp)
-    movdqa %xmm2, 96(%rsp)
-    movdqa %xmm3, 112(%rsp)
-    movdqa %xmm4, 128(%rsp)
-    movdqa %xmm5, 144(%rsp)
-    movdqa %xmm6, 160(%rsp)
-    movdqa %xmm7, 176(%rsp)
-    mov %rsp, %rbx
-    call hle_fs_host
-    cmpb $0, g_hle_count_on(%rip)
-    je 1f
-    mov 56(%rbx), %rdi
-    mov %rbp, %rsi
-    call hle_count_call
-1:
-    mov %rbx, %rdi
-    call hle_host_stack_enter
-    mov %rax, %r12
-    mov %r12, %rsp
-    sub $128, %rsp
-    # The caller's stack arguments (up to 16 qwords), in xmm8-15 - caller-
-    # saved, so free here - rather than rep movsq, whose start-up cost every
-    # HLE call paid (the GX workers make hundreds of thousands a second).
-    vmovdqu 16(%rbp), %xmm8
-    vmovdqu 32(%rbp), %xmm9
-    vmovdqu 48(%rbp), %xmm10
-    vmovdqu 64(%rbp), %xmm11
-    vmovdqu 80(%rbp), %xmm12
-    vmovdqu 96(%rbp), %xmm13
-    vmovdqu 112(%rbp), %xmm14
-    vmovdqu 128(%rbp), %xmm15
-    vmovdqu %xmm8, 0(%rsp)
-    vmovdqu %xmm9, 16(%rsp)
-    vmovdqu %xmm10, 32(%rsp)
-    vmovdqu %xmm11, 48(%rsp)
-    vmovdqu %xmm12, 64(%rsp)
-    vmovdqu %xmm13, 80(%rsp)
-    vmovdqu %xmm14, 96(%rsp)
-    vmovdqu %xmm15, 112(%rsp)
-    mov 0(%rbx), %rdi
-    mov 8(%rbx), %rsi
-    mov 16(%rbx), %rdx
-    mov 24(%rbx), %rcx
-    mov 32(%rbx), %r8
-    mov 40(%rbx), %r9
-    mov 48(%rbx), %rax
-    mov 56(%rbx), %r11
-    movdqa 64(%rbx), %xmm0
-    movdqa 80(%rbx), %xmm1
-    movdqa 96(%rbx), %xmm2
-    movdqa 112(%rbx), %xmm3
-    movdqa 128(%rbx), %xmm4
-    movdqa 144(%rbx), %xmm5
-    movdqa 160(%rbx), %xmm6
-    movdqa 176(%rbx), %xmm7
-    call *%r11
-    mov %rax, 0(%rbx)
-    mov %rdx, 8(%rbx)
-    movdqa %xmm0, 64(%rbx)
-    movdqa %xmm1, 80(%rbx)
-    call hle_fs_guest
-    mov 0(%rbx), %rax
-    mov 8(%rbx), %rdx
-    movdqa 64(%rbx), %xmm0
-    movdqa 80(%rbx), %xmm1
-    lea 192(%rbx), %rsp
-    pop %rbx
-    pop %r12
-    pop %rbp
-    .cfi_def_cfa %rsp, 8
-    ret
-    .cfi_endproc
-    .size hle_thunk_common, .-hle_thunk_common
+asm(".text\n"
+    "    .globl " ASM_SYM(hle_thunk_common) "\n"
+    ASM_TYPE_FUNCTION(hle_thunk_common)
+    ASM_SYM(hle_thunk_common) ":\n"
+    "    .cfi_startproc\n"
+    "    push %rbp\n"
+    "    .cfi_def_cfa_offset 16\n"
+    "    .cfi_offset %rbp, -16\n"
+    "    mov %rsp, %rbp\n"
+    "    .cfi_def_cfa_register %rbp\n"
+    "    push %r12\n"
+    "    .cfi_offset %r12, -24\n"
+    "    push %rbx\n"
+    "    .cfi_offset %rbx, -32\n"
+    "    sub $192, %rsp\n"
+    "    mov %rdi, 0(%rsp)\n"
+    "    mov %rsi, 8(%rsp)\n"
+    "    mov %rdx, 16(%rsp)\n"
+    "    mov %rcx, 24(%rsp)\n"
+    "    mov %r8, 32(%rsp)\n"
+    "    mov %r9, 40(%rsp)\n"
+    "    mov %rax, 48(%rsp)\n"
+    "    mov %r11, 56(%rsp)\n"
+    "    movdqa %xmm0, 64(%rsp)\n"
+    "    movdqa %xmm1, 80(%rsp)\n"
+    "    movdqa %xmm2, 96(%rsp)\n"
+    "    movdqa %xmm3, 112(%rsp)\n"
+    "    movdqa %xmm4, 128(%rsp)\n"
+    "    movdqa %xmm5, 144(%rsp)\n"
+    "    movdqa %xmm6, 160(%rsp)\n"
+    "    movdqa %xmm7, 176(%rsp)\n"
+    "    mov %rsp, %rbx\n"
+    "    call " ASM_SYM(hle_fs_host) "\n"
+    "    cmpb $0, " ASM_SYM(g_hle_count_on) "(%rip)\n"
+    "    je 1f\n"
+    "    mov 56(%rbx), %rdi\n"
+    "    mov %rbp, %rsi\n"
+    "    call " ASM_SYM(hle_count_call) "\n"
+    "1:\n"
+    "    mov %rbx, %rdi\n"
+    "    call " ASM_SYM(hle_host_stack_enter) "\n"
+    "    mov %rax, %r12\n"
+    "    mov %r12, %rsp\n"
+    "    sub $128, %rsp\n"
+    // The caller's stack arguments (up to 16 qwords), in xmm8-15 - caller-
+    // saved, so free here - rather than rep movsq, whose start-up cost every
+    // HLE call paid (the GX workers make hundreds of thousands a second).
+    "    vmovdqu 16(%rbp), %xmm8\n"
+    "    vmovdqu 32(%rbp), %xmm9\n"
+    "    vmovdqu 48(%rbp), %xmm10\n"
+    "    vmovdqu 64(%rbp), %xmm11\n"
+    "    vmovdqu 80(%rbp), %xmm12\n"
+    "    vmovdqu 96(%rbp), %xmm13\n"
+    "    vmovdqu 112(%rbp), %xmm14\n"
+    "    vmovdqu 128(%rbp), %xmm15\n"
+    "    vmovdqu %xmm8, 0(%rsp)\n"
+    "    vmovdqu %xmm9, 16(%rsp)\n"
+    "    vmovdqu %xmm10, 32(%rsp)\n"
+    "    vmovdqu %xmm11, 48(%rsp)\n"
+    "    vmovdqu %xmm12, 64(%rsp)\n"
+    "    vmovdqu %xmm13, 80(%rsp)\n"
+    "    vmovdqu %xmm14, 96(%rsp)\n"
+    "    vmovdqu %xmm15, 112(%rsp)\n"
+    "    mov 0(%rbx), %rdi\n"
+    "    mov 8(%rbx), %rsi\n"
+    "    mov 16(%rbx), %rdx\n"
+    "    mov 24(%rbx), %rcx\n"
+    "    mov 32(%rbx), %r8\n"
+    "    mov 40(%rbx), %r9\n"
+    "    mov 48(%rbx), %rax\n"
+    "    mov 56(%rbx), %r11\n"
+    "    movdqa 64(%rbx), %xmm0\n"
+    "    movdqa 80(%rbx), %xmm1\n"
+    "    movdqa 96(%rbx), %xmm2\n"
+    "    movdqa 112(%rbx), %xmm3\n"
+    "    movdqa 128(%rbx), %xmm4\n"
+    "    movdqa 144(%rbx), %xmm5\n"
+    "    movdqa 160(%rbx), %xmm6\n"
+    "    movdqa 176(%rbx), %xmm7\n"
+    "    call *%r11\n"
+    "    mov %rax, 0(%rbx)\n"
+    "    mov %rdx, 8(%rbx)\n"
+    "    movdqa %xmm0, 64(%rbx)\n"
+    "    movdqa %xmm1, 80(%rbx)\n"
+    "    call " ASM_SYM(hle_fs_guest) "\n"
+    "    mov 0(%rbx), %rax\n"
+    "    mov 8(%rbx), %rdx\n"
+    "    movdqa 64(%rbx), %xmm0\n"
+    "    movdqa 80(%rbx), %xmm1\n"
+    "    lea 192(%rbx), %rsp\n"
+    "    pop %rbx\n"
+    "    pop %r12\n"
+    "    pop %rbp\n"
+    "    .cfi_def_cfa %rsp, 8\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    ASM_SIZE(hle_thunk_common)
 
-    .globl hle_call_guest6
-    .type hle_call_guest6,@function
-hle_call_guest6:
-    .cfi_startproc
-    push %rbp
-    .cfi_def_cfa_offset 16
-    .cfi_offset %rbp, -16
-    mov %rsp, %rbp
-    .cfi_def_cfa_register %rbp
-    push %rbx
-    .cfi_offset %rbx, -24
-    push %r12
-    .cfi_offset %r12, -32
-    mov %rdi, %rbx
-    mov %rsi, %rdi
-    mov %rdx, %rsi
-    mov %rcx, %rdx
-    mov %r8, %rcx
-    mov %r9, %r8
-    mov 16(%rbp), %r9
-    push %r9
-    push %r8
-    push %rcx
-    push %rdx
-    push %rsi
-    push %rdi
-    call hle_fs_guest
-    pop %rdi
-    pop %rsi
-    pop %rdx
-    pop %rcx
-    pop %r8
-    pop %r9
-    xor %eax, %eax
-    call *%rbx
-    push %rax
-    push %rdx
-    call hle_fs_host
-    pop %rdx
-    pop %rax
-    pop %r12
-    pop %rbx
-    pop %rbp
-    .cfi_def_cfa %rsp, 8
-    ret
-    .cfi_endproc
-    .size hle_call_guest6, .-hle_call_guest6
-)");
+    "    .globl " ASM_SYM(hle_call_guest6) "\n"
+    ASM_TYPE_FUNCTION(hle_call_guest6)
+    ASM_SYM(hle_call_guest6) ":\n"
+    "    .cfi_startproc\n"
+    "    push %rbp\n"
+    "    .cfi_def_cfa_offset 16\n"
+    "    .cfi_offset %rbp, -16\n"
+    "    mov %rsp, %rbp\n"
+    "    .cfi_def_cfa_register %rbp\n"
+    "    push %rbx\n"
+    "    .cfi_offset %rbx, -24\n"
+    "    push %r12\n"
+    "    .cfi_offset %r12, -32\n"
+    "    mov %rdi, %rbx\n"
+    "    mov %rsi, %rdi\n"
+    "    mov %rdx, %rsi\n"
+    "    mov %rcx, %rdx\n"
+    "    mov %r8, %rcx\n"
+    "    mov %r9, %r8\n"
+    "    mov 16(%rbp), %r9\n"
+    "    push %r9\n"
+    "    push %r8\n"
+    "    push %rcx\n"
+    "    push %rdx\n"
+    "    push %rsi\n"
+    "    push %rdi\n"
+    "    call " ASM_SYM(hle_fs_guest) "\n"
+    "    pop %rdi\n"
+    "    pop %rsi\n"
+    "    pop %rdx\n"
+    "    pop %rcx\n"
+    "    pop %r8\n"
+    "    pop %r9\n"
+    "    xor %eax, %eax\n"
+    "    call *%rbx\n"
+    "    push %rax\n"
+    "    push %rdx\n"
+    "    call " ASM_SYM(hle_fs_host) "\n"
+    "    pop %rdx\n"
+    "    pop %rax\n"
+    "    pop %r12\n"
+    "    pop %rbx\n"
+    "    pop %rbp\n"
+    "    .cfi_def_cfa %rsp, 8\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    ASM_SIZE(hle_call_guest6));
 #endif
 
 extern "C" void hle_thunk_common();
@@ -704,47 +707,45 @@ hle_longjmp_raw:
     jmp *56(%rdi)
 )");
 #else
-asm(R"(
-    .text
-    .globl hle_setjmp_raw
-    .type hle_setjmp_raw,@function
-hle_setjmp_raw:
-    mov %rbx, 0(%rdi)
-    mov %rbp, 8(%rdi)
-    mov %r12, 16(%rdi)
-    mov %r13, 24(%rdi)
-    mov %r14, 32(%rdi)
-    mov %r15, 40(%rdi)
-    lea 8(%rsp), %rax
-    mov %rax, 48(%rdi)
-    mov (%rsp), %rax
-    mov %rax, 56(%rdi)
-    stmxcsr 64(%rdi)
-    fnstcw 68(%rdi)
-    xor %eax, %eax
-    ret
-    .size hle_setjmp_raw, .-hle_setjmp_raw
+asm(".text\n"
+    "    .globl " ASM_SYM(hle_setjmp_raw) "\n"
+    ASM_TYPE_FUNCTION(hle_setjmp_raw)
+    ASM_SYM(hle_setjmp_raw) ":\n"
+    "    mov %rbx, 0(%rdi)\n"
+    "    mov %rbp, 8(%rdi)\n"
+    "    mov %r12, 16(%rdi)\n"
+    "    mov %r13, 24(%rdi)\n"
+    "    mov %r14, 32(%rdi)\n"
+    "    mov %r15, 40(%rdi)\n"
+    "    lea 8(%rsp), %rax\n"
+    "    mov %rax, 48(%rdi)\n"
+    "    mov (%rsp), %rax\n"
+    "    mov %rax, 56(%rdi)\n"
+    "    stmxcsr 64(%rdi)\n"
+    "    fnstcw 68(%rdi)\n"
+    "    xor %eax, %eax\n"
+    "    ret\n"
+    ASM_SIZE(hle_setjmp_raw)
 
-    .globl hle_longjmp_raw
-    .type hle_longjmp_raw,@function
-hle_longjmp_raw:
-    mov 0(%rdi), %rbx
-    mov 8(%rdi), %rbp
-    mov 16(%rdi), %r12
-    mov 24(%rdi), %r13
-    mov 32(%rdi), %r14
-    mov 40(%rdi), %r15
-    ldmxcsr 64(%rdi)
-    fldcw 68(%rdi)
-    mov %esi, %eax
-    test %eax, %eax
-    jnz 1f
-    mov $1, %eax
-1:
-    mov 48(%rdi), %rsp
-    jmp *56(%rdi)
-    .size hle_longjmp_raw, .-hle_longjmp_raw
-)");
+    "    .globl " ASM_SYM(hle_longjmp_raw) "\n"
+    ASM_TYPE_FUNCTION(hle_longjmp_raw)
+    ASM_SYM(hle_longjmp_raw) ":\n"
+    "    mov 0(%rdi), %rbx\n"
+    "    mov 8(%rdi), %rbp\n"
+    "    mov 16(%rdi), %r12\n"
+    "    mov 24(%rdi), %r13\n"
+    "    mov 32(%rdi), %r14\n"
+    "    mov 40(%rdi), %r15\n"
+    "    ldmxcsr 64(%rdi)\n"
+    "    fldcw 68(%rdi)\n"
+    "    mov %esi, %eax\n"
+    "    test %eax, %eax\n"
+    "    jnz 1f\n"
+    "    mov $1, %eax\n"
+    "1:\n"
+    "    mov 48(%rdi), %rsp\n"
+    "    jmp *56(%rdi)\n"
+    ASM_SIZE(hle_longjmp_raw));
 #endif
 
 // hle_call_guest_regs: GuestCallRegs (thunk.h) - four stack arguments
@@ -805,60 +806,58 @@ hle_call_guest_regs:
     .cfi_endproc
 )");
 #else
-asm(R"(
-    .text
-    .globl hle_call_guest_regs
-    .type hle_call_guest_regs,@function
-hle_call_guest_regs:
-    .cfi_startproc
-    push %rbp
-    .cfi_def_cfa_offset 16
-    .cfi_offset %rbp, -16
-    mov %rsp, %rbp
-    .cfi_def_cfa_register %rbp
-    push %rbx
-    .cfi_offset %rbx, -24
-    push %r12
-    .cfi_offset %r12, -32
-    mov %rdi, %rbx
-    call hle_fs_guest
-    sub $32, %rsp
-    mov 120(%rbx), %r11
-    mov %r11, 0(%rsp)
-    mov 128(%rbx), %r11
-    mov %r11, 8(%rsp)
-    mov 136(%rbx), %r11
-    mov %r11, 16(%rsp)
-    mov 144(%rbx), %r11
-    mov %r11, 24(%rsp)
-    mov 8(%rbx), %rdi
-    mov 16(%rbx), %rsi
-    mov 24(%rbx), %rdx
-    mov 32(%rbx), %rcx
-    mov 40(%rbx), %r8
-    mov 48(%rbx), %r9
-    movq 56(%rbx), %xmm0
-    movq 64(%rbx), %xmm1
-    movq 72(%rbx), %xmm2
-    movq 80(%rbx), %xmm3
-    movq 88(%rbx), %xmm4
-    movq 96(%rbx), %xmm5
-    movq 104(%rbx), %xmm6
-    movq 112(%rbx), %xmm7
-    mov $8, %eax
-    call *0(%rbx)
-    add $32, %rsp
-    mov %rax, 152(%rbx)
-    movq %xmm0, 160(%rbx)
-    call hle_fs_host
-    pop %r12
-    pop %rbx
-    pop %rbp
-    .cfi_def_cfa %rsp, 8
-    ret
-    .cfi_endproc
-    .size hle_call_guest_regs, .-hle_call_guest_regs
-)");
+asm(".text\n"
+    "    .globl " ASM_SYM(hle_call_guest_regs) "\n"
+    ASM_TYPE_FUNCTION(hle_call_guest_regs)
+    ASM_SYM(hle_call_guest_regs) ":\n"
+    "    .cfi_startproc\n"
+    "    push %rbp\n"
+    "    .cfi_def_cfa_offset 16\n"
+    "    .cfi_offset %rbp, -16\n"
+    "    mov %rsp, %rbp\n"
+    "    .cfi_def_cfa_register %rbp\n"
+    "    push %rbx\n"
+    "    .cfi_offset %rbx, -24\n"
+    "    push %r12\n"
+    "    .cfi_offset %r12, -32\n"
+    "    mov %rdi, %rbx\n"
+    "    call " ASM_SYM(hle_fs_guest) "\n"
+    "    sub $32, %rsp\n"
+    "    mov 120(%rbx), %r11\n"
+    "    mov %r11, 0(%rsp)\n"
+    "    mov 128(%rbx), %r11\n"
+    "    mov %r11, 8(%rsp)\n"
+    "    mov 136(%rbx), %r11\n"
+    "    mov %r11, 16(%rsp)\n"
+    "    mov 144(%rbx), %r11\n"
+    "    mov %r11, 24(%rsp)\n"
+    "    mov 8(%rbx), %rdi\n"
+    "    mov 16(%rbx), %rsi\n"
+    "    mov 24(%rbx), %rdx\n"
+    "    mov 32(%rbx), %rcx\n"
+    "    mov 40(%rbx), %r8\n"
+    "    mov 48(%rbx), %r9\n"
+    "    movq 56(%rbx), %xmm0\n"
+    "    movq 64(%rbx), %xmm1\n"
+    "    movq 72(%rbx), %xmm2\n"
+    "    movq 80(%rbx), %xmm3\n"
+    "    movq 88(%rbx), %xmm4\n"
+    "    movq 96(%rbx), %xmm5\n"
+    "    movq 104(%rbx), %xmm6\n"
+    "    movq 112(%rbx), %xmm7\n"
+    "    mov $8, %eax\n"
+    "    call *0(%rbx)\n"
+    "    add $32, %rsp\n"
+    "    mov %rax, 152(%rbx)\n"
+    "    movq %xmm0, 160(%rbx)\n"
+    "    call " ASM_SYM(hle_fs_host) "\n"
+    "    pop %r12\n"
+    "    pop %rbx\n"
+    "    pop %rbp\n"
+    "    .cfi_def_cfa %rsp, 8\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    ASM_SIZE(hle_call_guest_regs));
 #endif
 
 namespace {
@@ -995,7 +994,8 @@ void* guest_thread_enter() {
     tcb->magic = kTcbMagic;
     tcb->host_fs = get_fs();
     std::uint64_t guard = 0;
-#if !defined(_WIN32)
+    // glibc's canary (fs:0x28), for host code run under guest FS.
+#if defined(__linux__)
     asm volatile("mov %%fs:0x28, %0" : "=r"(guard));
 #endif
     tcb->stack_guard = guard;
@@ -1006,6 +1006,8 @@ void* guest_thread_enter() {
         host_log("guest tcb %p guard=0x%llx %s", static_cast<void*>(tcb), static_cast<unsigned long long>(guard),
 #if defined(_WIN32)
                  "gs-slot=TlsAlloc");
+#elif defined(__APPLE__)
+                 "gs-slot=pthread-key");
 #else
                  tls_gs_mode() ? (g_fsgsbase ? "gs-slot=wrgsbase" : "gs-slot=arch_prctl")
                                : (g_fsgsbase ? "fs-switch=wrfsbase" : "fs-switch=arch_prctl"));
@@ -1017,6 +1019,9 @@ void* guest_thread_enter() {
         // The real TEB: the slot the rewritten sites read is this process's
         // TLS slot (core/tls_rewrite.cpp took it from TlsAlloc).
         TlsSetValue(tls_gs_slot(), tcb);
+#elif defined(__APPLE__)
+        // The rewritten sites read gs:[8*key], this pthread key's value.
+        pthread_setspecific(static_cast<pthread_key_t>(tls_gs_slot()), tcb);
 #else
         // The Windows shape on Linux: the rewritten sites read
         // gs:[TlsSlots+8n], so GS gets a TEB-sized block whose slot holds the
@@ -1043,7 +1048,9 @@ void guest_thread_leave(void* tcb_v) {
     }
 #if defined(_WIN32)
     if (tls_gs_mode()) TlsSetValue(tls_gs_slot(), nullptr);
-#else
+#elif defined(__APPLE__)
+    pthread_setspecific(static_cast<pthread_key_t>(tls_gs_slot()), nullptr);
+#elif defined(__linux__)
     if (t_guest_teb) {
         if (g_fsgsbase) {
             asm volatile("wrgsbase %0" : : "r"(static_cast<std::uint8_t*>(nullptr)) : "memory");

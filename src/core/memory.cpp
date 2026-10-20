@@ -13,6 +13,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 bool guest_alloc(GuestMemory* mem, std::uint64_t slide, std::size_t size) {
     mem->slide = slide;
@@ -36,6 +39,26 @@ bool guest_alloc(GuestMemory* mem, std::uint64_t slide, std::size_t size) {
     if (!mem->base) {
         host_log("VirtualAlloc(0x%llx, %zu) failed: %lu",
                  static_cast<unsigned long long>(slide), size, GetLastError());
+        return false;
+    }
+#elif defined(__APPLE__)
+    // bbhost's own image covers 0x400000 on macOS, so fall back to the window
+    // kernel.cpp holds (as a Windows run does), then anywhere (tests).
+    const std::size_t round = (size + 0xfff) & ~std::size_t(0xfff);
+    constexpr int kFlags = MAP_PRIVATE | MAP_ANONYMOUS;
+    mem->base = mac_vm_map(reinterpret_cast<void*>(slide), round, PROT_READ | PROT_WRITE, kFlags, -1, 0, MacVmPlace::NoReplace);
+    if (!mem->base) {
+        mem->base = mac_vm_map(reinterpret_cast<void*>(kMacVmImageBase), round, PROT_READ | PROT_WRITE, kFlags, -1, 0,
+                               MacVmPlace::NoReplace);
+        if (!mem->base) mem->base = mac_vm_map(nullptr, round, PROT_READ | PROT_WRITE, kFlags, -1, 0, MacVmPlace::Anywhere);
+        if (mem->base) {
+            mem->slide = reinterpret_cast<std::uint64_t>(mem->base);
+            host_log("guest slide is 0x%llx (preferred 0x%llx was taken)", static_cast<unsigned long long>(mem->slide),
+                     static_cast<unsigned long long>(slide));
+        }
+    }
+    if (!mem->base) {
+        host_log("mmap(%zu) failed", size);
         return false;
     }
 #else
@@ -63,6 +86,8 @@ void guest_free(GuestMemory* mem) {
     }
 #if defined(_WIN32)
     VirtualFree(mem->base, 0, MEM_RELEASE);
+#elif defined(__APPLE__)
+    mac_vm_unmap(mem->base, (mem->size + 0xfff) & ~std::size_t(0xfff));  // in a window, placeholders again
 #else
     munmap(mem->base, mem->size);
 #endif

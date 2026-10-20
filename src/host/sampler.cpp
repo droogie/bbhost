@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 #include <sys/mman.h>
 #include <linux/perf_event.h>
 #include <dirent.h>
@@ -36,7 +36,7 @@
 #include <unistd.h>
 #endif
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 namespace {
 
 constexpr int kDepth = 40;
@@ -681,7 +681,7 @@ void sampler_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
         }
     }).detach();
 }
-#else  // _WIN32
+#elif defined(_WIN32)
 
 // The same sampler on Windows, without signals: the sampler thread suspends
 // each thread it watches, reads its context, unwinds it (host frames by the
@@ -1045,6 +1045,450 @@ void sampler_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
             if (now - last_maps > std::chrono::seconds(5)) {
                 std::fflush(f);
                 write_maps(out + ".maps");
+                last_maps = now;
+            }
+        }
+    }).detach();
+}
+#elif defined(__APPLE__)
+
+// macOS samples the Windows way: a SIGPROF handler would run on a guest
+// thread under Rosetta's signal emulation and cut blocking calls short. The
+// HLE trampoline's frame links host and guest stacks (core/thunk.cpp), so one
+// frame-pointer walk covers both.
+//
+// While a thread is suspended nothing that takes a lock is touched (malloc,
+// the log, dyld, stdio): it may hold one. Rosetta's own thread answers
+// thread_get_state for the others, so it is never suspended.
+//
+// <out>.maps gives each image's link address as its offset, so
+// tools/wallprof.py takes link addresses (bbhost is not PIE).
+
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <pthread.h>
+
+namespace {
+
+constexpr int kDepth = 40;
+std::uint64_t g_guest_lo = 0, g_guest_hi = 0;
+std::atomic<std::uint32_t> g_main_tid{0};
+
+bool in_guest(std::uint64_t pc) { return pc >= g_guest_lo && pc < g_guest_hi; }
+
+struct Image {
+    std::uint64_t lo, hi;    // __TEXT in memory
+    std::uint64_t header;    // the Mach-O header's address: module+offset is from here (atos -l)
+    std::uint64_t link;      // __TEXT's link address
+    std::string path;
+};
+
+// Every loaded image's __TEXT, from dyld - which takes its lock, so never
+// while a thread is suspended.
+std::vector<Image> read_images() {
+    std::vector<Image> out;
+    const std::uint32_t n = _dyld_image_count();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto* h = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(i));
+        const char* name = _dyld_get_image_name(i);
+        if (!h || !name || h->magic != MH_MAGIC_64) continue;
+        const std::uint64_t slide = static_cast<std::uint64_t>(_dyld_get_image_vmaddr_slide(i));
+        const auto* lc = reinterpret_cast<const load_command*>(h + 1);
+        for (std::uint32_t k = 0; k < h->ncmds; ++k) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
+                if (std::strncmp(seg->segname, "__TEXT", 16) == 0) {
+                    out.push_back({seg->vmaddr + slide, seg->vmaddr + slide + seg->vmsize,
+                                   static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(h)), seg->vmaddr, name});
+                    break;
+                }
+            }
+            lc = reinterpret_cast<const load_command*>(reinterpret_cast<const std::uint8_t*>(lc) + lc->cmdsize);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const Image& a, const Image& b) { return a.lo < b.lo; });
+    return out;
+}
+
+// Filled while no thread is suspended, read (no allocation) while one is.
+struct Code {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;  // sorted
+    std::uint64_t kernel_lo = 0, kernel_hi = 0;                   // libsystem_kernel: the system call stubs
+
+    void set(const std::vector<Image>& imgs) {
+        ranges.clear();
+        for (const Image& m : imgs) {
+            ranges.emplace_back(m.lo, m.hi);
+            const char* slash = std::strrchr(m.path.c_str(), '/');
+            if (std::strcmp(slash ? slash + 1 : m.path.c_str(), "libsystem_kernel.dylib") == 0) {
+                kernel_lo = m.lo;
+                kernel_hi = m.hi;
+            }
+        }
+    }
+    bool has(std::uint64_t pc) const {
+        if (in_guest(pc)) return true;
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(pc, ~0ull));
+        return it != ranges.begin() && pc < std::prev(it)->second;
+    }
+    bool in_kernel_stubs(std::uint64_t pc) const { return pc >= kernel_lo && pc < kernel_hi; }
+};
+
+// vm_read_overwrite fails instead of faulting on a frame pointer that leads
+// to an unmapped page.
+struct StackReader {
+    static constexpr int kPages = 4;
+    static constexpr std::uint64_t kPage = 4096;  // Rosetta's pages
+    std::uint64_t page[kPages];
+    bool ok[kPages];
+    int next = 0;
+    alignas(16) std::uint8_t data[kPages][kPage];
+
+    void reset() {
+        for (int k = 0; k < kPages; ++k) page[k] = ~0ull;
+    }
+    bool rd8(std::uint64_t a, std::uint64_t* v) {
+        if (a < 0x10000 || (a & 7)) return false;
+        const std::uint64_t p = a & ~(kPage - 1);
+        int k = 0;
+        while (k < kPages && page[k] != p) ++k;
+        if (k == kPages) {
+            k = next;
+            next = (next + 1) % kPages;
+            page[k] = p;
+            vm_size_t got = 0;
+            ok[k] = vm_read_overwrite(mach_task_self(), static_cast<vm_address_t>(p), kPage,
+                                      reinterpret_cast<vm_address_t>(data[k]), &got) == KERN_SUCCESS &&
+                    got == kPage;
+        }
+        if (!ok[k]) return false;
+        std::memcpy(v, data[k] + (a - p), 8);
+        return true;
+    }
+};
+
+struct Sample {
+    std::uint64_t flip = 0;
+    std::uint32_t tid = 0;
+    int n = 0;
+    std::uint64_t pc[kDepth];
+};
+
+// The chain may jump between the host and guest stacks at HLE calls and
+// guest callbacks.
+void unwind(Sample& s, const x86_thread_state64_t& st, StackReader& r, const Code& code) {
+    r.reset();
+    s.pc[s.n++] = st.__rip;
+    // A system call stub keeps no frame: the caller's return address is at
+    // rsp, rbp still the caller's frame.
+    if (code.in_kernel_stubs(st.__rip)) {
+        std::uint64_t ret = 0;
+        if (r.rd8(st.__rsp, &ret) && code.has(ret)) s.pc[s.n++] = ret;
+    }
+    std::uint64_t rbp = st.__rbp;
+    int jumps = 0;
+    while (s.n < kDepth) {
+        std::uint64_t up = 0, ret = 0;
+        if (!r.rd8(rbp, &up) || !r.rd8(rbp + 8, &ret) || !code.has(ret)) break;
+        s.pc[s.n++] = ret;
+        if (up == rbp) break;
+        if ((up < rbp || up - rbp > (64ull << 20)) && ++jumps > 4) break;
+        rbp = up;
+    }
+}
+
+std::vector<std::string> split(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t a = 0;
+    while (a <= s.size()) {
+        const std::size_t b = s.find(',', a);
+        const std::string part = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+        if (!part.empty()) out.push_back(part);
+        if (b == std::string::npos) break;
+        a = b + 1;
+    }
+    return out;
+}
+
+struct Thread {
+    thread_act_t port = MACH_PORT_NULL;  // holds a send right until release_threads
+    std::uint32_t tid = 0;
+    std::string name;  // pthread_setname_np's; unnamed: "main" for the game's main loop, else "bbhost" (Linux's comm)
+};
+
+bool rosetta_thread(const char* name) { return std::strncmp(name, "com.apple.rosetta", 17) == 0; }
+
+// Asked once, without suspending: a thread it fails for is never suspended.
+bool readable(thread_act_t port, std::uint32_t tid) {
+    static std::mutex mu;
+    static std::vector<std::pair<std::uint32_t, bool>> known;
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& k : known) {
+        if (k.first == tid) return k.second;
+    }
+    x86_thread_state64_t st;
+    mach_msg_type_number_t c = x86_THREAD_STATE64_COUNT;
+    const bool ok = thread_get_state(port, x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&st), &c) == KERN_SUCCESS;
+    known.emplace_back(tid, ok);
+    return ok;
+}
+
+// The ports are released by release_threads.
+std::vector<Thread> list_threads(int* skipped = nullptr) {
+    std::vector<Thread> out;
+    thread_act_array_t th = nullptr;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return out;
+    const mach_port_t self = mach_thread_self();
+    out.reserve(n);
+    int skip = 0;
+    for (mach_msg_type_number_t i = 0; i < n; ++i) {
+        thread_identifier_info_data_t id{};
+        thread_extended_info_data_t ei{};
+        mach_msg_type_number_t c = THREAD_IDENTIFIER_INFO_COUNT;
+        const bool have_id = thread_info(th[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id), &c) == KERN_SUCCESS;
+        c = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(th[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&ei), &c) != KERN_SUCCESS) ei.pth_name[0] = 0;
+        ei.pth_name[sizeof(ei.pth_name) - 1] = 0;
+        const auto tid = static_cast<std::uint32_t>(id.thread_id);
+        if (th[i] == self || !have_id || rosetta_thread(ei.pth_name) || !readable(th[i], tid)) {
+            if (th[i] != self) ++skip;
+            mach_port_deallocate(mach_task_self(), th[i]);
+            continue;
+        }
+        Thread t;
+        t.port = th[i];
+        t.tid = tid;
+        t.name = ei.pth_name[0] ? ei.pth_name : tid == g_main_tid.load() ? "main" : "bbhost";
+        out.push_back(std::move(t));
+    }
+    mach_port_deallocate(mach_task_self(), self);
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(th), n * sizeof(th[0]));
+    if (skipped) *skipped = skip;
+    return out;
+}
+
+void release_threads(std::vector<Thread>& ts) {
+    for (Thread& t : ts) mach_port_deallocate(mach_task_self(), t.port);
+    ts.clear();
+}
+
+// Nothing between suspend and resume may take a lock. False when the thread
+// is gone or would not answer.
+bool take(const Thread& t, Sample& s, StackReader& r, const Code& code) {
+    s.tid = t.tid;
+    s.n = 0;
+    if (thread_suspend(t.port) != KERN_SUCCESS) return false;
+    x86_thread_state64_t st;
+    mach_msg_type_number_t c = x86_THREAD_STATE64_COUNT;
+    const bool got = thread_get_state(t.port, x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&st), &c) == KERN_SUCCESS;
+    if (got) unwind(s, st, r, code);
+    thread_resume(t.port);
+    return got && s.n;
+}
+
+void write_maps(const std::string& path, const std::vector<Image>& imgs) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    for (const Image& m : imgs) {
+        std::fprintf(f, "%llx-%llx r-xp %llx 00:00 0 %s\n", static_cast<unsigned long long>(m.lo), static_cast<unsigned long long>(m.hi),
+                     static_cast<unsigned long long>(m.link), m.path.c_str());
+    }
+    std::fclose(f);
+}
+
+// Ours as bbhost+offset from the Mach-O header, which atos -l takes.
+std::string frame_name(std::uint64_t pc, const std::vector<Image>& imgs) {
+    char buf[256];
+    if (in_guest(pc)) {
+        std::snprintf(buf, sizeof(buf), " g%llx", static_cast<unsigned long long>(pc - g_guest_lo + 0x400000ull));
+        return buf;
+    }
+    for (const Image& m : imgs) {
+        if (pc < m.lo || pc >= m.hi) continue;
+        const char* slash = std::strrchr(m.path.c_str(), '/');
+        const char* name = slash ? slash + 1 : m.path.c_str();
+        Dl_info di{};
+        if (m.header != host_image_base() && dladdr(reinterpret_cast<void*>(static_cast<std::uintptr_t>(pc)), &di) && di.dli_sname &&
+            di.dli_saddr && pc - reinterpret_cast<std::uintptr_t>(di.dli_saddr) < 0x4000) {
+            std::snprintf(buf, sizeof(buf), " %s!%s+0x%llx", name, di.dli_sname,
+                          static_cast<unsigned long long>(pc - reinterpret_cast<std::uintptr_t>(di.dli_saddr)));
+        } else {
+            std::snprintf(buf, sizeof(buf), " %s+0x%llx", name, static_cast<unsigned long long>(pc - m.header));
+        }
+        return buf;
+    }
+    std::snprintf(buf, sizeof(buf), " %llx", static_cast<unsigned long long>(pc));
+    return buf;
+}
+
+// Formatted and logged only once every thread runs again.
+void log_all_threads(const char* why) {
+    const std::vector<Image> imgs = read_images();
+    static Code code;
+    code.set(imgs);
+    static StackReader* const reader = new StackReader;
+    int skipped = 0;
+    std::vector<Thread> ts = list_threads(&skipped);
+    std::vector<Sample> samples(ts.size());
+    int answered = 0;
+    for (std::size_t i = 0; i < ts.size(); ++i) answered += take(ts[i], samples[i], *reader, code);
+    host_log("watchdog: %s - %zu threads, %d answered (%d of Rosetta's or unreadable left out):", why, ts.size(), answered, skipped);
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+        std::string line;
+        if (!samples[i].n) line = " (no answer)";
+        for (int k = 0; k < samples[i].n && k < 18; ++k) line += frame_name(samples[i].pc[k], imgs);
+        host_log("  %u %s:%s", ts[i].tid, ts[i].name.c_str(), line.c_str());
+    }
+    release_threads(ts);
+}
+
+}  // namespace
+
+void sampler_recover() {}  // the walks read through vm_read_overwrite: nothing faults
+void sampler_note_main_thread() { g_main_tid.store(host_thread_id()); }
+
+// As on Windows: suspending a thread does not cut a blocking call short, so
+// the watchdog runs from the start.
+void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
+    if (!g_guest_lo) {
+        g_guest_lo = guest_lo;
+        g_guest_hi = guest_hi;
+    }
+    // BBHOST_WATCHDOG_S (default 15; 0 off): how long without a flip is a stall.
+    static const int stall_s = [] {
+        const char* e = std::getenv("BBHOST_WATCHDOG_S");
+        return e ? std::max(0, std::atoi(e)) : 15;
+    }();
+    if (!stall_s) return;
+    std::thread([] {
+        host_thread_set_name("bb-watchdog");
+        std::uint64_t last_flip = hle_video_flip_count();
+        int still_s = 0, dumps = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const std::uint64_t flip = hle_video_flip_count();
+            if (flip != last_flip) {
+                if (still_s >= stall_s) host_log("watchdog: flips again after %d s (flip %llu)", still_s, static_cast<unsigned long long>(flip));
+                last_flip = flip;
+                still_s = 0;
+                continue;
+            }
+            ++still_s;
+            // A stall: said every 5 s, and every thread's stack at its start
+            // and 30 s on (at most six dumps a run).
+            if (still_s >= stall_s && (still_s - stall_s) % 5 == 0) {
+                host_log("watchdog: no flip for %d s (flip %llu)", still_s, static_cast<unsigned long long>(flip));
+            }
+            if ((still_s == stall_s || still_s == stall_s + 30) && dumps < 6) {
+                ++dumps;
+                char why[64];
+                std::snprintf(why, sizeof(why), "no flip for %d s", still_s);
+                log_all_threads(why);
+            }
+        }
+    }).detach();
+}
+
+void sampler_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
+    const char* names = std::getenv("BBHOST_SAMPLE");
+    if (!names || !*names) return;
+    const std::vector<std::string> prefixes = split(names);
+    const char* hz_env = std::getenv("BBHOST_SAMPLE_HZ");
+    const int hz = hz_env ? std::max(10, std::atoi(hz_env)) : 997;
+    const char* out_env = std::getenv("BBHOST_SAMPLE_OUT");
+    const std::string out = out_env ? out_env : "build/samples";
+    g_guest_lo = guest_lo;
+    g_guest_hi = guest_hi;
+    if (const char* pe = std::getenv("BBHOST_SAMPLE_PERF"); pe && pe[0] == '1') {
+        host_log("sampler: BBHOST_SAMPLE_PERF is Linux only; sampling by thread states instead");
+    }
+    FILE* f = std::fopen((out + ".txt").c_str(), "w");
+    if (!f) {
+        host_log("sampler: cannot write %s.txt", out.c_str());
+        return;
+    }
+    host_log("sampler: %s at %d Hz into %s.txt (thread states)", names, hz, out.c_str());
+    std::thread([prefixes, hz, out, f] {
+        host_thread_set_name("bb-sampler");
+        const auto period = std::chrono::nanoseconds(1000000000 / hz);
+        auto next = std::chrono::steady_clock::now();
+        auto last_scan = next - std::chrono::seconds(10), last_maps = next - std::chrono::seconds(10);
+        std::vector<Thread> watched;
+        std::vector<std::uint32_t> named;
+        std::vector<Image> imgs;
+        Code code;
+        auto* reader = new StackReader;
+        std::uint64_t skipped = 0, said_skipped = 0, worst_late_flip = 0;
+        double worst_late_ms = 0;
+        static const std::uint64_t from_flip = [] {
+            const char* e = std::getenv("BBHOST_SAMPLE_FROM_FLIP");
+            return e ? std::strtoull(e, nullptr, 10) : 0ull;
+        }();
+        Sample s;
+        for (;;) {
+            next += period;
+            std::this_thread::sleep_until(next);
+            if (from_flip && hle_video_flip_count() < from_flip) continue;
+            const auto now = std::chrono::steady_clock::now();
+            // Held up: the ticks missed are dropped, not fired back to back (as on Linux).
+            if (now - next > 4 * period) {
+                skipped += static_cast<std::uint64_t>((now - next) / period);
+                const double late_ms = std::chrono::duration<double, std::milli>(now - next).count();
+                if (late_ms > worst_late_ms) {
+                    worst_late_ms = late_ms;
+                    worst_late_flip = hle_video_flip_count();
+                }
+                next = now;
+            }
+            if (now - last_scan > std::chrono::seconds(1)) {
+                last_scan = now;
+                imgs = read_images();
+                code.set(imgs);
+                release_threads(watched);
+                for (Thread& t : list_threads()) {
+                    bool hit = false;
+                    for (const std::string& p : prefixes) {
+                        hit = p == "main" ? t.tid == g_main_tid.load() : t.name.compare(0, p.size(), p) == 0;
+                        if (hit) break;
+                    }
+                    if (!hit) {
+                        mach_port_deallocate(mach_task_self(), t.port);
+                        continue;
+                    }
+                    if (std::find(named.begin(), named.end(), t.tid) == named.end()) {
+                        named.push_back(t.tid);
+                        std::fprintf(f, "#thread %u %s\n", t.tid, t.name.c_str());
+                    }
+                    watched.push_back(std::move(t));
+                }
+                const double scan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
+                if (scan_ms > 20) host_log("sampler: finding the threads took %.0f ms", scan_ms);
+            }
+            s.flip = hle_video_flip_count();
+            for (const Thread& t : watched) {
+                if (!take(t, s, *reader, code)) continue;
+                std::fprintf(f, "%llu %u", static_cast<unsigned long long>(s.flip), s.tid);
+                for (int k = 0; k < s.n; ++k) {
+                    const std::uint64_t pc = s.pc[k];
+                    if (in_guest(pc)) {
+                        std::fprintf(f, " g%llx", static_cast<unsigned long long>(pc - g_guest_lo + 0x400000ull));  // Binary Ninja's address
+                    } else {
+                        std::fprintf(f, " %llx", static_cast<unsigned long long>(pc));
+                    }
+                }
+                std::fputc('\n', f);
+            }
+            if (now - last_maps > std::chrono::seconds(5)) {
+                std::fflush(f);
+                write_maps(out + ".maps", imgs);
+                if (skipped != said_skipped) {
+                    host_log("sampler: %llu ticks skipped while this thread was held up (the longest %.0f ms, at flip %llu)",
+                             static_cast<unsigned long long>(skipped), worst_late_ms, static_cast<unsigned long long>(worst_late_flip));
+                    said_skipped = skipped;
+                }
                 last_maps = now;
             }
         }

@@ -241,6 +241,10 @@ struct TranslateOptions {
     // of LDS, more than Vulkan devices have to offer, so the array we declare is
     // the size COMPUTE_PGM_RSRC2 asks for, capped here.
     std::uint32_t max_lds_bytes = 32 * 1024;
+    // Lane index from an exclusive subgroup add instead of
+    // SubgroupLocalInvocationId: MoltenVK has no subgroup built-ins outside
+    // fragment and compute, so a vertex stage reading one fails to compile.
+    bool lane_from_scan = false;
     const Program* fetch = nullptr;   // VS fetch shader, inlined at s_swappc_b64
     // Vertex stage without `fetch`: s_swappc_b64 loads these elements from
     // vertex input where it would have called the fetch shader.
@@ -360,6 +364,9 @@ struct TranslateOptions {
     // where they care - not all of them do.
     bool tess_patch_cull = false;
     bool tess_patch_cull_all = false;  // a check: leave every patch out
+    // Declare StageParams::vertex_formats even if unread: a domain shader fused
+    // with its LS (gcn/tess_vertex.h) merges params blocks only of one type.
+    bool params_vertex_formats = false;
     // ds_append / ds_consume with GDS set count in the guest word the dispatch
     // binds for each GDS dword (StageParams::gds_counter): GX keeps an
     // append/consume buffer's counter in the word past its records and only
@@ -394,7 +401,7 @@ struct TranslateResult {
     // Page-table walks the shader keeps, by reason (a load's instruction and
     // why it is not a storage-buffer read): sites in the program.
     std::map<std::string, std::uint32_t> walks;
-    // Vertex-shader interface, for the rect-list geometry shader.
+    // Vertex-shader interface, for the rect-list expansion.
     std::vector<std::uint32_t> vs_params;  // output locations the params are written at
     std::vector<std::uint32_t> ps_inputs;  // pixel stage: the inputs the shader reads (input k at location k without ps_input_map)
     int vs_clip_count = 0;
@@ -418,6 +425,13 @@ struct TranslateResult {
 // v1 + v2 - v0 for position and every varying.
 std::vector<std::uint32_t> make_rect_geometry_shader(const std::vector<std::uint32_t>& param_locations, int clip_count,
                                                      bool point_size);
+// The same rectangle via tessellation (3-point patches, levels 1) where the
+// device has no geometry stage (Metal). The vertex stage must not write a
+// point size: MoltenVK then draws nothing for a tessellated draw.
+struct RectTessShaders {
+    std::vector<std::uint32_t> control, evaluation;
+};
+RectTessShaders make_rect_tess_shaders(const std::vector<std::uint32_t>& param_locations, int clip_count);
 
 // A T#'s dimensions predicted from the program alone (image_dims.cpp), in the
 // form TranslateOptions::image_dims takes: dim as spv::Dim with 3 for a cube,

@@ -1,5 +1,6 @@
 #include "host/gpu_mutex.h"
 
+#include "core/portable.h"
 #include "log.h"
 
 #include <algorithm>
@@ -16,7 +17,7 @@
 #include <unistd.h>
 #endif
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 extern "C" char __executable_start;  // the linker's: where this binary's image starts
 #endif
 
@@ -58,14 +59,50 @@ Site* site_of(void* at) {
 
 std::atomic<std::uint64_t> g_last_report{0};
 
+#if !defined(_WIN32)
+// A word for popen's shell: in single quotes, each of its own written '\''.
+std::string shell_quote(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            q += "'\\''";
+        } else {
+            q += c;
+        }
+    }
+    return q + "'";
+}
+#endif
+
 // addr2line on our own binary for a handful of addresses.
 std::vector<std::string> symbolize(const std::vector<void*>& addrs) {
     std::vector<std::string> out(addrs.size(), "?");
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    // atos wants the image's load address (its Mach-O header) with -l.
+    const std::string exe = host_exe_path();
+    if (exe.empty()) return out;
+    char base[32];
+    std::snprintf(base, sizeof(base), "0x%lx", static_cast<unsigned long>(host_image_base()));
+    std::string cmd = "atos -o " + shell_quote(exe) + " -l " + base;
+    for (void* a : addrs) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " 0x%lx", static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(a) - 1));
+        cmd += buf;
+    }
+    if (FILE* p = popen(cmd.c_str(), "r")) {
+        char line[1024];
+        for (std::size_t i = 0; i < addrs.size(); ++i) {
+            if (!std::fgets(line, sizeof(line), p)) break;
+            line[std::strcspn(line, "\n")] = 0;
+            out[i] = line;
+        }
+        pclose(p);
+    }
+#elif !defined(_WIN32)
     // Our own path: in the child, /proc/self/exe would be addr2line.
-    char exe[4096] = {};
-    if (readlink("/proc/self/exe", exe, sizeof(exe) - 1) <= 0) return out;
-    std::string cmd = std::string("addr2line -f -C -e '") + exe + "'";
+    const std::string exe = host_exe_path();
+    if (exe.empty()) return out;
+    std::string cmd = "addr2line -f -C -e " + shell_quote(exe);
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(&__executable_start);
     for (void* a : addrs) {
         char buf[32];

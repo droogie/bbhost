@@ -11,6 +11,10 @@
 // size of a TEB whose slot n holds the TCB, FS stays glibc's for good, and
 // the thunks stop switching FS - so the Windows-shaped path is proven on
 // the game here, before a Windows build exists.
+//
+// macOS lets no program set FS or GS either, but libpthread keeps each
+// thread's TSD at GS (key k at gs:[8*k]), under Rosetta 2 too. There the
+// slot is a pthread key of ours whose value is the TCB.
 #pragma once
 
 #include <cstddef>
@@ -24,11 +28,24 @@ constexpr std::uint32_t kTebTlsSlots = 0x1480;
 constexpr std::uint32_t kTebTlsSlotCount = 64;
 constexpr std::size_t kTebStandInSize = 0x1800;
 
+// Where the slots start in the GS segment: TEB.TlsSlots on Windows and in
+// the Linux stand-in; on macOS GS is the TSD array itself, key 0 at gs:0.
+#if defined(__APPLE__)
+constexpr std::uint32_t kGsSlotsBase = 0;
+// libpthread's TSD array (_INTERNAL_POSIX_THREAD_KEYS_END); a key past it is
+// not at gs:[8*key].
+constexpr std::uint32_t kTsdSlotCount = 768;
+#else
+constexpr std::uint32_t kGsSlotsBase = kTebTlsSlots;
+#endif
+
 // True when the guest reads its TCB through GS (BBHOST_TLS_GS=1 on Linux,
-// always on Windows). Read anywhere; fixed before the eboot is loaded.
+// always on Windows and macOS). Read anywhere; fixed before the eboot is
+// loaded.
 bool tls_gs_mode();
-// The displacement the rewritten sites read: kTebTlsSlots + 8 * slot, and
-// the slot itself (Windows: from TlsAlloc, below 64 so it is in the TEB).
+// The displacement the rewritten sites read: kGsSlotsBase + 8 * slot, and
+// the slot itself (Windows: from TlsAlloc, below 64 so it is in the TEB;
+// macOS: a pthread key).
 std::uint32_t tls_gs_disp();
 std::uint32_t tls_gs_slot();
 

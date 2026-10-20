@@ -35,10 +35,11 @@ void host_read_safe_recover();
 // minute soak (hle/gx_trace.cpp, safe_read).
 bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi);
 // The calling thread's OS id (gettid / GetCurrentThreadId), for logs and keys.
+// macOS: pthread_threadid_np, which fits 32 bits in practice.
 std::uint32_t host_thread_id();
 // Names the calling thread for the tools that list threads: pthread_setname_np
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
-// SetThreadDescription, which the sampler and debuggers read.
+// SetThreadDescription, which the sampler and debuggers read. macOS: 63 chars.
 void host_thread_set_name(const char* name);
 // The largest width and height among the desktop's displays, in physical
 // pixels (each display's current mode). False when the platform does not say
@@ -48,8 +49,20 @@ bool host_desktop_max_size(int* w, int* h);
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.
 void host_thread_fit_name(const char* name, char (&out)[16]);
 // Where this executable is loaded: code addresses minus this are what
-// addr2line takes (the link addresses, PIE's start at 0).
+// addr2line takes (the link addresses, PIE's start at 0). macOS: for atos -l.
 std::uintptr_t host_image_base();
+// This executable's path, or empty. Windows: in the ANSI code page the C
+// library's file calls take; macOS: symbolic links resolved.
+std::string host_exe_path();
+#if defined(__APPLE__)
+// macOS: the loaded image with a segment (executable when code_only) holding
+// addr: its path and Mach-O header address. bbhost's data segment holds the
+// guest's low windows (core/mac_vm.h), so only code_only rejects those.
+bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base);
+// macOS: [addr, addr+len) is mapped readable. Fault- and lock-free, so the
+// fault handler may ask; Rosetta 2's stacks can't be told by address.
+bool host_readable(std::uint64_t addr, std::size_t len);
+#endif
 // Windows: the threads host_thread_set_name named, with their CPU time
 // (kernel + user, 100 ns units), for frame statistics. A registry, not a
 // Toolhelp snapshot: that walks every thread on the system, tens of
@@ -64,7 +77,8 @@ struct HostThreadTime {
 std::vector<HostThreadTime> host_thread_times();
 // Sleeps for about `usec` microseconds: usleep on Linux; on Windows a
 // high-resolution waitable timer (Sleep's granularity is the 15.6 ms system
-// tick without timeBeginPeriod, and the guest's polling loops sleep 100 us).
+// tick without timeBeginPeriod, and the guest's polling loops sleep 100 us);
+// macOS: a kqueue timer, as usleep wakes up to a quarter of the sleep late.
 void host_sleep_us(std::uint64_t usec);
 // Sleeps until `t` on the steady clock through host_sleep_us. Use these, not
 // std::this_thread::sleep_for/sleep_until, for anything under a millisecond:

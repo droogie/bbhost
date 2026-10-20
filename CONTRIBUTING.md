@@ -25,9 +25,10 @@
   (`render/...`, `perf/...`, `fix/...`) and open a pull request.
 - Rebase on `origin/master` before opening it; keep history linear, one
   commit per logical change.
-- CI builds Linux and Windows and runs the tests; it must pass. CI has no GPU
-  and no game files, so evidence that a change works in game is yours to
-  bring.
+- CI builds Linux, Windows and macOS and runs the tests; the Linux and Windows
+  jobs must pass. The macOS jobs don't block for now (`continue-on-error`), but
+  look at them. CI has no GPU and no game files, so evidence that a change
+  works in game is yours to bring.
 - A commit message says what changed and why: a short subject
   (`render: the woods' trees are instanced draws`), then the cause and how it
   was checked.
@@ -69,6 +70,25 @@ release* from the Actions page.
 - **Engine knowledge** (layouts, addresses) that plugins can use belongs in
   `include/bbhost/engine/`.
 - Windows builds use Clang only (`__attribute__((sysv_abi))`).
+- **macOS** runs bbhost as an x86_64 program under Rosetta 2, and CI cannot
+  catch these rules:
+  - Hand-written assembly names C symbols with `ASM_SYM(name)`
+    (`src/core/asm_sym.h`): Mach-O puts an underscore before every C name.
+  - A host thread that runs guest callbacks is a `HostThread`
+    (`src/core/host_thread.h`), not a `std::thread`: macOS gives a thread a
+    512 KiB stack where the guest's callbacks run on the caller's own.
+  - A mapping at a fixed guest address goes through `mac_vm_map`
+    (`src/core/mac_vm.h`), not `mmap` with `MAP_FIXED`: the guest's address
+    windows are placeholders that it keeps, so nothing of the host's lands in
+    them.
+  - A signal handler reads and writes registers through `UC_REG(uc, RIP)` and
+    the like (`src/core/host_ucontext.h`), not through `gregs`: on macOS the
+    context points at a thread state with other member names.
+  - No writable data on a page the game's code runs from: under Rosetta a
+    write to such a page makes it translate the page again, tens of
+    microseconds a write. Counters, masks and slots that code updates while
+    the game runs go on pages of their own that are never executable
+    (`src/core/maskmov_rewrite.cpp`, `src/engine/graphics_patch.cpp`).
 
 ## Rendering changes
 

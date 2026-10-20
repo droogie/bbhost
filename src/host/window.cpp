@@ -50,6 +50,8 @@ static std::atomic<std::uint64_t> g_window_pixels{0};
 namespace {
 
 std::atomic<bool> g_active{false};
+// SDL's video came up (an error box can show), whether or not the window did.
+std::atomic<bool> g_video_up{false};
 std::mutex g_pad_mu;
 PadState g_pad;
 
@@ -1484,9 +1486,10 @@ bool window_start_impl(int width, int height, const char* title);
 // messages go to that thread's queue, and the system destroys it when that
 // thread exits. Made on the helper, it showed for a moment and was gone (a
 // Windows 11 laptop, every run), while the game ran on without it; the
-// caller is the thread that pumps it (run_guest_start).
+// caller is the thread that pumps it (run_guest_start). Same on macOS: SDL's
+// Cocoa driver starts on the main thread only.
 bool host_window_start(int width, int height, const char* title) {
-#if defined(BBHOST_HAVE_SDL3) && defined(_WIN32)
+#if defined(BBHOST_HAVE_SDL3) && (defined(_WIN32) || defined(__APPLE__))
     return window_start_impl(width, height, title);
 #elif defined(BBHOST_HAVE_SDL3)
     // The shared state lives past a return from here (the thread may not
@@ -1534,15 +1537,26 @@ bool host_window_start(int width, int height, const char* title) {
 #if defined(BBHOST_HAVE_SDL3)
 namespace {
 bool window_start_impl(int width, int height, const char* title) {
+#if defined(__APPLE__)
+    // Fullscreen in place, as on PC, not in a Space of its own behind an
+    // animation.
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
+    g_video_up = true;
     // The options are read before the window exists, so a saved Fullscreen
     // is only a wish until here (host_window_set_fullscreen).
     const bool fullscreen = g_want_fullscreen.load();
-    g_window = SDL_CreateWindow(title, width, height,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+#if defined(__APPLE__)
+    // Retina pixels, not points scaled up blurred; the presenter already
+    // reads sizes in pixels.
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#endif
+    g_window = SDL_CreateWindow(title, width, height, flags);
     if (g_window && fullscreen) host_log("window: fullscreen");
     if (!g_window) {
         host_log("SDL_CreateWindow failed: %s", SDL_GetError());
@@ -2225,6 +2239,7 @@ void host_window_stop() {
 }
 
 bool host_window_active() { return g_active.load(); }
+bool host_window_video_up() { return g_video_up.load(); }
 
 MouseState host_mouse_state() {
     std::lock_guard<std::mutex> lock(g_mouse_mu);

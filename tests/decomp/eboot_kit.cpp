@@ -18,6 +18,7 @@
 #include <limits>
 #include <string>
 
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -195,9 +196,14 @@ void load(const char* test) {
         tcb->self = tcb;
         tcb->magic = kTcbMagic;
         g_tcb = tcb;
+#if defined(__APPLE__)
+        // macOS: the slot is a pthread key of ours, read at gs:[8*key].
+        pthread_setspecific(static_cast<pthread_key_t>(tls_gs_slot()), tcb);
+#else
         auto* teb = static_cast<std::uint8_t*>(std::calloc(1, kTebStandInSize));
         std::memcpy(teb + tls_gs_disp(), &tcb, sizeof(tcb));
         syscall(SYS_arch_prctl, ARCH_SET_GS, reinterpret_cast<unsigned long>(teb));
+#endif
     }
     guest_fp();
     g_loaded = true;

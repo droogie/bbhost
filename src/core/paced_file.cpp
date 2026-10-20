@@ -29,6 +29,9 @@ bool HostPacedFile::sync() {
     if (std::fflush(f_) != 0) return false;
 #if defined(_WIN32)
     return _commit(_fileno(f_)) == 0;
+#elif defined(__APPLE__)
+    // No fdatasync on macOS; F_FULLFSYNC (drive cache flush) is not needed.
+    return ::fsync(fileno(f_)) == 0;
 #else
     return ::fdatasync(fileno(f_)) == 0;
 #endif

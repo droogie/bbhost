@@ -4,6 +4,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #else
 #include <link.h>
 #endif
@@ -38,6 +40,13 @@ constexpr Hook kHooks[] = {
 bool loaded(const char* module) {
 #if defined(_WIN32)
     return GetModuleHandleA(module) != nullptr;
+#elif defined(__APPLE__)
+    const std::uint32_t n = _dyld_image_count();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && std::strstr(name, module)) return true;
+    }
+    return false;
 #else
     struct Find {
         const char* name;

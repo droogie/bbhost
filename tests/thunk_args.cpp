@@ -1,5 +1,6 @@
 // Phase 0.1: the guest->host thunk must forward register args, stack args,
 // varargs, vector args, preserve return registers, nest, and switch FS.
+#include "core/asm_sym.h"
 #include "core/thunk.h"
 #include "core/tls_rewrite.h"
 #include "guest_abi.h"
@@ -165,40 +166,33 @@ void* g_cap_inner_ret = nullptr;
 void* g_cap_outer_ret = nullptr;
 void cap_outer();
 }
-#if defined(_WIN32)
-#define TYPE_SIZE_(name, what)
-#else
-#define TYPE_SIZE_(name, what) what
-#endif
-asm(R"(
-    .text
-    .globl cap_inner
-)" TYPE_SIZE_(cap_inner, R"(    .type cap_inner,@function
-)") R"(cap_inner:
-    push %rbp
-    mov %rsp, %rbp
-    mov $1, %edi
-    mov $2, %esi
-    mov $3, %edx
-    call *g_cap_stub(%rip)
-1:  lea 1b(%rip), %rax
-    mov %rax, g_cap_inner_ret(%rip)
-    pop %rbp
-    ret
-)" TYPE_SIZE_(cap_inner, R"(    .size cap_inner, .-cap_inner
-)") R"(
-    .globl cap_outer
-)" TYPE_SIZE_(cap_outer, R"(    .type cap_outer,@function
-)") R"(cap_outer:
-    push %rbp
-    mov %rsp, %rbp
-    call cap_inner
-2:  lea 2b(%rip), %rax
-    mov %rax, g_cap_outer_ret(%rip)
-    pop %rbp
-    ret
-)" TYPE_SIZE_(cap_outer, R"(    .size cap_outer, .-cap_outer
-)"));
+asm(".text\n"
+    "    .globl " ASM_SYM(cap_inner) "\n"
+    ASM_TYPE_FUNCTION(cap_inner)
+    ASM_SYM(cap_inner) ":\n"
+    "    push %rbp\n"
+    "    mov %rsp, %rbp\n"
+    "    mov $1, %edi\n"
+    "    mov $2, %esi\n"
+    "    mov $3, %edx\n"
+    "    call *" ASM_SYM(g_cap_stub) "(%rip)\n"
+    "1:  lea 1b(%rip), %rax\n"
+    "    mov %rax, " ASM_SYM(g_cap_inner_ret) "(%rip)\n"
+    "    pop %rbp\n"
+    "    ret\n"
+    ASM_SIZE(cap_inner)
+
+    "    .globl " ASM_SYM(cap_outer) "\n"
+    ASM_TYPE_FUNCTION(cap_outer)
+    ASM_SYM(cap_outer) ":\n"
+    "    push %rbp\n"
+    "    mov %rsp, %rbp\n"
+    "    call " ASM_SYM(cap_inner) "\n"
+    "2:  lea 2b(%rip), %rax\n"
+    "    mov %rax, " ASM_SYM(g_cap_outer_ret) "(%rip)\n"
+    "    pop %rbp\n"
+    "    ret\n"
+    ASM_SIZE(cap_outer));
 
 namespace {
 void check_capture_frame() {

@@ -17,6 +17,10 @@
 //              the comparison must flag exactly that texel. A perturbed copy of
 //              A's output checks the comparator the same way.
 //   variant    --ps: the same draw with another pixel shader, against A.
+// --bench N: alternating timed batches of N draws, captured modules and variant.
+// --bench-split: a pass per repeat, since a tiler shades an opaque draw repeated
+// in one pass once, plus an empty-pass series to subtract (empty_ms_per_draw).
+// --bench-wall: submit-to-fence time. --bench-batches: how many batches.
 // --specialize: every run's stages take the specialization constants bbhost's
 // optimized relink gives them (render.cpp relink_pipeline): the vertex
 // formats as constants for a vertex shader that reads them from its params,
@@ -40,8 +44,14 @@
 // multiset of its records; every other byte of every page exactly.
 //
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
+// The portability subset's features struct is in the beta header.
+#if defined(__APPLE__)
+#define VK_ENABLE_BETA_EXTENSIONS 1
+#endif
 #include "core/sha256.h"
 #include "gcn/translate.h"
+#include "host/descriptor_layouts.h"
+#include "host/vk_portability.h"
 #include "replay/compare.h"
 #include "replay/json.h"
 
@@ -51,6 +61,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -246,6 +257,7 @@ public:
     VkFence fence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties mem{};
     bool depth_bounds = false;
+    bool sampler_lod_bias = true;      // false where the portability subset has no sampler mip LOD bias (MoltenVK)
     bool gpl = false;                  // VK_EXT_graphics_pipeline_library (--library)
     float timestamp_period_ns = 0.0f;  // 0: the queue has no timestamp queries
     std::string name;
@@ -262,6 +274,7 @@ public:
         }
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
+        gpu::portability_enumeration(ici, exts);
         ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
         ici.ppEnabledLayerNames = layers.data();
         ici.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
@@ -315,12 +328,15 @@ public:
         std::vector<VkExtensionProperties> props(next);
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, props.data());
         std::vector<const char*> dext;
-        bool gpl_ext = false, lib_ext = false;
+        bool gpl_ext = false, lib_ext = false, portability = false;
         for (const VkExtensionProperties& e : props) {
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) dext.push_back("VK_KHR_maintenance8");
             if (std::strcmp(e.extensionName, "VK_EXT_graphics_pipeline_library") == 0) gpl_ext = true;
             if (std::strcmp(e.extensionName, "VK_KHR_pipeline_library") == 0) lib_ext = true;
+            if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) portability = true;
         }
+        // A device that lists the portability subset must have it enabled.
+        if (portability) dext.push_back("VK_KHR_portability_subset");
         gpl = gpl_ext && lib_ext;
         if (gpl) {  // bbhost's BBHOST_PIPELINE_LIBRARY path, replayed with --library
             dext.push_back("VK_KHR_pipeline_library");
@@ -333,22 +349,42 @@ public:
         VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
         fgpl.graphicsPipelineLibrary = VK_TRUE;
         if (gpl) f13.pNext = &fgpl;
+#if defined(__APPLE__)
+        // As bbhost: enable every portability-subset feature the device has.
+        VkPhysicalDevicePortabilitySubsetFeaturesKHR fport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+        if (portability) {
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &fport;
+            vkGetPhysicalDeviceFeatures2(phys, &qf);
+            fport.pNext = f13.pNext;
+            f13.pNext = &fport;
+            sampler_lod_bias = fport.samplerMipLodBias == VK_TRUE;
+        }
+#endif
+        VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        have.pNext = &have12;
+        vkGetPhysicalDeviceFeatures2(phys, &have);
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         f12.pNext = &f13;
         f12.bufferDeviceAddress = VK_TRUE;
+        f12.samplerMirrorClampToEdge = have12.samplerMirrorClampToEdge;
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &f12;
         f2.features.shaderInt64 = VK_TRUE;
         f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
         f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-        f2.features.geometryShader = VK_TRUE;
+        // MoltenVK has no geometry stage or cull distances: a capture that
+        // needs one fails at its pipeline.
+        f2.features.geometryShader = supported.geometryShader;
         f2.features.tessellationShader = supported.tessellationShader;  // as bbhost: its host tessellator's stages
+        f2.features.shaderTessellationAndGeometryPointSize = supported.shaderTessellationAndGeometryPointSize;
         f2.features.independentBlend = VK_TRUE;
         f2.features.fillModeNonSolid = VK_TRUE;
         f2.features.depthClamp = VK_TRUE;
         f2.features.dualSrcBlend = VK_TRUE;
         f2.features.shaderClipDistance = VK_TRUE;
-        f2.features.shaderCullDistance = VK_TRUE;
+        f2.features.shaderCullDistance = supported.shaderCullDistance;
         f2.features.samplerAnisotropy = VK_TRUE;
         f2.features.fragmentStoresAndAtomics = VK_TRUE;
         f2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
@@ -584,6 +620,7 @@ struct RunResult {
     // order (StageData::buffer_written).
     std::vector<std::vector<std::uint8_t>> stored;
     double gpu_ms = -1.0;             // RunOptions::timed: GPU time of the draws
+    double wall_ms = -1.0;            // the submission holding the draws, submit to fence (--bench-wall)
 };
 
 struct RunOptions {
@@ -596,6 +633,8 @@ struct RunOptions {
     bool timed = false;        // timestamps around the draws
     bool library = false;      // the pipeline is linked from libraries: independent sets, depth/stencil/cull state set per draw
     bool native = false;       // --native: the game-hull draw's three lifted stages on stage I/O (Replayer::native_pipeline)
+    bool split = false;        // --bench-split: each repeat in a render pass of its own
+    bool nodraw = false;       // --bench-split's empty series: the passes without the draws
     bool ls_set4 = false;      // --ls-set4: the variant's LS binds its constant buffers in set 4 (Replayer::load_ls_set4)
 };
 
@@ -659,7 +698,8 @@ public:
         if (native_layout_) vkDestroyPipelineLayout(dev_.device, native_layout_, nullptr);
         if (tess_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, tess_set_layout_, nullptr);
         if (empty_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, empty_set_layout_, nullptr);
-        if (set_layout_) vkDestroyDescriptorSetLayout(dev_.device, set_layout_, nullptr);
+        if (set_layouts_[1] && set_layouts_[1] != set_layouts_[0]) vkDestroyDescriptorSetLayout(dev_.device, set_layouts_[1], nullptr);
+        if (set_layouts_[0]) vkDestroyDescriptorSetLayout(dev_.device, set_layouts_[0], nullptr);
         if (cb_set_layout_) vkDestroyDescriptorSetLayout(dev_.device, cb_set_layout_, nullptr);
         for (auto& st : stages_) {
             dev_.destroy(st.params);
@@ -1089,7 +1129,7 @@ public:
         // Descriptor sets; views that alias the depth target view this run's image.
         check(vkResetDescriptorPool(dev_.device, pool_, 0), "vkResetDescriptorPool");
         VkDescriptorSet sets[4] = {};
-        VkDescriptorSetLayout layouts[4] = {set_layout_, set_layout_, cb_set_layout_, tess_set_layout_};
+        VkDescriptorSetLayout layouts[4] = {set_layouts_[0], set_layouts_[1], cb_set_layout_, tess_set_layout_};
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsai.descriptorPool = pool_;
         dsai.descriptorSetCount = ro.native || ro.ls_set4 ? 4 : 3;
@@ -1138,6 +1178,7 @@ public:
             for (const json::Value& b : json::arr(stages[st], "samplers")) {
                 const std::uint32_t binding = json::u32(b, "binding");
                 if (binding < gcn::kBindingSampler0 || binding >= gcn::kBindingSampler0 + 32) fail("sampler binding out of range");
+                if (binding >= gcn::kBindingSampler0 + stage_samplers_) fail("more samplers than the device binds a stage");
                 image_infos.push_back({samplers_.at(json::str(b, "sampler")), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
                 VkWriteDescriptorSet ws{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 ws.dstSet = sets[st];
@@ -1238,6 +1279,7 @@ public:
             qci.queryCount = 2;
             check(vkCreateQueryPool(dev_.device, &qci, nullptr, &qpool), "vkCreateQueryPool");
         }
+        const auto wall0 = std::chrono::steady_clock::now();
         dev_.submit([&](VkCommandBuffer cmd) {
             if (qpool) vkCmdResetQueryPool(cmd, qpool, 0, 2);
             std::vector<VkRenderingAttachmentInfo> atts;
@@ -1263,6 +1305,8 @@ public:
             ri.pColorAttachments = atts.data();
             if (has_depth_) ri.pDepthAttachment = &depth;
             if (has_stencil_) ri.pStencilAttachment = &depth;
+            // Outside the pass: Apple GPUs time only at encoder boundaries.
+            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
             vkCmdBeginRendering(cmd, &ri);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ro.pipeline);
             const bool set4 = ro.native || ro.ls_set4;
@@ -1328,7 +1372,6 @@ public:
                 if (index_.size < static_cast<VkDeviceSize>(count) * (type == VK_INDEX_TYPE_UINT32 ? 4 : 2)) fail("index blob shorter than the draw");
                 vkCmdBindIndexBuffer(cmd, index_.buffer, 0, type);
             }
-            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
             if (ro.native) {
                 // The game's draw (tessellation.draw): its index range, instances and base vertex.
                 const json::Value& nd = json::member(*tessellation(), "draw");
@@ -1340,12 +1383,17 @@ public:
                 }
             } else {
                 for (std::uint32_t k = 0; k < std::max(ro.repeat, 1u); ++k) {
+                    if (ro.split && k) {
+                        vkCmdEndRendering(cmd);
+                        vkCmdBeginRendering(cmd, &ri);
+                    }
+                    if (ro.nodraw) continue;
                     if (indexed) vkCmdDrawIndexed(cmd, count, instances, 0, base_vertex, 0);
                     else vkCmdDraw(cmd, count, instances, static_cast<std::uint32_t>(base_vertex), 0);
                 }
             }
-            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
             vkCmdEndRendering(cmd);
+            if (qpool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
             for (Plane& p : planes) {
                 VkBufferImageCopy r{};
                 r.imageSubresource = {p.out.aspect, 0, 0, 1};
@@ -1353,9 +1401,11 @@ public:
                 vkCmdCopyImageToBuffer(cmd, p.image, VK_IMAGE_LAYOUT_GENERAL, p.staging.buffer, 1, &r);
             }
         });
+        const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
 
         RunResult result;
         result.name = ro.name;
+        result.wall_ms = wall_ms;
         if (qpool) {
             std::uint64_t ts[2] = {};
             check(vkGetQueryPoolResults(dev_.device, qpool, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
@@ -1500,31 +1550,43 @@ private:
     }
 
     void build_layout() {
-        // bbhost's set layout (src/host/gpu.cpp): the modules were translated against it.
-        std::vector<VkDescriptorSetLayoutBinding> binds;
-        binds.push_back({gcn::kBindingParams, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-        for (std::uint32_t k = 0; k < 32; ++k) {
-            binds.push_back({gcn::kBindingImage0 + k, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
-            binds.push_back({gcn::kBindingSampler0 + k, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr});
-            binds.push_back({gcn::kBindingStorageImage0 + k, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_ALL, nullptr});
+        // bbhost's set layouts (src/host/descriptor_layouts.h), which the
+        // modules were translated against: shared by all stages unless over
+        // the device's per-stage limits (MoltenVK), then per stage as there.
+        using Binds = std::vector<VkDescriptorSetLayoutBinding>;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(dev_.phys, &props);
+        const Binds shared = gpu::shared_set_bindings(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, gpu::kMaxImages, true, VK_SHADER_STAGE_ALL);
+        const Binds all_cbs = gpu::cb_push_bindings(false);
+        const bool per_stage = !gpu::layout_over_limits({{&shared}, {&shared}, {&all_cbs}}, props.limits).empty();
+        bool pushed = false;
+        for (const json::Value& st : json::arr(cap_.m, "stages")) {
+            if (json::flag(st, "present")) pushed = pushed || spirv_uses_set(words_of(cap_.blob(json::str(st, "spirv")), "stage SPIR-V"), 2);
         }
-        for (std::uint32_t k = 0; k < gcn::kMaxBuffers; ++k) {
-            binds.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+        stage_samplers_ = gpu::shared_set_samplers(per_stage, props.limits.maxPerStageDescriptorSamplers);
+        if (per_stage) {
+            std::printf("drawreplay: descriptor sets per stage, %u samplers a stage, constant buffers in %s: the layouts as they are "
+                        "are over the device's limits\n",
+                        stage_samplers_, pushed ? "set 2" : "the stage sets");
         }
-        VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        lci.bindingCount = static_cast<std::uint32_t>(binds.size());
-        lci.pBindings = binds.data();
-        check(vkCreateDescriptorSetLayout(dev_.device, &lci, nullptr, &set_layout_), "vkCreateDescriptorSetLayout");
-        // Set 2: the constant buffers, both stages' bindings (spirv_uses_set).
-        std::vector<VkDescriptorSetLayoutBinding> cbs;
-        for (std::uint32_t k = 0; k < 2 * gcn::kMaxBuffers; ++k) {
-            cbs.push_back({gcn::kBindingStorageBuffer0 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+        const auto make = [&](const Binds& binds, VkDescriptorSetLayout& out) {
+            VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            lci.bindingCount = static_cast<std::uint32_t>(binds.size());
+            lci.pBindings = binds.data();
+            check(vkCreateDescriptorSetLayout(dev_.device, &lci, nullptr, &out), "vkCreateDescriptorSetLayout");
+        };
+        if (per_stage) {
+            for (int st = 0; st < 2; ++st) {
+                make(gpu::shared_set_bindings(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage_samplers_, !pushed, gpu::kGfxSetStages[st]),
+                     set_layouts_[st]);
+            }
+            make(pushed ? gpu::cb_push_bindings(true) : Binds{}, cb_set_layout_);
+        } else {
+            make(shared, set_layouts_[0]);
+            set_layouts_[1] = set_layouts_[0];
+            make(all_cbs, cb_set_layout_);  // set 2: the constant buffers, both stages' bindings
         }
-        VkDescriptorSetLayoutCreateInfo cci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        cci.bindingCount = static_cast<std::uint32_t>(cbs.size());
-        cci.pBindings = cbs.data();
-        check(vkCreateDescriptorSetLayout(dev_.device, &cci, nullptr, &cb_set_layout_), "vkCreateDescriptorSetLayout");
-        VkDescriptorSetLayout three[3] = {set_layout_, set_layout_, cb_set_layout_};
+        VkDescriptorSetLayout three[3] = {set_layouts_[0], set_layouts_[1], cb_set_layout_};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plci.setLayoutCount = 3;
         plci.pSetLayouts = three;
@@ -1544,7 +1606,7 @@ private:
         check(vkCreateDescriptorSetLayout(dev_.device, &tci, nullptr, &tess_set_layout_), "vkCreateDescriptorSetLayout (tess)");
         VkDescriptorSetLayoutCreateInfo eci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         check(vkCreateDescriptorSetLayout(dev_.device, &eci, nullptr, &empty_set_layout_), "vkCreateDescriptorSetLayout (empty)");
-        VkDescriptorSetLayout five[5] = {set_layout_, set_layout_, cb_set_layout_, empty_set_layout_, tess_set_layout_};
+        VkDescriptorSetLayout five[5] = {set_layouts_[0], set_layouts_[1], cb_set_layout_, empty_set_layout_, tess_set_layout_};
         plci.setLayoutCount = 5;
         plci.pSetLayouts = five;
         check(vkCreatePipelineLayout(dev_.device, &plci, nullptr, &native_layout_), "vkCreatePipelineLayout (native)");
@@ -1583,6 +1645,11 @@ private:
             sci.addressModeV = static_cast<VkSamplerAddressMode>(json::u32(s, "address_v"));
             sci.addressModeW = static_cast<VkSamplerAddressMode>(json::u32(s, "address_w"));
             sci.mipLodBias = json::read_f32(s, "mip_lod_bias");
+            if (sci.mipLodBias != 0.0f && !dev_.sampler_lod_bias) {
+                // As bbhost's sampler_for; may then differ from `live`.
+                std::fprintf(stderr, "drawreplay: sampler %s: mip LOD bias %g left out, the device has none\n", id.c_str(), sci.mipLodBias);
+                sci.mipLodBias = 0.0f;
+            }
             sci.anisotropyEnable = json::flag(s, "anisotropy_enable") ? VK_TRUE : VK_FALSE;
             sci.maxAnisotropy = json::read_f32(s, "max_anisotropy");
             sci.compareEnable = json::flag(s, "compare_enable") ? VK_TRUE : VK_FALSE;
@@ -1760,7 +1827,8 @@ private:
     std::map<std::string, VkImageView> views_;
     std::map<std::string, VkSampler> samplers_;
     StageData stages_[2];
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layouts_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // one layout twice unless per stage
+    std::uint32_t stage_samplers_ = gpu::kMaxImages;                              // the samplers a stage set declares
     VkDescriptorSetLayout cb_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tess_set_layout_ = VK_NULL_HANDLE, empty_set_layout_ = VK_NULL_HANDLE;
@@ -1904,13 +1972,16 @@ struct Options {
     bool live = true;
     bool validate = false;
     std::uint32_t bench = 0;  // draws per timed batch
+    int bench_batches = 16;   // --bench-batches N: timed batches per series (after 3 warm-up batches)
+    bool bench_split = false; // --bench-split: one render pass per repeat, and an empty-pass series to subtract
+    bool bench_wall = false;  // --bench-wall: submit-to-fence wall time instead of GPU timestamps
     bool library = false;     // the variant is linked from pipeline libraries (BBHOST_PIPELINE_LIBRARY)
     bool specialize = false;  // every run with the optimized relink's specialization constants
 };
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
-                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N]\n");
+                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N] [--bench-batches N] [--bench-split] [--bench-wall]\n");
     std::exit(2);
 }
 
@@ -1936,6 +2007,9 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--no-live") o.live = false;
         else if (a == "--validate") o.validate = true;
         else if (a == "--bench") o.bench = static_cast<std::uint32_t>(std::strtoul(value().c_str(), nullptr, 10));
+        else if (a == "--bench-batches") o.bench_batches = std::max(1, std::atoi(value().c_str()));
+        else if (a == "--bench-split") o.bench_split = true;
+        else if (a == "--bench-wall") o.bench_wall = true;
         else if (!a.empty() && a[0] == '-') usage();
         else if (o.capture.empty()) o.capture = a;
         else usage();
@@ -2567,18 +2641,21 @@ int replay_main(const Options& o) {
                           "and are not compared; capture/replay builds are not the game's timing runs");
         // Warm-up batches are discarded (pipeline finalisation, caches), and the
         // order alternates so drift over the run favours neither pipeline.
-        constexpr int kWarmup = 3, kBatches = 16;
-        std::vector<double> translated, variant;
+        constexpr int kWarmup = 3;
+        const int kBatches = o.bench_batches;
+        std::vector<double> translated, variant, empty;
         for (int k = 0; k < kWarmup + kBatches; ++k) {
             RunOptions b;
             b.name = "bench";
             b.timed = true;
             b.repeat = o.bench;
+            b.split = o.bench_split;
             const auto time = [&](VkPipeline p, bool native, bool set4) {
                 b.pipeline = p;
                 b.native = native;
                 b.ls_set4 = set4;
-                return r.run(b).gpu_ms / o.bench;
+                const RunResult rr = r.run(b);
+                return (o.bench_wall ? rr.wall_ms : rr.gpu_ms) / o.bench;
             };
             const VkPipeline other = variant_pipeline ? variant_pipeline : native_pipeline;
             const bool other_native = !variant_pipeline && native_pipeline;
@@ -2591,7 +2668,14 @@ int replay_main(const Options& o) {
                 tc = time(captured, false, false);
                 if (other) tv = time(other, other_native, other_set4);
             }
+            double te = 0.0;
+            if (o.bench_split) {
+                b.nodraw = true;
+                te = time(captured, false, false);
+                b.nodraw = false;
+            }
             if (k < kWarmup) continue;
+            if (o.bench_split) empty.push_back(te);
             translated.push_back(tc);
             if (other) variant.push_back(tv);
         }
@@ -2613,6 +2697,10 @@ int replay_main(const Options& o) {
             bench.set("variant_median_ms", median(variant));
             if (!variant_pipeline) bench.set("variant_is_native", true);
             std::printf("  bench: %s %.4f ms per draw\n", variant_pipeline ? "variant" : "native pipeline", median(variant));
+        }
+        if (!empty.empty()) {
+            bench.set("empty_ms_per_draw", series(empty));
+            bench.set("empty_median_ms", median(empty));
         }
         report.set("bench", bench);
     }

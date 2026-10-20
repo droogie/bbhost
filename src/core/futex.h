@@ -20,7 +20,7 @@
 // timer while more than a couple are left, then the rest on the thread's
 // high-resolution waitable timer in short slices, and spins the last few
 // microseconds with `pause` - so a guest's 200 us timed wait neither returns
-// at once and spins nor sleeps a whole tick.
+// at once and spins nor sleeps a whole tick. macOS: os_sync_wait_on_address.
 //
 // BBHOST_FUTEX=0 puts the same words on parked std::condition_variables
 // (winpthreads on Windows), the primitives the sync layer used before, for

@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
+# Rosetta 2 runs AVX from macOS 15 on. Must precede project().
+if(CMAKE_HOST_APPLE)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "oldest macOS bbhost runs on")
+endif()
 project(bbhost LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -8,6 +12,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR
     "bbhost must be built with Clang on Windows so guest SysV functions can be implemented with __attribute__((sysv_abi)).")
+endif()
+if(APPLE)
+  set(BBHOST_MACOS_ARCH "${CMAKE_OSX_ARCHITECTURES}")
+  if(NOT BBHOST_MACOS_ARCH)
+    set(BBHOST_MACOS_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  if(NOT BBHOST_MACOS_ARCH STREQUAL "x86_64")
+    message(FATAL_ERROR
+      "bbhost runs the game's x86-64 code in its own process, so on macOS it is built for x86_64 alone "
+      "(-DCMAKE_OSX_ARCHITECTURES=x86_64; tools/build_macos.sh), and Rosetta 2 runs it on Apple Silicon.")
+  endif()
+  # Apple's clang searches /usr/local/include before -isystem dirs, so a
+  # Homebrew ffmpeg's headers would shadow the prefix's; -I wins.
+  set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 endif()
 
 # LibAtrac9 (MIT, https://github.com/Thealexbarney/LibAtrac9): ATRAC9 decoding for sceAjm.
@@ -25,11 +43,13 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/tess_vertex.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
 target_link_libraries(gcndis PRIVATE gcn)
+add_executable(spvrelax tools/spvrelax.cpp src/host/spirv_relax.cpp)
+target_link_libraries(spvrelax PRIVATE gcn)
 find_library(SPIRV_TOOLS_LIB SPIRV-Tools)
 if(SPIRV_TOOLS_LIB)
   add_executable(gcn2spv tools/gcn2spv.cpp)
@@ -53,6 +73,7 @@ add_executable(bbhost
   src/host/win_crash.cpp
   src/host/plugins.cpp
   src/core/tls_rewrite.cpp
+  src/core/maskmov_rewrite.cpp
   src/core/config.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
@@ -250,12 +271,23 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavformat libavutil libswscale libswresample)
 endif()
+if(FFMPEG_FOUND AND APPLE)
+  # CMake dedups repeated "-framework" words, orphaning the framework names.
+  get_target_property(BBHOST_FFMPEG_LINK_OPTIONS PkgConfig::FFMPEG INTERFACE_LINK_OPTIONS)
+  if(BBHOST_FFMPEG_LINK_OPTIONS)
+    string(REGEX REPLACE "-framework;([^;]+)" "SHELL:-framework \\1" BBHOST_FFMPEG_LINK_OPTIONS "${BBHOST_FFMPEG_LINK_OPTIONS}")
+    set_target_properties(PkgConfig::FFMPEG PROPERTIES INTERFACE_LINK_OPTIONS "${BBHOST_FFMPEG_LINK_OPTIONS}")
+  endif()
+endif()
 if(FFMPEG_FOUND)
   message(STATUS "bbhost: ffmpeg found; movies decode")
   target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_FFMPEG=1)
   target_link_libraries(bbhost PRIVATE PkgConfig::FFMPEG)
 else()
   message(STATUS "bbhost: ffmpeg not found; movies are skipped")
+  if(APPLE AND BBHOST_RELEASE)
+    message(FATAL_ERROR "a macOS release build needs ffmpeg (pkg-config and the prefix tools/build_macos.sh builds)")
+  endif()
 endif()
 
 find_package(Vulkan QUIET)
@@ -264,7 +296,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/spirv_relax.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
@@ -289,12 +321,36 @@ if(Vulkan_FOUND)
 else()
   target_sources(bbhost PRIVATE src/host/gpu_stub.cpp)
 endif()
+# The loader also searches vulkan/ beside the executable, so copying the SDK's
+# MoltenVK and validation manifests there (absolute library paths) lets a
+# build run without VK_DRIVER_FILES or VK_LAYER_PATH.
+if(APPLE AND Vulkan_FOUND AND Vulkan_LIBRARY)
+  get_filename_component(BBHOST_VULKAN_LIBDIR "${Vulkan_LIBRARY}" DIRECTORY)
+  get_filename_component(BBHOST_VULKAN_SHARE "${BBHOST_VULKAN_LIBDIR}/../share/vulkan" ABSOLUTE)
+  foreach(BBHOST_MANIFEST icd.d/MoltenVK_icd.json explicit_layer.d/VkLayer_khronos_validation.json)
+    set(BBHOST_MANIFEST_SRC "${BBHOST_VULKAN_SHARE}/${BBHOST_MANIFEST}")
+    if(NOT EXISTS "${BBHOST_MANIFEST_SRC}")
+      continue()
+    endif()
+    file(READ "${BBHOST_MANIFEST_SRC}" BBHOST_MANIFEST_JSON)
+    set(BBHOST_MANIFEST_KEY layer)
+    if(BBHOST_MANIFEST MATCHES "^icd")
+      set(BBHOST_MANIFEST_KEY ICD)
+    endif()
+    string(JSON BBHOST_MANIFEST_LIB GET "${BBHOST_MANIFEST_JSON}" ${BBHOST_MANIFEST_KEY} library_path)
+    get_filename_component(BBHOST_MANIFEST_DIR "${BBHOST_MANIFEST_SRC}" DIRECTORY)
+    get_filename_component(BBHOST_MANIFEST_LIB "${BBHOST_MANIFEST_LIB}" ABSOLUTE BASE_DIR "${BBHOST_MANIFEST_DIR}")
+    string(JSON BBHOST_MANIFEST_JSON SET "${BBHOST_MANIFEST_JSON}" ${BBHOST_MANIFEST_KEY} library_path "\"${BBHOST_MANIFEST_LIB}\"")
+    file(GENERATE OUTPUT "$<TARGET_FILE_DIR:bbhost>/vulkan/${BBHOST_MANIFEST}" CONTENT "${BBHOST_MANIFEST_JSON}\n")
+    message(STATUS "bbhost: vulkan/${BBHOST_MANIFEST} beside bbhost names ${BBHOST_MANIFEST_LIB}")
+  endforeach()
+endif()
 if(SDL3_FOUND AND Vulkan_FOUND)
   message(STATUS "bbhost: SDL3 ${SDL3_VERSION} + Vulkan found; building the window shell")
   target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SDL3=1)
   target_link_libraries(bbhost PRIVATE SDL3::SDL3 Vulkan::Vulkan)
   # The setup window (host/launcher.h): Dear ImGui (MIT,
-  # https://github.com/ocornut/imgui, third_party/imgui/VERSION) on SDL3's 2D renderer.
+  # https://github.com/ocornut/imgui, third_party/imgui/VERSION.txt) on SDL3's 2D renderer.
   add_library(imgui STATIC third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_sdl3.cpp third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp
@@ -340,6 +396,15 @@ set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS 
 # The follow camera's step is the game's own AVX, intrinsic for intrinsic
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
+
+# macOS: the guest's low windows are a zero-fill section in bbhost's own image
+# (core/mac_vm.h), so the image is fixed low, non-PIE (deprecated flags, but
+# they work). mac_reserve.cpp must stay the last source, or ld puts other
+# zero-fill data past it, out of rip-relative reach.
+if(APPLE)
+  target_sources(bbhost PRIVATE src/core/mac_vm.cpp src/core/mac_reserve.cpp)
+  target_link_options(bbhost PRIVATE -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x10000 -Wl,-no_pie -Wl,-no_fixup_chains)
+endif()
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -413,11 +478,14 @@ if(UNIX)
   target_include_directories(sdk_headers_test PRIVATE include)
   target_compile_features(sdk_headers_test PRIVATE cxx_std_17)
   add_test(NAME sdk_headers_test COMMAND sdk_headers_test)
-  add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
-  target_include_directories(libc_native_test PRIVATE src)
-  target_compile_features(libc_native_test PRIVATE cxx_std_17)
-  add_test(NAME libc_native_test COMMAND libc_native_test)
-  set_tests_properties(libc_native_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Needs <elf.h>, which macOS lacks.
+  if(NOT APPLE)
+    add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
+    target_include_directories(libc_native_test PRIVATE src)
+    target_compile_features(libc_native_test PRIVATE cxx_std_17)
+    add_test(NAME libc_native_test COMMAND libc_native_test)
+    set_tests_properties(libc_native_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   add_executable(libc_ctype_test tests/libc_ctype_test.cpp)
   target_include_directories(libc_ctype_test PRIVATE src)
   target_compile_features(libc_ctype_test PRIVATE cxx_std_17)
@@ -443,8 +511,10 @@ if(UNIX)
   target_include_directories(image_file_test PRIVATE src)
   target_link_libraries(image_file_test PRIVATE ZLIB::ZLIB)
   add_test(NAME image_file_test COMMAND image_file_test)
-  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  # portable.cpp: host_exe_path, for config.cpp
+  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/sfo.cpp src/core/portable.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(config_test PRIVATE pthread)
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
@@ -460,14 +530,25 @@ if(UNIX)
   add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
   target_include_directories(paced_file_test PRIVATE src)
   add_test(NAME paced_file_test COMMAND paced_file_test)
+
+  add_executable(maskmov_rewrite_test tests/maskmov_rewrite_test.cpp src/core/maskmov_rewrite.cpp src/decomp/insn.cpp)
+  target_include_directories(maskmov_rewrite_test PRIVATE src)
+  target_link_libraries(maskmov_rewrite_test PRIVATE pthread)
+  if(APPLE)
+    target_sources(maskmov_rewrite_test PRIVATE src/core/mac_vm.cpp)
+  endif()
+  add_test(NAME maskmov_rewrite_test COMMAND maskmov_rewrite_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
   # without the eboot.
   add_library(eboot_kit STATIC tests/decomp/eboot_kit.cpp src/core/elf.cpp src/core/memory.cpp src/core/sha256.cpp
-              src/core/tls_rewrite.cpp)
+              src/core/tls_rewrite.cpp src/core/maskmov_rewrite.cpp src/decomp/insn.cpp)
   target_include_directories(eboot_kit PUBLIC src include tests tests/decomp)
   target_compile_definitions(eboot_kit PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  if(APPLE)
+    target_sources(eboot_kit PRIVATE src/core/mac_vm.cpp)  # core/memory.cpp maps the image through it
+  endif()
   # decomp_<name>: tests/decomp/<name>_test.cpp, with SOURCES built beside it,
   # LIBS linked, and ARGS for its run.
   function(bbhost_decomp_test name)
@@ -493,7 +574,18 @@ if(UNIX)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp src/core/futex.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
+  if(APPLE)
+    target_sources(sync_test PRIVATE src/core/mac_vm.cpp)  # the arena is mapped through it
+  endif()
   add_test(NAME sync_test COMMAND sync_test)
+  if(APPLE)
+    add_executable(mac_vm_test tests/mac_vm_test.cpp src/core/mac_vm.cpp)
+    target_include_directories(mac_vm_test PRIVATE src)
+    add_test(NAME mac_vm_test COMMAND mac_vm_test)
+    add_executable(host_thread_test tests/host_thread_test.cpp)
+    target_include_directories(host_thread_test PRIVATE src)
+    add_test(NAME host_thread_test COMMAND host_thread_test)
+  endif()
   add_executable(at9_test tests/at9_test.cpp src/hle/ajm.cpp src/host/main_wait.cpp)
   target_include_directories(at9_test PRIVATE src third_party/libatrac9/C/src)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
@@ -562,14 +654,26 @@ if(UNIX)
   target_link_libraries(gcn_bindings_test PRIVATE gcn)
   add_test(NAME gcn_bindings_test COMMAND gcn_bindings_test)
   set_tests_properties(gcn_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  if(Vulkan_FOUND)
+    add_executable(descriptor_layouts_test tests/descriptor_layouts_test.cpp)
+    target_link_libraries(descriptor_layouts_test PRIVATE gcn Vulkan::Headers)
+    add_test(NAME descriptor_layouts_test COMMAND descriptor_layouts_test)
+  endif()
   if(SPIRV_TOOLS_LIB)
     add_executable(gcn_translate_test tests/gcn_translate_test.cpp)
     target_link_libraries(gcn_translate_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_translate_test COMMAND gcn_translate_test)
   set_tests_properties(gcn_translate_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(spirv_contraction_test tests/spirv_contraction_test.cpp src/host/spirv_relax.cpp)
+    target_link_libraries(spirv_contraction_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME spirv_contraction_test COMMAND spirv_contraction_test)
     add_executable(gcn_lds_window_test tests/gcn_lds_window_test.cpp)
     target_link_libraries(gcn_lds_window_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lds_window_test COMMAND gcn_lds_window_test)
+    add_executable(gcn_tess_vertex_test tests/gcn_tess_vertex_test.cpp)
+    target_link_libraries(gcn_tess_vertex_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_tess_vertex_test COMMAND gcn_tess_vertex_test)
     add_executable(gcn_lift_test tests/gcn_lift_test.cpp)
     target_link_libraries(gcn_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lift_test COMMAND gcn_lift_test)
@@ -592,6 +696,11 @@ if(UNIX)
       target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
       add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
       set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      add_executable(gcn_vertex_stage_test tests/gcn_vertex_stage_test.cpp)
+      target_link_libraries(gcn_vertex_stage_test PRIVATE gcn ${SPIRV_TOOLS_LIB} Vulkan::Vulkan)
+      add_test(NAME gcn_vertex_stage_test COMMAND gcn_vertex_stage_test)
+      set_tests_properties(gcn_vertex_stage_test PROPERTIES TIMEOUT 60)
     endif()
   endif()
 endif()

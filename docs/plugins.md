@@ -1,6 +1,7 @@
 # Plugins
 
-A plugin is a shared library (`.so` on Linux, `.dll` on Windows) that bbhost
+A plugin is a shared library (`.so` on Linux, `.dll` on Windows; on macOS a
+Mach-O bundle, still named `.so`) that bbhost
 loads at start. Because the game runs natively inside bbhost's process, a
 plugin can read and write game objects directly, hook game functions, call
 them, and use the services bbhost builds on top of the engine (params, event
@@ -39,6 +40,8 @@ settings. In game, F9 opens the plugin menu over the game.
 cc -shared -fPIC -I<bbhost>/include -o plugins/mine.so mine.c
 # Windows, cross-compiled with Clang
 clang --target=x86_64-w64-mingw32 -shared -I<bbhost>/include -o plugins/mine.dll mine.c
+# macOS: x86_64, like bbhost
+clang -arch x86_64 -bundle -I<bbhost>/include -o plugins/mine.so mine.c
 ```
 
 The smallest useful plugin counts frames:

@@ -94,8 +94,21 @@ void check_cases() {
 
 // Two pages in the low 2 GiB, a rel32 apart at most.
 std::uint8_t* low_page() {
+#if defined(__APPLE__)
+    // Nothing is free below 4 GiB on macOS (__PAGEZERO, core/mac_vm.h): one
+    // mapping keeps the two pages close.
+    static std::uint8_t* pages = nullptr;
+    static int taken = 0;
+    if (!pages) {
+        void* p = mmap(nullptr, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return nullptr;
+        pages = static_cast<std::uint8_t*>(p);
+    }
+    return taken < 2 ? pages + 0x1000 * taken++ : nullptr;
+#else
     void* p = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     return p == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(p);
+#endif
 }
 
 void put(std::uint8_t* at, std::initializer_list<std::uint8_t> bytes) { std::memcpy(at, bytes.begin(), bytes.size()); }

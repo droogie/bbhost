@@ -13,6 +13,7 @@
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
 
+#include "core/asm_sym.h"
 #include "core/elf.h"
 #include "core/memory.h"
 #include "core/host_clock.h"
@@ -1652,13 +1653,8 @@ extern "C" GUEST_ABI std::uint64_t frame_after() {
     return p.ret;
 }
 extern "C" void* g_frame_after_thunk = nullptr;
-#if defined(_WIN32)
-#define FR_TYPE_(n)
-#else
-#define FR_TYPE_(n) ".type " #n ", @function\n"
-#endif
-asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
-    "push %rax\n push %rdx\n call *g_frame_after_thunk(%rip)\n"
+asm(".text\n.globl " ASM_SYM(frame_ret) "\n" ASM_TYPE_FUNCTION(frame_ret) ASM_SYM(frame_ret) ":\n"
+    "push %rax\n push %rdx\n call *" ASM_SYM(g_frame_after_thunk) "(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 int frame_rate_game_fps() { return g_game_fps; }

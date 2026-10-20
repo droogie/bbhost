@@ -8,6 +8,7 @@
 
 #include "gcn/translate.h"
 #include "hle/modules.h"
+#include "host/descriptor_layouts.h"
 #include "host/gpu.h"
 #include "host/stream_ops.h"
 
@@ -22,6 +23,10 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
                          VkDeviceMemory* out, const char* file, int line);
 void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
 std::string bb_memory_sites_report();
+// Live blocks for buffers with device addresses, in all and by site: what
+// MoltenVK makes resident for every dispatch.
+std::uint64_t bb_memory_address_blocks();
+std::string bb_memory_address_report();
 // BBHOST_TEST_VRAM_MB: allocations in the memory types of `types` (a bit each)
 // fail with VK_ERROR_OUT_OF_DEVICE_MEMORY once they would hold more than
 // `bytes` together - a smaller card's video memory acted out on a bigger one.
@@ -73,7 +78,6 @@ bool image_memory_in_vram(const ImageMemory& m);
 constexpr std::uint64_t kChunkBytes = 1ull << gcn::kDmemChunkShift;
 // How far a whole-span import runs on into the next chunk (gpu.cpp map setup).
 constexpr std::uint64_t kChunkOverlap = 64ull << 20;
-constexpr std::uint32_t kMaxImages = 32;
 // A frame with more draws than this takes a mid-frame submit (render.cpp).
 // Measured 2026-09-26: 354 flips of ~11,000 in a combat soak, and 45 of 60 in
 // the worst seconds - but those submits wait on nothing (`gpu-wait` 0-1 ms a
@@ -216,6 +220,16 @@ struct Gpu {
     bool has_depth_bounds = false;        // VkPhysicalDeviceFeatures::depthBounds
     bool has_depth_bias_clamp = false;    // VkPhysicalDeviceFeatures::depthBiasClamp
     bool has_tessellation = false;        // VkPhysicalDeviceFeatures::tessellationShader
+    bool has_geometry_shader = false;     // VkPhysicalDeviceFeatures::geometryShader (none on MoltenVK)
+    // shaderTessellationAndGeometryPointSize: needed to pass the point size
+    // through the geometry and evaluation stages.
+    bool has_tess_geom_point_size = false;
+    // samplerMirrorClampToEdge: S# clamp mode 3, mirrored repeat without it.
+    bool has_mirror_clamp = false;
+    // False where the portability subset lacks samplerMipLodBias (MoltenVK).
+    bool sampler_lod_bias = true;
+    // maxPerStageDescriptorSamplers (MoltenVK: 16); see stage_fits_device.
+    std::uint32_t max_stage_samplers = kMaxImages;
     std::uint32_t subgroup_stages = 0;    // VkPhysicalDeviceSubgroupProperties::supportedStages
     // Pixel shaders at wave32 (gcn/wave.h):
     // decided at device creation (gpu.cpp), given to each fragment stage by
@@ -374,6 +388,12 @@ struct Gpu {
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
     bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
+    // MoltenVK makes every buffer with a device address resident for each
+    // dispatch, so they are kept few.
+    bool moltenvk = false;
+    // MoltenVK: a draw whose vertex input takes more slots runs its fetch
+    // shader instead. 0: no limit.
+    std::uint32_t vertex_buffer_room = 0;
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start
@@ -391,10 +411,14 @@ struct Gpu {
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
     // BBHOST_BINDLESS=1 (bindless.cpp): graphics stages read
     // images and samplers from one global set (set 3); their own sets hold the
-    // params block alone. gfx_set_layout is the graphics stage sets' layout:
-    // set_layout's, or the params block alone when bindless.
+    // params block alone. gfx_set_layouts are set 0's and set 1's: set_layout's
+    // bindings, or the params block alone when bindless; two layouts only with
+    // per_stage_sets.
     bool bindless = false;
-    VkDescriptorSetLayout gfx_set_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gfx_set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // Bindings name only the stages that read them: on MoltenVK, whose
+    // per-stage limits are too low otherwise (descriptor_layouts.h).
+    bool per_stage_sets = false;
     VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
     VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
@@ -475,6 +499,12 @@ struct Gpu {
     // =2 also charges the time between pairs to what was recorded in it
     // (profile_gap_ns, by recording sites).
     bool profile = false;
+    // 4096 on MoltenVK: past a 32 KiB Metal counter buffer it emulates the
+    // pool, every timestamp the same. Draws past it go untimed.
+    std::uint32_t queries_per_slot = kQueriesPerSlot;
+    // Metal backs 32 pools a device (MoltenVK), past which one is emulated as
+    // above, so a profiled run there keeps fewer slots. 0: no limit.
+    std::uint32_t timestamp_pools = 0;
     bool profile_gaps = false;
     bool profile_passes = false;  // BBHOST_GPU_PROFILE=3: a pair a render pass, not a draw (render.cpp)
     // BBHOST_GPU_PROFILE=3 (or =1 with BBHOST_GPU_PROFILE_STATS=1) where the
@@ -592,6 +622,8 @@ std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
 void defer_destroy(const DevBuffer& b);  // freed once the current command buffer retired
+// On macOS the memory waits for every submission recorded so far to retire.
+void free_dev_buffer_locked(const DevBuffer& b);
 // Upload staging: `size` bytes placed in a mapped host-visible chunk the current command buffer shares with the ones
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to
 // the span; `offset` is the span's offset in it.
@@ -854,6 +886,9 @@ struct RtImage {
     std::uint64_t base = 0;
     bool depth = false;
     bool storage = false;      // created with STORAGE usage (a depth snapshot: depth_copy_record_locked writes it)
+    // D32_SFLOAT_S8_UINT standing in for a missing D24_UNORM_S8_UINT: fills,
+    // copies and readbacks still treat it as unorm depth (depth_is_float).
+    bool depth_stand_in = false;
     bool initialised = false;  // layout moved to GENERAL
     // Depth targets: the HTILE metadata buffer (DB_HTILE_DATA_BASE). The
     // engine clears depth by filling HTILE; the next draw that binds the
@@ -1301,6 +1336,10 @@ void textures_retired(int slot);                    // that submission completed
 
 // render.cpp
 void render_end_pass_locked();   // ends dynamic rendering if active (before dispatch/flush)
+// Clears held back for the next pass's load op (BBHOST_FOLD_CLEARS); flush
+// before recording anything else.
+extern bool g_clears_pending;
+void pending_clears_flush_locked(const char* why = "");
 void render_report();
 bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, VkImage dst, VkRect2D area, VkExtent2D src,
                                 std::uint32_t src_x = 0, std::uint32_t src_y = 0, VkImageView dst_view = VK_NULL_HANDLE);
@@ -1582,5 +1621,9 @@ extern VkDescriptorBufferInfo g_params_desc;
 // A view is being let go: the cached sets that hold it are dropped. Under g.mu.
 void set_cache_forget_view_locked(VkImageView view);
 std::string set_cache_report();
+
+// False (said once) when the stage names more samplers than
+// max_stage_samplers: its pipeline is not built.
+bool stage_fits_device(const gcn::TranslateResult& meta, const std::string& name);
 
 }  // namespace gpu

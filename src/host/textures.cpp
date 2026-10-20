@@ -14,6 +14,7 @@
 #include "hle/modules.h"
 #include "log.h"
 
+#include <array>
 #include <atomic>
 #include <limits>
 #include <memory>
@@ -113,6 +114,44 @@ FormatInfo image_format(std::uint32_t dfmt, std::uint32_t nfmt) {
     case 40: return {snorm ? VK_FORMAT_BC6H_SFLOAT_BLOCK : VK_FORMAT_BC6H_UFLOAT_BLOCK, 16, 4};
     case 41: return {srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK, 16, 4};
     default: return {};
+    }
+}
+
+// Metal has no 96-bit pixel format: where the device cannot sample
+// R32G32B32, a T# is held as R32G32B32A32 with alpha 1 (what it reads anyway).
+// Decided by the device's answer, not by platform.
+bool rgb32_unsampled(VkFormat f) {
+    static const std::array<bool, 3> unsampled = [] {
+        std::array<bool, 3> u{};
+        const VkFormat formats[3] = {VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32_SINT};
+        for (int k = 0; k < 3; ++k) {
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(g.phys, formats[k], &fp);
+            u[k] = !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+            if (u[k]) host_log("texture: format %d cannot be sampled here: R32G32B32 textures are held as R32G32B32A32", formats[k]);
+        }
+        return u;
+    }();
+    switch (f) {
+    case VK_FORMAT_R32G32B32_SFLOAT: return unsampled[0];
+    case VK_FORMAT_R32G32B32_UINT: return unsampled[1];
+    case VK_FORMAT_R32G32B32_SINT: return unsampled[2];
+    default: return false;
+    }
+}
+VkFormat rgb32_as_rgba32(VkFormat f) {
+    return f == VK_FORMAT_R32G32B32_UINT ? VK_FORMAT_R32G32B32A32_UINT
+           : f == VK_FORMAT_R32G32B32_SINT ? VK_FORMAT_R32G32B32A32_SINT
+                                           : VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+// From the last texel, so nothing is overwritten before it has moved.
+void spread_rgb32(std::uint8_t* p, std::size_t n, VkFormat rgba) {
+    const std::uint32_t one = rgba == VK_FORMAT_R32G32B32A32_SFLOAT ? 0x3f800000u : 1u;
+    for (std::size_t i = n; i-- > 0;) {
+        std::uint32_t t[4];
+        std::memcpy(t, p + i * 12, 12);
+        t[3] = one;
+        std::memcpy(p + i * 16, t, 16);
     }
 }
 
@@ -528,6 +567,9 @@ struct Surface {
     std::uint32_t unchanged = 0;  // consecutive checks that found the memory unchanged (check backoff)
     std::uint32_t uploads = 0;
     std::uint32_t block = 1;  // texel block edge: 4 for BC, 1 otherwise
+    // rgb32_unsampled: the image's texels are 16 bytes, `esize` and the guest's
+    // stay 12.
+    bool rgb32_as_rgba = false;
     // A shader stored into it (surface_queue_writeback): the image holds what
     // the guest memory underneath does not.
     bool gpu_written = false;
@@ -770,7 +812,7 @@ void compute_levels(Surface& sf, std::uint32_t count, std::uint32_t block) {
         }
         lv.src_slice_bytes = static_cast<std::size_t>(lv.pitch_e) * ph * sf.esize;
         lv.src_slice_bytes = (lv.src_slice_bytes + 255) & ~static_cast<std::size_t>(255);
-        lv.dst_slice_bytes = static_cast<std::size_t>(lv.w_e) * lv.h_e * sf.esize;
+        lv.dst_slice_bytes = static_cast<std::size_t>(lv.w_e) * lv.h_e * (sf.rgb32_as_rgba ? 16u : sf.esize);
         lv.src_off = src;
         lv.dst_off = dst;
         const std::size_t slice_groups = lv.tiling == 19 ? (mem_slices + 3) / 4 * 4 : mem_slices;
@@ -829,6 +871,7 @@ struct TexturePrep {
     std::size_t total_src = 0, total_dst = 0;
     std::uint64_t content_hash = 0, exact_hash = 0;
     bool hash_only = false;     // the GPU untiles this upload; the prep only hashes the source
+    VkFormat spread_to = VK_FORMAT_UNDEFINED;  // Surface::rgb32_as_rgba: the texels spread to this format's 16 bytes
     std::atomic<int> state{0};  // 0 queued, 1 running, 2 done; changed under PrepPool's mutex
 };
 
@@ -861,6 +904,7 @@ void run_prep(TexturePrep& p) {
                                                lv.pitch_e, sl & 3, p.esize)
                           : untile_slice(dst, p.src + lv.src_off + sl * lv.src_slice_bytes, lv.src_slice_bytes, lv.tiling, lv.w_e, lv.h_e,
                                          lv.pitch_e, p.esize);
+            if (untiled && p.spread_to != VK_FORMAT_UNDEFINED) spread_rgb32(dst, static_cast<std::size_t>(lv.w_e) * lv.h_e, p.spread_to);
         }
     }
     g_tex_untile_us.fetch_add(us_since(t0), std::memory_order_relaxed);
@@ -1008,7 +1052,7 @@ std::atomic<std::uint64_t> g_gpu_untiled{0}, g_gpu_untiled_bytes{0}, g_gpu_until
 // linear or 1D level whose elements would reach past its slice (the CPU makes
 // that surface zeros; it keeps those).
 bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileGpuPass>& passes, VkDeviceAddress src_copy = 0) {
-    if (sf.type == 10 || sf.thick || (sf.esize != 4 && sf.esize != 8 && sf.esize != 16) || (sf.base & 3)) return false;
+    if (sf.type == 10 || sf.thick || (sf.esize != 4 && sf.esize != 8 && sf.esize != 16) || sf.rgb32_as_rgba || (sf.base & 3)) return false;
     // src_copy: the surface's bytes copied whole to device-local memory, the
     // same layout from there; else read in place through the import.
     const VkDeviceAddress src = src_copy ? src_copy : guest_device_address(sf.base, sf.total_src);
@@ -1105,6 +1149,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     prep->levels = sf.levels;
     prep->slices = sf.slices;
     prep->esize = sf.esize;
+    if (sf.rgb32_as_rgba) prep->spread_to = sf.format;
     prep->width = sf.width;
     prep->height = sf.height;
     prep->tiling = sf.tiling;
@@ -1896,7 +1941,7 @@ void refresh_surface_locked(Surface& sf) {
 std::atomic<std::uint64_t> g_surface_carries{0};
 
 bool carry_surface_locked(Surface& dst, const Surface& src) {
-    if (!src.gpu_written || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
+    if (!src.gpu_written || src.block != 1 || src.esize != dst.esize || src.rgb32_as_rgba != dst.rgb32_as_rgba || src.type == 10 || dst.type == 10 || src.thick ||
         dst.thick || dst.levels.empty() || src.levels.empty() || dst.info.arrayLayers > src.info.arrayLayers) {
         return false;
     }
@@ -2390,7 +2435,9 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         dim = 1;
         arrayed = true;
     }
-    const FormatInfo fi = image_format(dfmt, nfmt);
+    FormatInfo fi = image_format(dfmt, nfmt);
+    const bool rgb32_as_rgba = fi.bytes_per_element == 12 && rgb32_unsampled(fi.format);
+    if (rgb32_as_rgba) fi.format = rgb32_as_rgba32(fi.format);
     bool cube = false;
     // view_type(13) sets arrayed=true and would undo the flatten: that is
     // a040875f "want dim 1, got dim 1 array" on a type-13 T# whose LAST_ARRAY
@@ -2422,7 +2469,12 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     const std::uint32_t slices = type == 10 ? depth : layers;
     if (fi.format == VK_FORMAT_UNDEFINED || width == 0 || height == 0 || slices == 0 || base == 0) {
         static std::atomic<int> logs{0};
-        if (logs.fetch_add(1) < 8) host_log("texture: unsupported T# dfmt=%u nfmt=%u type=%u %ux%u", dfmt, nfmt, type, width, height);
+        // A T# with no base is the game's null texture (its format is
+        // supported, there is just nothing to read): said apart from the rest.
+        if (logs.fetch_add(1) < 8) {
+            host_log("texture: %s T# dfmt=%u nfmt=%u type=%u %ux%u%s", base == 0 ? "null (base 0)" : "unsupported", dfmt, nfmt, type,
+                     width, height, fi.format == VK_FORMAT_UNDEFINED ? ", no Vulkan format" : "");
+        }
         g_unsupported.fetch_add(1);
         return VK_NULL_HANDLE;
     }
@@ -2493,6 +2545,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         sf.height_e = (height + fi.block - 1) / fi.block;
         sf.pitch_e = std::max(sf.width_e, (pitch + fi.block - 1) / fi.block);
         sf.esize = fi.bytes_per_element;
+        sf.rgb32_as_rgba = rgb32_as_rgba;
         sf.block = fi.block;
         sf.slices = slices;
         sf.thick = tiling == 19;
@@ -2822,7 +2875,16 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
         case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 2: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 3: {
+            // MIRROR_ONCE_LAST_TEXEL. Without mirror-clamp, a mirrored repeat:
+            // the same over [-1, 1], the one mirror image the mode is for.
+            if (g.has_mirror_clamp) return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                host_log("texture: S# mirror-once clamp as a mirrored repeat: the device has no samplerMirrorClampToEdge");
+            }
+            return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        }
         case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         }
@@ -2846,6 +2908,16 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     std::int32_t bias = static_cast<std::int32_t>(s[2] & 0x3fff);
     if (bias & 0x2000) bias -= 0x4000;
     sci.mipLodBias = static_cast<float>(bias) / 256.0f;
+    // No mip LOD bias on MoltenVK (Metal samplers have none): mips are picked
+    // unbiased. Not folded into the shaders: the S# is read after translation,
+    // and SPIR-V's Bias exists for implicit levels only.
+    if (sci.mipLodBias != 0.0f && !g.sampler_lod_bias) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            host_log("texture: S# LOD bias %g left out, as every other: the device has no sampler mip LOD bias", sci.mipLodBias);
+        }
+        sci.mipLodBias = 0.0f;
+    }
     // The comparison only applies to samplers the shader uses with
     // image_sample_c* (Vulkan needs compareEnable for Dref ops and forbids it
     // for plain sampling); DEPTH_COMPARE_FUNC gives the function.
@@ -2970,7 +3042,7 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
     for (auto kv = g_surfaces.lower_bound(va); kv != g_surfaces.end() && kv->first < end; ++kv) {
         Surface& sf = kv->second;
         if (sf.failed || !sf.image || !sf.total_src || sf.base + sf.total_src > end) continue;
-        if (sf.block != 1 || !float_clearable(sf.format)) {
+        if (sf.block != 1 || sf.rgb32_as_rgba || !float_clearable(sf.format)) {  // R32G32B32 is not clearable, held as RGBA or not
             g_fill_surfaces_skipped.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -3050,8 +3122,11 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     }
     DevBuffer staging;
     VkDeviceSize staging_offset = 0;
-    if (!acquire_staging_locked(staging, bytes, staging_offset)) return false;
-    std::memcpy(staging.map, data, bytes);
+    // Surface::rgb32_as_rgba: the rows are the guest's 12-byte texels.
+    const std::size_t texels = static_cast<std::size_t>(wb) * hb;
+    if (!acquire_staging_locked(staging, sf.rgb32_as_rgba ? texels * 16 : bytes, staging_offset)) return false;
+    std::memcpy(staging.map, data, sf.rgb32_as_rgba ? texels * 12 : bytes);
+    if (sf.rgb32_as_rgba) spread_rgb32(static_cast<std::uint8_t*>(staging.map), texels, sf.format);
     begin_recording_locked();
     render_end_pass_locked();
     const VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3216,8 +3291,10 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
         return false;
     }
     // vkCmdCopyImage wants size-compatible formats: the same one, or the same
-    // bytes per texel with no compression on either side.
-    if (src.format != dst.format && (src.esize != dst.esize || src.block != 1 || dst.block != 1)) {
+    // bytes per texel with no compression on either side. An R32G32B32
+    // surface held as R32G32B32A32 copies only to and from another one.
+    const bool src_rgb32 = src.surface && src.surface->rgb32_as_rgba, dst_rgb32 = dst.surface && dst.surface->rgb32_as_rgba;
+    if (src_rgb32 != dst_rgb32 || (src.format != dst.format && (src.esize != dst.esize || src.block != 1 || dst.block != 1))) {
         g_image_copy_format.fetch_add(1, std::memory_order_relaxed);
         refused("formats");
         return false;
@@ -3555,8 +3632,7 @@ void textures_retired(int slot) {
                          n > 0 ? f[0] : 0.f, n > 1 ? f[1] : 0.f, n > 2 ? f[2] : 0.f, n > 2 ? f[n / 2] : 0.f, n > 0 ? f[n - 1] : 0.f);
             }
         }
-        vkDestroyBuffer(g.device, wb.staging.buffer, nullptr);
-        vkFreeMemory(g.device, wb.staging.memory, nullptr);
+        free_dev_buffer_locked(wb.staging);
     }
     g_slot_writebacks[slot].clear();
 }

@@ -9,6 +9,7 @@
 #include "gcn/container.h"
 #include "gcn/isa.h"
 #include "gcn/lift.h"
+#include "gcn/tess_vertex.h"
 #include "gcn/translate.h"
 
 #include <spirv-tools/libspirv.hpp>
@@ -248,6 +249,66 @@ void particles(const std::vector<Shader>& all) {
     CHECK(hs_n >= 4 && hs_ok == hs_n);
 }
 
+// ---- the particles as one vertex stage (gcn/tess_vertex.h) ----
+// Where tessellation runs through compute, every LS x domain shader pair,
+// translated as the host does, must fuse and validate at both hull levels.
+void fused_particles(const std::vector<Shader>& all) {
+    std::set<std::vector<std::uint32_t>> seen;
+    std::vector<gcn::TranslateResult> ls_t, ds_t;
+    for (const Shader& s : all) {
+        if (s.name.find("tessellate") == std::string::npos || !seen.insert(s.code.words).second) continue;
+        if (s.code.type == 6) {
+            gcn::TranslateOptions o;
+            o.stage = gcn::Stage::Vertex;
+            o.tess_role = gcn::TranslateOptions::TessRole::LsVertex;
+            o.tess_lds_attributes = true;
+            o.tess_attr_vec4s = 16;
+            o.rsrc1 = s.regs[4];
+            o.rsrc2 = s.regs[5];
+            o.descriptor_set = 0;
+            gcn::TranslateResult t = gcn::translate(s.program, o);
+            CHECK(t.ok());
+            if (t.ok()) ls_t.push_back(std::move(t));
+            continue;
+        }
+        if (s.code.type != 1 || !reads_lds(s.program)) continue;
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::TessEval;
+        o.tess_role = gcn::TranslateOptions::TessRole::DomainTes;
+        o.tess_lds_attributes = true;
+        o.tess_attr_vec4s = 16;
+        o.tess_patch_control_points = 1;
+        o.rsrc1 = s.regs[4];
+        o.rsrc2 = s.regs[5];
+        o.vs_out_cntl = s.regs[8];
+        o.descriptor_set = 0;
+        o.cb_descriptor_set = 2;
+        o.cb_ssbo = true;
+        o.params_vertex_formats = true;
+        gcn::TranslateResult t = gcn::translate(s.program, o);
+        CHECK(t.ok());
+        if (t.ok()) ds_t.push_back(std::move(t));
+    }
+    int n = 0, ok = 0;
+    for (const gcn::TranslateResult& d : ds_t) {
+        for (const gcn::TranslateResult& l : ls_t) {
+            for (std::uint32_t level : {1u, 3u}) {
+                ++n;
+                const gcn::TessVertexFuse f = gcn::fuse_tess_vertex(l.spirv, d.spirv, level, true);
+                if (!f.ok()) {
+                    std::fprintf(stderr, "fused particle stage: %s\n", f.error.c_str());
+                    continue;
+                }
+                if (valid_spirv(f.spirv, "fused particle stage")) ++ok;
+            }
+        }
+    }
+    std::printf("particles as one vertex stage: %d/%d LS and domain shader pairs fused and valid (%zu LS, %zu domain shaders)\n", ok, n,
+                ls_t.size(), ds_t.size());
+    CHECK(!ls_t.empty() && !ds_t.empty());
+    CHECK(ok == n);
+}
+
 // ---- the game's own hulls: a patch of control points in its LDS window ----
 // One program set - LS, hull, domain shader - as a native hull pipeline runs
 // it (render.cpp kTessNativeSet): the window from the containers (the layout
@@ -435,6 +496,7 @@ int main() {
         return kTestSkip;
     }
     particles(particles_all);
+    fused_particles(particles_all);
     dol_pn(flver_all);
     every_hull(flver_all);
     if (g_failures) {

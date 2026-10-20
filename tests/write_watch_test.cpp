@@ -2,6 +2,7 @@
 // plain host memory, and the property the texture cache relies on - a watch
 // that reads clean means the memory is what was read after arming it.
 #include "core/write_watch.h"
+#include "core/host_ucontext.h"
 
 #include <atomic>
 #include <cerrno>
@@ -14,7 +15,6 @@
 
 #include <signal.h>
 #include <sys/mman.h>
-#include <ucontext.h>
 #include <unistd.h>
 
 namespace {
@@ -31,7 +31,7 @@ constexpr std::size_t kPage = 4096;
 
 void on_segv(int sig, siginfo_t* info, void* ctx) {
     auto* uc = static_cast<ucontext_t*>(ctx);
-    if (write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0)) {
+    if (write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), (UC_REG(uc, ERR) & 2) != 0)) {
         return;
     }
     std::signal(sig, SIG_DFL);
@@ -51,12 +51,24 @@ int main() {
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
+#if defined(__APPLE__)
+    sigaction(SIGBUS, &sa, nullptr);  // macOS's signal for a write to a read-only page
+#endif
 
     // Below 2^40, where guest memory lives and the watch's table reaches.
     void* m = MAP_FAILED;
     for (std::uint64_t hint = 0x7000000000ull; m == MAP_FAILED && hint < 0x8000000000ull; hint += 0x10000000ull) {
+#if defined(__APPLE__)
+        // No MAP_FIXED_NOREPLACE on macOS: the hint or nothing.
+        m = mmap(reinterpret_cast<void*>(hint), 16 * kPage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m != MAP_FAILED && m != reinterpret_cast<void*>(hint)) {
+            munmap(m, 16 * kPage);
+            m = MAP_FAILED;
+        }
+#else
         m = mmap(reinterpret_cast<void*>(hint), 16 * kPage, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+#endif
     }
     CHECK(m != MAP_FAILED);
     if (m == MAP_FAILED) return 1;

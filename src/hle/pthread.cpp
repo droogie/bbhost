@@ -10,6 +10,9 @@
 #include "core/tls_rewrite.h"
 
 #include <pthread.h>  // winpthreads on Windows: the same API
+#if defined(__APPLE__)
+#include <unistd.h>  // getpagesize
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -397,9 +400,24 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     }
     pthread_attr_t ha;
     pthread_attr_init(&ha);
+#if defined(__APPLE__)
+    // macOS defaults to 512 KiB (glibc: 8 MiB) and refuses a size that is not
+    // a page multiple.
+    {
+        constexpr std::size_t kDefaultGuestStack = 8 * 1024 * 1024;
+        const std::size_t page = static_cast<std::size_t>(getpagesize());
+        const std::size_t want = ((stack ? stack : kDefaultGuestStack) + page - 1) / page * page;
+        if (const int se = pthread_attr_setstacksize(&ha, want)) {
+            host_log("pthread_create %s: a stack of 0x%zx refused (%s); the system's default instead", b->name, want,
+                     std::strerror(se));
+        }
+        stack = want;
+    }
+#else
     if (stack >= 16384) {
         pthread_attr_setstacksize(&ha, stack);
     }
+#endif
     if (b->detached) {
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     }
@@ -500,6 +518,9 @@ GUEST_ABI int hle_sce_rename(void* th, const char* name) {
     if (b->started) {
 #if defined(_WIN32)
         pthread_setname_np(b->pt, b->name);
+#elif defined(__APPLE__)
+        // macOS can name only the calling thread.
+        if (pthread_equal(b->pt, pthread_self())) host_thread_set_name(b->name);
 #else
         char comm[16];
         host_thread_fit_name(b->name, comm);

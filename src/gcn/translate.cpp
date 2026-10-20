@@ -394,6 +394,27 @@ struct Translator {
     Id cu(std::uint32_t v) { return m.const_u32(v); }
 
     Id lane() { return ld(v_lane); }
+    // TranslateOptions::lane_from_scan. The lane must be the subgroup's own
+    // numbering (ballots and shuffles index by it), and the exclusive add only
+    // counts active invocations below this one, so it is used as an index:
+    // the lane is the position of the entry ballot's rank-th set bit, right
+    // even with inactive lanes in between. Call at entry, before any branch.
+    Id lane_by_scan(Id lo, Id hi) {
+        const Id rank = m.emit(spv::OpGroupNonUniformIAdd, t_u32, {cu(spv::ScopeSubgroup), spv::GoExclusiveScan, c_one_u});
+        const Id in_lo = popcnt(lo);
+        const Id upper = uge(rank, in_lo);  // a 64-lane subgroup's lane 32 or above
+        Id word = sel(upper, hi, lo);
+        Id n = sel(upper, isub(rank, in_lo), rank);
+        Id pos = sel(upper, cu(32), c_zero_u);
+        for (std::uint32_t width = 16; width; width >>= 1) {
+            const Id count = popcnt(iand(word, cu((1u << width) - 1)));
+            const Id skip = uge(n, count);
+            n = sel(skip, isub(n, count), n);
+            word = sel(skip, m.emit(spv::OpShiftRightLogical, t_u32, {word, cu(width)}), word);
+            pos = sel(skip, iadd(pos, cu(width)), pos);
+        }
+        return pos;
+    }
     // Bit of a 64-bit mask (lo, hi) for this lane.
     Id mask_bit(Id lo, Id hi) {
         const Id l = lane();
@@ -2329,6 +2350,25 @@ struct Translator {
         }
         return {addr_add(base, off), stride};
     }
+    // The hardware's NUM_RECORDS check for writes (SGPR offset not checked).
+    // Needed: particle shaders take indices from GDS counters, which are not
+    // emulated, and unchecked writes landed on the game's CPU-only heaps.
+    Id buffer_write_in_range(const Inst& in) {
+        if (in.addr64) return m.const_bool(true);  // no range check in this mode
+        const Id w1 = read_s(in.srsrc + 1, in), records = read_s(in.srsrc + 2, in);
+        const Id stride = iand(shr(w1, cu(16)), cu(0x3fff));
+        int va = in.vaddr;
+        const Id index = in.idxen ? ld(vgpr_var(va++)) : c_zero_u;
+        Id off = cu(in.offset12);
+        if (in.offen) off = iadd(off, ld(vgpr_var(va)));
+        const Id raw = ieq(stride, c_zero_u);
+        return bor(band(raw, ult(off, records)), band(bnot(raw), ult(index, records)));
+    }
+    template <typename F>
+    void buffer_write_guard(const Inst& in, F body) {
+        const Id ok = buffer_write_in_range(in);
+        if_then(exec_known() ? ok : band(exec_bit(), ok), body);
+    }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
         {
@@ -2347,7 +2387,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 for (int k = 0; k < n; ++k) store_u32_at(addr_addc(ba.addr, k * 4), vals[k]);
             });
         };
@@ -2369,7 +2409,7 @@ struct Translator {
             std::vector<Id> vals;
             for (int k = 0; k < nv; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
             vals = store_dst_sel_rt(vals, w3);
-            exec_guard([&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
+            buffer_write_guard(in, [&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
             break;
         }
         case 8: case 9: case 10: case 11: {  // ubyte/sbyte/ushort/sshort
@@ -2393,7 +2433,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             const Id mask = cu(op == 24 ? 0xffu : 0xffffu);
             const Id val = iand(ld(vgpr_var(in.vdata)), mask);
-            exec_guard([&] { store_masked_any(ba.addr, val, c_zero_u, mask, c_zero_u); });
+            buffer_write_guard(in, [&] { store_masked_any(ba.addr, val, c_zero_u, mask, c_zero_u); });
             break;
         }
         case 28:
@@ -2422,7 +2462,7 @@ struct Translator {
             const BufferAddr ba = buffer_address(in);
             const Id val = ld(vgpr_var(in.vdata));
             Id result_var = m.local_variable(p_fn_u32, c_zero_u);
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 const Id p = guest_ptr(ba.addr);
                 const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), val});
                 m.store(result_var, r);
@@ -2847,7 +2887,7 @@ struct Translator {
             }
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
-            exec_guard([&] {
+            buffer_write_guard(in, [&] {
                 if (bits[0] == 32) {
                     for (int k = 0; k < n && k < count; ++k) store_u32_at(addr_addc(ba.addr, k * 4), vals[k]);
                 } else if (bits[0] == 16 && in.nfmt == 7) {
@@ -3048,6 +3088,8 @@ struct Translator {
     // here each subgroup does that with one atomic in the word, and the
     // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
     // index unique. A dword with no word bound does nothing and returns 0.
+    // First EXEC lane by ballot, not Elect/BroadcastFirst: MoltenVK's two
+    // disagree on the lane when lane 0 is inactive.
     void gds_counter(const Inst& in, std::uint32_t off) {
         if (!gds_member) {
             error(std::string(mnemonic(in)) + " in GDS outside a compute program: no counter to bind");
@@ -3067,13 +3109,15 @@ struct Translator {
         const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
         const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
         const Id result = m.local_variable(p_fn_u32, c_zero_u);
-        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        const Id lsb_lo = m.ext_inst(t_u32, spv::GlslFindILsb, {blo}), lsb_hi = m.ext_inst(t_u32, spv::GlslFindILsb, {bhi});
+        const Id first_lane = sel(ine(blo, c_zero_u), lsb_lo, sel(ine(bhi, c_zero_u), iadd(lsb_hi, cu(32)), c_zero_u));
+        const Id first = band(active, ieq(lane(), first_lane));
         if_then(band(first, bound), [&] {
             const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
             const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
             m.store(result, r);
         });
-        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
+        write_v(in.dst, m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), ld(result), first_lane}));
     }
 
     // ---- images
@@ -3640,7 +3684,8 @@ struct Translator {
         const bool vertex_w3 = (opt.stage == Stage::Vertex && opt.vertex_formats_from_params && !opt.vertex_input.empty()) ||
                                opt.tess_role == TranslateOptions::TessRole::LsCompute ||
                                opt.tess_role == TranslateOptions::TessRole::LsVertex ||  // the control points (kTess*)
-                               (opt.tess_role == TranslateOptions::TessRole::HullTcs && opt.tess_window);  // its user data
+                               (opt.tess_role == TranslateOptions::TessRole::HullTcs && opt.tess_window) ||  // its user data
+                               opt.params_vertex_formats;
         // The domain role also reads what it takes to leave out a patch whose
         // centre is at or behind the camera plane (StageParams::patch_cull_w).
         const bool patch_cull = opt.tess_role == TranslateOptions::TessRole::Domain && opt.tess_patch_cull;
@@ -3761,7 +3806,11 @@ struct Translator {
         }
 
         // Built-in inputs
-        in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        if (opt.lane_from_scan) {
+            m.capability(spv::CapGroupNonUniformArithmetic);
+        } else {
+            in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        }
         if (opt.stage == Stage::Vertex) {
             in_vertex_index = builtin_in(p_in_u32, spv::BiVertexIndex, "vertex_index");
             in_instance_index = builtin_in(p_in_u32, spv::BiInstanceIndex, "instance_index");
@@ -3868,10 +3917,16 @@ struct Translator {
             m.emit_void(spv::OpKill, {});
             m.label(l_on);
         }
-        m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        Id entry_lo = 0, entry_hi = 0;  // lane_from_scan: one entry ballot for both uses
+        if (opt.lane_from_scan) {
+            ballot(m.const_bool(true), entry_lo, entry_hi);
+            m.store(v_lane, lane_by_scan(entry_lo, entry_hi));
+        } else {
+            m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        }
         {
-            Id lo, hi;
-            ballot(m.const_bool(true), lo, hi);
+            Id lo = entry_lo, hi = entry_hi;
+            if (!opt.lane_from_scan) ballot(m.const_bool(true), lo, hi);
             m.store(v_exec_lo, lo);
             m.store(v_exec_hi, hi);
             refresh_exec_bit();
@@ -4893,6 +4948,122 @@ std::vector<std::uint32_t> make_rect_geometry_shader(const std::vector<std::uint
     m.execution_mode(fn, static_cast<spv::ExecutionMode>(29 /* OutputTriangleStrip */));
     m.execution_mode(fn, static_cast<spv::ExecutionMode>(26 /* OutputVertices */), {4});
     return m.assemble();
+}
+
+RectTessShaders make_rect_tess_shaders(const std::vector<std::uint32_t>& param_locations, int clip_count) {
+    using spv::Id;
+    // gl_MaxPatchVertices, as glslang declares the input arrays.
+    constexpr std::uint32_t kMaxPatchVertices = 32;
+    RectTessShaders out;
+    for (int evaluation = 0; evaluation < 2; ++evaluation) {
+        spv::Module m;
+        m.capability(spv::CapShader);
+        m.capability(spv::CapTessellation);
+        if (clip_count) m.capability(spv::CapClipDistance);
+        m.memory_model(0 /* Logical */, 1 /* GLSL450 */);
+        const Id t_void = m.type_void();
+        const Id t_bool = m.type_bool();
+        const Id t_f32 = m.type_float(32);
+        const Id t_i32 = m.type_int(32, true);
+        const Id t_v3f = m.type_vector(t_f32, 3);
+        const Id t_v4f = m.type_vector(t_f32, 4);
+        // No point size: see make_rect_tess_shaders in translate.h.
+        std::vector<Id> members = {t_v4f};
+        if (clip_count) members.push_back(m.type_array(t_f32, m.const_u32(static_cast<std::uint32_t>(clip_count))));
+        const Id t_pv = m.type_struct(members);
+        m.decorate(t_pv, spv::DecBlock);
+        m.member_decorate(t_pv, 0, spv::DecBuiltIn, {spv::BiPosition});
+        if (clip_count) m.member_decorate(t_pv, 1, spv::DecBuiltIn, {3 /* ClipDistance */});
+        const Id c_in_n = m.const_u32(kMaxPatchVertices), c_three = m.const_u32(3);
+        const Id in_pv = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_pv, c_in_n)), spv::ScInput);
+        const Id out_pv = m.global_variable(m.type_pointer(spv::ScOutput, evaluation ? t_pv : m.type_array(t_pv, c_three)), spv::ScOutput);
+        m.name(in_pv, "gl_in");
+        m.name(out_pv, "gl_out");
+        std::vector<Id> interface = {in_pv, out_pv};
+        std::vector<std::pair<Id, Id>> params;  // (in array var, out var)
+        for (std::uint32_t loc : param_locations) {
+            const Id in = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_v4f, c_in_n)), spv::ScInput);
+            const Id o = m.global_variable(m.type_pointer(spv::ScOutput, evaluation ? t_v4f : m.type_array(t_v4f, c_three)), spv::ScOutput);
+            m.decorate(in, spv::DecLocation, {loc});
+            m.decorate(o, spv::DecLocation, {loc});
+            interface.push_back(in);
+            interface.push_back(o);
+            params.push_back({in, o});
+        }
+        const Id p_in_v4 = m.type_pointer(spv::ScInput, t_v4f), p_out_v4 = m.type_pointer(spv::ScOutput, t_v4f);
+        const Id p_in_f = m.type_pointer(spv::ScInput, t_f32), p_out_f = m.type_pointer(spv::ScOutput, t_f32);
+        const auto ci = [&](std::uint32_t v) { return m.const_i32(static_cast<std::int32_t>(v)); };
+        Id in_builtin = 0, outer = 0, inner = 0;
+        if (evaluation) {
+            in_builtin = m.global_variable(m.type_pointer(spv::ScInput, t_v3f), spv::ScInput);
+            m.decorate(in_builtin, spv::DecBuiltIn, {spv::BiTessCoord});
+            m.name(in_builtin, "tess_coord");
+        } else {
+            in_builtin = m.global_variable(m.type_pointer(spv::ScInput, t_i32), spv::ScInput);
+            m.decorate(in_builtin, spv::DecBuiltIn, {spv::BiInvocationId});
+            m.name(in_builtin, "invocation_id");
+            outer = m.global_variable(m.type_pointer(spv::ScOutput, m.type_array(t_f32, m.const_u32(4))), spv::ScOutput);
+            inner = m.global_variable(m.type_pointer(spv::ScOutput, m.type_array(t_f32, m.const_u32(2))), spv::ScOutput);
+            m.decorate(outer, spv::DecBuiltIn, {spv::BiTessLevelOuter});
+            m.decorate(inner, spv::DecBuiltIn, {spv::BiTessLevelInner});
+            m.decorate(outer, spv::DecPatch);
+            m.decorate(inner, spv::DecPatch);
+            m.name(outer, "tess_level_outer");
+            m.name(inner, "tess_level_inner");
+            interface.push_back(outer);
+            interface.push_back(inner);
+        }
+        interface.push_back(in_builtin);
+        const Id fn = m.begin_function(t_void, m.type_function(t_void, {}));
+        m.label();
+        if (!evaluation) {
+            // Levels 1 all round: one quad, two triangles.
+            const Id id = m.load(t_i32, in_builtin);
+            m.store(m.access_chain(p_out_v4, out_pv, {id, ci(0)}), m.load(t_v4f, m.access_chain(p_in_v4, in_pv, {id, ci(0)})));
+            for (int k = 0; k < clip_count; ++k) {
+                m.store(m.access_chain(p_out_f, out_pv, {id, ci(1), ci(static_cast<std::uint32_t>(k))}),
+                        m.load(t_f32, m.access_chain(p_in_f, in_pv, {id, ci(1), ci(static_cast<std::uint32_t>(k))})));
+            }
+            for (const auto& [in, o] : params) m.store(m.access_chain(p_out_v4, o, {id}), m.load(t_v4f, m.access_chain(p_in_v4, in, {id})));
+            for (std::uint32_t k = 0; k < 4; ++k) m.store(m.access_chain(p_out_f, outer, {ci(k)}), m.const_f32(1.0f));
+            for (std::uint32_t k = 0; k < 2; ++k) m.store(m.access_chain(p_out_f, inner, {ci(k)}), m.const_f32(1.0f));
+        } else {
+            // (0,0) v0, (1,0) v1, (0,1) v2, (1,1) v1 + v2 - v0 as in the GS.
+            const Id coord = m.load(t_v3f, in_builtin);
+            const Id u = m.emit(spv::OpFOrdGreaterThan, t_bool, {m.emit(spv::OpCompositeExtract, t_f32, {coord, 0}), m.const_f32(0.5f)});
+            const Id v = m.emit(spv::OpFOrdGreaterThan, t_bool, {m.emit(spv::OpCompositeExtract, t_f32, {coord, 1}), m.const_f32(0.5f)});
+            const auto corner = [&](Id type, Id a, Id b, Id c) {
+                const Id d = m.emit(spv::OpFSub, type, {m.emit(spv::OpFAdd, type, {b, c}), a});
+                return m.emit(spv::OpSelect, type, {u, m.emit(spv::OpSelect, type, {v, d, b}), m.emit(spv::OpSelect, type, {v, c, a})});
+            };
+            std::vector<Id> pos(3);
+            for (std::uint32_t k = 0; k < 3; ++k) pos[k] = m.load(t_v4f, m.access_chain(p_in_v4, in_pv, {ci(k), ci(0)}));
+            m.store(m.access_chain(p_out_v4, out_pv, {ci(0)}), corner(t_v4f, pos[0], pos[1], pos[2]));
+            for (int k = 0; k < clip_count; ++k) {
+                std::vector<Id> d(3);
+                for (std::uint32_t i = 0; i < 3; ++i) {
+                    d[i] = m.load(t_f32, m.access_chain(p_in_f, in_pv, {ci(i), ci(1), ci(static_cast<std::uint32_t>(k))}));
+                }
+                m.store(m.access_chain(p_out_f, out_pv, {ci(1), ci(static_cast<std::uint32_t>(k))}), corner(t_f32, d[0], d[1], d[2]));
+            }
+            for (const auto& [in, o] : params) {
+                std::vector<Id> p(3);
+                for (std::uint32_t i = 0; i < 3; ++i) p[i] = m.load(t_v4f, m.access_chain(p_in_v4, in, {ci(i)}));
+                m.store(o, corner(t_v4f, p[0], p[1], p[2]));
+            }
+        }
+        m.emit_void(spv::OpReturn, {});
+        m.end_function();
+        m.entry_point(evaluation ? spv::EmTessellationEvaluation : spv::EmTessellationControl, fn, "main", interface);
+        // Modes in both stages: Metal needs the domain in the control stage.
+        // Cw keeps triangles wound as v0 v1 v2 (domain origin upper left).
+        m.execution_mode(fn, spv::ExQuads);
+        m.execution_mode(fn, spv::ExSpacingEqual);
+        m.execution_mode(fn, spv::ExVertexOrderCw);
+        if (!evaluation) m.execution_mode(fn, spv::ExOutputVertices, {3});
+        (evaluation ? out.evaluation : out.control) = m.assemble();
+    }
+    return out;
 }
 
 }  // namespace gcn

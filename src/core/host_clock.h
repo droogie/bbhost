@@ -43,8 +43,9 @@ std::uint64_t host_clock_ticks_at(std::uint64_t hz);
 // (Windows; logs what it set and what the timer resolution now is).
 void host_timing_init();
 
-// The calling thread's scheduling class (Windows: SetThreadPriority; a no-op
-// on Linux). Each of these threads starts once, and each says so in the log.
+// The calling thread's scheduling class (Windows: SetThreadPriority; macOS:
+// its QoS class; a no-op on Linux). Each of these threads starts once, and
+// each says so in the log.
 enum class HostThreadClass {
     Pacing,   // the vblank clock: little work, on time
     GpuFeed,  // command processors, recorder, submission, presenter

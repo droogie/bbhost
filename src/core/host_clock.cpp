@@ -9,6 +9,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <timeapi.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
 #endif
 
 namespace {
@@ -171,6 +174,20 @@ void host_thread_set_class(HostThreadClass c, const char* who) {
         host_log("timing: %s runs at %s priority (BBHOST_THREAD_PRIO=0: normal)", who, level);
     } else {
         host_log("timing: %s could not be set to %s priority (error %lu)", who, level, static_cast<unsigned long>(GetLastError()));
+    }
+#elif defined(__APPLE__)
+    // macOS schedules by QoS class, not priority. The game's threads keep the
+    // default class (still P-cores); these go above it.
+    (void)c;
+    if (!on) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) host_log("timing: the pacing threads run at the default QoS class (BBHOST_THREAD_PRIO=0)");
+        return;
+    }
+    if (const int e = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); e == 0) {
+        host_log("timing: %s runs at the user-interactive QoS class (BBHOST_THREAD_PRIO=0: default)", who);
+    } else {
+        host_log("timing: %s could not be set to the user-interactive QoS class (%s)", who, std::strerror(e));
     }
 #else
     (void)on;

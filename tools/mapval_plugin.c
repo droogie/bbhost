@@ -19,6 +19,8 @@
  *                                             to 1, the player next to it
  *                                             facing it until it dies (the
  *                                             driver presses attack)
+ *     fight <s> <radius> [x y z]              as kill for <s> seconds, the enemy's
+ *                                             HP left, the player's kept full
  *     falldeath <name> <x> <y> <z> <height>   HP to 1, dropped from height
  *                                             above the point: a death there
  *     travel <return point> <block hex> <name> [<event flag>...]
@@ -155,6 +157,14 @@ static void load_tour(const char* path) {
             if (sscanf(line, "%*s %*f %f %f %f %f", &s.x, &s.y, &s.z, &team) >= 3) s.yaw = 1;
             s.hold = s.hold + 0; /* radius */
             s.team = (int)team;
+        }
+        else if (!strcmp(kind, "fight") && sscanf(line, "%*s %f %f", &s.yaw, &s.hold) == 2) {
+            /* a kill step: nflags -1 marks a fight, flags[0] its seconds */
+            s.kind = S_KILL, strcpy(s.name, "fight");
+            s.nflags = -1;
+            s.flags[0] = (uint32_t)s.yaw;
+            s.yaw = sscanf(line, "%*s %*f %*f %f %f %f", &s.x, &s.y, &s.z) == 3;
+            s.team = 23; /* the hostile ones */
         }
         else if (!strcmp(kind, "falldeath") && sscanf(line, "%*s %63s %f %f %f %f", s.name, &s.x, &s.y, &s.z, &s.hold) == 5)
             s.kind = S_FALL;
@@ -570,7 +580,7 @@ static void tick(double t) {
                 float e[3];
                 chr_name(kill_chr, nm, sizeof nm);
                 chr_pos(kill_chr, e);
-                *(int*)(uintptr_t)(chr_data(kill_chr) + 0xf8) = 1;
+                if (s->nflags != -1) *(int*)(uintptr_t)(chr_data(kill_chr) + 0xf8) = 1;
                 api->log("mapval kill-target %s %.3f %.3f %.3f %.3f dist %.1f", nm, t, e[0], e[1], e[2], d);
                 put_next_to(kill_chr, t);
                 api->log("mapval kill-ready %s %.3f", nm, t);
@@ -586,11 +596,14 @@ static void tick(double t) {
                 chr_name(kill_chr, nm, sizeof nm);
                 api->log("mapval kill-done %s %.3f %.3f %.3f %.3f player %.3f %.3f %.3f", nm, t, e[0], e[1], e[2], p[0], p[1], p[2]);
                 next = 1;
-            } else if (el > 60) {
+            } else if (s->nflags == -1 && el > s->flags[0]) {
+                api->log("mapval fight-end %.3f hp %d/%d", t, ehp, emx);
+                next = 1;
+            } else if (s->nflags != -1 && el > 60) {
                 api->log("mapval kill-timeout %.3f hp %d", t, ehp);
                 next = 1;
             } else {
-                if (ehp > 1) *(int*)(uintptr_t)(chr_data(kill_chr) + 0xf8) = 1;
+                if (ehp > 1 && s->nflags != -1) *(int*)(uintptr_t)(chr_data(kill_chr) + 0xf8) = 1;
                 if (t - kill_last_warp > 2) {
                     float dx = e[0] - p[0], dz = e[2] - p[2];
                     if (dx * dx + dz * dz > 2.5f * 2.5f) put_next_to(kill_chr, t);

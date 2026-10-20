@@ -1,7 +1,8 @@
 # Release binaries: the Windows zip (cross-built in an Arch Linux container,
 # tools/ci_windows.sh), the portable Linux tarball (Ubuntu 24.04 with static
-# libstdc++, tools/ci_build.sh + tools/package_linux.sh) and the Steam Deck
-# kit made from it, with the unstripped binaries for symbolizing crash
+# libstdc++, tools/ci_build.sh + tools/package_linux.sh), the Steam Deck
+# kit made from it, and the macOS zip (tools/package_macos.sh), with the
+# unstripped binaries (the dSYM for macOS) for symbolizing crash
 # reports. The bundles go to the live server (https://thehuntersdream.com) by
 # default, and the playtest kits for the dev server (tools/package_playtest.sh)
 # are never among them: tools/check_release_bundle.sh fails the release
@@ -25,6 +26,7 @@
 # The bare executables the publish job adds keep the same names in every
 # release - bbhost.exe and bbhost (Linux) - so a shortcut or a launcher entry
 # (a Steam non-Steam game) keeps working when one is replaced by the next.
+# macOS has none: its bbhost needs the package's lib/, so the zip is the update.
 # SHA256SUMS lists them with the packages, signed with the release key
 # (SHA256SUMS.sig, made with the RELEASE_SIGNING_KEY secret; a tag without the
 # secret fails rather than publish unsigned). bbhost itself (src/host/updater.h)
@@ -37,6 +39,8 @@
 # The jobs' checks - package-linux, package-windows and package-all (the Steam
 # Deck kit, the updater's executables and the bundle check), with build.yml's
 # tests - are the ones master's ruleset requires before a pull request merges.
+# package-macos and tests-macos are not, and continue on error while the port
+# is new: a failed macOS package is left out of the release.
 #
 # The debug menu's font (engine/debug_menu.h) is the Debug Menu plugin's own,
 # made from public-domain fonts (plugins/debug_menu): nothing is fetched.
@@ -114,9 +118,52 @@ jobs:
         if: failure()
         run: tail -n 80 build/win-deps/*.log build-win.*.log || true
 
+  macos:
+    name: package-macos
+    runs-on: macos-15
+    continue-on-error: true   # not yet required: see the comment at the top
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: ~/VulkanSDK
+          key: vulkan-sdk-macos-${{ hashFiles('tools/ci_macos_setup.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: build-macos/prefix
+          key: deps-${{ runner.os }}-${{ hashFiles('tools/build_macos.sh') }}
+      - name: Rosetta 2 and the Vulkan SDK
+        run: tools/ci_macos_setup.sh
+      - name: build
+        run: CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/build_macos.sh
+      - name: package
+        env:
+          RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
+        run: |
+          # The plugins' signatures need OpenSSL 3 (Ed25519); macOS's own openssl is LibreSSL.
+          if command -v brew > /dev/null && [ -d "$(brew --prefix openssl@3 2>/dev/null)/bin" ]; then
+            export PATH="$(brew --prefix openssl@3)/bin:$PATH"
+          fi
+          openssl version
+          tools/package_macos.sh build-macos/build/bbhost build/mac
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
+          name: macos
+          path: |
+            build/mac/*.zip
+      - name: logs on failure
+        if: failure()
+        run: tail -n 80 build-macos/*.log || true
+
   publish:
     name: package-all
-    needs: [linux, windows]
+    needs: [linux, windows, macos]
+    # Whatever package-macos did, once Linux and Windows have their packages.
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -138,19 +185,38 @@ jobs:
           install -m 755 "dist/x/bbhost-linux-$v/bbhost" dist/release/bbhost
           # The official plugins, signed in the packages, as assets of their own:
           # the plugin manager's "Get the latest official plugins" fetches
-          # bbhost-plugin-<name>-windows.dll / -linux.so and their .sig.
+          # bbhost-plugin-<name>-windows.dll / -linux.so / -macos.so and their .sig.
           unzip -q "$w" "bbhost-win-$v/plugins/*" -d dist/x
           tar xzf dist/linux/bbhost-linux-$v.tar.gz -C dist/x "bbhost-linux-$v/plugins"
           for f in dist/x/bbhost-win-$v/plugins/*.dll; do
             [ -f "$f" ] || continue; n=$(basename "$f" .dll)
             cp "$f" "dist/release/bbhost-plugin-$n-windows.dll"
-            [ -f "$f.sig" ] && cp "$f.sig" "dist/release/bbhost-plugin-$n-windows.dll.sig"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/release/bbhost-plugin-$n-windows.dll.sig"; fi
           done
           for f in dist/x/bbhost-linux-$v/plugins/*.so; do
             [ -f "$f" ] || continue; n=$(basename "$f" .so)
             cp "$f" "dist/release/bbhost-plugin-$n-linux.so"
-            [ -f "$f.sig" ] && cp "$f.sig" "dist/release/bbhost-plugin-$n-linux.so.sig"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/release/bbhost-plugin-$n-linux.so.sig"; fi
           done
+      - name: the macOS assets
+        # Checked aside, so a missing or bad macOS package is left out.
+        continue-on-error: true
+        run: |
+          w=$(ls dist/windows/bbhost-win-*.zip); v=$(basename "$w" .zip); v=${v#bbhost-win-}
+          m=dist/macos/bbhost-mac-$v.zip
+          if [ ! -f "$m" ]; then echo "no macOS package (package-macos failed): the release goes out without it"; exit 0; fi
+          rm -rf dist/mac dist/xm; mkdir -p dist/mac dist/xm
+          cp dist/macos/* dist/mac/
+          unzip -q "$m" "bbhost-mac-$v/plugins/*" -d dist/xm
+          for f in dist/xm/bbhost-mac-$v/plugins/*.so; do
+            [ -f "$f" ] || continue; n=$(basename "$f" .so)
+            cp "$f" "dist/mac/bbhost-plugin-$n-macos.so"
+            if [ -f "$f.sig" ]; then cp "$f.sig" "dist/mac/bbhost-plugin-$n-macos.so.sig"; fi
+          done
+          tools/check_release_bundle.sh dist/mac
+          mv dist/mac/* dist/release/
+      - name: the checksums
+        run: |
           (cd dist/release && sha256sum * > SHA256SUMS)
           ls -la dist/release
       - uses: actions/upload-artifact@v4
@@ -187,8 +253,8 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball and Steam Deck kit, unsigned, kept 14 days.
-          Download \`windows\`, \`linux\` or \`steamdeck\` (each with its package), or \`release\` (everything), from the bottom of the run page:
+          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball, Steam Deck kit and, when its job passed, macOS zip (experimental), unsigned, kept 14 days.
+          Download \`windows\`, \`linux\`, \`steamdeck\` or \`macos\` (each with its package), or \`release\` (everything), from the bottom of the run page:
           $RUN#artifacts"
           gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release

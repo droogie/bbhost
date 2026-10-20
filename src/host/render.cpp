@@ -9,15 +9,18 @@
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
+#include "host/spirv_relax.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
 
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
+#include "gcn/tess_vertex.h"
 #include "gcn/names.h"
 #include "gcn/wave.h"
 #include "gcn/isa.h"
+#include "gcn/spirv.h"
 #include "hle/modules.h"
 #include "log.h"
 
@@ -104,12 +107,33 @@ VkFormat cb_format(const CbInfo& i) {
     }
 }
 
+// 16-bit depth with stencil: D24_UNORM_S8_UINT, else D32_SFLOAT_S8_UINT
+// (Apple GPUs and AMD have no 24-bit depth). The guest still sees unorm depth
+// (RtImage::depth_stand_in). Depth bias steps differ: 2^-24 for D24, one ulp
+// of the depth for D32F.
+VkFormat depth16_stencil_format() {
+    static const VkFormat f = [] {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((fp.optimalTilingFeatures & need) == need) return VK_FORMAT_D24_UNORM_S8_UINT;
+        host_log("render: D24_UNORM_S8_UINT is no depth target here (features 0x%x): 16-bit depth with stencil is drawn into D32_SFLOAT_S8_UINT",
+                 fp.optimalTilingFeatures);
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }();
+    return f;
+}
 VkFormat db_format(std::uint32_t z_info, std::uint32_t stencil_info) {
     const std::uint32_t zf = z_info & 3;
     const bool stencil = (stencil_info & 1) != 0;
     if (zf == 0) return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_UNDEFINED;
-    if (zf == 1) return stencil ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D16_UNORM;
+    if (zf == 1) return stencil ? depth16_stencil_format() : VK_FORMAT_D16_UNORM;
     return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+}
+// As fills, copies and readbacks see the memory: a stand-in holds unorm.
+bool depth_is_float(const RtImage& r) {
+    return (r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D32_SFLOAT_S8_UINT) && !r.depth_stand_in;
 }
 
 VkCompareOp compare_op(std::uint32_t f) {
@@ -216,6 +240,8 @@ struct ShaderStage {
 struct GfxPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     ShaderStage vs, ps, gs;
+    // Rect lists without a geometry stage (rect_list_path); shared, not owned.
+    VkShaderModule rect_tcs = VK_NULL_HANDLE, rect_tes = VK_NULL_HANDLE;
     // A tessellated draw's generated vertex and control stages. The
     // domain shader stays in `vs` - it binds what a vertex stage binds, so
     // every descriptor, prefetch and user-data path is the one already there -
@@ -239,7 +265,7 @@ struct GfxPipeline {
     gcn::TranslateResult tess_hs;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
-    // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
+    // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layouts.
     VkDescriptorSetLayout set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     // The no-fallback variant, once a draw whose constant buffers all bound
@@ -248,6 +274,10 @@ struct GfxPipeline {
     GfxPipeline* lean_variant = nullptr;
     bool lean_building = false;  // a worker is building its no-fallback variant (queue_lean_variant)
     bool building = false;       // a worker is building this pipeline; nothing reads it until handed over
+    // BBHOST_PIPELINE_DEFER: flip at which drawing was deferred (0: never),
+    // and draws skipped since.
+    std::uint64_t defer_flip = 0;
+    std::uint32_t defer_skipped = 0;
     // Per stage: whether the translation lists the images and samplers
     // paths_for does, so the prefetch takes the words the pipeline key
     // resolved (key_stage_matches, checked on the first draw).
@@ -321,6 +351,10 @@ const std::string* g_pass_profile_name = nullptr;  // the profile name of the dr
 // read of a target this tracking does not see (a T# whose base is inside the
 // target rather than at it, or an image bound another way), which the
 // validation layer cannot see through the bindless set either.
+// Off on macOS too: no measurable gain there, and Metal does not order these
+// reads (MoltenVK puts images in MTLHeaps), so a missed barrier is a white
+// frame. begin_pass's sample check must count the open pass's targets as
+// written, or post-processing chains read their input with no barrier.
 struct PassHazards {
     bool owed = false;
     std::unordered_set<std::uint64_t> written;  // attachment bases written since the last barrier
@@ -329,7 +363,8 @@ struct PassHazards {
 PassHazards g_hazards;
 const bool g_lazy_barriers = [] {
     const char* e = std::getenv("BBHOST_PASS_BARRIERS");
-    return e && std::strcmp(e, "lazy") == 0;
+    if (e && *e) return std::strcmp(e, "lazy") == 0;
+    return false;
 }();
 std::atomic<std::uint64_t> g_barriers_paid{0}, g_barriers_skipped{0}, g_barriers_mid_pass{0};
 
@@ -801,6 +836,27 @@ bool tess_lds_bound() {
     }();
     return on;
 }
+
+// Particles as one vertex stage (gcn/tess_vertex.h): MoltenVK runs
+// tessellation through a compute encoder that restarts the render pass, so
+// constant-factor patches are drawn as triangle lists instead. Default on
+// MoltenVK only; BBHOST_TESS_VERTEX=0/1 forces it.
+bool tess_vertex_wanted() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_TESS_VERTEX");
+        const bool want = e && *e ? e[0] != '0' : g.moltenvk;
+        host_log("render: particles %s (BBHOST_TESS_VERTEX=%s)",
+                 want ? "as one vertex stage, no tessellation stages" : "on the host's tessellator", e && *e ? e : "unset");
+        return want;
+    }();
+    return on;
+}
+// Domain shaders that did not fuse (by program hash) keep the tessellator.
+enum TessVtxMiss { kTvIndexed, kTvIndirect, kTvShape, kTvFactors, kTvProgram, kTvMisses };
+std::atomic<std::uint64_t> g_tess_vtx_draws{0}, g_tess_vtx_patches{0}, g_tess_vtx_failed{0};
+std::atomic<std::uint64_t> g_tess_vtx_miss[kTvMisses] = {};
+std::mutex g_tess_vtx_mu;
+std::unordered_set<std::uint64_t> g_tess_vtx_refused;  // under g_tess_vtx_mu
 void note_stage_params(int st, const gcn::StageParams& params, bool set_repeated) {
     const std::uint64_t h = fnv1a(&params, sizeof(params), fnv1a(&st, sizeof(st)));
     static std::uint64_t last[2] = {};
@@ -1287,7 +1343,7 @@ std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint
 void copy_layers_locked(const RtImage& from, RtImage& to);
 
 RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std::uint32_t height, bool depth,
-                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0) {
+                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0, bool depth_stand_in = false) {
     // An image this one replaces whose last write was a fill (RtImage::
     // fill_last): the new image starts with that fill if it covers it. The
     // blood layers' small targets move between sizes as well as between sRGB
@@ -1354,14 +1410,16 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         // A draw into slice k of a layered target names SLICE_MAX = k (a cube's
         // faces are drawn one slice at a time), so fewer slices than the image
         // has is the same target.
-        if (r.format == format && r.width == width && r.height == height && r.layers >= layers) {
+        // A depth stand-in is another guest format than a real D32_SFLOAT_S8_UINT.
+        const bool same_format = r.format == format && r.depth_stand_in == depth_stand_in;
+        if (same_format && r.width == width && r.height == height && r.layers >= layers) {
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
             rt_written(r);
             return &r;
         }
         g.rt_replacements.fetch_add(1);
-        if (r.format == format && r.width == width && r.height == height) {
+        if (same_format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
             // cube's first frame this happens once per face.
             static std::atomic<int> logs{0};
@@ -1412,6 +1470,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     r.width = width;
     r.height = height;
     r.depth = depth;
+    r.depth_stand_in = depth_stand_in;
     r.layers = std::max(layers, 1u);
     r.slice_bytes = slice_bytes;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1582,17 +1641,19 @@ std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws 
 
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, bool depth_stand_in = false) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
+        bool depth_stand_in = false;
         RtImage* rt = nullptr;
     };
     static Memo memo[9];
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
-        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
+        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
+        m.depth_stand_in == depth_stand_in) {
         apply_pending_clear(*m.rt);
         rt_written(*m.rt);
         return m.rt;
@@ -1651,8 +1712,8 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     } else {
         ++g_extent_guessed;
     }
-    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, rt};
+    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, depth_stand_in);
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, depth_stand_in, rt};
     return rt;
 }
 
@@ -1876,6 +1937,7 @@ const bool g_dump_spirv = [] {
 }();
 void dump_spirv(const std::string& name, const std::vector<std::uint32_t>& spirv) {
     if (!g_dump_spirv) return;
+    host_mkdir("build");  // mkdir makes one level
     host_mkdir("build/spv");
     const std::string path = "build/spv/" + name + ".spv";
     if (FILE* f = std::fopen(path.c_str(), "wb")) {
@@ -1900,10 +1962,99 @@ void dump_buffers(const std::string& name, const gcn::TranslateResult& meta, std
     }
 }
 
+spv::RelaxStages relax_contraction_stages() {
+    static const spv::RelaxStages stages = [] {
+        const char* e = std::getenv("BBHOST_VS_CONTRACTION");
+        return e && e[0] == '1' ? spv::RelaxStages::Fragment : spv::RelaxStages::GraphicsInvariant;
+    }();
+    return stages;
+}
+
+// BBHOST_PS_DISCARD_EXACT=1 keeps discard conditions exact. Only a redraw
+// under an EQUAL depth test needs that, none seen so far, and on MoltenVK it
+// costs every alpha-tested shader optnone helpers.
+bool relax_exact_discards() {
+    static const bool exact = [] {
+        const char* e = std::getenv("BBHOST_PS_DISCARD_EXACT");
+        return e && e[0] == '1';
+    }();
+    return exact;
+}
+
+// MoltenVK makes each NoContraction op a [[clang::optnone]] helper call
+// (pixel shaders 4-20x slower), so its modules drop the decoration; other
+// drivers keep it for free. Done here, not in the translator, so the
+// translation cache and the lifter's checks see unchanged modules.
+// Vertex-pipeline stages get an Invariant Position instead, so two pipelines
+// drawing one surface still agree on depth. BBHOST_NO_CONTRACTION=1 keeps
+// every decoration; BBHOST_VS_CONTRACTION=1 keeps vertex stages exact.
+bool relax_contraction_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_NO_CONTRACTION");
+        const bool keep = e && e[0] == '1';
+        if (g.moltenvk) {
+            host_log("gpu: NoContraction %s (MoltenVK)%s%s", keep ? "kept" : "dropped",
+                     keep ? " - BBHOST_NO_CONTRACTION=1"
+                          : relax_contraction_stages() == spv::RelaxStages::GraphicsInvariant
+                                ? " in fragment stages, except what feeds FragDepth, and in vertex-pipeline stages, "
+                                  "whose Position is Invariant instead"
+                                : " in fragment stages, except what feeds FragDepth; vertex stages exact "
+                                  "(BBHOST_VS_CONTRACTION=1)",
+                     relax_exact_discards() ? "; discard decisions exact (BBHOST_PS_DISCARD_EXACT=1)" : "");
+        }
+        return g.moltenvk && !keep;
+    }();
+    return on;
+}
+
+// BBHOST_SPIRV_SALT=<text> (checks): names module-scope variables <text>_<id>
+// so neither the pipeline cache nor Metal's own shader cache (which a fresh
+// data folder leaves warm) hits: a cold-compile run. Names change nothing else.
+std::vector<std::uint32_t> salt_names(const std::vector<std::uint32_t>& in) {
+    static const std::string salt = [] {
+        const char* e = std::getenv("BBHOST_SPIRV_SALT");
+        return std::string(e ? e : "");
+    }();
+    if (salt.empty() || in.size() < 5) return {};
+    std::unordered_set<std::uint32_t> vars;
+    for (std::size_t at = 5; at < in.size();) {
+        const std::uint32_t count = in[at] >> 16, op = in[at] & 0xffff;
+        if (count == 0 || at + count > in.size()) return {};
+        if (op == 59 && count >= 4 && in[at + 3] != 7) vars.insert(in[at + 2]);  // OpVariable, not Function storage
+        at += count;
+    }
+    std::vector<std::uint32_t> out(in.begin(), in.begin() + 5);
+    bool named = false;
+    for (std::size_t at = 5; at < in.size();) {
+        const std::uint32_t count = in[at] >> 16, op = in[at] & 0xffff;
+        // Capability..MemberName: names go after these, before decorations.
+        static const std::unordered_set<std::uint32_t> before = {0, 2, 3, 4, 5, 6, 7, 10, 11, 14, 15, 16, 17, 331};
+        if (!named && !before.count(op)) {
+            named = true;
+            for (const std::uint32_t id : vars) {
+                const std::string name = salt + "_" + std::to_string(id);
+                const std::size_t words = name.size() / 4 + 1;
+                out.push_back(static_cast<std::uint32_t>((2 + words) << 16 | 5));  // OpName
+                out.push_back(id);
+                std::vector<std::uint32_t> text(words, 0);
+                std::memcpy(text.data(), name.data(), name.size());
+                out.insert(out.end(), text.begin(), text.end());
+            }
+        }
+        if (!(op == 5 && count >= 2 && vars.count(in[at + 1]))) out.insert(out.end(), in.begin() + at, in.begin() + at + count);
+        at += count;
+    }
+    return out;
+}
+
 bool make_module(const std::vector<std::uint32_t>& spirv, VkShaderModule& out) {
+    std::vector<std::uint32_t> relaxed;
+    if (relax_contraction_on()) relaxed = spv::relax_contraction(spirv, relax_contraction_stages(), nullptr, relax_exact_discards());
+    if (std::vector<std::uint32_t> salted = salt_names(relaxed.empty() ? spirv : relaxed); !salted.empty()) relaxed = std::move(salted);
+    const std::vector<std::uint32_t>& words = relaxed.empty() ? spirv : relaxed;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = spirv.size() * 4;
-    smci.pCode = spirv.data();
+    smci.codeSize = words.size() * 4;
+    smci.pCode = words.data();
     return vkCreateShaderModule(g.device, &smci, nullptr, &out) == VK_SUCCESS;
 }
 
@@ -2012,6 +2163,10 @@ struct DrawState {
     // for; the evaluation stage keeps the usual one.
     bool tess_attrs = false;
     std::uint32_t tess_attr_vec4s = 8;
+    // As one vertex stage (gcn/tess_vertex.h): tess_hw is false and `vs` is
+    // the LS and domain shader fused.
+    bool tess_vtx = false;
+    std::uint32_t tess_vtx_level = 1;
     std::uint64_t ls_va = 0, ls_fetch_va = 0;
     std::uint32_t ls_rsrc1 = 0, ls_rsrc2 = 0;
     std::uint32_t ls_user[16] = {};
@@ -2086,7 +2241,7 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
     k.ps = ps_hash;
     k.prim = s.prim;
     k.domain_level = s.domain_level;
-    k.tess_hw = s.tess_hw;
+    k.tess_hw = (s.tess_hw ? 1u : 0u) | (s.tess_vtx ? 2u : 0u);
     k.tess_control_points = s.tess_control_points;
     std::memcpy(k.tess_outer, s.tess_outer, sizeof(k.tess_outer));
     std::memcpy(k.tess_inner, s.tess_inner, sizeof(k.tess_inner));
@@ -2096,6 +2251,10 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
         k.hs_rsrc1 = s.hs_rsrc1;
         k.hs_rsrc2 = s.hs_rsrc2;
         k.tess_window = s.tess_window;
+        k.tess_shape = (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2;
+    }
+    if (s.tess_vtx) {
+        k.domain_level = s.tess_vtx_level;
         k.tess_shape = (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2;
     }
     if (s.tess_native) {  // the LS is the pipeline's vertex stage, and the lifts fold the constants
@@ -2621,10 +2780,12 @@ void apply_table_masks_locked() {
 // BBHOST_SET_LAYOUTS (on unless 0): each graphics pipeline's sets have a layout
 // with only the params buffer and the bindings its stage's translation
 // declares, instead of the shared layout's 113, so allocating and binding a set
-// covers the descriptors the stage uses. Stages with the same bindings share a
-// layout, and pipelines with the same pair share a pipeline layout: a
-// no-fallback variant declares its base pipeline's bindings, so it takes the
-// sets written for them. Compute dispatches keep the shared layout.
+// covers the descriptors the stage uses. Stages of one set with the same
+// bindings share a layout, and pipelines with the same pair share a pipeline
+// layout: a no-fallback variant declares its base pipeline's bindings, so it
+// takes the sets written for them. With Gpu::per_stage_sets each set is
+// visible to its own stages only, so per-stage limits count each shader apart.
+// Compute dispatches keep the shared layout.
 const bool g_set_layouts = [] {
     const char* e = std::getenv("BBHOST_SET_LAYOUTS");
     return !(e && e[0] == '0');
@@ -2634,7 +2795,7 @@ const bool g_set_layouts = [] {
 // link from pipeline libraries whose shaders are compiled when GX creates them:
 // a cold world load stalls 12.6 s
 // against 19.4 s, for 2.4% more GPU time and 1.1 GiB more host memory in steady
-// state. Needs the per-stage set layouts; both sets take the shared layout
+// state. Needs the per-stage set layouts; both sets take the shared layouts
 // (build_gfx_pipeline).
 bool use_pipeline_library() {
     static const bool on = [] {
@@ -2647,39 +2808,12 @@ std::mutex g_stage_layout_mu;  // pipelines are built on worker threads too
 std::unordered_map<std::uint64_t, VkDescriptorSetLayout> g_stage_set_layouts;  // by binding list, under g_stage_layout_mu
 std::unordered_map<std::uint64_t, VkPipelineLayout> g_stage_pipe_layouts;       // by set layout pair, under g_stage_layout_mu
 
-VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta) {
+// `set`: 0 for the vertex shader's set, 1 for the pixel shader's.
+VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta, int set) {
     std::lock_guard<std::mutex> lk(g_stage_layout_mu);
-    std::vector<VkDescriptorSetLayoutBinding> binds;
-    binds.push_back({gcn::kBindingParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
-    for (const gcn::ImageBinding& b : meta.images) {
-        binds.push_back({b.binding, b.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL,
-                         nullptr});
-    }
-    for (const gcn::SamplerBinding& b : meta.samplers) {
-        binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr});
-    }
-    if (meta.bindless) {  // images and samplers are set 3's
-        binds.erase(std::remove_if(binds.begin(), binds.end(),
-                                   [](const VkDescriptorSetLayoutBinding& b) {
-                                       return b.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
-                                              b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
-                                              b.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER;
-                                   }),
-                    binds.end());
-    }
-    for (const gcn::BufferBinding& b : meta.buffers) {
-        if (cb_push_on()) break;  // set 2, pushed
-        binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
-    }
-    std::sort(binds.begin(), binds.end(), [](const VkDescriptorSetLayoutBinding& a, const VkDescriptorSetLayoutBinding& b) {
-        return a.binding < b.binding;
-    });
-    binds.erase(std::unique(binds.begin(), binds.end(),
-                            [](const VkDescriptorSetLayoutBinding& a, const VkDescriptorSetLayoutBinding& b) {
-                                return a.binding == b.binding && a.descriptorType == b.descriptorType;
-                            }),
-                binds.end());
-    std::uint64_t key = 1469598103934665603ull;
+    const VkShaderStageFlags stages = gfx_set_stages(g.per_stage_sets, set);
+    const std::vector<VkDescriptorSetLayoutBinding> binds = stage_set_bindings(meta, params_descriptor_type(), !cb_push_on(), stages);
+    std::uint64_t key = fnv1a(&stages, sizeof(stages));
     for (const VkDescriptorSetLayoutBinding& b : binds) {
         key = fnv1a(&b.binding, sizeof(b.binding), key);
         key = fnv1a(&b.descriptorType, sizeof(b.descriptorType), key);
@@ -3277,6 +3411,19 @@ std::uint64_t ps_stage_key(const PsStageInputs& in) {
     if (g.bindless) key ^= 0xb1d1e55b1d1e55ull;  // another translation
     return dims_modes_key(key, *in.dims, *in.modes);
 }
+// MoltenVK's vertex and evaluation stages run ballots and shuffles but have no
+// subgroup built-ins, and are left out of subgroupSupportedStages.
+bool stage_lane_from_scan(gcn::Stage stage) {
+    VkShaderStageFlags bit = VK_SHADER_STAGE_COMPUTE_BIT;
+    switch (stage) {
+    case gcn::Stage::Vertex: bit = VK_SHADER_STAGE_VERTEX_BIT; break;
+    case gcn::Stage::Pixel: bit = VK_SHADER_STAGE_FRAGMENT_BIT; break;
+    case gcn::Stage::Compute: bit = VK_SHADER_STAGE_COMPUTE_BIT; break;
+    case gcn::Stage::TessControl: bit = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; break;
+    case gcn::Stage::TessEval: bit = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; break;
+    }
+    return (g.subgroup_stages & bit) == 0;
+}
 gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     gcn::TranslateOptions po;
     po.stage = gcn::Stage::Pixel;
@@ -3299,6 +3446,7 @@ gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     po.ps_flat_mask = in.flat_mask;
     po.ps_input_map = *in.input_map;
     po.ps_clip_discard = in.clip_discard;
+    po.lane_from_scan = stage_lane_from_scan(po.stage);
     return po;
 }
 // BBHOST_CLIP_VARYING=0 (checks): clip distances go to the clipper again
@@ -3425,6 +3573,8 @@ struct VsStageInputs {
     bool tess_attrs = false;
     std::uint32_t tess_attr_vec4s = 8;
     std::uint32_t tess_window = 0;  // TranslateOptions::tess_window: the game's own hull runs
+    // DrawState::tess_vtx: translated with the LS's params member, to be fused.
+    bool tess_vertex = false;
 };
 std::uint64_t vs_stage_key(const VsStageInputs& in) {
     std::uint64_t key = fnv1a(in.words->data(), in.words->size() * 4);
@@ -3443,6 +3593,7 @@ std::uint64_t vs_stage_key(const VsStageInputs& in) {
         key = fnv1a(&in.tess_control_points, 4, key ^ 0x7e56u);
         key = fnv1a(&in.tess_attrs, 1, key);
         key = fnv1a(&in.tess_attr_vec4s, 4, key);
+        if (in.tess_vertex) key ^= 0x7e5b0f0e5e0ull;
         if (in.tess_window || !in.tess_quads || !in.tess_cw || in.tess_spacing) {
             const std::uint32_t shape[4] = {in.tess_window, in.tess_quads ? 1u : 0u, in.tess_cw ? 1u : 0u,
                                             static_cast<std::uint32_t>(in.tess_spacing)};
@@ -3474,6 +3625,7 @@ gcn::TranslateOptions tess_ls_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
     o.fetch = fetch;
     o.exec_known = g.exec_known;
     o.descriptor_set = 0;
+    o.lane_from_scan = stage_lane_from_scan(o.stage);
     return o;
 }
 // The two stages of a tessellated draw that carry no GCN code, made once:
@@ -3512,6 +3664,45 @@ VkShaderModule tess_passthrough_module(const std::string& dump_name) {
         if (!make_module(tvs, module)) module = VK_NULL_HANDLE;
     }
     return module;
+}
+
+// Rect lists need a fourth vertex: from a geometry shader, else (Metal has no
+// geometry stage) from the tessellator. BBHOST_RECT_GS=0 forces tessellation.
+enum class RectPath { kGeometry, kTessellation, kTriangle };
+RectPath rect_list_path() {
+    static const RectPath path = [] {
+        const char* e = std::getenv("BBHOST_RECT_GS");
+        if (g.has_geometry_shader && !(e && e[0] == '0')) return RectPath::kGeometry;
+        if (g.has_tessellation) {
+            host_log("render: rect lists through the tessellation stages (%s)",
+                     g.has_geometry_shader ? "BBHOST_RECT_GS=0" : "the device has no geometry shader");
+            return RectPath::kTessellation;
+        }
+        host_log("render: rect lists drawn as their first triangle: the device has neither geometry nor tessellation shaders");
+        return RectPath::kTriangle;
+    }();
+    return path;
+}
+// One per vertex-shader interface, never destroyed. Null on failure.
+struct RectTessModules {
+    VkShaderModule control = VK_NULL_HANDLE, evaluation = VK_NULL_HANDLE;
+};
+RectTessModules rect_tess_modules(const std::vector<std::uint32_t>& params, int clip_count, const std::string& dump_name) {
+    static std::mutex mu;
+    static std::map<std::pair<std::vector<std::uint32_t>, int>, RectTessModules> modules;  // under mu
+    const auto key = std::make_pair(params, clip_count);
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = modules.find(key); it != modules.end()) return it->second;
+    const gcn::RectTessShaders t = gcn::make_rect_tess_shaders(params, clip_count);
+    dump_spirv(dump_name + "-rect-tcs", t.control);
+    dump_spirv(dump_name + "-rect-tes", t.evaluation);
+    RectTessModules m;
+    if (!make_module(t.control, m.control) || !make_module(t.evaluation, m.evaluation)) {
+        if (m.control) vkDestroyShaderModule(g.device, m.control, nullptr);
+        m = RectTessModules{};
+    }
+    modules.emplace(key, m);
+    return m;
 }
 
 // The game's own hull shader as a tessellation control stage (DrawState::
@@ -3558,6 +3749,7 @@ VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name
     o.tess_cw = s.tess_cw;
     o.exec_known = g.exec_known;
     o.descriptor_set = 0;
+    o.lane_from_scan = stage_lane_from_scan(o.stage);
     const gcn::Program prog = gcn::decode(hs->words.data(), hs->words.size());
     const gcn::TranslateResult r = translate_cached(prog, o);
     VkShaderModule m = VK_NULL_HANDLE;
@@ -3793,6 +3985,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
         // buffer, so the stage reads its own patch and nothing else.
         vo.tess_lds_attributes = in.tess_attrs;
         vo.tess_attr_vec4s = in.tess_attr_vec4s;
+        vo.params_vertex_formats = in.tess_vertex;
     } else if (in.domain_level) {
         vo.tess_role = gcn::TranslateOptions::TessRole::Domain;
         vo.domain_level = in.domain_level;
@@ -3805,6 +3998,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
         vo.tess_patch_cull = tess_patch_cull_near() != 0.0f;
         vo.tess_patch_cull_all = tess_patch_cull_near() < 0.0f;
     }
+    vo.lane_from_scan = stage_lane_from_scan(vo.stage);
     return vo;
 }
 bool note_vs_precompile_hit(std::uint64_t vs_key);
@@ -4211,14 +4405,21 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     pl.clip_discard = clip_discard;
     pl.tess_hw = s.tess_hw;
     pl.tess_control_points = s.tess_control_points;
-    const std::uint32_t vs_out_cntl =
+    std::uint32_t vs_out_cntl =
         s.vs_out_cntl | (clip_discard ? gcn::TranslateOptions::kVsOutCntlClipVarying |
                                             ((clip_discard >> 8) & 31) << gcn::TranslateOptions::kVsOutCntlClipLocationShift
                                       : 0u);
-    const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
-                              vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
-                              s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
-                              s.tess_window};
+    // No point size for tessellated rect lists: MoltenVK draws nothing when
+    // the vertex stage writes one.
+    if (s.rect && rect_list_path() == RectPath::kTessellation) vs_out_cntl &= ~(1u << 16);
+    // Nor for a domain shader where the device forbids it
+    // (Gpu::has_tess_geom_point_size); fused, it is translated the same.
+    if ((s.tess_hw || s.tess_vtx) && !g.has_tess_geom_point_size) vs_out_cntl &= ~(1u << 16);
+    VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
+                        vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
+                        s.tess_hw || s.tess_vtx, s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
+                        s.tess_window};
+    vs_in.tess_vertex = s.tess_vtx;
     // BBHOST_DECOMP: the no-fallback variant of a selected vertex shader on
     // vertex input runs its lift, under a key of its own - and so does one
     // that calls no fetch shader at all (its inputs are the vertex and
@@ -4228,6 +4429,10 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // A domain shader on the host's tessellator, its control point as stage
     // attributes: lifted as the evaluation stage (gcn::lift_domain_shader).
     const bool ds_lift = stage_lean && s.tess_hw && s.tess_attrs && (g_lift_tess & kLiftTessDomain) && decomp_selects(vs_name);
+    // Fused, the cached stage's key must hold the LS, level and winding too.
+    const CachedProgram* vtx_ls = s.tess_vtx ? program_at(s.ls_va) : nullptr;
+    const FetchProgram* vtx_fetch = s.tess_vtx && s.ls_fetch_va ? fetch_program_at(s.ls_fetch_va) : nullptr;
+    if (s.tess_vtx && (!vtx_ls || (s.ls_fetch_va && !vtx_fetch))) return fail("particles as one vertex stage: the LS program");
     // A native hull pipeline lifts its domain shader or is not built: the
     // window's tessellation constants and where they are read are the lift's.
     const bool ds_native = s.tess_native;
@@ -4237,6 +4442,12 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         vs_key = fnv1a(s.tess_constants, sizeof(s.tess_constants), vs_key ^ 0x7e5a71f3ull);
         vs_key = fnv1a(&s.tess_cb[0], sizeof(s.tess_cb[0]), vs_key);
     }
+    if (s.tess_vtx) {
+        const std::uint64_t ls_key =
+            tess_ls_key(vtx_ls->words, vtx_fetch ? &vtx_fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
+        const std::uint32_t shape[3] = {s.tess_vtx_level, s.tess_cw ? 1u : 0u, tess_lds_bound() ? 1u : 0u};
+        vs_key = fnv1a(shape, sizeof(shape), fnv1a(&ls_key, sizeof(ls_key), vs_key ^ 0x7e5b5f3a11ull));
+    }
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
     if (vs_hit) {
@@ -4244,7 +4455,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         pl.vs.module = vs_hit->module;
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
         manifest_note_hit(vs_key);
-        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
+        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native && !s.tess_vtx) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -4259,7 +4470,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         const gcn::TranslateOptions vo = vs_translate_options(vs_in, fetch_words.empty() ? nullptr : &fetch_prog);
         pl.vs.fresh() = translate_cached(vs_prog, vo);
         note_stage_translation(0, vs_words, vs_key, stage_lean);
-        note_vs_precompile_miss(vs_name, vs_in);
+        if (!s.tess_vtx) note_vs_precompile_miss(vs_name, vs_in);  // precompile would build it unfused
         note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
         note_first_translation(0, vs_name);
         note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
@@ -4274,7 +4485,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
+        // The manifest keeps no tessellation shape, and would replay a fused stage's key unfused.
+        if (!vs_in.tess_window && !s.tess_vtx) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
@@ -4341,6 +4553,46 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             pl.vs.fresh().spirv = std::move(lifted.spirv);
             pl.vs.lifted = true;
         }
+        if (s.tess_vtx) {
+            // Fetch shader inlined: the fused stage has no vertex input. A
+            // pair that does not fuse keeps the tessellator from then on.
+            gcn::Program lprog = gcn::decode(vtx_ls->words.data(), vtx_ls->words.size());
+            gcn::Program fprog;
+            if (vtx_fetch) fprog = gcn::decode(vtx_fetch->words.data(), vtx_fetch->words.size());
+            gcn::TranslateOptions lo = tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s, vtx_fetch ? &fprog : nullptr);
+            lo.tess_lds_bound = tess_lds_bound();  // the params block the domain shader declares
+            const gcn::TranslateResult lt = lprog.errors.empty() ? translate_cached(lprog, lo) : gcn::TranslateResult{};
+            std::string why = !lprog.errors.empty() ? "LS decode: " + lprog.errors[0].what
+                              : !lt.ok()            ? "LS: " + (lt.errors.empty() ? std::string("no SPIR-V") : lt.errors[0])
+                              : !lt.images.empty() || !lt.samplers.empty() || !lt.buffers.empty() ? std::string("the LS binds resources")
+                                                                                                 : std::string();
+            gcn::TessVertexFuse fused;
+            if (why.empty()) {
+                fused = gcn::fuse_tess_vertex(lt.spirv, pl.vs.meta().spirv, s.tess_vtx_level, s.tess_cw);
+                if (!fused.ok()) why = fused.error;
+            }
+            static std::mutex logged_mu;
+            static std::set<std::string> logged;
+            bool first;
+            {
+                std::lock_guard<std::mutex> lk(logged_mu);
+                first = logged.insert(vs_name + "/" + vtx_ls->name + "/" + std::to_string(s.tess_vtx_level)).second;
+            }
+            if (!why.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(g_tess_vtx_mu);
+                    if (const CachedProgram* ds = program_at(s.vs_va)) g_tess_vtx_refused.insert(ds->hash);
+                }
+                host_log("render: particles: domain shader %s and LS %s not fused, the host's tessellator kept: %s", vs_name.c_str(),
+                         vtx_ls->name.c_str(), why.c_str());
+                return fail("particles as one vertex stage: " + why);
+            }
+            if (first) {
+                host_log("render: particles as one vertex stage: domain shader %s with LS %s at level %u (%zu words; %zu + %zu)", vs_name.c_str(),
+                         vtx_ls->name.c_str(), s.tess_vtx_level, fused.spirv.size(), lt.spirv.size(), pl.vs.meta().spirv.size());
+            }
+            pl.vs.fresh().spirv = std::move(fused.spirv);
+        }
     }
     if (ds_native && !pl.vs.lifted) return fail("native hull pipeline: its domain shader's cached stage is not a lift");
     if (g_dump_spirv || g_token_user_data_check) {
@@ -4361,7 +4613,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // pass has to end the render pass to produce it.
     pl.tess_attrs = s.tess_attrs;
     pl.tess_attr_vec4s = s.tess_attr_vec4s;
-    if (pl.tess_attrs) {
+    // Fused, the LS is in `vs` already; tess_attrs still routes its user data.
+    if (pl.tess_attrs && !s.tess_vtx) {
         CachedProgram* ls = program_at(s.ls_va);
         const FetchProgram* fetch = s.ls_fetch_va ? fetch_program_at(s.ls_fetch_va) : nullptr;
         if (!ls || (s.ls_fetch_va && !fetch)) return fail("tessellation LS program");
@@ -4521,25 +4774,34 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                  s.tess_control_points, s.tess_outer[0], s.tess_outer[1], s.tess_outer[2], s.tess_outer[3], s.tess_inner[0],
                  s.tess_inner[1]);
     }
-    // Rect list: geometry shader expanding the triangle into its rectangle.
-    if (s.rect) {
+    // Rect list: the triangle expanded into its rectangle (rect_list_path).
+    if (s.rect && rect_list_path() == RectPath::kGeometry) {
+        // Point size only where a geometry shader may write it.
         const std::vector<std::uint32_t> gs = gcn::make_rect_geometry_shader(pl.vs.meta().vs_params, pl.vs.meta().vs_clip_count,
-                                                                             pl.vs.meta().vs_point_size);
+                                                                             pl.vs.meta().vs_point_size && g.has_tess_geom_point_size);
         dump_spirv(pl.name + "-gs", gs);
         pl.gs.fresh().spirv = gs;
         if (!make_module(gs, pl.gs.module)) return fail("GS module");
+    } else if (s.rect && rect_list_path() == RectPath::kTessellation) {
+        const RectTessModules t = rect_tess_modules(pl.vs.meta().vs_params, pl.vs.meta().vs_clip_count, pl.name);
+        if (!t.control) return fail("rect tessellation modules");
+        pl.rect_tcs = t.control;
+        pl.rect_tes = t.evaluation;
     }
 
+    if (!stage_fits_device(pl.vs.meta(), vs_name) || !stage_fits_device(pl.ps.meta(), ps_name)) {
+        return fail("more samplers than the device binds a stage");
+    }
     if (g_set_layouts) {
         // Pipeline libraries: every vertex shader's set has the shared layout, so a
         // pixel shader's fragment-shader library is laid out the same whatever
         // vertex shader it runs with. (Libraries laid out with their own set only,
         // a null or empty set in the other stage's slot and independent sets,
         // fast-linked into pipelines that lost the device on the RTX 4070 driver.)
-        pl.set_layouts[0] = use_pipeline_library() ? g.gfx_set_layout : stage_set_layout(pl.vs.meta());
-        // Under libraries both sets take the shared layout, so a vertex shader's
+        pl.set_layouts[0] = use_pipeline_library() ? g.gfx_set_layouts[0] : stage_set_layout(pl.vs.meta(), 0);
+        // Under libraries both sets take the shared layouts, so a vertex shader's
         // pre-rasterization library does not depend on its pixel shader (step 6b).
-        pl.set_layouts[1] = use_pipeline_library() ? g.gfx_set_layout : stage_set_layout(pl.ps.meta());  // params only without a PS
+        pl.set_layouts[1] = use_pipeline_library() ? g.gfx_set_layouts[1] : stage_set_layout(pl.ps.meta(), 1);  // params only without a PS
         pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? stage_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1]) : VK_NULL_HANDLE;
         if (pl.tess_set_layout) {  // a native hull pipeline's, or a particle LS's constant buffers
             pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? tess_native_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1], pl.tess_set_layout)
@@ -4716,7 +4978,7 @@ VkPipeline create_library(VkGraphicsPipelineCreateInfo& gpci, VkGraphicsPipeline
 }
 
 // A vertex shader's pre-rasterization library, with a rect list's geometry
-// shader. Both sets take the shared layout and it gets no target formats (step
+// shader. Both sets take the shared layouts and it gets no target formats (step
 // 6b), so it is keyed by the shaders and raster state alone and can be compiled
 // before any draw uses it (step 6d).
 // The raster states each vertex shader's libraries were built in, for the
@@ -4730,11 +4992,19 @@ struct PreRasterStates {
 // The host tessellator's part of a pre-rasterization library: its
 // generated vertex stage (the LS translated, or the pass-through), the control
 // stage made for the hull shader's factors, and the patch size. The domain
-// shader is the library's `vs`, as the evaluation stage.
+// shader is the library's `vs`, as the evaluation stage. A rect list sets
+// `evaluation` instead: `vs` stays the vertex stage.
 struct TessLibraryStages {
-    VkShaderModule vertex = VK_NULL_HANDLE, control = VK_NULL_HANDLE;
+    VkShaderModule vertex = VK_NULL_HANDLE, control = VK_NULL_HANDLE, evaluation = VK_NULL_HANDLE;
     std::uint32_t control_points = 1;
 };
+const TessLibraryStages* rect_library_stages(const GfxPipeline& pl, TessLibraryStages& t) {
+    if (!pl.rect_tes) return nullptr;
+    t.control = pl.rect_tcs;
+    t.evaluation = pl.rect_tes;
+    t.control_points = 3;
+    return &t;
+}
 
 // `vertex_formats`: 48 specialization words for the vertex shader, for an
 // optimized relink (relink_pipeline) - 16 vertex-format descriptors
@@ -4771,6 +5041,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         const std::uint64_t t[3] = {reinterpret_cast<std::uint64_t>(tess->vertex), reinterpret_cast<std::uint64_t>(tess->control),
                                     tess->control_points};
         key = fnv1a(t, sizeof(t), key ^ 0x7e55000000000000ull);
+        if (tess->evaluation) key = fnv1a(&tess->evaluation, sizeof(tess->evaluation), key ^ 0x7ec7000000000000ull);
     }
     if (vertex_formats) key = fnv1a(vertex_formats, 48 * sizeof(std::uint32_t), key ^ 0x5bec000000000000ull);
     return pipeline_library(kLibPreRaster, key, "pre-rasterization", vs.meta().spirv.size(), [&] {
@@ -4783,7 +5054,12 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
             stages.push_back(si);
         };
         VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
-        if (tess) {
+        if (tess && tess->evaluation) {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, vs.module);
+            stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tess->control);
+            stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tess->evaluation);
+            ts.patchControlPoints = tess->control_points;
+        } else if (tess) {
             stage(VK_SHADER_STAGE_VERTEX_BIT, tess->vertex);
             stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tess->control);
             stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, vs.module);
@@ -4799,7 +5075,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
             return e;
         }();
         const VkSpecializationInfo spec{48, spec_entries.data(), 48 * sizeof(std::uint32_t), vertex_formats};
-        if (vertex_formats && !tess) stages.front().pSpecializationInfo = &spec;
+        if (vertex_formats && (!tess || tess->evaluation)) stages.front().pSpecializationInfo = &spec;  // the translated vertex stage
         if (gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, gs.module);
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount = 1;
@@ -5318,7 +5594,9 @@ void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
         if (job.specialize_formats) std::copy(job.vertex_formats, job.vertex_formats + 16, words);
         std::copy(job.w3[0], job.w3[0] + 16, words + 16);
         std::copy(job.stride[0], job.stride[0] + 16, words + 32);
-        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words)) {
+        TessLibraryStages rect;
+        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts,
+                                                     rect_library_stages(pl, rect), words)) {
             libraries[1] = pr;
             if (job.specialize_formats) w.relinks_specialized.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -5488,9 +5766,10 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!stage_fits_device(stage.meta(), job.name)) return give_up("more samplers than the device binds a stage");
     const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries (build_gfx_pipeline)
-    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
+    const VkDescriptorSetLayout set = g.gfx_set_layouts[1];  // both sets take the shared layouts under libraries (build_gfx_pipeline)
+    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layouts[0], set) : VK_NULL_HANDLE;
     dump_spirv("precompile-" + job.name, stage.meta().spirv);
     t_library_owner = job.name.c_str();
     const VkPipeline library = layout ? fragment_library(stage.meta(), stage.module, set, layout) : VK_NULL_HANDLE;
@@ -5623,13 +5902,13 @@ void precompile_manifest(const ManifestStage& m) {
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
         if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
+    ok = ok && stage_fits_device(stage.meta(), m.name);
     if (ok && !m.tess_hw && !m.domain_level) {
-        const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
-        const VkDescriptorSetLayout sets[2] = {set, set};
-        const VkPipelineLayout layout = set ? stage_pipeline_layout(set, set) : VK_NULL_HANDLE;
+        const VkDescriptorSetLayout sets[2] = {g.gfx_set_layouts[0], g.gfx_set_layouts[1]};  // the shared layouts under libraries
+        const VkPipelineLayout layout = sets[0] && sets[1] ? stage_pipeline_layout(sets[0], sets[1]) : VK_NULL_HANDLE;
         t_library_owner = m.name.c_str();
         if (m.stage) {
-            ok = layout && fragment_library(stage.meta(), stage.module, set, layout) != VK_NULL_HANDLE;
+            ok = layout && fragment_library(stage.meta(), stage.module, sets[1], layout) != VK_NULL_HANDLE;
         } else {
             const ShaderStage no_gs;
             ok = layout && pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) != VK_NULL_HANDLE;
@@ -5725,9 +6004,10 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!stage_fits_device(stage.meta(), job.name)) return give_up("more samplers than the device binds a stage");
     const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
-    const VkPipelineLayout layout = stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout);
+    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layouts[0], g.gfx_set_layouts[1]};  // the shared layouts under libraries
+    const VkPipelineLayout layout = stage_pipeline_layout(sets[0], sets[1]);
     const ShaderStage no_gs;
     t_library_owner = job.name.c_str();
     const VkPipeline library = layout ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) : VK_NULL_HANDLE;
@@ -6031,7 +6311,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    const VkPrimitiveTopology topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
+    const VkPrimitiveTopology topology = pl.tess_hw || pl.rect_tes ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     std::uint64_t vi_key = fnv1a(&topology, sizeof(topology));
     if (vertex_input) vi_key = fnv1a(&vertex_input->hash, sizeof(vertex_input->hash), vi_key);
     const VkPipeline vi = pipeline_library(kLibVertexInput, vi_key, "vertex input", 0, [&] {
@@ -6056,7 +6336,8 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         tess.control = pl.tess_tcs;
         tess.control_points = pl.tess_control_points;
     }
-    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr);
+    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts,
+                                             pl.tess_hw ? &tess : rect_library_stages(pl, tess));
 
     const VkPipeline fs = fragment_library(pl.ps.meta(), pl.ps.module, pl.set_layouts[1], pl.layout);
 
@@ -6106,6 +6387,20 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     return ok;
 }
 
+// An empty module (not kept) counts as writing one.
+bool spirv_writes_position(const std::vector<std::uint32_t>& spirv) {
+    if (spirv.size() <= 5) return true;
+    for (std::size_t at = 5; at < spirv.size();) {
+        const std::uint32_t count = spirv[at] >> 16, op = spirv[at] & 0xffff;
+        if (count == 0 || at + count > spirv.size()) return true;
+        if (op == spv::OpDecorate && count >= 4 && spirv[at + 2] == spv::DecBuiltIn && spirv[at + 3] == spv::BiPosition) return true;
+        if (op == spv::OpMemberDecorate && count >= 5 && spirv[at + 3] == spv::DecBuiltIn && spirv[at + 4] == spv::BiPosition) return true;
+        if (op == spv::OpFunction) return false;  // decorations come before every function
+        at += count;
+    }
+    return false;
+}
+
 // The Vulkan pipeline of a translated and laid-out GfxPipeline, from any draw
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
@@ -6137,18 +6432,34 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     } else {
         stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
     }
+    if (pl.rect_tes) {  // a rect list's expansion without a geometry stage
+        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.rect_tcs);
+        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.rect_tes);
+    }
     if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
-    if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
-    // Pixel shaders at wave32: built whole, the fragment stage is given its
-    // subgroup size here (linked, in its library: fragment_library).
     // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
     // buffers) is built whole: its layout has a set past the shared ones,
     // which the fragment library a pixel shader shares does not.
     const bool linked = use_pipeline_library() && pl.layout && !pl.tess_set_layout;
+    // GX binds a GS object's export shader as a VS that only stores to
+    // buffers and writes no position. Metal refuses to link a fragment stage
+    // whose inputs no vertex output writes, so such a pipeline discards
+    // rasterization and drops the pixel shader; its stores still run.
+    const bool no_raster = !linked && !pl.gs.module && !spirv_writes_position(pl.vs.meta().spirv);
+    if (no_raster && pl.ps.module) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("render: pipeline %s: its vertex stage writes no position, so it discards rasterization and leaves out its pixel shader",
+                     pl.name.c_str());
+        }
+    }
+    if (pl.ps.module && !no_raster) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    // Pixel shaders at wave32: built whole, the fragment stage is given its
+    // subgroup size here (linked, in its library: fragment_library).
     const char* const owner = t_library_owner;
     t_library_owner = pl.name.c_str();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ps_wave{};
-    const bool ps_sized = !linked && pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
+    const bool ps_sized = !linked && pl.ps.module && !no_raster && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     if (vertex_input) {  // Vulkan vertex input
@@ -6159,10 +6470,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     const GfxFixedState f = fixed_state(s);
-    ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
+    ia.topology = pl.tess_hw || pl.rect_tes ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
-    ts.patchControlPoints = std::max<std::uint32_t>(1, pl.tess_control_points);
+    ts.patchControlPoints = pl.rect_tes ? 3 : std::max<std::uint32_t>(1, pl.tess_control_points);
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1;
     vp.scissorCount = 1;
@@ -6176,6 +6487,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     rs.depthBiasConstantFactor = f.bias_constant;
     rs.depthBiasClamp = f.bias_clamp;
     rs.depthBiasSlopeFactor = f.bias_slope;
+    rs.rasterizerDiscardEnable = no_raster ? VK_TRUE : VK_FALSE;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -6206,7 +6518,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     gpci.pStages = stages.data();
     gpci.pVertexInputState = &vi;
     gpci.pInputAssemblyState = &ia;
-    if (pl.tess_hw) gpci.pTessellationState = &ts;
+    if (pl.tess_hw || pl.rect_tes) gpci.pTessellationState = &ts;
     gpci.pViewportState = &vp;
     gpci.pRasterizationState = &rs;
     gpci.pMultisampleState = &ms;
@@ -6244,7 +6556,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
             host_log("render: slow pipeline %s%s on %s: vkCreateGraphicsPipelines %lld ms; SPIR-V words VS %zu, PS %zu%s; VS params %zu, "
                      "PS images %zu, buffers VS %zu PS %zu",
                      pl.name.c_str(), pl.lean ? " (no-fallback)" : "", t_pipeline_worker ? "a worker" : "the command processor",
-                     static_cast<long long>(ms_), pl.vs.meta().spirv.size(), pl.ps.meta().spirv.size(), pl.gs.module ? ", with GS" : "",
+                     static_cast<long long>(ms_), pl.vs.meta().spirv.size(), pl.ps.meta().spirv.size(), pl.gs.module ? ", with GS" : pl.rect_tes ? ", with rect tessellation" : "",
                      pl.vs.meta().vs_params.size(), pl.ps.meta().images.size(), pl.vs.meta().buffers.size(), pl.ps.meta().buffers.size());
         }
     }
@@ -6377,6 +6689,29 @@ const bool g_lean_first = [] {
     const char* e = std::getenv("BBHOST_LEAN_FIRST");
     return !(e && e[0] == '0');
 }();
+// BBHOST_PIPELINE_DEFER (default on with MoltenVK only): in game, the
+// no-fallback variant is built by a worker and its draws are skipped until
+// ready. MoltenVK compiles MSL in vkCreateGraphicsPipelines (up to ~750 ms
+// cold) with no precompile, so building in place stalls; deferred, new objects
+// show a few frames late. Loading screens still build in place: a draw there
+// may be made only once.
+bool pipeline_defer_on() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_PIPELINE_DEFER");
+        return e && *e ? (e[0] == '0' ? 0 : 1) : -1;
+    }();
+    return mode < 0 ? g.moltenvk : mode == 1;
+}
+std::chrono::microseconds pipeline_defer_wait() {
+    static const std::chrono::microseconds wait{[] {
+        const char* e = std::getenv("BBHOST_PIPELINE_DEFER_WAIT_MS");
+        return static_cast<long long>((e && *e ? std::max(0.0, std::atof(e)) : 16.0) * 1000.0);
+    }()};
+    return wait;
+}
+std::uint64_t g_defer_wait_flip = ~0ull;           // under g.mu: the flip g_defer_waited counts for
+std::chrono::microseconds g_defer_waited{0};       // under g.mu
+std::atomic<std::uint64_t> g_defer_queued{0}, g_defer_in_wait{0}, g_defer_pipelines_skipped{0}, g_defer_draws_skipped{0};
 struct LeanBuildJob {
     GfxPipeline* base = nullptr;     // the pipeline the variant belongs to
     GfxPipeline* variant = nullptr;  // its entry in g_gfx, reserved by the command processor
@@ -6398,6 +6733,7 @@ struct LeanBuilders {
     std::condition_variable cv;
     std::deque<std::unique_ptr<LeanBuildJob>> jobs;             // under mu
     std::vector<std::pair<GfxPipeline*, GfxPipeline*>> done;   // (base, variant), under mu
+    std::condition_variable done_cv;                           // a build went to `done` (wait_lean_build_locked)
 };
 std::atomic<bool> g_lean_builds_ready{false};
 std::atomic<std::uint64_t> g_lean_builds_queued{0}, g_lean_builds_done{0};
@@ -6405,7 +6741,9 @@ std::atomic<std::uint64_t> g_lean_builds_queued{0}, g_lean_builds_done{0};
 LeanBuilders& lean_builders() {
     static LeanBuilders* const builders = [] {
         auto* w = new LeanBuilders;  // never destroyed: its threads run until exit
-        for (int i = 0; i < 2; ++i) {
+        // Deferred pipelines don't draw until built, and arrive in bursts.
+        const int threads = pipeline_defer_on() ? 4 : 2;
+        for (int i = 0; i < threads; ++i) {
             std::thread([w] {
                 for (;;) {
                     std::unique_ptr<LeanBuildJob> job;
@@ -6426,6 +6764,7 @@ LeanBuilders& lean_builders() {
                     w->done.emplace_back(j.base, j.variant);
                     g_lean_builds_ready.store(true, std::memory_order_relaxed);
                     g_lean_builds_done.fetch_add(1, std::memory_order_relaxed);
+                    w->done_cv.notify_all();
                 }
             }).detach();
         }
@@ -6486,14 +6825,15 @@ void queue_pipeline_build(GfxPipeline& base, GfxPipeline& variant, const DrawSta
 }
 
 // Under g.mu: reserves the variant's entry and hands the build to a worker.
-void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+GfxPipeline& queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
                         const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
                         const std::string& vs_name, const std::string& ps_name,
                         const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                         const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
                         const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
-    queue_pipeline_build(base, g_gfx[lean_key], s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes,
-                         vertex_input);
+    GfxPipeline& variant = g_gfx[lean_key];
+    queue_pipeline_build(base, variant, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input);
+    return variant;
 }
 
 // Under g.mu: gives finished variants to their base pipelines.
@@ -6512,6 +6852,37 @@ void apply_lean_builds_locked() {
         base->lean_variant = variant;
         base->lean_building = false;
     }
+}
+
+// Under g.mu, held while waiting; bounded by the flip's wait budget unless
+// `until_built`. Returns whether `variant` was built.
+bool wait_lean_build_locked(const GfxPipeline& variant, bool until_built = false) {
+    const std::uint64_t flip = hle_video_flip_count();
+    if (g_defer_wait_flip != flip) {
+        g_defer_wait_flip = flip;
+        g_defer_waited = std::chrono::microseconds{0};
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool done = false;
+    if (until_built || g_defer_waited < pipeline_defer_wait()) {
+        LeanBuilders& w = lean_builders();
+        std::unique_lock<std::mutex> lk(w.mu);
+        const auto built = [&] {
+            for (const auto& [base, v] : w.done) {
+                if (v == &variant) return true;
+            }
+            return false;
+        };
+        if (until_built) {
+            w.done_cv.wait(lk, built);
+            done = true;
+        } else {
+            done = w.done_cv.wait_until(lk, t0 + (pipeline_defer_wait() - g_defer_waited), built);
+        }
+    }
+    g_defer_waited += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0);
+    apply_lean_builds_locked();
+    return done;
 }
 
 // Under g.mu: a native hull pipeline (DrawState::tess_native) built by a
@@ -6550,9 +6921,114 @@ void end_pass_for_draw_locked() {
     }
     g_pass.active = false;
     if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering(false)) rec().end_rendering(false);
+    if (g_pass.profiled) {  // its pair closes here too, or the slot's results never become available
+        profile_end_locked();
+        g_pass.profiled = false;
+    }
     for (int t = 0; t < g_pass.ntargets; ++t) g_hazards.written.insert(g_pass.targets[t]);
     g_hazards.owed = true;
     copy_versions_pass_end_locked();
+}
+
+// ---- Clears folded into the next pass (BBHOST_FOLD_CLEARS) ----
+// MoltenVK makes each vkCmdClear*Image a Metal render encoder of its own, a
+// GPU gap. A clear is held back and becomes the next pass's LOAD_OP_CLEAR when
+// that pass covers the whole image layer; any other recorded work flushes the
+// held clears first (recorder.cpp's hooks). Default on with MoltenVK only.
+bool fold_clears_on() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_FOLD_CLEARS");
+        return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
+    }();
+    return mode < 0 ? g.moltenvk : mode == 1;
+}
+struct HeldClear {
+    const RtImage* r;  // compared, never read: what it was is kept here
+    std::uint64_t base;
+    VkImage image;
+    std::uint32_t width, height;
+    VkImageSubresourceRange range;
+    VkClearValue value;
+};
+std::vector<HeldClear> g_held_clears;  // under g.mu, oldest first
+std::atomic<std::uint64_t> g_clears_folded{0}, g_clears_unfolded{0};
+
+void record_clear_now(const HeldClear& c) {
+    if (c.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+        rec().clear_color_image(c.image, VK_IMAGE_LAYOUT_GENERAL, c.value.color, 1, &c.range);
+    } else {
+        rec().clear_depth_stencil_image(c.image, VK_IMAGE_LAYOUT_GENERAL, c.value.depthStencil, 1, &c.range);
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+// The caller still records the barrier. False: the caller records the clear.
+bool hold_clear_locked(RtImage& r, const VkImageSubresourceRange& range, const VkClearValue& value) {
+    if (!fold_clears_on() || range.baseMipLevel || range.levelCount != 1 || range.layerCount != 1) return false;
+    for (const HeldClear& c : g_held_clears) {
+        if (c.image == r.image) {
+            pending_clears_flush_locked();  // a second clear of it: the first goes in order
+            break;
+        }
+    }
+    g_held_clears.push_back(HeldClear{&r, r.base, r.image, r.width, r.height, range, value});
+    g_clears_pending = true;
+    return true;
+}
+
+// Held clears that don't fold into this pass are recorded before it.
+void fold_pending_clears_locked(const DrawState& s, VkExtent2D extent, std::vector<VkRenderingAttachmentInfo>& colors,
+                                VkRenderingAttachmentInfo& depth, VkRenderingAttachmentInfo* stencil) {
+    std::vector<HeldClear> pending;
+    pending.swap(g_held_clears);
+    g_clears_pending = false;
+    for (const HeldClear& c : pending) {
+        bool folded = false;
+        const bool whole = c.width == extent.width && c.height == extent.height;
+        if (whole && (c.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) {
+            for (std::size_t t = 0; t < colors.size() && !folded; ++t) {
+                if (s.color[t] != c.r || s.color[t]->image != c.image || s.color_layer[t] != c.range.baseArrayLayer ||
+                    colors[t].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    continue;
+                }
+                colors[t].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                colors[t].clearValue = c.value;
+                folded = true;
+            }
+        } else if (whole && s.depth == c.r && s.depth->image == c.image && s.depth_layer == c.range.baseArrayLayer &&
+                   depth.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+                   (!stencil || stencil->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)) {
+            const bool st = (c.range.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+            if (!st || stencil) {
+                if (c.range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    depth.clearValue = c.value;
+                }
+                if (st) {
+                    stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    stencil->clearValue = c.value;
+                }
+                folded = true;
+            }
+        }
+        if (folded) {
+            g_clears_folded.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            static std::set<std::uint64_t> seen_bases;
+            g_clears_unfolded.fetch_add(1, std::memory_order_relaxed);
+            if (seen_bases.size() < 64 && seen_bases.insert(c.base).second) {
+                host_log("render: clear of 0x%llx (%ux%u, layer %u, aspect %x) not folded into the pass beginning on %ux%u (depth 0x%llx layer %u, "
+                         "rt0 0x%llx)",
+                         static_cast<unsigned long long>(c.base), c.width, c.height, c.range.baseArrayLayer, c.range.aspectMask,
+                         extent.width, extent.height, static_cast<unsigned long long>(s.depth ? s.depth->base : 0), s.depth_layer,
+                         static_cast<unsigned long long>(s.color[0] ? s.color[0]->base : 0));
+            }
+            record_clear_now(c);
+        }
+    }
 }
 
 // `hazard`: the draw samples a target written since the last barrier (lazy
@@ -6610,6 +7086,10 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         if (!extent.width || s.depth->width < extent.width) extent.width = s.depth->width;
         if (!extent.height || s.depth->height < extent.height) extent.height = s.depth->height;
     }
+    if (g_clears_pending) {
+        const bool has_stencil = s.depth && s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM;
+        fold_pending_clears_locked(s, extent, colors, depth, has_stencil ? &stencil : nullptr);
+    }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent};
     ri.layerCount = 1;
@@ -6657,7 +7137,9 @@ void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t
     if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!range.aspectMask) return;
-    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    VkClearValue cv{};
+    cv.depthStencil = v;
+    if (!hold_clear_locked(r, range, cv)) rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -7143,6 +7625,26 @@ DrawCmds* draw_packet_early_locked() {
     return g_draw_cmds->deferred() ? g_draw_cmds : nullptr;
 }
 
+bool g_clears_pending = false;
+
+void pending_clears_flush_locked(const char* why) {
+    if (g_held_clears.empty()) return;
+    std::vector<HeldClear> pending;
+    pending.swap(g_held_clears);
+    g_clears_pending = false;
+    for (const HeldClear& c : pending) {
+        g_clears_unfolded.fetch_add(1, std::memory_order_relaxed);
+        static std::set<std::string> seen;
+        char key[160];
+        std::snprintf(key, sizeof(key), "0x%llx (%ux%u) recorded before other work (%s)", static_cast<unsigned long long>(c.base),
+                      c.width, c.height, why);
+        if (seen.size() < 64 && seen.insert(key).second) {
+            host_log("render: clear of %s at flip %llu", key, static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        record_clear_now(c);
+    }
+}
+
 void render_end_pass_locked() {
     if (g_pass.active) {
         g_pass.active = false;
@@ -7340,7 +7842,9 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         if (logs.fetch_add(1) < 12) {
             host_log("render: fill clear of depth target 0x%llx to %g", static_cast<unsigned long long>(r.base), v.depth);
         }
-        rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        VkClearValue cv{};
+        cv.depthStencil = v;
+        if (!hold_clear_locked(r, range, cv)) rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     } else {
         VkClearColorValue v{};
         const bool bgra = r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB;
@@ -7348,7 +7852,9 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         v.float32[1] = rgba[1];
         v.float32[2] = bgra ? rgba[0] : rgba[2];
         v.float32[3] = rgba[3];
-        rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        VkClearValue cv{};
+        cv.color = v;
+        if (!hold_clear_locked(r, range, cv)) rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -7495,7 +8001,7 @@ bool render_clear_by_fill_locked(std::uint64_t va, std::size_t bytes, std::uint3
     if (r.depth) {
         float f;
         std::memcpy(&f, &value, 4);
-        rgba[0] = r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? f : static_cast<float>(value & 0xffffff) / 16777215.0f;
+        rgba[0] = depth_is_float(r) ? f : static_cast<float>(value & 0xffffff) / 16777215.0f;
     } else if (value != 0 && rt_bytes_per_pixel(r) == 4 &&
                (r.format == VK_FORMAT_R8G8B8A8_UNORM || r.format == VK_FORMAT_R8G8B8A8_SRGB || bgra)) {
         // Unpacked as the memory layout the shader would see (RGBA order).
@@ -7687,7 +8193,13 @@ std::string render_fill_stats() {
                   static_cast<unsigned long long>(g_fill_surfaces.load()),
                   static_cast<unsigned long long>(g_fill_surfaces_skipped.load()), g_pending_clears.size(), g_pending_clear_max,
                   static_cast<unsigned long long>(g_pending_scan_steps), static_cast<unsigned long long>(g_pending_scans));
-    return buf;
+    std::string out = buf;
+    if (fold_clears_on()) {
+        std::snprintf(buf, sizeof(buf), "; clears folded into a pass's load op %llu, recorded %llu",
+                      static_cast<unsigned long long>(g_clears_folded.load()), static_cast<unsigned long long>(g_clears_unfolded.load()));
+        out += buf;
+    }
+    return out;
 }
 
 void render_report() {
@@ -7812,6 +8324,18 @@ void render_report() {
                  static_cast<unsigned long long>(g.draws_tess[kDrawTessNative].load()),
                  static_cast<unsigned long long>(g_tess_native_refusals.load()), static_cast<unsigned long long>(g_tess_native_waits.load()),
                  g_lift_tess);
+        if (tess_vertex_wanted()) {
+            host_log("render: particles as one vertex stage (BBHOST_TESS_VERTEX): %llu draws (%llu patches), %llu not drawn; kept on the "
+                     "host's tessellator: %llu indexed, %llu indirect, %llu of another shape, %llu with other factors, %llu whose stage "
+                     "did not fuse",
+                     static_cast<unsigned long long>(g_tess_vtx_draws.load()), static_cast<unsigned long long>(g_tess_vtx_patches.load()),
+                     static_cast<unsigned long long>(g_tess_vtx_failed.load()),
+                     static_cast<unsigned long long>(g_tess_vtx_miss[kTvIndexed].load()),
+                     static_cast<unsigned long long>(g_tess_vtx_miss[kTvIndirect].load()),
+                     static_cast<unsigned long long>(g_tess_vtx_miss[kTvShape].load()),
+                     static_cast<unsigned long long>(g_tess_vtx_miss[kTvFactors].load()),
+                     static_cast<unsigned long long>(g_tess_vtx_miss[kTvProgram].load()));
+        }
         host_log("render: tessellated draws the game's hull shader ran for %llu (%llu patches); LDS buffer accesses %s",
                  static_cast<unsigned long long>(g_tess_hull_draws.load()), static_cast<unsigned long long>(g_tess_hull_patches.load()),
                  tess_lds_bound() ? "bounded to their window and region (BBHOST_TESS_LDS_BOUND=0: unchecked)"
@@ -7906,6 +8430,13 @@ void render_report() {
         if (g_skip_tables) {
             host_log("render: no-fallback variants built on worker threads %llu of %llu queued",
                      static_cast<unsigned long long>(g_lean_builds_done.load()), static_cast<unsigned long long>(g_lean_builds_queued.load()));
+            if (pipeline_defer_on()) {
+                host_log("render: deferred pipelines (BBHOST_PIPELINE_DEFER, wait %lld ms a flip): %llu queued with nothing to draw meanwhile, "
+                         "%llu ready within the wait, %llu shown late (%llu draws skipped)",
+                         static_cast<long long>(pipeline_defer_wait().count() / 1000), static_cast<unsigned long long>(g_defer_queued.load()),
+                         static_cast<unsigned long long>(g_defer_in_wait.load()), static_cast<unsigned long long>(g_defer_pipelines_skipped.load()),
+                         static_cast<unsigned long long>(g_defer_draws_skipped.load()));
+            }
             host_log("render: table read masks computed on worker threads %llu of %llu queued",
                      static_cast<unsigned long long>(g_table_masks_done.load()), static_cast<unsigned long long>(g_table_masks_queued.load()));
             host_log("render: GX draws with user-data tables or blocks left out of the ring %llu (%llu of them); rebuilt for the fallback "
@@ -8373,7 +8904,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     // A depth source becomes an R32_SFLOAT colour snapshot (its Z plane),
     // sampled by the lighting passes as a plain float texture.
     const bool from_depth = src.depth;
-    if (from_depth && src.format != VK_FORMAT_D32_SFLOAT && src.format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+    if (from_depth && !depth_is_float(src)) {
         note_copy_refused_locked(kCopyRefusedDepthFormat, via, src_base, dst_base, bytes);
         return false;
     }
@@ -8651,7 +9182,7 @@ void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre,
                 const std::uint64_t tbase = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) << 8;
                 host_log("render: %s binding %u (%s) has no texture: %s, want dim %u%s, got dim %u%s",
                          pipeline_name ? pipeline_name : "?", b.binding, b.path.str().c_str(),
-                         !resolved ? "T# unreadable" : !shape_ok ? "wrong shape" : "unsupported format", b.dim,
+                         !resolved ? "T# unreadable" : !shape_ok ? "wrong shape" : tbase == 0 ? "a null T# (base 0)" : "unsupported format", b.dim,
                          b.arrayed ? " array" : "", got_dim, got_arrayed ? " array" : "");
                 host_log("  T# %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
                 host_log("  reads as T#: base 0x%llx dfmt %u nfmt %u %ux%u type %u tiling %u%s",
@@ -9769,6 +10300,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         std::uint32_t stride;
         VkFormat format;
         std::uint64_t va;
+        std::uint32_t bytes;
     } placed[16];
     p.elements.clear();
     // The device-local copy of each vertex record, once per record: its
@@ -9852,7 +10384,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         ve.count = fe.count;
         ve.w3 = w[3];
         p.elements.push_back(ve);
-        placed[e] = {loc.buffer, loc.offset, stride, fmt, va};
+        placed[e] = {loc.buffer, loc.offset, stride, fmt, va, bytes};
     }
     // Every element reads address + v0 * stride, so elements in one buffer
     // with one stride can share a binding at their lowest offset with the rest
@@ -9887,6 +10419,24 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         return true;
     };
     if (!bind(g_vertex_input == 2)) bind(true);
+    // MoltenVK fails a pipeline with more vertex buffers than Metal has slots
+    // left (mvk_vertex_buffer_room); the fetch shader reads them instead.
+    if (g.vertex_buffer_room) {
+        std::vector<std::uint32_t> bytes(n);
+        for (std::size_t e = 0; e < n; ++e) bytes[e] = placed[e].bytes;
+        const std::uint32_t slots = mvk_vertex_input_slots(p.bindings, p.attributes, bytes);
+        if (slots > g.vertex_buffer_room) {
+            t_vertex_input_refusal = kVsWhySlots;
+            static std::mutex said_mu;  // plan_vertex_input also runs on the LS planning path
+            static std::set<std::uint64_t> said;
+            std::lock_guard<std::mutex> lk(said_mu);
+            if (said.size() < 16 && said.insert(fetch_hash).second) {
+                host_log("render: fetch shader %016llx at 0x%llx kept: its vertex input takes %u of Metal's buffer slots, %u are left for it",
+                         static_cast<unsigned long long>(fetch_hash), static_cast<unsigned long long>(o.fetch_va), slots, g.vertex_buffer_room);
+            }
+            return false;
+        }
+    }
     std::uint64_t h = fnv1a("vertex input", 12);
     h = fnv1a(p.elements.data(), p.elements.size() * sizeof(gcn::VertexElement), h);
     h = fnv1a(p.bindings.data(), p.bindings.size() * sizeof(VkVertexInputBindingDescription), h);
@@ -10306,6 +10856,7 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
 std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) {
     if (!data || !bytes || !align || (align & (align - 1))) return 0;
     std::lock_guard<GpuMutex> lk(g.mu);
+    if (!init_locked()) return 0;  // no device: the tables stay on the command stream
     return ring_place(static_cast<const std::uint8_t*>(data), bytes, align < 8 ? 8 : align);
 }
 
@@ -10835,6 +11386,9 @@ struct TessDraw {
     // there is no compute pass and no buffer between them.
     bool attrs = false;
     std::uint32_t attr_vec4s = 8;
+    // As one vertex stage (tess_vertex_wanted): no tessellation stages.
+    bool vtx = false;
+    std::uint32_t vtx_level = 1;
     std::uint64_t ls_va = 0, ls_fetch_va = 0;
     std::uint32_t ls_rsrc1 = 0, ls_rsrc2 = 0;
     std::uint32_t ls_user[16] = {};
@@ -11383,6 +11937,47 @@ bool tess_hull_constants_locked(const GpuDraw& d, TessDraw& t) {
     return true;
 }
 
+// Only shapes gcn::tess_vertex_domain_point lays out, and no index buffer or
+// indirect args: the LS takes vertex i / points as its vertex id.
+void tess_vertex_choose(const GpuDraw& d, TessDraw& t, std::uint64_t ds_va, std::uint32_t tf_param) {
+    if (!tess_vertex_wanted() || t.hull || t.native || !t.attrs) return;
+    const float level = t.outer[0];
+    TessVtxMiss miss = kTvMisses;
+    if (d.indirect_va) {
+        miss = kTvIndirect;
+    } else if (d.index_va) {
+        miss = kTvIndexed;
+    } else if (t.control_points != 1 || !t.quads || t.spacing != 0) {
+        miss = kTvShape;
+    } else if (level != t.outer[1] || level != t.outer[2] || level != t.outer[3] || t.inner[0] != 1.0f || t.inner[1] != 1.0f ||
+               level != std::floor(level) || level < 1.0f || level > static_cast<float>(gcn::kTessVertexMaxLevel)) {
+        miss = kTvFactors;
+    } else if (CachedProgram* ds = program_at(ds_va)) {
+        std::lock_guard<std::mutex> lk(g_tess_vtx_mu);
+        if (g_tess_vtx_refused.count(ds->hash)) miss = kTvProgram;
+    } else {
+        miss = kTvProgram;
+    }
+    if (miss != kTvMisses) {
+        g_tess_vtx_miss[miss].fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            static const char* const why[kTvMisses] = {"indexed", "indirect", "not one control point, a quad, integer spacing",
+                                                       "factors other than equal integral outer and inner 1", "its stage did not fuse"};
+            host_log("render: particles kept on the host's tessellator: %s (%u patches, outer %g %g %g %g, inner %g %g, VGT_TF_PARAM %08x)",
+                     why[miss], t.count, t.outer[0], t.outer[1], t.outer[2], t.outer[3], t.inner[0], t.inner[1], tf_param);
+        }
+        return;
+    }
+    t.vtx = true;
+    t.vtx_level = static_cast<std::uint32_t>(level);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        host_log("render: particles as one vertex stage: %u patches at level %u, %u vertices (VGT_TF_PARAM %08x)", t.count, t.vtx_level,
+                 t.count * gcn::tess_vertex_points(t.vtx_level), tf_param);
+    }
+}
+
 bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     const GpuDrawInputs* plan_gx = tess_gx(d);
     t.hw = tess_hw_locked(t);
@@ -11555,10 +12150,11 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         t.ls_rsrc1 = gi ? gi->ls_pgm[2] : rsrc1;
         t.ls_rsrc2 = gi ? gi->ls_pgm[3] : rsrc2;
         std::memcpy(t.ls_user, user, sizeof(t.ls_user));
-        probe_ls_input(t.ls_fetch_va, user,
-                       plan_gx ? (static_cast<std::uint64_t>(plan_gx->vs_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(plan_gx->vs_pgm[0]) << 8)
-                               : (static_cast<std::uint64_t>(d.sh[0x49] & 0xff) << 40) | (static_cast<std::uint64_t>(d.sh[0x48]) << 8),
-                       plan_gx ? d.gx_objects : nullptr);
+        const std::uint64_t ds_va =
+            plan_gx ? (static_cast<std::uint64_t>(plan_gx->vs_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(plan_gx->vs_pgm[0]) << 8)
+                    : (static_cast<std::uint64_t>(d.sh[0x49] & 0xff) << 40) | (static_cast<std::uint64_t>(d.sh[0x48]) << 8);
+        probe_ls_input(t.ls_fetch_va, user, ds_va, plan_gx ? d.gx_objects : nullptr);
+        tess_vertex_choose(d, t, ds_va, plan_gx ? plan_gx->tf_param : d.ctx[0x2db]);
         return true;
     }
 
@@ -11601,7 +12197,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             host_log("render: tessellation LS %s: %s", pl.name.c_str(),
                      !prog.errors.empty() ? prog.errors[0].what.c_str() : pl.meta.errors[0].c_str());
             pl.failed = true;
-        } else if (!make_module(pl.meta.spirv, module)) {
+        } else if (!stage_fits_device(pl.meta, pl.name) || !make_module(pl.meta.spirv, module)) {
             pl.failed = true;
         } else {
             dump_spirv(pl.name, pl.meta.spirv);
@@ -12087,7 +12683,10 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
     // A native hull pipeline draws the game's patch list as it is: its index
     // buffer, base vertex and instances.
     if (!t.attrs && !t.native) dd.index_va = 0;
-    dd.index_count = t.native ? t.count
+    // The LS derives its vertex id from a non-indexed draw.
+    if (t.vtx) dd.index_va = 0;
+    dd.index_count = t.vtx      ? t.count * gcn::tess_vertex_points(t.vtx_level)
+                     : t.native ? t.count
                      : t.hull ? t.count * t.instances
                      : t.hw   ? t.count * t.control_points
                               : t.count * tess_vertices_a_patch(t.level);
@@ -12122,6 +12721,10 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
     }
     g.draw_calls.fetch_sub(1, std::memory_order_relaxed);  // draw_impl counted it again
     g_tess_draws.fetch_add(1, std::memory_order_relaxed);
+    if (t.vtx) {
+        (ok ? g_tess_vtx_draws : g_tess_vtx_failed).fetch_add(1, std::memory_order_relaxed);
+        if (ok) g_tess_vtx_patches.fetch_add(t.count, std::memory_order_relaxed);
+    }
     g_tess_patches.fetch_add(t.hull ? t.count * t.instances / t.control_points : t.count, std::memory_order_relaxed);
     if (t.hull) {
         // Where the game's hull draws keep their windows, the first times: a
@@ -12385,10 +12988,19 @@ static bool draw_impl(const GpuDraw& d) {
     std::memcpy(s.ps_user, in.ps_user, sizeof(s.ps_user));
     // A tessellated draw's patches become triangles (draw_tessellated), unless
     // the host's own tessellator draws them, when they stay a patch list.
-    s.prim = t_tess ? (t_tess->hw ? 9u : 4u) : in.prim;
+    s.prim = t_tess ? (t_tess->hw && !t_tess->vtx ? 9u : 4u) : in.prim;
     s.domain_level = t_tess && !t_tess->hw ? t_tess->level : 0;
     if (t_tess && t_tess->hw) {
-        s.tess_hw = true;
+        // Fused (TessDraw::vtx): a triangle list; shape and level are what
+        // the vertex stage lays out.
+        s.tess_hw = !t_tess->vtx;
+        s.tess_vtx = t_tess->vtx;
+        if (s.tess_vtx) {
+            s.tess_vtx_level = t_tess->vtx_level;
+            s.tess_quads = t_tess->quads;
+            s.tess_cw = t_tess->cw;
+            s.tess_spacing = t_tess->spacing;
+        }
         s.tess_control_points = t_tess->control_points;
         std::memcpy(s.tess_outer, t_tess->outer, sizeof(s.tess_outer));
         std::memcpy(s.tess_inner, t_tess->inner, sizeof(s.tess_inner));
@@ -12570,8 +13182,10 @@ static bool draw_impl(const GpuDraw& d) {
                 // slices of DEPTH_SIZE's padded w x h follow each other.
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
+                // depth16_stencil_format: 16-bit depth with stencil in D32_SFLOAT_S8_UINT.
+                const bool stand_in = (z_info & 3) == 1 && df == VK_FORMAT_D32_SFLOAT_S8_UINT;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent);
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, stand_in);
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;
@@ -12785,7 +13399,7 @@ static bool draw_impl(const GpuDraw& d) {
     // input, which its lift takes in place of the fetch shader (the domain
     // shader in the vertex slot calls none). The pipeline's key holds the plan.
     // A native hull pipeline's LS likewise, which it cannot go without.
-    if (t_tess && t_tess->hw && (t_tess->native || (t_tess->attrs && (g_lift_tess & kLiftTessLs))) && gx_geometry && d.gx_render &&
+    if (t_tess && t_tess->hw && !t_tess->vtx && (t_tess->native || (t_tess->attrs && (g_lift_tess & kLiftTessLs))) && gx_geometry && d.gx_render &&
         g_vertex_input && !use_vertex_input) {
         if (const FetchProgram* lf = t_tess->ls_fetch_va ? fetch_program_at(t_tess->ls_fetch_va) : nullptr) {
             use_vertex_input = plan_vertex_input(lf->words, lf->hash, *gx_geometry, vertex_input);
@@ -13978,7 +14592,7 @@ static bool draw_impl(const GpuDraw& d) {
             stage_params[st] = params;
             stage_first_buffer[st] = first_buffer;
             draw_stamp.to(kRenderCostBuffers);
-            const VkDescriptorSetLayout layout = pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout;
+            const VkDescriptorSetLayout layout = pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st];
             static thread_local std::vector<std::uint64_t> material;
             if (!meta.bindless) stage_final_views(meta, stage_images[st], pl.name.c_str(), views);
             const auto handle = [](auto h) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(h)); };
@@ -14012,7 +14626,7 @@ static bool draw_impl(const GpuDraw& d) {
             VkDescriptorPool pool = VK_NULL_HANDLE;
             VkDescriptorSet set = set_cache_alloc(layout, pool);
             const bool cached = set != VK_NULL_HANDLE;
-            if (!cached) set = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+            if (!cached) set = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
             if (!set) {
                 draw_failed(kFailSet);
                 return false;
@@ -14079,7 +14693,7 @@ static bool draw_impl(const GpuDraw& d) {
         stage_params[st] = params;
         stage_first_buffer[st] = first_buffer;
         draw_stamp.to(kRenderCostBuffers);
-        sets[st] = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+        sets[st] = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
         bump(g_set_built);
         if (!sets[st]) {
             static std::atomic<int> logs{0};
@@ -14196,13 +14810,44 @@ static bool draw_impl(const GpuDraw& d) {
             // A worker builds the variant only while a created fallback can draw
             // meanwhile; otherwise (BBHOST_LEAN_FIRST) it is built here, and the
             // fallback is never created unless a draw lacks a binding.
-            if (g_async_pipelines && pl.pipeline && !g_dump_spirv && !g_token_user_data_check) {
+            const bool async = g_async_pipelines && !g_dump_spirv && !g_token_user_data_check;
+            if (async && pl.pipeline) {
                 queue_lean_variant(pl, lean_key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
                                    ps_sampler_modes, vertex_plan);
+            } else if (async && pipeline_defer_on() && !g_precompile_boost.load(std::memory_order_relaxed)) {
+                // Not ready within the flip's budget: this draw is skipped.
+                const GfxPipeline& variant = queue_lean_variant(pl, lean_key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims,
+                                                                ps_dims, vs_sampler_modes, ps_sampler_modes, vertex_plan);
+                g_defer_queued.fetch_add(1, std::memory_order_relaxed);
+                if (wait_lean_build_locked(variant)) {
+                    g_defer_in_wait.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    pl.defer_flip = std::max<std::uint64_t>(1, hle_video_flip_count());
+                    g_defer_pipelines_skipped.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 pl.lean_variant = &gfx_pipeline(s, lean_key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
                                                 vs_sampler_modes, ps_sampler_modes, true, vertex_plan);
             }
+        }
+        if (!pl.lean_variant && pl.lean_building && pl.defer_flip && g_precompile_boost.load(std::memory_order_relaxed)) {
+            // On a loading screen a draw may be made only once: wait.
+            if (auto v = g_gfx.find(fnv1a("cb-lean", 7, key)); v != g_gfx.end()) wait_lean_build_locked(v->second, true);
+        }
+        if (!pl.lean_variant && pl.lean_building && pl.defer_flip) {
+            ++pl.defer_skipped;
+            g_defer_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (pl.defer_flip && pl.lean_variant) {
+            static int logs = 0;
+            if (logs < 200) {
+                ++logs;
+                host_log("render: deferred pipeline %s draws from flip %llu, %llu flips late (%u draws skipped)", pl.name.c_str(),
+                         static_cast<unsigned long long>(hle_video_flip_count()),
+                         static_cast<unsigned long long>(hle_video_flip_count() - pl.defer_flip), pl.defer_skipped);
+            }
+            pl.defer_flip = 0;
         }
         if (pl.lean_variant) {
             GfxPipeline& lean = *pl.lean_variant;
@@ -14255,7 +14900,7 @@ static bool draw_impl(const GpuDraw& d) {
                 // would change it. Take a fresh set and slot and write the
                 // whole stage into them instead. (With constant buffers pushed,
                 // the set holds none, and the params slot is this draw's own.)
-                const VkDescriptorSet fresh = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layout);
+                const VkDescriptorSet fresh = alloc_set_locked(pl.set_layouts[st] ? pl.set_layouts[st] : g.gfx_set_layouts[st]);
                 if (!fresh) {
                     static std::atomic<int> logs{0};
                     if (logs.fetch_add(1) < 4) {
@@ -14434,7 +15079,8 @@ static bool draw_impl(const GpuDraw& d) {
         // only for programs that can discard (ps_early_tests_matter).
         cd.translate.set("early_fragment_tests", spirv_has_early_fragment_tests(bind_pl->ps.meta().spirv));
         cd.translate.set("debug_ps", g_debug_ps_color);
-        cd.translate.set("rect_geometry_shader", s.rect);
+        cd.translate.set("rect_geometry_shader", s.rect && bind_pl->gs.module);
+        cd.translate.set("rect_tessellation", bind_pl->rect_tes != VK_NULL_HANDLE);
         cd.translate.set("ps_lifted", bind_pl->ps.lifted);
         cd.translate.set("vs_lifted", bind_pl->vs.lifted);
         cd.translate.set("vertex_formats_from_params", bind_pl->vs_formats_from_params);
@@ -14449,6 +15095,8 @@ static bool draw_impl(const GpuDraw& d) {
             cd.translate.set("tess_lds_bound", tess_lds_bound());  // the tessellation stages' LDS checks (TranslateOptions::tess_lds_bound)
             cd.translate.set("bindless", g.bindless);
         }
+        cd.translate.set("vs_lane_from_scan", stage_lane_from_scan(bind_pl->tess_hw ? gcn::Stage::TessEval : gcn::Stage::Vertex));
+        cd.translate.set("ps_lane_from_scan", stage_lane_from_scan(gcn::Stage::Pixel));
         capture_session = capture_begin_locked(std::move(cd));
     }
     draw_stamp.to(kRenderCostVariant);
@@ -14462,19 +15110,26 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // Lazy pass barriers: what this draw samples against the targets written
     // since the last barrier, and noted for the passes after it.
+    // The open pass's targets count as written: begin_pass ends it only after
+    // this check, so sampling one from another pass needs the barrier.
     bool sample_hazard = false;
+    const std::uint64_t draw_pass_key = pass_key(s);
     if (g_lazy_barriers) {
+        const bool other_pass = g_pass.active && g_pass.key != draw_pass_key;
         for (int st = 0; st < 2; ++st) {
             for (const StageImages::Image& im : stage_images[st].images) {
                 if (!im.resolved) continue;
                 const std::uint64_t base = tsharp_base(im.w);
                 if (g_hazards.owed && g_hazards.written.count(base)) sample_hazard = true;
+                if (other_pass && !sample_hazard) {
+                    for (int t = 0; t < g_pass.ntargets; ++t) sample_hazard = sample_hazard || g_pass.targets[t] == base;
+                }
                 g_hazards.sampled.insert(base);
             }
         }
     }
     g_pass_profile_name = &bind_pl->profile_name;
-    begin_pass(s, pass_key(s), sample_hazard);
+    begin_pass(s, draw_pass_key, sample_hazard);
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
     // translated shader shows up as a hang in vkCmdBindPipeline rather than in
@@ -15384,6 +16039,51 @@ void host_gpu_refill_selftest() {
         ++g_rt_gen;
         bump_view_epoch();
     }
+
+    // A fill of a D32_SFLOAT_S8_UINT target is unorm for a depth stand-in,
+    // float otherwise; the same memory asked for the other way is a new image.
+    {
+        constexpr std::uint32_t kSide = 64;
+        constexpr std::size_t kBytes = kSide * kSide * 4;
+        auto first_depth = [&](RtImage& r) -> float {
+            DevBuffer staging;
+            if (!create_dev_buffer(staging, 4, true)) return -1.0f;
+            begin_recording_locked();
+            render_end_pass_locked();
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            region.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
+            flush_locked();
+            float f = -1.0f;
+            std::memcpy(&f, staging.map, 4);
+            vkDestroyBuffer(g.device, staging.buffer, nullptr);
+            vkFreeMemory(g.device, staging.memory, nullptr);
+            return f;
+        };
+        struct DepthCase {
+            const char* name;
+            bool stand_in;
+            std::uint32_t value;
+            float want;
+        };
+        const DepthCase depth_cases[] = {{"16-bit depth with stencil", true, 0x00800000u, 8388608.0f / 16777215.0f},
+                                         {"32-bit float depth with stencil", false, 0x3e800000u, 0.25f},
+                                         {"16-bit depth with stencil again", true, 0x00400000u, 4194304.0f / 16777215.0f}};
+        for (const DepthCase& c : depth_cases) {
+            RtImage* r = rt_image(kBase, VK_FORMAT_D32_SFLOAT_S8_UINT, kSide, kSide, true, 1, kBytes, c.stand_in);
+            if (!r) {
+                host_log("refill test: no depth target");
+                break;
+            }
+            const bool cleared = render_clear_by_fill_locked(kBase, kBytes, c.value);
+            const float got = first_depth(*r);
+            const bool pass = cleared && r->depth_stand_in == c.stand_in && std::abs(got - c.want) < 1e-6f;
+            host_log("refill test: a fill of a %s target before any draw clears it to %.7f (want %.7f) - %s", c.name, got, c.want,
+                     pass ? "PASS" : "FAIL");
+        }
+        drop();
+    }
 }
 
 // BBHOST_DUMP_ALL=1 also writes every colour target as build/rt-<base>.ppm.
@@ -16088,10 +16788,25 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                 std::free(draws_text);
             }
             std::size_t failed = 0;
-            for (const auto& t : images) {
-                if (!write_target_image(*t)) ++failed;
-                vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
-                vkFreeMemory(g.device, t->staging.memory, nullptr);
+            if (g.moltenvk) {
+                // MoltenVK makes every device-address buffer resident, unretained,
+                // in every command buffer: freeing these under frames in flight
+                // loses the device. Free them after a flush.
+                for (const auto& t : images) {
+                    if (!write_target_image(*t)) ++failed;
+                }
+                std::lock_guard<GpuMutex> lock(g.mu);
+                if (g.ok) flush_locked();
+                for (const auto& t : images) {
+                    vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
+                    vkFreeMemory(g.device, t->staging.memory, nullptr);
+                }
+            } else {
+                for (const auto& t : images) {
+                    if (!write_target_image(*t)) ++failed;
+                    vkDestroyBuffer(g.device, t->staging.buffer, nullptr);
+                    vkFreeMemory(g.device, t->staging.memory, nullptr);
+                }
             }
             if (failed) host_log("dump: F12 could not write %zu of the %zu images", failed, images.size());
             host_log("dump: F12 files written to %s - send that folder with the log", folder.c_str());
@@ -16209,7 +16924,7 @@ namespace {
 // flushes once for all of them and takes the bytes (take_target_pixels).
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     const bool depth = r.depth;
-    if (depth && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
+    if (depth && !depth_is_float(r)) return false;
     out.width = r.width;
     out.height = r.height;
     out.format = r.format;

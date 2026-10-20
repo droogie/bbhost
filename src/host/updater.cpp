@@ -2,6 +2,7 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
+#include "core/portable.h"
 #include "log.h"
 #include "replay/json.h"
 
@@ -58,13 +59,14 @@ void set_lines(const std::string& status, const std::string& detail) {
 
 fs::path exe_path() {
 #if defined(_WIN32)
+    // The wide name: host_exe_path's is in the ANSI code page, which may not
+    // spell the path, and libstdc++ reads a narrow fs::path as UTF-8.
     std::wstring buf(32768, L'\0');
     const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
     buf.resize(n);
     return fs::path(buf);
 #else
-    std::error_code ec;
-    return fs::read_symlink("/proc/self/exe", ec);
+    return fs::path(host_exe_path());
 #endif
 }
 
@@ -212,6 +214,10 @@ void set_plugins_status(const std::string& s) {
 #if defined(_WIN32)
 constexpr const char* kPluginSuffix = "-windows.dll";
 constexpr const char* kPluginExt = ".dll";
+#elif defined(__APPLE__)
+// A plugin on macOS is a Mach-O bundle, still named .so (CMake's MODULE).
+constexpr const char* kPluginSuffix = "-macos.so";
+constexpr const char* kPluginExt = ".so";
 #else
 constexpr const char* kPluginSuffix = "-linux.so";
 constexpr const char* kPluginExt = ".so";

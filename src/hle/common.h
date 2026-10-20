@@ -100,6 +100,36 @@ inline int to_freebsd(int e) {
         case EOWNERDEAD: return 96;
         default: break;
     }
+#elif defined(__APPLE__)
+    // macOS matches FreeBSD up to ENEEDAUTH (81), plus EOVERFLOW and ENOTSUP.
+    switch (e) {
+        case EIDRM: return 82;
+        case ENOMSG: return 83;
+        case ECANCELED: return 85;
+        case EILSEQ: return 86;
+        case ENOATTR: return 87;
+        case EBADMSG: return 89;
+        case EMULTIHOP: return 90;
+        case ENOLINK: return 91;
+        case EPROTO: return 92;
+        case EOPNOTSUPP: return 45;
+        case ENOTRECOVERABLE: return 95;
+        case EOWNERDEAD: return 96;
+        // macOS-only: the nearest FreeBSD code, not the one with their number.
+        case ETIME: return 60;   // ETIMEDOUT
+        case EQFULL: return 55;  // ENOBUFS
+        case EPWROFF:
+        case EDEVERR:
+        case EBADEXEC:
+        case EBADARCH:
+        case ESHLIBVERS:
+        case EBADMACHO:
+        case ENODATA:
+        case ENOSR:
+        case ENOSTR:
+        case ENOPOLICY: return 5;  // EIO
+        default: break;
+    }
 #endif
     return e;
 }

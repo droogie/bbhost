@@ -9,6 +9,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
 #else
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -88,6 +90,11 @@ inline void cpu_pause() {
     __builtin_ia32_pause();
 #endif
 }
+#elif defined(__APPLE__)
+// macOS: timeouts are relative, on the mach_absolute_time clock that
+// steady_clock also reads.
+constexpr os_sync_wait_on_address_flags_t kWaitPrivate = OS_SYNC_WAIT_ON_ADDRESS_NONE;
+constexpr os_sync_wake_by_address_flags_t kWakePrivate = OS_SYNC_WAKE_BY_ADDRESS_NONE;
 #else
 long futex_call(std::atomic<std::uint32_t>* word, int op, std::uint32_t val, const timespec* ts, std::uint32_t bitset) {
     return syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(word), op, val, ts, nullptr, bitset);
@@ -141,6 +148,23 @@ bool host_futex_wait(std::atomic<std::uint32_t>* word, std::uint32_t expected, c
             cpu_pause();
         }
     }
+#elif defined(__APPLE__)
+    if (!deadline) {
+        os_sync_wait_on_address(word, expected, sizeof(expected), kWaitPrivate);
+        return true;
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(*deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) {
+        g_timeouts.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const int r = os_sync_wait_on_address_with_timeout(word, expected, sizeof(expected), kWaitPrivate, OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                                       static_cast<std::uint64_t>(left));
+    if (r < 0 && errno == ETIMEDOUT) {
+        g_timeouts.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 #else
     if (!deadline) {
         futex_call(word, FUTEX_WAIT_PRIVATE, expected, nullptr, 0);
@@ -168,6 +192,8 @@ void host_futex_wake_one(std::atomic<std::uint32_t>* word) {
     }
 #if defined(_WIN32)
     WakeByAddressSingle(reinterpret_cast<PVOID>(word));
+#elif defined(__APPLE__)
+    os_sync_wake_by_address_any(word, sizeof(std::uint32_t), kWakePrivate);  // ENOENT when nobody waits
 #else
     futex_call(word, FUTEX_WAKE_PRIVATE, 1, nullptr, 0);
 #endif
@@ -181,6 +207,8 @@ void host_futex_wake_all(std::atomic<std::uint32_t>* word) {
     }
 #if defined(_WIN32)
     WakeByAddressAll(reinterpret_cast<PVOID>(word));
+#elif defined(__APPLE__)
+    os_sync_wake_by_address_all(word, sizeof(std::uint32_t), kWakePrivate);
 #else
     futex_call(word, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, 0);
 #endif

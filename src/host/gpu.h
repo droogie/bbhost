@@ -411,10 +411,11 @@ enum DrawVs { kDrawVsLifted, kDrawVsTranslated, kDrawVsOther, kDrawVsFallback, k
 // geometry (packets), vertex input is off, the game binds the vertex table
 // itself (no slot in the draw's user data), the fetch shader has another shape
 // than the GX input layouts', or an element has no record, no Vulkan vertex
-// format, a stride shorter than itself, or data outside one imported buffer.
+// format, a stride shorter than itself, or data outside one imported buffer;
+// or (MoltenVK) more vertex buffers than Metal has slots left for them.
 enum DrawVsWhy {
     kVsWhyTessHw, kVsWhyDomain, kVsWhyNoFetch, kVsWhyNoGx, kVsWhyInputOff, kVsWhyOwnTable,
-    kVsWhyShape, kVsWhyRecord, kVsWhyFormat, kVsWhyStride, kVsWhyPlacement, kVsWhyCount
+    kVsWhyShape, kVsWhyRecord, kVsWhyFormat, kVsWhyStride, kVsWhyPlacement, kVsWhySlots, kVsWhyCount
 };
 const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.

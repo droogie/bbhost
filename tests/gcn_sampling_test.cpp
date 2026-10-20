@@ -2,6 +2,7 @@
 // SPIR-V validity. No game files are needed. Exit 77 if no suitable Vulkan
 // device is available.
 #include "gcn/translate.h"
+#include "host/vk_portability.h"
 #include <spirv-tools/libspirv.hpp>
 #include <vulkan/vulkan.h>
 #include <array>
@@ -753,12 +754,17 @@ struct Fixture {
     }
     void barrier(VkAccessFlags src, VkAccessFlags dst) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; mb.srcAccessMask = src; mb.dstAccessMask = dst;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        // The host's reads are the host stage's, which ALL_COMMANDS leaves out.
+        const VkPipelineStageFlags host = (dst & VK_ACCESS_HOST_READ_BIT) ? VK_PIPELINE_STAGE_HOST_BIT : 0;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | host,
                              0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     bool init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_2;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
+        std::vector<const char*> iext;
+        gpu::portability_enumeration(ici, iext);
+        ici.enabledExtensionCount = static_cast<uint32_t>(iext.size()); ici.ppEnabledExtensionNames = iext.data();
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
         uint32_t count = 0; check(vkEnumeratePhysicalDevices(instance, &count, nullptr));
         std::vector<VkPhysicalDevice> devices(count);
@@ -795,6 +801,13 @@ struct Fixture {
         VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES}; v12.bufferDeviceAddress = VK_TRUE;
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; di.pNext = &v12;
         di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi; di.pEnabledFeatures = &features;
+        // A device that lists the portability subset must have it enabled.
+        uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &nd, nullptr);
+        std::vector<VkExtensionProperties> de(nd); vkEnumerateDeviceExtensionProperties(physical, nullptr, &nd, de.data());
+        const char* portability_subset = "VK_KHR_portability_subset";
+        for (const VkExtensionProperties& e : de) if (std::strcmp(e.extensionName, portability_subset) == 0) {
+            di.enabledExtensionCount = 1; di.ppEnabledExtensionNames = &portability_subset;
+        }
         check(vkCreateDevice(physical, &di, nullptr, &device)); vkGetDeviceQueue(device, family, 0, &queue);
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = family; pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

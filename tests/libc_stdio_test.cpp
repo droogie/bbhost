@@ -112,6 +112,7 @@ int main() {
     }
     CHECK(std::fclose(messages) == 0);
 #if !defined(_WIN32)
+#if defined(__linux__)  // macOS has no /dev/full
     FILE* full = open_file("/dev/full", "wb");
     CHECK(full && std::setvbuf(full, nullptr, _IONBF, 0) == 0);
     CHECK(file_result(full, [&] { return std::fputc('x', full); }, write_access) == EOF);
@@ -120,6 +121,7 @@ int main() {
     t_guest_errno = 73;
     CHECK(stdio_print(full, "%s %d", "payload", 42) == -1 && t_guest_errno == 28 && std::ferror(full));
     close_file(full);
+#endif
     int descriptors[2];
     CHECK(::pipe(descriptors) == 0);
     FILE* pipe = ::fdopen(descriptors[0], "rb");

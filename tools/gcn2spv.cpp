@@ -44,6 +44,15 @@ bool read_header(const gcn::BundleEntry& e, const gcn::ShaderCode& code, Header&
     return true;
 }
 
+// GCN2SPV_LANE_SCAN=1: as on MoltenVK, no subgroup built-ins in these stages.
+bool lane_from_scan(gcn::Stage stage) {
+    static const bool on = [] {
+        const char* e = std::getenv("GCN2SPV_LANE_SCAN");
+        return e && e[0] == '1';
+    }();
+    return on && (stage == gcn::Stage::Vertex || stage == gcn::Stage::TessEval);
+}
+
 gcn::TranslateOptions options_for(const Header& h) {
     gcn::TranslateOptions o;
     o.stage = h.stage;
@@ -69,6 +78,7 @@ gcn::TranslateOptions options_for(const Header& h) {
         return !(e && e[0] == '0');
     }();
     o.exec_known = exec_known;
+    o.lane_from_scan = lane_from_scan(o.stage);
     if (h.stage == gcn::Stage::Pixel) {
         o.ps_input_ena = h.regs[8];
         o.descriptor_set = 1;
@@ -122,8 +132,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (std::string(argv[1]) == "--tess-stubs") {
-        // The two generated stages of a tessellated draw, validated.
+        // The generated tessellation and rect-list stages, validated.
         const float outer[4] = {1.0f, 1.0f, 1.0f, 1.0f}, inner[2] = {1.0f, 1.0f};
+        const gcn::RectTessShaders rect = gcn::make_rect_tess_shaders({0, 1, 4}, 2);
         spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
         tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* msg) {
             std::fprintf(stderr, "  %s\n", msg);
@@ -132,7 +143,9 @@ int main(int argc, char** argv) {
         for (const auto& [name, words] : std::vector<std::pair<const char*, std::vector<std::uint32_t>>>{
                  {"tessellation vertex stage", gcn::make_tess_passthrough_vs()},
                  {"tessellation control stage", gcn::make_tess_constant_tcs(outer, inner, 1)},
-                 {"tessellation control stage, attributes", gcn::make_tess_constant_tcs(outer, inner, 1, 8)}}) {
+                 {"tessellation control stage, attributes", gcn::make_tess_constant_tcs(outer, inner, 1, 8)},
+                 {"rect list control stage", rect.control},
+                 {"rect list evaluation stage", rect.evaluation}}) {
             const bool ok = tools.Validate(words);
             std::printf("%s: %zu words, %s\n", name, words.size(), ok ? "valid" : "INVALID");
             bad += !ok;
@@ -178,6 +191,7 @@ int main(int argc, char** argv) {
             o.tess_role = gcn::TranslateOptions::TessRole::Domain;
             o.domain_level = stage.size() > 3 ? static_cast<std::uint32_t>(std::atoi(stage.c_str() + 3)) : 1;
         } else o.stage = gcn::Stage::Vertex;
+        o.lane_from_scan = lane_from_scan(o.stage);
         const char* out = nullptr;
         gcn::Program fetch;
         for (int a = 6; a < argc; ++a) {

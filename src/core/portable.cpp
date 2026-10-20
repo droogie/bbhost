@@ -29,6 +29,15 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <climits>
+#include <mach-o/dyld.h>
+#include <mach-o/ldsyms.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/event.h>
+#endif
 
 bool host_mkdir(const char* path) {
 #if defined(_WIN32)
@@ -150,6 +159,14 @@ bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi) {
             l = static_cast<std::uint64_t>(low);
             h = static_cast<std::uint64_t>(high);
         }
+#elif defined(__APPLE__)
+        // stackaddr is the high end.
+        const auto top = reinterpret_cast<std::uint64_t>(pthread_get_stackaddr_np(pthread_self()));
+        const std::size_t size = pthread_get_stacksize_np(pthread_self());
+        if (top && size && top > size) {
+            l = top - size;
+            h = top;
+        }
 #else
         pthread_attr_t attr;
         if (pthread_getattr_np(pthread_self(), &attr) == 0) {
@@ -172,6 +189,10 @@ bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi) {
 std::uint32_t host_thread_id() {
 #if defined(_WIN32)
     return static_cast<std::uint32_t>(GetCurrentThreadId());
+#elif defined(__APPLE__)
+    std::uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<std::uint32_t>(tid);
 #else
     return static_cast<std::uint32_t>(syscall(SYS_gettid));
 #endif
@@ -248,6 +269,10 @@ void host_thread_set_name(const char* name) {
     if (!name || !name[0]) return;
 #if defined(_WIN32)
     pthread_setname_np(pthread_self(), name);
+#elif defined(__APPLE__)
+    char buf[64];  // MAXTHREADNAMESIZE, the terminator included
+    std::snprintf(buf, sizeof(buf), "%s", name);
+    pthread_setname_np(buf);
 #else
     char comm[16];
     host_thread_fit_name(name, comm);
@@ -333,6 +358,36 @@ void host_sleep_us(std::uint64_t usec) {
         }
     }
     Sleep(static_cast<DWORD>((usec + 999) / 1000));
+#elif defined(__APPLE__)
+    // usleep's timer leeway wakes a non-real-time thread up to a quarter of
+    // the sleep late, which breaks frame pacing; a NOTE_CRITICAL kqueue timer
+    // has none. One kqueue per sleeping thread.
+    static const bool precise = [] {
+        const char* e = std::getenv("BBHOST_PRECISE_SLEEP");
+        const bool on = !(e && e[0] == '0');
+        host_log("timing: host sleeps on %s", on ? "a kqueue timer with NOTE_CRITICAL, without the system's leeway (BBHOST_PRECISE_SLEEP=0: usleep)"
+                                                 : "usleep, up to a quarter of the sleep late (BBHOST_PRECISE_SLEEP=0)");
+        return on;
+    }();
+    struct Queue {
+        int fd = precise ? kqueue() : -1;
+        ~Queue() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    static thread_local const Queue queue;
+    const int kq = queue.fd;
+    if (usec > 0 && kq >= 0) {
+        struct kevent64_s ev;
+        EV_SET64(&ev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS | NOTE_CRITICAL, static_cast<std::int64_t>(usec), 0, 0, 0);
+        struct kevent64_s fired;
+        if (kevent64(kq, &ev, 1, &fired, 1, 0, nullptr) == 1) return;
+        // Interrupted: disarm, or a later sleep gets this event.
+        EV_SET64(&ev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, 0, 0, 0);
+        kevent64(kq, &ev, 1, nullptr, 0, 0, nullptr);
+        return;
+    }
+    usleep(static_cast<useconds_t>(usec));
 #else
     usleep(static_cast<useconds_t>(usec));
 #endif
@@ -434,7 +489,73 @@ void host_page_guard(void* p, std::size_t size) {
 #if defined(_WIN32)
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__ImageBase); }
+
+std::string host_exe_path() {
+    char buf[4096];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    return n == 0 || n >= sizeof(buf) ? std::string() : std::string(buf, n);
+}
+#elif defined(__APPLE__)
+std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&_mh_execute_header); }
+
+std::string host_exe_path() {
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // the size it needs
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    char real[PATH_MAX];
+    return realpath(path.c_str(), real) ? std::string(real) : std::string();
+}
+
+bool host_image_of(std::uint64_t addr, bool code_only, const char** name, std::uint64_t* base) {
+    const std::uint32_t n = _dyld_image_count();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto* h = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(i));
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        const auto slide = static_cast<std::uint64_t>(_dyld_get_image_vmaddr_slide(i));
+        const auto* lc = reinterpret_cast<const load_command*>(h + 1);
+        for (std::uint32_t k = 0; k < h->ncmds; ++k) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
+                // __PAGEZERO, no access, spans the low 4 GiB: never a module's.
+                const bool counts = code_only ? (seg->initprot & VM_PROT_EXECUTE) != 0 : seg->initprot != 0;
+                const std::uint64_t lo = seg->vmaddr + slide;
+                if (counts && addr >= lo && addr - lo < seg->vmsize) {
+                    *name = _dyld_get_image_name(i);
+                    *base = reinterpret_cast<std::uint64_t>(h);
+                    return true;
+                }
+            }
+            lc = reinterpret_cast<const load_command*>(reinterpret_cast<const char*>(lc) + lc->cmdsize);
+        }
+    }
+    return false;
+}
+
+bool host_readable(std::uint64_t addr, std::size_t len) {
+    if (addr + len < addr) return false;  // past the end of the address space
+    for (std::uint64_t at = addr; at < addr + len;) {
+        mach_vm_address_t a = at;
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_short_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &a, &size, &depth, reinterpret_cast<vm_region_recurse_info_t>(&info),
+                                   &count) != KERN_SUCCESS ||
+            a > at || !(info.protection & VM_PROT_READ)) {
+            return false;
+        }
+        at = a + size;
+    }
+    return true;
+}
 #else
 extern "C" char __executable_start;
 std::uintptr_t host_image_base() { return reinterpret_cast<std::uintptr_t>(&__executable_start); }
+
+std::string host_exe_path() {
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string();
+}
 #endif

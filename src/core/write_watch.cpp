@@ -19,6 +19,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include "core/mac_vm.h"
+#endif
 
 namespace {
 
@@ -133,6 +136,17 @@ __attribute__((no_stack_protector, always_inline)) inline int protect_pages(std:
     const DWORD e = GetLastError();
     return (e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_NO_SYSTEM_RESOURCES || e == ERROR_COMMITMENT_LIMIT) ? ENOMEM
                                                                                                           : EACCES;
+}
+#elif defined(__APPLE__)
+// libc's mprotect is safe here: macOS's errno is reached through GS, which
+// stays the system's on guest threads. Returns 0 or the errno value.
+__attribute__((no_stack_protector, always_inline)) inline int protect_pages(std::uint64_t addr, std::uint64_t len,
+                                                                            bool writable) {
+    if (mprotect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)), static_cast<std::size_t>(len),
+                 writable ? (PROT_READ | PROT_WRITE) : PROT_READ) == 0) {
+        return 0;
+    }
+    return errno;
 }
 #else
 // mprotect without libc: its wrapper sets errno on failure, and errno is
@@ -334,7 +348,13 @@ int write_watch_fault_writers(std::uint64_t* pcs, std::uint64_t* callers, std::u
         std::uint32_t n;
     };
     std::vector<Writer> seen;
+#if defined(__APPLE__)
+    // Host code lies among guest addresses on macOS; the guest's is in the
+    // eboot's window.
+    const auto guest = [](std::uint64_t a) { return a >= kMacVmImageBase && a < kMacVmImageBase + kMacVmImageSize; };
+#else
     const auto guest = [](std::uint64_t a) { return a > 0x10000 && a < 0x100000000000ull; };
+#endif
     for (unsigned i = 0; i < kFaultRing; ++i) {
         if (!g_fault_addr[i].load(std::memory_order_acquire)) continue;
         std::uint64_t pc = 0, caller = 0;

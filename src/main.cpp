@@ -8,6 +8,7 @@
 #include "core/thunk.h"
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/maskmov_rewrite.h"
 #include "core/win_watch.h"
 #include "core/write_watch.h"
 #include "engine/addr.h"
@@ -61,11 +62,17 @@
 #else
 #include <csignal>
 #include <signal.h>
-#include <ucontext.h>
+#include "core/host_ucontext.h"
 #include <pthread.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
+#if defined(__linux__)
 #include <link.h>
+#endif
+#if defined(__APPLE__)
+#include <setjmp.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 void exit_reports();  // the reports a run prints when ended from outside (below)
@@ -149,12 +156,18 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 if (kind && !std::strcmp(kind, "invalid")) std::fclose(static_cast<FILE*>(nullptr));
                 *static_cast<volatile int*>(nullptr) = 1;
             }
-            if ((exit_flip && hle_video_flip_count() >= exit_flip) ||
-                (exit_seconds > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= exit_seconds)) {
+            const std::uint64_t flips_now = hle_video_flip_count();
+            const double secs_now = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
+            const bool flip_hit = exit_flip && flips_now >= exit_flip;
+            if (flip_hit || (exit_seconds > 0 && secs_now >= exit_seconds)) {
                 // The guest keeps running while this prints; the window is
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
-                host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                if (flip_hit)
+                    host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                else
+                    host_log("exit: %.0f s reached at flip %llu (BBHOST_EXIT_SECONDS)", exit_seconds,
+                             static_cast<unsigned long long>(flips_now));
                 exit_reports();
                 // The cache save takes the GPU lock, which the command
                 // processor (still running) may hold for good: a helper
@@ -269,6 +282,107 @@ void log_cpu() {
              hybrid ? ", hybrid" : "", std::thread::hardware_concurrency());
 }
 
+#if defined(__APPLE__)
+// Rosetta 2 (macOS 15+) runs AVX and friends but its CPUID shows them only
+// with ROSETTA_ADVERTISE_AVX=1, and game code picks its path by CPUID: so
+// re-exec once with it set. A value already set (even 0) is respected.
+bool rosetta_translated() {
+    int v = 0;
+    std::size_t n = sizeof(v);
+    return sysctlbyname("sysctl.proc_translated", &v, &n, nullptr, 0) == 0 && v == 1;
+}
+
+void rosetta_advertise_avx(char** argv) {
+    if (!rosetta_translated() || std::getenv("ROSETTA_ADVERTISE_AVX")) return;
+    const std::string exe = host_exe_path();
+    if (exe.empty()) return;
+    setenv("ROSETTA_ADVERTISE_AVX", "1", 1);
+    execv(exe.c_str(), argv);
+    const int e = errno;
+    unsetenv("ROSETTA_ADVERTISE_AVX");
+    host_log("cpu: starting again with ROSETTA_ADVERTISE_AVX=1 failed (%s); the game's CPUID shows no AVX", std::strerror(e));
+}
+
+// Executed under a SIGILL catcher, since CPUID may not tell what Rosetta runs.
+// LZCNT is judged by its result: without it the same bytes are BSR.
+sigjmp_buf g_cpu_probe_jb;
+void cpu_probe_sigill(int) { siglongjmp(g_cpu_probe_jb, 1); }
+template <typename F>
+bool cpu_runs(F f) {
+    if (sigsetjmp(g_cpu_probe_jb, 1) != 0) return false;
+    return f();
+}
+
+void check_cpu(int argc, char** argv) {
+    struct sigaction sa{}, old{};
+    sa.sa_handler = cpu_probe_sigill;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, &old);
+    const struct {
+        const char* name;
+        bool runs;
+    } probes[] = {
+        {"AVX", cpu_runs([] {
+             asm volatile("vxorps %%ymm0, %%ymm0, %%ymm0\n\tvzeroupper" ::: "xmm0");
+             return true;
+         })},
+        {"AVX2", cpu_runs([] {
+             asm volatile("vpaddd %%ymm0, %%ymm0, %%ymm0\n\tvzeroupper" ::: "xmm0");
+             return true;
+         })},
+        {"F16C", cpu_runs([] {
+             asm volatile("vcvtph2ps %%xmm0, %%xmm0" ::: "xmm0");
+             return true;
+         })},
+        {"BMI1", cpu_runs([] {
+             unsigned v = 0xf0, r = 1;
+             asm volatile("andn %1, %1, %0" : "=r"(r) : "r"(v));
+             return r == 0;
+         })},
+        {"POPCNT", cpu_runs([] {
+             unsigned v = 0xf0f0, r = 0;
+             asm volatile("popcnt %1, %0" : "=r"(r) : "r"(v));
+             return r == 8;
+         })},
+        {"LZCNT", cpu_runs([] {
+             unsigned v = 1, r = 0;
+             asm volatile("lzcnt %1, %0" : "=r"(r) : "r"(v));
+             return r == 31;
+         })},
+        {"MOVBE", cpu_runs([] {
+             std::uint32_t m = 0x11223344, r = 0;
+             asm volatile("movbe %1, %0" : "=r"(r) : "m"(m));
+             return r == 0x44332211;
+         })},
+    };
+    sigaction(SIGILL, &old, nullptr);
+    std::string missing;
+    for (const auto& p : probes) {
+        if (!p.runs) missing += std::string(missing.empty() ? "" : ", ") + p.name;
+    }
+    const bool rosetta = rosetta_translated();
+    if (missing.empty()) {
+        const char* adv = std::getenv("ROSETTA_ADVERTISE_AVX");
+        host_log("cpu: AVX, AVX2, F16C, BMI1, POPCNT, LZCNT and MOVBE run%s", !rosetta ? ""
+                 : adv && std::strcmp(adv, "1") == 0 ? " (Rosetta 2; CPUID shows them: ROSETTA_ADVERTISE_AVX=1)"
+                                                     : " (Rosetta 2; CPUID does not show them)");
+        return;
+    }
+    const std::string text =
+        rosetta ? "bbhost needs macOS 15 or later: Rosetta 2 runs AVX and the other instructions the game's code uses "
+                  "from macOS 15 on, and here it does not run " + missing + "."
+                : "This processor does not run " + missing + ", which the game's code uses (the PS4's processor has "
+                  "them all), so bbhost cannot run the game on it.";
+    host_log("cpu: %s", text.c_str());
+    // A Finder launch has no terminal for the log; --headless has nobody to
+    // close a box.
+    bool headless = false;
+    for (int i = 1; i < argc; ++i) headless = headless || std::strcmp(argv[i], "--headless") == 0;
+    if (!headless) host_window_error_box("bbhost cannot run here", text.c_str());
+    std::exit(1);
+}
+#endif
+
 }  // namespace
 
 // The reports a run prints when it is ended from outside: SIGTERM from
@@ -340,6 +454,7 @@ void exit_reports() {
     frame_pool_report();
     key_prompts_report();
     decomp_report();
+    maskmov_rewrite_exit_report();
     mouse_camera_report();
 }
 
@@ -480,20 +595,20 @@ void on_trap(int sig, siginfo_t*, void* ctx) {
     auto* uc = static_cast<ucontext_t*>(ctx);
     const std::uint64_t bp = g_bp_va.load();
     if (bp) {
-        const std::uint64_t rip = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
+        const std::uint64_t rip = static_cast<std::uint64_t>(UC_REG(uc, RIP));
         auto* bpp = reinterpret_cast<volatile std::uint8_t*>(static_cast<std::uintptr_t>(bp));
         if (g_bp_armed.load() && rip == bp + 1) {
             // int3 hit: capture arg3 (RDX) and the Matrix2x4 it points at.
-            const std::uint64_t rdx = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RDX]);
+            const std::uint64_t rdx = static_cast<std::uint64_t>(UC_REG(uc, RDX));
             const int i = g_bp_hits.fetch_add(1);
             if (i < kBpCap) {
                 g_bp_ptr[i] = rdx;
-                const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+                const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
                 g_bp_ret[i] = *reinterpret_cast<const volatile std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
-                g_bp_rdi[i] = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RDI]);
-                g_bp_rsi[i] = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSI]);
-                g_bp_r8[i]  = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_R8]);
-                g_bp_r9[i]  = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_R9]);
+                g_bp_rdi[i] = static_cast<std::uint64_t>(UC_REG(uc, RDI));
+                g_bp_rsi[i] = static_cast<std::uint64_t>(UC_REG(uc, RSI));
+                g_bp_r8[i]  = static_cast<std::uint64_t>(UC_REG(uc, R8));
+                g_bp_r9[i]  = static_cast<std::uint64_t>(UC_REG(uc, R9));
                 g_bp_rdx_raw[i] = rdx;
                 // Also snapshot [R8 + 0x60] as a Matrix2x4: for sub_4b7ab0 that is
                 // the object field the packing matrix is copied from.
@@ -510,11 +625,11 @@ void on_trap(int sig, siginfo_t*, void* ctx) {
             }
             g_bp_rdx.store(rdx);
             *bpp = static_cast<std::uint8_t>(g_bp_orig.load());   // restore
-            uc->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(bp);  // re-run the real insn
+            UC_REG(uc, RIP) = static_cast<host_greg_t>(bp);  // re-run the real insn
             g_bp_armed.store(false);
             if (i + 1 < kBpCap) {
                 g_bp_rearm.store(true);
-                uc->uc_mcontext.gregs[REG_EFL] |= std::uint64_t(0x100);  // step, then re-arm
+                UC_REG(uc, EFL) |= std::uint64_t(0x100);  // step, then re-arm
             }
             return;
         }
@@ -522,14 +637,14 @@ void on_trap(int sig, siginfo_t*, void* ctx) {
             *bpp = 0xcc;
             g_bp_armed.store(true);
             g_bp_rearm.store(false);
-            uc->uc_mcontext.gregs[REG_EFL] &= ~std::uint64_t(0x100);
+            UC_REG(uc, EFL) &= ~std::uint64_t(0x100);
             return;
         }
     }
     const std::uint64_t page = g_wp_page.load();
     if (g_wp_armed.load() && page) {
         mprotect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(page)), 0x1000, g_wp_prot.load());
-        uc->uc_mcontext.gregs[REG_EFL] &= ~std::uint64_t(0x100);
+        UC_REG(uc, EFL) &= ~std::uint64_t(0x100);
         return;
     }
     std::signal(sig, SIG_DFL);
@@ -550,11 +665,11 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
             if (fa >= g_wp_lo.load() && fa < g_wp_hi.load()) {
                 const int i = g_wp_n.fetch_add(1);
                 if (i < kWpCap) {
-                    g_wp_ring[i].rip = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
+                    g_wp_ring[i].rip = static_cast<std::uint64_t>(UC_REG(uc, RIP));
                     g_wp_ring[i].addr = fa;
                     // sub_4e5c00 keeps the source pointer in r13 and dest in r12.
-                    const std::uint64_t r13 = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_R13]);
-                    const std::uint64_t r12 = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_R12]);
+                    const std::uint64_t r13 = static_cast<std::uint64_t>(UC_REG(uc, R13));
+                    const std::uint64_t r12 = static_cast<std::uint64_t>(UC_REG(uc, R12));
                     g_wp_ring[i].r13 = r13;
                     g_wp_ring[i].r12 = r12;
                     // r13 was a source pointer only for the write this watch was
@@ -562,20 +677,27 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
                     // this runs with the guest's FS, so no libc either - and a
                     // memcpy's source and destination are kept as rsi and rdi.
                     g_wp_ring[i].src_val = 0;
-                    g_wp_ring[i].rsi = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSI]);
-                    g_wp_ring[i].rdi = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RDI]);
+                    g_wp_ring[i].rsi = static_cast<std::uint64_t>(UC_REG(uc, RSI));
+                    g_wp_ring[i].rdi = static_cast<std::uint64_t>(UC_REG(uc, RDI));
                     if (g_wp_stack_n.load() == 0) {
                         // Step 6: capture the guest thread's SSE control word
                         // (MXCSR) - logged later in hle_watch_report (host_log is
                         // not async-signal-safe). Default 0x1f80; FTZ/DAZ or a
                         // non-nearest rounding mode would corrupt tessellation.
+#if defined(__APPLE__)
+                        g_wp_mxcsr.store(uc->uc_mcontext->__fs.__fpu_mxcsr);
+                        std::uint16_t cw = 0;
+                        std::memcpy(&cw, &uc->uc_mcontext->__fs.__fpu_fcw, sizeof(cw));  // a bitfield struct
+                        g_wp_cwd.store(cw);
+#else
                         if (uc->uc_mcontext.fpregs) {
                             g_wp_mxcsr.store(uc->uc_mcontext.fpregs->mxcsr);
                             g_wp_cwd.store(uc->uc_mcontext.fpregs->cwd);
                         }
+#endif
                         // Only what lies on rsp's own page: a shallow stack
                         // ends before 256 words, and this runs on it.
-                        const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+                        const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
                         const auto* sp = reinterpret_cast<const volatile std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
                         const int words = static_cast<int>(std::min<std::uint64_t>(256, (((rsp + 0x1000) & ~0xfffull) - rsp) / 8));
                         for (int k = 0; k < words; ++k) g_wp_stack[k] = sp[k];
@@ -589,7 +711,7 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
                 g_wp_page.store(0);
             } else {
                 // Keep watching: single-step past this write, re-arm on SIGTRAP.
-                uc->uc_mcontext.gregs[REG_EFL] |= std::uint64_t(0x100);
+                UC_REG(uc, EFL) |= std::uint64_t(0x100);
             }
             return;
         }
@@ -597,29 +719,29 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
     hle_fs_host();  // the faulting thread may be running guest code with guest FS
     sampler_recover();  // a fault in the profiler's unwind drops its sample
     host_read_safe_recover();  // a fault in host_read_safe's copy fails the read
-    const std::uint64_t pc = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
+    const std::uint64_t pc = static_cast<std::uint64_t>(UC_REG(uc, RIP));
     const std::uint64_t addr = reinterpret_cast<std::uint64_t>(info->si_addr);
     host_log("SIGSEGV pc=0x%llx addr=0x%llx (guest pc 0x%llx)", static_cast<unsigned long long>(pc),
              static_cast<unsigned long long>(addr), static_cast<unsigned long long>(pc));
     host_log("  rax=%llx rdi=%llx rsi=%llx rdx=%llx rcx=%llx r8=%llx r13=%llx r15=%llx rsp=%llx rbp=%llx",
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RAX]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RDI]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RSI]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RDX]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RCX]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_R8]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_R13]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_R15]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RSP]),
-             static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RBP]));
+             static_cast<unsigned long long>(UC_REG(uc, RAX)),
+             static_cast<unsigned long long>(UC_REG(uc, RDI)),
+             static_cast<unsigned long long>(UC_REG(uc, RSI)),
+             static_cast<unsigned long long>(UC_REG(uc, RDX)),
+             static_cast<unsigned long long>(UC_REG(uc, RCX)),
+             static_cast<unsigned long long>(UC_REG(uc, R8)),
+             static_cast<unsigned long long>(UC_REG(uc, R13)),
+             static_cast<unsigned long long>(UC_REG(uc, R15)),
+             static_cast<unsigned long long>(UC_REG(uc, RSP)),
+             static_cast<unsigned long long>(UC_REG(uc, RBP)));
     {
         // The GX heap's release pass (0x2aaa860) walks its nodes in r14. When the
         // node is guest memory, show it and every mapping of its physical page:
         // a node whose first word holds another address's value shares memory
         // with that address.
-        const std::uint64_t r14 = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_R14]);
-        host_log("  r12=%llx r14=%llx rbx=%llx", static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_R12]),
-                 static_cast<unsigned long long>(r14), static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RBX]));
+        const std::uint64_t r14 = static_cast<std::uint64_t>(UC_REG(uc, R14));
+        host_log("  r12=%llx r14=%llx rbx=%llx", static_cast<unsigned long long>(UC_REG(uc, R12)),
+                 static_cast<unsigned long long>(r14), static_cast<unsigned long long>(UC_REG(uc, RBX)));
         if (r14 && hle_kernel_va_mapped(r14, 48)) {
             const auto* p = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(r14));
             host_log("  r14 %llx: %llx %llx %llx %llx %llx %llx", static_cast<unsigned long long>(r14),
@@ -632,8 +754,13 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
     }
     std::uint64_t chain_returns[8] = {};  // the frame-pointer chain's first return addresses
     {
-        const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+        const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
+#if defined(__APPLE__)
+        // Rosetta 2 puts thread stacks low: ask the VM map, not the address.
+        if (hle_kernel_va_mapped(rsp, 64) || host_readable(rsp, 64)) {
+#else
         if (hle_kernel_va_mapped(rsp, 64) || rsp > 0x700000000000ull) {
+#endif
             const auto* sp = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
             host_log("  stack %llx: %llx %llx %llx %llx  %llx %llx %llx %llx",
                      static_cast<unsigned long long>(rsp),
@@ -644,13 +771,17 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
         }
         // Guest code keeps frame pointers: the return addresses up the rbp chain,
         // for as long as each frame sits above the last within this stack.
-        std::uint64_t rbp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RBP]);
+        std::uint64_t rbp = static_cast<std::uint64_t>(UC_REG(uc, RBP));
         char chain[512];
         int len = 0;
         int depth = 0;
 
         for (; rbp > rsp && rbp - rsp < (256u << 20) && (rbp & 7) == 0 &&
+#if defined(__APPLE__)
+               (hle_kernel_va_mapped(rbp, 16) || host_readable(rbp, 16));
+#else
                (hle_kernel_va_mapped(rbp, 16) || rbp > 0x700000000000ull);
+#endif
              ++depth) {
             const auto* f = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rbp));
             if (depth < 16 && len < static_cast<int>(sizeof(chain)) - 20)
@@ -673,6 +804,11 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
             bool found;
         };
         const auto where = [](std::uint64_t a, const char* what) {
+#if defined(__APPLE__)
+            // Offset from the Mach-O header, as atos -l takes it.
+            Module m{a, nullptr, 0, false};
+            m.found = host_image_of(a, true, &m.name, &m.base);
+#else
             if (a < 0x100000000000ull) return false;
             Module m{a, nullptr, 0, false};
             dl_iterate_phdr(
@@ -689,6 +825,7 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
                     return 0;
                 },
                 &m);
+#endif
             if (!m.found) return false;
             Dl_info info{};
             const bool named = dladdr(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), &info) && info.dli_sname;
@@ -700,14 +837,18 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
         for (const std::uint64_t r : chain_returns) {
             if (r) where(r, "frame");
         }
-        const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+        const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
+#if defined(__APPLE__)
+        if (host_readable(rsp, 128 * 8)) {  // the 128 words the loop reads
+#else
         if (rsp > 0x700000000000ull) {
+#endif
             const auto* sp = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
             for (int k = 0, shown = 0; k < 128 && shown < 16; ++k) shown += where(sp[k], "stack word") ? 1 : 0;
         }
     }
     {
-        const std::uint64_t block = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSI]);
+        const std::uint64_t block = static_cast<std::uint64_t>(UC_REG(uc, RSI));
         if (block >= 16 && hle_kernel_va_mapped(block - 16, 64)) {
             const auto* p = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(block - 16));
             host_log("  rsi-16 %llx: %llx %llx %llx %llx  %llx %llx %llx %llx",
@@ -732,15 +873,21 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
 // frame has no stack protector either.
 __attribute__((no_stack_protector)) void on_segv_entry(int sig, siginfo_t* info, void* ctx) {
     auto* uc = static_cast<ucontext_t*>(ctx);
-    const bool is_write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;  // the page fault's W bit
+    const bool is_write = (UC_REG(uc, ERR) & 2) != 0;  // the page fault's W bit
+#if defined(__APPLE__)
+    // macOS raises SIGBUS for protection faults (the write watch's).
+    const bool access_fault = sig == SIGSEGV || sig == SIGBUS;
+#else
+    const bool access_fault = sig == SIGSEGV;
+#endif
     // The writer, for the texture census: the pc, the top of the stack
     // (return addresses when the write is in a leaf like memcpy) and the
     // frame's return address. Plain reads of the guest's own stack, no libc.
     std::uint64_t frame[kWriteWatchFrame] = {};
-    if (sig == SIGSEGV && is_write) {
-        frame[0] = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
-        const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
-        const std::uint64_t rbp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RBP]);
+    if (access_fault && is_write) {
+        frame[0] = static_cast<std::uint64_t>(UC_REG(uc, RIP));
+        const std::uint64_t rsp = static_cast<std::uint64_t>(UC_REG(uc, RSP));
+        const std::uint64_t rbp = static_cast<std::uint64_t>(UC_REG(uc, RBP));
         const auto page_ok = [](std::uint64_t a) { return a > 0x10000 && (a & 0xfff) <= 0xff8; };
         for (int k = 0; k < 6; ++k) {
             const std::uint64_t at = rsp + 8ull * static_cast<std::uint64_t>(k);
@@ -749,7 +896,7 @@ __attribute__((no_stack_protector)) void on_segv_entry(int sig, siginfo_t* info,
         }
         if (page_ok(rbp + 8) && ((rbp + 8) >> 12) == (rsp >> 12)) frame[7] = *reinterpret_cast<const std::uint64_t*>(rbp + 8);
     }
-    if (sig == SIGSEGV && write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), is_write, frame)) {
+    if (access_fault && write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), is_write, frame)) {
         return;
     }
     on_segv(sig, info, ctx);
@@ -878,8 +1025,25 @@ int main(int argc, char** argv) {
         }
     }
 #else
+#if defined(__APPLE__)
+    rosetta_advertise_avx(argv);  // before anything else: it may start bbhost again
+    host_log("bbhost %s (%s, macOS x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+    // The write watch, guest protections and stub pages assume 4 KiB pages.
+    if (getpagesize() != 4096) {
+        host_log("bbhost: the page size is %d bytes; bbhost needs 4 KiB pages (an x86_64 build run by Rosetta 2)", getpagesize());
+        return 1;
+    }
+    if (!hle_kernel_reserve_guest_windows()) {  // before anything else can take those addresses
+        host_log("bbhost: the guest's address windows are not all free; see the mac-vm lines above");
+        return 1;
+    }
+#else
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
+#endif
     log_cpu();
+#if defined(__APPLE__)
+    check_cpu(argc, argv);
+#endif
     std::signal(SIGTERM, on_term);
     {
         struct sigaction sa{};
@@ -1059,6 +1223,20 @@ int main(int argc, char** argv) {
             host_options_apply();  // the display settings, now that there is one
         }
     }
+#if defined(__APPLE__)
+    // A Mac run without a GPU shows nothing: end with the reason rather than
+    // run blind, unless BBHOST_GPU=0 asked for that.
+    if (!windowed && !(std::getenv("BBHOST_GPU") && std::getenv("BBHOST_GPU")[0] == '0') && !host_gpu_available()) {
+        const char* text =
+            "bbhost found no usable Vulkan 1.3 GPU. It reaches MoltenVK through the Vulkan loader and the driver "
+            "manifest found relative to the executable (the build folder's layout, or the packaged app's): run "
+            "bbhost where it was built or from the package, not a copy moved elsewhere.";
+        host_log("gpu: %s (BBHOST_GPU=0 runs without one)", text);
+        if (host_window_video_up()) host_window_error_box("bbhost cannot run here", text);
+        std::fflush(nullptr);
+        std::exit(1);
+    }
+#endif
     host_log("calling _start 0x%llx (CRT runs _init, stack=0x%zx)",
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);

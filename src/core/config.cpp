@@ -1,4 +1,5 @@
 #include "core/config.h"
+#include "core/portable.h"
 #include "core/sfo.h"
 #include "log.h"
 #include "bbhost_version.h"
@@ -206,27 +207,14 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
 std::map<std::string, std::string> g_values;  // the config file's raw values, for config_value
 
 std::string exe_dir() {
+    std::string p = host_exe_path();
 #if defined(_WIN32)
-    char buf[4096];
-    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return ".";
-    std::string p(buf, n);
     for (char& ch : p) {
         if (ch == '\\') ch = '/';
     }
+#endif
     const std::size_t slash = p.find_last_of('/');
     return slash == std::string::npos ? "." : p.substr(0, slash);
-#else
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) {
-        return ".";
-    }
-    buf[n] = 0;
-    std::string p(buf);
-    std::size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-#endif
 }
 
 bool file_exists(const std::string& p) {
@@ -263,11 +251,14 @@ std::string env_dir(const char* name) {
 // The per-user folders (config_user_dir): what a player sets once and every
 // download or update of bbhost then finds - the game's paths, the F10
 // settings, the account. BBHOST_CONFIG_DIR replaces the config one (tests,
-// a portable setup).
+// a portable setup). macOS: Application Support unless XDG_* is set.
 std::string user_config_dir() {
     if (std::string d = env_dir("BBHOST_CONFIG_DIR"); !d.empty()) return d;
 #if defined(_WIN32)
     if (std::string d = env_dir("APPDATA"); !d.empty()) return d + "/bbhost";
+#elif defined(__APPLE__)
+    if (std::string d = env_dir("XDG_CONFIG_HOME"); !d.empty()) return d + "/bbhost";
+    if (std::string d = env_dir("HOME"); !d.empty()) return d + "/Library/Application Support/bbhost";
 #else
     if (std::string d = env_dir("XDG_CONFIG_HOME"); !d.empty()) return d + "/bbhost";
     if (std::string d = env_dir("HOME"); !d.empty()) return d + "/.config/bbhost";
@@ -278,6 +269,9 @@ std::string user_config_dir() {
 std::string user_data_dir() {
 #if defined(_WIN32)
     if (std::string d = env_dir("LOCALAPPDATA"); !d.empty()) return d + "/bbhost/data";
+#elif defined(__APPLE__)
+    if (std::string d = env_dir("XDG_DATA_HOME"); !d.empty()) return d + "/bbhost/data";
+    if (std::string d = env_dir("HOME"); !d.empty()) return d + "/Library/Application Support/bbhost/data";
 #else
     if (std::string d = env_dir("XDG_DATA_HOME"); !d.empty()) return d + "/bbhost/data";
     if (std::string d = env_dir("HOME"); !d.empty()) return d + "/.local/share/bbhost/data";
@@ -895,8 +889,13 @@ bool config_write_template(const std::string& path) {
     out << "# bbhost configuration. Set the two paths under [paths], then run bbhost.\n"
            "# On Windows write them either way: \"C:\\Games\\Bloodborne\" or \"C:/Games/Bloodborne\".\n"
            "# A relative path is taken from the folder this file is in.\n"
+#if defined(__APPLE__)
+           "# This file is the per-user one (~/Library/Application Support/bbhost on macOS):\n"
+           "# every copy of bbhost reads it, so a new download or an update keeps it.\n"
+#else
            "# This file is the per-user one (%APPDATA%\\bbhost on Windows, ~/.config/bbhost on\n"
            "# Linux): every copy of bbhost reads it, so a new download or an update keeps it.\n"
+#endif
            "[paths]\n"
            "# The folder that contains dvdroot_ps4 (the decrypted game dump). An update\n"
            "# kept beside it in a folder of its own (CUSA00900-UPDATE or CUSA00900-patch,\n"
@@ -907,8 +906,13 @@ bool config_write_template(const std::string& path) {
            "#   eboot = \"C:\\Games\\Bloodborne\\eboot.bin\"\n"
            "eboot = \"PATH-TO-THE-EBOOT\"\n"
            "# Writable folder for saves, caches and /data. Default: the per-user data\n"
+#if defined(__APPLE__)
+           "# folder (~/Library/Application Support/bbhost/data), which outlives any\n"
+           "# copy of bbhost.\n"
+#else
            "# folder (%LOCALAPPDATA%\\bbhost\\data, ~/.local/share/bbhost/data), which\n"
            "# outlives any copy of bbhost.\n"
+#endif
            "# data = \"D:/bbhost-data\"\n"
            "# The PC port's asset overlay: files here resolve ahead of the dump, so a\n"
            "# modified asset never has to be written into it. Default: <data>/mods.\n"

@@ -16,6 +16,8 @@
 // host's own va_list can be compared against it (tests/sysv_va_test.cpp).
 #pragma once
 
+#include "core/asm_sym.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -47,15 +49,10 @@ int sysv_vfscanf(std::FILE* f, const char* fmt, SysvVaList* ap);
 // `slot` is the register the va_list pointer goes in: the one after the
 // fixed arguments (1 fixed -> rsi, 2 -> rdx, 3 -> rcx, 4 -> r8). The frame:
 //   +0x00 rdi..r9   +0x30 xmm0..xmm7   +0xb0 the va_list   +0xe0 caller's stack args
-#if defined(_WIN32)
-#define SYSV_VA_TYPE_(name)
-#else
-#define SYSV_VA_TYPE_(name) ".type " #name ", @function\n"
-#endif
 #define SYSV_VA_ENTRY(name, target, nfixed, slot)                                                        \
     extern "C" GUEST_ABI int name(...);                                                                  \
     asm(".text\n"                                                                                        \
-        ".globl " #name "\n" SYSV_VA_TYPE_(name) #name ":\n"                                             \
+        ".globl " ASM_SYM(name) "\n" ASM_TYPE_FUNCTION(name) ASM_SYM(name) ":\n"                         \
         ".cfi_startproc\n"                                                                               \
         "subq $0xd8, %rsp\n"                                                                             \
         ".cfi_adjust_cfa_offset 0xd8\n"                                                                  \
@@ -69,7 +66,7 @@ int sysv_vfscanf(std::FILE* f, const char* fmt, SysvVaList* ap);
         "leaq 0xe0(%rsp), %rax\n movq %rax, 0xb8(%rsp)\n"                                                \
         "movq %rsp, 0xc0(%rsp)\n"                                                                        \
         "leaq 0xb0(%rsp), %" #slot "\n"                                                                  \
-        "call " #target "\n"                                                                             \
+        "call " ASM_SYM(target) "\n"                                                                     \
         "addq $0xd8, %rsp\n"                                                                             \
         ".cfi_adjust_cfa_offset -0xd8\n"                                                                 \
         "ret\n"                                                                                          \

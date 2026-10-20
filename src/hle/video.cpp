@@ -266,6 +266,15 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
     static std::mutex mu;
     std::unique_lock<std::mutex> lock(mu, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    // "dumpseq <prefix> <n>": the next n flips, each to <prefix>-<flip>.ppm.
+    static std::string seq_prefix;
+    static int seq_left = 0;
+    if (seq_left > 0 && display_va) {
+        --seq_left;
+        const std::string path = seq_prefix + "-" + std::to_string(count) + ".ppm";
+        if (!host_gpu_dump_display(display_va, path.c_str())) host_log("test: frame dump at flip %llu failed", static_cast<unsigned long long>(count));
+        if (!seq_left) host_log("test: dump sequence done at flip %llu", static_cast<unsigned long long>(count));
+    }
     std::deque<TestRequest> todo;
     {
         std::lock_guard<std::mutex> lk(g_test_req_mu);
@@ -273,7 +282,12 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
     }
     for (const TestRequest& r : todo) {
         const std::string &verb = r.verb, &arg = r.arg, &arg2 = r.arg2;
-        if (verb == "dump" && !arg.empty()) {
+        if (verb == "dumpseq" && !arg.empty()) {
+            seq_prefix = arg;
+            seq_left = arg2.empty() ? 30 : std::atoi(arg2.c_str());
+            host_log("test: dumping the next %d flips from flip %llu to %s-<flip>.ppm", seq_left, static_cast<unsigned long long>(count),
+                     arg.c_str());
+        } else if (verb == "dump" && !arg.empty()) {
             const bool ok = display_va && host_gpu_dump_display(display_va, arg.c_str());
             host_log("test: frame dump at flip %llu to %s%s", static_cast<unsigned long long>(count), arg.c_str(), ok ? "" : " failed");
         } else if (verb == "capture" && !arg.empty()) {

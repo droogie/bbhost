@@ -123,6 +123,15 @@ gcn::TranslateOptions pixel_options(const json::Value& m) {
         o.ps_input_map.push_back(static_cast<std::uint8_t>(c & 0x1f));
     }
     o.ps_clip_discard = clip_discard(tr);
+    // As render.cpp ps_translate_options: with push descriptors (MoltenVK) the
+    // constant buffers sit in set 2, which the captured bindings show.
+    if (const json::Value* f = tr.find("ps_lane_from_scan"); f && f->type == json::Value::Type::Bool) o.lane_from_scan = f->boolean;
+    for (const json::Value& b : json::arr(ps, "buffers")) {
+        if (json::u32(b, "binding") >= gcn::kBindingStorageBuffer0 + gcn::kMaxBuffers) {
+            o.cb_descriptor_set = 2;
+            o.cb_binding_base = gcn::kBindingStorageBuffer0 + gcn::kMaxBuffers;
+        }
+    }
     return o;
 }
 
@@ -156,6 +165,7 @@ gcn::TranslateOptions vertex_options(const json::Value& m) {
     o.cb_ssbo = json::flag(tr, "cb_ssbo");
     o.cb_no_fallback = json::flag(tr, "cb_no_fallback");
     o.exec_known = json::flag(tr, "exec_known");
+    if (const json::Value* f = tr.find("vs_lane_from_scan"); f && f->type == json::Value::Type::Bool) o.lane_from_scan = f->boolean;  // MoltenVK: no subgroup built-ins in vertex stages
     const json::Value* vi = m.find("vertex_input");
     if (vi && vi->type == json::Value::Type::Object) {
         for (const json::Value& e : json::arr(*vi, "elements")) {
