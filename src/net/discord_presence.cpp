@@ -3,6 +3,7 @@
 #include "discord_rpc.h"
 #include "host/options.h"
 
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -12,16 +13,20 @@ namespace {
 constexpr char kApplicationId[] = "1562063078466650206";
 bool g_initialized = false;
 std::string g_last_activity;
+std::chrono::steady_clock::time_point g_last_publish{};
 
 void publish(const char* details, const char* state) {
     if (!details || !state) return;
     const std::string activity_key = std::string(details) + "\n" + state;
-    if (g_last_activity == activity_key) return;
+    const auto now = std::chrono::steady_clock::now();
+    // Retry periodically so a late Discord launch or restart needs no manual toggle.
+    if (g_last_activity == activity_key && now - g_last_publish < std::chrono::seconds(10)) return;
     DiscordRichPresence presence{};
     presence.details = details;
     presence.state = state;
     Discord_UpdatePresence(&presence);
     g_last_activity = activity_key;
+    g_last_publish = now;
 }
 
 }  // namespace
@@ -64,6 +69,7 @@ void ShutdownDiscordRPC() {
     Discord_Shutdown();
     g_initialized = false;
     g_last_activity.clear();
+    g_last_publish = {};
 }
 
 }  // namespace net

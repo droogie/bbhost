@@ -5,7 +5,7 @@
 
 namespace bb {
 
-inline constexpr Rva GAME_DATA_MAN_SINGLETON{0x553b130};
+inline constexpr Rva GAME_DATA_MAN_SINGLETON{0x58fb130};
 // Both singleton creation sites allocate 0xc8 bytes with alignment 8.
 // GameDataMan below intentionally remains a prefix view, not an owning type.
 inline constexpr std::size_t GAME_DATA_MAN_ALLOCATION_SIZE = 0xc8;
@@ -62,6 +62,14 @@ inline constexpr std::uint16_t GAME_DATA_CHUNK_END_ID = 0xffff;
 inline constexpr std::size_t GAME_DATA_CHARACTER_SUMMARY_COUNT = 10;
 inline constexpr std::size_t GAME_DATA_CHARACTER_SUMMARY_SIZE = 0x220;
 inline constexpr std::size_t GAME_DATA_CHARACTER_SUMMARY_STORE_SIZE = 0x1560;
+// Runtime save-summary fields used by host-side player identity.
+inline constexpr std::size_t GAME_DATA_MAN_CHARACTER_SUMMARY_STORE_OFFSET = 0x58;
+inline constexpr std::size_t GAME_DATA_MAN_PLAY_TIME_OFFSET = 0x94;
+inline constexpr std::uint32_t GAME_DATA_CHARACTER_LEVEL_MAX = 544;
+// The native GameDataMan prefix has no confirmed member names for these values.
+inline constexpr std::size_t GAME_DATA_MAN_NG_CYCLE_OFFSET = 0x68;
+inline constexpr std::size_t GAME_DATA_MAN_TRUE_DEATH_COUNT_OFFSET = 0x84;
+inline constexpr std::size_t GAME_DATA_MAN_DEATH_COUNT_OFFSET = 0x88;
 // Current field-by-field writer; older save versions use a different layout.
 inline constexpr std::size_t GAME_DATA_CHARACTER_SUMMARY_WIRE_SIZE = 0x192;
 inline constexpr Rva GAME_DATA_CHARACTER_SUMMARY_STORE_CONSTRUCT_FN{0x14f6870};
@@ -597,6 +605,7 @@ BB_OFFSET(PlayerEquipmentData, runtime_item_references, 0x24);
 BB_OFFSET(PlayerEquipmentData, saved_item_ids, 0x64);
 BB_SIZE(GameDataCharacterSummary, GAME_DATA_CHARACTER_SUMMARY_SIZE);
 BB_OFFSET(GameDataCharacterSummary, level, 0x24);
+BB_OFFSET(GameDataCharacterSummary, play_time_div_1000, 0x28);
 BB_OFFSET(GameDataCharacterSummary, face_data, 0x38);
 BB_OFFSET(GameDataCharacterSummary, equipment_data, 0x150);
 BB_OFFSET(GameDataCharacterSummary, player_byte_ca, 0x210);
@@ -604,6 +613,8 @@ BB_OFFSET(GameDataCharacterSummary, unknown218, 0x218);
 BB_SIZE(GameDataCharacterSummaryStore, GAME_DATA_CHARACTER_SUMMARY_STORE_SIZE);
 BB_OFFSET(GameDataCharacterSummaryStore, occupied, 0x10);
 BB_OFFSET(GameDataCharacterSummaryStore, records, 0x20);
+static_assert(GAME_DATA_MAN_CHARACTER_SUMMARY_STORE_OFFSET == offsetof(GameDataMan, unknown_data_58), "character summary store offset");
+static_assert(GAME_DATA_MAN_PLAY_TIME_OFFSET == offsetof(GameDataMan, play_time_raw), "manager play-time offset");
 BB_SIZE(GameDataFaceRecord, GAME_DATA_FACE_RECORD_SIZE);
 BB_SIZE(GameDataFaceWireRecord, GAME_DATA_FACE_WIRE_RECORD_SIZE);
 BB_SIZE(GameDataChunkHeader, 8);

@@ -1,5 +1,8 @@
 #include "discord_rpc.h"
 
+// BBHost's IPC transport implementation; the public C declarations are from
+// Discord's MIT-licensed discord-rpc header, distributed with its license.
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +25,7 @@ bool g_initialized = false;
 bool g_connected = false;
 std::string g_appId;
 std::uint64_t g_nonce = 0;
+std::chrono::steady_clock::time_point g_next_connect_attempt{};
 
 #ifdef _WIN32
 HANDLE g_discordPipe = INVALID_HANDLE_VALUE;
@@ -91,7 +95,7 @@ bool send_frame(std::uint32_t opcode, const std::string& payload) {
     auto send_bytes = [](const void* data, std::size_t size) {
         const char* cursor = static_cast<const char*>(data);
         while (size) {
-            const ssize_t sent = ::send(g_discordSocket, cursor, size, 0);
+            const ssize_t sent = ::send(g_discordSocket, cursor, size, MSG_NOSIGNAL);
             if (sent <= 0) return false;
             cursor += sent;
             size -= static_cast<std::size_t>(sent);
@@ -152,8 +156,12 @@ bool connect_discord() {
         if (::connect(g_discordSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
             const std::string hello = "{\"v\":1,\"client_id\":\"" + json_escape(g_appId.c_str()) + "\"}";
             const std::uint32_t header[2] = {0, static_cast<std::uint32_t>(hello.size())};
-            const bool sent = ::send(g_discordSocket, header, sizeof(header), 0) == sizeof(header) &&
-                              ::send(g_discordSocket, hello.data(), hello.size(), 0) == static_cast<ssize_t>(hello.size());
+            const bool sent = ::send(g_discordSocket, header, sizeof(header), MSG_NOSIGNAL) == sizeof(header) &&
+                              ::send(g_discordSocket, hello.data(), hello.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(hello.size());
+            if (!sent) {
+                ::close(g_discordSocket);
+                g_discordSocket = -1;
+            }
             return sent;
         }
         ::close(g_discordSocket);
@@ -161,6 +169,16 @@ bool connect_discord() {
     }
     return false;
 #endif
+}
+
+bool reconnect_if_due() {
+    if (g_connected) return true;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < g_next_connect_attempt) return false;
+    g_next_connect_attempt = now + std::chrono::seconds(5);
+    g_connected = connect_discord();
+    if (g_connected) std::printf("[bbhost] Discord IPC reconnected.\n");
+    return g_connected;
 }
 
 std::string make_activity_payload(const DiscordRichPresence* presence) {
@@ -224,6 +242,7 @@ void Discord_Initialize(const char* applicationId, DiscordEventHandlers* handler
     if (g_initialized) return;
     if (applicationId) g_appId = applicationId;
     std::printf("[bbhost] Discord_Initialize called with App ID: %s\n", g_appId.c_str());
+    g_next_connect_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     g_connected = connect_discord();
     g_initialized = true;
     if (g_connected) {
@@ -260,9 +279,20 @@ void Discord_UpdatePresence(const DiscordRichPresence* presence) {
     std::printf("[bbhost] Discord_UpdatePresence -> Details: '%s' | State: '%s'\n",
                 presence->details ? presence->details : "None",
                 presence->state ? presence->state : "None");
-    if (!g_connected || !send_frame(1, make_activity_payload(presence))) {
+    if ((!g_connected && !reconnect_if_due()) || !send_frame(1, make_activity_payload(presence))) {
         std::printf("[bbhost] Discord SET_ACTIVITY IPC write failed.\n");
         g_connected = false;
+#ifdef _WIN32
+        if (g_discordPipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_discordPipe);
+            g_discordPipe = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (g_discordSocket >= 0) {
+            ::close(g_discordSocket);
+            g_discordSocket = -1;
+        }
+#endif
     }
 }
 
