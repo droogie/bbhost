@@ -49,6 +49,9 @@ std::uint32_t menu_region_confirm_button();
 // Counts list updates that had input - a menu with focus.
 std::uint64_t menu_pointer_tick();
 
+// True while the title/front-end flow is active and the game world has not started.
+bool menu_pointer_front_end();
+
 // Is the player in a menu? True while some list has input focus. DS3's
 // CSMouseMan switches the same way - a pointer while UI owns the input,
 // mouse-look otherwise - and the camera and the pointer both key off this.

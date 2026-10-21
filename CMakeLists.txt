@@ -23,6 +23,12 @@ add_library(monocypher STATIC third_party/monocypher/monocypher.c third_party/mo
 target_include_directories(monocypher PUBLIC third_party/monocypher)
 set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE ON)
 
+# Discord Rich Presence uses Discord's local IPC pipe or socket.
+file(GLOB DISCORD_RPC_SOURCES "third_party/discord-rpc/*.cpp")
+add_library(discord-rpc STATIC ${DISCORD_RPC_SOURCES})
+target_include_directories(discord-rpc PUBLIC third_party/discord-rpc)
+set_target_properties(discord-rpc PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
 add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
@@ -105,6 +111,7 @@ add_executable(bbhost
   src/net/http.cpp
   src/net/session.cpp
   src/net/stun.cpp
+  src/net/discord_presence.cpp
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
@@ -214,7 +221,7 @@ configure_file(${CMAKE_BINARY_DIR}/gen/debug_menu_strings_en.inc.new ${CMAKE_BIN
 bb_plugin(debug_menu plugins/debug_menu/debug_menu.cpp)
 target_include_directories(bb_plugin_debug_menu PRIVATE ${CMAKE_BINARY_DIR}/gen)
 
-target_link_libraries(bbhost PRIVATE atrac9 monocypher)
+target_link_libraries(bbhost PRIVATE atrac9 monocypher discord-rpc)
 # A release build (the release workflow) looks for updates by default; one
 # built from source only when update.check says so.
 option(BBHOST_RELEASE "build a release: updates are checked for by default" OFF)
