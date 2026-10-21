@@ -18,6 +18,8 @@
 #include "bbhost/params.hpp"
 
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -182,6 +184,25 @@ public:
     }
     void set_stat(const char* name, std::int64_t v) const { api->player_stat_set(name, v); }
     void message(const std::string& text, float seconds = 4.0f) const { api->show_message(text.c_str(), seconds); }
+    // A loading screen is up (plugin API 12: the host's own answer, the one
+    // its log's "loading:" lines come from). on_world_load comes with a
+    // load's screen still up: a plugin that moves the player waits for this to
+    // be false. On an older host the same test is made here, from the game:
+    // its NowLoading request (a byte at 0x596286b) with no in-game frame run
+    // since (the CSNowLoadingHelper at *0x593e8b8, +0x50 or +0x51), on the
+    // 1.09 eboot those addresses are for; false on another.
+    bool loading_screen() const {
+        if (api->version >= 12 && api->size >= offsetof(BbHostApi, loading_screen) + sizeof(api->loading_screen) &&
+            api->loading_screen)
+            return api->loading_screen() != 0;
+        if (!api->eboot_is_109()) return false;
+        std::uint8_t requested = 0;
+        std::uint64_t helper = 0;
+        if (api->read(0x596286b, &requested, 1) != 0 || !requested) return false;
+        if (api->read(0x593e8b8, &helper, 8) != 0 || !helper) return true;
+        const auto* h = reinterpret_cast<const volatile std::uint8_t*>(static_cast<std::uintptr_t>(helper));
+        return !h[0x50] && !h[0x51];
+    }
 
     // The physics world's gravity (x, y, z; y up), which the player, the
     // enemies, ragdolls and loose objects all fall by: {0, -9.8, 0} as the

@@ -16,6 +16,7 @@
 #include "engine/player_data.h"
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
+#include "engine/loading.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
 #include "bbhost/engine/symbols.hpp"
@@ -316,6 +317,8 @@ int api_camera_get(float pos[3], float focus[3]) { return api_eboot_is_109() && 
 int api_player_block(std::uint32_t* block) { return api_eboot_is_109() && world_player_block(block) ? 0 : 1; }
 int api_lamp_warp(std::int32_t return_point) { return api_eboot_is_109() && world_lamp_warp_queue(return_point) ? 0 : 1; }
 int api_player_warp(std::uint32_t block, const float xyz[3], float yaw) { return api_eboot_is_109() && world_player_warp_queue(block, xyz, yaw) ? 0 : 1; }
+// Version 12: the loading screen, as the host's own test last saw it (engine/loading.h).
+int api_loading_screen() { return loading_screen_up() ? 1 : 0; }
 
 int api_on_event_flag(void (*fn)(std::uint32_t, int, void*), void* user) {
     if (!fn || !api_eboot_is_109()) return 1;
@@ -790,6 +793,7 @@ const BbHostApi g_api = {
     &api_on_option, &api_on_action, &api_game_file, &api_overlay_file,
     &api_set_rules, &api_on_world_rules, &api_visitor,
     &api_replace_text,
+    &api_loading_screen,
 };
 
 std::string read_file(const std::string& path) {
