@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 10 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -137,7 +137,14 @@ gives the Binary Ninja address.
   and the camera are, and the map block.
 - `player_warp` (v6) and `lamp_warp` (v7): move the player within a block or
   travel to a lamp. Only for opt-in gameplay plugins the player has turned on.
-- `on_world_load` (v8): called whenever the player is placed in a map.
+- `on_world_load` (v8): called whenever the player is placed in a map. For a
+  load that is as soon as the load has built the player, with its loading
+  screen still up.
+- `loading_screen()` (v12): 1 while a loading screen is up - the host's own
+  test, the one behind its log's `loading:` lines. A plugin that moves the
+  player waits for 0: a warp asked inside the screen lands before the world
+  is ready, and a lamp travel is refused once the load has replaced the
+  player.
 - `chr_list` (v8): every character the world holds, with its `ChrIns` pointer,
   NpcParam row, model, team, HP and position.
 - `sp_effect_apply`, `sp_effect_has` (v8): apply a SpEffectParam row to a
@@ -180,7 +187,7 @@ C++ plugins can use `include/bbhost/`:
 
 | Header | Contents |
 |---|---|
-| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`), typed params, characters, flags, stats, messages, `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
+| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`), typed params, characters, flags, stats, messages, `loading_screen()` (on a host older than v12 it makes the same test from the game's memory), `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
 | `bbhost/params.hpp` | a struct for every param row type and a tag for every table, generated from the game's own paramdefs, with offsets checked by `static_assert` |
 | `bbhost/engine/` | engine layouts and addresses for 1.09: characters, the world, matchmaking and sessions, GX, YEBIS and more |
 
@@ -210,7 +217,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
   row.
 - World state (bosses, doors, NPC progress): event flags. A boss fight is a
   family of flags around its defeat flag.
-- Moving the player: `player_warp` inside a block, `lamp_warp` between maps.
+- Moving the player: `player_warp` inside a block, `lamp_warp` between maps,
+  each once `loading_screen()` is 0. Count waits in seconds, not frames: a
+  loading screen can flip hundreds of times a second.
 - Physics and time: `gravity()` and the time scale.
 - Anything else: the engine layouts, `hook2` and `call_guest`.
 

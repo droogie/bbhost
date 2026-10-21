@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 10.
+/* bbhost plugin API, version 12.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -35,7 +35,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 11
+#define BB_PLUGIN_API_VERSION 12
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -300,7 +300,8 @@ typedef struct BbHostApi {
     int (*param_ids)(const char* table, uint32_t* ids, size_t max, size_t* count);
     /* fn(block, user) on the main thread each time the player is placed in a
      * map - a load, a warp, a death, a lamp - with the block player_block
-     * packs, once the world holds them. */
+     * packs, once the world holds them: for a load, while its screen is
+     * still up (loading_screen, version 12). */
     int (*on_world_load)(void (*fn)(uint32_t block, void* user), void* user);
     /* The characters WorldChrMan holds: up to max into out, the total into
      * *count. From the main thread; the pointers are good until the next
@@ -375,6 +376,18 @@ typedef struct BbHostApi {
      * references moved, or -1 outside the image phase or for another eboot.
      * A string the code reaches some other way keeps its text. */
     int (*replace_text)(const BbText* texts, size_t count);
+
+    /* Version 12: the loading screen. */
+    /* 1 while a loading screen is up - the game's NowLoading request with no
+     * in-game frame run since, the host's own test, which its log's
+     * "loading:" lines come from - and 0 in the world, at the title and in
+     * its menus. The host reads it once a frame, after the on_frame
+     * callbacks: they see the frame before's. A plugin that moves the player
+     * waits for 0: on_world_load comes as soon as a load has built the
+     * player, with its screen still up, and a warp asked then lands before
+     * the world is ready, a lamp travel is refused once the load replaces
+     * the player. Any thread. */
+    int (*loading_screen)(void);
 } BbHostApi;
 
 #ifdef __cplusplus

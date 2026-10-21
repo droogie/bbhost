@@ -401,6 +401,15 @@ if(UNIX)
   add_dependencies(mapval_probe_test mapval_probe)
   add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
   set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The boss rush plugin's travel and fog warp on a pretend host whose loads
+  # are slow (plugins/boss_rush): nothing moves the player inside a loading
+  # screen, and only a travel that truly fails stops the run.
+  add_executable(boss_rush_test tests/boss_rush_test.cpp)
+  target_include_directories(boss_rush_test PRIVATE include)
+  target_compile_features(boss_rush_test PRIVATE cxx_std_17)
+  target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(boss_rush_test bb_plugin_boss_rush)
+  add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
