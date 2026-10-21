@@ -52,11 +52,14 @@ bool tbuffer_dst_sel() {
 
 namespace {
 std::atomic<bool> g_index_bounds{false};  // set_index_bounds
+std::atomic<bool> g_image_store_bounds{true};  // set_image_store_bounds
 std::atomic<bool> g_oob_count{false};     // set_oob_count
 std::atomic<bool> g_oob_control{false};   // set_oob_control
 }  // namespace
 void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
 bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
+void set_image_store_bounds(bool on) { g_image_store_bounds.store(on, std::memory_order_relaxed); }
+bool image_store_bounds() { return g_image_store_bounds.load(std::memory_order_relaxed); }
 void set_oob_count(bool on) { g_oob_count.store(on, std::memory_order_relaxed); }
 bool oob_count() { return g_oob_count.load(std::memory_order_relaxed); }
 void set_oob_control(bool on) { g_oob_control.store(on, std::memory_order_relaxed); }
@@ -755,6 +758,89 @@ struct Translator {
             m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(m.emit(spv::OpIAdd, t_u64, {oob_base64, m.const_u64(at)})), cu(spv::ScopeDevice),
                                               cu(spv::MsNone), c_one_u});
         });
+    }
+    // gcn::set_oob_control: of the accesses past a halved limit, one in 256 -
+    // those whose `key` (a coordinate or an index) hashes to 0 in its top eight
+    // bits - so the control's adds stay a small part of the draws' time; `cond`
+    // as it is otherwise.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        return band(cond, ieq(shr(imul(key, cu(0x9e3779b1u)), cu(24)), c_zero_u));
+    }
+    // gcn::set_oob_count: an image access at integer coordinates (`coords`,
+    // signed, the layer last where `arrayed`) against the view the host binds
+    // for `img` - a load (OpImageFetch at `level`, 0 for none) or a store
+    // (OpImageWrite, level 0 of the view; `level` the image_store_mip's).
+    // The size counts where the level is one the view has (the size is read at
+    // level 0 elsewhere, and the level counts instead). The control halves
+    // every limit. Then the view against the T# in.srsrc names (its width and
+    // height, a 3D image's depth, at its BASE_LEVEL plus the level read): where
+    // the two disagree about a lane (kOobViewSmaller, kOobViewLarger).
+    void oob_image(const ImageVar& img, std::uint32_t dim, bool arrayed, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
+        if (!oob_base64 || coords.empty()) return;
+        m.capability(spv::CapImageQuery);
+        const Id image = load_image(img);
+        const std::size_t n = coords.size();
+        const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : t_v4i;
+        const auto limit = [&](Id v) { return oob_control() ? shr(v, c_one_u) : v; };
+        const Id key = ui(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(v, limit(lim))}), key); };
+        Id size, level_in = 0;
+        if (store) {
+            size = m.emit(spv::OpImageQuerySize, size_type, {image});
+            if (level) oob_note(ine(ui(level), c_zero_u), kOobImageStoreLevel);
+        } else {
+            Id at = c_zero_u;
+            if (level) {
+                const Id levels = ui(m.emit(spv::OpImageQueryLevels, t_i32, {image}));
+                level_in = ult(ui(level), levels);
+                oob_note(past(ui(level), levels), kOobImageLoadLevel);
+                at = sel(level_in, ui(level), c_zero_u);
+            }
+            size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, i(at)});
+        }
+        const std::size_t axes = arrayed ? n - 1 : n;
+        Id outside = 0;
+        for (std::size_t k = 0; k < axes; ++k) {
+            const Id s = ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            const Id bad = past(ui(coords[k]), s);
+            outside = outside ? bor(outside, bad) : bad;
+        }
+        if (outside) oob_note(level_in ? band(outside, level_in) : outside, store ? kOobImageStoreSize : kOobImageLoadSize);
+        if (arrayed) {
+            const Id layers = ui(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
+            oob_note(past(ui(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image: the T#'s size at the level the access reads
+        // (BASE_LEVEL + the load's level; a store's, level 0 of the view).
+        const Id w2 = read_s(in.srsrc + 2, in), w3 = read_s(in.srsrc + 3, in);
+        Id rel = c_zero_u;
+        if (level && !store) rel = sel(level_in, ui(level), c_zero_u);
+        const Id at_level = iadd(iand(shr(w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shr(full, at_level);
+            return sel(ine(v, c_zero_u), v, c_one_u);
+        };
+        std::vector<Id> tsize = {shrink(iadd(iand(w2, cu(0x3fff)), c_one_u)), shrink(iadd(iand(shr(w2, cu(14)), cu(0x3fff)), c_one_u))};
+        if (dim == spv::Dim3D && !in.r128) tsize.push_back(shrink(iadd(iand(read_s(in.srsrc + 4, in), cu(0x1fff)), c_one_u)));
+        const std::size_t taxes = std::min<std::size_t>(dim == spv::Dim1D ? 1 : dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = ui(coords[k]);
+            const Id t = ult(c, limit(tsize[k]));
+            const Id v = ult(c, ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? band(in_t, t) : t;
+            in_v = in_v ? band(in_v, v) : v;
+        }
+        if (in_t) {
+            Id smaller = band(in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})), larger = band(m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v);
+            if (level_in) {
+                smaller = band(smaller, level_in);
+                larger = band(larger, level_in);
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
+        }
     }
     Id guest_ptr(Id guest_u64) {
         const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, guest_u64});
@@ -2761,7 +2847,8 @@ struct Translator {
         // the binding (its last dword at or past the array's length).
         if (oob_base64) {
             const Id records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), kOobPastRecords);
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), vindex),
+                     kOobPastRecords);
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
             const Id last = iadd(cb_bias(index), iadd(first, cu(static_cast<std::uint32_t>(nwords - 1))));
             oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(last, length)}), kOobPastBinding);
@@ -3416,9 +3503,25 @@ struct Translator {
             std::vector<Id> vals;
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true, in);
+            // gcn::set_image_store_bounds: GCN writes nothing outside the
+            // image, so the lanes outside the view's size and layers skip it.
+            Id inside = 0;
+            if (image_store_bounds()) {
+                m.capability(spv::CapImageQuery);
+                const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, {load_image(img)});
+                for (int k = 0; k < ncoord; ++k) {
+                    const Id ok = ult(ui(coords[static_cast<std::size_t>(k)]), ui(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+                    inside = inside ? band(inside, ok) : ok;
+                }
+            }
             exec_guard([&] {
                 const Id image = load_image(img);
-                m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                if (inside) {
+                    if_then(inside, [&] { m.emit_void(spv::OpImageWrite, {image, coord, texel}); });
+                } else {
+                    m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                }
             });
             return;
         }
@@ -3435,6 +3538,7 @@ struct Translator {
                 ops.push_back(spv::IoLod);
                 ops.push_back(i(ld(vgpr_var(in.vaddr + ncoord))));
             }
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 1 ? ops.back() : 0, false, in);
             const Id texel = texel_as_v4f(img, m.emit(spv::OpImageFetch, texel_type(img), ops));
             write_texel(in, texel);
             return;
@@ -4222,9 +4326,9 @@ struct Translator {
         }
         sym_user_data();
         Id lds_bytes = 0;
-        // gcn::set_oob_count: a vertex or pixel stage with no LDS of its own
-        // finds the counters where a tessellation stage finds its LDS.
-        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) &&
+        // gcn::set_oob_count: a vertex, pixel or compute stage with no LDS in a
+        // buffer finds the counters where a tessellation stage finds its LDS.
+        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel || opt.stage == Stage::Compute) &&
             opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None) {
             oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             std::uint32_t h = 2166136261u;  // the program's slot: FNV-1a of its words

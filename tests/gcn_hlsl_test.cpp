@@ -699,6 +699,35 @@ void typed_load_bounds() {
     gcn::set_index_bounds(false);
 }
 
+// gcn::set_image_store_bounds: a compute shader's image_store with its
+// lanes outside the view's size skipped - the storage image's size printed as
+// GetDimensions, the write under the compare - and without the skip, through
+// DXC alike.
+void image_store_bounds() {
+    std::vector<std::uint32_t> w;
+    w.push_back(0x7e000000u | 1u << 17 | 1u << 9 | 5u);                 // v_mov_b32 v1, s5: y
+    w.push_back(0x7e000000u | 4u << 17 | 1u << 9 | (kV + 0));           // v_mov_b32 v4, v0
+    for (std::uint32_t k = 5; k < 8; ++k) w.push_back(0x7e000000u | k << 17 | 1u << 9 | 128u);  // v_mov_b32 vk, 0
+    w.push_back(0xf0000000u | 8u << 18 | 0xfu << 8);                    // image_store v[4:7], v[0:1], s[8:15] dmask 0xf
+    w.push_back(0u | 4u << 8 | (8u / 4) << 16);
+    w.push_back(kEndpgm);
+    for (const bool on : {true, false}) {
+        gcn::set_image_store_bounds(on);
+        const gcn::Program p = gcn::decode(w.data(), w.size());
+        CHECK(p.errors.empty());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Compute;
+        o.rsrc2 = 16u << 1;
+        o.cs_threads[0] = 64;
+        o.image_dims = {{1 /* 2D */, false}};
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        through_hlsl(gcn::lift_compute_shader(p, o, ref), on ? "image store, outside the view skipped" : "image store",
+                     on ? std::vector<std::string>{"GetDimensions("} : std::vector<std::string>{});
+    }
+    gcn::set_image_store_bounds(true);
+}
+
 int main() {
     g_have_dxc = g_dxc.load();
     // A library named by BBHOST_HLSL_DXC must load: the continuous-integration
@@ -717,6 +746,7 @@ int main() {
     vertex_invariant();
     clip_prologue();
     typed_load_bounds();
+    image_store_bounds();
     native_half_rtz();
     std::printf("gcn_hlsl_test: %d lifts printed, %d compiled by DXC%s\n", g_printed, g_compiled, g_have_dxc ? "" : " (no DXC)");
     if (g_failures) {

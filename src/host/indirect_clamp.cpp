@@ -62,6 +62,7 @@ bool make_locked() {
     mai.pNext = &flags;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    MemOwner own_mem("indirect dispatch guard");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_ring_mem) != VK_SUCCESS) return false;
     if (vkBindBufferMemory(g.device, g_ring, g_ring_mem, 0) != VK_SUCCESS) return false;
     void* map = nullptr;

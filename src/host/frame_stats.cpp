@@ -112,10 +112,15 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
              static_cast<unsigned long long>(vs[kDrawVsOther]), static_cast<unsigned long long>(vs[kDrawVsFallback]),
              static_cast<unsigned long long>(now.draws_clip_discard - was.draws_clip_discard));
     if (now.oob_on) {
+        unsigned long long d[11];
+        for (int k = 0; k < 11; ++k) d[k] = static_cast<unsigned long long>(now.oob[k] - was.oob[k]);
         host_log("frame detail: out-of-range buffer accesses: typed loads by index past num_records %llu, past their binding %llu; walks by "
                  "index past num_records %llu",
-                 static_cast<unsigned long long>(now.oob[0] - was.oob[0]), static_cast<unsigned long long>(now.oob[1] - was.oob[1]),
-                 static_cast<unsigned long long>(now.oob[2] - was.oob[2]));
+                 d[0], d[1], d[2]);
+        host_log("frame detail: out-of-range image accesses: loads outside the view's size %llu, past its levels %llu, past its layers "
+                 "%llu; stores outside its size %llu, past its layers %llu, at a level other than 0 %llu; the view smaller than the T# %llu, "
+                 "larger %llu",
+                 d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
     }
     std::uint64_t ts[kDrawTessCount];
     for (int i = 0; i < kDrawTessCount; ++i) ts[i] = now.draws_tess[i] - was.draws_tess[i];

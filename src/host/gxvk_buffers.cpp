@@ -2,6 +2,7 @@
 // threads call (host/gxvk.h, host/gxvk_table.h). The command processor's
 // side, which places, fills and binds the copies, is gxvk_vk.cpp.
 #include "host/gxvk_table.h"
+#include "host/gxvk_watch.h"
 
 #include "log.h"
 
@@ -42,27 +43,17 @@ std::unordered_map<std::uint64_t, std::uint32_t> g_by_holder;
 std::map<std::uint64_t, std::uint32_t> g_by_memory;
 
 // The copy watch: the kept default buffers' ranges, which a GPU copy may
-// write. A slot is [lo, hi) with lo 0 when free; set and cleared under the
-// table's lock, read without it by every copy (copy_written).
-constexpr int kWatchSlots = 64;
-std::atomic<std::uint64_t> g_watch_lo[kWatchSlots] = {}, g_watch_hi[kWatchSlots] = {};
-std::atomic<int> g_watch_used{0};
+// write (host/gxvk_watch.h): set and cleared under the table's lock, asked
+// without it by every copy (copy_written). BBHOST_GXVK_BUFFERS=2 checks its
+// granules against its slots on every copy (copy_watch_check).
+CopyWatch<> g_watch;
+std::atomic<std::uint64_t> g_watch_checks{0}, g_watch_near{0}, g_watch_hits{0}, g_watch_missed{0};
 
-int watch_add_locked(std::uint64_t lo, std::uint64_t hi) {
-    for (int i = 0; i < kWatchSlots; ++i) {
-        if (g_watch_lo[i].load(std::memory_order_relaxed)) continue;
-        g_watch_hi[i].store(hi, std::memory_order_relaxed);
-        g_watch_lo[i].store(lo, std::memory_order_release);
-        g_watch_used.fetch_add(1, std::memory_order_relaxed);
-        return i;
-    }
-    return -1;
-}
+int watch_add_locked(std::uint64_t lo, std::uint64_t hi) { return g_watch.add(lo, hi); }
 
 void watch_remove_locked(BufferEntry& e) {
     if (e.watch_slot < 0) return;
-    g_watch_lo[e.watch_slot].store(0, std::memory_order_release);
-    g_watch_used.fetch_sub(1, std::memory_order_relaxed);
+    g_watch.remove(e.watch_slot);
     e.watch_slot = -1;
 }
 
@@ -220,10 +211,7 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
         int slot = -1;
         if (why < 0 && usage == 0 && (slot = watch_add_locked(memory, memory + bytes)) < 0) why = 8;
         if (why < 0 && !take_index(index)) why = 7;
-        if (why >= 0 && slot >= 0) {
-            g_watch_lo[slot].store(0, std::memory_order_release);
-            g_watch_used.fetch_sub(1, std::memory_order_relaxed);
-        }
+        if (why >= 0 && slot >= 0) g_watch.remove(slot);
         if (why >= 0) {
             g_not_kept[why].fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -277,14 +265,18 @@ void buffer_written(std::uint64_t holder, Retire why) {
 }
 
 void copy_written(std::uint64_t va, std::uint64_t bytes) {
-    if (!bytes || !g_watch_used.load(std::memory_order_relaxed)) return;
-    for (int i = 0; i < kWatchSlots; ++i) {
-        const std::uint64_t lo = g_watch_lo[i].load(std::memory_order_acquire);
-        if (!lo || va >= g_watch_hi[i].load(std::memory_order_relaxed) || va + bytes <= lo) continue;
-        std::lock_guard<std::mutex> lk(g_mu);
-        retire_overlapping_locked(va, bytes, kRetireCopy);
-        return;
-    }
+    if (!g_watch.written(va, bytes)) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    retire_overlapping_locked(va, bytes, kRetireCopy);
+}
+
+void copy_watch_check(std::uint64_t va, std::uint64_t bytes) {
+    if (!buffers_on() || !bytes) return;
+    const bool near = g_watch.near(va, bytes), hit = g_watch.hit(va, bytes);
+    g_watch_checks.fetch_add(1, std::memory_order_relaxed);
+    if (near) g_watch_near.fetch_add(1, std::memory_order_relaxed);
+    if (hit) g_watch_hits.fetch_add(1, std::memory_order_relaxed);
+    if (hit && !near) g_watch_missed.fetch_add(1, std::memory_order_relaxed);
 }
 
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why) {
@@ -327,6 +319,11 @@ void buffers_report() {
     host_log("gxvk buffers: %s; kept %llu immutable and %llu default buffers (%zu live, %zu entries); not kept: %s; retired: %s", mode,
              static_cast<ull>(g_made[0].load()), static_cast<ull>(g_made[1].load()), live, entries, nk.empty() ? "none" : nk.c_str(),
              rt.empty() ? "none" : rt.c_str());
+    if (const std::uint64_t checks = g_watch_checks.load())
+        host_log("gxvk buffers: copy watch checked on %llu copies: %llu near a watched range's granules, %llu meeting one; the granules "
+                 "missed %llu (none may)",
+                 static_cast<ull>(checks), static_cast<ull>(g_watch_near.load()), static_cast<ull>(g_watch_hits.load()),
+                 static_cast<ull>(g_watch_missed.load()));
 }
 
 }  // namespace gxvk

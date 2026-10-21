@@ -156,7 +156,7 @@ These are for test runs and off by default.
 |---|---|
 | `BBHOST_FRAME_DETAIL=1` | with `BBHOST_FRAME_STATS=1`: after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
 | `BBHOST_TEST_WARP=1` | lets plugins move the player (the probe) |
-| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
+| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a sequence of consecutive frames (`dumpseq <dir> <n>`: the next n flips, one file each), a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
 

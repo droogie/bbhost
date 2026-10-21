@@ -113,15 +113,20 @@ void hash_program(KeyHasher& h, const gcn::Program& p) {
     h.u32(static_cast<std::uint32_t>(p.insts.size()));
     h.u32(p.end);
     bool indexed = false;  // a typed load by index (gcn::indexed_typed_load)
+    bool stores = false;   // an image store (gcn::image_store_inst)
     for (const gcn::Inst& in : p.insts) {
         h.u32(in.size);
         for (std::uint32_t k = 0; k < in.size && k < 3; ++k) h.u32(in.words[k]);
         if (in.has_literal) h.u32(in.literal);
         indexed = indexed || gcn::indexed_typed_load(in);
+        stores = stores || gcn::image_store_inst(in);
     }
     // Its index checked against num_records (gcn::set_index_bounds): the
     // programs without such a load keep their keys.
     if (indexed && gcn::index_bounds()) h.u32(0x1d0bu);
+    // Its image stores' lanes outside the view skipped (gcn::set_image_store_bounds):
+    // the programs that store no image keep their keys.
+    if (stores && gcn::image_store_bounds()) h.u32(0x5b0du);
 }
 
 // Every TranslateOptions field, in declaration order (translate.h).
@@ -193,8 +198,9 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     if (!gcn::subgroup_ops_in(o)) h.u32(0x5b01u);
     // A clip-discarding pixel shader that demotes the pixel rather than ending it.
     if (o.stage == gcn::Stage::Pixel && o.ps_clip_discard && gcn::clip_demote()) h.u32(0xde40u);
-    // The out-of-range counters (gcn::set_oob_count, a diagnostic).
-    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bdu : 0x00bcu);
+    // The out-of-range counters (gcn::set_oob_count, a diagnostic): buffers,
+    // images and compute stages since 0x00be.
+    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bfu : 0x00beu);
 }
 
 // ---- an entry: the TranslateResult, every field ----
@@ -949,6 +955,9 @@ int hlsl_mode() {
     // at use, 2 behind the game), then the Shaders setting, then the default -
     // DXC's modules from the cache, the rest compiled behind the game.
     static const int mode = [] {
+        // BBHOST_OOB_COUNT (gpu.cpp): the counters live in the lifter's
+        // SPIR-V, not in DXC's modules - the lift only while they count.
+        if (const char* o = std::getenv("BBHOST_OOB_COUNT"); o && (o[0] == '1' || o[0] == '2')) return 0;
         const char* e = std::getenv("BBHOST_HLSL");
         if (e && (e[0] >= '0' && e[0] <= '2') && !e[1]) return e[0] - '0';
         const int s = g_hlsl_setting.load();

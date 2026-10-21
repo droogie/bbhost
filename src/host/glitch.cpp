@@ -338,6 +338,7 @@ bool ensure_chain_locked(std::uint32_t w, std::uint32_t h, VkFormat format) {
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
+    MemOwner own_mem("glitch hunt");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_chain.memory) != VK_SUCCESS) {
         vkDestroyImage(g.device, g_chain.image, nullptr);
         g_chain = Chain{};
@@ -358,6 +359,7 @@ bool ensure_buffer_locked(DevBuffer& b, std::uint64_t bytes) {
         vkFreeMemory(g.device, b.memory, nullptr);
         b = DevBuffer{};
     }
+    MemOwner own_mem("glitch hunt");
     return create_dev_buffer(b, bytes, true, true);
 }
 

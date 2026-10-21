@@ -2075,6 +2075,21 @@ private:
             const std::string v = n == 1 ? outs[0] : "uint" + std::to_string(n) + "(" + join(outs) + ")";
             return define(in, as_kind_of(v, 'u', rk));
         }
+        case spv::OpImageQuerySize: {
+            // A storage image's size (an image store's bounds, the lift's
+            // guest_image_store): RWTexture*.GetDimensions, which takes no level.
+            const std::string id = value_name(in.id);
+            const std::uint32_t n = coord_count(it, true);
+            std::vector<std::string> outs;
+            static const char* comp[] = {"_w", "_h", "_d"};
+            for (std::uint32_t k = 0; k < n; ++k) outs.push_back(id + comp[k]);
+            if (type(it).sampled != 2) fail("a size query of an image that is not a storage image");
+            if (lanes_of(in.type) != n) fail("a size query of another width");
+            line("uint " + join(outs) + ";");
+            line(iname + ".GetDimensions(" + join(outs) + ");");
+            const std::string v = n == 1 ? outs[0] : "uint" + std::to_string(n) + "(" + join(outs) + ")";
+            return define(in, as_kind_of(v, 'u', rk));
+        }
         case spv::OpImageQueryLevels: {
             const std::string id = value_name(in.id);
             const std::uint32_t n = coord_count(it, true);

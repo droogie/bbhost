@@ -185,6 +185,7 @@ bool make_target(Target& t, std::uint32_t w, std::uint32_t h, VkImageUsageFlags 
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("FSR images");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &t.memory) != VK_SUCCESS) return false;
     vkBindImageMemory(g.device, t.image, t.memory, 0);
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};

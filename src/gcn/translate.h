@@ -466,26 +466,61 @@ bool clip_demote();
 void set_index_bounds(bool on);
 bool index_bounds();
 inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && in.op < 4 && in.idxen; }
-// A diagnostic (the host's BBHOST_OOB_COUNT=1): a translated vertex or pixel
-// stage counts the buffer accesses that leave what GCN would read, without
-// changing what it reads - into the dwords StageParams::lds_address points at
-// (a stage with no LDS of its own), four per program (TranslateResult::
-// oob_slot): [kOobPastRecords] a typed load by index from a bound buffer at or
-// past the V#'s num_records (what set_index_bounds makes 0),
-// [kOobPastBinding] the same load reaching past the buffer's binding (what
+// An image store (image_store, image_store_mip) whose coordinates fall outside
+// the image writes nothing on GCN; Vulkan leaves such a write undefined unless
+// robust image access is on. With set_image_store_bounds a store's lanes
+// outside the size and layers of the view the host binds for its T# skip it
+// (mimg, the lift's guest_image_store), as on the PS4 - the game's compute
+// passes write past the bottom of their targets where the height is not a
+// multiple of their tiles. On by default (the host's
+// BBHOST_IMAGE_STORE_BOUNDS=0 turns it off); set before the first
+// translation. Keyed for the programs that hold an image store
+// (image_store_inst), so it moves no other program's key.
+void set_image_store_bounds(bool on);
+bool image_store_bounds();
+inline bool image_store_inst(const Inst& in) { return in.enc == Enc::MIMG && (in.op == 8 || in.op == 9); }
+// A diagnostic (the host's BBHOST_OOB_COUNT=1): a vertex, pixel or compute
+// stage with no tessellation or GS role, translated or lifted, counts the
+// accesses that leave what GCN would read or what the bound view holds,
+// without changing what it reads - into the dwords StageParams::lds_address
+// points at (a stage with no LDS of its own), kOobKinds per program
+// (TranslateResult::oob_slot): [kOobPastRecords] a typed load by index from a
+// bound buffer at or past the V#'s num_records (what set_index_bounds makes
+// 0), [kOobPastBinding] the same load reaching past the buffer's binding (what
 // robust buffer access would clamp), [kOobWalkPastRecords] a buffer access
 // walked through the page table by index at or past num_records (GCN reads 0
-// and drops a store there). Only lanes EXEC holds count. Lifts do not count.
-// Set once before the first translation; part of every key while on.
+// and drops a store there); and of the image accesses at integer coordinates,
+// against the view the host binds (what robust image access acts on):
+// [kOobImageLoadSize] an image_load(_mip) with a coordinate at or past the
+// view's size at the level read (negative ones too), [kOobImageLoadLevel] an
+// image_load_mip at or past the view's level count, [kOobImageLoadLayer] an
+// arrayed load (a 2D array's, a cube's face) at or past its layer count,
+// [kOobImageStoreSize] and [kOobImageStoreLayer] the same of an
+// image_store(_mip) (lanes set_image_store_bounds skips), [kOobImageStoreLevel]
+// an image_store_mip at a level other than 0 (mimg writes level 0 of the view);
+// and of those loads and stores against the T#'s own size at the level
+// (width, height, a 3D image's depth: the game's image), where the view and
+// the T# disagree - [kOobViewSmaller] inside the T#'s size but outside the
+// view's (the host bound a smaller view than the game's image: what GCN
+// reads or writes, the host does not), [kOobViewLarger] outside the T#'s but
+// inside the view's (GCN reads 0 or drops it, the host reads or writes). Only
+// lanes EXEC holds count. Set
+// once before the first translation; part of every key while on.
 void set_oob_count(bool on);
 bool oob_count();
-// The counters' control (BBHOST_OOB_COUNT=2): a typed load by index counts
-// as past the records from half of them on, so a run shows the counters
-// reach the host where the game reads nothing past them. Keyed with the rest.
+// The counters' control (BBHOST_OOB_COUNT=2): every limit halved - a typed
+// load by index counts as past the records from half of them on, an image
+// access past half the view's size, levels or layers - and of those accesses
+// one in 256 counted (by a hash of the index or the first coordinate), so a
+// run shows each kind reaches the host where the game reads nothing past
+// them, at a small part of the draws' time. Keyed with the rest.
 void set_oob_control(bool on);
 bool oob_control();
-constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 4;
+constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 11;
 constexpr std::uint32_t kOobPastRecords = 0, kOobPastBinding = 1, kOobWalkPastRecords = 2;
+constexpr std::uint32_t kOobImageLoadSize = 3, kOobImageLoadLevel = 4, kOobImageLoadLayer = 5;
+constexpr std::uint32_t kOobImageStoreSize = 6, kOobImageStoreLayer = 7, kOobImageStoreLevel = 8;
+constexpr std::uint32_t kOobViewSmaller = 9, kOobViewLarger = 10;
 // The Vulkan stage a translation or lift with these options runs in.
 std::uint32_t vk_stage_of(const TranslateOptions& o);
 inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }

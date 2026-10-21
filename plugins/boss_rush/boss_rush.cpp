@@ -17,8 +17,8 @@
 //   seed = ""
 //   dlc = true          # The Old Hunters' bosses
 //   chalice = false     # and the ten only the chalice dungeons have, in their fixed dungeons
-//   start_delay = 10    # seconds from Start to the first round
-//   auto_start = false  # begin when the world first loads, without the menu
+//   start_delay = 10    # seconds from Start to the first round (in the world)
+//   auto_start = false  # begin once the first load's screen has gone, without the menu
 //   first = 1           # start at the Nth boss of the order (practice one: first = N, rounds = 1)
 //   rounds = 0          # only N bosses (0: all)
 //   awake = true        # the fog wall stands as on a return; false: the first time's entrances
@@ -28,6 +28,12 @@
 // run is under way the save holds woken bosses (restore.txt puts them back if
 // the game is closed mid-run).
 //
+// The player is moved only in the world: each travel and fog warp waits for
+// the load's screen to go (plugin API 12, loading_screen), and the waits are
+// seconds, not frames (clocks()), so a slow load or a loading screen that
+// flips hundreds of times a second changes nothing. A travel the game drops
+// is asked again; one it will not take stops the run, and the message says so.
+//
 // Every boss's defeat flag and arena lamp come from the game's own data: the
 // boss fights' event scripts (the health bar's NpcName and its entity) and
 // the lamps each defeat lights (tools/mapval_lamps.py's "requires" column);
@@ -36,6 +42,8 @@
 #include "bbhost/engine/sprj/camera.hpp"
 #include "bbhost/engine/sprj/game_data_man.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -46,7 +54,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "boss_rush",
     "Boss rush",
-    "1.1.0",
+    "1.1.1",
     "bbhost",
     "Fight the game's bosses back to back, timed; deaths retry the round and the save's bosses are restored at the end.",
 };
@@ -159,38 +167,87 @@ enum class State { Waiting, Countdown, Warping, Fighting, Retry, Cleared, Done }
 State g_state = State::Waiting;
 std::vector<const Boss*> g_run;
 std::size_t g_round = 0;
-int g_timer = 0;               // frames
-std::uint64_t g_frames = 0;    // frames since the run began
-std::uint64_t g_round_start = 0;
+double g_wait = 0;          // the state's wait, s: the countdown's in real time, Retry's and Cleared's in the world's
+double g_run_start = 0;     // real time when the first round began
+double g_round_start = -1;  // real time when this round's fight began (its first stand at the fog); -1: not yet
 std::int64_t g_deaths_at_start = 0;
-std::vector<std::uint64_t> g_round_frames;
+std::vector<double> g_round_times;  // s
 std::map<std::uint32_t, bool> g_original;  // every flag the run changes, as the save had them
 std::string g_dir;
 int g_start_delay = 10;
-bool g_auto_start = false, g_auto_started = false, g_restored = false;
+bool g_auto_start = false, g_auto_started = false, g_auto_pending = false, g_restored = false;
 // boss_rush.test_kill = N (seconds): a test switch - N seconds into a round
 // the boss (the character whose NpcParam names it) is put at 0 HP.
 int g_retries = 0;
 int g_refused = 0;                 // times this round's map sent the player away without a death
 std::int64_t g_deaths_at_arrival = 0;
 std::int64_t g_deaths_refilled = 0;  // the deaths count the last refill answered
-int g_warp_frames = 0;
 int g_test_kill = 0;
-int g_fight_frames = 0;
+double g_fight_time = 0;  // the world's time since this round's arrival, or its last retry
 // boss_rush.test_watch = 1: a test switch - the player's and the boss's
 // positions every two seconds of a round, to see the boss move once the
 // player has gone through the fog.
 bool g_test_watch = false;
-int g_watch_frames = 0;
-int g_quiet_frames = 0;
+double g_watch_at = 0, g_quiet_at = 0;  // the world's time of the next watch line, the next quiet_arena
 bool g_skip_intro = true;
 
-constexpr int kFps = 60;  // on_frame runs once a game frame; the clock is in frames at the game's target
+// Time, in seconds, from two clocks read once a frame (clocks()):
+//  - real time: the run's and the rounds' times, loading screens in, and the
+//    countdown the player is told about (which runs only in the world);
+//  - the world's time, the game's own, which the waits are about (a travel
+//    the game is given time to begin, a fade, a pick-up): a frame adds its
+//    length but at most 1/30 s - the game's step, so a renderer too slow for
+//    30 frames a second slows it as it slows the game - and nothing while a
+//    loading screen is up or there is no world (the title and its menus).
+// They were frames, at 60 a second. At another frame rate every wait was off,
+// and a loading screen flips hundreds of times a second: a load of a few
+// seconds used up the travel's "25 s", the travel was asked again inside the
+// load, refused there (no player), and the run stopped saying travel was off.
+// boss_rush.test_frame_seconds = s: a test switch - each frame is s long, for
+// a pretend host whose frames come as fast as it makes them.
+double g_frame_seconds = 0;
+std::chrono::steady_clock::time_point g_t0;
+std::uint64_t g_frame_no = 0;
+double g_now = 0;          // real time since the plugin started
+double g_dt = 0;           // this frame's length
+double g_world_time = 0;   // the world's time
+double g_step = 0;         // this frame's share of it
+double g_world_since = 0;  // g_world_time when the world last came back
+bool g_loading = false;    // this frame: a loading screen is up
+bool g_in_world = false;   // this frame: no loading screen, and the player in a map
+void clocks() {
+    const double now = g_frame_seconds > 0 ? static_cast<double>(g_frame_no) * g_frame_seconds
+                                           : std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count();
+    g_dt = g_frame_no++ ? std::max(0.0, now - g_now) : 0.0;
+    g_now = now;
+    g_loading = g.loading_screen();
+    std::uint32_t block = 0;
+    const bool world = !g_loading && g.api->player_block(&block) == 0;
+    if (world && !g_in_world) g_world_since = g_world_time;
+    g_in_world = world;
+    g_step = world ? std::min(g_dt, 1.0 / 30.0) : 0.0;
+    g_world_time += g_step;
+}
+// How long the world has been up since it last came back; 0 outside it.
+double settled() { return g_in_world ? g_world_time - g_world_since : 0.0; }
+// A lamp travel is asked only in the world, this long after a loading screen
+// (or the title) has gone: past the fade-in, during which the game can drop
+// one (the first asked after a death's respawn often went).
+constexpr double kSettle = 3.0;
 
-std::string clock_text(std::uint64_t frames) {
-    const std::uint64_t s = frames / kFps;
+// A message for the player, shown once the world is up: on_world_load comes
+// while a load's screen is still up.
+std::string g_banner;
+float g_banner_s = 0;
+void banner(const std::string& text, float seconds) {
+    g_banner = text;
+    g_banner_s = seconds;
+}
+
+std::string clock_text(double seconds) {
+    const auto s = static_cast<unsigned long long>(seconds > 0 ? seconds : 0);
     char t[32];
-    std::snprintf(t, sizeof(t), "%llu:%02llu", static_cast<unsigned long long>(s / 60), static_cast<unsigned long long>(s % 60));
+    std::snprintf(t, sizeof(t), "%llu:%02llu", s / 60, s % 60);
     return t;
 }
 
@@ -215,9 +272,14 @@ void restore_leftovers() {
     }
 }
 
-// A run ends in the Hunter's Dream, at its first return point (ReturnPointParam).
+// A run ends in the Hunter's Dream, at its first return point
+// (ReturnPointParam), travelled to in the world and settled (dream_tick).
 constexpr std::int32_t kHuntersDream = 2102950;
-void to_dream() {
+bool g_to_dream = false;
+void to_dream() { g_to_dream = true; }
+void dream_tick() {
+    if (!g_to_dream || settled() < kSettle) return;
+    g_to_dream = false;
     if (g.api->lamp_warp(kHuntersDream) != 0) g.log("boss_rush: could not travel to the Hunter's Dream");
 }
 
@@ -226,12 +288,12 @@ void finish() {
     give_back();
     const std::int64_t deaths = g.stat("deaths") - g_deaths_at_start;
     std::ostringstream text;
-    text << "Boss rush complete - " << clock_text(g_frames) << ", " << deaths << (deaths == 1 ? " death" : " deaths");
+    text << "Boss rush complete - " << clock_text(g_now - g_run_start) << ", " << deaths << (deaths == 1 ? " death" : " deaths");
     g.message(text.str(), 10.0f);
     std::ofstream f(g_dir + "/results.txt", std::ios::app);
     f << text.str() << '\n';
-    for (std::size_t i = 0; i < g_run.size() && i < g_round_frames.size(); ++i) {
-        f << "  " << g_run[i]->name << ": " << clock_text(g_round_frames[i]) << '\n';
+    for (std::size_t i = 0; i < g_run.size() && i < g_round_times.size(); ++i) {
+        f << "  " << g_run[i]->name << ": " << clock_text(g_round_times[i]) << '\n';
     }
     g.log("boss_rush: %s", text.str().c_str());
     g_state = State::Done;
@@ -288,7 +350,13 @@ void borrow_altar() {
 
 // The save's flags as they were before the run (the altar slot among them).
 void give_back() {
-    for (const auto& [flag, on] : g_original) g.set_flag(flag, on);
+    int missed = 0;  // read back otherwise: a flag whose block is not loaded
+    for (const auto& [flag, on] : g_original) {
+        g.set_flag(flag, on);
+        missed += g.flag(flag) != on;
+    }
+    const std::string note = missed ? " (" + std::to_string(missed) + " read back otherwise)" : "";
+    g.log("boss_rush: %zu flags back as the save had them%s", g_original.size(), note.c_str());
     std::remove((g_dir + "/restore.txt").c_str());
     if (g_altar >= 0) {
         g.log("boss_rush: altar slot %d given back (map id %08x), the altar in use as before (%02x)", g_altar + 1,
@@ -466,27 +534,33 @@ void quiet_arena(const Boss* b) {
     if (off) g.log("boss_rush: %d characters switched off around %s's fog wall", off, b->name);
 }
 
-// The warp goes at the start of the next frame and can be lost while the
-// load's screen is still up (a chalice dungeon's can take 16 s), so a second
-// later it is checked, and asked again, for up to kFogTries seconds.
-constexpr int kFogTries = 20;
-int g_fog_tries = 0, g_fog_check = 0;
+// The fog warp, inside the arena's block: asked once the world is up, never
+// while the arrival's loading screen is (on_world_load comes with it still
+// up, and a warp then lands before the world is ready: the streamer can ask
+// for the neighbouring blocks inside the screen, and the arrival comes out
+// partial, its effects left over for the visit). Checked a second of the
+// world's time later and asked again, for up to kFogTries of them.
+constexpr int kFogTries = 10;
+int g_fog_tries = 0;
+int g_fog = 0;  // 0: none; 1: wanted, once the world is up; 2: asked, checked at g_fog_at
+double g_fog_at = 0;
 void to_fog(const Boss* b) {
     float p[3], yaw = 0;
     fog_spot(b, p, &yaw);
     g.api->player_warp(0, p, yaw);
-    g_fog_check = kFps;
+    g_fog = 2;
+    g_fog_at = g_world_time + 1.0;
 }
 void check_fog(const Boss* b) {
-    if (g_fog_check <= 0 || --g_fog_check > 0) return;
     float p[3], at[3], yaw = 0;
     fog_spot(b, p, &yaw);
     if (g.api->player_position(at, nullptr) != 0) {
-        g_fog_check = kFps;
+        g_fog_at = g_world_time + 1.0;
         return;
     }
     const float dx = at[0] - p[0], dz = at[2] - p[2];
     if (dx * dx + dz * dz < 4.0f) {
+        g_fog = 0;
         reset_camera();
         g.log("boss_rush: at %s's fog wall (%.1f %.1f %.1f)", b->name, at[0], at[1], at[2]);
         quiet_arena(b);
@@ -503,33 +577,109 @@ void check_fog(const Boss* b) {
         }
         return;
     }
-    if (++g_fog_tries > kFogTries) {
+    if (++g_fog_tries >= kFogTries) {
+        g_fog = 0;
         g.log("boss_rush: could not reach %s's fog wall (at %.1f %.1f %.1f)", b->name, at[0], at[1], at[2]);
+        g.message("Boss rush: could not reach " + std::string(b->name) + "'s fog wall - walk to it from the lamp", 6.0f);
         return;
     }
     to_fog(b);
 }
+void fog_tick(const Boss* b) {
+    if (g_fog == 1) {
+        if (g_round_start < 0) g_round_start = g_now;  // the round's time runs from its first stand at the fog
+        g.log("boss_rush: to %s's fog wall, %.2f s of the world after the loading screen", b->name, settled());
+        to_fog(b);
+    } else if (g_fog == 2 && g_world_time >= g_fog_at) {
+        check_fog(b);
+    }
+}
 
+// A round's travel, a lamp travel into the boss's map: asked in the world,
+// settled (kSettle), never inside a loading screen - asked there, the game
+// began it as the screen went, or bbhost refused it (the load had no player
+// yet). The game not beginning it - no loading screen kTravelWait of the
+// world's time after the ask - means it dropped it: asked again. Only when
+// it has dropped kTravelAsks of them, or bbhost refuses one with the player
+// there (travel is off), has it truly failed: the run stops, saying so.
+constexpr double kTravelWait = 10.0;
+constexpr int kTravelAsks = 5;
+int g_travel_asks = 0;        // this round's asks
+double g_travel_at = -1;      // the world's time of the last ask; -1: none yet
+bool g_travel_began = false;  // a loading screen since the last ask
+// boss_rush.test_drop_travel = N: a test switch - the first N asks of each
+// round are not passed on, as the game drops a travel.
+int g_test_drop_travel = 0;
+
+void travel_failed(const Boss* b, const std::string& why) {
+    g.log("boss_rush: %s to %s's arena (lamp %d, asked %d times); the run stops", why.c_str(), b->name, b->lamp, g_travel_asks);
+    give_back();
+    g.message("Boss rush stopped: " + why + " to " + b->name + "'s arena", 8.0f);
+    g_state = State::Done;
+}
+
+void travel_tick(const Boss* b) {
+    if (g_loading) {  // begun (or another load): the arrival is on_world_load's
+        g_travel_began = true;
+        return;
+    }
+    if (settled() < kSettle || (g_travel_at >= 0 && g_world_time - g_travel_at < kTravelWait)) return;
+    if (g_travel_at >= 0) {
+        g.log("boss_rush: the travel to %s's arena %s; again", b->name,
+              g_travel_began ? "did not arrive (a load, but to another map)" : "was not begun (no loading screen)");
+    }
+    if (g_travel_asks >= kTravelAsks) {
+        travel_failed(b, g_travel_began ? "the game would not travel" : "the game did not begin the travel");
+        return;
+    }
+    ++g_travel_asks;
+    g_travel_at = g_world_time;
+    g_travel_began = false;
+    g.log("boss_rush: travel to %s's arena (lamp %d, ask %d), %.2f s of the world after the loading screen", b->name, b->lamp,
+          g_travel_asks, settled());
+    if (g_travel_asks <= g_test_drop_travel) {
+        g.log("boss_rush: test: travel ask %d to %s's arena dropped", g_travel_asks, b->name);
+        return;
+    }
+    if (g.api->lamp_warp(b->lamp) != 0) {
+        std::uint32_t block = 0;
+        if (g.api->player_block(&block) != 0) {  // no player this frame after all: not a refusal
+            --g_travel_asks;
+            g_travel_at = -1;
+            return;
+        }
+        travel_failed(b, "bbhost refused the travel");
+    }
+}
+
+void begin();
 void start_round() {
     const Boss* b = g_run[g_round];
     wake(b);
-    if (g.api->lamp_warp(b->lamp) != 0) {
-        g.log("boss_rush: cannot travel to %s's arena (lamp %d)", b->name, b->lamp);
-        g.message("Boss rush: travel is off - is the plugin turned on?", 8.0f);
-        g_state = State::Done;
-        return;
-    }
     g.log("boss_rush: round %zu - %s", g_round + 1, b->name);
     g_state = State::Warping;
-    g_warp_frames = 0;
+    g_travel_asks = 0;
+    g_travel_at = -1;
+    g_travel_began = false;
+    travel_tick(b);
 }
 
 void tick() {
-    if (g_state != State::Waiting && g_state != State::Done) ++g_frames;
+    clocks();
+    if (g_auto_pending && g_in_world) {  // Start by itself: once the first load's screen has gone
+        g_auto_pending = false;
+        begin();
+    }
+    if (g_in_world && !g_banner.empty()) {
+        g.message(g_banner, g_banner_s);
+        g_banner.clear();
+    }
+    dream_tick();
     switch (g_state) {
     case State::Countdown:
-        if (--g_timer == 0) {
-            g_frames = 0;
+        if (g_in_world) g_wait -= g_dt;
+        if (g_wait <= 0 && settled() >= kSettle) {
+            g_run_start = g_now;
             g_deaths_at_start = g_deaths_refilled = g.stat("deaths");
             g_altar = -1;
             for (const Boss* b : g_run) {
@@ -549,36 +699,47 @@ void tick() {
             start_round();
         }
         break;
-    case State::Fighting:
-        check_fog(g_run[g_round]);
-        if (++g_quiet_frames % kFps == 0) quiet_arena(g_run[g_round]);  // whoever the map made since
-        if (g_test_watch && ++g_watch_frames % (2 * kFps) == 0) {
+    case State::Fighting: {
+        const Boss* b = g_run[g_round];
+        const double fought = g_fight_time;
+        if (g_in_world) {
+            g_fight_time += g_step;
+            fog_tick(b);
+            if (g_world_time >= g_quiet_at) {  // whoever the map made since
+                g_quiet_at = g_world_time + 1.0;
+                quiet_arena(b);
+            }
+        }
+        if (g_test_watch && g_in_world && g_world_time >= g_watch_at) {
+            g_watch_at = g_world_time + 2.0;
             float at[3] = {}, yaw = 0;
             g.api->player_position(at, &yaw);
             std::string t;
             for (const BbChr& c : g.characters()) {
                 const auto* npc = c.npc_param > 0 ? g.param<bb::params::NpcParam>(static_cast<std::uint32_t>(c.npc_param)) : nullptr;
-                if (!npc || npc->nameId / 100 != g_run[g_round]->name_id / 100 || c.hp <= 0) continue;
+                if (!npc || npc->nameId / 100 != b->name_id / 100 || c.hp <= 0) continue;
                 char one[96];
                 std::snprintf(one, sizeof(one), " c%04u %.1f %.1f %.1f hp %d", c.model, c.pos[0], c.pos[1], c.pos[2], c.hp);
                 t += one;
             }
-            g.log("boss_rush: watch %ds: player %.1f %.1f %.1f yaw %.2f; boss%s", g_watch_frames / kFps, at[0], at[1], at[2], yaw,
+            g.log("boss_rush: watch %.0fs: player %.1f %.1f %.1f yaw %.2f; boss%s", g_fight_time, at[0], at[1], at[2], yaw,
                   t.empty() ? " not found" : t.c_str());
         }
         // The defeat flag is the defeat event's own: the event system sets it
         // when the event ends, not through SetEventFlag, so on_event_flag
         // does not see it - it is read here instead.
-        if (g.flag(g_run[g_round]->defeat_flag)) {
-            g_round_frames.push_back(g_frames - g_round_start);
-            g.message(std::string(g_run[g_round]->name) + " defeated - " + clock_text(g_frames - g_round_start), 6.0f);
-            g.log("boss_rush: %s defeated in %s", g_run[g_round]->name, clock_text(g_frames - g_round_start).c_str());
+        if (g.flag(b->defeat_flag)) {
+            const double took = g_round_start >= 0 ? g_now - g_round_start : 0.0;
+            g_round_times.push_back(took);
+            g.message(std::string(b->name) + " defeated - " + clock_text(took), 6.0f);
+            g.log("boss_rush: %s defeated in %s", b->name, clock_text(took).c_str());
             g_state = State::Cleared;
-            g_timer = 10 * kFps;  // time to pick up what it dropped
+            g_wait = 10.0;  // time to pick up what it dropped
             break;
         }
+        // Each test step once, as the world's time passes its second.
+        const auto passes = [&](double at) { return fought < at && g_fight_time >= at; };
         if (g_test_kill) {
-            ++g_fight_frames;
             const auto find_boss = [](std::size_t* among) -> BbChr {
                 const std::vector<BbChr> chrs = g.characters();
                 if (among) *among = chrs.size();
@@ -589,7 +750,7 @@ void tick() {
                 }
                 return BbChr{};
             };
-            if (!g_skip_intro && g_fight_frames == 10 * kFps) {
+            if (!g_skip_intro && passes(10.0)) {
                 // Wake it the way a player does: walk up to it.
                 const BbChr boss = find_boss(nullptr);
                 if (boss.ins) {
@@ -597,7 +758,7 @@ void tick() {
                     g.api->player_warp(0, near, 0.0f);
                 }
             }
-            if (g_fight_frames == g_test_kill * kFps) {
+            if (passes(static_cast<double>(g_test_kill))) {
                 // Every character of the fight: a boss can be several (the two
                 // witches of Hemwick; the three Shadows, whose names are 212010,
                 // 212020 and 212030 - one hundred).
@@ -631,20 +792,15 @@ void tick() {
             }
         }
         break;
+    }
     case State::Warping:
-        // A warp that has not landed in 25 s was lost (asked for while the
-        // game could not take it - the first from the Hunter's Dream after a
-        // death often is): ask again.
-        if (++g_warp_frames == 25 * kFps) {
-            g.log("boss_rush: the warp to %s's arena did not land; again", g_run[g_round]->name);
-            start_round();
-        }
+        travel_tick(g_run[g_round]);
         break;
-    case State::Retry:
-        if (--g_timer == 0) start_round();
+    case State::Retry:  // in the world: the next round's flags are written where the map is
+        if (g_in_world && (g_wait -= g_step) <= 0) start_round();
         break;
     case State::Cleared:
-        if (--g_timer == 0) {
+        if (g_in_world && (g_wait -= g_step) <= 0) {
             g_refused = 0;
             if (++g_round >= g_run.size()) finish();
             else start_round();
@@ -688,10 +844,11 @@ void begin() {
     if (g_run.empty()) return;
     g_round = 0;
     g_retries = g_refused = 0;
-    g_round_frames.clear();
+    g_round_times.clear();
     g_original.clear();
+    g_to_dream = false;
     g_state = State::Countdown;
-    g_timer = g_start_delay * kFps;
+    g_wait = g_start_delay;  // seconds in the world: a loading screen holds it
     g.log("boss_rush: %zu bosses, %s order", g_run.size(), g.config("boss_rush.order", "story").c_str());
     g.message("Boss rush: " + std::to_string(g_run.size()) + " bosses - the first in " + std::to_string(g_start_delay) +
                   " seconds",
@@ -713,9 +870,9 @@ void stop(const char* why) {
 void skip() {
     if (g_state != State::Fighting && g_state != State::Warping && g_state != State::Retry) return;
     g.log("boss_rush: %s skipped", g_run[g_round]->name);
-    g_round_frames.push_back(0);
+    g_round_times.push_back(0);
     g_state = State::Cleared;
-    g_timer = 1;
+    g_wait = 0;
 }
 
 }  // namespace
@@ -726,6 +883,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     g_dir = api->plugin_dir("boss_rush");
     g_test_kill = static_cast<int>(g.config_number("boss_rush.test_kill", 0));
     g_test_watch = g.config_bool("boss_rush.test_watch", false);
+    g_test_drop_travel = static_cast<int>(g.config_number("boss_rush.test_drop_travel", 0));
+    g_frame_seconds = g.config_number("boss_rush.test_frame_seconds", 0);
+    g_t0 = std::chrono::steady_clock::now();
     g_auto_start = g.config_bool("boss_rush.auto_start", false);
     build_run();
     g.api->on_action("boss_rush", [](const char* action, void*) {
@@ -741,9 +901,11 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 g_restored = true;
                 restore_leftovers();
             }
+            // Start by itself: once this load's screen has gone (tick), so the
+            // countdown is seen and the travel asked in the world.
             if (g_auto_start && !g_auto_started) {
                 g_auto_started = true;
-                begin();
+                g_auto_pending = true;
             }
         } else if (g_state == State::Warping || g_state == State::Fighting) {
             const Boss* b = g_run[g_round];
@@ -757,10 +919,10 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 // way in). Twice, and the round is skipped.
                 if (g.stat("deaths") == g_deaths_at_arrival && ++g_refused >= 2) {
                     g.log("boss_rush: %s's map sends the player away on this save; skipped", b->name);
-                    g.message("Cannot reach " + std::string(b->name) + " on this save - skipped", 6.0f);
-                    g_round_frames.push_back(0);
+                    banner("Cannot reach " + std::string(b->name) + " on this save - skipped", 6.0f);
+                    g_round_times.push_back(0);
                     g_state = State::Cleared;
-                    g_timer = 3 * kFps;
+                    g_wait = 3.0;
                     return;
                 }
                 ++g_retries;
@@ -768,22 +930,24 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                     g.log("boss_rush: sent away from %s's map without a death; once more", b->name);
                 } else {
                     g.log("boss_rush: died to %s; back to its arena (retry %d)", b->name, g_retries);
-                    g.message("Again - " + std::string(b->name), 4.0f);
+                    banner("Again - " + std::string(b->name), 4.0f);
                 }
+                // The travel back, asked once the respawn's screen has gone and
+                // the world has settled (travel_tick): past its fade-in.
                 g_state = State::Retry;
-                g_timer = 8 * kFps;  // past the respawn's fade-in: a warp asked for during it is lost
+                g_wait = 0;
                 return;
             }
             if (g_state == State::Warping) {
-                g_round_start = g_frames;
+                g_round_start = -1;
                 g_deaths_at_arrival = g.stat("deaths");
                 log_flags(b, "arrived");
-                g.message("Round " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
+                banner("Round " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
             } else {
                 // A death in the boss's own map: back at the block's lamp.
                 ++g_retries;
                 log_flags(b, "back after a death");
-                g.message("Again - " + std::string(b->name), 4.0f);
+                banner("Again - " + std::string(b->name), 4.0f);
             }
             // A death since the last refill (here, or elsewhere before this
             // round's travel): vials and bullets back to the most.
@@ -791,11 +955,13 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 g_deaths_refilled = deaths;
                 if (g.config_bool("boss_rush.refill", true)) refill();
             }
-            // To the fog wall, whichever way the player came into the map.
+            // To the fog wall, whichever way the player came into the map, once
+            // this load's screen has gone (fog_tick).
             g_fog_tries = 0;
-            to_fog(b);
+            g_fog = 1;
             g_state = State::Fighting;
-            g_fight_frames = g_watch_frames = g_quiet_frames = 0;
+            g_fight_time = 0;
+            g_watch_at = g_quiet_at = g_world_time;
         }
     });
     return 0;

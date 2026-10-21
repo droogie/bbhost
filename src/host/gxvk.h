@@ -153,9 +153,13 @@ void buffer_replaced(std::uint64_t holder);
 void buffer_written(std::uint64_t holder, Retire why);
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why);
 // A GPU copy's destination with the handles on (=1): a kept default buffer it
-// writes is retired - tested against their ranges without a lock, so a copy
-// into memory no kept default buffer holds (nearly all) costs a few loads.
+// writes is retired - asked of the copy watch without a lock
+// (host/gxvk_watch.h), so a copy into memory no kept default buffer holds
+// (nearly all) reads a counter or two.
 void copy_written(std::uint64_t va, std::uint64_t bytes);
+// BBHOST_GXVK_BUFFERS=2: the copy watch's granules checked against its slots
+// for a copy's destination (the exit report counts a miss, which may not be).
+void copy_watch_check(std::uint64_t va, std::uint64_t bytes);
 void memory_released(std::uint64_t va, std::uint64_t bytes);
 // The exit report's lines for the table (gx_resources_report calls it; the
 // command processor's side reports with the GPU's).

@@ -1836,7 +1836,20 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                 continue;
             }
             if (now >= it->from) {
-                p.buttons |= it->button;
+                // A stick name (lup .. rright, bits above the pad's) deflects that stick fully
+                // for the hold, as BBHOST_AUTOPRESS's do: a test request's walk.
+                if (it->button & 0x1ef0000u) {
+                    if (it->button & 0x10000u) p.ly = 0;
+                    if (it->button & 0x20000u) p.ly = 255;
+                    if (it->button & 0x40000u) p.lx = 0;
+                    if (it->button & 0x80000u) p.lx = 255;
+                    if (it->button & 0x200000u) p.ry = 0;
+                    if (it->button & 0x400000u) p.ry = 255;
+                    if (it->button & 0x800000u) p.rx = 0;
+                    if (it->button & 0x1000000u) p.rx = 255;
+                } else {
+                    p.buttons |= it->button;
+                }
                 g_tap_pad.store(true, std::memory_order_relaxed);
             }
             ++it;

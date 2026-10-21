@@ -159,9 +159,55 @@ struct Mirror {
     std::vector<std::uint64_t> resident;  // a bit per page
     std::vector<VkSparseMemoryBind> pending;
     std::uint64_t resident_pages = 0;
+    // Windowed (no sparse binding; BBHOST_SHADOW_WINDOWS): the chunk's mirror
+    // as buffers of a 64 MiB window each, made with their memory when a page
+    // in the window is first copied, instead of one buffer for the whole
+    // chunk made at its first draw.
+    bool windowed = false;
+    struct Window {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    std::vector<Window> windows;
 };
 constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
+// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 16 on an
+// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 16 to 512).
+// Larger windows hold more pages no draw reads, smaller ones send more ranges
+// across a window's edge to host memory - on an integrated GPU the same RAM:
+// on the Radeon 680M at a lamp 16 MiB windows held 1,248 MiB where 64 MiB ones
+// held 1,728, at the same frame rate, with 6.8 M ranges read in place instead
+// of 1.6 M. Read when the first mirror is made, after the device is known.
+std::uint32_t window_pages() {
+    static const std::uint32_t pages = [] {
+        std::uint64_t mb = g.integrated ? 16 : 64;
+        if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
+            const std::uint64_t v = std::strtoull(e, nullptr, 10);
+            if (v >= 16 && v <= 512 && (v & (v - 1)) == 0) mb = v;
+        }
+        return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
+    }();
+    return pages;
+}
+std::uint64_t window_bytes() { return static_cast<std::uint64_t>(window_pages()) * kPageBytes; }
 VkSemaphore g_bind_sem[kSlots] = {};
+
+// Without sparse binding a mirror was a whole chunk: 1 GiB of video memory for
+// the first vertex range a draw read in it. Over an area's places the game's
+// meshes lie in four to six of the guest's chunks, so the mirrors took 4-6 GiB
+// of an integrated GPU's carve-out (a Radeon 8060S, where the fixed share is
+// its budget less 6.5 GiB), and on an 8 GB AMD card, where a whole mirror is
+// made only while 1.8 GiB is free above the reserve, two fitted and the other
+// chunks' vertices crossed the bus. Made 64 MiB window by window as their
+// pages are first copied, they hold the windows the draws read; a range
+// across two windows is read from host memory, as one in a chunk with no
+// mirror was. BBHOST_SHADOW_WINDOWS=0: whole mirrors, as before.
+const bool g_windows_on = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_WINDOWS");
+    return !(e && e[0] == '0');
+}();
+std::uint64_t g_window_crossings = 0;  // ranges across two windows, read from host memory
+std::uint64_t g_windows_made = 0;
 
 bool all_ok(const std::vector<std::uint64_t>& ok, std::uint32_t p0, std::uint32_t p1) {
     for (std::uint32_t w = p0 >> 6; w <= p1 >> 6; ++w) {
@@ -200,8 +246,9 @@ std::uint64_t g_given_back_ms = 0;   // when video memory last ran short (shadow
 std::uint64_t g_gives = 0, g_returns = 0;
 // The live share (shadow_live): a mirror block or a whole mirror is made only
 // while video memory keeps the reserve and this cushion above it for the
-// next area's textures (BBHOST_SHADOW_CUSHION_MB, 256); a page refused for
-// want of room is read from host memory by that draw and tried again later.
+// next area's textures (BBHOST_SHADOW_CUSHION_MB; a 24th of the budget at the
+// start, from 128 to 256 MiB, as the reserve scales); a page refused for want
+// of room is read from host memory by that draw and tried again later.
 bool g_live = false;
 std::uint64_t g_cushion = 256ull << 20;
 std::uint64_t g_room_refusals = 0;     // copies refused for want of room, counted per draw
@@ -368,9 +415,39 @@ bool mirror_room(std::uint64_t bytes) {
     return false;
 }
 
+// A windowed mirror's window w, made now if it is not: false when the
+// mirrors' share has no room for it or video memory none.
+bool window_ready(Mirror& m, std::uint32_t w) {
+    Mirror::Window& win = m.windows[w];
+    if (win.buffer) return true;
+    if (!mirror_room(window_bytes())) return false;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = window_bytes();
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &win.buffer) != VK_SUCCESS) {
+        win.buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, win.buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("mirror windows");
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &win.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(g.device, win.buffer, nullptr);
+        win = Mirror::Window{};
+        return false;
+    }
+    vkBindBufferMemory(g.device, win.buffer, win.memory, 0);
+    g_mirror_bytes += req.size;
+    ++g_windows_made;
+    return true;
+}
+
 Mirror* mirror_for(std::uint32_t chunk) {
     Mirror& m = g_mirrors[chunk];
-    if (m.buffer || m.failed) return m.failed ? nullptr : &m;
+    if (m.buffer || m.windowed || m.failed) return m.failed ? nullptr : &m;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = kChunkBytes;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -404,6 +481,18 @@ Mirror* mirror_for(std::uint32_t chunk) {
         }
         bci.flags = 0;
     }
+    if (g_windows_on) {
+        m.windowed = true;
+        m.windows.assign(kChunkBytes / window_bytes(), Mirror::Window{});
+        m.pages.resize(kPagesPerChunk);
+        m.ok.assign(kPagesPerChunk / 64, 0);
+        m.dyn.assign(kPagesPerChunk / 64, 0);
+        m.gpu.assign(kPagesPerChunk / 64, 0);
+        host_log("buffer shadow: mirror for chunk %u made %llu MiB window by window as its pages are copied (no sparse binding; "
+                 "BBHOST_SHADOW_WINDOWS=0: whole)",
+                 chunk, static_cast<unsigned long long>(window_bytes() >> 20));
+        return &m;
+    }
     if (g_live && g_mirror_bytes + kChunkBytes <= g_mirror_cap && !mirror_room(kChunkBytes)) {
         // No room for a whole mirror now: this draw reads host memory, and
         // a later one asks again.
@@ -428,6 +517,7 @@ Mirror* mirror_for(std::uint32_t chunk) {
         vkGetBufferMemoryRequirements(g.device, m.buffer, &req);
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        MemOwner own_mem("mirrors");
         if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &m.memory) != VK_SUCCESS) {
             vkDestroyBuffer(g.device, m.buffer, nullptr);
             m.buffer = VK_NULL_HANDLE;
@@ -539,6 +629,7 @@ bool new_stage_chunk(StageChunk& c) {
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("vertex stage chunks");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS) {
         vkDestroyBuffer(g.device, c.buffer, nullptr);
         c = StageChunk{};
@@ -1144,6 +1235,15 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
+    // A windowed mirror serves a range from one window's buffer.
+    const std::uint32_t win = m->windowed ? p0 / window_pages() : 0;
+    if (m->windowed && p1 / window_pages() != win) {
+        ++g_window_crossings;
+        bump(g_imports);
+        return;
+    }
+    const VkDeviceSize win_base = static_cast<VkDeviceSize>(win) * window_bytes();
+    const auto mirror_buffer = [&] { return m->windowed ? m->windows[win].buffer : m->buffer; };
     if (g_verify) {
         for (std::uint32_t p = p0; p <= p1; ++p) {
             Page& pg = m->pages[p];
@@ -1161,8 +1261,8 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     begin_recording(*m, stamp);
     if (all_ok(m->ok, p0, p1)) {
         bump(g_hits);
-        loc.buffer = m->buffer;
-        loc.offset = off;
+        loc.buffer = mirror_buffer();
+        loc.offset = off - win_base;
         loc.avail = bytes;
         return;
     }
@@ -1185,6 +1285,18 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         ++g_room_skips;
         bump(g_imports);
         return;
+    }
+    // A windowed mirror's window is made before any page's write watch is
+    // armed; with no room for it the range is read from host memory, and a
+    // later draw asks again (the live share) - with the fixed share it stays
+    // there, as a chunk with no whole mirror did.
+    if (m->windowed && !m->windows[win].buffer) {
+        const bool retry_wait = g_live && now_ms() < g_room_retry_ms;
+        if (retry_wait || !window_ready(*m, win)) {
+            if (g_live) ++(retry_wait ? g_room_skips : g_room_refusals);
+            bump(g_imports);
+            return;
+        }
     }
     // The pages this call will copy, armed a run at a time: one protection of
     // the guest view and one of its GPU alias per run of consecutive pages,
@@ -1273,7 +1385,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     std::uint32_t n_regions = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     auto flush = [&] {
-        if (n_regions) vkCmdCopyBuffer(cmd, src_buffer, m->buffer, n_regions, regions);
+        if (n_regions) vkCmdCopyBuffer(cmd, src_buffer, mirror_buffer(), n_regions, regions);
         n_regions = 0;
     };
     for (std::uint32_t p = p0; p <= p1; ++p) {
@@ -1445,6 +1557,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                     bump(g_imports);
                     return;
                 }
+                MemOwner own_mem("mirror blocks");
                 if (!room || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
                     go_dynamic(*m, p, page_va, !room ? "has no room in the mirrors' share of video memory"
                                                      : "has no device memory for its mirror page");
@@ -1473,18 +1586,19 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         // copied - a valid page overwritten, its own left as it was: the
         // Dream's meshes drew from the wrong bytes.
         const VkDeviceSize src = staged ? staged_at : at - source->lo;
-        if (n_regions && copy_run_extends(regions[n_regions - 1], src, at, kPageBytes)) {
+        const VkDeviceSize dst = at - win_base;  // in the window's buffer, for a windowed mirror
+        if (n_regions && copy_run_extends(regions[n_regions - 1], src, dst, kPageBytes)) {
         } else {
             if (n_regions == 16) flush();
-            regions[n_regions++] = {src, at, kPageBytes};
+            regions[n_regions++] = {src, dst, kPageBytes};
         }
         bump(g_uploads);
         bump(g_upload_bytes, kPageBytes);
     }
     flush();
     bump(g_hits);
-    loc.buffer = m->buffer;
-    loc.offset = off;
+    loc.buffer = mirror_buffer();
+    loc.offset = off - win_base;
     loc.avail = bytes;
 }
 
@@ -1649,11 +1763,13 @@ bool snap_ring_make() {
     if (type != UINT32_MAX && !ring_fits_budget(type, req.size, "the rewritten vertex data's ring", &note)) type = UINT32_MAX;
     if (type != UINT32_MAX) {
         mai.memoryTypeIndex = type;
+        MemOwner own_mem("vertex copies ring");
         if (vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) == VK_SUCCESS) g_snap.device_local = true;
         note_ring_placed(g_snap.device_local, req.size);
     }
     if (!g_snap.memory) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, visible);
+        MemOwner own_mem("vertex copies ring");
         if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) != VK_SUCCESS) {
             vkDestroyBuffer(g.device, g_snap.buffer, nullptr);
             g_snap.buffer = VK_NULL_HANDLE;
@@ -2056,6 +2172,7 @@ void shadow_budget_locked() {
     // keeps the fixed share.
     const char* live = std::getenv("BBHOST_SHADOW_LIVE");
     g_live = !(e && *e) && vram_reserve_bytes() && !(live && live[0] == '0');
+    g_cushion = std::clamp<std::uint64_t>((g.local_budget >> 20) / 24, 128, 256) << 20;
     if (const char* c = std::getenv("BBHOST_SHADOW_CUSHION_MB"); c && *c) g_cushion = std::strtoull(c, nullptr, 10) << 20;
     g_mirror_cap = e && *e ? static_cast<std::uint64_t>(std::strtoull(e, nullptr, 10)) << 20
                    : g_live ? ~0ull
@@ -2063,8 +2180,11 @@ void shadow_budget_locked() {
     g_initial_cap = g_mirror_cap;
     if (!buffer_shadow_on()) return;
     if (g_live) {
+        char how[64];
+        std::snprintf(how, sizeof(how), "%llu MiB windows", static_cast<unsigned long long>(window_bytes() >> 20));
         host_log("buffer shadow: its mirrors may hold what video memory has free above the reserve and a %llu MiB cushion (%s)",
-                 static_cast<unsigned long long>(g_cushion >> 20), g.has_sparse ? "64 MiB blocks" : "whole 1 GiB mirrors: no sparse binding");
+                 static_cast<unsigned long long>(g_cushion >> 20),
+                 g.has_sparse ? "64 MiB blocks" : g_windows_on ? how : "whole 1 GiB mirrors: no sparse binding");
         return;
     }
     if (!g.has_sparse && g_mirror_cap < kChunkBytes) {
@@ -2081,9 +2201,12 @@ void shadow_budget_locked() {
 void shadow_give_back_locked(Gpu::Slot& slot) {
     std::uint32_t mirrors = 0;
     for (Mirror& m : g_mirrors) {
-        if (!m.buffer) continue;
-        slot.garbage.push_back(DevBuffer{m.memory, m.buffer});
+        if (!m.buffer && !m.windowed) continue;
+        if (m.buffer) slot.garbage.push_back(DevBuffer{m.memory, m.buffer});
         for (VkDeviceMemory b : m.blocks) slot.garbage.push_back(DevBuffer{b, VK_NULL_HANDLE});
+        for (const Mirror::Window& w : m.windows) {
+            if (w.buffer) slot.garbage.push_back(DevBuffer{w.memory, w.buffer});
+        }
         m = Mirror{};
         m.failed = true;
         ++mirrors;
@@ -2139,12 +2262,15 @@ void flush_mirrors_locked(Gpu::Slot& slot, const char* why) {
     std::uint32_t n = 0;
     const std::uint64_t held = g_mirror_bytes;
     for (Mirror& m : g_mirrors) {
-        if (!m.buffer) {
+        if (!m.buffer && !m.windowed) {
             if (!m.failed) m = Mirror{};
             continue;
         }
-        slot.garbage.push_back(DevBuffer{m.memory, m.buffer});
+        if (m.buffer) slot.garbage.push_back(DevBuffer{m.memory, m.buffer});
         for (VkDeviceMemory b : m.blocks) slot.garbage.push_back(DevBuffer{b, VK_NULL_HANDLE});
+        for (const Mirror::Window& w : m.windows) {
+            if (w.buffer) slot.garbage.push_back(DevBuffer{w.memory, w.buffer});
+        }
         m = Mirror{};
         ++n;
     }
@@ -2264,6 +2390,47 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
     }
 }
 
+std::uint64_t shadow_room_refusals_locked() { return g_room_refusals + g_room_skips; }
+
+void shadow_vram_census_locked(ShadowCensus& c) {
+    c = ShadowCensus{};
+    c.live = g_live;
+    c.sparse = g.has_sparse;
+    c.cap = g_live ? 0 : g_mirror_cap;
+    c.given_back = g_given_back;
+    for (const Mirror& m : g_mirrors) {
+        if (!m.buffer && !m.windowed) continue;
+        std::uint64_t valid = 0;
+        // The 64 MiB windows of the chunk that hold a copied page: what a
+        // mirror made window by window (no sparse binding) would hold.
+        std::uint32_t windows = 0;
+        for (std::uint32_t w = 0; w * kBlockPages < m.pages.size(); ++w) {
+            bool any = false;
+            for (std::uint32_t p = w * kBlockPages; p < (w + 1) * kBlockPages && p < m.pages.size(); ++p) {
+                const bool held = m.pages[p].valid || (m.sparse && (m.resident[p >> 6] >> (p & 63)) & 1);
+                any |= held;
+                valid += m.pages[p].valid && !m.pages[p].dynamic;
+            }
+            windows += any;
+        }
+        c.windows += windows;
+        if (m.sparse) {
+            c.block_bytes += static_cast<std::uint64_t>(m.blocks.size()) * kBlockPages * kPageBytes;
+            c.blocks += static_cast<std::uint32_t>(m.blocks.size());
+        } else if (m.windowed) {
+            for (const Mirror::Window& w : m.windows) {
+                if (!w.buffer) continue;
+                c.block_bytes += window_bytes();  // a window is a block of its own
+                ++c.blocks;
+            }
+        } else if (m.memory) {
+            c.whole_bytes += kChunkBytes;
+            ++c.whole;
+        }
+        c.data_bytes += valid * kPageBytes;
+    }
+}
+
 std::string shadow_report() {
     std::uint64_t resident = 0;
     for (std::uint32_t c = 0; c < gcn::kDmemChunks; ++c) resident += g_mirrors[c].resident_pages;
@@ -2305,6 +2472,13 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
                   static_cast<unsigned long long>(g_mirror_bytes >> 20), share, g_given_back ? " (given back: video memory ran short)" : "");
     std::string out = std::string(buf) + h + rr;
+    if (g_windows_made || g_window_crossings) {
+        char wn[160];
+        std::snprintf(wn, sizeof(wn), "; mirror windows of %llu MiB made %llu, ranges across two windows read from host memory %llu",
+                      static_cast<unsigned long long>(window_bytes() >> 20), static_cast<unsigned long long>(g_windows_made),
+                      static_cast<unsigned long long>(g_window_crossings));
+        out += wn;
+    }
     if (g_second_chances) {
         char sc[96];
         std::snprintf(sc, sizeof(sc), "; dynamic pages given another try at a load %llu", static_cast<unsigned long long>(g_second_chances));

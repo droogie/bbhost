@@ -199,14 +199,35 @@ either way.
 
 **Black or broken image in the world, or slow on a card with little video
 memory.** bbhost follows the driver's video memory budget as the game runs:
-it keeps the last 512 MiB for render targets, puts textures in system memory
-when the card is down to that, and moves them back once there is room. Every
+it keeps the last 512 MiB for render targets (less on a card with under
+6 GB free: a twelfth of what is free at the start, at least 256 MiB), puts
+textures in system memory when the card is down to that, and moves them back
+once there is room. Every
 five seconds the log says `video memory: headroom ...`; look there, and for
 `video memory is full`, before anything else. Other programs holding video
 memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
 7.5 GB free bbhost also holds less memory ahead (the log says `small video
 memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
 an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
+
+The same report says where the video memory goes: `gpu: video memory (MiB)`
+gives what the driver counts against its budget, what bbhost's own
+allocations hold and the driver's own share; `video memory held` lists what
+the game needs now (render targets, textures in use, buffers by owner) and
+`video memory caches` what bbhost keeps because the card has room (the
+vertex data's mirrors, textures not used for a while, free room in the image
+heap), which it gives back when memory runs short. At exit the log gives each
+owner's highest. Render targets never go in the textures' blocks, so that a
+block of textures can empty and be given back; a texture still takes free
+room between the targets before a new block is made
+(`BBHOST_HEAP_CLASSES=strict` keeps the two apart; `BBHOST_HEAP_CLASSES=0`
+and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
+`BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
+ring and the texture upload scratch at their largest from the start. On a GPU
+without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
+made 64 MiB at a time as the game's meshes need them (16 MiB on an
+integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
+gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -251,10 +272,14 @@ the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 120). The effects - fire, lamps', candles' and braziers' flicker, blood,
-magic, every effect the game's effect manager runs - and the wind that sways
-grass and trees step in whole 1/30 s above 30, as many times a second as at
-30 (every other frame at 60, every fourth at 120), the flicker and the sway
-keeping the cadence the game has at 30. The frames between whole steps still
+magic, every effect the game's effect manager runs - step in whole 1/30 s
+above 30, as many times a second as at 30 (every other frame at 60, every
+fourth at 120), the flicker keeping the cadence the game has at 30. The wind
+that sways grass and trees moves every frame at 30's pace: the game steps it a
+fixed 1/60 s each 1/30 s frame, so above 30 it takes half each frame's step,
+and its bend keeps the game's weight of 1/60 (`engine/wind_pace.h`;
+`BBHOST_WIND_PACE=0` steps it by the frame's time with a weight of 1/30, twice
+30's pace and bend). The frames between whole steps still
 run the effects' update, so effects follow what they ride on and are drawn
 every frame, but with what the game counts in updates held for the next
 whole step - a node's state, its emissions and the definitions its
@@ -262,13 +287,17 @@ conditions pick, the controllers, a light's flicker phase, a wobbling
 motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
-with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
-instead (60 updates a second above 60) and the wind by the frame's time;
-`frame` steps both by the frame's time. `smooth` keeps 30's whole steps
+with 60 too). The grid particles of GPU type 0x2712 (Cainhurst's snow among
+them) also wait for the whole step on the frames between, gate on or off, so
+their emissions reach the grid as at 30 (`BBHOST_SFX_2712_HOLD=0` runs them
+on every frame as before, when at 60 and above none did). `[video] effect_steps = 60` steps the effects in whole 1/60 s
+instead (60 updates a second above 60); `frame` steps them by the frame's
+time. `smooth` keeps 30's whole steps
 for what the effects count and moves what they move by time - a particle's
-path, a motion's turn, the GPU particles' clock - by each frame's own time,
-in the effects whose every part has been converted for it; the rest run as
-at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
+path, a motion's turn, the GPU particles' clock, a ribbon's head (its points
+still inserted once a whole step), the wind sources' gusts - by each frame's
+own time, in the effects whose every part has been converted for it; the rest
+run as at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
 `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting. Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
@@ -293,7 +322,12 @@ whole steps as at N fps whatever the frame's time - the carry grows 1/N a
 frame - so a renderer far below N (lavapipe) runs the cadence N has, 1/30, 0,
 1/30, 0 ... at 60 with whole 1/30 s steps; the rest of the game keeps the
 frame's time (1/30 s a frame below 30 fps), so the effects run N/30 times
-slower than it. The start of the log says which rate
+slower than it. `BBHOST_SIM_FRAME_TIME=1` (a test switch, same rates) does
+the same for the whole game: each frame counts as its target's length (1/60 at
+60, the swing's when `BBHOST_TEST_FPS_SWING` moves it), so every clock the game
+steps by - the task step, physics, the effects' schedule, the wind - advances
+as at that rate however long the frame took, and a slow renderer runs the
+game in slow motion at the rate's steps. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).

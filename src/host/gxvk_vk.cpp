@@ -143,6 +143,7 @@ bool take_from_locked(int b, VkDeviceSize need, BufferEntry& e) {
 
 int new_block_locked(VkDeviceSize size, bool host, bool dedicated) {
     Block nb;
+    MemOwner own_mem("gxvk buffer copies");
     if (!create_dev_buffer(nb.buf, size, host)) return -1;
     nb.host = host || nb.buf.in_host;
     nb.dedicated = dedicated;
@@ -245,6 +246,7 @@ bool fill_locked(BufferEntry& e, std::uint32_t handle) {
         // each recording's bytes).
         if (g_readback_serial != g.flushes) g_readback_serial = g.flushes, g_readback_serial_bytes = 0;
         Readback rb;
+        MemOwner own_mem("gxvk readbacks");
         if (g_readback_serial_bytes + e.bytes <= kReadbackBytesPerRecording && create_dev_buffer(rb.buf, e.bytes, true, true)) {
             g_readback_serial_bytes += e.bytes;
             VkMemoryBarrier mb{};

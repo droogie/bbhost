@@ -538,6 +538,23 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         prev_hash_us = hash_us;
         prev_repl = repl;
     }
+    // BBHOST_VRAM_REPORT_S=<s>: the video memory lines every s seconds as well,
+    // on the flips between the 300-flip reports - lavapipe flips 300 times in
+    // a minute or more, a place's whole window. Off (0) by default.
+    if (host_tooling()) {
+        static const double every = [] {
+            const char* e = std::getenv("BBHOST_VRAM_REPORT_S");
+            return e && *e ? std::atof(e) : 0.0;
+        }();
+        static auto last_v = std::chrono::steady_clock::now();
+        if (every > 0 && n % 300 != 0) {
+            const auto tv = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(tv - last_v).count() >= every) {
+                last_v = tv;
+                host_gpu_log_video_memory(false);
+            }
+        }
+    }
     // With tooling off only what the report also did for the game: the
     // pipeline cache written when it has grown.
     if (!host_tooling()) {
@@ -645,6 +662,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         host_gpu_resources_report();
         if (const std::string r = host_gpu_ps_wave_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_memory_budget_report(); !r.empty()) host_log("  %s", r.c_str());
+        host_gpu_log_video_memory(false);
         // What the PC enhancements and Bloom cost in these flips: the file
         // lookups that passed the generated overlays by, the frames that read
         // the altar's flags, the views that drew YEBIS's glare.

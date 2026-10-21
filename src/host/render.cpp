@@ -7003,6 +7003,13 @@ void apply_relinks_locked() {
 // pipeline, then the optimized relink with the specialization that draw gave
 // it - and kept, by its content key, for the draw that needs it.
 }  // namespace
+// BBHOST_OOB_COUNT: a compute program's counter slot (TranslateResult::
+// oob_slot), named for the exit report as note_oob_slots names a draw's.
+void note_oob_compute_slot(std::uint32_t slot, const std::string& name) {
+    if (!g.oob.map || slot >= gcn::kOobSlots) return;
+    std::lock_guard<std::mutex> lk(g_oob_names_mu);
+    g_oob_names[slot].insert("CS " + name);
+}
 }  // namespace gpu
 namespace {
 void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
@@ -10326,6 +10333,34 @@ void render_return_targets_locked() {
     }
 }
 
+void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h) {
+    const std::uint64_t now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    constexpr std::uint64_t kIdleMs = 10000;  // the reuse retire's idle time (BBHOST_IMG_REUSE_IDLE's default)
+    for (const auto& [base, r] : g_rts) {
+        if (!r.image) continue;
+        const std::uint64_t bytes = r.memory.size;
+        if (!image_memory_in_vram(r.memory)) {
+            c.rt_host.add(bytes);
+            continue;
+        }
+        if (r.written_ms && now - r.written_ms >= kIdleMs) c.rt_idle.add(bytes);
+        if (r.depth) c.rt_depth.add(bytes);
+        else if (display_w && r.width == display_w && r.height == display_h) c.rt_display.add(bytes);
+        else c.rt_colour.add(bytes);
+    }
+    for (const auto& [base, r] : g_snapshots) {
+        if (!r.image) continue;
+        const std::uint64_t bytes = r.memory.size;
+        if (!image_memory_in_vram(r.memory)) {
+            c.rt_host.add(bytes);
+            continue;
+        }
+        c.snapshots.add(bytes);
+        if (r.written_ms && now - r.written_ms >= kIdleMs) c.snap_idle.add(bytes);
+    }
+}
+
 std::string render_return_report() {
     if (!g_rt_returned) return {};
     char buf[96];
@@ -10788,20 +10823,35 @@ void cross_vendor_report() {
              static_cast<ull>(g_raster_census[0].load()), static_cast<ull>(g_raster_census[1].load()));
     if (g.oob.map) {
         // BBHOST_OOB_COUNT=1: the totals, then the programs with the most.
-        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
-        std::uint64_t total[3] = {};
+        const std::vector<std::uint64_t> c = oob_totals();
+        constexpr std::uint32_t K = gcn::kOobKinds;
+        std::uint64_t total[K] = {};
         std::vector<std::pair<std::uint64_t, std::uint32_t>> slots;
         for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
             std::uint64_t n = 0;
-            for (std::uint32_t k = 0; k < 3; ++k) {
-                total[k] += c[slot * gcn::kOobKinds + k];
-                n += c[slot * gcn::kOobKinds + k];
+            for (std::uint32_t k = 0; k < K; ++k) {
+                total[k] += c[slot * K + k];
+                n += c[slot * K + k];
             }
             if (n) slots.push_back({n, slot});
         }
         host_log("render: out-of-range buffer accesses (BBHOST_OOB_COUNT): typed loads by index at or past num_records %llu, reaching past "
-                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds, translated stages)",
-                 static_cast<ull>(total[0]), static_cast<ull>(total[1]), static_cast<ull>(total[2]));
+                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds; vertex, pixel and compute "
+                 "stages, translated or lifted)",
+                 static_cast<ull>(total[gcn::kOobPastRecords]), static_cast<ull>(total[gcn::kOobPastBinding]),
+                 static_cast<ull>(total[gcn::kOobWalkPastRecords]));
+        host_log("render: out-of-range image accesses (BBHOST_OOB_COUNT): loads at integer coordinates outside the bound view's size at "
+                 "their level %llu, at or past its level count %llu, at or past its layer count %llu; stores outside its size %llu, past "
+                 "its layers %llu (%s), at a level other than 0 %llu (lanes EXEC holds)",
+                 static_cast<ull>(total[gcn::kOobImageLoadSize]), static_cast<ull>(total[gcn::kOobImageLoadLevel]),
+                 static_cast<ull>(total[gcn::kOobImageLoadLayer]), static_cast<ull>(total[gcn::kOobImageStoreSize]),
+                 static_cast<ull>(total[gcn::kOobImageStoreLayer]),
+                 gcn::image_store_bounds() ? "skipped, BBHOST_IMAGE_STORE_BOUNDS" : "written, BBHOST_IMAGE_STORE_BOUNDS=0",
+                 static_cast<ull>(total[gcn::kOobImageStoreLevel]));
+        host_log("render: image accesses where the bound view and the game's T# disagree (BBHOST_OOB_COUNT): inside the T#'s size but "
+                 "outside the view's %llu (the host's view smaller than the game's image), outside the T#'s but inside the view's %llu "
+                 "(larger) - loads and stores, lanes EXEC holds",
+                 static_cast<ull>(total[gcn::kOobViewSmaller]), static_cast<ull>(total[gcn::kOobViewLarger]));
         std::sort(slots.rbegin(), slots.rend());
         std::lock_guard<std::mutex> lk(g_oob_names_mu);
         for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
@@ -10810,8 +10860,13 @@ void cross_vendor_report() {
             if (auto it = g_oob_names.find(slot); it != g_oob_names.end()) {
                 for (const std::string& n : it->second) names += (names.empty() ? "" : ", ") + n;
             }
-            host_log("render:   slot %u (%s): past records %u, past the binding %u, walks past records %u", slot, names.empty() ? "?" : names.c_str(),
-                     c[slot * gcn::kOobKinds], c[slot * gcn::kOobKinds + 1], c[slot * gcn::kOobKinds + 2]);
+            const std::uint64_t* s = &c[slot * K];
+            host_log("render:   slot %u (%s): past records %llu, past the binding %llu, walks past records %llu; image loads outside %llu, "
+                     "past levels %llu, past layers %llu; stores outside %llu, past layers %llu, at another level %llu; the view smaller "
+                     "than the T# %llu, larger %llu",
+                     slot, names.empty() ? "?" : names.c_str(), static_cast<ull>(s[0]), static_cast<ull>(s[1]), static_cast<ull>(s[2]),
+                     static_cast<ull>(s[3]), static_cast<ull>(s[4]), static_cast<ull>(s[5]), static_cast<ull>(s[6]), static_cast<ull>(s[7]),
+                     static_cast<ull>(s[8]), static_cast<ull>(s[9]), static_cast<ull>(s[10]));
         }
     }
     host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",
@@ -10824,9 +10879,9 @@ void cross_vendor_report() {
     }
     host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
              "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
-             "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
+             "sampler fixes %s (BBHOST_SAMPLER_FIXES), image store bounds %s (BBHOST_IMAGE_STORE_BOUNDS)",
              g_ps_input_defaults ? "on" : "off", gcn::subgroup_stages(), barrier_masks_fixed() ? "on" : "off", render_layout_fixes() ? "on" : "off",
-             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off");
+             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off", gcn::image_store_bounds() ? "on" : "off");
 }
 
 void render_report() {
@@ -11395,6 +11450,7 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
             scratch = DevBuffer{};
             std::uint64_t want = 1ull << 20;
             while (want < need) want <<= 1;
+            MemOwner own_mem("depth copy buffer");
             if (!create_dev_buffer(scratch, want, false)) {
                 scratch = DevBuffer{};
                 return false;
@@ -12574,7 +12630,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             static std::uint64_t scratch_lap = 1;
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
-                if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                if (!scratch.buffer) {
+                    MemOwner own_mem("constant-buffer copies ring");
+                    create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
                 // binds the copy its first snapshot made: the game wrote the
@@ -16376,13 +16435,15 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     // twice as many as submissions in flight, until 16 submissions in flight
     // would have made them 8 MiB.)
     //
-    // With small video memory (gpu.cpp, small_vram) the ring grows as it is
-    // needed instead of being made whole at the first tessellated draw: each
-    // region is a buffer of its own, and a recording takes the region that
-    // has been free longest (its submission and the two after it have run),
-    // a new one while fewer than 16 are made, and only then waits for the
-    // oldest - so the ring holds as many regions as recordings in flight
-    // really use. BBHOST_TESS_RING=grow / =whole says instead.
+    // The ring grows as it is needed instead of being made whole at the
+    // first tessellated draw: each region is a buffer of its own, and a
+    // recording takes the region that has been free longest (its submission
+    // and the two after it have run), a new one while fewer than 16 are
+    // made, and only then waits for the oldest - so the ring holds as many
+    // regions as recordings in flight really use: 4-5 of the 16 (64-80 MiB
+    // of 256) over the tour's places on 4 and 6 GB budgets, where it grew
+    // first (small_vram). BBHOST_TESS_RING=whole makes it whole at the first
+    // tessellated draw, as before.
     static DevBuffer ring;
     constexpr std::uint64_t kRingBytes = kTessRingBytes;
     constexpr std::uint64_t kRegions = kTessRegions;
@@ -16397,7 +16458,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     static Region* current = nullptr;
     static const bool grows = [] {
         const char* e = std::getenv("BBHOST_TESS_RING");
-        return e && *e ? std::strcmp(e, "grow") == 0 : g.small_vram;
+        return !(e && std::strcmp(e, "whole") == 0);
     }();
     // Device-local: the stages behind it read and write it all draw long - the
     // game's own hull shaders and their domain shaders, at up to 16 cells a
@@ -16406,6 +16467,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     // BBHOST_DUMP_ON_BRIGHT, which read it back.
     static const bool ring_read_back = std::getenv("BBHOST_TESS_DEBUG") || std::getenv("BBHOST_DUMP_ON_BRIGHT");
     if (!grows && !ring.buffer) {
+        MemOwner own_mem("tessellation ring");
         if (!create_dev_buffer(ring, kRingBytes, ring_read_back, ring_read_back)) return false;
         std::lock_guard<std::mutex> lk(g_tess_lds_mu);
         g_tess_ring_address = ring.address;
@@ -16441,6 +16503,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
                 if (!oldest || r.submission < oldest->submission) oldest = &r;
             }
             region = idle;
+            MemOwner own_mem("tessellation ring");
             if (!region && unmade && create_dev_buffer(unmade->buf, kRegionBytes, ring_read_back, ring_read_back)) {
                 region = unmade;
                 std::lock_guard<std::mutex> lk(g_tess_lds_mu);
@@ -16458,6 +16521,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             // once there is room (it is free: nothing in flight reads it).
             if (region->buf.in_host && vram_return_on() && vram_room_for(kRegionBytes)) {
                 DevBuffer nb;
+                MemOwner own_mem("tessellation ring");
                 if (create_dev_buffer(nb, kRegionBytes, ring_read_back, ring_read_back) && !nb.in_host) {
                     defer_destroy(region->buf);
                     region->buf = nb;
@@ -18335,6 +18399,7 @@ static bool draw_impl(const GpuDraw& d) {
                         vkFreeMemory(g.device, k.buf.memory, nullptr);
                         k.buf = DevBuffer{};
                     }
+                    MemOwner own_mem("diagnostic readbacks");
                     if (create_dev_buffer(k.buf, bytes, true, true)) {
                         k.width = src->width;
                         k.height = src->height;
@@ -20746,6 +20811,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
     static bool have_last = false;
     if (!smalls[0].buf.buffer) {
         for (Small& sm : smalls) {
+            MemOwner own_mem("diagnostic readbacks");
             if (!create_dev_buffer(sm.buf, kSide * kSide * 4, true, true)) return;
         }
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -20766,6 +20832,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
         if (mai.memoryTypeIndex == UINT32_MAX) return;
+        MemOwner own_mem("diagnostic readbacks");
         if (vkAllocateMemory(g.device, &mai, nullptr, &small_mem) != VK_SUCCESS) return;
         vkBindImageMemory(g.device, small, small_mem, 0);
     }
@@ -21014,6 +21081,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
                     vkFreeMemory(g.device, one.buf.memory, nullptr);
                     one.buf = DevBuffer{};
                 }
+                MemOwner own_mem("diagnostic readbacks");
                 if (create_dev_buffer(one.buf, bytes, true, true)) {
                     one.width = src->width;
                     one.height = src->height;
@@ -21408,6 +21476,7 @@ bool gpu::rt_float_max_locked(RtImage& r, float* out3) {
     if (r.depth || (!half4 && r.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32)) return false;
     const std::size_t bpp = rt_bytes_per_pixel(r);
     DevBuffer staging;
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, static_cast<std::uint64_t>(r.width) * r.height * bpp, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
@@ -21453,6 +21522,7 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     out.format = r.format;
     out.depth = depth;
     out.bpp = depth ? 4 : rt_bytes_per_pixel(r);
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, static_cast<std::uint64_t>(r.width) * r.height * out.bpp, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
@@ -21473,6 +21543,7 @@ bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) 
     out.depth = false;
     out.stencil = true;
     out.bpp = 1;
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, (static_cast<std::uint64_t>(r.width) * r.height + 3) & ~3ull, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();

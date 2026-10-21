@@ -4,6 +4,7 @@
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
+#include "engine/wind_pace.h"
 #include "decomp/sfx/step_gate.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
@@ -772,6 +773,9 @@ std::atomic<bool> g_scale_by_step{false};
 // whole 1/60 s (60).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
+// The wind's step (engine/wind_pace.h): half the task step, which 0x2713d8d
+// reads in place of the frame-time slot - 30's pace at every rate.
+std::uint64_t g_wind_va = 0;
 int g_sfx_steps_a_second = 30;
 // BBHOST_SFX_SIM_FPS=N (a test mode, 30 to 1000): the effects' step schedule
 // of N frames a second whatever the frame's own time - the carry grows 1/N a
@@ -979,6 +983,19 @@ bool g_dt_unfloored = false;
 // The shortest frame each_frame believes: a guard against a zero or negative
 // measurement, not a limit (the title runs ~0.4 ms frames).
 constexpr float kShortestFrame = 1.0f / 20000.0f;
+// BBHOST_SIM_FRAME_TIME=1 (a test mode for slow devices, converted rates
+// only): each frame counts as its target's length - 1/60 at 60, 1/120 at 120,
+// the swing's (BBHOST_TEST_FPS_SWING) when it moves - instead of the time it
+// took, so a software device that runs a frame a second still steps the game
+// as at that rate: every clock of the game, the effects' schedule with them,
+// advances a target's length a frame. The game then runs slower than real
+// time; a loading screen (no target) keeps its measured time.
+const bool g_sim_frame_time = [] {
+    const char* e = std::getenv("BBHOST_SIM_FRAME_TIME");
+    const bool on = e && e[0] == '1';
+    if (on) host_log("frame rate: BBHOST_SIM_FRAME_TIME=1: each frame counts as its target's length (a test mode)");
+    return on;
+}();
 // BBHOST_BENCH_UNCAPPED=1 (with BBHOST_UNCAP=1, which completes flips at
 // once): every frame runs with no target - a measure of how fast the machine
 // can run the game's frames, not a way to play it: at 60 and 90 the steps
@@ -1114,6 +1131,7 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
     f->frame_history[idx].delayed_or_behind = f->frame_behind;
     const float frame_s = us_to_float(frame_us) / 1000000.0f;
     f->measured_frame_seconds = frame_s;
+    if (g_sim_frame_time && converted && f->target_frame_seconds > 0.0f) f->measured_frame_seconds = f->target_frame_seconds;
     // On time, unless this frame and the late ones before it overran their
     // budget (plus 1% of the target), in which case only when the allowance
     // is used up.
@@ -1404,6 +1422,7 @@ void each_frame(const SprjFlipper* f) {
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
         frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
+        if (g_wind_va) put<float>(g_wind_va, wind_pace::step_for(step));
         if (g_play_ms_va) {
             // The step in whole milliseconds, the rest carried to the next frame.
             g_play_ms_carry += static_cast<double>(step) * 1000.0;
@@ -1726,7 +1745,7 @@ int apply_rate(ElfImage* image, int want) {
         // (with the guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the cave and
         // the game's add stay).
         const std::uint64_t block = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
-        const std::uint64_t step_bn = block, sfx_bn = block + 4, play_bn = block + 8;
+        const std::uint64_t step_bn = block, sfx_bn = block + 4, play_bn = block + 8, wind_bn = block + 12;
         const std::int64_t step_disp = static_cast<std::int64_t>(step_bn) - static_cast<std::int64_t>(kStepLoad + 8);
         const std::int64_t sfx_disp = static_cast<std::int64_t>(sfx_bn) - static_cast<std::int64_t>(kSfxStepLoad + 8);
         const std::int64_t play_disp = static_cast<std::int64_t>(play_bn) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
@@ -1766,6 +1785,35 @@ int apply_rate(ElfImage* image, int want) {
                 write(kPlayTimeAdd, now, sizeof(now));
             } else {
                 host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
+            }
+            // The wind at 30's pace (engine/wind_pace.h): its step half the
+            // task step, its force weighed by the game's 1/60 as at 30.
+            // BBHOST_WIND_PACE=0 leaves both at the frame-time sites' (the
+            // frame's step and 1/30: twice 30's pace and bend).
+            static const bool wind_pace_on = [] {
+                const char* e = std::getenv("BBHOST_WIND_PACE");
+                return !(e && e[0] == '0');
+            }();
+            constexpr std::uint32_t kWindStepAt = 0x2713d8d, kWindForceAt = 0x27149ea, kWindStepConstant = 0x4d29e70;
+            std::int32_t step_to = 0, force_to = 0;
+            if (!wind_pace_on) {
+                host_log("frame rate: BBHOST_WIND_PACE=0: the wind steps by the frame's time with the force weighed by 1/30 - twice "
+                         "30's pace and bend above 30");
+            } else if (!holds(kWindStepAt, "c5fa1025736b0403") || !holds(kWindForceAt, "c57a103572196102") ||
+                       !wind_pace::rel32_to(kWindStepAt, 8, wind_bn, &step_to) ||
+                       !wind_pace::rel32_to(kWindForceAt, 8, kWindStepConstant, &force_to)) {
+                host_log("frame rate: sub_2713870's step and force loads are not the frame-time sites'; the wind keeps them");
+            } else {
+                g_wind_va = va(static_cast<std::uint32_t>(wind_bn));
+                put<float>(g_wind_va, wind_pace::step_for(1.0f / static_cast<float>(fps)));
+                std::uint8_t disp[4];
+                le(step_to, disp);
+                write(kWindStepAt + 4, disp, sizeof(disp));
+                le(force_to, disp);
+                write(kWindForceAt + 4, disp, sizeof(disp));
+                host_log("frame rate: the wind steps half the task step a frame, its force weighed by 1/60 - 30's pace and bend "
+                         "(sub_2713870's loads at 0x%x and 0x%x; BBHOST_WIND_PACE=0 for the frame's step)",
+                         kWindStepAt, kWindForceAt);
             }
             const int steps = effect_steps();
             if (steps == 0) {

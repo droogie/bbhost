@@ -44,3 +44,7 @@ void live_resolution_go_back();
 // The render size now, and a counter that moves each time a change has been
 // applied (0 before any).
 std::uint64_t live_resolution_current(unsigned* w, unsigned* h);
+
+// The display buffers' size, made at the start for the largest size a live
+// change may reach; false before it is known or without live changes.
+bool live_resolution_display_size(unsigned* w, unsigned* h);

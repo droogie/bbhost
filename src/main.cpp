@@ -1061,6 +1061,7 @@ int main(int argc, char** argv) {
     stack[1] = reinterpret_cast<std::int64_t>(eboot);
     stack[2] = 0;
 
+    host_set_headless(cfg.headless);  // the display buffers' size asks the desktop only with a window to come
     hle_patch_guest(&image);
     plugins_image(&image);  // the plugins' patches and hooks, after the host's own
     // The developers' debug menu, when the Debug Menu plugin is on: after the

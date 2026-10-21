@@ -36,7 +36,9 @@
 #include "decomp/guest.h"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "log.h"
@@ -63,12 +65,16 @@ constexpr u64 kControllerUpdate = 0x2c820f0;   // (controller, instance, step)
 constexpr u64 kPrerollContext = 0x56dbd80;     // sub_2c500e0's stand-in render context's vtable
 constexpr u64 kGxRecordUpdate = 0x2cbcf50;     // a GPU particle system's record taking an item: (record, item)
 constexpr u64 kGxType2713 = 0x56eb0d0;         // GPU particle type 0x2713's vtable: its parameters are curves read at the elapsed time
+constexpr u64 kGxType2712 = 0x56eb030;         // GPU particle type 0x2712's vtable: the grid simulation (update sub_12e6080)
+constexpr u64 kGxTypeRibbon = 0x56e3620;       // FFX-format GX type 0x28's vtable: a ribbon (update sub_2ec1e00)
+constexpr std::size_t kRibbonDefinition = 0x12c;  // what sub_2ec1e00 reads of its definition (type +8): up to +0x128's dword
 constexpr u64 kWobbleA = 0x2e89d10;            // motion 0x570e6d0's update (and the end of 0x570e690's): count +0x6c, period +0x68
 constexpr u64 kWobbleABase = 0x2e866f0;        //   its base motion, which moves by the step
 constexpr u64 kWobbleB = 0x2e8e430;            // motion 0x570e8d0's update: count +0x7c, period +0x78
 constexpr u64 kWobbleBBase = 0x2e8bfd0;        //   its base motion
 constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the lerp toward the parent, then kWobbleA
 constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
+constexpr u64 kWindSourcesStep = 0x1314660;    // the wind sources' registry (*0x58b0bb0) stepped: (registry, step)
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -80,6 +86,7 @@ using ControllerFn = GUEST_ABI u64 (*)(u64 controller, u64 instance, float step)
 using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64 local);
 using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
 using LightFadesFn = GUEST_ABI void (*)(u64 list, float step);
+using WindStepFn = GUEST_ABI void (*)(u64 registry, float step);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
@@ -88,6 +95,7 @@ void* g_game_wobble_b = nullptr;
 void* g_game_wobble_follow = nullptr;
 void* g_game_gx_record = nullptr;
 void* g_game_light_fades = nullptr;
+void* g_game_wind_step = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
@@ -98,6 +106,61 @@ std::atomic<u32> g_smooth{0};
 std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
+std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
+std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
+std::atomic<u64> g_records_2712_held{0};
+std::atomic<u32> g_hold_2712{1};  // BBHOST_SFX_2712_HOLD=0: type 0x2712's update runs on the frames between whole steps, as before
+
+// The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
+// instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
+// updates, through the game's node update) or a held instance's look the same to it. A small open table of words
+// (the frame's serial << 48 | the type), a slot of another frame free to take; wiped when the serial's 16 bits wrap.
+constexpr std::size_t kRibbonSlots = 1024;
+std::atomic<u64> g_ribbon_marks[kRibbonSlots] = {};
+std::atomic<u32> g_frame_serial{1};
+constexpr u64 kMarkType = 0xffffffffffffull;
+inline std::size_t ribbon_slot(u64 type) { return static_cast<std::size_t>(((type >> 3) * 0x9E3779B97F4A7C15ull) >> 54) & (kRibbonSlots - 1); }
+inline u64 ribbon_frame() { return static_cast<u64>(g_frame_serial.load(std::memory_order_relaxed) & 0xffffu) << 48; }
+bool ribbon_mark(u64 type) {
+    const u64 now = ribbon_frame(), want = now | (type & kMarkType);
+    std::size_t h = ribbon_slot(type);
+    for (int k = 0; k < 16; ++k, h = (h + 1) & (kRibbonSlots - 1)) {
+        u64 w = g_ribbon_marks[h].load(std::memory_order_relaxed);
+        while ((w & ~kMarkType) != now)
+            if (g_ribbon_marks[h].compare_exchange_weak(w, want, std::memory_order_release, std::memory_order_relaxed)) return true;
+        if (w == want) return true;
+    }
+    return false;
+}
+bool ribbon_marked(u64 type) {
+    const u64 now = ribbon_frame(), want = now | (type & kMarkType);
+    std::size_t h = ribbon_slot(type);
+    for (int k = 0; k < 16; ++k, h = (h + 1) & (kRibbonSlots - 1)) {
+        const u64 w = g_ribbon_marks[h].load(std::memory_order_acquire);
+        if (w == want) return true;
+        if ((w & ~kMarkType) != now) return false;
+    }
+    return false;
+}
+
+// The game's vaddss x, x, y: the record's time plus an item's step, as sub_2cbcf50 adds them; and vsubss, its
+// elapsed time.
+inline float add_ss(float x, float y) {
+    __asm__("addss %1, %0" : "+x"(x) : "x"(y));
+    return x;
+}
+inline float sub_ss(float x, float y) {
+    __asm__("subss %1, %0" : "+x"(x) : "x"(y));
+    return x;
+}
+// The next float up (or down) from a finite x, by its bits (no libm: nextafter may set errno, the host's TLS).
+inline float ulp_toward(float x, bool up) {
+    u32 b = std::bit_cast<u32>(x);
+    if ((b & 0x7fffffffu) == 0) return std::bit_cast<float>(up ? 1u : 0x80000001u);
+    const bool positive = !(b & 0x80000000u);
+    b = positive == up ? b + 1 : b - 1;
+    return std::bit_cast<float>(b);
+}
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
 inline bool held() {
@@ -165,21 +228,35 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // The converted classes' vtables, by Binary Ninja address: the classes whose
 // updates do with their step only what time does, each read in Binary Ninja -
 // the motions, the modules, the binders, the StandardParticle and Spark
-// simulations, the FFX-format GX types and the wind source 0x283c also held to
-// the game's own code by tests/decomp/sfx_classes_test.cpp (one whole step
-// against the frame domain's frames) - and the FFX light, whose one counted
-// part sfx_light_update runs once a whole step
+// simulations, the FFX-format GX types and the wind sources 0x283c and 0x283d
+// also held to the game's own code by tests/decomp/sfx_classes_test.cpp (one
+// whole step against the frame domain's frames) - and the FFX light, whose one
+// counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
-// frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
-// (they count their updates), the module 0x5760f20, the GPU particle types
-// 0x2712 (0x56eb030: whole grid passes of elapsed x 30), 0x2713 (0x56eb0d0:
-// its parameters are curves read at the elapsed time) and 0x283d (0x56eac40),
-// and the FFX-format GX type 0x28 (0x56e3620: a ribbon, its points added an
-// update with a draw of the FX RNG).
+// frames as with 30: the module 0x5760f20 and the GPU particle type 0x2712
+// (0x56eb030: whole grid passes of elapsed x 30). The wobbles are on it: their
+// counts and re-rolls held between whole steps by sfx_wobble_a, sfx_wobble_b and
+// sfx_wobble_follow, their base motions (0x570e5d0's, 0x570e7d0's) and the
+// follows by the frame's own time - 0x570e890's follow is the game's own, its
+// call of sub_2e8e430 at its end reaching sfx_wobble_b. The ribbon, FFX-format
+// GX type 0x28, and the GPU particle type 0x2713 (its parameters curves read at
+// the elapsed time) are on it for sfx_gx_record_update, which inserts the
+// ribbon's points once a whole step at the whole step's time and gives 0x2713's
+// curves the whole step's elapsed time (tests/decomp/sfx_step_gate_test.cpp).
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
+    0x570e610,  // motion: the same with gravity (data_5ad1150 x a curve at the node's time, in the parent's frame) by step
+    0x570e5d0,  // motion: the same with the effects' wind world's force by step, and its drift added to the move
+    0x570e6d0,  // motion: 0x570e5d0's, then a count and a re-roll every +0x68 calls - held between whole steps (sfx_wobble_a)
+    0x570e690,  // motion: a share of the parent's move, then 0x570e6d0's - its count held between whole steps (sfx_wobble_follow)
+    0x570e850,  // motion: the velocity plus the speed curve x a direction, the position by step x that, facing the move
+    0x570e810,  // motion: the same with gravity (a curve at the node's time) by step, in the parent's frame
+    0x570e7d0,  // motion: the same with the wind world's force by step and its drift added to the move
+    0x570e8d0,  // motion: 0x570e7d0's, then a count and a re-roll of the direction every +0x78 calls - held between whole steps (sfx_wobble_b)
+    0x570e890,  // motion: a share of the parent's move (the direction turned with it), then 0x570e8d0's (its call of sub_2e8e430 ours)
     0x570e790,  // motion: turned by step x its rates (or three curves)
     0x570e710,  // motion: a transform; never reads its step
+    0x570e910,  // motion: its position a curve's value at the node's time; never reads its step
     0x56eb2e0,  // module: the children follow; never reads the parameters the step is in
     0x5756e50,  // module (Sprj): its model advanced by step x +0xc4
     0x56e3090,  // binder: CPU particles; time += step, ended by it, the item's count born at it
@@ -196,6 +273,9 @@ constexpr u64 kConverted[] = {
     0x56e3580,  // GX type 0x2b (FFX format): +0x20, or +0x18 and +0x1c, += the elapsed time x rates at the scaled time
     0x56ebe20,  // GX type 3 / 0x3d (FFX format): +0x18 and +0x1c += the elapsed time x rates; a root definition's value
     0x56eadf0,  // GX type 0x283c: a wind source; its fade += the elapsed time, its velocity the move over it (0 for none)
+    0x56eac40,  // GX type 0x283d: a wind source without the velocity; its fade += the elapsed time
+    0x56e3620,  // GX type 0x28 (FFX format): a ribbon; its inserts once a whole step at its time (sfx_gx_record_update)
+    0x56eb0d0,  // GPU particle type 0x2713: its curves read at the whole step's elapsed time (sfx_gx_record_update)
 };
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
@@ -266,6 +346,21 @@ u64 first_unconverted(u64 instance) {
     return 0;
 }
 
+// The instance's ribbons and GPU particle types 0x2713 marked for this frame (ribbon_mark); false when one finds no slot.
+bool mark_ribbons(u64 instance) {
+    const auto next_of = game_function<NextFn>(kNodeNext);
+    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node))
+        for (u64 item = load<u64>(node + 0x80 + 0x30); item; item = load<u64>(item + 0x18)) {
+            const u64 target = load<u64>(item + 0x20);
+            if (!target || load<u64>(target) != game_address(0x56e3100)) continue;
+            const u64 holder = load<u64>(target + 0x10);
+            const u64 type = holder ? load<u64>(holder + 8) : 0;
+            if (type && (load<u64>(type) == game_address(kGxTypeRibbon) || load<u64>(type) == game_address(kGxType2713)) && !ribbon_mark(type))
+                return false;
+        }
+    return true;
+}
+
 u8 smooth_update(u64 instance, u64 context, float step) {
     g_smooth_updates.fetch_add(1, std::memory_order_relaxed);
     const bool tick = !g_between.load(std::memory_order_relaxed) || MUTANT(20);
@@ -318,6 +413,9 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
             if (const u64 kept = first_unconverted(instance)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(kept);
+            } else if (!mark_ribbons(instance)) {
+                g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
+                count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon (or a 0x2713) this frame: held, as at 30
             } else {
                 return smooth_update(instance, context, step);
             }
@@ -431,6 +529,38 @@ DECOMP_LEAF void sfx_light_fades(u64 list, float step) {
     game(list, s);
 }
 
+// sub_1314660(the wind sources' registry *0x58b0bb0, step): every registered
+// wind source - the map's wind areas (WindIns, sub_210ec40) and the effects'
+// wind types 0x283c / 0x283d alike, class 0x56ec140 - stepped through its
+// vtable +0x58, sub_2d552d0: its last step (+0x38), its age (+0x1f4 += step)
+// and its gust phase (+0x1b4 += step x its rate +0x1a8 x 10), nothing counted
+// (an entry's default object, 0x56ebf70, steps nothing). The effect manager's
+// update (0x26ff3ee) hands it the effects' step times its time scale (+0x5d8),
+// so above 30 the gusts moved in whole 1/30 s, held between. The smooth steps
+// give it the frame's own time on the same scale instead: the same seconds of
+// gusts, a change each frame. Only the manager's call (its step: the whole
+// step's, or none, on its scale) is taken; another caller's, and the game's own
+// still frame (SprjSfx+0x8c), are the game's.
+DECOMP_LEAF void sfx_wind_sources_step(u64 registry, float step) {
+    const auto game = reinterpret_cast<WindStepFn>(g_game_wind_step);
+    float s = step;
+    if (g_smooth.load(std::memory_order_relaxed) && !MUTANT(38)) {
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+        if (manager && !load<u32>(sfx + 0x8c)) {
+            const float time_scale = load<float>(manager + 0x5d8);
+            const float whole = g_step_between.load(std::memory_order_relaxed) ? 0.0f : 1.0f / 30.0f;
+            if (std::bit_cast<u32>(whole * time_scale) == std::bit_cast<u32>(step)) {
+                g_wind_steps_smooth.fetch_add(1, std::memory_order_relaxed);
+                s = g_frame_step.load(std::memory_order_relaxed) * (MUTANT(39) ? 1.0f : time_scale);
+            } else {
+                g_wind_steps_other.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    game(registry, s);
+}
+
 // The wobble motions. Motion classes 0x570e6d0 and 0x570e690 (whose update,
 // sub_2e896f0, ends in the first's, sub_2e89d10) and 0x570e8d0 (sub_2e8e430)
 // run their base motion and then count their calls - +0x6c against the
@@ -455,17 +585,36 @@ DECOMP_LEAF void sfx_wobble_a(u64 motion, u64 node, const float* step, u64 local
 }
 
 DECOMP_LEAF void sfx_wobble_b(u64 motion, u64 node, const float* step, u64 local) {
-    if (!held()) {
+    if (!held() || MUTANT(44)) {
         reinterpret_cast<MotionFn>(g_game_wobble_b)(motion, node, step, local);
         return;
     }
     g_motions_held.fetch_add(1, std::memory_order_relaxed);
     game_function<MotionFn>(kWobbleBBase)(motion, node, step, local);
+    if (MUTANT(45)) store<u32>(motion + 0x7c, load<u32>(motion + 0x7c) + 1);  // counted anyway
 }
 
+// With the smooth steps, a smooth instance's container call (sfx_node::smooth_call
+// names its node) between whole steps runs sub_2e896f0 itself: its follow takes
+// a share (a curve at the node's time, or +0xb0) of the parent's move since the
+// last call (the parent's rows it keeps at +0x70..+0x9f) - a share of each
+// frame's move adds up to that share of the whole step's - and its base motion
+// moves by the frame's step; its count and re-roll wait for the whole step, the
+// period +0x68 held at its largest for the call and the count +0x6c put back
+// (the wobble's own update, sub_2e89d10, is ours and holds them anyway).
 DECOMP_LEAF void sfx_wobble_follow(u64 motion, u64 node, const float* step, u64 local) {
+    const auto game = reinterpret_cast<MotionFn>(g_game_wobble_follow);
     if (!held() || MUTANT(11)) {
-        reinterpret_cast<MotionFn>(g_game_wobble_follow)(motion, node, step, local);
+        game(motion, node, step, local);
+        return;
+    }
+    if (sfx_node::smooth_call().node == node && !MUTANT(42)) {
+        g_motions_smooth.fetch_add(1, std::memory_order_relaxed);
+        const u32 count = load<u32>(motion + 0x6c), period = load<u32>(motion + 0x68);
+        store<u32>(motion + 0x68, 0xffffffffu);
+        game(motion, node, step, local);
+        store<u32>(motion + 0x68, period);
+        if (!MUTANT(43)) store<u32>(motion + 0x6c, count);
         return;
     }
     g_motions_held.fetch_add(1, std::memory_order_relaxed);
@@ -489,9 +638,191 @@ DECOMP_LEAF void sfx_wobble_follow(u64 motion, u64 node, const float* step, u64 
 // the game's call runs as it is - the matrix, the bounds, every other field -
 // and both are put back, so the type's update and its draw read the last whole
 // step's elapsed time and values, as on every frame at 30.
+// The ribbon, FFX-format GX type 0x28 (0x56e3620; update sub_2ec1e00, read in
+// Binary Ninja), under the smooth steps. Its type keeps a history of points:
+// times +0x88, places +0x90 / +0x98 / +0xa0, lengths +0xa8 and two optional
+// arrays, +0x7c of them kept, room for +0x78. Each update, at its record's time
+// (+0x28) alone - it never reads the elapsed time:
+//   - points whose time plus the definition's life (+0x8c) has passed go, and
+//     the oldest go to make room for the update's new ones;
+//   - the points from the last kept one to the emitter (the record's matrix)
+//     are made again: a spline between the last two inserted places and a line
+//     from the last to the emitter, plus an extrapolated one - drawn, not kept
+//     (+0x80 of them);
+//   - when more than the definition's interval (+0x88) has passed since the
+//     last insert (+0x1c), the spline's points are kept, the place history
+//     shifts, and one draw of the FX RNG sets the next point's scalar (+0x4c):
+//     the insert, counted - at most one an update;
+//   - with smoothing (+0x98 above 0), every kept point moves that share toward
+//     the next one - counted too, once an update.
+// So at 30 a ribbon inserts at most 30 times a second, and its spacing, its
+// draws and its smoothing follow its updates; with the frame's own time on
+// every frame it would insert and smooth up to once a frame (four times at
+// 120, overflowing room the set-up sized for 60 inserts a second). The smooth
+// steps' frame domain therefore runs it:
+//   - between whole steps, the game's call with a copy of its definition in
+//     the type's +8 whose interval is +inf and smoothing 0, put back after: no
+//     insert, draw or smoothing, and the drawn points made again to the
+//     emitter at the frame's own time - the ribbon's head moves every frame;
+//   - on a frame with a whole step, the game's call as it is, at the whole
+//     step's time and place: a smooth instance's item carries the frame's
+//     step, which ends `into` (the frame's carry past the step, scaled) after
+//     it, so the call gets the step less that, and the emitter's matrix that
+//     far between the last frame's (the record's) and this one's - the
+//     inserts, draws and smoothing of 30, at 30's times - then a second, as
+//     between whole steps, by `into` with this frame's matrix, so the drawn
+//     points end at the emitter at the frame's own time; the record's times
+//     are left as the game's one call leaves them.
+// A held instance's item between whole steps carries no step, and on a frame
+// with one the whole step's (as does a frame of 1/30 s itself): the game's.
+// The record update runs after the instance's (the render context queues its
+// items), so what the frame is comes from the frame's own numbers.
+namespace {
+
+inline void ribbon_held_call(GxRecordFn game, u64 record, u64 item, u64 type) {
+    const u64 def = load<u64>(type + 8);
+    alignas(16) u8 copy[0x130];
+    std::memcpy(copy, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(def)), kRibbonDefinition);
+    const u64 at = reinterpret_cast<u64>(copy);
+    if (!MUTANT(29)) store<u32>(at + 0x88, 0x7f800000u);  // +inf: no insert
+    if (!MUTANT(29) && !MUTANT(30)) store<u32>(at + 0x98, 0u);  // no smoothing
+    store<u64>(type + 8, at);
+    game(record, item);
+    if (load<u64>(type + 8) == at && !MUTANT(34)) store<u64>(type + 8, def);
+}
+
+// Whether a ribbon's record update is a smooth instance's, and how: 0 the game's, 1 between whole steps, 2 a frame with
+// a whole step whose item ends `into` past it.
+inline int ribbon_mode(u64 record, u64 item, u64 type, float& into) {
+    if (!g_smooth.load(std::memory_order_relaxed)) return 0;
+    if (!ribbon_marked(type) && !MUTANT(37)) {  // not a smooth instance's this frame: a pre-roll's, a held one's
+        g_ribbons_unmarked.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const u64 sfx = load<u64>(game_address(kSprjSfx));
+    if (sfx && load<u32>(sfx + 0x8c)) return 0;  // the game's own still frame
+    const float step = load<float>(item + 0x60);
+    if (!(step > 0.0f)) return 0;  // a held instance between whole steps, or the manager still
+    if (g_step_between.load(std::memory_order_relaxed)) return 1;
+    // A frame with a whole step: a smooth instance's step is the frame's (the node update's (frame x time scale) x
+    // scale); a held one's the whole step's. A frame of 1/30 s, where the two are one, is the game's.
+    const float frame = g_frame_step.load(std::memory_order_relaxed);
+    if (!(frame < 1.0f / 30.0f)) return 0;
+    const u64 node = load<u64>(record + 0x10);
+    const u64 instance = node ? load<u64>(node + 0x58) : 0;
+    const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+    if (!instance || !manager || load<u8>(manager + 0x5ce)) return 0;
+    const float time_scale = load<float>(manager + 0x5d8), scale = load<float>(instance + 8);
+    if (std::bit_cast<u32>(frame * time_scale * scale) != std::bit_cast<u32>(step)) return 0;
+    into = g_frame_into.load(std::memory_order_relaxed) * time_scale * scale;
+    return 2;
+}
+
+// GPU particle type 0x2712's update (sub_12e6080, read in Binary Ninja) counts in its updates: at the start of
+// each it checks its emission timer +0x528 (run out: an interval drawn from the FX RNG at data_5940de8 +0x30, the
+// emission flag +0x2f4 set, else cleared), it draws six more FX RNG values for its emitter's jitter (+0x2e4..+0x2ec,
+// +0x308..+0x310 and its grid's +0x138 object's +0x24c / +0x270), moves its grid to the emitter (+0x20: sub_132e6f0,
+// sub_132e620) and at the end takes the record's elapsed time off the timer. Its grid pass (vtable +0x18, sub_12e6e10
+// -> sub_132e860 -> sub_1330e40, which reads the flag) runs only when that elapsed time is above 0. On a frame between
+// whole steps the item's step is 0: the timer that ran out on the whole step fired there, the pass did not run, and
+// the next whole step cleared the flag - at 60 fps and above none of its emissions reached the grid, at 45 about half,
+// and the FX RNG was drawn on every frame. So on such a frame the record takes its item - its rows, its times (the
+// elapsed time 0, so no pass) and its bounds - with a stand-in for the type whose update is only that update's
+// result: the bounds sub_12e6080 always gives, data_4b38150's w lane choosing data_4b38020's 1 over data_4b38140's
+// -FLT_MAX and data_4b38130's FLT_MAX. The type itself waits for the whole step, as at 30.
+DECOMP_LEAF void sfx_2712_bounds(u64 out, u64, u64, u64) {
+    for (u64 lane = 0; lane < 4; ++lane) {
+        const u32 w = load<u32>(game_address(0x4b38150) + 4 * lane), one = load<u32>(game_address(0x4b38020) + 4 * lane);
+        const u32 lo = load<u32>(game_address(0x4b38140) + 4 * lane), hi = load<u32>(game_address(0x4b38130) + 4 * lane);
+        store<u32>(out + 4 * lane, (w & one) | (~w & lo));
+        store<u32>(out + 0x10 + 4 * lane, MUTANT(48) ? 0u : (w & one) | (~w & hi));
+    }
+}
+alignas(16) u64 g_type_2712_vtable[8];
+alignas(16) u64 g_type_2712_stand_in[2];
+
+}  // namespace
+
 DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
     const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
     const u64 type = load<u64>(record + 8);
+    if (type && load<u64>(type) == game_address(kGxType2712) && g_hold_2712.load(std::memory_order_relaxed) && !MUTANT(46) &&
+        load<float>(item + 0x60) == 0.0f && between_steps()) {
+        g_records_2712_held.fetch_add(1, std::memory_order_relaxed);
+        g_type_2712_vtable[2] = reinterpret_cast<u64>(&sfx_2712_bounds);  // vtable +0x10, the update
+        g_type_2712_stand_in[0] = reinterpret_cast<u64>(g_type_2712_vtable);
+        store<u64>(record + 8, reinterpret_cast<u64>(g_type_2712_stand_in));
+        game(record, item);
+        if (!MUTANT(47)) store<u64>(record + 8, type);
+        return;
+    }
+    if (type && load<u64>(type) == game_address(kGxTypeRibbon)) {
+        float into = 0.0f;
+        const int mode = ribbon_mode(record, item, type, into);
+        if (mode == 1) {
+            g_ribbons_between.fetch_add(1, std::memory_order_relaxed);
+            ribbon_held_call(game, record, item, type);
+            return;
+        }
+        if (mode == 2) {
+            g_ribbons_whole.fetch_add(1, std::memory_order_relaxed);
+            const float step = load<float>(item + 0x60);
+            if (!(into > 0.0f) || !(into < step) || MUTANT(31)) {
+                game(record, item);  // the frame ends on the whole step (or a mutant's: the inserts at the frame's time)
+                return;
+            }
+            const u32 before = load<u32>(record + 0x28);
+            // the whole step's time, and its place: the matrix rows (the place in their w lanes) as far between the last
+            // frame's, which the record holds, and this frame's as the step is into the frame
+            const float share = (step - into) / step;
+            float rows[12];
+            std::memcpy(rows, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(item)), sizeof rows);
+            if (!MUTANT(35))
+                for (int i = 0; i < 12; ++i) {
+                    const float last = load<float>(record + 0x50 + 4 * static_cast<u64>(i));
+                    store<float>(item + 4 * static_cast<u64>(i), last + (rows[i] - last) * share);
+                }
+            store<float>(item + 0x60, step - into);
+            game(record, item);
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(item)), rows, sizeof rows);
+            if (!MUTANT(32)) {
+                store<float>(item + 0x60, into);  // and on to the frame's time and place: the drawn points, nothing counted
+                ribbon_held_call(game, record, item, type);
+            }
+            if (!MUTANT(33)) {
+                store<u32>(record + 0x24, before);
+                store<float>(record + 0x28, add_ss(std::bit_cast<float>(before), step));
+            }
+            store<float>(item + 0x60, step);
+            return;
+        }
+    }
+    if (type && load<u64>(type) == game_address(kGxType2713) && g_smooth.load(std::memory_order_relaxed) && ribbon_marked(type)) {
+        // A smooth instance's GPU particle type 0x2713 (marked by its instance's update this frame): its update reads its
+        // five curves at the record's elapsed time, as does its draw - the whole step's at 30. The game's call with the
+        // whole step (1/30 on the manager's and the instance's scales) for the type's update, then the record's times as
+        // the frame's step leaves them, the previous one where the draw reads the same elapsed time again.
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+        const u64 node = load<u64>(record + 0x10);
+        const u64 instance = node ? load<u64>(node + 0x58) : 0;
+        const float step = load<float>(item + 0x60);
+        if (manager && instance && !load<u32>(sfx + 0x8c) && step > 0.0f) {
+            g_records_whole.fetch_add(1, std::memory_order_relaxed);
+            const float whole = 1.0f / 30.0f * load<float>(manager + 0x5d8) * load<float>(instance + 8);
+            const float before = load<float>(record + 0x28);
+            if (!MUTANT(40)) store<float>(item + 0x60, whole);
+            game(record, item);
+            store<float>(item + 0x60, step);
+            if (MUTANT(40)) return;
+            const float elapsed = sub_ss(load<float>(record + 0x28), before), cur = add_ss(before, step);
+            float prev = sub_ss(cur, elapsed);
+            for (int k = 0; k < 8 && sub_ss(cur, prev) != elapsed; ++k) prev = ulp_toward(prev, sub_ss(cur, prev) > elapsed);
+            store<float>(record + 0x24, MUTANT(41) ? before : prev);
+            store<float>(record + 0x28, cur);
+            return;
+        }
+    }
     const bool is_2713 = type && (load<u64>(type) == game_address(kGxType2713) || MUTANT(15));
     if (!is_2713 || (load<float>(item + 0x60) != 0.0f && !MUTANT(16)) || (load<u32>(record + 0x24) == load<u32>(record + 0x28) && !MUTANT(17)) ||
         !between_steps()) {
@@ -519,6 +850,14 @@ void decomp_sfx_gate_frame(bool between) {
 void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
 
 void decomp_sfx_frame_time(float frame, float from, float into) {
+    // a new frame for the ribbons' marks: the serial's 16 bits wrapping, the table wiped (between frames: no effect
+    // update runs now) and 0 skipped
+    u32 serial = g_frame_serial.load(std::memory_order_relaxed) + 1;
+    if (!(serial & 0xffffu)) {
+        for (auto& m : g_ribbon_marks) m.store(0, std::memory_order_relaxed);
+        ++serial;
+    }
+    g_frame_serial.store(serial, std::memory_order_relaxed);
     g_frame_step.store(frame, std::memory_order_relaxed);
     g_frame_from.store(from, std::memory_order_relaxed);
     g_frame_into.store(into, std::memory_order_relaxed);
@@ -540,19 +879,30 @@ constexpr std::uint8_t kFollowEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x4
 constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x68};
 // The light fades' (sub rsp, 0x18).
 constexpr std::uint8_t kLightFadesEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+// The wind sources' step: push rbp; mov rbp, rsp; push r14, rbx; sub rsp, 0x10; vmovss [rbp-0x14], xmm0.
+constexpr std::uint8_t kWindStepEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x10, 0xc5, 0xfa, 0x11, 0x45, 0xec};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
     host_log("decomp: the effects' frames between whole steps: %llu frames; %llu instance updates, %llu light updates and %llu wobble "
-             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time; %llu calls on the game's own still frame left to it",
+             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time, %llu GPU type 0x2712 updates held for the "
+             "whole step (BBHOST_SFX_2712_HOLD=%u); %llu calls on the game's own still frame left to it",
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
-             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_still_frames.load()));
+             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_records_2712_held.load()),
+             g_hold_2712.load(), static_cast<ull>(g_still_frames.load()));
     if (!g_smooth.load()) return;
     host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
              "list (%zu classes on it)",
              static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
     host_log("decomp:   FFX light updates by the frame's time: %llu, %llu of them after the whole step's own; light fades by the frame's time: %llu",
              static_cast<ull>(g_lights_smooth.load()), static_cast<ull>(g_lights_counted.load()), static_cast<ull>(g_fades_smooth.load()));
+    host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
+             "%llu not a smooth instance's (a pre-roll's or a held one's: the game's)",
+             static_cast<ull>(g_ribbons_between.load()), static_cast<ull>(g_ribbons_whole.load()), static_cast<ull>(g_ribbons_unmarked.load()));
+    host_log("decomp:   wind source steps by the frame's time: %llu (%llu another caller's, the game's); GPU particle type 0x2713 records at "
+             "the whole step's elapsed time: %llu; following wobble motions between whole steps by the frame's time: %llu",
+             static_cast<ull>(g_wind_steps_smooth.load()), static_cast<ull>(g_wind_steps_other.load()), static_cast<ull>(g_records_whole.load()),
+             static_cast<ull>(g_motions_smooth.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
@@ -566,6 +916,10 @@ void report() {
 
 void decomp_sfx_step_gate_add() {
     const char* area = "sfx";
+    if (const char* e = std::getenv("BBHOST_SFX_2712_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_2712.store(e[0] == '1' ? 1u : 0u);
+    if (!g_hold_2712.load())
+        host_log("decomp: GPU type 0x2712's update runs on the frames between whole effect steps, as before (BBHOST_SFX_2712_HOLD=0): "
+                 "its emissions there never reach its grid");
     DecompFunction instance{"sub_2c4ff30", area, 0x2c4ff30, kInstanceEntry, sizeof(kInstanceEntry),
                             reinterpret_cast<void*>(&sfx_instance_update), DecompKind::Leaf, &g_game_instance};
     instance.report = &report;
@@ -582,4 +936,6 @@ void decomp_sfx_step_gate_add() {
                 DecompKind::Leaf, &g_game_gx_record});
     decomp_add({"sub_12e5500", area, kLightFades, kLightFadesEntry, sizeof(kLightFadesEntry), reinterpret_cast<void*>(&sfx_light_fades),
                 DecompKind::Leaf, &g_game_light_fades});
+    decomp_add({"sub_1314660", area, kWindSourcesStep, kWindStepEntry, sizeof(kWindStepEntry), reinterpret_cast<void*>(&sfx_wind_sources_step),
+                DecompKind::Leaf, &g_game_wind_step});
 }

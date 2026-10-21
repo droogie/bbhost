@@ -353,12 +353,16 @@ private:
     // lane of GCN's wave, every buffer reached through the page table as the
     // reference reaches it (lift_compute_shader).
     bool compute() const { return opt.stage == Stage::Compute && opt.tess_role == TranslateOptions::TessRole::None; }
-    // gcn::set_oob_count: a vertex or pixel stage whose reference counts
-    // counts as it does (its typed loads by index; a graphics lift walks
-    // nothing), through the same counters (TranslateResult::oob_slot).
+    // gcn::set_oob_count: a vertex, pixel or compute stage whose reference
+    // counts counts as it does - its typed loads by index, a compute shader's
+    // walks by index, its image loads and stores at integer coordinates (a
+    // graphics lift walks nothing) - through the same counters
+    // (TranslateResult::oob_slot).
     bool oob_counting() const {
-        return oob_count() && !compute() && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) &&
-               opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None && ref.oob_slot < kOobSlots;
+        return oob_count() &&
+               (compute() || ((opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) && opt.tess_role == TranslateOptions::TessRole::None &&
+                              opt.gs_role == TranslateOptions::GsRole::None)) &&
+               ref.oob_slot < kOobSlots;
     }
     Id oob_base64 = 0;  // the counters' device address (StageParams::lds_address), at the entry
     // Threads in the dispatch's workgroup, and whether GCN's waves of it are
@@ -2796,7 +2800,18 @@ private:
         const Id stride = ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w1, cu(16)), cu(0x3fff));
         Id off = ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in)));
         int va = in.vaddr;
-        if (in.idxen) off = ibin(spv::OpIAdd, off, ibin(spv::OpIMul, as_u(value(256 + va++)), stride));
+        if (in.idxen) {
+            const Id index = as_u(value(256 + va++));
+            off = ibin(spv::OpIAdd, off, ibin(spv::OpIMul, index, stride));
+            if (oob_base64) {
+                // gcn::set_oob_count, as the reference's buffer_address: a walk
+                // by index at or past num_records (its stride not 0).
+                const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+                const Id inside = m.emit(spv::OpULessThan, t_bool, {index, records});
+                oob_note(m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpINotEqual, t_bool, {stride, cu(0)}), m.emit(spv::OpLogicalNot, t_bool, {inside})}),
+                         kOobWalkPastRecords);
+            }
+        }
         if (in.offen) off = ibin(spv::OpIAdd, off, as_u(value(256 + va)));
         g.addr = addr_add(base, off);
         return g;
@@ -3091,7 +3106,28 @@ private:
         for (const Id r : raws) vals.push_back(b.kind == 1 ? r : b.kind == 2 ? to_i(r) : as_f(word(r)));
         const Id texel = m.emit(spv::OpCompositeConstruct, b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f, vals);
         if (!res.rejections.empty()) return;
-        where_exec(exec_lane(), [&] { m.emit_void(spv::OpImageWrite, {image_only(ii->second), coord, texel}); });
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 9 ? to_i(as_u(value(256 + in.vaddr + ncoord))) : 0, true, in);  // gcn::set_oob_count
+        // gcn::set_image_store_bounds, as the reference: the lanes outside the
+        // view's size and layers skip the store, as GCN writes nothing there.
+        Id inside = 0;
+        if (image_store_bounds()) {
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : m.type_vector(t_i32, 4),
+                                   {image_only(ii->second)});
+            for (int k = 0; k < ncoord; ++k) {
+                const Id dim_k = from_i(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+                const Id ok = m.emit(spv::OpULessThan, t_bool, {from_i(coords[static_cast<std::size_t>(k)]), dim_k});
+                inside = inside ? m.emit(spv::OpLogicalAnd, t_bool, {inside, ok}) : ok;
+            }
+        }
+        where_exec(exec_lane(), [&] {
+            const auto write = [&] { m.emit_void(spv::OpImageWrite, {image_only(ii->second), coord, texel}); };
+            if (inside) {
+                where_true(inside, write);
+            } else {
+                write();
+            }
+        });
         ++image_stores;
         note += " stored";
     }
@@ -3301,7 +3337,7 @@ private:
             // num_records, and a read past the binding.
             const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
             const Id limit = oob_control() ? shift(spv::OpShiftRightLogical, records, cu(1)) : records;  // gcn::set_oob_control
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), kOobPastRecords);
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), vindex), kOobPastRecords);
             int total_bits = 0;
             for (int k = 0; k < count; ++k) total_bits += bits[k];
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
@@ -4143,6 +4179,7 @@ private:
             ops.push_back(spv::IoLod);
             ops.push_back(to_i(as_u(vgpr(in.vaddr + ncoord))));
         }
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 1 ? ops.back() : 0, false, in);  // gcn::set_oob_count
         const Id texel_type = b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f;
         Id texel = m.emit(spv::OpImageFetch, texel_type, ops);
         if (b.kind) texel = m.emit(spv::OpBitcast, t_v4f, {texel});
@@ -4613,6 +4650,102 @@ private:
             m.emit_void(spv::OpBranch, {l_merge});
             cur_label = m.label(l_merge);
         });
+    }
+    // gcn::set_oob_control, as the reference's oob_sampled: of the accesses past
+    // a halved limit, those whose `key` hashes to 0 in its top eight bits.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        const Id h = shift(spv::OpShiftRightLogical, ibin(spv::OpIMul, key, cu(0x9e3779b1u)), cu(24));
+        return m.emit(spv::OpLogicalAnd, t_bool, {cond, ieq(h, cu(0))});
+    }
+    // gcn::set_oob_count, as the reference's oob_image: an image access at
+    // integer coordinates (`coords`, signed, the layer last where `b` is
+    // arrayed) against the view bound for the reference's image `ii` - a load
+    // at `level` (0 for none) or a store (`level` the image_store_mip's) - and
+    // that view against the T# in.srsrc names.
+    void oob_image(std::uint32_t ii, const ImageBinding& b, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
+        if (!oob_base64 || coords.empty()) return;
+        m.capability(spv::CapImageQuery);
+        const Id image = image_only(ii);
+        const std::size_t n = coords.size();
+        const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : m.type_vector(t_i32, 4);
+        const auto limit = [&](Id v) { return oob_control() ? shift(spv::OpShiftRightLogical, v, cu(1)) : v; };
+        const auto below = [&](Id v, Id lim) { return m.emit(spv::OpULessThan, t_bool, {v, lim}); };
+        const Id key = from_i(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {below(v, limit(lim))}), key); };
+        Id size, level_in = 0;
+        if (store) {
+            size = m.emit(spv::OpImageQuerySize, size_type, {image});
+            if (level) oob_note(m.emit(spv::OpINotEqual, t_bool, {from_i(level), cu(0)}), kOobImageStoreLevel);
+        } else {
+            Id at = cu(0);
+            if (level) {
+                const Id levels = from_i(m.emit(spv::OpImageQueryLevels, t_i32, {image}));
+                level_in = below(from_i(level), levels);
+                oob_note(past(from_i(level), levels), kOobImageLoadLevel);
+                at = m.emit(spv::OpSelect, t_u32, {level_in, from_i(level), cu(0)});
+            }
+            size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, to_i(at)});
+        }
+        const std::size_t axes = b.arrayed ? n - 1 : n;
+        Id outside = 0;
+        for (std::size_t k = 0; k < axes; ++k) {
+            const Id s = from_i(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            const Id bad = past(from_i(coords[k]), s);
+            outside = outside ? m.emit(spv::OpLogicalOr, t_bool, {outside, bad}) : bad;
+        }
+        if (outside) {
+            oob_note(level_in ? m.emit(spv::OpLogicalAnd, t_bool, {outside, level_in}) : outside, store ? kOobImageStoreSize : kOobImageLoadSize);
+        }
+        if (b.arrayed) {
+            const Id layers = from_i(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
+            oob_note(past(from_i(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image, as the reference reads it: the T#'s size at
+        // BASE_LEVEL plus the level read.
+        const Id w2 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in)), w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+        Id rel = cu(0);
+        if (level && !store) rel = m.emit(spv::OpSelect, t_u32, {level_in, from_i(level), cu(0)});
+        const Id at_level = ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shift(spv::OpShiftRightLogical, full, at_level);
+            return m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {v, cu(0)}), v, cu(1)});
+        };
+        std::vector<Id> tsize = {shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w2, cu(0x3fff)), cu(1))),
+                                 shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w2, cu(14)), cu(0x3fff)), cu(1)))};
+        if (b.dim == spv::Dim3D && !b.r128) {
+            const Id w4 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 4), in));
+            tsize.push_back(shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w4, cu(0x1fff)), cu(1))));
+        }
+        const std::size_t taxes = std::min<std::size_t>(b.dim == spv::Dim1D ? 1 : b.dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = from_i(coords[k]);
+            const Id t = below(c, limit(tsize[k]));
+            const Id v = below(c, from_i(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? m.emit(spv::OpLogicalAnd, t_bool, {in_t, t}) : t;
+            in_v = in_v ? m.emit(spv::OpLogicalAnd, t_bool, {in_v, v}) : v;
+        }
+        if (in_t) {
+            Id smaller = m.emit(spv::OpLogicalAnd, t_bool, {in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})});
+            Id larger = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v});
+            if (level_in) {
+                smaller = m.emit(spv::OpLogicalAnd, t_bool, {smaller, level_in});
+                larger = m.emit(spv::OpLogicalAnd, t_bool, {larger, level_in});
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
+        }
+    }
+    // `body` where `cond` holds (a selection, as where_exec's on a lane's EXEC bit).
+    void where_true(Id cond, const std::function<void()>& body) {
+        const Id l_then = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+        cur_label = m.label(l_then);
+        body();
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
     }
     void where_exec(const Val& e, const std::function<void()>& body) {
         if (e.constant) {

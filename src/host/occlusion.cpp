@@ -222,6 +222,7 @@ bool make_preds_locked() {
     mai.allocationSize = req.size;
     mai.memoryTypeIndex =
         find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    MemOwner own_mem("occlusion queries");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_preds.memory) != VK_SUCCESS) {
         vkDestroyBuffer(g.device, g_preds.buffer, nullptr);
         g_preds.buffer = VK_NULL_HANDLE;
@@ -351,6 +352,7 @@ void occlusion_device_ready_locked() {
     }
     const char* failed = nullptr;
     if (!make_pipeline_locked()) failed = "its compute pipeline";
+    MemOwner own_mem("occlusion queries");
     if (!failed && !create_dev_buffer(g_state, sizeof(State), true, true)) failed = "its state buffer";
     if (!failed) std::memset(g_state.map, 0, sizeof(State));
     if (!failed && !make_preds_locked()) failed = "its predicate buffer";

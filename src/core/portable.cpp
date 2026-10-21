@@ -13,6 +13,10 @@
 #include <mutex>
 #include <vector>
 
+#if !defined(_WIN32) && defined(BBHOST_HAVE_SDL3)
+#include <SDL3/SDL.h>
+#endif
+
 #if defined(_WIN32)
 #include <direct.h>
 #include <malloc.h>
@@ -285,6 +289,12 @@ void host_thread_set_name(const char* name) {
 #endif
 }
 
+namespace {
+std::atomic<bool> g_headless{false};
+}  // namespace
+
+void host_set_headless(bool headless) { g_headless.store(headless); }
+
 bool host_desktop_max_size(int* w, int* h) {
 #if defined(_WIN32)
     // EnumDisplaySettings gives each display's mode in physical pixels,
@@ -305,6 +315,30 @@ bool host_desktop_max_size(int* w, int* h) {
         dd = DISPLAY_DEVICEW{};
         dd.cb = sizeof(dd);
     }
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
+    return true;
+#elif defined(BBHOST_HAVE_SDL3)
+    // The displays SDL's video driver lists (X11 or Wayland), each desktop
+    // mode in physical pixels. The video subsystem is brought up for the
+    // question alone - this is asked before the window shell starts - and
+    // let go. Not for a headless run: it opens no window, and a test box may
+    // have no display server.
+    if (g_headless.load()) return false;
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
+    int count = 0, bw = 0, bh = 0;
+    if (SDL_DisplayID* ids = SDL_GetDisplays(&count)) {
+        for (int i = 0; i < count; ++i) {
+            const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(ids[i]);
+            if (!m) continue;
+            const float d = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+            bw = std::max(bw, static_cast<int>(static_cast<float>(m->w) * d + 0.5f));
+            bh = std::max(bh, static_cast<int>(static_cast<float>(m->h) * d + 0.5f));
+        }
+        SDL_free(ids);
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
     if (bw <= 0 || bh <= 0) return false;
     *w = bw;
     *h = bh;

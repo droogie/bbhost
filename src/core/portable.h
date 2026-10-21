@@ -44,9 +44,12 @@ void host_thread_set_name(const char* name);
 // nice 19 on Linux), for good: work that must never take a core the game wants.
 void host_thread_background();
 // The largest width and height among the desktop's displays, in physical
-// pixels (each display's current mode). False when the platform does not say
-// (only Windows answers today).
+// pixels (each display's current mode). False when the platform does not say:
+// a headless run (host_set_headless), or a build without SDL off Windows.
 bool host_desktop_max_size(int* w, int* h);
+// Whether this run opens no window (main, once the configuration is final):
+// host_desktop_max_size then asks no display server.
+void host_set_headless(bool headless);
 // The name Linux can hold (15 characters): leading dotted parts dropped
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.
 void host_thread_fit_name(const char* name, char (&out)[16]);

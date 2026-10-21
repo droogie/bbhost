@@ -96,6 +96,8 @@ void host_gpu_shadow_gx_settled(std::uint64_t, std::size_t) {}
 std::string host_gpu_target_copy_report() { return {}; }
 std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
+std::string host_gpu_video_memory_report(bool) { return {}; }
+void host_gpu_log_video_memory(bool) {}
 void host_gpu_set_loading(bool) {}
 void host_gpu_world_reached() {}
 std::size_t host_gpu_shader_backlog() { return 0; }

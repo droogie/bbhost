@@ -299,6 +299,7 @@ public:
         Readback rb;
         rb.blob = name;
         rb.bytes = total;
+        MemOwner own_mem("draw captures");
         if (!create_dev_buffer(rb.staging, total, true)) {
             why = "no host-visible staging buffer of " + std::to_string(total) + " bytes";
             return false;
@@ -323,6 +324,7 @@ public:
         Readback rb;
         rb.blob = name;
         rb.bytes = bytes;
+        MemOwner own_mem("draw captures");
         if (!bytes || !create_dev_buffer(rb.staging, bytes, true)) {
             why = "no host-visible staging buffer of " + std::to_string(bytes) + " bytes";
             return false;

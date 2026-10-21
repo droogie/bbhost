@@ -14,11 +14,29 @@
 //     position apart by the Euler term h^2 a (n-1)/2n exactly; a sloped one:
 //     the velocity apart by h^2 k b (n-1)/2n (the curve read at each frame);
 //     the same facing; a step of 0 moves nothing;
+//   - the gravity motion 0x570e610 (sub_2e87a10) and the wind motion 0x570e5d0
+//     (sub_2e866f0, the wobbles' base): the Euler motion's update with gravity
+//     (data_5ad1150 times a curve at the node's time, in the parent's frame)
+//     and, for the wind motion, the effects' wind world's force at the node's
+//     place and its drift added to the move: gravity alone the velocity and
+//     position apart by their Euler terms exactly; every case without a
+//     reversal or a stop held to the update's equations (in double), whole
+//     step and frames alike; facing along the final move in both;
+//   - the direction motions 0x570e850 (sub_2e8d740), 0x570e810 (sub_2e8cc60,
+//     with gravity) and 0x570e7d0 (sub_2e8bfd0, with the wind world; the
+//     wobble 0x570e8d0's base): the velocity +0x20 by the step times the
+//     local force, the move the step times the velocity plus the speed curve
+//     times the direction +0x10 (never written) plus the drift: no branch, so
+//     every case held to the update's equations in double, whole step and
+//     frames alike; facing along the final move;
 //   - the rotation motion 0x570e790 (sub_2e8b100): the node turned by the step
 //     times its rates (+0x10..+0x18, or three curves): one axis turns the
 //     same, three within the Euler angles' (h w)^2; a step of 0 turns nothing;
 //   - the transform motion 0x570e710 (sub_2e8a3d0): never reads its step
 //     (rdx is overwritten first): every byte the same for any step;
+//   - the curve motion 0x570e910 (sub_2e8ec00): the position its curve at
+//     the node's time, the rotation kept; never reads its step: every byte
+//     the same for any step;
 //   - the composite motion 0x570e750 (sub_2e8ae30): its two parts, in order,
 //     with its own arguments;
 //   - the children module 0x56eb2e0 (sub_12fccf0): never reads the container's
@@ -42,7 +60,8 @@
 //     and +0x1c, the same) and 3 / 0x3d (0x56ebe20, sub_1325cd0: +0x18 and
 //     +0x1c the same): the same bounds and bytes, the accumulations within a
 //     rounding a frame, nothing added by a step of 0;
-//   - the wind source 0x283c (0x56eadf0, sub_12e3c30): its fade (+0xd0) by
+//   - the wind sources 0x283c (0x56eadf0, sub_12e3c30) and 0x283d (0x56eac40,
+//     sub_12e27b0, no velocity): its fade (+0xd0) by
 //     the elapsed time, its strengths from a curve at the record's time and
 //     that fade, its velocity the handle's move over the elapsed time: the
 //     same shape, place and bounds, the fade, strengths and velocity within
@@ -176,21 +195,145 @@ void run(MotionFn f, u64 motion, u64 node, u64 local, float h, int n) {
     const double frame = static_cast<double>(h) / n;
     for (int i = 0; i < n; ++i) {
         const float from = static_cast<float>(i * frame);
-        float s = n == 1 ? h : static_cast<float>(frame);
+        float s = n == 1 || g_control == 3 ? h : static_cast<float>(frame);
         store<float>(node + 0x7c, i && g_control != 2 ? addss(t, from) : t);
         f(motion, node, &s, local);
         store<float>(node + 0x7c, t);
     }
 }
 
-int check_euler(int cases) {
-    const auto euler = eboot_kit::fn<MotionFn>(kEuler);
-    int bad = 0, tight = 0, sloped = 0, clamped = 0, facing = 0;
+// The three Euler motions, by layout (velocity +0x10, the speed curve +8):
+//   - 0x570e650 (sub_2e88510, 0x40 bytes): the speed curve's scale +0x24, facing +0x28, no gravity;
+//   - 0x570e610 (sub_2e87a10, 0x40 bytes): the gravity curve +0x20 (its value times the effects' gravity,
+//     data_5ad1150, turned into the motion's frame by the inverse of the local transform it is handed - the parent's
+//     rows), the speed curve's scale +0x30, facing +0x34;
+//   - 0x570e5d0 (sub_2e866f0, 0x60 bytes; also the wobble motions' base): the effects' wind world (data_5ad1148): its
+//     force at the node's world place (vtable +0x10, with the motion's sources at +0x20) plus the gravity curve +0x48's
+//     gravity, turned into the motion's frame; its drift (vtable +0x28 for the instance's +4) times +0x50, turned the
+//     same way, added to the velocity for the move only; the speed curve's scale +0x58, facing +0x5c.
+// Each call: v += step x the local force (gravity x its curve at the node's time, and the world's); then, with a speed
+// curve, v changes along itself by step x the curve x the scale (from rest along the node's facing; a change that would
+// reverse it stops it); then the position += step x (v + the local drift), facing the move when asked.
+struct EulerLayout {
+    const char* name;
+    u64 fn, vt;
+    u64 k, face, gravity;  // the speed curve's scale and the facing switch; the gravity curve's slot (0: none)
+    u64 drift;             // the wind world's drift scale (0: no wind world)
+    u64 size;
+};
+constexpr u64 kGravityMotion = 0x2e87a10, kGravityVt = 0x570e610, kGravity = 0x5ad1150;
+constexpr u64 kWindMotion = 0x2e866f0, kWindMotionVt = 0x570e5d0, kWindWorld = 0x5ad1148;
+constexpr EulerLayout kEulerLayout{"Euler motion", kEuler, kEulerVt, 0x24, 0x28, 0, 0, 0x40};
+constexpr EulerLayout kGravityLayout{"gravity motion", kGravityMotion, kGravityVt, 0x30, 0x34, 0x20, 0, 0x40};
+constexpr EulerLayout kWindLayout{"wind motion", kWindMotion, kWindMotionVt, 0x58, 0x5c, 0x48, 0x50, 0x60};
+
+// The wind world the wind motion asks (a test object at data_5ad1148): a force for a place and a drift for an id.
+alignas(16) float g_world_force[4], g_world_drift[4];
+GUEST_ABI __m128 stub_world_force(u64, const float*, u64) { return _mm_load_ps(g_world_force); }
+GUEST_ABI const float* stub_world_drift(u64, u32) { return g_world_drift; }
+alignas(64) u8 g_world_vt[0x40];
+alignas(64) u8 g_world[0x40];
+
+// A rigid transform's three rows (rotation, the translation in the w lanes), as a parent's matrix is handed to a motion.
+void rigid_rows(u64 m) {
+    const u64 q = block(16);
+    random_quat(q);
+    const V4 r = v4(q);
+    const double x = r.x, y = r.y, z = r.z, w = r.w;
+    put4(m, 1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), uni(-5, 5));
+    put4(m + 16, 2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), uni(-5, 5));
+    put4(m + 32, 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), uni(-5, 5));
+}
+
+// The update in double, for a case that never comes near rest or a reversal: one call of step h at the node's time t.
+struct EulerModel {
+    double v[3], p[3];
+    double gl[3] = {0, 0, 0};       // the local gravity (R^T G); 0 without a gravity curve
+    double ga = 0, gb = 0;          // the gravity curve
+    bool speed = false;
+    double sa = 0, sb = 0, k = 0;   // the speed curve and its scale
+    double fl[3] = {0, 0, 0};       // the wind world's force and drift, local
+    double dl[3] = {0, 0, 0};
+    double low = 1e30;              // the least speed met before a speed change, and how near a reversal it came
+    double margin = 1e30;
+    void call(double h, double t) {
+        const double cg = ga + gb * t;
+        for (int i = 0; i < 3; ++i) v[i] += h * (gl[i] * cg + fl[i]);
+        if (speed) {
+            const double s = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            const double K = h * (sa + sb * t) * k;
+            low = std::min(low, s);
+            margin = std::min(margin, s + K);
+            if (-K <= s) {
+                if (K != 0 && s > 1e-5)
+                    for (int i = 0; i < 3; ++i) v[i] += K * v[i] / s;
+            } else {
+                v[0] = v[1] = v[2] = 0;
+            }
+        }
+        for (int i = 0; i < 3; ++i) p[i] += h * (v[i] + dl[i]);
+    }
+    // A whole step h at t, as run() calls the game's (the node's time i h/n past t for the i-th of n frames).
+    void steps(double h, double t, int n) {
+        for (int i = 0; i < n; ++i) call(n == 1 ? h : h / n, i ? t + i * (h / n) : t);
+    }
+};
+
+int check_euler_layout(int cases, const EulerLayout& L) {
+    const auto euler = eboot_kit::fn<MotionFn>(L.fn);
+    int bad = 0, tight = 0, sloped = 0, clamped = 0, facing = 0, gravity = 0, modelled = 0;
     for (int c = 0; c < cases; ++c) {
         g_blocks.clear();
-        const u64 motion = block(0x40), node = make_node(), local = block(0x40);
-        store<u64>(motion, game_address(kEulerVt));
-        const bool has_curve = g_rng.chance(0.7), slope = has_curve && g_rng.chance(0.5);
+        const u64 motion = block(L.size), node = make_node(), local = block(0x40);
+        store<u64>(motion, game_address(L.vt));
+        // the gravity motion: its parent's rows, the effects' gravity and its curve (none, constant or sloped);
+        // a case of the gravity motion has its speed curve less often, so that gravity alone is common
+        EulerModel m;
+        bool has_gravity = false;
+        double G[3] = {0, 0, 0};
+        double fmax = 0;  // the wind world's force, its size
+        if (L.drift) {
+            // the wind world: a force (now and then none) and a drift for the node's instance; the node's world place
+            for (int i = 0; i < 4; ++i) {
+                g_world_force[i] = g_rng.chance(0.2) ? 0.0f : uni(-6, 6);
+                g_world_drift[i] = g_rng.chance(0.2) ? 0.0f : uni(-3, 3);
+            }
+            store<float>(motion + L.drift, g_rng.chance(0.2) ? 0.0f : uni(-2, 2));
+            const u64 inst = block(0x98);
+            store<u32>(inst + 4, g_rng.u32());
+            store<u64>(node + 0x58, inst);
+            for (const u64 at : {0x2cull, 0x3cull, 0x4cull}) store<float>(node + at, uni(-50, 50));
+        }
+        if (L.gravity) {
+            rigid_rows(local);
+            if (g_rng.chance(0.5)) G[1] = -9.8;
+            else
+                for (double& g : G) g = uni(-12, 12);
+            put4(reinterpret_cast<u64>(eboot_kit::at(kGravity)), G[0], G[1], G[2], uni(-3, 3));
+            has_gravity = g_rng.chance(0.8);
+            if (has_gravity) {
+                m.ga = uni(-2, 2);
+                m.gb = g_rng.chance(0.5) ? 0.0f : uni(-2, 2);
+                store<u64>(motion + L.gravity, curve(static_cast<float>(m.ga), static_cast<float>(m.gb)));
+                // R^T G, the rows' rotation
+                for (int i = 0; i < 3; ++i) m.gl[i] = load<float>(local + 4 * i) * G[0] + load<float>(local + 16 + 4 * i) * G[1] + load<float>(local + 32 + 4 * i) * G[2];
+            } else {
+                store<u64>(motion + L.gravity, 0);
+                m.ga = m.gb = 0;
+            }
+        }
+        if (L.drift) {
+            // the world's force and the scaled drift, turned into the motion's frame (R^T)
+            const double ws = load<float>(motion + L.drift);
+            for (int i = 0; i < 3; ++i) {
+                m.fl[i] = load<float>(local + 4 * i) * g_world_force[0] + load<float>(local + 16 + 4 * i) * g_world_force[1] +
+                          load<float>(local + 32 + 4 * i) * g_world_force[2];
+                m.dl[i] = ws * (load<float>(local + 4 * i) * g_world_drift[0] + load<float>(local + 16 + 4 * i) * g_world_drift[1] +
+                                load<float>(local + 32 + 4 * i) * g_world_drift[2]);
+            }
+            fmax = std::sqrt(m.fl[0] * m.fl[0] + m.fl[1] * m.fl[1] + m.fl[2] * m.fl[2]);
+        }
+        const bool has_curve = g_rng.chance(L.gravity ? 0.6 : 0.7), slope = has_curve && g_rng.chance(0.5);
         const float a = uni(-3, 3), b = slope ? uni(-2, 2) : 0.0f, k = uni(-2, 2);
         store<u64>(motion + 8, has_curve ? curve(a, b) : 0);
         // a velocity of 1 to 6, or now and then none
@@ -199,22 +342,38 @@ int check_euler(int cases) {
         const double dl = len3(d) + 1e-9;
         const double speed = still ? 0.0 : g_rng.chance(0.2) ? uni(0.01f, 0.3f) : uni(1, 6);
         put4(motion + 0x10, d.x / dl * speed, d.y / dl * speed, d.z / dl * speed, 0);
-        store<float>(motion + 0x24, k);
-        store<u8>(motion + 0x28, g_rng.chance(0.5) ? 1 : 0);
+        store<float>(motion + L.k, k);
+        store<u8>(motion + L.face, g_rng.chance(0.5) ? 1 : 0);
         const float h = g_rng.chance(0.7) ? 1.0f / 30.0f : static_cast<float>(1.0 / 30.0 * uni(0.25f, 2.0f));
         // a first call with no step (the w lanes become the x ones, as every call leaves them)
         float zero = 0.0f;
         euler(motion, node, &zero, local);
-        const std::vector<u8> m0 = bytes_of(motion, 0x40), n0 = bytes_of(node, 0x100);
+        const std::vector<u8> m0 = bytes_of(motion, L.size), n0 = bytes_of(node, 0x100);
         const char* why = nullptr;
         // a step of 0 moves nothing
         euler(motion, node, &zero, local);
-        if (bytes_of(motion, 0x40) != m0 || bytes_of(node, 0x100) != n0) why = "a step of 0";
+        if (bytes_of(motion, L.size) != m0 || bytes_of(node, 0x100) != n0) why = "a step of 0";
         put_bytes(motion, m0);
         put_bytes(node, n0);
         // whole step
         run(euler, motion, node, local, h, 1);
         const V4 pa = v4(node), va = v4(motion + 0x10), qa = v4(node + 0x10);
+        const double t0 = load<float>(node + 0x7c);
+        const V4 v0 = v4(reinterpret_cast<u64>(m0.data()) + 0x10), p0 = v4(reinterpret_cast<u64>(n0.data()));
+        m.speed = has_curve;
+        m.sa = a, m.sb = b, m.k = k;
+        auto model = [&](int n) {
+            EulerModel x = m;
+            x.v[0] = v0.x, x.v[1] = v0.y, x.v[2] = v0.z;
+            x.p[0] = p0.x, x.p[1] = p0.y, x.p[2] = p0.z;
+            x.steps(h, t0, n);
+            return x;
+        };
+        const EulerModel ma = model(1);
+        double gmax = 0;  // the largest gravity acceleration the step meets
+        if (has_gravity) gmax = std::sqrt(m.gl[0] * m.gl[0] + m.gl[1] * m.gl[1] + m.gl[2] * m.gl[2]) * (std::fabs(m.ga) + std::fabs(m.gb) * (t0 + h));
+        gmax += fmax;
+        if (has_gravity) ++gravity;
         for (const int n : {2, 4}) {
             if (why) break;
             put_bytes(motion, m0);
@@ -222,51 +381,261 @@ int check_euler(int cases) {
             run(euler, motion, node, local, h, n);
             const V4 pb = v4(node), vb = v4(motion + 0x10), qb = v4(node + 0x10);
             const double t = load<float>(node + 0x7c);
-            const double v0 = speed, fk_max = has_curve ? (std::fabs(a) + std::fabs(b) * (t + h)) * std::fabs(k) : 0.0;
+            const double fk_max = has_curve ? (std::fabs(a) + std::fabs(b) * (t + h)) * std::fabs(k) : 0.0;
             const double euler_term = static_cast<double>(h) * h * (n - 1) / (2.0 * n);
-            const double round = 2e-5 * (1.0 + len3(pa) + v0);
-            if (v0 > 0 && v0 > 1.5 * h * fk_max + 1e-3) {
-                // no reversal within the step: the velocity stays on its line
+            const double round = 2e-5 * (1.0 + len3(pa) + speed + h * gmax);
+            const double vround = 2e-5 * (1.0 + speed + h * gmax);
+            // the game's code against the model, whole step and frames, where the model's branches are not in doubt
+            const EulerModel mb = model(n);
+            const bool clean = ma.low > 1e-3 && mb.low > 1e-3 && ma.margin > 1e-4 && mb.margin > 1e-4;
+            if (clean) {
+                ++modelled;
+                const V4 mva{ma.v[0], ma.v[1], ma.v[2], 0}, mvb{mb.v[0], mb.v[1], mb.v[2], 0};
+                const V4 mpa{ma.p[0], ma.p[1], ma.p[2], 0}, mpb{mb.p[0], mb.p[1], mb.p[2], 0};
+                if (dist3(va, mva) > vround || dist3(vb, mvb) > vround) why = "the velocity against the update's equations";
+                else if (dist3(pa, mpa) > round || dist3(pb, mpb) > round) why = "the position against the update's equations";
+                if (why && !g_quiet)
+                    std::printf("  %s model: v %.6g %.6g %.6g / %.6g %.6g %.6g, p apart %.3g / %.3g\n", L.name, va.x - mva.x, va.y - mva.y, va.z - mva.z,
+                                vb.x - mvb.x, vb.y - mvb.y, vb.z - mvb.z, dist3(pa, mpa), dist3(pb, mpb));
+            }
+            if (!why && has_gravity && !has_curve && !L.drift) {
+                // gravity alone: the velocity apart by G gb h^2 (n-1)/2n (the curve read at each frame's time), the position by
+                // G c(t0) h^2 (n-1)/2n - G gb h^3 (n+1)(n-1)/6n^2 (the Euler terms)
+                ++tight;
+                const double dv = m.gb * euler_term, c0 = m.ga + m.gb * t0;
+                const double dp = c0 * euler_term - m.gb * static_cast<double>(h) * h * h * (n + 1) * (n - 1) / (6.0 * n * n);
+                const V4 want_v{va.x + m.gl[0] * dv, va.y + m.gl[1] * dv, va.z + m.gl[2] * dv, 0};
+                const V4 want_p{pa.x - m.gl[0] * dp, pa.y - m.gl[1] * dp, pa.z - m.gl[2] * dp, 0};
+                if (dist3(vb, want_v) > vround) why = "gravity's velocity (the curve read at each frame)";
+                else if (dist3(pb, want_p) > round) why = "gravity's position (the Euler terms)";
+            } else if (!why && !has_gravity && !L.drift && has_curve && speed > 0 && speed > 1.5 * h * fk_max + 1e-3) {
+                // the speed curve alone, no reversal within the step: the velocity stays on its line
                 if (!slope) {
                     ++tight;
-                    const double acc = has_curve ? static_cast<double>(a) * k : 0.0;  // along the direction
-                    if (dist3(va, vb) > 2e-5 * (1.0 + v0)) why = "a constant curve's velocity";
+                    const double acc = static_cast<double>(a) * k;  // along the direction
+                    if (dist3(va, vb) > 2e-5 * (1.0 + speed)) why = "a constant curve's velocity";
                     // pb - pa = -(Euler term) a d, d the velocity's direction
-                    V4 want{pa.x - euler_term * acc * va.x / len3(va), pa.y - euler_term * acc * va.y / len3(va),
-                            pa.z - euler_term * acc * va.z / len3(va), 0};
+                    V4 want{pa.x - euler_term * acc * va.x / len3(va), pa.y - euler_term * acc * va.y / len3(va), pa.z - euler_term * acc * va.z / len3(va),
+                            0};
                     if (!why && dist3(pb, want) > round) why = "a constant curve's position (the Euler term)";
                 } else {
                     ++sloped;
                     // the speed apart by h^2 k b (n-1)/2n: the curve read at each frame's time
                     const double dv = euler_term * static_cast<double>(k) * b;
-                    if (std::fabs(len3(vb) - len3(va) - dv) > 2e-5 * (1.0 + v0)) why = "a sloped curve's speed (the curve read at each frame)";
+                    if (std::fabs(len3(vb) - len3(va) - dv) > 2e-5 * (1.0 + speed)) why = "a sloped curve's speed (the curve read at each frame)";
                     if (!why && dist3(pa, pb) > euler_term * fk_max + h * std::fabs(dv) + round) why = "a sloped curve's position";
                 }
-                if (!why && load<u8>(motion + 0x28)) {
-                    // facing the last call's move: its direction a float rounding of the positions over that move apart
-                    ++facing;
-                    const double move = h / n * v0, noise = 2.4e-7 * (1.0 + len3(pa)) / move + 1e-5;
-                    if (quat_angle(qa, qb) > noise) {
-                        why = "the facing";
-                        if (!g_quiet)
-                            std::printf("  facing: direction %.4f %.4f %.4f, apart %.4g\n", va.x / len3(va), va.y / len3(va), va.z / len3(va),
-                                        quat_angle(qa, qb));
-                    }
-                }
-            } else if (v0 > 0) {
+            } else if (!why && !clean && has_curve && speed > 0) {
                 ++clamped;  // a reversal within the step stops it: both stop, the frames having moved less
-                if (dist3(pa, pb) > h * (v0 + h * fk_max) + round) why = "a reversal";
-            } else if (dist3(pa, pb) > euler_term * fk_max + round) {
+                if (dist3(pa, pb) > h * (speed + h * (fk_max + gmax)) + round) why = "a reversal";
+            } else if (!why && !clean && dist3(pa, pb) > euler_term * (fk_max + gmax) + h * h * gmax + round) {
                 why = "from rest";
             }
+            const double moved_a = std::sqrt((va.x + m.dl[0]) * (va.x + m.dl[0]) + (va.y + m.dl[1]) * (va.y + m.dl[1]) + (va.z + m.dl[2]) * (va.z + m.dl[2]));
+            const double moved_b = std::sqrt((vb.x + m.dl[0]) * (vb.x + m.dl[0]) + (vb.y + m.dl[1]) * (vb.y + m.dl[1]) + (vb.z + m.dl[2]) * (vb.z + m.dl[2]));
+            if (!why && load<u8>(motion + L.face) && clean && moved_a > 1e-2 && moved_b > 1e-2) {
+                // facing the last call's move (sub_2e871a0: a rotation whose Z axis looks along it; the rotation before is not
+                // read): in each run along that run's final velocity, so the two apart as far as the velocities are (which
+                // the model holds), whatever the roll does near the up axis
+                ++facing;
+                const auto forward = [](const V4& q) {
+                    return V4{2 * (q.x * q.z + q.y * q.w), 2 * (q.y * q.z - q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y), 0};
+                };
+                const auto angle = [](const V4& u, const V4& v) {
+                    const double c = (u.x * v.x + u.y * v.y + u.z * v.z) / std::max(1e-30, len3(u) * len3(v));
+                    return std::acos(std::max(-1.0, std::min(1.0, c)));
+                };
+                const V4 fa = forward(qa), fb = forward(qb);
+                const V4 ma_{va.x + m.dl[0], va.y + m.dl[1], va.z + m.dl[2], 0}, mb_{vb.x + m.dl[0], vb.y + m.dl[1], vb.z + m.dl[2], 0};
+                const double off_a = angle(fa, ma_), off_b = angle(fb, mb_), apart = angle(fa, fb), turn = angle(ma_, mb_);
+                const double noise = 2.4e-7 * (1.0 + len3(pa)) / (h / n * std::min(len3(ma_), len3(mb_))) + 1e-4;
+                if (off_a > noise || off_b > noise) why = "the facing (not along the final move)";
+                else if (apart > turn + 2.0 * noise) why = "the facing (the two runs' further apart than their moves)";
+                if (why && !g_quiet) std::printf("  facing: off %.3g / %.3g, apart %.3g, the moves %.3g\n", off_a, off_b, apart, turn);
+            }
         }
-        if (why && ++bad <= 6 && !g_quiet) std::printf("euler case %d (curve %d slope %d, speed %g, h %g): %s differs\n", c, has_curve, slope, speed, h, why);
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("%s case %d (gravity %d, curve %d slope %d, speed %g, h %g): %s differs\n", L.name, c, has_gravity, has_curve, slope, speed, h, why);
     }
     if (!g_quiet)
-        std::printf("decomp_sfx_classes: Euler motion: %d cases (%d with a constant curve or none, %d sloped, %d reversing, %d facing), %d differ\n",
-                    cases, tight, sloped, clamped, facing, bad);
+        std::printf("decomp_sfx_classes: %s: %d cases (%d with gravity; %d held to the update's equations, %d with one Euler term exact, %d sloped, "
+                    "%d reversing, %d facing), %d differ\n",
+                    L.name, cases, gravity, modelled, tight, sloped, clamped, facing, bad);
     return bad;
 }
+int check_euler(int cases) { return check_euler_layout(cases, kEulerLayout); }
+int check_gravity_motion(int cases) { return check_euler_layout(cases, kGravityLayout); }
+int check_wind_motion(int cases) { return check_euler_layout(cases, kWindLayout); }
+
+// The direction motions, by layout: the speed curve +8 (at the node's time) times the direction +0x10 (the set-up's,
+// normalised; the update never writes it) added to the velocity +0x20 for the move - no scale, no reversal, no stop:
+//   - 0x570e850 (sub_2e8d740, 0x40 bytes): no force (v += step x 0), facing +0x38;
+//   - 0x570e810 (sub_2e8cc60, 0x50 bytes): the gravity curve +0x30's gravity, turned into the motion's frame, facing +0x44;
+//   - 0x570e7d0 (sub_2e8bfd0, 0x70 bytes; the wobble 0x570e8d0's base): the wind world's force at the node's world place
+//     (its sources at +0x30) plus the gravity curve +0x58's gravity, turned into the motion's frame; the world's drift
+//     (vtable +0x28 for the instance's +4) times +0x60, turned the same way, added to the move; facing +0x6c.
+// Each call: v += step x the local force; p += step x (v + the curve x the direction + the local drift); facing the move
+// when asked. No branch: every case is held to these equations in double, the whole step and its frames alike.
+struct DirLayout {
+    const char* name;
+    u64 fn, vt;
+    u64 face, gravity, drift;  // the facing switch; the gravity curve's slot (0: none); the drift scale (0: no wind world)
+    u64 size;
+};
+constexpr DirLayout kDirLayout{"direction motion", 0x2e8d740, 0x570e850, 0x38, 0, 0, 0x40};
+constexpr DirLayout kDirGravityLayout{"direction gravity motion", 0x2e8cc60, 0x570e810, 0x44, 0x30, 0, 0x50};
+constexpr DirLayout kDirWindLayout{"direction wind motion", 0x2e8bfd0, 0x570e7d0, 0x6c, 0x58, 0x60, 0x70};
+
+struct DirModel {
+    double v[3], p[3], d[3];
+    double gl[3] = {0, 0, 0}, ga = 0, gb = 0;  // the local gravity and its curve
+    bool speed = false;
+    double sa = 0, sb = 0;                     // the speed curve
+    double fl[3] = {0, 0, 0}, dl[3] = {0, 0, 0};
+    double move[3] = {0, 0, 0};  // the last call's move
+    void call(double h, double t) {
+        const double cg = ga + gb * t, cs = speed ? sa + sb * t : 0.0;
+        for (int i = 0; i < 3; ++i) v[i] += h * (gl[i] * cg + fl[i]);
+        for (int i = 0; i < 3; ++i) {
+            move[i] = h * (v[i] + cs * d[i] + dl[i]);
+            p[i] += move[i];
+        }
+    }
+    void steps(double h, double t, int n) {
+        for (int i = 0; i < n; ++i) call(n == 1 ? h : h / n, i ? t + i * (h / n) : t);
+    }
+};
+
+int check_direction_layout(int cases, const DirLayout& L) {
+    const auto motion_fn = eboot_kit::fn<MotionFn>(L.fn);
+    int bad = 0, gravity = 0, sloped = 0, facing = 0, winds = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const u64 motion = block(L.size), node = make_node(), local = block(0x40);
+        store<u64>(motion, game_address(L.vt));
+        rigid_rows(local);
+        // a world vector turned into the motion's frame: the inverse of the parent's rows (R^T)
+        const auto to_local = [&](const double w[3], double out[3]) {
+            for (int i = 0; i < 3; ++i)
+                out[i] = load<float>(local + 4 * i) * w[0] + load<float>(local + 16 + 4 * i) * w[1] + load<float>(local + 32 + 4 * i) * w[2];
+        };
+        DirModel m;
+        double amax = 0;  // the largest acceleration the step meets
+        if (L.drift) {
+            // the wind world: a force (now and then none) and a drift for the node's instance; the node's world place
+            for (int i = 0; i < 4; ++i) {
+                g_world_force[i] = g_rng.chance(0.2) ? 0.0f : uni(-6, 6);
+                g_world_drift[i] = g_rng.chance(0.2) ? 0.0f : uni(-3, 3);
+            }
+            store<float>(motion + L.drift, g_rng.chance(0.2) ? 0.0f : uni(-2, 2));
+            const u64 inst = block(0x98);
+            store<u32>(inst + 4, g_rng.u32());
+            store<u64>(node + 0x58, inst);
+            for (const u64 at : {0x2cull, 0x3cull, 0x4cull}) store<float>(node + at, uni(-50, 50));
+            const double ws = load<float>(motion + L.drift);
+            const double wf[3] = {g_world_force[0], g_world_force[1], g_world_force[2]};
+            const double wd[3] = {ws * g_world_drift[0], ws * g_world_drift[1], ws * g_world_drift[2]};
+            to_local(wf, m.fl);
+            to_local(wd, m.dl);
+            amax += len3({m.fl[0], m.fl[1], m.fl[2], 0});
+            ++winds;
+        }
+        bool has_gravity = false;
+        if (L.gravity) {
+            double G[3] = {0, -9.8, 0};
+            if (g_rng.chance(0.5))
+                for (double& g : G) g = uni(-12, 12);
+            put4(reinterpret_cast<u64>(eboot_kit::at(kGravity)), G[0], G[1], G[2], uni(-3, 3));
+            has_gravity = g_rng.chance(0.8);
+            if (has_gravity) {
+                m.ga = uni(-2, 2);
+                m.gb = g_rng.chance(0.5) ? 0.0f : uni(-2, 2);
+                store<u64>(motion + L.gravity, curve(static_cast<float>(m.ga), static_cast<float>(m.gb)));
+                // G as the game reads it (floats)
+                const double Gf[3] = {static_cast<float>(G[0]), static_cast<float>(G[1]), static_cast<float>(G[2])};
+                to_local(Gf, m.gl);
+                ++gravity;
+            } else {
+                store<u64>(motion + L.gravity, 0);
+            }
+        }
+        const bool has_curve = g_rng.chance(0.75), slope = has_curve && g_rng.chance(0.5);
+        const float a = uni(-3, 3), b = slope ? uni(-2, 2) : 0.0f;
+        store<u64>(motion + 8, has_curve ? curve(a, b) : 0);
+        if (slope) ++sloped;
+        // the direction: normalised as the set-up leaves it (now and then not: the update does not care); a velocity (the
+        // set-up's 0, or one the forces gave)
+        V4 d{uni(-1, 1), uni(-1, 1), uni(-1, 1), 0};
+        const double dn = g_rng.chance(0.8) ? len3(d) + 1e-9 : 1.0;
+        put4(motion + 0x10, d.x / dn, d.y / dn, d.z / dn, 0);
+        const bool rest = g_rng.chance(0.3);
+        put4(motion + 0x20, rest ? 0 : uni(-4, 4), rest ? 0 : uni(-4, 4), rest ? 0 : uni(-4, 4), 0);
+        store<u8>(motion + L.face, g_rng.chance(0.5) ? 1 : 0);
+        const float h = g_rng.chance(0.7) ? 1.0f / 30.0f : static_cast<float>(1.0 / 30.0 * uni(0.25f, 2.0f));
+        // a first call with no step (the w lanes become the x ones, as every call leaves them)
+        float zero = 0.0f;
+        motion_fn(motion, node, &zero, local);
+        const std::vector<u8> m0 = bytes_of(motion, L.size), n0 = bytes_of(node, 0x100);
+        const char* why = nullptr;
+        // a step of 0 moves nothing
+        motion_fn(motion, node, &zero, local);
+        if (bytes_of(motion, L.size) != m0 || bytes_of(node, 0x100) != n0) why = "a step of 0";
+        // the whole step, then its frames, each against the equations
+        const V4 v0 = v4(reinterpret_cast<u64>(m0.data()) + 0x20), p0 = v4(reinterpret_cast<u64>(n0.data()));
+        const V4 d0 = v4(reinterpret_cast<u64>(m0.data()) + 0x10);
+        const double t0 = load<float>(node + 0x7c);
+        m.speed = has_curve, m.sa = a, m.sb = b;
+        auto model = [&](int n) {
+            DirModel x = m;
+            x.v[0] = v0.x, x.v[1] = v0.y, x.v[2] = v0.z;
+            x.p[0] = p0.x, x.p[1] = p0.y, x.p[2] = p0.z;
+            x.d[0] = d0.x, x.d[1] = d0.y, x.d[2] = d0.z;
+            x.steps(h, t0, n);
+            return x;
+        };
+        if (has_gravity) amax += len3({m.gl[0], m.gl[1], m.gl[2], 0}) * (std::fabs(m.ga) + std::fabs(m.gb) * (t0 + h));
+        const double cmax = has_curve ? std::fabs(a) + std::fabs(b) * (t0 + h) : 0.0;
+        for (const int n : {1, 2, 4}) {
+            if (why) break;
+            put_bytes(motion, m0);
+            put_bytes(node, n0);
+            run(motion_fn, motion, node, local, h, n);
+            const V4 p = v4(node), v = v4(motion + 0x20), q = v4(node + 0x10);
+            const DirModel mm = model(n);
+            const double speed = len3(v0) + h * amax;
+            const double vround = 2e-5 * (1.0 + speed);
+            const double round = 2e-5 * (1.0 + len3(p0) + speed + cmax + len3({m.dl[0], m.dl[1], m.dl[2], 0}));
+            if (dist3(v, {mm.v[0], mm.v[1], mm.v[2], 0}) > vround) why = n == 1 ? "the whole step's velocity" : "the frames' velocity";
+            else if (dist3(p, {mm.p[0], mm.p[1], mm.p[2], 0}) > round) why = n == 1 ? "the whole step's position" : "the frames' position";
+            else if (bytes_of(motion + 0x10, 16) != std::vector<u8>(m0.begin() + 0x10, m0.begin() + 0x20)) why = "the direction (written)";
+            if (why && !g_quiet)
+                std::printf("  %s n %d: v apart %.3g (%.3g), p apart %.3g (%.3g)\n", L.name, n, dist3(v, {mm.v[0], mm.v[1], mm.v[2], 0}), vround,
+                            dist3(p, {mm.p[0], mm.p[1], mm.p[2], 0}), round);
+            const double moved = std::sqrt(mm.move[0] * mm.move[0] + mm.move[1] * mm.move[1] + mm.move[2] * mm.move[2]);
+            if (!why && load<u8>(motion + L.face) && moved > 1e-2 * h / n) {
+                // facing the last call's move (sub_2e871a0: a rotation whose Z axis looks along it; the rotation before is
+                // not read), in each run along that run's final move
+                ++facing;
+                const V4 f{2 * (q.x * q.z + q.y * q.w), 2 * (q.y * q.z - q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y), 0};
+                const double cosine = (f.x * mm.move[0] + f.y * mm.move[1] + f.z * mm.move[2]) / std::max(1e-30, len3(f) * moved);
+                const double off = std::acos(std::max(-1.0, std::min(1.0, cosine)));
+                const double noise = 2.4e-7 * (1.0 + len3(p)) / moved + 1e-4;
+                if (off > noise) why = "the facing (not along the final move)";
+                if (why && !g_quiet) std::printf("  facing: off %.3g (noise %.3g), n %d\n", off, noise, n);
+            }
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("%s case %d (gravity %d, curve %d slope %d, h %g): %s differs\n", L.name, c, has_gravity, has_curve, slope, h, why);
+    }
+    if (!g_quiet)
+        std::printf("decomp_sfx_classes: %s: %d cases (%d with gravity, %d with the wind world, %d sloped speed curves, %d facings), "
+                    "%d differ\n",
+                    L.name, cases, gravity, winds, sloped, facing, bad);
+    return bad;
+}
+int check_direction_motion(int cases) { return check_direction_layout(cases, kDirLayout); }
+int check_direction_gravity(int cases) { return check_direction_layout(cases, kDirGravityLayout); }
+int check_direction_wind(int cases) { return check_direction_layout(cases, kDirWindLayout); }
 
 int check_rotation(int cases) {
     const auto rotation = eboot_kit::fn<MotionFn>(kRotation);
@@ -373,6 +742,59 @@ int check_transform(int cases) {
         if (!same && ++bad <= 6 && !g_quiet) std::printf("transform case %d: a step changed what it did\n", c);
     }
     if (!g_quiet) std::printf("decomp_sfx_classes: transform motion: %d cases, every byte the same for 5 steps, %d differ\n", cases, bad);
+    return bad;
+}
+
+// The curve motion 0x570e910 (sub_2e8ec00): the node's position (+0) the value of its curve (+8, vtable +0x58: a
+// vector) at the node's time (+0x7c), its rotation (+0x10) kept; it never reads its step - the frame domain's node time
+// is the whole of what it is handed. Every byte the same for any step, the position the curve at the node's time.
+GUEST_ABI __m128 curve_vector(u64 curve, u64, const float* t) {
+    const float k = load<float>(curve + 8), c = load<float>(curve + 12);
+    return _mm_set_ps(1.0f, c - *t, *t * 0.5f + c, *t * k + c);
+}
+alignas(64) u8 g_curve4_vtable[0x80];
+int check_curve_motion(int cases) {
+    const auto motion_fn = eboot_kit::fn<MotionFn>(0x2e8ec00);
+    store<u64>(reinterpret_cast<u64>(g_curve4_vtable) + 0x58, reinterpret_cast<u64>(&curve_vector));
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const u64 motion = block(0x20), node = make_node(), local = block(0x40), cv = block(0x20);
+        store<u64>(cv, reinterpret_cast<u64>(g_curve4_vtable));
+        store<float>(cv + 8, uni(-3, 3));
+        store<float>(cv + 12, uni(-20, 20));
+        const bool has = g_rng.chance(0.9);
+        store<u64>(motion + 8, has ? cv : 0);
+        store<float>(node + 0x7c, uni(0, 30));
+        const std::vector<u8> m0 = bytes_of(motion, 0x20), n0 = bytes_of(node, 0x100);
+        std::vector<u8> m1, n1;
+        const char* why = nullptr;
+        for (const float st : {1.0f / 30.0f, 0.0f, 1.0f / 120.0f, 1.0f, -1.0f}) {
+            put_bytes(motion, m0);
+            put_bytes(node, n0);
+            float step = g_control == 5 ? 0.0f : st;
+            motion_fn(motion, node, &step, local);
+            if (g_control == 5 && st != 0.0f) store<float>(node, load<float>(node) + st);  // the control: a position moved by the step
+            if (m1.empty()) {
+                m1 = bytes_of(motion, 0x20);
+                n1 = bytes_of(node, 0x100);
+            } else if (bytes_of(motion, 0x20) != m1 || bytes_of(node, 0x100) != n1) {
+                why = "a step changed what it did";
+            }
+        }
+        if (!why) {
+            std::vector<u8> want = n0;
+            if (has) {
+                float t;
+                std::memcpy(&t, n0.data() + 0x7c, 4);
+                const __m128 v = curve_vector(cv, node, &t);
+                std::memcpy(want.data(), &v, 16);
+            }
+            if (n1 != want) why = has ? "the position is not the curve at the node's time" : "no curve, yet the node changed";
+        }
+        if (why && ++bad <= 6 && !g_quiet) std::printf("curve motion case %d: %s\n", c, why);
+    }
+    if (!g_quiet) std::printf("decomp_sfx_classes: curve motion: %d cases, every byte the same for 5 steps, %d differ\n", cases, bad);
     return bad;
 }
 
@@ -1084,20 +1506,28 @@ GUEST_ABI void stub_wind_velocity(u64, const float* v) {
 }
 GUEST_ABI u64 stub_wind_object(u64) { return 0; }
 
-int check_wind_source(int cases) {
-    const auto update = eboot_kit::fn<TypeUpdate>(0x12e3c30);
+// The two wind types' layouts: 0x283c (sub_12e3c30) and 0x283d (sub_12e27b0, the same without the velocity, and its
+// strength and transform set only with a curve).
+struct WindLayout {
+    const char* name;
+    u64 fn, kind, sizes, velocity_on, velocity_scale, fade_time, strengths, curve, fade, handle;
+};
+constexpr WindLayout kWind283c{"0x283c", 0x12e3c30, 0x20, 0x24, 0x44, 0x48, 0x58, 0x78, 0xb8, 0xd0, 0xe0};
+constexpr WindLayout kWind283d{"0x283d", 0x12e27b0, 0x18, 0x1c, 0, 0, 0x50, 0x60, 0x88, 0x98, 0xa0};
+int check_wind_layout(int cases, const WindLayout& w) {
+    const auto update = eboot_kit::fn<TypeUpdate>(w.fn);
     int bad = 0;
     long ending = 0, released = 0, moving = 0;
     for (int c = 0; c < cases; ++c) {
         g_blocks.clear();
         const u64 type = block(0x100), rec = block(0x80), node = block(0x100), inst = block(0x98);
         for (int k = 0x10; k < 0x100; k += 4) store<float>(type + k, uni(-3, 3));
-        store<u32>(type + 0x20, static_cast<u32>(g_rng.range(0, 5)));
-        store<u32>(type + 0x44, g_rng.chance(0.7) ? 1u : 0u);
-        store<float>(type + 0x58, g_rng.chance(0.1) ? 0.0f : uni(0.05f, 2));
-        store<u64>(type + 0xb8, g_rng.chance(0.6) ? curve(uni(0, 2), g_rng.chance(0.5) ? 0.0f : uni(-0.5f, 0.5f)) : 0);
-        store<float>(type + 0xd0, g_rng.chance(0.3) ? 0.0f : uni(0, 1));
-        store<u64>(type + 0xe0, g_rng.chance(0.1) ? ~0ull : 0x100 + static_cast<u64>(c));
+        store<u32>(type + w.kind, static_cast<u32>(g_rng.range(0, 5)));
+        if (w.velocity_on) store<u32>(type + w.velocity_on, g_rng.chance(0.7) ? 1u : 0u);
+        store<float>(type + w.fade_time, g_rng.chance(0.1) ? 0.0f : uni(0.05f, 2));
+        store<u64>(type + w.curve, g_rng.chance(w.velocity_on ? 0.6 : 0.8) ? curve(uni(0, 2), g_rng.chance(0.5) ? 0.0f : uni(-0.5f, 0.5f)) : 0);
+        store<float>(type + w.fade, g_rng.chance(0.3) ? 0.0f : uni(0, 1));
+        store<u64>(type + w.handle, g_rng.chance(0.1) ? ~0ull : 0x100 + static_cast<u64>(c));
         const u32 state = static_cast<u32>(g_rng.range(0, 9));
         store<u32>(node + 0xdc, state);
         store<u64>(node + 0x58, inst);  // no overrides (+0x40)
@@ -1139,7 +1569,7 @@ int check_wind_source(int cases) {
         const double ulp_t = std::ldexp(1.0, std::ilogb(std::max(1.0, std::fabs(static_cast<double>(t)) + 1.0)) - 23);
         const double ulp_p = std::ldexp(1.0, std::ilogb(26.0) - 23);
         // the strength's largest size: the curve's value at the end (or 1); the fade only lowers it
-        const u64 strength_curve = load<u64>(type + 0xb8);
+        const u64 strength_curve = load<u64>(type + w.curve);
         const double s_max = strength_curve ? std::fabs(static_cast<double>(load<float>(strength_curve + 8))) +
                                                   std::fabs(static_cast<double>(load<float>(strength_curve + 12))) * (std::fabs(static_cast<double>(t)) + 1.0)
                                             : 1.0;
@@ -1164,15 +1594,15 @@ int check_wind_source(int cases) {
             for (u64 off = 0; off < 0x100 && !why; off += 4) {
                 const float a = load<float>(reinterpret_cast<u64>(type_whole.data()) + off), b = load<float>(type + off);
                 if (eboot_kit::same_float(a, b)) continue;
-                if (off != 0xd0 || std::fabs(static_cast<double>(a) - b) > 2.0 * n * (ulp_t + 1.2e-7 * (1 + std::fabs(static_cast<double>(a)))))
-                    why = off == 0xd0 ? "the fade" : "a word of the type";
+                if (off != w.fade || std::fabs(static_cast<double>(a) - b) > 2.0 * n * (ulp_t + 1.2e-7 * (1 + std::fabs(static_cast<double>(a)))))
+                    why = off == w.fade ? "the fade" : "a word of the type";
             }
             if (why) break;
             // the strengths: the curve at the same time, the fade within its rounding
-            const double fade_err = 2.0 * n * (ulp_t + 1.2e-7) / std::max(0.05, static_cast<double>(load<float>(type + 0x58)));
+            const double fade_err = 2.0 * n * (ulp_t + 1.2e-7) / std::max(0.05, static_cast<double>(load<float>(type + w.fade_time)));
             for (int i = 0; i < 2 && !why; ++i) {
                 const double a = whole.strength[i], b = fr.strength[i];
-                const double k = s_max * std::fabs(static_cast<double>(load<float>(type + 0x78 + 4 * static_cast<u64>(i))));
+                const double k = s_max * std::fabs(static_cast<double>(load<float>(type + w.strengths + 4 * static_cast<u64>(i))));
                 if (!eboot_kit::same_float(whole.strength[i], fr.strength[i]) && std::fabs(a - b) > 4e-6 * (1 + std::fabs(a)) + 4.0 * fade_err * k)
                     why = "the strengths";
             }
@@ -1180,7 +1610,7 @@ int check_wind_source(int cases) {
             double vmax = 0;
             for (int i = 0; i < 4; ++i) vmax = std::max(vmax, std::fabs(static_cast<double>(whole.velocity[i])));
             const double tol_v = 4e-6 * (1 + vmax) + vmax * 2.0 * n * ulp_t / h +
-                                 3.0 * n * ulp_p / h * s_max * std::fabs(static_cast<double>(load<float>(type + 0x48)));
+                                 3.0 * n * ulp_p / h * s_max * (w.velocity_scale ? std::fabs(static_cast<double>(load<float>(type + w.velocity_scale))) : 0.0);
             for (int i = 0; i < 4 && !why; ++i) {
                 const double a = whole.velocity[i], b = fr.velocity[i];
                 if (!eboot_kit::same_float(whole.velocity[i], fr.velocity[i]) && std::fabs(a - b) > tol_v) why = "the velocity";
@@ -1194,19 +1624,20 @@ int check_wind_source(int cases) {
             store<float>(rec + 0x18, t);
             put_at(0.0);
             update(reinterpret_cast<u64>(b_frame), type, rec, 0);
-            if (load<u32>(type + 0xd0) != load<u32>(reinterpret_cast<u64>(type0.data()) + 0xd0)) why = "a step of 0's fade";
+            if (load<u32>(type + w.fade) != load<u32>(reinterpret_cast<u64>(type0.data()) + w.fade)) why = "a step of 0's fade";
             for (int i = 0; i < 3 && !why; ++i)
                 if (g_wind.velocities && g_wind.velocity[i] != 0.0f) why = "a step of 0's velocity";
         }
         if (why && ++bad <= 6 && !g_quiet)
-            std::printf("wind source case %d (shape %u, state %u, time %g, velocity %u): %s differs\n", c,
-                        load<u32>(reinterpret_cast<u64>(type0.data()) + 0x20), state, t, load<u32>(reinterpret_cast<u64>(type0.data()) + 0x44), why);
+            std::printf("wind source %s case %d (shape %u, state %u, time %g): %s differs\n", w.name, c,
+                        load<u32>(reinterpret_cast<u64>(type0.data()) + w.kind), state, t, why);
     }
     if (!g_quiet)
-        std::printf("decomp_sfx_classes: the wind source 0x283c: %d cases (%ld ending, %ld of them let go, %ld moving), %d differ\n", cases, ending, released,
-                    moving, bad);
+        std::printf("decomp_sfx_classes: the wind source %s: %d cases (%ld ending, %ld of them let go, %ld moving), %d differ\n", w.name, cases, ending,
+                    released, moving, bad);
     return bad;
 }
+int check_wind_source(int cases) { return check_wind_layout(cases, kWind283c) + check_wind_layout(cases, kWind283d); }
 
 // --- the GPU particle simulations ------------------------------------------------------
 
@@ -1311,6 +1742,11 @@ int main() {
     store<u64>(reinterpret_cast<u64>(g_type_vt) + 0x10, reinterpret_cast<u64>(&stub_type_update));
     store<u64>(reinterpret_cast<u64>(g_type3d_vt) + 0x40, reinterpret_cast<u64>(&stub_type_bounds));
     eboot_kit::stub(0x2712f40, reinterpret_cast<const void*>(&stub_root_value));
+    // The wind motion's wind world (data_5ad1148): the test's force and drift.
+    store<u64>(reinterpret_cast<u64>(g_world_vt) + 0x10, reinterpret_cast<u64>(&stub_world_force));
+    store<u64>(reinterpret_cast<u64>(g_world_vt) + 0x28, reinterpret_cast<u64>(&stub_world_drift));
+    store<u64>(reinterpret_cast<u64>(g_world), reinterpret_cast<u64>(g_world_vt));
+    store<u64>(reinterpret_cast<u64>(eboot_kit::at(kWindWorld)), reinterpret_cast<u64>(g_world));
     // The wind source's reach: the node's end (sub_2c4f110) and the wind system's calls.
     eboot_kit::stub(0x2c4f110, reinterpret_cast<const void*>(&stub_node_ended));
     eboot_kit::stub(0x2717e10, reinterpret_cast<const void*>(&stub_wind_release));
@@ -1351,8 +1787,14 @@ int main() {
     constexpr int kCases = 4000;
     int bad = 0;
     bad += check_euler(kCases);
+    bad += check_gravity_motion(kCases);
+    bad += check_wind_motion(kCases);
+    bad += check_direction_motion(kCases);
+    bad += check_direction_gravity(kCases);
+    bad += check_direction_wind(kCases);
     bad += check_rotation(kCases);
     bad += check_transform(kCases / 4);
+    bad += check_curve_motion(kCases / 4);
     bad += check_composite(kCases / 4);
     bad += check_children(kCases / 4);
     bad += check_sprj(kCases / 4);
@@ -1370,9 +1812,20 @@ int main() {
         const char* what;
     } controls[] = {{1, check_cpu_particles, "the emission count on every frame (the CPU particles)"},
                     {2, check_euler, "the node's time left at its whole step (the Euler motion's curve)"},
+                    {2, check_gravity_motion, "the node's time left at its whole step (the gravity motion's curves)"},
+                    {3, check_gravity_motion, "each frame handed the whole step (the gravity motion)"},
+                    {2, check_wind_motion, "the node's time left at its whole step (the wind motion's curves)"},
+                    {3, check_wind_motion, "each frame handed the whole step (the wind motion)"},
+                    {2, check_direction_motion, "the node's time left at its whole step (the direction motion's curve)"},
+                    {3, check_direction_motion, "each frame handed the whole step (the direction motion)"},
+                    {2, check_direction_gravity, "the node's time left at its whole step (the direction gravity motion's curves)"},
+                    {3, check_direction_gravity, "each frame handed the whole step (the direction gravity motion)"},
+                    {2, check_direction_wind, "the node's time left at its whole step (the direction wind motion's curves)"},
+                    {3, check_direction_wind, "each frame handed the whole step (the direction wind motion)"},
                     {3, check_gx_record, "each frame handed the whole step (the GX record)"},
                     {3, check_ffx_types, "each frame handed the whole step (the FFX-format GX types' rates)"},
                     {3, check_wind_source, "each frame handed the whole step (the wind source's fade, strengths and velocity)"},
+                    {5, check_curve_motion, "a position moved by the step (the curve motion)"},
                     {4, check_sims, "each simulation update the whole step's time"}};
     for (const auto& k : controls) {
         g_control = k.control;
@@ -1382,6 +1835,8 @@ int main() {
         }
     }
     g_control = 0;
-    std::printf("decomp_sfx_classes: %s; %d of 6 controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold", 6 - missed);
+    const int ncontrols = static_cast<int>(sizeof controls / sizeof controls[0]);
+    std::printf("decomp_sfx_classes: %s; %d of %d controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold",
+                ncontrols - missed, ncontrols);
     return bad || missed ? 1 : 0;
 }

@@ -607,10 +607,13 @@ struct GpuStats {
     // Draws whose pixel shader discards by the vertex stage's clip distances at
     // entry (TranslateOptions::kVsOutCntlClipVarying).
     std::uint64_t draws_clip_discard;
-    // BBHOST_OOB_COUNT=1 (gcn::set_oob_count): the counters' totals by kind -
-    // typed loads by index past num_records, past their binding, walks by
-    // index past num_records; oob_on whether they count.
-    std::uint64_t oob[3];
+    // BBHOST_OOB_COUNT=1 (gcn::set_oob_count): the counters' totals by kind
+    // (gcn::kOobKinds, in its order) - typed loads by index past num_records,
+    // past their binding, walks by index past num_records; image loads outside
+    // the bound view's size, past its levels, past its layers; image stores
+    // outside its size, past its layers, at a level other than 0; the view
+    // smaller than the T#, larger; oob_on whether they count.
+    std::uint64_t oob[11];
     bool oob_on;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
@@ -734,6 +737,11 @@ void host_gpu_compile_cancel();
 // The device in use: "vendor:device:driver:pipelineCacheUUID name".
 std::string host_gpu_device_identity();
 std::string host_gpu_memory_budget_report();
+// Where this process's video memory goes, by owner and kind, held against
+// cached (gpu.cpp video_memory_report_locked): every 300 flips, and at exit
+// with each owner's highest. Empty with BBHOST_VRAM_REPORT=0 or no GPU.
+std::string host_gpu_video_memory_report(bool at_exit);
+void host_gpu_log_video_memory(bool at_exit);  // the same, logged a line a call (indented but the exit's first)
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
 void host_gpu_unlock();
