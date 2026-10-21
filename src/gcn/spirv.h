@@ -21,7 +21,7 @@ enum Op : std::uint16_t {
     OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32, OpTypeFunction = 33,
     OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43, OpConstantComposite = 44,
     OpConstantNull = 46, OpSpecConstant = 50, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
-    OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
+    OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65, OpArrayLength = 68,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpCompositeInsert = 82, OpSampledImage = 86,
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,

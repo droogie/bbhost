@@ -56,7 +56,8 @@ bool same(const gcn::TranslateResult& a, const gcn::TranslateResult& b) {
         a.buffers.size() != b.buffers.size() || a.image_at != b.image_at || a.sampler_at != b.sampler_at || a.buffer_at != b.buffer_at ||
         a.errors != b.errors || a.lds_bytes != b.lds_bytes || a.store_buffers.size() != b.store_buffers.size() ||
         a.untraced_stores != b.untraced_stores || a.unnormalized_samples != b.unnormalized_samples || a.walks != b.walks ||
-        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size) {
+        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size ||
+        a.oob_slot != b.oob_slot) {
         return false;
     }
     for (std::size_t i = 0; i < a.images.size(); ++i) {
@@ -273,6 +274,40 @@ int main(int argc, char** argv) {
         CHECK(g_tc.hits.load() == 0 && g_tc.misses.load() == 1);
     }
     gcn::set_runtime_sample_offsets(!gcn::runtime_sample_offsets());
+
+    // 3b. The typed loads' index check (gcn::set_index_bounds) is in the key of
+    // the programs that hold such a load (gcn::indexed_typed_load), and of no
+    // other: turned on, those translate again - as the translator makes them
+    // now - and every other program is still taken from the file.
+    {
+        gcn::set_index_bounds(true);
+        reset_cache();
+        translation_cache_load(path);
+        std::size_t indexed = 0, by_kind[3] = {}, changed = 0, changed_kind[3] = {};
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const Case& c = cases[i];
+            bool has = false;
+            for (const gcn::Inst& in : c.prog.insts) has = has || gcn::indexed_typed_load(in);
+            const std::uint64_t misses = g_tc.misses.load();
+            const gcn::TranslateResult t = translate_cached(c.prog, c.o);
+            CHECK(same(t, gcn::translate(c.prog, c.o)));
+            CHECK((g_tc.misses.load() != misses) == has);
+            const int kind = c.o.stage == gcn::Stage::Vertex ? 0 : c.o.stage == gcn::Stage::Pixel ? 1 : 2;
+            if (has) {
+                ++indexed;
+                ++by_kind[kind];
+            }
+            // Its module changed: a load the bound path takes (indexed_buffer_load), not a walk.
+            if (t.spirv != fresh[i].spirv) {
+                ++changed;
+                ++changed_kind[kind];
+            }
+        }
+        gcn::set_index_bounds(false);
+        std::printf("index bounds: %zu of %zu programs hold a typed load by index (vertex %zu, pixel %zu, compute %zu): their keys "
+                    "moved, no other's; %zu modules changed (vertex %zu, pixel %zu, compute %zu)\n", indexed, cases.size(), by_kind[0],
+                    by_kind[1], by_kind[2], changed, changed_kind[0], changed_kind[1], changed_kind[2]);
+    }
 
     // 4. A damaged entry is translated again, and left out of the next write.
     {

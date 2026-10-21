@@ -6,7 +6,10 @@
 //             0x2566300 CreateTexture3D - (ctx, holder** out, desc*,
 //             initial data*, ...). The holder exists only when the method
 //             returns, so the hook swaps the return address for gx_res_ret,
-//             which reads *out and registers it.
+//             which reads *out and registers it. CreateBuffer is on the
+//             decomp list (decomp/gx/resources.cpp): ours tells the registry
+//             itself (buffer_made_entry), and the hook goes on only when
+//             ours is not in place (gx_resources_install_late).
 //   Map       0x2569c30 (ctx, ?, holder, subresource, type, mapped*): a CPU
 //             write is coming. Type 1/2 return the memory itself after a GPU
 //             wait; for a buffer, 3 hands out a new renamed copy from the
@@ -33,12 +36,15 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "core/write_watch.h"
+#include "decomp/decomp.h"
+#include "decomp/gx/resources.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
 #include "guest_abi.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/gxvk.h"
 #include "log.h"
 
 #if !defined(_WIN32)
@@ -73,6 +79,16 @@ constexpr std::uint64_t kCreateRtv = 0x25667a0, kCreateDsv = 0x2566610;
 // Shader-resource views (the T# GX built at +0x10) and samplers
 // (the S# at +0x0), (ctx, object** out, ...).
 constexpr std::uint64_t kCreateSrv = 0x25669a0, kCreateSampler = 0x2565b40;
+// BBHOST_GXVK_CENSUS (host/gxvk.h): the unordered-access view creator (ctx,
+// view** out, holder, description, ...: the shader-resource view's prologue),
+// the block pool's initialisation 0x2aa9b50(pool, allocator, base, bytes) -
+// GX's upload heap, the device's one region (0x256b0f0) - and its aligned
+// hand-out 0x2aa9fa0(pool, bytes, alignment), beside 0x2aa9d50.
+constexpr std::uint64_t kCreateUav = 0x2566b60, kPoolInit = 0x2aa9b50, kPoolAligned = 0x2aa9fa0;
+// push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; push rax
+constexpr std::uint8_t kPoolInitPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+// push rbp; mov rbp, rsp; push r15, r14, r12, rbx; mov rbx, rdx
+constexpr std::uint8_t kPoolAlignedPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xd3};
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; sub rsp, 0x48; mov rbx, rcx
 constexpr std::uint8_t kSamplerPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                0x53, 0x48, 0x83, 0xec, 0x48, 0x48, 0x89, 0xcb};
@@ -126,6 +142,11 @@ constexpr std::uint8_t kCreate1DPrologue[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x
 #define BB_PUSH6 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53
 constexpr std::uint8_t kPrologue58[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x58};  // the three creators and Map
 constexpr std::uint8_t kRingPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x28};
+// GX's UpdateSubresource of a buffer that is not a constant buffer starts its
+// compute copy here (ctx, resource = holder + 0x18, data, offset, bytes); a
+// constant buffer's update never reaches it (0x2568a20 renames those).
+constexpr std::uint64_t kStaticBufferUpdate = 0x2ab3560;
+constexpr std::uint8_t kStaticUpdatePrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x18};
 constexpr std::uint8_t kDsvPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x68};  // the render-target view creator's is kPrologue58
 // YEBIS's own D3D11-shaped device and context (vtables 0x5708810 / 0x570a380),
 // which keep its textures and buffers out of GX: CreateTexture2D (slot 5 ->
@@ -446,6 +467,22 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         // BBHOST_GX_TWINS=1: one the GPU writes gets a device-local twin at its first use.
         host_gpu_gx_buffer_made(e.info.memory, e.info.bytes, e.info.usage, bind, e.info.gen);
     }
+    // GX on Vulkan (host/gxvk.h): a buffer the host keeps gets its entry and
+    // its handle at +0x14; BBHOST_GXVK_CENSUS: the class word and canaries in
+    // the holder's spare bytes. Not a 1D texture's, whose holder GX builds
+    // inline.
+    if (!(key & kMemoryKey)) {
+        if (e.info.type == 1) {
+            std::uint8_t cpu = 0;
+            std::uint32_t misc = 0;
+            rd(holder + 0x3a, &cpu);
+            rd(holder + 0x3c, &misc);
+            gxvk::buffer_made(holder, e.info.memory, e.info.bytes, e.info.usage, cpu, e.info.bind, misc, initial_data);
+            gxvk::census_buffer_made(holder, initial_data);
+        } else if (e.info.type == 3 || e.info.type == 4) {
+            gxvk::census_texture_made(holder);
+        }
+    }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
 }
@@ -474,6 +511,9 @@ void register_entry(std::uint64_t key, Entry& e) {
             const GxResourceInfo& old = h->second.info;
             if (old.memory + old.bytes <= e.info.memory) continue;
             g_overlapped[old.type < 5 ? old.type : 0][e.info.type < 5 ? e.info.type : 0].fetch_add(1, std::memory_order_relaxed);
+            // A buffer the host keeps a copy of ended with this (host/gxvk.h;
+            // its lock is never held while the registry's is taken).
+            if (old.type == 1) gxvk::buffer_replaced(o->second);
             if (g_overlap_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
                 host_log("gx-resources: resource %u (type %u) [0x%llx, +0x%x) made at flip %llu over live resource %u (type %u) [0x%llx, +0x%x) "
                          "made at flip %llu",
@@ -495,6 +535,7 @@ void register_entry(std::uint64_t key, Entry& e) {
                          old != g_by_holder.end() ? old->second.info.id : 0u, old != g_by_holder.end() ? old->second.info.type : 0u,
                          static_cast<unsigned long long>(old != g_by_holder.end() ? old->second.created_flip : 0), static_cast<unsigned long long>(m->second));
             }
+            if (const auto old = g_by_holder.find(m->second); old != g_by_holder.end() && old->second.info.type == 1) gxvk::buffer_replaced(m->second);
             if (old_holder_alive(m->second)) g_by_holder.erase(m->second);
         }
         g_by_memory[e.info.memory] = key;
@@ -641,6 +682,7 @@ void unregister_holder(std::uint64_t holder) {
         host_gpu_shadow_gx_write(buffer_memory, buffer_bytes);
         host_gpu_gx_buffer_gone(buffer_memory, buffer_gen);
     }
+    if (buffer_memory) gxvk::buffer_gone(holder);
 }
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
@@ -760,6 +802,9 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     // and its image is no longer what its memory holds - the texture cache,
     // which does not watch a GX resource's memory, is told (host textures).
     if (texture_memory && texture_bytes) host_gpu_texture_written(texture_memory, texture_bytes);
+    if (buffer_bytes) gxvk::census_buffer_mapped(holder, static_cast<std::uint32_t>(type), mapped, buffer_bytes, result == 0 && mapped, own_memory != 0);
+    // A buffer the CPU writes is not one the host keeps a copy of (host/gxvk.h).
+    if (buffer_bytes) gxvk::buffer_written(holder, gxvk::kRetireMap);
 }
 
 // The creators: rsi = holder**, rcx = initial data. The holder exists at the return.
@@ -767,6 +812,28 @@ GUEST_ABI std::int64_t create_hook(std::uint64_t id, const std::uint64_t* saved)
     t_pending.push_back({saved[6], static_cast<Kind>(id), saved[4], saved[3], saved[2]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
+}
+
+// GX on Vulkan (host/gxvk.h): a buffer's update by a GPU copy - a kept
+// default buffer's entry is retired (a lock only for a holder with a handle).
+GUEST_ABI std::int64_t static_update_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (saved[4]) gxvk::buffer_written(saved[4] - 0x18, gxvk::kRetireUpdate);
+    return 0;
+}
+
+// GX's CreateBuffer as ours (decomp/gx/resources.cpp) tells the registry
+// what it made or why it made nothing: what gx_res_after does at the hooked
+// creator's return (the failure counted - the first eight logged with the
+// description's first two words, as there - and a new holder registered).
+GUEST_ABI void buffer_made_entry(std::uint64_t holder, std::uint64_t desc, std::uint64_t initial_data, std::uint64_t result) {
+    if (static_cast<std::uint32_t>(result) != 0) {
+        const std::uint64_t n = g_create_failures.fetch_add(1, std::memory_order_relaxed);
+        std::uint32_t wh[2] = {0, 0};
+        if (n < 8 && desc && rd(desc, &wh))
+            host_log("gx-resources: a buffer of %ux%u was not made (error %u)", wh[0], wh[1], static_cast<std::uint32_t>(result));
+        return;
+    }
+    if (holder) register_holder(holder, holder, kBuffer, initial_data != 0);
 }
 
 // A render-target or depth-stencil view just made: its 2D texture's extent at
@@ -828,10 +895,19 @@ GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
-// The upload pool's block source: rsi = bytes, the block comes back in rax.
+// The upload pool's block source: rdi = the pool, rsi = bytes, the block
+// comes back in rax. The pool's aligned hand-out (0x2aa9fa0) has the same
+// first two arguments.
 GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
-    t_pending.push_back({saved[6], kPoolCall, 0, 0, saved[4]});
+    t_pending.push_back({saved[6], kPoolCall, 0, saved[5], saved[4]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// The block pool's initialisation (BBHOST_GXVK_CENSUS): rdi = the pool, rdx =
+// its region, rcx = the region's bytes.
+GUEST_ABI std::int64_t pool_init_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_heap(saved[5], saved[3], saved[2]);
     return 0;
 }
 
@@ -1143,6 +1219,7 @@ GUEST_ABI std::int64_t ring_hook(std::uint64_t, const std::uint64_t* saved) {
 
 // A texture holder's destructor: rdi = holder.
 GUEST_ABI std::int64_t texture_dtor_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_texture_gone(saved[5]);
     unregister_holder(saved[5]);
     return 0;
 }
@@ -1163,6 +1240,7 @@ GUEST_ABI std::int64_t create1d_hook(std::uint64_t, const std::uint64_t* saved) 
 
 // A buffer's resource release: rdi = holder + 0x18.
 GUEST_ABI std::int64_t buffer_release_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_buffer_gone(saved[5] - 0x18);
     unregister_holder(saved[5] - 0x18);
     return 0;
 }
@@ -1275,6 +1353,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
                 g_ring_bytes.fetch_add(p.ring_bytes, std::memory_order_relaxed);
                 host_gpu_shadow_gx_handed(ptr, p.ring_bytes, 2);
             }
+            if (got) gxvk::census_ring(ptr, p.ring_bytes);
         }
         if (g_trace) trace_map(p);
     } else if (p.kind == kYebisCreate) {
@@ -1316,14 +1395,19 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         }
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
-        if (result && p.type && rd(result + 8, &block) && block) {
+        if (g_census && result && p.type && rd(result + 8, &block) && block) {
             g_pool_calls.fetch_add(1, std::memory_order_relaxed);
             g_pool_bytes.fetch_add(p.type, std::memory_order_relaxed);
             host_gpu_shadow_gx_handed(block, p.type, 1);
         }
+        if (result && p.type) gxvk::census_handout(p.holder, result, p.type);
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
-        if (p.out && rd(p.out, &object) && object) {
+        if (p.type == 5) {
+            // An unordered-access view (BBHOST_GXVK_CENSUS's hook alone): its canaries.
+            if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &object) && object) gxvk::census_view_made(object, 5);
+        } else if (p.out && rd(p.out, &object) && object) {
+            if (p.type == 3 && static_cast<std::uint32_t>(result) == 0) gxvk::census_view_made(object, 3);
             std::uint32_t extent = 0;
             std::uint64_t words = 0;
             if (p.type == 1 || p.type == 2) {  // a view
@@ -1417,8 +1501,9 @@ void gx_resources_install(ElfImage* image) {
             host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(va));
         }
     };
-    hook(kCreateBuffer, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kBuffer);
     hook(kCreateTexture, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture);
+    if (gxvk::buffers_on())
+        hook(kStaticBufferUpdate, kStaticUpdatePrologue, sizeof(kStaticUpdatePrologue), reinterpret_cast<void*>(&static_update_hook), 0);
     hook(kCreateTexture3D, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture3D);
     hook(kMap, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&map_hook), 0);
     if (g_tex_ahead) hook(kTsharpBuild, kTsharpBuildPrologue, sizeof(kTsharpBuildPrologue), reinterpret_cast<void*>(&tsharp_hook), 0);
@@ -1463,7 +1548,7 @@ void gx_resources_install(ElfImage* image) {
         const char* e = std::getenv("BBHOST_SHADOW_RING_EXACT");
         return !(e && e[0] == '0');
     }();
-    if (g_trace || g_census || g_ring_exact) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    if (g_trace || g_census || g_ring_exact || gxvk::census()) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
     g_res_yebis = [] {
         const char* e = std::getenv("BBHOST_RES_YEBIS");
         return !(e && e[0] == '0');
@@ -1491,7 +1576,12 @@ void gx_resources_install(ElfImage* image) {
         if (g_res_scaleform)
             hook(kScaleformUnmap, kScaleformUnmapPrologue, sizeof(kScaleformUnmapPrologue), reinterpret_cast<void*>(&scaleform_unmap_hook), 0);
     }
-    if (g_census) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (g_census || gxvk::census()) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (gxvk::census()) {
+        hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+        hook(kPoolInit, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0);
+        hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
+    }
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1499,6 +1589,23 @@ void gx_resources_install(ElfImage* image) {
     hook(kCreateSampler, kSamplerPrologue, sizeof(kSamplerPrologue), reinterpret_cast<void*>(&view_create_hook), 4);
     host_log("gx-resources: registry on: %d hooks (creators, Map, destructors)%s%s", hooked, refused ? ", some refused" : "",
              g_trace ? "; Map and ring callers logged" : "");
+}
+
+// After the decomp list is placed: GX's CreateBuffer is ours (it calls the
+// registry's entry itself), the compare run's stand-in (which calls the
+// entry's host function), or the game's - hooked at its prologue as the
+// other creators are.
+void gx_resources_install_late(ElfImage* image) {
+    if (!g_gx_res_after_thunk) return;
+    const int placed = decomp_placed("gx_create_buffer");
+    if (placed) {
+        decomp_gx::g_buffer_made_host = reinterpret_cast<void*>(&buffer_made_entry);
+        decomp_gx::g_buffer_made_entry = hle_wrap_fn(reinterpret_cast<void*>(&buffer_made_entry));
+        return;
+    }
+    const std::uint64_t at = image->mem.slide + (kCreateBuffer - kPreferredGuestSlide);
+    if (!engine_prologue_hook(image, at, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kBuffer))
+        host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(kCreateBuffer));
 }
 
 std::uint64_t gx_guest_to_bn(std::uint64_t va) { return g_slide ? bn(va) : va; }
@@ -1643,6 +1750,7 @@ void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
         }
     }
     retire_memory(va, static_cast<std::uint32_t>(std::min<std::size_t>(len, 0xffffffffu)), 0);
+    if (n) gxvk::memory_released(va, len);
     // The mirrors keep pages by their physical memory, which this range no
     // longer names: they hear of it as a write, and a range their map of the
     // guest's mappings no longer has copies every told page again.
@@ -1932,4 +2040,6 @@ void gx_resources_report() {
             host_log("gx-map:   0x%llx x%llu", static_cast<ull>(caller), static_cast<ull>(n));
         }
     }
+    gxvk::census_report();
+    gxvk::buffers_report();
 }

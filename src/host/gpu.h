@@ -201,6 +201,15 @@ struct GxDrawObjects {
     std::uint16_t vtx_valid = 0;
     std::uint32_t vtx_rec[16][4] = {};
     std::uint64_t vtx_obj[16] = {};  // the buffer object behind each table slot (its home address at +0x20)
+    // The index buffer's object (its holder, as the pending state names it;
+    // 0: none), and the GX upload heap's hand-outs so far at the call
+    // (host/gxvk.h handout_seq: the census's stamp, 0 without it).
+    std::uint64_t ib_obj = 0;
+    std::uint64_t call_seq = 0;
+    // GX on Vulkan (host/gxvk.h): the handle of each vertex slot's buffer and
+    // of the index buffer, as their holders carried it at the call (0: none).
+    std::uint32_t vtx_handle[16] = {};
+    std::uint32_t ib_handle = 0;
 };
 
 // One stage's resource records as the GX commit wrote them for a draw, copied
@@ -598,6 +607,11 @@ struct GpuStats {
     // Draws whose pixel shader discards by the vertex stage's clip distances at
     // entry (TranslateOptions::kVsOutCntlClipVarying).
     std::uint64_t draws_clip_discard;
+    // BBHOST_OOB_COUNT=1 (gcn::set_oob_count): the counters' totals by kind -
+    // typed loads by index past num_records, past their binding, walks by
+    // index past num_records; oob_on whether they count.
+    std::uint64_t oob[3];
+    bool oob_on;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
 // typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,

@@ -149,6 +149,8 @@ add_executable(bbhost
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
   src/host/cb_proof.cpp
+  src/host/gxvk_census.cpp
+  src/host/gxvk_buffers.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -280,7 +282,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
@@ -375,6 +377,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/draw.cpp
   src/decomp/gx/command_list.cpp
   src/decomp/gx/present.cpp
+  src/decomp/gx/resources.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
@@ -385,6 +388,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
   src/decomp/sfx/step_gate.cpp
+  src/decomp/sfx/node_update.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
 )
@@ -527,6 +531,9 @@ if(UNIX)
   add_executable(ring_budget_test tests/ring_budget_test.cpp)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
+  add_executable(arena_memory_test tests/arena_memory_test.cpp)
+  target_include_directories(arena_memory_test PRIVATE src)
+  add_test(NAME arena_memory_test COMMAND arena_memory_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
@@ -582,7 +589,9 @@ if(UNIX)
   bbhost_decomp_test(chalice_ritual)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
-  bbhost_decomp_test(sfx_step_gate)
+  bbhost_decomp_test(sfx_step_gate SOURCES src/decomp/sfx/node_update.cpp)
+  bbhost_decomp_test(sfx_node_update)
+  bbhost_decomp_test(sfx_classes)
   bbhost_decomp_test(adaptive_mutex)
   bbhost_decomp_test(ez_work)
   bbhost_decomp_test(ez_node_cache)
@@ -594,6 +603,8 @@ if(UNIX)
   bbhost_decomp_test(gx_draw SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_command_list)
   bbhost_decomp_test(gx_present)
+  bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_upload_heap)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
@@ -612,6 +623,10 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # PA_CL_CLIP_CNTL as depth clamp and rasterizer discard (tests/clip_control_test.cpp).
+  add_executable(clip_control_test tests/clip_control_test.cpp)
+  target_include_directories(clip_control_test PRIVATE src)
+  add_test(NAME clip_control_test COMMAND clip_control_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)

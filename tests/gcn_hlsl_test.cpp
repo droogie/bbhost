@@ -666,6 +666,39 @@ void native_half_rtz() {
 
 }  // namespace
 
+// A typed load by index (tbuffer_load_format_xyzw idxen) from a V# in a
+// table, with and without its check against the V#'s num_records
+// (gcn::set_index_bounds): printed, compiled by DXC, the interface and
+// operations the lift's.
+void typed_load_bounds() {
+    std::vector<std::uint32_t> w;
+    w.push_back(0xc0000000u | 2u << 22 | 8u << 15 | (2u / 2) << 9 | 1u << 8 | 4u);  // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+    w.push_back(0xbf8c007fu);                                                       // s_waitcnt lgkmcnt(0)
+    w.push_back(0x7e000000u | 4u << 17 | 1u << 9 | 1u);                             // v_mov_b32 v4, s1: the element's index
+    w.push_back(0xe8000000u | 7u << 23 | 14u << 19 | 3u << 16 | 1u << 13);           // tbuffer_load_format_xyzw v[0:3], v4, s[8:11] idxen
+    w.push_back(4u | 0u << 8 | (8u / 4) << 16 | 128u << 24);
+    w.push_back(0xbf8c0f70u);                                                       // s_waitcnt vmcnt(0)
+    w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);                          // exp mrt0 v0, v1, v2, v3 done vm
+    w.push_back(0u | 1u << 8 | 2u << 16 | 3u << 24);
+    w.push_back(kEndpgm);
+    for (const bool on : {true, false}) {
+        gcn::set_index_bounds(on);
+        const gcn::Program p = gcn::decode(w.data(), w.size());
+        CHECK(p.errors.empty());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Pixel;
+        o.rsrc2 = 4u << 1;
+        o.ps_input_ena = 2;
+        o.descriptor_set = 1;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok() && ref.buffers.size() == 2 && ref.buffers[1].indexed);
+        through_hlsl(gcn::lift_pixel_shader(p, o, ref), on ? "typed load by index, checked against its records" : "typed load by index");
+    }
+    gcn::set_index_bounds(false);
+}
+
 int main() {
     g_have_dxc = g_dxc.load();
     // A library named by BBHOST_HLSL_DXC must load: the continuous-integration
@@ -683,6 +716,7 @@ int main() {
     samples_and_loops();
     vertex_invariant();
     clip_prologue();
+    typed_load_bounds();
     native_half_rtz();
     std::printf("gcn_hlsl_test: %d lifts printed, %d compiled by DXC%s\n", g_printed, g_compiled, g_have_dxc ? "" : " (no DXC)");
     if (g_failures) {

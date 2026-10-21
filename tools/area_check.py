@@ -16,7 +16,9 @@ Hunter's Dream headstones do, moves the player to the place's view, switches
 off the ordinary enemies within 40 m, puts the camera behind the player and
 then holds still:
 
-  settle      --settle seconds (15): streaming and the first compiles
+  settle      --settle seconds (15): streaming and the first compiles - and at
+              least --settle-flips frames (60) after the loading screen went:
+              on a slow renderer (lavapipe) its fade-out outlasts the seconds
   window      --measure seconds (20): what the place costs
   frames      the displayed frame twice, 2 s apart, for a visual A/B
 
@@ -310,8 +312,8 @@ def pick_areas(spec):
 
 # --- the plan -------------------------------------------------------------------
 
-DEFAULTS = {"settle": 15.0, "measure": 20.0, "dumps": 2, "dump_gap": 2.0, "quiet": QUIET_RADIUS, "start": 8.0, "fps": 60,
-            "captures": 6, "capture_settle": 10.0, "capture_window": 30.0}
+DEFAULTS = {"settle": 15.0, "settle_flips": 60, "measure": 20.0, "dumps": 2, "dump_gap": 2.0, "quiet": QUIET_RADIUS,
+            "start": 8.0, "fps": 60, "captures": 6, "capture_settle": 10.0, "capture_window": 30.0}
 
 
 def tour(areas, opts, kind):
@@ -342,6 +344,8 @@ def tour(areas, opts, kind):
         lines.append("mark %s:arrived" % a.id)
         if kind == "perf":
             lines.append("hold %.1f" % opts["settle"])
+            if opts.get("settle_flips"):
+                lines.append("flips %d" % opts["settle_flips"])
             if quiet:
                 lines.append("quiet %.0f" % opts["quiet"])
             lines.append("mark %s:measure" % a.id)
@@ -373,6 +377,8 @@ def tour(areas, opts, kind):
                     lines.append("pitch off")
         else:
             lines.append("hold %.1f" % opts["capture_settle"])
+            if opts.get("settle_flips"):
+                lines.append("flips %d" % opts["settle_flips"])
             lines.append("capture %d %s" % (opts["captures"], a.id))
             lines.append("mark %s:capture" % a.id)
             lines.append("hold %.1f" % opts["capture_window"])
@@ -463,6 +469,8 @@ def pass_budget(areas, opts, kind):
     limits (a travel gives up after travel_seconds, a warp after ten 3 s tries)
     and the holds."""
     per = travel_seconds(opts) + 35 + 10
+    # the frames past the loading screen (flips): ~2.5 s a frame on a slow renderer, nothing much at 60
+    per += opts.get("settle_flips", 0) * (3.0 if travel_seconds(opts) > 150 else 0.1)
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * (opts["dump_gap"] + 2) + 3 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"] + 60)
     looks = sum(look_seconds(l, opts) + 30 for a in areas for l in a.looks) if kind == "perf" else 0
@@ -2043,7 +2051,8 @@ def resolve_options(args):
         if not shutil.which("numactl"):
             raise ValueError("--numa-node needs numactl")
     opts = dict(DEFAULTS)
-    opts.update({"settle": args.settle, "measure": args.measure, "dumps": args.dumps, "quiet": args.quiet, "start": args.start,
+    opts.update({"settle": args.settle, "settle_flips": args.settle_flips, "measure": args.measure, "dumps": args.dumps,
+                 "quiet": args.quiet, "start": args.start,
                  "fps": args.fps, "captures": args.captures, "capture_window": args.capture_window,
                  "pipeline_cache": args.pipeline_cache == "seed", "p2p_port": args.p2p_port, "width": args.width,
                  "height": args.height, "env": args.env, "keep_data": args.keep_data, "keep_captures": args.keep_captures,
@@ -2243,6 +2252,8 @@ def add_run_options(p):
     p.add_argument("--out", required=True, help="a new folder for the run")
     p.add_argument("--areas", default="all", help="comma list of places (ids or prefixes), in order; default all")
     p.add_argument("--settle", type=float, default=DEFAULTS["settle"], help="seconds at a place before the window")
+    p.add_argument("--settle-flips", type=int, default=DEFAULTS["settle_flips"],
+                   help="frames past the loading screen's end before the window as well (0: seconds only)")
     p.add_argument("--measure", type=float, default=DEFAULTS["measure"], help="seconds of the window")
     p.add_argument("--dumps", type=int, default=DEFAULTS["dumps"], help="frames dumped after the window, 2 s apart")
     p.add_argument("--captures", type=int, default=DEFAULTS["captures"],

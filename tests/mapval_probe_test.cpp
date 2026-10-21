@@ -225,6 +225,7 @@ int main(int argc, char** argv) {
                                "camera\n"
                                "mark central-yharnam:arrived\n"
                                "hold 0.1\n"
+                               "flips 200\n"
                                "mark central-yharnam:measure\n"
                                "hold 0.2\n"
                                "mark central-yharnam:measured\n"
@@ -277,7 +278,7 @@ int main(int argc, char** argv) {
         fs::remove_all(dir);
         return g_failures ? 1 : 0;
     }
-    CHECK(logged("mapval: tour of 18 steps"));
+    CHECK(logged("mapval: tour of 19 steps"));
     CHECK(g_world.frame != nullptr);
 
     // Frames, 5 ms apart, until the tour is done or 30 s pass. A travel puts
@@ -285,7 +286,10 @@ int main(int argc, char** argv) {
     // 150 frames here, 0.75 s - a load's flips come fast, and the ninety
     // still frames the probe once took for an arrival pass under it.
     const auto t0 = std::chrono::steady_clock::now();
+    long frame_i = 0, first_load_end_i = -1, measure_i = -1;  // frames, to check "flips"
     while (!logged("mapval tour-done") && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30)) {
+        ++frame_i;
+        if (measure_i < 0 && logged("mapval mark central-yharnam:measure ")) measure_i = frame_i;
         if (g_world.travel_in > 0 && --g_world.travel_in == 0) {
             g_world.travel_in = -1;
             g_world.block = g_world.travel_block;
@@ -297,6 +301,7 @@ int main(int argc, char** argv) {
         if (g_world.loading_left > 0 && --g_world.loading_left == 0) {
             put<std::uint8_t>(kLoadingHelper + 0x50, 1);  // the in-game update ran
             g_world.loading_ends.push_back(g_log.size());
+            if (first_load_end_i < 0) first_load_end_i = frame_i;
         }
         // Something hurts the player now and then: the holds put it right.
         if (logged("mapval step 4 hold") && !logged("mapval mark central-yharnam:measure")) put<std::int32_t>(kData + 0xf8, 40);
@@ -318,6 +323,10 @@ int main(int argc, char** argv) {
     CHECK(log_index("mapval loading-begins") < log_index("mapval loading-ends"));
     CHECK(log_index("mapval loading-ends") < log_index("mapval travel-done central-yharnam"));
     CHECK(logged("s of it loading"));
+    // "flips 200": the measure mark at least 200 frames after the loading
+    // screen went, past the travel's still frames and the hold.
+    CHECK(logged("mapval flips-done") && first_load_end_i > 0 && measure_i - first_load_end_i >= 200);
+    CHECK(log_index("mapval step 5 flips") < log_index("mapval flips-done"));
     CHECK(log_index("mapval placed") < log_index("mapval travel-done central-yharnam"));
     CHECK(logged("mapval placed") && logged(" 18010000") && logged(" 20000000"));
     // The marks, in order, with the block and the position.

@@ -45,7 +45,7 @@ namespace {
 // program, and a result field the entry does not hold would come back empty.
 #if defined(__GLIBCXX__) && defined(__x86_64__)
 static_assert(sizeof(gcn::TranslateOptions) == 320, "a new TranslateOptions field: add it to hash_options");  // a bool can land in padding: check the list too
-static_assert(sizeof(gcn::TranslateResult) == 456, "a new TranslateResult field: add it to write_result and read_result");
+static_assert(sizeof(gcn::TranslateResult) == 464, "a new TranslateResult field: add it to write_result and read_result");
 static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8, "a new ResourcePath field: add it to the entry");
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
@@ -59,7 +59,7 @@ static_assert(sizeof(gcn::LiftResult) == 296, "a new LiftResult field: add it to
 constexpr std::uint32_t kMagic = 0x43544242;  // "BBTC"
 // The file's own layout. The translator's changes are its fingerprint's;
 // this changes only when the entries are written differently.
-constexpr std::uint32_t kVersion = 3;  // 2: wave64_needs; 3: gds_counters
+constexpr std::uint32_t kVersion = 4;  // 2: wave64_needs; 3: gds_counters; 4: oob_slot
 // What the file may hold (compressed; it is kept in memory while the game
 // runs): past it, the entries this run did not use go first. A world run's
 // ~9,000 translations and lifts are a few tens of MiB.
@@ -112,11 +112,16 @@ struct KeyHasher {
 void hash_program(KeyHasher& h, const gcn::Program& p) {
     h.u32(static_cast<std::uint32_t>(p.insts.size()));
     h.u32(p.end);
+    bool indexed = false;  // a typed load by index (gcn::indexed_typed_load)
     for (const gcn::Inst& in : p.insts) {
         h.u32(in.size);
         for (std::uint32_t k = 0; k < in.size && k < 3; ++k) h.u32(in.words[k]);
         if (in.has_literal) h.u32(in.literal);
+        indexed = indexed || gcn::indexed_typed_load(in);
     }
+    // Its index checked against num_records (gcn::set_index_bounds): the
+    // programs without such a load keep their keys.
+    if (indexed && gcn::index_bounds()) h.u32(0x1d0bu);
 }
 
 // Every TranslateOptions field, in declaration order (translate.h).
@@ -188,6 +193,8 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     if (!gcn::subgroup_ops_in(o)) h.u32(0x5b01u);
     // A clip-discarding pixel shader that demotes the pixel rather than ending it.
     if (o.stage == gcn::Stage::Pixel && o.ps_clip_discard && gcn::clip_demote()) h.u32(0xde40u);
+    // The out-of-range counters (gcn::set_oob_count, a diagnostic).
+    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bdu : 0x00bcu);
 }
 
 // ---- an entry: the TranslateResult, every field ----
@@ -341,6 +348,7 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
     w.words(r.ps_inputs);
     w.i32(r.vs_clip_count);
     w.u8(r.vs_point_size ? 1 : 0);
+    w.u32(r.oob_slot);  // gcn::set_oob_count
     w.u32(r.wave64_needs);  // what keeps a pixel program at 64 lanes (gcn/wave.h)
     w.u32(r.gds_counters);
 }
@@ -408,6 +416,7 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
     r.words(t.ps_inputs);
     t.vs_clip_count = r.i32();
     t.vs_point_size = r.u8() != 0;
+    t.oob_slot = r.u32();
     t.wave64_needs = r.u32();
     t.gds_counters = r.u32();
     return r.ok && r.p == r.end;

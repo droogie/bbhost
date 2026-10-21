@@ -37,6 +37,12 @@
  *     wait <s>
  * and, for tools/area_check.py, which measures each place it stands in:
  *     hold <s>                                wait with the player's HP kept full
+ *     flips <n>                               wait, HP kept full, until the
+ *                                             loading screen has been gone for
+ *                                             <n> frames: on a slow renderer
+ *                                             (lavapipe, ~0.4 frames a second)
+ *                                             its fade-out takes 20-30 frames,
+ *                                             far past a settle in seconds
  *     mark <name>                             log `mapval mark <name> <t> <block>
  *                                             <x> <y> <z> yaw <yaw> hp <hp> loading
  *                                             <0|1>`: where the player is then
@@ -139,11 +145,13 @@ static int loading_screen(void) {
 }
 static int loading;        /* this frame's answer */
 static double loading_t0;  /* when the screen came up */
+static uint64_t frame_no;           /* frames seen (on_frame calls) */
+static uint64_t loading_end_frame;  /* frame_no when the loading screen last went ("flips") */
 
 /* --- the tour ------------------------------------------------------------ */
 
 enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12,
-       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS, S_PITCH };
+       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS, S_PITCH, S_FLIPS };
 #define MAX_STEPS 4096
 typedef struct {
     int kind;
@@ -267,6 +275,8 @@ static void load_tour(const char* path) {
             s.kind = S_WAIT, strcpy(s.name, "wait");
         else if (!strcmp(kind, "hold") && sscanf(line, "%*s %f", &s.hold) == 1)
             s.kind = S_HOLD, strcpy(s.name, "hold");
+        else if (!strcmp(kind, "flips") && sscanf(line, "%*s %f", &s.hold) == 1)
+            s.kind = S_FLIPS, strcpy(s.name, "flips");
         else if (!strcmp(kind, "mark") && sscanf(line, "%*s %63s", s.name) == 1)
             s.kind = S_MARK;
         else if (!strcmp(kind, "camera"))
@@ -653,6 +663,9 @@ static void begin(int i, double t) {
         api->log("mapval walk-ready %s %.3f %.3f %.3f %.3f", s->name, t, p[0], p[1], p[2]);
     } else if (s->kind == S_HOLD) {
         api->log("mapval step %d hold %.3f %.1f s", i, t, s->hold);
+    } else if (s->kind == S_FLIPS) {
+        api->log("mapval step %d flips %.3f %.0f after the loading screen (%llu so far%s)", i, t, s->hold,
+                 (unsigned long long)(frame_no - loading_end_frame), loading ? ", the screen is up" : "");
     } else if (s->kind == S_MARK) {
         float p[3] = {0, 0, 0}, yaw = 0;
         uint32_t b = 0;
@@ -947,6 +960,17 @@ static void tick(double t) {
     } else if (s->kind == S_HOLD) {
         heal();
         if (el >= s->hold) next = 1;
+    } else if (s->kind == S_FLIPS) {
+        heal();
+        if (!loading && frame_no - loading_end_frame >= (uint64_t)s->hold) {
+            api->log("mapval flips-done %.3f %llu frames after the loading screen, %.1f s waited", t,
+                     (unsigned long long)(frame_no - loading_end_frame), el);
+            next = 1;
+        } else if (el > 900) { /* a screen that never goes: the tour goes on */
+            api->log("mapval flips-gave-up %.3f after %.0f s, %llu frames after the loading screen%s", t, el,
+                     (unsigned long long)(frame_no - loading_end_frame), loading ? ", the screen still up" : "");
+            next = 1;
+        }
     } else if (s->kind == S_TURN) {
         heal();
         int k = (int)(el / (s->hold > 0.05f ? s->hold : 0.05f));
@@ -1047,11 +1071,13 @@ static void on_frame(void* u) {
     float p[3], yaw = 0;
     int have = api->player_position(p, &yaw) == 0;
     int was = loading;
+    ++frame_no;
     loading = loading_screen();
     if (loading && !was) {
         loading_t0 = t;
         api->log("mapval loading-begins %.3f", t);
     } else if (!loading && was) {
+        loading_end_frame = frame_no;
         if (cur >= 0 && !tour_done && (steps[cur].kind == S_TRAVEL || retravel)) travel_loading += t - loading_t0;
         api->log("mapval loading-ends %.3f after %.1f s", t, t - loading_t0);
     }

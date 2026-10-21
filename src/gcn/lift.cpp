@@ -353,6 +353,14 @@ private:
     // lane of GCN's wave, every buffer reached through the page table as the
     // reference reaches it (lift_compute_shader).
     bool compute() const { return opt.stage == Stage::Compute && opt.tess_role == TranslateOptions::TessRole::None; }
+    // gcn::set_oob_count: a vertex or pixel stage whose reference counts
+    // counts as it does (its typed loads by index; a graphics lift walks
+    // nothing), through the same counters (TranslateResult::oob_slot).
+    bool oob_counting() const {
+        return oob_count() && !compute() && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) &&
+               opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None && ref.oob_slot < kOobSlots;
+    }
+    Id oob_base64 = 0;  // the counters' device address (StageParams::lds_address), at the entry
     // Threads in the dispatch's workgroup, and whether GCN's waves of it are
     // all whole (every lane of each 64 runs an invocation).
     std::uint32_t workgroup_threads() const {
@@ -3286,14 +3294,35 @@ private:
         }
         const std::uint32_t index = site->second;
         const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
-        const Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, as_u(value(256 + in.vaddr)), stride_dw));
+        const Id vindex = as_u(value(256 + in.vaddr));
+        Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, vindex, stride_dw));
+        if (oob_base64) {
+            // gcn::set_oob_count, as the reference: an index at or past
+            // num_records, and a read past the binding.
+            const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+            const Id limit = oob_control() ? shift(spv::OpShiftRightLogical, records, cu(1)) : records;  // gcn::set_oob_control
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), kOobPastRecords);
+            int total_bits = 0;
+            for (int k = 0; k < count; ++k) total_bits += bits[k];
+            const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
+            const Id last = ibin(spv::OpIAdd, cb_bias(index), ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>((total_bits + 31) / 32 - 1))));
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {last, length})}), kOobPastBinding);
+        }
+        // gcn::set_index_bounds, as the reference: past num_records the
+        // binding's first element is read and the words are 0.
+        Id ok = 0;
+        if (index_bounds()) {
+            ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
+            first = m.emit(spv::OpSelect, t_u32, {ok, first, cu(static_cast<std::uint32_t>(off / 4))});
+        }
         const Id bias = cb_bias(index);
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         std::vector<Id> words;
         for (int k = 0; k < (total + 31) / 32; ++k) {
             const Id at = ibin(spv::OpIAdd, bias, ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k))));
-            words.push_back(m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at})));
+            const Id w = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at}));
+            words.push_back(ok ? m.emit(spv::OpSelect, t_u32, {ok, w, cu(0)}) : w);
         }
         typed_load_result(in, words, count, bits);
         ++buffer_loads;
@@ -4568,6 +4597,23 @@ private:
     }
     // `body` where the invocation's EXEC bit is set: GCN writes LDS only from
     // the lanes EXEC holds (translate.cpp exec_guard).
+    // gcn::set_oob_count: one more of `kind` for this program where `cond`
+    // holds in a lane EXEC holds.
+    void oob_note(Id cond, std::uint32_t kind) {
+        if (!oob_base64) return;
+        where_exec(exec_lane(), [&] {
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+            cur_label = m.label(l_then);
+            const std::uint64_t at = (static_cast<std::uint64_t>(ref.oob_slot) * kOobKinds + kind) * 4;
+            const Id ptr = m.access_chain(p_psb_u32, m.emit(spv::OpConvertUToPtr, p_psb_block, {m.emit(spv::OpIAdd, t_u64, {oob_base64, m.const_u64(at)})}),
+                                          {cu(0)});
+            m.emit(spv::OpAtomicIAdd, t_u32, {ptr, cu(spv::ScopeDevice), cu(spv::MsNone), cu(1)});
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+        });
+    }
     void where_exec(const Val& e, const std::function<void()>& body) {
         if (e.constant) {
             if (e.set) body();
@@ -7787,9 +7833,9 @@ private:
     void emit() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        if (compute()) {
+        if (compute() || oob_counting()) {
             // Guest memory through physical storage buffer pointers, as the
-            // reference reaches it.
+            // reference reaches it (and the counters, gcn::set_oob_count).
             m.capability(spv::CapPhysicalStorageBufferAddresses);
             m.extension("SPV_KHR_physical_storage_buffer");
             m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
@@ -8021,10 +8067,11 @@ private:
             m.name(es_gs, "es_gs");
             interface.push_back(es_gs);
         }
-        if (compute()) declare_guest_memory();
+        if (compute() || oob_counting()) declare_guest_memory();
         fn_main = m.begin_function(t_void, m.type_function(t_void, {}));
         m.name(fn_main, "main");
         cur_label = m.label();
+        if (oob_counting()) oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
         if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
         if (gs_geom()) gs_ring_model();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set

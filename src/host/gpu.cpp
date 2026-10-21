@@ -3206,6 +3206,18 @@ bool init_locked() {
         const bool demote = q13.shaderDemoteToHelperInvocation == VK_TRUE && !(e && e[0] == '0');
         if (demote) f13.shaderDemoteToHelperInvocation = VK_TRUE;
         gcn::set_clip_demote(demote);
+        // BBHOST_ROBUST_IMAGES=1: robust image access (also required by 1.3).
+        // GCN gives 0 for an image load outside the image and drops a store
+        // there; the translation and the lift load and store at the
+        // program's coordinates (image_load as OpImageFetch, image_store as
+        // OpImageWrite), which Vulkan leaves undefined outside the image -
+        // a 1x1 dummy bound for a missing texture among them. Off by default:
+        // the driver compiles every pipeline again once with it.
+        const char* ri = std::getenv("BBHOST_ROBUST_IMAGES");
+        if (ri && ri[0] == '1' && q13.robustImageAccess == VK_TRUE) {
+            f13.robustImageAccess = VK_TRUE;
+            host_log("gpu: robust image access on (BBHOST_ROBUST_IMAGES=1)");
+        }
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;
@@ -3263,6 +3275,16 @@ bool init_locked() {
     if (const char* e = std::getenv("BBHOST_ROBUST"); e && e[0] == '1') {
         f2.features.robustBufferAccess = VK_TRUE;  // core since 1.0, always supported
         host_log("gpu: robust buffer access on (BBHOST_ROBUST=1)");
+    }
+    // BBHOST_INDEX_BOUNDS=1: the shaders' own check instead, where GCN makes
+    // one - a typed load by index past the V#'s num_records reads 0
+    // (gcn::set_index_bounds), on every driver, at a compare and a select a
+    // load. Off by default: the modules of about 1,100 of the game's 2,680
+    // programs change with it (a pipeline compile each, once).
+    {
+        const char* e = std::getenv("BBHOST_INDEX_BOUNDS");
+        gcn::set_index_bounds(e && e[0] == '1');
+        if (gcn::index_bounds()) host_log("gpu: typed loads by index read 0 past the V#'s records (BBHOST_INDEX_BOUNDS=1)");
     }
     f2.features.fragmentStoresAndAtomics = VK_TRUE;
     f2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
@@ -3664,6 +3686,22 @@ bool init_locked() {
     }
     for (std::uint32_t k = 0; k < gcn::kL2Entries; ++k) static_cast<std::uint64_t*>(g.sink_l2.map)[k] = g.sink.address;
     for (std::uint32_t k = 0; k < gcn::kL1Entries; ++k) static_cast<std::uint64_t*>(g.l1.map)[k] = g.sink_l2.address;
+    // BBHOST_OOB_COUNT=1 (a diagnostic): translated vertex and pixel stages
+    // count the buffer accesses that leave what GCN would read into this
+    // buffer (gcn::set_oob_count; StageParams::lds_address points at it);
+    // the frame detail line and the exit report read it. Lifts do not count:
+    // run with BBHOST_DECOMP=0 for every stage.
+    // =2: the control (gcn::set_oob_control) - a load by index counts as past
+    // the records from half of them on, to show the counters reach the host.
+    if (const char* e = std::getenv("BBHOST_OOB_COUNT"); e && (e[0] == '1' || e[0] == '2')) {
+        if (create_dev_buffer(g.oob, std::uint64_t{gcn::kOobSlots} * gcn::kOobKinds * 4, true, true)) {
+            std::memset(g.oob.map, 0, g.oob.size);
+            gcn::set_oob_count(true);
+            gcn::set_oob_control(e[0] == '2');
+            host_log("gpu: out-of-range buffer accesses counted (BBHOST_OOB_COUNT=%c; vertex and pixel stages%s)", e[0],
+                     e[0] == '2' ? "; the control: loads by index from half the records on count as past them" : "");
+        }
+    }
 
     // Mirror-map the whole direct memory so it can be imported in chunks.
     g.mirror_size = hle_kernel_dmem_size();
@@ -3777,6 +3815,7 @@ void begin_recording_locked() {
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
         twins_arm_wanted_locked();  // BBHOST_PARTICLE_TWINS: from this recording's first use of each
+        gxvk_begin_recording_locked();  // GX buffers by handle: retired entries taken back
         busy_begin_locked(g.slots[g.slot]);
         gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
@@ -6034,6 +6073,7 @@ void retire_slot_locked(int k) {
     }
     sl.garbage.clear();
     untile_checks_run_locked(sl.untile_checks);  // before their staging is reused
+    gxvk_slot_retired_locked(k);  // BBHOST_GXVK_BUFFERS=2: the copies this slot's uploads made, read back
     for (const DevBuffer& b : sl.staging_chunks) {
         const auto it = g.staging_users.find(b.buffer);
         if (it == g.staging_users.end() || --it->second) continue;
@@ -7330,6 +7370,13 @@ GpuStats host_gpu_stats() {
     st.shader_dispatches = g.shader_dispatches.load(std::memory_order_relaxed);
     st.lifted_dispatches = g.lifted_dispatches.load(std::memory_order_relaxed);
     st.draws_clip_discard = g.draws_clip_discard.load(std::memory_order_relaxed);
+    if (g.oob.map) {
+        st.oob_on = true;
+        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
+        for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
+            for (std::uint32_t k = 0; k < 3; ++k) st.oob[k] += c[slot * gcn::kOobKinds + k];
+        }
+    }
     return st;
 }
 
@@ -10647,6 +10694,12 @@ void host_gpu_report() {
                      static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
+        // GX buffers by handle (host/gxvk.h): one line each.
+        for (std::string gx = gxvk_report(); !gx.empty();) {
+            const std::size_t nl = gx.find('\n');
+            host_log("%s", gx.substr(0, nl).c_str());
+            gx = nl == std::string::npos ? std::string() : gx.substr(nl + 1);
+        }
     }
     {
         // Before the census lock: compute_lift_report takes g.mu, and a

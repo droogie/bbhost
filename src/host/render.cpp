@@ -7,6 +7,7 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
+#include "host/clip_control.h"
 #include "host/gpu_internal.h"
 #include "host/masked_blend.h"
 #include "host/shader_bundles.h"
@@ -16,6 +17,8 @@
 #include "host/vertex_plan.h"
 
 #include "host/cb_proof.h"
+#include "host/gxvk.h"
+#include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
@@ -311,6 +314,10 @@ struct GfxPipeline {
     std::uint32_t relink_vertex_formats[16] = {};
     VkPolygonMode relink_polygon = VK_POLYGON_MODE_FILL;
     bool relink_clamp = false;
+    bool relink_discard = false;
+    // Made with rasterizer discard dynamic (GfxFixedState::rasterizer_discard):
+    // a draw sets it on after binding the pipeline.
+    bool raster_discard = false;
     // The indexed loads' V# words 3 (StageParams::cb_w3, by stage and buffer)
     // the relink was specialized with, and once it is adopted the fast-linked
     // pipeline, which a draw whose words differ binds instead.
@@ -341,6 +348,9 @@ struct Pass {
     std::uint64_t targets[9] = {};  // its attachments' bases (lazy pass barriers)
     int ntargets = 0;
     bool profiled = false;  // BBHOST_GPU_PROFILE=3: a timestamp pair is open around it
+    // Its attachments a draw of it has written so far: bit t colour slot t, bit
+    // 8 depth or stencil (the feedback census, note_feedback_loops).
+    std::uint32_t written = 0;
 };
 Pass g_pass;
 const std::string* g_pass_profile_name = nullptr;  // the profile name of the draw beginning the next pass (BBHOST_GPU_PROFILE=3)
@@ -1123,6 +1133,21 @@ thread_local const char* t_draw_pipeline = nullptr;  // the draw being resolved,
 // The draw being resolved came from a Scaleform (or wrapper) token: its
 // constant buffers are bound from a copy taken now (resolve_stage_buffers).
 thread_local bool t_snapshot_cbs = false;
+// The draw's call stamp for the GX upload heap's checks (host/gxvk.h; set by
+// draw_impl for the draw it resolves, 0 otherwise - dispatches, the census
+// off).
+thread_local std::uint64_t t_gxvk_call_seq = 0;
+// GX on Vulkan: plan_vertex_input planning a draw again without handles (a
+// binding the plan would share between two buffers' copies).
+thread_local bool t_gxvk_no_handles = false;
+// Where a vertex element bound by handle sits in the plan: its 1 GiB of
+// guest address space as one buffer and its address as the offset, as the
+// mirrors and the import place guest memory (one buffer a direct-memory
+// chunk, the address's offset in it) - so the bindings, the attributes and
+// the pipeline are what today's path plans. Never a real buffer.
+constexpr std::uint64_t kGxvkPlanTag = 0xfffe000000000000ull;
+VkBuffer gxvk_plan_buffer(std::uint64_t va) { return reinterpret_cast<VkBuffer>(kGxvkPlanTag | (va >> 30)); }
+bool gxvk_plan_buffer_is(VkBuffer b) { return (reinterpret_cast<std::uint64_t>(b) & 0xffff000000000000ull) == kGxvkPlanTag; }
 std::atomic<std::uint64_t> g_sf_cb_snapshots{0};
 thread_local char t_draw_origin[160] = "";             // and where it came from
 void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count, bool barrier = true);  // below, outside the unnamed namespace
@@ -2471,6 +2496,77 @@ struct DrawState {
     std::uint64_t program_fp = 0;  // GpuDrawInputs::program_fp: stands for vte_cntl and the PS/VS fields below it
 };
 
+// BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
+// CLIP_DISABLE, ZCLIP_NEAR_DISABLE and ZCLIP_FAR_DISABLE as depth clamp on the
+// register path and DX_RASTERIZATION_KILL as rasterizer discard on both; 0
+// keeps depth clamp from CLIP_DISABLE alone and rasterizes every draw.
+const bool g_clip_control = [] {
+    const char* e = std::getenv("BBHOST_CLIP_CONTROL");
+    return !(e && e[0] == '0');
+}();
+// The draws the decode touches, for the exit report. On the register path (no
+// GX rasterizer description): those with CLIP_DISABLE, ZCLIP_NEAR_DISABLE or
+// ZCLIP_FAR_DISABLE, those whose depth clamp the decode changes (a z bit
+// without CLIP_DISABLE), and those with GL's clip space (DX_CLIP_SPACE_DEF
+// clear) or user clip planes (UCP_ENA_0-5), which nothing reads. On both
+// paths: those with DX_RASTERIZATION_KILL. The first pipelines of the changed
+// and the killed ones by name. A draw with none of these bits counts nothing.
+struct ClipCensus {
+    std::atomic<std::uint64_t> clip_disable{0}, near_off{0}, far_off{0}, clamp_changed{0}, gl_space{0}, ucp{0}, kill{0}, gx_kill{0};
+    std::atomic<bool> names_full{false};
+    std::mutex mu;
+    std::set<std::string> clamp_names, kill_names;  // under mu
+} g_clip_census;
+void clip_control_census(const DrawState& s, const std::string& name) {
+    const std::uint32_t c = s.clip_cntl;
+    const auto note = [&name](std::set<std::string>& names) {
+        if (g_clip_census.names_full.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lk(g_clip_census.mu);
+        if (names.size() < 12) names.insert(name);
+        if (g_clip_census.clamp_names.size() >= 12 && g_clip_census.kill_names.size() >= 12) g_clip_census.names_full = true;
+    };
+    if (s.gx_raster && s.gx_depth) {
+        if (c & kDxRasterizationKill) {
+            g_clip_census.gx_kill.fetch_add(1, std::memory_order_relaxed);
+            note(g_clip_census.kill_names);
+        }
+        return;
+    }
+    if (!(c & (kClipDisable | kZclipNearDisable | kZclipFarDisable | kDxRasterizationKill | 0x3fu)) && (c & kDxClipSpaceDef)) return;
+    if (c & kClipDisable) g_clip_census.clip_disable.fetch_add(1, std::memory_order_relaxed);
+    if (c & kZclipNearDisable) g_clip_census.near_off.fetch_add(1, std::memory_order_relaxed);
+    if (c & kZclipFarDisable) g_clip_census.far_off.fetch_add(1, std::memory_order_relaxed);
+    if (!(c & kDxClipSpaceDef)) g_clip_census.gl_space.fetch_add(1, std::memory_order_relaxed);
+    if (c & 0x3fu) g_clip_census.ucp.fetch_add(1, std::memory_order_relaxed);
+    if (c & kDxRasterizationKill) {
+        g_clip_census.kill.fetch_add(1, std::memory_order_relaxed);
+        note(g_clip_census.kill_names);
+    }
+    if ((c & (kZclipNearDisable | kZclipFarDisable)) && !(c & kClipDisable)) {
+        g_clip_census.clamp_changed.fetch_add(1, std::memory_order_relaxed);
+        note(g_clip_census.clamp_names);
+    }
+}
+std::string clip_control_report() {
+    const ClipCensus& c = g_clip_census;
+    const auto n = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load()); };
+    if (!n(c.clip_disable) && !n(c.near_off) && !n(c.far_off) && !n(c.gl_space) && !n(c.ucp) && !n(c.kill) && !n(c.gx_kill)) return {};
+    std::string clamp, kill;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_census.mu);
+        for (const std::string& name : g_clip_census.clamp_names) clamp += " " + name;
+        for (const std::string& name : g_clip_census.kill_names) kill += " " + name;
+    }
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "clip control (PA_CL_CLIP_CNTL; BBHOST_CLIP_CONTROL %s): register-path draws with CLIP_DISABLE %llu, ZCLIP_NEAR_DISABLE %llu, "
+                  "ZCLIP_FAR_DISABLE %llu, DX_RASTERIZATION_KILL %llu, GL clip space %llu, user clip planes %llu (the last two not read); depth clamp "
+                  "changed by the z bits %llu; GX-described draws with DX_RASTERIZATION_KILL %llu. Clamp changed for:%s; killed:%s",
+                  g_clip_control ? "on" : "off", n(c.clip_disable), n(c.near_off), n(c.far_off), n(c.kill), n(c.gl_space), n(c.ucp),
+                  n(c.clamp_changed), n(c.gx_kill), clamp.empty() ? " none" : clamp.c_str(), kill.empty() ? " none" : kill.c_str());
+    return buf;
+}
+
 // Everything a graphics pipeline is made from, hashed once as one packed
 // record (it was some thirty-five calls, each over a field or two). The
 // image dimensions and sampler modes join it in draw_impl.
@@ -2535,6 +2631,8 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
     }
     if (s.gx_blend) {
         std::memcpy(k.state, s.gx_ids, sizeof(s.gx_ids));  // the state objects stand for the registers they were encoded into
+        // ...except DX_RASTERIZATION_KILL, which fixed_raster_depth reads from the register on both paths (0 where clear: the key as before).
+        if (g_clip_control) k.state[11] = s.clip_cntl & kDxRasterizationKill;
     } else {
         k.state[0] = s.depth_control;
         k.state[1] = s.stencil_control;
@@ -2668,6 +2766,8 @@ bool format_blends(VkFormat format) {
 
 void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     f.topology = s.topo;
+    const ClipControlState clip = clip_control_state(s.clip_cntl, g_clip_control);
+    f.rasterizer_discard = clip.rasterizer_discard;
     // BBHOST_DEBUG_NO_CULL=1 / BBHOST_DEBUG_NO_DEPTH=1: draw everything
     // (is geometry reaching the target at all?).
     static const bool no_cull = [] { const char* e = std::getenv("BBHOST_DEBUG_NO_CULL"); return e && e[0] == '1'; }();
@@ -2706,7 +2806,9 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     f.cull_mode = no_cull ? 0u : ((mode & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((mode & 2) ? VK_CULL_MODE_BACK_BIT : 0);
     f.front_face = (mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     if ((mode & 0x10) && ((mode >> 5) & 7) == 1) f.polygon_mode = VK_POLYGON_MODE_LINE;  // POLY_MODE with LINES
-    f.depth_clamp = (s.clip_cntl & (1u << 16)) != 0;  // ZCLIP_NEAR_DISABLE approximated
+    // PA_CL_CLIP_CNTL: z not clipped (CLIP_DISABLE, ZCLIP_NEAR_DISABLE or
+    // ZCLIP_FAR_DISABLE) is depth clamp (host/clip_control.h).
+    f.depth_clamp = clip.depth_clamp;
     const std::uint32_t dc = s.depth_control;
     f.depth_test = (dc & 2) && s.depth && !no_depth;
     f.depth_write = (dc & 4) && s.depth;
@@ -4501,7 +4603,7 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
                                    bool linked) {
     struct Head {
         std::uint64_t vs, ps, vi;
-        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, pad;
+        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, raster_discard;
     } h{};
     h.vs = pl.vs_key;
     h.ps = pl.ps.module ? pl.ps_key : 0;
@@ -4515,6 +4617,7 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
     h.layout_only = pl.layout_only ? 1u : 0u;
     h.formats_from_params = pl.vs_formats_from_params ? 1u : 0u;
     h.clip_discard = pl.clip_discard;
+    h.raster_discard = f.rasterizer_discard ? 1u : 0u;
     std::uint64_t k = fnv1a(&h, sizeof(h), 0x9b9e7ac0ffee0001ull);
     k = fnv1a(f.blends.data(), f.blends.size() * sizeof(VkPipelineColorBlendAttachmentState), k);
     k = fnv1a(f.color_formats.data(), f.color_formats.size() * sizeof(VkFormat), k);
@@ -4803,6 +4906,8 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
     std::copy(pre->relink_vertex_formats, pre->relink_vertex_formats + 16, pl.relink_vertex_formats);
     pl.relink_polygon = pre->relink_polygon;
     pl.relink_clamp = pre->relink_clamp;
+    pl.relink_discard = pre->relink_discard;
+    pl.raster_discard = pre->raster_discard;
     pl.relink_pending = pre->relink_pending;
     pl.prebuilt = true;
     if (recipe) {
@@ -5300,6 +5405,18 @@ void note_clip_discard_pipeline(const std::string& name, std::uint32_t clip_disc
     if (logs.fetch_add(1, std::memory_order_relaxed) < 24) {
         host_log("render: pipeline %s: its pixel shader discards where clip distances 0-%u are negative, at entry", name.c_str(), (clip_discard & 0xff) - 1);
     }
+}
+// BBHOST_OOB_COUNT=1: the programs behind each counter slot (TranslateResult::
+// oob_slot), for the exit report's per-program lines.
+std::mutex g_oob_names_mu;
+std::map<std::uint32_t, std::set<std::string>> g_oob_names;  // under g_oob_names_mu
+void note_oob_slots(const GfxPipeline& pl) {
+    if (!g.oob.map) return;
+    const std::size_t plus = pl.name.find('+');
+    const std::string vs = pl.name.substr(0, plus), ps = plus == std::string::npos ? std::string() : pl.name.substr(plus + 1);
+    std::lock_guard<std::mutex> lk(g_oob_names_mu);
+    if (pl.vs.meta().oob_slot < gcn::kOobSlots) g_oob_names[pl.vs.meta().oob_slot].insert("VS " + vs);
+    if (pl.ps.meta().oob_slot < gcn::kOobSlots) g_oob_names[pl.ps.meta().oob_slot].insert("PS " + ps);
 }
 void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
     if (pl.ps.meta().spirv.empty() || pl.vs.meta().spirv.empty() || s.tess_hw || s.gs || s.rect) return;
@@ -5929,6 +6046,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         return fail("a tessellation pipeline with a set 4 needs per-stage set layouts (BBHOST_SET_LAYOUTS=0)");
     }
     note_unwritten_ps_inputs(pl, s);
+    note_oob_slots(pl);
     if (create && !create_gfx_pipeline(pl, s, vertex_input, fetch_words.size())) pl.failed = true;
     return pl;
 }
@@ -6141,9 +6259,12 @@ struct TessLibraryStages {
 // (gcn::kVertexFormatSpecId), 16 indexed loads' words 3 (gcn::kCbW3SpecId),
 // then their 16 strides (gcn::kCbStrideSpecId), 0 where the default (read the
 // params) stays; null keeps every default.
+// `discard`: rasterizer discard as a dynamic state, which the draw sets on
+// (GfxFixedState::rasterizer_discard); the libraries of every other pipeline
+// are made as before.
 VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPolygonMode polygon_mode, bool draw_clamp, VkPipelineLayout layout,
                               const VkDescriptorSetLayout set_layouts[2], const TessLibraryStages* tess = nullptr,
-                              const std::uint32_t* vertex_formats = nullptr, bool keep = true) {
+                              const std::uint32_t* vertex_formats = nullptr, bool keep = true, bool discard = false) {
     const bool depth_clamp = draw_clamp && !g.dynamic_depth_clamp;  // else the draw sets it (DrawLibraryState)
     if (!vertex_formats && keep) {
         const std::uint64_t vs_hash = fnv1a(vs.meta().spirv.data(), vs.meta().spirv.size() * 4);
@@ -6173,6 +6294,10 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         key = fnv1a(t, sizeof(t), key ^ 0x7e55000000000000ull);
     }
     if (vertex_formats) key = fnv1a(vertex_formats, 48 * sizeof(std::uint32_t), key ^ 0x5bec000000000000ull);
+    if (discard) {
+        const std::uint32_t d = 1;
+        key = fnv1a(&d, sizeof(d), key ^ 0xd15c000000000000ull);
+    }
     return pipeline_library(kLibPreRaster, key, "pre-rasterization", vs.meta().spirv.size(), [&] {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         const auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -6211,10 +6336,13 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         // Depth bias on with dynamic values (DrawLibraryState), 0 0 0 for a
         // state without one - which is no bias - as D3D11 drivers treat it.
         rs.depthBiasEnable = VK_TRUE;
-        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE,
-                                      VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT};
+        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE,
+                                VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+                                VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
+        std::uint32_t ndyn = g.dynamic_depth_clamp ? 6 : 5;
+        if (discard) dyn[ndyn++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;
         VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dsi.dynamicStateCount = g.dynamic_depth_clamp ? 6 : 5;
+        dsi.dynamicStateCount = ndyn;
         dsi.pDynamicStates = dyn;
         VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gpci.stageCount = static_cast<std::uint32_t>(stages.size());
@@ -6418,6 +6546,7 @@ struct PrecompileJob {
     std::uint32_t vertex_formats[16] = {};
     VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
     bool depth_clamp = false;
+    bool raster_discard = false;
     // And its indexed loads' words 3 and strides as its first draw had them
     // (by stage).
     std::uint32_t w3[2][16] = {};
@@ -6728,6 +6857,7 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
     std::copy(pl.relink_vertex_formats, pl.relink_vertex_formats + 16, job.vertex_formats);
     job.polygon_mode = pl.relink_polygon;
     job.depth_clamp = pl.relink_clamp;
+    job.raster_discard = pl.relink_discard;
     if (g_relink_w3 && !pl.tess_hw && pl.lean) {
         for (int st = 0; st < 2; ++st) {
             const gcn::TranslateResult& meta = st ? pl.ps.meta() : pl.vs.meta();
@@ -6785,7 +6915,8 @@ VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
         if (job.specialize_formats) std::copy(job.vertex_formats, job.vertex_formats + 16, words);
         std::copy(job.w3[0], job.w3[0] + 16, words + 16);
         std::copy(job.stride[0], job.stride[0] + 16, words + 32);
-        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words)) {
+        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words, true,
+                                                     job.raster_discard)) {
             libraries[1] = pr;
             if (job.specialize_formats) w.relinks_specialized.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -6951,6 +7082,7 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
         std::copy(pl->relink_vertex_formats, pl->relink_vertex_formats + 16, job.vertex_formats);
         job.polygon_mode = pl->relink_polygon;
         job.depth_clamp = pl->relink_clamp;
+        job.raster_discard = pl->relink_discard;
         std::memcpy(job.w3, r.spec_w3, sizeof(job.w3));
         std::memcpy(job.stride, r.spec_stride, sizeof(job.stride));
         std::memcpy(job.w3_mask, r.spec_w3_mask, sizeof(job.w3_mask));
@@ -8664,7 +8796,8 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         tess.control = pl.tess_tcs;
         tess.control_points = pl.tess_control_points;
     }
-    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr);
+    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr,
+                                             nullptr, true, f.rasterizer_discard);
 
     const VkPipeline fs = fragment_library(pl.ps.meta(), pl.ps.module, pl.set_layouts[1], pl.layout);
 
@@ -8710,6 +8843,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         }
         pl.relink_polygon = f.polygon_mode;
         pl.relink_clamp = f.depth_clamp;
+        pl.relink_discard = f.rasterizer_discard;
         pl.relink_pending = true;
     }
     return ok;
@@ -8909,11 +9043,13 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = static_cast<std::uint32_t>(f.blends.size());
     cb.pAttachments = f.blends.data();
-    const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                  VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                            VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
+    std::uint32_t ndyn = g.has_depth_bounds ? 7 : 6;
+    if (f.rasterizer_discard) dyn[ndyn++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;  // the draw sets it on
     VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dsi.dynamicStateCount = g.has_depth_bounds ? 7 : 6;
+    dsi.dynamicStateCount = ndyn;
     dsi.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = static_cast<std::uint32_t>(f.color_formats.size());
@@ -8990,6 +9126,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         return false;
     }
     if (content_key && !t_replaying) recipe_note_created(pl, content_key);
+    pl.raster_discard = f.rasterizer_discard;
     vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pl.pipeline), pl.name.c_str());  // the layer's draw messages name it
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
@@ -9317,6 +9454,109 @@ bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<
 }
 
 // ---- pass management ------------------------------------------------------------
+// Depth targets whose first pass loads them as nothing made them - no clear,
+// copy or carry before it (a new colour target starts zeroed, BBHOST_RT_ZERO; a
+// depth target does not): whatever the image heap held, on every GPU, and on
+// AMD's its depth metadata set up over those bytes. By whether the draw that
+// begins the pass tests depth or stencil against them ([0], the first named) or
+// only writes or ignores them ([1]), for the exit report (cross_vendor_report).
+std::atomic<std::uint64_t> g_depth_first_unmade[2] = {};
+void note_depth_first_pass(const RtImage& r, const DrawState& s) {
+    GfxFixedState f;
+    fixed_raster_depth(s, f);
+    const bool reads = (f.depth_test && f.depth_compare != VK_COMPARE_OP_ALWAYS) || f.stencil_test || f.depth_bounds_test;
+    g_depth_first_unmade[reads ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (reads && logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        host_log("render: depth target 0x%llx %ux%u format %d: its first pass %s against bytes nothing wrote (flip %llu)",
+                 static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format),
+                 f.depth_test && f.depth_compare != VK_COMPARE_OP_ALWAYS ? "depth-tests" : f.stencil_test ? "stencil-tests" : "bounds-tests",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
+// Feedback loops: a draw that samples an image its own pass draws into (a T#
+// at an attachment's base) - undefined in Vulkan unless nothing in the pass
+// writes it as an attachment (VUID-vkCmdDraw-None-06538/06539), and out of the
+// validation layer's sight through the bindless set. Without a barrier between
+// the write and the read, what the read sees is the driver's (a compressed
+// target's texels read through metadata not written back yet, on some).
+// Draws counted by the worst of what they read: [0] an attachment the
+// draw itself writes, [1] one an earlier draw of the pass wrote, [2] one
+// nothing in the pass has written so far (allowed); the first of [0] and [1]
+// named. BBHOST_FEEDBACK_CENSUS=1, or with the validation layer on: a few
+// compares a draw, skipped otherwise.
+std::atomic<std::uint64_t> g_feedback_draws[3] = {};
+bool feedback_census_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_FEEDBACK_CENSUS");
+        return (e && e[0] == '1') || validation_on();
+    }();
+    return on;
+}
+void note_feedback_loops(const DrawState& s, const StageImages* stages, int nstages, const std::string& pipeline) {
+    std::uint32_t mine = 0;  // the attachments this draw writes, as Pass::written
+    for (int t = 0; t < 8; ++t) {
+        if (s.color[t] && s.color_mask[t]) mine |= 1u << t;
+    }
+    if (s.depth) {
+        GfxFixedState f;
+        fixed_raster_depth(s, f);
+        const auto writes = [](const VkStencilOpState& o) {
+            return o.failOp != VK_STENCIL_OP_KEEP || o.passOp != VK_STENCIL_OP_KEEP || o.depthFailOp != VK_STENCIL_OP_KEEP;
+        };
+        if (f.depth_write || (f.stencil_test && (writes(f.front) || writes(f.back)))) mine |= 1u << 8;
+    }
+    int worst = 3;
+    for (int st = 0; st < nstages; ++st) {
+        for (const StageImages::Image& im : stages[st].images) {
+            if (!im.resolved) continue;
+            const std::uint64_t base = tsharp_base(im.w);
+            // The layers the T# reads (BASE_ARRAY .. LAST_ARRAY): another layer
+            // of a layered target than the one drawn is no loop.
+            const std::uint32_t first_layer = im.w[5] & 0x1fff, last_layer = std::max(first_layer, (im.w[5] >> 13) & 0x1fff);
+            for (int t = 0; t <= 8; ++t) {
+                const RtImage* r = t < 8 ? s.color[t] : s.depth;
+                if (!r || r->base != base) continue;
+                const std::uint32_t layer = t < 8 ? s.color_layer[t] : s.depth_layer;
+                if (r->layers > 1 && (layer < first_layer || layer > last_layer)) continue;
+                const int kind = (mine >> t) & 1 ? 0 : (g_pass.written >> t) & 1 ? 1 : 2;
+                if (kind < 2) {
+                    static std::atomic<int> logs{0};
+                    if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        host_log("render: pipeline %s: its %s stage samples 0x%llx, its pass's %s%s, which %s (flip %llu)", pipeline.c_str(),
+                                 st ? "pixel" : "vertex", static_cast<unsigned long long>(base), t < 8 ? "colour target " : "depth target",
+                                 t < 8 ? std::to_string(t).c_str() : "", kind == 0 ? "the draw writes" : "an earlier draw of the pass wrote",
+                                 static_cast<unsigned long long>(hle_video_flip_count()));
+                    }
+                }
+                worst = std::min(worst, kind);
+            }
+        }
+    }
+    if (worst < 3) g_feedback_draws[worst].fetch_add(1, std::memory_order_relaxed);
+    g_pass.written |= mine;
+}
+
+// Draws the PS4 rasterizes nothing for (PA_CL_CLIP_CNTL.DX_RASTERIZATION_KILL,
+// bit 22), which ours rasterize; and point-list draws whose last vertex stage
+// writes no PointSize - Vulkan leaves their size undefined (the validation
+// layer's topology-08773, flagged on whole pipelines only), where GCN takes
+// PA_SU_POINT_SIZE. Counted, [0] killed, [1] unsized points, the first named.
+std::atomic<std::uint64_t> g_raster_census[2] = {};
+void note_raster_census(const DrawState& s, const GfxPipeline& pl) {
+    const bool kill = ((s.clip_cntl >> 22) & 1) != 0;
+    const bool unsized = s.topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST && !s.gs && !s.tess_hw && !s.domain_level && !pl.vs.meta().vs_point_size;
+    if (kill) g_raster_census[0].fetch_add(1, std::memory_order_relaxed);
+    if (unsized) g_raster_census[1].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if ((kill || unsized) && logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        host_log("render: pipeline %s: a draw %s%s%s (PA_CL_CLIP_CNTL %08x, flip %llu)", pl.name.c_str(), kill ? "the PS4 rasterizes nothing for" : "",
+                 kill && unsized ? ", and " : "", unsized ? "of points whose vertex stage writes no PointSize" : "", s.clip_cntl,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
 // The barrier a pass ended between draws still owes, paid now (no pass open).
 void pay_pass_barrier_locked() {
     if (g_hazards.owed) {
@@ -9401,6 +9641,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (s.depth) {
+        if (!s.depth->initialised && !(s.depth->view_clear && s.depth->view_clear_load)) note_depth_first_pass(*s.depth, s);
         ensure_initialised(*s.depth);
         depth.imageView = attachment_view(*s.depth, s.depth_layer);
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -9448,6 +9689,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     g_pass.key = key;
     g_pass.extent = extent;
     g_pass.ntargets = 0;
+    g_pass.written = 0;
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) g_pass.targets[g_pass.ntargets++] = s.color[t]->base;
     }
@@ -10541,6 +10783,45 @@ void cross_vendor_report() {
              static_cast<ull>(g_compare_guarded.load()));
     host_log("render: pipelines whose pixel shader discards by clip distances at entry (built for draws or from the manifest): %llu",
              static_cast<ull>(g_clip_discard_pipelines.load()));
+    host_log("render: draws the PS4 rasterizes nothing for (DX_RASTERIZATION_KILL) %llu, point-list draws whose vertex stage writes no "
+             "PointSize %llu",
+             static_cast<ull>(g_raster_census[0].load()), static_cast<ull>(g_raster_census[1].load()));
+    if (g.oob.map) {
+        // BBHOST_OOB_COUNT=1: the totals, then the programs with the most.
+        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
+        std::uint64_t total[3] = {};
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> slots;
+        for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
+            std::uint64_t n = 0;
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                total[k] += c[slot * gcn::kOobKinds + k];
+                n += c[slot * gcn::kOobKinds + k];
+            }
+            if (n) slots.push_back({n, slot});
+        }
+        host_log("render: out-of-range buffer accesses (BBHOST_OOB_COUNT): typed loads by index at or past num_records %llu, reaching past "
+                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds, translated stages)",
+                 static_cast<ull>(total[0]), static_cast<ull>(total[1]), static_cast<ull>(total[2]));
+        std::sort(slots.rbegin(), slots.rend());
+        std::lock_guard<std::mutex> lk(g_oob_names_mu);
+        for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
+            const std::uint32_t slot = slots[i].second;
+            std::string names;
+            if (auto it = g_oob_names.find(slot); it != g_oob_names.end()) {
+                for (const std::string& n : it->second) names += (names.empty() ? "" : ", ") + n;
+            }
+            host_log("render:   slot %u (%s): past records %u, past the binding %u, walks past records %u", slot, names.empty() ? "?" : names.c_str(),
+                     c[slot * gcn::kOobKinds], c[slot * gcn::kOobKinds + 1], c[slot * gcn::kOobKinds + 2]);
+        }
+    }
+    host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",
+             static_cast<ull>(g_depth_first_unmade[0].load()), static_cast<ull>(g_depth_first_unmade[1].load()));
+    if (feedback_census_on()) {
+        host_log("render: draws sampling an attachment of their own pass (BBHOST_FEEDBACK_CENSUS): %llu one the draw writes, %llu one an "
+                 "earlier draw of the pass wrote, %llu one nothing in the pass has written",
+                 static_cast<ull>(g_feedback_draws[0].load()), static_cast<ull>(g_feedback_draws[1].load()),
+                 static_cast<ull>(g_feedback_draws[2].load()));
+    }
     host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
              "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
              "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
@@ -12138,6 +12419,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        if (gxvk::census() && base) gxvk::census_constant_bound(base, bytes, t_gxvk_call_seq, g.flushes, gx != nullptr);
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
         Located loc;
@@ -13072,6 +13354,20 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         std::uint64_t va;
     } placed[16];
     p.elements.clear();
+    // GX on Vulkan (host/gxvk.h): an element of a record in a GX buffer the
+    // host keeps is bound from the buffer's device-local copy by the handle
+    // its call read from the holder - no copy version, mirror, snapshot or
+    // import to find. It is planned where the guest address puts it
+    // (gxvk_plan_buffer), and each binding then takes the copy's range. With
+    // BBHOST_GXVK_BUFFERS=2 every element takes today's path and the
+    // handle's is checked beside it. A record's outcome is counted once, the
+    // first of its elements' that is not "by handle".
+    const bool handles = gxvk::buffers_on() && !t_gxvk_no_handles;
+    const bool handles_bind = handles && gxvk_buffers_bind_mode();
+    Located by_handle[16];
+    bool handle_el[16] = {}, ended_el[16] = {};
+    std::int8_t slot_result[16];
+    std::memset(slot_result, -1, sizeof slot_result);
     // The device-local copy of each vertex record, once per record: its
     // elements share it (buffer_shadow.cpp).
     struct RecordShadow {
@@ -13115,6 +13411,26 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
+        if (handles) {
+            const std::uint64_t holder = o.vtx_obj[fe.slot];
+            const std::uint32_t h = o.vtx_handle[fe.slot];
+            const int r = !holder ? gxvk::kFallNoObject
+                          : !h    ? gxvk::kFallNoHandle
+                                  : gxvk_resolve_locked(gxvk::kUseVertex, h, holder, va, need, by_handle[e]);
+            if (slot_result[fe.slot] < 0 || slot_result[fe.slot] == gxvk::kFalls) slot_result[fe.slot] = static_cast<std::int8_t>(r);
+            handle_el[e] = r == gxvk::kFalls;
+            ended_el[e] = handle_el[e] && gxvk_last_resolve_ended();
+            if (handle_el[e] && handles_bind) {
+                gcn::VertexElement ve;
+                ve.location = static_cast<std::uint32_t>(e);
+                ve.vdata = fe.vdata;
+                ve.count = fe.count;
+                ve.w3 = w[3];
+                p.elements.push_back(ve);
+                placed[e] = {gxvk_plan_buffer(va), va, stride, fmt, va};
+                continue;
+            }
+        }
         Located loc;
         const int version = copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
@@ -13206,6 +13522,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 read_bytes_memo = draw_read_bytes(w, stride, record_bytes);
                 return read_bytes_memo;
             };
+            // BBHOST_GXVK_CENSUS: the record by what holds its bytes, and the
+            // upload heap's checks over what the draw reads of it.
+            if (gxvk::census())
+                gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, draw_read_bytes(w, stride, record_bytes), o.call_seq, g.flushes);
             bool in_place = false;
             if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
@@ -13280,6 +13600,19 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             loc.buffer = rs->whole.buffer;
             loc.offset = rs->whole.offset + fe.offset;
         }
+        // BBHOST_GXVK_BUFFERS=2: today's path must find the bytes of an
+        // element the handle serves in guest memory as it stands (not for a
+        // buffer bound after its end, whose memory may be another's now).
+        if (handle_el[e] && !ended_el[e]) {
+            const std::uint32_t h = o.vtx_handle[fe.slot];
+            std::int64_t last = 0;
+            if (version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, h);
+            else if (windowed) gxvk_disagree_locked(gxvk_kWindow, h);
+            else if (snapped || rs->snapped) gxvk_disagree_locked(gxvk_kSnapshot, h);
+            else if (by_handle[e].avail < need && draw_last_vertex(last) && last >= 0 &&
+                     static_cast<std::uint64_t>(last) * stride + bytes > by_handle[e].avail)
+                gxvk_disagree_locked(gxvk_kPastEnd, h);
+        }
         gcn::VertexElement ve;
         ve.location = static_cast<std::uint32_t>(e);
         ve.vdata = fe.vdata;
@@ -13293,34 +13626,83 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     // as attribute offsets, as a D3D11 stream holds its elements at
     // AlignedByteOffset. Offsets past what every device allows (2047) get
     // their own bindings.
-    auto bind = [&](bool per_element) {
-        p.bindings.clear();
-        p.attributes.clear();
-        std::uint32_t binding_of[16];
+    std::uint32_t binding_of[16];
+    auto bind = [&](VertexInputPlan& q, const Placed* pl, bool per_element) {
+        q.bindings.clear();
+        q.attributes.clear();
         for (std::size_t e = 0; e < n; ++e) {
             binding_of[e] = UINT32_MAX;
-            for (std::uint32_t k = 0; !per_element && k < p.bindings.size(); ++k) {
-                if (p.buffer[k] == placed[e].buffer && p.bindings[k].stride == placed[e].stride) binding_of[e] = k;
+            for (std::uint32_t k = 0; !per_element && k < q.bindings.size(); ++k) {
+                if (q.buffer[k] == pl[e].buffer && q.bindings[k].stride == pl[e].stride) binding_of[e] = k;
             }
             if (binding_of[e] == UINT32_MAX) {
-                binding_of[e] = static_cast<std::uint32_t>(p.bindings.size());
-                p.bindings.push_back({binding_of[e], placed[e].stride, VK_VERTEX_INPUT_RATE_VERTEX});
-                p.buffer[binding_of[e]] = placed[e].buffer;
-                p.offset[binding_of[e]] = placed[e].offset;
-                p.va[binding_of[e]] = placed[e].va;
-            } else if (placed[e].offset < p.offset[binding_of[e]]) {
-                p.offset[binding_of[e]] = placed[e].offset;
-                p.va[binding_of[e]] = placed[e].va;
+                binding_of[e] = static_cast<std::uint32_t>(q.bindings.size());
+                q.bindings.push_back({binding_of[e], pl[e].stride, VK_VERTEX_INPUT_RATE_VERTEX});
+                q.buffer[binding_of[e]] = pl[e].buffer;
+                q.offset[binding_of[e]] = pl[e].offset;
+                q.va[binding_of[e]] = pl[e].va;
+            } else if (pl[e].offset < q.offset[binding_of[e]]) {
+                q.offset[binding_of[e]] = pl[e].offset;
+                q.va[binding_of[e]] = pl[e].va;
             }
         }
         for (std::size_t e = 0; e < n; ++e) {
-            const VkDeviceSize rel = placed[e].offset - p.offset[binding_of[e]];
+            const VkDeviceSize rel = pl[e].offset - q.offset[binding_of[e]];
             if (rel > 2047) return false;
-            p.attributes.push_back({static_cast<std::uint32_t>(e), binding_of[e], placed[e].format, static_cast<std::uint32_t>(rel)});
+            q.attributes.push_back({static_cast<std::uint32_t>(e), binding_of[e], pl[e].format, static_cast<std::uint32_t>(rel)});
         }
         return true;
     };
-    if (!bind(g_vertex_input == 2)) bind(true);
+    if (!bind(p, placed, g_vertex_input == 2)) bind(p, placed, true);
+    if (handles) {
+        bool mixed = false;
+        std::uint32_t first_handle = 0;
+        for (std::size_t e = 0; e < n && !first_handle; ++e)
+            if (handle_el[e]) first_handle = o.vtx_handle[els[e].slot];
+        if (handles_bind) {
+            // Each binding planned at a guest address takes its copy's range:
+            // the copy of its lowest element, which every element of the
+            // binding shares - or, a binding of two buffers' elements, the
+            // draw is planned again without handles.
+            for (std::uint32_t k = 0; k < p.bindings.size() && !mixed; ++k) {
+                if (!gxvk_plan_buffer_is(p.buffer[k])) continue;
+                std::size_t lo = n;
+                std::uint64_t holder = 0;
+                for (std::size_t e = 0; e < n; ++e) {
+                    if (binding_of[e] != k) continue;
+                    const std::uint64_t h = o.vtx_obj[els[e].slot];
+                    if (!handle_el[e] || (holder && h != holder)) mixed = true;
+                    holder = h;
+                    if (placed[e].offset == p.offset[k] && lo == n) lo = e;
+                }
+                if (lo == n) mixed = true;
+                if (mixed) break;
+                p.buffer[k] = by_handle[lo].buffer;
+                p.offset[k] = by_handle[lo].offset;
+            }
+        } else if (first_handle) {
+            // BBHOST_GXVK_BUFFERS=2: the plan from the handles is today's.
+            Placed pv[16];
+            for (std::size_t e = 0; e < n; ++e) {
+                pv[e] = placed[e];
+                if (handle_el[e]) pv[e].buffer = gxvk_plan_buffer(placed[e].va), pv[e].offset = placed[e].va;
+            }
+            VertexInputPlan qv;
+            qv.elements = p.elements;
+            if (!bind(qv, pv, g_vertex_input == 2)) bind(qv, pv, true);
+            if (vertex_plan_hash(qv) != vertex_plan_hash(p)) gxvk_disagree_locked(gxvk_kLayout, first_handle);
+        }
+        for (std::uint32_t slot = 0; slot < 16; ++slot) {
+            if (slot_result[slot] < 0) continue;
+            gxvk_count_locked(gxvk::kUseVertex, mixed && slot_result[slot] == gxvk::kFalls ? gxvk::kFallMixed : slot_result[slot]);
+        }
+        if (mixed) {
+            t_gxvk_no_handles = true;
+            const bool ok = plan_vertex_input(fetch_words, fetch_hash, o, p, memo);
+            t_gxvk_no_handles = false;
+            return ok;
+        }
+    }
     p.hash = vertex_plan_hash(p);
     return true;
 }
@@ -14339,6 +14721,7 @@ std::string host_gpu_clear_view_report() {
                  static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
                  static_cast<unsigned long long>(g_cv_stencil_kept));
     }
+    if (const std::string r = clip_control_report(); !r.empty()) host_log("render: %s", r.c_str());
     if (g_masked_blend_pipelines.load()) {
         host_log("render: %llu pipelines built with a blend state for a colour target they write no channel of, zeroed (%llu of them "
                  "blending into it; BBHOST_MASKED_BLEND=0 keeps the game's)",
@@ -16746,6 +17129,10 @@ static bool draw_impl(const GpuDraw& d) {
     timer.next(kPhaseDraw);
     RenderCostStamp draw_stamp;
     t_token_draw = d.gx_token;
+    struct CallSeq {
+        explicit CallSeq(std::uint64_t v) { t_gxvk_call_seq = v; }
+        ~CallSeq() { t_gxvk_call_seq = 0; }
+    } call_seq(d.gx_objects ? d.gx_objects->call_seq : 0);
     apply_table_masks_locked();
     apply_lean_builds_locked();
     apply_relinks_locked();
@@ -17514,6 +17901,7 @@ static bool draw_impl(const GpuDraw& d) {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         if (pl.recipe && recipe_attach_ls_pass(*pl.recipe)) g_pmanifest.dirty = true;
     }
+    clip_control_census(s, pl.name);
     if (pl.failed) {
         draw_failed(kFailPipeline);
         // Which pipelines, once each: the exit report only counts them.
@@ -18277,6 +18665,7 @@ static bool draw_impl(const GpuDraw& d) {
         gcn::StageParams params{};
         params.l1_table = g.l1.address;
         std::memcpy(params.user_sgpr, st == 0 ? s.vs_user : s.ps_user, sizeof(params.user_sgpr));
+        params.lds_address = g.oob.address;  // BBHOST_OOB_COUNT=1: the counters (gcn::set_oob_count); 0 otherwise
         if (st == 0 && t_tess) {
             params.lds_address = t_tess->lds_address;
             params.lds_bytes = t_tess->lds_bytes;
@@ -19195,6 +19584,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     g_pass_profile_name = &bind_pl->profile_name;
     begin_pass(s, pass_key(s), sample_hazard);
+    if (feedback_census_on()) note_feedback_loops(s, stage_images, 2, bind_pl->name);
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
     // translated shader shows up as a hang in vkCmdBindPipeline rather than in
@@ -19295,7 +19685,7 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     if (g_recorded.pipeline != bind_vk) {
-        cmds.bind_pipeline(bind_vk);
+        cmds.bind_pipeline(bind_vk, bind_pl->raster_discard);
         g_recorded.pipeline = bind_vk;
         // A pipeline with this state static (the host tessellator's are built
         // whole) leaves the dynamic values invalid: the next library draw sets
@@ -19465,9 +19855,32 @@ static bool draw_impl(const GpuDraw& d) {
         if (g_import_audit && d.indirect_va) audit_range(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), kUseIndex);
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
         Located loc;
-        const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        // GX on Vulkan (host/gxvk.h): the indices from the index buffer's
+        // device-local copy, by the handle its call read from the holder;
+        // BBHOST_GXVK_BUFFERS=2 takes today's path and checks the handle's.
+        bool by_handle = false;
+        std::uint32_t index_handle = 0;
+        if (gxvk::buffers_on()) {
+            const GxDrawObjects* go = d.gx_objects;
+            Located hl;
+            const int r = !go || !go->ib_obj ? gxvk::kFallNoObject
+                          : !go->ib_handle  ? gxvk::kFallNoHandle
+                          : d.indirect_va   ? gxvk::kFallIndirect
+                                            : gxvk_resolve_locked(gxvk::kUseIndex, go->ib_handle, go->ib_obj, d.index_va, index_bytes, hl);
+            gxvk_count_locked(gxvk::kUseIndex, r);
+            if (r == gxvk::kFalls) {
+                index_handle = go->ib_handle;
+                if (gxvk_buffers_bind_mode()) {
+                    loc = hl;
+                    by_handle = true;
+                }
+            }
+        }
+        const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
-        if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
+        if (!by_handle && version != kCopyVersionInside &&
+            (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
             const ImportSite site("an index buffer");
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
@@ -19479,6 +19892,8 @@ static bool draw_impl(const GpuDraw& d) {
             return false;
         }
         note_arena_read(kArenaIndex, d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2));
+        if (gxvk::census())
+            gxvk::census_binding(gxvk::kUseIndex, d.gx_objects ? d.gx_objects->ib_obj : 0, d.index_va, index_bytes, t_gxvk_call_seq, g.flushes);
         if (glitch_watching_draw()) glitch_watch_read_locked(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), 1);
         const VkIndexType itype = d.index_type == 1 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         if (g_recorded.index_buffer != loc.buffer || g_recorded.index_offset != loc.offset || g_recorded.index_type != itype) {
@@ -19565,6 +19980,7 @@ static bool draw_impl(const GpuDraw& d) {
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     if (bind_pl->clip_discard) bump(g.draws_clip_discard);
+    if (((s.clip_cntl >> 22) & 1) || s.topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST) note_raster_census(s, *bind_pl);
     const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
     if (bind_pl->tess_hw) {

@@ -108,6 +108,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     VkDescriptorBufferInfo extra[2] = {};
 
     VkPipeline pipeline = VK_NULL_HANDLE;  // null: keep the bound one
+    bool raster_discard = false;           // the pipeline's dynamic rasterizer discard, set on after the bind
     bool library = false;
     DrawLibraryState lib{};
     bool has_depth_bounds = false;
@@ -181,6 +182,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
         write_buffer.clear();
         write_image.clear();
         pipeline = VK_NULL_HANDLE;
+        raster_discard = false;
         library = bind_sets = viewport = scissor = bounds = stencil = blend = index = draw = marker = false;
         stage_set_bound = false;
         end_pass = begin_pass = false;
@@ -375,6 +377,7 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         vkCmdBeginRendering(cmd, &p.rendering);
     }
     if (p.pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    if (p.pipeline && p.raster_discard) vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
     if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
     if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
     if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
@@ -1486,12 +1489,14 @@ void DrawCmds::take_sets(std::vector<VkWriteDescriptorSet>& writes, std::vector<
     p.taken_images.swap(images);
 }
 
-void DrawCmds::bind_pipeline(VkPipeline pipeline) {
+void DrawCmds::bind_pipeline(VkPipeline pipeline, bool discard) {
     if (!packet_) {
         vkCmdBindPipeline(g_cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        if (discard) vkCmdSetRasterizerDiscardEnable(g_cmd(), VK_TRUE);
         return;
     }
     static_cast<DrawPacket*>(packet_)->pipeline = pipeline;
+    static_cast<DrawPacket*>(packet_)->raster_discard = discard;
 }
 
 void DrawCmds::library_state(const DrawLibraryState& s, bool has_depth_bounds) {

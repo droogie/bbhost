@@ -264,11 +264,15 @@ motion's turns and its lag toward what it follows
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
 with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
 instead (60 updates a second above 60) and the wind by the frame's time;
-`frame` steps both by the frame's time; `BBHOST_SFX_STEP=30|60|frame`
-overrides the setting. Above 60 and Uncapped the game paces itself
-and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
-them a second; a rate the machine cannot hold runs slower than real time in
-the few places that count frames.
+`frame` steps both by the frame's time. `smooth` keeps 30's whole steps
+for what the effects count and moves what they move by time - a particle's
+path, a motion's turn, the GPU particles' clock - by each frame's own time,
+in the effects whose every part has been converted for it; the rest run as
+at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
+`BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting. Above 60 and
+Uncapped the game paces itself and its frames are shown as they come, so 90
+on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
+runs slower than real time in the few places that count frames.
 The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.

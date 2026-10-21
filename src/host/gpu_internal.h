@@ -503,6 +503,7 @@ struct Gpu {
     std::uint64_t mirror_size = 0;
     DmemChunk dmem[gcn::kDmemChunks];
     DevBuffer l1, sink, sink_l2;
+    DevBuffer oob;  // BBHOST_OOB_COUNT=1: gcn::set_oob_count's counters (gcn::kOobSlots x kOobKinds dwords)
     std::map<std::uint32_t, DevBuffer> l2;          // by va >> 32
     std::map<std::uint64_t, Chunk> anon_imports;    // by va: imported flexible mappings
     std::vector<GuestMapInfo> maps;                 // last snapshot
@@ -864,6 +865,44 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 // range overlaps a live twin, whose guest bytes are stale - no CPU copy of
 // them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
 // walk, 1 a texture) reaches them - copied back and let go.
+// GX on Vulkan, stage 1 (host/gxvk.h, gxvk_vk.cpp): GX buffers bound by
+// handle. gxvk_resolve_locked: where a vertex record's element or an index
+// range [va, va + bytes) of the GX buffer whose holder carried `handle` at
+// the call lies in that buffer's device-local copy (placed and filled in this
+// recording's uploads at its first binding) - gxvk::kFalls with `out` the
+// copy's range, else why not (gxvk::Fallback). A vertex record may count on
+// past its buffer's end (its V# counts from the buffer's start, its base an
+// offset into it): it is bound all the same, out.avail what the copy holds
+// from va - the draw reads only its vertices, inside the buffer (the compare
+// mode checks that). gxvk_count_locked counts a
+// binding's outcome (kFalls: by handle). gxvk_buffers_bind_mode: whether
+// draws bind the copies (BBHOST_GXVK_BUFFERS=1) rather than only check them
+// beside today's path (2): gxvk_disagree_locked counts what such a check
+// found, and retires the entry.
+bool gxvk_buffers_bind_mode();
+int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Located& out);
+// Whether the last resolve bound a buffer after its end (its holder released,
+// its memory unmapped or reused): the copy holds what the draw recorded
+// before the end reads, and guest memory may not any more.
+bool gxvk_last_resolve_ended();
+void gxvk_count_locked(int use, int result);
+enum GxvkDisagree : int {
+    gxvk_kCopyVersion,   // today's path finds a copy version over the bytes
+    gxvk_kWindow,        // ... the bytes in one of the draw's CPU-written windows
+    gxvk_kSnapshot,      // ... the bytes on a page the game rewrites (a snapshot)
+    gxvk_kLayout,        // the vertex input planned from the handles is not today's
+    gxvk_kGuestChanged,  // the buffer's bytes no longer hash as they did when copied
+    gxvk_kDeviceCopy,    // the device copy, read back, is not those bytes
+    gxvk_kPastEnd,       // a draw reads a record past its buffer's end (its V# counted from the buffer's start)
+    gxvk_kDisagrees,
+};
+void gxvk_disagree_locked(int kind, std::uint32_t handle);
+// At a recording's start: retired entries taken back (their ranges free once
+// the work recorded with them has run). At a slot's retirement: the compare
+// run's read-backs of the copies its uploads made, checked.
+void gxvk_begin_recording_locked();
+void gxvk_slot_retired_locked(int slot);
+std::string gxvk_report();
 bool twins_on();
 bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
 // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies
@@ -1023,6 +1062,9 @@ struct GfxFixedState {
     VkCullModeFlags cull_mode = 0;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_clamp = false;
+    // PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL (host/clip_control.h): the pipeline
+    // takes rasterizer discard as a dynamic state and the draw sets it.
+    bool rasterizer_discard = false;
     bool depth_test = false, depth_write = false, depth_bounds_test = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
     VkStencilOpState front{}, back{};
@@ -1896,7 +1938,9 @@ public:
     // caller's `writes` and `images` hold nothing it wrote.
     void take_sets(std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorImageInfo>& images,
                    const std::vector<VkDescriptorBufferInfo>& buffers, const VkDescriptorBufferInfo* extra, std::size_t n_extra);
-    void bind_pipeline(VkPipeline pipeline);
+    // `discard`: the pipeline takes rasterizer discard as a dynamic state, set
+    // on after it is bound (a draw PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL kills).
+    void bind_pipeline(VkPipeline pipeline, bool discard = false);
     void library_state(const DrawLibraryState& s, bool has_depth_bounds);
     // `dynamic`: the params blocks' offsets (set_cache_on()), else null.
     // `bindless`: the pipeline's stages read the global set, bound as set 3.

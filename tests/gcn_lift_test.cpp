@@ -3366,6 +3366,119 @@ void typed_loads() {
     }
 }
 
+// A typed load by index past the V#'s records (gcn::set_index_bounds): GCN
+// reads 0 for an index at or past num_records. The binding holds the records
+// (the host binds count x stride) and nothing after them - as the interpreter
+// gives it, refusing a read past it, where a driver without robust buffer
+// access reads whatever memory follows. With the check, the lift reads the
+// binding's first element there and gives 0, the records themselves as
+// before; without it, the read past the binding. The translation and the lift
+// both compare (OpULessThan against word 2).
+void index_bounds() {
+    const auto program = [&] {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);  // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+        a.sopp(kWaitcnt, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop1(kVMov, k, kC0 + 9);
+        a.vop1(kVMov, 4, 1);              // v4 = s1: the element's index
+        a.tbuffer_load(3, 0, 4, 8, 14, 7);  // tbuffer_load_format_xyzw v[0:3], v4, s[8:11] idxen, 32_32_32_32 float
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    std::vector<std::uint32_t> table(16, 0);
+    table[6] = 4;  // the V#'s word 2: four records
+    std::vector<std::uint32_t> data(2 + 4 * 4);  // bias 2, then four records of 16 bytes: the binding ends with them
+    for (std::uint32_t k = 0; k < data.size(); ++k) data[k] = 0x3000u + k;
+    std::size_t compares[2][2] = {};  // OpULessThan in the lift and the reference, off and on
+    for (const bool on : {true, false}) {
+        gcn::set_index_bounds(on);
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_words(program(), nullptr, &ref);
+        CHECK(lifted_valid(l));
+        CHECK(ref.buffers.size() == 2 && ref.buffers[1].indexed);
+        if (!l.ok() || ref.buffers.size() != 2) continue;
+        // The compare against the records, in both modules when on (OpULessThan).
+        compares[on ? 1 : 0][0] = count_op(l.spirv, 176);
+        compares[on ? 1 : 0][1] = count_op(ref.spirv, 176);
+        for (const std::uint32_t index : {0u, 3u, 4u, 0xffffffffu}) {
+            std::array<std::uint32_t, 16> user{}, bias{}, stride{};
+            user[1] = index;
+            bias[1] = 2;
+            stride[1] = 16;
+            const ScalarRun r = run_scalar_ps(l.spirv, user, bias, stride, {{ref.buffers[0].binding, table}, {ref.buffers[1].binding, data}});
+            const bool inside = index < 4;
+            if (!on && !inside) {
+                // Past the binding: the interpreter refuses what a driver would read.
+                CHECK(!r.ok && r.error.find("past the binding") != std::string::npos);
+                continue;
+            }
+            if (!r.ok) std::fprintf(stderr, "index bounds %d, index %u: %s\n", on ? 1 : 0, index, r.error.c_str());
+            CHECK(r.ok);
+            for (std::uint32_t k = 0; k < 4 && r.ok; ++k) {
+                const std::uint32_t want = inside ? data[2 + index * 4 + k] : 0u;
+                if (r.mrt0[k] != want) {
+                    std::fprintf(stderr, "index bounds %d, index %u: component %u read %08x, expected %08x\n", on ? 1 : 0, index, k, r.mrt0[k], want);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    gcn::set_index_bounds(false);
+    // The compare against the records, one more in each module when on.
+    CHECK(compares[1][0] == compares[0][0] + 1 && compares[1][1] == compares[0][1] + 1);
+}
+
+// gcn::set_oob_count (BBHOST_OOB_COUNT, a diagnostic): the translation of a
+// typed load by index from a bound buffer counts an index past the V#'s
+// records and a read past the binding - two atomic adds, one array length -
+// into the program's slot, and its lift the same; the same load walked
+// through the page table counts a walk past the records (one add). Valid
+// modules either way; nothing counted when off.
+void oob_counting() {
+    const auto program = [&] {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 4, 1);
+        a.tbuffer_load(3, 0, 4, 8, 14, 7);
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    for (const bool on : {true, false}) {
+        gcn::set_oob_count(on);
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_words(program(), nullptr, &ref);
+        CHECK(spirv_valid(ref.spirv));
+        CHECK(count_op(ref.spirv, 234) == (on ? 2u : 0u));  // OpAtomicIAdd: past the records, past the binding
+        CHECK(count_op(ref.spirv, 68) == (on ? 1u : 0u));   // OpArrayLength
+        CHECK((ref.oob_slot < gcn::kOobSlots) == on);
+        CHECK(lifted_valid(l));
+        CHECK(count_op(l.spirv, 234) == (on ? 2u : 0u));   // the lift counts as its reference
+        CHECK(count_op(l.spirv, 68) == (on ? 1u : 0u));
+        // The same load left to the page table: a walk past the records.
+        gcn::TranslateResult walk;
+        lift_words(program(), nullptr, &walk, {"user_sgpr[2]->load(+16)"});
+        CHECK(spirv_valid(walk.spirv));
+        CHECK(count_op(walk.spirv, 234) == (on ? 1u : 0u));
+    }
+    // The control (gcn::set_oob_control): the same counts against half the
+    // records - another module, as valid, with the same adds.
+    gcn::set_oob_count(true);
+    gcn::TranslateResult counting, control;
+    const gcn::LiftResult lc = lift_words(program(), nullptr, &counting);
+    gcn::set_oob_control(true);
+    const gcn::LiftResult lk = lift_words(program(), nullptr, &control);
+    gcn::set_oob_control(false);
+    CHECK(spirv_valid(control.spirv) && lifted_valid(lk));
+    CHECK(control.spirv != counting.spirv && lk.spirv != lc.spirv);
+    CHECK(count_op(control.spirv, 234) == 2 && count_op(lk.spirv, 234) == 2);
+    gcn::set_oob_count(false);
+}
+
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
 // v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
 // constant buffer read through a copy of its V# is bound - where every copy
@@ -3556,6 +3669,8 @@ void run() {
     descriptor_loads();
     ranged_loads();
     typed_loads();
+    index_bounds();
+    oob_counting();
     copies();
     cselect();
     lshl_b64();

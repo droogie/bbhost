@@ -111,6 +111,12 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
              static_cast<unsigned long long>(vs[kDrawVsLifted]), static_cast<unsigned long long>(vs[kDrawVsTranslated]),
              static_cast<unsigned long long>(vs[kDrawVsOther]), static_cast<unsigned long long>(vs[kDrawVsFallback]),
              static_cast<unsigned long long>(now.draws_clip_discard - was.draws_clip_discard));
+    if (now.oob_on) {
+        host_log("frame detail: out-of-range buffer accesses: typed loads by index past num_records %llu, past their binding %llu; walks by "
+                 "index past num_records %llu",
+                 static_cast<unsigned long long>(now.oob[0] - was.oob[0]), static_cast<unsigned long long>(now.oob[1] - was.oob[1]),
+                 static_cast<unsigned long long>(now.oob[2] - was.oob[2]));
+    }
     std::uint64_t ts[kDrawTessCount];
     for (int i = 0; i < kDrawTessCount; ++i) ts[i] = now.draws_tess[i] - was.draws_tess[i];
     if (ts[kDrawTess]) {

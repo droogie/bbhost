@@ -48,6 +48,34 @@ void steady(double seconds, int rate, int frames) {
     const double want = time * rate;
     CHECK(steps >= static_cast<long>(want) - 1 && steps <= static_cast<long>(want) + 1);
 }
+
+// The frame's own time as the schedule takes it: at most 1/30 s, none for a
+// frame that is not above 0 (or NaN).
+double taken(double seconds) {
+    if (!(seconds > 0.0)) return 0.0;
+    return seconds > 1.0 / 30.0 ? 1.0 / 30.0 : seconds;
+}
+
+// The smooth steps' frame domain over `frames` frames of `seconds` each: the
+// frame's time as a float, the carry after it (never below 0, under a step
+// and a thirtieth), and the whole steps taken plus the carry adding up to the
+// time that passed, frame by frame.
+void frame_domain(double seconds, int rate, int frames) {
+    double carry = 0.0, passed = 0.0;
+    long steps = 0;
+    for (int i = 0; i < frames; ++i) {
+        const double before = carry;
+        const sfx_schedule::Frame f = sfx_schedule::next(carry, seconds, rate);
+        CHECK(bits(f.from) == bits(static_cast<float>(before > 0.0 ? before : 0.0)));
+        CHECK(bits(f.frame) == bits(static_cast<float>(taken(seconds))));
+        CHECK(f.into >= 0.0f);
+        CHECK(bits(f.into) == bits(static_cast<float>(carry > 0.0 ? carry : 0.0)));
+        CHECK(f.into < 1.0f / static_cast<float>(rate) + 1.0f / 30.0f);
+        steps += f.whole;
+        passed += taken(seconds);
+        CHECK(std::fabs(static_cast<double>(steps) / rate + carry - passed) < 1e-9);
+    }
+}
 }  // namespace
 
 int main() {
@@ -130,6 +158,86 @@ int main() {
         CHECK(steps >= static_cast<long>(time * rate) - 1 && steps <= static_cast<long>(time * rate) + 1);
         CHECK(between > 0);
         CHECK(longest <= (rate == 30 ? 7 : 3));  // at 240 fps the most frames between whole steps
+    }
+    // The smooth steps' frame domain. At 30 every frame is a whole step: the
+    // frame's time is the game's 1/30 and nothing is carried.
+    {
+        double c = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            const sfx_schedule::Frame f = next(c, static_cast<float>(1.0 / 30), 30);
+            CHECK(f.whole == 1);
+            CHECK(bits(f.frame) == 0x3d088889u && bits(f.frame) == bits(f.seconds));
+            CHECK(bits(f.into) == 0u);  // +0, so a tick time plus the carry times a scale is the tick time's bits
+            CHECK(bits(f.from) == 0u);
+        }
+    }
+    // At 120 the carry comes a quarter of a step further each frame and goes
+    // back under the step as a whole one is taken.
+    {
+        double c = 0.0;
+        const double want[8] = {1.0 / 120, 2.0 / 120, 3.0 / 120, 0.0, 1.0 / 120, 2.0 / 120, 3.0 / 120, 0.0};
+        for (int i = 0; i < 8; ++i) {
+            const sfx_schedule::Frame f = next(c, 1.0 / 120, 30);
+            CHECK(f.whole == (i % 4 == 3 ? 1 : 0));
+            CHECK(bits(f.frame) == bits(static_cast<float>(1.0 / 120)));
+            CHECK(std::fabs(static_cast<double>(f.into) - want[i]) < 1e-7);
+            CHECK(std::fabs(static_cast<double>(f.from) - (i % 4 == 0 ? 0.0 : want[i - 1])) < 1e-7);
+            // A frame ends where the next begins.
+            if (i) CHECK(std::fabs(static_cast<double>(f.from) - want[i - 1]) < 1e-7 || i % 4 == 0);
+        }
+    }
+    // A slow frame (lavapipe's): the frame domain takes 1/30 s, as the game steps.
+    {
+        double c = 0.0;
+        const sfx_schedule::Frame f = next(c, 0.25, 30);
+        CHECK(f.whole == 1 && bits(f.frame) == bits(f.seconds) && bits(f.into) == 0u);
+    }
+    // None for a frame that is not above 0, and the carry stays where it was.
+    for (const double bad : {0.0, -1.0, std::nan("")}) {
+        double c = 1.0 / 120;
+        const sfx_schedule::Frame f = next(c, bad, 30);
+        CHECK(f.whole == 0 && bits(f.frame) == 0u && bits(f.into) == bits(static_cast<float>(1.0 / 120)));
+    }
+    // Frame by frame at the steady rates and both step rates.
+    for (const double fps : {30.0, 45.0, 60.0, 90.0, 120.0, 144.0, 165.0, 240.0, 1000.0}) {
+        frame_domain(1.0 / fps, 30, 20000);
+        frame_domain(1.0 / fps, 60, 20000);
+    }
+    frame_domain(static_cast<float>(1.0 / 120), 30, 20000);  // BBHOST_SFX_SIM_FPS's float
+    frame_domain(0.25, 30, 100);
+    // A second's totals at the rates a player picks: 30 whole steps, and the
+    // frames' time adding up to the second.
+    for (const int fps : {30, 60, 90, 120, 144}) {
+        double c = 0.0, frames = 0.0;
+        int whole = 0;
+        for (int i = 0; i < fps; ++i) {
+            const sfx_schedule::Frame f = next(c, 1.0 / fps, 30);
+            whole += f.whole;
+            frames += f.frame;
+        }
+        CHECK(whole == 30);
+        CHECK(std::fabs(frames - 1.0) < 1e-5);
+    }
+    // Jittered (1/240 s to 1/20 s): the carry's bounds and the continuity a
+    // second at a time, so the running sums' rounding stays far under the bound.
+    {
+        std::mt19937 rng(20261020u);
+        std::uniform_real_distribution<double> ft(1.0 / 240, 1.0 / 20);
+        double c = 0.0;
+        for (int second = 0; second < 2000; ++second) {
+            double passed = 0.0;
+            long steps = 0;
+            const double start = c;
+            while (passed < 1.0) {
+                const double s = ft(rng);
+                const sfx_schedule::Frame f = next(c, s, 30);
+                CHECK(bits(f.frame) == bits(static_cast<float>(taken(s))));
+                CHECK(f.into >= 0.0f && f.into < 1.0f / 30.0f + 1.0f / 30.0f);
+                steps += f.whole;
+                passed += taken(s);
+            }
+            CHECK(std::fabs(start + passed - (static_cast<double>(steps) / 30 + c)) < 1e-9);
+        }
     }
     if (!g_fail) std::printf("sfx_schedule_test: ok\n");
     return g_fail ? 1 : 0;

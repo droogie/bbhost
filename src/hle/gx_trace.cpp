@@ -26,6 +26,7 @@
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
+#include "host/gxvk.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "log.h"
@@ -843,6 +844,10 @@ struct alignas(16) GxRec {
     std::uint16_t vtx_valid = 0;
     std::uint32_t vtx_rec[16][4] = {};
     std::uint64_t vtx_obj[16] = {};
+    // GX on Vulkan (host/gxvk.h): the handle each slot's holder carries, and
+    // the index buffer's (0: none, or a renamed copy).
+    std::uint32_t vtx_handle[16] = {};
+    std::uint32_t ib_handle = 0;
     StageSnap st[6];
     // For the layout probes: viewport 0 (x y w h minz maxz), scissor 0 (l t r
     // b), the rasterizer object and the first bound PS/VS resource slots.
@@ -1009,10 +1014,19 @@ std::uint64_t vertex_buffer_address(std::uint64_t map, std::uint64_t key_obj) {
 //   byte +0x47 + byte +0x48, bound at the VS user-data slot in the low byte
 //   of the dword at *(+0x38). Streams in +0x4c bind each element to its own
 //   user-data slot instead; those are not built here.
+// The handle a GX buffer's holder carries once the host keeps the buffer
+// (host/gxvk.h), else 0.
+std::uint32_t buffer_handle(std::uint64_t holder) {
+    if (!gxvk::buffers_on()) return 0;
+    const std::uint32_t w = rd32(holder + gxvk::kHolderSpareA);
+    return gxvk::is_handle(w) ? w : 0;
+}
+
 void build_vertex_table(GxRec& r, std::uint64_t s) {
     r.vtx_ud = 0xff;
     r.vtx_valid = 0;
     std::memset(r.vtx_obj, 0, sizeof(r.vtx_obj));
+    std::memset(r.vtx_handle, 0, sizeof(r.vtx_handle));
     const std::uint64_t layout = r.op1;
     if (!layout) return;
     const std::uint32_t table_mask = rd32(layout + 0x50);
@@ -1032,6 +1046,7 @@ void build_vertex_table(GxRec& r, std::uint64_t s) {
         const bool renamed = (rd32(obj + 0x40) & 0xff) != 0;
         const std::uint64_t base = (renamed ? vertex_buffer_address(r.ctx + 0xb6f8, obj + 0x18) : rd64(obj + 0x20)) +
                                    rd32(s + 0x1a0 + 4 * static_cast<std::uint64_t>(j));
+        const std::uint32_t handle = renamed ? 0 : buffer_handle(obj);
         const std::uint32_t count = rd32(obj + 0x2c) / stride;
         for (std::uint32_t e = range & 0xff, end = e + ((range >> 8) & 0xff); e < end; ++e) {
             const std::uint32_t slot = rd32(slot_va + 4 * static_cast<std::uint64_t>(e)) & 0xff;
@@ -1050,6 +1065,7 @@ void build_vertex_table(GxRec& r, std::uint64_t s) {
             rec[3] = (((f >> 2) & 4) << 27) | (rec[3] & 0xc7ffffff);
             std::memcpy(r.vtx_rec[slot], rec, sizeof(rec));
             r.vtx_obj[slot] = obj;
+            r.vtx_handle[slot] = handle;
             r.vtx_valid = static_cast<std::uint16_t>(r.vtx_valid | (1u << slot));
         }
     }
@@ -1111,7 +1127,9 @@ void snapshot(GxRec& r, std::uint64_t s) {
         for (int i = 0; i < 32; ++i) r.vbs += rd64(s + 0x20 + 8 * i) != 0;
     }
     // INDEX_BASE without the state offset, as the input-assembly flush takes it.
-    r.ib_base = !r.ib ? 0 : (rd32(r.ib + 0x40) & 0xff) ? vertex_buffer_address(r.ctx + 0xb6f8, r.ib + 0x18) : rd64(r.ib + 0x20);
+    const bool ib_renamed = r.ib && (rd32(r.ib + 0x40) & 0xff) != 0;
+    r.ib_base = !r.ib ? 0 : ib_renamed ? vertex_buffer_address(r.ctx + 0xb6f8, r.ib + 0x18) : rd64(r.ib + 0x20);
+    r.ib_handle = r.ib && !ib_renamed ? buffer_handle(r.ib) : 0;
     build_vertex_table(r, s);
     r.blend = rd64(s + 0x4d0);
     r.ds = rd64(s + 0x4d8);
@@ -1974,6 +1992,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                 std::memcpy(s.obj_tex + j * 32, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(view + 0x10)), 32);
                 s.obj_tex_set |= 1ull << j;
                 s.obj_tex_id[j] = g_view_check ? check_object_words(view, s.obj_tex + j * 32, 0) : gx_object_id(view);
+                if (gxvk::census()) gxvk::census_view_bound(view, 3);
             }
         }
         stamp.to(kCostRecTex);
@@ -2055,6 +2074,10 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                                           0x20077fac & 0xc7ffffff};
             std::memcpy(s.obj_cb + cbs[i].j * 16, rec, sizeof(rec));
             s.obj_cb_set |= 1u << cbs[i].j;
+        }
+        // BBHOST_GXVK_CENSUS: each one by what holds its bytes (host/gxvk.h).
+        if (gxvk::census()) {
+            for (int i = 0; i < ncb; ++i) gxvk::census_constant(cbs[i].key - 0x18, cbs[i].addr, ((cbs[i].size + 15) >> 4) * 16);
         }
         stamp.to(kCostRecCb);
         // BBHOST_CB_RECORD_PROOF: each buffer's bytes as they are at the call,
@@ -2197,6 +2220,11 @@ void note_update(const std::uint64_t* f) {
             if (g_update_dst.size() < 4096) ++g_update_dst[addr];
         }
     }
+    // BBHOST_GXVK_CENSUS: a buffer updated (`res` is its holder).
+    if (type == 1) {
+        gxvk::census_buffer_updated(res);
+        gxvk::buffer_written(res, gxvk::kRetireUpdate);
+    }
     const std::uint64_t watch = g_watch_update;
     if (!watch || type != 1 || watch < addr + lo || watch >= addr + hi) return;
     g_updates_watched.fetch_add(1, std::memory_order_relaxed);
@@ -2324,12 +2352,15 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
             o.index_type = r.ib_fmt == 0x2a ? 1 : 0;
             o.index_va = r.ib_base + r.ib_off + (start & 0xffffffff) * (o.index_type ? 4 : 2);
             o.index_known = true;
+            o.ib_obj = r.ib;
+            o.ib_handle = r.ib_handle;
         }
         o.fetch_va = r.op1 ? rd64(r.op1 + 0x10) : 0;
         o.vtx_ud = r.vtx_ud;
         o.vtx_valid = r.vtx_valid;
         std::memcpy(o.vtx_rec, r.vtx_rec, sizeof(r.vtx_rec));
         std::memcpy(o.vtx_obj, r.vtx_obj, sizeof(r.vtx_obj));
+        std::memcpy(o.vtx_handle, r.vtx_handle, sizeof(r.vtx_handle));
     } else if (r.kind == kDrawIndirect || r.kind == kDrawIndexedIndirect) {
         // 0x25699d0 / 0x2569ab0 (ctx, state, args buffer holder,
         // byte offset): SET_BASE to the holder's memory, then DRAW_INDIRECT at
@@ -2341,13 +2372,19 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
             o.index_type = r.ib_fmt == 0x2a ? 1 : 0;
             o.index_va = r.ib_base + r.ib_off;
             o.index_known = true;
+            o.ib_obj = r.ib;
+            o.ib_handle = r.ib_handle;
         }
         o.fetch_va = r.op1 ? rd64(r.op1 + 0x10) : 0;
         o.vtx_ud = r.vtx_ud;
         o.vtx_valid = r.vtx_valid;
         std::memcpy(o.vtx_rec, r.vtx_rec, sizeof(r.vtx_rec));
         std::memcpy(o.vtx_obj, r.vtx_obj, sizeof(r.vtx_obj));
+        std::memcpy(o.vtx_handle, r.vtx_handle, sizeof(r.vtx_handle));
     }
+    // The GX upload heap's hand-outs so far (BBHOST_GXVK_CENSUS: what the
+    // command processor checks the draw's renamed copies against; 0 without it).
+    o.call_seq = gxvk::handout_seq();
 }
 
 // A slot comes round again only after the whole ring (16,384 draws, ~0.2 s),
@@ -2805,6 +2842,27 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 // usage, source, usage, size) is one such copy, and CopyResource's. Both
 // shaders copy size >> 2 whole dwords.
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
+    // A GX buffer the host keeps a copy of is immutable, which no copy may
+    // write, or default, which one may: a copy into a kept buffer retires it
+    // (host/gxvk.h) - the compare mode looks every destination up under the
+    // table's lock, as a check; the handles test it against the default ones'
+    // ranges without one.
+    if (gxvk::buffers_on()) {
+        const bool all = gxvk::watch_writes();
+        if (kind == kCopyBuffers) {
+            const std::uint64_t entries = f[2];
+            const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
+            for (std::uint32_t i = 0; entries && i < count; ++i) {
+                const std::uint64_t e = entries + 0x18ull * i;
+                if (all) gxvk::memory_written(rd64(e), rd32(e + 0x10), gxvk::kRetireCopy);
+                else gxvk::copy_written(rd64(e), rd32(e + 0x10));
+            }
+        } else if (all) {
+            gxvk::memory_written(f[4], f[0] & 0xffffffffull, gxvk::kRetireCopy);
+        } else {
+            gxvk::copy_written(f[4], f[0] & 0xffffffffull);
+        }
+    }
     // The sources are renamed copies GX writes back (or CopyResource's
     // source): the CPU is done with them, which the buffer shadow's mirrors
     // over them wait for (host_gpu_shadow_gx_settled) - but for a constant
@@ -5040,6 +5098,7 @@ bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* wh
         const int j = __builtin_ctz(m);
         const std::uint64_t uav = rd64(st + 0x2368 + 8 * static_cast<std::uint64_t>(j));
         if (uav && safe_read(uav + 0x10, s.obj_smp + j * 32, 32)) s.obj_smp_set |= 1u << j;
+        if (uav && gxvk::census()) gxvk::census_view_bound(uav, 5);
     }
     for (std::uint32_t m = smp; m; m &= m - 1) {
         const int j = __builtin_ctz(m);
@@ -6668,7 +6727,9 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     auto* c = static_cast<std::uint8_t*>(page);
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
-        if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
+        if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census && !gxvk::census() &&
+            !gxvk::watch_writes())
+            continue;
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;

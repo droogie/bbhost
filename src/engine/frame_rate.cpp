@@ -1419,6 +1419,7 @@ void each_frame(const SprjFlipper* f) {
             put<float>(g_sfx_step_va, sf.seconds);
             decomp_sfx_gate_frame(g_sfx_gate && sf.whole == 0);
             decomp_sfx_step_frame(sf.whole == 0);
+            decomp_sfx_frame_time(sf.frame, sf.from, sf.into);
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
@@ -1546,11 +1547,24 @@ int effect_steps() {
         v = config_value("video.effect_steps");
         from = "[video] effect_steps";
     }
-    if (v.empty() || v == "30") return 30;
+    if (v.empty() || v == "30" || v == "smooth") return 30;
     if (v == "60") return 60;
     if (v == "frame") return 0;
-    host_log("frame rate: %s = %s is none of 30, 60 and frame; 30 runs", from, v.c_str());
+    host_log("frame rate: %s = %s is none of 30, smooth, 60 and frame; 30 runs", from, v.c_str());
     return 30;
+}
+
+// Effect steps smooth: whole 1/30 s for what the effects count in updates, as
+// 30, and the frame's own time for what they integrate, in every instance whose
+// classes the step gate has converted (decomp/sfx/step_gate.cpp; the rest hold
+// as 30). [video] effect_steps = "smooth" or BBHOST_SFX_STEP=smooth asks for it;
+// BBHOST_SFX_SMOOTH=0|1 overrides either for a harness.
+bool effect_steps_smooth() {
+    bool on;
+    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) on = std::string(e) == "smooth";
+    else on = config_value("video.effect_steps") == "smooth";
+    if (const char* e = std::getenv("BBHOST_SFX_SMOOTH"); e && (e[0] == '0' || e[0] == '1')) on = e[0] == '1';
+    return on;
 }
 
 // The follow camera's tuning above 30 fps: the game's own (Original) unless
@@ -1771,6 +1785,16 @@ int apply_rate(ElfImage* image, int want) {
                 }
                 g_sfx_gate = steps == 30;
                 if (const char* e = std::getenv("BBHOST_SFX_GATE"); e && (e[0] == '0' || e[0] == '1')) g_sfx_gate = e[0] == '1';
+                // The smooth steps hold what they cannot convert as 30 does: the gate stays on with them.
+                const bool smooth = effect_steps_smooth();
+                if (smooth && steps != 30) host_log("frame rate: effect steps smooth needs whole 1/30 s steps; effect steps %d runs as asked", steps);
+                if (smooth && steps == 30) {
+                    g_sfx_gate = true;
+                    decomp_sfx_smooth(true);
+                    host_log("frame rate: effect steps smooth: what the effects count in updates steps in whole 1/30 s, what they integrate "
+                             "by the frame's own time, in the instances whose classes are converted (decomp/sfx/step_gate.cpp; the rest as "
+                             "30; BBHOST_SFX_SMOOTH=0 to run them all as 30)");
+                }
                 host_log("frame rate: the frames between whole effect steps %s (BBHOST_SFX_GATE=%d to %s)",
                          g_sfx_gate ? "run the effects' update without counting - their nodes' state, emission and definitions, "
                                       "their controllers, the lights' flicker phase wait for the next whole step (decomp/sfx/step_gate.cpp)"

@@ -56,6 +56,9 @@ struct GxResourceInfo {
 std::uint64_t gx_guest_to_bn(std::uint64_t va);
 
 void gx_resources_install(ElfImage* image);
+// After decomp_install: GX's CreateBuffer hooked for the registry unless
+// ours (decomp/gx/resources.cpp), which tells it itself, is in place.
+void gx_resources_install_late(ElfImage* image);
 // How many buffer and texture creations have returned an error so far (an
 // allocation that did not fit: engine/live_resolution.cpp checks it around a
 // change). 0 when the registry is off.

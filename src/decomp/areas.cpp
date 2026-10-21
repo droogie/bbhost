@@ -22,6 +22,7 @@ void decomp_gx_constant_engine_add();  // gx/constant_engine.cpp: the Gnm consta
 void decomp_gx_draw_add();             // gx/draw.cpp: GX's draw, dispatch and commit methods, the post-draw, the buffer's flush
 void decomp_gx_command_list_add();     // gx/command_list.cpp: GX's command lists finished and executed, a segment to the GPU
 void decomp_gx_present_add();          // gx/present.cpp: the swap chain's present - the frame's end and its pacing
+void decomp_gx_resources_add();        // gx/resources.cpp: GX's CreateBuffer - a buffer's holder, handed to the host as it is made
 void decomp_gnmx_cue_add();            // gnmx/cue.cpp: Gnmx's constant update engine around the flip pass's draw
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
 void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
@@ -32,6 +33,7 @@ void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's me
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
 void decomp_sfx_step_gate_add();       // sfx/step_gate.cpp: the effects' frames between whole steps
+void decomp_sfx_node_update_add();     // sfx/node_update.cpp: the effects' node update
 void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMutex::Lock
 void decomp_ez_work_add();             // sync/ez_work.cpp: CSEzWork::ProcessOne - the work pools' job pop, and their node caches
 
@@ -54,6 +56,7 @@ void decomp_add_areas() {
     decomp_gx_draw_add();
     decomp_gx_command_list_add();
     decomp_gx_present_add();
+    decomp_gx_resources_add();
     decomp_gnmx_cue_add();
     decomp_yebis_gnm_add();
     decomp_yebis_context_add();
@@ -64,6 +67,7 @@ void decomp_add_areas() {
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();
     decomp_sfx_step_gate_add();
+    decomp_sfx_node_update_add();
     decomp_adaptive_mutex_add();
     decomp_ez_work_add();
 }

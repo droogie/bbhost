@@ -29,8 +29,10 @@
 //    trees step in whole 1/30 s the same way, 30 times a second as at 30, the
 //    frames between holding what the effects count in updates
 //    (decomp/sfx/step_gate.cpp, BBHOST_SFX_GATE; [video] effect_steps or
-//    BBHOST_SFX_STEP: 60 for the effects in whole 1/60 s and the wind by the
-//    frame's time, frame for both by the frame's time).
+//    BBHOST_SFX_STEP: smooth for 30 with what the effects move by time moved
+//    by the frame's own time in the effects converted for it, 60 for the
+//    effects in whole 1/60 s and the wind by the frame's time, frame for both
+//    by the frame's time).
 //    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.

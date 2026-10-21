@@ -50,6 +50,18 @@ bool tbuffer_dst_sel() {
     return on;
 }
 
+namespace {
+std::atomic<bool> g_index_bounds{false};  // set_index_bounds
+std::atomic<bool> g_oob_count{false};     // set_oob_count
+std::atomic<bool> g_oob_control{false};   // set_oob_control
+}  // namespace
+void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
+bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
+void set_oob_count(bool on) { g_oob_count.store(on, std::memory_order_relaxed); }
+bool oob_count() { return g_oob_count.load(std::memory_order_relaxed); }
+void set_oob_control(bool on) { g_oob_control.store(on, std::memory_order_relaxed); }
+bool oob_control() { return g_oob_control.load(std::memory_order_relaxed); }
+
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
     // one setting only cost a second entry.
@@ -153,6 +165,9 @@ struct Translator {
     // TranslateOptions::tess_role: LDS is the buffer at StageParams::lds_address.
     bool lds_in_buffer = false;
     Id lds_base64 = 0;
+    // gcn::set_oob_count: the counters' device address (StageParams::lds_address),
+    // loaded at the entry of a stage that counts; 0 otherwise.
+    Id oob_base64 = 0;
     // TranslateOptions::tess_lds_bound: how many bytes from lds_base64 the
     // stage may touch - the patch's window, or StageParams::lds_bytes - and
     // whether member 3 of the params block is the uvec4 that holds the latter.
@@ -730,6 +745,16 @@ struct Translator {
     Id host_ptr(Id host_u64) {
         const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host_u64});
         return m.access_chain(p_psb_u32, block, {c_zero_u});
+    }
+    // gcn::set_oob_count: one more of `kind` for this program where `cond`
+    // holds in a lane EXEC holds.
+    void oob_note(Id cond, std::uint32_t kind) {
+        if (!oob_base64) return;
+        if_then(band(cond, exec_cond()), [&] {
+            const std::uint64_t at = (static_cast<std::uint64_t>(res.oob_slot) * kOobKinds + kind) * 4;
+            m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(m.emit(spv::OpIAdd, t_u64, {oob_base64, m.const_u64(at)})), cu(spv::ScopeDevice),
+                                              cu(spv::MsNone), c_one_u});
+        });
     }
     Id guest_ptr(Id guest_u64) {
         const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, guest_u64});
@@ -2407,7 +2432,7 @@ struct Translator {
         Id addr;   // u64 guest address of the element
         Id stride;
     };
-    BufferAddr buffer_address(const Inst& in) {
+    BufferAddr buffer_address(const Inst& in, bool walk = true) {
         const Id w0 = read_s(in.srsrc, in), w1 = read_s(in.srsrc + 1, in);
         const Id base = make_u64(w0, iand(w1, cu(0xff)));
         const Id stride = iand(shr(w1, cu(16)), cu(0x3fff));
@@ -2417,6 +2442,12 @@ struct Translator {
         if (in.idxen) {
             const Id index = ld(vgpr_var(va++));
             off = iadd(off, imul(index, stride));
+            // gcn::set_oob_count: a walk by index at or past num_records (a
+            // structured buffer's: its stride not 0).
+            if (walk && oob_base64) {
+                oob_note(band(ine(stride, c_zero_u), m.emit(spv::OpLogicalNot, t_bool, {ult(index, read_s(in.srsrc + 2, in))})),
+                         kOobWalkPastRecords);
+            }
         }
         if (in.offen) {
             off = iadd(off, ld(vgpr_var(va)));
@@ -2722,10 +2753,31 @@ struct Translator {
             stride = sel(ine(spec, c_zero_u), spec, stride);
         }
         const Id stride_dw = shr(stride, cu(2));
-        const Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(ld(vgpr_var(in.vaddr)), stride_dw));
+        const Id vindex = ld(vgpr_var(in.vaddr));
+        Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(vindex, stride_dw));
         // The element's guest address feeds only the fallback walk.
-        const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in).addr;
-        comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+        const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in, false).addr;
+        // gcn::set_oob_count: an index at or past num_records, and a read past
+        // the binding (its last dword at or past the array's length).
+        if (oob_base64) {
+            const Id records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), kOobPastRecords);
+            const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
+            const Id last = iadd(cb_bias(index), iadd(first, cu(static_cast<std::uint32_t>(nwords - 1))));
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(last, length)}), kOobPastBinding);
+        }
+        if (!index_bounds()) {
+            comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+            return true;
+        }
+        // gcn::set_index_bounds: an index at or past num_records reads 0, as on
+        // GCN - the binding's first element read instead (its dwords are in the
+        // binding whatever the records: buffer_for sized it), the words dropped.
+        const Id ok = ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in));
+        first = sel(ok, first, cu(static_cast<std::uint32_t>(off / 4)));
+        std::vector<Id> words = read_bound(index, in.srsrc, first, nwords, guest);
+        for (Id& w : words) w = sel(ok, w, c_zero_u);
+        comps = format_decode(words, in.dfmt, in.nfmt, 4);
         return true;
     }
     // TranslateOptions::cb_ssbo + cb_no_fallback in a compute shader (a
@@ -4170,6 +4222,17 @@ struct Translator {
         }
         sym_user_data();
         Id lds_bytes = 0;
+        // gcn::set_oob_count: a vertex or pixel stage with no LDS of its own
+        // finds the counters where a tessellation stage finds its LDS.
+        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) &&
+            opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None) {
+            oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
+            std::uint32_t h = 2166136261u;  // the program's slot: FNV-1a of its words
+            for (const Inst& in : prog.insts) {
+                for (std::uint32_t k = 0; k < in.size && k < 3; ++k) h = (h ^ in.words[k]) * 16777619u;
+            }
+            res.oob_slot = h % kOobSlots;
+        }
         if (lds_in_buffer) {
             lds_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             if (params_head_v4) {

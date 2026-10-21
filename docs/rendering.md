@@ -266,6 +266,16 @@ target is undefined and Vulkan writes nothing through an empty mask, so the
 state is dead where a driver honours the mask; a driver may blend the undefined
 output in anyway, and with the state zeroed there is nothing to blend
 (`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
+A draw whose rasterizer state comes from the registers rather than a GX
+description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
+ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth
+block clamps depth to the viewport's range, which is Vulkan's depth clamp.
+GX's rasterizer builder sets both z bits from D3D11's DepthClipEnable, so this
+is exact for its states; Vulkan has no switch per plane, and a register with one
+alone clamps the other plane's geometry onto it instead of clipping it.
+DX_RASTERIZATION_KILL is rasterizer discard, a dynamic state only the pipelines
+of such draws take (`BBHOST_CLIP_CONTROL=0` keeps depth clamp from CLIP_DISABLE
+alone and rasterizes every draw).
 
 **Native passes.** Several parts of the frame no longer run the game's GPU
 path at all:
@@ -617,6 +627,54 @@ built yet; the reasoning, as measured on the development machine:
   processor resolves each draw (F12 captures, `tools/glitch_hunt.sh`,
   `BBHOST_GX_COST`, `drawreplay`). Its first step would be a compact command
   per draw, built at the GX call in place of the token's sparse records.
+
+### GX's objects as Vulkan objects (a design note)
+
+GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in
+guest memory, and the command processor finds each draw's bytes there by
+address: copy versions, the buffer shadow's mirrors and snapshots, the
+import, the texture cache. The direction is to make GX's objects Vulkan
+objects when GX creates them, so that a draw carries their handles and the
+command processor resolves nothing, in stages: buffers, then textures and
+views, then GX's state as pipeline pieces, then command lists recorded into
+Vulkan command buffers in parallel and completions on timeline semaphores,
+after which guest memory is no longer what the GPU reads for GX's objects.
+
+**Buffers (the first stage, off by default while it is measured).** A census
+(`BBHOST_GXVK_CENSUS=1`) measured what it rests on at Central Yharnam, Old
+Yharnam, Nightmare of Mensis and Cainhurst: GX makes 53-60 thousand buffers
+in such a session, 92% of them constant buffers without data; its immutable
+vertex and index buffers - about 1,040-1,340 of them, 1.2-1.6 GB - are never
+written again through GX (no Map of them, no UpdateSubresource of a buffer
+other than a constant buffer), and hold 75-85% of the vertex records the
+draws bind at the three places where the command processor limits the frame
+rate (85-94% of those in GX's own buffers) and 74-79% of their index ranges
+(99%). A GX holder has spare bytes that no
+GX code writes: the dword at +0x14, the upper half of the reference count
+(every locked operation on the count is 32-bit), in buffers and textures
+alike, which canaries confirmed at every binding and death (1 of 2.2 million
+checks failed). The dword at +0x44 is not spare in a constant buffer's
+holder: GX counts in its upper half.
+
+`BBHOST_GXVK_BUFFERS=1` gives such a buffer - immutable, or default with
+initial data; no CPU access; a vertex or index bind and nothing the GPU
+writes - an entry in a host table when GX's CreateBuffer (on the decomp
+list) makes it, and the entry's handle in the holder's +0x14. The GX call
+copies the handle into the draw's record beside the holder; the command
+processor binds the entry's device-local copy - placed in a pool and filled
+from the buffer's memory in the uploads of the first recording that binds it
+- instead of resolving the record's address, and plans the vertex input at
+the guest addresses, so its bindings and pipeline are today's. A Map, an
+UpdateSubresource or a GPU copy into the buffer retires the entry and its
+bindings take today's path again; a buffer that ended (its holder released,
+its memory unmapped or given to a new resource) is still bound from its copy
+by the draws recorded before its end. Video memory is used down to the
+reserve kept for render targets and device buffers, then host-visible
+memory. `BBHOST_GXVK_BUFFERS=2` keeps today's path and checks the handles
+beside it - the vertex input, the bytes as today's path finds them, the
+buffer's bytes against their hash when copied, the device copy read back -
+and the exit report counts the bindings by handle, the fallbacks by reason
+and any disagreement.
 
 ## Tools
 

@@ -415,6 +415,9 @@ void hle_patch_guest(ElfImage* image) {
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
     decomp_add_areas();
     decomp_install(image);
+    // After the list: GX's CreateBuffer tells the registry itself when it is
+    // ours, else it is hooked (engine/gx_resources.h).
+    gx_resources_install_late(image);
     // After the list: the mouse turns our follow camera when it is in place,
     // else the game's by hooks (engine/mouse_camera.h).
     mouse_camera_install(image);

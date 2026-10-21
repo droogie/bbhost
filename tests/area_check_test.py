@@ -172,6 +172,12 @@ class TourTest(unittest.TestCase):
         k = lines.index("mark central-yharnam:measure")
         self.assertEqual(lines[k + 1], "hold %.1f" % ac.DEFAULTS["measure"])
         self.assertEqual(lines[k + 2], "mark central-yharnam:measured")
+        # The settle waits frames past the loading screen too: a slow renderer's fade-out outlasts the seconds.
+        k = lines.index("hold %.1f" % ac.DEFAULTS["settle"])
+        self.assertEqual(lines[k + 1], "flips %d" % ac.DEFAULTS["settle_flips"])
+        self.assertLess(k + 1, lines.index("mark central-yharnam:measure"))
+        self.assertNotIn("flips", ac.tour(areas, dict(ac.DEFAULTS, settle_flips=0), "perf"))
+        self.assertIn("flips 60\ncapture 6 central-yharnam", ac.tour(areas[:1], dict(ac.DEFAULTS), "capture"))
         # A standpoint's warp comes right after the travel, as a fog wall's does.
         text = ac.tour(ac.pick_areas("laurence-staircase"), dict(ac.DEFAULTS), "perf")
         x, y, z, yaw = ac.AREA_BY_ID["laurence-staircase"].view()
@@ -268,13 +274,16 @@ class TourTest(unittest.TestCase):
             ac.os.environ.pop("AREA_TRAVEL_S", None)
             self.assertNotIn("BBHOST_MAPVAL_TRAVEL_S", ac.pass_settings(Path("/r"), areas, opts, "perf"))
             self.assertEqual(ac.travel_seconds(opts), 150)
-            base = ac.pass_budget(areas, opts, "perf")
+            seconds_only = dict(opts, settle_flips=0)
+            base = ac.pass_budget(areas, seconds_only, "perf")
             ac.os.environ["AREA_TRAVEL_S"] = "600"
             self.assertEqual(ac.pass_settings(Path("/r"), areas, opts, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "600")
-            self.assertEqual(ac.pass_budget(areas, opts, "perf"), base + 450)
+            self.assertEqual(ac.pass_budget(areas, seconds_only, "perf"), base + 450)
             given = dict(opts, env=["BBHOST_MAPVAL_TRAVEL_S=1500"])
             self.assertEqual(ac.pass_settings(Path("/r"), areas, given, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "1500")
             self.assertEqual(ac.travel_seconds(given), 1500)
+            # a slow renderer's frames past the loading screen take seconds each: the budget allows for them
+            self.assertGreater(ac.pass_budget(areas, opts, "perf"), ac.pass_budget(areas, dict(opts, settle_flips=0), "perf") + 150)
 
     def test_title_taps_until_the_world(self):
         """launch() asks for the menus' confirm button until the world's first
