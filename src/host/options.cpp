@@ -89,6 +89,7 @@ enum SettingId {
     kChangeAppearance,
     kRebirth,
     kFivePlayers,
+    kDiscordRpc,
     kSettingCount,
 };
 
@@ -249,6 +250,8 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.", true},
     {"five_players", "Five players", {"On", "Off"}, 0,
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
+    {"discord_rpc", "Discord Rich Presence", {"Off", "On"}, 0,
+     "Show the active Bloodborne area and loaded character in your Discord profile.", false},
 };
 
 const Row g_rows[] = {
@@ -290,6 +293,7 @@ const Row g_rows[] = {
     {Row::Header, "STARTUP"},
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kDebugCamera},
+    {Row::Option, nullptr, kDiscordRpc},
     // The private server's account. No passwords: link this PC to
     // the account signed into on the website with Discord, or make one held
     // by this PC with a recovery code. The token is kept in the options file.
