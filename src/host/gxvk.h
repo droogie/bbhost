@@ -39,12 +39,28 @@
 
 namespace gxvk {
 
-// BBHOST_GXVK_BUFFERS: 0 (the default) today's path; 1 GX buffers bound by
-// their handles; 2 both, compared; "census" the census alone (as
-// BBHOST_GXVK_CENSUS=1, which can join the others). Read once.
+// BBHOST_GXVK_BUFFERS: unset, GX buffers bound by their handles (1) on a
+// discrete GPU with room in its video memory; today's path (0) on an
+// integrated GPU or with tight memory, where the draws read GX's buffers
+// where they are (the buffer shadow in place there, or no shadow) and a
+// buffer's copy would hold memory and buy nothing, and with small video
+// memory, where the copies compete with the targets and textures for it and
+// one dip to the reserve costs far more GPU time than the command processor
+// saves. 0 today's path; 1 by handle on any GPU; 2 both, compared; "census"
+// the census alone (as BBHOST_GXVK_CENSUS=1, which can join the others).
+// Read once, as the GX hooks are installed: the device's kind is asked before
+// the device is made (host_gpu_integrated, host_gpu_memory_tight,
+// host_gpu_small_vram).
 enum class Buffers : int { kOff = 0, kOn = 1, kCompare = 2 };
 Buffers buffers_mode();
 bool census();
+// The device as the default sees it.
+enum class BuffersDevice : int { kRoomy, kIntegrated, kTight, kSmallVram };
+// The mode for the switch's value (null or empty: unset) on that device.
+inline Buffers buffers_mode_for(const char* env, BuffersDevice device) {
+    if (!env || !*env) return device == BuffersDevice::kRoomy ? Buffers::kOn : Buffers::kOff;
+    return env[0] == '1' ? Buffers::kOn : env[0] == '2' ? Buffers::kCompare : Buffers::kOff;
+}
 
 // A GX buffer holder's spare dwords: +0x14, the reference count's upper half
 // (every locked access GX makes to the count is to the dword at +0x10), and
@@ -102,7 +118,8 @@ void census_constant_bound(std::uint64_t va, std::uint64_t bytes, std::uint64_t 
 // The exit report (gx_resources_report calls it).
 void census_report();
 
-// --- GX buffers by handle (BBHOST_GXVK_BUFFERS=1; 2 compares) ---
+// --- GX buffers by handle (BBHOST_GXVK_BUFFERS: the default, except on an integrated GPU or with
+// tight memory; 2 compares) ---
 //
 // A GX buffer the host can keep - immutable, or default with initial data;
 // no CPU access; bound as vertex or index data, and as nothing the GPU
@@ -196,6 +213,12 @@ bool arena_move_pending(std::uint64_t* va, std::uint64_t* bytes);
 // then whether the move held, with what the memory is.
 void arena_moving(bool on);
 void arena_moved(bool ok, const char* what);
+// Whether the move held: the heap is video memory the CPU writes.
+bool arena_moved_ok();
+// BBHOST_GXVK_ARENA=2: the host mapping the heap was given, recorded as pieces
+// of `piece` bytes side by side (each its own mapping, import and move:
+// host/arena_move.h); false in every other mode.
+bool arena_pieces(std::uint64_t* va, std::uint64_t* bytes, std::uint64_t* piece);
 // The fault handler's (async-signal-safe, no stack protector): a write fault
 // on the heap while it moves waits for the move and returns true (retry).
 bool arena_move_fault(std::uint64_t addr);
@@ -210,6 +233,8 @@ void arena_handout(std::uint64_t pool, std::uint64_t node);
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
+// The binding's range crosses two of the heap's pieces (=2), so no one buffer holds it.
+void arena_crossing();
 // Today's path over the heap, counted where it runs: the work stage 1c takes
 // away, and the command processor's reads of descriptor tables in the heap -
 // slow once the heap is in write-combined video memory (BBHOST_GXVK_ARENA=2).

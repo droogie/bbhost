@@ -6,14 +6,16 @@
 #include <cmath>
 
 // What a frame of the water interaction does. Decided once a frame at the
-// manager's update (water_gate_time): kWaterStart on the first frame and
-// after the game time went back or leapt (a load), kWaterTime on a frame that
-// closes a whole 1/30 s of game time since the last step, else kWaterSkip.
-// Settled at its task (water_gate_camera): in screen-space mode, whose grid
-// follows the camera in whole units, a frame decided kWaterSkip on which the
-// camera's truncated x or z left the last step's steps after all
-// (kWaterCamera), and takes its 1/30 s from the next steps (at most one step
-// ahead). Pure, for the unit test.
+// manager's update: on the frame-rate code's schedule of whole 1/30 s
+// (water_gate_schedule; the effects' own when they step in 1/30 s), else on
+// the game time (water_gate_time): kWaterStart on the first frame and after
+// the game time went back or leapt (a load), kWaterTime on a frame that
+// closes a whole 1/30 s, else kWaterSkip. Settled at its task
+// (water_gate_camera): in screen-space mode, whose grid follows the camera in
+// whole units, a frame decided kWaterSkip on which the camera's truncated x
+// or z left the last step's steps after all (kWaterCamera), and takes its
+// 1/30 s from the next steps (at most one step ahead): the schedule's next
+// whole step is skipped, or the time's bank pays it. Pure, for the unit test.
 enum WaterStep { kWaterSkip = 0, kWaterStart, kWaterTime, kWaterCamera };
 struct WaterGate {
     bool started = false;
@@ -21,6 +23,7 @@ struct WaterGate {
     float last_time = 0.0f;  // the game time at the last update
     float banked = 0.0f;     // game time not yet stepped: since the last step, less what steps took ahead (-1/30 .. 1/30)
     float camera_x = 0.0f, camera_z = 0.0f;  // trunc(camera) at the last step
+    bool owed = false;  // a camera step took the next scheduled whole step's 1/30 s
 };
 
 constexpr float kWaterStep = 1.0f / 30.0f;
@@ -65,6 +68,24 @@ inline WaterStep water_gate_time(WaterGate& g, float time) {
     return kWaterSkip;
 }
 
+// On the frame-rate code's schedule: a frame it gives a whole 1/30 s steps,
+// unless a camera step already took it (owed); the frames between hold. The
+// first scheduled frame starts (the camera's last place unknown).
+inline WaterStep water_gate_schedule(WaterGate& g, bool between) {
+    if (!g.started) {
+        g.started = true;
+        g.have_camera = false;
+        g.owed = false;
+        return kWaterStart;
+    }
+    if (between) return kWaterSkip;
+    if (g.owed && !WATER_MUTANT(17)) {
+        g.owed = false;
+        return kWaterSkip;
+    }
+    return kWaterTime;
+}
+
 inline WaterStep water_gate_camera(WaterGate& g, WaterStep why, bool scroll, float camera_x, float camera_z) {
     const float cx = water_trunc(camera_x), cz = water_trunc(camera_z);
     if (why == kWaterSkip) {
@@ -72,6 +93,7 @@ inline WaterStep water_gate_camera(WaterGate& g, WaterStep why, bool scroll, flo
         why = kWaterCamera;
         if (!WATER_MUTANT(5)) g.banked -= kWaterStep;
         if (g.banked < -kWaterStep) g.banked = -kWaterStep;
+        g.owed = true;
     }
     if (scroll) {
         g.have_camera = true;
@@ -88,3 +110,8 @@ inline WaterStep water_gate_step(WaterGate& g, float time, bool scroll, float ca
 }
 
 void decomp_water_gate_add();
+// The frame-rate code's schedule for the frame about to run (engine/frame_rate.cpp's
+// each_frame): whether it falls between whole 1/30 s steps. Once told, the
+// water steps on it; before (at 30, where no frame rate is converted) on the
+// game time.
+void decomp_water_step_frame(bool between);

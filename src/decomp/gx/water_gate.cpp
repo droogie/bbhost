@@ -25,11 +25,15 @@
 // four times at 120 (measured on Moonside Lake in game time: 30.0 steps a game
 // second at 30, 60.0 at 60, one a frame at both).
 //
-// Ours steps on the frames that close a whole 1/30 s of game time - the GX
-// world's clock, *(0x5940dd8)+0x78cc, the one the shaders' time is read from
-// (sub_2651f10) - decided once a frame at the update, before the task and the
-// water surfaces' draws. On the frames between, the update runs as the game's,
-// and then:
+// Ours steps on the frames that take a whole 1/30 s on the frame-rate code's
+// schedule (engine/frame_rate.cpp's each_frame, engine/sfx_schedule.h): the
+// effects' own whole steps when they step in 1/30 s - one clock for both, on
+// the same frames - else the same schedule of 1/30 s on the same frame time.
+// Where nothing is scheduled (at 30, no frame rate converted) it steps on the
+// GX world's game time, *(0x5940dd8)+0x78cc, once a whole 1/30 s of it has
+// passed: at 30, every frame. Decided once a frame at the update, before the
+// task and the water surfaces' draws. On the frames between, the update runs
+// as the game's, and then:
 //   - each grid it turned round is turned back, so +0x10 holds the last
 //     step's heights again and the next step reads its two maps before in
 //     order (new maps a resize swapped in during the update, sub_12bd860,
@@ -51,8 +55,9 @@
 // between steps on which the camera's truncated x or z left the last step's,
 // the task turns the grids round again and steps too, whatever its time, so
 // the grid and what it holds never part, and the step is taken from the next
-// ones (at most one ahead), which keeps 30 a second while the camera crosses;
-// it takes that frame's impulses as any step does.
+// ones (at most one ahead: the schedule's next whole step is skipped), which
+// keeps 30 a second while the camera crosses; it takes that frame's impulses
+// as any step does.
 //
 // BBHOST_WATER_GATE=0: the game's update and task, every frame.
 #include "decomp/gx/water_gate.h"
@@ -119,6 +124,7 @@ struct ManagerGate {
     WaterGate gate;
     bool decided = false;  // its update ran since its task last did
     bool waiting = false;  // a held frame's update handed impulses on that no task took
+    u64 scheduled = 0;     // the schedule's frame this manager's update last read
     WaterStep why = kWaterSkip;
     int turned = 0;        // the grids that update turned round, in its order
     u64 grids[kGrids];
@@ -127,6 +133,11 @@ struct ManagerGate {
 ManagerGate g_managers[kManagers];
 
 std::atomic<u64> g_frames{0}, g_steps{0}, g_camera_steps{0}, g_held{0}, g_turned_back{0}, g_impulses_kept{0}, g_impulses_lost{0}, g_passed{0};
+// The frame-rate code's schedule (decomp_water_step_frame): the frame about to run between whole 1/30 s steps or
+// not, and a count of the frames it was told for (0: never - the game time decides).
+std::atomic<u32> g_schedule_between{0};
+std::atomic<u64> g_schedule_frames{0};
+std::atomic<u64> g_scheduled{0};
 
 #ifndef DECOMP_WATER_GATE_TEST_GX
 inline u64 gx_world() { return load<u64>(game_address(kGxWorld)); }
@@ -242,7 +253,18 @@ DECOMP_LEAF u64 water_update(u64 manager) {
     m->waiting = false;
     m->decided = true;
     m->turned = 0;
-    m->why = MUTANT(3) ? kWaterTime : water_gate_time(m->gate, load<float>(gx + kGameTime));
+    const u64 frame = g_schedule_frames.load(std::memory_order_acquire);
+    if (MUTANT(3)) {
+        m->why = kWaterTime;
+    } else if (frame && !MUTANT(16)) {
+        // the schedule's frame: a whole 1/30 s or between (a second update in that frame holds)
+        const bool between = frame == m->scheduled || g_schedule_between.load(std::memory_order_relaxed) != 0;
+        m->scheduled = frame;
+        m->why = water_gate_schedule(m->gate, between);
+        g_scheduled.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        m->why = water_gate_time(m->gate, load<float>(gx + kGameTime));
+    }
     if (m->why != kWaterSkip) return game(manager);
     if (!grids_to_turn(manager, *m)) {
         // more grids than kept: this frame steps
@@ -300,6 +322,11 @@ DECOMP_LEAF u64 water_task(u64 self, u64 context, u64 param) {
     return game(self, context, param);
 }
 
+void decomp_water_step_frame(bool between) {
+    g_schedule_between.store(between ? 1u : 0u, std::memory_order_relaxed);
+    g_schedule_frames.fetch_add(1, std::memory_order_release);
+}
+
 void decomp_water_gate_report() {
     if (decomp_placed("sub_2677780") != 1 || decomp_placed("sub_2677e50") != 1) return;
     const u64 frames = g_frames.load(), steps = g_steps.load();
@@ -309,6 +336,10 @@ void decomp_water_gate_report() {
              static_cast<ull>(frames), static_cast<ull>(steps), static_cast<ull>(g_camera_steps.load()), static_cast<ull>(g_held.load()),
              static_cast<ull>(g_turned_back.load()), static_cast<ull>(g_impulses_kept.load()), static_cast<ull>(g_impulses_lost.load()),
              static_cast<ull>(g_passed.load()), g_gate_on ? "" : " (BBHOST_WATER_GATE=0: every frame the game's)");
+    if (g_gate_on)
+        host_log("decomp: the water interaction's steps: %llu updates on the frame-rate code's schedule of whole 1/30 s (the "
+                 "effects' when they step in 1/30 s), the rest on the game time",
+                 static_cast<ull>(g_scheduled.load()));
 }
 
 namespace {

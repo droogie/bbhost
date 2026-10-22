@@ -5,6 +5,7 @@ bool host_gpu_init(const char* const*, std::uint32_t, bool) { return false; }
 bool host_gpu_available() { return false; }
 bool host_gpu_memory_tight() { return false; }
 bool host_gpu_small_vram() { return false; }
+bool host_gpu_integrated() { return false; }
 void host_gpu_queue_lock() {}
 void host_gpu_queue_unlock() {}
 std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*) { return 0; }

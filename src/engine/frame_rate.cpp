@@ -6,6 +6,7 @@
 #include "engine/sfx_schedule.h"
 #include "engine/wind_pace.h"
 #include "decomp/sfx/step_gate.h"
+#include "decomp/gx/water_gate.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -773,6 +774,9 @@ std::atomic<bool> g_scale_by_step{false};
 // whole 1/60 s (60).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
+// The water interaction's own schedule of whole 1/30 s, while the effects
+// step otherwise (in 1/60 s, by the frame's time, or not scheduled at all).
+double g_water_carry = 0.0;
 // The wind's step (engine/wind_pace.h): half the task step, which 0x2713d8d
 // reads in place of the frame-time slot - 30's pace at every rate.
 std::uint64_t g_wind_va = 0;
@@ -1430,6 +1434,7 @@ void each_frame(const SprjFlipper* f) {
             g_play_ms_carry -= ms;
             put<std::int32_t>(g_play_ms_va, ms);
         }
+        bool water_between = false;
         if (g_sfx_step_va) {
             // The step in whole 1/30 s or 1/60 s (at most one 1/30, or two
             // 1/60), the rest carried (engine/sfx_schedule.h).
@@ -1439,7 +1444,17 @@ void each_frame(const SprjFlipper* f) {
             decomp_sfx_gate_frame(g_sfx_gate && sf.whole == 0);
             decomp_sfx_step_frame(sf.whole == 0);
             decomp_sfx_frame_time(sf.frame, sf.from, sf.into);
+            water_between = sf.whole == 0;
         }
+        // The water interaction's steps (decomp/gx/water_gate.cpp): the
+        // effects' whole steps when they step in whole 1/30 s - one clock, the
+        // same frames - else the same schedule of whole 1/30 s on the same
+        // frame time.
+        if (!g_sfx_step_va || g_sfx_steps_a_second != 30) {
+            water_between =
+                sfx_schedule::next(g_water_carry, g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step), 30).whole == 0;
+        }
+        decomp_water_step_frame(water_between);
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
     const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));

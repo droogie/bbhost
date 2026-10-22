@@ -4,6 +4,7 @@
 #include "core/memory.h"
 #include "core/thunk.h"
 #include "decomp/insn.h"
+#include "decomp/name_lines.h"
 #include "engine/addr.h"
 #include "log.h"
 
@@ -164,6 +165,16 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
     return true;
 }
 
+// The install report's names in parts (decomp/name_lines.h): a part and its
+// prefix stay well inside the 1023 characters one log line holds.
+constexpr std::size_t kNameLineWidth = 900;
+
+void log_names(const char* what, const std::vector<std::string>& names) {
+    const std::vector<std::string> lines = decomp_name_lines(names, kNameLineWidth);
+    for (std::size_t i = 0; i < lines.size(); ++i)
+        host_log("decomp: %s (%zu/%zu): %s", what, i + 1, lines.size(), lines[i].c_str());
+}
+
 }  // namespace
 
 std::uint64_t g_decomp_slide = kPreferredGuestSlide;
@@ -190,24 +201,24 @@ void decomp_install(ElfImage* image) {
     const char* off = std::getenv("BBHOST_DECOMP_OFF");
     const char* cmp = std::getenv("BBHOST_DECOMP_COMPARE");
     g_comparing = cmp && cmp[0] == '1';
-    std::string ours, kept;
+    std::vector<std::string> ours, kept;
     for (const DecompFunction& fn : g_added) {
         if (listed(off, fn.name)) {
-            kept += kept.empty() ? fn.name : std::string(", ") + fn.name;
+            kept.emplace_back(fn.name);
             continue;
         }
         const bool compare = g_comparing && fn.compare && fn.counts;
         if (!place(image, fn, compare)) {
-            kept += kept.empty() ? fn.name : std::string(", ") + fn.name;
+            kept.emplace_back(fn.name);
             continue;
         }
         g_placed.push_back({&fn, compare});
-        ours += ours.empty() ? "" : ", ";
-        ours += fn.name;
-        if (compare) ours += " (compared)";
+        ours.push_back(compare ? std::string(fn.name) + " (compared)" : std::string(fn.name));
     }
-    host_log("decomp: %zu of %zu functions ours: %s%s%s", g_placed.size(), g_added.size(), ours.empty() ? "none" : ours.c_str(),
-             kept.empty() ? "" : "; the game's: ", kept.c_str());
+    // The count first, then the names in parts: the game's (switched off or not placed), then ours.
+    host_log("decomp: %zu of %zu functions ours, %zu the game's", g_placed.size(), g_added.size(), kept.size());
+    log_names("the game's", kept);
+    log_names("ours", ours);
 }
 
 void decomp_report() {

@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 std::uint32_t host_thread_id() { return 1; }
 void host_thread_set_name(const char*) {}
 void host_thread_background() {}
@@ -93,7 +95,8 @@ int main() {
     }
     CHECK(hlsl_mode() == 2 && hlsl_on());  // the default: behind the game
 
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "bbhost-hlsl-default-test";
+    // The folder is this process's own: two test runs at once each have theirs.
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("bbhost-hlsl-default-test-" + std::to_string(getpid()));
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     std::filesystem::create_directories(dir / "shaders", ec);

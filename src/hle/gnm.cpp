@@ -543,16 +543,26 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         prev_hash_us = hash_us;
         prev_repl = repl;
     }
+    // The video memory lines (host_gpu_log_video_memory) come from a census of
+    // every image and mirror page that holds the GPU lock for 2-3 ms on an RTX
+    // 4070 at 1080p and 1440p, so they go with every sixth 300-flip report -
+    // every 1,800 flips, 30 s at 60 fps - not with each one.
+    // BBHOST_VRAM_REPORT_FLIPS=<n> sets it (a multiple of 300, 300 at least).
+    static const std::uint64_t vram_flips = [] {
+        const char* e = std::getenv("BBHOST_VRAM_REPORT_FLIPS");
+        const unsigned long long v = e && *e ? std::strtoull(e, nullptr, 10) : 1800ull;
+        return static_cast<std::uint64_t>(v >= 300 ? v / 300 * 300 : 300);
+    }();
     // BBHOST_VRAM_REPORT_S=<s>: the video memory lines every s seconds as well,
-    // on the flips between the 300-flip reports - lavapipe flips 300 times in
-    // a minute or more, a place's whole window. Off (0) by default.
+    // on the flips between those reports - lavapipe flips 300 times in a
+    // minute or more, a place's whole window. Off (0) by default.
     if (host_tooling()) {
         static const double every = [] {
             const char* e = std::getenv("BBHOST_VRAM_REPORT_S");
             return e && *e ? std::atof(e) : 0.0;
         }();
         static auto last_v = std::chrono::steady_clock::now();
-        if (every > 0 && n % 300 != 0) {
+        if (every > 0 && n % vram_flips != 0) {
             const auto tv = std::chrono::steady_clock::now();
             if (std::chrono::duration<double>(tv - last_v).count() >= every) {
                 last_v = tv;
@@ -677,7 +687,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         host_gpu_resources_report();
         if (const std::string r = host_gpu_ps_wave_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_memory_budget_report(); !r.empty()) host_log("  %s", r.c_str());
-        host_gpu_log_video_memory(false);
+        if (n % vram_flips == 0) host_gpu_log_video_memory(false);
         // What the PC enhancements and Bloom cost in these flips: the file
         // lookups that passed the generated overlays by, the frames that read
         // the altar's flags, the views that drew YEBIS's glare.

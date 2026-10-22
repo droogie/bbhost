@@ -319,6 +319,9 @@ bool host_gpu_memory_tight();
 // small-video-memory settings apply. Before the device exists, as
 // host_gpu_memory_tight.
 bool host_gpu_small_vram();
+// Whether the GPU run on is an integrated one (its video memory is the
+// system's RAM). Before the device exists, as host_gpu_memory_tight.
+bool host_gpu_integrated();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
@@ -738,8 +741,9 @@ void host_gpu_compile_cancel();
 std::string host_gpu_device_identity();
 std::string host_gpu_memory_budget_report();
 // Where this process's video memory goes, by owner and kind, held against
-// cached (gpu.cpp video_memory_report_locked): every 300 flips, and at exit
-// with each owner's highest. Empty with BBHOST_VRAM_REPORT=0 or no GPU.
+// cached (gpu.cpp video_memory_report_locked): every 1,800 flips
+// (BBHOST_VRAM_REPORT_FLIPS, gnm.cpp), and at exit with each owner's highest.
+// Empty with BBHOST_VRAM_REPORT=0 or no GPU.
 std::string host_gpu_video_memory_report(bool at_exit);
 void host_gpu_log_video_memory(bool at_exit);  // the same, logged a line a call (indented but the exit's first)
 // Serialises queue use between the presenter and the executor.

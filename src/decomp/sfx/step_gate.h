@@ -8,6 +8,10 @@ void decomp_sfx_gate_frame(bool between);
 // Whether the frame is between whole effect steps at all, the gate on or off:
 // what GPU particle type 0x2713's record keeps its whole step's time on.
 void decomp_sfx_step_frame(bool between);
+// What decomp_sfx_step_frame was last told: false before it was told, at 30
+// and wherever bbhost does not schedule the effects' steps. From a leaf: the
+// GX lights' blink begins its cycles on the other frames (decomp/gx/blink.cpp).
+bool decomp_sfx_between_steps();
 // The same frame's own time and the carry before and after it
 // (engine/sfx_schedule.h's frame, from and into): what the smooth steps' frame
 // domain steps the effects by and puts on their nodes' times.

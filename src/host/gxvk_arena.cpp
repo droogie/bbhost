@@ -25,6 +25,7 @@
 #include "host/gxvk.h"
 
 #include "hle/modules.h"
+#include "host/arena_move.h"
 #include "host/gpu.h"
 #include "host/label_landing.h"
 #include "log.h"
@@ -66,6 +67,12 @@ const Arena g_mode = [] {
 // One in-place binding in this many has its bytes hashed (compare: all).
 constexpr std::uint32_t kSampleEvery = 64;
 constexpr std::uint64_t kHashMax = 4096;  // a longer range's first bytes
+// The heap moved into video memory the CPU writes (=2): the CPU reads it at
+// tens of MB/s (an RTX 4070's: 64 MiB took 2.1 s), under the arena's lock on
+// the command processor, so its bytes are sampled one binding in 1024 and
+// hashed over their first 256 bytes.
+constexpr std::uint32_t kSampleEveryMoved = 1024;
+constexpr std::uint64_t kHashMaxMoved = 256;
 constexpr std::uint64_t kPageShift = 16;
 
 std::atomic<std::uint64_t> g_lo{0}, g_hi{0}, g_pool{0};
@@ -116,14 +123,17 @@ std::atomic<bool> g_in_place{true};  // false after a violation
 // BBHOST_GXVK_ARENA=2: the host mapping the pool was given, to move at the
 // GPU's start; and while it moves, its range (the fault handler's).
 std::atomic<std::uint64_t> g_move_va{0}, g_move_bytes{0};
+// The pieces the host mapping is recorded as (each its own mapping, import and
+// move: host/arena_move.h); 0 while the heap is not ours.
+std::atomic<std::uint64_t> g_piece{0};
 std::atomic<std::uint64_t> g_moving_lo{0}, g_moving_hi{0};
 std::atomic<int> g_moved{-1};  // -1 not tried, 0 failed, 1 moved
 std::atomic<int> g_said{0};
 
 std::atomic<std::uint64_t> g_handouts{0}, g_outside{0}, g_bound[kUses] = {}, g_bound_bytes[kUses] = {};
-enum Why : int { kWhyNoRecord, kWhyStraddle, kWhyStored, kWhyProofOff, kWhyNoBacking, kWhys };
+enum Why : int { kWhyNoRecord, kWhyStraddle, kWhyStored, kWhyProofOff, kWhyNoBacking, kWhyPieces, kWhys };
 const char* const kWhyName[kWhys] = {"no hand-out holds it", "it runs past its hand-out", "the shader stores to it", "the proof failed earlier",
-                                     "the heap is not in one buffer"};
+                                     "the heap is not in one buffer", "it crosses two of the heap's pieces"};
 std::atomic<std::uint64_t> g_fell[kWhys] = {};
 std::atomic<std::uint64_t> g_violations_order{0}, g_violations_bytes{0}, g_samples_checked{0}, g_samples_skipped{0};
 std::atomic<std::uint64_t> g_noted[kArenaNotes] = {}, g_noted_bytes[kArenaNotes] = {};
@@ -135,7 +145,7 @@ std::uint64_t done_submissions() {
 std::uint64_t hash_of(std::uint64_t va, std::uint64_t bytes) {
     const std::uint8_t* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va));
     std::uint64_t h = 1469598103934665603ull;
-    const std::uint64_t n = std::min(bytes, kHashMax);
+    const std::uint64_t n = std::min(bytes, g_moved.load(std::memory_order_relaxed) == 1 ? kHashMaxMoved : kHashMax);
     std::uint64_t i = 0;
     for (; i + 8 <= n; i += 8) {
         std::uint64_t w;
@@ -206,13 +216,20 @@ std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64
     // for a V# (40 bits) and GPU-visible as the kernel's own host mappings
     // are; at the GPU's start its bytes move into video memory placed over it
     // (gpu.cpp). The game's region stays allocated, unused.
+    // In pieces (BBHOST_GXVK_ARENA_PIECE_MB, default 32): mappings side by side,
+    // each moved and imported on its own - NVIDIA's driver places at most 124
+    // MiB of that memory at a time (host/arena_move.h).
     if (g_mode == Arena::kMoved && !g_move_va.load(std::memory_order_relaxed)) {
         const std::uint64_t len = (bytes + 0xffff) & ~std::uint64_t{0xffff};
-        if (const std::uint64_t va = hle_kernel_map_host(len)) {
+        const std::uint64_t piece = arena_move::piece_bytes(std::getenv("BBHOST_GXVK_ARENA_PIECE_MB"));
+        if (const std::uint64_t va = hle_kernel_map_host_pieces(len, piece)) {
             g_move_bytes.store(len, std::memory_order_relaxed);
+            g_piece.store(piece, std::memory_order_relaxed);
             g_move_va.store(va, std::memory_order_release);
-            host_log("gxvk arena: GX's upload heap goes to 0x%llx (%llu MiB) to move at the GPU's start, not the game's region 0x%llx",
-                     static_cast<ull>(va), static_cast<ull>(len >> 20), static_cast<ull>(region));
+            host_log("gxvk arena: GX's upload heap goes to 0x%llx (%llu MiB, %llu pieces of up to %llu MiB) to move at the GPU's start, "
+                     "not the game's region 0x%llx",
+                     static_cast<ull>(va), static_cast<ull>(len >> 20), static_cast<ull>((len + piece - 1) / piece), static_cast<ull>(piece >> 20),
+                     static_cast<ull>(region));
             region = va;
             *out_bytes = bytes;
         }
@@ -249,6 +266,18 @@ bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {
     *hi = g_hi.load(std::memory_order_relaxed);
     return true;
 }
+
+bool arena_pieces(std::uint64_t* va, std::uint64_t* bytes, std::uint64_t* piece) {
+    const std::uint64_t p = g_piece.load(std::memory_order_relaxed);
+    const std::uint64_t v = g_move_va.load(std::memory_order_acquire);
+    if (!p || !v) return false;
+    *va = v;
+    *bytes = g_move_bytes.load(std::memory_order_relaxed);
+    *piece = p;
+    return true;
+}
+
+bool arena_moved_ok() { return g_moved.load(std::memory_order_relaxed) == 1; }
 
 void arena_handout(std::uint64_t pool, std::uint64_t node) {
     if (g_mode == Arena::kOff || !node) return;
@@ -336,7 +365,8 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
                 rec.stamp = std::max(rec.stamp, MUTANT(1) ? serial : serial + 1);
                 found = true;
                 // The bytes, sampled (compare: every one).
-                if (g_mode == Arena::kCompare || ++g_sample_tick % kSampleEvery == 0) {
+                if (g_mode == Arena::kCompare ||
+                    ++g_sample_tick % (g_moved.load(std::memory_order_relaxed) == 1 ? kSampleEveryMoved : kSampleEvery) == 0) {
                     const std::uint64_t done = done_submissions();
                     check_samples_locked(done);
                     if (g_sample_n == kSamples) {  // full: the oldest goes unchecked
@@ -428,6 +458,7 @@ __attribute__((no_stack_protector)) bool arena_move_fault(std::uint64_t addr) {
 }
 
 void arena_no_backing() { g_fell[kWhyNoBacking].fetch_add(1, std::memory_order_relaxed); }
+void arena_crossing() { g_fell[kWhyPieces].fetch_add(1, std::memory_order_relaxed); }
 
 void arena_note(ArenaNote what, std::uint64_t bytes) {
     g_noted[what].fetch_add(1, std::memory_order_relaxed);
@@ -511,6 +542,7 @@ void arena_report() {
     }
     std::string fell;
     for (int w = 0; w < kWhys; ++w) {
+        if (w == kWhyPieces && !g_piece.load(std::memory_order_relaxed)) continue;  // =2's: the heap in pieces
         char b[96];
         std::snprintf(b, sizeof b, "%s%s %llu", w ? ", " : "", kWhyName[w], v(g_fell[w]));
         fell += b;
@@ -521,9 +553,10 @@ void arena_report() {
              placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
     host_log("gxvk arena: the release proof: %llu hand-outs recorded (%llu outside the heap), %llu alive at most; %llu handed out again before "
              "their binding's submission completed; bytes checked %llu (%llu skipped: handed out again first, or the ring full), %llu changed "
-             "under a queued draw%s",
+             "under a queued draw%s%s",
              v(g_handouts), v(g_outside), static_cast<ull>(live_max), v(g_violations_order), v(g_samples_checked), v(g_samples_skipped),
-             v(g_violations_bytes), g_in_place.load() ? "" : " - in place stopped at the first");
+             v(g_violations_bytes), g_moved.load() == 1 ? " (one binding in 1024, its first 256 bytes: the heap is video memory)" : "",
+             g_in_place.load() ? "" : " - in place stopped at the first");
     static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending",
                                                        "descriptor-table reads"};
     std::string notes;

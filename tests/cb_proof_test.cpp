@@ -9,6 +9,7 @@
 #include "host/cb_proof.cpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -94,13 +95,21 @@ int main() {
     CHECK(check(u64{63} << 56, a, 16, kPathSnapshot, &d) == kNoCopy);
     CHECK(check(u64{200} << 56, a, 16, kPathSnapshot, &d) == kNoCopy);
 
-    // Another thread copying into its own ring (laps every few hundred
-    // copies) while this one compares its newest copies, read from a buffer
-    // nothing writes: same or lapped, never changed, whatever the timing.
+    // Another thread copying into its own ring (laps every few dozen copies)
+    // while this one compares its newest copies, read from a buffer nothing
+    // writes: same or lapped, never changed, whatever the timing. The phase
+    // is counted in progress, not in rounds: it waits for the writer's first
+    // copy, then compares until the writer has made kCopies more and this
+    // thread has compared kCompares times, so a loaded box makes it slower
+    // but never empty (a fixed 400,000 rounds were once over before the
+    // writer had run at all). Only a writer that makes no copy for kStall
+    // ends it early, as a failure.
     {
         std::vector<u8> src(kMaxCopy);
         for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<u8>(i ^ (i >> 8));
         constexpr int kSlots = 64;
+        constexpr u64 kCopies = 8192, kCompares = 400000;
+        constexpr auto kStall = std::chrono::seconds(30);
         std::atomic<u64> handles[kSlots];
         std::atomic<u32> sizes[kSlots];
         for (int i = 0; i < kSlots; ++i) {
@@ -120,24 +129,53 @@ int main() {
                 made.store(n, std::memory_order_relaxed);
             }
         });
-        u64 same = 0, lapped = 0, other = 0;
-        for (int round = 0; round < 400000; ++round) {
-            const int slot = round % kSlots;
+        // Whether the writer still moves: a copy within the last kStall.
+        u64 seen = 0;
+        auto moved = std::chrono::steady_clock::now();
+        const auto moving = [&] {
+            const u64 m = made.load(std::memory_order_relaxed);
+            if (m != seen) {
+                seen = m;
+                moved = std::chrono::steady_clock::now();
+                return true;
+            }
+            return std::chrono::steady_clock::now() - moved < kStall;
+        };
+        // The writer's first copy: on a loaded box a new thread can wait long for a CPU.
+        bool stalled = false;
+        while (!stalled && made.load(std::memory_order_relaxed) == 0) {
+            stalled = !moving();
+            std::this_thread::yield();
+        }
+        const u64 first = made.load(std::memory_order_relaxed);
+        u64 compares = 0, same = 0, lapped = 0, other = 0;
+        for (u64 round = 0; !stalled; ++round) {
+            if (round % 1024 == 0) {
+                if (made.load(std::memory_order_relaxed) - first >= kCopies && compares >= kCompares) break;
+                stalled = !moving();
+            }
+            const int slot = static_cast<int>(round % kSlots);
             const u64 hh = handles[slot].load(std::memory_order_acquire);
             const u32 bytes = sizes[slot].load(std::memory_order_relaxed);
             if (!hh || !bytes) continue;
             const Outcome o = check(hh, va(src.data()), std::min<u32>(bytes, 4096), kPathSnapshot, &d);
+            ++compares;
             same += o == kSame;
             lapped += o == kLapped;
             other += o != kSame && o != kLapped && o != kNotCovered;
         }
         stop = true;
         writer.join();
-        std::printf("concurrent: %llu copies made, %llu compares the same, %llu lapped, %llu otherwise\n",
-                    static_cast<unsigned long long>(made.load()), static_cast<unsigned long long>(same),
-                    static_cast<unsigned long long>(lapped), static_cast<unsigned long long>(other));
+        const u64 copies = made.load() - first;
+        std::printf("concurrent: %llu copies made while %llu compares ran: %llu the same, %llu lapped, %llu otherwise%s\n",
+                    static_cast<unsigned long long>(copies), static_cast<unsigned long long>(compares),
+                    static_cast<unsigned long long>(same), static_cast<unsigned long long>(lapped),
+                    static_cast<unsigned long long>(other), stalled ? "; the writer stalled" : "");
+        CHECK(!stalled);
+        CHECK(copies >= kCopies && compares >= kCompares);
         CHECK(other == 0);
         CHECK(same > 0);
+        CHECK(lapped > 0);
     }
 
     // The counts went where they were sent.

@@ -8,8 +8,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
+#include <string>
+
+#include <unistd.h>
 
 static int g_failures = 0;
 #define CHECK(cond)                                                            \
@@ -173,8 +177,12 @@ static void test_compare() {
     json::Value back;
     CHECK(json::parse(json::dump(report), back, error));
     CHECK(!json::flag(back, "match") && json::str(json::arr(back, "first_failures")[0], "b") == "nan");
-    CHECK(replay::write_heatmap("replay_compare_test_heatmap.ppm", nan));
-    std::remove("replay_compare_test_heatmap.ppm");
+    // The file is this process's own, in the temp folder: two test runs at
+    // once from one build folder (its working folder) would share it.
+    const std::string heatmap =
+        (std::filesystem::temp_directory_path() / ("bbhost-replay-compare-test-" + std::to_string(getpid()) + ".ppm")).string();
+    CHECK(replay::write_heatmap(heatmap, nan));
+    std::remove(heatmap.c_str());
 
     b = a;
     b.width = 2;

@@ -650,7 +650,7 @@ views, then GX's state as pipeline pieces, then command lists recorded into
 Vulkan command buffers in parallel and completions on timeline semaphores,
 after which guest memory is no longer what the GPU reads for GX's objects.
 
-**Buffers (the first stage, off by default while it is measured).** A census
+**Buffers (the first stage).** A census
 (`BBHOST_GXVK_CENSUS=1`) measured what it rests on at Central Yharnam, Old
 Yharnam, Nightmare of Mensis and Cainhurst: GX makes 53-60 thousand buffers
 in such a session, 92% of them constant buffers without data; its immutable
@@ -666,10 +666,10 @@ alike, which canaries confirmed at every binding and death (1 of 2.2 million
 checks failed). The dword at +0x44 is not spare in a constant buffer's
 holder: GX counts in its upper half.
 
-`BBHOST_GXVK_BUFFERS=1` gives such a buffer - immutable, or default with
-initial data; no CPU access; a vertex or index bind and nothing the GPU
-writes - an entry in a host table when GX's CreateBuffer (on the decomp
-list) makes it, and the entry's handle in the holder's +0x14. The GX call
+Such a buffer - immutable, or default with initial data; no CPU access; a
+vertex or index bind and nothing the GPU writes - gets an entry in a host
+table when GX's CreateBuffer (on the decomp list) makes it, and the entry's
+handle in the holder's +0x14. The GX call
 copies the handle into the draw's record beside the holder; the command
 processor binds the entry's device-local copy - placed in a pool and filled
 from the buffer's memory in the uploads of the first recording that binds it
@@ -683,12 +683,29 @@ a counter or two, and one next to them searches the ranges, sorted, in
 halves; a buffer that ended (its holder released,
 its memory unmapped or given to a new resource) is still bound from its copy
 by the draws recorded before its end. Video memory is used down to the
-reserve kept for render targets and device buffers, then host-visible
-memory. `BBHOST_GXVK_BUFFERS=2` keeps today's path and checks the handles
+reserve kept for render targets and device buffers; short of room a buffer
+keeps today's path - never a copy in host memory on a discrete GPU, where
+one placed during a dip stayed for the session and every draw of it read
+across the bus (on an integrated GPU, whose host memory is the same RAM,
+host-visible memory is taken). `BBHOST_GXVK_BUFFERS=2` keeps today's path
+and checks the handles
 beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
+
+GX's buffers are bound by handle by default (`BBHOST_GXVK_BUFFERS=0` keeps
+today's path), except on an integrated GPU or with tight memory, where the
+draws read GX's buffers where they are - the buffer shadow in place, or no
+shadow - so a copy would hold memory and buy nothing, and with small video
+memory (under 7.5 GiB free at the start), where the copies compete with the
+targets and textures for it and one dip to the reserve costs far more GPU
+time than the command processor saves; there today's path stays unless
+`BBHOST_GXVK_BUFFERS=1`. On an RTX 4070, uncapped, the frame rate goes from
+83.6 to 94.6 at Old Yharnam and from 82.2 to 95.0 at the Nightmare of Mensis
+by handle, the command processor taking 1.4-1.6 ms a flip less; at 60 it
+takes up to 1 ms a flip less, with the GPU's time and the frame pacing
+unchanged.
 
 **The upload heap (the stage's second part, off by default while it is
 measured).** GX's device gives its block pool one region - GX's upload heap,
@@ -709,11 +726,28 @@ sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
 `BBHOST_GXVK_ARENA=2` also moves the heap into video memory the CPU writes,
-where the driver can place a mapping at an address of ours
-(`VK_EXT_map_memory_placed`) and the memory budget has room: GX's device is
-made before bbhost's, so its pool is given a host mapping of bbhost's, whose
-bytes are copied at the GPU's start - writes to it wait meanwhile - and the
-video memory is mapped over it.
+on Linux, where the driver can place a mapping at an address of ours
+(`VK_EXT_map_memory_placed`): GX's device is made before bbhost's, so its
+pool is given a host mapping of bbhost's, whose bytes are copied at the GPU's
+start - writes to it wait meanwhile - and the video memory is mapped over it.
+In pieces: NVIDIA's driver places that memory up to 124 MiB at a time, so the
+mapping is recorded as pieces of 32 MiB side by side
+(`BBHOST_GXVK_ARENA_PIECE_MB` sets it, 1 to 124), each an allocation of its
+own placed over its part and imported on its own, and a binding across two
+pieces takes today's path (the exit report counts it). The room is what the
+driver counts in use: the heap's 160 MiB must fit beside it with 16 MiB to
+spare, which an RTX 4070's 246 MiB window without resizable BAR holds next to
+the params ring; the constant-buffer copies' ring then goes in host memory.
+A step that fails is undone - the heap host memory again, with every write
+GX made - and the log says which and why; `=2` then binds in place as `=1`
+does - with the heap in bbhost's pieces when the driver has no placed
+mappings (lavapipe), in the game's region on Windows. Measured on an RTX
+4070, `=2` loses about two thirds of the frame rate although every move
+worked - uncapped, Old Yharnam from 90.8 to 31.7 fps, the Nightmare of
+Mensis from 90.9 to 34.4 and Central Yharnam from 105.2 to 31.6, and 31-34
+fps at 60 - because the CPU reads the heap too: bbhost's copies of GX's
+renamed buffers and the game's main thread, and the CPU reads video memory
+at about 30 MB/s. So it stays off, and the heap stays in host memory.
 
 ## Tools
 

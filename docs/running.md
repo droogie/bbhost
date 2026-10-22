@@ -182,6 +182,18 @@ that log. Overlays that hook Vulkan are a common cause: OBS's game capture is
 kept out automatically on AMD cards (`[video] obs_capture` changes that), and
 OBS's Window Capture records bbhost without any hook.
 
+**A crash just after arriving somewhere, with `fmod ring:` in the log.** FMOD,
+the game's sound library, lists every sound it has loaded, and it frees the one
+subsound object a stream of many sounds (a voice bank) shares even when that
+object refused to be released because an event still plays it - leaving it in
+the list. The next sound loaded beside it then writes into memory the game has
+used again since. bbhost takes such a sound out of the list first and keeps
+it, marked so that nothing plays it again; the log's `fmod ring:` lines say
+when it did, and the one at exit how many it kept (a few hundred bytes each
+that are never freed). `BBHOST_FMOD_GUARD=0` is the game's own behaviour;
+`BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they come and go and checks
+the list as sounds are loaded.
+
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render
 target the last draws wrote and the draw list into a folder of its own beside
@@ -210,7 +222,8 @@ memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
 memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
 an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
 
-The same report says where the video memory goes: `gpu: video memory (MiB)`
+Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
+says where the video memory goes: `gpu: video memory (MiB)`
 gives what the driver counts against its budget, what bbhost's own
 allocations hold and the driver's own share; `video memory held` lists what
 the game needs now (render targets, textures in use, buffers by owner) and
@@ -233,6 +246,13 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
+On other GPUs, unless memory is tight or video memory small, the game's own
+immutable vertex and index buffers are bound from copies of their own, made
+in video memory as they are first drawn, so the command processor does not
+look each draw's bytes up; one that finds no room keeps the mirrors
+(`BBHOST_GXVK_BUFFERS=0` goes back to the mirrors for all of them; `=1` makes
+the copies on an integrated GPU, with tight memory or small video memory
+too).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -306,10 +326,14 @@ bbhost.toml that sets `effect_steps` keeps its value; one without it gets
 smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
 `BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
 characters leave in water (GX's water interaction, one wave step a frame) step
-at 30 a second of game time above 30 too, so they spread as fast as at 30, and
-the water shows the last step between steps
+at 30 a second of game time above 30 too, on the effects' whole steps, so they
+spread as fast as at 30, and the water shows the last step between steps
 (`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
-twice as fast at 60). Above 60 and
+twice as fast at 60). The flicker of the torches, braziers and candles (each
+GX light's blink) begins its cycles on the effects' whole steps, holding the
+light's high on the frames between, so the lights blink as fast as at 30
+(`decomp/gx/blink.cpp`; `BBHOST_BLINK_HOLD=0` begins them on any frame, 5-7%
+faster above 30). Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.

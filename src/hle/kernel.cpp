@@ -552,6 +552,39 @@ std::uint64_t hle_kernel_map_host(std::uint64_t len) {
     return 0;
 }
 
+// The same memory as one host mapping, recorded as mappings of `piece` bytes
+// each side by side (the last one shorter): each is imported on its own, so
+// each can be moved on its own (GX on Vulkan's arena, BBHOST_GXVK_ARENA=2:
+// host/arena_move.h). `piece`: whole 64 KiB.
+std::uint64_t hle_kernel_map_host_pieces(std::uint64_t len, std::uint64_t piece) {
+    const std::uint64_t page = 0x10000;
+    len = (len + page - 1) & ~(page - 1);
+    if (!piece || (piece & (page - 1))) return 0;
+    for (std::uint64_t hint = 0xF000000000ull; len && hint >= 0xC000000000ull; hint -= 0x40000000ull) {
+        const int prot = kProtCpuRead | kProtCpuWrite;
+        if (!host_map_anon(reinterpret_cast<void*>(static_cast<std::uintptr_t>(hint)), len, prot, Fix::NoReplace)) continue;
+        std::uint64_t n = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_dmem_mu);
+            maps_cut_locked(hint, hint + len);
+            for (std::uint64_t at = 0; at < len; at += piece, ++n) {
+                MappedRegion r{};
+                r.start = static_cast<std::uintptr_t>(hint + at);
+                r.len = std::min(piece, len - at);
+                r.phys = -1;
+                r.prot = prot | kProtGpuRead | kProtGpuWrite;
+                r.dmem = false;
+                g_maps.push_back(r);
+            }
+            g_maps_gen.fetch_add(1);
+        }
+        host_log("kernel: host mapping 0x%llx len 0x%llx, as %llu mappings of up to 0x%llx", static_cast<unsigned long long>(hint),
+                 static_cast<unsigned long long>(len), static_cast<unsigned long long>(n), static_cast<unsigned long long>(piece));
+        return hint;
+    }
+    return 0;
+}
+
 // Every mapping of the physical memory behind a direct-memory address, logged
 // (address of the same byte, protection, alias or not); returns a CPU address
 // of that byte other than `va` and the GPU alias, or 0. For finding writers

@@ -9,6 +9,8 @@
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
 #include "host/arena_memory.h"
+#include "host/arena_move.h"
+#include "host/arena_move_vk.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
@@ -1290,111 +1292,103 @@ bool gpu_span(const std::vector<GuestMapInfo>& maps, std::uint32_t index, std::u
 }
 
 // GX on Vulkan's arena (BBHOST_GXVK_ARENA=2, host/gxvk.h): GX's upload heap,
-// which its pool was given as a host mapping of ours (its device is made
-// before ours), moved now into video memory the CPU writes - while its bytes
-// are copied a write to it waits in the fault handler, then the device memory
-// is placed over the mapping (VK_EXT_map_memory_placed) - and taken as that
-// mapping's import, so every lookup by address finds it. Short of any step
+// which its pool was given as a host mapping of ours recorded as pieces (its
+// device is made before ours), moved now into video memory the CPU writes -
+// each piece an allocation of its own placed over its part of the heap
+// (VK_EXT_map_memory_placed) and taken as that part's import, so every lookup
+// by address finds it. host/arena_move.h has the steps and the undo; while
+// they run, a write to the heap waits in the fault handler. Short of any step
 // it stays host memory, imported as the kernel's other host mappings are.
 void arena_place_locked() {
-    std::uint64_t va = 0, bytes = 0;
+    std::uint64_t va = 0, bytes = 0, piece = 0;
     if (!gxvk::arena_move_pending(&va, &bytes)) return;
 #if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2) && !defined(_WIN32)
+    char why[200];
     if (!g.has_placed_map) {
-        char why[160];
         std::snprintf(why, sizeof why, "the device cannot place a mapping (%s)", g.placed_missing);
         return gxvk::arena_moved(false, why);
     }
-    if (g.placed_align && (va % g.placed_align || bytes % g.placed_align))
-        return gxvk::arena_moved(false, "the mapping is not at the alignment placing takes");
-    Chunk c;
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-    if (vkCreateBuffer(g.device, &bci, nullptr, &c.buffer) != VK_SUCCESS) return gxvk::arena_moved(false, "no buffer");
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
-    // In place, nothing reads it on the CPU: video memory the CPU writes, while its budget has room.
-    arena_memory::Type types[VK_MAX_MEMORY_TYPES];
-    arena_memory::Heap heaps[VK_MAX_MEMORY_HEAPS];
-    for (std::uint32_t t = 0; t < g.mem_props.memoryTypeCount; ++t)
-        types[t] = {g.mem_props.memoryTypes[t].propertyFlags, g.mem_props.memoryTypes[t].heapIndex};
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    if (g.has_memory_budget) {
-        VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
-        mp2.pNext = &mb;
-        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp2);
-    }
-    for (std::uint32_t h = 0; h < g.mem_props.memoryHeapCount; ++h)
-        heaps[h] = {g.mem_props.memoryHeaps[h].size, g.mem_props.memoryHeaps[h].flags, g.has_memory_budget && mb.heapBudget[h] != 0,
-                    mb.heapBudget[h], mb.heapUsage[h]};
-    const arena_memory::Choice choice =
-        arena_memory::choose(types, g.mem_props.memoryTypeCount, heaps, req.memoryTypeBits, req.size, false);
-    if (choice.kind != arena_memory::Kind::kBar || req.size > bytes) {
-        vkDestroyBuffer(g.device, c.buffer, nullptr);
-        return gxvk::arena_moved(false, req.size > bytes ? "the buffer needs more than the mapping holds" : "no room in video memory the CPU writes");
-    }
-    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.pNext = &flags;
-    mai.allocationSize = bytes;  // the whole mapping: a placed mapping takes the allocation whole
-    mai.memoryTypeIndex = choice.type;
+    if (!gxvk::arena_pieces(&va, &bytes, &piece)) return gxvk::arena_moved(false, "its mapping is not in pieces");
+    const arena_move::Pieces layout{va, bytes, piece};
+    if (g.placed_align && (va % g.placed_align || piece % g.placed_align))
+        return gxvk::arena_moved(false, "the pieces are not at the alignment placing takes");
+    // The memory type a piece's buffer takes in video memory the CPU writes.
+    std::uint32_t type = UINT32_MAX;
     {
-        MemOwner own_mem("GX's upload heap (the arena)");
-        if (vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS) {
-            vkDestroyBuffer(g.device, c.buffer, nullptr);
-            return gxvk::arena_moved(false, "its memory could not be allocated");
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = piece;
+        bci.usage = arena_move::kPieceUsage;
+        VkBuffer probe = VK_NULL_HANDLE;
+        if (vkCreateBuffer(g.device, &bci, nullptr, &probe) != VK_SUCCESS) return gxvk::arena_moved(false, "no buffer");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(g.device, probe, &req);
+        vkDestroyBuffer(g.device, probe, nullptr);
+        if (req.size > piece) return gxvk::arena_moved(false, "a piece's buffer needs more than the piece");
+        type = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    if (type == UINT32_MAX) return gxvk::arena_moved(false, "the device has no video memory the CPU writes");
+    const std::uint32_t heap = g.mem_props.memoryTypes[type].heapIndex;
+    const auto heap_now = [&] {
+        arena_memory::Heap h;
+        h.size = g.mem_props.memoryHeaps[heap].size;
+        h.flags = g.mem_props.memoryHeaps[heap].flags;
+        if (g.has_memory_budget) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            mp2.pNext = &mb;
+            vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp2);
+            h.have_budget = mb.heapBudget[heap] != 0;
+            h.budget = mb.heapBudget[heap];
+            h.used = mb.heapUsage[heap];
         }
-    }
-    vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
-    const auto give_up = [&](const char* why) {
-        vkDestroyBuffer(g.device, c.buffer, nullptr);
-        vkFreeMemory(g.device, c.memory, nullptr);
-        gxvk::arena_moved(false, why);
+        return h;
     };
-    void* tmp = nullptr;
-    if (vkMapMemory(g.device, c.memory, 0, VK_WHOLE_SIZE, 0, &tmp) != VK_SUCCESS) return give_up("its memory could not be mapped");
-    void* const at = reinterpret_cast<void*>(static_cast<std::uintptr_t>(va));
-    // Writes to the heap wait from here (gxvk::arena_move_fault) until the placed mapping is there.
-    gxvk::arena_moving(true);
-    if (::mprotect(at, bytes, PROT_READ) != 0) {
-        gxvk::arena_moving(false);
-        vkUnmapMemory(g.device, c.memory);
-        return give_up("the mapping could not be made read-only");
+    const arena_memory::Heap before = heap_now();
+    if (!arena_move::bar_room(before, bytes)) {
+        std::snprintf(why, sizeof why, "no room in video memory the CPU writes (heap %u of %llu MiB, %llu MiB in use, %llu MiB kept free)", heap,
+                      static_cast<unsigned long long>(before.size >> 20), static_cast<unsigned long long>(before.used >> 20),
+                      static_cast<unsigned long long>(arena_move::kKeep >> 20));
+        return gxvk::arena_moved(false, why);
     }
+    // The steps over Vulkan and the kernel (host/arena_move_vk.h); each piece,
+    // once all are placed, its part's import.
+    arena_move::VkOps ops;
+    ops.dev = g.device;
+    ops.p = &layout;
+    ops.type = type;
+    ops.map2 = reinterpret_cast<PFN_vkMapMemory2KHR>(g.map_memory2);
+    ops.unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(g.unmap_memory2);
+    ops.unmap_reserve = g.unmap_reserve;
+    ops.on_moving = gxvk::arena_moving;
+    ops.on_adopt = [](std::uint64_t at, const arena_move::VkPiece& piece) {
+        Chunk c;
+        c.buffer = piece.buffer;
+        c.memory = piece.memory;
+        c.address = piece.address;
+        c.size = piece.size;
+        g.anon_imports[at] = c;
+    };
+    MemOwner own_mem("GX's upload heap (the arena)");
     const auto t0 = std::chrono::steady_clock::now();
-    std::memcpy(tmp, at, bytes);
-    vkUnmapMemory(g.device, c.memory);
-    VkMemoryMapPlacedInfoEXT placed{VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT};
-    placed.pPlacedAddress = at;
-    VkMemoryMapInfoKHR mi{VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR};
-    mi.pNext = &placed;
-    mi.flags = VK_MEMORY_MAP_PLACED_BIT_EXT;
-    mi.memory = c.memory;
-    mi.offset = 0;
-    mi.size = VK_WHOLE_SIZE;
-    void* got = nullptr;
-    const VkResult r = reinterpret_cast<PFN_vkMapMemory2KHR>(g.map_memory2)(g.device, &mi, &got);
-    if (r != VK_SUCCESS || got != at) {
-        if (r == VK_SUCCESS) vkUnmapMemory(g.device, c.memory);
-        ::mprotect(at, bytes, PROT_READ | PROT_WRITE);
-        gxvk::arena_moving(false);
-        return give_up("placing the mapping failed");
-    }
-    gxvk::arena_moving(false);
+    const arena_move::Result r = arena_move::move(ops, layout);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    bai.buffer = c.buffer;
-    c.address = vkGetBufferDeviceAddress(g.device, &bai);
-    c.size = bytes;
-    g.anon_imports[va] = c;
-    char what[192];
-    std::snprintf(what, sizeof what, "%s (memory type %u), placed at 0x%llx, %llu MiB copied in %.1f ms", arena_memory::name(choice.kind), choice.type,
-                  static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes >> 20), ms);
-    gxvk::arena_moved(true, what);
+    const arena_memory::Heap after = heap_now();
+    if (!r.ok) {
+        if (r.piece != ~0ull)
+            std::snprintf(why, sizeof why, "%s (piece %llu of %llu; undone in %.1f ms)", r.why, static_cast<unsigned long long>(r.piece),
+                          static_cast<unsigned long long>(layout.count()), ms);
+        else
+            std::snprintf(why, sizeof why, "%s", r.why);
+        return gxvk::arena_moved(false, why);
+    }
+    std::snprintf(why, sizeof why,
+                  "video memory the CPU writes (memory type %u, heap %u): %llu pieces of %llu MiB placed at 0x%llx, %llu MiB copied in %.1f ms; "
+                  "%llu of %llu MiB of the heap in use now",
+                  type, heap, static_cast<unsigned long long>(layout.count()), static_cast<unsigned long long>(piece >> 20),
+                  static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes >> 20), ms,
+                  static_cast<unsigned long long>(after.used >> 20), static_cast<unsigned long long>(after.size >> 20));
+    gxvk::arena_moved(true, why);
 #else
     gxvk::arena_moved(false, "this build cannot place a mapping");
 #endif
@@ -2804,6 +2798,7 @@ bool small_vram(const Candidate& c) {
     return start_vram_free(c) < (7680ull << 20);
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
+std::atomic<int> g_integrated{-1};  // whether the device run on is an integrated GPU, -1 until known
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
@@ -2963,6 +2958,9 @@ bool init_locked() {
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
                               static_cast<unsigned long long>(c.heaps >> 20));
+        if (g_integrated.exchange(g.integrated ? 1 : 0) == (g.integrated ? 0 : 1))
+            host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
+                     g.integrated ? "an integrated GPU" : "not an integrated GPU");
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -3263,6 +3261,9 @@ bool init_locked() {
         vkGetPhysicalDeviceFeatures2(g.phys, &qf);
         if (q.memoryMapPlaced) {
             fplaced.memoryMapPlaced = VK_TRUE;
+            // An undone move unmaps its placed pieces keeping their range reserved, where the driver can.
+            fplaced.memoryUnmapReserve = q.memoryUnmapReserve;
+            g.unmap_reserve = q.memoryUnmapReserve == VK_TRUE;
             fplaced.pNext = f13.pNext;
             f13.pNext = &fplaced;
             dext.push_back("VK_KHR_map_memory2");
@@ -3578,6 +3579,7 @@ bool init_locked() {
 #if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2)
     if (g.device && g.has_placed_map) {
         g.map_memory2 = reinterpret_cast<void*>(vkGetDeviceProcAddr(g.device, "vkMapMemory2KHR"));
+        g.unmap_memory2 = reinterpret_cast<void*>(vkGetDeviceProcAddr(g.device, "vkUnmapMemory2KHR"));
         VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &pp;
@@ -6953,8 +6955,9 @@ std::string image_heap_report() {
 // goes, by owner and kind, and how much of it is what the run must hold
 // against what caches took because the card had room - the mirrors, textures
 // no bind has looked up for a while, free room in the image heap's blocks -
-// which give it back when video memory runs short. Every 300 flips and at
-// exit, beside the "memory by heap" line. BBHOST_VRAM_REPORT=0: not made.
+// which give it back when video memory runs short. Every 1,800 flips
+// (BBHOST_VRAM_REPORT_FLIPS) and at exit, after the "memory by heap" line.
+// BBHOST_VRAM_REPORT=0: not made.
 namespace {
 std::atomic<std::uint64_t> g_spare_play_blocks{1};  // the memory keeper's spare in play (start_memory_reserve)
 std::uint64_t g_vram_peak_usage = 0;                // the most the driver counted in the video memory heap at a report
@@ -7908,51 +7911,62 @@ bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool 
     return init_locked();
 }
 
+namespace {
+// What the host asks of the device before it makes it - tight memory, small
+// video memory, an integrated GPU - from an instance of its own, without
+// extensions, choosing the device as the real one will: one probe for all
+// three, and each one's first answer holds (the device's own, when it is
+// made first).
+void probe_before_device() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        bool tight = false, small = false, integrated = false;
+        if (g_enabled) {
+            obs_capture_policy();  // before the first instance, this one
+            VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+            app.pApplicationName = "bbhost";
+            app.apiVersion = VK_API_VERSION_1_3;
+            VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+            ici.pApplicationInfo = &app;
+            VkInstance instance = VK_NULL_HANDLE;
+            if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
+                std::vector<Candidate> usable;
+                const int chosen = choose_device(instance, false, usable);
+                if (chosen >= 0) {
+                    const Candidate& c = usable[static_cast<std::size_t>(chosen)];
+                    tight = memory_tight(c);
+                    small = small_vram(c);
+                    integrated = c.type_rank == 3;
+                }
+                vkDestroyInstance(instance, nullptr);
+            }
+        }
+        int unknown = -1;
+        g_tight.compare_exchange_strong(unknown, tight ? 1 : 0);
+        unknown = -1;
+        g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+        unknown = -1;
+        g_integrated.compare_exchange_strong(unknown, integrated ? 1 : 0);
+    });
+}
+}  // namespace
+
 bool host_gpu_memory_tight() {
     if (const int t = g_tight.load(); t >= 0) return t == 1;
-    bool tight = false;
-    if (g_enabled) {
-        obs_capture_policy();  // before the first instance, this one
-        // Before the device: an instance of its own, without extensions.
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "bbhost";
-        app.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &app;
-        VkInstance instance = VK_NULL_HANDLE;
-        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
-            std::vector<Candidate> usable;
-            const int chosen = choose_device(instance, false, usable);
-            if (chosen >= 0) tight = memory_tight(usable[static_cast<std::size_t>(chosen)]);
-            vkDestroyInstance(instance, nullptr);
-        }
-    }
-    int unknown = -1;
-    g_tight.compare_exchange_strong(unknown, tight ? 1 : 0);
+    probe_before_device();
     return g_tight.load() == 1;
 }
 
 bool host_gpu_small_vram() {
     if (const int s = g_small.load(); s >= 0) return s == 1;
-    bool small = false;
-    if (g_enabled) {
-        obs_capture_policy();  // before the first instance
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "bbhost";
-        app.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &app;
-        VkInstance instance = VK_NULL_HANDLE;
-        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
-            std::vector<Candidate> usable;
-            const int chosen = choose_device(instance, false, usable);
-            if (chosen >= 0) small = small_vram(usable[static_cast<std::size_t>(chosen)]);
-            vkDestroyInstance(instance, nullptr);
-        }
-    }
-    int unknown = -1;
-    g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+    probe_before_device();
     return g_small.load() == 1;
+}
+
+bool host_gpu_integrated() {
+    if (const int i = g_integrated.load(); i >= 0) return i == 1;
+    probe_before_device();
+    return g_integrated.load() == 1;
 }
 
 bool host_gpu_available() {

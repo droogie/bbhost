@@ -38,6 +38,7 @@ namespace gxvk {
 bool census() { return false; }
 }  // namespace gxvk
 std::uint64_t hle_kernel_map_host(std::uint64_t) { return 0; }  // the move (BBHOST_GXVK_ARENA=2) is not tested here
+std::uint64_t hle_kernel_map_host_pieces(std::uint64_t, std::uint64_t) { return 0; }  // (its steps are: tests/arena_move_test.cpp)
 
 namespace {
 

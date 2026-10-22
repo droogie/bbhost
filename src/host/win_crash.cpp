@@ -3,6 +3,7 @@
 #if defined(_WIN32)
 
 #include "core/portable.h"
+#include "engine/fmod_ring.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
@@ -172,6 +173,7 @@ void report(EXCEPTION_POINTERS* ep) {
         }
     }
     sf_heap_probe_crash_report();
+    fmod_ring_crash_report();
     hle_fs_log_recent_opens();
     hle_gnm_dump_recent_writes(0, 48);
 }

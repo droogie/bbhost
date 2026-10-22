@@ -18,6 +18,7 @@
 #include "host/vertex_plan.h"
 
 #include "host/cb_proof.h"
+#include "host/arena_move.h"
 #include "host/gxvk.h"
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
@@ -12602,16 +12603,58 @@ bool draw_window_locked(std::uint64_t base, std::uint64_t bytes, Located& out) {
     return false;
 }
 
+// BBHOST_GXVK_ARENA=2: the heap mapped as pieces side by side, each its own
+// import (host/arena_move.h), found at its first binding: a binding within
+// one piece is bound there, one across two takes today's path (counted).
+bool heap_piece_located_locked(const arena_move::Pieces& p, std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    static std::vector<Located> pieces;  // piece k's import
+    static std::vector<signed char> tried;  // 1 found, -1 none
+    static bool said = false;
+    std::uint64_t k = 0;
+    if (!p.within(va, bytes, &k)) {
+        if (p.holds(va, &k)) gxvk::arena_crossing();
+        else gxvk::arena_no_backing();
+        return false;
+    }
+    if (pieces.size() != p.count()) {
+        pieces.assign(p.count(), Located{});
+        tried.assign(p.count(), 0);
+    }
+    if (!tried[k]) {
+        const Located l = locate(p.start(k), p.len(k));
+        tried[k] = l.buffer && l.avail >= p.len(k) ? 1 : -1;
+        if (tried[k] > 0) pieces[k] = l;
+        if (!said || tried[k] < 0)
+            host_log("gxvk arena: the heap's piece %llu of %llu (%llu MiB at 0x%llx) is %s", static_cast<unsigned long long>(k),
+                     static_cast<unsigned long long>(p.count()), static_cast<unsigned long long>(p.len(k) >> 20),
+                     static_cast<unsigned long long>(p.start(k)), tried[k] > 0 ? "one import's: bound there" : "in no one import: today's path");
+        said = true;
+    }
+    if (tried[k] < 0) {
+        gxvk::arena_no_backing();
+        return false;
+    }
+    const std::uint64_t in = va - p.start(k);
+    loc = {pieces[k].buffer, pieces[k].offset + in, pieces[k].avail - in};
+    return true;
+}
+
 // GX's upload heap's buffer (stage 1c, host/gxvk.h): the one import over the
 // whole heap, found at its first binding (the renderer's lock held). With
-// none - the heap across two imports - its bindings take today's path.
+// none - the heap across two imports - its bindings take today's path. A
+// binding it does not bind is counted (gxvk::arena_no_backing).
 bool heap_located_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    std::uint64_t pva = 0, pbytes = 0, piece = 0;
+    if (gxvk::arena_pieces(&pva, &pbytes, &piece)) return heap_piece_located_locked(arena_move::Pieces{pva, pbytes, piece}, va, bytes, loc);
     static Located heap;
     static std::uint64_t heap_lo = 0;
     static bool tried = false;
     if (!tried) {
         std::uint64_t lo = 0, hi = 0;
-        if (!gxvk::arena_heap(&lo, &hi)) return false;
+        if (!gxvk::arena_heap(&lo, &hi)) {
+            gxvk::arena_no_backing();
+            return false;
+        }
         tried = true;
         const Located l = locate(lo, hi - lo);
         if (l.buffer && l.avail >= hi - lo) {
@@ -12620,7 +12663,10 @@ bool heap_located_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         }
         host_log("gxvk arena: the heap's bytes are %s", heap.buffer ? "one import's: bound there" : "not in one import: today's path");
     }
-    if (!heap.buffer || va < heap_lo || va - heap_lo + bytes > heap.avail) return false;
+    if (!heap.buffer || va < heap_lo || va - heap_lo + bytes > heap.avail) {
+        gxvk::arena_no_backing();
+        return false;
+    }
     loc = {heap.buffer, heap.offset + (va - heap_lo), heap.avail - (va - heap_lo)};
     return true;
 }
@@ -12729,10 +12775,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // with it, which host/gxvk_arena.cpp proves as it binds - with no
         // copy-version, window, twin or pending-write lookup and no snapshot.
         bool in_heap = false;
-        if (outcome == kUnmapped && gxvk::arena_wanted() && gxvk::arena_bind(base, bytes, g.flushes, gxvk::kUseConstant, b.written)) {
-            in_heap = heap_located_locked(base, bytes, loc);
-            if (!in_heap) gxvk::arena_no_backing();
-        }
+        if (outcome == kUnmapped && gxvk::arena_wanted() && gxvk::arena_bind(base, bytes, g.flushes, gxvk::kUseConstant, b.written))
+            in_heap = heap_located_locked(base, bytes, loc);  // (one it does not bind is counted there)
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
@@ -12891,7 +12935,17 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
-                    create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    // GX's upload heap moved into video memory the CPU writes
+                    // (BBHOST_GXVK_ARENA=2) holds that window: the copies left -
+                    // about a tenth of today's with the heap bound in place - go
+                    // in host memory.
+                    if (gxvk::arena_moved_ok()) {
+                        create_dev_buffer(scratch, kScratch, true);
+                        host_log("gpu: the constant-buffer copies' ring in host memory: GX's upload heap holds the video memory the CPU "
+                                 "writes (BBHOST_GXVK_ARENA=2)");
+                    } else {
+                        create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    }
                 }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
@@ -13772,12 +13826,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 const std::uint64_t reads = draw_read_bytes(w, stride, rec_bytes);
                 if (reads >= fe.offset + bytes && gxvk::arena_bind(rec_va, reads, g.flushes, gxvk::kUseVertex, false)) {
                     Located whole;
-                    if (heap_located_locked(rec_va, reads, whole)) {
+                    if (heap_located_locked(rec_va, reads, whole)) {  // (one it does not bind is counted there)
                         loc = {whole.buffer, whole.offset + fe.offset, whole.avail - fe.offset};
                         heap_record = true;
                         placed_need = std::min(placed_need, reads - fe.offset);
-                    } else {
-                        gxvk::arena_no_backing();
                     }
                 }
             }

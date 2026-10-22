@@ -982,6 +982,8 @@ void decomp_sfx_gate_frame(bool between) {
 
 void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
 
+bool decomp_sfx_between_steps() { return g_step_between.load(std::memory_order_relaxed) != 0; }
+
 void decomp_sfx_frame_time(float frame, float from, float into) {
     // a new frame for the ribbons' marks: the serial's 16 bits wrapping, the table wiped (between frames: no effect
     // update runs now) and 0 skipped

@@ -3,8 +3,15 @@
 //
 // An entry's copy is placed at the first draw that binds it: a range of a
 // device-local pool block (64 MiB blocks, first fit at 256-byte steps; a
-// larger buffer a block of its own), or of a host-visible one once video
-// memory is down to the reserve kept for render targets and device buffers.
+// larger buffer a block of its own) while video memory is above the reserve
+// kept for render targets and device buffers. Short of room the entry is
+// retired and its buffer keeps today's path - resolved by address, as the
+// buffer shadow serves it, which gives its mirrors back and takes them again
+// as memory comes and goes - never a copy in host memory on a discrete GPU:
+// one placed there during a dip stayed for the session, and every draw of it
+// read across the bus (Nightmare of Mensis with 6 GB: the GPU 18.3 ms a flip
+// against 5.7). On an integrated GPU host memory is the same RAM, and a
+// host-visible block is still taken there once video memory is short.
 // Its bytes come from the buffer's memory in the recording's uploads - the
 // buffer shadow's command buffer, which runs before the recording's own work
 // (buffer_shadow.cpp) - from the import, or with window imports through
@@ -29,6 +36,7 @@
 #include <utility>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -62,6 +70,7 @@ std::deque<Dead> g_dead;  // under g.mu, oldest first
 // Counters (the command processor writes them, the report reads them).
 std::atomic<std::uint64_t> g_placed[2], g_placed_bytes[2], g_blocks_made[2], g_block_bytes[2], g_uploads{0}, g_upload_bytes{0},
     g_staged{0}, g_ranges_freed{0}, g_taken_back{0};
+std::atomic<std::uint64_t> g_blocks_refused{0};  // device-local blocks that went to host memory, given back (discrete GPU)
 std::atomic<std::uint64_t> g_disagree[gxvk_kDisagrees], g_checks{0}, g_readbacks{0}, g_readback_bytes{0}, g_readbacks_skipped{0};
 std::atomic<int> g_disagree_logged{0};
 std::uint64_t g_barrier_serial = ~0ull;  // the recording whose uploads have the source barrier
@@ -145,6 +154,14 @@ int new_block_locked(VkDeviceSize size, bool host, bool dedicated) {
     Block nb;
     MemOwner own_mem("gxvk buffer copies");
     if (!create_dev_buffer(nb.buf, size, host)) return -1;
+    // A device-local block that found video memory full went to host memory
+    // (create_dev_buffer's fallback): not on a discrete GPU (above).
+    if (!host && nb.buf.in_host && !g.integrated) {
+        vkDestroyBuffer(g.device, nb.buf.buffer, nullptr);
+        vkFreeMemory(g.device, nb.buf.memory, nullptr);
+        g_blocks_refused.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
     nb.host = host || nb.buf.in_host;
     nb.dedicated = dedicated;
     nb.free.emplace(0, size);
@@ -161,28 +178,42 @@ int new_block_locked(VkDeviceSize size, bool host, bool dedicated) {
     return static_cast<int>(g_blocks.size() - 1);
 }
 
-// A range for `bytes`: video memory first while it is above the reserve,
-// else host-visible memory.
+// Whether placing `need` more would reach the reserve. BBHOST_TEST_GXVK_NO_ROOM=N
+// (tests): once N copies are placed, it would, as in a dip.
+bool pool_short_locked(VkDeviceSize need) {
+    static const long long after = [] {
+        const char* e = std::getenv("BBHOST_TEST_GXVK_NO_ROOM");
+        return e && *e ? std::atoll(e) : -1;
+    }();
+    if (after >= 0 && static_cast<long long>(g_placed[0].load(std::memory_order_relaxed) + g_placed[1].load(std::memory_order_relaxed)) >= after)
+        return true;
+    return vram_within_reserve(need);
+}
+
+// A range for `bytes`: video memory while it is above the reserve; host-visible
+// memory after it only on an integrated GPU (above). False: no room.
 bool pool_place_locked(VkDeviceSize bytes, BufferEntry& e) {
     reclaim_locked();
+    const bool host_ok = g.integrated;
     const VkDeviceSize need = (std::max<VkDeviceSize>(bytes, 1) + kAlign - 1) & ~(kAlign - 1);
     if (need > kBlockBytes) {
-        const bool room = !vram_within_reserve(need);
+        const bool room = !pool_short_locked(need);
         int b = room ? new_block_locked(need, false, true) : -1;
-        if (b < 0) b = new_block_locked(need, true, true);
+        if (b < 0 && host_ok) b = new_block_locked(need, true, true);
         return b >= 0 && take_from_locked(b, need, e);
     }
-    for (int host = 0; host < 2; ++host) {
+    for (int host = 0; host < (host_ok ? 2 : 1); ++host) {
         for (std::size_t b = 0; b < g_blocks.size(); ++b) {
             const Block& bl = g_blocks[b];
             if (!bl.buf.buffer || bl.dedicated || bl.host != (host != 0) || bl.free_bytes < need) continue;
             if (take_from_locked(static_cast<int>(b), need, e)) return true;
         }
-        if (host == 0 && !vram_within_reserve(kBlockBytes)) {
+        if (host == 0 && !pool_short_locked(kBlockBytes)) {
             const int b = new_block_locked(kBlockBytes, false, false);
             if (b >= 0 && take_from_locked(b, need, e)) return true;
         }
     }
+    if (!host_ok) return false;
     const int b = new_block_locked(kBlockBytes, true, false);
     return b >= 0 && take_from_locked(b, need, e);
 }
@@ -449,12 +480,14 @@ std::string gxvk_report() {
     std::snprintf(b, sizeof b,
                   "\ngxvk buffers: copies placed %llu in video memory (%llu MiB), %llu in host memory (%llu MiB); pool blocks made %llu + %llu, "
                   "holding %llu + %llu MiB now; %llu uploads (%llu MiB, %llu through staging); ranges freed %llu, entries taken back %llu; "
-                  "vertex bindings whose V# counts past the buffer's end %llu",
+                  "vertex bindings whose V# counts past the buffer's end %llu; %s",
                   static_cast<ull>(g_placed[0].load()), static_cast<ull>(g_placed_bytes[0].load() >> 20), static_cast<ull>(g_placed[1].load()),
                   static_cast<ull>(g_placed_bytes[1].load() >> 20), static_cast<ull>(g_blocks_made[0].load()), static_cast<ull>(g_blocks_made[1].load()),
                   static_cast<ull>(g_block_bytes[0].load() >> 20), static_cast<ull>(g_block_bytes[1].load() >> 20), static_cast<ull>(g_uploads.load()),
                   static_cast<ull>(g_upload_bytes.load() >> 20), static_cast<ull>(g_staged.load()), static_cast<ull>(g_ranges_freed.load()),
-                  static_cast<ull>(g_taken_back.load()), static_cast<ull>(g_overrun.load()));
+                  static_cast<ull>(g_taken_back.load()), static_cast<ull>(g_overrun.load()),
+                  g.integrated ? "host memory once video memory is short (an integrated GPU)"
+                               : ("no copy in host memory (a discrete GPU): blocks refused there " + std::to_string(g_blocks_refused.load())).c_str());
     s += b;
     if (compare_mode()) {
         std::uint64_t total = 0;

@@ -24,19 +24,16 @@ namespace {
 using ull = unsigned long long;
 
 struct Flags {
+    bool given = false;  // BBHOST_GXVK_BUFFERS set: its mode on any device
     Buffers mode = Buffers::kOff;
     bool census = false;
 };
 const Flags g_flags = [] {
     Flags f;
     if (const char* e = std::getenv("BBHOST_GXVK_BUFFERS"); e && *e) {
-        if (std::strcmp(e, "census") == 0) {
-            f.census = true;
-        } else if (e[0] == '1') {
-            f.mode = Buffers::kOn;
-        } else if (e[0] == '2') {
-            f.mode = Buffers::kCompare;
-        }
+        f.given = true;
+        f.mode = buffers_mode_for(e, BuffersDevice::kRoomy);
+        if (std::strcmp(e, "census") == 0) f.census = true;
     }
     if (const char* e = std::getenv("BBHOST_GXVK_CENSUS"); e && e[0] == '1') f.census = true;
     return f;
@@ -167,7 +164,7 @@ Class class_of(std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Use 
         return kUntagged;
     }
     // (With GX buffers by handle, +0x14 holds the handle: no canary there.)
-    if (g_flags.mode == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {
+    if (buffers_mode() == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {
         g_spare_checked[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
         if (a != canary(holder, 0x14)) {
             g_spare_broken[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
@@ -222,7 +219,28 @@ void heap_bound(Use use, std::uint64_t va, std::uint64_t bytes, std::uint64_t ca
 
 }  // namespace
 
-Buffers buffers_mode() { return g_flags.mode; }
+Buffers buffers_mode() {
+    // Decided at the first ask - the GX hooks' install, on the host's thread
+    // before the game runs - and said once.
+    static const Buffers mode = [] {
+        if (g_flags.given) return g_flags.mode;
+        const BuffersDevice d = host_gpu_integrated()     ? BuffersDevice::kIntegrated
+                                : host_gpu_memory_tight() ? BuffersDevice::kTight
+                                : host_gpu_small_vram()   ? BuffersDevice::kSmallVram
+                                                          : BuffersDevice::kRoomy;
+        const Buffers m = buffers_mode_for(nullptr, d);
+        if (d == BuffersDevice::kSmallVram)
+            host_log("gxvk: GX's buffers on today's path: small video memory, where their copies compete with the targets and textures "
+                     "(BBHOST_GXVK_BUFFERS=1 binds them by handle)");
+        else if (m == Buffers::kOff)
+            host_log("gxvk: GX's buffers on today's path: %s, whose draws read them where they are (BBHOST_GXVK_BUFFERS=1 binds them by handle)",
+                     d == BuffersDevice::kIntegrated ? "an integrated GPU" : "tight memory");
+        else
+            host_log("gxvk: GX's buffers bound by handle (BBHOST_GXVK_BUFFERS=0: today's path)");
+        return m;
+    }();
+    return mode;
+}
 bool census() { return g_flags.census; }
 
 void census_buffer_made(std::uint64_t holder, bool initial_data) {
@@ -233,7 +251,7 @@ void census_buffer_made(std::uint64_t holder, bool initial_data) {
     const std::uint32_t word = kMagic | (usage & kUsage) | (initial_data ? kData : 0u) | (static_cast<std::uint32_t>(cpu & 3) << kCpuShift) |
                                (static_cast<std::uint32_t>(bind) << kBindShift);
     wr32(holder + kHolderSpareB, word);
-    if (g_flags.mode == Buffers::kOff) wr32(holder + kHolderSpareA, canary(holder, 0x14));
+    if (buffers_mode() == Buffers::kOff) wr32(holder + kHolderSpareA, canary(holder, 0x14));
     g_buffers_made.fetch_add(1, std::memory_order_relaxed);
     const std::uint32_t key = (static_cast<std::uint32_t>(usage & 3) << 16) | (initial_data ? 0x8000u : 0u) |
                               (static_cast<std::uint32_t>(cpu & 3) << 8) | bind;

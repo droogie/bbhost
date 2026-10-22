@@ -143,12 +143,15 @@ class Area:
     plugins/boss_rush keeps them), or a standpoint of its own (`stand`: an MSB
     position on the ground and the facing in degrees, for a view no wall
     gives). `flags`: event flags turned on before the travel's load reads
-    them - the doors in front of two arenas, as the boss rush opens them."""
+    them - the doors in front of two arenas, as the boss rush opens them.
+    `flags_off`: event flags turned off the same way - a cutscene's "seen"
+    flag, so the place shows it from any save."""
 
     def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=(), stand=None, chalice=None, looks=(),
-                 enemies=False):
+                 enemies=False, flags_off=()):
         self.id, self.name, self.block, self.return_point, self.fog, self.dlc = ident, name, block, return_point, fog, dlc
         self.flags = tuple(flags)
+        self.flags_off = tuple(flags_off)
         self.stand = tuple(stand) if stand else None
         # A chalice dungeon the place enters through an altar slot (CHALICE_SLOT's fields), the lamp travel to 2902950.
         self.chalice = dict(chalice) if chalice else None
@@ -184,6 +187,7 @@ class Area:
         return {"id": self.id, "name": self.name, "block": self.block, "return_point": self.return_point, "dlc": self.dlc,
                 "fog": list(self.fog) if self.fog else None, "stand": list(self.stand) if self.stand else None,
                 "view": [round(c, 4) for c in v] if v else None, "flags": list(self.flags),
+                "flags_off": list(self.flags_off),
                 "chalice": dict(self.chalice) if self.chalice else None,
                 "looks": [list(l[:5]) + ([l[5]] if l[5] else []) for l in self.looks],
                 "enemies": self.enemies}
@@ -227,11 +231,14 @@ AREAS = (
          fog=(51.51, 35.71, 311.57, -150.0)),
     Area("cleric-beast", "Central Yharnam bridge: the Cleric Beast's arena", "m24_01_00_00", 2412951,
          fog=(-154.14, -27.02, 35.16, -135.0)),
-    # Cainhurst's roof lamp (Logarius' Seat, headstone slot 26) on a first visit: the castle's arrival cutscene, not
-    # play. It holds the player at the lamp past the place's window - no HUD, no hunter, a panning camera - and when
-    # it ends the player falls through the roof, whose collisions stay off until Martyr Logarius is defeated (m25's
-    # event 12500810, flag 12501800). Kept as a bench for frame pacing through a cutscene's cuts.
-    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat - the arrival cutscene, not play", "m25_00_00_00", 2502951),
+    # Cainhurst's roof lamp (Logarius' Seat, headstone slot 26) as on a first visit: the castle's arrival cutscene,
+    # not play. It holds the player at the lamp past the place's window - no HUD, no hunter, a panning camera - and
+    # when it ends the player falls through the roof, whose collisions stay off until Martyr Logarius is defeated
+    # (m25's event 12500810, flag 12501800). Kept as a bench for frame pacing through a cutscene's cuts. The travel
+    # turns the cutscene's flag 12500000 off before its load, so the cutscene plays from any save: one the courtyard
+    # left with it on put the player on the roof without it, to fall at once.
+    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat - the arrival cutscene, not play", "m25_00_00_00", 2502951,
+         flags_off=(12500000,)),
     # Cainhurst in play: the courtyard's lamp (headstone slot 25) with flag 12500000 set before the travel's load,
     # which skips the arrival cutscene - the player stands at the lamp, HUD up, through the settle and the window, and
     # the layout's snow and fog effects are created as in play. It sets that flag, so it goes after cainhurst-roof
@@ -336,7 +343,8 @@ def tour(areas, opts, kind):
         if a.chalice:
             lines.extend(chalice_lines(a))
         else:
-            lines.append(" ".join(["travel %d %s %s" % (a.return_point, a.block_hex(), a.id)] + ["%d" % f for f in a.flags]))
+            lines.append(" ".join(["travel %d %s %s" % (a.return_point, a.block_hex(), a.id)] + ["%d" % f for f in a.flags]
+                                  + ["%d=0" % f for f in a.flags_off]))
         if godded and not a.enemies:
             lines.append("god off")  # again after the travel: a failed travel skips the last place's own
         godded = a.enemies

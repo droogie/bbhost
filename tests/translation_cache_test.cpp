@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 std::uint32_t host_thread_id() { return 1; }
 void host_thread_set_name(const char*) {}
 void host_thread_background() {}
@@ -221,8 +223,16 @@ int main(int argc, char** argv) {
     for (const Case& c : cases) lift_cases += c.lift_ps;
     std::printf("%zu shaders (of %zu), %zu pixel shaders lifted of %zu\n", cases.size(), all.size(), lifted, lift_cases);
 
-    // 2. A first start fills the file, a second takes everything from it.
-    const std::string path = (std::filesystem::temp_directory_path() / "bbhost-translation-cache-test.bin").generic_string();
+    // 2. A first start fills the file, a second takes everything from it. The
+    // file is this process's own (two test runs at once, from two build
+    // folders, would load what the other saved), and it goes at any exit, a
+    // CHECK's std::exit too.
+    static const std::string path =
+        (std::filesystem::temp_directory_path() / ("bbhost-translation-cache-test-" + std::to_string(getpid()) + ".bin")).generic_string();
+    std::atexit([] {
+        std::error_code gone;
+        std::filesystem::remove(path, gone);
+    });
     std::error_code ec;
     std::filesystem::remove(path, ec);
     const std::uint64_t entries = cases.size() * 2 + lift_cases;
@@ -352,7 +362,6 @@ int main(int argc, char** argv) {
         run_start(cases, fresh, lifts);
         CHECK(g_tc.hits.load() == 0 && g_tc.misses.load() == cases.size() * 2);
     }
-    std::filesystem::remove(path, ec);
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;

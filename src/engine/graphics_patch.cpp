@@ -7,6 +7,7 @@
 #include "engine/addr.h"
 #include "engine/camera.h"
 #include "engine/fmod_probe.h"
+#include "engine/fmod_ring.h"
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
 #include "engine/menu_memory.h"
@@ -1561,6 +1562,7 @@ void graphics_patch_install(ElfImage* image) {
     frame_rate_install(image);
     camera_install(image);
     fmod_probe_install(image);
+    fmod_ring_install(image);
     sf_heap_probe_install(image);
     probe_patch(image);
     live_install(image);

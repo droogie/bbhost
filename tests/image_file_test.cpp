@@ -8,10 +8,13 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -126,25 +129,29 @@ bool decode(const std::vector<std::uint8_t>& file, std::uint32_t* w, std::uint32
 }  // namespace
 
 int main() {
+    // The files are this process's own, in the temp folder: two test runs at
+    // once from one build folder (its working folder) would share them.
+    const std::string base = (std::filesystem::temp_directory_path() / ("bbhost-image-file-test-" + std::to_string(getpid()))).string();
+    const std::string png_path = base + ".png", ppm_path = base + ".ppm";
     // Small and odd-sized, then one large enough for several IDAT chunks.
     struct Size {
         std::uint32_t w, h;
     };
     for (const Size sz : {Size{1, 1}, Size{37, 23}, Size{640, 480}}) {
         const std::vector<std::uint8_t> px = picture(sz.w, sz.h, sz.w * 7 + sz.h);
-        CHECK(write("image_file_test.png", sz.w, sz.h, px));
+        CHECK(write(png_path, sz.w, sz.h, px));
         std::uint32_t w = 0, h = 0;
         std::vector<std::uint8_t> back;
         int idats = 0;
-        const std::vector<std::uint8_t> file = slurp("image_file_test.png");
+        const std::vector<std::uint8_t> file = slurp(png_path);
         CHECK(decode(file, &w, &h, &back, &idats));
         CHECK(w == sz.w && h == sz.h);
         CHECK(back == px);
         if (sz.w == 640) CHECK(idats > 1 && file.size() < px.size());
         std::printf("image_file_test: %ux%u png %zu bytes in %d IDAT\n", sz.w, sz.h, file.size(), idats);
 
-        CHECK(write("image_file_test.ppm", sz.w, sz.h, px));
-        const std::vector<std::uint8_t> ppm = slurp("image_file_test.ppm");
+        CHECK(write(ppm_path, sz.w, sz.h, px));
+        const std::vector<std::uint8_t> ppm = slurp(ppm_path);
         const std::string head = "P6\n" + std::to_string(sz.w) + " " + std::to_string(sz.h) + "\n255\n";
         CHECK(ppm.size() == head.size() + px.size());
         CHECK(ppm.size() >= head.size() && std::memcmp(ppm.data(), head.data(), head.size()) == 0);
@@ -153,14 +160,14 @@ int main() {
     // A file closed short of its rows is reported, and a folder that is not there fails at open.
     {
         ImageFile f;
-        CHECK(f.open("image_file_test.png", 4, 4));
+        CHECK(f.open(png_path, 4, 4));
         const std::uint8_t row[12] = {};
         CHECK(f.row(row));
         CHECK(!f.close());
         CHECK(!f.open("no-such-folder/x.png", 4, 4));
     }
-    std::remove("image_file_test.png");
-    std::remove("image_file_test.ppm");
+    std::remove(png_path.c_str());
+    std::remove(ppm_path.c_str());
     if (g_fail) {
         std::printf("%d failed\n", g_fail);
         return 1;

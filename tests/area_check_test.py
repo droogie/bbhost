@@ -107,13 +107,22 @@ class TourTest(unittest.TestCase):
         self.assertEqual(len(ac.AREAS), 16)
         self.assertEqual(len({a.id for a in ac.AREAS}), 16)
         # Cainhurst: the roof lamp is the arrival cutscene and says so; the courtyard's lamp is play, with the flag
-        # that skips that cutscene - set by the travel, so it comes after the roof in the list.
+        # that skips that cutscene - set by the travel, so it comes after the roof in the list. The roof's travel
+        # turns that flag off, so the cutscene plays whatever the save says.
         roof, court = ac.AREA_BY_ID["cainhurst-roof"], ac.AREA_BY_ID["cainhurst-courtyard"]
-        self.assertEqual((roof.return_point, roof.flags), (2502951, ()))
+        self.assertEqual((roof.return_point, roof.flags, roof.flags_off), (2502951, (), (12500000,)))
         self.assertIn("cutscene", roof.name)
-        self.assertEqual((court.return_point, court.flags), (2502950, (12500000,)))
+        self.assertEqual((court.return_point, court.flags, court.flags_off), (2502950, (12500000,), ()))
         ids = [a.id for a in ac.AREAS]
         self.assertLess(ids.index("cainhurst-roof"), ids.index("cainhurst-courtyard"))
+        self.assertEqual(roof.as_dict()["flags_off"], [12500000])
+        lines = ac.tour([roof, court], dict(ac.DEFAULTS), "perf").splitlines()
+        self.assertEqual([l for l in lines if l.startswith("travel ")],
+                         ["travel 2502951 19000000 cainhurst-roof 12500000=0",
+                          "travel 2502950 19000000 cainhurst-courtyard 12500000"])
+        # The flag goes with the travel, the place's first step, which a failed travel before it skips to.
+        self.assertTrue(lines[lines.index("# cainhurst-roof: " + roof.name) + 1].startswith("travel 2502951 "))
+        self.assertNotIn("flags", "\n".join(l for l in lines if not l.startswith("#")).split())
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())

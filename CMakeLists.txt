@@ -105,6 +105,7 @@ add_executable(bbhost
   src/engine/mouse_camera.cpp
   src/engine/mouse_camera_stubs.cpp
   src/engine/fmod_probe.cpp
+  src/engine/fmod_ring.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
   src/engine/frame_tick.cpp
@@ -313,6 +314,12 @@ if(Vulkan_FOUND)
   add_executable(hlsl_equiv tools/hlsl_equiv.cpp src/host/dxc.cpp)
   target_include_directories(hlsl_equiv PRIVATE src)
   target_link_libraries(hlsl_equiv PRIVATE gcn Vulkan::Vulkan ${CMAKE_DL_LIBS})
+  # GX's upload heap's move (BBHOST_GXVK_ARENA=2) on a GPU, outside the game: the steps bbhost runs, checked (Linux).
+  if(NOT WIN32)
+    add_executable(arena_move_check tools/arena_move_check.cpp)
+    target_include_directories(arena_move_check PRIVATE src)
+    target_link_libraries(arena_move_check PRIVATE Vulkan::Vulkan Threads::Threads)
+  endif()
   # Offline replay of BBHOST_CAPTURE_DRAW captures.
   add_executable(drawreplay tools/drawreplay.cpp src/core/sha256.cpp)
   target_include_directories(drawreplay PRIVATE src)
@@ -380,6 +387,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/present.cpp
   src/decomp/gx/resources.cpp
   src/decomp/gx/water_gate.cpp
+  src/decomp/gx/blink.cpp
   src/decomp/gx/upload_heap.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
@@ -521,6 +529,10 @@ if(UNIX)
   add_executable(wind_pace_test tests/wind_pace_test.cpp)
   target_include_directories(wind_pace_test PRIVATE src)
   add_test(NAME wind_pace_test COMMAND wind_pace_test)
+  # FMOD's sound-group ring guard without the game (tests/fmod_ring_test.cpp).
+  add_executable(fmod_ring_test tests/fmod_ring_test.cpp)
+  target_include_directories(fmod_ring_test PRIVATE src)
+  add_test(NAME fmod_ring_test COMMAND fmod_ring_test)
   add_executable(tess_lds_test tests/tess_lds_test.cpp src/host/tess_lds.cpp)
   target_include_directories(tess_lds_test PRIVATE src)
   add_test(NAME tess_lds_test COMMAND tess_lds_test)
@@ -562,6 +574,14 @@ if(UNIX)
   target_include_directories(gxvk_watch_test PRIVATE src)
   target_link_libraries(gxvk_watch_test PRIVATE Threads::Threads)
   add_test(NAME gxvk_watch_test COMMAND gxvk_watch_test)
+  # BBHOST_GXVK_BUFFERS's modes, unset and given, by the device's kind.
+  add_executable(gxvk_buffers_mode_test tests/gxvk_buffers_mode_test.cpp)
+  target_include_directories(gxvk_buffers_mode_test PRIVATE src)
+  add_test(NAME gxvk_buffers_mode_test COMMAND gxvk_buffers_mode_test)
+  # GX's upload heap moved in pieces (BBHOST_GXVK_ARENA=2): the layout, the room rule and the steps with their undo.
+  add_executable(arena_move_test tests/arena_move_test.cpp)
+  target_include_directories(arena_move_test PRIVATE src)
+  add_test(NAME arena_move_test COMMAND arena_move_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
@@ -638,6 +658,7 @@ if(UNIX)
   bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_upload_heap)
   bbhost_decomp_test(gx_water_gate)
+  bbhost_decomp_test(gx_blink)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
@@ -652,6 +673,10 @@ if(UNIX)
   target_link_libraries(host_lists_test PRIVATE pthread)
   add_test(NAME host_lists_test COMMAND host_lists_test)
   set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The decomp's install report in parts a log line holds (tests/decomp_lines_test.cpp).
+  add_executable(decomp_lines_test tests/decomp_lines_test.cpp)
+  target_include_directories(decomp_lines_test PRIVATE src)
+  add_test(NAME decomp_lines_test COMMAND decomp_lines_test)
   # The blend state of a colour target a draw writes no channel of (tests/masked_blend_test.cpp).
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)

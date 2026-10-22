@@ -18,6 +18,10 @@
 //     in screen-space mode (the camera still and running) and with a grid a
 //     water surface:
 //       - 30 steps a game second, every frame at 30;
+//       - on the frame-rate code's schedule of whole 1/30 s (engine/sfx_schedule.h,
+//         the effects' own), a step on every whole frame and on no other - one
+//         clock with the effects - and a camera step taking the schedule's next
+//         whole step; on the game time where nothing is scheduled;
 //       - every step reads the maps the two steps before it wrote, in order,
 //         and the frames between show the last step's (the surfaces' +0x10);
 //       - every impulse taken by exactly one step - the next, or after a
@@ -34,6 +38,7 @@
 #define DECOMP_WATER_GATE_TEST_GX
 int g_water_gate_mutant = 0;
 #include "decomp/gx/water_gate.cpp"
+#include "engine/sfx_schedule.h"
 
 #include <cmath>
 #include <cstdio>
@@ -440,10 +445,12 @@ struct Frames {
     int off_from = -1, off_to = -1;  // the manager off over these frames
     bool our_task = true;            // false: the game's task in place of ours
     int impulse_every = 1;           // a frame, each surface
+    bool schedule = false;           // the frame-rate code's schedule of whole 1/30 s told each frame (sfx_schedule::next)
 };
 
 struct Outcome {
     int frames = 0, steps = 0, held_shown_wrong = 0, misaligned = 0, bad_answers = 0;
+    int off_schedule = 0;  // frames that stepped where the schedule held, or held where it stepped (camera steps apart)
     double game_s = 0.0;
 };
 
@@ -457,8 +464,12 @@ Outcome play(World& w, const Frames& f) {
         mg.gate = WaterGate{};
         mg.decided = false;
         mg.waiting = false;
+        mg.scheduled = 0;
         mg.turned = 0;
     }
+    g_schedule_frames.store(0);
+    g_schedule_between.store(0);
+    double carry = 0.0;  // the schedule's, as engine/frame_rate.cpp keeps it
     g_task_ours.store(false);
     const u64 self = 0x1234, context = reinterpret_cast<u64>(g_context), param = reinterpret_cast<u64>(g_param);
     const u64 cam = reinterpret_cast<u64>(g_camera);
@@ -475,6 +486,12 @@ Outcome play(World& w, const Frames& f) {
     for (int i = 0; i < f.frames; ++i) {
         w.now = static_cast<double>(t) - static_cast<double>(t0);
         set_time(t);
+        const double dt = f.uneven ? uniform(1.0 / 240, 1.0 / 30) : 1.0 / f.fps;
+        bool whole = true;
+        if (f.schedule) {  // each_frame: the schedule for the frame about to run, from its own time
+            whole = sfx_schedule::next(carry, dt, 30).whole > 0;
+            decomp_water_step_frame(!whole);
+        }
         float x = 10.5f, z = -20.5f;
         if (f.running) {
             x = static_cast<float>(-3.0 + 6.5 * w.now);
@@ -491,6 +508,9 @@ Outcome play(World& w, const Frames& f) {
         const u64 r = f.our_task ? water_task(self, context, param) : game_task(self, context, param);
         const bool stepped = w.steps != steps_before;
         if (on && f.our_task && (stepped ? r != 0x5eedu || !g_args_ok : r != 0)) ++o.bad_answers;
+        // on the schedule, without the camera: a step on every whole frame and on no other (the first two frames the
+        // game's and the start)
+        if (f.schedule && !f.running && on && i >= 2 && stepped != whole) ++o.off_schedule;
         // the grid follows the camera: every frame whose truncated camera left the last step's steps
         if (w.screen && on) {
             if (stepped) {
@@ -507,7 +527,6 @@ Outcome play(World& w, const Frames& f) {
             const bool shown = content_of(load<u64>(grid + 0x10)) == w.written[g];
             if (!shown && !(g == 0 && w.swapped_in)) ++o.held_shown_wrong;
         }
-        const double dt = f.uneven ? uniform(1.0 / 240, 1.0 / 30) : 1.0 / f.fps;
         t += static_cast<float>(dt);
         ++o.frames;
     }
@@ -553,6 +572,7 @@ void frames_and_maps() {
         double fps;
         bool uneven;
     } const kRates[] = {{"30", 30, false}, {"60", 60, false}, {"90", 90, false}, {"120", 120, false}, {"144", 144, false}, {"uneven", 0, true}};
+    for (int sched = 1; sched >= 0; --sched)
     for (int screen = 1; screen >= 0; --screen) {
         for (int running = 0; running < (screen ? 2 : 1); ++running) {
             for (const Rate& rt : kRates) {
@@ -564,16 +584,19 @@ void frames_and_maps() {
                 f.uneven = rt.uneven;
                 f.screen = screen != 0;
                 f.running = running != 0;
+                f.schedule = sched != 0;
                 f.frames = rt.uneven ? 2400 : static_cast<int>(rt.fps * 10);
                 const Outcome o = play(w, f);
+                if (sched && !running) check(o.off_schedule == 0, "on the schedule, a step on every whole 1/30 s frame and no other");
                 int bad = 0;
                 for (int g = 0; g < (screen ? 1 : kSurfaces); ++g) bad += out_of_order(w, g);
                 const double per_s = (screen ? o.steps : o.steps / kSurfaces) / o.game_s;
                 if (!g_quiet)
-                    std::printf("  %s, %s%s: %d frames, %.2f steps a game second, %d steps read out of order, %d frames showing other than "
-                                "the last step, worst impulse delay %.1f ms\n",
-                                rt.name, screen ? "screen-space" : "a grid a surface", running ? ", running" : "", o.frames, per_s, bad,
-                                o.held_shown_wrong, w.worst_delay * 1000.0);
+                    std::printf("  %s, %s%s%s: %d frames, %.2f steps a game second, %d steps read out of order, %d frames showing other "
+                                "than the last step, worst impulse delay %.1f ms%s\n",
+                                rt.name, screen ? "screen-space" : "a grid a surface", running ? ", running" : "",
+                                sched ? ", on the schedule" : ", on the game time", o.frames, per_s, bad, o.held_shown_wrong,
+                                w.worst_delay * 1000.0, sched && !running ? (o.off_schedule ? ", OFF the schedule" : ", on its frames") : "");
                 check(bad == 0, "every step reads the two before it in order");
                 check(o.held_shown_wrong == 0, "the frames between steps show the last step's heights");
                 check(o.misaligned == 0, "every frame whose truncated camera left the last step's steps");
@@ -694,7 +717,9 @@ int main() {
                                            "impulses kept waiting after an update that did nothing",
                                            "impulses swapped between two heaps' vectors (and no room used)",
                                            "a camera step without turning the maps round again",
-                                           "a camera step's impulses kept waiting as well"};
+                                           "a camera step's impulses kept waiting as well",
+                                           "the schedule ignored (the game time decides)",
+                                           "a camera step's whole step not taken from the schedule's next"};
     constexpr int kCount = sizeof kMutants / sizeof kMutants[0] - 1;
     int caught = 0, mutants = 0;
     g_quiet = true;

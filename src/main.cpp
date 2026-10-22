@@ -16,6 +16,7 @@
 #include "engine/np_test.h"
 #include "engine/gx_resources.h"
 #include "engine/params.h"
+#include "engine/fmod_ring.h"
 #include "engine/sf_heap_probe.h"
 #include "guest_abi.h"
 #include "hle/fs.h"
@@ -344,6 +345,7 @@ void exit_reports() {
     key_prompts_report();
     decomp_report();
     mouse_camera_report();
+    fmod_ring_report();
 }
 
 #if !defined(_WIN32)
@@ -722,6 +724,7 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
         }
     }
     sf_heap_probe_crash_report();
+    fmod_ring_crash_report();
     hle_fs_log_recent_opens();
     hle_gnm_dump_recent_writes(0, 48);
     signal(sig, SIG_DFL);

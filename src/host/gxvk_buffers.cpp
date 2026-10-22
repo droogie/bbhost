@@ -293,7 +293,7 @@ void memory_released(std::uint64_t va, std::uint64_t bytes) {
 
 void buffers_report() {
     if (!buffers_on()) return;
-    const char* const mode = buffers_mode() == Buffers::kCompare ? "compared (BBHOST_GXVK_BUFFERS=2)" : "bound by handle (BBHOST_GXVK_BUFFERS=1)";
+    const char* const mode = buffers_mode() == Buffers::kCompare ? "compared (BBHOST_GXVK_BUFFERS=2)" : "bound by handle (BBHOST_GXVK_BUFFERS=0: today's path)";
     std::string nk;
     for (int k = 0; k < 9; ++k) {
         const std::uint64_t n = g_not_kept[k].load();
