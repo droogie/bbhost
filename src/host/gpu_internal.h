@@ -428,11 +428,20 @@ struct Gpu {
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
+    // VK_EXT_map_memory_placed with VK_KHR_map_memory2, enabled only for GX on
+    // Vulkan's arena when it moves GX's upload heap (BBHOST_GXVK_ARENA=2,
+    // gpu.cpp arena_place_locked): its map function and the alignment a
+    // placed mapping takes.
+    bool has_placed_map = false;
+    const char* placed_missing = "not asked for";  // why has_placed_map is false, for the arena's log
+    void* map_memory2 = nullptr;  // PFN_vkMapMemory2KHR
+    VkDeviceSize placed_align = 0;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
     // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
     bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
+    VkDriverId driver_id = {};    // VkPhysicalDeviceDriverProperties::driverID (VK_DRIVER_ID_MESA_LLVMPIPE: lavapipe)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start
@@ -717,6 +726,26 @@ bool image_heap_classes_on();  // BBHOST_HEAP_CLASSES
 int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* used, const std::vector<int>& skip);
 // The textures' blocks drain (textures.cpp, BBHOST_HEAP_DRAIN): see there.
 void drain_texture_blocks_locked();
+// The targets' blocks drain (render.cpp drain_target_blocks_locked): the
+// targets' block that holds least when the class has two or more - its index,
+// the bytes it holds and the free room of the others' (-1: none); a block no
+// image goes in while it is emptied (-1: none); a block's bytes in use; and an
+// image's memory from room the heap's video memory blocks already have -
+// never a new block, never host memory (false when there is none).
+int image_heap_target_drain_candidate_locked(std::uint64_t* used, std::uint64_t* room_elsewhere);
+void image_heap_avoid_block_locked(int block);
+int image_heap_avoided_block_locked();
+std::uint64_t image_heap_block_used_locked(int block);
+bool image_memory_place_existing_locked(const VkMemoryRequirements& req, ImageMemory& out, int cls);
+// textures.cpp: whether the block holds a surface that cannot be made again
+// (a shader or a copy wrote it), and letting go of what it holds that can -
+// textures, copies of targets' regions, level aliases (made again at their
+// next bind); returns the bytes let go.
+bool textures_block_pinned_locked(int block);
+std::uint64_t textures_drop_block_locked(int block);
+void drain_target_blocks_locked();  // render.cpp, once a second from the submission
+std::uint64_t image_heap_spare_in_play();  // the memory keeper's spare blocks in play (gpu.cpp)
+std::string target_drain_report();  // render.cpp: what the targets' blocks drain did
 // The drain so far: blocks emptied, textures and MiB taken out, blocks left
 // because a surface the GPU wrote sits in them.
 void textures_drain_counts(std::uint64_t out[4]);
@@ -783,6 +812,16 @@ struct VramCensus {
     VramKind gpu_written_in_tex, tex_in_targets;
     // depth_copy.cpp and other images with memory of their own in video
     // memory: counted by gpu_memtrack's owners instead.
+    // By image heap block (ImageMemory::block), bytes of each kind: colour
+    // targets, depth targets, snapshots, GPU-written surfaces, textures,
+    // copies of targets' regions and levels - what keeps a block from emptying.
+    enum : int { kBlockColour, kBlockDepth, kBlockSnapshot, kBlockGpuWritten, kBlockTexture, kBlockRegion, kBlockKinds };
+    std::vector<std::array<std::uint64_t, kBlockKinds>> by_block;
+    void note_block(std::int32_t block, int kind, std::uint64_t bytes) {
+        if (block < 0 || block > 4096) return;
+        if (by_block.size() <= static_cast<std::size_t>(block)) by_block.resize(static_cast<std::size_t>(block) + 1, {});
+        by_block[static_cast<std::size_t>(block)][static_cast<std::size_t>(kind)] += bytes;
+    }
 };
 // display_w x display_h: the display buffers' size (0 x 0: not known).
 void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h);  // render.cpp
@@ -1057,6 +1096,12 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
 // the game rewrites, or a range this cannot tell cheaply - before the caller
 // works out how much of it a draw reads.
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
+// What the pages of [va, va+bytes) are to the buffer shadow now, the least
+// placeable page deciding (BBHOST_VB_RACE=2's census): read in place, told
+// and never handed out (what in place reads; mirrored), under renamed copies
+// GX hands out, write-watched, rewritten (host memory for good), not tracked.
+enum : int { kPlaceNone = 0, kPlacePlaced, kPlaceTold, kPlaceHanded, kPlaceWatched, kPlaceDynamic, kPlaceUntracked, kPlaceClasses };
+int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
@@ -1351,10 +1396,15 @@ constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
 // BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
 // when recorded and again when its submission retires - memory rewritten while
-// the draw waited for the GPU. Caller holds the lock.
+// the draw waited for the GPU. =2: the ranges the buffer shadow's mirrors
+// serve too (`mirrored`), hashed at their ends - what reading them in place
+// would have raced - counted by page class (shadow_place_class_locked).
+// Caller holds the lock.
 bool vb_race_on();
-void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes);
+bool vb_race_mirrored_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored = false);
 void vb_race_retired_locked(std::uint64_t serial);
+void vb_race_exit_report_locked();  // the counts at exit, by page class too (a short run's only line)
 // buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
 // GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
 // land - recorded in a submission that has not retired. Caller holds the lock.

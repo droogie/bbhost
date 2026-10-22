@@ -22,7 +22,22 @@
 // free bytes and count of ranges out against the model's); and that once
 // everything has landed and been reclaimed the region is whole again (one
 // hand-out of all of it, at its start). A control run lands one label the
-// model is not told of, and must be caught. Skips without the 1.09 eboot.
+// model is not told of, and must be caught.
+//
+// Ours of the pool's init (decomp/gx/upload_heap.cpp, gx_upload_pool_init)
+// against the game's, on generated cases: pools at every alignment, regions
+// at every alignment and of every length, node allocators whose block comes
+// or does not (the init's failure path), with the host's region entry absent,
+// keeping the game's region, or giving one of its own (then ours must equal
+// the game's init over that one). From the same bytes and the same
+// allocator, the pool's bytes, the allocator's, its calls and the return
+// value must be the game's; four deliberate mistakes must each be caught.
+// Then the model above runs again over a pool ours made. Skips without the
+// 1.09 eboot.
+#define DECOMP_GX_UPLOAD_HEAP_MUTANTS
+// Ours, built here with its mistakes.
+#include "decomp/gx/upload_heap.cpp"
+
 #include "eboot_kit.h"
 
 #include "decomp/guest.h"
@@ -35,6 +50,8 @@
 #include <vector>
 
 using namespace decomp;
+
+int g_upload_heap_mutant = 0;
 
 namespace {
 
@@ -113,14 +130,16 @@ void range_of(u64 node, u64& start, u64& end) {
 
 // control: a label lands that the model is not told of (a reuse before the
 // GPU is done, as the model sees it), once, which the checks must catch.
-long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool control = false) {
+long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool control = false, bool ours = false) {
     Pool pool;
     store<u64>(pool.at() + 0xd8, reinterpret_cast<u64>(g_lock_vtable));
     alignas(16) static u64 cb[2] = {0x7700, 0};
     alignas(64) static u8 ctx[0xb500];
     const u64 ctx_holder_value = reinterpret_cast<u64>(ctx);
     const u64 cb_holder = reinterpret_cast<u64>(cb), ctx_holder = reinterpret_cast<u64>(&ctx_holder_value);
-    if (!eboot_kit::fn<InitFn>(kPoolInit)(pool.at(), reinterpret_cast<u64>(g_allocator), region, region_bytes)) {
+    const u64 made = ours ? gx_upload_pool_init(pool.at(), reinterpret_cast<u64>(g_allocator), region, region_bytes)
+                          : eboot_kit::fn<InitFn>(kPoolInit)(pool.at(), reinterpret_cast<u64>(g_allocator), region, region_bytes);
+    if (!made) {
         fail(-1, "the pool's init failed");
         return 0;
     }
@@ -229,10 +248,146 @@ long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool 
     if (all) range_of(all, s, e);
     if (!all || s != base || e != limit) fail(steps, "one hand-out of the whole region did not get it (its ranges not merged back)");
     if (!g_quiet)
-        std::printf("  %s landings, %llu-byte region: %ld steps, %ld hand-outs (%ld refused: no room), %ld reclaims, %zu labels\n",
-                    in_order ? "in-order" : "out-of-order", static_cast<ull>(region_bytes), steps, handed, refused, reclaims, g_labels.size());
+        std::printf("  %s landings, %llu-byte region%s: %ld steps, %ld hand-outs (%ld refused: no room), %ld reclaims, %zu labels\n",
+                    in_order ? "in-order" : "out-of-order", static_cast<ull>(region_bytes), ours ? ", ours of the init" : "", steps, handed,
+                    refused, reclaims, g_labels.size());
     g_labels.clear();
     return handed;
+}
+
+// ---- ours of the init against the game's ---------------------------------
+// A node allocator whose blocks come from a fixed arena, bump by bump, so the
+// same calls from the same state hand out the same addresses; `fail_at` makes
+// that allocation (counted from 1) return nothing.
+alignas(64) u8 g_bump_arena[1 << 16];
+std::size_t g_bump_next = 0;
+int g_bump_calls = 0, g_bump_fail_at = 0;
+struct Call {
+    u64 bytes, align, result;
+};
+std::vector<Call> g_bump_log;
+GUEST_ABI u64 bump_alloc(u64 self, u64 bytes, u64 align, u64 extra) {
+    (void)self, (void)extra;
+    ++g_bump_calls;
+    u64 result = 0;
+    const std::size_t a = align ? static_cast<std::size_t>(align) : 1;
+    const std::size_t at = (g_bump_next + a - 1) / a * a;
+    if (g_bump_calls != g_bump_fail_at && at + bytes <= sizeof g_bump_arena) {
+        result = reinterpret_cast<u64>(g_bump_arena + at);
+        g_bump_next = at + static_cast<std::size_t>(bytes);
+    }
+    g_bump_log.push_back({bytes, align, result});
+    return result;
+}
+GUEST_ABI void bump_free(u64 self, u64 p) {
+    (void)self;
+    g_bump_log.push_back({0, 0, p});
+}
+alignas(16) u64 g_bump_vtable[32];
+alignas(16) u64 g_bump_allocator[2];
+
+// The host's region entry as the test plays it: none, keep the game's, or
+// give its own.
+u64 g_entry_region = 0, g_entry_bytes = 0, g_entry_pool = 0;
+int g_entry_calls = 0;
+GUEST_ABI u64 test_region_entry(u64 pool, u64 region, u64 bytes, u64 bytes_out) {
+    (void)region, (void)bytes;
+    ++g_entry_calls;
+    g_entry_pool = pool;
+    if (!g_entry_region) return 0;
+    store<u64>(bytes_out, g_entry_bytes);
+    return g_entry_region;
+}
+
+struct InitRun {
+    u64 result = 0;
+    u8 pool[0x140] = {};
+    u8 arena[0x2000] = {};
+    std::vector<Call> calls;
+};
+
+// One case, from the same pool bytes and allocator state: the game's init over
+// (region, bytes) - or over the entry's region when it gives one - and ours.
+// `where`: the pool's offset in its buffer (its alignment).
+int compare_case(std::size_t where, u64 region, u64 bytes, int fail_at, int entry_mode, eboot_kit::Rng& rng) {
+    alignas(64) static u8 buffer[0x200];
+    u8 start[sizeof(InitRun::pool)];
+    for (u8& b : start) b = static_cast<u8>(rng.next());
+    u8 arena_fill = static_cast<u8>(rng.next());
+    const u64 pool = reinterpret_cast<u64>(buffer + where);
+    const u64 alloc = reinterpret_cast<u64>(g_bump_allocator);
+    const auto run = [&](bool ours, InitRun& out) {
+        std::memcpy(buffer + where, start, sizeof start);
+        std::memset(g_bump_arena, arena_fill, sizeof g_bump_arena);
+        g_bump_next = 0;
+        g_bump_calls = 0;
+        g_bump_fail_at = fail_at;
+        g_bump_log.clear();
+        if (ours) {
+            g_entry_calls = 0;
+            decomp_gx::g_upload_region_entry = entry_mode ? reinterpret_cast<void*>(&test_region_entry) : nullptr;
+            out.result = gx_upload_pool_init(pool, alloc, region, bytes);
+            decomp_gx::g_upload_region_entry = nullptr;
+        } else {
+            const bool theirs = entry_mode == 2;
+            out.result = eboot_kit::fn<InitFn>(kPoolInit)(pool, alloc, theirs ? g_entry_region : region, theirs ? g_entry_bytes : bytes);
+        }
+        std::memcpy(out.pool, buffer + where, sizeof out.pool);
+        std::memcpy(out.arena, g_bump_arena, sizeof out.arena);
+        out.calls = g_bump_log;
+    };
+    if (entry_mode == 2) {
+        g_entry_region = (0x10000000000ull - (static_cast<u64>(rng.range(1, 1 << 20)) << 16)) + static_cast<u64>(rng.range(0, 63));
+        g_entry_bytes = static_cast<u64>(rng.range(32, 1 << 30));
+    } else {
+        g_entry_region = 0;
+    }
+    InitRun theirs, ours;
+    run(false, theirs);
+    run(true, ours);
+    int bad = 0;
+    if (theirs.result != ours.result) ++bad;
+    if (std::memcmp(theirs.pool, ours.pool, sizeof theirs.pool) != 0) ++bad;
+    if (std::memcmp(theirs.arena, ours.arena, sizeof theirs.arena) != 0) ++bad;
+    if (theirs.calls.size() != ours.calls.size()) {
+        ++bad;
+    } else {
+        for (std::size_t i = 0; i < theirs.calls.size(); ++i)
+            if (theirs.calls[i].bytes != ours.calls[i].bytes || theirs.calls[i].align != ours.calls[i].align ||
+                theirs.calls[i].result != ours.calls[i].result)
+                ++bad;
+    }
+    if (entry_mode && (g_entry_calls != 1 || g_entry_pool != pool)) ++bad;  // the entry told of this pool, once
+    return bad;
+}
+
+// Cases of every kind; returns the cases that differed.
+long compare_init(long cases, std::uint64_t seed, long* made, long* failed) {
+    eboot_kit::Rng rng(seed);
+    long differed = 0;
+    for (long c = 0; c < cases; ++c) {
+        const std::size_t where = static_cast<std::size_t>(rng.range(0, 63));
+        u64 region;
+        switch (rng.range(0, 3)) {
+            case 0: region = 0x143400040ull; break;
+            case 1: region = static_cast<u64>(rng.range(1, 1 << 30)) << 4; break;
+            case 2: region = (static_cast<u64>(rng.range(1, 1 << 24)) << 12) + static_cast<u64>(rng.range(0, 4095)); break;
+            default: region = rng.next() & 0xffffffffffull; break;
+        }
+        u64 bytes;
+        switch (rng.range(0, 3)) {
+            case 0: bytes = 0xa000000ull; break;
+            case 1: bytes = static_cast<u64>(rng.range(32, 4096)); break;
+            case 2: bytes = static_cast<u64>(rng.range(1, 1 << 30)); break;
+            default: bytes = (static_cast<u64>(rng.range(1, 1 << 14)) << 16) + static_cast<u64>(rng.range(0, 15)); break;
+        }
+        const int fail_at = rng.chance(0.15) ? 1 : 0;  // the node allocator's one block refused
+        const int entry_mode = rng.range(0, 2);
+        if (fail_at) ++*failed;
+        else ++*made;
+        if (compare_case(where, region, bytes, fail_at, entry_mode, rng)) ++differed;
+    }
+    return differed;
 }
 
 }  // namespace
@@ -246,6 +401,34 @@ int main(int argc, char** argv) {
     g_allocator[0] = reinterpret_cast<u64>(g_alloc_vtable);
     g_lock_vtable[0x18 / 8] = reinterpret_cast<u64>(&fake_lock);
     g_lock_vtable[0x28 / 8] = reinterpret_cast<u64>(&fake_unlock);
+    g_bump_vtable[0x58 / 8] = reinterpret_cast<u64>(&bump_alloc);
+    g_bump_vtable[0x70 / 8] = reinterpret_cast<u64>(&bump_free);
+    g_bump_allocator[0] = reinterpret_cast<u64>(g_bump_vtable);
+    // Ours of the init against the game's.
+    long made = 0, refused = 0;
+    const long cases = argc > 2 ? std::atol(argv[2]) : 20000;
+    const long differed = compare_init(cases, 0x1c0de, &made, &refused);
+    if (differed) {
+        ++g_failed;
+        std::printf("FAIL: ours of the pool's init differs from the game's in %ld of %ld cases\n", differed, cases);
+    } else {
+        std::printf("  the pool's init: ours equals the game's in %ld cases (%ld made, %ld with the node allocator's block refused)\n", cases,
+                    made, refused);
+    }
+    static const char* const kMistake[] = {"", "the length not cut to 16 bytes", "the failure path keeping its node allocator",
+                                           "the free list's sentinel not linked to the node", "the return value's node bytes dropped"};
+    for (int m = 1; m <= 4; ++m) {
+        g_upload_heap_mutant = m;
+        long mm = 0, mr = 0;
+        const long d = compare_init(2000, 0x5eed + static_cast<std::uint64_t>(m), &mm, &mr);
+        g_upload_heap_mutant = 0;
+        if (!d) {
+            ++g_failed;
+            std::printf("FAIL: mistake %d (%s) not caught\n", m, kMistake[m]);
+        } else {
+            std::printf("  mistake %d (%s) caught: %ld of 2000 cases differ\n", m, kMistake[m], d);
+        }
+    }
     // The region is only addresses to the pool (it never touches the bytes):
     // the upload heap's as the game makes it, and an unaligned one.
     long total = 0;
@@ -262,6 +445,7 @@ int main(int argc, char** argv) {
         ++g_failed;
         std::printf("FAIL: a label landed behind the model's back was not caught\n");
     }
+    total += run_sequence(0x143400040ull, 0xa000000ull, steps / 2, false, false, true);  // over a pool ours made
     if (g_failed) {
         std::printf("gx_upload_heap_test: %d failures\n", g_failed);
         return 1;

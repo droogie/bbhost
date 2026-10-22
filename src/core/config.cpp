@@ -1079,3 +1079,9 @@ std::string config_value(const std::string& key) {
     auto it = g_values.find(key);
     return it == g_values.end() ? std::string() : unquote(it->second);
 }
+
+std::string config_effect_steps() {
+    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) return e;
+    const std::string v = config_value("video.effect_steps");
+    return v.empty() ? "smooth" : v;
+}

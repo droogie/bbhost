@@ -45,7 +45,7 @@ std::map<std::uint64_t, std::uint32_t> g_by_memory;
 // The copy watch: the kept default buffers' ranges, which a GPU copy may
 // write (host/gxvk_watch.h): set and cleared under the table's lock, asked
 // without it by every copy (copy_written). BBHOST_GXVK_BUFFERS=2 checks its
-// granules against its slots on every copy (copy_watch_check).
+// granules against its ranges on every copy (copy_watch_check).
 CopyWatch<> g_watch;
 std::atomic<std::uint64_t> g_watch_checks{0}, g_watch_near{0}, g_watch_hits{0}, g_watch_missed{0};
 

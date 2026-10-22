@@ -1,4 +1,5 @@
 #include "hle/equeue.h"
+#include "hle/flip_pacing.h"
 #include "hle/modules.h"
 #include "hle/common.h"
 #include "core/portable.h"
@@ -111,6 +112,32 @@ const bool g_flip_hold = [] {
 }();
 std::atomic<std::uint64_t> g_flip_holds{0};
 std::atomic<int> g_fps_cap{30};  // video.fps_cap: upper bound on presented frames/s
+
+// The flip keeper (hle/flip_pacing.h): a game that comes back from a stall (a
+// load, a cut in a cutscene) with its frames ready after the tick, so that its
+// wait never meets one, is put back on the tick by one flip completing a tick
+// late, once.
+// It reads the game's first look at the flip status after each flip call
+// (hle_video_status, on the thread that calls its flips) and acts on the
+// vblank. BBHOST_FLIP_KEEPER=0 turns it off.
+const bool g_flip_keeper = [] {
+    const char* e = std::getenv("BBHOST_FLIP_KEEPER");
+    return !(e && e[0] == '0');
+}();
+flip_pacing::TickKeeper g_keeper;           // under g_vo_mu
+std::int64_t g_last_called_arg = -1;        // under g_vo_mu: the game's last flip call's argument (its flip count)
+std::thread::id g_flip_thread;              // under g_vo_mu: the thread that calls the game's flips
+bool g_flip_asked = true;                   // under g_vo_mu: its first status look since its last flip call is seen
+std::uint64_t g_first_look_ns = 0;          // under g_vo_mu: when that look was (steady ns)
+// The flip timeline (BBHOST_FLIP_TIMELINE=1, gnm.cpp) shows when the game
+// first looked at the flip status before each flip call - when its frame was
+// ready - in either keeper arm, so the looks are followed for it too.
+const bool g_flip_looks_timeline = [] {
+    const char* e = std::getenv("BBHOST_FLIP_TIMELINE");
+    return e && e[0] == '1';
+}();
+std::uint64_t g_keeper_said = 0;            // under g_vo_mu: kicks logged
+std::atomic<std::int64_t> g_tick_period_ns{16666667};  // the flip clock's period
 
 // Present on arrival (KyoPS4x #249's split, made here natively): a frame the
 // command processor has finished recording is handed to the presenter at
@@ -496,6 +523,12 @@ void wake_flip_waiter() {
     g_flip_wait_cv.notify_one();
 }
 
+// The keeper runs for this port now: flips paced to the vblank at 60 on a 60 Hz flip clock.
+bool keeper_on_locked(const VideoPort& p) {
+    return g_flip_keeper && !g_flip_uncapped.load(std::memory_order_relaxed) && !g_flip_loading.load(std::memory_order_relaxed) &&
+           flip_pacing::keeper_paced(p.flip_rate, g_fps_cap.load(std::memory_order_relaxed), g_tick_period_ns.load(std::memory_order_relaxed));
+}
+
 void vblank_tick(std::uint64_t vcount) {
     g_vcount.store(vcount, std::memory_order_relaxed);
     const std::uint64_t gpu_done = g_flip_after_gpu ? host_gpu_submissions_completed() : ~0ull;
@@ -531,6 +564,9 @@ void vblank_tick(std::uint64_t vcount) {
                 vcount < p.flip_queue.front().recorded_tick + 2 * (static_cast<std::uint64_t>(p.flip_rate) + 1)) {
                 g_flip_holds.fetch_add(1, std::memory_order_relaxed);
                 continue;  // queued less than two flip periods ago
+            }
+            if (keeper_on_locked(p) && g_keeper.take_kick(vcount)) {
+                continue;  // the keeper's kick (hle/flip_pacing.h): this flip waits one tick more
             }
             // Also honour video.fps_cap: Bloodborne asks for flip_rate 0 (60)
             // but is a 30 fps title paced by GPU time on hardware; the cap
@@ -645,6 +681,10 @@ void start_vsync() {
         // Set, never cleared: the game above 60 or uncapped has set it already
         // (hle_video_set_game_pace).
         if (const char* e = std::getenv("BBHOST_UNCAP"); e && e[0] == '1') g_flip_uncapped.store(true);
+        if (g_flip_keeper) {
+            host_log("video: a game back from a pause of its own off the vblank tick is put back on it with one flip a tick late "
+                     "(the flip keeper; BBHOST_FLIP_KEEPER=0 leaves it)");
+        }
         host_log("video: %s", g_present_on_arrival
                                   ? "a frame is shown when the command processor has it, its flip completes on the vblank "
                                     "(BBHOST_PRESENT_ON_ARRIVAL=0: shown when its flip completes)"
@@ -686,6 +726,7 @@ void start_vsync() {
             bool forced_rate = false;
             if (const int forced = config().vblank_hz; forced >= 20 && forced <= 1000) {
                 period = period_for(static_cast<float>(forced));
+                g_tick_period_ns.store(period.count(), std::memory_order_relaxed);
                 announced_hz = static_cast<float>(forced);
                 forced_rate = true;
                 host_log("video: flip clock at %d Hz (video.vblank_hz)", forced);
@@ -714,6 +755,7 @@ void start_vsync() {
                     const float hz = host_window_refresh_hz();
                     const auto want = hz >= 20.0f && hz <= 1000.0f ? period_for(hz) : kDefaultPeriod;
                     period = want;
+                    g_tick_period_ns.store(period.count(), std::memory_order_relaxed);
                     if (hz != announced_hz) {
                         announced_hz = hz;
                         if (hz >= 20.0f && hz <= 1000.0f) {
@@ -991,6 +1033,26 @@ GUEST_ABI int hle_video_status(int handle, void* st) {
     out.flip_pending_num = p->pending;
     out.current_buffer = p->current_buffer;
     std::memcpy(st, &out, sizeof(out));
+    // The flip keeper: the game's first look since its last flip call, on the
+    // thread that calls them - when, against the tick, and whether its wait
+    // will block (the flip two back from its next not yet completed).
+    if ((g_flip_keeper || g_flip_looks_timeline) && !g_flip_asked && std::this_thread::get_id() == g_flip_thread) {
+        g_flip_asked = true;
+        g_first_look_ns = steady_ns();
+        if (g_flip_keeper && keeper_on_locked(*p)) {
+            const auto now = static_cast<std::int64_t>(g_first_look_ns);
+            const auto tick = static_cast<std::int64_t>(g_last_tick_ns.load(std::memory_order_relaxed));
+            g_keeper.note_ask(now, now - tick, g_last_called_arg - p->flip_arg >= 2, g_vcount.load(std::memory_order_relaxed));
+            if (g_keeper.kicks() > g_keeper_said) {  // every kick: one in 300 ticks at most
+                g_keeper_said = g_keeper.kicks();
+                host_log("video: the flip keeper's kick %llu (vblank %llu): the game's flips came after the tick without waiting; one "
+                         "waited a tick more to put it back on the tick (%llu of its %llu looks late, %llu held)",
+                         static_cast<unsigned long long>(g_keeper.kicks()), static_cast<unsigned long long>(g_vcount.load()),
+                         static_cast<unsigned long long>(g_keeper.late_asks()), static_cast<unsigned long long>(g_keeper.asks()),
+                         static_cast<unsigned long long>(g_keeper.held_asks()));
+            }
+        }
+    }
     return 0;
 }
 
@@ -1026,7 +1088,26 @@ std::string hle_video_pacing_window() {
                       static_cast<unsigned long long>(take(g_flip_holds)));
         out += h;
     }
+    if (g_flip_keeper) {
+        std::lock_guard<std::mutex> lock(g_vo_mu);
+        char k[160];
+        std::snprintf(k, sizeof(k), "; flip keeper: %llu kicks in all (the game's looks %llu, held %llu, late %llu)",
+                      static_cast<unsigned long long>(g_keeper.kicks()), static_cast<unsigned long long>(g_keeper.asks()),
+                      static_cast<unsigned long long>(g_keeper.held_asks()), static_cast<unsigned long long>(g_keeper.late_asks()));
+        out += k;
+    }
     return out;
+}
+
+std::uint64_t hle_video_note_flip_call(std::int64_t arg) {
+    if (!g_flip_keeper && !g_flip_looks_timeline) return 0;
+    std::lock_guard<std::mutex> lock(g_vo_mu);
+    const std::uint64_t looked = g_flip_asked && std::this_thread::get_id() == g_flip_thread ? g_first_look_ns : 0;
+    g_last_called_arg = arg;
+    g_flip_thread = std::this_thread::get_id();
+    g_flip_asked = false;
+    g_first_look_ns = 0;
+    return looked;
 }
 
 void hle_video_set_loading_uncapped(bool on) { flip_holds_screen(g_flip_loading.exchange(on, std::memory_order_relaxed), on); }

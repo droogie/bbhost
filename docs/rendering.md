@@ -266,6 +266,16 @@ target is undefined and Vulkan writes nothing through an empty mask, so the
 state is dead where a driver honours the mask; a driver may blend the undefined
 output in anyway, and with the state zeroed there is nothing to blend
 (`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
+Lavapipe, once a pipeline without colour attachments has been bound in a
+command buffer, draws every colour attachment of the later draws in it with
+attachment 0's blend state: a target the shader does not export is written
+wherever attachment 0 blends, and the puddle decals left NaN in the G-buffer's
+seventh target - black holes in the floor. On lavapipe alone, a draw that
+follows a depth-only pipeline in the command buffer being recorded, and whose
+attachments' blend states differ where that would change what it draws, starts
+a command buffer of its own, what was recorded before it submitted without
+waiting (`BBHOST_LVP_BLEND_SPLIT=0` records it like any other); other drivers
+draw it correctly.
 A draw whose rasterizer state comes from the registers rather than a GX
 description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
 ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth
@@ -669,7 +679,8 @@ UpdateSubresource or a GPU copy into the buffer retires the entry and its
 bindings take today's path again. Every GPU copy GX records asks a watch of
 the kept default buffers' ranges first, by the 64 KiB granules they cover
 (one-byte counters in a 16 KiB table), so a copy far from all of them reads
-a counter or two; a buffer that ended (its holder released,
+a counter or two, and one next to them searches the ranges, sorted, in
+halves; a buffer that ended (its holder released,
 its memory unmapped or given to a new resource) is still bound from its copy
 by the draws recorded before its end. Video memory is used down to the
 reserve kept for render targets and device buffers, then host-visible
@@ -678,6 +689,31 @@ beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
+
+**The upload heap (the stage's second part, off by default while it is
+measured).** GX's device gives its block pool one region - GX's upload heap,
+160 MiB, made by the pool's init, which is on the decomp list - and every
+renamed constant buffer, Map rename and ring allocation comes from it. GX
+hands a range out again only after an end-of-pipe label behind the work that
+used it has landed, and a label lands only once the host's submission has
+completed, so a renamed copy holds what its draws read until the GPU has
+done with them: in the census, 70% of constant-buffer bindings and 10% of
+vertex records lie in the heap. `BBHOST_GXVK_ARENA=1` binds those where they
+are, in the heap's import - a vertex record as far as its draw reads -
+without the snapshot copy or the lookups. Every run it is used
+proves the rule again: each hand-out is a record, each binding stamps the
+record it lies in with its submission, and a hand-out over a record's memory
+needs that submission completed; and one binding in 64 has its bytes hashed
+when it is bound and again when its submission has completed. A violation
+sends every binding of the heap back to today's path for the rest of the run,
+and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
+and checks every binding of the heap as in place would bind it.
+`BBHOST_GXVK_ARENA=2` also moves the heap into video memory the CPU writes,
+where the driver can place a mapping at an address of ours
+(`VK_EXT_map_memory_placed`) and the memory budget has room: GX's device is
+made before bbhost's, so its pool is given a host mapping of bbhost's, whose
+bytes are copied at the GPU's start - writes to it wait meanwhile - and the
+video memory is mapped over it.
 
 ## Tools
 

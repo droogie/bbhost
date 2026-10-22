@@ -104,8 +104,16 @@ def area_lines(area, t, block, window_intervals, view=None, settle_events=(), du
 
 class TourTest(unittest.TestCase):
     def test_places_and_views(self):
-        self.assertEqual(len(ac.AREAS), 15)
-        self.assertEqual(len({a.id for a in ac.AREAS}), 15)
+        self.assertEqual(len(ac.AREAS), 16)
+        self.assertEqual(len({a.id for a in ac.AREAS}), 16)
+        # Cainhurst: the roof lamp is the arrival cutscene and says so; the courtyard's lamp is play, with the flag
+        # that skips that cutscene - set by the travel, so it comes after the roof in the list.
+        roof, court = ac.AREA_BY_ID["cainhurst-roof"], ac.AREA_BY_ID["cainhurst-courtyard"]
+        self.assertEqual((roof.return_point, roof.flags), (2502951, ()))
+        self.assertIn("cutscene", roof.name)
+        self.assertEqual((court.return_point, court.flags), (2502950, (12500000,)))
+        ids = [a.id for a in ac.AREAS]
+        self.assertLess(ids.index("cainhurst-roof"), ids.index("cainhurst-courtyard"))
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())

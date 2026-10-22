@@ -35,6 +35,7 @@
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -65,7 +66,6 @@ constexpr u64 kControllerUpdate = 0x2c820f0;   // (controller, instance, step)
 constexpr u64 kPrerollContext = 0x56dbd80;     // sub_2c500e0's stand-in render context's vtable
 constexpr u64 kGxRecordUpdate = 0x2cbcf50;     // a GPU particle system's record taking an item: (record, item)
 constexpr u64 kGxType2713 = 0x56eb0d0;         // GPU particle type 0x2713's vtable: its parameters are curves read at the elapsed time
-constexpr u64 kGxType2712 = 0x56eb030;         // GPU particle type 0x2712's vtable: the grid simulation (update sub_12e6080)
 constexpr u64 kGxTypeRibbon = 0x56e3620;       // FFX-format GX type 0x28's vtable: a ribbon (update sub_2ec1e00)
 constexpr std::size_t kRibbonDefinition = 0x12c;  // what sub_2ec1e00 reads of its definition (type +8): up to +0x128's dword
 constexpr u64 kWobbleA = 0x2e89d10;            // motion 0x570e6d0's update (and the end of 0x570e690's): count +0x6c, period +0x68
@@ -75,6 +75,7 @@ constexpr u64 kWobbleBBase = 0x2e8bfd0;        //   its base motion
 constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the lerp toward the parent, then kWobbleA
 constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
 constexpr u64 kWindSourcesStep = 0x1314660;    // the wind sources' registry (*0x58b0bb0) stepped: (registry, step)
+constexpr u64 kWindReceivers = 0x27174e0;      // the wind system's (*0x5940e00) receivers' update: (system, step)
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -87,6 +88,7 @@ using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64
 using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
 using LightFadesFn = GUEST_ABI void (*)(u64 list, float step);
 using WindStepFn = GUEST_ABI void (*)(u64 registry, float step);
+using WindReceiversFn = GUEST_ABI void (*)(u64 system, float step);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
@@ -96,6 +98,7 @@ void* g_game_wobble_follow = nullptr;
 void* g_game_gx_record = nullptr;
 void* g_game_light_fades = nullptr;
 void* g_game_wind_step = nullptr;
+void* g_game_wind_receivers = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
@@ -108,8 +111,8 @@ std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
 std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
-std::atomic<u64> g_records_2712_held{0};
-std::atomic<u32> g_hold_2712{1};  // BBHOST_SFX_2712_HOLD=0: type 0x2712's update runs on the frames between whole steps, as before
+std::atomic<u64> g_warmups_held{0};
+std::atomic<u32> g_hold_warmup{1};  // BBHOST_SFX_WIND_WARMUP_HOLD=0: the wind system's warm-up counts every frame, as before
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
 // instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
@@ -233,8 +236,9 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // whole step against the frame domain's frames) - and the FFX light, whose one
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
-// frames as with 30: the module 0x5760f20 and the GPU particle type 0x2712
-// (0x56eb030: whole grid passes of elapsed x 30). The wobbles are on it: their
+// frames as with 30: the module 0x5760f20. The game never makes GPU particle type
+// 0x2712 (0x56eb030): its registered create (0x12e7da0) returns null, so a
+// record of it never gets a type and never updates. The wobbles are on it: their
 // counts and re-rolls held between whole steps by sfx_wobble_a, sfx_wobble_b and
 // sfx_wobble_follow, their base motions (0x570e5d0's, 0x570e7d0's) and the
 // follows by the frame's own time - 0x570e890's follow is the game's own, its
@@ -280,12 +284,53 @@ constexpr u64 kConverted[] = {
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
 
-inline bool converted_class(u64 object) {
-    if (!object) return true;
-    const u64 vt = load<u64>(object);
+// The converted classes' vtables as the game has them, in a small open table that conv_build fills when the smooth
+// steps start (and the tests when they change the list): one probe or two a class where the list's scan took up to
+// one compare a converted class, for every motion, module and binder of every smooth instance, every frame. A list
+// it was not built for is scanned as before.
+constexpr std::size_t kConvSlots = 128;
+struct ConvTable {
+    const u64* list = nullptr;
+    std::size_t count = 0;
+    u64 slot[kConvSlots] = {};
+};
+ConvTable g_conv;
+inline std::size_t conv_slot(u64 vt) { return static_cast<std::size_t>(((vt >> 3) * 0x9E3779B97F4A7C15ull) >> 57) & (kConvSlots - 1); }
+void conv_build() {
+    ConvTable t;
+    t.list = g_converted;
+    t.count = g_converted_count;
+    for (std::size_t i = 0; i < g_converted_count && i < kConvSlots / 2; ++i) {
+        const u64 vt = game_address(g_converted[i]);
+        std::size_t h = conv_slot(vt);
+        while (t.slot[h] && t.slot[h] != vt) h = (h + 1) & (kConvSlots - 1);
+        t.slot[h] = vt;
+    }
+    if (g_converted_count > kConvSlots / 2) t.list = nullptr;  // too many for the table: scanned
+    g_conv = t;
+}
+inline bool converted_vt(u64 vt) {
+    if (!vt) return false;
+    if (g_conv.list == g_converted && g_conv.count == g_converted_count && g_conv.list) {
+        for (std::size_t h = conv_slot(vt);; h = (h + 1) & (kConvSlots - 1)) {
+            const u64 seen = g_conv.slot[h];
+            if (seen == vt) return true;
+            if (!seen) return false;
+        }
+    }
     for (std::size_t i = 0; i < g_converted_count; ++i)
         if (vt == game_address(g_converted[i])) return true;
     return false;
+}
+inline bool converted_class(u64 object) { return !object || converted_vt(load<u64>(object)); }
+
+// A node tree's next node, as sub_2c4f0e0 (kNodeNext) walks it: its first child (+0x70), else the next sibling
+// (+0x68) of it or of the nearest parent (+0x60) that has one, else none.
+inline u64 node_next(u64 node) {
+    if (const u64 child = load<u64>(node + 0x70)) return child;
+    for (; node; node = load<u64>(node + 0x60))
+        if (const u64 sibling = load<u64>(node + 0x68)) return sibling;
+    return 0;
 }
 
 // The classes that kept an instance on the held frames: their vtables and counts, a small open table
@@ -322,10 +367,13 @@ bool motion_converted(u64 motion, int depth, u64& kept) {
     return false;
 }
 
-// The first class of the instance's off the list (its vtable), or 0 when every one is on it.
-u64 first_unconverted(u64 instance) {
-    const auto next_of = game_function<NextFn>(kNodeNext);
-    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node)) {
+// The first class of the instance's off the list (its vtable), or 0 when every one is on it. With `marks`, the same
+// walk collects the instance's ribbons and GPU particle types 0x2713 for ribbon_mark (up to kMarks; past that
+// `*nmarks` is kMarks + 1 and mark_ribbons walks them again).
+constexpr int kMarks = 16;
+u64 first_unconverted(u64 instance, u64* marks = nullptr, int* nmarks = nullptr, bool* unbound = nullptr) {
+    const u64 binder_vt = game_address(0x56e3100), ribbon_vt = game_address(kGxTypeRibbon), vt2713 = game_address(kGxType2713);
+    for (u64 node = load<u64>(instance + 0x78); node; node = node_next(node)) {
         u64 kept = 0;
         if (!motion_converted(load<u64>(node + 0x90), 0, kept)) return kept;
         for (const u64 slot : {0x98ull, 0xa0ull, 0xa8ull}) {
@@ -336,10 +384,15 @@ u64 first_unconverted(u64 instance) {
             const u64 target = load<u64>(item + 0x20);
             if (!converted_class(target)) return load<u64>(target);
             // a GX binder's type instance (the GPU particle systems' kinds)
-            if (target && load<u64>(target) == game_address(0x56e3100)) {
+            if (target && load<u64>(target) == binder_vt) {
                 const u64 holder = load<u64>(target + 0x10);
                 const u64 type = holder ? load<u64>(holder + 8) : 0;
+                if (!type && unbound) *unbound = true;  // the GX side makes its type when it binds the record
                 if (!converted_class(type)) return load<u64>(type);
+                if (marks && type && (load<u64>(type) == ribbon_vt || load<u64>(type) == vt2713)) {
+                    if (*nmarks < kMarks) marks[*nmarks] = type;
+                    if (*nmarks <= kMarks) ++*nmarks;
+                }
             }
         }
     }
@@ -348,8 +401,7 @@ u64 first_unconverted(u64 instance) {
 
 // The instance's ribbons and GPU particle types 0x2713 marked for this frame (ribbon_mark); false when one finds no slot.
 bool mark_ribbons(u64 instance) {
-    const auto next_of = game_function<NextFn>(kNodeNext);
-    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node))
+    for (u64 node = load<u64>(instance + 0x78); node; node = node_next(node))
         for (u64 item = load<u64>(node + 0x80 + 0x30); item; item = load<u64>(item + 0x18)) {
             const u64 target = load<u64>(item + 0x20);
             if (!target || load<u64>(target) != game_address(0x56e3100)) continue;
@@ -359,6 +411,88 @@ bool mark_ribbons(u64 instance) {
                 return false;
         }
     return true;
+}
+
+// The instances' classifications (classify), kept for the frames between whole steps. An instance's node tree, the
+// classes its nodes use and its pending binders change only in what the effects count, on whole steps - the node
+// state machine sets nodes up, binds binders and frees the dead ones then - except a GX binder's type, which the GX
+// side makes when it first binds the record. So a classification made since the last whole step stands on a frame
+// between them while the instance still has its definition (+0x38), its root node (+0x78) and that node's first child
+// (+0x70), and every GX binder it met had its type; at most kSlotMarks ribbons and 0x2713 types to mark are kept with
+// it (more: classified every frame). A frame with a whole step always classifies anew. One 64-byte slot an instance,
+// by its address (a collision is classified again), behind a sequence word: a writer takes it odd by
+// compare-and-swap or leaves it, readers check it even and unchanged around their reads. A released instance's slot
+// is cleared at its last update (+0x88 bit 2), so an instance made later at the same address starts afresh.
+constexpr std::size_t kClassSlots = 2048;
+constexpr int kSlotMarks = 2;
+struct alignas(64) ClassSlot {
+    std::atomic<u32> seq{0};
+    std::atomic<u32> serial{0};
+    std::atomic<u64> inst{0}, def{0}, root{0}, child{0}, kept{0};
+    std::atomic<u64> marks[kSlotMarks] = {};
+};
+ClassSlot g_class_slots[kClassSlots];
+std::atomic<u32> g_step_serial{1};  // frames with a whole step so far
+std::atomic<u64> g_class_made{0}, g_class_reused{0};
+inline ClassSlot& class_slot(u64 instance) {
+    return g_class_slots[static_cast<std::size_t>(((instance >> 4) * 0x9E3779B97F4A7C15ull) >> 53) & (kClassSlots - 1)];
+}
+
+// The instance's first class off the list (0: none) and, when there is none, its ribbons and 0x2713 types to mark
+// (`*nmarks` past kMarks: too many to collect), as first_unconverted finds them - kept for the frames to the next
+// whole step.
+u64 classify(u64 instance, u64* marks, int* nmarks) {
+    const u64 def = load<u64>(instance + 0x38), root = load<u64>(instance + 0x78), child = root ? load<u64>(root + 0x70) : 0;
+    const u32 serial = g_step_serial.load(std::memory_order_relaxed);
+    ClassSlot& slot = class_slot(instance);
+    *nmarks = 0;
+    if (g_between.load(std::memory_order_relaxed)) {
+        const u32 s1 = slot.seq.load(std::memory_order_acquire);
+        if (!(s1 & 1) && slot.inst.load(std::memory_order_relaxed) == instance &&
+            (slot.serial.load(std::memory_order_relaxed) == serial || MUTANT(51)) &&
+            ((slot.def.load(std::memory_order_relaxed) == def && slot.root.load(std::memory_order_relaxed) == root &&
+              slot.child.load(std::memory_order_relaxed) == child) ||
+             MUTANT(52))) {
+            const u64 kept = slot.kept.load(std::memory_order_relaxed);
+            u64 kept_marks[kSlotMarks];
+            for (int i = 0; i < kSlotMarks; ++i) kept_marks[i] = slot.marks[i].load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slot.seq.load(std::memory_order_relaxed) == s1) {
+                g_class_reused.fetch_add(1, std::memory_order_relaxed);
+                for (int i = 0; i < kSlotMarks && kept_marks[i]; ++i) marks[(*nmarks)++] = kept_marks[i];
+                return kept;
+            }
+        }
+    }
+    bool unbound = false;
+    const u64 kept = first_unconverted(instance, marks, nmarks, &unbound);
+    g_class_made.fetch_add(1, std::memory_order_relaxed);
+    if ((!unbound || MUTANT(53)) && *nmarks <= kSlotMarks) {
+        u32 s = slot.seq.load(std::memory_order_relaxed);
+        if (!(s & 1) && slot.seq.compare_exchange_strong(s, s + 1, std::memory_order_relaxed)) {
+            std::atomic_thread_fence(std::memory_order_release);
+            slot.inst.store(instance, std::memory_order_relaxed);
+            slot.serial.store(serial, std::memory_order_relaxed);
+            slot.def.store(def, std::memory_order_relaxed);
+            slot.root.store(root, std::memory_order_relaxed);
+            slot.child.store(child, std::memory_order_relaxed);
+            slot.kept.store(kept, std::memory_order_relaxed);
+            for (int i = 0; i < kSlotMarks; ++i) slot.marks[i].store(!kept && i < *nmarks ? marks[i] : 0, std::memory_order_relaxed);
+            slot.seq.store(s + 2, std::memory_order_release);
+        }
+    }
+    return kept;
+}
+
+// A released instance's classification let go (its address may hold another instance next).
+void forget_class(u64 instance) {
+    ClassSlot& slot = class_slot(instance);
+    u32 s = slot.seq.load(std::memory_order_relaxed);
+    if (slot.inst.load(std::memory_order_relaxed) != instance || (s & 1)) return;
+    if (!slot.seq.compare_exchange_strong(s, s + 1, std::memory_order_relaxed)) return;
+    std::atomic_thread_fence(std::memory_order_release);
+    if (slot.inst.load(std::memory_order_relaxed) == instance) slot.inst.store(0, std::memory_order_relaxed);
+    slot.seq.store(s + 2, std::memory_order_release);
 }
 
 u8 smooth_update(u64 instance, u64 context, float step) {
@@ -385,9 +519,8 @@ u8 smooth_update(u64 instance, u64 context, float step) {
     }
     const u64 definition = load<u64>(instance + 0x38);
     if (!definition) return 1;
-    const auto next_of = game_function<NextFn>(kNodeNext);
     for (u64 node = load<u64>(instance + 0x78); node;) {
-        const u64 next = next_of(node);
+        const u64 next = node_next(node);
         if (!sfx_node::update(node, st, definition, context)) {
             game_function<NodeFn>(kNodeRelease)(node);
             game_function<NodeFn>(kNodeClear)(node);
@@ -407,13 +540,16 @@ u8 smooth_update(u64 instance, u64 context, float step) {
 // are skipped and each node runs node_held(), which frees none.
 DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     const u32 flags = load<u32>(instance + 0x88);
+    if (g_smooth.load(std::memory_order_relaxed) && (flags & 4) && !MUTANT(54)) forget_class(instance);
     if (g_smooth.load(std::memory_order_relaxed) && !(flags & 4) && (flags & 1)) {
         const u64 sfx = load<u64>(game_address(kSprjSfx));
         if (!(sfx && load<u32>(sfx + 0x8c))) {  // the game's own still frame stays the game's
-            if (const u64 kept = first_unconverted(instance)) {
+            u64 marks[kMarks];
+            int nmarks = 0;
+            if (const u64 kept = classify(instance, marks, &nmarks)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(kept);
-            } else if (!mark_ribbons(instance)) {
+            } else if (nmarks > kMarks ? !mark_ribbons(instance) : !std::all_of(marks, marks + nmarks, [](u64 t) { return ribbon_mark(t); })) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon (or a 0x2713) this frame: held, as at 30
             } else {
@@ -429,9 +565,8 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     }
     const u64 definition = load<u64>(instance + 0x38);
     if (!definition) return 1;
-    const auto next_of = game_function<NextFn>(kNodeNext);
     for (u64 node = load<u64>(instance + 0x78); node;) {
-        const u64 next = next_of(node);
+        const u64 next = node_next(node);
         float copy = s;
         if (!node_held(node, &copy, definition, context)) {
             game_function<NodeFn>(kNodeRelease)(node);
@@ -559,6 +694,36 @@ DECOMP_LEAF void sfx_wind_sources_step(u64 registry, float step) {
         }
     }
     game(registry, s);
+}
+
+// The wind system's receivers' update (sub_27174e0, read in Binary Ninja; the
+// effect manager's update calls it at 0x26ff41a with its step). After a reset
+// (sub_27136a0, sub_2717100: +0x4c = 1, +0x4d = 1, +0x50 = 60) it counts its
+// calls - +0x50 down by one a call while +0x4d is set, then +0x4d cleared - and
+// clears the reset's one-shot +0x4c; while either is set the grass and trees'
+// sway (sub_2713870) settles (each receiver's call count +0xc30, its first
+// call's damping of +0x6a0). The receivers' callbacks it hands the step to
+// (+0x180, sub_132c730) are never set - their set-up (sub_132c230) zeroes them
+// and nothing writes them - and the rest of the update (each receiver's
+// overlapping wind sources, sub_132c750; its own time +0x58) does not read the
+// step. So the count is the update's one counted part: 60 calls, 2 s at 30, and
+// 1 s at 60 or 0.5 s at 120 with the frames between whole steps counting too.
+// On such a frame - the gate on or off, not the game's own still frame - the
+// count (+0x4d, +0x50) waits for the whole step: the rest of the update runs as
+// the game's, +0x4c cleared by the first call as the game clears it.
+DECOMP_LEAF void sfx_wind_receivers(u64 system, float step) {
+    const auto game = reinterpret_cast<WindReceiversFn>(g_game_wind_receivers);
+    if (!g_hold_warmup.load(std::memory_order_relaxed) || MUTANT(49) || !between_steps()) {
+        game(system, step);
+        return;
+    }
+    g_warmups_held.fetch_add(1, std::memory_order_relaxed);
+    const u8 on = load<u8>(system + 0x4d);
+    const u32 left = load<u32>(system + 0x50);
+    game(system, step);
+    if (MUTANT(50)) return;
+    store<u8>(system + 0x4d, on);
+    store<u32>(system + 0x50, left);
 }
 
 // The wobble motions. Motion classes 0x570e6d0 and 0x570e690 (whose update,
@@ -718,44 +883,11 @@ inline int ribbon_mode(u64 record, u64 item, u64 type, float& into) {
     return 2;
 }
 
-// GPU particle type 0x2712's update (sub_12e6080, read in Binary Ninja) counts in its updates: at the start of
-// each it checks its emission timer +0x528 (run out: an interval drawn from the FX RNG at data_5940de8 +0x30, the
-// emission flag +0x2f4 set, else cleared), it draws six more FX RNG values for its emitter's jitter (+0x2e4..+0x2ec,
-// +0x308..+0x310 and its grid's +0x138 object's +0x24c / +0x270), moves its grid to the emitter (+0x20: sub_132e6f0,
-// sub_132e620) and at the end takes the record's elapsed time off the timer. Its grid pass (vtable +0x18, sub_12e6e10
-// -> sub_132e860 -> sub_1330e40, which reads the flag) runs only when that elapsed time is above 0. On a frame between
-// whole steps the item's step is 0: the timer that ran out on the whole step fired there, the pass did not run, and
-// the next whole step cleared the flag - at 60 fps and above none of its emissions reached the grid, at 45 about half,
-// and the FX RNG was drawn on every frame. So on such a frame the record takes its item - its rows, its times (the
-// elapsed time 0, so no pass) and its bounds - with a stand-in for the type whose update is only that update's
-// result: the bounds sub_12e6080 always gives, data_4b38150's w lane choosing data_4b38020's 1 over data_4b38140's
-// -FLT_MAX and data_4b38130's FLT_MAX. The type itself waits for the whole step, as at 30.
-DECOMP_LEAF void sfx_2712_bounds(u64 out, u64, u64, u64) {
-    for (u64 lane = 0; lane < 4; ++lane) {
-        const u32 w = load<u32>(game_address(0x4b38150) + 4 * lane), one = load<u32>(game_address(0x4b38020) + 4 * lane);
-        const u32 lo = load<u32>(game_address(0x4b38140) + 4 * lane), hi = load<u32>(game_address(0x4b38130) + 4 * lane);
-        store<u32>(out + 4 * lane, (w & one) | (~w & lo));
-        store<u32>(out + 0x10 + 4 * lane, MUTANT(48) ? 0u : (w & one) | (~w & hi));
-    }
-}
-alignas(16) u64 g_type_2712_vtable[8];
-alignas(16) u64 g_type_2712_stand_in[2];
-
 }  // namespace
 
 DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
     const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
     const u64 type = load<u64>(record + 8);
-    if (type && load<u64>(type) == game_address(kGxType2712) && g_hold_2712.load(std::memory_order_relaxed) && !MUTANT(46) &&
-        load<float>(item + 0x60) == 0.0f && between_steps()) {
-        g_records_2712_held.fetch_add(1, std::memory_order_relaxed);
-        g_type_2712_vtable[2] = reinterpret_cast<u64>(&sfx_2712_bounds);  // vtable +0x10, the update
-        g_type_2712_stand_in[0] = reinterpret_cast<u64>(g_type_2712_vtable);
-        store<u64>(record + 8, reinterpret_cast<u64>(g_type_2712_stand_in));
-        game(record, item);
-        if (!MUTANT(47)) store<u64>(record + 8, type);
-        return;
-    }
     if (type && load<u64>(type) == game_address(kGxTypeRibbon)) {
         float into = 0.0f;
         const int mode = ribbon_mode(record, item, type, into);
@@ -844,6 +976,7 @@ DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
 
 void decomp_sfx_gate_frame(bool between) {
     g_between.store(between ? 1u : 0u, std::memory_order_relaxed);
+    if (!between) g_step_serial.fetch_add(1, std::memory_order_relaxed);
     if (between) g_frames_between.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -863,7 +996,10 @@ void decomp_sfx_frame_time(float frame, float from, float into) {
     g_frame_into.store(into, std::memory_order_relaxed);
 }
 
-void decomp_sfx_smooth(bool on) { g_smooth.store(on ? 1u : 0u, std::memory_order_relaxed); }
+void decomp_sfx_smooth(bool on) {
+    if (on) conv_build();
+    g_smooth.store(on ? 1u : 0u, std::memory_order_relaxed);
+}
 
 bool decomp_sfx_gate_placed() { return decomp_placed("sub_2c4ff30") == 1 && decomp_placed("sub_131e660") == 1; }
 
@@ -881,19 +1017,23 @@ constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0
 constexpr std::uint8_t kLightFadesEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 // The wind sources' step: push rbp; mov rbp, rsp; push r14, rbx; sub rsp, 0x10; vmovss [rbp-0x14], xmm0.
 constexpr std::uint8_t kWindStepEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x10, 0xc5, 0xfa, 0x11, 0x45, 0xec};
+// The wind receivers' update: push rbp; mov rbp, rsp; push r15..rbx; sub rsp, 0x78; vmovss [rbp-0x8c], xmm0.
+constexpr std::uint8_t kWindReceiversEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+                                                0x48, 0x83, 0xec, 0x78, 0xc5, 0xfa, 0x11, 0x85, 0x74, 0xff, 0xff, 0xff};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
     host_log("decomp: the effects' frames between whole steps: %llu frames; %llu instance updates, %llu light updates and %llu wobble "
-             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time, %llu GPU type 0x2712 updates held for the "
-             "whole step (BBHOST_SFX_2712_HOLD=%u); %llu calls on the game's own still frame left to it",
+             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time; %llu calls on the game's own still frame left to it",
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
-             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_records_2712_held.load()),
-             g_hold_2712.load(), static_cast<ull>(g_still_frames.load()));
+             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_still_frames.load()));
+    host_log("decomp:   the wind system's warm-up count held for the whole step on %llu frames (BBHOST_SFX_WIND_WARMUP_HOLD=%u)",
+             static_cast<ull>(g_warmups_held.load()), g_hold_warmup.load());
     if (!g_smooth.load()) return;
     host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
-             "list (%zu classes on it)",
-             static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
+             "list (%zu classes on it); their classes looked at %llu times, %llu more taken from the frame's whole step",
+             static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count,
+             static_cast<ull>(g_class_made.load()), static_cast<ull>(g_class_reused.load()));
     host_log("decomp:   FFX light updates by the frame's time: %llu, %llu of them after the whole step's own; light fades by the frame's time: %llu",
              static_cast<ull>(g_lights_smooth.load()), static_cast<ull>(g_lights_counted.load()), static_cast<ull>(g_fades_smooth.load()));
     host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
@@ -916,10 +1056,7 @@ void report() {
 
 void decomp_sfx_step_gate_add() {
     const char* area = "sfx";
-    if (const char* e = std::getenv("BBHOST_SFX_2712_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_2712.store(e[0] == '1' ? 1u : 0u);
-    if (!g_hold_2712.load())
-        host_log("decomp: GPU type 0x2712's update runs on the frames between whole effect steps, as before (BBHOST_SFX_2712_HOLD=0): "
-                 "its emissions there never reach its grid");
+    if (const char* e = std::getenv("BBHOST_SFX_WIND_WARMUP_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_warmup.store(e[0] == '1' ? 1u : 0u);
     DecompFunction instance{"sub_2c4ff30", area, 0x2c4ff30, kInstanceEntry, sizeof(kInstanceEntry),
                             reinterpret_cast<void*>(&sfx_instance_update), DecompKind::Leaf, &g_game_instance};
     instance.report = &report;
@@ -938,4 +1075,6 @@ void decomp_sfx_step_gate_add() {
                 DecompKind::Leaf, &g_game_light_fades});
     decomp_add({"sub_1314660", area, kWindSourcesStep, kWindStepEntry, sizeof(kWindStepEntry), reinterpret_cast<void*>(&sfx_wind_sources_step),
                 DecompKind::Leaf, &g_game_wind_step});
+    decomp_add({"sub_27174e0", area, kWindReceivers, kWindReceiversEntry, sizeof(kWindReceiversEntry),
+                reinterpret_cast<void*>(&sfx_wind_receivers), DecompKind::Leaf, &g_game_wind_receivers});
 }

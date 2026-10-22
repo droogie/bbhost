@@ -1553,35 +1553,29 @@ int wanted_fps() {
 }
 
 // The effects' and the wind's step above 30 fps: 30 (whole 1/30 s for both,
-// the frames between holding the effects' counts; the default), 60 (whole
-// 1/60 s for the effects, the frame's time for the wind) or 0 for frame (both
-// by the frame's time). BBHOST_SFX_STEP=30|60|frame wins over the config's
-// [video] effect_steps.
+// the frames between holding the effects' counts; smooth, the default, and
+// 30), 60 (whole 1/60 s for the effects, the frame's time for the wind) or 0
+// for frame (both by the frame's time). BBHOST_SFX_STEP=30|smooth|60|frame
+// wins over the config's [video] effect_steps.
 int effect_steps() {
-    std::string v;
-    const char* from = "BBHOST_SFX_STEP";
-    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) {
-        v = e;
-    } else {
-        v = config_value("video.effect_steps");
-        from = "[video] effect_steps";
-    }
-    if (v.empty() || v == "30" || v == "smooth") return 30;
+    const std::string v = config_effect_steps();
+    const char* env = std::getenv("BBHOST_SFX_STEP");
+    const char* from = env && *env ? "BBHOST_SFX_STEP" : "[video] effect_steps";
+    if (v == "30" || v == "smooth") return 30;
     if (v == "60") return 60;
     if (v == "frame") return 0;
     host_log("frame rate: %s = %s is none of 30, smooth, 60 and frame; 30 runs", from, v.c_str());
     return 30;
 }
 
-// Effect steps smooth: whole 1/30 s for what the effects count in updates, as
-// 30, and the frame's own time for what they integrate, in every instance whose
-// classes the step gate has converted (decomp/sfx/step_gate.cpp; the rest hold
-// as 30). [video] effect_steps = "smooth" or BBHOST_SFX_STEP=smooth asks for it;
-// BBHOST_SFX_SMOOTH=0|1 overrides either for a harness.
+// Effect steps smooth, the default: whole 1/30 s for what the effects count in
+// updates, as 30, and the frame's own time for what they integrate, in every
+// instance whose classes the step gate has converted (decomp/sfx/step_gate.cpp;
+// the rest hold as 30). [video] effect_steps = 30, 60 or frame (or
+// BBHOST_SFX_STEP) turns it off; BBHOST_SFX_SMOOTH=0|1 overrides either for a
+// harness.
 bool effect_steps_smooth() {
-    bool on;
-    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) on = std::string(e) == "smooth";
-    else on = config_value("video.effect_steps") == "smooth";
+    bool on = config_effect_steps() == "smooth";
     if (const char* e = std::getenv("BBHOST_SFX_SMOOTH"); e && (e[0] == '0' || e[0] == '1')) on = e[0] == '1';
     return on;
 }
@@ -1854,8 +1848,8 @@ int apply_rate(ElfImage* image, int want) {
                 le(sfx_disp, disp);
                 write(kSfxStepLoad + 4, disp, sizeof(disp));
                 host_log("frame rate: the effects step in whole 1/%d s, the rest carried (SprjSfx::Update's load at 0x%x; effect steps "
-                         "%d, [video] effect_steps or BBHOST_SFX_STEP: 30, 60 or frame)",
-                         steps, kSfxStepLoad, steps);
+                         "%s, [video] effect_steps or BBHOST_SFX_STEP: smooth (the default), 30, 60 or frame)",
+                         steps, kSfxStepLoad, smooth && steps == 30 ? "smooth" : steps == 30 ? "30" : "60");
                 if (steps == 30) {
                     // The wind's three loads, at the frame-time slot by the 60
                     // FPS++ sites, to the effects' step: each checked first.

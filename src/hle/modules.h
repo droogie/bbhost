@@ -145,6 +145,12 @@ void hle_gnm_find_writes(std::uint64_t va, std::uint64_t bytes, std::uint64_t va
 // recorded and submitted (the frame may then be shown at once); false from a
 // game thread's flip request, which may be ahead of them.
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded = false);
+// The game called sceGnmSubmitAndFlipCommandBuffers with flip argument `arg`, on
+// this thread (the flip keeper's view of its flips, hle/flip_pacing.h).
+// Returns when it first looked at the flip status since its flip before
+// (steady-clock ns; 0 when not tracked or it did not look), for the flip
+// timeline (BBHOST_FLIP_TIMELINE=1).
+std::uint64_t hle_video_note_flip_call(std::int64_t arg);
 std::uint64_t hle_video_flip_count();
 std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
 // A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the

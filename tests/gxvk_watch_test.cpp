@@ -2,18 +2,25 @@
 // random adds and removes up to every slot taken, random destinations - most
 // of them meeting a watched range or touching one's ends, the rest anywhere in
 // a 64 GiB space, so granules 1 GiB apart share their counters - and ranges
-// wider than the table. Its answers must be the list's: a slot meets a
-// destination exactly when a range does, the granules never say no where a
-// range meets it, a full watch takes no more, and once every range is gone no
-// granule holds a count. Then four deliberate mistakes, each of which must be
-// caught: the granules asked only at the destination's start, a range counted
-// one granule short, a removal that leaves its counts, a slot that takes a
-// range ending where the destination starts as meeting it.
+// wider than the table. Its answers must be the list's: the published ranges
+// meet a destination exactly when a range does, the granules never say no
+// where a range meets it, a full watch takes no more, and once every range is
+// gone no granule holds a count. Then five deliberate mistakes, each of which
+// must be caught: the granules asked only at the destination's start, a range
+// counted one granule short, a removal that leaves its counts, a range ending
+// where the destination starts taken as meeting it, and the search's range
+// asked for its own end instead of the highest end so far. Last, readers ask
+// while a writer adds and removes ranges, as GX's threads do while the table
+// changes: a range watched throughout must always be found, and an address no
+// range ever covers never.
 #define GXVK_WATCH_MUTANTS
 #include "host/gxvk_watch.h"
 
+#include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <vector>
 
 int g_watch_mutant = 0;
@@ -118,9 +125,10 @@ int main() {
         std::printf("FAIL: the watch disagrees with its ranges\n");
         ++failed;
     }
-    static const char* const kMistakes[4] = {"the granules asked only at the destination's start", "a range counted one granule short",
-                                             "a removal that leaves its counts", "a range ending at the destination's start taken as meeting it"};
-    for (int m = 1; m <= 4; ++m) {
+    static const char* const kMistakes[5] = {"the granules asked only at the destination's start", "a range counted one granule short",
+                                             "a removal that leaves its counts", "a range ending at the destination's start taken as meeting it",
+                                             "the search's range asked for its own end, not the highest end so far"};
+    for (int m = 1; m <= 5; ++m) {
         g_watch_mutant = m;
         const Result x = run(2);
         g_watch_mutant = 0;
@@ -131,6 +139,60 @@ int main() {
             std::printf("mistake %d (%s) caught: slot answers wrong %llu, granules missing %llu, counts left %llu\n", m, kMistakes[m - 1],
                         static_cast<unsigned long long>(x.wrong_hit), static_cast<unsigned long long>(x.missed),
                         static_cast<unsigned long long>(x.left_counts));
+        }
+    }
+    // Readers against a writer: one range watched throughout, others added and
+    // removed around it as fast as the writer can, readers asking all the while.
+    {
+        static gxvk::CopyWatch<> w;
+        std::mutex mu;
+        constexpr std::uint64_t kHeld = 0x200000000ull, kHeldEnd = kHeld + 0x60;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            w.add(kHeld, kHeldEnd);
+        }
+        std::atomic<bool> stop{false};
+        std::atomic<std::uint64_t> asked{0}, lost{0}, phantom{0};
+        std::thread writer([&] {
+            std::mt19937_64 rng(7);
+            std::vector<int> slots;
+            for (int i = 0; i < 400000; ++i) {
+                std::lock_guard<std::mutex> lk(mu);
+                if (slots.size() < 40 && (rng() & 1)) {
+                    const std::uint64_t lo = 0x100000000ull + (rng() % 0x80000000ull & ~15ull);
+                    const std::uint64_t a = lo < kHeld && lo + 0x10000 > kHeld ? lo - 0x20000 : lo;
+                    const int slot = w.add(a, a + 16 + (rng() % 0x8000 & ~15ull));
+                    if (slot >= 0) slots.push_back(slot);
+                } else if (!slots.empty()) {
+                    const std::size_t k = rng() % slots.size();
+                    w.remove(slots[k]);
+                    slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(k));
+                }
+            }
+            stop = true;
+        });
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 3; ++t) {
+            readers.emplace_back([&] {
+                std::uint64_t n = 0, l = 0, ph = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    l += !w.hit(kHeld + 0x20, 8) || !w.written(kHeld + 0x20, 8);
+                    ph += w.hit(0x900000000ull, 64);  // no range ever starts above 0x180000000 + 0x8000
+                    ++n;
+                }
+                asked += n;
+                lost += l;
+                phantom += ph;
+            });
+        }
+        writer.join();
+        for (std::thread& t : readers) t.join();
+        std::printf("readers against a writer: %llu asked, the held range lost %llu times, an unwatched address found %llu times\n",
+                    static_cast<unsigned long long>(asked.load()), static_cast<unsigned long long>(lost.load()),
+                    static_cast<unsigned long long>(phantom.load()));
+        if (lost || phantom || !asked) {
+            std::printf("FAIL: a reader saw the ranges mid-change\n");
+            ++failed;
         }
     }
     std::printf(failed ? "gxvk_watch_test: %d failed\n" : "gxvk_watch_test: ok\n", failed);

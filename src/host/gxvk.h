@@ -154,8 +154,8 @@ void buffer_written(std::uint64_t holder, Retire why);
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why);
 // A GPU copy's destination with the handles on (=1): a kept default buffer it
 // writes is retired - asked of the copy watch without a lock
-// (host/gxvk_watch.h), so a copy into memory no kept default buffer holds
-// (nearly all) reads a counter or two.
+// (host/gxvk_watch.h): a copy far from every kept default buffer reads a
+// counter or two, one next to them searches their ranges in halves.
 void copy_written(std::uint64_t va, std::uint64_t bytes);
 // BBHOST_GXVK_BUFFERS=2: the copy watch's granules checked against its slots
 // for a copy's destination (the exit report counts a miss, which may not be).
@@ -164,5 +164,67 @@ void memory_released(std::uint64_t va, std::uint64_t bytes);
 // The exit report's lines for the table (gx_resources_report calls it; the
 // command processor's side reports with the GPU's).
 void buffers_report();
+
+// --- Stage 1c: GX's upload heap bound in place (host/gxvk_arena.cpp) ---
+//
+// The heap - the one region GX's device gives its block pool, where every
+// renamed constant buffer, Map rename and ring allocation lies - is handed
+// out again only after the GPU has finished the work that used it, so a
+// range of it the command processor binds can be bound where it is: no
+// snapshot, no lookup. The release order is proven for every binding and
+// the bytes for a sample of them, every run; a violation sends every
+// binding of the heap back to today's path.
+// BBHOST_GXVK_ARENA: 0 (the default) today's path; 1 in place, where the
+// heap is; 2 in place, the heap moved into video memory the CPU writes
+// first (where the device can place a mapping, and the budget has room);
+// compare: today's path, with every binding of the heap checked as 1 would
+// bind it.
+enum class Arena : int { kOff = 0, kInPlace = 1, kCompare = 2, kMoved = 3 };
+Arena arena_mode();
+inline bool arena_wanted() { return arena_mode() != Arena::kOff; }
+// The pool's init (decomp/gx/upload_heap.cpp's entry): the pool and the
+// region it is made over. Returns the region to use instead and writes its
+// bytes, or 0 to keep the game's (stage 1c keeps it).
+std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t* out_bytes);
+// The heap's bounds, once its pool is made.
+bool arena_heap(std::uint64_t* lo, std::uint64_t* hi);
+// BBHOST_GXVK_ARENA=2: the heap to move (the host mapping the pool was given
+// instead of the game's region), until the GPU has moved it or given up.
+bool arena_move_pending(std::uint64_t* va, std::uint64_t* bytes);
+// The GPU's start, moving the heap: `on` while its bytes are copied and its
+// device memory placed over it (a write to it waits in the fault handler);
+// then whether the move held, with what the memory is.
+void arena_moving(bool on);
+void arena_moved(bool ok, const char* what);
+// The fault handler's (async-signal-safe, no stack protector): a write fault
+// on the heap while it moves waits for the move and returns true (retry).
+bool arena_move_fault(std::uint64_t addr);
+// A hand-out by the block pool (the registry's pool hooks, as they return):
+// the pool and the node it returned.
+void arena_handout(std::uint64_t pool, std::uint64_t node);
+// The command processor, as it binds [va, +bytes) for `use` in submission
+// `serial`: true when the range lies in one of the heap's hand-outs and is
+// to be bound in place (its submission is stamped on the hand-out); false
+// for today's path (counted by reason when the range lies in the heap).
+// `stored`: the shader stores to it.
+bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
+// The binding found no one buffer over the heap to bind it in.
+void arena_no_backing();
+// Today's path over the heap, counted where it runs: the work stage 1c takes
+// away, and the command processor's reads of descriptor tables in the heap -
+// slow once the heap is in write-combined video memory (BBHOST_GXVK_ARENA=2).
+enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending, kArenaTableRead, kArenaNotes };
+void arena_note(ArenaNote what, std::uint64_t bytes);
+// The exit report (gx_resources_report calls it).
+void arena_report();
+#ifdef GXVK_ARENA_TESTING
+// tests/gxvk_arena_test.cpp: everything forgotten, and the mode set.
+void arena_test_reset(Arena mode);
+struct ArenaTestCounts {
+    std::uint64_t violations_order = 0, violations_bytes = 0, samples_checked = 0, fell = 0;
+    bool in_place = true;
+};
+ArenaTestCounts arena_test_counts();
+#endif
 
 }  // namespace gxvk

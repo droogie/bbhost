@@ -1463,210 +1463,232 @@ int check_records(int cases, u64 sfx) {
     return bad;
 }
 
-// --- GPU particle type 0x2712's record ---------------------------------------------
+// --- the classifications kept between whole steps ---------------------------------------------
 
-// Type 0x2712 (vtable 0x56eb030; its update sub_12e6080 and its grid's sub_132e6f0 / sub_132e620 the game's own, its
-// definition's curves the test's) under frame sequences at 30, 45, 60, 90, 120, 144 and jittered rates, the record
-// taking its items through ours (the gate on or off), against the game's at 30 - every item a whole step's: after every
-// whole step the type's 0x600 bytes, its grid object's (+0x138) and the FX RNG (data_5940de8 +0x30) bit-equal to the
-// game's at 30 after as many whole steps; between whole steps the type, its grid object and the FX RNG untouched, the
-// record's rows the item's, its elapsed time 0 and its bounds the update's own (-FLT_MAX..FLT_MAX, w 1), the type back
-// in it; the emissions a grid pass sees (one runs after a frame's update when the record's elapsed time is above 0 and
-// reads +0x2f4) the same as at 30. With the hold off (BBHOST_SFX_2712_HOLD=0, the game's update on every frame) the
-// same counts are taken for the record: what the hold gives back.
-GUEST_ABI __m128 curve_2712(u64 curve, u64, const float* t) { return _mm_set1_ps(load<float>(curve + 8) + load<float>(curve + 12) * *t); }
-alignas(64) u8 g_curve_2712_vt[0x80];
-alignas(64) u8 g_fx_system[0x100];  // what data_5940de8 points at: +0 the rate its frame counts are in, +0x30 the FX RNG
-u64 curve_2712_new(float a, float b) {
-    const u64 c = block(0x20);
-    store<u64>(c, reinterpret_cast<u64>(g_curve_2712_vt));
-    store<float>(c + 8, a);
-    store<float>(c + 12, b);
-    return c;
+// classify against first_unconverted's own answer, frame by frame, under the real converted list: frames at 120 (a whole
+// step, then three between), the instance's nodes and classes changed the ways the game changes them - on a whole
+// step a node set up, a binder bound, a module made or let go (any class, off the list too); between them only a
+// pending binder taken by the GX side or a GX binder's type made (a ribbon among them). With a whole step the answer
+// is the walk's; between them the decision must be the walk's, or held where the walk now finds the instance all on the
+// list (its unconverted binder taken since), and a smooth instance's marks hold every type the walk would mark. Then the
+// cases the slot's checks are for: an instance not updated on the whole step (the serial), another instance at a
+// released or reused address (the shape, the release), a GX binder bound between whole steps (its type to mark).
+void cache_classes(u64 n, bool off) {
+    const int mk = g_rng.range(0, 2);
+    store<u64>(n + 0x90, mk == 0 ? 0 : motion_on(mk - 1));
+    store<u64>(n + 0x98, g_rng.chance(0.5) ? object_of(any(kOnModules)) : 0);
+    store<u64>(n + 0xa0, 0);
+    store<u64>(n + 0xa8, off ? object_of(kOffModule) : g_rng.chance(0.3) ? object_of(any(kOnModules)) : 0);
+    store<u64>(n + 0xb0, 0);
+    const int pending = g_rng.range(0, 2);
+    for (int k = 0; k < pending; ++k) pend(n, g_rng.chance(0.5) ? object_of(kCpuBinder) : gx_binder(any(kOnGxTypes)));
 }
-// The FX RNG's draws from one state to another (xorshift128, sub_12e6080's): how many steps, or -1 past `limit`.
-long rng_draws(const u32 from[4], const u32 to[4], long limit) {
-    u32 x = from[0], y = from[1], z = from[2], w = from[3];
-    for (long n = 0; n <= limit; ++n) {
-        if (x == to[0] && y == to[1] && z == to[2] && w == to[3]) return n;
-        const u32 t = x ^ (x << 11);
-        x = y, y = z, z = w;
-        w = w ^ (w >> 19) ^ t ^ (t >> 8);
+// A GX binder whose record has no type yet (the GX side makes it).
+u64 unbound_binder() {
+    const u64 b = object_of(kGxBinder), holder = block(0x20);
+    store<u64>(holder + 8, 0);
+    store<u64>(b + 0x10, holder);
+    return b;
+}
+void add_child(u64 inst, u64 n) {
+    const u64 root = load<u64>(inst + 0x78);
+    store<u64>(n + 0x60, root);
+    store<u64>(n + 0x68, 0);
+    store<u64>(n + 0x70, 0);
+    if (!load<u64>(root + 0x70)) {
+        store<u64>(root + 0x70, n);
+        return;
     }
-    return -1;
+    u64 sib = load<u64>(root + 0x70);
+    while (load<u64>(sib + 0x68)) sib = load<u64>(sib + 0x68);
+    store<u64>(sib + 0x68, n);
 }
-struct Seen2712 {
-    // by rate kind (30, 45, 60, 90, 120, 144, jittered): game seconds, emissions a pass saw (held, at 30, not held), draws
-    double seconds[7] = {}, seconds_off[7] = {};
-    long seen[7] = {}, seen30[7] = {}, seen_off[7] = {}, draws[7] = {}, draws30[7] = {}, draws_off[7] = {};
-    long held = 0, frames = 0;
-} g_seen_2712;
-int check_records_2712(int cases, u64 sfx) {
-    store<u32>(sfx + 0x8c, 0);
-    const u64 fx_slot = reinterpret_cast<u64>(eboot_kit::at(0x5940de8));
-    const u64 fx_before = load<u64>(fx_slot);
-    const u64 fx = reinterpret_cast<u64>(g_fx_system);
-    store<u64>(fx_slot, fx);
-    store<float>(fx, 30.0f);
-    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
-    constexpr u64 kTypeSize = 0x600, kGridObjectSize = 0x300;
-    static const u64 kCurves[] = {0x78, 0x88, 0x98, 0xb0, 0xc8, 0xe0, 0xf8, 0x110, 0x128, 0x140, 0x158};
-    static const double kRates[] = {30, 45, 60, 90, 120, 144};
+std::vector<u64> tree_nodes(u64 inst) {
+    std::vector<u64> v;
+    for (u64 n = load<u64>(inst + 0x78); n; n = node_next(n)) v.push_back(n);
+    return v;
+}
+struct CacheSeen {
+    long frames = 0, reused = 0, held_kept = 0;
+} g_seen_cache;
+
+// One frame's classify against the walk; `between`: the cached answer may hold an instance the walk finds all on the
+// list, and its marks may hold more types. Returns a reason it differs, or nullptr.
+const char* cache_frame(u64 inst, bool between) {
+    decomp_sfx_gate_frame(between);
+    const u64 reused_before = g_class_reused.load();
+    u64 m1[kMarks], m2[kMarks];
+    int n1 = 0, n2 = 0;
+    const u64 k1 = classify(inst, m1, &n1);
+    const u64 k2 = first_unconverted(inst, m2, &n2);
+    ++g_seen_cache.frames;
+    g_seen_cache.reused += static_cast<long>(g_class_reused.load() - reused_before);
+    if (!between) {
+        if (k1 != k2) return "with a whole step: another class kept";
+        if (!k1 && (n1 != n2 || !std::equal(m1, m1 + std::min(n1, kMarks), m2))) return "with a whole step: other marks";
+        return nullptr;
+    }
+    if (!k1 && k2) return "between whole steps: smooth where the walk keeps it";
+    if (k1 && !k2) {
+        ++g_seen_cache.held_kept;
+        return nullptr;
+    }
+    if (!k1) {
+        if (n2 > kMarks) return n1 > kMarks ? nullptr : "between whole steps: too many marks not seen";
+        for (int i = 0; i < n2; ++i)
+            if (std::find(m1, m1 + std::min(n1, kMarks), m2[i]) == m1 + std::min(n1, kMarks)) return "between whole steps: a type to mark missing";
+    }
+    return nullptr;
+}
+
+int check_class_cache(int cases, u64 sfx) {
+    g_converted = kConverted;
+    g_converted_count = sizeof kConverted / sizeof kConverted[0];
+    decomp_sfx_smooth(true);
     int bad = 0;
+    auto fail = [&](int c, const char* what, const char* why) {
+        if (++bad <= 6 && !g_quiet) std::printf("class cache %s %d: %s\n", what, c, why);
+    };
     for (int c = 0; c < cases; ++c) {
         g_blocks.clear();
-        const u64 def = block(0x200), node = block(0x100), counts = block(0x20), resolution = block(0x80);
-        for (const u64 at : kCurves) store<u64>(def + at, curve_2712_new(value(-50, 150), g_rng.chance(0.5) ? 0.0f : value(-30, 30)));
-        for (const u64 at : {0xa0ull, 0xa4ull, 0xb8ull, 0xbcull, 0xd0ull, 0xd4ull, 0xe8ull, 0xecull, 0x100ull, 0x104ull, 0x118ull, 0x11cull})
-            store<float>(def + at, value(-5, 5));
-        store<float>(def + 0x148, value(0, 2));
-        const bool mode1 = g_rng.chance(0.25);
-        store<u32>(def + 0x5c, mode1 ? 1u : 0u);
-        store<u32>(def + 0x58, static_cast<u32>(g_rng.range(5, 120)));  // mode 1: the emissions' end, in frames of the rate
-        store<u32>(def + 0x60, static_cast<u32>(g_rng.range(0, 4)));    // the interval: a base and a random share of [lo, hi]
-        store<u32>(def + 0x64, static_cast<u32>(g_rng.range(1, 20)));
-        store<u32>(def + 0x68, static_cast<u32>(g_rng.range(1, 20)));
-        for (const u64 at : {0x50ull, 0x54ull, 0x58ull}) store<u32>(resolution + at, static_cast<u32>(g_rng.range(4, 32)));
-        // the type and its grid object (+0x138, the grid's +0x118) - one for ours, one for the game's at 30
-        u64 types[2], grids[2], records[2], items[2];
-        for (int k = 0; k < 2; ++k) {
-            types[k] = block(kTypeSize);
-            grids[k] = block(kGridObjectSize);
-            records[k] = block(0x80);
-            items[k] = block(0x70);
-        }
-        for (u64 at = 0x10; at < kTypeSize; at += 4) store<float>(types[0] + at, g_rng.chance(0.5) ? 0.0f : value(-3, 3));
-        store<u64>(types[0], game_address(kGxType2712));
-        store<u64>(types[0] + 8, def);
-        store<u64>(types[0] + 0x20 + 0x110, resolution);
-        store<u64>(types[0] + 0x138, grids[0]);
-        store<float>(types[0] + 0x528, g_rng.chance(0.5) ? 0.0f : value(0, 0.5f));
-        for (u64 at = 0; at < kGridObjectSize; at += 4) store<float>(grids[0] + at, value(-3, 3));
-        for (u64 at = 0x250; at < 0x260; at += 4) store<float>(grids[0] + at, value(0.5f, 8));  // the grid's extent
-        std::memcpy(reinterpret_cast<void*>(types[1]), reinterpret_cast<void*>(types[0]), kTypeSize);
-        std::memcpy(reinterpret_cast<void*>(grids[1]), reinterpret_cast<void*>(grids[0]), kGridObjectSize);
-        store<u64>(types[1] + 0x138, grids[1]);
-        const float t0 = value(0, 20);
-        for (int k = 0; k < 2; ++k) {
-            store<u64>(records[k] + 8, types[k]);
-            store<u64>(records[k] + 0x10, node);
-            store<u64>(records[k] + 0x18, counts);  // +8 = 0: no buffers
-            store<float>(records[k] + 0x28, t0);
-            store<float>(records[k] + 0x24, t0);
-        }
-        // the emitter's path: its rows at the whole steps (the same in both runs), moving in between or not
-        const bool moving = g_rng.chance(0.6);
-        double p0[3], v[3];
-        for (int i = 0; i < 3; ++i) p0[i] = value(-30, 30), v[i] = value(-6, 6);
-        auto put_rows = [&](u64 item, double t) {
-            const double a = 0.3 * t, ca = std::cos(a), sa = std::sin(a);
-            const double rows[3][4] = {{ca, 0, sa, p0[0] + v[0] * t}, {0, 1, 0, p0[1] + v[1] * t}, {-sa, 0, ca, p0[2] + v[2] * t}};
-            for (int r = 0; r < 3; ++r)
-                for (int k = 0; k < 4; ++k) store<float>(item + 0x10 * r + 4 * k, static_cast<float>(rows[r][k]));
-        };
-        u32 rng0[4];
-        for (u32& w : rng0) w = g_rng.u32() | 1;
-        const int rate_kind = g_rng.range(0, 6);
-        const bool gate = g_rng.chance(0.7), off = g_rng.chance(0.25);  // off: the hold off, the counts taken for the record
-        g_hold_2712.store(off ? 0u : 1u);
-        const double seconds = value(1, 4);
-        // the game at 30: whole steps only, its states after each
-        std::vector<std::vector<u8>> states30;
-        long seen30 = 0;
-        std::memcpy(reinterpret_cast<void*>(fx + 0x30), rng0, 16);
-        const int steps = static_cast<int>(seconds * 30);
-        for (int k = 1; k <= steps; ++k) {
-            put_rows(items[1], static_cast<double>(k) / 30);
-            store<float>(items[1] + 0x60, 1.0f / 30.0f);
-            game(records[1], items[1]);
-            const float elapsed = load<float>(records[1] + 0x28) - load<float>(records[1] + 0x24);
-            if (elapsed > 0.0f && load<u8>(types[1] + 0x2f4)) ++seen30;
-            std::vector<u8> st(kTypeSize + kGridObjectSize + 16);
-            std::memcpy(st.data(), reinterpret_cast<void*>(types[1]), kTypeSize);
-            std::memcpy(st.data() + 0x138, &grids[0], 8);  // ours points at its own grid object
-            std::memcpy(st.data() + kTypeSize, reinterpret_cast<void*>(grids[1]), kGridObjectSize);
-            std::memcpy(st.data() + kTypeSize + kGridObjectSize, reinterpret_cast<void*>(fx + 0x30), 16);
-            states30.push_back(std::move(st));
-        }
-        u32 rng30[4];
-        std::memcpy(rng30, reinterpret_cast<void*>(fx + 0x30), 16);
-        // ours: the frames, a whole step's item 1/30, the others 0
-        std::memcpy(reinterpret_cast<void*>(fx + 0x30), rng0, 16);
-        double carry = 0.0, tau = 0.0;
-        int k = 0;
-        long seen = 0;
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, g_rng.chance(0.15));
         const char* why = nullptr;
-        int at = -1;
-        for (int f = 0; k < steps && !why && f < 100000; ++f) {
-            const double dt = rate_kind < 6 ? 1.0 / kRates[rate_kind] : g_rng.value(1.0f / 150, 1.0f / 31);
-            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
-            tau += fr.frame;
-            const bool tick = fr.whole > 0;
-            if (tick) ++k;
-            put_rows(items[0], tick || !moving ? static_cast<double>(k) / 30 : tau);
-            store<float>(items[0] + 0x60, tick ? 1.0f / 30.0f : 0.0f);
-            decomp_sfx_gate_frame(!tick && gate);
-            decomp_sfx_step_frame(!tick);
-            std::vector<u8> type_before(kTypeSize), grid_before(kGridObjectSize);
-            std::memcpy(type_before.data(), reinterpret_cast<void*>(types[0]), kTypeSize);
-            std::memcpy(grid_before.data(), reinterpret_cast<void*>(grids[0]), kGridObjectSize);
-            u32 rng_before[4];
-            std::memcpy(rng_before, reinterpret_cast<void*>(fx + 0x30), 16);
-            const u32 cur_before = load<u32>(records[0] + 0x28);
-            sfx_gx_record_update(records[0], items[0]);
-            decomp_sfx_step_frame(false);
-            decomp_sfx_gate_frame(false);
-            ++g_seen_2712.frames;
-            const float elapsed = load<float>(records[0] + 0x28) - load<float>(records[0] + 0x24);
-            if (elapsed > 0.0f && load<u8>(types[0] + 0x2f4)) ++seen;
-            if (load<u64>(records[0] + 8) != types[0]) why = "the type back in its record";
-            else if (!tick && !off) {
-                ++g_seen_2712.held;
-                if (std::memcmp(type_before.data(), reinterpret_cast<void*>(types[0]), kTypeSize) != 0) why = "between whole steps: the type";
-                else if (std::memcmp(grid_before.data(), reinterpret_cast<void*>(grids[0]), kGridObjectSize) != 0) why = "between whole steps: its grid object";
-                else if (std::memcmp(rng_before, reinterpret_cast<void*>(fx + 0x30), 16) != 0) why = "between whole steps: an FX RNG draw";
-                else if (std::memcmp(reinterpret_cast<void*>(records[0] + 0x50), reinterpret_cast<void*>(items[0]), 0x30) != 0)
-                    why = "between whole steps: the record's rows (the item's)";
-                else if (load<u32>(records[0] + 0x24) != cur_before || load<u32>(records[0] + 0x28) != cur_before)
-                    why = "between whole steps: the record's times (its elapsed time 0)";
-                else {
-                    static const u32 kLow[4] = {0xff7fffffu, 0xff7fffffu, 0xff7fffffu, 0x3f800000u}, kHigh[4] = {0x7f7fffffu, 0x7f7fffffu, 0x7f7fffffu, 0x3f800000u};
-                    if (std::memcmp(reinterpret_cast<void*>(records[0] + 0x30), kLow, 16) != 0 ||
-                        std::memcmp(reinterpret_cast<void*>(records[0] + 0x40), kHigh, 16) != 0)
-                        why = "between whole steps: the record's bounds (the update's own)";
+        for (int f = 0; f < 12 && !why; ++f) {
+            const bool between = f % 4 != 0;
+            std::vector<u64> nodes = tree_nodes(s.inst);
+            if (!between) {
+                // a whole step: what the game sets up or lets go then
+                const int what = g_rng.range(0, 5);
+                if (what == 0) {
+                    const u64 n = node(s.inst, 1, 3);
+                    cache_classes(n, g_rng.chance(0.2));
+                    add_child(s.inst, n);
+                } else if (what == 1) {
+                    const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                    pend(n, g_rng.chance(0.15) ? object_of(kOffModule) : g_rng.chance(0.4) ? unbound_binder() : gx_binder(any(kOnGxTypes)));
+                } else if (what == 2) {
+                    const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                    store<u64>(n + 0xa8, g_rng.chance(0.3) ? object_of(kOffModule) : 0);
                 }
-            } else if (tick && !off) {
-                const std::vector<u8>& want = states30[static_cast<std::size_t>(k - 1)];
-                if (std::memcmp(want.data(), reinterpret_cast<void*>(types[0]), kTypeSize) != 0) why = "after a whole step: the type (30's)";
-                else if (std::memcmp(want.data() + kTypeSize, reinterpret_cast<void*>(grids[0]), kGridObjectSize) != 0)
-                    why = "after a whole step: its grid object (30's)";
-                else if (std::memcmp(want.data() + kTypeSize + kGridObjectSize, reinterpret_cast<void*>(fx + 0x30), 16) != 0)
-                    why = "after a whole step: the FX RNG (30's)";
+            } else {
+                // between whole steps: a pending binder taken, or a GX binder's type made
+                const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                if (g_rng.chance(0.3) && load<u64>(n + 0xb0)) store<u64>(n + 0xb0, load<u64>(load<u64>(n + 0xb0) + 0x18));
+                for (u64 item = load<u64>(n + 0xb0); item; item = load<u64>(item + 0x18)) {
+                    const u64 t = load<u64>(item + 0x20);
+                    if (!t || load<u64>(t) != game_address(kGxBinder)) continue;
+                    const u64 holder = load<u64>(t + 0x10);
+                    if (holder && !load<u64>(holder + 8) && g_rng.chance(0.5)) {
+                        const int kind = g_rng.range(0, 3);
+                        store<u64>(holder + 8, object_of(kind == 0 ? kGxTypeRibbon : kind == 1 ? kOffGxType : any(kOnGxTypes)));
+                    }
+                }
             }
-            if (why) at = f;
+            why = cache_frame(s.inst, between);
         }
-        u32 rng_end[4];
-        std::memcpy(rng_end, reinterpret_cast<void*>(fx + 0x30), 16);
-        const long draws = rng_draws(rng0, rng_end, 1000000), draws30 = rng_draws(rng0, rng30, 1000000);
-        if (!why && !off && seen != seen30) why = "the emissions a grid pass sees (30's)";
-        if (!why && !off && draws != draws30) why = "the FX RNG's draws (30's)";
-        if (off) {
-            g_seen_2712.seconds_off[rate_kind] += steps / 30.0;
-            g_seen_2712.seen_off[rate_kind] += seen;
-            g_seen_2712.draws_off[rate_kind] += draws;
-        } else {
-            g_seen_2712.seconds[rate_kind] += steps / 30.0;
-            g_seen_2712.seen[rate_kind] += seen;
-            g_seen_2712.draws[rate_kind] += draws;
-            g_seen_2712.seen30[rate_kind] += seen30;
-            g_seen_2712.draws30[rate_kind] += draws30;
-        }
-        if (why && ++bad <= 6 && !g_quiet)
-            std::printf("type 0x2712 case %d (rate kind %d, gate %d, mode %d, moving %d): %s differs at frame %d\n", c, rate_kind, gate, mode1, moving, why,
-                        at);
+        if (why) fail(c, "case", why);
     }
-    g_hold_2712.store(1u);
-    store<u64>(fx_slot, fx_before);
+    // the serial: classified between whole steps, not updated on the next whole step, given a class off the list then
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        decomp_sfx_gate_frame(false);  // the next whole step, without this instance
+        store<u64>(s.nodes[0] + 0xa8, object_of(kOffModule));
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "serial", "a classification kept from the last whole step");
+            break;
+        }
+    }
+    // the shape: another instance made at the address between whole steps (a new definition and node tree)
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        store<u64>(s.inst + 0x38, definition(2));
+        const u64 root = node(s.inst, 1, 3);
+        cache_classes(root, true);
+        store<u64>(s.inst + 0x78, root);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "shape", "another instance at the address took the old one's classification");
+            break;
+        }
+    }
+    // the release: the instance released and another made at its address with the same definition and nodes, one of
+    // its classes off the list
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        const u64 def = load<u64>(s.inst + 0x38), root = load<u64>(s.inst + 0x78), child = load<u64>(root + 0x70);
+        store<u32>(s.inst + 0x88, 1 | 4);
+        sfx_instance_update(s.inst, s.ctx, 0.0f);  // its last update: the game's lets its tree go
+        store<u32>(s.inst + 0x88, 1);
+        store<u64>(s.inst + 0x38, def);
+        store<u64>(s.inst + 0x78, root);
+        store<u64>(root + 0x60, 0);
+        store<u64>(root + 0x68, 0);
+        store<u64>(root + 0x70, child);
+        if (child) {
+            store<u64>(child + 0x60, root);
+            store<u64>(child + 0x68, 0);
+            store<u64>(child + 0x70, 0);
+        }
+        store<u32>(root + 0x78, 1);
+        cache_classes(root, true);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "release", "an instance made at a released one's address took its classification");
+            break;
+        }
+    }
+    // a GX binder bound between whole steps: its ribbon marked on that frame
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        const u64 b = unbound_binder();
+        pend(s.nodes[0], b);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        const u64 ribbon = object_of(kGxTypeRibbon);
+        store<u64>(load<u64>(b + 0x10) + 8, ribbon);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        const u64 k = classify(s.inst, m, &n);
+        if (k || std::find(m, m + std::min(n, kMarks), ribbon) == m + std::min(n, kMarks)) {
+            fail(c, "binding", "a GX binder bound between whole steps: its ribbon not marked");
+            break;
+        }
+    }
+    decomp_sfx_gate_frame(false);
+    decomp_sfx_smooth(false);
+    if (!g_quiet)
+        std::printf("decomp_sfx_step_gate: %d class cache cases (%ld frames, %ld classifications taken from the whole step, %ld held a "
+                    "frame longer than the walk would), %d differ\n",
+                    cases, g_seen_cache.frames, g_seen_cache.reused, g_seen_cache.held_kept, bad);
     return bad;
 }
 
@@ -1871,6 +1893,104 @@ int check_wind_sources(int cases, u64 sfx, u64 manager) {
                                 static_cast<unsigned long long>(off), b, a);
             }
         }
+    }
+    return bad;
+}
+
+// --- the wind system's warm-up ---------------------------------------------------
+
+// The wind system (*0x5940e00) as its receivers' update (sub_27174e0, the game's own here) reads it, with no receivers:
+// its list +0x18 empty, its counts +0x20 and +0x38 0, the reset's one-shot +0x4c, the warm-up +0x4d and its count +0x50;
+// the thread's runtime heap (rel_dlruntime_obj_mb) and gettimeofday the test's. Frame sequences at 60, 120, 144 and
+// jittered rates through ours, the gate on or off, against the game's once a whole step (at 30): after every whole step
+// the system's bytes the game's at 30 after as many whole steps (the warm-up ends on the same whole step: 60 of them,
+// 2 s); between whole steps +0x4d and +0x50 untouched and every other byte the game's own call's (+0x4c cleared by the
+// first call, as the game clears it).
+u8* runtime_caps(u8* out, void*, int) {
+    std::memset(out, 0, 8);
+    out[0] = 0x20;  // a heap containers may use
+    return out;
+}
+void* runtime_alloc(void*, std::size_t size, std::size_t) { return std::malloc(size ? size : 1); }
+void runtime_free(void*, void* p) { std::free(p); }
+void* g_runtime_vt[16];
+alignas(16) u8 g_runtime[0x100];
+GUEST_ABI int stub_gettimeofday(void* tv, void*) {
+    std::memset(tv, 0, 16);
+    return 0;
+}
+struct SeenWarmup {
+    long cases = 0, frames = 0, held = 0, ended = 0;
+} g_seen_warmup;
+int check_wind_warmup(int cases) {
+    const auto game = eboot_kit::fn<WindReceiversFn>(kWindReceivers);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        u64 sys[2];
+        for (u64& w : sys) {
+            w = block(0x80);
+            const u64 head = block(0x20);
+            store<u64>(head, head);
+            store<u64>(head + 8, head);
+            store<u64>(w + 0x18, head);
+        }
+        // a reset just made, a warm-up partway, or none
+        const int kind = g_rng.range(0, 2);
+        const u8 reset = kind == 0 ? 1 : g_rng.chance(0.2) ? 1 : 0, on = kind == 2 ? 0 : 1;
+        const u32 left = kind == 0 ? 60u : static_cast<u32>(g_rng.range(0, 70));
+        for (const u64 w : sys) {
+            store<u8>(w + 0x4c, reset);
+            store<u8>(w + 0x4d, on);
+            store<u32>(w + 0x50, left);
+        }
+        const int rate_kind = g_rng.range(0, 3);
+        const int frames = g_rng.range(4, 400);
+        const bool gate = g_rng.chance(0.7);
+        double carry = 0.0;
+        const char* why = nullptr;
+        int at = -1;
+        ++g_seen_warmup.cases;
+        auto bytes = [](u64 w) {
+            std::vector<u8> v(0x80);
+            std::memcpy(v.data(), reinterpret_cast<const void*>(w), v.size());
+            std::memset(v.data() + 0x18, 0, 8);  // the list heads are each one's own
+            return v;
+        };
+        for (int f = 0; f < frames && !why; ++f) {
+            const double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
+            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
+            const bool tick = fr.whole > 0;
+            const float step = tick ? 1.0f / 30.0f : 0.0f;
+            // the game's own call on a copy: what this frame's call would be as the game's
+            const u64 copy = block(0x80);
+            std::memcpy(reinterpret_cast<void*>(copy), reinterpret_cast<void*>(sys[0]), 0x80);
+            game(copy, step);
+            decomp_sfx_gate_frame(!tick && gate);
+            decomp_sfx_step_frame(!tick);
+            const u8 on0 = load<u8>(sys[0] + 0x4d);
+            const u32 left0 = load<u32>(sys[0] + 0x50);
+            sfx_wind_receivers(sys[0], step);
+            decomp_sfx_step_frame(false);
+            decomp_sfx_gate_frame(false);
+            ++g_seen_warmup.frames;
+            if (!tick) {
+                ++g_seen_warmup.held;
+                std::vector<u8> want = bytes(copy);
+                want[0x4d] = on0;
+                std::memcpy(want.data() + 0x50, &left0, 4);
+                if (bytes(sys[0]) != want) why = "between whole steps: the count held, the rest the game's own call's";
+            } else {
+                // the game at 30, once this whole step
+                game(sys[1], step);
+                if (bytes(sys[0]) != bytes(sys[1])) why = "after a whole step: the game's at 30";
+                g_seen_warmup.ended += on && !load<u8>(sys[1] + 0x4d) && load<u8>(sys[1] + 0x4c) == 0 && left == 0;
+            }
+            if (why) at = f;
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("wind warm-up case %d (reset %u, on %u, left %u, rate kind %d, gate %d): %s differs at frame %d\n", c, reset, on, left, rate_kind,
+                        gate, why, at);
     }
     return bad;
 }
@@ -2473,30 +2593,16 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    // GPU particle type 0x2712: its update the game's, its definition's curves the test's.
-    store<u64>(reinterpret_cast<u64>(g_curve_2712_vt) + 0x58, reinterpret_cast<u64>(&curve_2712));
+    // The classifications kept between whole steps.
     g_quiet = false;
     g_rng.specials = false;
-    const int g2bad = check_records_2712(kCases / 4, sfx);
-    {
-        static const char* kRateNames[] = {"30", "45", "60", "90", "120", "144", "jittered"};
-        std::printf("decomp_sfx_step_gate: %d type 0x2712 cases (%ld frames, %ld record updates between whole steps with the type held), %d differ; "
-                    "a game second's emissions a grid pass sees and FX RNG draws, held / the game's at 30 / the hold off:\n",
-                    kCases / 4, g_seen_2712.frames, g_seen_2712.held, g2bad);
-        for (int r = 0; r < 7; ++r) {
-            const double s = g_seen_2712.seconds[r], so = g_seen_2712.seconds_off[r];
-            if (s <= 0 || so <= 0) continue;
-            std::printf("  %-8s %7.1f s held, %6.1f s off: emissions %.2f / %.2f / %.2f, draws %.1f / %.1f / %.1f\n", kRateNames[r], s, so,
-                        g_seen_2712.seen[r] / s, g_seen_2712.seen30[r] / s, g_seen_2712.seen_off[r] / so, g_seen_2712.draws[r] / s,
-                        g_seen_2712.draws30[r] / s, g_seen_2712.draws_off[r] / so);
-        }
-    }
-    if (g2bad) return 1;
+    const int ccbad = check_class_cache(kCases / 2, sfx);
+    if (ccbad) return 1;
     g_quiet = true;
-    for (const int m : {46, 47, 48}) {
+    for (const int m : {51, 52, 53, 54}) {
         g_sfx_gate_mutant = m;
-        if (!check_records_2712(400, sfx)) {
-            std::printf("decomp_sfx_step_gate: mutant %d not caught by the type 0x2712 records\n", m);
+        if (!check_class_cache(400, sfx)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the class cache\n", m);
             ++missed;
         }
     }
@@ -2532,6 +2638,37 @@ int main() {
         g_sfx_gate_mutant = m;
         if (!check_wind_sources(2000, sfx, manager)) {
             std::printf("decomp_sfx_step_gate: mutant %d not caught by the wind sources\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    // The wind system's warm-up: the thread's runtime heap and gettimeofday the test's.
+    g_runtime_vt[0x20 / 8] = reinterpret_cast<void*>(&runtime_caps);
+    g_runtime_vt[0x58 / 8] = reinterpret_cast<void*>(&runtime_alloc);
+    g_runtime_vt[0x70 / 8] = reinterpret_cast<void*>(&runtime_free);
+    {
+        void* const vt = g_runtime_vt;
+        std::memcpy(g_runtime + 0x28, &vt, 8);
+        u8* const runtime = g_runtime;
+        std::memcpy(static_cast<u8*>(eboot_kit::tcb()) - 0x730, &runtime, 8);  // rel_dlruntime_obj_mb
+    }
+    if (!eboot_kit::bind("gettimeofday", reinterpret_cast<const void*>(&stub_gettimeofday))) {
+        std::printf("decomp_sfx_step_gate: no gettimeofday import to bind\n");
+        return 1;
+    }
+    g_game_wind_receivers = eboot_kit::at(kWindReceivers);
+    g_quiet = false;
+    g_rng.specials = false;
+    const int wwbad = check_wind_warmup(kCases);
+    std::printf("decomp_sfx_step_gate: %d wind system warm-up cases (%ld frames, %ld between whole steps with the count held, %ld warm-ups ended), "
+                "%d differ\n",
+                kCases, g_seen_warmup.frames, g_seen_warmup.held, g_seen_warmup.ended, wwbad);
+    if (wwbad) return 1;
+    g_quiet = true;
+    for (const int m : {49, 50}) {
+        g_sfx_gate_mutant = m;
+        if (!check_wind_warmup(2000)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the wind warm-up\n", m);
             ++missed;
         }
     }
@@ -2583,6 +2720,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 46 mutants caught\n", 46 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 49 mutants caught\n", 49 - missed);
     return missed ? 1 : 0;
 }

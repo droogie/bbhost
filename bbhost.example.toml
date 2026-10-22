@@ -67,12 +67,13 @@ height = 1080
 fps_cap = 30
 # Above 30 fps, the effects (the lamps' and candles' flicker among them) and
 # the wind on grass and trees step in whole 1/30 s, 30 times a second as at
-# 30, with what the effects count in updates held on the frames between (30).
-# smooth: as 30, with what the effects move by time moved by each frame's own
-# time in the effects converted for it. 60: the effects in whole 1/60 s and
-# the wind by the frame's time; frame: both by the frame's time.
-# BBHOST_SFX_STEP=30, smooth, 60 or frame overrides this. Requires a restart.
-# effect_steps = 30
+# 30, with what the effects count in updates held on the frames between.
+# smooth (the default): as 30, with what the effects move by time moved by
+# each frame's own time in the effects converted for it. 30: whole 1/30 s
+# steps alone. 60: the effects in whole 1/60 s and the wind by the frame's
+# time; frame: both by the frame's time. BBHOST_SFX_STEP=30, smooth, 60 or
+# frame overrides this. Requires a restart.
+# effect_steps = "smooth"
 # The defaults of four F10 settings, by an entry's name; what F10 or the
 # game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
 # "1280x800" and "Fullscreen").

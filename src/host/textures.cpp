@@ -4121,6 +4121,52 @@ void drain_texture_blocks_locked() {
     }
 }
 
+bool textures_block_pinned_locked(int block) {
+    for (const auto& [base, sf] : g_surfaces) {
+        if (sf.image && sf.memory.block == block && !surface_in_host(sf) && (sf.gpu_written || sf.copied_mips || sf.failed)) return true;
+    }
+    return false;
+}
+
+std::uint64_t textures_drop_block_locked(int block) {
+    std::uint64_t bytes = 0;
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end();) {
+        Surface& sf = it->second;
+        if (!sf.image || sf.memory.block != block || surface_in_host(sf) || sf.gpu_written || sf.copied_mips || sf.failed) {
+            ++it;
+            continue;
+        }
+        bytes += sf.memory.size;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+    }
+    for (auto it = g_rt_regions.begin(); it != g_rt_regions.end();) {
+        if (it->second.img.image && it->second.img.memory.block == block) {
+            bytes += it->second.img.memory.size;
+            drop_rt_region(it->second);
+            it = g_rt_regions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_level_aliases.begin(); it != g_level_aliases.end();) {
+        if (it->second.img.image && it->second.img.memory.block == block) {
+            bytes += it->second.img.memory.size;
+            invalidate_rt_views(it->second.img.base);
+            defer_destroy_view(it->second.img.view);
+            defer_destroy_image(it->second.img.image, it->second.img.memory);
+            it = g_level_aliases.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (bytes) bump_view_epoch();
+    return bytes;
+}
+
 void textures_drain_counts(std::uint64_t out[4]) {
     out[0] = g_drained_blocks;
     out[1] = g_drained_surfaces;
@@ -4184,6 +4230,7 @@ void textures_vram_census_locked(VramCensus& c) {
             continue;
         }
         const int cls = image_memory_class_locked(sf.memory);
+        c.note_block(sf.memory.block, sf.gpu_written || sf.copied_mips ? VramCensus::kBlockGpuWritten : VramCensus::kBlockTexture, bytes);
         if (sf.gpu_written || sf.copied_mips) {
             (sf.written_ms && now - sf.written_ms >= 10000 ? c.gpu_written_idle : c.gpu_written).add(bytes);
             if (cls == kHeapTextures) c.gpu_written_in_tex.add(bytes);
@@ -4200,9 +4247,11 @@ void textures_vram_census_locked(VramCensus& c) {
     }
     for (const auto& [key, reg] : g_rt_regions) {
         if (reg.img.image) (image_memory_in_vram(reg.img.memory) ? c.regions : c.tex_host).add(reg.img.memory.size);
+        if (reg.img.image) c.note_block(reg.img.memory.block, VramCensus::kBlockRegion, reg.img.memory.size);
     }
     for (const auto& [key, al] : g_level_aliases) {
         if (al.img.image) (image_memory_in_vram(al.img.memory) ? c.regions : c.tex_host).add(al.img.memory.size);
+        if (al.img.image) c.note_block(al.img.memory.block, VramCensus::kBlockRegion, al.img.memory.size);
     }
 }
 

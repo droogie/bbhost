@@ -38,6 +38,7 @@
 #include "core/write_watch.h"
 #include "decomp/decomp.h"
 #include "decomp/gx/resources.h"
+#include "decomp/gx/upload_heap.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
 #include "guest_abi.h"
@@ -904,11 +905,23 @@ GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
-// The block pool's initialisation (BBHOST_GXVK_CENSUS): rdi = the pool, rdx =
-// its region, rcx = the region's bytes.
+// The block pool's initialisation (BBHOST_GXVK_CENSUS), the game's: rdi = the
+// pool, rdx = its region, rcx = the region's bytes.
 GUEST_ABI std::int64_t pool_init_hook(std::uint64_t, const std::uint64_t* saved) {
     gxvk::census_heap(saved[5], saved[3], saved[2]);
     return 0;
+}
+
+// The same, ours (decomp/gx/upload_heap.cpp): it tells us of the pool and its
+// region - the census, and GX on Vulkan's arena (host/gxvk.h), which binds
+// the heap in place - and takes the region the arena gives back (0: the
+// game's).
+GUEST_ABI std::uint64_t upload_region_entry(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t bytes_out) {
+    std::uint64_t ours_bytes = bytes;
+    const std::uint64_t ours = gxvk::arena_region(pool, region, bytes, &ours_bytes);
+    if (ours) std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(bytes_out)), &ours_bytes, sizeof ours_bytes);
+    gxvk::census_heap(pool, ours ? ours : region, ours ? ours_bytes : bytes);
+    return ours;
 }
 
 // YEBIS's device's creators (census): the object comes back through `out`.
@@ -1400,7 +1413,10 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
             g_pool_bytes.fetch_add(p.type, std::memory_order_relaxed);
             host_gpu_shadow_gx_handed(block, p.type, 1);
         }
-        if (result && p.type) gxvk::census_handout(p.holder, result, p.type);
+        if (result && p.type) {
+            gxvk::census_handout(p.holder, result, p.type);
+            gxvk::arena_handout(p.holder, result);
+        }
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
         if (p.type == 5) {
@@ -1576,12 +1592,13 @@ void gx_resources_install(ElfImage* image) {
         if (g_res_scaleform)
             hook(kScaleformUnmap, kScaleformUnmapPrologue, sizeof(kScaleformUnmapPrologue), reinterpret_cast<void*>(&scaleform_unmap_hook), 0);
     }
-    if (g_census || gxvk::census()) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-    if (gxvk::census()) {
+    // The block pool's hand-outs: for the census, and for GX on Vulkan's arena's
+    // release proof (host/gxvk_arena.cpp).
+    if (g_census || gxvk::census() || gxvk::arena_wanted())
+        hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (gxvk::census() || gxvk::arena_wanted())
         hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-        hook(kPoolInit, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0);
-        hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
-    }
+    if (gxvk::census()) hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1597,6 +1614,18 @@ void gx_resources_install(ElfImage* image) {
 // other creators are.
 void gx_resources_install_late(ElfImage* image) {
     if (!g_gx_res_after_thunk) return;
+    // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
+    // its init tells the host of it (the entry above); the game's is hooked at
+    // its prologue for the census (the arena then has no heap: today's path).
+    if (gxvk::census() || gxvk::arena_wanted()) {
+        if (decomp_placed("gx_upload_pool_init") == 1) {
+            decomp_gx::g_upload_region_entry = hle_wrap_fn(reinterpret_cast<void*>(&upload_region_entry));
+        } else if (gxvk::census()) {
+            const std::uint64_t at = image->mem.slide + (kPoolInit - kPreferredGuestSlide);
+            if (!engine_prologue_hook(image, at, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0))
+                host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(kPoolInit));
+        }
+    }
     const int placed = decomp_placed("gx_create_buffer");
     if (placed) {
         decomp_gx::g_buffer_made_host = reinterpret_cast<void*>(&buffer_made_entry);
@@ -2042,4 +2071,5 @@ void gx_resources_report() {
     }
     gxvk::census_report();
     gxvk::buffers_report();
+    gxvk::arena_report();
 }

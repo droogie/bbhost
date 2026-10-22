@@ -172,6 +172,32 @@ int main() {
         CHECK(c.ime_mode == "auto");
         unsetenv("BBHOST_IME");
     }
+    // [video] effect_steps: smooth when the file has no such key (the
+    // template ships it commented out and nothing saves it), and an explicit
+    // value - 30 among them - kept as written at any config version, the file
+    // untouched; BBHOST_SFX_STEP over either.
+    {
+        load("[player]\nname = \"Hunter\"\n");
+        CHECK(config_effect_steps() == "smooth");
+        load("[video]\n# whole steps\neffect_steps = 30\n");
+        CHECK(config_effect_steps() == "30");
+        CHECK(read(g_dir / "config" / "bbhost.toml").find("effect_steps = 30") != std::string::npos);
+        for (const char* ver : {"2", "4", "5"}) {
+            load(std::string("[video]\neffect_steps = 30\n\n[bbhost]\nconfig_version = ") + ver + "\n");
+            CHECK(config_effect_steps() == "30");
+            CHECK(read(g_dir / "config" / "bbhost.toml").find("effect_steps = 30") != std::string::npos);
+        }
+        load("[video]\neffect_steps = \"60\"\n");
+        CHECK(config_effect_steps() == "60");
+        load("[video]\neffect_steps = \"frame\"\n");
+        CHECK(config_effect_steps() == "frame");
+        load("[video]\neffect_steps = \"smooth\"\n");
+        CHECK(config_effect_steps() == "smooth");
+        setenv("BBHOST_SFX_STEP", "60", 1);
+        load("[video]\neffect_steps = 30\n");
+        CHECK(config_effect_steps() == "60");
+        unsetenv("BBHOST_SFX_STEP");
+    }
     // The template a first start writes types in the window.
     {
         const fs::path t = g_dir / "template.toml";

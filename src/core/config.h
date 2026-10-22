@@ -167,6 +167,10 @@ std::string config_user_dir();
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
+// The effects' steps above 30 fps as asked for: BBHOST_SFX_STEP, else [video]
+// effect_steps, else "smooth" (the default). The frame rate code reads 30,
+// smooth, 60 and frame (engine/frame_rate.cpp).
+std::string config_effect_steps();
 // Changes a loaded value in memory (raw, as config_set_values writes it): a
 // setting changed while running (the plugin menu), so config_value agrees
 // with the file just written. Main thread.

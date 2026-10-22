@@ -225,9 +225,14 @@ and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
 `BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
 ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
-made 64 MiB at a time as the game's meshes need them (16 MiB on an
+made 64 MiB at a time as the game's meshes need them (4 MiB on an
 integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
-gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones).
+gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones). On an
+integrated GPU, where those mirrors would be the same memory again, the
+meshes in the game's own vertex and index buffers are read where they are,
+with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
+them in place on any GPU), and vertex data left in host memory is not copied
+for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -287,18 +292,24 @@ conditions pick, the controllers, a light's flicker phase, a wobbling
 motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
-with 60 too). The grid particles of GPU type 0x2712 (Cainhurst's snow among
-them) also wait for the whole step on the frames between, gate on or off, so
-their emissions reach the grid as at 30 (`BBHOST_SFX_2712_HOLD=0` runs them
-on every frame as before, when at 60 and above none did). `[video] effect_steps = 60` steps the effects in whole 1/60 s
-instead (60 updates a second above 60); `frame` steps them by the frame's
-time. `smooth` keeps 30's whole steps
-for what the effects count and moves what they move by time - a particle's
-path, a motion's turn, the GPU particles' clock, a ribbon's head (its points
-still inserted once a whole step), the wind sources' gusts - by each frame's
-own time, in the effects whose every part has been converted for it; the rest
-run as at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
-`BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting. Above 60 and
+with 60 too). The wind's warm-up after a load (the grass and trees settling)
+counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
+before). By default (`[video] effect_steps = "smooth"`) the effects keep
+30's whole steps for what they count and move what they move by time - a
+particle's path, a motion's turn, the GPU particles' clock, a ribbon's head
+(its points still inserted once a whole step), the wind sources' gusts - by
+each frame's own time, in the effects whose every part has been converted
+for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
+1/30 s steps, as before; `60` steps the effects in whole 1/60 s instead (60
+updates a second above 60); `frame` steps them by the frame's time. A
+bbhost.toml that sets `effect_steps` keeps its value; one without it gets
+smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
+`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
+characters leave in water (GX's water interaction, one wave step a frame) step
+at 30 a second of game time above 30 too, so they spread as fast as at 30, and
+the water shows the last step between steps
+(`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
+twice as fast at 60). Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.

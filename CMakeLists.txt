@@ -151,6 +151,7 @@ add_executable(bbhost
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
+  src/host/gxvk_arena.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -378,6 +379,8 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/command_list.cpp
   src/decomp/gx/present.cpp
   src/decomp/gx/resources.cpp
+  src/decomp/gx/water_gate.cpp
+  src/decomp/gx/upload_heap.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
@@ -546,14 +549,27 @@ if(UNIX)
   add_executable(arena_memory_test tests/arena_memory_test.cpp)
   target_include_directories(arena_memory_test PRIVATE src)
   add_test(NAME arena_memory_test COMMAND arena_memory_test)
-  # The copy watch's granules in front of its slots (host/gxvk_watch.h).
+  # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  add_executable(flip_pacing_test tests/flip_pacing_test.cpp)
+  target_include_directories(flip_pacing_test PRIVATE src)
+  add_test(NAME flip_pacing_test COMMAND flip_pacing_test)
+  # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
+  add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
+  target_include_directories(gxvk_arena_test PRIVATE src)
+  target_compile_definitions(gxvk_arena_test PRIVATE GXVK_ARENA_TESTING GXVK_ARENA_MUTANTS)
+  add_test(NAME gxvk_arena_test COMMAND gxvk_arena_test)
   add_executable(gxvk_watch_test tests/gxvk_watch_test.cpp)
   target_include_directories(gxvk_watch_test PRIVATE src)
+  target_link_libraries(gxvk_watch_test PRIVATE Threads::Threads)
   add_test(NAME gxvk_watch_test COMMAND gxvk_watch_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
   add_test(NAME copy_runs_test COMMAND copy_runs_test)
+  # The buffer shadow's choices for pages an integrated GPU reads in place.
+  add_executable(shadow_place_test tests/shadow_place_test.cpp)
+  target_include_directories(shadow_place_test PRIVATE src)
+  add_test(NAME shadow_place_test COMMAND shadow_place_test)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
@@ -621,6 +637,7 @@ if(UNIX)
   bbhost_decomp_test(gx_present)
   bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_upload_heap)
+  bbhost_decomp_test(gx_water_gate)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
@@ -639,6 +656,10 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # Which draws start a command buffer of their own on lavapipe (tests/lvp_split_test.cpp).
+  add_executable(lvp_split_test tests/lvp_split_test.cpp)
+  target_include_directories(lvp_split_test PRIVATE src)
+  add_test(NAME lvp_split_test COMMAND lvp_split_test)
   # PA_CL_CLIP_CNTL as depth clamp and rasterizer discard (tests/clip_control_test.cpp).
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)

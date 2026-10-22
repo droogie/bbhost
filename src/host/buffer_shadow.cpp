@@ -47,6 +47,7 @@
 #include "engine/gx_resources.h"
 #include "host/copy_runs.h"
 #include "host/gpu_internal.h"
+#include "host/shadow_place.h"
 #include "log.h"
 
 #include <chrono>
@@ -133,6 +134,11 @@ struct Page {
     std::uint32_t read_lo = ~0u, read_hi = 0;
     bool valid = false;               // the mirror holds it (or will, once this submission's copies run)
     bool dynamic = false;             // bound from the import from now on (rewritten, unwatchable)
+    // In place (BBHOST_SHADOW_IN_PLACE): read from the import with no copy -
+    // GX tells every write to it. placed_seq is g_told_seq when it was placed,
+    // placed_checked the recording its placement was last checked in.
+    bool placed = false;
+    std::uint64_t placed_seq = 0, placed_checked = 0;
 };
 
 struct Mirror {
@@ -150,6 +156,9 @@ struct Mirror {
     // bound from host memory for good (Page::dynamic), and written by the
     // GPU in the recording `ok_stamp` (Page::gpu_written; cleared with ok).
     std::vector<std::uint64_t> dyn, gpu;
+    // A bit per page: placed in place and checked in the recording `ok_stamp`
+    // (BBHOST_SHADOW_IN_PLACE) - a draw on such pages binds the import.
+    std::vector<std::uint64_t> placed_ok;
     // Sparse: a 64 KiB device page is bound the first time the page is
     // copied, from 64 MiB blocks; the binds queue up until the submission.
     bool sparse = false;
@@ -171,19 +180,23 @@ struct Mirror {
     std::vector<Window> windows;
 };
 constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
-// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 16 on an
-// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 16 to 512).
+// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 4 on an
+// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 1 to 512).
 // Larger windows hold more pages no draw reads, smaller ones send more ranges
 // across a window's edge to host memory - on an integrated GPU the same RAM:
 // on the Radeon 680M at a lamp 16 MiB windows held 1,248 MiB where 64 MiB ones
 // held 1,728, at the same frame rate, with 6.8 M ranges read in place instead
-// of 1.6 M. Read when the first mirror is made, after the device is known.
+// of 1.6 M. With the told pages read in place (BBHOST_SHADOW_IN_PLACE) the
+// copies left are scattered: 228 MiB of them kept 63 windows of 16 MiB
+// (1,008 MiB), and in 4 MiB windows 464 MiB, at the same frame rate and with
+// no range read in place changing under its draws. Read when the first
+// mirror is made, after the device is known.
 std::uint32_t window_pages() {
     static const std::uint32_t pages = [] {
-        std::uint64_t mb = g.integrated ? 16 : 64;
+        std::uint64_t mb = g.integrated ? 4 : 64;
         if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
             const std::uint64_t v = std::strtoull(e, nullptr, 10);
-            if (v >= 16 && v <= 512 && (v & (v - 1)) == 0) mb = v;
+            if (v >= 1 && v <= 512 && (v & (v - 1)) == 0) mb = v;
         }
         return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
     }();
@@ -208,6 +221,26 @@ const bool g_windows_on = [] {
 }();
 std::uint64_t g_window_crossings = 0;  // ranges across two windows, read from host memory
 std::uint64_t g_windows_made = 0;
+
+// In place (BBHOST_SHADOW_IN_PLACE; on for an integrated GPU, =1 anywhere, =0
+// nowhere): a range whose every page GX tells the writes of - GX buffers
+// cover it whole and GX never handed it out to be rewritten - binds the
+// import where it lies, with no copy and no mirror memory, its page tracking
+// kept (shadow_place.h). On an integrated GPU the mirror was the same RAM
+// again: on the Radeon 680M at a lamp 1,264 MiB of 16 MiB windows held 531
+// MiB of page copies, ~84% of them told pages. Only with whole imports (a
+// window import has no import to bind).
+const int g_in_place_env = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_IN_PLACE");
+    return !e || !*e ? -1 : e[0] == '0' ? 0 : 1;
+}();
+bool in_place_on() {
+    static const bool on = imports_whole() && (g_in_place_env >= 0 ? g_in_place_env == 1 : g.integrated);
+    return on;
+}
+std::atomic<std::uint64_t> g_placed_binds{0};    // ranges bound in place
+std::uint64_t g_placed = 0, g_placed_again = 0;  // pages placed, and placed again after a told write
+std::uint64_t g_placed_refused = 0;              // ranges that had a page GX does not tell (to the mirrors)
 
 bool all_ok(const std::vector<std::uint64_t>& ok, std::uint32_t p0, std::uint32_t p1) {
     for (std::uint32_t w = p0 >> 6; w <= p1 >> 6; ++w) {
@@ -825,6 +858,8 @@ void go_dynamic(Mirror& m, std::uint32_t p, std::uint64_t va, const char* why) {
     Page& pg = m.pages[p];
     pg.dynamic = true;
     pg.valid = false;
+    pg.placed = false;
+    if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
     m.dyn[p >> 6] |= 1ull << (p & 63);
     if (g_dynamic.fetch_add(1, std::memory_order_relaxed) < 8) {
         host_log("buffer shadow: the page at 0x%llx %s; bound from host memory from now on", static_cast<unsigned long long>(va), why);
@@ -837,6 +872,7 @@ void begin_recording(Mirror& m, std::uint64_t stamp) {
     if (m.ok_stamp == stamp) return;
     std::fill(m.ok.begin(), m.ok.end(), 0);
     std::fill(m.gpu.begin(), m.gpu.end(), 0);
+    std::fill(m.placed_ok.begin(), m.placed_ok.end(), 0);
     m.ok_stamp = stamp;
 }
 
@@ -851,11 +887,12 @@ void invalidate_all_told(std::uint64_t seq, std::uint64_t submit) {
     for (Mirror& m : g_mirrors) {
         if (m.pages.empty()) continue;
         for (Page& pg : m.pages) {
-            if (!pg.told) continue;
+            if (!pg.told && !pg.placed) continue;
             pg.gx_written = seq;
             pg.gx_submit = submit;
         }
         std::fill(m.ok.begin(), m.ok.end(), 0);
+        std::fill(m.placed_ok.begin(), m.placed_ok.end(), 0);
     }
 }
 
@@ -928,6 +965,17 @@ void mark_handed_locked(const GxWrite& w) {
             first_span = seg;
         }
         g_hand_pages[k] += mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, true);
+        if (k == kHandMap) {
+            // Renamed copies are rewritten: no page under them is read in
+            // place from now on (shadow_place::eligible).
+            for (std::uint64_t at = phys & ~(kPageBytes - 1); at < phys + seg; at += kPageBytes) {
+                Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
+                if (m.pages.empty()) continue;
+                const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
+                m.pages[p].placed = false;
+                if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
+            }
+        }
         if (act) {
             for (std::uint64_t at = phys & ~(kPageBytes - 1); at < phys + seg; at += kPageBytes) {
                 Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
@@ -1081,6 +1129,7 @@ void drain_gx_writes_locked() {
                     pg.gx_written = seq;
                     pg.gx_submit = w.submit;
                     m.ok[p >> 6] &= ~(1ull << (p & 63));
+                    if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
                 }
             }
             va += seg;
@@ -1220,6 +1269,72 @@ bool buffer_shadow_on() {
     return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
 }
 
+namespace {
+// In place (in_place_on): true when [p0, p1] binds the import - each page
+// placed already, checked once a recording for a told write since (which
+// counts as a rewrite, as a copy did, and places it again), or placed now.
+// False for a range with a page GX does not tell the writes of, or one the
+// game keeps rewriting (host memory for good, its ranges copied as their
+// draws record): the mirror path takes those as before.
+bool place_range_locked(Mirror& m, std::uint32_t chunk, std::uint64_t va, std::uint64_t off, std::uint32_t p0, std::uint32_t p1,
+                        std::uint64_t map_lo, std::uint64_t map_hi, std::uint64_t stamp) {
+    begin_recording(m, stamp);
+    if (m.placed_ok.empty()) m.placed_ok.assign(kPagesPerChunk / 64, 0);
+    if (all_ok(m.placed_ok, p0, p1)) return true;
+    // Each page's facts: a placed page with no told write since stands as
+    // eligible without asking GX again; any other is asked (shadow_place.h).
+    thread_local std::vector<shadow_place::PageFacts> facts;
+    facts.assign(p1 - p0 + 1, shadow_place::PageFacts{});
+    const auto page_va = [&](std::uint32_t p) { return va - (off - (static_cast<std::uint64_t>(p) << kPageShift)); };
+    bool out = false;  // a page is not eligible: no more of GX's lookups, only whether a later one is rewritten
+    for (std::uint32_t p = p0; p <= p1; ++p) {
+        Page& pg = m.pages[p];
+        shadow_place::PageFacts& f = facts[p - p0];
+        f.dynamic = pg.dynamic;
+        if (pg.placed && pg.placed_checked != stamp) {
+            pg.placed_checked = stamp;
+            if (shadow_place::rewritten(pg.placed_seq, pg.gx_written)) pg.placed = false;
+        }
+        if (pg.placed || f.dynamic || out) {
+            f.told_cover = pg.placed;
+            continue;
+        }
+        const std::uint64_t lo = std::max(page_va(p), map_lo), hi = std::min(page_va(p) + kPageBytes, map_hi);
+        f.handed = page_handed(chunk, p);
+        f.told_cover = g_shadow_gx && !f.handed && hi > lo && gx_buffers_cover(lo, hi - lo);
+        out = !shadow_place::eligible(f);
+    }
+    const shadow_place::Range r = shadow_place::choose(facts.data(), p1 - p0 + 1);
+    if (r != shadow_place::Range::kInPlace) {
+        if (r == shadow_place::Range::kMirror) ++g_placed_refused;
+        return false;
+    }
+    // Every page may be read in place: those not placed yet are placed now,
+    // each placement a rewrite as a copy was.
+    const std::uint64_t t = now_ms();
+    for (std::uint32_t p = p0; p <= p1; ++p) {
+        Page& pg = m.pages[p];
+        if (!pg.placed) {
+            shadow_place::RewriteWindow w{pg.window_ms, pg.window_uploads};
+            const bool too_many = shadow_place::rewrite_too_many(w, t, kMaxUploads, kUploadWindowMs);
+            pg.window_ms = w.start_ms;
+            pg.window_uploads = w.count;
+            if (too_many) {
+                go_dynamic(m, p, page_va(p), "keeps being rewritten (in place)");
+                return false;
+            }
+            if (pg.placed_seq) ++g_placed_again;
+            pg.placed = true;
+            pg.placed_seq = std::max<std::uint64_t>(g_told_seq, 1);
+            pg.placed_checked = stamp;
+            ++g_placed;
+        }
+        m.placed_ok[p >> 6] |= 1ull << (p & 63);
+    }
+    return true;
+}
+}  // namespace
+
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
     if (twin_covers_locked(va, bytes)) return;  // a GX buffer's device-local twin: already device memory, its guest bytes stale
@@ -1235,6 +1350,11 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
+    // In place: the import is the binding, and `loc` already holds it.
+    if (in_place_on() && place_range_locked(*m, chunk, va, off, p0, p1, map_lo, map_hi, stamp)) {
+        bump(g_placed_binds);
+        return;
+    }
     // A windowed mirror serves a range from one window's buffer.
     const std::uint32_t win = m->windowed ? p0 / window_pages() : 0;
     if (m->windowed && p1 / window_pages() != win) {
@@ -1635,6 +1755,11 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const Mirror& m = g_mirrors[chunk];
     if (m.pages.empty()) return false;
     const std::uint64_t stamp = g.record_serial + 1;
+    // Read in place on purpose (BBHOST_SHADOW_IN_PLACE): on an integrated GPU
+    // a copy for the draw saves no bus either.
+    if (!m.placed_ok.empty() && m.ok_stamp == stamp &&
+        all_ok(m.placed_ok, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift)))
+        return false;
     for (std::uint64_t p = off >> kPageShift; p <= (off + bytes - 1) >> kPageShift; ++p) {
         if (m.pages[p].gpu_written == stamp) {
             bump(g_stage_refused);
@@ -1842,6 +1967,29 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
     // from the ring - what the draw read when it recorded.
     if (!g_snap.device_local && shadow_stage_locked(va, bytes, loc)) bump(g_snapshot_staged);
     return true;
+}
+
+int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!buffer_shadow_on() || !bytes) return kPlaceNone;
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return kPlaceNone;
+    const Mirror& m = g_mirrors[chunk];
+    const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift), p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
+    if (m.pages.empty() || p1 >= m.pages.size()) return kPlaceNone;
+    // The least placeable page decides; a long range by its first 256 pages.
+    int cls = kPlacePlaced;
+    for (std::uint32_t p = p0; p <= p1 && p < p0 + 256; ++p) {
+        const Page& pg = m.pages[p];
+        const int c = pg.dynamic               ? kPlaceDynamic
+                      : page_handed(chunk, p)  ? kPlaceHanded
+                      : pg.placed              ? kPlacePlaced
+                      : pg.valid && pg.told    ? kPlaceTold
+                      : pg.valid               ? kPlaceWatched
+                                               : kPlaceUntracked;
+        cls = std::max(cls, c);
+    }
+    return cls;
 }
 
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n) {
@@ -2471,6 +2619,47 @@ std::string shadow_report() {
     std::snprintf(rr, sizeof(rr), "; mirror pages resident %llu (%llu MiB); mirrors hold %llu MiB of video memory, share %s%s",
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
                   static_cast<unsigned long long>(g_mirror_bytes >> 20), share, g_given_back ? " (given back: video memory ran short)" : "");
+    std::string in_place_line;
+    if (in_place_on() || g_placed) {
+        std::uint64_t placed_now = 0;
+        // The pages the mirrors still hold copies of, by what covers them -
+        // GX buffers whole (handed out or not: in a range with another kind
+        // of page), GX resources in part, nothing GX made - each with the
+        // windows they lie in: what keeps the windows on an integrated GPU.
+        std::uint64_t held[4] = {}, wins[4] = {};
+        for (std::uint32_t ch = 0; ch < gcn::kDmemChunks; ++ch) {
+            const Mirror& m = g_mirrors[ch];
+            for (std::uint32_t w = 0; w * window_pages() < m.pages.size(); ++w) {
+                bool in[4] = {};
+                for (std::uint32_t p = w * window_pages(); p < (w + 1) * window_pages() && p < m.pages.size(); ++p) {
+                    const Page& pg = m.pages[p];
+                    placed_now += pg.placed;
+                    if (!pg.valid || pg.dynamic || !pg.bytes) continue;
+                    const int k = page_handed(ch, p)                           ? 1
+                                  : gx_buffers_cover(pg.va, pg.bytes)            ? 0
+                                  : gx_resource_overlapping(pg.va, pg.bytes, nullptr) ? 2
+                                                                                 : 3;
+                    ++held[k];
+                    in[k] = true;
+                }
+                for (int k = 0; k < 4; ++k) wins[k] += in[k];
+            }
+        }
+        char ip[512];
+        std::snprintf(ip, sizeof(ip),
+                      "buffer shadow in place (BBHOST_SHADOW_IN_PLACE): ranges bound %llu, pages placed %llu (%llu MiB now), placed again after a "
+                      "told write %llu, ranges with a page GX does not tell %llu; pages the mirrors hold copies of (MiB, in windows): GX "
+                      "buffers' whole %llu in %llu, under renamed copies %llu in %llu, GX resources' in part %llu in %llu, nothing GX made "
+                      "%llu in %llu",
+                      static_cast<unsigned long long>(g_placed_binds.load()), static_cast<unsigned long long>(g_placed),
+                      static_cast<unsigned long long>((placed_now * kPageBytes) >> 20), static_cast<unsigned long long>(g_placed_again),
+                      static_cast<unsigned long long>(g_placed_refused), static_cast<unsigned long long>((held[0] * kPageBytes) >> 20),
+                      static_cast<unsigned long long>(wins[0]), static_cast<unsigned long long>((held[1] * kPageBytes) >> 20),
+                      static_cast<unsigned long long>(wins[1]), static_cast<unsigned long long>((held[2] * kPageBytes) >> 20),
+                      static_cast<unsigned long long>(wins[2]), static_cast<unsigned long long>((held[3] * kPageBytes) >> 20),
+                      static_cast<unsigned long long>(wins[3]));
+        in_place_line = ip;
+    }
     std::string out = std::string(buf) + h + rr;
     if (g_windows_made || g_window_crossings) {
         char wn[160];
@@ -2577,6 +2766,7 @@ std::string shadow_report() {
                  static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
                  static_cast<unsigned long long>(g_written_no_resource.load()));
     }
+    if (!in_place_line.empty()) out += "\n" + in_place_line;  // a line of its own (gnm.cpp logs a line a call)
     return out;
 }
 

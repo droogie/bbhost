@@ -374,9 +374,11 @@ std::vector<std::pair<const void*, std::size_t>> collect_ce(unsigned count, void
 // command processor - per flip, when the game asked for it against the
 // previous flip and the vblank clock, how many submissions of its frame came
 // and how many of them in the 3 ms before it, how long the game waited to
-// hand it over (the backlog bound), and when the command processor had
-// recorded it. Two lines a flip ("flip-tl" from the game's thread, "flip-tr"
-// from the command processor's), matched by number.
+// hand it over (the backlog bound), when the command processor had recorded
+// it, and how long before the call the game first looked at the flip status
+// (its frame ready; the flip pacing's hold is the wait between). Two lines a
+// flip ("flip-tl" from the game's thread, "flip-tr" from the command
+// processor's), matched by number.
 const bool g_flip_tl = [] {
     const char* e = std::getenv("BBHOST_FLIP_TIMELINE");
     return e && e[0] == '1';
@@ -405,6 +407,7 @@ GUEST_ABI int hle_gnm_submit(unsigned count, void** dcb, unsigned* dcb_bytes, vo
 }
 GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes,
                                  int handle, int buffer, unsigned, std::int64_t arg) {
+    const std::uint64_t tl_looked = hle_video_note_flip_call(arg);
     const std::uint64_t tl_call = g_flip_tl ? tl_now() : 0;
     std::uint64_t tl_n = 0;
     if (g_flip_tl) {
@@ -428,10 +431,12 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         unsigned late = 0;
         for (const std::uint64_t j : g_tl_jobs) late += tl_call - j <= 3000000ull ? 1 : 0;
         host_log("flip-tl #%llu call +%.2f ms (tick phase %.2f), %zu jobs since the last flip (%u in the 3 ms before), waited %.2f ms to hand "
-                 "over, backlog %llu",
+                 "over, backlog %llu, looked %.2f ms before the call (tick phase %.2f)",
                  static_cast<unsigned long long>(tl_n), g_tl_last_call ? static_cast<double>(tl_call - g_tl_last_call) / 1e6 : 0.0,
                  tl_phase_ms(tl_call), g_tl_jobs.size(), late, static_cast<double>(t - tl_call) / 1e6,
-                 static_cast<unsigned long long>(hle_gnm_cp_backlog()));
+                 static_cast<unsigned long long>(hle_gnm_cp_backlog()),
+                 tl_looked && tl_looked <= tl_call ? static_cast<double>(tl_call - tl_looked) / 1e6 : -1.0,
+                 tl_looked ? tl_phase_ms(tl_looked) : -1.0);
         g_tl_jobs.clear();
         g_tl_last_call = tl_call;
     }
@@ -655,7 +660,17 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             host_log("  sync: %s", sync.c_str());
             host_log("  pacing: %s; %s", frame_rate_limiter_window().c_str(), hle_video_pacing_window().c_str());
         }
-        host_log("  %s", host_gpu_shadow_report().c_str());
+        {
+            // A line a call (host_log keeps 1 KiB of one): the shadow's main
+            // line, then its own lines after it (the in-place census).
+            const std::string r = host_gpu_shadow_report();
+            for (std::size_t at = 0; at <= r.size();) {
+                const std::size_t nl = r.find('\n', at);
+                host_log("  %s", r.substr(at, nl == std::string::npos ? std::string::npos : nl - at).c_str());
+                if (nl == std::string::npos) break;
+                at = nl + 1;
+            }
+        }
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_occlusion_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_image_heap_report(); !r.empty()) host_log("  %s", r.c_str());

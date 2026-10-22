@@ -222,13 +222,21 @@ AREAS = (
          stand=(-462.9, 1530.7, -313.47, -150.0), dlc=True),
     # The GPU particles' places, after the twelve so their travels stay as they were. Vicar Amelia's room from the fog
     # wall at the top of the stairs, facing in: the heaviest particle simulation measured. The Cleric Beast's arena:
-    # the same particles with a steadier window. Logarius' Seat on Cainhurst's roof: the snow; a fresh arrival plays
-    # the castle's cutscene over the window, so its numbers are noisy.
+    # the same particles with a steadier window.
     Area("vicar-amelia", "Grand Cathedral: Vicar Amelia's room", "m24_00_00_00", 2402950,
          fog=(51.51, 35.71, 311.57, -150.0)),
     Area("cleric-beast", "Central Yharnam bridge: the Cleric Beast's arena", "m24_01_00_00", 2412951,
          fog=(-154.14, -27.02, 35.16, -135.0)),
-    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat", "m25_00_00_00", 2502951),
+    # Cainhurst's roof lamp (Logarius' Seat, headstone slot 26) on a first visit: the castle's arrival cutscene, not
+    # play. It holds the player at the lamp past the place's window - no HUD, no hunter, a panning camera - and when
+    # it ends the player falls through the roof, whose collisions stay off until Martyr Logarius is defeated (m25's
+    # event 12500810, flag 12501800). Kept as a bench for frame pacing through a cutscene's cuts.
+    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat - the arrival cutscene, not play", "m25_00_00_00", 2502951),
+    # Cainhurst in play: the courtyard's lamp (headstone slot 25) with flag 12500000 set before the travel's load,
+    # which skips the arrival cutscene - the player stands at the lamp, HUD up, through the settle and the window, and
+    # the layout's snow and fog effects are created as in play. It sets that flag, so it goes after cainhurst-roof
+    # in a tour that has both.
+    Area("cainhurst-courtyard", "Forsaken Cainhurst Castle: the courtyard's lamp", "m25_00_00_00", 2502950, flags=(12500000,)),
 )
 
 # Places a run names by id but "all" leaves out. A Root chalice dungeon from a player's glyph enters through an altar
