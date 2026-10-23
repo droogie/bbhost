@@ -208,6 +208,22 @@ bool kept_at(std::uint64_t va, std::uint64_t bytes);
 enum class Arena : int { kOff = 0, kInPlace = 1, kCompare = 2 };
 Arena arena_mode();
 inline bool arena_wanted() { return arena_mode() != Arena::kOff; }
+// BBHOST_GXVK_COPYBACK_CHECK=1 (a diagnostic, off by default; counts only): today's copy-backs read their source when
+// the command processor reaches the copy token, and GX retires a context's blocks when UpdateSubresource kicks its
+// command buffer, before the copy-backs that read renames in them are resolved. So a copy-back's source can be in a
+// block whose retire label has landed - GX may take it back any time - or one GX has already handed out again. The
+// arena keeps its hand-out records for this (both of the pool's ends), each with its node, the hand-out's number and,
+// once the command processor writes the node's status (the retire's end-of-pipe label), the submission that label
+// lands with; at each copy-back token its source's record is classed and counted for the exit report.
+bool copyback_check_wanted();
+// The hand-outs so far (lock-free): what the GX thread stamps a copy-back batch with as it records it.
+std::uint64_t arena_handout_seq();
+// The command processor writes `bytes` at `va` in the submission being recorded, `serial` (host_gpu_mem_write_serial):
+// a hand-out's node, its block retired.
+void arena_label(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
+// A copy-back from [src, +bytes) as the command processor reaches its token; `seq`: the hand-outs so far when the GX
+// thread recorded it.
+void copyback_check(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq);
 // The pool's init (decomp/gx/upload_heap.cpp's entry): the pool and the
 // region it is made over, which stays the game's.
 void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes);

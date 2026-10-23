@@ -12209,6 +12209,7 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     const ImportSite site("a label or CP write");
     if (!g.ok || bytes > 65536) return false;
     if (serial) *serial = g.flushes;  // the submission this write is recorded into
+    if (bytes <= 8) gxvk::arena_label(va, bytes, g.flushes);  // BBHOST_GXVK_COPYBACK_CHECK: a block's retire (a no-op without it)
     if (hle_gnm_arena_monitor() && hle_gx_arena_covers_marker(va, bytes)) {
         std::uint64_t v = 0;
         std::memcpy(&v, data, bytes < 8 ? bytes : 8);

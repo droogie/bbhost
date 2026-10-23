@@ -2842,6 +2842,8 @@ struct GuestCopy {
     // A whole texture copied (CopyResource): the generations of the textures
     // whose memory the copy starts at, 0 for anything else (host_gpu_copy_guest).
     std::uint64_t src_gen = 0, dst_gen = 0;
+    // BBHOST_GXVK_COPYBACK_CHECK: the upload heap's hand-outs so far as the GX thread recorded the copy-back.
+    std::uint64_t seq = 0;
 };
 // The live GX texture whose memory starts at `va` and covers `bytes`: its generation, or 0.
 std::uint64_t whole_texture_gen(std::uint64_t va, std::uint64_t bytes) {
@@ -2921,9 +2923,11 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
         const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
         if (!entries || !count) return 0;
         copies.reserve(count);
+        const std::uint64_t seq = gxvk::copyback_check_wanted() ? gxvk::arena_handout_seq() : 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::uint64_t e = entries + 0x18ull * i;
             copies.push_back({rd64(e), rd64(e + 8), (rd32(e + 0x10) >> 2) * 4ull, true});
+            copies.back().seq = seq;
         }
     } else {
         GuestCopy one{f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4};
@@ -7216,10 +7220,12 @@ void hle_gx_copy_token(std::uint64_t id) {
             run_dst.clear();
             run_src.clear();
             run_bytes.clear();
+            static const bool check = gxvk::copyback_check_wanted();
             for (std::size_t j = i; j < copies.size() && copies[j].back; ++j) {
                 run_dst.push_back(copies[j].dst);
                 run_src.push_back(copies[j].src);
                 run_bytes.push_back(copies[j].bytes);
+                if (check) gxvk::copyback_check(copies[j].src, copies[j].bytes, copies[j].seq);
             }
             const std::size_t took = host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
             for (std::size_t k = 0; k < took; ++k) bytes += copies[i + k].bytes;

@@ -41,6 +41,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // tests/gxvk_arena_test.cpp builds this file with mutants: small wrong turns
@@ -85,9 +86,25 @@ struct Record {
     std::uint32_t gen = 0;
     bool live = false;
     bool held = false;  // a copy-back's source held in it (arena_hold) since its hand-out
+    // BBHOST_GXVK_COPYBACK_CHECK: the pool's node (its first dword is the status a retire's label writes), the
+    // hand-out's number, and the submissions that must have completed for that label to have landed (0: not written).
+    std::uint64_t node = 0, seq = 0, retire = 0;
 };
 std::mutex g_mu;
 std::vector<Record> g_records;            // under g_mu
+// BBHOST_GXVK_COPYBACK_CHECK: the live records by their node (under g_mu), the nodes' span (a cheap test for the
+// command processor's label writes) and the hand-outs so far, published for the GX threads.
+const bool g_check = [] {
+    const char* e = std::getenv("BBHOST_GXVK_COPYBACK_CHECK");
+    return e && e[0] == '1';
+}();
+std::unordered_map<std::uint64_t, std::uint32_t> g_node_rec;
+std::atomic<std::uint64_t> g_node_lo{~0ull}, g_node_hi{0}, g_seq_pub{0};
+enum CheckClass : int { kChkReused, kChkLanded, kChkWalked, kChkOpen, kChkNoRecord, kChkClasses };
+const char* const kChkName[kChkClasses] = {"its block handed out again since GX issued the copy-back",
+                                           "its block's retire label landed (GX may take it back)", "its block retired, the label not landed",
+                                           "its block not retired", "no hand-out holds it"};
+std::atomic<std::uint64_t> g_chk[kChkClasses] = {}, g_chk_labels{0};
 std::vector<std::uint32_t> g_free;        // under g_mu: records not live
 std::vector<std::vector<std::uint32_t>> g_pages;  // under g_mu: by page, the live records over it
 std::uint64_t g_live = 0, g_live_max = 0;         // under g_mu
@@ -151,7 +168,7 @@ std::atomic<std::int64_t> g_wait_minute{0};       // the steady clock's minute t
 std::atomic<std::uint64_t> g_waits_in_minute{0};
 
 // The records are kept for in-place bindings (BBHOST_GXVK_ARENA) or copy-backs from the heap (BBHOST_GXVK_HEAP_COPY).
-bool proof_wanted() { return g_mode != Arena::kOff || heap_copy_wanted(); }
+bool proof_wanted() { return g_mode != Arena::kOff || heap_copy_wanted() || g_check; }
 
 // The submissions whose work is done: the landing's count or the retirements',
 // whichever is further. The landing's count raised before their labels are in
@@ -200,6 +217,10 @@ void drop_locked(std::uint32_t r) {
     }
     rec.live = false;
     ++rec.gen;
+    if (rec.node) {
+        const auto it = g_node_rec.find(rec.node);
+        if (it != g_node_rec.end() && it->second == r) g_node_rec.erase(it);
+    }
     g_free.push_back(r);
     --g_live;
 }
@@ -244,6 +265,44 @@ Arena arena_mode() { return g_mode; }
 bool arena_proof_wanted() { return proof_wanted(); }
 
 bool arena_recording() { return proof_wanted() && g_in_place.load(std::memory_order_relaxed); }
+
+bool copyback_check_wanted() { return g_check; }
+
+std::uint64_t arena_handout_seq() { return g_seq_pub.load(std::memory_order_acquire); }
+
+void arena_label(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
+    if (!g_check || va + bytes <= g_node_lo.load(std::memory_order_relaxed) || va > g_node_hi.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_released) return;
+    const auto it = g_node_rec.find(va);
+    if (it == g_node_rec.end()) return;
+    Record& rec = g_records[it->second];
+    if (!rec.live || rec.node != va) return;
+    rec.retire = serial + 1;
+    g_chk_labels.fetch_add(1, std::memory_order_relaxed);
+}
+
+void copyback_check(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq) {
+    if (!g_check || !bytes) return;
+    const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
+    if (!lo || src < lo || src >= hi) return;  // not the heap's
+    const std::uint64_t done = done_submissions();
+    CheckClass c = kChkNoRecord;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_released) return;
+        const std::uint64_t p = (src - lo) >> kPageShift;
+        if (p < g_pages.size()) {
+            for (const std::uint32_t r : g_pages[p]) {
+                const Record& rec = g_records[r];
+                if (!rec.live || src < rec.start || src >= rec.end) continue;
+                c = rec.seq > seq ? kChkReused : !rec.retire ? kChkOpen : done >= rec.retire ? kChkLanded : kChkWalked;
+                break;
+            }
+        }
+    }
+    g_chk[c].fetch_add(1, std::memory_order_relaxed);
+}
 
 void arena_unrecorded() {
     if (proof_wanted()) g_unrecorded.fetch_add(1, std::memory_order_relaxed);
@@ -406,6 +465,15 @@ void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
     rec.live = true;
     rec.held = false;
     ++g_handout_seq;
+    if (g_check) {
+        rec.node = node;
+        rec.seq = g_handout_seq;
+        rec.retire = 0;
+        g_node_rec[node] = r;
+        if (node < g_node_lo.load(std::memory_order_relaxed)) g_node_lo.store(node, std::memory_order_relaxed);
+        if (node > g_node_hi.load(std::memory_order_relaxed)) g_node_hi.store(node, std::memory_order_relaxed);
+        g_seq_pub.store(g_handout_seq, std::memory_order_release);
+    }
     for (std::uint64_t p = p0; p <= p1; ++p) g_pages[p].push_back(r);
     if (++g_live > g_live_max) g_live_max = g_live;
     if (g_fail_after && recorded == g_fail_after)
@@ -642,6 +710,20 @@ ArenaTestCounts arena_test_counts() {
 #endif
 
 void arena_report() {
+    if (g_check) {
+        std::string by;
+        std::uint64_t all = 0;
+        for (int c = 0; c < kChkClasses; ++c) all += g_chk[c].load();
+        for (int c = 0; c < kChkClasses; ++c) {
+            char b[160];
+            std::snprintf(b, sizeof b, "%s%s %llu", c ? "; " : "", kChkName[c], static_cast<ull>(g_chk[c].load()));
+            by += b;
+        }
+        host_log("gxvk copy-back check (BBHOST_GXVK_COPYBACK_CHECK): %llu copy-backs from the heap as the command processor reached "
+                 "their tokens: %s. Retire labels the command processor wrote on a hand-out's node: %llu; hand-outs recorded %llu%s",
+                 static_cast<ull>(all), by.c_str(), static_cast<ull>(g_chk_labels.load()), static_cast<ull>(g_handouts.load()),
+                 g_released ? " (the records stopped early)" : "");
+    }
     if (!proof_wanted() && !census()) return;
     const auto v = [](const std::atomic<std::uint64_t>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
     if (!proof_wanted()) {
