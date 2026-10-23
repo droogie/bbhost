@@ -914,14 +914,12 @@ GUEST_ABI std::int64_t pool_init_hook(std::uint64_t, const std::uint64_t* saved)
 
 // The same, ours (decomp/gx/upload_heap.cpp): it tells us of the pool and its
 // region - the census, and GX on Vulkan's arena (host/gxvk.h), which binds
-// the heap in place - and takes the region the arena gives back (0: the
-// game's).
+// the heap in place - and keeps the game's region (0).
 GUEST_ABI std::uint64_t upload_region_entry(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t bytes_out) {
-    std::uint64_t ours_bytes = bytes;
-    const std::uint64_t ours = gxvk::arena_region(pool, region, bytes, &ours_bytes);
-    if (ours) std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(bytes_out)), &ours_bytes, sizeof ours_bytes);
-    gxvk::census_heap(pool, ours ? ours : region, ours ? ours_bytes : bytes);
-    return ours;
+    (void)bytes_out;
+    gxvk::arena_region(pool, region, bytes);
+    gxvk::census_heap(pool, region, bytes);
+    return 0;
 }
 
 // YEBIS's device's creators (census): the object comes back through `out`.

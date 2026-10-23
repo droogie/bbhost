@@ -68,7 +68,6 @@ struct GuestMapInfo {
 void hle_kernel_snapshot_maps(std::vector<GuestMapInfo>& out);
 std::uint64_t hle_kernel_maps_generation();  // changes whenever the map list does
 std::uint64_t hle_kernel_map_host(std::uint64_t len);  // host read/write memory in the GPU page table; 0 on failure
-std::uint64_t hle_kernel_map_host_pieces(std::uint64_t len, std::uint64_t piece);  // the same, recorded as mappings of `piece` bytes side by side
 std::uint64_t hle_kernel_gpu_alias(std::uint64_t va);  // direct memory's GPU alias of a CPU address; 0 when none
 std::uint64_t hle_kernel_mappings_of(std::uint64_t va);
 // Write-protects [va, va+len) for the texture cache when it is direct memory

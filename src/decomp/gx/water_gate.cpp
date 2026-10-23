@@ -39,10 +39,16 @@
 //     order (new maps a resize swapped in during the update, sub_12bd860,
 //     are turned back with them, as the game's next update expects them);
 //   - the task returns at once, and the impulses the update handed on stay
-//     where the task reads them: the next update, before the game's, moves
-//     them to the end of each surface's queue (in the room the queue has; into
-//     an empty queue's place when it has none - the swap the update does
-//     itself), so the next step takes them with the ones added meanwhile.
+//     where the task reads them. A wake's effect queues its impulse each time
+//     it is drawn (GPU particle type 0x2968's draw, sub_12fc710, through
+//     sub_2677170): a frame each, whatever the effects' steps, so a step that
+//     took every frame's would splat two frames' at 60 and four at 120
+//     against 30's one - the wakes twice and four times as strong. A step
+//     takes the latest frame's: the next update, before the game's, drops the
+//     held frame's when newer ones wait in the surface's queue, and else moves
+//     them there (in the room the queue has; into the empty queue's place when
+//     it has none - the swap the update does itself), so impulses queued on
+//     some frames only still reach the next step.
 //     The update hands the impulses on while nothing adds to the queues; the
 //     task may run while the game adds the next frame's, so ours touches the
 //     two vectors only in the update, as the game's does.
@@ -132,7 +138,8 @@ struct ManagerGate {
 };
 ManagerGate g_managers[kManagers];
 
-std::atomic<u64> g_frames{0}, g_steps{0}, g_camera_steps{0}, g_held{0}, g_turned_back{0}, g_impulses_kept{0}, g_impulses_lost{0}, g_passed{0};
+std::atomic<u64> g_frames{0}, g_steps{0}, g_camera_steps{0}, g_held{0}, g_turned_back{0}, g_impulses_kept{0}, g_impulses_replaced{0},
+    g_impulses_lost{0}, g_passed{0};
 // The frame-rate code's schedule (decomp_water_step_frame): the frame about to run between whole 1/30 s steps or
 // not, and a count of the frames it was told for (0: never - the game time decides).
 std::atomic<u32> g_schedule_between{0};
@@ -202,14 +209,14 @@ bool grids_to_turn(u64 manager, ManagerGate& m) {
     return !screen || add(load<u64>(screen));
 }
 
-// A held frame's impulses back in their queues, before the update hands the
-// queues on: each water surface's +0x98 vector still holds what the held
-// frame's update handed it; they go to the end of its +0xa0 queue, in the room
-// the queue has (whatever the two vectors' heaps: the queue keeps its own
-// room), or - the queue empty and without the room - the two vectors swap
-// places, as the update's own swap does, when they come from one heap. Else
-// they are dropped. The +0x98 vector is left empty either way. Adds to the
-// counts kept and lost.
+// A held frame's impulses, before the update hands the queues on: each water
+// surface's +0x98 vector still holds what the held frame's update handed it.
+// With newer ones in its +0xa0 queue they are dropped: the step takes the
+// latest frame's. Else they go to the queue, in the room it has (whatever the
+// two vectors' heaps: the queue keeps its own room), or - without the room -
+// the two vectors swap places, as the update's own swap does, when they come
+// from one heap; else they are dropped. The +0x98 vector is left empty either
+// way. Adds to the counts kept, replaced and lost.
 void requeue_impulses(u64 manager) {
     const u64 first = load<u64>(manager + kManagerSurfaces), end = load<u64>(manager + kManagerSurfaces + 8);
     for (u64 at = first; at < end; at += 8) {
@@ -221,7 +228,11 @@ void requeue_impulses(u64 manager) {
         if (t_end <= t_first) continue;
         const u64 bytes = t_end - t_first;
         const u64 q_first = load<u64>(queued + 8), q_end = load<u64>(queued + 0x10), q_room = load<u64>(queued + 0x18);
-        if (q_end >= q_first && q_room >= q_end && q_room - q_end >= bytes && !MUTANT(13)) {
+        if (q_end > q_first && !MUTANT(18)) {
+            // a newer frame's wait: those are the step's
+            store<u64>(taken + 0x10, t_first);
+            g_impulses_replaced.fetch_add(bytes / kImpulseBytes, std::memory_order_relaxed);
+        } else if (q_end >= q_first && q_room >= q_end && q_room - q_end >= bytes && !MUTANT(13)) {
             std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(q_end)), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(t_first)),
                          bytes);
             store<u64>(queued + 0x10, q_end + bytes);
@@ -332,9 +343,10 @@ void decomp_water_gate_report() {
     const u64 frames = g_frames.load(), steps = g_steps.load();
     host_log("decomp: the water interaction's wave steps: %llu frames, %llu stepped (%llu of them as the camera crossed the grid's unit), "
              "%llu held between whole 1/30 s (their update's turn of the height maps undone on %llu grids; %llu impulses kept for the next "
-             "step, %llu dropped for want of room), %llu task calls with no update before them the game's%s",
+             "step, %llu given up for a newer frame's, %llu dropped for want of room), %llu task calls with no update before them the game's%s",
              static_cast<ull>(frames), static_cast<ull>(steps), static_cast<ull>(g_camera_steps.load()), static_cast<ull>(g_held.load()),
-             static_cast<ull>(g_turned_back.load()), static_cast<ull>(g_impulses_kept.load()), static_cast<ull>(g_impulses_lost.load()),
+             static_cast<ull>(g_turned_back.load()), static_cast<ull>(g_impulses_kept.load()), static_cast<ull>(g_impulses_replaced.load()),
+             static_cast<ull>(g_impulses_lost.load()),
              static_cast<ull>(g_passed.load()), g_gate_on ? "" : " (BBHOST_WATER_GATE=0: every frame the game's)");
     if (g_gate_on)
         host_log("decomp: the water interaction's steps: %llu updates on the frame-rate code's schedule of whole 1/30 s (the "

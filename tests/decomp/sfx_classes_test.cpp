@@ -42,6 +42,12 @@
 //   - the children module 0x56eb2e0 (sub_12fccf0): never reads the container's
 //     parameters (rsi is overwritten first), where the step is: the same calls
 //     and bytes for any step;
+//   - the FFX spot light module 0x56ebc40 (sub_1320260): its GX spot light
+//     from curves at the node's age, two modes that store, keep or blend from
+//     stored values by a curve at the age (storing nothing): never reads its
+//     params or context, where the step is - the same calls and bytes for any
+//     - and the frames' last call, at the node's time, leaves the module and
+//     the light as the whole step's call there does;
 //   - the Sprj module 0x5756e50 (sub_23749d0): its model and its sound advance
 //     by the step times its rate +0xc4 - the game's product handed to both, and
 //     the frames' sum within a rounding of the whole step's - and nothing else
@@ -1016,6 +1022,168 @@ int check_sprj(int cases) {
     return bad;
 }
 
+// --- the FFX spot light module 0x56ebc40 (sub_1320260) ----------------------------------
+//
+// Its update sets its GX spot light from curves at the node's age (the node's time +0x7c less the module's start
+// +0x10): the transform from the node's rows (sub_264a360), two colours (+0x70, +0x80) from the vec4 curves +0x38 and
+// +0x40 times the instance's colour and scale, the ranges and the cone (sub_2649ca0, by way of atanf) from the curves
+// +0x48..+0x60, the visibility (sub_2702000) from what they give. Two modes, +0xa0 for the colours and +0xa4 for the
+// ranges: 0 stores the curves' values (+0xb0, +0xc0, +0xe0, +0xe4; +0xd0..+0xdc), 1 keeps the stored ones, 2 blends
+// from the stored ones to the curves by a curve at the age (+0x88, +0x80), storing nothing. It never reads its params
+// or its context, where the step is, and it counts nothing a call: the frames' last call, at the node's time, leaves
+// what the whole step's call there leaves.
+
+constexpr u64 kSpotUpdate = 0x1320260;
+
+// A vec4 curve: (curve, node, &time) -> a + b t in every lane, a at +0x10 and b at +0x20.
+GUEST_ABI __m128 curve4_linear(u64 c, u64, const float* t) {
+    const __m128 a = _mm_loadu_ps(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(c + 0x10)));
+    const __m128 b = _mm_loadu_ps(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(c + 0x20)));
+    return _mm_add_ps(a, _mm_mul_ps(b, _mm_set1_ps(*t)));
+}
+alignas(64) u8 g_spot_curve4_vt[0x80];
+u64 curve4() {
+    const u64 c = block(0x40);
+    store<u64>(c, reinterpret_cast<u64>(g_spot_curve4_vt));
+    for (int k = 0; k < 4; ++k) {
+        store<float>(c + 0x10 + 4 * k, uni(0.0f, 2.0f));
+        store<float>(c + 0x20 + 4 * k, uni(-1.0f, 1.0f));
+    }
+    return c;
+}
+// The cone's setter (light, near, far, two angles) and the visibility's (owner, light, on), recorded; the query of
+// what the light is attached to answered from its arguments; atanf the host's.
+GUEST_ABI void stub_cone(u64 light, float a, float b, float c, float d) {
+    g_rec.push_back({20, light, static_cast<u64>(bits(a)) | static_cast<u64>(bits(b)) << 32,
+                     bits(c) ^ (bits(d) << 7 | bits(d) >> 25)});
+}
+GUEST_ABI void stub_visibility(u64 owner, u64 light, u32 on) { g_rec.push_back({21, owner, light, on & 0xff}); }
+GUEST_ABI u64 stub_pass(u64 x) { return x; }
+GUEST_ABI u32 stub_attached(u64 x, u64 node, u64) { return static_cast<u32>((x ^ node) >> 6 & 1); }
+GUEST_ABI float host_atanf(float x) { return std::atan(x); }
+
+struct Spot {
+    u64 module, node, light, instance;
+};
+Spot make_spot() {
+    Spot s;
+    s.module = block(0x100);
+    s.node = make_node();
+    s.light = block(0x240);
+    s.instance = block(0x50);
+    for (int k = 0; k < 0x240; k += 4) store<u32>(s.light + k, g_rng.u32() & 0x3fffffffu);
+    store<u8>(s.light + 0xc4, 0);
+    store<u8>(s.light + 0xc5, g_rng.chance(0.2) ? 1 : 0);
+    for (const u64 row : {0x20ull, 0x30ull, 0x40ull}) put4(s.node + row, uni(-5, 5), uni(-5, 5), uni(-5, 5), uni(-5, 5));
+    store<u64>(s.node + 0x58, s.instance);
+    put4(s.instance + 0x10, uni(0, 1), uni(0, 1), uni(0, 1), uni(0, 1));
+    for (const u64 o : {0x20ull, 0x24ull, 0x28ull}) store<float>(s.instance + o, uni(0.5f, 2.0f));
+    if (g_rng.chance(0.7)) {
+        const u64 r = block(0x230);
+        for (int k = 0; k < 0x230; k += 4) store<float>(r + k, uni(0.1f, 2.0f));
+        store<float>(r + 0x60, uni(0.5f, 2.0f));
+        for (const u64 o : {0x204ull, 0x20cull, 0x20dull, 0x20eull, 0x218ull}) store<u8>(r + o, g_rng.chance(0.5) ? 1 : 0);
+        store<u32>(r + 0x208, g_rng.u32());
+        u64 attach = 0;
+        if (g_rng.chance(0.5)) {
+            attach = block(0x170);
+            store<u64>(attach + 0x18, block(0x10));
+            store<u32>(attach + 0x164, g_rng.u32());
+        }
+        store<u64>(r + 0x1f0, attach);
+        store<u32>(r + 0x1f8, g_rng.u32());
+        store<u64>(s.instance + 0x40, r);
+    } else {
+        store<u64>(s.instance + 0x40, 0);
+    }
+    const u64 m = s.module;
+    store<u64>(m + 8, s.node);
+    store<float>(m + 0x10, uni(0.0f, 2.0f));
+    store<u8>(m + 0x18, g_rng.chance(0.5) ? 1 : 0);
+    store<u64>(m + 0x20, block(0x10));
+    store<u64>(m + 0x28, s.light);
+    store<u8>(m + 0x30, g_rng.chance(0.5) ? 1 : 0);
+    store<u64>(m + 0x38, curve4());
+    store<u64>(m + 0x40, curve4());
+    for (const u64 o : {0x48ull, 0x50ull, 0x58ull, 0x60ull, 0x80ull, 0x88ull})
+        store<u64>(m + o, curve(uni(0.5f, 3.0f), uni(-0.5f, 0.5f)));
+    for (const u64 o : {0x90ull, 0x98ull}) store<u64>(m + o, g_rng.chance(0.5) ? curve(uni(0.5f, 3.0f), uni(-0.5f, 0.5f)) : 0);
+    store<float>(m + 0x6c, uni(0.5f, 2.0f));
+    store<float>(m + 0x70, uni(0.5f, 2.0f));
+    store<u32>(m + 0xa0, static_cast<u32>(g_rng.range(0, 2)));
+    store<u32>(m + 0xa4, static_cast<u32>(g_rng.range(0, 2)));
+    for (int k = 0xb0; k < 0xe8; k += 4) store<float>(m + k, uni(0.1f, 2.0f));
+    return s;
+}
+
+int check_spot_light(int cases) {
+    const auto spot = opaque(eboot_kit::fn<ModuleFn>(kSpotUpdate));
+    int bad = 0, held = 0, blended = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const Spot s = make_spot();
+        held += load<u32>(s.module + 0xa0) == 1 || load<u32>(s.module + 0xa4) == 1;
+        blended += load<u32>(s.module + 0xa0) == 2 || load<u32>(s.module + 0xa4) == 2;
+        const std::vector<u8> m0 = bytes_of(s.module, 0x100), l0 = bytes_of(s.light, 0x240), n0 = bytes_of(s.node, 0x100);
+        auto reset = [&] {
+            put_bytes(s.module, m0);
+            put_bytes(s.light, l0);
+            put_bytes(s.node, n0);
+            g_rec.clear();
+        };
+        const char* why = nullptr;
+        // (1) the step is in the params, which it never reads, nor its context: two of each, everything in them different
+        const u64 pa = block(0x70), pb = block(0x70), ctx = block(0x40);
+        for (int k = 0; k < 0x70; k += 4) {
+            store<u32>(pa + k, g_rng.u32());
+            store<u32>(pb + k, g_rng.u32());
+        }
+        store<float>(pa + 0x60, 1.0f / 30.0f);
+        store<float>(pb + 0x60, 1.0f / 120.0f);
+        reset();
+        spot(s.module, pa, 0);
+        const std::vector<Rec> ra = g_rec;
+        const std::vector<u8> ma = bytes_of(s.module, 0x100), la = bytes_of(s.light, 0x240);
+        reset();
+        spot(s.module, pb, ctx);
+        bool same = g_rec.size() == ra.size() && bytes_of(s.module, 0x100) == ma && bytes_of(s.light, 0x240) == la;
+        for (std::size_t i = 0; same && i < g_rec.size(); ++i)
+            same = g_rec[i].what == ra[i].what && g_rec[i].a == ra[i].a && g_rec[i].b == ra[i].b && g_rec[i].dt == ra[i].dt;
+        if (!same) why = "the params or the context changed what it did";
+        // (2) the whole step's call at the node's time T, against the frame domain's 4 calls at 120 - the node's time put
+        // T - 3h, T - 2h, T - h and T, as the container calls put it - and their last call's light and module
+        const float t = load<float>(s.node + 0x7c), h = 1.0f / 120.0f;
+        if (!why) {
+            reset();
+            spot(s.module, pa, 0);
+            const std::vector<u8> mw = bytes_of(s.module, 0x100), lw = bytes_of(s.light, 0x240);
+            Rec cone_w{};
+            for (const Rec& r : g_rec)
+                if (r.what == 20) cone_w = r;
+            reset();
+            Rec cone_f{};
+            for (int i = 3; i >= 0; --i) {
+                const float at = g_control == 2 ? addss(t, -3 * h) : addss(t, -i * h);
+                store<float>(s.node + 0x7c, at);
+                spot(s.module, pb, 0);
+            }
+            store<float>(s.node + 0x7c, t);
+            for (const Rec& r : g_rec)
+                if (r.what == 20) cone_f = r;
+            if (bytes_of(s.module, 0x100) != mw) why = "the module after the frames against the whole step";
+            else if (bytes_of(s.light, 0x240) != lw) why = "the light after the frames against the whole step";
+            else if (cone_f.a != cone_w.a || cone_f.dt != cone_w.dt) why = "the cone after the frames against the whole step";
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("spot light case %d (modes %u, %u): %s\n", c, load<u32>(s.module + 0xa0), load<u32>(s.module + 0xa4), why);
+    }
+    if (!g_quiet)
+        std::printf("decomp_sfx_classes: FFX spot light: %d cases (%d with a mode keeping, %d blending), the step never read and the frames' last "
+                    "call the whole step's, %d differ\n",
+                    cases, held, blended, bad);
+    return bad;
+}
+
 // --- the CPU particles (the binder 0x56e3090's system) ----------------------------------
 
 using SystemFn = GUEST_ABI void (*)(u64 system, u64 item);
@@ -1783,6 +1951,17 @@ int main() {
     eboot_kit::stub(0x2160500, reinterpret_cast<const void*>(&stub_reserve));
     eboot_kit::stub(0x1c37770, reinterpret_cast<const void*>(&stub_collect));
     store<u64>(reinterpret_cast<u64>(g_model_vt) + 0x30, reinterpret_cast<u64>(&stub_model_set));
+    // The FFX spot light's reach: its cone's setter, its visibility, what its light is attached to; atanf.
+    store<u64>(reinterpret_cast<u64>(g_spot_curve4_vt) + 0x58, reinterpret_cast<u64>(&curve4_linear));
+    eboot_kit::stub(0x2649ca0, reinterpret_cast<const void*>(&stub_cone));
+    eboot_kit::stub(0x2702000, reinterpret_cast<const void*>(&stub_visibility));
+    eboot_kit::stub(0x131dbb0, reinterpret_cast<const void*>(&stub_pass));
+    eboot_kit::stub(0x2c545f0, reinterpret_cast<const void*>(&stub_pass));
+    eboot_kit::stub(0x2713030, reinterpret_cast<const void*>(&stub_attached));
+    if (!eboot_kit::bind("atanf", reinterpret_cast<const void*>(&host_atanf))) {
+        std::printf("decomp_sfx_classes: no atanf import to bind\n");
+        return 1;
+    }
 
     constexpr int kCases = 4000;
     int bad = 0;
@@ -1798,6 +1977,7 @@ int main() {
     bad += check_composite(kCases / 4);
     bad += check_children(kCases / 4);
     bad += check_sprj(kCases / 4);
+    bad += check_spot_light(kCases / 4);
     bad += check_cpu_particles(kCases);
     bad += check_gx_record(kCases);
     bad += check_sims(kCases / 8);
@@ -1812,6 +1992,7 @@ int main() {
         const char* what;
     } controls[] = {{1, check_cpu_particles, "the emission count on every frame (the CPU particles)"},
                     {2, check_euler, "the node's time left at its whole step (the Euler motion's curve)"},
+                    {2, check_spot_light, "the node's time left at its whole step (the FFX spot light's curves)"},
                     {2, check_gravity_motion, "the node's time left at its whole step (the gravity motion's curves)"},
                     {3, check_gravity_motion, "each frame handed the whole step (the gravity motion)"},
                     {2, check_wind_motion, "the node's time left at its whole step (the wind motion's curves)"},

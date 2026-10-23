@@ -10,7 +10,6 @@
 #include "core/imports.h"
 #include "core/win_watch.h"
 #include "core/write_watch.h"
-#include "host/gxvk.h"
 #include "engine/addr.h"
 #include "engine/guest.h"
 #include "engine/np_test.h"
@@ -754,12 +753,6 @@ __attribute__((no_stack_protector)) void on_segv_entry(int sig, siginfo_t* info,
             frame[1 + k] = *reinterpret_cast<const std::uint64_t*>(at);
         }
         if (page_ok(rbp + 8) && ((rbp + 8) >> 12) == (rsp >> 12)) frame[7] = *reinterpret_cast<const std::uint64_t*>(rbp + 8);
-    }
-    // GX's upload heap while it moves into video memory at the GPU's start
-    // (host/gxvk.h, BBHOST_GXVK_ARENA=2): the write waits for the move and is
-    // retried on the memory placed there.
-    if (sig == SIGSEGV && is_write && gxvk::arena_move_fault(reinterpret_cast<std::uint64_t>(info->si_addr))) {
-        return;
     }
     if (sig == SIGSEGV && write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), is_write, frame)) {
         return;

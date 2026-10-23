@@ -24,8 +24,11 @@
 //         whole step; on the game time where nothing is scheduled;
 //       - every step reads the maps the two steps before it wrote, in order,
 //         and the frames between show the last step's (the surfaces' +0x10);
-//       - every impulse taken by exactly one step - the next, or after a
-//         camera's step took its 1/30 s ahead the one after - none twice;
+//       - every step takes the latest frame's impulses (a held frame's are
+//         given up for a newer frame's: a wake's effect queues one a frame),
+//         and impulses queued on the frames after steps only still reach the
+//         next step - after a camera's step took its 1/30 s ahead the one
+//         after; none twice;
 //       - a resize swapped in on a frame between steps read as the game's
 //         update at 30 hands it on;
 //       - the manager off for a while (its update does nothing): nothing taken
@@ -238,6 +241,15 @@ struct World {
     std::map<u64, int> taken;      // id -> times taken
     double worst_delay = 0.0;
     double now = 0.0;
+    // each surface's latest frame's impulses (queue_impulse), the frame a step last took its impulses, and the steps
+    // that took other than the latest frame's since the step before (checked while the manager stays on)
+    std::vector<u64> batch[kSurfaces];
+    int batch_frame[kSurfaces] = {-1, -1, -1};
+    int last_take[kSurfaces] = {-1, -1, -1};
+    int frame_no = 0;
+    bool check_latest = true;
+    int not_latest = 0;
+    int rooms_swapped = 0;  // frames on which surface 2's two vectors (two heaps) no longer held their own rooms
 };
 World* W = nullptr;
 
@@ -342,13 +354,23 @@ GUEST_ABI u64 game_task(u64 self, u64 context, u64 param) {
         const u64 grid = load<u64>(h);
         game_resize_copy(grid);
         const u64 taken = load<u64>(s + 0x98);
+        std::vector<u64> ids;
         for (u64 q = load<u64>(taken + 8); q < load<u64>(taken + 0x10); q += sizeof(Impulse)) {
             const u64 id = load<u64>(q);
+            ids.push_back(id);
             const int n = ++W->taken[id];
             if (n == 1) {
                 const double d = W->now - W->added[id];
                 if (d > W->worst_delay) W->worst_delay = d;
             }
+        }
+        const int si = static_cast<int>((p - load<u64>(mgr + 0x40)) / 8);
+        if (W->check_latest && si >= 0 && si < kSurfaces) {
+            // the latest frame's since this surface's last step, or none
+            const std::vector<u64> none_new;
+            const std::vector<u64>& expect = W->batch_frame[si] > W->last_take[si] ? W->batch[si] : none_new;
+            if (ids != expect) ++W->not_latest;
+            W->last_take[si] = W->frame_no;
         }
         if (!load<u8>(mgr + 0x79)) game_step(grid);
     }
@@ -424,7 +446,8 @@ void build(World& w, bool screen) {
     store<u64>(m + 0x48, reinterpret_cast<u64>(&w.surface_list[kSurfaces]));
 }
 
-void queue_impulse(World& w, int surface) {  // sub_2677170
+void queue_impulse(World& w, int surface) {  // sub_2677170: nothing while the manager is off
+    if (!load<u8>(at(w.manager) + 0x78)) return;
     const u64 queued = load<u64>(at(w.surfaces[surface]) + 0xa0);
     const u64 end = load<u64>(queued + 0x10);
     if (end + sizeof(Impulse) > load<u64>(queued + 0x18)) {
@@ -435,6 +458,11 @@ void queue_impulse(World& w, int surface) {  // sub_2677170
     store<u64>(end, id);
     store<u64>(queued + 0x10, end + sizeof(Impulse));
     w.added[id] = w.now;
+    if (w.batch_frame[surface] != w.frame_no) {
+        w.batch[surface].clear();
+        w.batch_frame[surface] = w.frame_no;
+    }
+    w.batch[surface].push_back(id);
 }
 
 struct Frames {
@@ -445,6 +473,7 @@ struct Frames {
     int off_from = -1, off_to = -1;  // the manager off over these frames
     bool our_task = true;            // false: the game's task in place of ours
     int impulse_every = 1;           // a frame, each surface
+    bool after_steps = false;        // impulses only on the frames after a step (an effect queueing on its steps' draws)
     bool schedule = false;           // the frame-rate code's schedule of whole 1/30 s told each frame (sfx_schedule::next)
 };
 
@@ -459,6 +488,7 @@ struct Outcome {
 Outcome play(World& w, const Frames& f) {
     W = &w;
     w.resize_at = f.resize_at;
+    w.check_latest = f.off_from < 0;
     for (ManagerGate& mg : g_managers) {
         mg.manager.store(0);
         mg.gate = WaterGate{};
@@ -481,9 +511,10 @@ Outcome play(World& w, const Frames& f) {
     Outcome o;
     float t = 500.0f;
     const float t0 = t;
-    bool have_step = false;
+    bool have_step = false, stepped_before = true;
     float step_x = 0, step_z = 0;
     for (int i = 0; i < f.frames; ++i) {
+        w.frame_no = i;
         w.now = static_cast<double>(t) - static_cast<double>(t0);
         set_time(t);
         const double dt = f.uneven ? uniform(1.0 / 240, 1.0 / 30) : 1.0 / f.fps;
@@ -500,13 +531,14 @@ Outcome play(World& w, const Frames& f) {
         set_camera(x, z);
         const bool on = !(i >= f.off_from && i < f.off_to);
         store<u8>(at(w.manager) + 0x78, on ? 1 : 0);
-        if (i % f.impulse_every == 0)
+        if (f.after_steps ? stepped_before : i % f.impulse_every == 0)
             for (int s = 0; s < kSurfaces; ++s) queue_impulse(w, s);
         const int steps_before = w.steps;
         water_update(at(w.manager));
         g_args_ok = true;
         const u64 r = f.our_task ? water_task(self, context, param) : game_task(self, context, param);
         const bool stepped = w.steps != steps_before;
+        stepped_before = stepped;
         if (on && f.our_task && (stepped ? r != 0x5eedu || !g_args_ok : r != 0)) ++o.bad_answers;
         // on the schedule, without the camera: a step on every whole frame and on no other (the first two frames the
         // game's and the start)
@@ -521,6 +553,10 @@ Outcome play(World& w, const Frames& f) {
                 ++o.misaligned;
             }
         }
+        // surface 2's vectors come from two heaps: each keeps its own room, every frame
+        if (load<u64>(load<u64>(at(w.surfaces[2]) + 0x98) + 8) != reinterpret_cast<u64>(&w.room[4][0]) ||
+            load<u64>(load<u64>(at(w.surfaces[2]) + 0xa0) + 8) != reinterpret_cast<u64>(&w.room[5][0]))
+            ++w.rooms_swapped;
         // what the water surfaces bind: the last step's heights
         for (int g = 0; g < (w.screen ? 1 : kSurfaces); ++g) {
             const u64 grid = at(w.grids[g]);
@@ -551,18 +587,14 @@ int out_of_order(const World& w, int g, const std::vector<std::pair<long, long>>
     return bad;
 }
 
-// Each impulse queued taken once (but the last 0.2 s's, which may still wait);
-// none taken twice.
-void impulses_once(const World& w, const char* what) {
-    int missing = 0, twice = 0;
-    for (const auto& [id, time] : w.added) {
-        const auto it = w.taken.find(id);
-        const int n = it == w.taken.end() ? 0 : it->second;
-        if (n > 1) ++twice;
-        if (n == 0 && time < w.now - 0.2) ++missing;
-    }
-    if (!g_quiet && (missing || twice)) std::printf("    %s: %d impulses never taken, %d taken twice\n", what, missing, twice);
-    check(missing == 0, what);
+// Every step took the latest frame's impulses since the step before (or none,
+// none queued since); none taken twice.
+void impulses_latest(const World& w, const char* what) {
+    int twice = 0;
+    for (const auto& [id, n] : w.taken) twice += n > 1;
+    if (!g_quiet && (w.not_latest || twice))
+        std::printf("    %s: %d steps took other than the latest frame's impulses, %d taken twice\n", what, w.not_latest, twice);
+    check(w.not_latest == 0, what);
     check(twice == 0, "no impulse taken twice");
 }
 
@@ -605,10 +637,29 @@ void frames_and_maps() {
                     check((screen ? o.steps : o.steps / kSurfaces) == o.frames, "at 30 every frame steps");
                 else
                     check(std::fabs(per_s - 30.0) < (running ? 0.6 : 0.4), "30 steps a game second");
-                impulses_once(w, "every impulse taken by a step");
+                impulses_latest(w, "a step takes the latest frame's impulses, none older beside them");
                 // the next step at the latest - after a camera's step took its 1/30 s ahead, up to one more
                 const double frame = rt.uneven ? 1.0 / 30 : 1.0 / rt.fps;
                 check(w.worst_delay <= (running ? 2 * kWaterStep : kWaterStep) + frame + 1e-4, "an impulse waits for the next step at most");
+                // an effect that queues its impulses on the frames after the steps only (the ones its steps drew): each
+                // reaches the next step, whatever frames are held between
+                static World ws;
+                ws = World{};
+                build(ws, screen != 0);
+                f.after_steps = true;
+                play(ws, f);
+                impulses_latest(ws, "impulses queued on the frames after steps only reach the next step");
+                check(ws.worst_delay <= (running ? 2 * kWaterStep : kWaterStep) + frame + 1e-4,
+                      "an impulse queued after a step waits for the next step at most");
+                // and one that queues every 7th frame, whatever the steps: a camera's step takes what waits, and nothing
+                // it took comes back
+                ws = World{};
+                build(ws, screen != 0);
+                f.after_steps = false;
+                f.impulse_every = 7;
+                play(ws, f);
+                impulses_latest(ws, "impulses queued every 7th frame: each step the latest since the step before");
+                check(ws.rooms_swapped == 0 && w.rooms_swapped == 0, "two heaps' vectors never swapped");
             }
         }
     }
@@ -642,24 +693,45 @@ void resize() {
 }
 
 void off_and_passes() {
-    // the manager off for a while (its update does nothing): nothing taken twice
+    // the manager off for a while (its update does nothing, nothing is queued): nothing taken twice - from a frame that
+    // stepped (what it took still in +0x98) and from one between
     static World w;
+    Frames f;
+    int twice = 0;
+    for (int from : {201, 200})
+        for (int len : {60, 61}) {
+            w = World{};
+            build(w, true);
+            f = Frames{};
+            f.fps = 60;
+            f.frames = 600;
+            f.off_from = from;
+            f.off_to = from + len;
+            play(w, f);
+            twice = 0;
+            for (const auto& [id, n] : w.taken) twice += n > 1;
+            check(twice == 0, "with the manager off for a while no impulse is taken twice");
+            check(out_of_order(w, 0) == 0, "with the manager off for a while the steps read in order");
+            check(w.rooms_swapped == 0, "two heaps' vectors never swapped, the manager off for a while");
+        }
+    // surface 2's vectors come from two heaps: each keeps its own room
+    const u64 room_taken = reinterpret_cast<u64>(&w.room[4][0]), room_queued = reinterpret_cast<u64>(&w.room[5][0]);
+    auto own_rooms = [&](World& x) {
+        const u64 t = load<u64>(at(x.surfaces[2]) + 0x98), q = load<u64>(at(x.surfaces[2]) + 0xa0);
+        return load<u64>(t + 8) == room_taken && load<u64>(q + 8) == room_queued;
+    };
+    check(own_rooms(w), "two heaps' vectors never swapped");
+    // the same with impulses every 7th frame: a held frame's then wait for the next step with nothing newer beside them
+    // (they move to the queue, in its room), and what a step took never comes back, the manager off or on
     w = World{};
     build(w, true);
-    Frames f;
-    f.fps = 60;
-    f.frames = 600;
-    f.off_from = 200;
-    f.off_to = 260;
+    f.impulse_every = 7;
     play(w, f);
-    int twice = 0;
+    twice = 0;
     for (const auto& [id, n] : w.taken) twice += n > 1;
-    check(twice == 0, "with the manager off for a while no impulse is taken twice");
-    check(out_of_order(w, 0) == 0, "with the manager off for a while the steps read in order");
-    // surface 2's vectors come from two heaps: each keeps its own room
-    const u64 taken = load<u64>(at(w.surfaces[2]) + 0x98), queued = load<u64>(at(w.surfaces[2]) + 0xa0);
-    const u64 room_taken = reinterpret_cast<u64>(&w.room[4][0]), room_queued = reinterpret_cast<u64>(&w.room[5][0]);
-    check(load<u64>(taken + 8) == room_taken && load<u64>(queued + 8) == room_queued, "two heaps' vectors never swapped");
+    check(twice == 0, "impulses every 7th frame, the manager off for a while: none taken twice");
+    check(own_rooms(w) && w.rooms_swapped == 0, "impulses every 7th frame: two heaps' vectors never swapped");
+    f.impulse_every = 1;
     // BBHOST_WATER_GATE=0: every frame the game's
     w = World{};
     build(w, true);
@@ -719,7 +791,8 @@ int main() {
                                            "a camera step without turning the maps round again",
                                            "a camera step's impulses kept waiting as well",
                                            "the schedule ignored (the game time decides)",
-                                           "a camera step's whole step not taken from the schedule's next"};
+                                           "a camera step's whole step not taken from the schedule's next",
+                                           "a held frame's impulses kept beside a newer frame's (every frame's taken)"};
     constexpr int kCount = sizeof kMutants / sizeof kMutants[0] - 1;
     int caught = 0, mutants = 0;
     g_quiet = true;

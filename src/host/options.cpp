@@ -59,6 +59,7 @@ enum SettingId {
     kVsync,
     kFrameCap,
     kFpsCounter,
+    kMemoryCounter,
     kFov,
     kCameraDistance,
     kCameraHeight,
@@ -127,6 +128,11 @@ Setting g_set[kSettingCount] = {
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
      "The game's frames per second, in the top right corner.", false},
+    // What bbhost holds of video memory and of the memory Windows counts as
+    // shared GPU memory (host/window.cpp, host_gpu_memory_glance).
+    {"memory_counter", "Memory counter", {"Off", "On"}, 0,
+     "Video memory in use (how much is cache, given back when it runs short) and the game's memory the GPU reads, "
+     "which Windows counts as shared GPU memory.", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
@@ -272,6 +278,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFpsCounter},
+    {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -729,6 +736,7 @@ void rebuild_settings() {
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.fps_counter = on_of(kFpsCounter);
+    h.memory_counter = on_of(kMemoryCounter);
     {
         // BBHOST_RES=WxH still wins, so an A/B run started with one behaves
         // the way its command line says.

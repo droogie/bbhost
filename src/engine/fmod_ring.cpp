@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -70,6 +71,10 @@ std::atomic<std::uint64_t> g_guarded{0};
 std::mutex g_kept_mu;
 std::unordered_map<std::uint64_t, std::uint64_t> g_kept;  // under g_kept_mu
 std::atomic<std::uint64_t> g_kept_count{0}, g_kept_freed{0}, g_kept_live{0};
+// The detector: the sounds events hold as programmer sounds (EventSound::prepare's
+// 0x200), and how many events hold each.
+std::mutex g_prog_mu;
+std::unordered_map<std::uint64_t, std::uint32_t> g_prog;  // under g_prog_mu: a programmer sound -> events holding it
 
 std::uint64_t va(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
 std::uint64_t bn(std::uint64_t a) { return a - g_slide + kPreferredGuestSlide; }
@@ -296,7 +301,16 @@ GUEST_ABI std::int64_t free_hook(std::uint64_t, const std::uint64_t* saved) {
                  static_cast<unsigned long long>(bn(r[0])), static_cast<unsigned long long>(r[1] ? bn(r[1]) : 0),
                  static_cast<unsigned long long>(r[2] ? bn(r[2]) : 0), static_cast<unsigned long long>(r[3] ? bn(r[3]) : 0),
                  static_cast<unsigned long long>(n));
-        if (g_check) log_history(p, 32);
+        if (g_check) {
+            std::uint32_t held = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_prog_mu);
+                const auto it = g_prog.find(p);
+                if (it != g_prog.end()) held = it->second;
+            }
+            host_log("fmod ring:   %u event(s) hold it as a programmer sound", held);
+            log_history(p, 32);
+        }
     }
     return keep ? 1 : 0;  // 1: MemPool::free is not run (its caller ignores the result)
 }
@@ -370,6 +384,126 @@ GUEST_ABI std::int64_t create_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
+// --- the game's FSBs and the event system's programmer sounds (the detector) --
+// The game keeps each FSB it loads in a holder of its own (0x60 bytes: +0x10
+// the name, +0x20 let go, +0x21 preloaded with EventSystem::preloadFSB, +0x22
+// a voice set, +0x28 the Sound): a sample bank in memory (0x2c0f090), a
+// preloaded stream (0x2c0f210), or a voice set (0x2c0f370: a stream whose
+// subsounds are the voice lines, its line table beside it). Its voice-line
+// start (0x2bf27f0) takes a line with getSubSound - for a stream of several
+// subsounds, the one shared subsound object - and hands it to the line's
+// event at SOUNDDEF_CREATE; EventSound::prepare marks it 0x200 (0x11f8456,
+// then the getOpenState call at 0x11f8465) until EventSound::releaseSound
+// clears that and calls SOUNDDEF_RELEASE back (0x11f7cfc). The holder's
+// release (0x2c0eae0) releases the Sound.
+constexpr std::uint64_t kBankLoad = 0x2c0f090, kStreamLoad = 0x2c0f210, kVoiceLoad = 0x2c0f370, kHolderRelease = 0x2c0eae0;
+constexpr std::uint8_t kAlignedLoadPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                                 0x41, 0x54, 0x53, 0x48, 0x81, 0xe4, 0xe0, 0xff, 0xff, 0xff};
+constexpr std::uint8_t kVoiceLoadPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                               0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xa8, 0x00, 0x00, 0x00};
+constexpr std::uint8_t kHolderReleasePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                                   0x41, 0x54, 0x53, 0x49, 0x89, 0xfe};
+constexpr std::uint64_t kProgSet = 0x11f8465, kGetOpenState = 0x11bb760;   // prepare: the call after the 0x200
+constexpr std::uint64_t kProgRelease = 0x11f7cfc, kEventCallback = 0x11dc8b0;  // releaseSound: SOUNDDEF_RELEASE (7)
+
+std::atomic<std::uint64_t> g_prog_sets{0}, g_prog_releases{0}, g_holder_loads{0}, g_holder_releases{0};
+
+std::string guest_cstr(std::uint64_t a, std::size_t max = 96) {
+    std::string s;
+    for (std::size_t i = 0; a && i < max && readable(a + i, 1); ++i) {
+        const char ch = static_cast<char>(*reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(a + i)));
+        if (!ch) break;
+        s += ch;
+    }
+    return s;
+}
+
+// A sound and, for a subsound, what it belongs to.
+std::string sound_text(std::uint64_t s) {
+    char b[200];
+    if (!s || !readable(s, kNode + 24) || !is_sound(g_vt, s)) {
+        std::snprintf(b, sizeof(b), "%llx (not a sound)", static_cast<unsigned long long>(s));
+        return b;
+    }
+    const std::uint64_t p = rd(s + kParent);
+    const std::uint32_t pn = p && readable(p, kNode + 24) ? rd32(p + kNumSubsounds) : 0;
+    std::snprintf(b, sizeof(b), "%llx (flags %x, %u subsounds, %s; parent %llx of %u subsounds)", static_cast<unsigned long long>(s),
+                  rd32(s + kFlags), rd32(s + kNumSubsounds), rd(s + kShared) == s ? "a stream's shared subsound" : "its own",
+                  static_cast<unsigned long long>(p), pn);
+    return b;
+}
+
+GUEST_ABI std::int64_t holder_load_hook(std::uint64_t id, const std::uint64_t* saved) {
+    // (holder, ...): the names are often on the caller's stack, outside the
+    // memory the detector reads; the holder's release names the FSB.
+    const std::uint64_t n = g_holder_loads.fetch_add(1) + 1;
+    const char* kind = id == 1 ? "a sample bank" : id == 2 ? "a preloaded stream" : "a voice set";
+    if (id != 1 || n <= 256) {
+        host_log("fmod ring: the game loads %s into holder %llx (%llu loads)", kind, static_cast<unsigned long long>(saved[5]),
+                 static_cast<unsigned long long>(n));
+    }
+    return 0;
+}
+
+GUEST_ABI std::int64_t holder_release_hook(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t h = saved[5];
+    if (!readable(h, 0x60)) return 0;
+    const std::uint64_t n = g_holder_releases.fetch_add(1) + 1;
+    const std::uint64_t s = rd(h + 0x28);
+    const std::uint64_t sh = s && readable(s, kNode + 24) ? rd(s + kShared) : 0;
+    std::string held;
+    if (sh) {
+        std::lock_guard<std::mutex> lk(g_prog_mu);
+        const auto it = g_prog.find(sh);
+        if (it != g_prog.end()) held = ", its shared subsound held by " + std::to_string(it->second) + " event(s) as a programmer sound";
+    }
+    if (n <= 256 || !held.empty()) {
+        host_log("fmod ring: the game releases holder %llx (%s; let go %u, preloaded %u, voice set %u): sound %s%s%s (%llu releases)",
+                 static_cast<unsigned long long>(h), guest_cstr(rd(h + 0x10)).c_str(), rd32(h + 0x20) & 0xff, (rd32(h + 0x20) >> 8) & 0xff,
+                 (rd32(h + 0x20) >> 16) & 0xff, sound_text(s).c_str(), sh ? (", shared subsound " + sound_text(sh)).c_str() : "",
+                 held.c_str(), static_cast<unsigned long long>(n));
+    }
+    return 0;
+}
+
+GUEST_ABI std::int64_t prog_set_hook(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t s = saved[5];  // rdi: the sound just marked 0x200
+    std::uint32_t holders = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_prog_mu);
+        holders = ++g_prog[s];
+    }
+    const std::uint64_t n = g_prog_sets.fetch_add(1) + 1;
+    if (n <= 64 || (n & (n - 1)) == 0 || holders > 1) {
+        host_log("fmod ring: an event takes programmer sound %s, now held by %u event(s) (%llu so far)", sound_text(s).c_str(),
+                 holders, static_cast<unsigned long long>(n));
+    }
+    return 0;
+}
+
+GUEST_ABI std::int64_t prog_release_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (saved[4] != 7) return 0;  // esi: SOUNDDEF_RELEASE
+    const std::uint64_t s = saved[2];  // rcx: the sound
+    std::uint32_t left = 0;
+    bool counted = false;
+    {
+        std::lock_guard<std::mutex> lk(g_prog_mu);
+        const auto it = g_prog.find(s);
+        if (it != g_prog.end()) {
+            counted = true;
+            left = --it->second;
+            if (!left) g_prog.erase(it);
+        }
+    }
+    const std::uint64_t n = g_prog_releases.fetch_add(1) + 1;
+    if (n <= 64 || (n & (n - 1)) == 0) {
+        host_log("fmod ring: an event lets programmer sound %llx go%s, %u event(s) still hold it (%llu so far)",
+                 static_cast<unsigned long long>(s), counted ? "" : " (one no event took as a programmer sound)", left,
+                 static_cast<unsigned long long>(n));
+    }
+    return 0;
+}
+
 bool hook(ElfImage* image, std::uint64_t at, const std::uint8_t* pro, std::size_t n, void* fn, const char* what) {
     const bool ok = engine_prologue_hook(image, va(at), pro, n, fn);
     if (!ok) host_log("fmod ring: %s (0x%llx) NOT hooked (unexpected bytes)", what, static_cast<unsigned long long>(at));
@@ -403,6 +537,25 @@ void fmod_ring_install(ElfImage* image) {
                   "SoundI::setSubSound") && ok;
         ok = hook(image, kCreate, kCreatePrologue, sizeof(kCreatePrologue), reinterpret_cast<void*>(&create_hook),
                   "SystemI::createSound") && ok;
+        const auto load = [&](std::uint64_t at, const std::uint8_t* pro, std::size_t n, std::uint64_t id, const char* what) {
+            const bool placed = engine_prologue_hook(image, va(at), pro, n, reinterpret_cast<void*>(&holder_load_hook), id);
+            if (!placed) host_log("fmod ring: %s (0x%llx) NOT hooked (unexpected bytes)", what, static_cast<unsigned long long>(at));
+            return placed;
+        };
+        ok = load(kBankLoad, kAlignedLoadPrologue, sizeof(kAlignedLoadPrologue), 1, "the game's bank load") && ok;
+        ok = load(kStreamLoad, kAlignedLoadPrologue, sizeof(kAlignedLoadPrologue), 2, "the game's stream load") && ok;
+        ok = load(kVoiceLoad, kVoiceLoadPrologue, sizeof(kVoiceLoadPrologue), 3, "the game's voice set load") && ok;
+        ok = hook(image, kHolderRelease, kHolderReleasePrologue, sizeof(kHolderReleasePrologue),
+                  reinterpret_cast<void*>(&holder_release_hook), "the game's FSB holder release") && ok;
+        if (!engine_call_site_hook(image, va(kProgSet), va(kGetOpenState), reinterpret_cast<void*>(&prog_set_hook))) {
+            host_log("fmod ring: EventSound::prepare's programmer sound (0x%llx) NOT hooked", static_cast<unsigned long long>(kProgSet));
+            ok = false;
+        }
+        if (!engine_call_site_hook(image, va(kProgRelease), va(kEventCallback), reinterpret_cast<void*>(&prog_release_hook))) {
+            host_log("fmod ring: EventSound::releaseSound's SOUNDDEF_RELEASE (0x%llx) NOT hooked",
+                     static_cast<unsigned long long>(kProgRelease));
+            ok = false;
+        }
     }
     host_log("fmod ring: sound-group guard %s%s%s%s", g_guard ? "on" : "off",
              g_check ? ", detector on (BBHOST_FMOD_CHECK=1: history, master ring walks)" : "",
@@ -427,6 +580,17 @@ void fmod_ring_report() {
              "freed since by a release under way, %llu never freed (%llu bytes)",
              static_cast<unsigned long long>(n), static_cast<unsigned long long>(k), static_cast<unsigned long long>(f),
              static_cast<unsigned long long>(live), static_cast<unsigned long long>(bytes));
+    if (g_check) {
+        std::size_t held = 0;
+        {
+            std::unique_lock<std::mutex> lk(g_prog_mu, std::try_to_lock);
+            if (lk.owns_lock()) held = g_prog.size();
+        }
+        host_log("fmod ring: the game loaded %llu FSB(s) into holders and released %llu; events took %llu programmer sound(s) "
+                 "and let %llu go, %zu still held",
+                 static_cast<unsigned long long>(g_holder_loads.load()), static_cast<unsigned long long>(g_holder_releases.load()),
+                 static_cast<unsigned long long>(g_prog_sets.load()), static_cast<unsigned long long>(g_prog_releases.load()), held);
+    }
 }
 
 void fmod_ring_crash_report() {

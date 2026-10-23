@@ -60,4 +60,16 @@ Range choose(const Facts* pages, std::uint32_t n) {
 // its placement (sequence numbers of the shadow's drained GX writes).
 inline bool rewritten(std::uint64_t placed_seq, std::uint64_t newest_write_seq) { return newest_write_seq > placed_seq; }
 
+// Whether told pages are read in place at all: BBHOST_SHADOW_IN_PLACE (`env`
+// -1 unset, 0 off, 1 on any GPU; unset, on for an integrated GPU). The
+// binding is the range's import: with whole imports there is always one; with
+// window imports (BBHOST_IMPORT_WINDOWS=1) it is the range's window, imported
+// where the binding asks for it unless the import thread did so already -
+// `windows_too` (BBHOST_SHADOW_IN_PLACE_WINDOWS, 0 to keep in place to whole
+// imports, as it was).
+inline bool in_place_wanted(bool imports_whole, int env, bool windows_too, bool integrated) {
+    if (!imports_whole && !windows_too) return false;
+    return env >= 0 ? env == 1 : integrated;
+}
+
 }  // namespace shadow_place

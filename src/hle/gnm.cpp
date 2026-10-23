@@ -496,6 +496,9 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         static auto prev_t = t;
         static GpuStats prev = s;
         static std::uint64_t prev_uploads = uploads, prev_hashes = hashes, prev_hash_us = hash_us, prev_repl = repl, stalls = 0;
+        std::uint64_t import_n = 0, import_us = 0;  // guest memory imports the command processor waited for
+        host_gpu_import_waits(&import_n, &import_us);
+        static std::uint64_t prev_import_n = import_n, prev_import_us = import_us;
         const std::uint64_t gap_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t - prev_t).count());
         if (gap_ms >= stall_ms && stalls++ < 4000) {
             std::string ph;
@@ -510,7 +513,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      "texture ms: images %llu, staging %llu, untile %llu, record %llu, views %llu; pipeline ms: translate %llu, "
                      "modules %llu, create %llu; stage translations %llu, stages reused %llu; pipeline work ms: shader libraries "
                      "%llu (%llu), interface libraries %llu (%llu), links %llu (%llu), whole pipelines %llu (%llu), layouts %llu "
-                     "(%llu), waiting for a library %llu, compute pipelines %llu (%llu)",
+                     "(%llu), waiting for a library %llu, compute pipelines %llu (%llu); imports waited for %llu in %llu ms",
                      n, static_cast<unsigned long long>(gap_ms), static_cast<unsigned long long>(hle_gnm_cp_backlog()), ph.c_str(),
                      static_cast<unsigned long long>(s.pipelines - prev.pipelines), static_cast<unsigned long long>(s.draws - prev.draws),
                      static_cast<unsigned long long>(s.dispatches - prev.dispatches), static_cast<unsigned long long>(uploads - prev_uploads),
@@ -529,8 +532,11 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      static_cast<unsigned long long>((work[3] - prev_work[3]) / 1000), static_cast<unsigned long long>(work[9] - prev_work[9]),
                      static_cast<unsigned long long>((work[4] - prev_work[4]) / 1000), static_cast<unsigned long long>(work[10] - prev_work[10]),
                      static_cast<unsigned long long>((work[5] - prev_work[5]) / 1000),
-                     static_cast<unsigned long long>((work[12] - prev_work[12]) / 1000), static_cast<unsigned long long>(work[13] - prev_work[13]));
+                     static_cast<unsigned long long>((work[12] - prev_work[12]) / 1000), static_cast<unsigned long long>(work[13] - prev_work[13]),
+                     static_cast<unsigned long long>(import_n - prev_import_n), static_cast<unsigned long long>((import_us - prev_import_us) / 1000));
         }
+        prev_import_n = import_n;
+        prev_import_us = import_us;
         std::copy(work, work + 14, prev_work);
         for (int i = 0; i < 5; ++i) {
             prev_tex_us[i] = tex_us[i];

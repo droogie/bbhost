@@ -95,6 +95,25 @@ void test_rewritten() {
     CHECK(!shadow_place::rewritten(1, 0));  // never written
 }
 
+void test_in_place_wanted() {
+    // Unset: an integrated GPU reads told pages in place, a discrete one does not - with either kind of import.
+    CHECK(shadow_place::in_place_wanted(true, -1, true, true));
+    CHECK(!shadow_place::in_place_wanted(true, -1, true, false));
+    CHECK(shadow_place::in_place_wanted(false, -1, true, true));
+    CHECK(!shadow_place::in_place_wanted(false, -1, true, false));
+    // =1 on any GPU, =0 on none.
+    CHECK(shadow_place::in_place_wanted(true, 1, true, false));
+    CHECK(shadow_place::in_place_wanted(false, 1, true, false));
+    CHECK(!shadow_place::in_place_wanted(true, 0, true, true));
+    CHECK(!shadow_place::in_place_wanted(false, 0, true, true));
+    // BBHOST_SHADOW_IN_PLACE_WINDOWS=0: whole imports only, as before; whole imports are not affected by it.
+    CHECK(!shadow_place::in_place_wanted(false, -1, false, true));
+    CHECK(!shadow_place::in_place_wanted(false, 1, false, true));
+    CHECK(shadow_place::in_place_wanted(true, -1, false, true));
+    CHECK(shadow_place::in_place_wanted(true, 1, false, false));
+    CHECK(!shadow_place::in_place_wanted(true, -1, false, false));
+}
+
 }  // namespace
 
 int main() {
@@ -102,6 +121,7 @@ int main() {
     test_choose();
     test_rewrites();
     test_rewritten();
+    test_in_place_wanted();
     if (g_fail) {
         std::printf("shadow_place_test: %d failure(s)\n", g_fail);
         return 1;

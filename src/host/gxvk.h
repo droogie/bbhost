@@ -192,36 +192,17 @@ void buffers_report();
 // the bytes for a sample of them, every run; a violation sends every
 // binding of the heap back to today's path.
 // BBHOST_GXVK_ARENA: 0 (the default) today's path; 1 in place, where the
-// heap is; 2 in place, the heap moved into video memory the CPU writes
-// first (where the device can place a mapping, and the budget has room);
-// compare: today's path, with every binding of the heap checked as 1 would
-// bind it.
-enum class Arena : int { kOff = 0, kInPlace = 1, kCompare = 2, kMoved = 3 };
+// heap is; compare: today's path, with every binding of the heap checked as
+// 1 would bind it. (2, the heap moved into video memory the CPU writes, was
+// measured slower and is gone: docs/rendering.md.)
+enum class Arena : int { kOff = 0, kInPlace = 1, kCompare = 2 };
 Arena arena_mode();
 inline bool arena_wanted() { return arena_mode() != Arena::kOff; }
 // The pool's init (decomp/gx/upload_heap.cpp's entry): the pool and the
-// region it is made over. Returns the region to use instead and writes its
-// bytes, or 0 to keep the game's (stage 1c keeps it).
-std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t* out_bytes);
+// region it is made over, which stays the game's.
+void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes);
 // The heap's bounds, once its pool is made.
 bool arena_heap(std::uint64_t* lo, std::uint64_t* hi);
-// BBHOST_GXVK_ARENA=2: the heap to move (the host mapping the pool was given
-// instead of the game's region), until the GPU has moved it or given up.
-bool arena_move_pending(std::uint64_t* va, std::uint64_t* bytes);
-// The GPU's start, moving the heap: `on` while its bytes are copied and its
-// device memory placed over it (a write to it waits in the fault handler);
-// then whether the move held, with what the memory is.
-void arena_moving(bool on);
-void arena_moved(bool ok, const char* what);
-// Whether the move held: the heap is video memory the CPU writes.
-bool arena_moved_ok();
-// BBHOST_GXVK_ARENA=2: the host mapping the heap was given, recorded as pieces
-// of `piece` bytes side by side (each its own mapping, import and move:
-// host/arena_move.h); false in every other mode.
-bool arena_pieces(std::uint64_t* va, std::uint64_t* bytes, std::uint64_t* piece);
-// The fault handler's (async-signal-safe, no stack protector): a write fault
-// on the heap while it moves waits for the move and returns true (retry).
-bool arena_move_fault(std::uint64_t addr);
 // A hand-out by the block pool (the registry's pool hooks, as they return):
 // the pool and the node it returned.
 void arena_handout(std::uint64_t pool, std::uint64_t node);
@@ -233,11 +214,9 @@ void arena_handout(std::uint64_t pool, std::uint64_t node);
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
-// The binding's range crosses two of the heap's pieces (=2), so no one buffer holds it.
-void arena_crossing();
 // Today's path over the heap, counted where it runs: the work stage 1c takes
-// away, and the command processor's reads of descriptor tables in the heap -
-// slow once the heap is in write-combined video memory (BBHOST_GXVK_ARENA=2).
+// away, and what the command processor reads of the heap on the CPU (the
+// descriptor tables in it).
 enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending, kArenaTableRead, kArenaNotes };
 void arena_note(ArenaNote what, std::uint64_t bytes);
 // The exit report (gx_resources_report calls it).

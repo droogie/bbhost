@@ -42,6 +42,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <emmintrin.h>
+
 #include "log.h"
 
 using namespace decomp;
@@ -76,6 +78,9 @@ constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the
 constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
 constexpr u64 kWindSourcesStep = 0x1314660;    // the wind sources' registry (*0x58b0bb0) stepped: (registry, step)
 constexpr u64 kWindReceivers = 0x27174e0;      // the wind system's (*0x5940e00) receivers' update: (system, step)
+constexpr u64 kGxStandard = 0x56eb1d0;         // GPU particle type 0x2710 StandardParticle's vtable (update sub_12f18f0)
+constexpr u64 kGxSpark = 0x56eb120;            // GPU particle type 0x2718 Spark's (update sub_12ed0b0)
+constexpr u64 kTypeSimulation = 0x6b0;         // both types' simulation, what sub_13040b0 / sub_12fef10 take
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -111,6 +116,8 @@ std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
 std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
+std::atomic<u64> g_emit_frames{0}, g_emit_windows{0}, g_emit_capped{0}, g_emit_held{0}, g_emit_changed{0}, g_emit_unslotted{0};
+std::atomic<u64> g_emit_other{0};  // updates on a frame of the frame domain whose step is not a smooth instance's: the game's
 std::atomic<u64> g_warmups_held{0};
 std::atomic<u32> g_hold_warmup{1};  // BBHOST_SFX_WIND_WARMUP_HOLD=0: the wind system's warm-up counts every frame, as before
 
@@ -230,10 +237,11 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 
 // The converted classes' vtables, by Binary Ninja address: the classes whose
 // updates do with their step only what time does, each read in Binary Ninja -
-// the motions, the modules, the binders, the StandardParticle and Spark
-// simulations, the FFX-format GX types and the wind sources 0x283c and 0x283d
-// also held to the game's own code by tests/decomp/sfx_classes_test.cpp (one
-// whole step against the frame domain's frames) - and the FFX light, whose one
+// the motions, the modules (the FFX spot light 0x56ebc40 among them), the
+// binders, the StandardParticle and Spark simulations, the FFX-format GX types
+// and the wind sources 0x283c and 0x283d also held to the game's own code by
+// tests/decomp/sfx_classes_test.cpp (one whole step against the frame domain's
+// frames) - and the FFX light, whose one
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
 // frames as with 30: the module 0x5760f20. The game never makes GPU particle type
@@ -272,6 +280,8 @@ constexpr u64 kConverted[] = {
     0x56eaa90,  // GPU particle type 0x27d8: no time
     0x56eb290,  // GPU particle type 0x2968: constant bounds
     0x56ebba0,  // module: the FFX light; its flicker phase counted once a whole step at the step's time (sfx_light_update)
+    0x56ebc40,  // module: the FFX spot light (sub_1320260); its light from curves at the node's age, its modes' stored values
+                // set, kept or blended from by a curve at the age; never reads its step, counts nothing a call
     0x56e35d0,  // GX type 0x6b (FFX format): only its bounds, from its properties' largest values; no time
     0x56e3530,  // GX type 0x14 / 0x3b (FFX format): +0x10 += the elapsed time x a rate read at the scaled time, its bounds
     0x56e3580,  // GX type 0x2b (FFX format): +0x20, or +0x18 and +0x1c, += the elapsed time x rates at the scaled time
@@ -885,6 +895,244 @@ inline int ribbon_mode(u64 record, u64 item, u64 type, float& into) {
 
 }  // namespace
 
+// StandardParticle's and Spark's simulations under the smooth steps (sub_13040b0 and sub_12fef10, read in Binary
+// Ninja; their types' updates call them on the type +0x6b0 with the record's elapsed time). An update adds its step to
+// the emission timer +0x3880 and, while the emitter is on (+0x3872; with +0x253c clear, also only while its events so
+// far +0x3884 are fewer than +0x2620 when +0x261c is 1, and +0x3872 cleared once its time +0x387c reaches +0x2540),
+// takes an event for each interval (+0x3888 x +0x393c) the timer holds: a count drawn from +0x25e0..+0x25e4, plus
+// +0x25dc and +0x3944, never below 0. The update's total stops at its cap - 20, or 16 + min(int(2 x (+0x29c4 + +0x25dc +
+// max(+0x25e4, 0)) x clamp(max(+0x29a8, +0x29ac), 1, 50)), +0x2890) when that int is 4 or more - and an update that
+// reaches it drops the rest of its timer (+0x3880 = 0). It leaves the total times +0x3940 (the wind's share between
+// +0x29a8 and +0x29ac, sub_1304e00), truncated and at most the cap, in +0x3878 for its dispatch to emit (sub_1305d30,
+// sub_13009b0). At 30 an update is a whole step. With the smooth steps' frame step an update is a frame, so an emitter
+// that 30 caps - a burst, a dense spray - emits past the cap, and +0x3940's fraction is lost once a frame instead of once
+// a whole step.
+//
+// So a smooth instance's update of these types (its item's step the frame's on the manager's and the instance's scales)
+// counts toward a window: the whole step its emitter's time falls in (+0x387c after the step, in whole steps of 1/30 on
+// those scales), as 30's updates fall. The game's call runs with +0x3940 at 1, so +0x3878 is the frame's total; on a
+// window's later frames +0x2890 and +0x29c4 are set so the cap is what the window has left, and the game's own capped
+// update drops the timer there, where the whole step's would. The frame then emits what the window's total would emit in
+// one update, less what the window emitted already. Once a window is capped, its frames run with +0x3872 clear - no
+// event, no draw, nothing emitted - and the timer stays dropped. The window's cap is the one its first counting frame's
+// update took. A whole step's own update (a frame of 1/30 s), a pre-roll's, a held instance's and the game's still frame
+// are the game's.
+namespace {
+
+struct alignas(64) EmitSlot {
+    std::atomic<u64> sim{0};
+    std::atomic<u32> touched{0};  // g_frame_serial when last taken
+    std::atomic<u32> busy{0};
+    double time = 0;  // the emitter's smooth steps since its slot began (or it began again)
+    float total = 0;  // its own time (+0x387c) after its last update
+    s64 window = -1;
+    s32 counts = 0, emitted = 0, cap = 0;
+    s32 events = 0;          // the emitter's events (+0x3884) as its window began
+    u32 interval = 0;        // the window's interval (+0x3888): 30's update takes every event of its step at it
+    u32 rolled = 0;          // the interval the window's last update with events drew
+    u8 open = 0, capped = 0, counted = 0, ended = 0, drew = 0;
+};
+constexpr std::size_t kEmitSlots = 4096;
+EmitSlot g_emit_slots[kEmitSlots];
+
+// The emitter's slot, taken for this call: its own, a free one, or one no update has taken for 32 frames; null when
+// none of eight is (the call is then the game's).
+EmitSlot* emit_slot(u64 sim) {
+    const u32 now = g_frame_serial.load(std::memory_order_relaxed);
+    std::size_t h = static_cast<std::size_t>(((sim >> 4) * 0x9E3779B97F4A7C15ull) >> 52) & (kEmitSlots - 1);
+    for (int k = 0; k < 8; ++k, h = (h + 1) & (kEmitSlots - 1)) {
+        EmitSlot& s = g_emit_slots[h];
+        const u64 owner = s.sim.load(std::memory_order_relaxed);
+        if (owner != sim && owner && now - s.touched.load(std::memory_order_relaxed) < 32) continue;
+        if (s.busy.exchange(1, std::memory_order_acquire)) continue;
+        const u64 o = s.sim.load(std::memory_order_relaxed);
+        if (o != sim) {
+            if (o && now - s.touched.load(std::memory_order_relaxed) < 32) {
+                s.busy.store(0, std::memory_order_release);
+                continue;
+            }
+            s.sim.store(sim, std::memory_order_relaxed);
+            s.open = 0;
+            s.window = -1;
+        }
+        s.touched.store(now, std::memory_order_relaxed);
+        return &s;
+    }
+    return nullptr;
+}
+
+// The cap an update takes from its emitter's fields (0x1304a19..0x1304acb; Spark's the same at 0x12ff6bb): the
+// game's comparisons, so a NaN goes as it does there.
+inline s32 emission_cap(u64 sim) {
+    const s32 hi = load<s32>(sim + 0x25e4);
+    const u32 sum = static_cast<u32>(load<s32>(sim + 0x29c4)) + static_cast<u32>(load<s32>(sim + 0x25dc)) + static_cast<u32>(hi >= 0 ? hi : 0);
+    const float a = load<float>(sim + 0x29a8), b = load<float>(sim + 0x29ac);
+    const float f = a > b ? a : b;  // ucomiss a, b; jbe: b
+    double factor;
+    if (1.0f > f) factor = 1.0;
+    else factor = static_cast<double>(f > 50.0f ? 50.0f : f);
+    double x = static_cast<double>(static_cast<s32>(sum));
+    x = x + x;
+    const s32 r = _mm_cvttsd_si32(_mm_set_sd(x * factor));
+    if (r < 4) return 20;
+    const s32 limit = load<s32>(sim + 0x2890);
+    return (r > limit ? limit : r) + 16;
+}
+
+// What one update emits of a total: the total times +0x3940, truncated, none below 0 and at most the cap
+// (0x1304d8c..0x1304daf).
+inline s32 emission_of(s32 total, float mult, s32 cap) {
+    const s32 e = _mm_cvttss_si32(_mm_set_ss(static_cast<float>(total) * mult));
+    return e < 0 ? 0 : (e > cap ? cap : e);
+}
+
+// A smooth instance's update of a StandardParticle or Spark type, counted toward its whole step's window; false when
+// the call is not one (the caller runs the game's).
+bool emission_window_call(GxRecordFn game, u64 record, u64 item, u64 type) {
+    const u64 sfx = load<u64>(game_address(kSprjSfx));
+    if (!sfx || load<u32>(sfx + 0x8c)) return false;  // the game's own still frame
+    const float frame = g_frame_step.load(std::memory_order_relaxed);
+    if (!(frame < 1.0f / 30.0f) && !MUTANT(55)) return false;  // a frame of a whole step: the game's update is 30's
+    const u64 manager = load<u64>(sfx + kManagerOf);
+    const u64 node = load<u64>(record + 0x10);
+    const u64 instance = node ? load<u64>(node + 0x58) : 0;
+    if (!manager || !instance || load<u8>(manager + 0x5ce)) return false;
+    const float time_scale = load<float>(manager + 0x5d8), scale = load<float>(instance + 8);
+    const float step = load<float>(item + 0x60);
+    // a smooth instance's item carries the frame's step on its scales (the node update's (frame x time scale) x scale);
+    // a held one's carries a whole step or none, a pre-roll's its own
+    if (!(step > 0.0f)) return false;
+    if (std::bit_cast<u32>(frame * time_scale * scale) != std::bit_cast<u32>(step)) {
+        g_emit_other.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const float whole = 1.0f / 30.0f * time_scale * scale;
+    if (!(whole > 0.0f)) return false;
+    const u64 sim = type + kTypeSimulation;
+    EmitSlot* slot = emit_slot(sim);
+    if (!slot) {
+        g_emit_unslotted.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_emit_frames.fetch_add(1, std::memory_order_relaxed);
+    // the window: the whole step this update's end falls in, (k x whole, (k + 1) x whole] of the emitter's smooth steps
+    // since it began - its own time (+0x387c) adds the record's elapsed times, which its time's rounding moves off the
+    // steps; a time that went back (a new emitter at the address, or its time begun again) begins them again
+    const float own_time = load<float>(sim + 0x387c);
+    const bool begun = !slot->open || own_time < slot->total;
+    if (begun) slot->time = 0;
+    const double time_end = slot->time + static_cast<double>(step);
+    const double at = time_end / static_cast<double>(whole) - 1e-4;
+    const s64 window = at > 0.0 ? static_cast<s64>(at) : 0;
+    const double to_end = static_cast<double>(window + 1) * static_cast<double>(whole) - slot->time;  // from this update to the window's end
+    slot->time = time_end;
+    if (begun || slot->window != window || MUTANT(56)) {
+        // 30's update re-rolls the interval once after its step's events (twice past the cap): the next window takes
+        // what the last one's last update with events drew
+        if (!begun && slot->drew) store<u32>(sim + 0x3888, slot->rolled);
+        slot->open = 1;
+        slot->window = window;
+        slot->counts = slot->emitted = slot->cap = 0;
+        slot->capped = slot->counted = slot->ended = slot->drew = 0;
+        slot->events = load<s32>(sim + 0x3884);
+        slot->interval = load<u32>(sim + 0x3888);
+        g_emit_windows.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((slot->capped || slot->ended) && !MUTANT(57)) {
+        // the window's whole step was capped, or ended its emitter: nothing more this window, the timer as that left it
+        g_emit_held.fetch_add(1, std::memory_order_relaxed);
+        const u8 on = load<u8>(sim + 0x3872);
+        store<u8>(sim + 0x3872, 0);
+        game(record, item);
+        // the update's own end of the emitter (with +0x253c clear, its time at +0x2540) stays, and the window's
+        const bool ended = slot->ended || (load<u32>(sim + 0x253c) == 0 && !(load<float>(sim + 0x387c) < load<float>(sim + 0x2540)));
+        store<u8>(sim + 0x3872, ended ? 0 : on);
+        if (slot->capped) store<float>(sim + 0x3880, 0.0f);
+        slot->total = load<float>(sim + 0x387c);
+        slot->busy.store(0, std::memory_order_release);
+        return true;
+    }
+    const float mult = load<float>(sim + 0x3940);
+    const s32 limit = load<s32>(sim + 0x2890), addend = load<s32>(sim + 0x29c4);
+    const bool later = slot->counted && !MUTANT(58);
+    s32 left = 0;
+    // the window's later frames: the cap it has left - 16 + min(int(2 x (2^23 + ...) x f), left - 16), the formula's own
+    // way to it - and, when the whole step's update began with events to go, no stop at the events' limit inside it (its
+    // one check was at the start); the definition's copy of the limit too (+0x3811 mode 1 +0x2cb0, mode 2 +0x3340)
+    u64 max_at[2] = {0x2620, 0x2620};
+    s32 max_was[2] = {0, 0};
+    const u8 mode = load<u8>(sim + 0x3860) ? load<u8>(sim + 0x3811) : 0;
+    if (mode == 1) max_at[1] = 0x2cb0;
+    if (mode == 2) max_at[1] = 0x3340;
+    if (!MUTANT(59)) store<float>(sim + 0x3940, 1.0f);
+    if (slot->drew && !MUTANT(62)) store<u32>(sim + 0x3888, slot->interval);  // its events at the window's interval
+    if (later) {
+        left = slot->cap - slot->counts;
+        store<s32>(sim + 0x29c4, 0x800000);
+        store<s32>(sim + 0x2890, left - 16);
+        if (slot->counted == 2 && !MUTANT(60))
+            for (int i = 0; i < 2; ++i) {
+                max_was[i] = load<s32>(sim + max_at[i]);
+                store<s32>(sim + max_at[i], 0x7fffffff);
+            }
+    }
+    const u32 timer = load<u32>(sim + 0x3880), events = load<u32>(sim + 0x3884), interval = load<u32>(sim + 0x3888);
+    game(record, item);
+    const s32 n = load<s32>(sim + 0x3878);
+    store<float>(sim + 0x3940, mult);
+    if (load<u32>(sim + 0x3884) != events) {  // events: it drew the next interval
+        slot->drew = 1;
+        slot->rolled = load<u32>(sim + 0x3888);
+    }
+    if (later) {
+        store<s32>(sim + 0x29c4, addend);
+        store<s32>(sim + 0x2890, limit);
+        if (slot->counted == 2 && !MUTANT(60))
+            for (int i = 1; i >= 0; --i) store<s32>(sim + max_at[i], max_was[i]);
+    } else {
+        // the window's first update: the whole step's limits as its fields now hold them - with +0x253c clear, an end time
+        // (+0x2540) the whole step reaches stops the emitter at its update, nothing emitted, and fewer events so far than
+        // +0x2620 (+0x261c 1) let it run past them
+        left = slot->cap = emission_cap(sim);  // from the fields its update took
+        const bool limits = load<u32>(sim + 0x253c) == 0;
+        const float end = static_cast<float>(static_cast<double>(own_time) + to_end);  // its own time at the window's end
+        if (limits && !(end < load<float>(sim + 0x2540)) && !MUTANT(61)) {
+            store<u32>(sim + 0x3880, std::bit_cast<u32>(add_ss(std::bit_cast<float>(timer), step)));
+            store<u32>(sim + 0x3884, events);
+            store<u32>(sim + 0x3888, interval);
+            store<s32>(sim + 0x3878, 0);
+            store<u8>(sim + 0x3872, 0);
+            slot->ended = 1;
+            slot->drew = 0;  // 30's update stops before its events: no draw
+            slot->total = load<float>(sim + 0x387c);
+            slot->busy.store(0, std::memory_order_release);
+            return true;
+        }
+        slot->counted = limits && load<u32>(sim + 0x261c) == 1 && load<s32>(sim + 0x2620) > slot->events ? 2 : 1;
+    }
+    slot->total = load<float>(sim + 0x387c);
+    if (MUTANT(59)) {
+        slot->counts += n;
+        slot->busy.store(0, std::memory_order_release);
+        return true;
+    }
+    const s32 total = slot->counts + n;
+    const s32 want = emission_of(total, mult, slot->cap);
+    const s32 emit = want > slot->emitted ? want - slot->emitted : 0;
+    store<s32>(sim + 0x3878, emit);
+    if (emit != emission_of(n, mult, slot->cap)) g_emit_changed.fetch_add(1, std::memory_order_relaxed);
+    slot->counts = total;
+    slot->emitted += emit;
+    if (n > 0 && n >= left) {
+        slot->capped = 1;
+        g_emit_capped.fetch_add(1, std::memory_order_relaxed);
+    }
+    slot->busy.store(0, std::memory_order_release);
+    return true;
+}
+
+}  // namespace
+
 DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
     const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
     const u64 type = load<u64>(record + 8);
@@ -955,6 +1203,9 @@ DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
             return;
         }
     }
+    if (type && g_smooth.load(std::memory_order_relaxed) &&
+        (load<u64>(type) == game_address(kGxStandard) || load<u64>(type) == game_address(kGxSpark)) && emission_window_call(game, record, item, type))
+        return;
     const bool is_2713 = type && (load<u64>(type) == game_address(kGxType2713) || MUTANT(15));
     if (!is_2713 || (load<float>(item + 0x60) != 0.0f && !MUTANT(16)) || (load<u32>(record + 0x24) == load<u32>(record + 0x28) && !MUTANT(17)) ||
         !between_steps()) {
@@ -1045,6 +1296,12 @@ void report() {
              "the whole step's elapsed time: %llu; following wobble motions between whole steps by the frame's time: %llu",
              static_cast<ull>(g_wind_steps_smooth.load()), static_cast<ull>(g_wind_steps_other.load()), static_cast<ull>(g_records_whole.load()),
              static_cast<ull>(g_motions_smooth.load()));
+    host_log("decomp:   GPU particle emission (StandardParticle, Spark) a whole step at a time: %llu smooth updates in %llu windows, "
+             "%llu windows capped, %llu updates held after the cap or the end, %llu emitting other than their own update would; the game's: "
+             "%llu without a slot, %llu whose step was not a smooth instance's",
+             static_cast<ull>(g_emit_frames.load()), static_cast<ull>(g_emit_windows.load()), static_cast<ull>(g_emit_capped.load()),
+             static_cast<ull>(g_emit_held.load()), static_cast<ull>(g_emit_changed.load()), static_cast<ull>(g_emit_unslotted.load()),
+             static_cast<ull>(g_emit_other.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;

@@ -37,8 +37,6 @@ std::uint64_t landed() { return 0; }
 namespace gxvk {
 bool census() { return false; }
 }  // namespace gxvk
-std::uint64_t hle_kernel_map_host(std::uint64_t) { return 0; }  // the move (BBHOST_GXVK_ARENA=2) is not tested here
-std::uint64_t hle_kernel_map_host_pieces(std::uint64_t, std::uint64_t) { return 0; }  // (its steps are: tests/arena_move_test.cpp)
 
 namespace {
 
@@ -96,8 +94,7 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
     const auto chance = [&](double p) { return std::uniform_real_distribution<double>(0, 1)(rng) < p; };
     const auto range = [&](u64 lo, u64 hi) { return std::uniform_int_distribution<u64>(lo, hi)(rng); };
     const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
-    u64 got = 0;
-    gxvk::arena_region(kPool, base, kHeapBytes, &got);
+    gxvk::arena_region(kPool, base, kHeapBytes);
     std::map<u64, Out> out;  // by start: every hand-out the pool has not taken back
     u64 serial = 0;          // the submission being recorded
     Result r;

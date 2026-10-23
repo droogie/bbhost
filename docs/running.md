@@ -246,6 +246,13 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
+With window imports (the default on an integrated GPU under Windows;
+`BBHOST_IMPORT_WINDOWS` or `import_windows` under `[gpu]` decide it; see
+[rendering.md](rendering.md)) the meshes are read in place too, from their
+windows, which a thread of their own imports as the game makes its buffers
+(`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
+window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
+windows at their first draw).
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not
@@ -253,6 +260,30 @@ look each draw's bytes up; one that finds no room keeps the mirrors
 (`BBHOST_GXVK_BUFFERS=0` goes back to the mirrors for all of them; `=1` makes
 the copies on an integrated GPU, with tight memory or small video memory
 too).
+
+**Task Manager shows more GPU memory than shadPS4.** Task Manager's GPU
+columns for a process count two things: *dedicated GPU memory* is the card's
+video memory, *shared GPU memory* is system memory the GPU can reach. bbhost
+lets the GPU read the game's own memory where it lies, as the PS4's single
+memory does: the game's GPU-visible memory (about 4 GB in the world) is
+imported into Vulkan, and Windows counts every imported page as shared GPU
+memory, although it is the game's memory, which the process holds either way,
+not a second copy. Upload staging (memory the CPU fills for the GPU to copy
+from, up to about 0.8 GB) counts there too. shadPS4 copies what the GPU uses
+into buffers and images of its own instead, so its shared column stays small.
+Measured at the same place (Central Yharnam, 1080p) on one laptop: with its
+RTX 3070 Ti Laptop GPU, shadPS4 0.19 showed 2.7 GB dedicated and 0.1 GB
+shared, bbhost 3.0 GB dedicated and 4.8 GB shared. On an integrated GPU
+Windows counts all of it as shared: on the same laptop's Radeon 680M shadPS4
+showed 2.9 GB and bbhost 7.8 GB. To compare the two, read the dedicated
+column on a card of its own, or turn on the Memory counter (F10), which shows
+bbhost's own count under the FPS counter: the video memory in use, how much of
+it is cache that bbhost gives back when memory runs short, and the shared
+memory. With window imports (`import_windows = true` under `[gpu]`, the
+default on an integrated GPU under Windows) only the memory the GPU uses is
+imported: on that laptop the shared column fell by
+about 2.7 GB on the RTX and 2.1 GB on the 680M, at the cost of waits when a
+place is first drawn (the log's `imports waited for`).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -327,7 +358,8 @@ smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
 `BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
 characters leave in water (GX's water interaction, one wave step a frame) step
 at 30 a second of game time above 30 too, on the effects' whole steps, so they
-spread as fast as at 30, and the water shows the last step between steps
+spread as fast as at 30; each step takes the latest frame's wakes, as at 30,
+and the water shows the last step between steps
 (`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
 twice as fast at 60). The flicker of the torches, braziers and candles (each
 GX light's blink) begins its cycles on the effects' whole steps, holding the

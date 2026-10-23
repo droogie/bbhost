@@ -196,10 +196,17 @@ detiling, the buffer shadow's mirrors). `BBHOST_IMPORT_WINDOWS=1` imports
 only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
 over several windows replaces the ones it covers, so no page is imported
-twice, and a dispatch imports what its shader reads and stores. It is off by
-default (`gpu.import_windows` in the config turns it on too): the work under
-way moves each of those uses off guest memory, and windows are then only the
-fallback for what is not moved yet. The Steam Deck kit turns it on: there the
+twice, and a dispatch imports what its shader reads and stores (an import a
+draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
+waited for N in M ms`, and the exit report gives the driver's time by the
+thread that waited). It is on by default on an integrated GPU under Windows,
+where whole spans kept about 1.5 GB more of the game's memory resident for the
+GPU. It is off on a graphics card of its own, and under Linux, where window
+imports have not been measured on an integrated GPU yet (AMD's imports go
+through udmabuf there). `gpu.import_windows`, true or false, decides it either
+way. The work under way moves each of those uses off guest memory, and
+windows are then only the fallback for what is not moved yet. The Steam Deck
+kit turns it on: there the
 memory shared with the GPU stays under the driver's budget and the start is
 about 3 s sooner, at the same frame rate (its device-local twins, below, stay
 off: on an APU they are the same memory plus copies). One such move,
@@ -725,29 +732,18 @@ when it is bound and again when its submission has completed. A violation
 sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
-`BBHOST_GXVK_ARENA=2` also moves the heap into video memory the CPU writes,
-on Linux, where the driver can place a mapping at an address of ours
-(`VK_EXT_map_memory_placed`): GX's device is made before bbhost's, so its
-pool is given a host mapping of bbhost's, whose bytes are copied at the GPU's
-start - writes to it wait meanwhile - and the video memory is mapped over it.
-In pieces: NVIDIA's driver places that memory up to 124 MiB at a time, so the
-mapping is recorded as pieces of 32 MiB side by side
-(`BBHOST_GXVK_ARENA_PIECE_MB` sets it, 1 to 124), each an allocation of its
-own placed over its part and imported on its own, and a binding across two
-pieces takes today's path (the exit report counts it). The room is what the
-driver counts in use: the heap's 160 MiB must fit beside it with 16 MiB to
-spare, which an RTX 4070's 246 MiB window without resizable BAR holds next to
-the params ring; the constant-buffer copies' ring then goes in host memory.
-A step that fails is undone - the heap host memory again, with every write
-GX made - and the log says which and why; `=2` then binds in place as `=1`
-does - with the heap in bbhost's pieces when the driver has no placed
-mappings (lavapipe), in the game's region on Windows. Measured on an RTX
-4070, `=2` loses about two thirds of the frame rate although every move
-worked - uncapped, Old Yharnam from 90.8 to 31.7 fps, the Nightmare of
-Mensis from 90.9 to 34.4 and Central Yharnam from 105.2 to 31.6, and 31-34
-fps at 60 - because the CPU reads the heap too: bbhost's copies of GX's
-renamed buffers and the game's main thread, and the CPU reads video memory
-at about 30 MB/s. So it stays off, and the heap stays in host memory.
+Moving the heap into video memory the CPU writes was tried and dropped
+(`BBHOST_GXVK_ARENA=2`, removed): GX's device is made before bbhost's, so its
+pool was given a host mapping of bbhost's, whose bytes were copied into video
+memory at the GPU's start and the video memory mapped over it
+(`VK_EXT_map_memory_placed`, on Linux), in pieces of 32 MiB - NVIDIA's driver
+places that memory at most 124 MiB at a time. Every move worked, and on an
+RTX 4070 the frame rate fell by about two thirds - uncapped, Old Yharnam
+from 90.8 to 31.7 fps, the Nightmare of Mensis from 90.9 to 34.4 and Central
+Yharnam from 105.2 to 31.6, and 31-34 fps at 60 - because the CPU reads the
+heap too - bbhost's copies of GX's renamed buffers and the game's main
+thread - and the CPU reads video memory at about 30 MB/s. The heap stays in
+host memory, where `=1` binds it.
 
 ## Tools
 

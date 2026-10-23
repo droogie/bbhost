@@ -2080,6 +2080,58 @@ bool host_window_pump() {
         host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
         host_overlay_text(x, y, scale, 0xe6e6e6ffu, text);
     }
+    // The top right's next line: below the FPS counter when it is on.
+    float corner_y = fps_on ? 14.0f + 24.0f * 0.8f + 16.0f : 14.0f;
+    if (host_settings_ref().memory_counter) {
+        // The memory counter, below the FPS counter: the video memory the
+        // driver counts against bbhost and how much of ours is cache (given
+        // back when memory runs short), and the host memory the GPU reads -
+        // the game's own memory imported, upload staging - which Windows
+        // counts as shared GPU memory, so the two read beside Task Manager's
+        // dedicated and shared columns (docs/running.md). Read once a second;
+        // the cache from the video memory census, run here every 30 s (2-3 ms
+        // under the renderer's lock).
+        static char text[96] = "";
+        static std::uint64_t read_at = 0, census_at = 0;
+        const std::uint64_t now = host_clock_monotonic_ns();
+        if (!read_at || now - read_at >= 1'000'000'000ull) {
+            read_at = now;
+            const bool census = !census_at || now - census_at >= 30'000'000'000ull;
+            if (census) {
+                census_at = now;
+                host_gpu_memory_census_refresh();
+            }
+            GpuMemoryGlance m;
+            text[0] = '\0';
+            if (host_gpu_memory_glance(m)) {
+                const auto gb = [](std::uint64_t b) { return static_cast<double>(b) / static_cast<double>(1ull << 30); };
+                if (m.cache_known) {
+                    std::snprintf(text, sizeof(text), "VRAM %.1f GB (%.1f cache)  Shared %.1f GB", gb(m.vram), gb(std::min(m.cache, m.vram)),
+                                  gb(m.shared));
+                } else {
+                    std::snprintf(text, sizeof(text), "VRAM %.1f GB  Shared %.1f GB", gb(m.vram), gb(m.shared));
+                }
+                // In the log too, at each census, in MiB: what the counter showed, beside Task Manager's.
+                if (census)
+                    host_log("memory counter: video memory %llu MiB (cache %llu MiB%s), shared %llu MiB%s",
+                             static_cast<unsigned long long>(m.vram >> 20), static_cast<unsigned long long>(m.cache >> 20),
+                             m.cache_known ? "" : ", no census yet", static_cast<unsigned long long>(m.shared >> 20),
+                             m.integrated ? " (an integrated GPU: Windows counts both as shared)" : "");
+            }
+        }
+        if (text[0]) {
+            float dw = 0.0f;
+            {
+                std::lock_guard<std::mutex> ml(g_mouse_mu);
+                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+            }
+            const float scale = 0.8f, w = host_overlay_text_width(scale, text);
+            const float x = dw - w - 20.0f, y = corner_y;
+            host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
+            host_overlay_text(x, y, scale, 0xe6e6e6ffu, text);
+            corner_y += 24.0f * scale + 16.0f;
+        }
+    }
     {
         // A plugin's banner (host_message_show): centred in the upper third,
         // fading over its last half second.
@@ -2115,10 +2167,10 @@ bool host_window_pump() {
         // (and the first ever) builds every shader again. On a few cores that
         // runs past the title into the first minute of play, which stutters
         // while it lasts (on the Steam Deck the start's 3,000 compiles take its
-        // four workers 26 s): say so, top right, below the FPS counter. A
-        // backlog gone within two seconds - most PCs' - never shows, and the
-        // line does not start over in the short lulls between GX's bursts of
-        // creations.
+        // four workers 26 s): say so, top right, below the FPS and memory
+        // counters. A backlog gone within two seconds - most PCs' - never
+        // shows, and the line does not start over in the short lulls between
+        // GX's bursts of creations.
         static std::chrono::steady_clock::time_point busy_from{}, busy_last{};
         const std::size_t left = host_gpu_shader_backlog();
         const auto now = std::chrono::steady_clock::now();
@@ -2136,7 +2188,7 @@ bool host_window_pump() {
             char text[64];
             std::snprintf(text, sizeof(text), "Building shaders: %zu left", left);
             const float scale = 0.8f, w = host_overlay_text_width(scale, text);
-            const float x = dw - w - 20.0f, y = host_settings_ref().fps_counter ? 14.0f + 24.0f * scale + 16.0f : 14.0f;
+            const float x = dw - w - 20.0f, y = corner_y;
             host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
             host_overlay_text(x, y, scale, 0xe8dcc0ffu, text);
         }

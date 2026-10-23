@@ -8,9 +8,8 @@
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
-#include "host/arena_memory.h"
-#include "host/arena_move.h"
-#include "host/arena_move_vk.h"
+#include "host/import_mode.h"
+#include "host/import_prefetch.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
@@ -186,7 +185,15 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 // Window imports: direct memory imported a window at a time, on demand -
 // BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows = true in the config (the
 // Steam Deck kit's default: the host heap under its budget, the start ~3 s
-// sooner, the same frames and frame rate). Off by default elsewhere: a tenth
+// sooner, the same frames and frame rate), and by default on an integrated
+// GPU under Windows, where the whole spans kept ~1.5 GB more of the game's
+// memory resident for the GPU, all of it counted as the process's GPU memory
+// (a Radeon 680M at a lamp, with the told meshes read in place from their
+// windows: Task Manager's shared GPU memory 8.0 -> 6.2 GB, the working set
+// 12.7 -> 11.1 GB, the frame rate and the frames the same;
+// imports_whole_decide). Not yet under Linux, where an integrated GPU imports
+// through udmabuf dma-bufs with tight memory, unmeasured with windows there.
+// Off by default on a discrete GPU: a tenth
 // of the draws keep page-table walks through V#s and pointers the host does
 // not resolve (the exit report's "walk" lines), and what they reach must
 // already be imported or they read the sink. Off, each chunk's GPU-visible
@@ -750,6 +757,12 @@ void note_copied_locked(std::uint64_t dst) {
     ++c.copies;
 }
 std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
+// The driver's time of each import by the path that made it: the import
+// thread's (bb-import) keeps nobody waiting; any other import's time is the
+// time of the thread that asked for it - the command processor's, at a
+// binding, a device address or a walk (under the renderer's lock, so whatever
+// else wants it waits too), the mapping thread's for a whole span.
+std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
@@ -793,6 +806,13 @@ std::unique_ptr<Chunk> make_import(std::uint32_t index, std::uint64_t lo, std::u
     const int who = t_import_who >= 0 && t_import_who < kImportWhos ? t_import_who : kIwBinding;
     g_import_who_n[who].fetch_add(1, std::memory_order_relaxed);
     g_import_who_bytes[who].fetch_add(size, std::memory_order_relaxed);
+    g_import_who_us[who].fetch_add(static_cast<std::uint64_t>(us), std::memory_order_relaxed);
+    if (who != kIwPrefetch && who != kIwSpan) {
+        std::uint64_t was = g_import_wait_max_us.load(std::memory_order_relaxed);
+        while (static_cast<std::uint64_t>(us) > was &&
+               !g_import_wait_max_us.compare_exchange_weak(was, static_cast<std::uint64_t>(us), std::memory_order_relaxed)) {
+        }
+    }
     if (g_imports_made.fetch_add(1, std::memory_order_relaxed) < 8 || size > (256ull << 20)) {
         host_log("gpu: dmem chunk %u: +%llu MiB, %llu MiB imported at device address 0x%llx in %lld us", index,
                  static_cast<unsigned long long>(lo >> 20), static_cast<unsigned long long>(size >> 20),
@@ -1125,10 +1145,23 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
 }
 
 std::atomic<signed char> g_imports_whole{-1};
+std::atomic<signed char> g_integrated_known{-1};  // the chosen device is integrated (1) or not (0); -1 before
+// BBHOST_IMPORT_WINDOWS (1 windows, 0 whole spans), else gpu.import_windows
+// (true, false), else by the device and the platform: windows on an
+// integrated GPU under Windows, whole spans elsewhere (host/import_mode.h).
+// Asked before the device is chosen with neither set, it answers whole spans
+// without deciding (nothing is imported before).
 bool imports_whole_decide() {
-    bool whole;
-    if (const char* e = std::getenv("BBHOST_IMPORT_WINDOWS"); e && *e) whole = e[0] != '1';
-    else whole = config_value("gpu.import_windows") != "true";
+#if defined(_WIN32)
+    constexpr bool kWindowsHost = true;
+#else
+    constexpr bool kWindowsHost = false;
+#endif
+    const std::string cfg = config_value("gpu.import_windows");
+    const import_mode::Mode m = import_mode::decide(std::getenv("BBHOST_IMPORT_WINDOWS"), cfg.c_str(),
+                                                    g_integrated_known.load(std::memory_order_relaxed), kWindowsHost);
+    if (m == import_mode::Mode::kUndecided) return true;
+    const bool whole = m == import_mode::Mode::kWhole;
     g_imports_whole.store(whole ? 1 : 0, std::memory_order_relaxed);
     return whole;
 }
@@ -1142,13 +1175,23 @@ bool imports_whole_decide() {
 // processor. A run of windows some binding imported meanwhile is dropped (an
 // import is never put over part of another: no page imported twice).
 // BBHOST_IMPORT_PREFETCH=0: imports at the first use only.
+// The meshes too (host/import_prefetch.h): a vertex or index buffer the
+// buffer shadow reads in place when GX tells its writes (BBHOST_SHADOW_IN_PLACE,
+// on an integrated GPU), once the device says the shadow does.
+// BBHOST_IMPORT_PREFETCH_MESHES=0: their windows at their first draw's
+// binding, on the command processor.
 namespace {
 const bool g_prefetch_on = [] {
     const char* e = std::getenv("BBHOST_IMPORT_PREFETCH");
     return !(e && e[0] == '0');
 }();
+const bool g_prefetch_meshes = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_PREFETCH_MESHES");
+    return !(e && e[0] == '0');
+}();
 struct PrefetchJob {
     std::uint64_t va = 0, bytes = 0;
+    bool meshes = false;  // import_prefetch::Ask::kMeshes: only if the shadow reads told meshes in place
 };
 std::mutex g_pf_mu;
 std::condition_variable g_pf_cv;
@@ -1156,6 +1199,7 @@ std::deque<PrefetchJob> g_pf_jobs;  // under g_pf_mu
 bool g_pf_started = false;          // under g_pf_mu
 std::atomic<std::uint64_t> g_pf_asked{0}, g_pf_known{0}, g_pf_checked{0}, g_pf_imports{0}, g_pf_bytes{0}, g_pf_raced{0},
     g_pf_dropped{0};
+std::atomic<std::uint64_t> g_pf_mesh_asked{0}, g_pf_mesh_skipped{0}, g_pf_mesh_imports{0}, g_pf_mesh_bytes{0};
 
 void prefetch_thread() {
     host_thread_set_name("bb-import");
@@ -1213,6 +1257,10 @@ void prefetch_thread() {
         {
             std::lock_guard<GpuMutex> lock(g.mu);
             if (!g.ok || !rebuild_page_tables()) continue;
+            if (job.meshes && !shadow_in_place_on()) {  // (asked again: the mirrors copy them through staging, no import)
+                g_pf_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             for (const GuestMapInfo& mi : g.maps) {
                 if (!mi.dmem || mi.phys < 0) continue;
                 const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
@@ -1257,6 +1305,10 @@ void prefetch_thread() {
             }
             g_pf_imports.fetch_add(1, std::memory_order_relaxed);
             g_pf_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            if (job.meshes) {
+                g_pf_mesh_imports.fetch_add(1, std::memory_order_relaxed);
+                g_pf_mesh_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            }
             d.imports.push_back(std::move(c));
             install_import_locked(r.chunk, d.imports.back().get());
             t_import_va = job.va;  // the census: by the buffer the job is for
@@ -1289,109 +1341,6 @@ bool gpu_span(const std::vector<GuestMapInfo>& maps, std::uint32_t index, std::u
         hi = std::max(hi, (std::min(b, base + kChunkBytes) - base + kAlign - 1) & ~(kAlign - 1));
     }
     return hi > lo;
-}
-
-// GX on Vulkan's arena (BBHOST_GXVK_ARENA=2, host/gxvk.h): GX's upload heap,
-// which its pool was given as a host mapping of ours recorded as pieces (its
-// device is made before ours), moved now into video memory the CPU writes -
-// each piece an allocation of its own placed over its part of the heap
-// (VK_EXT_map_memory_placed) and taken as that part's import, so every lookup
-// by address finds it. host/arena_move.h has the steps and the undo; while
-// they run, a write to the heap waits in the fault handler. Short of any step
-// it stays host memory, imported as the kernel's other host mappings are.
-void arena_place_locked() {
-    std::uint64_t va = 0, bytes = 0, piece = 0;
-    if (!gxvk::arena_move_pending(&va, &bytes)) return;
-#if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2) && !defined(_WIN32)
-    char why[200];
-    if (!g.has_placed_map) {
-        std::snprintf(why, sizeof why, "the device cannot place a mapping (%s)", g.placed_missing);
-        return gxvk::arena_moved(false, why);
-    }
-    if (!gxvk::arena_pieces(&va, &bytes, &piece)) return gxvk::arena_moved(false, "its mapping is not in pieces");
-    const arena_move::Pieces layout{va, bytes, piece};
-    if (g.placed_align && (va % g.placed_align || piece % g.placed_align))
-        return gxvk::arena_moved(false, "the pieces are not at the alignment placing takes");
-    // The memory type a piece's buffer takes in video memory the CPU writes.
-    std::uint32_t type = UINT32_MAX;
-    {
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = piece;
-        bci.usage = arena_move::kPieceUsage;
-        VkBuffer probe = VK_NULL_HANDLE;
-        if (vkCreateBuffer(g.device, &bci, nullptr, &probe) != VK_SUCCESS) return gxvk::arena_moved(false, "no buffer");
-        VkMemoryRequirements req{};
-        vkGetBufferMemoryRequirements(g.device, probe, &req);
-        vkDestroyBuffer(g.device, probe, nullptr);
-        if (req.size > piece) return gxvk::arena_moved(false, "a piece's buffer needs more than the piece");
-        type = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    }
-    if (type == UINT32_MAX) return gxvk::arena_moved(false, "the device has no video memory the CPU writes");
-    const std::uint32_t heap = g.mem_props.memoryTypes[type].heapIndex;
-    const auto heap_now = [&] {
-        arena_memory::Heap h;
-        h.size = g.mem_props.memoryHeaps[heap].size;
-        h.flags = g.mem_props.memoryHeaps[heap].flags;
-        if (g.has_memory_budget) {
-            VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-            VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
-            mp2.pNext = &mb;
-            vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp2);
-            h.have_budget = mb.heapBudget[heap] != 0;
-            h.budget = mb.heapBudget[heap];
-            h.used = mb.heapUsage[heap];
-        }
-        return h;
-    };
-    const arena_memory::Heap before = heap_now();
-    if (!arena_move::bar_room(before, bytes)) {
-        std::snprintf(why, sizeof why, "no room in video memory the CPU writes (heap %u of %llu MiB, %llu MiB in use, %llu MiB kept free)", heap,
-                      static_cast<unsigned long long>(before.size >> 20), static_cast<unsigned long long>(before.used >> 20),
-                      static_cast<unsigned long long>(arena_move::kKeep >> 20));
-        return gxvk::arena_moved(false, why);
-    }
-    // The steps over Vulkan and the kernel (host/arena_move_vk.h); each piece,
-    // once all are placed, its part's import.
-    arena_move::VkOps ops;
-    ops.dev = g.device;
-    ops.p = &layout;
-    ops.type = type;
-    ops.map2 = reinterpret_cast<PFN_vkMapMemory2KHR>(g.map_memory2);
-    ops.unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(g.unmap_memory2);
-    ops.unmap_reserve = g.unmap_reserve;
-    ops.on_moving = gxvk::arena_moving;
-    ops.on_adopt = [](std::uint64_t at, const arena_move::VkPiece& piece) {
-        Chunk c;
-        c.buffer = piece.buffer;
-        c.memory = piece.memory;
-        c.address = piece.address;
-        c.size = piece.size;
-        g.anon_imports[at] = c;
-    };
-    MemOwner own_mem("GX's upload heap (the arena)");
-    const auto t0 = std::chrono::steady_clock::now();
-    const arena_move::Result r = arena_move::move(ops, layout);
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    const arena_memory::Heap after = heap_now();
-    if (!r.ok) {
-        if (r.piece != ~0ull)
-            std::snprintf(why, sizeof why, "%s (piece %llu of %llu; undone in %.1f ms)", r.why, static_cast<unsigned long long>(r.piece),
-                          static_cast<unsigned long long>(layout.count()), ms);
-        else
-            std::snprintf(why, sizeof why, "%s", r.why);
-        return gxvk::arena_moved(false, why);
-    }
-    std::snprintf(why, sizeof why,
-                  "video memory the CPU writes (memory type %u, heap %u): %llu pieces of %llu MiB placed at 0x%llx, %llu MiB copied in %.1f ms; "
-                  "%llu of %llu MiB of the heap in use now",
-                  type, heap, static_cast<unsigned long long>(layout.count()), static_cast<unsigned long long>(piece >> 20),
-                  static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes >> 20), ms,
-                  static_cast<unsigned long long>(after.used >> 20), static_cast<unsigned long long>(after.size >> 20));
-    gxvk::arena_moved(true, why);
-#else
-    gxvk::arena_moved(false, "this build cannot place a mapping");
-#endif
 }
 
 // Import one anonymous (flexible memory) guest mapping.
@@ -2644,7 +2593,6 @@ struct Candidate {
     std::uint32_t family = 0, queues = 0;
     bool sparse = false, maint8 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
     bool memory_fd = false, dma_buf = false;
-    bool placed_map = false, map_memory2 = false;
     int type_rank = 0;
     VkDeviceSize local = 0;
     VkDeviceSize heaps = 0;  // every heap, device-local or not (memory_tight)
@@ -2684,8 +2632,6 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             if (std::strcmp(e.extensionName, "VK_AMD_buffer_marker") == 0) c.buffer_marker = true;
             if (std::strcmp(e.extensionName, "VK_KHR_external_memory_fd") == 0) c.memory_fd = true;
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_dma_buf") == 0) c.dma_buf = true;
-            if (std::strcmp(e.extensionName, "VK_EXT_map_memory_placed") == 0) c.placed_map = true;
-            if (std::strcmp(e.extensionName, "VK_KHR_map_memory2") == 0) c.map_memory2 = true;
         }
         VkPhysicalDeviceProperties dp{};
         vkGetPhysicalDeviceProperties(d, &dp);
@@ -2931,18 +2877,11 @@ bool init_locked() {
         g.family_queues = c.queues;
         g.has_sparse = c.sparse;
         g.has_maint8 = c.maint8;
-        // Only for the arena's move (BBHOST_GXVK_ARENA=2), and only where the
-        // build's headers know the extension.
-#if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2)
-        g.has_placed_map = c.placed_map && c.map_memory2 && gxvk::arena_mode() == gxvk::Arena::kMoved;
-        if (gxvk::arena_mode() == gxvk::Arena::kMoved)
-            g.placed_missing = !c.placed_map ? "the device has no VK_EXT_map_memory_placed" : !c.map_memory2 ? "the device has no VK_KHR_map_memory2" : "";
-#else
-        g.placed_missing = "this build's Vulkan headers have no VK_EXT_map_memory_placed";
-#endif
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
+        g_integrated_known.store(g.integrated ? 1 : 0, std::memory_order_relaxed);
+        if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // by the device, unless set
         twins_decide(c.type_rank == 4);
         g.tight = memory_tight(c);
         {
@@ -3250,30 +3189,6 @@ bool init_locked() {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
     }
-#if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2)
-    // A mapping placed at an address of ours: GX's upload heap moved into video
-    // memory under the mapping its pool was given (arena_place_locked).
-    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT fplaced{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
-    if (g.has_placed_map) {
-        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
-        VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        qf.pNext = &q;
-        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
-        if (q.memoryMapPlaced) {
-            fplaced.memoryMapPlaced = VK_TRUE;
-            // An undone move unmaps its placed pieces keeping their range reserved, where the driver can.
-            fplaced.memoryUnmapReserve = q.memoryUnmapReserve;
-            g.unmap_reserve = q.memoryUnmapReserve == VK_TRUE;
-            fplaced.pNext = f13.pNext;
-            f13.pNext = &fplaced;
-            dext.push_back("VK_KHR_map_memory2");
-            dext.push_back("VK_EXT_map_memory_placed");
-        } else {
-            g.has_placed_map = false;
-            g.placed_missing = "the device's memoryMapPlaced feature is off";
-        }
-    }
-#endif
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
     // asking for a size, and Vulkan then holds every stage to the device's
@@ -3576,21 +3491,6 @@ bool init_locked() {
             reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
         if (!g.cmd_push_descriptor_set) g.has_push_descriptor = false;
     }
-#if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2)
-    if (g.device && g.has_placed_map) {
-        g.map_memory2 = reinterpret_cast<void*>(vkGetDeviceProcAddr(g.device, "vkMapMemory2KHR"));
-        g.unmap_memory2 = reinterpret_cast<void*>(vkGetDeviceProcAddr(g.device, "vkUnmapMemory2KHR"));
-        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
-        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        p2.pNext = &pp;
-        vkGetPhysicalDeviceProperties2(g.phys, &p2);
-        g.placed_align = pp.minPlacedMemoryMapAlignment;
-        if (!g.map_memory2) {
-            g.has_placed_map = false;
-            g.placed_missing = "the device gave no vkMapMemory2KHR";
-        }
-    }
-#endif
     if (g.device) {
         // How much video memory is ours: the driver's budget for the heap now,
         // before anything of ours is in it (the card's memory less what the
@@ -3916,7 +3816,6 @@ bool init_locked() {
         return false;
     }
     choose_dmem_import();
-    arena_place_locked();  // GX on Vulkan's arena: GX's upload heap into video memory (BBHOST_GXVK_ARENA=2), before anything imports it
     host_log("gpu: %s (Vulkan %u.%u), subgroup size %u (stages 0x%x: %s%s%s), host pointer alignment %u%s%s%s", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), subp.subgroupSize,
              g.subgroup_stages, (g.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT) ? "vertex " : "",
@@ -6973,6 +6872,8 @@ bool vram_report_on() {
     return on;
 }
 
+std::atomic<std::uint64_t> g_glance_cache{0};  // video memory the last census found to be cache
+std::atomic<bool> g_glance_census{false};
 std::string video_memory_report_locked(bool at_exit) {
     using ull = unsigned long long;
     const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
@@ -7060,6 +6961,8 @@ std::string video_memory_report_locked(bool at_exit) {
     const std::int64_t unattributed = static_cast<std::int64_t>(used_vram + own_images) - static_cast<std::int64_t>(images);
     const std::uint64_t held = targets + c.snapshots.bytes + gpu_written + c.regions.bytes + c.tex_bound.bytes + (devbuf_bytes - scratch_kept);
     const std::uint64_t cached = mirror_bytes + c.tex_cold.bytes + c.tex_ahead.bytes + free_vram + scratch_kept;
+    g_glance_cache.store(cached, std::memory_order_relaxed);  // the memory counter's (host_gpu_memory_glance)
+    g_glance_census.store(true, std::memory_order_relaxed);
 
     std::snprintf(buf, sizeof(buf),
                   "gpu: video memory (MiB): heap %u %s %llu of %llu = ours %llu (held %llu, caches %llu, in flight %lld) + the driver's own %lld; "
@@ -7871,34 +7774,47 @@ void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t, std::uin
 void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen) { twins_buffer_gone(memory, gen); }
 
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
-    if (imports_whole() || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
-    // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
-    // compute writes, particles), a dynamic one (usage 2: rings the game
-    // rewrites, bound from host memory). A vertex or index buffer (bind 0x1,
-    // 0x2) only without the buffer shadow - with it the mirror serves meshes,
-    // their pages copied through staging. Textures never: their uploads go
-    // through staging too.
-    const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
-    if (!in_place) return;
-    // One the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1), needs
-    // no import: its twin is filled through staging at its first use. With
-    // level 2 neither does a dynamic one: the draws read its renamed copies
-    // (CPU-written rings), and its own memory once GX's copy-backs have
-    // written it - which makes it a twin.
-    if ((twins_level() == 1 || twins_level() == 2) && usage == 0 && (bind & 0x80)) return;
-    if (twins_level() == 2 && usage == 2) return;
+    if (imports_whole() || !g_prefetch_on || !bytes) return;
+    // What the GPU reads in place (host/import_prefetch.h): an unordered-access
+    // buffer, a dynamic one, a vertex or index buffer without the buffer
+    // shadow - not one kept as a device-local twin (BBHOST_GX_TWINS), whose
+    // twin is filled through staging - and, with the shadow, the meshes it
+    // reads in place. Textures never: their uploads go through staging.
+    // (Not the meshes while GX on Vulkan binds GX's buffers by handle,
+    // BBHOST_GXVK_BUFFERS: its own copies serve them, and nothing reads them in place.)
+    const import_prefetch::Ask ask = import_prefetch::ask(usage, bind, buffer_shadow_on(), twins_level(), g_prefetch_meshes && !gxvk::buffers_on());
+    if (ask == import_prefetch::Ask::kNone) return;
+    const bool meshes = ask == import_prefetch::Ask::kMeshes;
+    // The meshes only while the shadow reads told ones in place, which is
+    // known once the device is made (the thread drops every job before then):
+    // on a discrete GPU with window imports nothing more is queued.
+    if (meshes && !(g.ok && shadow_in_place_on())) {
+        g_pf_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_pf_mu);
     g_pf_asked.fetch_add(1, std::memory_order_relaxed);
+    if (meshes) g_pf_mesh_asked.fetch_add(1, std::memory_order_relaxed);
     if (g_pf_jobs.size() >= 8192) {
         g_pf_dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    g_pf_jobs.push_back({va, bytes});
+    g_pf_jobs.push_back({va, bytes, meshes});
     if (!g_pf_started) {
         g_pf_started = true;
         std::thread(prefetch_thread).detach();
     }
     g_pf_cv.notify_one();
+}
+
+void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
+    std::uint64_t cn = 0, cus = 0;
+    for (const int who : {kIwBinding, kIwAddress, kIwWalk}) {
+        cn += g_import_who_n[who].load(std::memory_order_relaxed);
+        cus += g_import_who_us[who].load(std::memory_order_relaxed);
+    }
+    if (n) *n = cn;
+    if (us) *us = cus;
 }
 
 bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool want_present) {
@@ -10445,6 +10361,30 @@ std::string host_gpu_video_memory_report(bool at_exit) {
     return gpu::video_memory_report_locked(at_exit);
 }
 
+void host_gpu_memory_census_refresh() { (void)host_gpu_video_memory_report(false); }
+
+bool host_gpu_memory_glance(GpuMemoryGlance& out) {
+    using namespace gpu;
+    if (!g.ok || !g.phys) return false;
+    std::uint64_t ours[3] = {};
+    for (const MemOwnerTotal& o : bb_memory_owner_totals()) {
+        for (int c = 0; c < 3; ++c) ours[c] += o.bytes[c];
+    }
+    out.vram = ours[0];
+    if (g.has_memory_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+        if (g.local_heap < mp.memoryProperties.memoryHeapCount && mb.heapUsage[g.local_heap]) out.vram = mb.heapUsage[g.local_heap];
+    }
+    out.shared = ours[2];
+    out.cache = g_glance_cache.load(std::memory_order_relaxed);
+    out.cache_known = g_glance_census.load(std::memory_order_relaxed);
+    out.integrated = g.integrated;
+    return true;
+}
+
 void host_gpu_log_video_memory(bool at_exit) {
     const std::string r = host_gpu_video_memory_report(at_exit);
     if (r.empty()) return;
@@ -11284,7 +11224,8 @@ void host_gpu_report() {
         host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
                  "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
                  "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
-                 imports_whole() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1 or gpu.import_windows", static_cast<ull>(g_imports_made.load()),
+                 imports_whole() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1, gpu.import_windows or an integrated GPU under Windows",
+                 static_cast<ull>(g_imports_made.load()),
                  mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
                  mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),
                  static_cast<ull>(g_import_who_n[kIwWalk].load()), mib(g_import_who_bytes[kIwWalk]),
@@ -11292,13 +11233,27 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        // Who waited for the driver: the import thread's imports keep nobody waiting.
+        const auto ms = [](const std::atomic<std::uint64_t>& us) { return static_cast<double>(us.load()) / 1e3; };
+        host_log("gpu: guest memory imports waited for (the driver's time of the thread that asked): by the paths that needed them %llu in %.0f ms "
+                 "(bindings %llu in %.0f, device addresses %llu in %.0f, walks %llu in %.0f; the longest %.1f ms), whole spans %llu in %.0f ms; "
+                 "the import thread's %llu in %.0f ms",
+                 static_cast<ull>(g_import_who_n[kIwBinding].load() + g_import_who_n[kIwAddress].load() + g_import_who_n[kIwWalk].load()),
+                 ms(g_import_who_us[kIwBinding]) + ms(g_import_who_us[kIwAddress]) + ms(g_import_who_us[kIwWalk]),
+                 static_cast<ull>(g_import_who_n[kIwBinding].load()), ms(g_import_who_us[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()),
+                 ms(g_import_who_us[kIwAddress]), static_cast<ull>(g_import_who_n[kIwWalk].load()), ms(g_import_who_us[kIwWalk]),
+                 ms(g_import_wait_max_us), static_cast<ull>(g_import_who_n[kIwSpan].load()), ms(g_import_who_us[kIwSpan]),
+                 static_cast<ull>(g_import_who_n[kIwPrefetch].load()), ms(g_import_who_us[kIwPrefetch]));
         if (!imports_whole()) {
             host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
                      "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
-                     "(their walks reach what nothing imports for them)",
+                     "(their walks reach what nothing imports for them); meshes the buffer shadow reads in place "
+                     "(BBHOST_IMPORT_PREFETCH_MESHES): %llu asked, %llu dropped while it does not, %llu imports made (%llu MiB)",
                      static_cast<ull>(g_pf_asked.load()), static_cast<ull>(g_pf_known.load()), static_cast<ull>(g_pf_checked.load()),
                      static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
-                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
+                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()),
+                     static_cast<ull>(g_pf_mesh_asked.load()), static_cast<ull>(g_pf_mesh_skipped.load()), static_cast<ull>(g_pf_mesh_imports.load()),
+                     mib(g_pf_mesh_bytes));
         }
         // (A copy taken under the lock: the command processor may still be
         // making imports while the exit report runs.)

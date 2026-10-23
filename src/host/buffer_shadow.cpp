@@ -228,14 +228,24 @@ std::uint64_t g_windows_made = 0;
 // import where it lies, with no copy and no mirror memory, its page tracking
 // kept (shadow_place.h). On an integrated GPU the mirror was the same RAM
 // again: on the Radeon 680M at a lamp 1,264 MiB of 16 MiB windows held 531
-// MiB of page copies, ~84% of them told pages. Only with whole imports (a
-// window import has no import to bind).
+// MiB of page copies, ~84% of them told pages. With window imports
+// (BBHOST_IMPORT_WINDOWS=1) the import is the range's window, which the
+// binding's locate() makes when the import thread has not (GX's meshes are
+// imported as GX makes them, host_gpu_import_prefetch);
+// BBHOST_SHADOW_IN_PLACE_WINDOWS=0 keeps in place to whole imports, the
+// mirrors serving every mesh with window imports, as before.
 const int g_in_place_env = [] {
     const char* e = std::getenv("BBHOST_SHADOW_IN_PLACE");
     return !e || !*e ? -1 : e[0] == '0' ? 0 : 1;
 }();
+const bool g_in_place_windows = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_IN_PLACE_WINDOWS");
+    return !(e && e[0] == '0');
+}();
+// (Decided at the first use, a draw's or the import thread's, by when the
+// device - and whether it is integrated - is known.)
 bool in_place_on() {
-    static const bool on = imports_whole() && (g_in_place_env >= 0 ? g_in_place_env == 1 : g.integrated);
+    static const bool on = shadow_place::in_place_wanted(imports_whole(), g_in_place_env, g_in_place_windows, g.integrated);
     return on;
 }
 std::atomic<std::uint64_t> g_placed_binds{0};    // ranges bound in place
@@ -1268,6 +1278,7 @@ bool integrated_with_room() {
 bool buffer_shadow_on() {
     return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
 }
+bool shadow_in_place_on() { return buffer_shadow_on() && in_place_on(); }
 
 namespace {
 // In place (in_place_on): true when [p0, p1] binds the import - each page
@@ -1350,9 +1361,12 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
-    // In place: the import is the binding, and `loc` already holds it.
+    // In place: the import is the binding, and `loc` already holds it - or,
+    // with window imports, holds the stand-in of shadow_mirror_locked's
+    // question, whose caller then binds the import locate() finds or makes
+    // (and asks again, which counts the bind).
     if (in_place_on() && place_range_locked(*m, chunk, va, off, p0, p1, map_lo, map_hi, stamp)) {
-        bump(g_placed_binds);
+        if (loc.buffer != g.sink.buffer) bump(g_placed_binds);
         return;
     }
     // A windowed mirror serves a range from one window's buffer.

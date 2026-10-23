@@ -428,16 +428,6 @@ struct Gpu {
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
-    // VK_EXT_map_memory_placed with VK_KHR_map_memory2, enabled only for GX on
-    // Vulkan's arena when it moves GX's upload heap (BBHOST_GXVK_ARENA=2,
-    // gpu.cpp arena_place_locked): its map function and the alignment a
-    // placed mapping takes.
-    bool has_placed_map = false;
-    const char* placed_missing = "not asked for";  // why has_placed_map is false, for the arena's log
-    void* map_memory2 = nullptr;  // PFN_vkMapMemory2KHR
-    void* unmap_memory2 = nullptr;  // PFN_vkUnmapMemory2KHR: an undone move's unmaps
-    bool unmap_reserve = false;     // memoryUnmapReserve: an unmap may keep its range reserved
-    VkDeviceSize placed_align = 0;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
     // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
@@ -927,9 +917,12 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // With past_end (and window imports) the range may run on into the next
 // chunk's span by up to kChunkOverlap, as one import of this chunk's.
 const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
-// Whether direct memory is imported whole (the default) rather than by window
-// on demand (BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows in the config).
-// Decided once - at the GPU's start, or at an earlier first ask - and read
+// Whether direct memory is imported whole (the default on a discrete GPU, and
+// under Linux) rather than by window on demand (BBHOST_IMPORT_WINDOWS=1,
+// gpu.import_windows in the config, or the default of an integrated GPU under
+// Windows; host/import_mode.h). Decided once - at the GPU's
+// start, or at an earlier first ask when the environment or config says, else
+// once the device is chosen - and read
 // inline after that: the command processor asks dozens of times a draw (a
 // call to a function-local static was 1.2-1.5% of bb-cp0 at 60 fps).
 extern std::atomic<signed char> g_imports_whole;  // -1 until decided, then 1 or 0
@@ -1078,6 +1071,10 @@ std::string untile_gpu_report();
 // recording); `loc` keeps the import otherwise. A write over a range makes the
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
+// Whether the shadow reads told pages in place (BBHOST_SHADOW_IN_PLACE and,
+// with window imports, BBHOST_SHADOW_IN_PLACE_WINDOWS): only once the device
+// is made, which it is decided by.
+bool shadow_in_place_on();
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // The same without a host location first: true, `out` the mirror, when the
 // mirrors serve [va, va+bytes) whole (copying what they must); false when it

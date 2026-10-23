@@ -84,6 +84,7 @@ struct State {
     std::unordered_map<int, ThreadTime> threads;
     GpuBusy gpu{};  // host_gpu_busy() when the window opened
     GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_DETAIL=1)
+    std::uint64_t import_waits = 0, import_wait_us = 0;  // host_gpu_import_waits() when it opened
 };
 
 // BBHOST_FRAME_DETAIL=1: the second's draws by how their pixel shader ran,
@@ -168,6 +169,7 @@ void frame_stats_on_flip() {
         s.threads = thread_times();
         s.gpu = host_gpu_busy();
         if (frame_stats_detail()) s.stats = host_gpu_stats();
+        host_gpu_import_waits(&s.import_waits, &s.import_wait_us);
         return;
     }
     s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_flip).count());
@@ -246,11 +248,27 @@ void frame_stats_on_flip() {
         gpu = gb;
     }
     s.gpu = gpu_now;
+    // Guest memory imports the command processor waited for in the window
+    // (window imports, BBHOST_IMPORT_WINDOWS=1: made at a binding rather than
+    // by the import thread), last again, and only when there were any.
+    std::string imports;
+    {
+        std::uint64_t in = 0, ius = 0;
+        host_gpu_import_waits(&in, &ius);
+        if (in > s.import_waits) {
+            char ib[96];
+            std::snprintf(ib, sizeof(ib), "; imports waited for %llu in %.1f ms", static_cast<unsigned long long>(in - s.import_waits),
+                          static_cast<double>(ius - s.import_wait_us) / 1e3);
+            imports = ib;
+        }
+        s.import_waits = in;
+        s.import_wait_us = ius;
+    }
     host_log("frames: %.2f s: %zu flips (%.1f/s), displayed %.1f/s, interval avg %.1f p95 %.1f max %.1f ms, %d over 16.7, %d over 33.3; "
-             "cpu %.0f%%:%s; main loop waited %.0f ms, slept %.0f ms, file I/O %.0f ms%s%s",
+             "cpu %.0f%%:%s; main loop waited %.0f ms, slept %.0f ms, file I/O %.0f ms%s%s%s",
              secs, n, static_cast<double>(n) / secs, displayed, sum / static_cast<double>(n), p95, worst, over16, over33, total,
              top.c_str(), static_cast<double>(sync_ns) / 1e6, static_cast<double>(sleep_ns) / 1e6,
-             static_cast<double>(file_ns) / 1e6, work.c_str(), gpu.c_str());
+             static_cast<double>(file_ns) / 1e6, work.c_str(), gpu.c_str(), imports.c_str());
     if (frame_stats_detail()) {
         const GpuStats stats = host_gpu_stats();
         log_detail(s.stats, stats, s.intervals_ms);

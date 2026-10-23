@@ -423,6 +423,26 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
 // it in place, its windows are imported ahead of their first use on a thread
 // of their own; nothing otherwise. Any thread, any lock.
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind);
+// The memory counter's numbers (host setting memory_counter, host/window.cpp):
+// `vram` the video memory the driver counts against bbhost's process (its
+// budget heap's usage: our allocations and the driver's own), `cache` the part
+// of ours the last video memory census found to be cache - given back when
+// memory runs short (`cache_known` false before a census) - and `shared` the
+// host memory our allocations hold that the GPU reads (the game's memory
+// imported, upload staging), which Windows counts as shared GPU memory. On an
+// integrated GPU Windows counts the video memory as shared too. False before
+// the device is made.
+struct GpuMemoryGlance {
+    std::uint64_t vram = 0, cache = 0, shared = 0;
+    bool cache_known = false, integrated = false;
+};
+bool host_gpu_memory_glance(GpuMemoryGlance& out);
+// The video memory census run now, not logged (for the counter's cache).
+void host_gpu_memory_census_refresh();
+// The guest memory imports the command processor waited for so far - made at
+// a binding, a device address or a walk, not by the import thread - and the
+// driver's time they took (the frames and stall lines' "imports waited for").
+void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us);
 // A GX buffer was made over [memory, memory + bytes) with this usage, these
 // bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
 // GPU writes (usage default, unordered-access bind) gets a device-local twin

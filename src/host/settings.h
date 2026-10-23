@@ -24,6 +24,7 @@ struct HostSettings {
     bool vsync = true;
     int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90, 120; 0 is uncapped
     bool fps_counter = false;
+    bool memory_counter = false;  // video memory and shared GPU memory, under the FPS counter (host/window.cpp)
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
 
     // Camera: multipliers on LockCamParam's values (engine/camera.cpp)

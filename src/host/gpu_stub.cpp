@@ -39,6 +39,12 @@ bool host_gpu_gds_subgroup() { return true; }
 bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}
+bool host_gpu_memory_glance(GpuMemoryGlance&) { return false; }
+void host_gpu_memory_census_refresh() {}
+void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
+    if (n) *n = 0;
+    if (us) *us = 0;
+}
 void host_gpu_gx_buffer_made(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t, std::uint64_t) {}
 void host_gpu_gx_buffer_mapped_own(std::uint64_t, std::uint64_t, std::uint64_t) {}
 void host_gpu_gx_buffer_gone(std::uint64_t, std::uint64_t) {}

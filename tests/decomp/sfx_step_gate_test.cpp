@@ -59,6 +59,16 @@
 //     elapsed time for the type's curves, the record's times then the frame's
 //     and its elapsed one the type's again for the draw; an unmarked one or
 //     the game's own still frame the game's call;
+//   - the same record update with StandardParticle's and Spark's simulations
+//     (0x13040b0, 0x12fef10, the game's) under the smooth steps, an emitter a
+//     case (dense ones the cap reaches, small ones, a wind share that
+//     truncates, an end time or a limit of events, new ones at their set-up's
+//     interval), in 2, 3, 4, 5 or 8 frames a whole step or uneven splits,
+//     against the game's update a whole step at a time: what each whole step's
+//     frames emit, its events, the emitter on or off and its timer at its end;
+//     frames of one update a window every byte and the FX RNG the game's; and
+//     over 40 s, emitters whose interval is drawn at random emitting the same
+//     events a second (within 3%) as 30's whole steps;
 //   - the wobble motions 0x570e6d0 and 0x570e690 under the smooth steps, in a
 //     staged node's real update at 60, 120, 144 and jittered rates against
 //     the game's update once a whole step: the count and the FX RNG after
@@ -1760,6 +1770,316 @@ int check_records_smooth(int cases, u64 sfx, u64 manager) {
     return bad;
 }
 
+// --- GPU particle emission under the smooth steps ------------------------------------------
+//
+// StandardParticle's and Spark's simulations (the game's sub_13040b0 and sub_12fef10) under a type update of the
+// test's (their vtables' +0x10: the record's elapsed time handed to the simulation at the type +0x6b0, as sub_12f18f0
+// and sub_12ed0b0 hand it), through the game's record update and ours. An emitter a case: a fixed count and interval
+// (no draw changes them), sometimes a cap within reach, +0x3940 not 1, an end time or a limit of events. The game's
+// record update a whole step at a time (1/30 on the manager's and the instance's scales) against ours over the frame
+// domain's frames of each whole step (2, 3, 4, 5 or 8 of them, or an uneven split): what the frames emit (+0x3878, taken
+// and zeroed after each update as the dispatch takes it) the whole step's emission, and at its end the same events, the
+// emitter on or off as the whole step leaves it and its timer within the frames' sums' rounding (0 after a cap). And
+// frames just under a whole step, one update a window: every byte of the emitter and the FX RNG as the game's call with
+// the same step.
+using SimFn = GUEST_ABI void (*)(u64 sim, float dt);
+GUEST_ABI void stub_standard_type(u64 out, u64 type, u64 rec, u64) {
+    eboot_kit::fn<SimFn>(0x13040b0)(type + kTypeSimulation, sub_ss(load<float>(rec + 0x18), load<float>(rec + 0x14)));
+    std::memset(reinterpret_cast<void*>(out), 0, 32);
+}
+GUEST_ABI void stub_spark_type(u64 out, u64 type, u64 rec, u64) {
+    eboot_kit::fn<SimFn>(0x12fef10)(type + kTypeSimulation, sub_ss(load<float>(rec + 0x18), load<float>(rec + 0x14)));
+    std::memset(reinterpret_cast<void*>(out), 0, 32);
+}
+alignas(64) u8 g_emit_rng[0x80];
+struct ParticleCase {
+    u64 record, item, type, sim;
+};
+constexpr std::size_t kSimBytes = 0x3b40;
+ParticleCase make_particles(bool spark, float scale, float whole, int kind) {
+    ParticleCase e;
+    e.record = block(0x80);
+    e.item = block(0x70);
+    e.type = block(kTypeSimulation + kSimBytes);
+    const u64 node = block(0x100), counts = block(0x20), inst = block(0x98);
+    store<u64>(e.type, game_address(spark ? kGxSpark : kGxStandard));
+    store<u64>(e.type + 8, block(0x100));
+    store<u64>(e.record + 8, e.type);
+    store<u64>(e.record + 0x10, node);
+    store<u64>(e.record + 0x18, counts);  // +8 = 0: no buffers
+    store<u64>(node + 0x58, inst);
+    store<float>(inst + 8, scale);
+    // the record's time small: its rounding moves the elapsed time a type reads off the item's step, and the timer sums
+    // with it (the windows count the steps themselves)
+    const float t = value(0, 0.5f);
+    store<float>(e.record + 0x24, t);
+    store<float>(e.record + 0x28, t);
+    for (int k = 0; k < 0x60; k += 4) store<float>(e.item + k, value(-3, 3));
+    const u64 sim = e.sim = e.type + kTypeSimulation;
+    store<u8>(sim + 0x3860, 0);
+    store<u32>(sim + 0x2a1c, 0);
+    store<u32>(sim + 0x283c, 0xfffffff);
+    store<u8>(sim + 0x3872, 1);
+    // the interval: just over the re-roll's floor (the dense ones; at 0.01 itself 3 x 1/30 = 10 x 0.01 makes a timer a
+    // cap set to 0 meet an interval exactly, where rounding - 30's or the frames' - decides the event's step) or wider; the
+    // re-roll gives it again (+0x2604 = +0x2608 = 0)
+    const float interval = kind == 0 || g_rng.chance(0.4) ? value(0.0101f, 0.0104f) : value(0.0105f, 0.12f);
+    // a new emitter: its set-up's interval (0.01, sub_12fda09), its events at that for 30's first whole step, then the
+    // definition's from the first re-roll on
+    const bool fresh = g_rng.chance(0.4);
+    store<float>(sim + 0x3888, fresh ? 0.01f : interval);
+    store<float>(sim + 0x2600, interval);
+    store<float>(sim + 0x2604, 0.0f);
+    store<float>(sim + 0x2608, 0.0f);
+    const float sigma = g_rng.chance(0.7) ? 1.0f : value(0.3f, 1.5f);
+    store<float>(sim + 0x393c, sigma);
+    // a count an event: within reach of the cap (16 or more, at the floor), or small
+    const int count = kind == 0 ? g_rng.range(16, 120) : g_rng.range(0, 12);
+    store<u32>(sim + 0x25e0, static_cast<u32>(count));
+    store<u32>(sim + 0x25e4, static_cast<u32>(count));
+    store<u32>(sim + 0x25dc, g_rng.chance(0.7) ? 0u : static_cast<u32>(g_rng.range(0, 30)));
+    store<u32>(sim + 0x3944, g_rng.chance(0.8) ? 0u : static_cast<u32>(g_rng.range(0, 6)));
+    store<u32>(sim + 0x29c4, g_rng.chance(0.6) ? 0u : static_cast<u32>(g_rng.range(0, 40)));
+    store<float>(sim + 0x29a8, g_rng.chance(0.6) ? 1.0f : value(0.0f, 3.0f));
+    store<float>(sim + 0x29ac, g_rng.chance(0.6) ? 1.0f : value(0.0f, 2.0f));
+    store<u32>(sim + 0x2890, static_cast<u32>(g_rng.chance(0.5) ? 2048 : g_rng.range(0, 64)));
+    // what the wind leaves of it: 1, or a share that truncates
+    store<float>(sim + 0x3940, kind == 2 || g_rng.chance(0.3) ? value(0.15f, 2.5f) : 1.0f);
+    // the limits: none, or an end time, or a limit of events
+    const bool limits = kind == 3 || g_rng.chance(0.25);
+    store<u32>(sim + 0x253c, limits ? 0u : 1u);
+    // an end time inside a whole step, away from its ends (where the frames' sums and 30's could round apart)
+    const float own = fresh || g_rng.chance(0.5) ? 0.0f : static_cast<float>(g_rng.range(1, 6)) * whole;
+    store<float>(sim + 0x2540, limits && g_rng.chance(0.6) ? own + (static_cast<float>(g_rng.range(0, 14)) + value(0.1f, 0.9f)) * whole : 1e9f);
+    store<u32>(sim + 0x261c, limits && g_rng.chance(0.6) ? 1u : 0u);
+    store<u32>(sim + 0x2620, static_cast<u32>(g_rng.range(0, 16)));
+    store<u32>(sim + 0x3884, static_cast<u32>(fresh || g_rng.chance(0.7) ? 0 : g_rng.range(0, 6)));
+    store<float>(sim + 0x3880, fresh ? 0.0f : value(0.0f, interval * sigma));  // as an update leaves it
+    // its own time: new, or some whole steps on (as 30's updates leave it)
+    store<float>(sim + 0x387c, own);
+    store<float>(sim + 0x3a2c, value(0, 100));
+    return e;
+}
+std::vector<u8> sim_bytes(const ParticleCase& e) {
+    std::vector<u8> v(kSimBytes + 0x80);
+    std::memcpy(v.data(), reinterpret_cast<void*>(e.sim), kSimBytes);
+    std::memcpy(v.data() + kSimBytes, reinterpret_cast<void*>(e.record), 0x80);
+    return v;
+}
+void put_sim(const ParticleCase& e, const std::vector<u8>& v) {
+    std::memcpy(reinterpret_cast<void*>(e.sim), v.data(), kSimBytes);
+    std::memcpy(reinterpret_cast<void*>(e.record), v.data() + kSimBytes, 0x80);
+}
+void emit_rng_seed(u32 seed) {
+    std::memset(g_emit_rng, 0, sizeof g_emit_rng);
+    for (int k = 0x30; k < 0x40; k += 4) store<u32>(reinterpret_cast<u64>(g_emit_rng) + k, seed * 2654435761u + static_cast<u32>(k) * 40503u + 1u);
+}
+struct EmitSeen {
+    long cases = 0, steps = 0, frames = 0, capped = 0, truncated = 0, ended = 0, limited = 0, single = 0;
+} g_seen_emit;
+int check_emission(int cases, u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    int bad = 0;
+    decomp_sfx_smooth(true);
+    store<u32>(sfx + 0x8c, 0u);
+    store<u8>(manager + 0x5ce, 0);
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        // a new emitter (the last case's may have had its address, with its own time behind this one's)
+        for (EmitSlot& x : g_emit_slots) {
+            x.sim.store(0);
+            x.open = 0;
+        }
+        const bool spark = g_rng.chance(0.5);
+        const float scale = g_rng.chance(0.7) ? 1.0f : value(0.5f, 2.0f), time_scale = g_rng.chance(0.8) ? 1.0f : value(0.5f, 1.5f);
+        store<float>(manager + 0x5d8, time_scale);
+        const float whole = 1.0f / 30.0f * time_scale * scale;
+        const int kind = g_rng.range(0, 3);  // 0 a cap within reach, 1 small counts, 2 a share that truncates, 3 limits
+        const ParticleCase e = make_particles(spark, scale, whole, kind);
+        const std::vector<u8> start = sim_bytes(e);
+        const u32 seed = g_rng.u32();
+        const char* why = nullptr;
+        int at = -1;
+        ++g_seen_emit.cases;
+        if (g_rng.chance(0.15)) {
+            // one update a window: frames just under a whole step, ours against the game's call with the same step (no
+            // limits: a window's end time stops an emitter at its whole step's end, not at the update's)
+            ++g_seen_emit.single;
+            store<u32>(e.sim + 0x253c, 1u);
+            const std::vector<u8> start1 = sim_bytes(e);
+            const float frame = 1.0f / 30.0f * 0.999999f;
+            const float step = frame * time_scale * scale;
+            std::vector<u8> theirs[12];
+            u8 rng_theirs[12][16];
+            emit_rng_seed(seed);
+            for (int k = 0; k < 12; ++k) {
+                store<float>(e.item + 0x60, step);
+                game(e.record, e.item);
+                theirs[k] = sim_bytes(e);
+                std::memcpy(rng_theirs[k], g_emit_rng + 0x30, 16);
+                store<u32>(e.sim + 0x3878, 0);
+            }
+            put_sim(e, start1);
+            emit_rng_seed(seed);
+            for (int k = 0; k < 12 && !why; ++k) {
+                decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+                store<float>(e.item + 0x60, step);
+                sfx_gx_record_update(e.record, e.item);
+                if (sim_bytes(e) != theirs[k]) why = "one update a window: the emitter";
+                else if (std::memcmp(rng_theirs[k], g_emit_rng + 0x30, 16) != 0) why = "one update a window: the FX RNG";
+                if (why) at = k;
+                store<u32>(e.sim + 0x3878, 0);
+            }
+        } else {
+            // the reference: the game's update a whole step at a time
+            constexpr int kSteps = 16;
+            s32 emitted[kSteps];
+            u32 events[kSteps], on[kSteps];
+            float timer[kSteps];
+            emit_rng_seed(seed);
+            for (int k = 0; k < kSteps; ++k) {
+                store<float>(e.item + 0x60, whole);
+                game(e.record, e.item);
+                emitted[k] = load<s32>(e.sim + 0x3878);
+                store<u32>(e.sim + 0x3878, 0);
+                events[k] = load<u32>(e.sim + 0x3884);
+                on[k] = load<u8>(e.sim + 0x3872);
+                timer[k] = load<float>(e.sim + 0x3880);
+            }
+            // ours: the frames of each whole step, as the frame domain gives them
+            put_sim(e, start);
+            emit_rng_seed(seed ^ 0x9e3779b9u);
+            const int split = g_rng.range(0, 5);
+            const int ns[5] = {2, 3, 4, 5, 8};
+            for (int k = 0; k < kSteps && !why; ++k) {
+                float parts[8];
+                int n = 0;
+                if (split < 5 && g_rng.chance(0.75)) {
+                    n = ns[split];
+                    for (int j = 0; j < n; ++j) parts[j] = whole / static_cast<float>(n);
+                } else {
+                    n = g_rng.range(2, 6);
+                    float left = whole;
+                    for (int j = 0; j < n - 1; ++j) {
+                        parts[j] = left * value(0.15f, 0.6f);
+                        left -= parts[j];
+                    }
+                    parts[n - 1] = left;
+                }
+                s32 sum = 0;
+                for (int j = 0; j < n; ++j) {
+                    // the frame's own time on the instance's scales: (frame x time scale) x scale is the part
+                    const float frame = parts[j] / scale / time_scale;
+                    decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+                    const float step = frame * time_scale * scale;
+                    store<float>(e.item + 0x60, step);
+                    sfx_gx_record_update(e.record, e.item);
+                    sum += load<s32>(e.sim + 0x3878);
+                    store<u32>(e.sim + 0x3878, 0);
+                    ++g_seen_emit.frames;
+                }
+                ++g_seen_emit.steps;
+                if (sum != emitted[k]) why = "what a whole step's frames emit";
+                else if (load<u32>(e.sim + 0x3884) != events[k]) why = "the events at a whole step's end";
+                else if (load<u8>(e.sim + 0x3872) != on[k]) why = "the emitter on or off at a whole step's end";
+                else {
+                    const float t = load<float>(e.sim + 0x3880);
+                    if (timer[k] == 0.0f ? t != 0.0f : !(std::fabs(t - timer[k]) <= 2e-5f)) why = "the timer at a whole step's end";
+                }
+                if (why) at = k;
+                if (timer[k] == 0.0f && emitted[k] > 0) ++g_seen_emit.capped;
+            }
+            if (load<float>(e.sim + 0x3940) != 1.0f) ++g_seen_emit.truncated;
+            if (load<u32>(e.sim + 0x253c) == 0) {
+                ++g_seen_emit.limited;
+                if (!on[kSteps - 1]) ++g_seen_emit.ended;
+            }
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("emission case %d (%s, kind %d, count %u, interval %g, cap fields %u/%u, x%g, limits %u end %g max %u/%u): %s differs at step %d\n", c,
+                        spark ? "Spark" : "StandardParticle", kind, load<u32>(reinterpret_cast<u64>(start.data()) + 0x25e0),
+                        load<float>(reinterpret_cast<u64>(start.data()) + 0x3888), load<u32>(reinterpret_cast<u64>(start.data()) + 0x29c4),
+                        load<u32>(reinterpret_cast<u64>(start.data()) + 0x2890), load<float>(reinterpret_cast<u64>(start.data()) + 0x3940),
+                        load<u32>(reinterpret_cast<u64>(start.data()) + 0x253c), load<float>(reinterpret_cast<u64>(start.data()) + 0x2540),
+                        load<u32>(reinterpret_cast<u64>(start.data()) + 0x261c), load<u32>(reinterpret_cast<u64>(start.data()) + 0x2620), why, at);
+    }
+    decomp_sfx_smooth(false);
+    return bad;
+}
+
+// Emitters whose interval the re-roll draws at random (+0x2604..+0x2608): 30's update takes every event of its step at
+// one interval, frames re-roll after each of theirs, so the game's own update a frame emits less where the interval is
+// short (an interval of 0..0.1 s: about 27 events a second at 30, 20 at 120). Over 40 s, the window's frames against the
+// game's whole steps: the same events a second within 3% (the draws differ), and the game's own frames for comparison.
+struct RateSeen {
+    double game30 = 0, ours = 0, theirs = 0;
+    int emitters = 0;
+} g_seen_rates;
+int check_emission_rates(u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    int bad = 0;
+    decomp_sfx_smooth(true);
+    store<u32>(sfx + 0x8c, 0u);
+    store<u8>(manager + 0x5ce, 0);
+    store<float>(manager + 0x5d8, 1.0f);
+    const struct {
+        float base, hi;
+    } kinds[] = {{0.0f, 0.1f}, {0.0f, 0.03f}, {0.02f, 0.06f}, {0.01f, 0.05f}};
+    for (const auto& k : kinds)
+        for (const int fps : {60, 120, 144}) {
+            long n30 = 0, nours = 0, ntheirs = 0;
+            for (int rep = 0; rep < 8; ++rep) {
+                g_blocks.clear();
+                for (EmitSlot& x : g_emit_slots) {
+                    x.sim.store(0);
+                    x.open = 0;
+                }
+                ParticleCase e = make_particles(g_rng.chance(0.5), 1.0f, 1.0f / 30.0f, 1);
+                store<u32>(e.sim + 0x25e0, 1u);
+                store<u32>(e.sim + 0x25e4, 1u);
+                for (const u64 off : {0x25dcull, 0x3944ull, 0x29c4ull}) store<u32>(e.sim + off, 0u);
+                store<u32>(e.sim + 0x253c, 1u);
+                store<float>(e.sim + 0x3940, 1.0f);
+                store<float>(e.sim + 0x393c, 1.0f);
+                store<u32>(e.sim + 0x2890, 4096u);
+                store<float>(e.sim + 0x2600, k.base);
+                store<float>(e.sim + 0x2604, 0.0f);
+                store<float>(e.sim + 0x2608, k.hi);
+                const std::vector<u8> start = sim_bytes(e);
+                const float frame = 1.0f / static_cast<float>(fps);
+                emit_rng_seed(g_rng.u32());
+                for (int f = 0; f < 40 * 30; ++f) {
+                    store<float>(e.item + 0x60, 1.0f / 30.0f);
+                    game(e.record, e.item);
+                    n30 += load<s32>(e.sim + 0x3878);
+                    store<u32>(e.sim + 0x3878, 0);
+                }
+                for (int arm = 0; arm < 2; ++arm) {
+                    put_sim(e, start);
+                    emit_rng_seed(g_rng.u32());
+                    for (int f = 0; f < 40 * fps; ++f) {
+                        decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+                        store<float>(e.item + 0x60, frame);
+                        if (arm == 0) sfx_gx_record_update(e.record, e.item);
+                        else game(e.record, e.item);
+                        (arm == 0 ? nours : ntheirs) += load<s32>(e.sim + 0x3878);
+                        store<u32>(e.sim + 0x3878, 0);
+                    }
+                }
+            }
+            g_seen_rates.game30 += n30;
+            g_seen_rates.ours += nours;
+            g_seen_rates.theirs += ntheirs;
+            ++g_seen_rates.emitters;
+            const double r = static_cast<double>(nours) / static_cast<double>(n30 ? n30 : 1);
+            if (!(r > 0.97 && r < 1.03) && ++bad <= 6 && !g_quiet)
+                std::printf("emission rate (interval %g + 0..%g, %d fps): %.2f a second against 30's %.2f (the game's frames %.2f)\n", k.base, k.hi, fps,
+                            nours / 320.0, n30 / 320.0, ntheirs / 320.0);
+        }
+    decomp_sfx_smooth(false);
+    return bad;
+}
+
 // --- the wind sources' registry step ---------------------------------------------------
 
 // A registry (*0x58b0bb0): +0x28 a list's sentinel, each node's +0 the next and +0x10 its entry, an entry's +0x48 its
@@ -2624,6 +2944,33 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    // GPU particle emission under the smooth steps: the two types' updates the test's, the FX RNG holder its own.
+    store<u64>(game_address(kGxStandard) + 0x10, reinterpret_cast<u64>(&stub_standard_type));
+    store<u64>(game_address(kGxSpark) + 0x10, reinterpret_cast<u64>(&stub_spark_type));
+    store<u64>(reinterpret_cast<u64>(eboot_kit::at(0x5940de8)), reinterpret_cast<u64>(g_emit_rng));
+    g_quiet = false;
+    g_rng.specials = false;
+    const int ebad = check_emission(kCases / 4, sfx, manager);
+    std::printf("decomp_sfx_step_gate: %d GPU particle emission cases (%ld whole steps against %ld frames, %ld of them capped; %ld emitters "
+                "truncating, %ld with limits, %ld ended; %ld one update a window), %d differ\n",
+                kCases / 4, g_seen_emit.steps, g_seen_emit.frames, g_seen_emit.capped, g_seen_emit.truncated, g_seen_emit.limited,
+                g_seen_emit.ended, g_seen_emit.single, ebad);
+    if (ebad) return 1;
+    const int rbad2 = check_emission_rates(sfx, manager);
+    std::printf("decomp_sfx_step_gate: GPU particle emission at random intervals over 40 s: %.1f events a second in 30's whole steps, %.1f in "
+                "frames counted a whole step at a time (the game's own update a frame: %.1f), %d of %d rates off by over 3%%\n",
+                g_seen_rates.game30 / (g_seen_rates.emitters * 320.0), g_seen_rates.ours / (g_seen_rates.emitters * 320.0),
+                g_seen_rates.theirs / (g_seen_rates.emitters * 320.0), rbad2, g_seen_rates.emitters);
+    if (rbad2) return 1;
+    g_quiet = true;
+    for (const int m : {56, 57, 58, 59, 60, 61, 62}) {
+        g_sfx_gate_mutant = m;
+        if (!check_emission(1000, sfx, manager)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the GPU particle emission\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
     // The wind sources' registry step.
     g_game_wind_step = eboot_kit::at(kWindSourcesStep);
     g_quiet = false;
@@ -2720,6 +3067,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 49 mutants caught\n", 49 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 56 mutants caught\n", 56 - missed);
     return missed ? 1 : 0;
 }
