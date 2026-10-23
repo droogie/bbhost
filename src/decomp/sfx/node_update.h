@@ -24,6 +24,8 @@ struct Steps {
     float into = 0.0f;     // a plain node's definition-time offset for its second call: the frame's end past it, scaled
     bool tick = true;      // a frame with a whole step: the counted parts run, a dead node is freed
     bool smooth = false;   // the smooth steps' frame domain: each container call is published (smooth_call)
+    float sub = 0.0f;      // the emission clock's sub-step (1/60 s, scaled; node_emit.h): an emitting staged node makes the
+                           // events of the sub-steps its time reaches this frame; 0: the game's one event a whole step
 };
 
 // The node update with those steps; false when the node is to be freed.

@@ -1085,3 +1085,9 @@ std::string config_effect_steps() {
     const std::string v = config_value("video.effect_steps");
     return v.empty() ? "smooth" : v;
 }
+
+std::string config_effect_emission() {
+    if (const char* e = std::getenv("BBHOST_SFX_EMISSION"); e && *e) return e;
+    const std::string v = config_value("video.effect_emission");
+    return v.empty() ? "60" : v;
+}

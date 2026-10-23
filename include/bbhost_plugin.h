@@ -23,7 +23,10 @@
  *
  * Addresses are Binary Ninja's for the 1.09 eboot (the image at its preferred
  * base 0x400000). guest_addr() turns one into the runtime address; the read,
- * write, patch and hook calls take Binary Ninja addresses themselves.
+ * write, patch and hook calls take Binary Ninja addresses themselves. read()
+ * also takes the runtime address of any guest memory outside the image - the
+ * pointers a plugin reads out of the game's heaps. Under Windows the image
+ * may be slid (to 0x300000000), and the heaps lie below it as well as above.
  */
 #ifndef BBHOST_PLUGIN_H
 #define BBHOST_PLUGIN_H
@@ -188,8 +191,9 @@ typedef struct BbHostApi {
     /* Runtime address of a Binary Ninja address, 0 when not the 1.09 build
      * or outside the image. */
     uint64_t (*guest_addr)(uint64_t bn_addr);
-    /* Copies n bytes at a Binary Ninja address (any mapped guest memory when
-     * the address is a runtime one above the image). 0 on success. */
+    /* Copies n bytes from a Binary Ninja address inside the image, or from a
+     * runtime address the guest has mapped (its heaps, above the image or,
+     * under Windows, below the slid image) or above the image. 0 on success. */
     int (*read)(uint64_t bn_addr, void* out, size_t n);
     /* Writes n bytes to a data page. 0 on success. */
     int (*write)(uint64_t bn_addr, const void* data, size_t n);

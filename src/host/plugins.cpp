@@ -1,4 +1,5 @@
 #include "host/plugins.h"
+#include "host/plugin_address.h"
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
@@ -25,6 +26,7 @@
 #include "core/thunk.h"
 #include "guest_abi.h"
 #include "hle/fs.h"
+#include "hle/modules.h"
 #include "host/ruleset.h"
 #include "host/updater.h"
 #include "host/window.h"
@@ -146,9 +148,13 @@ std::uint64_t runtime_of(std::uint64_t bn, std::size_t n) {
 
 std::uint64_t api_guest_addr(std::uint64_t bn) { return api_eboot_is_109() ? runtime_of(bn, 1) : 0; }
 
+// A Binary Ninja address inside the image, else a runtime address: above the
+// image, or anywhere the guest has mapped - under Windows its heaps lie below
+// the slid image too (host/plugin_address.h).
 int api_read(std::uint64_t bn, void* out, std::size_t n) {
-    std::uint64_t at = runtime_of(bn, n);
-    if (!at && g_image && bn >= g_image->mem.slide + g_image->mem.size) at = bn;  // a runtime address elsewhere
+    if (!g_image) return 1;
+    const std::uint64_t at = plugin_address::read_address(bn, n, g_image->mem.slide, g_image->mem.size,
+                                                          [](std::uint64_t a, std::size_t len) { return hle_kernel_va_mapped(a, len); });
     if (!at) return 1;
     return host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n) ? 0 : 1;
 }

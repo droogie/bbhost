@@ -171,6 +171,11 @@ std::string config_value(const std::string& key);
 // effect_steps, else "smooth" (the default). The frame rate code reads 30,
 // smooth, 60 and frame (engine/frame_rate.cpp).
 std::string config_effect_steps();
+// The effects' emission clock as asked for: BBHOST_SFX_EMISSION, else [video]
+// effect_emission, else "60" (the default): "60" for emission events at 60 a
+// second at every frame rate, "30" for the game's one an update
+// (decomp/sfx/node_emit.cpp, engine/frame_rate.cpp).
+std::string config_effect_emission();
 // Changes a loaded value in memory (raw, as config_set_values writes it): a
 // setting changed while running (the plugin menu), so config_value agrees
 // with the file just written. Main thread.

@@ -717,7 +717,11 @@ unchanged.
 **The upload heap (the stage's second part, off by default while it is
 measured).** GX's device gives its block pool one region - GX's upload heap,
 160 MiB, made by the pool's init, which is on the decomp list - and every
-renamed constant buffer, Map rename and ring allocation comes from it. GX
+renamed constant buffer, Map rename and ring allocation comes from it. The
+pool hands out from both ends of it: the deferred contexts from the heap's
+start, the immediate context from its top (its Map discards, among them a
+256 KiB copy a frame for the ring its user-primitive draws fill), with one
+free list between them, so after a large load the two ends meet. GX
 hands a range out again only after an end-of-pipe label behind the work that
 used it has landed, and a label lands only once the host's submission has
 completed, so a renamed copy holds what its draws read until the GPU has
@@ -730,7 +734,10 @@ record it lies in with its submission, and a hand-out over a record's memory
 needs that submission completed; and one binding in 64 has its bytes hashed
 when it is bound and again when its submission has completed. A violation
 sends every binding of the heap back to today's path for the rest of the run,
-and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
+and the exit report says so. Both ends' hand-outs are records: while only the
+start's were, memory the top end took back after the load into Old Yharnam
+read as a stale record's, and the proof stopped in two of four runs.
+`BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
 Moving the heap into video memory the CPU writes was tried and dropped
 (`BBHOST_GXVK_ARENA=2`, removed): GX's device is made before bbhost's, so its

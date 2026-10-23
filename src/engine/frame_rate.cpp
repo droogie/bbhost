@@ -6,6 +6,7 @@
 #include "engine/sfx_schedule.h"
 #include "engine/wind_pace.h"
 #include "decomp/sfx/step_gate.h"
+#include "decomp/sfx/node_emit.h"
 #include "decomp/gx/water_gate.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
@@ -2050,6 +2051,24 @@ void frame_rate_install(ElfImage* image) {
         g_source = e[0] == '0' ? Source::Guest : e[0] == '2' ? Source::Compare : Source::Ours;
     }
     const int want = wanted_fps();
+    // The effects' emission clock ([video] effect_emission, BBHOST_SFX_EMISSION;
+    // decomp/sfx/node_emit.cpp): an effect's emission events - the CPU particles
+    // and children its nodes make - at 60 a second at every frame rate, 30
+    // included, the rest of what the effects count as at 30. 8,421 of the game's
+    // 15,330 CPU emitter records ask for an event every 1/60 s, and one update
+    // makes at most one: 30 a second at 30. "30" keeps the game's one an update.
+    {
+        const std::string v = config_effect_emission();
+        const bool on = v != "30";
+        if (on && v != "60") host_log("frame rate: effect_emission = %s is neither 60 nor 30; 60 runs", v.c_str());
+        sfx_node::set_emission_clock(on ? 2 : 0);
+        host_log("frame rate: the effects' emission %s (%s = %s)",
+                 on ? "on a 1/60 s clock: their particles and children made as at 60 updates a second at every frame rate, the "
+                      "rest of what they count as at 30 (decomp/sfx/node_emit.cpp)"
+                    : "the game's own: one event an update, 30 a second at 30 and on whole 1/30 s steps",
+                 std::getenv("BBHOST_SFX_EMISSION") && *std::getenv("BBHOST_SFX_EMISSION") ? "BBHOST_SFX_EMISSION" : "[video] effect_emission",
+                 on ? "60" : "30");
+    }
     // 90 and uncapped set a target the game's own modes do not have: ours
     // runs them (compare and the guest's run at 30 and 60).
     if ((want > 60 || want == 0) && g_source != Source::Ours) {
@@ -2089,6 +2108,16 @@ void frame_rate_install(ElfImage* image) {
     }
     g_game_fps = got;
     hle_video_set_game_pace(got);  // above 60 and uncapped: flips complete at once (hle/video.cpp)
+    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step (30 and smooth), one in a
+    // whole 1/60 s step (one event an update is 60 a second already); effect steps frame stays the game's.
+    if (sfx_node::emission_clock() > 0) {
+        const int steps = effect_steps();
+        if (steps == 60) sfx_node::set_emission_clock(1);
+        if (steps == 0) {
+            sfx_node::set_emission_clock(0);
+            host_log("frame rate: effect steps frame: the effects' emission stays the game's, one event an update");
+        }
+    }
     if (got == 0) {
         // Uncapped: character creation is told apart from the title's menus
         // (menus_unlimited); without that the menus keep the limit.

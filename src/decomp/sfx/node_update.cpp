@@ -31,6 +31,8 @@
 // first), so a NaN keeps the payload it has in the game.
 #include "decomp/sfx/node_update.h"
 
+#include "decomp/sfx/node_emit.h"
+
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
@@ -137,6 +139,54 @@ inline void call_container(u64 node, float step, u64 definition, u64 context, fl
     if (shift_e && load<u32>(node + 0xe0) == e_shifted) store<u32>(node + 0xe0, e);
 }
 
+// A staged node's emitting state on a whole step: the game's (sub_2c4e6b0), or under the emission clock its edges only,
+// the clock making the events (node_emit.h).
+inline u32 emit_edges(u64 node, u64 definition, u64 context, const sfx_node::Steps& st) {
+    if (st.sub > 0.0f && !MUTANT(20)) return sfx_node::emit(node, definition, context, sfx_node::Emit::Edges, 0.0f, true);
+    return game_function<NextStateFn>(kEmit)(node, definition, context);
+}
+
+// The emission clock (node_emit.h): an emitting staged node (state 1) makes its emission events at the 1/60 s
+// sub-steps of its time - those of its whole step (from its time +0x7c) and, on a whole step's frame, of the next one
+// (from the time the step leaves it) - each at its own time and before the container call that bears its particles:
+//   - CPU particles: the sub-steps in this frame's span of the node's time, from the carry before the frame to the
+//     carry after it (past the whole step's end on a whole step's frame), so each sub-step is made on the one frame
+//     whose span holds it; a node that began emitting on this whole step (its state was not 1) catches up from the
+//     step's own time;
+//   - children: on a whole step's frame only (the node trees change there), the whole step's own sub-steps.
+inline void clock_events(u64 node, u64 definition, u64 context, const sfx_node::Steps& st, bool entered) {
+    if (!(st.sub > 0.0f) || load<u32>(node + 0xdc) != 1 || (load<u32>(node + 0x78) & 4)) return;
+    const int subs = sfx_node::emission_clock() > 1 ? 2 : 1;
+    const u64 d = load<u64>(node + 0xd0);
+    const u32 f =
+        load<u32>(load<u64>(d + 0x10) + static_cast<u64>(load<u32>(load<u64>(d + 8) + 4 * static_cast<u64>(load<u32>(node + 0xd8)))) * 0xa0 + 4);
+    if (f & 1) return;  // a record that waits for its end makes no event
+    const float base = load<float>(node + 0x7c);
+    // A sub-step meets the next within a few roundings of the node's time: the sub-steps lie on the whole steps (+0x7c
+    // moved by the whole step), the next on the last event's time and the interval, and an add rounding the other way
+    // must not skip a sub-step (it skipped one in two of the 1/60 s emitters' events).
+    const float mag = base > 1.0f ? base : base < -1.0f ? -base : 1.0f;
+    const float slack = MUTANT(24) ? 0.0f : mag * (1.0f / 1048576.0f);
+    if (f & 2) {
+        if (!st.tick && !MUTANT(22)) return;
+        float s = base;
+        for (int k = 0; k < subs; ++k, s = add(s, st.sub)) sfx_node::emit(node, definition, context, sfx_node::Emit::Event, s, true, slack);
+        return;
+    }
+    if (!(f & 4)) return;
+    const float start = add(base, MUTANT(21) ? 0.0f : st.from);
+    const float next_base = st.tick ? add(base, st.counted) : base;  // the next whole step's time, as the step leaves it
+    const float end = add(next_base, st.into);
+    for (int a = 0; a < (st.tick ? 2 : 1); ++a) {
+        float s = a == 0 ? base : next_base;
+        for (int k = 0; k < subs; ++k, s = add(s, st.sub)) {
+            const bool in_span = !(s < start) && s < end;
+            const bool catch_up = entered && a == 0 && s < start && !MUTANT(23);
+            if (in_span || catch_up) sfx_node::emit(node, definition, context, sfx_node::Emit::Event, s, st.tick, slack);
+        }
+    }
+}
+
 }  // namespace
 
 namespace sfx_node {
@@ -156,6 +206,7 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
     const bool counts = st.tick || MUTANT(11);  // the counted parts run
     const float container_step = MUTANT(13) ? st.counted : st.frame;
     const u32 flags = load<u32>(node + 0x78);
+    const u32 state_in = load<u32>(node + 0xdc);  // a staged node's state on entry: whether its emitting began this step
     if (flags & 4) return st.tick || MUTANT(14) ? 0 : 1;  // a dead node: freed by a whole step, kept between them
     u8 keep = 1;
     if (!(flags & 1)) return keep;
@@ -202,11 +253,11 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
             if (const u64 binder = load<u64>(rec + 0x38)) game_function<BindFn>(kBind)(definition, node, load<u32>(rec + 0x30), binder);
             next = 9;
             if (!game_function<SetUpFn>(kSetUp)(node, definition, records, rec)) break;
-            next = game_function<NextStateFn>(kEmit)(node, definition, context);
+            next = emit_edges(node, definition, context, st);
             break;
         }
         case 1:
-            next = game_function<NextStateFn>(kEmit)(node, definition, context);
+            next = emit_edges(node, definition, context, st);
             break;
         case 2:
             store<float>(node + 0x7c, load<float>(game_address(kNoTime)));
@@ -238,7 +289,7 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
                 store<u32>(node + 0xd8, want);
                 break;
             }
-            next = game_function<NextStateFn>(kEmit)(node, definition, context);
+            next = emit_edges(node, definition, context, st);
             break;
         }
         case 4:
@@ -336,6 +387,8 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
             store<u8>(node + 0x78, static_cast<u8>(load<u8>(node + 0x78) & (MUTANT(4) ? 0x9fu : 0x8fu)));
         }
     }
+    // An emitting staged node's events of this frame, on the emission clock.
+    if (!plain && keep) clock_events(node, definition, context, st, counts && state_in != 1);
     // Every active node: its container once more, and its time.
     call_container(node, container_step, definition, keep && !MUTANT(5) ? context : 0, st.from,
                    plain ? (MUTANT(15) ? st.from : st.into) : 0.0f, st);
@@ -349,7 +402,12 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
 // sub_2c4df80 itself: the game's sequence, one step for both kinds and no offsets.
 DECOMP_LEAF u8 sfx_node_update(u64 node, float* step, u64 definition, u64 context) {
     const float s = *step;
-    return sfx_node::update(node, {s, s, 0.0f, 0.0f, true}, definition, context);
+    sfx_node::Steps st{s, s, 0.0f, 0.0f, true};
+    // Under the emission clock the update's step holds sfx_node::emission_clock() sub-steps of 1/60 s (two in the
+    // game's 1/30 s, one in a whole 1/60 s step); a step of 0 (the game's own still frame) keeps the game's event.
+    const int subs = sfx_node::emission_clock();
+    if (subs > 0 && s > 0.0f) st.sub = subs == 2 ? s * 0.5f : s;
+    return sfx_node::update(node, st, definition, context);
 }
 
 namespace {

@@ -86,6 +86,15 @@ constexpr std::uint64_t kCreateSrv = 0x25669a0, kCreateSampler = 0x2565b40;
 // GX's upload heap, the device's one region (0x256b0f0) - and its aligned
 // hand-out 0x2aa9fa0(pool, bytes, alignment), beside 0x2aa9d50.
 constexpr std::uint64_t kCreateUav = 0x2566b60, kPoolInit = 0x2aa9b50, kPoolAligned = 0x2aa9fa0;
+// The pool's other end. Each GX context reaches the pool through a memory
+// interface: a deferred context's (vtable 0x575f350) hands out with
+// 0x2aa9d50 and 0x2aa9fa0, first fit from the heap's start; the immediate
+// context's (0x575f300) with 0x2aaa010(pool, bytes) and 0x2aaa270(pool,
+// bytes, alignment), first fit from the free list's tail - the heap's top.
+// Its Map discards rename there: the dynamic ring of its user-primitive draws
+// takes a 256 KiB copy a frame. One free list serves both ends, so after a
+// large load they meet.
+constexpr std::uint64_t kPoolTopBlock = 0x2aaa010, kPoolTopAligned = 0x2aaa270;
 // push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; push rax
 constexpr std::uint8_t kPoolInitPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
 // push rbp; mov rbp, rsp; push r15, r14, r12, rbx; mov rbx, rdx
@@ -898,9 +907,17 @@ GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
 
 // The upload pool's block source: rdi = the pool, rsi = bytes, the block
 // comes back in rax. The pool's aligned hand-out (0x2aa9fa0) has the same
-// first two arguments.
-GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
-    t_pending.push_back({saved[6], kPoolCall, 0, saved[5], saved[4]});
+// first two arguments, and so do the top end's two. `top`: 1 for those.
+// Once the arena's proof has failed and no census counts, the hand-out runs
+// as if not hooked.
+GUEST_ABI std::int64_t pool_hook(std::uint64_t top, const std::uint64_t* saved) {
+    if (!gxvk::arena_recording() && (top || !(g_census || gxvk::census()))) {
+        gxvk::arena_unrecorded();
+        return 0;
+    }
+    Pending p{saved[6], kPoolCall, 0, saved[5], saved[4]};
+    p.extra = top;
+    t_pending.push_back(p);
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
@@ -1406,14 +1423,14 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         }
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
-        if (g_census && result && p.type && rd(result + 8, &block) && block) {
+        if (g_census && !p.extra && result && p.type && rd(result + 8, &block) && block) {
             g_pool_calls.fetch_add(1, std::memory_order_relaxed);
             g_pool_bytes.fetch_add(p.type, std::memory_order_relaxed);
             host_gpu_shadow_gx_handed(block, p.type, 1);
         }
         if (result && p.type) {
-            gxvk::census_handout(p.holder, result, p.type);
-            gxvk::arena_handout(p.holder, result);
+            if (!p.extra) gxvk::census_handout(p.holder, result, p.type);
+            gxvk::arena_handout(p.holder, result, p.extra != 0);
         }
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
@@ -1596,6 +1613,12 @@ void gx_resources_install(ElfImage* image) {
         hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     if (gxvk::census() || gxvk::arena_wanted())
         hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    // Its top end: the arena's records must hold both ends' hand-outs, or the
+    // memory one end reuses reads as the other end's stale record once they meet.
+    if (gxvk::arena_wanted()) {
+        hook(kPoolTopBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 1);
+        hook(kPoolTopAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 1);
+    }
     if (gxvk::census()) hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);

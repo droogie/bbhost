@@ -31,6 +31,7 @@
 #include "decomp/sfx/step_gate.h"
 
 #include "decomp/sfx/node_update.h"
+#include "decomp/sfx/node_emit.h"
 
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
@@ -81,6 +82,7 @@ constexpr u64 kWindReceivers = 0x27174e0;      // the wind system's (*0x5940e00)
 constexpr u64 kGxStandard = 0x56eb1d0;         // GPU particle type 0x2710 StandardParticle's vtable (update sub_12f18f0)
 constexpr u64 kGxSpark = 0x56eb120;            // GPU particle type 0x2718 Spark's (update sub_12ed0b0)
 constexpr u64 kTypeSimulation = 0x6b0;         // both types' simulation, what sub_13040b0 / sub_12fef10 take
+constexpr float kSixtieth = 1.0f / 60.0f;      // the emission clock's sub-step, unscaled
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -524,6 +526,9 @@ u8 smooth_update(u64 instance, u64 context, float step) {
         st.from = g_frame_from.load(std::memory_order_relaxed) * time_scale * (MUTANT(21) ? 1.0f : scale);
         st.into = g_frame_into.load(std::memory_order_relaxed) * time_scale * scale;
     }
+    // The emission clock's sub-step (decomp/sfx/node_emit.h): 1/60 s as the manager would hand it at 60 updates a
+    // second, the instance's scale on it - on every frame, a whole step's or not.
+    if (sfx_node::emission_clock() > 0 && !MUTANT(63)) st.sub = (kSixtieth * time_scale) * scale;
     if (tick) {
         for (u64 c = load<u64>(instance + 0x80); c; c = load<u64>(c + 0x20)) game_function<ControllerFn>(kControllerUpdate)(c, instance, st.counted);
     }

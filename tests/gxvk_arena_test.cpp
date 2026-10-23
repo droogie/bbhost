@@ -8,13 +8,15 @@
 // ranges are handed out again - unless the run puts one back early on
 // purpose, which is the reuse the proof exists to catch. Each hand-out is
 // told to the arena as the pool's node, and each binding as the command
-// processor binds it. The arena must find every early reuse (a range handed
-// out again over a binding whose submission has not completed) and nothing
-// else, in hand-outs that cover a released range whole, in part, or several
-// at once; it must refuse in-place binding to a range that runs past its
+// processor binds it. The arena must find the first early reuse (a range
+// handed out again over a binding whose submission has not completed) at the
+// hand-out that makes it and nothing before, in hand-outs that cover a
+// released range whole, in part, or several at once - and then stop: no
+// records kept, no hand-out recorded, every binding of the heap left to
+// today's path. It must refuse in-place binding to a range that runs past its
 // hand-out; and with every binding sampled (compare) it must find bytes
 // changed under a queued draw, and only those - a range handed out again is
-// rewritten as it should be. Then four deliberate mistakes, each of which
+// rewritten as it should be. Then six deliberate mistakes, each of which
 // must be caught.
 // Built with GXVK_ARENA_TESTING and GXVK_ARENA_MUTANTS (CMakeLists.txt), as its arena is.
 #include "host/gxvk.h"
@@ -83,6 +85,9 @@ struct Out {
 struct Result {
     long reuses_early = 0;  // the model's own count: hand-outs' overlaps of a range a running submission bound
     long handouts = 0, bindings = 0, in_place = 0, straddles = 0, bytes_changed = 0;
+    long first_model = -1, first_arena = -1;  // the steps of the model's first early reuse and of the arena's first find
+    bool failed = false;                      // the arena's proof has failed (in place off)
+    long in_place_after = 0;                  // bindings bound in place after that
 };
 
 // One run. `early`: the chance a hand-out takes a released range before its
@@ -130,12 +135,16 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
                     ++it;
                     continue;
                 }
-                if (o.last_bound > g_completed) ++r.reuses_early;
+                if (o.last_bound > g_completed) {
+                    ++r.reuses_early;
+                    if (r.first_model < 0) r.first_model = step;
+                }
                 it = out.erase(it);
             }
             out[start] = {start, end};
             gxvk::arena_handout(kPool, node_for(start, end));
             ++r.handouts;
+            if (r.first_arena < 0 && gxvk::arena_test_counts().violations_order) r.first_arena = step;
             // The new owner writes its bytes.
             std::memset(reinterpret_cast<void*>(start), static_cast<int>(range(0, 255)), static_cast<std::size_t>(bytes));
         } else if (what < 0.75) {
@@ -152,8 +161,10 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
             const bool past = chance(0.03);
             if (past) bytes = o.end - at + 16;
             if (at + bytes > base + kHeapBytes) continue;
+            if (!r.failed) r.failed = !gxvk::arena_test_counts().in_place;
             const bool placed = gxvk::arena_bind(at, bytes, serial, gxvk::kUseConstant, false);
             ++r.bindings;
+            if (r.failed && placed) ++r.in_place_after;
             if (past) {
                 ++r.straddles;
                 if (placed) fail("a binding past its hand-out's end bound in place", step);
@@ -203,18 +214,27 @@ int check_all(bool say) {
             std::printf("  clean run %llu: %ld hand-outs, %ld bindings (%ld in place, %ld past their range refused), no violation found\n",
                         static_cast<unsigned long long>(seed), r.handouts, r.bindings, r.in_place, r.straddles);
     }
-    // Early reuse: found exactly when the model made one (as a count of hand-outs that did).
-    long made = 0, found = 0;
+    // Early reuse: the first found at the hand-out that made it, and nothing before; then the arena stops.
+    long made = 0, stopped = 0;
     for (std::uint64_t seed = 11; seed <= 16; ++seed) {
         const Result r = run(Arena::kInPlace, 40000, 0.3, 0.0, seed);
         const auto c = gxvk::arena_test_counts();
         made += r.reuses_early;
-        found += static_cast<long>(c.violations_order);
-        if (static_cast<long>(c.violations_order) != r.reuses_early) fail("early reuses found are not those the model made", 0);
+        if (r.first_arena != r.first_model) fail("the first early reuse not found at the hand-out that made it", r.first_model);
+        if (c.violations_order > 1) fail("early reuses checked after the proof had failed", 0);
         if (c.violations_bytes) fail("bytes found changed where nothing rewrote them", 0);
-        if (r.reuses_early && c.in_place) fail("in place still on after an early reuse", 0);
+        if (!r.reuses_early) continue;
+        if (c.in_place) fail("in place still on after an early reuse", 0);
+        if (c.live) fail("records kept after the proof failed", 0);
+        if (!c.unrecorded) fail("hand-outs recorded after the proof failed", 0);
+        if (!c.proof_off) fail("no binding of the heap left to today's path after the proof failed", 0);
+        if (r.in_place_after) fail("a binding bound in place after the proof failed", 0);
+        ++stopped;
     }
-    if (say) std::printf("  early reuse: the model handed out over %ld ranges a running submission bound; the arena found %ld\n", made, found);
+    if (say)
+        std::printf("  early reuse: the model handed out over %ld ranges a running submission bound; the arena found each run's first as it was "
+                    "made and stopped there (%ld runs)\n",
+                    made, stopped);
     // Bytes rewritten under queued draws, every binding sampled (compare).
     long rewrites = 0, changed = 0;
     for (std::uint64_t seed = 21; seed <= 24; ++seed) {
@@ -226,6 +246,7 @@ int check_all(bool say) {
         if (r.bytes_changed && !c.violations_bytes) fail("bytes rewritten under a queued draw not found", 0);
         if (c.violations_order) fail("an early reuse found where the model made none (compare)", 0);
         if (r.in_place) fail("compare bound in place", 0);
+        if (c.violations_bytes && c.live) fail("records kept after changed bytes failed the proof (compare)", 0);
     }
     // No rewrite, compare: a range handed out again is rewritten by its new owner, which is no violation.
     for (std::uint64_t seed = 31; seed <= 33; ++seed) {
@@ -265,9 +286,9 @@ int main() {
     }
     static const char* const kMistake[] = {"", "a binding's stamp one submission short", "a hand-out over part of a record not checked",
                                            "a binding past its hand-out bound in place", "a sample checked after its range was handed out again",
-                                           "the heap's bounds test wrapping round above it"};
+                                           "the heap's bounds test wrapping round above it", "the arena going on with its records after the proof failed"};
     int missed = 0;
-    for (int m = 1; m <= 5; ++m) {
+    for (int m = 1; m <= 6; ++m) {
         g_arena_mutant = m;
         g_quiet = true;
         const int bad = check_all(false);

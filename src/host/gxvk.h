@@ -204,8 +204,15 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
 // The heap's bounds, once its pool is made.
 bool arena_heap(std::uint64_t* lo, std::uint64_t* hi);
 // A hand-out by the block pool (the registry's pool hooks, as they return):
-// the pool and the node it returned.
-void arena_handout(std::uint64_t pool, std::uint64_t node);
+// the pool and the node it returned; `top`: from the pool's top end (the
+// immediate context's).
+void arena_handout(std::uint64_t pool, std::uint64_t node, bool top = false);
+// Whether the arena still records hand-outs: it is on and its proof has held.
+// Once the proof fails it records nothing more, and the pool hooks need not
+// stop for it.
+bool arena_recording();
+// A hand-out the pool hooks let pass because the arena no longer records (counted for its report).
+void arena_unrecorded();
 // The command processor, as it binds [va, +bytes) for `use` in submission
 // `serial`: true when the range lies in one of the heap's hand-outs and is
 // to be bound in place (its submission is stamped on the hand-out); false
@@ -226,6 +233,7 @@ void arena_report();
 void arena_test_reset(Arena mode);
 struct ArenaTestCounts {
     std::uint64_t violations_order = 0, violations_bytes = 0, samples_checked = 0, fell = 0;
+    std::uint64_t proof_off = 0, unrecorded = 0, live = 0;  // after a failure: bindings and hand-outs it left alone; records kept
     bool in_place = true;
 };
 ArenaTestCounts arena_test_counts();

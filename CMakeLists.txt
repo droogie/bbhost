@@ -394,6 +394,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/sfx/ribbons.cpp
   src/decomp/sfx/step_gate.cpp
   src/decomp/sfx/node_update.cpp
+  src/decomp/sfx/node_emit.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
 )
@@ -585,6 +586,14 @@ if(UNIX)
   add_executable(import_mode_test tests/import_mode_test.cpp)
   target_include_directories(import_mode_test PRIVATE src)
   add_test(NAME import_mode_test COMMAND import_mode_test)
+  # What an integrated GPU gives back: the switches, the caches' budget, the drain's thresholds, the spare blocks.
+  add_executable(apu_memory_test tests/apu_memory_test.cpp)
+  target_include_directories(apu_memory_test PRIVATE src)
+  add_test(NAME apu_memory_test COMMAND apu_memory_test)
+  # Where a plugin's read() reads: the image by Binary Ninja address, the rest at runtime - the slid Windows layout too.
+  add_executable(plugin_address_test tests/plugin_address_test.cpp)
+  target_include_directories(plugin_address_test PRIVATE src)
+  add_test(NAME plugin_address_test COMMAND plugin_address_test)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
@@ -636,8 +645,10 @@ if(UNIX)
   bbhost_decomp_test(chalice_ritual)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
-  bbhost_decomp_test(sfx_step_gate SOURCES src/decomp/sfx/node_update.cpp)
-  bbhost_decomp_test(sfx_node_update)
+  bbhost_decomp_test(sfx_step_gate SOURCES src/decomp/sfx/node_update.cpp src/decomp/sfx/node_emit.cpp)
+  bbhost_decomp_test(sfx_node_update SOURCES src/decomp/sfx/node_emit.cpp)
+  bbhost_decomp_test(sfx_node_emit)
+  bbhost_decomp_test(sfx_emission_clock SOURCES src/decomp/sfx/node_emit.cpp)
   bbhost_decomp_test(sfx_classes)
   bbhost_decomp_test(adaptive_mutex)
   bbhost_decomp_test(ez_work)

@@ -2,7 +2,10 @@
 //
 // The heap is the one region GX's device gives its block pool, which every
 // renamed constant buffer, Map rename, ring allocation and draw table comes
-// from (decomp/gx/upload_heap.cpp tells us of it). GX hands a range of it out
+// from (decomp/gx/upload_heap.cpp tells us of it). The pool hands out from
+// both ends - the deferred contexts from the heap's start, the immediate
+// context from its top - and both ends' hand-outs are records here
+// (engine/gx_resources.cpp's pool hooks). GX hands a range of it out
 // again only after an end-of-pipe label behind the work that used it has
 // landed, and a label lands only once the host's submission has completed;
 // so a range the command processor binds holds the same bytes until the GPU
@@ -17,7 +20,9 @@
 //   hashed as it is bound and again once its submission has completed, and
 //   they must not have changed while its range was not handed out again.
 // A violation is counted, said once, and every binding of the heap takes
-// today's path for the rest of the run.
+// today's path for the rest of the run. The arena then stops its own work
+// too: its records are dropped, and it records no more hand-outs and looks up
+// no more bindings, so the run costs what today's path costs.
 //
 // BBHOST_GXVK_ARENA=1 binds in place; =compare keeps today's path and checks
 // every binding of the heap as 1 would bind it (the records and the bytes,
@@ -113,8 +118,20 @@ std::uint32_t g_sample_tick = 0;
 
 std::atomic<bool> g_in_place{true};  // false after a violation
 std::atomic<int> g_said{0};
+// BBHOST_TEST_ARENA_FAIL_AFTER=N: a violation after the N-th recorded hand-out,
+// for testing what the arena does once its proof has failed.
+#ifdef GXVK_ARENA_TESTING
+const std::uint64_t g_fail_after = 0;
+#else
+const std::uint64_t g_fail_after = [] {
+    const char* e = std::getenv("BBHOST_TEST_ARENA_FAIL_AFTER");
+    return e && *e ? std::strtoull(e, nullptr, 10) : 0ull;
+}();
+#endif
 
 std::atomic<std::uint64_t> g_handouts{0}, g_outside{0}, g_bound[kUses] = {}, g_bound_bytes[kUses] = {};
+std::atomic<std::uint64_t> g_handouts_top{0};   // of g_handouts: from the pool's top end
+std::atomic<std::uint64_t> g_unrecorded{0};     // hand-outs after the proof failed, left alone
 enum Why : int { kWhyNoRecord, kWhyStraddle, kWhyStored, kWhyProofOff, kWhyNoBacking, kWhys };
 const char* const kWhyName[kWhys] = {"no hand-out holds it", "it runs past its hand-out", "the shader stores to it", "the proof failed earlier",
                                      "the heap is not in one buffer"};
@@ -169,6 +186,19 @@ void drop_locked(std::uint32_t r) {
     --g_live;
 }
 
+// The proof has failed: the records, their pages and the samples waiting go,
+// once (under g_mu; nothing here is used again this run).
+bool g_released = false;  // under g_mu
+void release_locked() {
+    if (g_released || MUTANT(6)) return;
+    g_released = true;
+    std::vector<Record>().swap(g_records);
+    std::vector<std::uint32_t>().swap(g_free);
+    std::vector<std::vector<std::uint32_t>>().swap(g_pages);
+    g_live = 0;
+    g_sample_head = g_sample_n = 0;
+}
+
 // The oldest samples whose submission has completed: hashed again.
 void check_samples_locked(std::uint64_t done) {
     while (g_sample_n) {
@@ -192,6 +222,12 @@ void check_samples_locked(std::uint64_t done) {
 }  // namespace
 
 Arena arena_mode() { return g_mode; }
+
+bool arena_recording() { return g_mode != Arena::kOff && g_in_place.load(std::memory_order_relaxed); }
+
+void arena_unrecorded() {
+    if (g_mode != Arena::kOff) g_unrecorded.fetch_add(1, std::memory_order_relaxed);
+}
 
 void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes) {
     // =2 moved the heap into video memory the CPU writes: two thirds of the
@@ -230,8 +266,12 @@ bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {
     return true;
 }
 
-void arena_handout(std::uint64_t pool, std::uint64_t node) {
+void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
     if (g_mode == Arena::kOff || !node) return;
+    if (!g_in_place.load(std::memory_order_relaxed) && !MUTANT(6)) {  // the proof failed: nothing more to record
+        g_unrecorded.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
     std::uint64_t start = 0, next = 0, end = 0;
     std::memcpy(&start, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(node + 8)), 8);
@@ -249,9 +289,14 @@ void arena_handout(std::uint64_t pool, std::uint64_t node) {
         g_outside.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    g_handouts.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t done = done_submissions();
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_released) {  // the proof failed while this hand-out came in
+        g_unrecorded.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const std::uint64_t recorded = g_handouts.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (top) g_handouts_top.fetch_add(1, std::memory_order_relaxed);
     std::uint64_t p0, p1;
     page_range(start, end, p0, p1);
     // Every record the new range overlaps is over: its bindings must have completed.
@@ -286,12 +331,19 @@ void arena_handout(std::uint64_t pool, std::uint64_t node) {
     ++g_handout_seq;
     for (std::uint64_t p = p0; p <= p1; ++p) g_pages[p].push_back(r);
     if (++g_live > g_live_max) g_live_max = g_live;
+    if (g_fail_after && recorded == g_fail_after)
+        violation("a violation BBHOST_TEST_ARENA_FAIL_AFTER asked for", start, end - start, 0, done);
+    if (!g_in_place.load(std::memory_order_relaxed)) release_locked();
 }
 
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored) {
     if (g_mode == Arena::kOff) return false;
     const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
     if (!lo || va < lo || (va >= hi && !MUTANT(5))) return false;  // not the heap's: nothing to count
+    if (!g_in_place.load(std::memory_order_relaxed) && !MUTANT(6)) {  // the proof failed: today's path, no lookup
+        g_fell[kWhyProofOff].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     if (bytes > hi - va) {
         g_fell[kWhyStraddle].fetch_add(1, std::memory_order_relaxed);  // runs past the heap's end
         return false;
@@ -301,11 +353,13 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
         return false;
     }
     const std::uint64_t end = va + std::max<std::uint64_t>(bytes, 1);
-    bool found = false, straddle = false;
+    bool found = false, straddle = false, failed = false;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         const std::uint64_t p = (va - lo) >> kPageShift;
-        if (p < g_pages.size()) {
+        if (g_released) {
+            failed = true;  // the proof failed while this binding came in
+        } else if (p < g_pages.size()) {
             for (const std::uint32_t r : g_pages[p]) {
                 Record& rec = g_records[r];
                 if (va < rec.start || va >= rec.end) continue;
@@ -331,6 +385,14 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
                 break;
             }
         }
+        if (!g_in_place.load(std::memory_order_relaxed)) {  // a sample just checked found changed bytes
+            release_locked();
+            failed = true;
+        }
+    }
+    if (failed) {
+        g_fell[kWhyProofOff].fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
     if (!found) {
         g_fell[straddle ? kWhyStraddle : kWhyNoRecord].fetch_add(1, std::memory_order_relaxed);
@@ -400,6 +462,9 @@ void arena_test_reset(Arena mode) {
     g_in_place.store(true);
     g_said.store(0);
     g_handouts.store(0);
+    g_handouts_top.store(0);
+    g_unrecorded.store(0);
+    g_released = false;
     g_outside.store(0);
     for (auto& a : g_bound) a.store(0);
     for (auto& a : g_bound_bytes) a.store(0);
@@ -416,6 +481,12 @@ ArenaTestCounts arena_test_counts() {
     c.samples_checked = g_samples_checked.load();
     c.in_place = g_in_place.load();
     for (int w = 0; w < kWhys; ++w) c.fell += g_fell[w].load();
+    c.proof_off = g_fell[kWhyProofOff].load();
+    c.unrecorded = g_unrecorded.load();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        c.live = g_live;
+    }
     return c;
 }
 #endif
@@ -437,7 +508,8 @@ void arena_report() {
     std::uint64_t live_max = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        check_samples_locked(done_submissions());
+        if (!g_released) check_samples_locked(done_submissions());
+        if (!g_in_place.load(std::memory_order_relaxed)) release_locked();
         live_max = g_live_max;
     }
     if (g_trace) {
@@ -468,11 +540,15 @@ void arena_report() {
     const bool placing = g_mode == Arena::kInPlace;
     host_log("gxvk arena: %s; the heap's bindings %s: %s; today's path because %s", placing ? "bound in place" : "compared",
              placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
-    host_log("gxvk arena: the release proof: %llu hand-outs recorded (%llu outside the heap), %llu alive at most; %llu handed out again before "
-             "their binding's submission completed; bytes checked %llu (%llu skipped: handed out again first, or the ring full), %llu changed "
-             "under a queued draw%s",
-             v(g_handouts), v(g_outside), static_cast<ull>(live_max), v(g_violations_order), v(g_samples_checked), v(g_samples_skipped),
-             v(g_violations_bytes), g_in_place.load() ? "" : " - in place stopped at the first");
+    char after[160] = "";
+    if (!g_in_place.load())
+        std::snprintf(after, sizeof after, " - in place stopped at the first, and the arena with it: %llu hand-outs and %llu bindings left alone after",
+                      v(g_unrecorded), v(g_fell[kWhyProofOff]));
+    host_log("gxvk arena: the release proof: %llu hand-outs recorded (%llu from the pool's top end, %llu outside the heap), %llu alive at most; "
+             "%llu handed out again before their binding's submission completed; bytes checked %llu (%llu skipped: handed out again first, or "
+             "the ring full), %llu changed under a queued draw%s",
+             v(g_handouts), v(g_handouts_top), v(g_outside), static_cast<ull>(live_max), v(g_violations_order), v(g_samples_checked),
+             v(g_samples_skipped), v(g_violations_bytes), after);
     static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending",
                                                        "descriptor-table reads"};
     std::string notes;

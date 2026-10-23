@@ -1,6 +1,7 @@
 // Textures and samplers for the renderer: T#/S# words resolved from the
 // stage's user data become Vulkan images (untiled on upload) and samplers.
 // Render targets sampled as textures alias the render target image.
+#include "host/apu_memory.h"
 #include "host/gpu_internal.h"
 
 #if !defined(_WIN32)
@@ -1844,6 +1845,27 @@ std::atomic<std::uint64_t> g_census_hash_skipped{0}, g_census_check_hashed{0}, g
     g_cp_dirty_settled{0};
 std::atomic<std::uint64_t> g_ahead_used{0}, g_ahead_replaced{0}, g_ahead_bind_before_prep{0};
 
+// Textures a bind made itself - on the binding thread, the command processor's
+// side - rather than finding one made ahead (the exit report): those held back
+// from ahead creation (the reserve or the caches' budget), those evicted or
+// drained since they were made, and the rest (no GX resource made them, or
+// made ahead was off). What a cache's budget costs shows here: each is an
+// image made and an upload queued where a bind would have found one ready.
+// Under the renderer's lock; the reasons map is bounded (cleared when full,
+// its later binds then counted with the rest).
+namespace {
+enum BindReason : std::uint8_t { kBindHeld = 1, kBindGone = 2 };
+std::unordered_map<std::uint64_t, std::uint8_t> g_bind_reason;
+std::uint64_t g_bind_made = 0, g_bind_made_bytes = 0, g_bind_made_held = 0, g_bind_made_gone = 0, g_bind_reason_cleared = 0;
+void note_bind_reason_locked(std::uint64_t base, std::uint8_t why) {
+    if (g_bind_reason.size() >= (1u << 18)) {
+        g_bind_reason.clear();
+        ++g_bind_reason_cleared;
+    }
+    g_bind_reason[base] = why;
+}
+}  // namespace
+
 // Keeps a surface in step with the guest memory behind it. Split out of
 // texture_view() so a memo hit runs it too: it is the one part of resolving a
 // T# that is not a function of the descriptor.
@@ -2848,6 +2870,14 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         it = g_surfaces.emplace(base, sf).first;
         note_surface_added(it->second);
+        if (!t_force_async) {
+            ++g_bind_made;
+            g_bind_made_bytes += it->second.memory.size;
+            if (auto r = g_bind_reason.find(base); r != g_bind_reason.end()) {
+                ++(r->second == kBindHeld ? g_bind_made_held : g_bind_made_gone);
+                g_bind_reason.erase(r);
+            }
+        }
         ++g_tiling_hist[tiling];
         if (sf.base < 0x157010000ull && sf.base + sf.total_src > 0x15700c000ull) {
             host_log("texture: surface 0x%llx %ux%u type=%u tiling=%u src=%zu overlaps 0x15700c000-0x157010000 (end 0x%llx)",
@@ -3192,14 +3222,18 @@ std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_fail
 // While video memory is down to the reserve and a block (where the image heap
 // may no longer grow for textures, and the eviction looks for room), none is
 // made ahead: 62-64% of those are never bound, and each would take video
-// memory a bound texture wants - or go to host memory for nothing. The first
-// bind makes it, as before ahead creation. BBHOST_AHEAD_HOLD=0: always made.
+// memory a bound texture wants - or go to host memory for nothing. The same
+// over the caches' budget (BBHOST_CACHE_BUDGET_MB, an integrated GPU's: no
+// reserve applies there) once the world has settled - an area being entered
+// makes its textures ahead as ever. The first bind makes it, as before ahead
+// creation.
+// BBHOST_AHEAD_HOLD=0: always made.
 bool ahead_held_back() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_AHEAD_HOLD");
         return !(e && e[0] == '0');
     }();
-    return on && vram_within_reserve(256ull << 20);
+    return on && (vram_within_reserve(256ull << 20) || cache_budget_pressing(256ull << 20));
 }
 
 std::atomic<std::uint64_t> g_ahead_replaced_gen{0}, g_ahead_adopted{0};
@@ -3237,7 +3271,9 @@ bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
     }
     if (ahead_held_back()) {
         if (g_ahead_held.fetch_add(1, std::memory_order_relaxed) == 0)
-            host_log("texture: video memory is down to the reserve: textures are made at their first bind, not ahead, until there is room");
+            host_log("texture: %s: textures are made at their first bind, not ahead, until there is room",
+                     vram_within_reserve(256ull << 20) ? "video memory is down to the reserve" : "the video memory we hold is over the caches' budget");
+        note_bind_reason_locked(base, kBindHeld);
         return false;
     }
     bool dims_ok = true, arrayed = false;
@@ -3952,33 +3988,51 @@ void textures_before_submit() {
 // next bind makes one again from the guest memory that holds its texels.
 // Never one a shader or a copy wrote (its image holds what guest memory does
 // not). On a 6 GB card the made-ahead textures alone were 0.16-0.59 GiB.
-std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0;
+// Over the caches' budget (BBHOST_CACHE_BUDGET_MB; no reserve applies on an
+// integrated GPU) the same textures go, as much as the video memory we hold
+// is over it and 256 MiB a second at most: the room they leave is what the
+// drain then empties blocks with, which the keeper gives back. Those a bind
+// used and has not looked up for 20 s go at any time; those made ahead and
+// never bound only once the world has settled (world_settled), so the area
+// being entered keeps what it made ahead.
+std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0, g_evicted_budget = 0;
 
 void evict_cold_surfaces_locked() {
     static const std::uint64_t idle_ms = [] {
         const char* e = std::getenv("BBHOST_VRAM_EVICT_S");
         return (e && *e ? std::strtoull(e, nullptr, 10) : 20ull) * 1000;
     }();
-    if (!idle_ms || !vram_reserve_bytes()) return;
+    if (!idle_ms || (!vram_reserve_bytes() && !cache_budget_bytes())) return;
     static std::uint64_t last_ms = 0;
     const std::uint64_t now = now_ms();
     if (now - last_ms < 1000) return;
     last_ms = now;
     constexpr std::uint64_t kWant = 256ull << 20;
-    if (!vram_within_reserve(kWant)) return;
-    const std::uint64_t free_in_blocks = image_heap_vram_free_locked(kHeapTextures);
-    if (free_in_blocks >= kWant) return;
-    const std::uint64_t target = kWant - free_in_blocks;
+    std::uint64_t target = 0;
+    bool budget = false;
+    if (vram_within_reserve(kWant)) {
+        const std::uint64_t free_in_blocks = image_heap_vram_free_locked(kHeapTextures);
+        if (free_in_blocks >= kWant) return;
+        target = kWant - free_in_blocks;
+    } else if (const std::uint64_t over = cache_budget_excess()) {
+        target = std::min(over, kWant);
+        budget = true;
+    } else {
+        return;
+    }
     struct Cold {
         bool used;  // false: made ahead and never bound - these go first
         std::uint64_t used_ms, base;
         bool operator<(const Cold& o) const { return used != o.used ? !used : used_ms < o.used_ms; }
     };
+    const bool ahead_too = !budget || world_settled();
     std::vector<Cold> cold;
     for (const auto& [base, sf] : g_surfaces) {
         if (!sf.image || sf.failed || sf.gpu_written || sf.copied_mips || surface_in_host(sf)) continue;
         if (!sf.used_ms || now - sf.used_ms < idle_ms) continue;
-        cold.push_back({!(sf.ahead && !sf.ahead_used), sf.used_ms, base});
+        const bool used = !(sf.ahead && !sf.ahead_used);
+        if (!used && !ahead_too) continue;
+        cold.push_back({used, sf.used_ms, base});
     }
     if (cold.empty()) return;
     std::sort(cold.begin(), cold.end());
@@ -3991,6 +4045,7 @@ void evict_cold_surfaces_locked() {
         freed += sf.memory.size;
         ++n;
         if (!c.used) ++g_evicted_ahead;
+        note_bind_reason_locked(c.base, kBindGone);
         for (auto& v : sf.views) defer_destroy_view(v.second);
         defer_destroy_image(sf.image, sf.memory);
         if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
@@ -4001,10 +4056,12 @@ void evict_cold_surfaces_locked() {
     bump_view_epoch();
     g_evicted_surfaces += n;
     g_evicted_bytes += freed;
+    if (budget) g_evicted_budget += n;
     static int logs = 0;
     if (logs++ < 12)
-        host_log("texture: video memory down to the reserve: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
+        host_log("texture: %s: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
                  "%llu of them made ahead and never bound)",
+                 budget ? "the video memory we hold is over the caches' budget" : "video memory down to the reserve",
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(idle_ms / 1000),
                  static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
                  static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_evicted_ahead));
@@ -4023,8 +4080,128 @@ void evict_cold_surfaces_locked() {
 // back, as any empty one. While the mirrors' live share is refused room
 // (a card with little video memory, where every mirror page the image heap
 // holds idle sends vertex reads across the bus), half a block of free room
-// is enough, a block with up to 192 MiB in use is drained, 32 MiB a turn.
+// is enough, a block with up to 192 MiB in use is drained, 32 MiB a turn -
+// the lean thresholds (host/apu_memory.h), which a lean image heap
+// (BBHOST_HEAP_LEAN) and the video memory we hold over the caches' budget
+// (BBHOST_CACHE_BUDGET_MB) take too.
 std::uint64_t g_drained_blocks = 0, g_drained_surfaces = 0, g_drained_bytes = 0, g_drain_skipped = 0;
+
+// What keeps a textures' block from draining is a surface whose image holds
+// what guest memory does not - one a shader or a copy wrote after it was made
+// as a texture (one known to be GPU-written at its making goes in the
+// targets' blocks already). On an RTX 4070 under the lean thresholds the
+// drain refused 255 times for 53 of them, under 1 MiB together. With the lean
+// thresholds in force (BBHOST_HEAP_LEAN or the caches' budget, the world
+// settled) such a block's few - 32 MiB at most - move: the drain names the
+// block, and the flush, while its recording is open, makes each surface's
+// image again in room the targets' blocks already have (never a new block)
+// and copies its pixels across, after everything the recording wrote them
+// with, as the targets' drain moves targets (render.cpp). At the drain's next
+// turn the block holds only what can be made again and empties.
+// BBHOST_HEAP_RELOCATE=0: such a block is left as it is.
+namespace {
+int g_relocate_block = -1;  // the textures' block whose pinned surfaces move at the next flush
+std::uint64_t g_relocate_named = 0, g_relocated = 0, g_relocated_bytes = 0, g_relocate_no_room = 0, g_relocate_busy = 0;
+bool relocate_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_RELOCATE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// `sf`'s image made again, as it was made, in room a targets' block has, and
+// its pixels copied there in the open recording; the old image and views go
+// behind the submissions that may still read them.
+bool relocate_surface_locked(Surface& sf) {
+    VkImageCreateInfo ici = sf.info;
+    ici.pNext = nullptr;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage img = VK_NULL_HANDLE;
+    if (vkCreateImage(g.device, &ici, nullptr, &img) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g.device, img, &req);
+    ImageMemory mem;
+    if (!image_memory_place_existing_locked(req, mem, kHeapTargets)) {
+        vkDestroyImage(g.device, img, nullptr);
+        return false;
+    }
+    if (vkBindImageMemory(g.device, img, mem.memory, mem.offset) != VK_SUCCESS) {
+        defer_destroy_image(img, mem);
+        return false;
+    }
+    begin_recording_locked();
+    render_end_pass_locked();
+    VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+    for (VkImageMemoryBarrier& x : b) {
+        x.srcQueueFamilyIndex = x.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        x.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        x.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    b[0].image = sf.image;
+    b[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b[1].image = img;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b[1].srcAccessMask = 0;
+    b[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    std::vector<VkImageCopy> regions;
+    const bool three_d = ici.imageType == VK_IMAGE_TYPE_3D;
+    for (std::uint32_t l = 0; l < ici.mipLevels; ++l) {
+        VkImageCopy r{};
+        r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, ici.arrayLayers};
+        r.dstSubresource = r.srcSubresource;
+        r.extent = {std::max(1u, ici.extent.width >> l), std::max(1u, ici.extent.height >> l), three_d ? std::max(1u, ici.extent.depth >> l) : 1u};
+        regions.push_back(r);
+    }
+    rec().copy_image(sf.image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    for (auto& v : sf.views) defer_destroy_view(v.second);
+    sf.views.clear();
+    defer_destroy_image(sf.image, sf.memory);
+    sf.image = img;
+    sf.memory = mem;
+    if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+    bump_view_epoch();
+    return true;
+}
+}  // namespace
+
+// The flush's part (gpu.cpp, beside the targets' drain): the named block's
+// pinned surfaces moved, 32 MiB of them at most.
+void textures_relocate_pinned_locked() {
+    if (g_relocate_block < 0) return;
+    const int block = g_relocate_block;
+    g_relocate_block = -1;
+    std::uint64_t moved = 0, n = 0;
+    for (auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.memory.block != block || surface_in_host(sf) || !(sf.gpu_written || sf.copied_mips)) continue;
+        if (sf.failed || (sf.prep && !prep_done(*sf.prep))) {
+            ++g_relocate_busy;
+            continue;
+        }
+        if (moved >= (32ull << 20)) break;
+        const std::uint64_t bytes = sf.memory.size;
+        if (!relocate_surface_locked(sf)) {
+            ++g_relocate_no_room;
+            break;
+        }
+        moved += bytes;
+        ++n;
+    }
+    g_relocated += n;
+    g_relocated_bytes += moved;
+    static int logs = 0;
+    if (n && logs++ < 8)
+        host_log("texture: %llu surface(s) the GPU wrote (%llu KiB) moved out of the textures' image heap block %d into the targets' room, "
+                 "so it can drain (BBHOST_HEAP_RELOCATE=0 leaves them)",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(moved >> 10), block);
+}
 
 void drain_texture_blocks_locked() {
     static const bool on = [] {
@@ -4040,9 +4217,12 @@ void drain_texture_blocks_locked() {
     const std::uint64_t refusals = shadow_room_refusals_locked();
     const bool pressed = refusals != refusals_seen;
     refusals_seen = refusals;
-    constexpr std::uint64_t kBlock = 256ull << 20, kHotMs = 2000;
-    const std::uint64_t holes_at = pressed ? kBlock / 2 : kBlock * 3 / 2, most_used = pressed ? 192ull << 20 : 128ull << 20,
-                        hot_per_turn = pressed ? 32ull << 20 : 16ull << 20;
+    constexpr std::uint64_t kHotMs = 2000;
+    // The lean thresholds once the world has settled (the area being entered
+    // keeps its textures until then).
+    const bool lean = world_settled() && (heap_lean_on() || cache_over_budget());
+    const apu_memory::DrainLimits lim = apu_memory::drain_limits(pressed || lean);
+    const std::uint64_t holes_at = lim.holes_at, most_used = lim.most_used, hot_per_turn = lim.hot_per_turn;
     std::vector<int> skip;
     for (int tries = 0; tries < 4; ++tries) {
         std::uint64_t holes = 0, used = 0;
@@ -4050,12 +4230,15 @@ void drain_texture_blocks_locked() {
         if (block < 0 || holes < holes_at || used > most_used) return;
         // What the block holds, and whether all of it can be made again.
         std::vector<std::uint64_t> bases;
-        bool pinned = false;
+        bool pinned = false, failed = false;
+        std::uint64_t pinned_bytes = 0;
         for (const auto& [base, sf] : g_surfaces) {
             if (!sf.image || sf.memory.block != block || surface_in_host(sf)) continue;
             if (sf.gpu_written || sf.copied_mips || sf.failed) {
                 pinned = true;
-                break;
+                failed |= sf.failed;
+                pinned_bytes += sf.memory.size;
+                continue;
             }
             bases.push_back(base);
         }
@@ -4063,6 +4246,12 @@ void drain_texture_blocks_locked() {
         for (const auto& [key, reg] : g_rt_regions) other |= reg.img.image && reg.img.memory.block == block;
         for (const auto& [key, al] : g_level_aliases) other |= al.img.image && al.img.memory.block == block;
         if (pinned) {
+            // Under the lean thresholds a few such surfaces move at the next
+            // flush (textures_relocate_pinned_locked); the block drains after.
+            if (lean && relocate_on() && !failed && pinned_bytes <= (32ull << 20) && g_relocate_block < 0) {
+                g_relocate_block = block;
+                ++g_relocate_named;
+            }
             ++g_drain_skipped;
             skip.push_back(block);
             continue;
@@ -4077,6 +4266,7 @@ void drain_texture_blocks_locked() {
             if (recent) hot += sf.memory.size;
             bytes += sf.memory.size;
             ++n;
+            note_bind_reason_locked(base, kBindGone);
             for (auto& v : sf.views) defer_destroy_view(v.second);
             defer_destroy_image(sf.image, sf.memory);
             if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
@@ -4172,6 +4362,18 @@ void textures_drain_counts(std::uint64_t out[4]) {
     out[1] = g_drained_surfaces;
     out[2] = g_drained_bytes;
     out[3] = g_drain_skipped;
+}
+
+std::string textures_relocate_report() {
+    if (!g_relocate_named) return {};
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "; textures' blocks named for their GPU-written surfaces to move %llu: moved %llu (%llu KiB), no room for one %llu, one still "
+                  "uploading or failed %llu",
+                  static_cast<unsigned long long>(g_relocate_named), static_cast<unsigned long long>(g_relocated),
+                  static_cast<unsigned long long>(g_relocated_bytes >> 10), static_cast<unsigned long long>(g_relocate_no_room),
+                  static_cast<unsigned long long>(g_relocate_busy));
+    return buf;
 }
 
 // Textures a shortage (or the reserve) put in host memory come back once
@@ -5024,6 +5226,15 @@ void textures_report() {
              static_cast<unsigned long long>(g_ahead_bind_before_prep.load()), static_cast<unsigned long long>(g_ahead_replaced.load()),
              static_cast<unsigned long long>(g_retired_surfaces.load()), static_cast<unsigned long long>(g_retired_bytes.load() >> 20),
              static_cast<unsigned long long>(g_retire_kept_live.load()));
+    host_log("texture: made by a bind on the binding thread, none made ahead to find: %llu (%llu MiB) - %llu held back from ahead creation "
+             "(%llu holds: the reserve or the caches' budget), %llu evicted or drained since they were made, %llu the rest%s; evicted over the "
+             "caches' budget %llu",
+             static_cast<unsigned long long>(g_bind_made), static_cast<unsigned long long>(g_bind_made_bytes >> 20),
+             static_cast<unsigned long long>(g_bind_made_held), static_cast<unsigned long long>(g_ahead_held.load()),
+             static_cast<unsigned long long>(g_bind_made_gone),
+             static_cast<unsigned long long>(g_bind_made - g_bind_made_held - g_bind_made_gone),
+             g_bind_reason_cleared ? " (the reasons' map was full and cleared: some counted with the rest)" : "",
+             static_cast<unsigned long long>(g_evicted_budget));
     host_log("texture: identity: binds through a view of another generation than the surface's: surface replaced %llu, kept (the view's "
              "resource is gone) %llu, taken by the new resource it was written for %llu; made ahead over such an image instead taken %llu; uploads "
              "of a GX resource's image not write-watched %llu; checks of a shader-written one not hashed %llu",

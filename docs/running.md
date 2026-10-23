@@ -253,6 +253,24 @@ windows, which a thread of their own imports as the game makes its buffers
 (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
 window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
 windows at their first draw).
+An integrated GPU keeps no reserve, so nothing trims what bbhost keeps in
+play there: the textures made ahead of their first bind (most are never
+bound), textures not used for a while, free room in the image heap and the
+upload staging held from a load on. Three switches give them back, on any GPU;
+all three are on by default on an integrated GPU under Windows (a 2048 MiB
+budget there) and off elsewhere:
+- `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
+  upload staging goes back down to 256 MiB in play, 64 MiB every two seconds
+  from 30 s after a load. The log gives each free's time and flip, and the
+  exit line `given back in play` their total.
+- `BBHOST_CACHE_BUDGET_MB=<n>` (or `cache_budget_mb = <n>` under `[gpu]`): a
+  budget for the video memory bbhost holds. Over it, textures are made at their
+  first bind instead of ahead, those not bound for 20 s go, the textures'
+  blocks drain sooner and empty blocks go back at once. The exit line `made by
+  a bind` counts the textures a bind then had to make itself.
+- `BBHOST_HEAP_LEAN=1` (or `heap_lean = true` under `[gpu]`): the image heap
+  keeps no spare block in play and drains the textures' blocks sooner.
+
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not
@@ -355,7 +373,17 @@ for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
 updates a second above 60); `frame` steps them by the frame's time. A
 bbhost.toml that sets `effect_steps` keeps its value; one without it gets
 smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
-`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
+`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. An
+effect's emissions - the particles and children its nodes make - follow a
+clock of their own (`[video] effect_emission`, `BBHOST_SFX_EMISSION`): with
+`60`, the default, they come as the game's effects make them at 60 updates a
+second, every 1/60 s of the node's time at every frame rate, 30 included -
+with the smooth steps each on the frame its time falls in (a node's children
+on its whole steps' frames), otherwise on the whole step's frame; the rest of
+what the effects count keeps 30's steps. Most of the game's emitters (8,421 of its 15,330 CPU particle
+records) ask for an emission every 1/60 s, and an update makes at most one,
+so at 30 updates a second the game makes half of them - the PS4's look,
+which `effect_emission = 30` keeps (`decomp/sfx/node_emit.cpp`). The wakes
 characters leave in water (GX's water interaction, one wave step a frame) step
 at 30 a second of game time above 30 too, on the effects' whole steps, so they
 spread as fast as at 30; each step takes the latest frame's wakes, as at 30,

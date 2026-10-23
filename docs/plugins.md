@@ -96,7 +96,10 @@ gives the Binary Ninja address.
 
 **Memory and code**
 
-- `read(addr, out, n)`: a safe copy; 0 on success.
+- `read(addr, out, n)`: a safe copy; 0 on success. `addr` is a Binary Ninja
+  address inside the image, or the runtime address of guest memory outside it
+  (a pointer read from the game's heaps). Under Windows the image may be slid,
+  and the heaps lie below it as well as above.
 - `write(addr, data, n)`: writes data pages.
 - `patch(addr, expect, bytes, n)`: writes code bytes only if `expect` is there,
   then makes the page read-only and executable again. A patch manifest

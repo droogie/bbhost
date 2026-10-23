@@ -92,7 +92,10 @@ constexpr std::uint32_t kStageSlots = 2;      // VS + PS descriptor sets per dra
 // the laptop it waited 1.1-1.9 s of every 5 s for a slot in heavy views, and
 // the frame rate fell to 53-56 there. 16: 6-10 ms, 60 fps (2026-10-04).
 constexpr int kSlots = 16;
-constexpr std::uint64_t kStagingChunkBytes = 64ull << 20;  // upload staging chunk size
+// Upload staging's chunk size: 64 MiB, BBHOST_STAGING_CHUNK_MB=<4..64> smaller
+// (each chunk given back in play is one vkFreeMemory, which on an RTX 4070
+// took 22-29 ms for 64 MiB and stalled the frame behind it; gpu.cpp).
+std::uint64_t staging_chunk_bytes();
 constexpr std::uint64_t kStagingKeepBytes = 1024ull << 20;  // free upload staging chunks kept for reuse
 // BBHOST_GPU_PROFILE timestamp queries per slot: a pair per draw/dispatch,
 // the last pair spans the whole command buffer.
@@ -741,6 +744,11 @@ std::string target_drain_report();  // render.cpp: what the targets' blocks drai
 // The drain so far: blocks emptied, textures and MiB taken out, blocks left
 // because a surface the GPU wrote sits in them.
 void textures_drain_counts(std::uint64_t out[4]);
+// The textures' blocks' pinned surfaces (one a shader or a copy wrote) moved
+// into the targets' room, for the block the drain named (textures.cpp): in the
+// flush, while its recording is open. And what it has done, for the census.
+void textures_relocate_pinned_locked();
+std::string textures_relocate_report();
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage
@@ -755,6 +763,23 @@ std::uint64_t vram_reserve_bytes();
 // Whether video memory is down to the reserve (headroom under reserve +
 // `more` bytes); false when the reserve is off.
 bool vram_within_reserve(std::uint64_t more = 0);
+// The caches' budget and the lean image heap (gpu.cpp, host/apu_memory.h),
+// set with the reserve once the device is chosen: the budget in bytes (0:
+// none); whether the video memory we hold, with `more` about to be made, is
+// over it; how far over it is (0 under it); whether the image heap is lean -
+// no spare block in play, the textures' blocks drained at the lean
+// thresholds. Any thread.
+void cache_budget_init();
+std::uint64_t cache_budget_bytes();
+bool cache_over_budget(std::uint64_t more = 0);
+std::uint64_t cache_budget_excess();
+bool heap_lean_on();
+// The world settled: no loading screen, and BBHOST_CACHE_SETTLE_S (30) since
+// the last one ended. The budget and the lean heap press only then
+// (cache_budget_pressing: settled and over the budget), so an area being
+// entered keeps what it makes ahead.
+bool world_settled();
+bool cache_budget_pressing(std::uint64_t more = 0);
 // Textures kept out of the reserve so far (placed in host memory instead).
 std::uint64_t vram_reserve_refusals();
 // Whether what a shortage put in host memory comes back once video memory has
