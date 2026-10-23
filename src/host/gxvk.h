@@ -236,8 +236,9 @@ bool arena_proof_wanted();
 // A copy-back's source in the heap (stage 1d.2a): the batch's GPU copy and the draws that bind its version read
 // [va, +bytes), all in submission `serial`. True: one hand-out holds it whole and the proof holds - the record is
 // stamped with `serial`, and one hold in 64 has its bytes hashed (every one with BBHOST_GXVK_HEAP_COPY=compare) - so
-// the range keeps those bytes until that submission has completed. False: why is counted (no hand-out holds it, it
-// runs past its hand-out, the proof failed earlier).
+// the range keeps those bytes until that submission has completed: a hand-out over it before then waits for the GPU
+// first (arena_handout; sixteen such waits within a minute stop the proof). False: why is counted (no hand-out holds
+// it, it runs past its hand-out, the proof failed earlier).
 bool arena_hold(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
@@ -389,6 +390,7 @@ struct ArenaTestCounts {
     std::uint64_t violations_order = 0, violations_bytes = 0, samples_checked = 0, fell = 0;
     std::uint64_t proof_off = 0, unrecorded = 0, live = 0;  // after a failure: bindings and hand-outs it left alone; records kept
     std::uint64_t holds = 0, hold_fell = 0;                  // copy-backs' sources held (arena_hold), and refused
+    std::uint64_t hold_waits = 0;                            // hand-outs that waited for a held source's copy
     bool in_place = true;
 };
 ArenaTestCounts arena_test_counts();

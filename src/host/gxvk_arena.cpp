@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +84,7 @@ struct Record {
     std::uint64_t stamp = 0;  // the newest binding's submission + 1; 0: none
     std::uint32_t gen = 0;
     bool live = false;
+    bool held = false;  // a copy-back's source held in it (arena_hold) since its hand-out
 };
 std::mutex g_mu;
 std::vector<Record> g_records;            // under g_mu
@@ -141,6 +143,12 @@ std::atomic<std::uint64_t> g_violations_order{0}, g_violations_bytes{0}, g_sampl
 std::atomic<std::uint64_t> g_noted[kArenaNotes] = {}, g_noted_bytes[kArenaNotes] = {};
 // Copy-backs' sources held (arena_hold, stage 1d.2a), and those refused by reason (kWhyNoRecord, kWhyStraddle, kWhyProofOff).
 std::atomic<std::uint64_t> g_holds{0}, g_hold_bytes{0}, g_hold_fell[kWhys] = {};
+// Hand-outs over a held source whose copy had not run, which waited for the GPU first (arena_handout); this many
+// within a minute stop the proof for the run (a rate no run has come near: each wait stalls a GX thread).
+constexpr std::uint64_t kHoldWaitsMax = 16;
+std::atomic<std::uint64_t> g_hold_waits{0};
+std::atomic<std::int64_t> g_wait_minute{0};       // the steady clock's minute the count below is of
+std::atomic<std::uint64_t> g_waits_in_minute{0};
 
 // The records are kept for in-place bindings (BBHOST_GXVK_ARENA) or copy-backs from the heap (BBHOST_GXVK_HEAP_COPY).
 bool proof_wanted() { return g_mode != Arena::kOff || heap_copy_wanted(); }
@@ -294,6 +302,20 @@ bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {
     return true;
 }
 
+// Whether a live record over [start, end) holds a copy-back's source whose stamp `done` has not reached (under g_mu).
+bool held_pending_locked(std::uint64_t start, std::uint64_t end, std::uint64_t done) {
+    if (g_released) return false;
+    std::uint64_t p0, p1;
+    page_range(start, end, p0, p1);
+    for (std::uint64_t p = p0; p <= p1; ++p) {
+        for (const std::uint32_t r : g_pages[p]) {
+            const Record& rec = g_records[r];
+            if (rec.live && rec.held && rec.end > start && rec.start < end && rec.stamp > done) return true;
+        }
+    }
+    return false;
+}
+
 void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
     if (!proof_wanted() || !node) return;
     if (!g_in_place.load(std::memory_order_relaxed) && !MUTANT(6)) {  // the proof failed: nothing more to record
@@ -317,8 +339,34 @@ void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
         g_outside.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const std::uint64_t done = done_submissions();
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::uint64_t done = done_submissions();
+    std::unique_lock<std::mutex> lk(g_mu);
+    // A held copy-back's source (stage 1d.2a) whose copy has not run yet. GX takes a block back once the end-of-pipe
+    // label it writes when it retires the block has landed - but it retires a context's blocks when UpdateSubresource
+    // kicks the context's command buffer (sub_2aaf700), before the copy-backs that read renames in them are resolved
+    // (sub_2aadf50, a later submission). On the console that copy runs right after the retire; here the version's GPU
+    // copy runs with its own submission, which GX's reclaim can beat. The new owner has written nothing yet: the
+    // hand-out waits until what is recorded has been submitted and has run, as GX's own block reclaim does
+    // (decomp/gx/block_reclaim.cpp), so the source has been read first. kHoldWaitsMax such waits within a minute stop
+    // the proof for the run (copy-backs as today). The wait is outside g_mu: it takes the renderer's lock, which
+    // arena_hold's callers hold.
+    if (heap_copy_wanted() && !MUTANT(11) && held_pending_locked(start, end, done)) {
+        lk.unlock();
+        g_hold_waits.fetch_add(1, std::memory_order_relaxed);
+#ifdef GXVK_ARENA_TESTING
+        const std::int64_t minute = 1;  // (a test's sequences take milliseconds: one minute, never a boundary)
+#else
+        const std::int64_t minute =
+            std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+        if (g_wait_minute.exchange(minute, std::memory_order_relaxed) != minute) g_waits_in_minute.store(0, std::memory_order_relaxed);
+        const std::uint64_t in_minute = g_waits_in_minute.fetch_add(1, std::memory_order_relaxed) + 1;
+        host_gpu_flush();
+        if (!MUTANT(12)) done = done_submissions();
+        if (in_minute >= kHoldWaitsMax && !MUTANT(13))
+            violation("the hand-outs' waits for held copy-backs' sources reached their limit for a minute", start, end - start, 0, done);
+        lk.lock();
+    }
     if (g_released) {  // the proof failed while this hand-out came in
         g_unrecorded.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -356,6 +404,7 @@ void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
     rec.end = end;
     rec.stamp = 0;
     rec.live = true;
+    rec.held = false;
     ++g_handout_seq;
     for (std::uint64_t p = p0; p <= p1; ++p) g_pages[p].push_back(r);
     if (++g_live > g_live_max) g_live_max = g_live;
@@ -495,6 +544,7 @@ bool arena_hold(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
                     break;
                 }
                 if (!MUTANT(9)) rec.stamp = std::max(rec.stamp, serial + 1);
+                rec.held = true;
                 found = true;
                 // The bytes, sampled (BBHOST_GXVK_HEAP_COPY=compare: every one).
                 if (heap_copy_mode() == HeapCopy::kCompare || ++g_sample_tick % kSampleEvery == 0) {
@@ -567,6 +617,9 @@ void arena_test_reset(Arena mode) {
     g_holds.store(0);
     g_hold_bytes.store(0);
     for (auto& a : g_hold_fell) a.store(0);
+    g_hold_waits.store(0);
+    g_wait_minute.store(0);
+    g_waits_in_minute.store(0);
 }
 ArenaTestCounts arena_test_counts() {
     ArenaTestCounts c;
@@ -578,6 +631,7 @@ ArenaTestCounts arena_test_counts() {
     c.proof_off = g_fell[kWhyProofOff].load();
     c.holds = g_holds.load();
     for (int w = 0; w < kWhys; ++w) c.hold_fell += g_hold_fell[w].load();
+    c.hold_waits = g_hold_waits.load();
     c.unrecorded = g_unrecorded.load();
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -639,8 +693,10 @@ void arena_report() {
                  placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
     if (heap_copy_wanted())
         host_log("gxvk arena: copy-backs' sources held %llu (%llu MiB); not held because no hand-out holds it %llu, it runs past its "
-                 "hand-out %llu, the proof failed earlier %llu",
-                 v(g_holds), v(g_hold_bytes) >> 20, v(g_hold_fell[kWhyNoRecord]), v(g_hold_fell[kWhyStraddle]), v(g_hold_fell[kWhyProofOff]));
+                 "hand-out %llu, the proof failed earlier %llu; hand-outs over a held source whose copy had not run, which waited for "
+                 "the GPU first %llu",
+                 v(g_holds), v(g_hold_bytes) >> 20, v(g_hold_fell[kWhyNoRecord]), v(g_hold_fell[kWhyStraddle]), v(g_hold_fell[kWhyProofOff]),
+                 v(g_hold_waits));
     char after[160] = "";
     if (!g_in_place.load())
         std::snprintf(after, sizeof after, " - in place stopped at the first, and the arena with it: %llu hand-outs and %llu bindings left alone after",

@@ -935,12 +935,18 @@ the heap; a draw that binds the home as a constant buffer takes the source
 through the heap's snapshot above, so no shader reads a renamed constant
 buffer in place (one over the snapshots' 1 MiB puts the copy-backs in place
 first); a vertex or index binding reads the heap. The release order
-is proven every run for these sources as for the arena: each source stamps
-the hand-out it lies in with its submission, a hand-out over it before that
-submission has completed is a violation, and one source in 64 has its bytes
-hashed when it is taken and again when its submission has completed. A
-violation sends every copy-back back to a CPU copy for the rest of the run. A
-source no hand-out holds, one an earlier version covers, one while the heap's
+is checked every run for these sources as for the arena: each source stamps
+the hand-out it lies in with its submission, and one source in 64 has its
+bytes hashed when it is taken and again when its submission has completed.
+GX can hand a source out again before its copy has run: it retires a
+context's blocks when UpdateSubresource kicks the context's command buffer,
+before the copy-backs that read renames in them are resolved, which on the
+console run right after the retire. So such a hand-out waits for the GPU
+first, as GX's own block reclaim does: what is recorded is submitted and
+run, and the copy has read the source before its new owner writes it.
+Changed bytes, or sixteen such waits within a minute, send every copy-back
+back to a CPU copy for the rest of the run. A source no hand-out
+holds, one an earlier version covers, one while the heap's
 snapshots are off or after their guards tripped, and any with window imports
 take today's copy, counted by reason. `BBHOST_GXVK_HEAP_COPY=compare` copies
 as today, runs the proof over the sources as 1 would, and compares each
