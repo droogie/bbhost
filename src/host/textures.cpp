@@ -11,6 +11,7 @@
 #include "core/image_file.h"
 #include "core/portable.h"
 #include "engine/gx_resources.h"
+#include "host/gxvk.h"
 
 #include "core/write_watch.h"
 #include "hle/modules.h"
@@ -1365,6 +1366,38 @@ constexpr std::size_t kViewMemoSlots = 4096;  // a world run keeps about a thous
 constexpr int kViewMemoProbes = 8;
 std::vector<ViewMemoEntry> g_view_memo(kViewMemoSlots);
 Surface* g_last_view_surface = nullptr;
+
+// Stage 2a's census (BBHOST_GXVK_CENSUS=1, gxvk::census()): what stage 2's view handles would take. Every image
+// binding the command processor resolves (render.cpp prefetch_stage_images), by how its view was found - by its
+// shader-resource view's id, or from its T#'s words in a GX draw or in another (the middleware's, the engine's) - and
+// by what its surface is: a GX resource's image nobody wrote after its upload, one a shader, a copy or an upload token
+// wrote (a target, a UAV, a texture copied into), one the CPU rewrote (uploaded again), memory no live GX resource
+// owns, a target's image or a snapshot (no texture surface), or no view at all; with the distinct surfaces of each.
+// And every surface refresh by the way it ended: what a handle to an image nobody writes would skip.
+namespace img_census {
+// (Asked at the first use: gxvk_census.cpp's flags are another file's static.)
+inline bool on() {
+    static const bool v = gxvk::census();
+    return v;
+}
+enum Class : int { kImmutable, kGpuWritten, kCpuRewritten, kNotGx, kNoSurface, kNoView, kClasses };
+const char* const kClassName[kClasses] = {"a GX image nobody wrote after its upload", "a GX image a shader, a copy or an upload wrote",
+                                          "a GX image the CPU rewrote", "memory no live GX resource owns",
+                                          "a target's image or a snapshot", "no view"};
+const char* const kSourceName[3] = {"by the shader-resource view's id", "from the T# in a GX draw", "from the T# in another draw"};
+std::atomic<std::uint64_t> g_bindings[3][kClasses] = {};
+std::atomic<std::uint64_t> g_ahead[3] = {};  // of the bindings with a surface: one made at its resource's creation
+std::set<const void*> g_seen[3][kClasses];  // under g.mu: the distinct surfaces (views for kNoSurface)
+const Surface* g_last = nullptr;                // under g.mu: the surface the last view lookup found
+enum Refresh : int { kRefStamp, kRefGxDirty, kRefWatchUpload, kRefSchedule, kRefIdentityWritten, kRefIdentitySkipped, kRefRest, kRefreshes };
+const char* const kRefreshName[kRefreshes] = {"already this recording", "GX mapped it: uploaded", "the write watch saw a write: uploaded",
+                                              "checked too recently", "by identity, written by the GPU: skipped",
+                                              "registered and watched: skipped", "hashed or uploaded"};
+std::atomic<std::uint64_t> g_refresh[kRefreshes] = {};
+inline void refreshed(Refresh r) {
+    if (on()) g_refresh[r].fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace img_census
 // Set by texture_view_uncached when its view must be resolved again at every
 // bind (a render target's region copy, rt_region_view): the memos skip it.
 bool g_last_view_no_memo = false;
@@ -1892,12 +1925,16 @@ void refresh_surface_locked(Surface& sf) {
     if (gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
     if (g_refresh_once) {
         const std::uint64_t stamp = g.record_serial + 1;  // 0 stays "never"
-        if (sf.refreshed_serial == stamp) return;
+        if (sf.refreshed_serial == stamp) {
+            img_census::refreshed(img_census::kRefStamp);
+            return;
+        }
         sf.refreshed_serial = stamp;
     }
     sf.used_ms = g_coarse_ms;
     if (sf.gx_dirty) {
         sf.gx_dirty = false;
+        img_census::refreshed(img_census::kRefGxDirty);
         census_upload(sf, "GX map");
         upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, false);
         return;
@@ -1937,6 +1974,7 @@ void refresh_surface_locked(Surface& sf) {
                 const bool changed = content_hash_of(sf.base, sf.total_src, true) != sf.exact_hash;
                 g_watch_verify_n[sf.gx_registered ? 1 : 0][changed ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }
+            img_census::refreshed(img_census::kRefWatchUpload);
             census_upload(sf, "write watch");
             upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, false);
             sf.unchanged = 0;
@@ -1959,6 +1997,7 @@ void refresh_surface_locked(Surface& sf) {
     const bool hot = sf.hot && !((sf.watched || by_identity(sf)) && !sf.gpu_written);
     if (now_ms() - sf.checked_at_ms <
         (hot ? 0u : std::min<std::uint32_t>(2000u, 200u << std::min<std::uint32_t>(sf.unchanged / 10, 4u)))) {
+        img_census::refreshed(img_census::kRefSchedule);
         return;
     }
     bool check_only = false;
@@ -1974,6 +2013,7 @@ void refresh_surface_locked(Surface& sf) {
     // hashing that memory - the surfaces a tour hashed most, 15,165 checks and
     // 3.2 s of the command processor - looked for nothing.
     if (!g_hash_registered && by_identity(sf) && sf.gpu_written && !sf.cp_dirty) {
+        img_census::refreshed(img_census::kRefIdentityWritten);
         g_census_hash_skipped_written.fetch_add(1, std::memory_order_relaxed);
         sf.checked_at_ms = now_ms();
         ++sf.unchanged;
@@ -1982,6 +2022,7 @@ void refresh_surface_locked(Surface& sf) {
     }
     if (!g_hash_registered && sf.gx_registered && (sf.watched || by_identity(sf)) && !sf.gpu_written && !sf.cp_dirty) {
         if (g_census_hash_skipped.fetch_add(1, std::memory_order_relaxed) % 64 != 63) {
+            img_census::refreshed(img_census::kRefIdentitySkipped);
             sf.checked_at_ms = now_ms();
             ++sf.unchanged;
             if (sf.hot) --sf.hot;
@@ -1990,6 +2031,7 @@ void refresh_surface_locked(Surface& sf) {
         check_only = true;
         g_census_check_hashed.fetch_add(1, std::memory_order_relaxed);
     }
+    img_census::refreshed(img_census::kRefRest);
     // A surface that keeps hashing the same backs off - 200 ms, doubling
     // every ten unchanged checks, up to 2 s. Rehashing every bound texture
     // five times a second was a third of the command processor in the
@@ -2976,7 +3018,11 @@ std::uint64_t view_epoch() { return g_view_epoch; }
 // what it may and may not skip.
 VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
                          bool shader_arrayed, bool r128) {
-    if (!g_view_memo_mode) return texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
+    if (!g_view_memo_mode) {
+        const VkImageView v = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
+        if (img_census::on()) img_census::g_last = g_last_view_surface;
+        return v;
+    }
     const int nw = r128 ? 4 : 8;
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     std::uint64_t key = fnv1a(w, static_cast<std::size_t>(nw) * 4);
@@ -2993,6 +3039,7 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         // resolve rather than the wrong texture.
         if (e.key != key || e.flags != flags || std::memcmp(e.w, w, static_cast<std::size_t>(nw) * 4) != 0) continue;
         if (e.sf) refresh_surface_locked(*e.sf);
+        if (img_census::on()) img_census::g_last = e.sf;
         ++g_view_memo_hits;
         if (g_view_memo_mode == 2) {
             bool real_ok = true;
@@ -3021,6 +3068,7 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
     g_last_view_surface = nullptr;
     g_last_view_no_memo = false;
     const VkImageView view = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
+    if (img_census::on()) img_census::g_last = g_last_view_surface;
     ++g_view_memo_misses;
     if (g_last_view_no_memo) return view;
     // Only a descriptor that resolved is remembered. A T# whose memory is not
@@ -3076,6 +3124,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             refresh_surface_locked(*e.sf);
             e.refreshed = stamp;
         }
+        if (img_census::on()) img_census::g_last = e.sf;
         ++g_id_view_hits;
         dims_ok = e.dims_ok;
         dim = e.dim;
@@ -3086,6 +3135,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
     g_last_view_surface = nullptr;
     g_last_view_no_memo = false;
     const VkImageView view = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128, gx_view_gen_by_id(id));
+    if (img_census::on()) img_census::g_last = g_last_view_surface;
     // As the words memo: only a view that resolved is remembered - a texture
     // not streamed in yet has to be tried again (and a region copy is made
     // again at every bind).
@@ -3094,6 +3144,48 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
 }
 
 void texture_view_by_id_prefetch(std::uint32_t id) { __builtin_prefetch(&g_id_views[id & (kIdViewSlots - 1)]); }
+
+void textures_census_binding(int source, VkImageView view) {
+    using namespace img_census;
+    if (!on() || source < 0 || source > 2) return;
+    const Surface* sf = view ? g_last : nullptr;
+    const Class c = !view                                             ? kNoView
+                    : !sf                                             ? kNoSurface
+                    : !sf->gx_registered                              ? kNotGx
+                    : sf->gpu_written || sf->cp_dirty || sf->copied_mips ? kGpuWritten
+                    : sf->uploads > 1                                 ? kCpuRewritten
+                                                                      : kImmutable;
+    g_bindings[source][c].fetch_add(1, std::memory_order_relaxed);
+    if (sf && sf->ahead) g_ahead[source].fetch_add(1, std::memory_order_relaxed);
+    if (view) g_seen[source][c].insert(sf ? static_cast<const void*>(sf) : static_cast<const void*>(view));
+    g_last = nullptr;
+}
+
+void textures_census_report() {
+    using namespace img_census;
+    if (!on()) return;
+    for (int s = 0; s < 3; ++s) {
+        std::uint64_t total = 0;
+        for (int c = 0; c < kClasses; ++c) total += g_bindings[s][c].load();
+        std::string by;
+        for (int c = 0; c < kClasses; ++c) {
+            char b[160];
+            const std::uint64_t n = g_bindings[s][c].load();
+            std::snprintf(b, sizeof b, "%s%s %llu (%.1f%%, %zu distinct)", c ? "; " : "", kClassName[c], static_cast<unsigned long long>(n),
+                          total ? 100.0 * static_cast<double>(n) / static_cast<double>(total) : 0.0, g_seen[s][c].size());
+            by += b;
+        }
+        host_log("gxvk census: image bindings %s %llu (of them on an image made at its resource's creation %llu): %s", kSourceName[s],
+                 static_cast<unsigned long long>(total), static_cast<unsigned long long>(g_ahead[s].load()), by.c_str());
+    }
+    std::string rf;
+    for (int r = 0; r < kRefreshes; ++r) {
+        char b[96];
+        std::snprintf(b, sizeof b, "%s%s %llu", r ? ", " : "", kRefreshName[r], static_cast<unsigned long long>(g_refresh[r].load()));
+        rf += b;
+    }
+    host_log("gxvk census: surface refreshes by how they ended: %s", rf.c_str());
+}
 
 std::string texture_view_by_id_report() {
     char buf[160];
@@ -5378,6 +5470,7 @@ void textures_report() {
              static_cast<unsigned long long>(g_retired_by_gen_live.load()), static_cast<unsigned long long>(g_retire_kept_other_gen.load()),
              static_cast<unsigned long long>(g_retire_kept_written.load()), static_cast<unsigned long long>(g_retire_taken_next.load()),
              static_cast<unsigned long long>(g_ahead_replaced_gen.load()));
+    textures_census_report();
     host_log("texture: census: hashes skipped on registered watched surfaces %llu; of the 1-in-64 check hashes %llu, %llu found a change the watch had "
              "not reported",
              static_cast<unsigned long long>(g_census_hash_skipped.load()), static_cast<unsigned long long>(g_census_check_hashed.load()),

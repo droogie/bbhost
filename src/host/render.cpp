@@ -12377,6 +12377,7 @@ bool key_stage_matches(const gcn::TranslateResult& meta, const gcn::TranslateRes
 
 void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t* stage_user, StageImages& out,
                            const GxStageRecords* gx, const KeyStage* resolved) {
+    static const bool census_images = gxvk::census();  // stage 2a's census (textures_census_binding)
     out.images.resize(meta.images.size());
     const GxStagePlan* plan = gx && g_binding_plans && g_view_by_id ? &stage_plan(meta, *gx) : nullptr;
     for (std::size_t k = 0; k < meta.images.size(); ++k) {
@@ -12426,6 +12427,9 @@ void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t
             } else {
                 im.view = texture_view(im.w, b.storage, ok, im.dim, im.arrayed, b.da, b.r128);
             }
+            if (census_images) textures_census_binding(id ? 0 : gx ? 1 : 2, im.view);
+        } else if (census_images) {
+            textures_census_binding(gx ? 1 : 2, VK_NULL_HANDLE);
         }
     }
     out.samplers.resize(meta.samplers.size());

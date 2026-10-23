@@ -1679,6 +1679,11 @@ std::string texture_view_by_id_report();
 // Asks for the entry texture_view_by_id will read for `id` (the table is
 // larger than the caches; a draw asks for its views' entries together).
 void texture_view_by_id_prefetch(std::uint32_t id);
+// Stage 2a's census (gxvk::census()): an image binding prefetch_stage_images resolved - source 0 by its
+// shader-resource view's id, 1 from its T# in a GX draw, 2 from its T# in another draw - and the view it got (null:
+// none), classed by the surface the lookup found; counted, and reported with textures_report.
+void textures_census_binding(int source, VkImageView view);
+void textures_census_report();
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
