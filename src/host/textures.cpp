@@ -1020,9 +1020,30 @@ std::vector<std::shared_ptr<TexturePrep>> g_batch_preps;
 
 bool prep_done(const TexturePrep& p) { return p.state.load(std::memory_order_acquire) == 2; }
 
+// Stage 2a's census: the waits for a surface's prep that blocked, by the surface - a GX resource's first upload, its
+// later one, made at its resource's creation (ahead), or memory no live GX resource owns - and the batch waits.
+namespace prep_census {
+enum Class : int { kGxFirst, kGxAgain, kGxAhead, kNotGx, kBatch, kClasses };
+const char* const kName[kClasses] = {"a GX image's first upload", "a GX image's later upload", "a GX image made at its resource's creation",
+                                     "memory no live GX resource owns", "a batch's"};
+std::atomic<std::uint64_t> g_waits[kClasses] = {};
+inline bool on() {
+    static const bool v = gxvk::census();
+    return v;
+}
+void blocked(Class c) {
+    if (on()) g_waits[c].fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace prep_census
+
 // The surface's last upload, finished: its hashes are the surface's.
 void settle_prep(Surface& sf) {
     if (!sf.prep) return;
+    if (prep_census::on() && !prep_done(*sf.prep))
+        prep_census::blocked(!sf.gx_registered ? prep_census::kNotGx
+                             : sf.ahead       ? prep_census::kGxAhead
+                             : sf.uploads > 1 ? prep_census::kGxAgain
+                                              : prep_census::kGxFirst);
     PrepPool::get().wait(*sf.prep);
     sf.content_hash = sf.prep->content_hash;
     sf.exact_hash = sf.prep->exact_hash;
@@ -3185,6 +3206,13 @@ void textures_census_report() {
         rf += b;
     }
     host_log("gxvk census: surface refreshes by how they ended: %s", rf.c_str());
+    std::string pw;
+    for (int c = 0; c < prep_census::kClasses; ++c) {
+        char b[96];
+        std::snprintf(b, sizeof b, "%s%s %llu", c ? ", " : "", prep_census::kName[c], static_cast<unsigned long long>(prep_census::g_waits[c].load()));
+        pw += b;
+    }
+    host_log("gxvk census: texture prep waits that blocked, by surface: %s", pw.c_str());
 }
 
 std::string texture_view_by_id_report() {
@@ -4063,7 +4091,10 @@ void retire_surfaces_locked() {
 
 void textures_before_submit() {
     g_coarse_ms = now_ms();
-    for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) PrepPool::get().wait(*p);
+    for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) {
+        if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
+        PrepPool::get().wait(*p);
+    }
     g_batch_preps.clear();
     retire_surfaces_locked();
     image_reuse_sweep_locked();
@@ -4731,7 +4762,10 @@ void textures_prewait_for_submit() {
         if (g_batch_preps.empty()) return;
         preps = g_batch_preps;
     }
-    for (const std::shared_ptr<TexturePrep>& p : preps) PrepPool::get().wait(*p);
+    for (const std::shared_ptr<TexturePrep>& p : preps) {
+        if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
+        PrepPool::get().wait(*p);
+    }
 }
 
 void textures_submitted(int slot) {
