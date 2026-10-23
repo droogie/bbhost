@@ -15502,6 +15502,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         }();
         static const bool heap_snap = gxvk::heap_snap_wanted();
         bool known = false, check = false;
+        std::uint64_t copy_from = base;  // where a snapshot's bytes are read: the binding's, or a heap version's source (1d.2a)
+        bool from_heap = false;          // (that source: the snapshot below takes it, ahead of any window)
         if (!in_heap && outcome == kUnmapped && heap_snap &&
             gxvk::heap_snap_binding(base, bytes, b.written, !t_draw_windows.empty(), snapshots_on, cb_proof::g_on || glitch_watching_draw(),
                                     g_cb_ring_made)) {
@@ -15516,9 +15518,33 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
         } else if (!in_heap && outcome == kUnmapped && !known) {
-            version = copy_version_lookup_locked(base, bytes, &loc);
+            std::uint64_t heap_src = 0;
+            version = copy_version_lookup_locked(base, bytes, &loc, &heap_src);
             if (check && version != kCopyVersionNone) gxvk::heap_snap_disagree(gxvk::kHeapDiffCopyVersion, base, bytes);
             if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
+            // A home whose copy-back is pending as its source in GX's upload heap
+            // (stage 1d.2a, BBHOST_GXVK_HEAP_COPY=1): the version is that range, so
+            // the draw takes the source's bytes through the heap's snapshot (1d.1,
+            // with its answers for the source) - a copy in the ring, so no shader
+            // reads a renamed constant buffer in place - ahead of a YEBIS window,
+            // as the version is. One over the snapshots' 1 MiB puts the copy-backs
+            // in place first and binds the home as any other. (=compare counts
+            // what 1 would do, and binds today's version.)
+            if (version == kCopyVersionInside && heap_src) {
+                const bool snap = bytes <= (1u << 20);
+                gxvk::heap_copy_bound(snap);
+                if (gxvk::heap_copy_mode() == gxvk::HeapCopy::kOn) {
+                    if (snap) {
+                        copy_from = heap_src;
+                        from_heap = known = true;
+                        check = false;
+                    } else {
+                        copy_versions_put_in_place_locked(kCvHeapWide);
+                    }
+                    version = kCopyVersionNone;
+                    loc = Located{};
+                }
+            }
         }
         if (version == kCopyVersionStraddles) {
             if (run_part_stop(kRunStopOrder)) return;
@@ -15548,7 +15574,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         }
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
-            (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
+            (b.written || from_heap || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() &&
                         (known || (hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes)));
             if (!copy_only) {
@@ -15692,6 +15718,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
                     g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
+                    if (g_cb_ring_made) gxvk::heap_copy_ring_made();  // (and 1d.2a's versions from the heap need it for their homes' bindings)
                 }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
@@ -15725,14 +15752,14 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // buffer anyway: the snapshot is bound where it is.
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
                 if (dedupe && snapshot && (whole_ring || exact) && scratch.map) {
-                    memo = draw_ctx() ? &draw_ctx()->cb_memo_for(base) : &snap_memo_for(base);
-                    bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
+                    memo = draw_ctx() ? &draw_ctx()->cb_memo_for(copy_from) : &snap_memo_for(copy_from);
+                    bool share = memo->base == copy_from && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
                     // A run part's draw (BBHOST_RUN_COMMIT) binds the copy the
                     // command processor made of the buffer in this recording,
                     // as it would in order; its own memo only otherwise.
                     if (!share && run_part()) {
-                        const SnapMemo& cp = snap_memo_for(base);
-                        if (cp.base == base && cp.serial == g.record_serial && cp.lap == scratch_lap && cp.bytes >= bytes) {
+                        const SnapMemo& cp = snap_memo_for(copy_from);
+                        if (cp.base == copy_from && cp.serial == g.record_serial && cp.lap == scratch_lap && cp.bytes >= bytes) {
                             static thread_local SnapMemo cp_copy;
                             cp_copy = cp;
                             memo = &cp_copy;
@@ -15741,7 +15768,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     }
                     if (share && dedupe >= kDedupeCheck) {
                         const bool same = std::memcmp(static_cast<const std::uint8_t*>(scratch.map) + memo->at,
-                                                      reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes) == 0;
+                                                      reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), bytes) == 0;
                         bump(g_cb_snapshots_compared);
                         if (!same) {
                             bump(g_cb_snapshots_changed);
@@ -15767,7 +15794,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
                         if (whole_ring && list_resolve::commit_compare()) run_digest_ring_cb(i, memo->at, base, bytes);
                         outcome = kBound;
-                        if (!whole_ring) note_copy_binding_locked(info, base);
+                        if (!whole_ring) note_copy_binding_locked(info, copy_from);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
                         if (draw_ctx()) list_resolve::count(list_resolve::kCtxCbShared);
                     }
@@ -15784,7 +15811,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     VkDeviceSize copy_bytes = bytes;
                     if (g_wc_whole_lines) {
                         const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
-                        if (((base + bytes - 1) >> 12) == ((base + lines - 1) >> 12)) copy_bytes = lines;
+                        if (((copy_from + bytes - 1) >> 12) == ((copy_from + lines - 1) >> 12)) copy_bytes = lines;
                     }
                     // The ring's next `n` bytes, round it when it runs out.
                     // A run part's draw (BBHOST_RUN_COMMIT): under the parts'
@@ -15846,7 +15873,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         at = take(copy_bytes);
                     }
                     std::memcpy(static_cast<std::uint8_t*>(scratch.map) + at,
-                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), copy_bytes);
+                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
                     // (A snapshot's range holds no copy-back: the lookup above said so.)
                     if (!snapshot && !known) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
                     // A snapshot binds the whole ring and is found by its
@@ -15855,7 +15882,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // seen before - written for each draw, 17% of the frame
                     // rate GPU-bound.
                     const bool whole = whole_ring;
-                    if (memo) *memo = SnapMemo{base, bytes, at, g.record_serial, scratch_lap};
+                    if (memo) *memo = SnapMemo{copy_from, bytes, at, g.record_serial, scratch_lap};
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
@@ -15866,7 +15893,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // the lookup before it said).
                     if (!whole && version == kCopyVersionNone &&
                         (snapshot || known || copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone))
-                        note_copy_binding_locked(info, base);
+                        note_copy_binding_locked(info, copy_from);
                     // Not locked adds (bump): one right after the copy waited for
                     // its writes to the ring - write-combined memory - to drain,
                     // 8.6% of the command processor in Kyo's hall.

@@ -229,6 +229,16 @@ void arena_unrecorded();
 // for today's path (counted by reason when the range lies in the heap).
 // `stored`: the shader stores to it.
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
+// The arena's records and its proof are wanted: by the heap's bindings in place (BBHOST_GXVK_ARENA) or by
+// copy-backs from the heap (BBHOST_GXVK_HEAP_COPY, stage 1d.2a). The pool's hand-out hooks and the region's
+// bounds are installed for either.
+bool arena_proof_wanted();
+// A copy-back's source in the heap (stage 1d.2a): the batch's GPU copy and the draws that bind its version read
+// [va, +bytes), all in submission `serial`. True: one hand-out holds it whole and the proof holds - the record is
+// stamped with `serial`, and one hold in 64 has its bytes hashed (every one with BBHOST_GXVK_HEAP_COPY=compare) - so
+// the range keeps those bytes until that submission has completed. False: why is counted (no hand-out holds it, it
+// runs past its hand-out, the proof failed earlier).
+bool arena_hold(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
 // Today's path over the heap, counted where it runs: the work stage 1c takes
@@ -310,12 +320,75 @@ struct HeapSnapTestCounts {
 HeapSnapTestCounts heap_snap_test_counts();
 #endif
 
+// --- Stage 1d.2a: copy-backs from the heap with no CPU copy (host/gxvk_heapsnap.cpp; gpu.cpp copy_version_make_locked) ---
+//
+// GX's map resolves copy each renamed buffer back to its own memory, its home: on the console a GPU copy in command
+// order. bbhost makes each such copy-back a copy version on the CPU - the source's bytes copied into staging as the
+// command processor reaches it, bound for the home's draws until the batch's GPU copy puts them in place - so a
+// draw of the home sees the bytes the copy-back will write. Every source lies in GX's upload heap, which GX hands
+// out again only after the work that read it has completed (the arena's release order, proven per run), so the
+// version's bytes can be the source range itself: no staging, no CPU copy. The batch's GPU copy reads the heap; a
+// draw that binds the home as a shader's buffer takes the source through stage 1d.1's snapshot (a copy in the
+// ring, so no shader reads a renamed constant buffer in place), ahead of a YEBIS window as today's version is - one
+// over the snapshots' 1 MiB puts the copy-backs in place first, and one the shader stores to does so today; a
+// vertex or index binding reads the heap range, under the same proof as the copy. A source the proof does not hold, one an earlier version covers, or any while
+// 1d.1's snapshots are off or its guards have tripped takes today's version, counted by reason.
+// BBHOST_GXVK_HEAP_COPY: 0 (the default) today's versions; 1 the heap's sources taken as they are; compare: today's
+// versions, with the proof run over the sources as 1 would, and each version's bytes compared with its source's at
+// its batch (counted, the first few said).
+enum class HeapCopy : int { kOff = 0, kOn = 1, kCompare = 2 };
+HeapCopy heap_copy_mode();
+inline bool heap_copy_wanted() { return heap_copy_mode() != HeapCopy::kOff; }
+// A copy-back as copy_version_make_locked has it, for the choice.
+struct HeapCopyCase {
+    std::uint64_t lo = 0, hi = 0;      // the heap's bounds (lo 0: not known yet)
+    std::uint64_t src = 0, bytes = 0;  // the copy-back's source
+    bool snapshots = true;             // stage 1d.1 takes the heap's answers (its mode on)
+    bool tripped = false;              // a 1d.1 guard has tripped this run
+    bool ring = true;                  // the constant-buffer copies' ring is made
+    bool earlier = false;              // an earlier version covers the source (the copy reads that version)
+    bool located = true;               // the source lies in one import
+};
+// The choice: kHeapCopyFast (the version is the heap range, if the arena holds it), kHeapCopyNotHeap (not the
+// heap's: nothing to count), or why the version is a CPU copy as today.
+enum HeapCopyWhy : int {
+    kHeapCopySnapOff, kHeapCopyTripped, kHeapCopyPastEnd, kHeapCopyNoRing, kHeapCopyEarlier, kHeapCopyNotLocated,
+    kHeapCopyNotHeld,
+    kHeapCopyWhys,
+    kHeapCopyFast = -1, kHeapCopyNotHeap = -2
+};
+int heap_copy_class(const HeapCopyCase& c);
+// copy_version_make_locked's choice for a copy-back from [src, +bytes) (the renderer's lock held), counted:
+// kHeapCopyFast, kHeapCopyNotHeap or a reason. `ring`, `earlier`, `located`: as HeapCopyCase.
+int heap_copy_decide(std::uint64_t src, std::uint64_t bytes, bool ring, bool earlier, bool located);
+// The arena's answer for a source the choice took (arena_hold): counted; with false the version is today's.
+void heap_copy_held(bool held, std::uint64_t bytes);
+// Compare: at its batch, a version's bytes and its source's differ (the source changed while the version was pending).
+void heap_copy_changed(std::uint64_t src, std::uint64_t bytes);
+// A shader's-buffer binding of a home whose version is its source in the heap (render.cpp): snapshotted from the
+// source (`snapshot`), or over 1 MiB, the copy-backs put in place first. With =compare, what 1 would do.
+void heap_copy_bound(bool snapshot);
+// The constant-buffer copies' ring is made (render.cpp, the first snapshot): a heap-sourced version's constant-buffer
+// bindings need it.
+void heap_copy_ring_made();
+bool heap_copy_ring();
+// The exit report (gx_resources_report calls it).
+void heap_copy_report();
+#ifdef GXVK_HEAPSNAP_TESTING
+void heap_copy_test_reset(HeapCopy mode);
+struct HeapCopyTestCounts {
+    std::uint64_t fast = 0, held = 0, fell[kHeapCopyWhys] = {}, changed = 0, bound = 0, bound_wide = 0;
+};
+HeapCopyTestCounts heap_copy_test_counts();
+#endif
+
 #ifdef GXVK_ARENA_TESTING
 // tests/gxvk_arena_test.cpp: everything forgotten, and the mode set.
 void arena_test_reset(Arena mode);
 struct ArenaTestCounts {
     std::uint64_t violations_order = 0, violations_bytes = 0, samples_checked = 0, fell = 0;
     std::uint64_t proof_off = 0, unrecorded = 0, live = 0;  // after a failure: bindings and hand-outs it left alone; records kept
+    std::uint64_t holds = 0, hold_fell = 0;                  // copy-backs' sources held (arena_hold), and refused
     bool in_place = true;
 };
 ArenaTestCounts arena_test_counts();

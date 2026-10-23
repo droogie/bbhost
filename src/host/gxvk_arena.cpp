@@ -139,6 +139,11 @@ const char* const kWhyName[kWhys] = {"no hand-out holds it", "it runs past its h
 std::atomic<std::uint64_t> g_fell[kWhys] = {};
 std::atomic<std::uint64_t> g_violations_order{0}, g_violations_bytes{0}, g_samples_checked{0}, g_samples_skipped{0};
 std::atomic<std::uint64_t> g_noted[kArenaNotes] = {}, g_noted_bytes[kArenaNotes] = {};
+// Copy-backs' sources held (arena_hold, stage 1d.2a), and those refused by reason (kWhyNoRecord, kWhyStraddle, kWhyProofOff).
+std::atomic<std::uint64_t> g_holds{0}, g_hold_bytes{0}, g_hold_fell[kWhys] = {};
+
+// The records are kept for in-place bindings (BBHOST_GXVK_ARENA) or copy-backs from the heap (BBHOST_GXVK_HEAP_COPY).
+bool proof_wanted() { return g_mode != Arena::kOff || heap_copy_wanted(); }
 
 // The submissions whose work is done: the landing's count or the retirements',
 // whichever is further. The landing's count raised before their labels are in
@@ -228,10 +233,12 @@ void check_samples_locked(std::uint64_t done) {
 
 Arena arena_mode() { return g_mode; }
 
-bool arena_recording() { return g_mode != Arena::kOff && g_in_place.load(std::memory_order_relaxed); }
+bool arena_proof_wanted() { return proof_wanted(); }
+
+bool arena_recording() { return proof_wanted() && g_in_place.load(std::memory_order_relaxed); }
 
 void arena_unrecorded() {
-    if (g_mode != Arena::kOff) g_unrecorded.fetch_add(1, std::memory_order_relaxed);
+    if (proof_wanted()) g_unrecorded.fetch_add(1, std::memory_order_relaxed);
 }
 
 void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes) {
@@ -248,7 +255,7 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
         g_heap_lo.store(lo, std::memory_order_release);
     }
     heap_snap_region(lo, hi);  // stage 1d.1's snapshots with the lookups' answers known (host/gxvk_heapsnap.cpp), when on
-    if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
+    if (!proof_wanted() && !census()) return;  // the census counts today's path over the heap
     {
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_lo.load(std::memory_order_relaxed)) {
@@ -266,6 +273,9 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
         host_log("gxvk arena: GX's upload heap is 0x%llx, %llu MiB: its bindings %s, under the release proof (BBHOST_GXVK_ARENA=0: today's path)",
                  static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
                  g_mode == Arena::kCompare ? "checked as they would be bound in place, and bound as today" : "in place");
+    else if (heap_copy_wanted())
+        host_log("gxvk arena: GX's upload heap is 0x%llx, %llu MiB: its hand-outs recorded for the copy-backs' release proof "
+                 "(BBHOST_GXVK_HEAP_COPY), its bindings as today", static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20));
 }
 
 bool upload_heap(std::uint64_t* lo, std::uint64_t* hi) {
@@ -285,7 +295,7 @@ bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {
 }
 
 void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
-    if (g_mode == Arena::kOff || !node) return;
+    if (!proof_wanted() || !node) return;
     if (!g_in_place.load(std::memory_order_relaxed) && !MUTANT(6)) {  // the proof failed: nothing more to record
         g_unrecorded.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -457,6 +467,69 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
     return g_mode == Arena::kInPlace;
 }
 
+bool arena_hold(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
+    if (!proof_wanted()) return false;
+    const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
+    if (!lo || va < lo || va >= hi) return false;  // not the heap's: nothing to count
+    if (!g_in_place.load(std::memory_order_relaxed)) {  // the proof failed: no lookup
+        g_hold_fell[kWhyProofOff].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (bytes > hi - va) {
+        g_hold_fell[kWhyStraddle].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const std::uint64_t end = va + std::max<std::uint64_t>(bytes, 1);
+    bool found = false, straddle = false, failed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const std::uint64_t p = (va - lo) >> kPageShift;
+        if (g_released) {
+            failed = true;
+        } else if (p < g_pages.size()) {
+            for (const std::uint32_t r : g_pages[p]) {
+                Record& rec = g_records[r];
+                if (va < rec.start || va >= rec.end) continue;
+                if (end > rec.end && !MUTANT(8)) {
+                    straddle = true;
+                    break;
+                }
+                if (!MUTANT(9)) rec.stamp = std::max(rec.stamp, serial + 1);
+                found = true;
+                // The bytes, sampled (BBHOST_GXVK_HEAP_COPY=compare: every one).
+                if (heap_copy_mode() == HeapCopy::kCompare || ++g_sample_tick % kSampleEvery == 0) {
+                    const std::uint64_t done = done_submissions();
+                    check_samples_locked(done);
+                    if (g_sample_n == kSamples) {
+                        g_samples_skipped.fetch_add(1, std::memory_order_relaxed);
+                        g_sample_head = (g_sample_head + 1) % kSamples;
+                        --g_sample_n;
+                    }
+                    Sample& smp = g_samples[(g_sample_head + g_sample_n) % kSamples];
+                    smp = {va, bytes, hash_of(va, bytes), serial, r, rec.gen};
+                    ++g_sample_n;
+                }
+                break;
+            }
+        }
+        if (!g_in_place.load(std::memory_order_relaxed)) {  // a sample just checked found changed bytes
+            release_locked();
+            failed = true;
+        }
+    }
+    if (failed) {
+        g_hold_fell[kWhyProofOff].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!found && !MUTANT(10)) {
+        g_hold_fell[straddle ? kWhyStraddle : kWhyNoRecord].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_holds.fetch_add(1, std::memory_order_relaxed);
+    g_hold_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
 void arena_no_backing() { g_fell[kWhyNoBacking].fetch_add(1, std::memory_order_relaxed); }
 
 void arena_note(ArenaNote what, std::uint64_t bytes) {
@@ -491,6 +564,9 @@ void arena_test_reset(Arena mode) {
     g_violations_bytes.store(0);
     g_samples_checked.store(0);
     g_samples_skipped.store(0);
+    g_holds.store(0);
+    g_hold_bytes.store(0);
+    for (auto& a : g_hold_fell) a.store(0);
 }
 ArenaTestCounts arena_test_counts() {
     ArenaTestCounts c;
@@ -500,6 +576,8 @@ ArenaTestCounts arena_test_counts() {
     c.in_place = g_in_place.load();
     for (int w = 0; w < kWhys; ++w) c.fell += g_fell[w].load();
     c.proof_off = g_fell[kWhyProofOff].load();
+    c.holds = g_holds.load();
+    for (int w = 0; w < kWhys; ++w) c.hold_fell += g_hold_fell[w].load();
     c.unrecorded = g_unrecorded.load();
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -510,9 +588,9 @@ ArenaTestCounts arena_test_counts() {
 #endif
 
 void arena_report() {
-    if (g_mode == Arena::kOff && !census()) return;
+    if (!proof_wanted() && !census()) return;
     const auto v = [](const std::atomic<std::uint64_t>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
-    if (g_mode == Arena::kOff) {
+    if (!proof_wanted()) {
         std::string notes;
         static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending", "descriptor-table reads"};
         for (int n = 0; n < kArenaNotes; ++n) {
@@ -556,8 +634,13 @@ void arena_report() {
         fell += b;
     }
     const bool placing = g_mode == Arena::kInPlace;
-    host_log("gxvk arena: %s; the heap's bindings %s: %s; today's path because %s", placing ? "bound in place" : "compared",
-             placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
+    if (g_mode != Arena::kOff)
+        host_log("gxvk arena: %s; the heap's bindings %s: %s; today's path because %s", placing ? "bound in place" : "compared",
+                 placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
+    if (heap_copy_wanted())
+        host_log("gxvk arena: copy-backs' sources held %llu (%llu MiB); not held because no hand-out holds it %llu, it runs past its "
+                 "hand-out %llu, the proof failed earlier %llu",
+                 v(g_holds), v(g_hold_bytes) >> 20, v(g_hold_fell[kWhyNoRecord]), v(g_hold_fell[kWhyStraddle]), v(g_hold_fell[kWhyProofOff]));
     char after[160] = "";
     if (!g_in_place.load())
         std::snprintf(after, sizeof after, " - in place stopped at the first, and the arena with it: %llu hand-outs and %llu bindings left alone after",
@@ -575,7 +658,7 @@ void arena_report() {
         std::snprintf(b, sizeof b, "%s%s %llu (%llu MiB)", n ? ", " : "", kNoteName[n], v(g_noted[n]), v(g_noted_bytes[n]) >> 20);
         notes += b;
     }
-    host_log("gxvk arena: today's path over the heap: %s", notes.c_str());
+    if (g_mode != Arena::kOff) host_log("gxvk arena: today's path over the heap: %s", notes.c_str());
 }
 
 }  // namespace gxvk

@@ -1609,13 +1609,15 @@ void gx_resources_install(ElfImage* image) {
     }
     // The block pool's hand-outs: for the census, and for GX on Vulkan's arena's
     // release proof (host/gxvk_arena.cpp).
-    if (g_census || gxvk::census() || gxvk::arena_wanted())
+    // (The arena's records are wanted for its in-place bindings or for the
+    // copy-backs from the heap, stage 1d.2a: gxvk::arena_proof_wanted.)
+    if (g_census || gxvk::census() || gxvk::arena_proof_wanted())
         hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-    if (gxvk::census() || gxvk::arena_wanted())
+    if (gxvk::census() || gxvk::arena_proof_wanted())
         hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     // Its top end: the arena's records must hold both ends' hand-outs, or the
     // memory one end reuses reads as the other end's stale record once they meet.
-    if (gxvk::arena_wanted()) {
+    if (gxvk::arena_proof_wanted()) {
         hook(kPoolTopBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 1);
         hook(kPoolTopAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 1);
     }
@@ -1638,7 +1640,7 @@ void gx_resources_install_late(ElfImage* image) {
     // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
     // its init tells the host of it (the entry above); the game's is hooked at
     // its prologue for the census (the arena then has no heap: today's path).
-    if (gxvk::census() || gxvk::arena_wanted() || gxvk::heap_snap_wanted()) {
+    if (gxvk::census() || gxvk::arena_proof_wanted() || gxvk::heap_snap_wanted()) {
         if (decomp_placed("gx_upload_pool_init") == 1) {
             decomp_gx::g_upload_region_entry = hle_wrap_fn(reinterpret_cast<void*>(&upload_region_entry));
         } else if (gxvk::census()) {
@@ -2118,4 +2120,5 @@ void gx_resources_report() {
     gxvk::buffers_report();
     gxvk::arena_report();
     gxvk::heap_snap_report();
+    gxvk::heap_copy_report();
 }

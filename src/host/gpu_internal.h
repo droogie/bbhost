@@ -2192,11 +2192,14 @@ void copy_versions_flush_locked();
 void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
-// that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvPutReasons };
+// that walks the page table; a shader's buffer over 1 MiB inside a version
+// that is its source in GX's upload heap (stage 1d.2a: one the snapshots do
+// not take).
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvHeapWide, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
 // Whether a pending version's copy into place writes `buffer` (a window import
-// about to retire: its copies go into place first).
+// about to retire: its copies go into place first) - or, for a version that is
+// its source in GX's upload heap (stage 1d.2a), reads it.
 bool copy_versions_name_buffer_locked(VkBuffer buffer);
 // The same for [lo, hi) of `buffer` (a GX twin's slice about to be let go).
 bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi);
@@ -2205,8 +2208,12 @@ bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
+// `heap_src` (stage 1d.2a): with kCopyVersionInside, the guest address in GX's
+// upload heap the version's bytes for `base` are read from, when the version
+// is that range itself (no CPU copy) - or, with BBHOST_GXVK_HEAP_COPY=compare,
+// would be (its copy is today's) - else 0.
 enum { kCopyVersionNone, kCopyVersionInside, kCopyVersionStraddles };
-int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src = nullptr);
 // Draw captures take a binding's bytes from the guest memory it imports. A
 // binding resolved to a copy of guest memory taken as the draw records (a
 // YEBIS window's, the aligned scratch) is noted with the guest address its

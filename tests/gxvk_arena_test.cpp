@@ -18,8 +18,11 @@
 // today's path. It must refuse in-place binding to a range that runs past its
 // hand-out; and with every binding sampled (compare) it must find bytes
 // changed under a queued draw, and only those - a range handed out again is
-// rewritten as it should be. Then seven deliberate mistakes, each of which
-// must be caught.
+// rewritten as it should be. The same proof holds copy-backs' sources (stage
+// 1d.2a, arena_hold) with the arena's bindings off: a hold stamps its record
+// as a binding does, one past its hand-out or with no hand-out over it is
+// refused, and an early reuse over a held source is found as it is made. Then
+// ten deliberate mistakes, each of which must be caught.
 // Built with GXVK_ARENA_TESTING and GXVK_ARENA_MUTANTS (CMakeLists.txt), as its arena is.
 #include "host/gxvk.h"
 
@@ -43,8 +46,11 @@ namespace label_landing {
 std::uint64_t landing() { return g_completed; }
 std::uint64_t landed() { return trailing(); }
 }  // namespace label_landing
+// Copy-backs from the heap (stage 1d.2a): its mode, which keeps the records for the holds with the bindings off.
+gxvk::HeapCopy g_copy_mode = gxvk::HeapCopy::kOff;
 namespace gxvk {
 bool census() { return false; }
+HeapCopy heap_copy_mode() { return g_copy_mode; }
 void heap_snap_region(std::uint64_t, std::uint64_t) {}  // stage 1d.1's (tests/gxvk_heapsnap_test.cpp)
 }  // namespace gxvk
 
@@ -99,8 +105,11 @@ struct Result {
 };
 
 // One run. `early`: the chance a hand-out takes a released range before its
-// release has landed (and so, perhaps, over a binding still running).
-Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t seed) {
+// release has landed (and so, perhaps, over a binding still running). `holds`:
+// the draws' reads are copy-backs' sources held (arena_hold, stage 1d.2a), with
+// the arena's bindings off - the records kept for the holds alone.
+Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t seed, bool holds = false) {
+    g_copy_mode = holds ? gxvk::HeapCopy::kOn : gxvk::HeapCopy::kOff;
     gxvk::arena_test_reset(mode);
     g_completed = 0;
     std::mt19937_64 rng(seed);
@@ -170,12 +179,12 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
             if (past) bytes = o.end - at + 16;
             if (at + bytes > base + kHeapBytes) continue;
             if (!r.failed) r.failed = !gxvk::arena_test_counts().in_place;
-            const bool placed = gxvk::arena_bind(at, bytes, serial, gxvk::kUseConstant, false);
+            const bool placed = holds ? gxvk::arena_hold(at, bytes, serial) : gxvk::arena_bind(at, bytes, serial, gxvk::kUseConstant, false);
             ++r.bindings;
             if (r.failed && placed) ++r.in_place_after;
             if (past) {
                 ++r.straddles;
-                if (placed) fail("a binding past its hand-out's end bound in place", step);
+                if (placed) fail(holds ? "a copy-back's source past its hand-out's end held" : "a binding past its hand-out's end bound in place", step);
             } else {
                 o.last_bound = std::max(o.last_bound, serial + 1);
                 if (placed) ++r.in_place;
@@ -280,6 +289,41 @@ int check_all(bool say) {
     }
     if (say) std::printf("  bytes: %ld rewrites under queued draws made, %ld found; none found where ranges were only handed out again\n", rewrites,
                          changed);
+    // Copy-backs' sources held (stage 1d.2a), with the arena's bindings off: the records are kept for the holds, a hold
+    // stamps its record as a binding does, so an early reuse over a held source is found at the hand-out that made it;
+    // a hold past its hand-out is refused, and after the proof failed none is held.
+    long held = 0, hold_made = 0;
+    for (std::uint64_t seed = 51; seed <= 53; ++seed) {
+        const Result r = run(Arena::kOff, 40000, 0.0, 0.0, seed, true);
+        const auto c = gxvk::arena_test_counts();
+        held += static_cast<long>(c.holds);
+        if (c.violations_order || c.violations_bytes) fail("a violation found in a clean run of holds", 0);
+        if (!c.holds || r.in_place != static_cast<long>(c.holds)) fail("holds not counted as held in a clean run", 0);
+        if (c.hold_fell != static_cast<std::uint64_t>(r.straddles)) fail("holds refused other than those past their hand-out", 0);
+    }
+    for (std::uint64_t seed = 61; seed <= 64; ++seed) {
+        const Result r = run(Arena::kOff, 40000, 0.3, 0.0, seed, true);
+        const auto c = gxvk::arena_test_counts();
+        hold_made += r.reuses_early;
+        if (r.first_arena != r.first_model) fail("an early reuse over a held source not found at the hand-out that made it", r.first_model);
+        if (!r.reuses_early) continue;
+        if (r.in_place_after) fail("a copy-back's source held after the proof failed", 0);
+        if (c.live) fail("records kept after the proof failed (holds)", 0);
+    }
+    {
+        g_copy_mode = gxvk::HeapCopy::kOn;
+        gxvk::arena_test_reset(Arena::kOff);
+        const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
+        gxvk::arena_region(kPool, base, kHeapBytes);
+        gxvk::arena_handout(kPool, node_for(base + 4096, base + 8192));
+        const bool none = gxvk::arena_hold(base + 64, 32, 0);
+        const bool inside = gxvk::arena_hold(base + 4096 + 64, 64, 0);
+        const auto c = gxvk::arena_test_counts();
+        if (none || !inside || c.holds != 1 || c.hold_fell != 1) fail("a source no hand-out holds held, or one inside a hand-out not", 0);
+        g_copy_mode = gxvk::HeapCopy::kOff;
+    }
+    if (say) std::printf("  copy-backs' sources: %ld held over three clean runs, none refused but past their hand-out; the model handed out "
+                         "over %ld held sources early and the arena found each run's first as it was made\n", held, hold_made);
     // Bindings outside the heap are not the arena's: nothing bound, nothing counted (an address above the heap once
     // wrapped the bounds test round and counted as a fallback); one running past the heap's end is refused.
     {
@@ -309,9 +353,11 @@ int main() {
     static const char* const kMistake[] = {"", "a binding's stamp one submission short", "a hand-out over part of a record not checked",
                                            "a binding past its hand-out bound in place", "a sample checked after its range was handed out again",
                                            "the heap's bounds test wrapping round above it", "the arena going on with its records after the proof failed",
-                                           "the landing's count taken once the labels are in memory, not before"};
+                                           "the landing's count taken once the labels are in memory, not before",
+                                           "a copy-back's source past its hand-out held", "a copy-back's source held without its stamp",
+                                           "a copy-back's source no hand-out holds held"};
     int missed = 0;
-    for (int m = 1; m <= 7; ++m) {
+    for (int m = 1; m <= 10; ++m) {
         g_arena_mutant = m;
         g_quiet = true;
         const int bad = check_all(false);

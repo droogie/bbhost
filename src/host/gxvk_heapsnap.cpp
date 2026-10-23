@@ -57,6 +57,17 @@ const HeapSnap g_mode = [] {
 }();
 #endif
 
+#ifdef GXVK_HEAPSNAP_TESTING
+HeapCopy g_copy_mode = HeapCopy::kOff;  // the test sets it (heap_copy_test_reset)
+#else
+const HeapCopy g_copy_mode = [] {
+    const char* e = std::getenv("BBHOST_GXVK_HEAP_COPY");
+    if (!e || !*e) return HeapCopy::kOff;
+    if (std::strcmp(e, "compare") == 0) return HeapCopy::kCompare;
+    return e[0] == '1' ? HeapCopy::kOn : HeapCopy::kOff;
+}();
+#endif
+
 // The snapshot's own limit (resolve_stage_buffers copies up to 1 MiB).
 constexpr std::uint64_t kMaxBytes = 1u << 20;
 
@@ -73,6 +84,14 @@ std::atomic<std::uint64_t> g_fast{0}, g_fast_bytes{0}, g_fell[kHeapSnapWhys] = {
 // From any thread (the kernel's unmaps), and rare: locked adds.
 std::atomic<std::uint64_t> g_guards[kHeapGuards] = {}, g_diffs[kHeapDiffs] = {};
 std::atomic<int> g_diffs_said{0};
+// Stage 1d.2a's counts (the renderer's lock held, but for the ring's flag).
+std::atomic<std::uint64_t> g_copy_fast{0}, g_copy_held{0}, g_copy_held_bytes{0}, g_copy_fell[kHeapCopyWhys] = {}, g_copy_changed{0},
+    g_copy_bound{0}, g_copy_bound_wide{0};
+std::atomic<bool> g_copy_ring{false};
+std::atomic<int> g_copy_said{0};
+const char* const kCopyWhyName[kHeapCopyWhys] = {"the heap snapshots off", "a 1d.1 guard tripped", "it runs past the heap's end",
+                                                 "the copies' ring not made yet", "an earlier version covers it",
+                                                 "not in one import", "the arena does not hold it"};
 
 const char* const kWhyName[kHeapSnapWhys] = {"the shader stores to it", "empty or over 1 MiB", "it runs past the heap's end",
                                              "its draw has CPU-written windows", "snapshots off", "a check needs them",
@@ -85,6 +104,7 @@ const char* const kDiffName[kHeapDiffs] = {"a copy version", "a twin", "a GPU wr
 }  // namespace
 
 HeapSnap heap_snap_mode() { return g_mode; }
+HeapCopy heap_copy_mode() { return g_copy_mode; }
 
 int heap_snap_class(const HeapSnapCase& c) {
     if (!c.lo || (c.base < c.lo && !MUTANT(5)) || c.base >= c.hi) return kHeapSnapNotHeap;
@@ -100,13 +120,20 @@ int heap_snap_class(const HeapSnapCase& c) {
 }
 
 void heap_snap_region(std::uint64_t lo, std::uint64_t hi) {
-    if (g_mode == HeapSnap::kOff || !lo || hi <= lo || g_claimed.exchange(true, std::memory_order_relaxed)) return;
+    if ((g_mode == HeapSnap::kOff && g_copy_mode == HeapCopy::kOff) || !lo || hi <= lo || g_claimed.exchange(true, std::memory_order_relaxed))
+        return;
     g_hi.store(hi, std::memory_order_relaxed);
     g_lo.store(lo, std::memory_order_release);  // a reader that sees it sees g_hi too
-    host_log("gxvk heap snapshots: GX's upload heap is 0x%llx, %llu MiB: its constant buffers %s (BBHOST_GXVK_HEAP_SNAP=0: today's path)",
-             static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
-             g_mode == HeapSnap::kCompare ? "bound as today, their lookups checked against the answers known for the heap"
-                                          : "snapshotted with the lookups' answers known");
+    if (g_mode != HeapSnap::kOff)
+        host_log("gxvk heap snapshots: GX's upload heap is 0x%llx, %llu MiB: its constant buffers %s (BBHOST_GXVK_HEAP_SNAP=0: today's path)",
+                 static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
+                 g_mode == HeapSnap::kCompare ? "bound as today, their lookups checked against the answers known for the heap"
+                                              : "snapshotted with the lookups' answers known");
+    if (g_copy_mode != HeapCopy::kOff)
+        host_log("gxvk heap copy-backs: GX's upload heap is 0x%llx, %llu MiB: copy-backs from it %s (BBHOST_GXVK_HEAP_COPY=0: today's)",
+                 static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
+                 g_copy_mode == HeapCopy::kCompare ? "copied on the CPU as today, the proof run over their sources and the bytes compared"
+                                                   : "taken as they are in the heap, under the arena's release proof");
 }
 
 bool heap_snap_binding(std::uint64_t base, std::uint64_t bytes, bool stored, bool windows, bool snapshots, bool check, bool ring) {
@@ -157,6 +184,105 @@ void heap_snap_disagree(HeapSnapDiff what, std::uint64_t va, std::uint64_t bytes
         host_log("gxvk heap snapshots: compare: the lookups found %s over 0x%llx, %llu bytes, where the heap's answer is none",
                  kDiffName[what], static_cast<ull>(va), static_cast<ull>(bytes));
 }
+
+int heap_copy_class(const HeapCopyCase& c) {
+    if (!c.lo || (c.src < c.lo && !MUTANT(16)) || c.src >= c.hi) return kHeapCopyNotHeap;
+    if (!c.snapshots && !MUTANT(13)) return kHeapCopySnapOff;
+    if (c.tripped && !MUTANT(12)) return kHeapCopyTripped;
+    if (MUTANT(17) ? c.bytes > c.hi - c.src + 1 : c.bytes > c.hi - c.src) return kHeapCopyPastEnd;
+    if (!c.ring && !MUTANT(15)) return kHeapCopyNoRing;
+    if (c.earlier && !MUTANT(14)) return kHeapCopyEarlier;
+    if (!c.located) return kHeapCopyNotLocated;
+    return kHeapCopyFast;
+}
+
+int heap_copy_decide(std::uint64_t src, std::uint64_t bytes, bool ring, bool earlier, bool located) {
+    HeapCopyCase c;
+    c.lo = g_lo.load(std::memory_order_acquire);
+    if (!c.lo || g_copy_mode == HeapCopy::kOff) return kHeapCopyNotHeap;
+    c.hi = g_hi.load(std::memory_order_relaxed);
+    if (src < c.lo || src >= c.hi) return kHeapCopyNotHeap;
+    c.src = src;
+    c.bytes = bytes;
+    // A pending home's constant-buffer bindings take the source through 1d.1's
+    // snapshot: its mode on, and the snapshots themselves (BBHOST_CB_SNAPSHOT).
+    static const bool cb_snapshots = [] {
+        const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+        return !(e && e[0] == '0');
+    }();
+    c.snapshots = g_mode == HeapSnap::kOn && cb_snapshots;
+    c.tripped = g_tripped.load(std::memory_order_acquire);
+    c.ring = ring;
+    c.earlier = earlier;
+    c.located = located;
+    const int why = heap_copy_class(c);
+    if (why >= 0) bump(g_copy_fell[why]);
+    else if (why == kHeapCopyFast) bump(g_copy_fast);
+    return why;
+}
+
+void heap_copy_held(bool held, std::uint64_t bytes) {
+    if (!held) {
+        bump(g_copy_fell[kHeapCopyNotHeld]);
+        return;
+    }
+    bump(g_copy_held);
+    bump(g_copy_held_bytes, bytes);
+}
+
+void heap_copy_changed(std::uint64_t src, std::uint64_t bytes) {
+    g_copy_changed.fetch_add(1, std::memory_order_relaxed);
+    if (g_copy_said.fetch_add(1, std::memory_order_relaxed) < 8)
+        host_log("gxvk heap copy-backs: compare: a version's bytes and its source's differ at its batch: 0x%llx, %llu bytes",
+                 static_cast<ull>(src), static_cast<ull>(bytes));
+}
+
+void heap_copy_bound(bool snapshot) { bump(snapshot ? g_copy_bound : g_copy_bound_wide); }
+void heap_copy_ring_made() { g_copy_ring.store(true, std::memory_order_relaxed); }
+bool heap_copy_ring() { return g_copy_ring.load(std::memory_order_relaxed); }
+
+void heap_copy_report() {
+    if (g_copy_mode == HeapCopy::kOff) return;
+    const auto v = [](const std::atomic<std::uint64_t>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
+    char fell[700] = "";
+    std::size_t at = 0;
+    for (int w = 0; w < kHeapCopyWhys && at < sizeof fell; ++w)
+        at += static_cast<std::size_t>(std::snprintf(fell + at, sizeof fell - at, "%s%s %llu", w ? ", " : "", kCopyWhyName[w], v(g_copy_fell[w])));
+    const bool cmp = g_copy_mode == HeapCopy::kCompare;
+    host_log("gxvk heap copy-backs: %s %llu (%llu MiB); a CPU copy as today because %s; their homes' bindings as a shader's buffer "
+             "%s %llu, %s over 1 MiB %llu",
+             cmp ? "compared, copied as today: the copy-backs from the heap that would be taken as they are"
+                 : "the copy-backs from the heap taken as they are, with no CPU copy:",
+             v(g_copy_held), v(g_copy_held_bytes) >> 20, fell, cmp ? "that would be snapshotted from the source" : "snapshotted from the source",
+             v(g_copy_bound), cmp ? "that would put the copy-backs in place first" : "the copy-backs put in place first", v(g_copy_bound_wide));
+    if (cmp)
+        host_log("gxvk heap copy-backs: compare: versions whose bytes and source's differed at their batch: %llu", v(g_copy_changed));
+}
+
+#ifdef GXVK_HEAPSNAP_TESTING
+void heap_copy_test_reset(HeapCopy mode) {
+    g_copy_mode = mode;
+    g_copy_fast.store(0);
+    g_copy_held.store(0);
+    g_copy_held_bytes.store(0);
+    for (auto& a : g_copy_fell) a.store(0);
+    g_copy_changed.store(0);
+    g_copy_bound.store(0);
+    g_copy_bound_wide.store(0);
+    g_copy_ring.store(false);
+    g_copy_said.store(0);
+}
+HeapCopyTestCounts heap_copy_test_counts() {
+    HeapCopyTestCounts c;
+    c.fast = g_copy_fast.load();
+    c.held = g_copy_held.load();
+    for (int w = 0; w < kHeapCopyWhys; ++w) c.fell[w] = g_copy_fell[w].load();
+    c.changed = g_copy_changed.load();
+    c.bound = g_copy_bound.load();
+    c.bound_wide = g_copy_bound_wide.load();
+    return c;
+}
+#endif
 
 #ifdef GXVK_HEAPSNAP_TESTING
 void heap_snap_test_reset(HeapSnap mode, std::uint64_t lo, std::uint64_t hi) {

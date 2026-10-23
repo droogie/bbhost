@@ -921,6 +921,31 @@ Central Yharnam, and Old Yharnam goes from 90.6 to 95.1 fps; at 60 it takes
 up to 0.55 ms a flip less, with the GPU's time, the frames and the frame
 pacing unchanged.
 
+**Copy-backs from the heap with no CPU copy (`BBHOST_GXVK_HEAP_COPY`, off by
+default while it is measured).** GX's map resolves copy each renamed buffer
+back to its own memory, its home - on the console a GPU copy in command
+order. bbhost makes each such copy-back a copy version: the source's bytes
+copied into staging as the command processor reaches it, bound for the home's
+draws until the batch's GPU copy puts them in place, so a draw of the home
+sees what the copy-back will write. Every such source is a renamed copy in
+GX's upload heap, which the game hands out again only after the work that
+read it has completed. With `BBHOST_GXVK_HEAP_COPY=1` the version is the
+source range itself: no staging and no CPU copy. The batch's GPU copy reads
+the heap; a draw that binds the home as a constant buffer takes the source
+through the heap's snapshot above, so no shader reads a renamed constant
+buffer in place (one over the snapshots' 1 MiB puts the copy-backs in place
+first); a vertex or index binding reads the heap. The release order
+is proven every run for these sources as for the arena: each source stamps
+the hand-out it lies in with its submission, a hand-out over it before that
+submission has completed is a violation, and one source in 64 has its bytes
+hashed when it is taken and again when its submission has completed. A
+violation sends every copy-back back to a CPU copy for the rest of the run. A
+source no hand-out holds, one an earlier version covers, one while the heap's
+snapshots are off or after their guards tripped, and any with window imports
+take today's copy, counted by reason. `BBHOST_GXVK_HEAP_COPY=compare` copies
+as today, runs the proof over the sources as 1 would, and compares each
+version with its source at its batch.
+
 ## Tools
 
 | Tool | What it does |

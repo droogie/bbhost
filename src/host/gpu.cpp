@@ -12610,6 +12610,13 @@ struct CopyVersion {
     DevBuffer copy;  // its map is the bytes
     VkDeviceSize offset = 0;
     Located canon;   // where they belong
+    // Stage 1d.2a (BBHOST_GXVK_HEAP_COPY): the source in GX's upload heap. With
+    // `heap` the version is that range itself - `copy` its import, its map the
+    // guest bytes - held by the arena's release proof until this submission has
+    // completed; with =compare (`check`) the copy is today's and is compared
+    // with the source at the batch.
+    std::uint64_t src = 0;
+    bool heap = false, check = false;
 };
 std::vector<CopyVersion> g_copy_versions;  // under g.mu: the pending ones, oldest first
 // The same by destination, for lookups at every binding: a scan of the list
@@ -12692,12 +12699,13 @@ bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi
 
 bool copy_versions_name_buffer_locked(VkBuffer buffer) {
     for (const CopyVersion& v : g_copy_versions) {
-        if (v.canon.buffer == buffer) return true;
+        if (v.canon.buffer == buffer || (v.heap && v.copy.buffer == buffer)) return true;  // (a heap version reads its import, 1d.2a)
     }
     return false;
 }
 
-int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
+int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src) {
+    if (heap_src) *heap_src = 0;
     if (g_copy_versions.empty() || !bytes) return kCopyVersionNone;
     const CopyVersion* v = copy_version_over(base, bytes);
     if (!v) return kCopyVersionNone;
@@ -12709,6 +12717,7 @@ int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located*
         *out = {v->copy.buffer, v->offset + (base - v->dst), v->bytes - (base - v->dst)};
         g_cv_bound.fetch_add(1, std::memory_order_relaxed);
     }
+    if (heap_src && (v->heap || v->check)) *heap_src = v->src + (base - v->dst);
     return kCopyVersionInside;
 }
 
@@ -12747,17 +12756,49 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     // holding all of it, else guest memory. Part of one: the GPU copy, after
     // the pass's own copies.
     const auto* from = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(src));
-    if (const CopyVersion* v = copy_version_over(src, bytes)) {
-        if (src < v->dst || src + bytes > v->dst + v->bytes) return refuse(kCvSource);
-        from = static_cast<const std::uint8_t*>(v->copy.map) + (src - v->dst);
+    const CopyVersion* earlier = copy_version_over(src, bytes);
+    if (earlier) {
+        if (src < earlier->dst || src + bytes > earlier->dst + earlier->bytes) return refuse(kCvSource);
+        from = static_cast<const std::uint8_t*>(earlier->copy.map) + (src - earlier->dst);
         bump(g_cv_from_version);
     }
     CopyVersion v;
     v.dst = dst;
     v.bytes = bytes;
     v.canon = canon;
-    if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
-    std::memcpy(v.copy.map, from, bytes);
+    // A source in GX's upload heap (stage 1d.2a, BBHOST_GXVK_HEAP_COPY=1): the
+    // version is the source range itself, in the heap's import - no staging, no
+    // copy - once the arena holds it: GX hands it out again only after this
+    // submission, which the batch's copy and the home's draws are recorded in,
+    // has completed (proven per run). With =compare the copy is made as today
+    // and checked against the source at the batch. Anything else, or a source
+    // the arena does not hold: today's copy (heap_copy_decide counts why).
+    if (gxvk::heap_copy_wanted()) {
+        Located s;
+        // (Whole spans only: with window imports locate would import a window
+        // of the heap for it.)
+        if (!earlier && imports_whole()) s = locate(src, bytes);
+        const int why = gxvk::heap_copy_decide(src, bytes, gxvk::heap_copy_ring(), earlier != nullptr, s.buffer && s.avail >= bytes);
+        if (why == gxvk::kHeapCopyFast) {
+            const bool held = gxvk::arena_hold(src, bytes, g.flushes);
+            gxvk::heap_copy_held(held, bytes);
+            v.src = src;
+            if (held && gxvk::heap_copy_mode() == gxvk::HeapCopy::kOn) {
+                v.heap = true;
+                v.copy = DevBuffer{};
+                v.copy.buffer = s.buffer;
+                v.copy.map = const_cast<std::uint8_t*>(from);
+                v.copy.size = bytes;
+                v.offset = s.offset;
+            } else if (held) {
+                v.check = true;
+            }
+        }
+    }
+    if (!v.heap) {
+        if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
+        std::memcpy(v.copy.map, from, bytes);
+    }
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     gxvk::heap_written(gxvk::kHeapGuardCopyVersion, dst, bytes);  // a copy-back's destination is never GX's upload heap (stage 1d.1)
     copy_version_add(v);
@@ -12772,6 +12813,12 @@ void copy_versions_flush_locked() {
     begin_recording_locked();  // made between recordings, their copies go in the next
     std::vector<CopyVersion> pending;
     pending.swap(g_copy_versions);
+    // BBHOST_GXVK_HEAP_COPY=compare: a version from the heap, copied as today,
+    // must still hold its source's bytes now - the batch is where =1 reads them.
+    for (const CopyVersion& v : pending) {
+        if (v.check && std::memcmp(v.copy.map, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(v.src)), v.bytes) != 0)
+            gxvk::heap_copy_changed(v.src, v.bytes);
+    }
     g_cv_sorted.clear();
     g_cv_lo = ~0ull;
     g_cv_hi = 0;
@@ -12833,7 +12880,8 @@ std::string copy_versions_report() {
                   "copy versions: %llu made (%llu read an earlier one), %llu bindings took one, %llu bindings across one's edge, "
                   "%llu copies refused (size %llu, surfaces %llu, targets %llu, not imported %llu, source %llu, other %llu); "
                   "%llu copies into place in %llu batches (%llu versions all overwritten by newer ones), of them early for a binding "
-                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu, a twin let go %llu; "
+                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu, a twin let go %llu, "
+                  "a binding over 1 MiB of a version from the upload heap %llu; "
                   "%llu transfers waited for an earlier one in their batch",
                   static_cast<ull>(g_cv_made.load()), static_cast<ull>(g_cv_from_version.load()), static_cast<ull>(g_cv_bound.load()),
                   static_cast<ull>(g_cv_straddled.load()), static_cast<ull>(g_cv_refused.load()), static_cast<ull>(g_cv_refused_why[kCvSize].load()),
@@ -12843,7 +12891,7 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_batches.load()), static_cast<ull>(g_cv_overwritten.load()), static_cast<ull>(g_cv_put[kCvStraddle].load()),
                   static_cast<ull>(g_cv_put[kCvPageTable].load()), static_cast<ull>(g_cv_put[kCvWalks].load()),
                   static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_cv_put[kCvPutTwin].load()),
-                  static_cast<ull>(g_batch_orders.load()));
+                  static_cast<ull>(g_cv_put[kCvHeapWide].load()), static_cast<ull>(g_batch_orders.load()));
     return b;
 }
 
