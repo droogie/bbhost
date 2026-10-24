@@ -1028,7 +1028,10 @@ const char* const kName[kClasses] = {"a GX image's first upload", "a GX image's 
                                      "memory no live GX resource owns", "a batch's"};
 std::atomic<std::uint64_t> g_waits[kClasses] = {};
 inline bool on() {
-    static const bool v = gxvk::census();
+    static const bool v = gxvk::census() || [] {  // and stage 2's census (BBHOST_GXVK_IMAGES=census)
+        const char* e = std::getenv("BBHOST_GXVK_IMAGES");
+        return e && std::strcmp(e, "census") == 0;
+    }();
     return v;
 }
 void blocked(Class c) {
@@ -1396,9 +1399,17 @@ Surface* g_last_view_surface = nullptr;
 // owns, a target's image or a snapshot (no texture surface), or no view at all; with the distinct surfaces of each.
 // And every surface refresh by the way it ended: what a handle to an image nobody writes would skip.
 namespace img_census {
-// (Asked at the first use: gxvk_census.cpp's flags are another file's static.)
+// (Asked at the first use: gxvk_census.cpp's flags are another file's static.) BBHOST_GXVK_IMAGES=census asks for it
+// too, with stage 2's classes (s2 below) beside 2a's.
+inline bool images_census() {
+    static const bool v = [] {
+        const char* e = std::getenv("BBHOST_GXVK_IMAGES");
+        return e && std::strcmp(e, "census") == 0;
+    }();
+    return v;
+}
 inline bool on() {
-    static const bool v = gxvk::census();
+    static const bool v = gxvk::census() || images_census();
     return v;
 }
 enum Class : int { kImmutable, kGpuWritten, kCpuRewritten, kNotGx, kNoSurface, kNoView, kClasses };
@@ -1415,6 +1426,16 @@ const char* const kRefreshName[kRefreshes] = {"already this recording", "GX mapp
                                               "checked too recently", "by identity, written by the GPU: skipped",
                                               "registered and watched: skipped", "hashed or uploaded"};
 std::atomic<std::uint64_t> g_refresh[kRefreshes] = {};
+// Stage 2's census (BBHOST_GXVK_IMAGES=census): each image binding by what stage 2 would bind it from - a GX texture
+// made with initial data (its content known at creation), a GX render or depth target (sampled), a GX texture the
+// GPU wrote (a UAV's, a copy's destination), another GX texture (filled after creation, by uploads), the middleware's
+// or the engine's T# (no GX view), or nothing GX made - and by whether the view itself was seen made (bound by its id).
+enum S2 : int { kS2Initial, kS2Target, kS2Gpu, kS2Other, kS2Middleware, kS2NotSeen, kS2Classes };
+const char* const kS2Name[kS2Classes] = {"a GX texture made with initial data", "a GX render or depth target", "a GX texture the GPU wrote",
+                                         "another GX texture", "the middleware's or the engine's T#", "nothing GX made"};
+std::atomic<std::uint64_t> g_s2[kS2Classes] = {}, g_s2_by_id[kS2Classes] = {};
+std::atomic<std::uint64_t> g_s2_targets[2][2] = {};  // [colour, depth][by a GX view seen made, by address]
+std::atomic<std::uint64_t> g_s2_target_memo[2][2] = {};  // [colour, depth][by a GX view seen made, by address]: the slot memo answered
 inline void refreshed(Refresh r) {
     if (on()) g_refresh[r].fetch_add(1, std::memory_order_relaxed);
 }
@@ -3170,6 +3191,21 @@ void textures_census_binding(int source, VkImageView view) {
     using namespace img_census;
     if (!on() || source < 0 || source > 2) return;
     const Surface* sf = view ? g_last : nullptr;
+    if (images_census()) {
+        S2 c2 = kS2NotSeen;
+        if (source == 2) {
+            c2 = kS2Middleware;
+        } else if (sf && sf->gx_registered) {
+            GxResourceInfo info;
+            const bool known = gx_resource_at(sf->gx_memory, 1, &info) && info.gen == sf->gx_gen;
+            c2 = known && (info.bind & 0x60) ? kS2Target  // D3D11's render-target (0x20) and depth-stencil (0x40) binds
+                 : sf->gpu_written || sf->cp_dirty || sf->copied_mips ? kS2Gpu
+                 : known && info.initial_data ? kS2Initial
+                                              : kS2Other;
+        }
+        g_s2[c2].fetch_add(1, std::memory_order_relaxed);
+        if (source == 0) g_s2_by_id[c2].fetch_add(1, std::memory_order_relaxed);
+    }
     const Class c = !view                                             ? kNoView
                     : !sf                                             ? kNoSurface
                     : !sf->gx_registered                              ? kNotGx
@@ -3213,6 +3249,46 @@ void textures_census_report() {
         pw += b;
     }
     host_log("gxvk census: texture prep waits that blocked, by surface: %s", pw.c_str());
+    if (images_census()) {
+        std::uint64_t total = 0, by_id = 0, gx = 0;
+        for (int c = 0; c < kS2Classes; ++c) total += g_s2[c].load(), by_id += g_s2_by_id[c].load();
+        for (int c = kS2Initial; c <= kS2Other; ++c) gx += g_s2[c].load();
+        std::string by;
+        for (int c = 0; c < kS2Classes; ++c) {
+            char b[200];
+            std::snprintf(b, sizeof b, "%s%s %llu (%.1f%%; by a view seen made %llu)", c ? "; " : "", kS2Name[c],
+                          static_cast<unsigned long long>(g_s2[c].load()), total ? 100.0 * static_cast<double>(g_s2[c].load()) / static_cast<double>(total) : 0.0,
+                          static_cast<unsigned long long>(g_s2_by_id[c].load()));
+            by += b;
+        }
+        const std::uint64_t tc_gx = g_s2_targets[0][0].load(), tc_addr = g_s2_targets[0][1].load(), td_gx = g_s2_targets[1][0].load(),
+                            td_addr = g_s2_targets[1][1].load();
+        const std::uint64_t targets = tc_gx + tc_addr + td_gx + td_addr;
+        std::uint64_t gx_by_id = 0;
+        for (int c = kS2Initial; c <= kS2Other; ++c) gx_by_id += g_s2_by_id[c].load();
+        host_log("render: stage 2 census (BBHOST_GXVK_IMAGES=census): image bindings %llu: %s", static_cast<unsigned long long>(total), by.c_str());
+        host_log("render: stage 2 census: targets bound %llu - colour through a GX render-target view seen made %llu, by address %llu; depth "
+                 "through a GX depth-stencil view seen made %llu, by address %llu; image bindings and targets from GX objects seen created "
+                 "%.1f%% (views seen made and GX resources %.1f%% of the bindings, %.1f%% counting only views bound by their id; targets "
+                 "through a GX view %.1f%%)",
+                 static_cast<unsigned long long>(targets), static_cast<unsigned long long>(tc_gx), static_cast<unsigned long long>(tc_addr),
+                 static_cast<unsigned long long>(td_gx), static_cast<unsigned long long>(td_addr),
+                 total + targets ? 100.0 * static_cast<double>(gx_by_id + tc_gx + td_gx) / static_cast<double>(total + targets) : 0.0,
+                 total ? 100.0 * static_cast<double>(gx) / static_cast<double>(total) : 0.0,
+                 total ? 100.0 * static_cast<double>(gx_by_id) / static_cast<double>(total) : 0.0,
+                 targets ? 100.0 * static_cast<double>(tc_gx + td_gx) / static_cast<double>(targets) : 0.0);
+        host_log("render: stage 2 census: targets the slot memo answered - colour through a GX view %llu, by address %llu; depth through a "
+                 "GX view %llu, by address %llu",
+                 static_cast<unsigned long long>(g_s2_target_memo[0][0].load()), static_cast<unsigned long long>(g_s2_target_memo[0][1].load()),
+                 static_cast<unsigned long long>(g_s2_target_memo[1][0].load()), static_cast<unsigned long long>(g_s2_target_memo[1][1].load()));
+    }
+}
+// Stage 2's census: a target the draw binds - colour (0) or depth (1) - whether a GX view seen made names it, and
+// whether target_image's slot memo answered (a miss is the lookup by address a handle would replace).
+void textures_census_target(int depth, bool gx_view, bool memo_hit) {
+    if (!img_census::images_census()) return;
+    img_census::g_s2_targets[depth ? 1 : 0][gx_view ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    if (memo_hit) img_census::g_s2_target_memo[depth ? 1 : 0][gx_view ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 }
 
 std::string texture_view_by_id_report() {

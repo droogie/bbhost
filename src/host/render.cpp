@@ -2232,6 +2232,7 @@ const int g_view_extents = [] {
 }();
 std::uint64_t g_extent_used = 0, g_extent_guessed = 0, g_extent_checked = 0, g_extent_disagree = 0;  // under g.mu
 std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws from the GX texture at the target
+bool g_target_memo_hit = false;  // whether target_image's last answer came from its slot's memo (stage 2's census)
 
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
@@ -2250,8 +2251,10 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         if (res_gen) ++g_draw_gen_same;
         apply_pending_clear(*m.rt);
         rt_written(*m.rt);
+        g_target_memo_hit = true;
         return m.rt;
     }
+    g_target_memo_hit = false;
     std::uint32_t w = 0, h = 0;
     // No view to take it from (YEBIS's draws, the wrapper's): the live GX
     // texture that begins at the target's memory says its size - the game's
@@ -12377,7 +12380,10 @@ bool key_stage_matches(const gcn::TranslateResult& meta, const gcn::TranslateRes
 
 void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t* stage_user, StageImages& out,
                            const GxStageRecords* gx, const KeyStage* resolved) {
-    static const bool census_images = gxvk::census();  // stage 2a's census (textures_census_binding)
+    static const bool census_images = gxvk::census() || [] {  // stage 2a's census (textures_census_binding), and stage 2's
+        const char* e = std::getenv("BBHOST_GXVK_IMAGES");
+        return e && std::strcmp(e, "census") == 0;
+    }();
     out.images.resize(meta.images.size());
     const GxStagePlan* plan = gx && g_binding_plans && g_view_by_id ? &stage_plan(meta, *gx) : nullptr;
     for (std::size_t k = 0; k < meta.images.size(); ++k) {
@@ -18226,6 +18232,7 @@ static bool draw_impl(const GpuDraw& d) {
         s.color[t] = target_image(t, base, fmt, pitch, padded_h, scissor_right, scissor_bottom, false, layers,
                                   static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t],
                                   target_gen(d, in.color_gen[t]));
+        textures_census_target(0, in.color_gen[t] != 0, g_target_memo_hit);
         s.color_layer[t] = slice_start;
         if (layers > 1) {
             static std::set<std::uint64_t> logged;
@@ -18303,6 +18310,7 @@ static bool draw_impl(const GpuDraw& d) {
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
                                        static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen));
+                textures_census_target(1, in.depth_gen != 0, g_target_memo_hit);
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;

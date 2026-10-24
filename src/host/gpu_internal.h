@@ -1684,6 +1684,9 @@ void texture_view_by_id_prefetch(std::uint32_t id);
 // none), classed by the surface the lookup found; counted, and reported with textures_report.
 void textures_census_binding(int source, VkImageView view);
 void textures_census_report();
+// Stage 2's census (BBHOST_GXVK_IMAGES=census): a target a draw binds, colour or depth, and whether a GX view the
+// registry saw made names it (its resource's generation known), and whether target_image's slot memo answered.
+void textures_census_target(int depth, bool gx_view, bool memo_hit);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
