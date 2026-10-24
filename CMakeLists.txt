@@ -389,6 +389,19 @@ if(UNIX)
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
     set_tests_properties(debug_menu_strings_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  if(Vulkan_FOUND)
+    # Production stage allocation/caller with synthetic Vulkan entry points;
+    # dead GPU paths are discarded, so no Vulkan loader or device is needed.
+    add_executable(stage_chunk_test tests/stage_chunk_test.cpp src/host/gpu_memtrack.cpp)
+    target_include_directories(stage_chunk_test PRIVATE src)
+    target_link_libraries(stage_chunk_test PRIVATE Vulkan::Headers)
+    target_compile_options(stage_chunk_test PRIVATE -ffunction-sections -fdata-sections -Wno-missing-field-initializers)
+    target_link_options(stage_chunk_test PRIVATE -Wl,--gc-sections)
+    foreach(case success create create-poison missing-type allocate allocate-poison bind bind-host limit given-back caller-bind)
+      add_test(NAME stage_chunk_${case} COMMAND stage_chunk_test ${case})
+      set_tests_properties(stage_chunk_${case} PROPERTIES ENVIRONMENT "BBHOST_BUFFER_SHADOW=1")
+    endforeach()
+  endif()
   # The map-validation probe's tour steps (tools/area_check.py's) on a pretend
   # host. Built beside the tests, never into plugins/, where bbhost would load it.
   add_library(mapval_probe MODULE tools/mapval_plugin.c)

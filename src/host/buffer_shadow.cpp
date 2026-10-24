@@ -350,21 +350,26 @@ void stage_release_slot(int slot) {
 
 bool new_stage_chunk(StageChunk& c) {
     if (g_stage_chunks >= kStageMaxChunks || g_given_back) return false;
+    StageChunk made;  // publish only after every acquisition, including binding, succeeds
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = kStageChunkBytes;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-    if (vkCreateBuffer(g.device, &bci, nullptr, &c.buffer) != VK_SUCCESS) return false;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &made.buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
+    vkGetBufferMemoryRequirements(g.device, made.buffer, &req);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS) {
-        vkDestroyBuffer(g.device, c.buffer, nullptr);
-        c = StageChunk{};
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &made.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(g.device, made.buffer, nullptr);
         return false;
     }
-    vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
+    if (vkBindBufferMemory(g.device, made.buffer, made.memory, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(g.device, made.buffer, nullptr);
+        vkFreeMemory(g.device, made.memory, nullptr);
+        return false;
+    }
+    c = made;
     ++g_stage_chunks;
     return true;
 }
