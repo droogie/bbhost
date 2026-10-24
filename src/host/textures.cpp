@@ -4198,7 +4198,7 @@ void textures_relocate_pinned_locked() {
     g_relocated_bytes += moved;
     static int logs = 0;
     if (n && logs++ < 8)
-        host_log("texture: %llu surface(s) the GPU wrote (%llu KiB) moved out of the textures' image heap block %d into the targets' room, "
+        host_log("texture: %llu surface(s) the GPU wrote (%llu KiB) moved out of image heap block %d into the targets' room, "
                  "so it can drain (BBHOST_HEAP_RELOCATE=0 leaves them)",
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(moved >> 10), block);
 }
@@ -4311,6 +4311,20 @@ void drain_texture_blocks_locked() {
     }
 }
 
+bool textures_relocate_block_locked(int block) {
+    if (!relocate_on() || block < 0 || (g_relocate_block >= 0 && g_relocate_block != block)) return false;
+    std::uint64_t pinned = 0;
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.memory.block != block || surface_in_host(sf) || !(sf.gpu_written || sf.copied_mips || sf.failed)) continue;
+        if (sf.failed) return false;  // made by no copy: it cannot move
+        pinned += sf.memory.size;
+    }
+    if (pinned > (32ull << 20)) return false;
+    if (g_relocate_block != block) ++g_relocate_named;
+    g_relocate_block = block;
+    return true;
+}
+
 bool textures_block_pinned_locked(int block) {
     for (const auto& [base, sf] : g_surfaces) {
         if (sf.image && sf.memory.block == block && !surface_in_host(sf) && (sf.gpu_written || sf.copied_mips || sf.failed)) return true;
@@ -4368,7 +4382,7 @@ std::string textures_relocate_report() {
     if (!g_relocate_named) return {};
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "; textures' blocks named for their GPU-written surfaces to move %llu: moved %llu (%llu KiB), no room for one %llu, one still "
+                  "; image heap blocks named for their GPU-written surfaces to move %llu: moved %llu (%llu KiB), no room for one %llu, one still "
                   "uploading or failed %llu",
                   static_cast<unsigned long long>(g_relocate_named), static_cast<unsigned long long>(g_relocated),
                   static_cast<unsigned long long>(g_relocated_bytes >> 10), static_cast<unsigned long long>(g_relocate_no_room),

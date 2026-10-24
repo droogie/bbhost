@@ -737,6 +737,10 @@ sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. Both ends' hand-outs are records: while only the
 start's were, memory the top end took back after the load into Old Yharnam
 read as a stale record's, and the proof stopped in two of four runs.
+A submission counts as completed for the proof from just before its labels
+land, not after: GX hands a range out again the moment it reads the label,
+which can come before bbhost has counted the labels in memory, and counted
+after, such a reuse read as early in one of four runs at Old Yharnam.
 `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
 Moving the heap into video memory the CPU writes was tried and dropped
@@ -751,6 +755,40 @@ Yharnam from 105.2 to 31.6, and 31-34 fps at 60 - because the CPU reads the
 heap too - bbhost's copies of GX's renamed buffers and the game's main
 thread - and the CPU reads video memory at about 30 MB/s. The heap stays in
 host memory, where `=1` binds it.
+
+**The heap's constant buffers, snapshotted with no lookups (on by default;
+`BBHOST_GXVK_HEAP_SNAP=0` keeps today's path).** On a discrete GPU, binding
+the heap in place has the shaders read those constant buffers from host
+memory across the bus, where today's copies sit in video memory, so the GPU
+took 0.2-0.3 ms a flip more uncapped at Old Yharnam and the Nightmare of
+Mensis; and on the Steam Deck, where nothing crosses a bus, binding in place
+measured no faster than the snapshots once a snapshotted constant buffer took
+no import lookup. What is left to take away is the lookups a snapshot still
+asks before its copy: whether a copy-back is still in a copy version over the
+range, whether a device-local twin holds it, whether a GPU write is still to
+land on it, and whether it is mapped. For the heap the answers are known - it
+is a copy-back's source and never its destination, no GX buffer's own memory
+lies in it, the GPU writes nothing there, and it is mapped for the session -
+so a binding there takes the snapshot with those answers: the same copy of
+the same bytes into the same ring, shared within a recording as before. It is
+the shape Dark Souls III's PC renderer has on the same engine: its material
+constant buffers are updated with `UpdateSubresource` just before they are
+bound, so Direct3D 11 copies the bytes at the call into the driver's own copy
+in video memory. The answers are watched where they could change, not at each
+binding: a GPU write noted over the heap, a copy version made into it, a twin
+made over it, its memory unmapped. The first such event is said in the log,
+and from it on every binding of the heap asks the lookups again; in the
+command processor's order it comes before any binding that could see it.
+`BBHOST_GXVK_HEAP_SNAP=compare` keeps today's path and checks each binding's
+lookups against the answers. The exit report counts the bindings that took
+the answers, the ones that did not by reason (stored to, empty or over 1 MiB,
+past the heap's end, a draw with CPU-written windows, snapshots off, a check
+that needs the lookups, no ring yet, after a trip), each guard, and with
+compare each disagreement. On an RTX 4070, uncapped, the command processor
+takes 0.46-0.49 ms a flip less at Old Yharnam, the Nightmare of Mensis and
+Central Yharnam, and Old Yharnam goes from 90.6 to 95.1 fps; at 60 it takes
+up to 0.55 ms a flip less, with the GPU's time, the frames and the frame
+pacing unchanged.
 
 ## Tools
 

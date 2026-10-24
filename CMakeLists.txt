@@ -153,6 +153,7 @@ add_executable(bbhost
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
   src/host/gxvk_arena.cpp
+  src/host/gxvk_heapsnap.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -557,11 +558,20 @@ if(UNIX)
   add_executable(flip_pacing_test tests/flip_pacing_test.cpp)
   target_include_directories(flip_pacing_test PRIVATE src)
   add_test(NAME flip_pacing_test COMMAND flip_pacing_test)
+  # The vertex clamp's lookup, only where its result is used (host/vertex_clamp.h).
+  add_executable(vertex_clamp_test tests/vertex_clamp_test.cpp)
+  target_include_directories(vertex_clamp_test PRIVATE src)
+  add_test(NAME vertex_clamp_test COMMAND vertex_clamp_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
   add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
   target_include_directories(gxvk_arena_test PRIVATE src)
   target_compile_definitions(gxvk_arena_test PRIVATE GXVK_ARENA_TESTING GXVK_ARENA_MUTANTS)
   add_test(NAME gxvk_arena_test COMMAND gxvk_arena_test)
+  # Stage 1d.1: the heap's constant buffers with the lookups' answers known - the choice and the writers' guards, with mutants.
+  add_executable(gxvk_heapsnap_test tests/gxvk_heapsnap_test.cpp src/host/gxvk_heapsnap.cpp)
+  target_include_directories(gxvk_heapsnap_test PRIVATE src)
+  target_compile_definitions(gxvk_heapsnap_test PRIVATE GXVK_HEAPSNAP_TESTING GXVK_HEAPSNAP_MUTANTS)
+  add_test(NAME gxvk_heapsnap_test COMMAND gxvk_heapsnap_test)
   add_executable(gxvk_watch_test tests/gxvk_watch_test.cpp)
   target_include_directories(gxvk_watch_test PRIVATE src)
   target_link_libraries(gxvk_watch_test PRIVATE Threads::Threads)

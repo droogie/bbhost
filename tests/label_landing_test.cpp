@@ -8,7 +8,8 @@
 // more everything lands, and so does what is added after; and with a producer,
 // a GPU and two landers racing, every label only ever moves forward and holds,
 // once its submission counts as landed, at least that submission's value, and
-// never a value whose submission has not run.
+// never a value whose submission has not run. landing() is past a submission
+// before any of its writes is stored, and landed() only after all of them.
 // Runs with BBHOST_LABEL_LANDING=1 (CMakeLists.txt).
 #include "host/label_landing.cpp"
 
@@ -43,7 +44,13 @@ std::uint64_t g_hole_lo = 0, g_hole_hi = 0;
 std::mutex g_order_mu;
 std::vector<std::uint64_t> g_order;
 bool g_keep_order = false;
+// The counts as each write of the watched address is stored.
+std::uint64_t g_watch = 0, g_watch_landing = 0, g_watch_landed = 0;
 bool mapped(std::uint64_t va, std::size_t bytes) {
+    if (va == g_watch) {
+        g_watch_landing = label_landing::landing();
+        g_watch_landed = label_landing::landed();
+    }
     if (va < g_hole_hi && va + bytes > g_hole_lo) return false;
     if (g_keep_order) {
         std::lock_guard<std::mutex> lk(g_order_mu);
@@ -86,16 +93,23 @@ int main() {
     alignas(8) static std::uint32_t labels[64] = {};
     alignas(8) static std::uint64_t markers[8] = {};
 
-    // Nothing lands before its submission has run.
+    // Nothing lands before its submission has run. landing() is past it
+    // before its writes are stored, landed() only after: the game may read a
+    // label the moment it is in memory.
     {
         const Write a[] = {w32(&labels[0], 1), w32(&labels[1], 2)};
         add(0, a, 2);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         CHECK(labels[0] == 0 && labels[1] == 0);
-        CHECK(landed() == 0);
+        CHECK(landed() == 0 && landing() == 0);
+        g_watch = va(&labels[1]);
         g_gpu.store(1);
         CHECK(landed_through(1));
         CHECK(labels[0] == 1 && labels[1] == 2);
+        CHECK(g_watch_landing == 1);  // counted before its labels were stored
+        CHECK(g_watch_landed == 0);   // landed() only after
+        CHECK(landing() == 1);
+        g_watch = 0;
     }
 
     // In order: within a submission (the last write to an address wins; a

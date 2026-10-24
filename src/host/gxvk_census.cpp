@@ -140,10 +140,12 @@ bool in_heap(std::uint64_t va, std::uint64_t bytes) {
            bytes <= g_heap.base + g_heap.bytes - va;
 }
 
-// The submissions whose work is done: the landing's count (labels in memory)
-// or the retirements', whichever is further.
+// The submissions whose work is done: the landing's count or the retirements',
+// whichever is further. The landing's count raised before their labels are in
+// memory (landing(), not landed()): GX hands a range out again as soon as it
+// reads its release label, which can be before landed() counts the submission.
 std::uint64_t done_submissions() {
-    return std::max<std::uint64_t>(label_landing::landed(), host_gpu_completed_submits_seen());
+    return std::max<std::uint64_t>(label_landing::landing(), host_gpu_completed_submits_seen());
 }
 
 // The class of a binding at `va` of a holder's buffer, from its class word.

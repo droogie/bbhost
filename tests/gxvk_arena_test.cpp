@@ -11,12 +11,14 @@
 // processor binds it. The arena must find the first early reuse (a range
 // handed out again over a binding whose submission has not completed) at the
 // hand-out that makes it and nothing before, in hand-outs that cover a
-// released range whole, in part, or several at once - and then stop: no
+// released range whole, in part, or several at once - and find nothing when
+// the counts raised after the labels land trail the one raised before (the
+// game reads a release label as soon as it is in memory) - and then stop: no
 // records kept, no hand-out recorded, every binding of the heap left to
 // today's path. It must refuse in-place binding to a range that runs past its
 // hand-out; and with every binding sampled (compare) it must find bytes
 // changed under a queued draw, and only those - a range handed out again is
-// rewritten as it should be. Then six deliberate mistakes, each of which
+// rewritten as it should be. Then seven deliberate mistakes, each of which
 // must be caught.
 // Built with GXVK_ARENA_TESTING and GXVK_ARENA_MUTANTS (CMakeLists.txt), as its arena is.
 #include "host/gxvk.h"
@@ -32,12 +34,18 @@ int g_arena_mutant = 0;
 
 // What the arena asks of the rest of bbhost.
 std::uint64_t g_completed = 0;  // submissions completed: those numbered below it
-std::uint64_t host_gpu_completed_submits_seen() { return g_completed; }
+// How far the counts raised once a submission's labels are in memory, or once
+// its slot retires, trail the landing's count, raised before the labels land.
+std::uint64_t g_lag = 0;
+std::uint64_t trailing() { return g_completed > g_lag ? g_completed - g_lag : 0; }
+std::uint64_t host_gpu_completed_submits_seen() { return trailing(); }
 namespace label_landing {
-std::uint64_t landed() { return 0; }
+std::uint64_t landing() { return g_completed; }
+std::uint64_t landed() { return trailing(); }
 }  // namespace label_landing
 namespace gxvk {
 bool census() { return false; }
+void heap_snap_region(std::uint64_t, std::uint64_t) {}  // stage 1d.1's (tests/gxvk_heapsnap_test.cpp)
 }  // namespace gxvk
 
 namespace {
@@ -214,6 +222,20 @@ int check_all(bool say) {
             std::printf("  clean run %llu: %ld hand-outs, %ld bindings (%ld in place, %ld past their range refused), no violation found\n",
                         static_cast<unsigned long long>(seed), r.handouts, r.bindings, r.in_place, r.straddles);
     }
+    // Clean, with the counts raised after the labels land trailing by up to three submissions: the
+    // game reuses a range as soon as its release label is in memory, so nothing is early.
+    for (std::uint64_t seed = 4; seed <= 5; ++seed) {
+        g_lag = 3;
+        const Result r = run(Arena::kInPlace, 60000, 0.0, 0.0, seed);
+        g_lag = 0;
+        const auto c = gxvk::arena_test_counts();
+        if (c.violations_order || c.violations_bytes) fail("a violation found where only the counts after the labels trailed", 0);
+        if (!c.in_place) fail("in place stopped where only the counts after the labels trailed", 0);
+        if (say)
+            std::printf("  clean run %llu, the counts after the labels three submissions behind: %ld hand-outs, %ld bindings (%ld in place), "
+                        "no violation found\n",
+                        static_cast<unsigned long long>(seed), r.handouts, r.bindings, r.in_place);
+    }
     // Early reuse: the first found at the hand-out that made it, and nothing before; then the arena stops.
     long made = 0, stopped = 0;
     for (std::uint64_t seed = 11; seed <= 16; ++seed) {
@@ -286,9 +308,10 @@ int main() {
     }
     static const char* const kMistake[] = {"", "a binding's stamp one submission short", "a hand-out over part of a record not checked",
                                            "a binding past its hand-out bound in place", "a sample checked after its range was handed out again",
-                                           "the heap's bounds test wrapping round above it", "the arena going on with its records after the proof failed"};
+                                           "the heap's bounds test wrapping round above it", "the arena going on with its records after the proof failed",
+                                           "the landing's count taken once the labels are in memory, not before"};
     int missed = 0;
-    for (int m = 1; m <= 6; ++m) {
+    for (int m = 1; m <= 7; ++m) {
         g_arena_mutant = m;
         g_quiet = true;
         const int bad = check_all(false);

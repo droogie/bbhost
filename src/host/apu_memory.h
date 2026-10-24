@@ -42,11 +42,33 @@ inline bool flag(const char* env, const char* config, bool fallback) {
 }
 
 // Part 1: upload staging over the floor goes back in play, a 64 MiB chunk
-// every two seconds once it has been over the floor for 30 s
+// every two seconds once the world has settled (staging_give_now)
 // (BBHOST_STAGING_RETURN, gpu.staging_return). Off by default: on an RTX 4070
 // each chunk's free stalled the frame it fell in (29-47 ms against 14-17).
 inline bool staging_return(const char* env, const char* config, int integrated, bool windows_host) {
     return flag(env, config, apu_defaults(integrated, windows_host));
+}
+
+// The world has settled once no loading screen is up and `settle_ms` have
+// passed since the latest load ended (BBHOST_CACHE_SETTLE_S). A load that
+// ends - `was_loading` to not `loading` at `now_ms` - restarts the count, so
+// a death or a lamp soon after an arrival starts it again.
+inline std::uint64_t latest_load_end(std::uint64_t latest_end_ms, bool was_loading, bool loading, std::uint64_t now_ms) {
+    return was_loading && !loading ? now_ms : latest_end_ms;
+}
+inline bool settled(std::uint64_t latest_end_ms, std::uint64_t now_ms, bool loading, std::uint64_t settle_ms) {
+    return latest_end_ms && !loading && now_ms >= latest_end_ms && now_ms - latest_end_ms >= settle_ms;
+}
+
+// Whether part 1 gives a chunk of staging back now: on, over the floor, the
+// world settled, and `pace_ms` since the last chunk unless video memory runs
+// short. Counted from the latest load's end, not from when staging went over
+// the floor: on the 680M a death within 30 s of an arrival had the frees fall
+// 7-10 s into the next arrival, while the area streams in and staging may
+// have to grow again - an allocation on the upload path.
+inline bool staging_give_now(bool on, std::uint64_t free_bytes, std::uint64_t floor, bool settled_now, bool reserve_short,
+                             std::uint64_t now_ms, std::uint64_t last_given_ms, std::uint64_t pace_ms) {
+    return on && free_bytes > floor && settled_now && (reserve_short || now_ms - last_given_ms >= pace_ms);
 }
 
 // Part 2: the caches' budget, in MiB of the device-local memory we hold; 0

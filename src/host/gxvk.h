@@ -228,6 +228,75 @@ enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending,
 void arena_note(ArenaNote what, std::uint64_t bytes);
 // The exit report (gx_resources_report calls it).
 void arena_report();
+// --- Stage 1d.1: the heap's constant buffers snapshotted with no lookups (host/gxvk_heapsnap.cpp) ---
+//
+// A constant buffer the game writes on the CPU is copied as its draw records
+// (render.cpp resolve_stage_buffers, BBHOST_CB_SNAPSHOT), and before the copy
+// the command processor asks four things of its range: whether a copy-back is
+// still in a copy version over it, whether a device-local twin holds it,
+// whether a GPU write is still to land on it, and whether it is mapped. For a
+// range in GX's upload heap the answers are known. The heap holds the renamed
+// copies the game writes on the CPU and nothing else: a copy-back's source,
+// never its destination; no GX buffer's own memory, so no twin; nothing the
+// GPU writes; mapped for the session. So such a binding takes the snapshot
+// with those answers instead of the lookups - the same copy of the same bytes
+// into the same ring as today's path. What could make an answer wrong is
+// watched where it would happen, not at each binding: a GPU write noted over
+// the heap, a copy version made into it, a twin made over it, its memory
+// unmapped (heap_written). The first such event is said once and counted, and
+// from it on every binding of the heap asks again - in the command processor's
+// order, so before any binding that could see what it did.
+// BBHOST_GXVK_HEAP_SNAP: unset or 1 (the default) the answers known; 0
+// today's path; compare: today's path, with each binding's lookups checked
+// against the known answers (counted by kind, the first few said).
+enum class HeapSnap : int { kOff = 0, kOn = 1, kCompare = 2 };
+HeapSnap heap_snap_mode();
+inline bool heap_snap_wanted() { return heap_snap_mode() != HeapSnap::kOff; }
+// A constant-buffer binding as the command processor has it, for the choice.
+struct HeapSnapCase {
+    std::uint64_t lo = 0, hi = 0;       // the heap's bounds (lo 0: not known yet)
+    std::uint64_t base = 0, bytes = 0;  // the binding's range
+    bool stored = false;                // the shader stores to it
+    bool windows = false;               // its draw has CPU-written windows (YEBIS)
+    bool snapshots = true;              // BBHOST_CB_SNAPSHOT is on
+    bool check = false;                 // a check that needs the lookups is on (the CB proof, the glitch watch)
+    bool ring = true;                   // the constant-buffer copies' ring is made
+    bool tripped = false;               // a guard has tripped this run
+};
+// The choice: kHeapSnapFast (the snapshot, the answers known), kHeapSnapNotHeap
+// (not the heap's: nothing to count), or why the binding takes the lookups.
+enum HeapSnapWhy : int {
+    kHeapSnapStored, kHeapSnapSize, kHeapSnapPastEnd, kHeapSnapWindows, kHeapSnapOff, kHeapSnapCheck, kHeapSnapNoRing, kHeapSnapTripped,
+    kHeapSnapWhys,
+    kHeapSnapFast = -1, kHeapSnapNotHeap = -2
+};
+int heap_snap_class(const HeapSnapCase& c);
+// At a constant buffer's binding (resolve_stage_buffers, the renderer's lock
+// held), with BBHOST_GXVK_HEAP_SNAP set: the choice for [base, +bytes), counted.
+// True: the binding takes the snapshot with the answers known (=1), or has its
+// lookups checked against them (compare).
+bool heap_snap_binding(std::uint64_t base, std::uint64_t bytes, bool stored, bool windows, bool snapshots, bool check, bool ring);
+// The writers': what would make an answer wrong for the heap's bindings. A
+// range that meets the heap trips the guard; anything else returns at once.
+enum HeapGuard : int { kHeapGuardGpuWrite, kHeapGuardCopyVersion, kHeapGuardTwin, kHeapGuardUnmap, kHeapGuards };
+void heap_written(HeapGuard what, std::uint64_t va, std::uint64_t bytes);
+// Compare: a lookup's answer, for a binding the choice took, that is not the known one.
+enum HeapSnapDiff : int { kHeapDiffCopyVersion, kHeapDiffTwin, kHeapDiffGpuWrite, kHeapDiffUnmapped, kHeapDiffs };
+void heap_snap_disagree(HeapSnapDiff what, std::uint64_t va, std::uint64_t bytes);
+// The heap's bounds are known (the pool's init, through arena_region): its first line.
+void heap_snap_region(std::uint64_t lo, std::uint64_t hi);
+// The exit report (gx_resources_report calls it).
+void heap_snap_report();
+#ifdef GXVK_HEAPSNAP_TESTING
+// tests/gxvk_heapsnap_test.cpp: everything forgotten, the mode and the heap set.
+void heap_snap_test_reset(HeapSnap mode, std::uint64_t lo, std::uint64_t hi);
+struct HeapSnapTestCounts {
+    std::uint64_t fast = 0, fell[kHeapSnapWhys] = {}, guards[kHeapGuards] = {}, diffs[kHeapDiffs] = {};
+    bool tripped = false;
+};
+HeapSnapTestCounts heap_snap_test_counts();
+#endif
+
 #ifdef GXVK_ARENA_TESTING
 // tests/gxvk_arena_test.cpp: everything forgotten, and the mode set.
 void arena_test_reset(Arena mode);

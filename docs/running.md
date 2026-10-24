@@ -261,8 +261,9 @@ all three are on by default on an integrated GPU under Windows (a 2048 MiB
 budget there) and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
   upload staging goes back down to 256 MiB in play, 64 MiB every two seconds
-  from 30 s after a load. The log gives each free's time and flip, and the
-  exit line `given back in play` their total.
+  from 30 s after the latest load (a death or a lamp starts the count again).
+  The log gives each free's time and flip, and the exit line `given back in
+  play` their total.
 - `BBHOST_CACHE_BUDGET_MB=<n>` (or `cache_budget_mb = <n>` under `[gpu]`): a
   budget for the video memory bbhost holds. Over it, textures are made at their
   first bind instead of ahead, those not bound for 20 s go, the textures'

@@ -1,8 +1,9 @@
 // What an integrated GPU gives back of the memory it holds in play
 // (host/apu_memory.h): the three parts' switches - the environment, then the
 // config, then the device's default, off everywhere until
-// kWindowsApuDefaults - and the budget, drain and spare arithmetic the memory
-// keeper and the textures' eviction and drain use.
+// kWindowsApuDefaults - the budget, drain and spare arithmetic the memory
+// keeper and the textures' eviction and drain use, and when the keeper gives
+// staging back (the world settled, counted from the latest load's end).
 #include "host/apu_memory.h"
 
 #include <cstdio>
@@ -116,6 +117,49 @@ void test_drain_and_spare() {
     CHECK(spare_play_blocks("0", false, false) == 0);
 }
 
+void test_staging_settle() {
+    // The world settles 30 s after the latest load's end, with no loading screen up.
+    constexpr std::uint64_t kSettle = 30000;
+    CHECK(!settled(0, 100000, false, kSettle));  // no load has ended yet
+    CHECK(!settled(10000, 39999, false, kSettle));
+    CHECK(settled(10000, 40000, false, kSettle));
+    CHECK(!settled(10000, 50000, true, kSettle));   // a loading screen is up
+    CHECK(!settled(50000, 40000, false, kSettle));  // a clock read before the end: not yet
+    // A load that ends restarts the count; one that begins, or no change, keeps it.
+    CHECK(latest_load_end(10000, true, false, 27000) == 27000);
+    CHECK(latest_load_end(0, true, false, 9000) == 9000);
+    CHECK(latest_load_end(10000, false, true, 26000) == 10000);
+    CHECK(latest_load_end(10000, false, false, 26000) == 10000);
+    CHECK(latest_load_end(10000, true, true, 26000) == 10000);
+    // The 680M's case: the world at 10 s, a death's loading screen from 26 to 28 s, staging over its floor all along.
+    // Counted from when staging went over the floor the frees began at 40 s, 12 s into the next arrival; counted
+    // from the latest load's end they wait until 58 s.
+    const std::uint64_t floor = 256 * kMiB, over = 768 * kMiB, pace = 2000;
+    std::uint64_t end = latest_load_end(0, true, false, 10000);
+    bool loading = false;
+    CHECK(!staging_give_now(true, over, floor, settled(end, 25000, loading, kSettle), false, 25000, 0, pace));
+    end = latest_load_end(end, loading, true, 26000);
+    loading = true;
+    CHECK(end == 10000);
+    CHECK(!staging_give_now(true, over, floor, settled(end, 27000, loading, kSettle), false, 27000, 0, pace));
+    end = latest_load_end(end, loading, false, 28000);
+    loading = false;
+    CHECK(end == 28000);
+    CHECK(!staging_give_now(true, over, floor, settled(end, 40000, loading, kSettle), false, 40000, 0, pace));
+    CHECK(!staging_give_now(true, over, floor, settled(end, 57999, loading, kSettle), false, 57999, 0, pace));
+    CHECK(staging_give_now(true, over, floor, settled(end, 58000, loading, kSettle), false, 58000, 0, pace));
+    // Then a chunk at a time, `pace` apart - sooner only when video memory runs short.
+    CHECK(!staging_give_now(true, over, floor, true, false, 59000, 58000, pace));
+    CHECK(staging_give_now(true, over, floor, true, true, 59000, 58000, pace));
+    CHECK(staging_give_now(true, over, floor, true, false, 60000, 58000, pace));
+    // Short of video memory is no reason to give it back before the world has settled.
+    CHECK(!staging_give_now(true, over, floor, false, true, 90000, 0, pace));
+    // Down to the floor and no further; off gives nothing back.
+    CHECK(!staging_give_now(true, floor, floor, true, false, 90000, 0, pace));
+    CHECK(staging_give_now(true, floor + 1, floor, true, false, 90000, 0, pace));
+    CHECK(!staging_give_now(false, over, floor, true, true, 90000, 0, pace));
+}
+
 }  // namespace
 
 int main() {
@@ -125,6 +169,7 @@ int main() {
     test_flag();
     test_budget();
     test_drain_and_spare();
+    test_staging_settle();
     if (g_fail) {
         std::printf("apu_memory_test: %d failed\n", g_fail);
         return 1;

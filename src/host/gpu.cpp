@@ -1061,6 +1061,98 @@ void install_import_locked(std::uint32_t index, Chunk* c) {
 }
 }  // namespace
 
+// ---- The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1; off, nothing is counted) ----
+// How long each import goes without a use - a binding, a device address, a
+// walk, a copy: every dmem_import that finds it - and what letting one go
+// after 60 s without a use would give back, against the imports it would
+// have had to make again: a use after such a gap is one, of its size, waited
+// for by whoever needed it (on a Radeon 680M 5-46 ms a 16 MiB window). Also
+// by game frames (1,800 and 3,600 flips: 30 and 60 s at 60 fps), for a run
+// slower than the game's own pace (lavapipe).
+namespace {
+std::int64_t steady_ms();  // below, beside the image heap
+const bool g_idle_census = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_IDLE_CENSUS");
+    return e && e[0] == '1';
+}();
+constexpr std::uint64_t kIdleLetGoMs = 60000;
+// Uses after a gap of 10-60 s, 60-120 s, 120 s or more: how many, and the imports' MiB.
+std::uint64_t g_idle_gap_n[3] = {}, g_idle_gap_bytes[3] = {};
+std::uint64_t g_idle_uses = 0;
+// Uses that letting go after 60 s (and after 1,800 / 3,600 flips) would have made imports again.
+std::uint64_t g_idle_again_n = 0, g_idle_again_bytes = 0, g_idle_again_f30_n = 0, g_idle_again_f30_bytes = 0, g_idle_again_f60_n = 0,
+              g_idle_again_f60_bytes = 0;
+// At the census reports: the live imports idle 60 s or more (and 3,600 flips or more), their sum (for the mean) and most.
+std::uint64_t g_idle_reports = 0, g_idle_over_sum = 0, g_idle_over_max = 0, g_idle_over_f_sum = 0, g_idle_over_f_max = 0;
+
+void idle_note_use_locked(Chunk& c) {
+    if (!g_idle_census) return;
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    if (c.used_ms) {
+        const std::uint64_t gap = now - c.used_ms, gapf = flip - c.used_flip;
+        if (gap >= 10000) {
+            const int b = gap < 60000 ? 0 : gap < 120000 ? 1 : 2;
+            ++g_idle_gap_n[b];
+            g_idle_gap_bytes[b] += c.size;
+        }
+        if (gap >= kIdleLetGoMs) {
+            ++g_idle_again_n;
+            g_idle_again_bytes += c.size;
+        }
+        if (gapf >= 1800) {
+            ++g_idle_again_f30_n;
+            g_idle_again_f30_bytes += c.size;
+        }
+        if (gapf >= 3600) {
+            ++g_idle_again_f60_n;
+            g_idle_again_f60_bytes += c.size;
+        }
+    }
+    ++g_idle_uses;
+    c.used_ms = now;
+    c.used_flip = flip;
+}
+}  // namespace
+
+// The census line (the video memory report and the exit report).
+std::string import_idle_report_locked() {
+    if (!g_idle_census) return {};
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    std::uint64_t live = 0, n = 0, under10 = 0, to60 = 0, over = 0, over_f = 0;
+    for (const DmemChunk& d : g.dmem) {
+        for (const auto& c : d.imports) {
+            live += c->size;
+            ++n;
+            const std::uint64_t idle = c->used_ms ? now - c->used_ms : 0;
+            (idle < 10000 ? under10 : idle < kIdleLetGoMs ? to60 : over) += c->size;
+            if (c->used_ms && flip - c->used_flip >= 3600) over_f += c->size;
+        }
+    }
+    ++g_idle_reports;
+    g_idle_over_sum += over;
+    g_idle_over_max = std::max(g_idle_over_max, over);
+    g_idle_over_f_sum += over_f;
+    g_idle_over_f_max = std::max(g_idle_over_f_max, over_f);
+    const auto mib = [](std::uint64_t b) { return static_cast<unsigned long long>(b >> 20); };
+    const double ms_per_mib = g_import_bytes.load() ? static_cast<double>(g_import_us.load()) / 1e3 / (static_cast<double>(g_import_bytes.load()) / (1 << 20)) : 0;
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf),
+                  "import idle census: live %llu MiB in %llu imports; idle now under 10 s %llu, 10-60 s %llu, 60 s or more %llu MiB (3,600 "
+                  "flips or more %llu MiB); at the %llu reports so far idle 60 s or more mean %llu, most %llu MiB (3,600 flips: mean %llu, "
+                  "most %llu); uses %llu, after a gap of 10-60 s %llu (%llu MiB), 60-120 s %llu (%llu MiB), 120 s or more %llu (%llu MiB); "
+                  "letting an import go after 60 s idle would have made %llu again (%llu MiB), after 1,800 flips %llu (%llu MiB), after 3,600 "
+                  "flips %llu (%llu MiB) - at this run's %.3f ms a MiB of the driver's time, %.0f ms",
+                  mib(live), static_cast<unsigned long long>(n), mib(under10), mib(to60), mib(over), mib(over_f),
+                  static_cast<unsigned long long>(g_idle_reports), mib(g_idle_over_sum / g_idle_reports), mib(g_idle_over_max),
+                  mib(g_idle_over_f_sum / g_idle_reports), mib(g_idle_over_f_max), static_cast<unsigned long long>(g_idle_uses),
+                  static_cast<unsigned long long>(g_idle_gap_n[0]), mib(g_idle_gap_bytes[0]), static_cast<unsigned long long>(g_idle_gap_n[1]),
+                  mib(g_idle_gap_bytes[1]), static_cast<unsigned long long>(g_idle_gap_n[2]), mib(g_idle_gap_bytes[2]),
+                  static_cast<unsigned long long>(g_idle_again_n), mib(g_idle_again_bytes), static_cast<unsigned long long>(g_idle_again_f30_n),
+                  mib(g_idle_again_f30_bytes), static_cast<unsigned long long>(g_idle_again_f60_n), mib(g_idle_again_f60_bytes), ms_per_mib,
+                  ms_per_mib * static_cast<double>(g_idle_again_bytes >> 20));
+    return buf;
+}
+
 const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes, bool past_end) {
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
@@ -1102,7 +1194,10 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     // refused with a lost device.
     if (in >= kChunkBytes || (!past_end && bytes > kChunkBytes - in)) return nullptr;
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
-    if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+    if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
+        idle_note_use_locked(*c);
+        return c;
+    }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
     if (in < d.span_lo || in >= reach || bytes > reach - in) return nullptr;  // not GPU-visible: the sink
     constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
@@ -1123,6 +1218,8 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     if (!c) return nullptr;
     note_import_asker_locked(c->size);
     install_import_locked(index, c);
+    if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
+    idle_note_use_locked(*c);
     return c;
 }
 
@@ -6761,8 +6858,8 @@ bool world_settled() {
         const char* e = std::getenv("BBHOST_CACHE_SETTLE_S");
         return (e && *e ? std::strtoull(e, nullptr, 10) : 30ull) * 1000;
     }();
-    const std::uint64_t ended = g_loading_ended_ms.load(std::memory_order_relaxed);
-    return ended && !loading_screen_now() && static_cast<std::uint64_t>(steady_ms()) - ended >= settle_ms;
+    return apu_memory::settled(g_loading_ended_ms.load(std::memory_order_relaxed), static_cast<std::uint64_t>(steady_ms()), loading_screen_now(),
+                               settle_ms);
 }
 bool cache_budget_pressing(std::uint64_t more) { return world_settled() && cache_over_budget(more); }
 std::uint64_t cache_budget_excess() { return apu_memory::excess(g_cache_budget.load(std::memory_order_relaxed), bb_memory_local_bytes()); }
@@ -7165,6 +7262,8 @@ std::string video_memory_report_locked(bool at_exit) {
                       "together at most %llu", peaks.c_str(), mib(device_peak));
         out += buf;
     }
+    // The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1).
+    if (const std::string idle = import_idle_report_locked(); !idle.empty()) out += "\n[bbhost]   " + idle;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
     out += buf;
@@ -7197,7 +7296,8 @@ std::string video_memory_report_locked(bool at_exit) {
 // image heap blocks, 7-9 ms, show no such frame). The staging made again at
 // the next load cost ~30 ms a chunk of pinning besides. BBHOST_STAGING_RETURN=1
 // (or gpu.staging_return = true; host/apu_memory.h) gives it back in play as
-// before: down to the floor after 30 s, a chunk every two seconds, each free
+// before: down to the floor once the world has settled (30 s after the latest
+// load, a death restarting the count), a chunk every two seconds, each free
 // timed for the exit report and logged with its flip.
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
@@ -7323,7 +7423,6 @@ void start_memory_reserve() {
                  staging_return ? ", given back to the start's in play (BBHOST_STAGING_RETURN, gpu.staging_return)"
                                 : ", kept in play (BBHOST_STAGING_RETURN=1 or gpu.staging_return = true gives it back)");
         make_staging(floor);
-        auto over_floor_since = std::chrono::steady_clock::time_point{};
         // One piece of memory goes back at a time, two seconds apart: freeing
         // half a gigabyte of upload staging in one go (eight vkFreeMemory of
         // pinned, mapped memory) stalled the frames behind it ~100 ms in every
@@ -7333,8 +7432,8 @@ void start_memory_reserve() {
         // MiB chunk every two seconds, a smaller one (BBHOST_STAGING_CHUNK_MB)
         // as much sooner: each vkFreeMemory is a stall in the driver that the
         // frame behind it can meet, and a smaller chunk's is shorter.
-        auto last_staging_given = std::chrono::steady_clock::time_point{};
-        const auto staging_pace = std::chrono::milliseconds(std::max<std::uint64_t>(250, 2000 * (staging_chunk_bytes() >> 20) / 64));
+        std::uint64_t last_staging_given_ms = 0;
+        const std::uint64_t staging_pace_ms = std::max<std::uint64_t>(250, 2000 * (staging_chunk_bytes() >> 20) / 64);
         bool was_loading = false;
         for (;;) {
             {
@@ -7386,7 +7485,8 @@ void start_memory_reserve() {
             }
             // In play: empty blocks above the spare go back after 10 s, one a
             // turn, two seconds apart (with BBHOST_STAGING_RETURN=1 also
-            // staging over the floor for 30 s, down to it, a chunk a turn).
+            // staging over the floor once the world has settled - 30 s after
+            // the latest load - down to it, a chunk a turn).
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
             DevBuffer scratch_gone;
@@ -7428,16 +7528,12 @@ void start_memory_reserve() {
                     g.scratch_free.pop_back();
                     g_scratch_returned.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (staging_return && g.staging_free_bytes > floor) {
-                    if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
-                    if (now - over_floor_since >= std::chrono::seconds(30) && (reserve_short || now - last_staging_given >= staging_pace) &&
-                        gone.empty() && !g.staging_free.empty()) {
-                        chunks.push_back(g.staging_free.back());
-                        g.staging_free_bytes -= g.staging_free.back().size;
-                        g.staging_free.pop_back();
-                    }
-                } else {
-                    over_floor_since = {};
+                if (apu_memory::staging_give_now(staging_return, g.staging_free_bytes, floor, world_settled(), reserve_short,
+                                                 static_cast<std::uint64_t>(steady_ms()), last_staging_given_ms, staging_pace_ms) &&
+                    gone.empty() && !g.staging_free.empty()) {
+                    chunks.push_back(g.staging_free.back());
+                    g.staging_free_bytes -= g.staging_free.back().size;
+                    g.staging_free.pop_back();
                 }
             }
             if (scratch_gone.buffer) {
@@ -7470,7 +7566,7 @@ void start_memory_reserve() {
                     ms_memory += std::chrono::duration<double, std::milli>(e - d).count();
                 }
                 last_given = std::chrono::steady_clock::now();
-                if (!chunks.empty()) last_staging_given = last_given;
+                if (!chunks.empty()) last_staging_given_ms = static_cast<std::uint64_t>(steady_ms());
                 if (!chunks.empty()) {
                     // Counted for the exit report (staging_pool_stats): what
                     // the frees cost is the question giving it back answers.
@@ -7535,6 +7631,16 @@ std::size_t g_copy_binding_next = 0;
 }  // namespace
 
 void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest) {
+    // Only the draw and dispatch captures ask (copy_binding_guest_locked).
+    // Written at every constant-buffer snapshot - ~4,300 a frame at the
+    // Nightmare of Mensis on a Steam Deck - its lines were among the command
+    // processor's cache misses there.
+    static const bool wanted = [] {
+        const char* d = std::getenv("BBHOST_CAPTURE_DRAW");
+        const char* c = std::getenv("BBHOST_CAPTURE_DISPATCH");
+        return (d && *d) || (c && *c);
+    }();
+    if (!wanted) return;
     g_copy_bindings[g_copy_binding_next++ % 64] = {info.buffer, info.offset, info.range, guest};
 }
 std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
@@ -9976,6 +10082,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
         g_twin_made.fetch_add(1, std::memory_order_relaxed);
         g_twin_made_bytes.fetch_add(nt.size, std::memory_order_relaxed);
         g_twin_live_bytes += nt.size;
+        gxvk::heap_written(gxvk::kHeapGuardTwin, memory, cbytes);  // GX's upload heap is no GX buffer's own memory (stage 1d.1)
         t = g_twin_live.emplace(memory, nt).first;
     }
     out.buffer = t->second.buffer;
@@ -10449,8 +10556,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
 }  // namespace gpu
 
 void host_gpu_set_loading(bool loading) {
-    if (gpu::g_loading_screen.exchange(loading) != loading) {
-        if (!loading) gpu::g_loading_ended_ms.store(static_cast<std::uint64_t>(gpu::steady_ms()), std::memory_order_relaxed);
+    if (const bool was = gpu::g_loading_screen.exchange(loading); was != loading) {
+        gpu::g_loading_ended_ms.store(apu_memory::latest_load_end(gpu::g_loading_ended_ms.load(std::memory_order_relaxed), was, loading,
+                                                                  static_cast<std::uint64_t>(gpu::steady_ms())),
+                                      std::memory_order_relaxed);
         gpu::g_keeper_cv.notify_one();
     }
     gpu::precompile_set_loading(loading);
@@ -11186,6 +11295,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
     std::memcpy(v.copy.map, from, bytes);
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
+    gxvk::heap_written(gxvk::kHeapGuardCopyVersion, dst, bytes);  // a copy-back's destination is never GX's upload heap (stage 1d.1)
     copy_version_add(v);
     bump(g_cv_made);  // not a locked add: that waits for the copy to leave the write-combining buffers
     return true;

@@ -105,7 +105,8 @@ fps_cap = 30
 # Memory bbhost keeps in play beyond what it draws with, for integrated GPUs
 # (where no video memory reserve trims it) and any GPU you want leaner:
 # - staging_return: the upload staging held from a load on (up to 768 MB) goes
-#   back down to 256 MB in play, 64 MB every two seconds from 30 s after a load.
+#   back down to 256 MB in play, 64 MB every two seconds from 30 s after the
+#   latest load (a death or a lamp starts the count again).
 # - cache_budget_mb: past this many MB of video memory held, textures are made
 #   when first drawn rather than ahead, unused ones go and the image heap
 #   drains sooner (0: no budget).

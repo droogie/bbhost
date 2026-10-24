@@ -7,11 +7,14 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
+#include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
+#include "host/label_landing.h"
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
 #include "host/shader_bundles.h"
+#include "host/vertex_clamp.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
@@ -967,15 +970,68 @@ struct VbWatch {
     std::uint32_t head[16];  // the first 64 bytes as recorded, for the change's report
     std::uint8_t cls;        // shadow_place_class_locked when recorded
     bool mirrored;           // a mirror served it (=2): a change is what in place would have raced
+    std::uint8_t why;        // why the mirrors left it in place (shadow_locate_why)
+    std::uint8_t hands;      // GX's hand-outs over its first page (shadow_hand_kinds_locked)
+    bool loading;            // recorded under a loading screen
+    std::uint64_t holder;    // the GX buffer the draw bound it by (0: not known)
+    std::uint64_t behind;    // submissions the GPU had still to finish when it was recorded
+    bool land_checked;       // hashed again just before its submission's labels landed (vb_race_before_land)
+    bool land_changed;       // and changed then
+    bool land_wanted;        // looked at then (BBHOST_VB_RACE_LAND)
 };
 const int g_vb_race_level = [] {
     const char* e = std::getenv("BBHOST_VB_RACE");
-    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+    return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0;
 }();
 const bool g_vb_race = g_vb_race_level != 0;
+// BBHOST_VB_RACE_LAND: which ranges are hashed again as their labels land
+// (vb_race_before_land). handed (the default): those on pages GX handed out,
+// rewritten, write-watched or untracked, the ones a hand-out can reach - a
+// told mesh is placed again at any told write, and hashing every mesh there
+// held the labels back (37 ms from submission to landing, against 0.55,
+// and the game's pace with them). all: every range. none: the command
+// processor's later check only, as before.
+const int g_vb_race_land = [] {
+    const char* e = std::getenv("BBHOST_VB_RACE_LAND");
+    if (e && std::strcmp(e, "all") == 0) return 2;
+    if (e && std::strcmp(e, "none") == 0) return 0;
+    return 1;
+}();
+// BBHOST_VB_RACE_LOG=all: every change gets its line (bounded), not only the
+// first 24 and then each power of two.
+const bool g_vb_race_log_all = [] {
+    const char* e = std::getenv("BBHOST_VB_RACE_LOG");
+    return e && (std::strcmp(e, "all") == 0 || e[0] == '1');
+}();
 // By [mirrored][class]: ranges checked and changed before their submission retired.
 std::uint64_t g_vb_class_checked[2][kPlaceClasses] = {}, g_vb_class_changed[2][kPlaceClasses] = {};
+// Ranges read in place by why the mirrors left them there, checked and changed.
+std::uint64_t g_vb_why_checked[kLocWhys] = {}, g_vb_why_changed[kLocWhys] = {};
+// And the changes by GX's hand-outs over them (shadow_hand_kinds_locked's bits), and under a loading screen.
+std::uint64_t g_vb_hands_changed[32] = {}, g_vb_loading_changed = 0, g_vb_loading_checked = 0;
+// Changes found after the draw's own labels were in memory (label_landing): GX
+// hands memory out again once a label behind its last use has landed, so such
+// a change may be a rightful reuse the check came too late to tell from a race.
+std::uint64_t g_vb_changed_late = 0;
+const char* const kLocWhyName[kLocWhys] = {"not asked", "a twin", "no mirror", "in place (told)", "across windows", "a mirror",
+                                           "host memory", "no room", "no window", "no import", "a GPU write pending", "no copy"};
+// =2: the mirror pages (64 KiB, by guest address; a range by its first 256) a
+// draw read from a mirror, and those that changed while the draw was queued -
+// what reading them in place, as an integrated GPU reads the meshes, would
+// have raced on; and the changed ranges' bytes. Bounded sets.
+std::unordered_set<std::uint64_t> g_vb_mirror_pages_read, g_vb_mirror_pages_changed;
+std::uint64_t g_vb_mirror_changed_bytes = 0;
+void vb_mirror_pages_note(std::unordered_set<std::uint64_t>& set, std::uint64_t va, std::uint64_t bytes) {
+    if (set.size() >= (1u << 20)) return;
+    const std::uint64_t p0 = va >> 16, p1 = (va + bytes - 1) >> 16;
+    for (std::uint64_t p = p0; p <= p1 && p < p0 + 256; ++p) set.insert(p);
+}
+// The ranges watched, in submission order. Under g_vb_mu as well as g.mu: the
+// label landing looks at them too (vb_race_before_land), from whichever
+// thread lands. g_vb_popped and g_vb_land_at count entries from the first.
 std::deque<VbWatch> g_vb_watch;
+std::mutex g_vb_mu;
+std::uint64_t g_vb_popped = 0, g_vb_land_at = 0, g_vb_land_checked = 0;
 std::uint64_t g_vb_checked = 0, g_vb_changed = 0, g_vb_changed_bytes = 0;
 std::uint64_t g_vb_gpu_written = 0;  // changed by a GPU write recorded with or after the draw: not a race
 std::map<std::string, std::uint64_t> g_vb_changed_by_pipeline;
@@ -1013,6 +1069,8 @@ std::uint64_t vb_race_hash_ends(std::uint64_t va, std::uint64_t bytes) {
 struct VbRaceRange {
     std::uint64_t va, bytes;
     bool mirrored;
+    std::uint8_t why;      // shadow_locate_why for the range
+    std::uint64_t holder;  // the GX buffer the draw bound it by
 };
 thread_local VbRaceRange t_vb_race_ranges[8];
 thread_local std::size_t t_vb_race_n = 0;
@@ -1062,20 +1120,54 @@ bool draw_last_vertex(std::int64_t& last) {
     return true;
 }
 
-bool vb_race_on() { return g_vb_race; }
-bool vb_race_mirrored_on() { return g_vb_race_level == 2; }
+// Before the labels of every submission before `completed` land - before GX
+// can be told those submissions have run and hand their memory out again -
+// each of their watched ranges is hashed again: a change then is the game
+// writing over bytes a queued draw read, never a rightful reuse the
+// command processor's own check, later, cannot tell from one.
+void vb_race_before_land(std::uint64_t completed) {
+    std::lock_guard<std::mutex> lk(g_vb_mu);
+    if (g_vb_land_at < g_vb_popped) g_vb_land_at = g_vb_popped;
+    while (g_vb_land_at < g_vb_popped + g_vb_watch.size()) {
+        VbWatch& w = g_vb_watch[static_cast<std::size_t>(g_vb_land_at - g_vb_popped)];
+        if (w.serial >= completed) break;
+        if (!w.land_wanted) {
+            ++g_vb_land_at;
+            continue;
+        }
+        w.land_checked = true;
+        w.land_changed =
+            hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
+        ++g_vb_land_at;
+    }
+}
 
-void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored) {
+bool vb_race_on() { return g_vb_race; }
+bool vb_race_mirrored_on() { return g_vb_race_level >= 2; }
+// =3: the census of every record and index range a mirror serves.
+bool vb_race_wide_on() { return g_vb_race_level == 3; }
+
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored, std::uint8_t why, std::uint64_t holder) {
     if (!g_vb_race) return;
+    static const bool hooked = [] {
+        if (label_landing::on() && g_vb_race_land) label_landing::set_before_land(&vb_race_before_land);
+        return true;
+    }();
+    (void)hooked;
     // Checked as soon as the timeline says their submission ran, not when its
     // slot comes round again (16 submissions on), by when the game may have
     // rewritten a ring the GPU was long done with.
-    if (!g_vb_watch.empty()) {
+    std::size_t watched = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_vb_mu);
+        watched = g_vb_watch.size();
+    }
+    if (watched) {
         std::uint64_t done = 0;
         if (g.timeline && vkGetSemaphoreCounterValue(g.device, g.timeline, &done) == VK_SUCCESS && done)
             vb_race_retired_locked(done - 1);
     }
-    if (!bytes || bytes > (16u << 20) || g_vb_watch.size() > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
+    if (!bytes || bytes > (16u << 20) || watched > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
     // Once a submission: a mesh's records are read by many of its draws.
     static std::uint64_t seen_key[4096], seen_serial[4096];
     const std::uint64_t key = va ^ (bytes << 40);
@@ -1089,10 +1181,18 @@ void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes
     w.bytes = bytes;
     w.mirrored = mirrored;
     w.cls = static_cast<std::uint8_t>(shadow_place_class_locked(va, bytes));
+    w.why = why < kLocWhys ? why : 0;
+    w.holder = holder;
+    w.loading = loading_screen_up();
+    w.behind = g.flushes > g.completed_submits ? g.flushes - g.completed_submits : 0;
+    w.hands = mirrored ? 0 : static_cast<std::uint8_t>(shadow_hand_kinds_locked(va));
+    w.land_wanted = g_vb_race_land == 2 || (g_vb_race_land == 1 && (w.hands != 0 || w.cls == kPlaceHanded || w.cls == kPlaceDynamic ||
+                                                                    w.cls == kPlaceWatched || w.cls == kPlaceUntracked));
     w.hash = mirrored ? vb_race_hash_ends(va, bytes) : vb_race_hash(va, bytes);
     std::memcpy(w.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), std::min<std::uint64_t>(bytes, sizeof(w.head)));
     w.flip = hle_video_flip_count();
     std::snprintf(w.name, sizeof(w.name), "%s", name);
+    std::lock_guard<std::mutex> lk(g_vb_mu);
     g_vb_watch.push_back(w);
 }
 
@@ -1111,6 +1211,35 @@ void vb_race_class_report() {
         }
     }
     if (!line.empty()) host_log("vb race: changed/checked by the pages' class:%s", line.c_str());
+    std::string why;
+    for (int k = 0; k < kLocWhys; ++k) {
+        if (!g_vb_why_checked[k]) continue;
+        char b[96];
+        std::snprintf(b, sizeof(b), "%s %s %llu/%llu", why.empty() ? "" : ",", kLocWhyName[k], static_cast<unsigned long long>(g_vb_why_changed[k]),
+                      static_cast<unsigned long long>(g_vb_why_checked[k]));
+        why += b;
+    }
+    if (!why.empty()) {
+        std::string hands;
+        for (int k = 0; k < 32; ++k) {
+            if (!g_vb_hands_changed[k]) continue;
+            char b[96];
+            std::snprintf(b, sizeof(b), " %s%s%s%s%s:%llu", k & 1 ? "M" : "", k & 2 ? "P" : "", k & 4 ? "R" : "", k & 8 ? "Y" : "", k & 16 ? "+out" : "",
+                          static_cast<unsigned long long>(g_vb_hands_changed[k]));
+            hands += k ? b : " none" + std::string(std::strchr(b, ':'));
+        }
+        host_log("vb race: read in place, changed/checked by why the mirrors left them there:%s; the changes by GX's hand-outs over them "
+                 "(M Map's renamed copies, P the pool, R the ring, Y YEBIS, +out a copy outstanding):%s; under a loading screen %llu/%llu; "
+                 "found after the draw's labels had landed (a rightful reuse the check may have come too late for) %llu; ranges hashed "
+                 "again as their labels landed %llu of %llu",
+                 why.c_str(), hands.c_str(), static_cast<unsigned long long>(g_vb_loading_changed),
+                 static_cast<unsigned long long>(g_vb_loading_checked), static_cast<unsigned long long>(g_vb_changed_late),
+                 static_cast<unsigned long long>(g_vb_land_checked), static_cast<unsigned long long>(g_vb_checked));
+    }
+    if (!g_vb_mirror_pages_read.empty())
+        host_log("vb race: mirror pages (64 KiB) draws read from a mirror %zu, of them changed while such a draw was queued %zu (the changed "
+                 "ranges %llu MiB) - what reading them in place would have raced on",
+                 g_vb_mirror_pages_read.size(), g_vb_mirror_pages_changed.size(), static_cast<unsigned long long>(g_vb_mirror_changed_bytes >> 20));
 }
 
 void vb_race_exit_report_locked() {
@@ -1124,26 +1253,70 @@ void vb_race_exit_report_locked() {
 
 void vb_race_retired_locked(std::uint64_t serial) {
     if (!g_vb_race) return;
-    while (!g_vb_watch.empty() && g_vb_watch.front().serial <= serial) {
-        const VbWatch& w = g_vb_watch.front();
+    for (;;) {
+        VbWatch w;
+        {
+            std::lock_guard<std::mutex> lk(g_vb_mu);
+            if (g_vb_watch.empty() || g_vb_watch.front().serial > serial) break;
+            w = g_vb_watch.front();
+            g_vb_watch.pop_front();
+            ++g_vb_popped;
+        }
         ++g_vb_checked;
-        const bool changed =
-            hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
+        if (w.land_checked) ++g_vb_land_checked;
+        // As its labels landed when the landing looked; else hashed now, and
+        // then too late to tell when the draw's labels have landed meanwhile.
+        const bool changed = w.land_checked ? w.land_changed
+                                            : hle_kernel_va_mapped(w.va, w.bytes) &&
+                                                  (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
         ++g_vb_class_checked[w.mirrored][w.cls < kPlaceClasses ? w.cls : 0];
+        if (w.mirrored) vb_mirror_pages_note(g_vb_mirror_pages_read, w.va, w.bytes);
+        if (!w.mirrored) {
+            ++g_vb_why_checked[w.why];
+            if (w.loading) ++g_vb_loading_checked;
+        }
         // A GPU write recorded with or after the draw (a simulation dispatch
         // rewriting its ring): the draw read before it in the GPU's order.
         if (changed && gpu_wrote_since_locked(w.va, w.bytes, w.serial)) {
             ++g_vb_gpu_written;
         } else if (changed && w.mirrored) {
             // The mirror's copy kept what the draw recorded: no race now, one
-            // in place - counted by class only.
+            // in place - counted by class, and the pages.
             ++g_vb_class_changed[1][w.cls < kPlaceClasses ? w.cls : 0];
+            vb_mirror_pages_note(g_vb_mirror_pages_changed, w.va, w.bytes);
+            g_vb_mirror_changed_bytes += w.bytes;
         } else if (changed) {
             ++g_vb_changed;
             g_vb_changed_bytes += w.bytes;
             ++g_vb_changed_by_pipeline[w.name];
             ++g_vb_class_changed[0][w.cls < kPlaceClasses ? w.cls : 0];
-            if (g_vb_changed <= 24 || (g_vb_changed & (g_vb_changed - 1)) == 0) {
+            ++g_vb_why_changed[w.why];
+            ++g_vb_hands_changed[w.hands & 31];
+            if (w.loading) ++g_vb_loading_changed;
+            const bool late = !w.land_checked && label_landing::on() && label_landing::landed() > w.serial;
+            if (late) ++g_vb_changed_late;
+            if (g_vb_race_log_all && g_vb_changed <= 20000) {
+                // One line a change: what it was, how far behind the GPU ran,
+                // what the shadow made of its pages and the GX buffer it is.
+                static const char* const kClass[kPlaceClasses] = {"no mirror's", "in place", "told", "handed out", "watched", "rewritten", "untracked"};
+                GxResourceInfo gi;
+                char buf[160] = "no GX buffer known";
+                if (w.holder && gx_resource_by_holder(w.holder, &gi))
+                    std::snprintf(buf, sizeof(buf), "GX %s %u, usage %u, bind 0x%x, %u bytes at 0x%llx, made at flip %llu",
+                                  gi.type == 1 ? "buffer" : "resource", gi.id, gi.usage, gi.bind, gi.bytes,
+                                  static_cast<unsigned long long>(gi.memory), static_cast<unsigned long long>(gi.created_flip));
+                else if (w.holder)
+                    std::snprintf(buf, sizeof(buf), "holder 0x%llx not in the registry", static_cast<unsigned long long>(w.holder));
+                host_log("vb race: changed %s 0x%llx +%llu, flip %llu -> %llu, submission %llu (%llu on, the GPU %llu behind when recorded)%s%s; "
+                         "%s, %s, hand-outs %s%s%s%s%s%s; %s",
+                         w.name, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes),
+                         static_cast<unsigned long long>(w.flip), static_cast<unsigned long long>(hle_video_flip_count()),
+                         static_cast<unsigned long long>(w.serial), static_cast<unsigned long long>(g.flushes - w.serial),
+                         static_cast<unsigned long long>(w.behind), w.loading ? ", loading" : "", late ? ", its labels landed before the check" : "",
+                         kClass[w.cls < kPlaceClasses ? w.cls : 0],
+                         kLocWhyName[w.why], w.hands ? "" : "none", w.hands & 1 ? "M" : "", w.hands & 2 ? "P" : "", w.hands & 4 ? "R" : "",
+                         w.hands & 8 ? "Y" : "", w.hands & 16 ? " (a copy outstanding)" : "", buf);
+            } else if (g_vb_changed <= 24 || (g_vb_changed & (g_vb_changed - 1)) == 0) {
                 host_log("vb race: draw %s's vertices 0x%llx (%llu bytes), recorded at flip %llu in submission %llu, changed before it "
                          "retired (flip %llu, %llu submissions on; %llu of %llu checked so far)",
                          w.name, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes),
@@ -1165,7 +1338,6 @@ void vb_race_retired_locked(std::uint64_t serial) {
                 host_log("vb race:   first 64 bytes:%s", diff.empty() ? " unchanged (past them)" : diff.c_str());
             }
         }
-        g_vb_watch.pop_front();
     }
     static std::uint64_t reported = 0;
     if (g_vb_checked - reported >= 2'000'000) {
@@ -1437,6 +1609,7 @@ void keep_params(const std::string& name, const gcn::StageParams& params, int st
 }
 std::atomic<std::uint64_t> g_cb_realigned{0}, g_cb_realigned_bytes{0};
 std::atomic<std::uint64_t> g_cb_snapshots{0};  // of them, memory the game writes on the CPU (BBHOST_CB_SNAPSHOT)
+bool g_cb_ring_made = false;  // the constant-buffer copies' ring is made (resolve_stage_buffers), under g.mu
 std::atomic<std::uint64_t> g_cb_snapshots_shared{0};  // bindings that took an earlier snapshot of the recording (BBHOST_CB_SNAPSHOT_DEDUPE)
 // BBHOST_CB_SNAPSHOT_DEDUPE=check / =compare: the bindings that found an
 // earlier snapshot of the recording and compared its bytes with the guest's,
@@ -10441,9 +10614,22 @@ bool rt_return_one_locked(RtImage& r) { return rt_remake_locked(r, false); }
 // nothing. Once a second while no load is on, 32 MiB of targets a turn; a
 // block not empty 30 s after its drain began is left as it is, and no other
 // drain begins for 30 s after one ends (a target the game makes again and
-// again would move each time).
+// again would move each time). A block that holds surfaces the GPU wrote, up
+// to 32 MiB of them, has them moved too (textures_relocate_block_locked, the
+// textures' drain's relocation; BBHOST_HEAP_RELOCATE=0 leaves such a block):
+// on an RTX 4070 held to a 4 GB card's budget (BBHOST_TEST_VRAM_MB=2950) the
+// Nightmare of Mensis's drain found its block so held four times, no block
+// went back, the mirrors stayed at 512 MiB while the draws asked for more,
+// and 16.8 million draws read their vertices across the bus: 53 fps
+// uncapped, the GPU at 18.5 ms a flip, against 90 when a block went back.
+// And while the mirrors are refused room (shadow_room_refusals_locked, as the
+// textures' drain takes its lean thresholds then), a block holding up to
+// 160 MiB is emptied for them, not only one holding 64: in another run there
+// the targets' 665 MiB of free room lay over six blocks, none holding 64 MiB
+// or less, the mirrors stayed at 448 MiB, and Mensis ran 48.7 fps (GPU
+// 20.3 ms a flip). BBHOST_HEAP_TARGET_DRAIN_PRESSED=0 keeps the 64 MiB.
 std::uint64_t g_td_blocks = 0, g_td_emptied = 0, g_td_targets = 0, g_td_bytes = 0, g_td_dropped = 0, g_td_refused = 0,
-              g_td_pinned = 0, g_td_gave_up = 0;
+              g_td_pinned = 0, g_td_gave_up = 0, g_td_relocating = 0, g_td_pressed = 0;
 }  // namespace
 
 void drain_target_blocks_locked() {
@@ -10457,6 +10643,14 @@ void drain_target_blocks_locked() {
     const std::uint64_t now = steady_ms();
     if (now - last_ms < 1000) return;
     last_ms = now;
+    static const bool pressed_on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_TARGET_DRAIN_PRESSED");
+        return !(e && e[0] == '0');
+    }();
+    static std::uint64_t refusals_seen = 0;
+    const std::uint64_t refusals = shadow_room_refusals_locked();
+    const bool pressed = pressed_on && refusals != refusals_seen;  // the mirrors refused room since the last turn
+    refusals_seen = refusals;
     int block = image_heap_avoided_block_locked();
     if (block >= 0 && image_heap_block_used_locked(block) == 0) {  // emptied: the keeper gives it back
         image_heap_avoid_block_locked(-1);
@@ -10474,12 +10668,16 @@ void drain_target_blocks_locked() {
         if (now < quiet_until_ms) return;
         std::uint64_t used = 0, room = 0;
         const int c = image_heap_target_drain_candidate_locked(&used, &room);
-        constexpr std::uint64_t kMostUsed = 64ull << 20, kSpare = 32ull << 20;
-        if (c < 0 || used > kMostUsed || room < used + kSpare) return;
+        constexpr std::uint64_t kMostUsed = 64ull << 20, kMostUsedPressed = 160ull << 20, kSpare = 32ull << 20;
+        if (c < 0 || used > (pressed ? kMostUsedPressed : kMostUsed) || room < used + kSpare) return;
+        if (used > kMostUsed) ++g_td_pressed;
         if (textures_block_pinned_locked(c)) {
-            ++g_td_pinned;
-            quiet_until_ms = now + 30000;
-            return;
+            if (!textures_relocate_block_locked(c)) {
+                ++g_td_pinned;
+                quiet_until_ms = now + 30000;
+                return;
+            }
+            ++g_td_relocating;  // its GPU-written surfaces move at this flush
         }
         block = c;
         image_heap_avoid_block_locked(block);
@@ -10492,6 +10690,9 @@ void drain_target_blocks_locked() {
                      block, static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(room >> 20));
     }
     g_td_dropped += textures_drop_block_locked(block);
+    // (Surfaces the GPU wrote that are still there - one busy at the last
+    // flush - are asked to move again.)
+    if (textures_block_pinned_locked(block)) textures_relocate_block_locked(block);
     std::uint64_t moved = 0;
     for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots}) {
         for (auto& [base, r] : *m) {
@@ -10513,14 +10714,17 @@ void drain_target_blocks_locked() {
 
 std::string target_drain_report() {
     if (!g_td_blocks && !g_td_pinned) return {};
-    char buf[256];
+    char buf[400];
     std::snprintf(buf, sizeof(buf),
-                  "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu): "
-                  "targets moved %llu (%llu MiB), textures and copies let go %llu MiB",
+                  "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu, "
+                  "its GPU-written surfaces moved too %llu, holding over 64 MiB for the mirrors %llu): targets moved %llu (%llu MiB), "
+                  "textures and copies let go %llu MiB",
                   static_cast<unsigned long long>(g_td_blocks), static_cast<unsigned long long>(g_td_emptied),
                   static_cast<unsigned long long>(g_td_gave_up), static_cast<unsigned long long>(g_td_refused),
-                  static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_targets),
-                  static_cast<unsigned long long>(g_td_bytes >> 20), static_cast<unsigned long long>(g_td_dropped >> 20));
+                  static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_relocating),
+                  static_cast<unsigned long long>(g_td_pressed),
+                  static_cast<unsigned long long>(g_td_targets), static_cast<unsigned long long>(g_td_bytes >> 20),
+                  static_cast<unsigned long long>(g_td_dropped >> 20));
     return buf;
 }
 
@@ -12661,6 +12865,24 @@ void cb_proof_binding(const GxStageRecords* gx, const GxStagePlan* plan, std::si
     cb_proof::note_result(diff, o, path, t_draw_pipeline, hle_video_flip_count(), since_call, dropped_since, any, base, bytes);
 }
 
+namespace {
+// The constant-buffer snapshots' memo (resolve_stage_buffers, the copy of a
+// recording a buffer snapshotted again binds) and the copies' ring's lap,
+// here so the prefetch before the copy can ask them too.
+struct SnapMemo {
+    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
+};
+SnapMemo g_snap_memo[1024];
+std::uint64_t g_scratch_lap = 1;
+inline SnapMemo& snap_memo_for(std::uint64_t base) { return g_snap_memo[((base >> 4) ^ (base >> 14)) & 1023]; }
+// BBHOST_CB_PREFETCH (on unless 0): a constant buffer the draw will copy as it
+// records has its lines asked for as soon as its base is known (below).
+const bool g_cb_prefetch = [] {
+    const char* e = std::getenv("BBHOST_CB_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+}  // namespace
+
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
 // through a storage buffer over the V#'s imported memory. The range starts at
 // the V# base aligned down to minStorageBufferOffsetAlignment and the shader
@@ -12721,6 +12943,29 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        // A buffer the game writes on the CPU is copied as the draw records
+        // (BBHOST_CB_SNAPSHOT, below), from memory a game thread has just
+        // written - its lines in that core's cache. Asked for here, ahead of
+        // the lookups the copy comes after, they arrive while those run: with
+        // the snapshots, bb-cp0 at the Nightmare of Mensis on a Steam Deck took
+        // 11 thousand more lines a frame from other cores' caches and 5
+        // thousand more from DRAM, and stalled on them - 2.5 million more
+        // cycles a frame for 0.6 million more instructions. Not for a buffer
+        // whose recording's first copy will serve it (the memo), the first
+        // 2 KiB at most (the hardware prefetcher takes a longer run on).
+        // BBHOST_CB_PREFETCH=0: no prefetch.
+        static const bool cb_snapshot_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        if (g_cb_prefetch && cb_snapshot_on && base && !b.written && bytes) {
+            const SnapMemo& m = snap_memo_for(base);
+            if (!(m.base == base && m.serial == g.record_serial && m.lap == g_scratch_lap && m.bytes >= bytes)) {
+                const std::uint64_t end = base + std::min<VkDeviceSize>(bytes, 2048);
+                for (std::uint64_t p = base & ~std::uint64_t{63}; p < end; p += 64)
+                    __builtin_prefetch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)), 0, 3);
+            }
+        }
         if (gxvk::census() && base) gxvk::census_constant_bound(base, bytes, t_gxvk_call_seq, g.flushes, gx != nullptr);
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
@@ -12738,35 +12983,65 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         bool in_heap = false;
         if (outcome == kUnmapped && gxvk::arena_wanted() && gxvk::arena_bind(base, bytes, g.flushes, gxvk::kUseConstant, b.written))
             in_heap = heap_located_locked(base, bytes, loc);  // (one it does not bind is counted there)
+        // The rest of GX's upload heap (stage 1d.1, BBHOST_GXVK_HEAP_SNAP=1): a
+        // renamed copy is snapshotted below with the lookups' answers known - no
+        // copy version (the heap is a copy-back's source, never its
+        // destination), no twin, no GPU write still to land, mapped - which
+        // host/gxvk_heapsnap.cpp watches at the writers instead. `known`: those
+        // answers taken; `check` (=compare): the lookups asked, and checked
+        // against them.
+        static const bool snapshots_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        static const bool heap_snap = gxvk::heap_snap_wanted();
+        bool known = false, check = false;
+        if (!in_heap && outcome == kUnmapped && heap_snap &&
+            gxvk::heap_snap_binding(base, bytes, b.written, !t_draw_windows.empty(), snapshots_on, cb_proof::g_on || glitch_watching_draw(),
+                                    g_cb_ring_made)) {
+            known = gxvk::heap_snap_mode() == gxvk::HeapSnap::kOn;
+            check = !known;
+        }
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
-        } else if (!in_heap && outcome == kUnmapped) {
+        } else if (!in_heap && outcome == kUnmapped && !known) {
             version = copy_version_lookup_locked(base, bytes, &loc);
+            if (check && version != kCopyVersionNone) gxvk::heap_snap_disagree(gxvk::kHeapDiffCopyVersion, base, bytes);
         }
         if (version == kCopyVersionStraddles) {
             copy_versions_put_in_place_locked(kCvStraddle);
             version = kCopyVersionNone;
         }
         bool in_window = false;  // loc is a window's copy (a capture reads its guest bytes)
-        // Window imports (BBHOST_IMPORT_WINDOWS=1): memory the game writes on
-        // the CPU, which the draw takes as a snapshot copied as it records
-        // (BBHOST_CB_SNAPSHOT, below), is read by the CPU alone - no import.
-        static const bool snapshots_on = [] {
-            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
-            return !(e && e[0] == '0');
-        }();
+        // Memory the game writes on the CPU, which the draw takes as a snapshot
+        // copied as it records (BBHOST_CB_SNAPSHOT, below), is read by the CPU
+        // alone: no import with window imports (BBHOST_IMPORT_WINDOWS=1), and
+        // with whole spans no lookup of the import either - locate, ~2% of the
+        // command processor at the Nightmare of Mensis on a Steam Deck, for a
+        // binding the snapshot then replaced. (Whether a GPU write is still to
+        // land on the range is asked once, for both.)
+        int pending_known = known ? 0 : -1;  // (the heap's answer: none)
+        const auto gpu_pending = [&]() {
+            if (pending_known < 0) pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+            return pending_known == 1;
+        };
+        if (check) {  // =compare: today's lookups, against the heap's answers
+            if (gpu_pending()) gxvk::heap_snap_disagree(gxvk::kHeapDiffGpuWrite, base, bytes);
+            if (!hle_kernel_va_mapped(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffUnmapped, base, bytes);
+            if (twin_covers_locked(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffTwin, base, bytes);
+        }
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
-                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
+            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() &&
+                        (known || (hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes)));
             if (!copy_only) {
                 // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
                 const ImportSite site(b.written                         ? "a shader's buffer, stored to"
                                       : imports_whole() || !import_census_on() ? "a shader's buffer, read"
                                       : bytes > (1u << 20)              ? "a shader's buffer, read (over 1 MiB)"
-                                      : gpu_writes_pending_locked(base, bytes) ? "a shader's buffer, read (a GPU write pending)"
+                                      : gpu_pending()                   ? "a shader's buffer, read (a GPU write pending)"
                                                                         : "a shader's buffer, read (not copied)");
                 loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
             }
@@ -12819,7 +13094,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
             // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
             // in place, the twin; its guest bytes are stale, so no copy of them.
-            const bool twin = !in_heap && twin_covers_locked(base, bytes);
+            const bool twin = !in_heap && !known && twin_covers_locked(base, bytes);
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
                 bump(g_sf_cb_snapshots);
@@ -12854,8 +13129,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (gxvk::arena_heap(&lo, &hi) && base >= lo && base < hi && gpu_writes_pending_locked(base, bytes))
                     gxvk::arena_note(gxvk::kArenaGpuPending, bytes);
             }
-            if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin &&
-                !gpu_writes_pending_locked(base, bytes)) {
+            if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin && !gpu_pending()) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
                 // The census: the copies stage 1c takes away.
@@ -12891,12 +13165,13 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // in which lap round it.
             static std::uint64_t segment_serial[kScratch / kScratchSegment] = {};
             static std::uint64_t segment_lap[kScratch / kScratchSegment] = {};
-            static std::uint64_t scratch_lap = 1;
+            std::uint64_t& scratch_lap = g_scratch_lap;
             // (A snapshot's range was located in imported memory: mapped.)
-            if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
+            if (realign && bytes && bytes <= (1u << 20) && (snapshot || known || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
                 }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
@@ -12905,9 +13180,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // draw of the submission reads the memory as it stands when the
                 // GPU runs it, so all of them see one state. (Copying again
                 // could only pick up the next frame's values, which the game
-                // may already be writing.) Whole-ring snapshots only - not the
-                // pushed ones (`exact`), each bound where its own copy is; the
-                // copy stays where it is for the rest of the lap (segment_serial).
+                // may already be writing.) A whole-ring binding takes the first
+                // copy's bias, a pushed one (`exact`) the first copy's offset;
+                // the copy stays where it is for the rest of the lap
+                // (segment_serial). Pushed, each binding had copied its own: on
+                // AMD's drivers, which bind at any dword, every snapshot at the
+                // Nightmare of Mensis - ~10,400 copies a frame, 2.7 MiB.
                 // BBHOST_CB_SNAPSHOT_DEDUPE=0: each binding copies its own.
                 // =check: shares as by default, but first compares the copy
                 // with the guest's bytes now and counts those that changed
@@ -12922,16 +13200,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
                     return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
                 }();
-                struct SnapMemo {
-                    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
-                };
-                static SnapMemo snap_memo[1024];
                 SnapMemo* memo = nullptr;
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
-                if (dedupe && whole_ring && scratch.map) {
-                    memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
+                if (dedupe && snapshot && (whole_ring || exact) && scratch.map) {
+                    memo = &snap_memo_for(base);
                     bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
                     if (share && dedupe >= kDedupeCheck) {
                         const bool same = std::memcmp(static_cast<const std::uint8_t*>(scratch.map) + memo->at,
@@ -12948,10 +13222,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         }
                     }
                     if (share) {
-                        info = VkDescriptorBufferInfo{scratch.buffer, 0, kScratch};
+                        info = whole_ring ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, memo->at, bytes};
                         params.cb_valid |= 1u << i;
-                        params.cb_bias_dw[i] = static_cast<std::uint32_t>(memo->at / 4);
+                        params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
                         outcome = kBound;
+                        if (!whole_ring) note_copy_binding_locked(info, base);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
                     }
                 }
@@ -12987,7 +13262,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     std::memcpy(static_cast<std::uint8_t*>(scratch.map) + at,
                                 reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), copy_bytes);
                     // (A snapshot's range holds no copy-back: the lookup above said so.)
-                    if (!snapshot) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
+                    if (!snapshot && !known) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
                     scratch_next = at + copy_bytes;
                     // A snapshot binds the whole ring and is found by its
                     // dword bias: one descriptor for all of them. Bound at its
@@ -13000,8 +13275,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
                     outcome = kBound;
-                    // The guest bytes, unless a copy-back's copy laid over them.
-                    if (!whole && version == kCopyVersionNone && copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone)
+                    // The guest bytes, unless a copy-back's copy laid over them
+                    // (never a snapshot's: its range has no copy version, as
+                    // the lookup before it said).
+                    if (!whole && version == kCopyVersionNone &&
+                        (snapshot || known || copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone))
                         note_copy_binding_locked(info, base);
                     // Not locked adds (bump): one right after the copy waited for
                     // its writes to the ring - write-combined memory - to drain,
@@ -13883,12 +14161,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, draw_read_bytes(w, stride, record_bytes), o.call_seq, g.flushes);
             bool in_place = false;
             bool shadow_served = false;  // a mirror serves the record (BBHOST_VB_RACE=2)
+            std::uint8_t locate_why = kLocNotAsked;  // why the mirrors left it in place (BBHOST_VB_RACE)
             if (heap_record) {
                 // The heap's import, from the record's start, as far as it holds.
                 ns.whole = {loc.buffer, loc.offset - fe.offset, std::min<std::uint64_t>(record_bytes, loc.avail + fe.offset)};
                 in_place = true;
             } else if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
+                shadow_served = vb_race_wide_on();  // =3: counted as the mirrors' too
             } else if (snapped) {
                 ns.whole = snap;  // the snapshot already (window imports)
                 ns.snapped = true;
@@ -13898,6 +14178,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
+                locate_why = shadow_locate_why();
                 // A record whose V# counts on past the end of the GX buffer it
                 // starts in - its records counted from the buffer's start
                 // though the base is an offset into it (five 582 KB records of
@@ -13908,13 +14189,19 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 // placement has it - kept the whole record in host memory, and
                 // each draw staged all of it (0.2-18 GB a 15-s window there,
                 // run to run). BBHOST_VERTEX_CLAMP=0: the V#'s extent.
-                if (ns.whole.buffer == loc.buffer && g_vertex_clamp) {
+                // Looked up only where the extent decides something - a mirror
+                // asked again, a snapshot or a staging copy, the race census
+                // (host/vertex_clamp.h): an integrated GPU without room for the
+                // mirrors reads every record in place, whatever its extent.
+                if (ns.whole.buffer == loc.buffer &&
+                    vertex_clamp::lookup_wanted(g_vertex_clamp, buffer_shadow_on(), vertex_stage_on(), vb_race_on())) {
                     const std::uint64_t end = gx_buffer_end(record_va);
                     if (end && end - record_va < record_bytes) {
                         record_bytes = end - record_va;
                         bump(g_vertex_records_clamped);
                         ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                         shadow_locate_locked(record_va, record_bytes, ns.whole);
+                        locate_why = shadow_locate_why();
                         if (ns.whole.buffer != loc.buffer) bump(g_vertex_clamped_mirrored);
                     }
                 }
@@ -13954,11 +14241,11 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             // order covers that).
             if (vb_race_on() && in_place && version == kCopyVersionNone && t_vb_race_n < 8 &&
                 !gpu_writes_pending_locked(record_va, read_bytes()))
-                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes(), false};
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes(), false, locate_why, o.vtx_obj[fe.slot]};
             // =2: a record a mirror serves, at its whole extent (no index scan).
             else if (vb_race_mirrored_on() && shadow_served && version == kCopyVersionNone && t_vb_race_n < 8 &&
                      !gpu_writes_pending_locked(record_va, record_bytes))
-                t_vb_race_ranges[t_vb_race_n++] = {record_va, record_bytes, true};
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, record_bytes, true, kLocServed, o.vtx_obj[fe.slot]};
             rs = &ns;
         }
         if (rs->whole.buffer) {
@@ -20235,6 +20522,7 @@ static bool draw_impl(const GpuDraw& d) {
         if ((vlogs.load(std::memory_order_relaxed) < 16 && vlogs.fetch_add(1) < 16))
             host_log("render: draw %s base_vertex=%d (VGT_INDX_OFFSET) count=%u", pl.name.c_str(), vtx_off, d.index_count);
     }
+    std::uint8_t index_why = kLocNotAsked;  // why the mirrors left the indices where they are (BBHOST_VB_RACE)
     if (d.index_va) {
         if (g_import_audit && d.indirect_va) audit_range(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), kUseIndex);
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
@@ -20263,11 +20551,18 @@ static bool draw_impl(const GpuDraw& d) {
         const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
         if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
-        if (!by_handle && version != kCopyVersionInside &&
-            (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
-            const ImportSite site("an index buffer");
-            loc = locate(d.index_va, index_bytes);
-            if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
+        // index_why: whether a mirror serves them, for the race census.
+        if (!by_handle && version != kCopyVersionInside) {
+            if (!imports_whole() && !d.indirect_va && shadow_mirror_locked(d.index_va, index_bytes, loc)) {
+                index_why = kLocServed;
+            } else {
+                const ImportSite site("an index buffer");
+                loc = locate(d.index_va, index_bytes);
+                if (!d.indirect_va) {
+                    shadow_locate_locked(d.index_va, index_bytes, loc);
+                    index_why = shadow_locate_why();
+                }
+            }
         }
         if (!loc.buffer) {
             static std::atomic<int> logs{0};
@@ -20642,13 +20937,16 @@ static bool draw_impl(const GpuDraw& d) {
             if (use_vertex_input) {
                 std::snprintf(tag, sizeof(tag), "v:%s", r.name);
                 for (std::size_t k = 0; k < t_vb_race_n; ++k)
-                    vb_race_note_locked(tag, t_vb_race_ranges[k].va, t_vb_race_ranges[k].bytes, t_vb_race_ranges[k].mirrored);
+                    vb_race_note_locked(tag, t_vb_race_ranges[k].va, t_vb_race_ranges[k].bytes, t_vb_race_ranges[k].mirrored,
+                                        t_vb_race_ranges[k].why, t_vb_race_ranges[k].holder);
             }
+            // Indices a mirror serves only with =3 (as served).
             const std::uint64_t ibytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type ? 4u : 2u);
-            if (r.indexed && !r.indirect_va && !gpu_writes_pending_locked(d.index_va, ibytes) &&
+            const bool imirrored = index_why == kLocServed;
+            if (r.indexed && !r.indirect_va && (!imirrored || vb_race_wide_on()) && !gpu_writes_pending_locked(d.index_va, ibytes) &&
                 copy_version_lookup_locked(d.index_va, ibytes, nullptr) == kCopyVersionNone) {
                 std::snprintf(tag, sizeof(tag), "i:%s", r.name);
-                vb_race_note_locked(tag, d.index_va, ibytes);
+                vb_race_note_locked(tag, d.index_va, ibytes, imirrored, index_why, d.gx_objects ? d.gx_objects->ib_obj : 0);
             }
         }
         t_vb_race_n = 0;

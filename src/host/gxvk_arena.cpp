@@ -139,8 +139,12 @@ std::atomic<std::uint64_t> g_fell[kWhys] = {};
 std::atomic<std::uint64_t> g_violations_order{0}, g_violations_bytes{0}, g_samples_checked{0}, g_samples_skipped{0};
 std::atomic<std::uint64_t> g_noted[kArenaNotes] = {}, g_noted_bytes[kArenaNotes] = {};
 
+// The submissions whose work is done: the landing's count or the retirements',
+// whichever is further. The landing's count raised before their labels are in
+// memory (landing(), not landed()): GX hands a range out again as soon as it
+// reads its release label, which can be before landed() counts the submission.
 std::uint64_t done_submissions() {
-    return std::max<std::uint64_t>(label_landing::landed(), host_gpu_completed_submits_seen());
+    return std::max<std::uint64_t>(MUTANT(7) ? label_landing::landed() : label_landing::landing(), host_gpu_completed_submits_seen());
 }
 
 std::uint64_t hash_of(std::uint64_t va, std::uint64_t bytes) {
@@ -235,10 +239,11 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
     if (const char* e = std::getenv("BBHOST_GXVK_ARENA"); e && e[0] == '2')
         host_log("gxvk arena: BBHOST_GXVK_ARENA=2 is gone - the heap in video memory the CPU writes was measured slower "
                  "(docs/rendering.md); today's path");
-    if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
     // The pool's bounds as its init sets them: 16-byte aligned.
     const std::uint64_t pad = (0u - static_cast<std::uint32_t>(region)) & 0xfu;
     const std::uint64_t lo = region + pad, hi = lo + ((bytes - pad) & ~std::uint64_t{0xf});
+    heap_snap_region(lo, hi);  // stage 1d.1's snapshots with the lookups' answers known (host/gxvk_heapsnap.cpp), when on
+    if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
     {
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_lo.load(std::memory_order_relaxed)) {

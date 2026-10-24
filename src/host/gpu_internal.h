@@ -110,6 +110,9 @@ struct Chunk {
     std::uint64_t size = 0;
     std::uint64_t lo = 0;
     std::vector<VkDeviceMemory> pieces;  // dma-buf imports bound into a sparse `buffer` (gpu.cpp, dmabuf_span)
+    // The idle census (BBHOST_IMPORT_IDLE_CENSUS=1, gpu.cpp): when it was made
+    // and last found by dmem_import (steady ms, flip).
+    std::uint64_t made_ms = 0, used_ms = 0, used_flip = 0;
 };
 // SCE_KERNEL_PROT_GPU_READ | SCE_KERNEL_PROT_GPU_WRITE: a mapping the GPU can reach.
 constexpr int kGuestProtGpu = 0x30;
@@ -749,6 +752,10 @@ void textures_drain_counts(std::uint64_t out[4]);
 // flush, while its recording is open. And what it has done, for the census.
 void textures_relocate_pinned_locked();
 std::string textures_relocate_report();
+// The targets' drain (render.cpp) asking for block `block`'s pinned surfaces
+// to move at the next flush, as the textures' drain does: true when they will
+// (BBHOST_HEAP_RELOCATE on, none failed, 32 MiB at most, no other block named).
+bool textures_relocate_block_locked(int block);
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage
@@ -1101,6 +1108,29 @@ bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrat
 // is made, which it is decided by.
 bool shadow_in_place_on();
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// Why the last shadow_locate_locked on this thread left its range where it
+// was, or that a mirror serves it (BBHOST_VB_RACE's census and lines).
+enum : std::uint8_t {
+    kLocNotAsked = 0,  // the shadow off, or not asked
+    kLocTwin,          // a GX buffer's device-local twin holds it
+    kLocNoMirror,      // in no chunk with a mirror
+    kLocInPlace,       // read in place on purpose: told pages (BBHOST_SHADOW_IN_PLACE)
+    kLocCrossing,      // across two mirror windows
+    kLocServed,        // a mirror serves it
+    kLocHost,          // a page in host memory for good, or one the GPU writes in this recording
+    kLocRoom,          // no room in the mirrors' share for now
+    kLocWindow,        // its mirror window is not made
+    kLocNoImport,      // no import to copy it from (whole imports)
+    kLocGpuPending,    // a GPU write still to land on a page to copy (window imports)
+    kLocNoCopy,        // no upload commands or staging for the copy
+    kLocWhys
+};
+std::uint8_t shadow_locate_why();
+// GX's hand-outs over [va]: bit k when a hand-out of kind k was ever over
+// its 4 KiB page - 0 Maps' renamed copies, 1 the upload pool's blocks, 2 ring
+// allocations, 3 YEBIS's renames (1-3 with BBHOST_RESOURCE_CENSUS=1) - and
+// bit 4 while a renamed copy over its 64 KiB page is outstanding.
+unsigned shadow_hand_kinds_locked(std::uint64_t va);
 // The same without a host location first: true, `out` the mirror, when the
 // mirrors serve [va, va+bytes) whole (copying what they must); false when it
 // is read from host memory (an import). Window imports bind meshes this way,
@@ -1422,11 +1452,16 @@ extern DrawRec g_draw_recs[kDrawRecs];
 // when recorded and again when its submission retires - memory rewritten while
 // the draw waited for the GPU. =2: the ranges the buffer shadow's mirrors
 // serve too (`mirrored`), hashed at their ends - what reading them in place
-// would have raced - counted by page class (shadow_place_class_locked).
-// Caller holds the lock.
+// would have raced - counted by page class (shadow_place_class_locked). =3:
+// those the mirrors serve with window imports too (shadow_mirror_locked), and
+// mirrored indices. Ranges read in place are counted by why the mirrors left
+// them there (`why`, shadow_locate_why); `holder` is the GX buffer the draw
+// bound them by, for the lines. BBHOST_VB_RACE_LOG=all: a line for every
+// change, not only the first ones. Caller holds the lock.
 bool vb_race_on();
 bool vb_race_mirrored_on();
-void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored = false);
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored = false, std::uint8_t why = 0,
+                         std::uint64_t holder = 0);
 void vb_race_retired_locked(std::uint64_t serial);
 void vb_race_exit_report_locked();  // the counts at exit, by page class too (a short run's only line)
 // buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the

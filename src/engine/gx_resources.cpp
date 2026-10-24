@@ -1638,7 +1638,7 @@ void gx_resources_install_late(ElfImage* image) {
     // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
     // its init tells the host of it (the entry above); the game's is hooked at
     // its prologue for the census (the arena then has no heap: today's path).
-    if (gxvk::census() || gxvk::arena_wanted()) {
+    if (gxvk::census() || gxvk::arena_wanted() || gxvk::heap_snap_wanted()) {
         if (decomp_placed("gx_upload_pool_init") == 1) {
             decomp_gx::g_upload_region_entry = hle_wrap_fn(reinterpret_cast<void*>(&upload_region_entry));
         } else if (gxvk::census()) {
@@ -1787,6 +1787,7 @@ void gx_resources_memory_protected(std::uint64_t va, std::size_t len, int prot) 
 }
 
 void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
+    gxvk::heap_written(gxvk::kHeapGuardUnmap, va, len);  // GX's upload heap is mapped for the session (stage 1d.1)
     if (!g_gx_res_after_thunk || !len) return;
     std::uint64_t n = 0;
     {
@@ -2093,4 +2094,5 @@ void gx_resources_report() {
     gxvk::census_report();
     gxvk::buffers_report();
     gxvk::arena_report();
+    gxvk::heap_snap_report();
 }
