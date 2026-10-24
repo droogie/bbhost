@@ -10643,7 +10643,7 @@ void drain_target_blocks_locked() {
         const char* e = std::getenv("BBHOST_HEAP_TARGET_DRAIN");
         return !(e && e[0] == '0');
     }();
-    if (!on || !image_heap_classes_on() || loading_screen_now() || heap_compact_on()) return;  // the compaction does it where on
+    if (!on || !image_heap_classes_on() || loading_screen_now()) return;
     if (image_heap_spare_in_play() && image_heap_avoided_block_locked() < 0) return;
     static std::uint64_t last_ms = 0, began_ms = 0, quiet_until_ms = 0;
     const std::uint64_t now = steady_ms();
@@ -10657,21 +10657,28 @@ void drain_target_blocks_locked() {
     const std::uint64_t refusals = shadow_room_refusals_locked();
     const bool pressed = pressed_on && refusals != refusals_seen;  // the mirrors refused room since the last turn
     refusals_seen = refusals;
-    int block = image_heap_avoided_block_locked();
+    // The block it empties, its own: the avoided-block slot is shared with
+    // the compaction (heap_compact::slot_free, slot_mine).
+    static int td_block = -1;
+    const int avoided = image_heap_avoided_block_locked();
+    if (td_block >= 0 && !heap_compact::slot_mine(td_block, avoided)) td_block = -1;  // its slot reused: given back
+    int block = td_block;
     if (block >= 0 && image_heap_block_used_locked(block) == 0) {  // emptied: the keeper gives it back
         image_heap_avoid_block_locked(-1);
+        td_block = -1;
         ++g_td_emptied;
         quiet_until_ms = now + 30000;
         return;
     }
     if (block >= 0 && now - began_ms >= 30000) {  // something in it stays: let it be
         image_heap_avoid_block_locked(-1);
+        td_block = -1;
         ++g_td_gave_up;
         quiet_until_ms = now + 30000;
         return;
     }
     if (block < 0) {
-        if (now < quiet_until_ms) return;
+        if (now < quiet_until_ms || !heap_compact::slot_free(avoided)) return;  // (the compaction may hold the slot)
         std::uint64_t used = 0, room = 0;
         const int c = image_heap_target_drain_candidate_locked(&used, &room);
         constexpr std::uint64_t kMostUsed = 64ull << 20, kMostUsedPressed = 160ull << 20, kSpare = 32ull << 20;
@@ -10686,6 +10693,7 @@ void drain_target_blocks_locked() {
             ++g_td_relocating;  // its GPU-written surfaces move at this flush
         }
         block = c;
+        td_block = c;
         image_heap_avoid_block_locked(block);
         began_ms = now;
         ++g_td_blocks;
@@ -10707,6 +10715,7 @@ void drain_target_blocks_locked() {
             const std::uint64_t bytes = r.memory.size;
             if (!rt_remake_locked(r, true)) {
                 image_heap_avoid_block_locked(-1);
+                td_block = -1;
                 ++g_td_refused;
                 quiet_until_ms = now + 30000;
                 return;
@@ -10735,10 +10744,13 @@ std::string target_drain_report() {
 }
 
 // The image heap's compaction (BBHOST_HEAP_COMPACT, gpu.cpp heap_compact_on;
-// the policy and its reasons in host/heap_compact.h). In place of the targets'
-// and textures' drains where on: once the world has settled, the emptiest
-// block of either class that its copies leave room for is emptied into the
-// others' holes and the keeper gives it back. No image goes in it meanwhile
+// the policy and its reasons in host/heap_compact.h). In place of the
+// textures' drain where on, and after the targets' drain, which still empties
+// a nearly empty targets' block within seconds of an arrival - left to the
+// compaction, that block was held about 30 s longer (a Steam Deck at Mensis,
+// a Radeon 680M at a lamp): once the world has settled, the emptiest block of
+// either class that its copies leave room for is emptied into the others'
+// holes and the keeper gives it back. No image goes in it meanwhile
 // (image_heap_avoid_block_locked). A turn a second: first what needs no copy
 // goes (textures not bound for heap_compact::kHotMs, made ahead and never
 // bound, copies of targets' regions), then the copies, largest first, while
@@ -10815,7 +10827,7 @@ void compact_image_heap_locked() {
         const int block = g_hc_block;
         // Emptied, or given back already (a new block in its slot is not
         // avoided, gpu.cpp heap_add_block_locked): the keeper's.
-        if (image_heap_block_used_locked(block) == 0 || image_heap_avoided_block_locked() != block) {
+        if (image_heap_block_used_locked(block) == 0 || !heap_compact::slot_mine(block, image_heap_avoided_block_locked())) {
             compact_end_locked(g_hc_emptied, now, quiet_until_ms, false);
             return;
         }
@@ -10858,7 +10870,9 @@ void compact_image_heap_locked() {
     bool classes = true, overflow = true, fullest = true, empty_block = false;
     image_heap_blocks_locked(blocks, &type, &classes, &overflow, &fullest);
     const std::uint64_t free_room = heap_compact::room(blocks, type, &empty_block);
-    if (!heap_compact::may_begin(true, settled, loading, image_heap_avoided_block_locked() >= 0, empty_block, now, quiet_until_ms)) return;
+    if (!heap_compact::may_begin(true, settled, loading, !heap_compact::slot_free(image_heap_avoided_block_locked()), empty_block, now,
+                                 quiet_until_ms))
+        return;  // (the targets' drain may hold the slot: it goes first after an arrival)
     if (free_room < heap_compact::kBlock + heap_compact::kRoomOver) {  // (before the census of what each block holds)
         ++g_hc_why[heap_compact::kRoom];
         return;

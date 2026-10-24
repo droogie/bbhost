@@ -309,8 +309,10 @@ back. Render targets, surfaces the GPU wrote and textures bound in the last 20 s
 are copied, the rest let go to be made again if the game asks; only when the
 copies fit and still leave room for the largest render target the game makes,
 one block at a time, 32 MiB a second, stopped by a load. It takes the place of
-the textures' and the targets' drains. The exit line `made in play` counts the
-image heap blocks that had to be made while the game played.
+the textures' drain; the targets' drain still gives a nearly empty targets'
+block back within seconds of an arrival, and the compaction takes what it
+leaves. The exit line `made in play` counts the image heap blocks that had to
+be made while the game played.
 
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made

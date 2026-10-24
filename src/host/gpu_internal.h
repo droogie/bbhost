@@ -752,7 +752,8 @@ std::uint64_t image_heap_spare_in_play();  // the memory keeper's spare blocks i
 std::string target_drain_report();  // render.cpp: what the targets' blocks drain did
 // The image heap's compaction (render.cpp compact_image_heap_locked,
 // host/heap_compact.h; BBHOST_HEAP_COMPACT, on where the image heap is lean,
-// in place of the two drains): its switch (gpu.cpp); the heap's blocks as it
+// in place of the textures' drain and after the targets' drain): its switch
+// (gpu.cpp); the heap's blocks as it
 // sees them, the memory type of its images and the placement's switches
 // (gpu.cpp); the surfaces of each block it would copy and whether a block
 // holds one that can neither move nor go (textures.cpp); a turn's textures -

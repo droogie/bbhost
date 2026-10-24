@@ -17,7 +17,9 @@
 // whether its copies fit the others' holes as the heap would place them
 // (host/heap_place.h) and leave room for the largest target the game makes in
 // play - a block made on the command processor costs ~190 ms on the 680M,
-// more than the memory is worth - the turns' pace, and when it stops.
+// more than the memory is worth - the turns' pace, when it stops, and how it
+// shares the avoided block with the targets' drain, which goes first after an
+// arrival.
 #include "host/heap_place.h"
 
 #include <algorithm>
@@ -76,6 +78,16 @@ inline bool may_begin(bool on, bool settled, bool loading, bool busy, bool empty
 // frames - lavapipe at 0.3 fps had the area still making its images when one
 // began, and a block was made on the command processor in play.
 inline bool flips_settled(std::uint64_t flip_now, std::uint64_t load_end_flip) { return flip_now - load_end_flip >= kSettleFlips; }
+
+// The block no image goes in while it is emptied is one slot (gpu.cpp
+// g_heap_avoid), which the targets' drain and the compaction share: the drain
+// empties a nearly empty targets' block within seconds of an arrival, the
+// compaction takes what it leaves once the world has settled. Either begins
+// only while the slot is free, and goes on only with the block it took - one
+// another holds is not its own, and one whose slot a new block reused (gpu.cpp
+// heap_add_block_locked) ends its turn.
+inline bool slot_free(int avoided) { return avoided < 0; }
+inline bool slot_mine(int mine, int avoided) { return mine >= 0 && mine == avoided; }
 
 // One under way stops: a load (a loading screen, or the world not settled
 // since one - a death, a lamp) or kGiveUpMs since it began.

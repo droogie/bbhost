@@ -96,6 +96,16 @@ void test_begin_and_stop() {
     CHECK(!flips_settled(1000 + kSettleFlips - 1, 1000));
     CHECK(flips_settled(1000 + kSettleFlips, 1000));
     CHECK(kSettleFlips == 900);
+    // The avoided-block slot the targets' drain and the compaction share: either begins only while it is free, and
+    // goes on only with the block it took.
+    CHECK(slot_free(-1));
+    CHECK(!slot_free(0));
+    CHECK(!slot_free(3));
+    CHECK(slot_mine(3, 3));
+    CHECK(slot_mine(0, 0));
+    CHECK(!slot_mine(3, 2));   // another's block
+    CHECK(!slot_mine(3, -1));  // given back, or its slot reused by a new block
+    CHECK(!slot_mine(-1, -1)); // nothing taken is nothing owned
     // A turn a second.
     CHECK(!turn_due(1999, 1000));
     CHECK(turn_due(2000, 1000));
