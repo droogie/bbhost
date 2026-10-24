@@ -1431,7 +1431,7 @@ std::atomic<std::uint64_t> g_refresh[kRefreshes] = {};
 // GPU wrote (a UAV's, a copy's destination), another GX texture (filled after creation, by uploads), the middleware's
 // or the engine's T# (no GX view), or nothing GX made - and by whether the view itself was seen made (bound by its id).
 enum S2 : int { kS2Initial, kS2Target, kS2Gpu, kS2Other, kS2Middleware, kS2NotSeen, kS2Classes };
-const char* const kS2Name[kS2Classes] = {"a GX texture made with initial data", "a GX render or depth target", "a GX texture the GPU wrote",
+const char* const kS2Name[kS2Classes] = {"a GX texture made with initial data", "a GX render or depth target (its texture, or the target's image through its view)", "a GX texture the GPU wrote",
                                          "another GX texture", "the middleware's or the engine's T#", "nothing GX made"};
 std::atomic<std::uint64_t> g_s2[kS2Classes] = {}, g_s2_by_id[kS2Classes] = {};
 std::atomic<std::uint64_t> g_s2_targets[2][2] = {};  // [colour, depth][by a GX view seen made, by address]
@@ -3195,7 +3195,11 @@ void textures_census_binding(int source, VkImageView view) {
         S2 c2 = kS2NotSeen;
         if (source == 2) {
             c2 = kS2Middleware;
-        } else if (sf && sf->gx_registered) {
+        } else if (!sf) {
+            // Bound by a GX view's id with no texture surface behind it: the view's image is a target's (or a
+            // snapshot of one), which a GX resource made too.
+            if (source == 0 && view) c2 = kS2Target;
+        } else if (sf->gx_registered) {
             GxResourceInfo info;
             const bool known = gx_resource_at(sf->gx_memory, 1, &info) && info.gen == sf->gx_gen;
             c2 = known && (info.bind & 0x60) ? kS2Target  // D3D11's render-target (0x20) and depth-stencil (0x40) binds
