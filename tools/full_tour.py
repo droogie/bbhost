@@ -1428,7 +1428,10 @@ def do_list(args):
             continue
         seen[content] = rc
         unique.append(rc)
-    out, left, plain, patched = pipeline_list.make_list(unique, progs, bool(args.eboot), not args.no_fetch_words)
+    # A geometry-shader record names its copy shader by its GS's container
+    # (pipeline_list.copy_programs); without them every such record is left out.
+    out, left, plain, patched = pipeline_list.make_list(unique, progs, bool(args.eboot), not args.no_fetch_words,
+                                                        pipeline_list.copy_programs(args.app0))
     if dupes:
         left["the same inputs as another record (re-keyed at a start)"] += dupes
     unknown = 0

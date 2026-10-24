@@ -1,8 +1,10 @@
 """tools/full_tour.py without the game: the stops' spread, a chunk's tour,
-a chunk's log read back into segments, and the union of the chunks'
-manifests that keeps every recipe in use."""
+a chunk's log read back into segments, the union of the chunks' manifests
+that keeps every recipe in use, and the list made from it."""
 
+import argparse
 import importlib.util
+import struct
 import sys
 import tempfile
 import unittest
@@ -135,6 +137,35 @@ class UnionTest(unittest.TestCase):
             self.assertEqual(run, 20)
             self.assertEqual(sorted(rc.key for rc in recipes), [1, 2, 3])
             self.assertTrue(all(rc.last_run == 20 for rc in recipes))  # none idle: bbhost drops nothing at its save
+
+
+class ListTest(unittest.TestCase):
+    def test_list_keeps_geometry_shader_records(self):
+        """A geometry-shader record (recipe format 5) goes into the list with
+        its ES named by hash and its copy shader by its GS's container."""
+        vs, ps, es, copy = (struct.pack("<2I", 1, 2), struct.pack("<I", 3), struct.pack("<3I", 4, 5, 6), struct.pack("<2I", 7, 8))
+        rc = recipe(11, 1, vs, ps)
+        tess = struct.pack("<I", pl.TESS_GS) + bytes(9 * 4 + 16 + 8 + 48 + 8)
+        section = struct.pack("<I", 0) + struct.pack("<6I", 0xc0044, 0x18, 2, 28, 8, 28) + struct.pack("<2Q", 0x2192d6900, 0x2192da000) + \
+            struct.pack("<I", 3) + es + pl.wstr("0000eeee") + struct.pack("<I", 2) + copy + pl.wstr("0000aaaa")
+        gs = pl.Recipe().parse(rc.body()[:-len(rc.tess)] + tess + section)
+        plain = recipe(12, 1, vs, ps)
+        progs = {"0000aaaa": vs, "0000bbbb": ps, "0000eeee": es}
+        saved = (pl.bundle_programs, pl.eboot_programs, pl.copy_programs)
+        pl.bundle_programs, pl.eboot_programs, pl.copy_programs = (lambda app0: dict(progs)), (lambda eboot: {}), (lambda app0: {"0000aaaa": copy})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                runs, out = Path(d) / "runs", Path(d) / "list.bin"
+                runs.mkdir()
+                pl.write_file(runs / "union-manifest.bin", 1, ORIGIN, [gs, plain])
+                args = argparse.Namespace(runs=[str(runs)], app0=d, eboot=None, out=str(out), order="recorded", no_fetch_words=False)
+                self.assertEqual(ft.do_list(args), 0)
+                _run, _origin, listed = pl.read_file(out)
+        finally:
+            pl.bundle_programs, pl.eboot_programs, pl.copy_programs = saved
+        self.assertEqual(len(listed), 2)
+        g = next(r for r in listed if r.gs is not None)
+        self.assertEqual((g.gs["es"], g.gs["es_ref"], g.gs["copy"], g.gs["copy_ref"]), (None, (3, pl.fnv1a(es)), None, (2, pl.fnv1a(copy))))
 
 
 if __name__ == "__main__":
