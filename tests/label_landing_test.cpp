@@ -10,6 +10,9 @@
 // once its submission counts as landed, at least that submission's value, and
 // never a value whose submission has not run. landing() is past a submission
 // before any of its writes is stored, and landed() only after all of them.
+// The last landings (recent_into) are each store's address, size, first
+// dword and submission, newest first, inside the range asked for; a skipped
+// write is not among them; and no more than kRecent are kept.
 // Runs with BBHOST_LABEL_LANDING=1 (CMakeLists.txt).
 #include "host/label_landing.cpp"
 
@@ -170,6 +173,20 @@ int main() {
         CHECK(got == 0x1122334455667788ull);
         CHECK(labels[5] == 0);  // skipped
         CHECK(labels[6] == 14);
+        // The last landings: the newest first, inside the range asked for,
+        // the skipped one not among them.
+        Landed got_l[4] = {};
+        CHECK(recent_into(va(&labels[5]), va(&labels[7]), got_l, 4) == 1);
+        CHECK(got_l[0].va == va(&labels[6]) && got_l[0].bytes == 4 && got_l[0].value == 14 && got_l[0].serial == 6);
+        CHECK(recent_into(va(&pair[0]), va(&pair[4]), got_l, 4) == 1);
+        CHECK(got_l[0].va == va(&pair[1]) && got_l[0].bytes == 8 && got_l[0].value == 0x55667788u);
+        CHECK(recent_into(va(&pair[2]), va(&pair[3]), got_l, 4) == 1);  // overlapping its second half
+        CHECK(recent_into(va(&labels[0]), va(&labels[7]), got_l, 4) == 4);
+        CHECK(got_l[0].va == va(&labels[6]) && got_l[1].va == va(&labels[4]) && got_l[1].value == 12 && got_l[2].value == 11 &&
+              got_l[2].serial == 4 && got_l[3].va == va(&labels[3]) && got_l[3].value == 10);
+        CHECK(recent_into(va(&labels[60]), va(&labels[64]), got_l, 4) == 0);
+        CHECK(recent_into(va(&labels[4]), va(&labels[6]), got_l, 4) == 2);  // not the one at the range's end
+        CHECK(recent_into(va(&labels[7]), va(&labels[8]), got_l, 4) == 0);  // nor the one ending at its start
         g_hole_lo = g_hole_hi = 0;
     }
 
@@ -195,6 +212,9 @@ int main() {
         CHECK(landed_through(8));
         CHECK(std::memcmp(guest, dump, 64) == 0);
         CHECK(labels[9] == 17);
+        Landed got_c[2] = {};
+        CHECK(recent_into(va(guest), va(guest) + 64, got_c, 2) == 1);  // a copy: its first dword
+        CHECK(got_c[0].bytes == 64 && got_c[0].value == 0x0a070401u && got_c[0].serial == 7);
         CHECK(guest2[0] == 0);  // submission 8 has not run
         {
             std::lock_guard<std::mutex> lk(g_order_mu);
@@ -282,6 +302,12 @@ int main() {
             }
         }
         for (int k = 0; k < 16; ++k) CHECK(race[k] == want[k]);
+        // Only the last kRecent landings are kept: all of them the race's
+        // now, the newest its last submission's.
+        static Landed kept[kRecent + 8];
+        CHECK(recent_into(va(&race[0]), va(&race[16]), kept, kRecent + 8) == static_cast<int>(kRecent));
+        CHECK(kept[0].serial == kLast - 1 && kept[kRecent - 1].serial <= kept[0].serial);
+        CHECK(recent_into(va(&labels[0]), va(&labels[8]), kept, 8) == 0);  // older than the last kRecent
     }
 
     // No GPU any more: everything lands, and what is added after it too.

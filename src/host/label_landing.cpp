@@ -130,15 +130,23 @@ constexpr int kBuckets = 2561;
 constexpr std::uint64_t kBucketNs = 100000;
 std::uint64_t g_ages[kBuckets] = {};
 
-std::uint64_t now_ns() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-}
+// The last landings (recent_into), a ring written under g_mu.
+Landed g_recent[kRecent];
+std::uint32_t g_recent_n = 0;
 
-void store(const Entry& w) {
+void store(const Entry& w, std::uint64_t serial) {
     if (g_hooks.mapped && !g_hooks.mapped(w.va, w.bytes)) {
         ++g_unmapped;
         return;
+    }
+    {
+        Landed& r = g_recent[g_recent_n++ % kRecent];
+        r.va = w.va;
+        r.bytes = w.bytes;
+        r.value = 0;
+        std::memcpy(&r.value, w.copy ? w.src : static_cast<const void*>(w.data), w.bytes < 4 ? w.bytes : 4);
+        r.serial = serial;
+        r.ns = label_landing::now_ns();
     }
     void* const p = reinterpret_cast<void*>(static_cast<std::uintptr_t>(w.va));
     if (w.copy) {
@@ -171,7 +179,7 @@ void land_locked(std::uint64_t completed) {
         const Batch b = g_batches.front();
         g_batches.pop_front();
         for (std::uint32_t k = 0; k < b.count; ++k) {
-            store(g_writes.front());
+            store(g_writes.front(), b.serial);
             g_writes.pop_front();
         }
         g_n_writes += b.count;  // (copies among them counted apart in store)
@@ -323,6 +331,23 @@ std::string report() {
                   static_cast<unsigned long long>(g_unmapped), static_cast<unsigned long long>(g_most_batches),
                   static_cast<unsigned long long>(g_most_writes), pct(0.5), pct(0.99), static_cast<unsigned long long>(g_batches.size()));
     return b;
+}
+
+std::uint64_t now_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+int recent_into(std::uint64_t lo, std::uint64_t hi, Landed* out, int cap) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const std::uint32_t n = g_recent_n;
+    const std::uint32_t kept = n < kRecent ? n : kRecent;
+    int found = 0;
+    for (std::uint32_t k = 0; k < kept && found < cap; ++k) {
+        const Landed r = g_recent[(n - 1 - k) % kRecent];
+        if (r.va + r.bytes > lo && r.va < hi) out[found++] = r;
+    }
+    return found;
 }
 
 }  // namespace label_landing

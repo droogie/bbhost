@@ -532,6 +532,11 @@ if(UNIX)
   add_executable(wind_pace_test tests/wind_pace_test.cpp)
   target_include_directories(wind_pace_test PRIVATE src)
   add_test(NAME wind_pace_test COMMAND wind_pace_test)
+  # WAIT_REG_MEM's compare and its can-never-pass rule on synthetic packets
+  # (tests/wait_reg_mem_test.cpp).
+  add_executable(wait_reg_mem_test tests/wait_reg_mem_test.cpp)
+  target_include_directories(wait_reg_mem_test PRIVATE src)
+  add_test(NAME wait_reg_mem_test COMMAND wait_reg_mem_test)
   # FMOD's sound-group ring guard without the game (tests/fmod_ring_test.cpp).
   add_executable(fmod_ring_test tests/fmod_ring_test.cpp)
   target_include_directories(fmod_ring_test PRIVATE src)

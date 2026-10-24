@@ -80,4 +80,19 @@ void set_before_land(void (*f)(std::uint64_t completed));
 bool wait_landed_past(std::uint64_t seen, std::chrono::microseconds timeout);
 std::string report();
 
+// The last kRecent landings, kept for a diagnostic that finds memory a
+// packet was read from written over (hle/gnm_exec.cpp: a WAIT_REG_MEM no
+// value can pass): each store's guest address, size, first dword, submission
+// and when it landed.
+constexpr std::uint32_t kRecent = 4096;
+struct Landed {
+    std::uint64_t va;
+    std::uint32_t bytes, value;
+    std::uint64_t serial, ns;
+};
+// Those inside [lo, hi), newest first, up to `cap`; the count found. Takes
+// the landing's lock: not for a hot path.
+int recent_into(std::uint64_t lo, std::uint64_t hi, Landed* out, int cap);
+std::uint64_t now_ns();  // the clock `ns` is on
+
 }  // namespace label_landing

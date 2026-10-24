@@ -10,6 +10,7 @@
 #include "hle/modules.h"
 #include "host/host_lists.h"
 #include "host/label_landing.h"
+#include "hle/wait_reg_mem.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
 
@@ -163,6 +164,16 @@ std::atomic<std::uint64_t> g_draw_failed{0};
 std::atomic<std::uint64_t> g_indirect_zero_cpu{0};  // GX indirect draws whose count read 0 on the CPU, drawn for the GPU to decide
 std::atomic<std::uint64_t> g_flush_by_op[256];
 std::atomic<std::uint64_t> g_wait_timeouts{0};
+std::atomic<std::uint64_t> g_wait_impossible{0};  // of those, waits no value could pass (a packet written over)
+// BBHOST_TEST_WAIT_MASK=N: the Nth label wait the command processor meets as
+// the game writes them (==, a mask of all ones, a reference above 1) is read
+// with a mask of 1, as if a label's 1 had landed on that dword - a wait no
+// value can pass, for the log that says where it came from.
+const long g_test_wait_mask = [] {
+    const char* e = std::getenv("BBHOST_TEST_WAIT_MASK");
+    return e && e[0] ? std::strtol(e, nullptr, 10) : 0L;
+}();
+std::atomic<long> g_test_wait_seen{0};
 std::atomic<std::uint64_t> g_wait_pending{0};  // waits satisfied by a recorded GPU write
 std::atomic<std::uint64_t> g_resyncs{0};       // PM4 walk re-locks
 
@@ -274,6 +285,111 @@ void census_dma(CensusDma kind, std::size_t bytes);
 thread_local std::uint64_t t_top_snap_lo = 0, t_top_snap_hi = 0, t_top_guest_lo = 0;
 std::uint64_t census_guest_va(std::uint64_t va) {
     return va >= t_top_snap_lo && va < t_top_snap_hi ? va - t_top_snap_lo + t_top_guest_lo : va;
+}
+// Where the top-level buffer being walked came from, census or not (for the
+// wait log): the range the game submitted, when the walk reads a copy of it -
+// a snapshot at the same offsets, or the packets its host list holds, copied
+// out one after another (the handoff).
+enum TopFrom : int { kTopInPlace, kTopSnapshot, kTopHandedOver };
+thread_local int t_top_from_kind = kTopInPlace;
+thread_local std::uint64_t t_top_from_lo = 0, t_top_from_bytes = 0;
+
+// A WAIT_REG_MEM the command processor gives up on, logged where it sits:
+// the packet, its place in the buffer being walked and the dwords before it
+// (the packets that set up what it waits on - a label, the event that writes
+// it - name its writer), the memory around what it polls, where the packet
+// came from in the game's memory and what is there now, and the labels that
+// landed in that memory lately.
+void log_wait_context(const std::uint32_t* b, std::size_t n, int depth, std::uint64_t va, const std::uint32_t* p) {
+    host_log("  packet: %08x %08x %08x %08x %08x %08x depth=%d", b[0], b[1], b[2], b[3], b[4], n > 5 ? b[5] : 0u, depth);
+    const std::uint64_t at = reinterpret_cast<std::uintptr_t>(b - 1);
+    const bool inside = at >= t_cb_lo && at < t_cb_hi;  // not a constant-engine packet's
+    // The 16 dwords before `q`, from no lower than `lo`.
+    const auto dwords_before = [](std::uint64_t q, std::uint64_t lo, char (&out)[16 * 9 + 1]) {
+        int len = 0;
+        out[0] = 0;
+        for (std::uint64_t p2 = std::max(lo, q >= 64 ? q - 64 : 0); p2 < q && len < static_cast<int>(sizeof(out)) - 9; p2 += 4) {
+            len += std::snprintf(out + len, sizeof(out) - len, " %08x", *reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(p2)));
+        }
+        return len;
+    };
+    {
+        char before[16 * 9 + 1];
+        const int len = inside ? dwords_before(at, t_cb_lo, before) : 0;
+        host_log("  at 0x%llx, +0x%llx into the buffer at 0x%llx (0x%llx bytes); the dwords before it:%s",
+                 static_cast<unsigned long long>(at), static_cast<unsigned long long>(at - t_cb_lo),
+                 static_cast<unsigned long long>(t_cb_lo), static_cast<unsigned long long>(t_cb_hi - t_cb_lo),
+                 len ? before : " none");
+    }
+    // Only what is mapped: a wait at the first bytes of a mapping
+    // (0x100000001 during a load, a malformed address) has nothing below it
+    // to show.
+    if (hle_kernel_va_mapped(va - 32, 32)) {
+        const std::uint32_t* m = p - 8;
+        host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+    }
+    if (hle_kernel_va_mapped(va, 32)) {
+        host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+    // Where the packet came from in the game's memory. An indirect buffer
+    // (depth > 0) and a range walked in place are read there; a top-level
+    // range walked as a copy came from the range the game submitted - at the
+    // same offsets for a snapshot, and for a handoff (host_lists) somewhere
+    // in it: looked for by its header, function, address and reference, then
+    // without the reference.
+    if (!inside) return;
+    std::uint64_t glo = t_cb_lo, ghi = t_cb_hi, gat = at;
+    const char* from = "the game's memory, walked in place";
+    if (depth == 0 && t_top_from_kind != kTopInPlace) {
+        glo = t_top_from_lo;
+        ghi = t_top_from_lo + t_top_from_bytes;
+        if (t_top_from_kind == kTopSnapshot) {
+            from = "a copy of the submitted range taken at the submission";
+            gat = glo + (at - t_cb_lo);
+        } else {
+            from = "the submitted range's host-list packets, copied out at the submission";
+            gat = 0;
+            const std::uint32_t want[5] = {b[-1], b[0], b[1], b[2], b[3]};
+            const std::uint64_t scan_hi = std::min(ghi, glo + (std::uint64_t{4} << 20));
+            if (scan_hi >= glo + 28 && hle_kernel_va_mapped(glo, scan_hi - glo)) {
+                for (std::size_t words = 5; words >= 4 && !gat; --words) {
+                    for (std::uint64_t q = glo; q + 28 <= scan_hi && !gat; q += 4) {
+                        if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(q)), want, words * 4) == 0) gat = q;
+                    }
+                }
+            }
+        }
+    }
+    if (gat && gat >= glo && gat + 28 <= ghi && hle_kernel_va_mapped(gat, 28)) {
+        const auto* g = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(gat));
+        char before[16 * 9 + 1];
+        const int len = gat != at ? dwords_before(gat, glo, before) : 0;
+        host_log("  from %s: the range at 0x%llx (0x%llx bytes), the packet at 0x%llx (+0x%llx); there now: %08x %08x %08x %08x %08x %08x %08x%s%s",
+                 from, static_cast<unsigned long long>(glo), static_cast<unsigned long long>(ghi - glo),
+                 static_cast<unsigned long long>(gat), static_cast<unsigned long long>(gat - glo), g[0], g[1], g[2], g[3], g[4], g[5], g[6],
+                 len ? "; the dwords before it there now:" : "", len ? before : "");
+    } else {
+        gat = 0;
+        host_log("  from %s: the range at 0x%llx (0x%llx bytes); the packet not found there now", from,
+                 static_cast<unsigned long long>(glo), static_cast<unsigned long long>(ghi - glo));
+    }
+    // The labels that landed in that range lately: a dword written over
+    // there between the game's writing the packet and its submitting the
+    // range names its writer.
+    label_landing::Landed hits[6];
+    const int found = label_landing::recent_into(glo, ghi, hits, 6);
+    const std::uint64_t now = label_landing::now_ns();
+    std::string line;
+    for (int k = 0; k < found; ++k) {
+        char one[192];
+        char off[48] = "";
+        if (gat) std::snprintf(off, sizeof(off), " (%+lld from the packet)", static_cast<long long>(hits[k].va - gat));
+        std::snprintf(one, sizeof(one), " 0x%llx%s %u bytes %08x, submission %llu, %.1f ms before;", static_cast<unsigned long long>(hits[k].va), off,
+                      hits[k].bytes, hits[k].value, static_cast<unsigned long long>(hits[k].serial),
+                      now > hits[k].ns ? static_cast<double>(now - hits[k].ns) / 1e6 : 0.0);
+        line += one;
+    }
+    host_log("  labels landed in the range, of the last %u: %d%s", label_landing::kRecent, found, line.c_str());
 }
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
@@ -1977,7 +2093,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 }
                 const unsigned fn = b[0] & 7;
                 const std::uint32_t ref = b[3];
-                const std::uint32_t mask = b[4];
+                std::uint32_t mask = b[4];
+                if (g_test_wait_mask > 0 && fn == 3 && mask == ~0u && ref > 1 && g_test_wait_seen.fetch_add(1) + 1 == g_test_wait_mask) {
+                    host_log("gnm exec: BBHOST_TEST_WAIT_MASK=%ld: this wait on 0x%llx for 0x%x is read with a mask of 1", g_test_wait_mask,
+                             static_cast<unsigned long long>(va), ref);
+                    mask = 1;
+                }
                 auto* p = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(va));
                 const auto start = std::chrono::steady_clock::now();
                 GpuPhaseTimer wait_timer(kPhaseWait);
@@ -1997,19 +2118,33 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     note_wait_timeout(va, ref, mask, fn);
                     break;
                 }
-                for (;;) {
-                    const std::uint32_t v = __atomic_load_n(p, __ATOMIC_ACQUIRE) & mask;
-                    bool ok;
-                    switch (fn) {
-                        case 1: ok = v < ref; break;
-                        case 2: ok = v <= ref; break;
-                        case 3: ok = v == ref; break;
-                        case 4: ok = v != ref; break;
-                        case 5: ok = v >= ref; break;
-                        case 6: ok = v > ref; break;
-                        default: ok = true; break;
+                // Nor on one no value can pass - a reference outside its mask
+                // for ==, past it for >= or >, 0 for <. The game writes none
+                // (hle/wait_reg_mem.h); one in the stream had a dword written
+                // over in memory before the submission - a YEBIS flush's wait
+                // for 0xdd with a mask of 1 once, on a Steam Deck building its
+                // pipelines, the magic of a token before it a 1 as well - and
+                // waited the whole timeout for nothing. Say so, with where it
+                // came from and what landed there, and go on as after the
+                // timeout (the other queues' drain is for a label they may
+                // write; none can make this one pass).
+                if (!wait_reg_mem::can_pass(fn, ref, mask)) {
+                    g_wait_timeouts.fetch_add(1);
+                    g_wait_impossible.fetch_add(1);
+                    note_wait_timeout(va, ref, mask, fn);
+                    static std::atomic<int> logs{0};
+                    if (logs.fetch_add(1) < 6) {
+                        host_log("gnm exec: WAIT_REG_MEM 0x%llx fn=%u ref=0x%x mask=0x%x can never pass - a dword of it was "
+                                 "written over in memory (the game writes no such wait); not waiting",
+                                 static_cast<unsigned long long>(va), fn, ref, mask);
+                        log_wait_context(b, n, depth, va, p);
                     }
-                    if (ok) {
+                    break;
+                }
+                for (;;) {
+                    const std::uint32_t raw = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+                    const std::uint32_t v = raw & mask;
+                    if (wait_reg_mem::passes(fn, raw, ref, mask)) {
                         break;
                     }
                     {
@@ -2025,16 +2160,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                             std::lock_guard<std::mutex> lk(g_pending_mu);
                             std::uint32_t pv = 0;
                             if (g_pending_labels.get(va, pv, pending_serial)) {
-                                pv &= mask;
-                                switch (fn) {
-                                    case 1: pending_ok = pv < ref; break;
-                                    case 2: pending_ok = pv <= ref; break;
-                                    case 3: pending_ok = pv == ref; break;
-                                    case 4: pending_ok = pv != ref; break;
-                                    case 5: pending_ok = pv >= ref; break;
-                                    case 6: pending_ok = pv > ref; break;
-                                    default: pending_ok = true; break;
-                                }
+                                pending_ok = wait_reg_mem::passes(fn, pv, ref, mask);
                             }
                         }
                         if (pending_ok) {
@@ -2066,18 +2192,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         // queued behind us may write this very label, and its
                         // writes must land before the game recycles objects.
                         drain_other_queues(t_queue_id, 200);
-                        const std::uint32_t v2 = __atomic_load_n(p, __ATOMIC_ACQUIRE) & mask;
-                        bool ok2;
-                        switch (fn) {
-                            case 1: ok2 = v2 < ref; break;
-                            case 2: ok2 = v2 <= ref; break;
-                            case 3: ok2 = v2 == ref; break;
-                            case 4: ok2 = v2 != ref; break;
-                            case 5: ok2 = v2 >= ref; break;
-                            case 6: ok2 = v2 > ref; break;
-                            default: ok2 = true; break;
-                        }
-                        if (ok2) {
+                        if (wait_reg_mem::passes(fn, __atomic_load_n(p, __ATOMIC_ACQUIRE), ref, mask)) {
                             break;
                         }
                         // Out of patience: something we do not
@@ -2089,38 +2204,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         if (logs.fetch_add(1) < 6) {
                             host_log("HLE fake: WAIT_REG_MEM 0x%llx fn=%u ref=0x%x mask=0x%x (value 0x%x) satisfied by host",
                                      static_cast<unsigned long long>(va), fn, ref, mask, v);
-                            host_log("  packet: %08x %08x %08x %08x %08x %08x depth=%d", b[0], b[1], b[2], b[3], b[4],
-                                     n > 5 ? b[5] : 0u, depth);
-                            // Where it sits, and what came before it in its
-                            // buffer: the packets that set up what it waits on
-                            // (a label, the event that writes it) name its writer.
-                            {
-                                const std::uint64_t at = reinterpret_cast<std::uintptr_t>(b - 1);
-                                const bool inside = at >= t_cb_lo && at < t_cb_hi;  // not a constant-engine packet's
-                                const std::uint64_t from = inside ? std::max(t_cb_lo, at >= 64 ? at - 64 : 0) : at;
-                                char before[16 * 9 + 1] = {};
-                                int len = 0;
-                                for (std::uint64_t p2 = from; p2 < at && len < static_cast<int>(sizeof(before)) - 9; p2 += 4) {
-                                    len += std::snprintf(before + len, sizeof(before) - len, " %08x",
-                                                         *reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(p2)));
-                                }
-                                host_log("  at 0x%llx, +0x%llx into the buffer at 0x%llx (0x%llx bytes); the dwords before it:%s",
-                                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(at - t_cb_lo),
-                                         static_cast<unsigned long long>(t_cb_lo),
-                                         static_cast<unsigned long long>(t_cb_hi - t_cb_lo), len ? before : " none");
-                            }
-                            // Only what is mapped: a wait at the first bytes of
-                            // a mapping (0x100000001 during a load, a malformed
-                            // address) has nothing below it to show.
-                            if (hle_kernel_va_mapped(va - 32, 32)) {
-                                const std::uint32_t* m = p - 8;
-                                host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3],
-                                         m[4], m[5], m[6], m[7]);
-                            }
-                            if (hle_kernel_va_mapped(va, 32)) {
-                                host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3],
-                                         p[4], p[5], p[6], p[7]);
-                            }
+                            log_wait_context(b, n, depth, va, p);
                         }
                         // BBHOST_FORCE_LABELS=1 also writes the expected value so CPU
                         // pollers proceed; default leaves the label alone (garbage
@@ -2665,6 +2749,9 @@ struct Job {
     std::uint64_t seq = 0;         // its place among every submission (hle_gnm_submitted_total once it was counted)
     // BBHOST_HOST_LISTS=2: each range's part of its host list, taken at the submission.
     std::vector<host_lists::Taken> lists{};
+    // The ranges as the game submitted them, a handed-over one's too (`guest`
+    // drops those): where a copy's packets came from, for the wait log.
+    std::vector<std::pair<const void*, std::size_t>> origin{};
 };
 
 std::vector<std::pair<const void*, std::size_t>> snapshot_cbs(const std::vector<std::pair<const void*, std::size_t>>& in,
@@ -2810,7 +2897,17 @@ void cp_thread(Queue* q, int id) {
                                          job.cbs[i].second,
                                          i < job.guest.size() ? reinterpret_cast<std::uintptr_t>(job.guest[i].first) : 0);
             }
+            // Where the walked bytes came from (the wait log): a copy's range,
+            // whole at the same offsets, or handed over as its list's packets
+            // (`guest` cleared for those).
+            t_top_from_kind = kTopInPlace;
+            if (i < job.origin.size() && job.origin[i].first && job.origin[i].first != job.cbs[i].first) {
+                t_top_from_kind = i < job.guest.size() && job.guest[i].first ? kTopSnapshot : kTopHandedOver;
+                t_top_from_lo = reinterpret_cast<std::uintptr_t>(job.origin[i].first);
+                t_top_from_bytes = job.origin[i].second;
+            }
             execute_one(job.cbs[i].first, job.cbs[i].second, !job.owned.empty());
+            t_top_from_kind = kTopInPlace;
             if (shadow) host_lists::shadow_end();
             t_top_snap_lo = t_top_snap_hi = 0;
             // With a snapshot, compare it against guest memory afterwards: if
@@ -3018,6 +3115,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         // game's buffers.
         Job job;
         job.guest = cbs;
+        job.origin = cbs;
         host_lists::Taken taken;
         for (std::size_t k = 0; k < cbs.size(); ++k) {
             const auto& cb = cbs[k];
@@ -3043,6 +3141,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         job.cbs = snapshot_cbs(cbs, job.owned);
         job.ce_cbs = snapshot_cbs(ce_cbs, job.owned);
         job.guest = cbs;
+        job.origin = cbs;
         job.done = std::move(done);
         job.lists = std::move(lists);
         q->jobs.push_back(std::move(job));
@@ -3103,6 +3202,11 @@ std::string hle_gnm_flush_reasons() {
     if (const std::uint64_t t = g_wait_timeouts.load()) {
         char buf[48];
         std::snprintf(buf, sizeof(buf), " wait-timeouts:%llu", static_cast<unsigned long long>(t));
+        out += buf;
+    }
+    if (const std::uint64_t t = g_wait_impossible.load()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " waits-that-could-never-pass:%llu", static_cast<unsigned long long>(t));
         out += buf;
     }
     {
