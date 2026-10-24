@@ -1624,6 +1624,8 @@ struct StageImages {
         std::uint32_t dim = 0;
         bool arrayed = false;
         bool resolved = false;  // the resource path was readable
+        std::uint32_t slot = 0;  // stage 2, bindless: the view's slot from its entry (0: looked up when bound)
+        std::uint64_t base = 0;  // stage 2: the T#'s base from the view's entry (0: tsharp_base(w) when wanted)
     };
     std::vector<Image> images;        // parallel to TranslateResult::images
     std::vector<VkSampler> samplers;  // parallel to TranslateResult::samplers; null when unresolved
@@ -1673,9 +1675,23 @@ VkImageView texture_view(const std::uint32_t* tsharp, bool storage, bool& dims_o
 // The same for a T# a shader-resource view holds, by the view's
 // id (GxStageRecords::obj_tex_id): its T# never changes, so the id stands for
 // the words and nothing of them is hashed or compared.
+// `slot` and `base`, when given: the view's bindless slot and its T#'s base from its entry (stage 2; 0 when it has
+// none).
 VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* tsharp, bool storage, bool& dims_ok, std::uint32_t& dim,
-                               bool& arrayed, bool shader_arrayed = false, bool r128 = false);
+                               bool& arrayed, bool shader_arrayed = false, bool r128 = false, std::uint32_t* slot = nullptr,
+                               std::uint64_t* base = nullptr);
 std::string texture_view_by_id_report();
+// The binding variant texture_view_by_id keys its entries by, as it works it out from its flags.
+inline std::uint8_t texture_view_flags(bool storage, bool shader_arrayed, bool r128) {
+    return static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
+}
+// Stage 2 (BBHOST_GXVK_IMAGES >= 1): the pipeline key's dims (image_dim_of) for a binding of a GX view, from the view's
+// entry when it is live and has them; false: decode the T#, and give a non-depth binding's dims to
+// texture_key_dims_note, which keeps them in the entry for the view's later bindings.
+bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed);
+void texture_key_dims_note(std::uint32_t id, std::uint8_t flags, std::uint32_t dim, bool arrayed);
+// BBHOST_GXVK_IMAGES as a number: 0 (or census) today's path, 1 stage 2's handles, 2 both, compared.
+int textures_images_mode();
 // Asks for the entry texture_view_by_id will read for `id` (the table is
 // larger than the caches; a draw asks for its views' entries together).
 void texture_view_by_id_prefetch(std::uint32_t id);
@@ -1776,6 +1792,8 @@ std::uint64_t textures_replacements();
 // descriptors whose real base is in word0; those fall back to word0 << 8.
 // A mapped unshifted word0 is a V#, not a T# — do not use it as an image base.
 std::uint64_t tsharp_base(const std::uint32_t* w);
+// A prefetched image's T# base: its view entry's (stage 2), else decoded from its words.
+inline std::uint64_t image_base(const StageImages::Image& im) { return im.base ? im.base : tsharp_base(im.w); }
 // shadPS4 Image::GetBaseType: Color2DArray / Color2DMsaa / Color2DMsaaArray
 // sample as Color2D. A single-layer type-13 T# at a colour-target address is
 // the YEBIS ping-pong; treating it as a 2D array made the SPIR-V shape miss

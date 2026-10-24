@@ -581,6 +581,9 @@ struct Surface {
     std::uint64_t gx_memory = 0, gx_bytes = 0;  // that resource's own memory: the surface's layout can reach past it
     std::uint8_t gx_type = 0;  // that resource's type (GxResourceInfo::type): 1 a buffer, 2-4 a texture
     bool gx_dirty = false;  // GX mapped it since its upload (textures_gx_written): upload it again
+    // Stage 2 (BBHOST_GXVK_IMAGES): a view entry binds it without refreshing it (IdViewEntry::fast). Whatever changes
+    // it then moves g_static_epoch (static_changed), and every such entry refreshes once at its next binding.
+    bool static_fast = false;
     // Created at the resource's creation, ahead of its first bind.
     bool ahead = false, ahead_used = false;
     // When it was made or a bind last looked it up (steady ms; a bind the
@@ -1131,6 +1134,25 @@ std::atomic<std::uint64_t> g_unwatched_uploads{0};  // uploads of a GX resource'
 // texture (not a buffer a T# reads as an image - the CPU writes those after
 // every Map, and they keep the watch), with identity on.
 bool by_identity(const Surface& sf) { return res_identity_on() && sf.gx_registered && sf.gx_type >= 2; }
+// Stage 2, BBHOST_GXVK_IMAGES: 0 (the default) or census, today's; 1 a GX view bound by its id takes the pipeline
+// key's dims from its entry (texture_key_dims_by_id), and a GX texture's image that nothing has written since its
+// upload binds without its surface's refresh while nothing could have changed it (images_static, static_changed);
+// 2 both ways: today's refresh and dims are what the draw gets, and where the entry's would have differed is counted.
+const int g_images_mode = [] {
+    const char* e = std::getenv("BBHOST_GXVK_IMAGES");
+    return e && *e >= '0' && *e <= '9' ? std::atoi(e) : 0;
+}();
+// Moves whenever something changes a surface a view entry binds without a refresh: an upload, a GX map drained
+// over it, a command-processor write, a shader's, a fill's, a copy's or an upload token's write. Each such entry
+// then refreshes at its next binding, so none needs to read its surface to learn that nothing happened.
+std::uint32_t g_static_epoch = 1;
+std::uint64_t g_static_changes = 0;  // under g.mu: the moves
+void static_changed(Surface& sf) {
+    if (!sf.static_fast) return;
+    sf.static_fast = false;
+    ++g_static_epoch;
+    ++g_static_changes;
+}
 bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     // An earlier upload still being prepared fills its own staging span (the
     // submission waits for it); its hashes are superseded by this one's.
@@ -1350,6 +1372,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     sf.exact_at_ms = now_ms();
     sf.checked_at_ms = now_ms();
     ++sf.uploads;
+    static_changed(sf);
     g_uploads.fetch_add(1);
     g_upload_bytes.fetch_add(sf.total_dst);
     return true;
@@ -2257,6 +2280,7 @@ bool carry_surface_locked(Surface& dst, const Surface& src) {
     dst.exact_at_ms = now_ms();
     dst.checked_at_ms = now_ms();
     dst.gpu_written = true;
+    static_changed(dst);
     if (g_surface_carries.fetch_add(1) < 16) {
         host_log("texture: 0x%llx seen again (%ux%u x%u, block %u, %zu levels) keeps the texels a shader stored "
                  "through the old view (%ux%u, %zu levels)",
@@ -3139,34 +3163,134 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
 // id; an entry lives while the view epoch it was made in is current, like the
 // words memo's. A miss resolves through the words (texture_view_uncached),
 // which also names the surface to keep fresh.
-struct IdViewEntry {
+// Stage 2 (BBHOST_GXVK_IMAGES=1) makes the entry the view's handle: one line that also carries the pipeline key's
+// dims for its bindings (decoded once), and, for a GX texture's image nothing has written since its upload
+// (images_static), lets a binding skip the surface's refresh while g_static_epoch stands and the coarse clock is
+// before recheck_ms - the entry and two globals instead of the surface's cold lines. The refresh still runs every
+// kStaticRecheckMs, which keeps its hash schedule and the eviction's clock (Surface::used_ms) going.
+constexpr std::uint32_t kNoKeyDim = ~0u;
+constexpr std::uint32_t kStaticRecheckMs = 200;
+struct alignas(64) IdViewEntry {
     std::uint32_t id = 0;
     std::uint8_t flags = 0;
     bool arrayed = false, dims_ok = false;
-    std::uint64_t epoch = 0;
+    bool fast = false;  // stage 2: refreshes skipped while static_epoch and recheck_ms hold
+    std::uint32_t epoch = 0;  // g_view_epoch's low 32 bits
+    // The recording its surface was last kept fresh in (record_serial + 1, low 32 bits):
+    // under BBHOST_REFRESH_ONCE a surface is checked once a recording, and the
+    // Surface itself is a cold line to read just to learn that it was.
+    std::uint32_t refreshed = 0;
     VkImageView view = VK_NULL_HANDLE;
     Surface* sf = nullptr;
     std::uint32_t dim = 0;
-    // The recording its surface was last kept fresh in (record_serial + 1):
-    // under BBHOST_REFRESH_ONCE a surface is checked once a recording, and the
-    // Surface itself is a cold line to read just to learn that it was.
-    std::uint64_t refreshed = 0;
+    // Stage 2: the pipeline key's dims for a binding of these flags that is not a depth compare (image_dim_of: the dim
+    // with the texel kind << 8, arrayed in bit 31); kNoKeyDim until a key has decoded them.
+    std::uint32_t key_dim = kNoKeyDim;
+    std::uint32_t static_epoch = 0, recheck_ms = 0;
+    // Stage 2, bindless: the view's slot in the global set, taken when the entry is made (0: none); it lives as long
+    // as the view, and the view as long as the entry's epoch.
+    std::uint32_t slot = 0;
+    // Stage 2: the T#'s base (tsharp_base), for what a draw does with its images' addresses (the recent-draw ring, the
+    // owed clears' overlap) without decoding the words again; 0 until the entry is made under stage 2.
+    std::uint64_t base = 0;
 };
+static_assert(sizeof(IdViewEntry) == 64, "an entry is one line");
 constexpr std::size_t kIdViewSlots = 8192;
 IdViewEntry g_id_views[kIdViewSlots];
 std::uint64_t g_id_view_hits = 0, g_id_view_misses = 0;
+// Stage 2's counts (under g.mu): bindings that skipped the refresh; refreshes run, by why the skip did not apply;
+// compare mode's refreshes the skip would have left out (and of them the hash backstop's catches, which a skip only
+// delays to the next recheck), and entries whose surface is not their view's resource's image by generation.
+std::uint64_t g_images_skips = 0, g_images_not_static = 0, g_images_epoch = 0, g_images_due = 0, g_images_pending = 0;
+std::uint64_t g_images_missed = 0, g_images_backstop = 0, g_images_wrong_gen = 0, g_images_compared = 0;
+
+// Stage 2: a surface whose refresh a view entry may skip while nothing that counts changes it - a GX texture's image
+// by identity (not hashed, not watched) that no shader, fill, copy, upload token, command-processor write or GX map
+// has touched since its upload. refresh_surface_locked has nothing to do for it but its hash schedule.
+bool images_static(const Surface& sf) {
+    return by_identity(sf) && !g_hash_registered && sf.image && !sf.failed && !sf.watched && !sf.gpu_written && !sf.cp_dirty &&
+           !sf.copied_mips && !sf.gx_dirty;
+}
+// After the entry's surface was refreshed: whether its bindings skip the refresh from here.
+void images_settle(IdViewEntry& e) {
+    e.fast = e.sf && images_static(*e.sf);
+    if (!e.fast) return;
+    e.sf->static_fast = true;
+    e.static_epoch = g_static_epoch;
+    e.recheck_ms = static_cast<std::uint32_t>(g_coarse_ms) + kStaticRecheckMs;
+}
+// The entry's surface refreshed as today's binding would, under stage 2: `skip` is whether the entry would have
+// skipped it. Compare mode refreshes anyway and counts what the skip would have missed.
+void images_refresh(IdViewEntry& e, bool skip) {
+    Surface& sf = *e.sf;
+    if (!skip) {
+        ++(!e.fast ? g_images_not_static
+           : e.static_epoch != g_static_epoch ? g_images_epoch
+           : gx_writes_pending().load(std::memory_order_relaxed) ? g_images_pending
+                                                                  : g_images_due);
+        refresh_surface_locked(sf);
+        images_settle(e);
+        return;
+    }
+    // Compare (=2): today's refresh runs; a skip is wrong where it found work - an upload, a write, a new image. A GX
+    // map told since the skip was decided (another thread's) is the next binding's to drain, not a miss.
+    if (gx_writes_pending().load(std::memory_order_acquire)) {
+        ++g_images_pending;
+        refresh_surface_locked(sf);
+        images_settle(e);
+        return;
+    }
+    ++g_images_compared;
+    const std::uint32_t uploads = sf.uploads;
+    const VkImage image = sf.image;
+    const std::uint64_t backstop = g_census_check_missed.load(std::memory_order_relaxed);
+    refresh_surface_locked(sf);
+    if (sf.uploads != uploads || sf.image != image || !images_static(sf)) {
+        if (g_census_check_missed.load(std::memory_order_relaxed) != backstop) {
+            ++g_images_backstop;
+        } else if (g_images_missed++ < 8) {
+            host_log("texture: stage 2: a refresh skipped for 0x%llx %ux%u would have missed %s", static_cast<unsigned long long>(sf.base),
+                     sf.width, sf.height, sf.uploads != uploads ? "an upload" : sf.image != image ? "a new image" : "a write");
+        }
+    }
+    images_settle(e);
+}
 
 VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
-                               bool shader_arrayed, bool r128) {
+                               bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
-    if (e.id == id && e.epoch == g_view_epoch && e.flags == flags) {
-        const std::uint64_t stamp = g.record_serial + 1;
-        if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
-            refresh_surface_locked(*e.sf);
-            e.refreshed = stamp;
+    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) {
+        // Stage 2: an image nothing has changed since the entry last refreshed its surface binds as it is. Compare
+        // mode leaves the recheck out (it refreshes anyway), so every refresh a skip stands in for is checked.
+        const bool skip = e.fast && e.static_epoch == g_static_epoch &&
+                          (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
+                          !gx_writes_pending().load(std::memory_order_acquire);
+        if (skip && g_images_mode == 1) {
+            ++g_images_skips;
+        } else {
+            const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
+            if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
+                if (g_images_mode) {
+                    images_refresh(e, skip);
+                } else {
+                    refresh_surface_locked(*e.sf);
+                }
+                e.refreshed = stamp;
+            }
+        }
+        if (g_images_mode == 2 && e.sf && e.sf->gx_registered) {
+            // The handle names its view's image: the surface is the resource's the view was made over, by generation.
+            const std::uint64_t gen = gx_view_gen_by_id(id);
+            if (gen && e.sf->gx_gen && e.sf->gx_gen != gen && g_images_wrong_gen++ < 8) {
+                host_log("texture: stage 2: view %u's entry binds 0x%llx of generation %llu, the view's resource is generation %llu", id,
+                         static_cast<unsigned long long>(e.sf->base), static_cast<unsigned long long>(e.sf->gx_gen),
+                         static_cast<unsigned long long>(gen));
+            }
         }
         if (img_census::on()) img_census::g_last = e.sf;
+        if (slot) *slot = e.slot;
+        if (base) *base = e.base;
         ++g_id_view_hits;
         dims_ok = e.dims_ok;
         dim = e.dim;
@@ -3174,6 +3298,8 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         return e.view;
     }
     ++g_id_view_misses;
+    if (slot) *slot = 0;
+    if (base) *base = 0;
     g_last_view_surface = nullptr;
     g_last_view_no_memo = false;
     const VkImageView view = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128, gx_view_gen_by_id(id));
@@ -3181,9 +3307,43 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
     // As the words memo: only a view that resolved is remembered - a texture
     // not streamed in yet has to be tried again (and a region copy is made
     // again at every bind).
-    if (view != VK_NULL_HANDLE && !g_last_view_no_memo) e = IdViewEntry{id, flags, arrayed, dims_ok, g_view_epoch, view, g_last_view_surface, dim, g.record_serial + 1};
+    if (view != VK_NULL_HANDLE && !g_last_view_no_memo) {
+        e = IdViewEntry{};
+        e.id = id;
+        e.flags = flags;
+        e.arrayed = arrayed;
+        e.dims_ok = dims_ok;
+        e.epoch = static_cast<std::uint32_t>(g_view_epoch);
+        e.view = view;
+        e.sf = g_last_view_surface;
+        e.dim = dim;
+        e.refreshed = static_cast<std::uint32_t>(g.record_serial + 1);
+        // The lookup has just brought the surface up to date (uploaded it, or refreshed it on its way).
+        if (g_images_mode) {
+            images_settle(e);
+            if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
+            e.base = tsharp_base(w);
+        }
+        if (slot) *slot = e.slot;
+        if (base) *base = e.base;
+    }
     return view;
 }
+
+bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
+    const IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags || e.key_dim == kNoKeyDim) return false;
+    dim = e.key_dim & (depth ? 0xffu : 0x7fffffffu);  // a depth compare's has no texel kind (image_dim_of)
+    arrayed = (e.key_dim >> 31) != 0;
+    return true;
+}
+
+void texture_key_dims_note(std::uint32_t id, std::uint8_t flags, std::uint32_t dim, bool arrayed) {
+    IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) e.key_dim = (dim & 0x7fffffffu) | (arrayed ? 0x80000000u : 0u);
+}
+
+int textures_images_mode() { return g_images_mode; }
 
 void texture_view_by_id_prefetch(std::uint32_t id) { __builtin_prefetch(&g_id_views[id & (kIdViewSlots - 1)]); }
 
@@ -3296,10 +3456,26 @@ void textures_census_target(int depth, bool gx_view, bool memo_hit) {
 }
 
 std::string texture_view_by_id_report() {
-    char buf[160];
+    char buf[640];
     std::snprintf(buf, sizeof(buf), "views found by their shader-resource view's id %llu, resolved from the T# for a new id %llu",
                   static_cast<unsigned long long>(g_id_view_hits), static_cast<unsigned long long>(g_id_view_misses));
-    return buf;
+    std::string s = buf;
+    if (g_images_mode) {
+        std::snprintf(buf, sizeof(buf), "; stage 2 (BBHOST_GXVK_IMAGES=%d): bindings that skipped their surface's refresh %llu; refreshes run "
+                      "%llu for an image not static, %llu after the static epoch moved (%llu moves), %llu due again, %llu with a GX map pending",
+                      g_images_mode, static_cast<unsigned long long>(g_images_skips), static_cast<unsigned long long>(g_images_not_static),
+                      static_cast<unsigned long long>(g_images_epoch), static_cast<unsigned long long>(g_static_changes),
+                      static_cast<unsigned long long>(g_images_due), static_cast<unsigned long long>(g_images_pending));
+        s += buf;
+        if (g_images_mode == 2) {
+            std::snprintf(buf, sizeof(buf), "; compare: skips checked %llu, a refresh would have missed %llu (the hash backstop's catches "
+                          "%llu, delayed to the next recheck), entries on another generation's image %llu",
+                          static_cast<unsigned long long>(g_images_compared), static_cast<unsigned long long>(g_images_missed),
+                          static_cast<unsigned long long>(g_images_backstop), static_cast<unsigned long long>(g_images_wrong_gen));
+            s += buf;
+        }
+    }
+    return s;
 }
 
 bool sampler_fixes_on() {
@@ -3406,6 +3582,7 @@ void surface_queue_writeback(std::uint64_t base) {
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() || it->second.failed || it->second.thick) return;
     it->second.gpu_written = true;
+    static_changed(it->second);
     surface_written(it->second);
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 16) {
@@ -3552,6 +3729,7 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        static_changed(sf);
         if (!sf.gpu_written) {
             sf.gpu_written = true;
             sf.watched = false;
@@ -3633,6 +3811,7 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    static_changed(sf);
     if (!sf.gpu_written) {
         sf.gpu_written = true;
         sf.watched = false;
@@ -3859,7 +4038,10 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    if (dst.surface) surface_written(*dst.surface);
+    if (dst.surface) {
+        surface_written(*dst.surface);
+        static_changed(*dst.surface);
+    }
     if (dst.surface && !dst.surface->gpu_written) {
         dst.surface->gpu_written = true;
         dst.surface->watched = false;
@@ -4001,6 +4183,7 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
                   static_cast<unsigned long long>(dst), to_w, to_h, static_cast<unsigned long long>(src), static_cast<unsigned long long>(src_gen));
     } else {
         surface_written(*to_surface);
+        static_changed(*to_surface);
         if (!to_surface->gpu_written) {
             to_surface->gpu_written = true;
             to_surface->watched = false;
@@ -4088,6 +4271,7 @@ void drain_gx_writes_locked() {
             if (!sf.total_src || sf.base + sf.total_src <= base) continue;
             sf.gx_dirty = true;
             sf.refreshed_serial = 0;
+            static_changed(sf);
             g_gx_written_surfaces.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -5238,6 +5422,7 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_
         sf.unchanged = 0;
         sf.cp_dirty = true;
         sf.cp_dirty_serial = g.flushes;
+        static_changed(sf);
         if (sf.hot < 2) sf.hot = 2;
         if (probe && sf.base == probe) {
             static std::atomic<int> logs{0};

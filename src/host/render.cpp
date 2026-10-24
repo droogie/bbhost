@@ -2434,6 +2434,14 @@ const int g_view_by_id = [] {
     return e ? std::atoi(e) : 1;
 }();
 std::uint64_t g_view_by_id_disagree = 0;  // under g.mu
+// Stage 2: the key's dims from GX views' entries (texture_key_dims_by_id), decoded, and compare mode's disagreements;
+// and, bindless, the slots from the entries that differ from the set's.
+std::uint64_t g_key_dims_by_id = 0, g_key_dims_decoded = 0, g_key_dims_disagree = 0, g_bindless_slot_disagree = 0;  // under g.mu
+std::uint64_t g_image_base_disagree = 0;  // under g.mu: compare mode's entry bases that differ from the T#'s
+// Stage 2: image bindings by how the prefetch found their view - [0] by a GX view's entry, [1] from the T# in a GX
+// draw (the binding's record has no view), [2] from the T# in another draw (the middleware's, the engine's), [3]
+// none (the T# unreadable). Under g.mu.
+std::uint64_t g_image_bind_paths[4] = {};
 
 // Programs by object. A GX draw carries its shader and input-layout
 // objects' ids (engine/gx_resources.h), which stand for what the object holds
@@ -9804,7 +9812,7 @@ void note_feedback_loops(const DrawState& s, const StageImages* stages, int nsta
     for (int st = 0; st < nstages; ++st) {
         for (const StageImages::Image& im : stages[st].images) {
             if (!im.resolved) continue;
-            const std::uint64_t base = tsharp_base(im.w);
+            const std::uint64_t base = image_base(im);
             // The layers the T# reads (BASE_ARRAY .. LAST_ARRAY): another layer
             // of a layered target than the one drawn is no loop.
             const std::uint32_t first_layer = im.w[5] & 0x1fff, last_layer = std::max(first_layer, (im.w[5] >> 13) & 0x1fff);
@@ -11587,6 +11595,22 @@ void render_report() {
     if (g_view_by_id) {
         host_log("render: %s%s", texture_view_by_id_report().c_str(),
                  g_view_by_id == 2 ? ("; disagreements with the T# " + std::to_string(g_view_by_id_disagree)).c_str() : "");
+        if (textures_images_mode()) {
+            const std::uint64_t* p = g_image_bind_paths;
+            const double all = static_cast<double>(std::max<std::uint64_t>(1, p[0] + p[1] + p[2] + p[3]));
+            host_log("render: stage 2: image bindings by a GX view's entry %llu (%.1f%%), from the T# in a GX draw (no view in its record) "
+                     "%llu (%.1f%%), from the T# in another draw %llu (%.1f%%), unresolved %llu",
+                     static_cast<unsigned long long>(p[0]), 100.0 * static_cast<double>(p[0]) / all, static_cast<unsigned long long>(p[1]),
+                     100.0 * static_cast<double>(p[1]) / all, static_cast<unsigned long long>(p[2]), 100.0 * static_cast<double>(p[2]) / all,
+                     static_cast<unsigned long long>(p[3]));
+            host_log("render: stage 2: pipeline key dims of GX views from their entries %llu, decoded %llu%s",
+                     static_cast<unsigned long long>(g_key_dims_by_id), static_cast<unsigned long long>(g_key_dims_decoded),
+                     textures_images_mode() == 2 ? ("; compared, disagreeing " + std::to_string(g_key_dims_disagree) +
+                                                    "; bindless slots from entries disagreeing " + std::to_string(g_bindless_slot_disagree) +
+                                                    "; T# bases from entries disagreeing " + std::to_string(g_image_base_disagree))
+                                                       .c_str()
+                                                 : "");
+        }
     }
     if (g_program_ids) {
         const std::string checked = g_program_ids == 2 ? "; disagreements with the address " + std::to_string(g_by_id_disagree) : std::string();
@@ -12347,6 +12371,7 @@ std::vector<std::pair<std::uint32_t, bool>> image_dims_for(const gcn::TranslateR
 }
 
 void resolve_key_stage(const gcn::TranslateResult* paths, const std::uint32_t* stage_user, const GxStageRecords* gx, KeyStage& out) {
+    static const int images_mode = textures_images_mode();
     out.dims.clear();
     out.modes.clear();
     out.images.clear();
@@ -12356,8 +12381,38 @@ void resolve_key_stage(const gcn::TranslateResult* paths, const std::uint32_t* s
     for (std::size_t k = 0; k < paths->images.size(); ++k) {
         const gcn::ImageBinding& b = paths->images[k];
         KeyStage::Words& r = out.images.emplace_back();
-        r.resolved = resolve_via_plan(plan ? &plan->images[k] : nullptr, b.path, stage_user, gx, b.r128 ? 4 : 8, r.w);
-        out.dims.push_back(image_dim_of(b, r.resolved, r.w));
+        const GxBindingPlan* bp = plan ? &plan->images[k] : nullptr;
+        r.resolved = resolve_via_plan(bp, b.path, stage_user, gx, b.r128 ? 4 : 8, r.w);
+        // Stage 2: a GX view's binding takes its dims from the view's entry, decoded once (the view's T# never changes).
+        const std::uint32_t id = images_mode && g_view_by_id && r.resolved && bp && bp->source == GxBindingPlan::kTex &&
+                                         ((gx->obj_tex_set >> bp->slot) & 1)
+                                     ? gx->obj_tex_id[bp->slot]
+                                     : 0;
+        if (!id) {
+            out.dims.push_back(image_dim_of(b, r.resolved, r.w));
+            continue;
+        }
+        const std::uint8_t flags = texture_view_flags(b.storage, b.da, b.r128);
+        std::uint32_t dim = 0;
+        bool arrayed = false;
+        if (texture_key_dims_by_id(id, flags, b.depth, dim, arrayed)) {
+            ++g_key_dims_by_id;
+            if (images_mode == 2) {
+                const std::pair<std::uint32_t, bool> want = image_dim_of(b, true, r.w);
+                if ((want.first != dim || want.second != arrayed) && g_key_dims_disagree++ < 8) {
+                    host_log("render: stage 2: view %u's dims from its entry %u%s, from its T# %u%s", id, dim, arrayed ? " array" : "",
+                             want.first, want.second ? " array" : "");
+                }
+                out.dims.push_back(want);
+                continue;
+            }
+            out.dims.emplace_back(dim, arrayed);
+            continue;
+        }
+        const std::pair<std::uint32_t, bool> d = image_dim_of(b, true, r.w);
+        ++g_key_dims_decoded;
+        if (!b.depth) texture_key_dims_note(id, flags, d.first, d.second);
+        out.dims.push_back(d);
     }
     for (std::size_t k = 0; k < paths->samplers.size(); ++k) {
         const gcn::SamplerBinding& b = paths->samplers[k];
@@ -12384,6 +12439,7 @@ void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t
         const char* e = std::getenv("BBHOST_GXVK_IMAGES");
         return e && std::strcmp(e, "census") == 0;
     }();
+    static const int images_mode = textures_images_mode();
     out.images.resize(meta.images.size());
     const GxStagePlan* plan = gx && g_binding_plans && g_view_by_id ? &stage_plan(meta, *gx) : nullptr;
     for (std::size_t k = 0; k < meta.images.size(); ++k) {
@@ -12418,7 +12474,11 @@ void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t
             const GxBindingPlan* bp = plan && k < plan->images.size() ? &plan->images[k] : nullptr;
             const std::uint32_t id = bp && bp->source == GxBindingPlan::kTex && ((gx->obj_tex_set >> bp->slot) & 1) ? gx->obj_tex_id[bp->slot] : 0;
             if (id) {
-                im.view = texture_view_by_id(id, im.w, b.storage, ok, im.dim, im.arrayed, b.da, b.r128);
+                im.view = texture_view_by_id(id, im.w, b.storage, ok, im.dim, im.arrayed, b.da, b.r128, &im.slot, &im.base);
+                if (images_mode == 2 && im.base && im.base != tsharp_base(im.w) && g_image_base_disagree++ < 8) {
+                    host_log("render: stage 2: view %u's base from its entry 0x%llx, from its T# 0x%llx", id,
+                             static_cast<unsigned long long>(im.base), static_cast<unsigned long long>(tsharp_base(im.w)));
+                }
                 if (g_view_by_id == 2) {
                     std::uint32_t dim = 0;
                     bool arrayed = false;
@@ -12428,14 +12488,18 @@ void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t
                         im.view = by_words;
                         im.dim = dim;
                         im.arrayed = arrayed;
+                        im.slot = 0;
+                        im.base = 0;
                     }
                 }
             } else {
                 im.view = texture_view(im.w, b.storage, ok, im.dim, im.arrayed, b.da, b.r128);
             }
             if (census_images) textures_census_binding(id ? 0 : gx ? 1 : 2, im.view);
-        } else if (census_images) {
-            textures_census_binding(gx ? 1 : 2, VK_NULL_HANDLE);
+            ++g_image_bind_paths[id ? 0 : gx ? 1 : 2];
+        } else {
+            if (census_images) textures_census_binding(gx ? 1 : 2, VK_NULL_HANDLE);
+            ++g_image_bind_paths[3];
         }
     }
     out.samplers.resize(meta.samplers.size());
@@ -12493,7 +12557,7 @@ void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre,
             // snapshot of a depth target, a texture) does not on every driver.
             // Every bind counted by kind for the exit report.
             static std::set<std::uint64_t> said;
-            const std::uint64_t base = tsharp_base(w);
+            const std::uint64_t base = image_base(im);
             const auto rt = g_rts.find(base);
             const auto sn = rt == g_rts.end() ? g_snapshots.find(base) : g_snapshots.end();
             const int kind = rt != g_rts.end() ? (rt->second.depth ? 0 : 1) : sn != g_snapshots.end() ? 2 : 3;
@@ -19841,8 +19905,19 @@ static bool draw_impl(const GpuDraw& d) {
         static thread_local std::vector<VkImageView> views;
         if (meta.bindless) {
             stage_final_views(meta, stage_images[st], pl.name.c_str(), views);
+            static const int images_mode = textures_images_mode();
+            const std::vector<StageImages::Image>& pre = stage_images[st].images;
             for (std::size_t k = 0; k < meta.images.size() && k < 16; ++k) {
+                // Stage 2: a view bound as its entry gave it takes the slot the entry took when it was made.
+                const std::uint32_t slot = k < pre.size() && pre[k].slot && views[k] == pre[k].view ? pre[k].slot : 0;
+                if (slot && images_mode != 2) {
+                    params.image_index[k] = slot;
+                    continue;
+                }
                 params.image_index[k] = bindless_view_slot_locked(views[k], meta.images[k].storage);
+                if (slot && slot != params.image_index[k] && g_bindless_slot_disagree++ < 8) {
+                    host_log("render: stage 2: a view's slot from its entry %u, from the set %u", slot, params.image_index[k]);
+                }
             }
             for (std::size_t k = 0; k < meta.samplers.size() && k < 16; ++k) {
                 const VkSampler smp = stage_images[st].samplers[k] ? stage_images[st].samplers[k] : g.dummy_sampler;
@@ -20385,7 +20460,7 @@ static bool draw_impl(const GpuDraw& d) {
         for (int st = 0; st < 2; ++st) {
             for (const StageImages::Image& im : stage_images[st].images) {
                 if (!im.resolved) continue;
-                const std::uint64_t base = tsharp_base(im.w);
+                const std::uint64_t base = image_base(im);
                 if (g_hazards.owed && g_hazards.written.count(base)) sample_hazard = true;
                 g_hazards.sampled.insert(base);
             }
@@ -20430,7 +20505,7 @@ static bool draw_impl(const GpuDraw& d) {
             sampled_known = true;
             for (int st = 0; st < 2; ++st) {
                 for (const StageImages::Image& im : stage_images[st].images) {
-                    if (im.resolved && nsampled < 64) sampled[nsampled++] = tsharp_base(im.w);
+                    if (im.resolved && nsampled < 64) sampled[nsampled++] = image_base(im);
                 }
             }
             sampled_all = nsampled < 64;  // else (more than fit): the scan below as it was
@@ -20480,7 +20555,7 @@ static bool draw_impl(const GpuDraw& d) {
                     for (int st = 0; st < 2 && !read; ++st) {
                         for (const StageImages::Image& im : stage_images[st].images) {
                             if (!im.resolved) continue;
-                            const std::uint64_t b = tsharp_base(im.w);
+                            const std::uint64_t b = image_base(im);
                             if (b >= r.base && b < end) {
                                 read = true;
                                 why = kVcwSampled;
@@ -21219,7 +21294,7 @@ static bool draw_impl(const GpuDraw& d) {
             r.tex[k] = 0;
             if (k < pl.ps.meta().images.size() && k < ps_images.images.size() && !pl.ps.meta().images[k].r128 &&
                 ps_images.images[k].resolved) {
-                r.tex[k] = tsharp_base(ps_images.images[k].w);
+                r.tex[k] = image_base(ps_images.images[k]);
                 std::memcpy(r.tsharp[k], ps_images.images[k].w, sizeof(r.tsharp[k]));
             }
         }
