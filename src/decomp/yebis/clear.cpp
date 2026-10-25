@@ -21,11 +21,23 @@
 // About one a frame (YEBIS's targets without the mask). Leaves: the game's
 // calls in the game's order; Gnm's texture accessors are called, as the
 // game's code does, on a texture of its own on the stack.
+//
+// One difference is ours on purpose, the one decomp/yebis/context.cpp makes
+// for YEBIS's drains and shader waits: the compute clear's wait - the game's
+// yebis_wait_compute written inline, an 8-byte label embedded in the command
+// buffer, an end-of-shader event writing 1 into it and the wait for it - is a
+// barrier token (decomp/yebis/token.h), so no label of a round the GPU has
+// not reached lands in YEBIS's command buffer once the game has begun it
+// again. The cache action after it stays.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "decomp/yebis/token.h"
+
+#include "log.h"
 
 #include <immintrin.h>
 
+#include <atomic>
 #include <cstdint>
 
 using namespace decomp;
@@ -61,7 +73,8 @@ constexpr u64 kSetComputeShader = 0x15fb840; // (gnm, shader)
 constexpr u64 kSetBuffers = 0x15fb6d0;       // (gnm, stage, slot, count, buffers*)
 constexpr u64 kSetTextures = 0x15fb6a0;      // (gnm, stage, slot, count, textures*)
 constexpr u64 kDispatch = 0x15fbd10;         // yebis_gnm_dispatch (ours)
-constexpr u64 kEmbedData = 0x14760c0, kEndOfShader = 0x1478320, kWaitRegMem = 0x1477b30;
+constexpr u64 kEmbedData = 0x14760c0;        // gnm_embed_data(cb, bytes, alignment as log2)
+[[maybe_unused]] constexpr u64 kEndOfShader = 0x1478320, kWaitRegMem = 0x1477b30;  // the game's wait (its label's event and wait)
 constexpr u64 kClearShaders = 0x593a048;     // the clear's compute shaders: 1D (+0), 2D (+8), 3D (+0x10)
 // Gnm's Texture (T#) and Buffer (V#) methods.
 constexpr u64 kTexType = 0x1489830, kTexWidth = 0x14898a0, kTexHeight = 0x1489100, kTexDepth = 0x14890e0;
@@ -84,6 +97,11 @@ struct Pair {
 using PairOf3 = GUEST_ABI Pair (*)(u64, u64, u64);
 
 u32 call1(u64 fn, u64 a) { return static_cast<u32>(game_function<One>(fn)(a)); }
+
+// The views cleared by compute (and the compute clears whose wait was written
+// as its token), and by the game's fast clear, whose own wait is still a
+// label in the command buffer (the exit report). Relaxed atomics, for leaves.
+std::atomic<std::uint64_t> g_compute_views{0}, g_clear_tokens{0}, g_fast_views{0};
 
 // A colour component as 8-bit unorm, as the fast path makes it: 255 for
 // exactly 1, else floor(c * 256) in double, truncated to an int (the
@@ -161,12 +179,11 @@ DECOMP_LEAF void yebis_compute_clear(u64 y, u64 in, u64 colour) {
             else return;
         }
     }
-    // The wait for the compute shaders (yebis_wait_compute's, inline), then the context's state back.
+    // The wait for the compute shaders (yebis_wait_compute's, inline): a barrier
+    // token where the game's has its label, the end-of-shader event and the
+    // wait (the header); then the caches, and the context's state back.
     const u64 cb = load<u64>(y + 0x8);
-    const u64 label = game_function<Three>(kEmbedData)(cb, 8, 3);
-    store<u64>(label, 0);
-    game_function<Four>(kEndOfShader)(cb, 0x2f, label, 1);
-    game_function<Five>(kWaitRegMem)(cb, label, 0xffffffffu, 3, 1);
+    if (yebis_barrier_token(cb, MUTANT(4) ? kGxNativeMagic : kGxBarrierMagic)) g_clear_tokens.fetch_add(1, std::memory_order_relaxed);
     game_function<Four>(kAcquireMem)(cb, 0x38, 0, 1);
     game_function<Two>(kSetComputeShader)(y, saved_shader);
     game_function<Five>(kSetTextures)(y, 0, 0, 1, static_cast<u8>(call1(kTexValid, reinterpret_cast<u64>(saved_tex))) ? reinterpret_cast<u64>(saved_tex) : 0);
@@ -193,6 +210,7 @@ DECOMP_LEAF void yebis_clear_target_compute(u64 y, u64 rt, u64 colour) {
 DECOMP_LEAF void yebis_context_clear_render_target_view(u64 ctx, u64 view, u64 colour) {
     const u64 rt = load<u64>(load<u64>(view + 0xd8));
     if (call1(kHasFastClear, rt)) {
+        g_fast_views.fetch_add(1, std::memory_order_relaxed);
         game_function<Two>(kFastClear)(ctx + kGnm, rt);
         const u32 r = unorm8(load<float>(colour)), g = unorm8(load<float>(colour + 4)), b = unorm8(load<float>(colour + 8));
         const u32 a = unorm8(load<float>(colour + 12));
@@ -200,6 +218,7 @@ DECOMP_LEAF void yebis_context_clear_render_target_view(u64 ctx, u64 view, u64 c
         game_function<Three>(kSetClearColor)(load<u64>(ctx + kCb), load<u32>(view + 0xe0), reinterpret_cast<u64>(words));
         return;
     }
+    g_compute_views.fetch_add(1, std::memory_order_relaxed);
     game_function<Three>(kClearTarget)(ctx + kGnm, load<u64>(load<u64>(view + 0xd8)), colour);
     game_function<One>(kWaitCompute)(load<u64>(ctx + kCb));
     game_function<Four>(kAcquireMem)(load<u64>(ctx + kCb), 0x38, 0, 0);
@@ -208,6 +227,15 @@ DECOMP_LEAF void yebis_context_clear_render_target_view(u64 ctx, u64 view, u64 c
 }
 
 namespace {
+void report() {
+    const u64 compute = g_compute_views.load(std::memory_order_relaxed), fast = g_fast_views.load(std::memory_order_relaxed);
+    const u64 tokens = g_clear_tokens.load(std::memory_order_relaxed);
+    if (compute || fast || tokens)
+        host_log("decomp: YEBIS's target clears: %llu views by compute, %llu by the game's fast clear (0x15ebe60, its own wait still a label in "
+                 "the command buffer); compute clears that ended with their wait as a barrier token: %llu",
+                 static_cast<ull>(compute), static_cast<ull>(fast), static_cast<ull>(tokens));
+}
+
 #define PUSH6 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53
 // sub rsp, 0xb8
 constexpr u8 kEntryComputeClear[] = {PUSH6, 0x48, 0x81, 0xec, 0xb8, 0x00, 0x00, 0x00};
@@ -227,5 +255,8 @@ void decomp_yebis_clear_add() {
         {"yebis_compute_clear", "yebis", 0x15e8930, kEntryComputeClear, sizeof kEntryComputeClear, reinterpret_cast<void*>(&yebis_compute_clear),
          DecompKind::Leaf},
     };
-    for (const DecompFunction& fn : fns) decomp_add(fn);
+    for (DecompFunction fn : fns) {
+        if (fn.bn == 0x2e41320) fn.report = &report;
+        decomp_add(fn);
+    }
 }

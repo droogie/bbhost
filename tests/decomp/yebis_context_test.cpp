@@ -7,10 +7,21 @@
 // flush counts that make the hazard test go both ways, garbage above each
 // 32-bit argument's bits - ours must make the game's calls with the game's
 // arguments in the game's order, leave every byte of the context, the views,
-// the textures, the command buffer's header and the drain's label as the
-// game's leaves them, and return what the game's returns. Nine deliberate
-// mistakes must be caught, and the entries hold the instructions written
-// against. Skips without the 1.09 eboot.
+// the textures and the command buffer's header as the game's leaves them, and
+// return what the game's returns. Nine deliberate mistakes must be caught, and
+// the entries hold the instructions written against. Skips without the 1.09
+// eboot.
+//
+// One difference is ours on purpose: a drain (at the end of a target bind) and
+// the three shader waits write a barrier token where the game's embed a label
+// in the command buffer, have an end-of-pipe or end-of-shader event write it
+// and wait for it. So for those, the compare leaves out the game's three calls
+// (embed_data, end_of_pipe or end_of_shader, wait_reg_mem) and its zeroing of
+// the embedded label, and checks instead that ours wrote one barrier token for
+// each - {0xc0001000, kGxBarrierMagic} at the command buffer's write pointer,
+// the pointer moved on by two dwords, the refill asked for two dwords with the
+// room left when there was none, nothing written when it refused - and made
+// every other call of the game's, the cache action's included, in order.
 #define DECOMP_YEBIS_CONTEXT_MUTANTS
 int g_context_mutant = 0;
 #include "decomp/yebis/context.cpp"
@@ -94,7 +105,8 @@ void fail(const char* what, int trial, const char* why) {
 // textures, Gnm render targets and the cells views point at them through,
 // the views array, the label, a compute shader and an argument buffer.
 constexpr u64 kCtxAt = 0x0, kCbAt = 0x3600, kViewsAt = 0x3700, kTexAt = 0x5000, kRtAt = 0x6000, kCellAt = 0x6600, kArrayAt = 0x6800,
-              kLabelAt = 0x6900, kShaderAt = 0x6a00, kBufferAt = 0x6b00, kArenaBytes = 0x7000;
+              kLabelAt = 0x6900, kShaderAt = 0x6a00, kBufferAt = 0x6b00, kPktAt = 0x7000, kRefillAt = 0x7200, kArenaBytes = 0x7400;
+constexpr u64 kPktBytes = 0x200;
 constexpr int kPool = 20;
 alignas(64) u8 g_arena[kArenaBytes];
 alignas(64) u8 g_saved[kArenaBytes];
@@ -105,11 +117,41 @@ u64 view_at(int k) { return A(kViewsAt + 0x100ull * k); }
 u64 garbage32() { return (static_cast<u64>(g_rng.u32()) << 32) | g_rng.u32(); }
 u64 small(int hi) { return static_cast<u64>(g_rng.range(0, hi)); }
 
+// The command buffer's refill, as its owner's callback: asked for dwords with
+// room left; gives a new chunk (kRefillAt) or refuses (g_refill_gives).
+struct RefillCall {
+    u64 cb, arg;
+    u32 dwords, room;
+    bool operator==(const RefillCall&) const = default;
+};
+std::vector<RefillCall> g_refills;
+bool g_refill_gives = true;
+GUEST_ABI u8 refill_stub(u64 cb, u32 dwords, u64 arg, u32 room) {
+    g_refills.push_back({cb, arg, dwords, room});
+    if (!g_refill_gives) return 0;
+    store<u64>(cb + 0x0, A(kRefillAt));
+    store<u64>(cb + 0x8, A(kRefillAt) + kPktBytes);
+    store<u64>(cb + 0x10, A(kRefillAt));
+    return 1;
+}
+
 // The context and its objects, generated.
 void generate() {
     for (u8& b : g_arena) b = static_cast<u8>(g_rng.u32());
     const u64 ctx = A(kCtxAt);
     store<u64>(ctx + kCb, A(kCbAt));
+    // The command buffer: its chunk, its end (now and then too near for a
+    // token's two dwords, or before the write pointer), its write pointer, its
+    // refill and the refill's argument.
+    {
+        const u64 cb = A(kCbAt), wp = A(kPktAt) + 8 * small(8);
+        const u64 room = g_rng.chance(0.15) ? small(1) * 4 : 8 * (1 + small(20));
+        store<u64>(cb + 0x0, g_rng.chance(0.03) ? 0 : A(kPktAt));
+        store<u64>(cb + 0x8, wp + room);
+        store<u64>(cb + 0x10, wp);
+        store<u64>(cb + 0x18, reinterpret_cast<u64>(&refill_stub));
+        g_refill_gives = !g_rng.chance(0.2);
+    }
     store<u64>(ctx + kDraws, small(12));
     store<u64>(ctx + kDrained, small(12));
     store<u64>(ctx + kFlushes, g_rng.chance(0.2) ? 0 : small(4));
@@ -192,8 +234,9 @@ u64 call(void* fn, const u64* a) {
     return reinterpret_cast<F6>(fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
 }
 
-// What the target binds covered: drains, first binds, slots unbound.
-long g_drained = 0, g_registered = 0, g_unbound = 0, g_binds = 0;
+// What the target binds covered: drains, first binds, slots unbound; and the
+// cases that wrote barrier tokens.
+long g_drained = 0, g_registered = 0, g_unbound = 0, g_binds = 0, g_tokens = 0;
 
 long run(int cases) {
     long n = 0;
@@ -221,10 +264,64 @@ long run(int cases) {
             }
             std::memcpy(g_arena, g_saved, kArenaBytes);
             g_rec.clear();
+            g_refills.clear();
             const u64 our_ret = call(kOurs[f], a);
             if (our_ret != game_ret) fail(kNames[f], t, "the return value");
-            if (g_rec != game) fail(kNames[f], t, "the calls");
-            if (std::memcmp(g_arena, g_game, kArenaBytes) != 0) fail(kNames[f], t, "the memory");
+            // The drain's and the shader waits' label calls, the deliberate
+            // difference: left out of the game's, one barrier token each
+            // expected of ours instead (the header comment).
+            std::vector<Call> want;
+            int barriers = 0;
+            const bool tokens = f == kFOmSetRenderTargets || f >= kFWaitCompute;
+            for (std::size_t k = 0; k < game.size(); ++k) {
+                if (tokens && k + 2 < game.size() && game[k].who == kEmbedId && (game[k + 1].who == 2 || game[k + 1].who == 3) &&
+                    game[k + 2].who == 4) {
+                    ++barriers;
+                    k += 2;
+                    continue;
+                }
+                want.push_back(game[k]);
+            }
+            if (g_rec != want) fail(kNames[f], t, "the calls");
+            // The tokens: what the command buffer should hold and say after
+            // `barriers` of them from the header as generated.
+            u8 expect[kArenaBytes];
+            std::memcpy(expect, g_game, kArenaBytes);
+            if (barriers) {
+                std::memcpy(expect + kLabelAt, g_saved + kLabelAt, 8);  // the game zeroed its label; ours has none
+                const u64 cb = A(kCbAt);
+                u64 chunk, end, wp;
+                std::memcpy(&chunk, g_saved + kCbAt, 8);
+                std::memcpy(&end, g_saved + kCbAt + 8, 8);
+                std::memcpy(&wp, g_saved + kCbAt + 0x10, 8);
+                std::vector<RefillCall> refills;
+                bool refused = false;
+                for (int b = 0; b < barriers; ++b) {
+                    if (!chunk || end < wp + 8) {
+                        u64 arg;
+                        std::memcpy(&arg, g_saved + kCbAt + 0x20, 8);
+                        refills.push_back({cb, arg, 2, end > wp ? static_cast<u32>((end - wp) >> 2) : 0});
+                        if (!g_refill_gives) {
+                            refused = true;
+                            continue;
+                        }
+                        chunk = A(kRefillAt);
+                        end = A(kRefillAt) + kPktBytes;
+                        wp = A(kRefillAt);
+                    }
+                    const u32 token[2] = {0xc0001000u, kGxBarrierMagic};
+                    std::memcpy(expect + (wp - A(0)), token, 8);
+                    wp += 8;
+                }
+                std::memcpy(expect + kCbAt, &chunk, 8);
+                std::memcpy(expect + kCbAt + 8, &end, 8);
+                std::memcpy(expect + kCbAt + 0x10, &wp, 8);
+                if (g_refills != refills) fail(kNames[f], t, refused ? "the refill (refused)" : "the refill");
+            } else if (!g_refills.empty()) {
+                fail(kNames[f], t, "a refill with no token to write");
+            }
+            if (std::memcmp(g_arena, expect, kArenaBytes) != 0) fail(kNames[f], t, barriers ? "the memory (with the tokens)" : "the memory");
+            if (barriers && !g_quiet) ++g_tokens;
             ++n;
         }
     }
@@ -287,7 +384,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("yebis_context_test: ok - %ld cases over %d functions (of %ld target binds, %ld drained, %ld bound a view the first time, %ld unset a "
-                "slot), 9 mutants caught\n",
-                total, kFns, g_binds, g_drained, g_registered, g_unbound);
+                "slot; %ld wrote barrier tokens), 9 mutants caught\n",
+                total, kFns, g_binds, g_drained, g_registered, g_unbound, g_tokens);
     return 0;
 }

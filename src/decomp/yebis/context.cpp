@@ -17,6 +17,19 @@
 // 0x15ebc20, 0x15ebc90). Leaves: each reads and writes the context and calls
 // the game's functions in the game's order with the game's arguments.
 //
+// The drains and the shader waits are where ours departs from the game's on
+// purpose: the game embeds an 8-byte label in the command buffer itself
+// (gnm_embed_data), has an end-of-pipe or end-of-shader event write 1 into
+// it and the GPU wait until it reads 1. Ours writes a barrier token there
+// instead, as decomp/gx/drain_token.cpp does for GX's own drains: the
+// renderer orders its own work, and the command processor takes the token as
+// the wait it was. YEBIS cycles two command buffers and starts one again
+// without waiting for the GPU (yebis_gnm_next_buffer, 0x15fae90), so a GPU
+// running behind used to land the old round's labels on the new round's
+// packets; with no label in the buffer there is nothing to land. The flush
+// label - the context's own memory, read by Map and the deferred deletes -
+// is written as the game writes it.
+//
 // YEBIS tracks its own hazards, as a D3D11 driver does: the context counts
 // draws (+0xc20) and remembers the count at its last drain (+0xc28); a
 // texture remembers the count it was last bound at (+0xa0 of the object at
@@ -30,8 +43,10 @@
 // reordered or extended at D3D11 granularity (docs/modding.md).
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "decomp/yebis/token.h"
 
 #include "core/thunk.h"
+#include "hle/modules.h"
 #include "log.h"
 
 #include <atomic>
@@ -83,9 +98,9 @@ constexpr u64 kAaModes = 0x57e4530, kDefaultAaMode = 0x5709420;
 constexpr u32 kExportAny = 0x43d11c, kExportWide = 0x98967f, kExportMixed = 0;
 
 constexpr u64 kAcquireMem = 0x1477f40;     // gnm_acquire_mem(cb, cache action, extended action, engine)
-constexpr u64 kEmbedData = 0x14760c0;      // gnm_embed_data(cb, bytes, alignment as log2): room in a NOP
+[[maybe_unused]] constexpr u64 kEmbedData = 0x14760c0;  // gnm_embed_data(cb, bytes, alignment as log2): room in a NOP (the game's drains)
 constexpr u64 kEndOfPipe = 0x14778f0;      // gnm_write_end_of_pipe_event(cb, event, dst, label, data, value, cache action, policy)
-constexpr u64 kEndOfShader = 0x1478320;    // gnm_write_end_of_shader_event(cb, event, label, value)
+[[maybe_unused]] constexpr u64 kEndOfShader = 0x1478320;  // gnm_write_end_of_shader_event(cb, event, label, value) (the game's waits)
 constexpr u64 kWaitRegMem = 0x1477b30;     // gnm_wait_reg_mem(cb, address, mask, function, reference)
 constexpr u64 kSetDepthTarget = 0x14739b0; // gnm_set_depth_render_target(cb, depth target or null)
 constexpr u64 kSetPrimType = 0x1473fe0;    // gnm_set_primitive_type(cb, type)
@@ -146,14 +161,16 @@ void stamp(u64 ctx, u64 view) {
     store<u64>(load<u64>(view + 0x80) + 0x10, load<u64>(ctx + kFlushes));
 }
 
-// The label, the end-of-pipe event that writes it and the wait for it - the
-// drain - then the caches.
+// The barrier token in the place of a drain's or a shader wait's label, its
+// event and the wait for it (decomp/yebis/token.h); the ninth mutant hands
+// it the wrong magic.
+void barrier_token(u64 cb) { (void)yebis_barrier_token(cb, MUTANT(9) ? kGxNativeMagic : kGxBarrierMagic); }
+
+// The drain: a barrier token where the game's has its label, the end-of-pipe
+// event that writes it and the wait for it; then the caches.
 u64 drain(u64 ctx) {
     store<u64>(ctx + kDrained, load<u64>(ctx + kDraws));
-    const u64 label = game_function<Three>(kEmbedData)(cb_of(ctx), 8, 3);
-    store<u64>(label, 0);
-    game_function<Eight>(kEndOfPipe)(cb_of(ctx), kEopFlushCbDb, 0, label, 2, 1, 0, 0);
-    game_function<Five>(kWaitRegMem)(cb_of(ctx), label, 0xffffffffu, 3, 1);
+    barrier_token(cb_of(ctx));
     return game_function<Four>(kAcquireMem)(cb_of(ctx), kFlushInvalidateL1L2, 0, 0);
 }
 
@@ -405,13 +422,12 @@ DECOMP_LEAF u64 yebis_context_wait_flush(u64 ctx) {
 }
 
 namespace {
-// A label in the command buffer, an end-of-shader event writing 1 into it,
-// the wait for it, a cache action.
+// A barrier token where the game's has a label in the command buffer, an
+// end-of-shader event (`event`: which shaders) writing 1 into it and the wait
+// for it; then a cache action.
 u64 wait_for_shaders(u64 cb, u32 event, u32 cache) {
-    const u64 label = game_function<Three>(kEmbedData)(cb, 8, 3);
-    store<u64>(label, 0);
-    game_function<Four>(kEndOfShader)(cb, event, label, 1);
-    game_function<Five>(kWaitRegMem)(cb, label, 0xffffffffu, 3, 1);
+    (void)event;  // the token waits for everything before it, as the renderer orders it
+    barrier_token(cb);
     return game_function<Four>(kAcquireMem)(cb, cache, 0, 1);
 }
 }  // namespace
@@ -419,7 +435,7 @@ u64 wait_for_shaders(u64 cb, u32 event, u32 cache) {
 // The waits (cb): for the compute shaders before a draw, for the pixel
 // shaders before a dispatch, for the compute shaders before a dispatch.
 DECOMP_LEAF u64 yebis_wait_compute(u64 cb) { return wait_for_shaders(cb, kEosCsDone, kFlushInvalidateL1L2); }
-DECOMP_LEAF u64 yebis_wait_pixels(u64 cb) { return wait_for_shaders(cb, MUTANT(9) ? kEosCsDone : kEosPsDone, kFlushInvalidateL1L2); }
+DECOMP_LEAF u64 yebis_wait_pixels(u64 cb) { return wait_for_shaders(cb, kEosPsDone, kFlushInvalidateL1L2); }
 DECOMP_LEAF u64 yebis_wait_dispatch(u64 cb) { return wait_for_shaders(cb, kEosCsDone, kInvalidateL1); }
 
 // OMSetRenderTargets's compare stand-in (BBHOST_DECOMP_COMPARE=1): the game's
@@ -547,6 +563,12 @@ void report() {
     const u64 alone = g_omsrt_alone.load(std::memory_order_relaxed);
     if (alone) host_log("decomp: yebis_context_om_set_render_targets compare: %llu calls left to the game's alone (a drain, a first bind or no room)",
                         static_cast<ull>(alone));
+    const u64 tokens = g_yebis_tokens.load(std::memory_order_relaxed), refused = g_yebis_token_refused.load(std::memory_order_relaxed);
+    if (tokens || refused) {
+        host_log("decomp: YEBIS's drains and shader waits written as barrier tokens (the compute clear's among them): %llu (%llu after a "
+                 "refill; %llu not written: the refill gave no room)",
+                 static_cast<ull>(tokens), static_cast<ull>(g_yebis_token_refills.load(std::memory_order_relaxed)), static_cast<ull>(refused));
+    }
 }
 
 // The entries the decomp list places them at.

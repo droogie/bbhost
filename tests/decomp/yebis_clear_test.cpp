@@ -9,9 +9,20 @@
 // targets (with and without the fast-clear mask, slice ranges, fragment
 // counts) and colours (1, NaN, values past 1 and past an int, negatives),
 // ours must make the game's calls with the game's arguments in the game's
-// order and leave the context and the arena as the game's leave them. Three
+// order and leave the context and the arena as the game's leave them. Four
 // deliberate mistakes must be caught, and the entries hold the instructions
 // written against. Skips without the 1.09 eboot.
+//
+// One difference is ours on purpose: the compute clear's wait for the compute
+// shaders is a barrier token where the game's embeds a label in the command
+// buffer, has an end-of-shader event write it and waits for it. So for the
+// compute clear, the compare leaves out the game's three calls (embed_data,
+// end_of_shader, wait_reg_mem) and its zeroing of the label, and checks
+// instead that ours wrote one barrier token - {0xc0001000, kGxBarrierMagic} at
+// the command buffer's write pointer, the pointer moved on by two dwords, the
+// refill asked for two dwords with the room left when there was none, nothing
+// written when it refused - and made every other call of the game's, the
+// cache action's included, in order.
 #define DECOMP_YEBIS_CLEAR_MUTANTS
 int g_clear_mutant = 0;
 #include "decomp/yebis/clear.cpp"
@@ -41,12 +52,34 @@ enum Who {
 };
 
 constexpr std::size_t kCtxBytes = 0x3600, kArenaBytes = 0x200;
+// The command buffer's packets: its chunk, and from kRefillAt the chunk its
+// refill gives.
+constexpr std::size_t kPktBytes = 0x400, kRefillAt = 0x200;
 alignas(64) u8 g_ctx[kCtxBytes], g_view[0x100], g_tex[0x100], g_rt[0x40], g_cb[0x40], g_shaders[0x40], g_colour[16], g_in[0x20];
 alignas(64) u8 g_arena[kArenaBytes];
+alignas(64) u8 g_pkt[kPktBytes];
 u64 g_arena_used = 0;
 u64 g_state_tex[4], g_buf_lo, g_buf_hi;
 
 u64 A(const void* p) { return reinterpret_cast<u64>(p); }
+
+// The command buffer's refill, as its owner's callback: asked for dwords with
+// room left; gives a new chunk (kRefillAt) or refuses (g_refill_gives).
+struct RefillCall {
+    u64 cb, arg;
+    u32 dwords, room;
+    bool operator==(const RefillCall&) const = default;
+};
+std::vector<RefillCall> g_refills;
+bool g_refill_gives = true;
+GUEST_ABI u8 refill_stub(u64 cb, u32 dwords, u64 arg, u32 room) {
+    g_refills.push_back({cb, arg, dwords, room});
+    if (!g_refill_gives) return 0;
+    store<u64>(cb + 0x0, A(g_pkt) + kRefillAt);
+    store<u64>(cb + 0x8, A(g_pkt) + kPktBytes);
+    store<u64>(cb + 0x10, A(g_pkt) + kRefillAt);
+    return 1;
+}
 std::vector<u64> words(u64 at, int n) {
     std::vector<u64> v;
     for (int i = 0; i < n; ++i) v.push_back(load<u64>(at + 8ull * i));
@@ -154,8 +187,21 @@ void generate() {
     for (u8* p : {g_view, g_tex, g_rt, g_cb, g_shaders}) for (int i = 0; i < 0x40; ++i) p[i] = static_cast<u8>(g_rng.u32());
     for (int i = 0x40; i < 0x100; ++i) g_view[i] = static_cast<u8>(g_rng.u32());
     for (u8& b : g_arena) b = static_cast<u8>(g_rng.u32());
+    for (u8& b : g_pkt) b = static_cast<u8>(g_rng.u32());
     const u64 ctx = A(g_ctx), y = ctx + kGnm;
     store<u64>(y + 0x8, A(g_cb));  // ctx + kCb
+    // The command buffer: its chunk (now and then none), its end (now and then
+    // too near for a token's two dwords, or at the write pointer), its write
+    // pointer, its refill; the refill's argument and the flags as generated.
+    {
+        const u64 wp = A(g_pkt) + 8ull * static_cast<u64>(g_rng.range(0, 8));
+        const u64 room = g_rng.chance(0.15) ? 4ull * static_cast<u64>(g_rng.range(0, 1)) : 8ull * static_cast<u64>(1 + g_rng.range(0, 20));
+        store<u64>(A(g_cb) + 0x0, g_rng.chance(0.03) ? 0 : A(g_pkt));
+        store<u64>(A(g_cb) + 0x8, wp + room);
+        store<u64>(A(g_cb) + 0x10, wp);
+        store<u64>(A(g_cb) + 0x18, reinterpret_cast<u64>(&refill_stub));
+        g_refill_gives = !g_rng.chance(0.2);
+    }
     store<u64>(y + 0x28, g_rng.next());  // the state, handed to the recorders only
     store<u64>(A(g_view) + 0xd8, A(g_view) + 0xf0);
     store<u64>(A(g_view) + 0xf0, A(g_rt));
@@ -181,12 +227,15 @@ u64 snapshot(std::vector<u8>& out) {
     out.insert(out.end(), g_arena, g_arena + kArenaBytes);
     out.insert(out.end(), g_cb, g_cb + 0x40);
     out.insert(out.end(), g_tex, g_tex + 0x40);
+    out.insert(out.end(), g_pkt, g_pkt + kPktBytes);
     return out.size();
 }
+constexpr std::size_t kSnapCb = kCtxBytes + kArenaBytes, kSnapPkt = kSnapCb + 0x80;
 
 // What the cases covered: clears that dispatched, that ended with the wait,
-// that stopped early; views cleared fast and by compute.
-long g_dispatched = 0, g_waited = 0, g_stopped = 0, g_fast = 0, g_slow = 0;
+// that stopped early; views cleared fast and by compute; compute clears that
+// wrote their token.
+long g_dispatched = 0, g_waited = 0, g_stopped = 0, g_fast = 0, g_slow = 0, g_tokens = 0;
 
 long run(int cases) {
     long n = 0;
@@ -228,16 +277,64 @@ long run(int cases) {
             std::memcpy(g_arena, before.data() + kCtxBytes, kArenaBytes);
             std::memcpy(g_cb, before.data() + kCtxBytes + kArenaBytes, 0x40);
             std::memcpy(g_tex, before.data() + kCtxBytes + kArenaBytes + 0x40, 0x40);
+            std::memcpy(g_pkt, before.data() + kSnapPkt, kPktBytes);
             std::memcpy(g_in, in_saved, sizeof in_saved);
             g_rec.clear();
+            g_refills.clear();
             g_arena_used = 0;
             void* ours_fn = f == 0 ? reinterpret_cast<void*>(&yebis_compute_clear)
                                    : f == 1 ? reinterpret_cast<void*>(&yebis_clear_target_compute)
                                             : reinterpret_cast<void*>(&yebis_context_clear_render_target_view);
             reinterpret_cast<F3>(ours_fn)(a[0], a[1], a[2]);
             snapshot(ours);
-            if (g_rec != calls) fail(kNames[f], t, "the calls");
-            if (ours != game) fail(kNames[f], t, "the memory");
+            // The compute clear's wait, the deliberate difference: its label
+            // calls left out of the game's, a barrier token expected of ours
+            // instead (the header comment). The other two run the game's
+            // compute clear in both.
+            std::vector<Call> want;
+            int barriers = 0, embeds = 0, label_embed = -1;
+            for (std::size_t k = 0; k < calls.size(); ++k) {
+                if (f == 0 && k + 2 < calls.size() && calls[k].who == kEmbedId && calls[k + 1].who == kEosId && calls[k + 2].who == kWaitId) {
+                    ++barriers;
+                    label_embed = embeds++;
+                    k += 2;
+                    continue;
+                }
+                if (calls[k].who == kEmbedId) ++embeds;
+                want.push_back(calls[k]);
+            }
+            if (g_rec != want) fail(kNames[f], t, "the calls");
+            std::vector<u8> expect = game;
+            if (barriers) {
+                // The game zeroed its label (its embed's room in the arena); ours has none.
+                const std::size_t label = kCtxBytes + 0x20ull * static_cast<std::size_t>(label_embed);
+                std::memcpy(expect.data() + label, before.data() + label, 8);
+                u64 chunk, end, wp, arg;
+                std::memcpy(&chunk, before.data() + kSnapCb, 8);
+                std::memcpy(&end, before.data() + kSnapCb + 8, 8);
+                std::memcpy(&wp, before.data() + kSnapCb + 0x10, 8);
+                std::memcpy(&arg, before.data() + kSnapCb + 0x20, 8);
+                std::vector<RefillCall> refills;
+                bool written = true;
+                if (!chunk || end < wp + 8) {
+                    refills.push_back({A(g_cb), arg, 2, end > wp ? static_cast<u32>((end - wp) >> 2) : 0});
+                    written = g_refill_gives;
+                    if (written) chunk = A(g_pkt) + kRefillAt, end = A(g_pkt) + kPktBytes, wp = A(g_pkt) + kRefillAt;
+                }
+                if (written) {
+                    const u32 token[2] = {0xc0001000u, kGxBarrierMagic};
+                    std::memcpy(expect.data() + kSnapPkt + (wp - A(g_pkt)), token, 8);
+                    wp += 8;
+                }
+                std::memcpy(expect.data() + kSnapCb, &chunk, 8);
+                std::memcpy(expect.data() + kSnapCb + 8, &end, 8);
+                std::memcpy(expect.data() + kSnapCb + 0x10, &wp, 8);
+                if (g_refills != refills) fail(kNames[f], t, written ? "the refill" : "the refill (refused)");
+                if (written && !g_quiet) ++g_tokens;
+            } else if (!g_refills.empty()) {
+                fail(kNames[f], t, "a refill with no token to write");
+            }
+            if (ours != expect) fail(kNames[f], t, barriers ? "the memory (with the token)" : "the memory");
             ++n;
         }
     }
@@ -282,7 +379,7 @@ int main(int argc, char** argv) {
         if (!at || std::memcmp(at, entries[f], sizes[f]) != 0) fail(kNames[f], -1, "the entry's instructions");
     }
     const long total = run(cases);
-    for (const int mutant : {1, 2, 3}) {
+    for (const int mutant : {1, 2, 3, 4}) {
         if (!caught(mutant)) {
             ++g_failed;
             std::printf("FAIL: mutant %d not caught\n", mutant);
@@ -292,8 +389,8 @@ int main(int argc, char** argv) {
         std::printf("yebis_clear_test: %d failures (%ld cases)\n", g_failed, total);
         return 1;
     }
-    std::printf("yebis_clear_test: ok - %ld cases (compute clears: %ld dispatched, %ld ended with the wait, %ld stopped early; views: %ld "
-                "fast, %ld by compute), 3 mutants caught\n",
-                total, g_dispatched, g_waited, g_stopped, g_fast, g_slow);
+    std::printf("yebis_clear_test: ok - %ld cases (compute clears: %ld dispatched, %ld ended with the wait, %ld of them a barrier token "
+                "written, %ld stopped early; views: %ld fast, %ld by compute), 4 mutants caught\n",
+                total, g_dispatched, g_waited, g_tokens, g_stopped, g_fast, g_slow);
     return 0;
 }
