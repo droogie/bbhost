@@ -125,9 +125,10 @@ whole game drew, which a first start builds before the player reaches it
 `build/pipeline-list`). `BBHOST_PACKAGE_PIPELINE_LIST=<file>` packs a local
 list instead, `BBHOST_PIPELINE_LIST_FETCH=0` leaves it out (a development
 kit), and `tools/check_release_bundle.sh` fails a release whose packages lack
-the pinned list. The pin is `pipeline-list-v2`, a pre-release of its own with
-1,924 pipelines and 9 compute records; with the pin left empty, the packages
-carry no list and the check asks for none.
+the pinned list. The pin is `pipeline-list-v3`, a pre-release of its own with
+1,199 pipelines (8 of them the GPU particles' geometry-shader pipelines) and
+10 compute records; with the pin left empty, the packages carry no list and
+the check asks for none.
 
 ## Continuous integration
 
