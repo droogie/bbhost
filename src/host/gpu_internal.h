@@ -1215,6 +1215,16 @@ bool indirect_clamp_locked(VkBuffer src, VkDeviceSize src_offset, std::uint64_t 
                            VkDeviceSize& offset);
 void indirect_clamp_retired_locked(std::uint64_t serial);
 std::string indirect_clamp_report();
+// BBHOST_GX_PARTICLES (gpu.cpp): how a draw that binds a geometry shader - the
+// GPU particles - is drawn: with the geometry shader (gs, the default), as one
+// vertex stage that runs the export and geometry shaders for each vertex (vs,
+// gcn/gs_vertex.h), or with the geometry shader and the vertex stage beside it,
+// their vertices compared bit for bit (check).
+enum class ParticlePath : std::uint8_t { kGs, kVs, kCheck };
+ParticlePath particle_path();
+// render.cpp: the check mode's records of the submission `serial`, compared
+// once it is done.
+void particle_check_retired_locked(std::uint64_t serial);
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);

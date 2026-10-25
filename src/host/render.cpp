@@ -27,7 +27,9 @@
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
+#include "gcn/gs_vertex.h"
 #include "gcn/lift.h"
+#include "gcn/spirv.h"
 #include "gcn/names.h"
 #include "gcn/wave.h"
 #include "gcn/isa.h"
@@ -278,6 +280,21 @@ struct GfxPipeline {
     // and buffers in set 4 (tess_set_layout); built whole, never a library.
     bool gs_native = false;
     ShaderStage gs_es;
+    // BBHOST_GX_PARTICLES=vs (gcn/gs_vertex.h): the ES and the GS as one vertex
+    // stage (gs_vs_module, gs_as_vs), drawn indexed over a static list of its
+    // particles' triangles (one strip each, or quads) with no geometry stage.
+    // =check keeps the geometry stage, as its check
+    // module (gs_check_module), and builds the vertex stage's check variant
+    // beside it (gs_check_pipeline, which rasterizes nothing); both write the
+    // draw's check record.
+    bool gs_as_vs = false;
+    VkShaderModule gs_vs_module = VK_NULL_HANDLE, gs_check_module = VK_NULL_HANDLE;
+    VkPipeline gs_check_pipeline = VK_NULL_HANDLE;
+    std::uint32_t gs_vertices = 0;       // a particle's vertices: one strip of them (gs_strip), or quads
+    bool gs_strip = false;
+    std::uint32_t gs_vertex_dwords = 0;  // a check record's vertex
+    std::uint32_t gs_flat_words = 0;     // check: the vertex's words the pixel shader reads flat, by bit (the first 32)
+    std::uint32_t gs_capacity_seen = 0;  // check: the most particles a draw of it had room for
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
@@ -877,6 +894,11 @@ std::atomic<std::uint64_t> g_tess_native_refusals{0}, g_tess_native_waits{0};
 // as VS/PS - BBHOST_GX_GS=0 - by its GS program and ES, which draws nothing
 // (the ES exports no position).
 std::atomic<std::uint64_t> g_gs_drawn{0};
+// Of them, as one vertex stage (BBHOST_GX_PARTICLES=vs): the draws, the
+// vertices they ran (their emitters' room, a particle's vertices each) and the
+// most particles one had room for.
+std::atomic<std::uint64_t> g_gs_vs_draws{0}, g_gs_vs_vertices{0};
+std::atomic<std::uint32_t> g_gs_vs_capacity_max{0};
 std::mutex g_gs_mu;
 std::map<std::string, std::uint64_t> g_gs_refused, g_gs_as_vs;  // under g_gs_mu
 std::set<std::string> g_gs_pipelines;                           // under g_gs_mu: the GS pipelines built, by name
@@ -5185,6 +5207,7 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
         return false;
     }
     pl.pipeline = pre->pipeline;
+    pl.gs_check_pipeline = pre->gs_check_pipeline;  // BBHOST_GX_PARTICLES=check: the vertex stage's beside it
     pl.library = pre->library;
     pl.generic = pre->generic;
     std::memcpy(pl.spec_w3, pre->spec_w3, sizeof(pl.spec_w3));
@@ -5510,6 +5533,356 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
     return true;
 }
 
+// ---- GPU particles as one vertex stage (BBHOST_GX_PARTICLES, gcn/gs_vertex.h) ----
+// A lift's own words: the stage's module may be DXC's (BBHOST_HLSL).
+std::vector<std::uint32_t> lift_words_of(const ShaderStage& st) {
+    std::vector<std::uint32_t> lift;
+    if (!hlsl_lift_of(st.meta().spirv, lift)) lift = st.meta().spirv;
+    return lift;
+}
+
+// The locations of a pixel shader's inputs that it reads flat, by bit.
+std::uint32_t flat_input_locations(const std::vector<std::uint32_t>& ps) {
+    std::set<std::uint32_t> flat, inputs;
+    std::map<std::uint32_t, std::uint32_t> location;
+    for (std::size_t i = 5; i < ps.size();) {
+        const std::uint32_t n = ps[i] >> 16, op = ps[i] & 0xffff;
+        if (!n || i + n > ps.size()) break;
+        if (op == spv::OpDecorate && n >= 3 && ps[i + 2] == spv::DecFlat) flat.insert(ps[i + 1]);
+        if (op == spv::OpDecorate && n >= 4 && ps[i + 2] == spv::DecLocation) location[ps[i + 1]] = ps[i + 3];
+        if (op == spv::OpVariable && n >= 4 && ps[i + 3] == spv::ScInput) inputs.insert(ps[i + 2]);
+        i += n;
+    }
+    std::uint32_t mask = 0;
+    for (const std::uint32_t id : flat) {
+        const auto it = location.find(id);
+        if (inputs.count(id) && it != location.end() && it->second < 32) mask |= 1u << it->second;
+    }
+    return mask;
+}
+
+// The pipeline's ES and GS lifts as one vertex stage, or with =check the
+// vertex stage's check variant and the GS's check module; false (`why`) when
+// the splice refuses them.
+bool build_gs_vertex_stage(GfxPipeline& pl, std::string& why) {
+    const bool check = particle_path() == ParticlePath::kCheck;
+    const std::vector<std::uint32_t> es = lift_words_of(pl.gs_es), gs = lift_words_of(pl.vs);
+    gcn::GsVertexOptions o;
+    o.check = check;
+    const gcn::GsVertexStage st = gcn::gs_vertex_stage(es, gs, o);
+    if (!st.ok()) {
+        why = st.why;
+        return false;
+    }
+    dump_spirv(pl.name + (check ? "-gs-vs-check" : "-gs-vs"), st.spirv);
+    if (!make_module(st.spirv, pl.gs_vs_module)) {
+        why = "its vertex stage's module";
+        return false;
+    }
+    pl.gs_vertices = st.vertices;
+    pl.gs_strip = st.strip;
+    pl.gs_vertex_dwords = st.vertex_dwords;
+    if (check) {
+        const gcn::GsVertexStage gc = gcn::gs_check_stage(gs, st.vertices);
+        if (!gc.ok()) {
+            why = "the check's geometry stage: " + gc.why;
+            return false;
+        }
+        dump_spirv(pl.name + "-gs-check", gc.spirv);
+        if (!make_module(gc.spirv, pl.gs_check_module)) {
+            why = "the check's geometry stage's module";
+            return false;
+        }
+        const std::uint32_t flat = flat_input_locations(lift_words_of(pl.ps));
+        for (const gcn::GsOutputSlot& out : st.outputs) {
+            if (out.location >= 32 || !(flat >> out.location & 1)) continue;
+            for (std::uint32_t w = out.offset; w < out.offset + out.dwords && w < 32; ++w) pl.gs_flat_words |= 1u << w;
+        }
+    } else {
+        pl.gs_as_vs = true;
+    }
+    static std::mutex logged_mu;
+    static std::set<std::string> logged;
+    bool first;
+    {
+        std::lock_guard<std::mutex> lk(logged_mu);
+        first = logged.insert(pl.name).second;
+    }
+    if (first) {
+        host_log("render: geometry-shader pipeline %s %s: %u vertices a particle as %s (%u emits on the GS's longest path), %zu words%s",
+                 pl.name.c_str(), check ? "checked against its vertex stage" : "as one vertex stage", st.vertices, st.strip ? "one strip" : "quads",
+                 st.path_emits, st.spirv.size(),
+                 check ? (", the vertex's words the pixel shader reads flat " + std::to_string(pl.gs_flat_words)).c_str() : "");
+    }
+    return true;
+}
+
+// The index lists a geometry-shader draw as a vertex stage is drawn over, a
+// particle's triangles in Vulkan's strip order, so each one's provoking vertex
+// is the strip's: for quads (key 0) unit j is quad j, 4j+0, 4j+1, 4j+2, 4j+1,
+// 4j+3, 4j+2; for one strip of n vertices (key n) unit p is particle p, its
+// triangle i (p n + i, p n + i+1+i%2, p n + i+2-i%2). Grown by doubling; a
+// replaced buffer stays (draws in flight read it).
+struct QuadIndices {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint64_t quads = 0;  // units
+};
+std::map<std::uint32_t, std::vector<QuadIndices>> g_quad_indices;  // under g.mu, by key; the last of each is the one drawn with
+constexpr std::uint64_t kQuadIndicesMax = 1ull << 24;  // vertices a list indexes
+// A unit's vertices and indices.
+std::uint32_t particle_unit_vertices(std::uint32_t key) { return key ? key : 4; }
+std::uint32_t particle_unit_indices(std::uint32_t key) { return key ? 3 * (key - 2) : 6; }
+
+VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
+    std::vector<QuadIndices>& lists = g_quad_indices[key];
+    if (!lists.empty() && lists.back().quads >= quads) return lists.back().buffer;
+    const std::uint32_t uv = particle_unit_vertices(key), ui = particle_unit_indices(key);
+    if (quads * uv > kQuadIndicesMax) return VK_NULL_HANDLE;
+    std::uint64_t n = lists.empty() ? (1ull << 16) / uv : lists.back().quads * 2;
+    while (n < quads) n *= 2;
+    QuadIndices q;
+    q.quads = n;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = n * ui * sizeof(std::uint32_t);
+    bci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &q.buffer) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, q.buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX)
+        mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    MemOwner own_mem("particle quad indices");
+    void* map = nullptr;
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &q.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(g.device, q.buffer, q.memory, 0) != VK_SUCCESS || vkMapMemory(g.device, q.memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        if (q.memory) vkFreeMemory(g.device, q.memory, nullptr);
+        vkDestroyBuffer(g.device, q.buffer, nullptr);
+        return VK_NULL_HANDLE;
+    }
+    auto* idx = static_cast<std::uint32_t*>(map);
+    for (std::uint64_t j = 0; j < n; ++j) {
+        const std::uint32_t v = static_cast<std::uint32_t>(uv * j);
+        std::uint32_t* out = idx + ui * j;
+        for (std::uint32_t i = 0; i + 2 < uv; ++i) {  // the strip's triangle i (a quad: triangles 0 and 1)
+            *out++ = v + i;
+            *out++ = v + i + 1 + i % 2;
+            *out++ = v + i + 2 - i % 2;
+        }
+    }
+    vkUnmapMemory(g.device, q.memory);
+    lists.push_back(q);
+    host_log("render: the particles' index list for %s holds %llu of them (%llu KiB)",
+             key ? ("strips of " + std::to_string(key)).c_str() : "quads", static_cast<unsigned long long>(n),
+             static_cast<unsigned long long>(bci.size >> 10));
+    return q.buffer;
+}
+
+// ---- BBHOST_GX_PARTICLES=check: the two paths' vertices compared -----------------------------
+// Each checked draw takes a record (gcn/gs_vertex.h) in a host-visible ring:
+// the GS writes what each of its invocations emitted, the vertex stage what
+// each kept vertex holds, and once the submission is done the host compares
+// them word for word - particle by particle, vertex by vertex - by program set.
+constexpr std::uint64_t kParticleCheckRingBytes = 256ull << 20;
+constexpr std::uint32_t kParticleCheckRoomMax = 2048;  // particles a record has room for
+struct ParticleCheckRecord {
+    std::uint64_t serial = 0, offset = 0, bytes = 0;
+    const GfxPipeline* pl = nullptr;  // pipelines are never erased
+    std::uint32_t room = 0, capacity = 0;
+    bool drawn = false;  // the vertex stage's check draw was recorded (else the draw stopped before it)
+};
+// The ring's first bytes: the empty record, no room, for a draw of a checked
+// pipeline that gets no record of its own.
+constexpr std::uint64_t kParticleCheckEmpty = 256;
+struct ParticleCheckStats {
+    std::uint64_t draws = 0, particles = 0, vertices = 0, vertex_diffs = 0, word_diffs = 0, flat_diffs = 0, count_diffs = 0, left_out = 0,
+                  gs_missing = 0, live = 0, capacity = 0, past_capacity = 0, past_room = 0, not_run = 0, instanced = 0;
+    std::uint32_t max_live = 0, max_capacity = 0;
+};
+struct ParticleCheck {
+    bool tried = false;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint8_t* map = nullptr;
+    VkDeviceAddress address = 0;
+    std::uint64_t head = 0;
+    std::deque<ParticleCheckRecord> pending;
+    std::map<std::string, ParticleCheckStats> by_set;
+    std::uint64_t unchecked_busy = 0, unchecked_no_args = 0, unchecked_no_pipeline = 0, unrecorded = 0, logged = 0;
+} g_pcheck;  // under g.mu
+
+bool particle_check_ready_locked() {
+    ParticleCheck& c = g_pcheck;
+    if (c.tried) return c.map != nullptr;
+    c.tried = true;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = kParticleCheckRingBytes;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &c.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &flags;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    MemOwner own_mem("particle check records");
+    void* map = nullptr;
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(g.device, c.buffer, c.memory, 0) != VK_SUCCESS || vkMapMemory(g.device, c.memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        host_log("render: the particle check's records could not be made: nothing is checked");
+        return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = c.buffer;
+    c.address = vkGetBufferDeviceAddress(g.device, &bai);
+    c.map = static_cast<std::uint8_t*>(map);
+    std::memset(c.map, 0, kParticleCheckEmpty);
+    c.head = kParticleCheckEmpty;
+    host_log("render: the particle check keeps %llu MiB of records (each draw up to %u particles)",
+             static_cast<unsigned long long>(kParticleCheckRingBytes >> 20), kParticleCheckRoomMax);
+    return true;
+}
+
+// A record for a draw of `pl` with room for `room` particles: its device
+// address, its header holding the arguments' (0: none free).
+VkDeviceAddress particle_check_record_locked(const GfxPipeline& pl, std::uint32_t room, VkDeviceAddress args) {
+    if (!particle_check_ready_locked() || !room) return 0;
+    ParticleCheck& c = g_pcheck;
+    const std::uint64_t per = gcn::gs_check_particle_dwords(pl.gs_vertices, pl.gs_vertex_dwords);
+    const std::uint64_t bytes = ((4ull * (gcn::kGsCheckHeaderDwords + 2ull * room * per)) + 255) & ~255ull;
+    if (bytes > kParticleCheckRingBytes / 4) return 0;
+    const std::uint64_t at = c.head + bytes > kParticleCheckRingBytes ? kParticleCheckEmpty : c.head;
+    for (const ParticleCheckRecord& r : c.pending) {
+        if (at < r.offset + r.bytes && r.offset < at + bytes) return 0;
+    }
+    c.head = at + bytes;
+    std::memset(c.map + at, 0, bytes);
+    auto* h = reinterpret_cast<std::uint32_t*>(c.map + at);
+    h[0] = static_cast<std::uint32_t>(args);
+    h[1] = static_cast<std::uint32_t>(args >> 32);
+    h[2] = room;
+    h[3] = pl.gs_vertices;
+    h[4] = pl.gs_vertex_dwords;
+    ParticleCheckRecord r;
+    r.serial = g.flushes;
+    r.offset = at;
+    r.bytes = bytes;
+    r.pl = &pl;
+    r.room = room;
+    c.pending.push_back(r);
+    return c.address + at;
+}
+
+// The record's check draw is recorded: it is compared when its submission is done.
+void particle_check_drawn_locked(VkDeviceAddress record) {
+    ParticleCheck& c = g_pcheck;
+    if (!c.pending.empty() && record == c.address + c.pending.back().offset) c.pending.back().drawn = true;
+}
+
+// The draw's room once its ES's buffers are known: no more particles than it has.
+void particle_check_capacity_locked(VkDeviceAddress record, std::uint32_t capacity) {
+    ParticleCheck& c = g_pcheck;
+    if (!record || c.pending.empty() || record != c.address + c.pending.back().offset) return;
+    ParticleCheckRecord& r = c.pending.back();
+    r.capacity = capacity;
+    r.room = std::min(r.room, capacity);
+    reinterpret_cast<std::uint32_t*>(c.map + r.offset)[2] = r.room;
+}
+
+void particle_check_compare_locked(const ParticleCheckRecord& r) {
+    ParticleCheck& c = g_pcheck;
+    if (!r.drawn) {
+        ++c.unrecorded;
+        return;
+    }
+    ParticleCheckStats& st = c.by_set[r.pl->name];
+    const auto* rec = reinterpret_cast<const std::uint32_t*>(c.map + r.offset);
+    ++st.draws;
+    if (!rec[8]) {  // its vertex stage never ran: no room, or the draw was predicated away
+        ++st.not_run;
+        return;
+    }
+    const std::uint32_t n = rec[5], instances = rec[6], room = rec[2], vpp = rec[3], vd = rec[4];
+    if (instances != 1) ++st.instanced;
+    st.live += n;
+    st.capacity += r.capacity;
+    st.max_live = std::max(st.max_live, n);
+    st.max_capacity = std::max(st.max_capacity, r.capacity);
+    if (n > r.capacity) ++st.past_capacity;
+    if (n > room) ++st.past_room;
+    const std::uint32_t checked = std::min(n, room);
+    const std::uint64_t per = gcn::gs_check_particle_dwords(vpp, vd);
+    for (std::uint32_t p = 0; p < checked; ++p) {
+        const std::uint32_t* v = rec + gcn::kGsCheckHeaderDwords + p * per;
+        const std::uint32_t* gr = rec + gcn::kGsCheckHeaderDwords + (static_cast<std::uint64_t>(room) + p) * per;
+        ++st.particles;
+        if (!gr[1]) {
+            ++st.gs_missing;
+            continue;
+        }
+        if (v[0] != gr[0]) ++st.count_diffs;
+        if (v[1] & 6) ++st.left_out;
+        const std::uint32_t emitted = std::min(gr[0], vpp);
+        for (std::uint32_t k = 0; k < emitted; ++k) {
+            const std::uint32_t* a = v + gcn::kGsCheckParticleHead + k * vd;
+            const std::uint32_t* b = gr + gcn::kGsCheckParticleHead + k * vd;
+            ++st.vertices;
+            std::uint32_t words = 0, flat = 0;
+            for (std::uint32_t w = 0; w < vd; ++w) {
+                if (a[w] == b[w]) continue;
+                ++words;
+                if (k % 4 < 2 && w < 32 && (r.pl->gs_flat_words >> w & 1)) ++flat;
+                if (c.logged < 16) {
+                    ++c.logged;
+                    host_log("render: particle check: %s, particle %u of %u, vertex %u, word %u: the GS's 0x%08x, the vertex stage's 0x%08x",
+                             r.pl->name.c_str(), p, n, k, w, b[w], a[w]);
+                }
+            }
+            if (words) ++st.vertex_diffs;
+            st.word_diffs += words;
+            if (flat) ++st.flat_diffs;
+        }
+    }
+}
+
+std::string particle_check_line(const std::string& set, const ParticleCheckStats& s) {
+    char b[640];
+    std::snprintf(b, sizeof(b),
+                  "%s: %llu draws (%llu whose vertex stage never ran), %llu particles, %llu vertices compared: %llu differ (%llu words), %llu "
+                  "at a flat input's provoking vertex; emit counts differ %llu, left out by the vertex stage %llu, no GS record %llu; live "
+                  "%llu against room %llu (most %u of %u), past the room %llu, past the record %llu, instanced %llu",
+                  set.c_str(), static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.not_run),
+                  static_cast<unsigned long long>(s.particles), static_cast<unsigned long long>(s.vertices),
+                  static_cast<unsigned long long>(s.vertex_diffs), static_cast<unsigned long long>(s.word_diffs),
+                  static_cast<unsigned long long>(s.flat_diffs), static_cast<unsigned long long>(s.count_diffs),
+                  static_cast<unsigned long long>(s.left_out), static_cast<unsigned long long>(s.gs_missing), static_cast<unsigned long long>(s.live),
+                  static_cast<unsigned long long>(s.capacity), s.max_live, s.max_capacity, static_cast<unsigned long long>(s.past_capacity),
+                  static_cast<unsigned long long>(s.past_room), static_cast<unsigned long long>(s.instanced));
+    return b;
+}
+
+}  // namespace
+
+void particle_check_retired_locked(std::uint64_t serial) {
+    ParticleCheck& c = g_pcheck;
+    while (!c.pending.empty() && c.pending.front().serial <= serial) {
+        particle_check_compare_locked(c.pending.front());
+        c.pending.pop_front();
+        std::uint64_t draws = 0;
+        for (const auto& [set, s] : c.by_set) draws += s.draws;
+        if (draws % 500 == 1) {
+            for (const auto& [set, s] : c.by_set) host_log("render: particle check so far: %s", particle_check_line(set, s).c_str());
+        }
+    }
+}
+
+namespace {
+
 // The first time each program's lift for a native hull pipeline is decided.
 bool tess_native_first(const std::string& name) {
     static std::mutex mu;
@@ -5755,6 +6128,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // is decided again below.
     pl.tess_native = false;
     pl.gs_native = false;
+    pl.gs_as_vs = false;
+    pl.gs_vs_module = pl.gs_check_module = VK_NULL_HANDLE;
     pl.tess_set_layout = VK_NULL_HANDLE;
     pl.tess_ls.lifted = false;
     pl.tess_hull_lifted = false;
@@ -6132,6 +6507,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     if (gs_lift) {
         std::string why;
         if (!build_gs_es_stage(pl, s, why)) return fail("geometry-shader pipeline: " + why);
+        // BBHOST_GX_PARTICLES=vs: the ES and the GS as one vertex stage, or the
+        // pipeline is not built; =check: a pipeline the splice refuses is drawn
+        // with its GS, unchecked.
+        if (particle_path() != ParticlePath::kGs && !build_gs_vertex_stage(pl, why)) {
+            if (particle_path() == ParticlePath::kVs) return fail("geometry-shader pipeline as a vertex stage: " + why);
+            std::lock_guard<std::mutex> lk(g_gs_mu);
+            if (g_gs_refused[std::string("check: ") + why]++ == 0) host_log("render: pipeline %s is drawn unchecked: %s", pl.name.c_str(), why.c_str());
+            pl.gs_vs_module = pl.gs_check_module = VK_NULL_HANDLE;
+        }
         std::lock_guard<std::mutex> lk(g_gs_mu);
         if (g_gs_pipelines.insert(pl.name).second) {
             host_log("render: geometry-shader pipeline %s: ES 0x%llx as the vertex stage (%u ring dwords), GS as the geometry stage (%u vertices of %u "
@@ -9265,10 +9649,14 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
             stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
             stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
             stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
+        } else if (pl.gs_native && pl.gs_as_vs) {
+            // BBHOST_GX_PARTICLES=vs: the ES and the GS as one vertex stage.
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.gs_vs_module);
         } else if (pl.gs_native) {
-            // A geometry-shader pipeline: the ES the vertex stage, `vs` the GS.
+            // A geometry-shader pipeline: the ES the vertex stage, `vs` the GS
+            // (with =check, its check module).
             stage(VK_SHADER_STAGE_VERTEX_BIT, pl.gs_es.module);
-            stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.vs.module);
+            stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs_check_module ? pl.gs_check_module : pl.vs.module);
         } else {
             stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
         }
@@ -9311,7 +9699,8 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         g_masked_blend_pipelines.fetch_add(1, std::memory_order_relaxed);
         if (t_masked_blend_blending) g_masked_blend_blending.fetch_add(1, std::memory_order_relaxed);
     }
-    ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
+    // A geometry-shader draw as one vertex stage draws the quad list's triangles.
+    ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : pl.gs_as_vs ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
     ts.patchControlPoints = std::max<std::uint32_t>(1, pl.tess_control_points);
@@ -9422,6 +9811,27 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         host_log("render: pipeline %s: vkCreateGraphicsPipelines failed", pl.name.c_str());
         pl.failed = true;
         return false;
+    }
+    // BBHOST_GX_PARTICLES=check: beside the GS, the vertex stage's check
+    // variant over the quad list (its every vertex outside the clip volume),
+    // with the pipeline's own state: binding it leaves the draw state alone.
+    if (pl.gs_native && !pl.gs_as_vs && pl.gs_vs_module && !pl.gs_check_pipeline) {
+        std::vector<VkPipelineShaderStageCreateInfo> cs;
+        for (const VkPipelineShaderStageCreateInfo& si : stages) {
+            if (si.stage == VK_SHADER_STAGE_GEOMETRY_BIT) continue;
+            cs.push_back(si);
+            if (si.stage == VK_SHADER_STAGE_VERTEX_BIT) cs.back().module = pl.gs_vs_module;
+        }
+        VkPipelineInputAssemblyStateCreateInfo cia = ia;
+        cia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkGraphicsPipelineCreateInfo cci = gpci;
+        cci.stageCount = static_cast<std::uint32_t>(cs.size());
+        cci.pStages = cs.data();
+        cci.pInputAssemblyState = &cia;
+        if (vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &cci, nullptr, &pl.gs_check_pipeline) != VK_SUCCESS) {
+            pl.gs_check_pipeline = VK_NULL_HANDLE;
+            host_log("render: pipeline %s: its check pipeline was not made; drawn unchecked", pl.name.c_str());
+        }
     }
     if (content_key && !t_replaying) recipe_note_created(pl, content_key);
     pl.raster_discard = f.rasterizer_discard;
@@ -11684,6 +12094,33 @@ void render_report() {
                      static_cast<unsigned long long>(g_gs_drawn.load()), g_gs_pipelines.size(), refused.empty() ? "none" : refused.c_str(),
                      as_vs.empty() ? "none" : as_vs.c_str());
         }
+        if (g_gs_vs_draws.load()) {
+            host_log("render: of them as one vertex stage (BBHOST_GX_PARTICLES=vs): %llu, %llu vertices run (their emitters' room), the most room "
+                     "%u particles",
+                     static_cast<unsigned long long>(g_gs_vs_draws.load()), static_cast<unsigned long long>(g_gs_vs_vertices.load()),
+                     g_gs_vs_capacity_max.load());
+        }
+    }
+    if (particle_path() == ParticlePath::kCheck) {
+        std::lock_guard<GpuMutex> lk(g.mu);
+        ParticleCheck& c = g_pcheck;
+        ParticleCheckStats all;
+        for (const auto& [set, s] : c.by_set) {
+            host_log("render: particle check: %s", particle_check_line(set, s).c_str());
+            for (std::uint64_t ParticleCheckStats::*f :
+                 {&ParticleCheckStats::draws, &ParticleCheckStats::particles, &ParticleCheckStats::vertices, &ParticleCheckStats::vertex_diffs,
+                  &ParticleCheckStats::word_diffs, &ParticleCheckStats::flat_diffs, &ParticleCheckStats::count_diffs, &ParticleCheckStats::left_out,
+                  &ParticleCheckStats::gs_missing, &ParticleCheckStats::live, &ParticleCheckStats::capacity, &ParticleCheckStats::past_capacity,
+                  &ParticleCheckStats::past_room, &ParticleCheckStats::not_run, &ParticleCheckStats::instanced})
+                all.*f += s.*f;
+            all.max_live = std::max(all.max_live, s.max_live);
+            all.max_capacity = std::max(all.max_capacity, s.max_capacity);
+        }
+        host_log("render: particle check (BBHOST_GX_PARTICLES=check), every program set: %s; draws unchecked: %llu with no record free, %llu "
+                 "with no arguments' address, %llu with no check pipeline, %llu stopped before their check draw; %zu records still in flight",
+                 particle_check_line("all", all).c_str(), static_cast<unsigned long long>(c.unchecked_busy),
+                 static_cast<unsigned long long>(c.unchecked_no_args), static_cast<unsigned long long>(c.unchecked_no_pipeline),
+                 static_cast<unsigned long long>(c.unrecorded), c.pending.size());
     }
     host_log("render: targets re-created in another format: %llu with their pixels carried over, %llu with them lost (another size "
              "or texel size), %llu of those starting with the fill their old image had last taken; new targets nothing "
@@ -13178,8 +13615,11 @@ const bool g_cb_prefetch = [] {
 // (cb_valid bit clear) and gets the dummy buffer.
 // `exact` (cb_exact_bindings, a pushed stage): every binding starts at its V#
 // base, its bias 0 - a shader translated with cb_bias_zero reads none.
+// `records`, when given: the most records a V# read by index holds (a
+// geometry-shader draw's emitter's room for particles).
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
-                           std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false) {
+                           std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
+                           std::uint32_t* records = nullptr) {
     // Why V#s end up on the page-table path, logged every 200,000 resolves.
     enum { kBound, kNoBase, kUnaligned, kUnmapped, kTooLong, kOutcomes };
     static std::uint64_t outcomes[kOutcomes] = {};
@@ -13215,6 +13655,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                               : std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
             params.cb_stride[i] = stride;
             params.cb_w3[i] = words[3];
+            if (records && resolved) *records = std::max(*records, words[2]);
             // A typed load takes the identity select whatever the V#'s DST_SEL
             // (gcn::tbuffer_dst_sel): the V#s whose own select is another, for
             // render_report - where the old rule and the ISA's part.
@@ -19639,6 +20080,35 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     draw_stamp.to(kRenderCostSetup);
+    // A geometry-shader draw as one vertex stage (BBHOST_GX_PARTICLES=vs) reads
+    // its indirect arguments at their device address, which the GS's params
+    // hold; one checked (=check), its record there, which holds that address.
+    // (The GS's check module writes the record: a draw that gets none has the
+    // empty one, which has no room.)
+    VkDeviceAddress particle_args = 0, particle_record = 0;
+    std::uint32_t particle_capacity = 0;  // the emitter's room for particles (its ES's buffers, set 4 below)
+    bool particle_checked = false;
+    if (pl.gs_native && (pl.gs_as_vs || pl.gs_check_module)) {
+        if (g.oob.address) return gs_refuse("BBHOST_OOB_COUNT takes the params' LDS address (as a vertex stage or checked)");
+        Located in_copy_at;
+        const bool in_copy = d.indirect_va && copy_version_lookup_locked(d.indirect_va, 16, &in_copy_at) != kCopyVersionNone;
+        if (d.indirect_va && !in_copy) particle_args = guest_device_address(d.indirect_va, 16);
+        if (pl.gs_as_vs && !particle_args) {
+            return gs_refuse(!d.indirect_va ? "not an indirect draw (as a vertex stage)"
+                             : in_copy      ? "its indirect arguments are in a copy (as a vertex stage)"
+                                            : "its indirect arguments have no device address (as a vertex stage)");
+        }
+        if (pl.gs_check_module) {
+            if (!particle_check_ready_locked()) return gs_refuse("the particle check's records were not made");
+            const std::uint32_t room = pl.gs_capacity_seen ? std::min(kParticleCheckRoomMax, pl.gs_capacity_seen) : kParticleCheckRoomMax;
+            if (particle_args && pl.gs_check_pipeline) particle_record = particle_check_record_locked(pl, room, particle_args);
+            particle_checked = particle_record != 0;
+            if (!particle_checked) {
+                ++(!particle_args ? g_pcheck.unchecked_no_args : !pl.gs_check_pipeline ? g_pcheck.unchecked_no_pipeline : g_pcheck.unchecked_busy);
+                particle_record = g_pcheck.address;  // the empty record
+            }
+        }
+    }
     static StageSetCache set_cache[2][kSetCacheWays];  // g.mu is held
     static int set_cache_next[2] = {0, 0};
     bool stage_reused[2] = {false, false};  // this stage took an earlier draw's set, or one the set cache keeps
@@ -19653,6 +20123,7 @@ static bool draw_impl(const GpuDraw& d) {
         params.l1_table = g.l1.address;
         std::memcpy(params.user_sgpr, st == 0 ? s.vs_user : s.ps_user, sizeof(params.user_sgpr));
         params.lds_address = g.oob.address;  // BBHOST_OOB_COUNT=1: the counters (gcn::set_oob_count); 0 otherwise
+        if (st == 0 && (particle_record || particle_args)) params.lds_address = particle_record ? particle_record : particle_args;
         if (st == 0 && t_tess) {
             params.lds_address = t_tess->lds_address;
             params.lds_bytes = t_tess->lds_bytes;
@@ -20140,8 +20611,18 @@ static bool draw_impl(const GpuDraw& d) {
         for (int k = 0; k < 16; ++k) ep.user_sgpr[k] = (eu.set >> k) & 1 ? eu.user[k] : in.vs_user[k];
         std::memcpy(s.es_user, ep.user_sgpr, sizeof(s.es_user));
         const std::size_t es_first = buffer_infos.size();
-        resolve_stage_buffers(em, ep.user_sgpr, ep, buffer_infos);
+        resolve_stage_buffers(em, ep.user_sgpr, ep, buffer_infos, nullptr, false, &particle_capacity);
         if (!every_buffer_bound(ep, em)) return gs_refuse("a constant buffer of its ES does not bind");
+        // As a vertex stage the draw runs its emitter's room - the most
+        // records a buffer its ES reads by index holds -, each particle at or
+        // past the arguments' count left out at the top of the stage.
+        if (pl.gs_as_vs && !particle_capacity) return gs_refuse("its emitter's room is not known (as a vertex stage)");
+        if (pl.gs_as_vs && static_cast<std::uint64_t>(particle_capacity) * pl.gs_vertices > kQuadIndicesMax)
+            return gs_refuse("its emitter's room is past the index list's (as a vertex stage)");
+        if (particle_checked) {
+            pl.gs_capacity_seen = std::max(pl.gs_capacity_seen, particle_capacity);
+            particle_check_capacity_locked(particle_record, particle_capacity);
+        }
         tess_set = alloc_set_locked(pl.tess_set_layout);
         if (!tess_set) return gs_refuse("no descriptor set for its ES");
         set4_pl = &pl;
@@ -20940,7 +21421,46 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     if (!g.profile_passes) profile_begin_locked(&bind_pl->profile_name);
-    if (d.indirect_va) {
+    // A geometry-shader draw as one vertex stage (and =check's beside the GS):
+    // indexed over its particles' index list (quads, or one strip a particle),
+    // the emitter's room of particles, a particle's vertices each. Its
+    // arguments are read by the stage itself.
+    const std::uint32_t particle_key = pl.gs_strip ? pl.gs_vertices : 0;
+    const std::uint64_t particle_quads = !pl.gs_vertices ? 0
+                                         : pl.gs_strip   ? static_cast<std::uint64_t>(particle_capacity)
+                                                         : static_cast<std::uint64_t>(particle_capacity) * (pl.gs_vertices / 4);
+    const std::uint64_t particle_indices = particle_quads * particle_unit_indices(particle_key);
+    const auto bind_quad_list = [&]() -> bool {
+        const VkBuffer ib = quad_indices_locked(particle_key, particle_quads);
+        if (!ib) return false;
+        if (g_recorded.index_buffer != ib || g_recorded.index_offset != 0 || g_recorded.index_type != VK_INDEX_TYPE_UINT32) {
+            cmds.index_buffer(ib, 0, VK_INDEX_TYPE_UINT32);
+            g_recorded.index_buffer = ib;
+            g_recorded.index_offset = 0;
+            g_recorded.index_type = VK_INDEX_TYPE_UINT32;
+        }
+        return true;
+    };
+    if (pl.gs_as_vs) {
+        if (!bind_quad_list()) {
+            if (!g.profile_passes) profile_end_locked();
+            draw_failed(kFailIndexBuffer);
+            return false;
+        }
+        if (g_import_audit) audit_range(d.indirect_va, 16, kUseIndex);
+        note_arena_read(kArenaIndirect, d.indirect_va, 16);
+        note_indirect_locked(d.indirect_va, 1, false);
+        DrawCall call;
+        call.kind = DrawCall::kIndexed;
+        call.count = static_cast<std::uint32_t>(particle_indices);
+        call.instances = 1;
+        glitch_draw_locked(call);
+        occlusion_draw_locked(call);
+        cmds.draw(call);
+        g_gs_vs_draws.fetch_add(1, std::memory_order_relaxed);
+        g_gs_vs_vertices.fetch_add(static_cast<std::uint64_t>(particle_capacity) * pl.gs_vertices, std::memory_order_relaxed);
+        if (particle_capacity > g_gs_vs_capacity_max.load(std::memory_order_relaxed)) g_gs_vs_capacity_max.store(particle_capacity, std::memory_order_relaxed);
+    } else if (d.indirect_va) {
         // What the GPU reads: five dwords for an indexed draw, four otherwise
         // (a 16-byte argument buffer is not read past its end).
         const std::uint64_t args_bytes = d.index_va ? 20 : 16;
@@ -20968,6 +21488,23 @@ static bool draw_impl(const GpuDraw& d) {
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         cmds.draw(call);
+        // BBHOST_GX_PARTICLES=check: the vertex stage beside the GS, in a draw
+        // of its own (the same sets and index buffer, bound by the GS's, and
+        // the same predicate), rasterizing nothing.
+        if (particle_checked && particle_quads && bind_quad_list()) {
+            cmds.publish();
+            cmds.start(!capture && !g.profile && !(g.has_checkpoints && !g.cmd_buffer_marker));
+            cmds.bind_pipeline(bind_pl->gs_check_pipeline, false);
+            g_recorded.pipeline = bind_pl->gs_check_pipeline;
+            DrawCall vc;
+            vc.kind = DrawCall::kIndexed;
+            vc.count = static_cast<std::uint32_t>(particle_indices);
+            vc.instances = 1;
+            vc.cond_buffer = call.cond_buffer;
+            vc.cond_offset = call.cond_offset;
+            cmds.draw(vc);
+            particle_check_drawn_locked(particle_record);
+        }
     } else if (d.index_va) {
         DrawCall call;
         call.kind = DrawCall::kIndexed;

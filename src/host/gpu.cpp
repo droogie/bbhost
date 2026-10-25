@@ -3661,10 +3661,24 @@ bool init_locked() {
                  static_cast<int>(q12.shaderFloat16), static_cast<int>(p12.shaderRoundingModeRTZFloat16),
                  static_cast<int>(p12.shaderDenormPreserveFloat16));
         // Draws that bind a geometry shader: with it, except on GCN under AMD's own driver (host/gs_gate.h).
+        // As one vertex stage (BBHOST_GX_PARTICLES=vs) they need no geometry stage, so the gate does not apply.
         const GsDevice gs_dev{g.vendor_id, drv.driverID, g.subgroup_min, g.subgroup_max};
         const GsPath gs = gs_path_for(gs_dev, std::getenv("BBHOST_GX_GS"));
-        g_gs_path.store(gs_path_on(gs) ? 1 : 0, std::memory_order_release);
-        switch (gs) {
+        const ParticlePath particles = particle_path();
+        const bool as_vertex_stage = particles == ParticlePath::kVs && gs == GsPath::kOffGcnAmd;
+        g_gs_path.store(gs_path_on(gs) || as_vertex_stage ? 1 : 0, std::memory_order_release);
+        if (gs_path_on(gs) || as_vertex_stage) {
+            host_log("gpu: GPU particles drawn %s (BBHOST_GX_PARTICLES=%s; gs draws them with the geometry shader, vs as one vertex stage, "
+                     "check with the geometry shader, the vertex stage compared beside it)",
+                     particles == ParticlePath::kVs      ? "as one vertex stage, without a geometry shader"
+                     : particles == ParticlePath::kCheck ? "with their geometry shader, checked against the vertex stage"
+                                                         : "with their geometry shader",
+                     particles == ParticlePath::kVs ? "vs" : particles == ParticlePath::kCheck ? "check" : "gs, the default");
+        }
+        if (as_vertex_stage) {
+            host_log("gpu: GCN under AMD's driver (subgroups %u-%u wide, driver %d): its particles go as one vertex stage (BBHOST_GX_PARTICLES=vs)",
+                     g.subgroup_min, g.subgroup_max, static_cast<int>(drv.driverID));
+        } else switch (gs) {
         case GsPath::kOn: host_log("gpu: draws that bind a geometry shader drawn with it (BBHOST_GX_GS=0: as their vertex and pixel shaders, as before v0.2.19)"); break;
         case GsPath::kOffGcnAmd:
             host_log("gpu: draws that bind a geometry shader drawn as their vertex and pixel shaders, as before v0.2.19: GCN under AMD's driver "
@@ -6405,6 +6419,7 @@ void retire_slot_locked(int k) {
     vkResetFences(g.device, 1, &sl.fence);
     indirect_stats_retired_locked(sl.serial);
     indirect_clamp_retired_locked(sl.serial);
+    particle_check_retired_locked(sl.serial);
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
@@ -8662,6 +8677,16 @@ bool host_gpu_gs_path() {
     if (v >= 0) return v != 0;
     const char* e = std::getenv("BBHOST_GX_GS");
     return !(e && e[0] == '0');
+}
+
+ParticlePath gpu::particle_path() {
+    static const ParticlePath p = [] {
+        const char* e = std::getenv("BBHOST_GX_PARTICLES");
+        if (e && std::strcmp(e, "vs") == 0) return ParticlePath::kVs;
+        if (e && std::strcmp(e, "check") == 0) return ParticlePath::kCheck;
+        return ParticlePath::kGs;
+    }();
+    return p;
 }
 
 // BBHOST_GDS_SUBGROUP (on; =0 off): a lifted compute shader steps a GDS

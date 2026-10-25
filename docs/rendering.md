@@ -173,6 +173,28 @@ long streaks across the screen, while NVIDIA, RDNA under AMD's driver, RADV
 and lavapipe draw them right. The log's start says which way it went, and
 `BBHOST_GX_GS=1` draws them with their geometry shader anyway.
 
+`BBHOST_GX_PARTICLES=vs` draws the particles with no geometry stage, on every
+device, the way a PC engine draws them: the export shader's and the geometry
+shader's lifts are spliced into one vertex stage (`gcn/gs_vertex.h`). Each
+output vertex runs its particle's export shader, keeps the ring dwords in the
+invocation for the geometry shader's loads, and keeps the one emitted vertex
+it stands for - a particle's vertices are the most the geometry shader can
+emit, four for a standard particle's quad, forty for a spark's trail of ten.
+The draw is indexed over a static list of each particle's triangles in the
+order its strips make them, so the provoking vertex of every triangle is the
+strip's: one strip a particle where the geometry shader cuts only after its
+last emit (the standard particles: up to eight vertices), else strips of four
+(the sparks); a vertex past its particle's emits is its last emit, which leaves
+every triangle it is in without area. It runs its emitter's room, the most records a buffer
+its export shader reads by index holds; the stage reads the simulation's
+indirect arguments itself and leaves out every particle at or past their
+count. `=check` draws with the geometry shader and runs the vertex stage
+beside it with nothing rasterized: both write what each vertex gets into a
+record, which the host compares word for word once the submission is done,
+and the exit report gives the differences by program set, those at a flat
+input's provoking vertex apart, and each emitter's room against its live
+count. `=gs`, the default, is the geometry shader's path above.
+
 A compute shader is lifted against its dispatch's translation and binds
 exactly what that binds - the parameter block with the page table, the images
 and samplers, the particles' counter words - so a dispatch is set up the same
