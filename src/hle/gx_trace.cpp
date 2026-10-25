@@ -320,16 +320,15 @@ int g_backend = 0;     // BBHOST_GX_BACKEND: 1 draws from GX inputs, 2 compares 
 // what the draw's own packets write, which a draw without packets must take
 // from GX.
 int g_native = 0;
-// BBHOST_GX_GS (on; =0 off): a draw that binds a geometry-shader object (the
-// effects' GPU particles) carries its GS - its stage registers, copy shader,
-// PS linkage and records (GpuDrawInputs::gs, kGxRecordGs) - for the renderer
-// to draw it with the ES as the vertex stage and the GS as the geometry stage
-// (render.cpp gs_draw). Off, such a draw goes as before: GX's VS (the ES) and
-// PS, which draws nothing - the ES exports no position.
-const bool g_gx_gs = [] {
-    const char* e = std::getenv("BBHOST_GX_GS");
-    return !(e && e[0] == '0');
-}();
+// BBHOST_GX_GS (host_gpu_gs_path: on, except on GCN under AMD's own driver -
+// host/gs_gate.h; =1 on, =0 off): a draw that binds a geometry-shader object
+// (the effects' GPU particles) carries its GS - its stage registers, copy
+// shader, PS linkage and records (GpuDrawInputs::gs, kGxRecordGs) - for the
+// renderer to draw it with the ES as the vertex stage and the GS as the
+// geometry stage (render.cpp gs_draw). Off, such a draw goes as before: GX's
+// VS (the ES) and PS, which draws nothing - the ES exports no position.
+// Decided with the device, before the game draws, and the same from then on.
+inline bool gx_gs() { return host_gpu_gs_path(); }
 // Token ids: every GX worker takes one a draw, so the counter has its line to
 // itself; the per-draw statistics are Tallies (core/tally.h).
 alignas(64) std::atomic<std::uint64_t> g_native_next{0};
@@ -1412,7 +1411,7 @@ shaders_done:
     // PA_CL_VS_OUT_CNTL, its output semantics as a VS's); the ES's ring vertex
     // size from its EsShader (+0x1c); and the PS's inputs linked to the copy
     // shader's outputs as GX links them to a VS's (above).
-    if (g_gx_gs && r.st[3].shader && !tess && r.st[4].shader) {
+    if (r.st[3].shader && !tess && r.st[4].shader && gx_gs()) {
         const std::uint64_t gs_gnm = rd64(r.st[3].shader + 0x100), es_gnm = rd64(r.st[0].shader + 0x100), ps_gnm = rd64(r.st[4].shader + 0x100);
         if (gs_gnm && es_gnm && ps_gnm) {
             in.gs = true;
@@ -1797,7 +1796,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     const int set0_stage = tess && r.st[2].shader ? 2 : 0;
     // BBHOST_GX_GS: a draw that binds a geometry shader has its GS's in
     // slot 3 (kGxRecordGs; it has no hull), slot 2 unused.
-    const bool gs = g_gx_gs && !tess && r.st[3].shader;
+    const bool gs = !tess && r.st[3].shader && gx_gs();
     const int stage_of[kGxRecords] = {set0_stage, 4, 0, gs ? 3 : 1};
     const std::uint64_t shaders[kGxRecords] = {r.st[set0_stage].shader, r.st[4].shader, tess ? r.st[0].shader : 0,
                                                tess ? r.st[1].shader : gs ? r.st[3].shader : 0};
@@ -2627,7 +2626,7 @@ bool native_draw_call(GxRec& r) {
     GxRecordsPtr packed;
     if (g_packed_records && records) {
         GxRecordsPtr block(pooled_records_raw());
-        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader || (g_gx_gs && r.st[3].shader)) ? 4 : 2, block.get());
+        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader || (r.st[3].shader && gx_gs())) ? 4 : 2, block.get());
         g_packed_draws.fetch_add(1, std::memory_order_relaxed);
         g_packed_bytes.fetch_add(records_bytes, std::memory_order_relaxed);
         for (std::uint64_t most = g_packed_most.load(std::memory_order_relaxed);

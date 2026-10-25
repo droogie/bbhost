@@ -158,6 +158,13 @@ draws by program. Vicar Amelia's
 room draws ~37,500 particles a frame; on an RTX 4070 they cost nothing
 measurable (uncapped, 72.2 fps with them against 71.8 without).
 
+On GCN under AMD's own driver (the proprietary one or AMDVLK: a GPU whose
+only subgroup size is 64, such as an RX 580), the path is off by default and
+those draws go as before. There, the Hunter's Dream's particles came out as
+long streaks across the screen, while NVIDIA, RDNA under AMD's driver, RADV
+and lavapipe draw them right. The log's start says which way it went, and
+`BBHOST_GX_GS=1` draws them with their geometry shader anyway.
+
 A compute shader is lifted against its dispatch's translation and binds
 exactly what that binds - the parameter block with the page table, the images
 and samplers, the particles' counter words - so a dispatch is set up the same

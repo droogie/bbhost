@@ -413,6 +413,9 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
 // turns them off, and GDS is dropped as before).
 bool host_gpu_gds_counters();
 bool host_gpu_gds_subgroup();  // BBHOST_GDS_SUBGROUP: the lift's GDS counters a subgroup at a time (TranslateOptions::gds_subgroup)
+// Whether a draw that binds a geometry shader is drawn with it (host/gs_gate.h): BBHOST_GX_GS, else on except on
+// GCN under AMD's own driver. Decided with the device; any thread.
+bool host_gpu_gs_path();
 // A copy out of or a fill of a counter word, on the GPU's timeline: the word
 // is the GPU's, as GX's GDS was, and its value is the one the dispatches
 // before this point in the stream left (D3D11's CopyStructureCount).

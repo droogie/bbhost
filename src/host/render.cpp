@@ -11631,7 +11631,7 @@ void render_report() {
             for (const auto& [why, n] : g_gs_refused) refused += (refused.empty() ? "" : ", ") + why + " x" + std::to_string(n);
             for (const auto& [prog, n] : g_gs_as_vs) as_vs += (as_vs.empty() ? "" : ", ") + prog + " x" + std::to_string(n);
             host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused, not drawn: %s; drawn as VS/PS "
-                     "(nothing drawn; BBHOST_GX_GS=0), by program: %s",
+                     "(nothing drawn; BBHOST_GX_GS=0, or GCN under AMD's driver), by program: %s",
                      static_cast<unsigned long long>(g_gs_drawn.load()), g_gs_pipelines.size(), refused.empty() ? "none" : refused.c_str(),
                      as_vs.empty() ? "none" : as_vs.c_str());
         }
