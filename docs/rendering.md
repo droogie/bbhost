@@ -198,7 +198,11 @@ beside it with nothing rasterized: both write what each vertex gets into a
 record, which the host compares word for word once the submission is done,
 and the exit report gives the differences by program set, those at a flat
 input's provoking vertex apart, and each emitter's room against its live
-count. `=gs`, the default, is the geometry shader's path above.
+count. `=gs`, the default, is the geometry shader's path above. With
+`BBHOST_GPU_PROFILE=1` these draws' pipelines carry `~particles` in their
+names, and a `gpu profile particles` line lists each of them with the
+arguments' pass (`particle-args`), so the paths' time a draw can be set side
+by side.
 
 A compute shader is lifted against its dispatch's translation and binds
 exactly what that binds - the parameter block with the page table, the images

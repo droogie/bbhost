@@ -9493,6 +9493,23 @@ std::string host_gpu_profile_report() {
         }
         if (!line.empty()) host_log("gpu profile compute (since the last):%s", line.c_str());
     }
+    {
+        // The GPU particles' draws ("~particles", render.cpp) and the pass
+        // that writes their arguments (particle-args), every one of them, on
+        // lines of their own: the paths' time a draw (BBHOST_GX_PARTICLES).
+        std::string line;
+        int listed = 0;
+        for (const auto& e : v) {
+            if (e.first.find("~particles") == std::string::npos && e.first != "particle-args") continue;
+            std::snprintf(buf, sizeof(buf), " %s=%.3fms(%llu)", e.first.c_str(), e.second.first / 1e6, static_cast<unsigned long long>(e.second.second));
+            line += buf;
+            if (++listed % 8 == 0) {
+                host_log("gpu profile particles (since the last):%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) host_log("gpu profile particles (since the last):%s", line.c_str());
+    }
     g.profile_ns.clear();
     if (g.profile_gaps) {
         // The gaps by what was recorded in them, the top twelve, as site

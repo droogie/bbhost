@@ -6093,7 +6093,10 @@ void particle_args_after_dispatch_locked() {
     std::memcpy(push + 8, &a.slots_address, 8);
     std::memcpy(push + 16, &n, 4);
     rec().push_constants(a.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    static const std::string profile_name = "particle-args";  // BBHOST_GPU_PROFILE: beside the particles' draws
+    profile_begin_locked(&profile_name);
     rec().dispatch((n + 63) / 64, 1, 1);
+    profile_end_locked();
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -21665,7 +21668,9 @@ static bool draw_impl(const GpuDraw& d) {
     }
     if (bind_pl->profile_name.empty()) {
         const bool walks = !bind_pl->vs.meta().walks.empty() || !bind_pl->ps.meta().walks.empty();
-        bind_pl->profile_name = pl.name + (bind_pl->lean ? "" : "~fallback") + (walks ? "~walks" : "");
+        // "~particles": a geometry-shader draw, however BBHOST_GX_PARTICLES
+        // draws it (host_gpu_profile_report lists those on lines of their own).
+        bind_pl->profile_name = pl.name + (bind_pl->lean ? "" : "~fallback") + (walks ? "~walks" : "") + (pl.gs_native ? "~particles" : "");
         static int logs = 0;  // under g.mu
         if (walks && logs < 400) {
             ++logs;
