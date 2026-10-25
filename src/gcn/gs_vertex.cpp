@@ -1,5 +1,5 @@
-// A geometry-shader draw's ES and GS lifts spliced into one vertex stage, and
-// the GS lift with its emits recorded for the check mode (gcn/gs_vertex.h).
+// A geometry-shader draw's ES and GS lifts spliced into one vertex stage
+// (gcn/gs_vertex.h).
 #include "gcn/gs_vertex.h"
 
 #include "gcn/spirv.h"
@@ -279,22 +279,13 @@ struct Splice {
 };
 
 // Guest-visible words through physical storage buffer pointers: the draw's
-// arguments and its check record.
+// arguments.
 struct Psb {
     Splice& s;
-    u32 t_u32, t_u64, p_u32, p_u64;
-    explicit Psb(Splice& sp)
-        : s(sp), t_u32(sp.t_u32()), t_u64(sp.t_u64()), p_u32(sp.ptr(spv::ScPhysicalStorageBuffer, t_u32)),
-          p_u64(sp.ptr(spv::ScPhysicalStorageBuffer, t_u64)) {}
+    u32 t_u32, t_u64, p_u32;
+    explicit Psb(Splice& sp) : s(sp), t_u32(sp.t_u32()), t_u64(sp.t_u64()), p_u32(sp.ptr(spv::ScPhysicalStorageBuffer, t_u32)) {}
     u32 at(std::vector<Ins>& out, u32 base, std::uint64_t bytes) { return bytes ? s.op(out, spv::OpIAdd, t_u64, {base, s.c_u64(bytes)}) : base; }
-    // base + 4 * idx (a u32 index of words).
-    u32 word(std::vector<Ins>& out, u32 base, u32 idx) {
-        const u32 wide = s.op(out, spv::OpUConvert, t_u64, {idx});
-        return s.op(out, spv::OpIAdd, t_u64, {base, s.op(out, spv::OpShiftLeftLogical, t_u64, {wide, s.c_u32(2)})});
-    }
     u32 load32(std::vector<Ins>& out, u32 addr) { return s.op(out, spv::OpLoad, t_u32, {s.op(out, spv::OpConvertUToPtr, p_u32, {addr}), 2 /* Aligned */, 4}); }
-    u32 load64(std::vector<Ins>& out, u32 addr) { return s.op(out, spv::OpLoad, t_u64, {s.op(out, spv::OpConvertUToPtr, p_u64, {addr}), 2, 8}); }
-    void store32(std::vector<Ins>& out, u32 addr, u32 value) { s.vop(out, spv::OpStore, {s.op(out, spv::OpConvertUToPtr, p_u32, {addr}), value, 2, 4}); }
 };
 
 // The ids an OpName names `name` in a module's debug section.
@@ -323,20 +314,6 @@ std::map<u32, Var> variables(const Mod& m) {
     }
     return out;
 }
-// The type or constant declaring `id` among a module's globals.
-const Ins* type_def(const Mod& m, u32 id) {
-    for (const Ins& in : m.globals) {
-        const std::uint16_t op = in.op();
-        if (op >= spv::OpTypeVoid && op <= spv::OpTypeFunction && in.w.size() > 1 && in.w[1] == id) return &in;
-    }
-    return nullptr;
-}
-const Ins* constant_def(const Mod& m, u32 id) {
-    for (const Ins& in : m.globals) {
-        if (in.op() == spv::OpConstant && in.w.size() > 3 && in.w[2] == id) return &in;
-    }
-    return nullptr;
-}
 // The pointee of a pointer type.
 u32 pointee(const Mod& m, u32 ptr_type) {
     for (const Ins& in : m.globals) {
@@ -344,66 +321,6 @@ u32 pointee(const Mod& m, u32 ptr_type) {
     }
     return 0;
 }
-// A 32-bit scalar, or a vector or an array of them: its words.
-struct Shape {
-    u32 words = 0, elem = 0;
-    bool is_float = false, aggregate = false;
-};
-bool shape_of(const Mod& m, u32 type, Shape& sh) {
-    const auto scalar = [&](u32 id) {
-        const Ins* d = type_def(m, id);
-        if (!d || d->w.size() < 3 || d->w[2] != 32 || (d->op() != spv::OpTypeFloat && d->op() != spv::OpTypeInt)) return false;
-        sh.elem = id;
-        sh.is_float = d->op() == spv::OpTypeFloat;
-        return true;
-    };
-    if (scalar(type)) {
-        sh.words = 1;
-        return true;
-    }
-    const Ins* t = type_def(m, type);
-    if (!t || t->w.size() < 4 || !scalar(t->w[2])) return false;
-    sh.aggregate = true;
-    if (t->op() == spv::OpTypeVector) {
-        sh.words = t->w[3];
-        return true;
-    }
-    if (t->op() == spv::OpTypeArray) {
-        const Ins* len = constant_def(m, t->w[3]);
-        if (!len) return false;
-        sh.words = len->w[3];
-        return sh.words > 0 && sh.words <= 64;
-    }
-    return false;
-}
-// A value's words as u32s.
-std::vector<u32> words_of(Splice& s, std::vector<Ins>& out, u32 value, const Shape& sh, u32 t_u32) {
-    std::vector<u32> w;
-    for (u32 i = 0; i < sh.words; ++i) {
-        const u32 c = sh.aggregate ? s.op(out, spv::OpCompositeExtract, sh.elem, {value, i}) : value;
-        w.push_back(sh.elem == t_u32 ? c : s.op(out, spv::OpBitcast, t_u32, {c}));
-    }
-    return w;
-}
-// The GS's outputs as a check record's vertex, in `outs`' order.
-bool output_slots(const Mod& g, const std::map<u32, Var>& gv, const std::vector<u32>& outs, std::vector<GsOutputSlot>& slots,
-                  std::map<u32, Shape>& shapes, u32& vertex_dwords, std::string& why) {
-    vertex_dwords = 0;
-    for (const u32 o : outs) {
-        Shape sh;
-        if (!shape_of(g, pointee(g, gv.at(o).type), sh)) return why = "an output that is not 32-bit words", false;
-        GsOutputSlot slot;
-        slot.builtin = gv.at(o).builtin;
-        slot.location = gv.at(o).location;
-        slot.offset = vertex_dwords;
-        slot.dwords = sh.words;
-        vertex_dwords += sh.words;
-        slots.push_back(slot);
-        shapes[o] = sh;
-    }
-    return true;
-}
-
 // The most emits on one path from the function's entry to its return (back
 // edges, to a block on the current path, not taken: the lift emits in no loop).
 bool most_emits(const std::vector<Ins>& fn, u32& most, std::string& why) {
@@ -617,8 +534,6 @@ GsVertexStage gs_vertex_stage(const std::vector<u32>& es_spirv, const std::vecto
         return refuse("a particle's vertices would be " + std::to_string(vertices) + (res.strip ? ", not a strip's triangle" : ", not whole quads"));
     }
     res.vertices = vertices;
-    std::map<u32, Shape> shapes;
-    if (!output_slots(g, gv, g_outputs, res.outputs, shapes, res.vertex_dwords, why) && opt.check) return refuse(why);
 
     // ---- ids: the GS's stay, the ES's move past them (its types the GS has merge) ----
     for (const Ins& in : g.globals) s.know(in);
@@ -762,14 +677,10 @@ GsVertexStage gs_vertex_stage(const std::vector<u32>& es_spirv, const std::vecto
     }
     const u32 l_end = s.fresh();
 
-    // The entry: which particle and emit this vertex is, the draw's arguments
-    // (with the check record: at its header's address).
+    // The entry: which particle and emit this vertex is, the draw's arguments.
     std::vector<Ins> entry;
     const u32 vid = s.op(entry, spv::OpLoad, t_u32, {map_id(e_vid)});
-    const u32 lds = s.op(entry, spv::OpLoad, t_u64, {s.op(entry, spv::OpAccessChain, p_uni_u64, {g_params, c1})});  // StageParams::lds_address
-    const u32 rec = opt.check ? lds : 0;
-    const u32 args = opt.check ? psb.load64(entry, rec) : lds;
-    const u32 cap = opt.check ? psb.load32(entry, psb.at(entry, rec, 8)) : 0;
+    const u32 args = s.op(entry, spv::OpLoad, t_u64, {s.op(entry, spv::OpAccessChain, p_uni_u64, {g_params, c1})});  // StageParams::lds_address
     const u32 n = psb.load32(entry, args);
     const u32 instances = psb.load32(entry, psb.at(entry, args, 4));
     const u32 first = psb.load32(entry, psb.at(entry, args, 8));
@@ -867,7 +778,6 @@ GsVertexStage gs_vertex_stage(const std::vector<u32>& es_spirv, const std::vecto
     s.vop(body, spv::OpLabel, {l_end});
     const u32 cnt = s.op(body, spv::OpLoad, t_u32, {counter});
     const u32 any = s.op(body, spv::OpINotEqual, t_bool, {cnt, c0});
-    const u32 emitted = s.op(body, spv::OpULessThan, t_bool, {k, cnt});
     const u32 within = s.op(body, spv::OpULessThanEqual, t_bool, {cnt, c_vpp});
     const u32 nb = s.op(body, spv::OpLogicalNot, t_bool, {s.op(body, spv::OpLoad, t_bool, {bad})});
     u32 strips_ok = nb;
@@ -877,59 +787,9 @@ GsVertexStage gs_vertex_stage(const std::vector<u32>& es_spirv, const std::vecto
         strips_ok = s.op(body, spv::OpLogicalAnd, t_bool, {sok, nb});
     }
     const u32 ok = s.op(body, spv::OpLogicalAnd, t_bool, {s.op(body, spv::OpLogicalAnd, t_bool, {any, within}), strips_ok});
-    // (The check mode's vertex stage draws beside the GS: its every vertex outside.)
-    std::map<u32, u32> kept;
     for (const u32 o : g_outputs) {
         const u32 fv = s.op(body, spv::OpLoad, out_type[o], {final_of[o]});
-        kept[o] = fv;
-        s.vop(body, spv::OpStore, {o, o != position ? fv : opt.check ? culled : s.op(body, spv::OpSelect, t_v4f, {ok, fv, culled})});
-    }
-    if (opt.check) {
-        // The check record: vertex 0 of the draw writes the arguments it read;
-        // vertex 0 of each particle in the record its emits and whether it was
-        // left out; each kept vertex its outputs.
-        const u32 l_head = s.fresh(), l_after_head = s.fresh(), l_rec = s.fresh(), l_count = s.fresh(), l_after_count = s.fresh(),
-                  l_out = s.fresh(), l_after_out = s.fresh(), l_ret = s.fresh();
-        const u32 first_vertex = s.op(body, spv::OpIEqual, t_bool, {vid, c0});
-        s.vop(body, spv::OpSelectionMerge, {l_after_head, 0});
-        s.vop(body, spv::OpBranchConditional, {first_vertex, l_head, l_after_head});
-        s.vop(body, spv::OpLabel, {l_head});
-        psb.store32(body, psb.at(body, rec, 20), n);
-        psb.store32(body, psb.at(body, rec, 24), instances);
-        psb.store32(body, psb.at(body, rec, 28), first);
-        psb.store32(body, psb.at(body, rec, 32), c1);
-        s.vop(body, spv::OpBranch, {l_after_head});
-        s.vop(body, spv::OpLabel, {l_after_head});
-        const u32 in_rec = s.op(body, spv::OpLogicalAnd, t_bool, {live, s.op(body, spv::OpULessThan, t_bool, {p, cap})});
-        s.vop(body, spv::OpSelectionMerge, {l_ret, 0});
-        s.vop(body, spv::OpBranchConditional, {in_rec, l_rec, l_ret});
-        s.vop(body, spv::OpLabel, {l_rec});
-        const u32 per = s.c_u32(gs_check_particle_dwords(vertices, res.vertex_dwords));
-        const u32 at = psb.word(body, psb.at(body, rec, 4 * kGsCheckHeaderDwords), s.op(body, spv::OpIMul, t_u32, {p, per}));
-        const u32 first_of_particle = s.op(body, spv::OpIEqual, t_bool, {k, c0});
-        s.vop(body, spv::OpSelectionMerge, {l_after_count, 0});
-        s.vop(body, spv::OpBranchConditional, {first_of_particle, l_count, l_after_count});
-        s.vop(body, spv::OpLabel, {l_count});
-        psb.store32(body, at, cnt);
-        const u32 strip_bit = s.op(body, spv::OpSelect, t_u32, {strips_ok, c0, s.c_u32(2)});
-        const u32 within_bit = s.op(body, spv::OpSelect, t_u32, {within, c0, c4});
-        psb.store32(body, psb.at(body, at, 4), s.op(body, spv::OpBitwiseOr, t_u32, {c1, s.op(body, spv::OpBitwiseOr, t_u32, {strip_bit, within_bit})}));
-        s.vop(body, spv::OpBranch, {l_after_count});
-        s.vop(body, spv::OpLabel, {l_after_count});
-        const u32 recorded = s.op(body, spv::OpLogicalAnd, t_bool, {ok, emitted});  // the particle kept, this vertex one of its emits
-        s.vop(body, spv::OpSelectionMerge, {l_after_out, 0});
-        s.vop(body, spv::OpBranchConditional, {recorded, l_out, l_after_out});
-        s.vop(body, spv::OpLabel, {l_out});
-        const u32 vat = psb.word(body, at, s.op(body, spv::OpIAdd, t_u32, {s.c_u32(kGsCheckParticleHead),
-                                                                          s.op(body, spv::OpIMul, t_u32, {k, s.c_u32(res.vertex_dwords)})}));
-        for (std::size_t o = 0; o < g_outputs.size(); ++o) {
-            const std::vector<u32> w = words_of(s, body, kept[g_outputs[o]], shapes[g_outputs[o]], t_u32);
-            for (std::size_t j = 0; j < w.size(); ++j) psb.store32(body, psb.at(body, vat, 4ull * (res.outputs[o].offset + j)), w[j]);
-        }
-        s.vop(body, spv::OpBranch, {l_after_out});
-        s.vop(body, spv::OpLabel, {l_after_out});
-        s.vop(body, spv::OpBranch, {l_ret});
-        s.vop(body, spv::OpLabel, {l_ret});
+        s.vop(body, spv::OpStore, {o, o != position ? fv : s.op(body, spv::OpSelect, t_v4f, {ok, fv, culled})});
     }
     s.vop(body, spv::OpReturn, {});
 
@@ -1017,172 +877,6 @@ GsVertexStage gs_vertex_stage(const std::vector<u32>& es_spirv, const std::vecto
     for (const Ins& in : entry) put(in);
     for (const Ins& in : body) put(in);
     put(mk(spv::OpFunctionEnd, {}));
-    outw[3] = s.next;
-    res.spirv = std::move(outw);
-    return res;
-}
-
-GsVertexStage gs_check_stage(const std::vector<u32>& gs_spirv, u32 vertices) {
-    GsVertexStage res;
-    Splice s;
-    const auto refuse = [&](const std::string& w) {
-        res.spirv.clear();
-        res.why = w;
-        return res;
-    };
-    std::string why;
-    if (!parse(gs_spirv, s.g, why)) return refuse("GS: " + why);
-    Mod& g = s.g;
-    if (g.entries[0].w.size() < 4 || g.entries[0].w[1] != 3 /* Geometry */) return refuse("the GS lift is not a geometry stage");
-    if (!vertices) return refuse("no vertices a particle");
-    const u32 g_main = g.entries[0].w[2];
-    const std::map<u32, Var> gv = variables(g);
-    const std::vector<u32> g_params_ids = named(g, "params");
-    if (g_params_ids.size() != 1 || !gv.count(g_params_ids[0])) return refuse("the GS has no params block");
-    const u32 g_params = g_params_ids[0];
-    u32 g_prim = 0;
-    std::vector<u32> g_outputs;
-    for (const auto& [id, v] : gv) {
-        if (v.sc == spv::ScInput && v.builtin == spv::BiPrimitiveId) g_prim = id;
-        if (v.sc == spv::ScOutput) g_outputs.push_back(id);
-    }
-    if (g_outputs.empty()) return refuse("the GS writes no output");
-    if (g.functions.size() != 1) return refuse("a lift with helper functions");
-    const std::vector<Ins>& fn = g.functions[0];
-    if (fn.size() < 3 || fn[0].w[2] != g_main || fn[1].op() != spv::OpLabel) return refuse("the entry point is not the module's function");
-    if (std::count_if(fn.begin(), fn.end(), [](const Ins& in) { return in.op() == spv::OpReturn; }) != 1 || fn[fn.size() - 2].op() != spv::OpReturn)
-        return refuse("a lift that does not return once, at its end");
-    std::map<u32, Shape> shapes;
-    if (!output_slots(g, gv, g_outputs, res.outputs, shapes, res.vertex_dwords, why)) return refuse(why);
-    res.vertices = vertices;
-    res.path_emits = vertices;
-
-    for (const Ins& in : g.globals) s.know(in);
-    s.next = g.bound;
-    const u32 t_u32 = s.t_u32(), t_bool = s.t_bool(), t_u64 = s.t_u64();
-    Psb psb(s);
-    std::vector<Ins> new_names, new_annots;
-    const u32 counter = s.private_var(t_u32, "gs_emitted", new_names);
-    std::map<u32, u32> shadow, out_type;
-    for (const u32 o : g_outputs) {
-        out_type[o] = pointee(g, gv.at(o).type);
-        shadow[o] = s.private_var(out_type[o], "gs_out", new_names);
-    }
-    const u32 vd = res.vertex_dwords;
-    const u32 acc_words = (vertices + 1) * vd;  // the first `vertices` emits, then one slot every later emit lands in
-    const u32 acc = s.private_var(s.have(spv::OpTypeArray, {t_u32, s.c_u32(acc_words)}), "gs_check_vertices", new_names);
-    const u32 p_priv_u32 = s.ptr(spv::ScPrivate, t_u32);
-    u32 prim_in = g_prim;
-    if (!prim_in) {
-        prim_in = s.fresh();
-        s.added.push_back(mk(spv::OpVariable, {s.ptr(spv::ScInput, t_u32), prim_in, spv::ScInput}));
-        new_annots.push_back(mk(spv::OpDecorate, {prim_in, spv::DecBuiltIn, spv::BiPrimitiveId}));
-    }
-    const u32 prim_type = g_prim ? pointee(g, gv.at(g_prim).type) : t_u32;
-    const u32 c1 = s.c_u32(1), c_vpp = s.c_u32(vertices), c_vd = s.c_u32(vd);
-    const u32 p_uni_u64 = s.ptr(spv::ScUniform, t_u64);
-
-    std::vector<Ins> out_fn;
-    out_fn.push_back(fn[0]);
-    out_fn.push_back(fn[1]);
-    std::size_t at = 2;
-    while (at < fn.size() && fn[at].op() == spv::OpVariable) out_fn.push_back(fn[at++]);
-    // The record and the particle, in the first block.
-    const u32 rec = s.op(out_fn, spv::OpLoad, t_u64, {s.op(out_fn, spv::OpAccessChain, p_uni_u64, {g_params, c1})});
-    const u32 cap = psb.load32(out_fn, psb.at(out_fn, rec, 8));
-    u32 p = s.op(out_fn, spv::OpLoad, prim_type, {prim_in});
-    if (prim_type != t_u32) p = s.op(out_fn, spv::OpBitcast, t_u32, {p});
-    std::vector<bool> idw;
-    for (; at + 1 < fn.size(); ++at) {
-        const Ins& in = fn[at];
-        const std::uint16_t op = in.op();
-        if (op == spv::OpStore && shadow.count(in.w[1])) {
-            Ins r = in;
-            r.w[1] = shadow[in.w[1]];
-            out_fn.push_back(r);
-            continue;
-        }
-        if (op == spv::OpEmitVertex) {
-            // The outputs from their stand-ins, and into the record's slot.
-            const u32 cnt = s.op(out_fn, spv::OpLoad, t_u32, {counter});
-            const u32 slot = s.op(out_fn, spv::OpSelect, t_u32, {s.op(out_fn, spv::OpULessThan, t_bool, {cnt, c_vpp}), cnt, c_vpp});
-            const u32 slot_at = s.op(out_fn, spv::OpIMul, t_u32, {slot, c_vd});
-            for (std::size_t o = 0; o < g_outputs.size(); ++o) {
-                const u32 out = g_outputs[o];
-                const u32 sv = s.op(out_fn, spv::OpLoad, out_type[out], {shadow[out]});
-                s.vop(out_fn, spv::OpStore, {out, sv});
-                const std::vector<u32> w = words_of(s, out_fn, sv, shapes[out], t_u32);
-                for (std::size_t j = 0; j < w.size(); ++j) {
-                    const u32 el = s.op(out_fn, spv::OpIAdd, t_u32, {slot_at, s.c_u32(res.outputs[o].offset + static_cast<u32>(j))});
-                    s.vop(out_fn, spv::OpStore, {s.op(out_fn, spv::OpAccessChain, p_priv_u32, {acc, el}), w[j]});
-                }
-            }
-            out_fn.push_back(in);
-            s.vop(out_fn, spv::OpStore, {counter, s.op(out_fn, spv::OpIAdd, t_u32, {cnt, c1})});
-            continue;
-        }
-        if (op == spv::OpReturn) {
-            // The particle's emits into its record.
-            const u32 l_store = s.fresh(), l_ret = s.fresh();
-            const u32 cnt = s.op(out_fn, spv::OpLoad, t_u32, {counter});
-            const u32 in_rec = s.op(out_fn, spv::OpULessThan, t_bool, {p, cap});
-            s.vop(out_fn, spv::OpSelectionMerge, {l_ret, 0});
-            s.vop(out_fn, spv::OpBranchConditional, {in_rec, l_store, l_ret});
-            s.vop(out_fn, spv::OpLabel, {l_store});
-            const u32 per = s.c_u32(gs_check_particle_dwords(vertices, vd));
-            const u32 base = psb.word(out_fn, psb.at(out_fn, rec, 4 * kGsCheckHeaderDwords),
-                                      s.op(out_fn, spv::OpIMul, t_u32, {s.op(out_fn, spv::OpIAdd, t_u32, {cap, p}), per}));
-            psb.store32(out_fn, base, cnt);
-            psb.store32(out_fn, psb.at(out_fn, base, 4), c1);
-            for (u32 w = 0; w < vertices * vd; ++w) {
-                const u32 x = s.op(out_fn, spv::OpLoad, t_u32, {s.op(out_fn, spv::OpAccessChain, p_priv_u32, {acc, s.c_u32(w)})});
-                psb.store32(out_fn, psb.at(out_fn, base, 4ull * (kGsCheckParticleHead + w)), x);
-            }
-            s.vop(out_fn, spv::OpBranch, {l_ret});
-            s.vop(out_fn, spv::OpLabel, {l_ret});
-            out_fn.push_back(in);
-            continue;
-        }
-        if (!id_words(in, idw)) return refuse("GS: an instruction the splice does not know (opcode " + std::to_string(op) + ")");
-        for (std::size_t w = 1; w < in.w.size(); ++w) {
-            if (idw[w] && shadow.count(in.w[w])) return refuse("the GS uses an output other than by storing it");
-        }
-        out_fn.push_back(in);
-    }
-    out_fn.push_back(fn.back());
-
-    std::set<u32> caps;
-    for (const Ins& in : g.caps) caps.insert(in.w[1]);
-    caps.insert(spv::CapPhysicalStorageBufferAddresses);
-    std::set<std::string> exts;
-    for (const Ins& in : g.exts) exts.insert(word_str(in.w, 1));
-    exts.insert("SPV_KHR_physical_storage_buffer");
-    std::vector<u32> iface = interface_of(g.entries[0]);
-    for (const Ins& in : s.added) {
-        if (in.op() == spv::OpVariable) iface.push_back(in.w[2]);
-    }
-    std::sort(iface.begin(), iface.end());
-    iface.erase(std::unique(iface.begin(), iface.end()), iface.end());
-    std::vector<u32> ep{3 /* Geometry */, g_main};
-    const std::vector<u32> name = str_words("main");
-    ep.insert(ep.end(), name.begin(), name.end());
-    ep.insert(ep.end(), iface.begin(), iface.end());
-
-    std::vector<u32> outw = {0x07230203u, gs_spirv[1], gs_spirv[2], 0u, 0u};
-    const auto put = [&](const Ins& in) { outw.insert(outw.end(), in.w.begin(), in.w.end()); };
-    for (const u32 c : caps) put(mk(spv::OpCapability, {c}));
-    for (const std::string& x : exts) put(mk(spv::OpExtension, str_words(x)));
-    for (const Ins& in : g.imports) put(in);
-    put(mk(spv::OpMemoryModel, {5348 /* PhysicalStorageBuffer64 */, g.model.empty() || g.model[0].w.size() < 3 ? 1u : g.model[0].w[2]}));
-    put(mk(spv::OpEntryPoint, ep));
-    for (const Ins& in : g.modes) put(in);
-    for (const Ins& in : g.debug) put(in);
-    for (const Ins& in : new_names) put(in);
-    for (const Ins& in : g.annots) put(in);
-    for (const Ins& in : new_annots) put(in);
-    for (const Ins& in : g.globals) put(in);
-    for (const Ins& in : s.added) put(in);
-    for (const Ins& in : out_fn) put(in);
     outw[3] = s.next;
     res.spirv = std::move(outw);
     return res;

@@ -77,7 +77,7 @@ struct GpuDrawInputs {
     std::uint32_t ls_hs_config = 0;  // VGT_LS_HS_CONFIG
     std::uint32_t tf_param = 0;      // VGT_TF_PARAM
     std::uint32_t hos_max = 0, hos_min = 0;
-    // A draw that binds a geometry shader (BBHOST_GX_GS, gcn/lift.h GsLift),
+    // A draw that binds a geometry shader (gcn/lift.h GsLift),
     // from its GX objects: `gs` says the rest of these are set. vs_* and the
     // PS linkage above stay the ES's - what the draw is drawn with where the
     // GS's pipeline is not made (today's VS/PS) - and these are the GS's: its
@@ -423,9 +423,6 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
 // turns them off, and GDS is dropped as before).
 bool host_gpu_gds_counters();
 bool host_gpu_gds_subgroup();  // BBHOST_GDS_SUBGROUP: the lift's GDS counters a subgroup at a time (TranslateOptions::gds_subgroup)
-// Whether a draw that binds a geometry shader is drawn with it (host/gs_gate.h): BBHOST_GX_GS, else on except on
-// GCN under AMD's own driver. Decided with the device; any thread.
-bool host_gpu_gs_path();
 // A copy out of or a fill of a counter word, on the GPU's timeline: the word
 // is the GPU's, as GX's GDS was, and its value is the one the dispatches
 // before this point in the stream left (D3D11's CopyStructureCount).

@@ -261,9 +261,9 @@ void particles(const std::vector<Shader>& all) {
         CHECK(glr.ok());
         through_hlsl(glr, "GS " + gs->name);
         // The two as one vertex stage (gcn/gs_vertex.h): valid, a particle's
-        // vertices whole quads - one for the standard particle, ten for the
-        // spark's trail -, and the check mode's two stages valid, with the same
-        // record. The particles' pairs must splice; the others are reported.
+        // vertices one strip for the standard particle, ten quads for the
+        // spark's trail. The particles' pairs must splice; the others are
+        // reported.
         const bool particle = std::strstr(p.gs, "StandardParticle") || std::strstr(p.gs, "SparkParticle");
         if (el.ok() && glr.ok()) splice(*gs, el, glr, particle);
     }
@@ -299,40 +299,14 @@ void splice(const Shader& gs, const gcn::LiftResult& el, const gcn::LiftResult& 
     if (!vs.ok()) std::fprintf(stderr, "%s: not as a vertex stage: %s\n", gs.name.c_str(), vs.why.c_str());
     if (particle) CHECK(vs.ok());
     if (!vs.ok()) return;
-    std::printf("  as a vertex stage: %u vertices a particle as %s (%u emits on its longest path), %zu words, %u words a vertex in a check "
-                "record\n",
-                vs.vertices, vs.strip ? "one strip" : "quads", vs.path_emits, vs.spirv.size(), vs.vertex_dwords);
+    std::printf("  as a vertex stage: %u vertices a particle as %s (%u emits on its longest path), %zu words\n", vs.vertices,
+                vs.strip ? "one strip" : "quads", vs.path_emits, vs.spirv.size());
     CHECK(valid_spirv(vs.spirv, "VS " + gs.name));
     dump_words(vs.spirv, "vs-" + gs.name);
     // The standard particle: path A's emits, then the common ones, one cut at
     // the end - one strip of up to eight. The spark: ten strips of four.
     if (std::strstr(gs.name.c_str(), "StandardParticle")) CHECK(vs.vertices == 8 && vs.strip);
     if (std::strstr(gs.name.c_str(), "SparkParticle")) CHECK(vs.vertices == 40 && !vs.strip);
-    // The check mode's vertex stage and geometry stage: valid, one record shape.
-    gcn::GsVertexOptions co;
-    co.check = true;
-    const gcn::GsVertexStage vc = gcn::gs_vertex_stage(el.spirv, glr.spirv, co);
-    if (!vc.ok()) std::fprintf(stderr, "%s: no check vertex stage: %s\n", gs.name.c_str(), vc.why.c_str());
-    CHECK(vc.ok());
-    const gcn::GsVertexStage gc = gcn::gs_check_stage(glr.spirv, vs.vertices);
-    if (!gc.ok()) std::fprintf(stderr, "%s: no check geometry stage: %s\n", gs.name.c_str(), gc.why.c_str());
-    CHECK(gc.ok());
-    if (vc.ok()) {
-        CHECK(valid_spirv(vc.spirv, "VS check " + gs.name));
-        dump_words(vc.spirv, "vs-check-" + gs.name);
-        CHECK(vc.vertices == vs.vertices);
-    }
-    if (gc.ok()) {
-        CHECK(valid_spirv(gc.spirv, "GS check " + gs.name));
-        dump_words(gc.spirv, "gs-check-" + gs.name);
-    }
-    if (vc.ok() && gc.ok()) {
-        CHECK(vc.vertex_dwords == gc.vertex_dwords && vc.outputs.size() == gc.outputs.size());
-        for (std::size_t i = 0; i < std::min(vc.outputs.size(), gc.outputs.size()); ++i) {
-            CHECK(vc.outputs[i].builtin == gc.outputs[i].builtin && vc.outputs[i].location == gc.outputs[i].location &&
-                  vc.outputs[i].offset == gc.outputs[i].offset && vc.outputs[i].dwords == gc.outputs[i].dwords);
-        }
-    }
     // A GS one emit short of whole quads on its every path is refused.
     if (particle) {
         const gcn::GsVertexStage cut = gcn::gs_vertex_stage(el.spirv, without_emits(glr.spirv, 1));

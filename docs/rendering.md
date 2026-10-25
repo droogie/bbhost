@@ -147,62 +147,52 @@ wandering visions - draw a point a particle through an export shader, a
 geometry shader and the copy shader the geometry shader's container carries.
 On the PS4 the export shader writes each point's attributes to a ring in
 memory, the geometry shader reads them there and writes its vertices to a
-second ring, and the copy shader exports those to the rasterizer. The lifter
-makes the export shader the pipeline's vertex stage, its ring stores its
-outputs, and the geometry shader its geometry stage on a point: its ring
-loads are the point's inputs, its stores and emits the vertices, and a
-vertex's outputs what the copy shader exports of its dwords. Neither ring
-exists on the host. A geometry shader that stores at an offset its compiler
-counts per lane (the standard particles') keeps that ring as an array in the
-invocation. The pipeline is built on the pipeline workers, so a system draws
-from the frame its pipeline is ready, and is recorded with its two extra
-programs in the stage manifest (format 5) for the next start. A draw the
-path refuses - its pipeline still being built, or a geometry shader the lift
-does not take - is not drawn: as its export and pixel shaders, as before, it
-would draw nothing and only store the export shader's ring through a buffer
-its draw's tables name. The exit report counts the refusals by reason.
-`BBHOST_GX_GS=0` draws every one as before, the exit report counting those
-draws by program. Vicar Amelia's
-room draws ~37,500 particles a frame; on an RTX 4070 they cost nothing
-measurable (uncapped, 72.2 fps with them against 71.8 without).
+second ring, and the copy shader exports those to the rasterizer. Neither ring
+exists on the host, and no geometry stage is used: the particles are drawn the
+way a PC engine draws them, as one vertex stage, on every device. The lifter
+lifts the export shader as a vertex stage, its ring stores its outputs, and
+the geometry shader as a geometry stage on a point: its ring loads are the
+point's inputs, its stores and emits the vertices, and a vertex's outputs what
+the copy shader exports of its dwords. A geometry shader that stores at an
+offset its compiler counts per lane (the standard particles') keeps that ring
+as an array in the invocation. The two lifts are then spliced into one vertex
+stage (`gcn/gs_vertex.h`). Each output vertex runs its particle's export
+shader, keeps the ring dwords in the invocation for the geometry shader's
+loads, and keeps the one emitted vertex it stands for - a particle's vertices
+are the most the geometry shader can emit on one path, eight for a standard
+particle, forty for a spark's trail of ten quads. The draw is indexed over a
+static list of each particle's triangles in the order its strips make them,
+so the provoking vertex of every triangle is the strip's: one strip a
+particle where the geometry shader cuts only after its last emit (the
+standard particles), else strips of four (the sparks); a vertex past its
+particle's emits is its last emit, which leaves every triangle it is in
+without area.
 
-On GCN under AMD's own driver (the proprietary one or AMDVLK: a GPU whose
-only subgroup size is 64, such as an RX 580), the path is off by default and
-those draws go as before. There, the Hunter's Dream's particles came out as
-long streaks across the screen, while NVIDIA, RDNA under AMD's driver, RADV
-and lavapipe draw them right. The log's start says which way it went, and
-`BBHOST_GX_GS=1` draws them with their geometry shader anyway.
+The stage reads the simulation's indirect arguments itself and leaves out
+every particle at or past their count. The draw takes the live count: right
+after each dispatch - the simulation's run outside any render pass - one more
+writes every emitter's indexed-draw arguments from the game's, its live count
+times a particle's indices, and the draw reads those. An emitter's first
+draws, before such a pass has written its arguments, run its room, the most
+records a buffer its export shader reads by index holds;
+`BBHOST_GX_PARTICLE_ARGS=0` always runs the room. The pipeline is built on the
+pipeline workers, so a system draws from the frame its pipeline is ready, and
+is recorded with its two extra programs in the stage manifest (format 5) for
+the next start. A draw the path refuses - its pipeline still being built, or
+a geometry shader the lift or the splice does not take - is not drawn: as its
+export and pixel shaders it would draw nothing and only store the export
+shader's ring through a buffer its draw's tables name. The exit report counts
+the refusals by reason. With `BBHOST_GPU_PROFILE=1` these draws' pipelines
+carry `~particles` in their names, and a `gpu profile particles` line lists
+each of them with the arguments' pass (`particle-args`).
 
-`BBHOST_GX_PARTICLES=vs` draws the particles with no geometry stage, on every
-device, the way a PC engine draws them: the export shader's and the geometry
-shader's lifts are spliced into one vertex stage (`gcn/gs_vertex.h`). Each
-output vertex runs its particle's export shader, keeps the ring dwords in the
-invocation for the geometry shader's loads, and keeps the one emitted vertex
-it stands for - a particle's vertices are the most the geometry shader can
-emit, four for a standard particle's quad, forty for a spark's trail of ten.
-The draw is indexed over a static list of each particle's triangles in the
-order its strips make them, so the provoking vertex of every triangle is the
-strip's: one strip a particle where the geometry shader cuts only after its
-last emit (the standard particles: up to eight vertices), else strips of four
-(the sparks); a vertex past its particle's emits is its last emit, which leaves
-every triangle it is in without area. The stage reads the simulation's
-indirect arguments itself and leaves out every particle at or past their
-count. The draw takes the live count: right after each dispatch - the
-simulation's run outside any render pass - one more writes every emitter's
-indexed-draw arguments from the game's, its live count times a particle's
-indices, and the draw reads those. An emitter's first draws, before such a
-pass has written its arguments, run its room, the most records a buffer its
-export shader reads by index holds; `BBHOST_GX_PARTICLE_ARGS=0` always runs
-the room. `=check` draws with the geometry shader and runs the vertex stage
-beside it with nothing rasterized: both write what each vertex gets into a
-record, which the host compares word for word once the submission is done,
-and the exit report gives the differences by program set, those at a flat
-input's provoking vertex apart, and each emitter's room against its live
-count. `=gs`, the default, is the geometry shader's path above. With
-`BBHOST_GPU_PROFILE=1` these draws' pipelines carry `~particles` in their
-names, and a `gpu profile particles` line lists each of them with the
-arguments' pass (`particle-args`), so the paths' time a draw can be set side
-by side.
+`BBHOST_GX_PARTICLES=gs` is a debug switch for comparisons: the particles are
+drawn with the geometry shader's lift as a geometry stage and the export
+shader's as the vertex stage, as earlier versions drew them. On GCN under
+AMD's own driver (the proprietary one or AMDVLK: a GPU whose only subgroup
+size is 64, such as an RX 580) that path drew the Hunter's Dream's particles
+as long streaks across the screen, so those versions left the particles out
+there; the vertex stage draws them on every device.
 
 A compute shader is lifted against its dispatch's translation and binds
 exactly what that binds - the parameter block with the page table, the images

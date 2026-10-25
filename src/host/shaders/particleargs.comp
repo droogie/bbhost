@@ -1,7 +1,6 @@
 #version 460
-// The GPU particles' draws as one vertex stage (render.cpp,
-// BBHOST_GX_PARTICLES=vs), their indexed draw's arguments written on the GPU
-// right after a dispatch: for each emitter of the host's list, its indirect
+// The GPU particles' draws as one vertex stage (render.cpp), their indexed
+// draw's arguments written on the GPU right after a dispatch: for each emitter of the host's list, its indirect
 // arguments - the simulation's {count, instances, first vertex, first
 // instance}, read where the game keeps them - as the draw over its particles'
 // index list takes them: the count, at most the particles the list and the

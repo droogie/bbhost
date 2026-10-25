@@ -725,10 +725,6 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
-  # Whether draws that bind a geometry shader are drawn with it, by device (tests/gs_gate_test.cpp).
-  add_executable(gs_gate_test tests/gs_gate_test.cpp)
-  target_include_directories(gs_gate_test PRIVATE src)
-  add_test(NAME gs_gate_test COMMAND gs_gate_test)
   # Which draws start a command buffer of their own on lavapipe (tests/lvp_split_test.cpp).
   add_executable(lvp_split_test tests/lvp_split_test.cpp)
   target_include_directories(lvp_split_test PRIVATE src)
