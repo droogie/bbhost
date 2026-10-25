@@ -1134,13 +1134,15 @@ std::atomic<std::uint64_t> g_unwatched_uploads{0};  // uploads of a GX resource'
 // texture (not a buffer a T# reads as an image - the CPU writes those after
 // every Map, and they keep the watch), with identity on.
 bool by_identity(const Surface& sf) { return res_identity_on() && sf.gx_registered && sf.gx_type >= 2; }
-// Stage 2, BBHOST_GXVK_IMAGES: 0 (the default) or census, today's; 1 a GX view bound by its id takes the pipeline
-// key's dims from its entry (texture_key_dims_by_id), and a GX texture's image that nothing has written since its
-// upload binds without its surface's refresh while nothing could have changed it (images_static, static_changed);
-// 2 both ways: today's refresh and dims are what the draw gets, and where the entry's would have differed is counted.
+// Stage 2, BBHOST_GXVK_IMAGES: 1 (the default) a GX view bound by its id takes the pipeline key's dims from its
+// entry (texture_key_dims_by_id), and a GX texture's image that nothing has written since its upload binds without
+// its surface's refresh while nothing could have changed it (images_static, static_changed); 0 (or census, which adds
+// the census) today's lookup and refresh; 2 both ways: today's refresh and dims are what the draw gets, and where the
+// entry's would have differed is counted.
 const int g_images_mode = [] {
     const char* e = std::getenv("BBHOST_GXVK_IMAGES");
-    return e && *e >= '0' && *e <= '9' ? std::atoi(e) : 0;
+    if (!e || !*e) return 1;
+    return *e >= '0' && *e <= '9' ? std::atoi(e) : 0;
 }();
 // Moves whenever something changes a surface a view entry binds without a refresh: an upload, a GX map drained
 // over it, a command-processor write, a shader's, a fill's, a copy's or an upload token's write. Each such entry

@@ -3883,6 +3883,12 @@ bool init_locked() {
         }
         host_log("gpu: constant buffers are pushed per draw (set 2); descriptor sets cached by content");
     }
+    // Stage 2's GX views (textures.cpp texture_view_by_id): their entries, or today's lookup and refresh.
+    switch (textures_images_mode()) {
+    case 0: host_log("gpu: GX views found by their id with today's lookup and refresh (BBHOST_GXVK_IMAGES=0; unset, they bind from their entries)"); break;
+    case 1: host_log("gpu: GX views bind from their entries, an image nothing has written without its surface's refresh (BBHOST_GXVK_IMAGES=1, the default; =0 today's lookup and refresh)"); break;
+    default: host_log("gpu: GX views found by their id with today's lookup and refresh, their entries compared beside it (BBHOST_GXVK_IMAGES=2)"); break;
+    }
     // Graphics stages under bindless keep only their params
     // block in their own sets; images and samplers are set 3's.
     g.gfx_set_layout = g.set_layout;

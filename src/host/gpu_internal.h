@@ -1690,7 +1690,7 @@ inline std::uint8_t texture_view_flags(bool storage, bool shader_arrayed, bool r
 // texture_key_dims_note, which keeps them in the entry for the view's later bindings.
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed);
 void texture_key_dims_note(std::uint32_t id, std::uint8_t flags, std::uint32_t dim, bool arrayed);
-// BBHOST_GXVK_IMAGES as a number: 0 (or census) today's path, 1 stage 2's handles, 2 both, compared.
+// BBHOST_GXVK_IMAGES as a number: 1 (the default) stage 2's handles, 0 (or census) today's path, 2 both, compared.
 int textures_images_mode();
 // Asks for the entry texture_view_by_id will read for `id` (the table is
 // larger than the caches; a draw asks for its views' entries together).

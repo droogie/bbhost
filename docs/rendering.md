@@ -729,6 +729,23 @@ by handle, the command processor taking 1.4-1.6 ms a flip less; at 60 it
 takes up to 1 ms a flip less, with the GPU's time and the frame pacing
 unchanged.
 
+GX's texture views bind from their entries by default
+(`BBHOST_GXVK_IMAGES=0` keeps today's lookup and refresh). The entry a view
+gets at its first binding is one line: its image view, the pipeline key's
+dimensions for its bindings (decoded once from its T#, which never changes),
+the T#'s base and, bindless, its slot. A GX texture's image that nothing has
+written since its upload binds without its surface's refresh while nothing
+could have changed it: every place that changes such a surface moves one
+epoch, and each entry then refreshes once (and every 200 ms regardless, for
+the content hashes' schedule and the eviction's clock). No image, view or
+layout changes. `BBHOST_GXVK_IMAGES=2` binds today's way and counts where an
+entry would have differed - a refresh it would have skipped that found
+work, an image of another generation, dimensions, bases, slots. On an RTX
+4070, uncapped, the command processor takes 0.42-0.56 ms a flip less at Old
+Yharnam, the Nightmare of Mensis and the Cainhurst courtyard (Old Yharnam
+92.8 to 98.3 fps), with the GPU's time, the frames and the frame pacing
+unchanged.
+
 **The upload heap (the stage's second part, off by default while it is
 measured).** GX's device gives its block pool one region - GX's upload heap,
 160 MiB, made by the pool's init, which is on the decomp list - and every
