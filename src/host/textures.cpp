@@ -868,6 +868,8 @@ struct TexturePrep {
     // well, the GPU untile's source in place of an import of guest memory.
     std::uint8_t* src_copy = nullptr;
     std::atomic<int> state{0};  // 0 queued, 1 running, 2 done; changed under PrepPool's mutex
+    // Stage 2d's census (prep_census::tag): where the upload came from and what the prep does.
+    std::uint8_t origin = 0, kind = 0;
 };
 
 const bool g_tex_async = [] {
@@ -1040,17 +1042,56 @@ inline bool on() {
 void blocked(Class c) {
     if (on()) g_waits[c].fetch_add(1, std::memory_order_relaxed);
 }
+// Stage 2d's census: every prep by where its upload came from - a bind's first upload (the command processor), made
+// ahead at the GX resource's creation (the creating thread), or a re-upload - and what it does: copy the tiled bytes
+// into staging for the GPU's untile (window imports), untile on the CPU, or only hash (the GPU untiles from guest
+// memory); queued, and the waits that blocked - at the submission (a batch's) or at a refresh (settle_prep) - with how
+// long they blocked.
+enum Origin : int { kOrBind, kOrAhead, kOrAgain, kOrigins };
+enum Kind : int { kKindWindowCopy, kKindCpuUntile, kKindHashOnly, kKinds };
+const char* const kOriginName[kOrigins] = {"a bind's first upload", "made ahead at creation", "a re-upload"};
+const char* const kKindName[kKinds] = {"copy for the GPU untile (window imports)", "CPU untile", "hash only"};
+std::atomic<std::uint64_t> g_queued[kOrigins][kKinds] = {}, g_queued_bytes[kOrigins][kKinds] = {};
+std::atomic<std::uint64_t> g_blocked[2][kOrigins][kKinds] = {}, g_blocked_us[2][kOrigins][kKinds] = {}, g_blocked_max_us[2] = {};
+void tag(TexturePrep& p, int origin, std::size_t bytes) {
+    p.origin = static_cast<std::uint8_t>(origin);
+    p.kind = static_cast<std::uint8_t>(p.src_copy ? kKindWindowCopy : p.hash_only ? kKindHashOnly : kKindCpuUntile);
+    if (!on()) return;
+    g_queued[p.origin][p.kind].fetch_add(1, std::memory_order_relaxed);
+    g_queued_bytes[p.origin][p.kind].fetch_add(bytes, std::memory_order_relaxed);
+}
+// A wait at `site` (0 the submission's, 1 a refresh's) for p, timed when it blocks.
+void timed_wait(TexturePrep& p, int site) {
+    if (!on() || prep_done(p)) {
+        PrepPool::get().wait(p);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    PrepPool::get().wait(p);
+    const std::uint64_t us = us_since(t0);
+    g_blocked[site][p.origin][p.kind].fetch_add(1, std::memory_order_relaxed);
+    g_blocked_us[site][p.origin][p.kind].fetch_add(us, std::memory_order_relaxed);
+    for (std::uint64_t m = g_blocked_max_us[site].load(std::memory_order_relaxed);
+         us > m && !g_blocked_max_us[site].compare_exchange_weak(m, us, std::memory_order_relaxed);) {
+    }
+}
 }  // namespace prep_census
 
-// The surface's last upload, finished: its hashes are the surface's.
-void settle_prep(Surface& sf) {
+// The surface's last upload, finished: its hashes are the surface's. `site`: who asks (the 2d census's settles).
+namespace prep_census {
+enum SettleSite : int { kSettleOther, kSettleWatchVerify, kSettleRefresh, kSettleCarry, kSettleWriteback, kSettleSites };
+const char* const kSettleName[kSettleSites] = {"another", "the write watch's check", "a refresh's hash", "a carry", "a writeback"};
+std::atomic<std::uint64_t> g_settle_blocked[kSettleSites] = {};
+}  // namespace prep_census
+void settle_prep(Surface& sf, int site = prep_census::kSettleOther) {
     if (!sf.prep) return;
+    if (prep_census::on() && !prep_done(*sf.prep)) prep_census::g_settle_blocked[site].fetch_add(1, std::memory_order_relaxed);
     if (prep_census::on() && !prep_done(*sf.prep))
         prep_census::blocked(!sf.gx_registered ? prep_census::kNotGx
                              : sf.ahead       ? prep_census::kGxAhead
                              : sf.uploads > 1 ? prep_census::kGxAgain
                                               : prep_census::kGxFirst);
-    PrepPool::get().wait(*sf.prep);
+    prep_census::timed_wait(*sf.prep, 1);
     sf.content_hash = sf.prep->content_hash;
     sf.exact_hash = sf.prep->exact_hash;
     sf.prep.reset();
@@ -1270,6 +1311,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     if (on_gpu) {
         if (!cpu_copy.map) {
             prep->hash_only = true;
+            prep_census::tag(*prep, t_force_async ? prep_census::kOrAhead : first ? prep_census::kOrBind : prep_census::kOrAgain, sf.total_src);
             PrepPool::get().submit(prep);
             if (prep->src_copy) g_batch_preps.push_back(prep);  // the staged source is read by this submission
             sf.prep = prep;
@@ -1278,6 +1320,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     // The checks compare two snapshots of the memory; the probe reads it
     // here: both as the command processor always did.
     if ((g_tex_async || t_force_async) && !g_untile_check && sf.base != tex_probe_base()) {
+        prep_census::tag(*prep, t_force_async ? prep_census::kOrAhead : first ? prep_census::kOrBind : prep_census::kOrAgain, sf.total_src);
         PrepPool::get().submit(prep);
         g_batch_preps.push_back(prep);
         sf.prep = prep;
@@ -2053,7 +2096,7 @@ void refresh_surface_locked(Surface& sf) {
             g_watch_sooner_ms.fetch_add(sooner, std::memory_order_relaxed);
             g_watch_uploads.fetch_add(1, std::memory_order_relaxed);
             if (g_watch_verify && hle_kernel_va_mapped(sf.base, sf.total_src)) {
-                settle_prep(sf);
+                settle_prep(sf, prep_census::kSettleWatchVerify);
                 const bool changed = content_hash_of(sf.base, sf.total_src, true) != sf.exact_hash;
                 g_watch_verify_n[sf.gx_registered ? 1 : 0][changed ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }
@@ -2137,7 +2180,7 @@ void refresh_surface_locked(Surface& sf) {
     // against yet, and waiting for it here serialized a surface rewritten
     // every frame back onto the command processor.
     if (sf.prep && !prep_done(*sf.prep)) return;
-    settle_prep(sf);
+    settle_prep(sf, prep_census::kSettleRefresh);
     // The census of what is hashed: which kind of surface each check is for.
     const int hash_class = !sf.gx_registered ? (sf.gpu_written ? 4 : sf.watched ? 5 : 6)
                            : sf.gpu_written    ? 1
@@ -2292,7 +2335,7 @@ bool carry_surface_locked(Surface& dst, const Surface& src) {
     barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     // The memory underneath is what it was; only a change to it from here on
     // is a new upload.
-    settle_prep(dst);
+    settle_prep(dst, prep_census::kSettleCarry);
     dst.content_hash = content_hash_of(dst.base, dst.total_src);
     dst.exact_hash = content_hash_of(dst.base, dst.total_src, true);
     dst.exact_at_ms = now_ms();
@@ -3435,6 +3478,39 @@ void textures_census_report() {
         pw += b;
     }
     host_log("gxvk census: texture prep waits that blocked, by surface: %s", pw.c_str());
+    {
+        using namespace prep_census;
+        std::string q, b;
+        for (int o = 0; o < kOrigins; ++o) {
+            for (int k = 0; k < kKinds; ++k) {
+                char t[200];
+                if (const std::uint64_t n = g_queued[o][k].load()) {
+                    std::snprintf(t, sizeof t, "%s%s, %s %llu (%llu MiB)", q.empty() ? "" : "; ", kOriginName[o], kKindName[k],
+                                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_queued_bytes[o][k].load() >> 20));
+                    q += t;
+                }
+                for (int site = 0; site < 2; ++site) {
+                    if (const std::uint64_t n = g_blocked[site][o][k].load()) {
+                        std::snprintf(t, sizeof t, "%s%s: %s, %s %llu (%.1f ms)", b.empty() ? "" : "; ", site ? "a refresh" : "the submission",
+                                      kOriginName[o], kKindName[k], static_cast<unsigned long long>(n),
+                                      static_cast<double>(g_blocked_us[site][o][k].load()) / 1000.0);
+                        b += t;
+                    }
+                }
+            }
+        }
+        host_log("gxvk census: texture preps queued by where their upload came from and what they do: %s", q.empty() ? "none" : q.c_str());
+        std::string st;
+        for (int k = 0; k < kSettleSites; ++k) {
+            char t[96];
+            std::snprintf(t, sizeof t, "%s%s %llu", k ? ", " : "", kSettleName[k], static_cast<unsigned long long>(g_settle_blocked[k].load()));
+            st += t;
+        }
+        host_log("gxvk census: settles that blocked on a prep, by who asked: %s", st.c_str());
+        host_log("gxvk census: texture prep waits that blocked, by where they waited, the upload's origin and the prep's kind: %s (the longest "
+                 "at the submission %.1f ms, at a refresh %.1f ms)", b.empty() ? "none" : b.c_str(),
+                 static_cast<double>(g_blocked_max_us[0].load()) / 1000.0, static_cast<double>(g_blocked_max_us[1].load()) / 1000.0);
+    }
     if (images_census()) {
         std::uint64_t total = 0, by_id = 0, gx = 0;
         for (int c = 0; c < kS2Classes; ++c) total += g_s2[c].load(), by_id += g_s2_by_id[c].load();
@@ -4384,7 +4460,7 @@ void textures_before_submit() {
     g_coarse_ms = now_ms();
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) {
         if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
-        PrepPool::get().wait(*p);
+        prep_census::timed_wait(*p, 0);
     }
     g_batch_preps.clear();
     retire_surfaces_locked();
@@ -5055,7 +5131,7 @@ void textures_prewait_for_submit() {
     }
     for (const std::shared_ptr<TexturePrep>& p : preps) {
         if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
-        PrepPool::get().wait(*p);
+        prep_census::timed_wait(*p, 0);
     }
 }
 
@@ -5076,7 +5152,7 @@ void textures_retired(int slot) {
                                 sf.tiling, sf.width_e, sf.height_e, sf.pitch_e, sf.esize);
             }
             if (ok) {
-                settle_prep(sf);
+                settle_prep(sf, prep_census::kSettleWriteback);
                 sf.content_hash = content_hash_of(sf.base, sf.total_src);
                 sf.exact_hash = content_hash_of(sf.base, sf.total_src, true);
             }
