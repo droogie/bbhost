@@ -123,7 +123,7 @@ Setting g_set[kSettingCount] = {
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
      "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
-     false},
+     true},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
