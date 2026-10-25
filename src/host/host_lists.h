@@ -52,6 +52,29 @@ void note_arena(std::uint64_t base, std::uint64_t chunk_bytes, std::uint64_t chu
 // (hle_gx_arena_acquire); what its list held is gone.
 void chunk_handed_out(std::uint64_t chunk_va, std::size_t chunk_bytes);
 
+// The chunks' rounds: each chunk's list begins one at its first packet, at a
+// packet written at or before the last one recorded (the chunk written again
+// from its start) and when GX hands the chunk out again. round_seq_now()
+// counts the rounds begun so far, in every chunk; a write the command
+// processor makes for a submission taken at count S into a chunk that has
+// begun a round since (rounds_since(..., S) > 0) lands on memory the game has
+// written again - what the game wrote it for is gone (label_landing.h).
+std::uint64_t round_seq_now();
+struct Reuse {
+    std::uint64_t chunk_lo = 0, chunk_end = 0;  // the chunk as its list knows it
+    int rounds_later = 0;                        // begun since; -1: four or more
+    std::uint64_t first_seq = 0;                 // the first of them, by round_seq_now()
+    std::uint64_t written_to = 0;                // the round under way's last packet recorded (0: none yet)
+    bool arena = false;                          // a chunk of one of GX's command arenas (note_arena)
+    bool unsubmitted = false;                    // the new round has not submitted that place yet: its walk reads it
+};
+// Hosted: the rounds the chunk holding [va, va + bytes) has begun since
+// round_seq_now() read `seq` (up to four), 0 when no list holds it.
+int rounds_since(std::uint64_t va, std::size_t bytes, std::uint64_t seq, Reuse* out);
+// Hosted, at a submission: [va, va + bytes) of its chunk's round under way
+// has gone to the command processor (Reuse::unsubmitted).
+void note_submitted(std::uint64_t va, std::size_t bytes);
+
 // A submitted range's part of its list: each entry the packet's place from
 // the range's start in dwords << 8 | its opcode.
 struct Taken {

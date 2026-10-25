@@ -638,6 +638,35 @@ struct CpDispatchTimer {
     }
 };
 std::atomic<std::uint64_t> g_token_nops{0};  // NOPs that were host-draw tokens (BBHOST_GX_NATIVE)
+// A token-shaped NOP (magic, id lo, id hi) with 0 or 1 where its magic belongs
+// and an id next to the last token's is a token whose magic was written over
+// in memory - a label's 1 landing on the game's next round of a command
+// buffer (label_landing.h) - and the walk skips it: its draw, copy or YEBIS
+// operation does not run. Counted (tokens-without-a-magic with the flush
+// reasons), the first few logged.
+thread_local std::uint32_t t_last_token_id = 0;
+std::atomic<std::uint64_t> g_tokens_lost{0};
+bool id_token_magic(std::uint32_t m) {
+    switch (m) {
+        case kGxNativeMagic: case kGxCopyMagic: case kGxFillMagic: case kGxUploadMagic: case kGxImageCopyMagic:
+        case kGxClearMagic: case kGxCountCopyMagic: case kGxScaleformMagic: case kGxDispatchMagic: case kGxYebisMagic:
+            return true;
+        default:
+            return false;
+    }
+}
+void note_token_shape(const std::uint32_t* b, std::size_t n) {
+    if (n != 3) return;
+    if (id_token_magic(b[0])) {
+        t_last_token_id = b[1];
+        return;
+    }
+    if (b[0] > 1 || b[2] != 0 || !b[1] || !t_last_token_id || b[1] - t_last_token_id + 64u >= 128u) return;
+    if (g_tokens_lost.fetch_add(1, std::memory_order_relaxed) < 6) {
+        host_log("gnm exec: a token without its magic (%08x %08x %08x after token %08x): written over in memory, so skipped", b[0], b[1],
+                 b[2], t_last_token_id);
+    }
+}
 std::atomic<std::uint64_t> g_copy_nops{0};   // NOPs that were copy tokens (BBHOST_GX_NATIVE_COPIES)
 std::atomic<std::uint64_t> g_exec_dwords{0};  // dwords of the packets executed, headers included
 thread_local int t_queue_id = -1;
@@ -2373,6 +2402,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             break;
         }
         case kNop:
+            note_token_shape(b, n);
             // A GX pipeline drain, as a barrier token: the wait it was.
             if (n >= 1 && b[0] == kGxBarrierMagic) {
                 t_barrier_pending = true;
@@ -2752,6 +2782,10 @@ struct Job {
     // The ranges as the game submitted them, a handed-over one's too (`guest`
     // drops those): where a copy's packets came from, for the wait log.
     std::vector<std::pair<const void*, std::size_t>> origin{};
+    // The command buffers' round count when the game submitted it
+    // (host_lists.h round_seq_now): the writes walking it makes carry it, so
+    // one that lands in a buffer the game has begun again since is told apart.
+    std::uint64_t round_seq = 0;
 };
 
 std::vector<std::pair<const void*, std::size_t>> snapshot_cbs(const std::vector<std::pair<const void*, std::size_t>>& in,
@@ -2873,6 +2907,7 @@ void cp_thread(Queue* q, int id) {
         cpu_profile_tick(profile);
         t_job_free_event = g_arena_monitor ? job.free_event : ~0ull;
         t_cp_job_seq = job.seq;
+        host_gpu_set_write_tag(job.round_seq, &t_cur_op);
         for (const auto& cb : job.cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (const auto& cb : job.ce_cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (std::size_t i = 0; i < job.cbs.size(); ++i) {
@@ -3075,6 +3110,14 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         }
         return;
     }
+    // The command buffers' rounds so far: the game has written all it submits
+    // (Job::round_seq); and what of each chunk's round under way is submitted.
+    const std::uint64_t round_seq = host_lists::round_seq_now();
+    if (host_lists::g_mode) {
+        for (const auto& cb : cbs) {
+            if (cb.first && cb.second) host_lists::note_submitted(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
+        }
+    }
     Queue* q = queue_for(queue_id);
     std::unique_lock<std::mutex> lk(q->mu);
     if (!q->started) {
@@ -3150,6 +3193,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         q->jobs.back().lists = std::move(lists);
     }
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
+    q->jobs.back().round_seq = round_seq;
     ++q->submitted;
     q->jobs.back().seq = g_submitted_total.fetch_add(1, std::memory_order_release) + 1;
     q->cv.notify_all();
@@ -3207,6 +3251,11 @@ std::string hle_gnm_flush_reasons() {
     if (const std::uint64_t t = g_wait_impossible.load()) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), " waits-that-could-never-pass:%llu", static_cast<unsigned long long>(t));
+        out += buf;
+    }
+    if (const std::uint64_t t = g_tokens_lost.load(std::memory_order_relaxed)) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " tokens-without-a-magic:%llu", static_cast<unsigned long long>(t));
         out += buf;
     }
     {
@@ -3724,6 +3773,9 @@ void hle_gnm_wait_report() {
 
 void hle_gnm_cp_report() {
     host_lists::report();
+    host_log("cp: what written-over packets cost the walk: waits no value could pass %llu (not waited for), tokens without their magic "
+             "%llu (skipped)",
+             static_cast<unsigned long long>(g_wait_impossible.load()), static_cast<unsigned long long>(g_tokens_lost.load()));
     if (g_cc_gpu.load() || g_cc_cpu.load() || g_cc_lost.load() || g_cc_same.load() || g_cc_differ.load() || g_cc_no_packet.load()) {
         host_log("cp: CopyStructureCount tokens: copied on the GPU's timeline %llu, on the CP %llu, unmapped %llu; checked against the packet "
                  "after the token: the same %llu, differing %llu, no packet %llu",

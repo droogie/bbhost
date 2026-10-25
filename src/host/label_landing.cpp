@@ -2,10 +2,12 @@
 #include "host/label_landing.h"
 
 #include "core/portable.h"
+#include "log.h"
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -63,6 +65,8 @@ struct Entry {
     bool copy;
     std::uint8_t data[8];
     const void* src;
+    std::uint64_t epoch = 0;  // Write::epoch
+    std::uint32_t op = 0;
 };
 
 // A queue in a ring that doubles when full: no allocation a batch (a deque's
@@ -134,11 +138,89 @@ std::uint64_t g_ages[kBuckets] = {};
 Landed g_recent[kRecent];
 std::uint32_t g_recent_n = 0;
 
-void store(const Entry& w, std::uint64_t serial) {
+// A write into memory the game has written again since its submission
+// (Hooks::reused) is not stored: what it was for - the wait of the round it
+// was made in, which the command processor passed on the recorded value - is
+// gone, and what is there is the game's next round, which on the console the
+// write had reached long before (the GPU writes a label microseconds after
+// passing it). BBHOST_LABEL_REUSED_DROP=0 stores it as before. Either way it
+// is counted, and the first ones are logged.
+bool g_drop_reused = [] {  // not const: tests/label_landing_test.cpp turns it on and off
+    const char* e = std::getenv("BBHOST_LABEL_REUSED_DROP");
+    return !(e && e[0] == '0');
+}();
+// Counts, under g_mu: such writes, those at or below the new round's last
+// packet (written over), those dropped; and by what the first dword they would
+// write over held: a PM4 type-3 header, four capital letters (a token's
+// magic), all ones (a wait's mask), 0, anything else.
+std::uint64_t g_reused = 0, g_reused_over = 0, g_reused_dropped = 0, g_reused_arena = 0, g_reused_unsubmitted = 0;
+enum ThereKind { kThereHeader, kThereMagic, kThereOnes, kThereZero, kThereOther, kThereKinds };
+const char* const kThereName[kThereKinds] = {"a packet header", "a token's magic", "all ones", "0", "something else"};
+std::uint64_t g_reused_there[kThereKinds] = {};
+ThereKind there_kind(std::uint32_t v) {
+    if ((v >> 30) == 3 && v != 0xffffffffu) return kThereHeader;
+    bool letters = true;
+    for (int k = 0; k < 4; ++k) {
+        const unsigned c = (v >> (8 * k)) & 0xff;
+        letters = letters && c >= 'A' && c <= 'Z';
+    }
+    if (letters) return kThereMagic;
+    return v == 0xffffffffu ? kThereOnes : v == 0 ? kThereZero : kThereOther;
+}
+
+void note_reused(const Entry& w, const Batch& b, const Reused& at) {
+    ++g_reused;
+    const bool over = at.written_to && w.va <= at.written_to;
+    if (over) ++g_reused_over;
+    if (at.arena) ++g_reused_arena;
+    std::uint64_t value = 0, there = 0;
+    std::memcpy(&value, w.data, w.bytes < 8 ? w.bytes : 8);
+    std::memcpy(&there, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(w.va)), w.bytes < 8 ? w.bytes : 8);
+    // An eight-byte write covers two dwords: a header in either is the one it names.
+    ThereKind kind = there_kind(static_cast<std::uint32_t>(there));
+    if (w.bytes == 8 && kind != kThereHeader && there_kind(static_cast<std::uint32_t>(there >> 32)) == kThereHeader) kind = kThereHeader;
+    ++g_reused_there[kind];
+    if (at.unsubmitted) ++g_reused_unsubmitted;
+    if (g_reused > 12) return;
+    char rounds[16];
+    if (at.rounds_later < 0) {
+        std::snprintf(rounds, sizeof(rounds), "4+");
+    } else {
+        std::snprintf(rounds, sizeof(rounds), "%d", at.rounds_later);
+    }
+    host_log("label landing: a command-processor write (opcode 0x%02x) into memory the game has written again since its submission: "
+             "0x%llx <- 0x%llx (%u bytes), there now 0x%llx; %.1f ms after its submission's labels were queued; the command buffer "
+             "0x%llx..0x%llx%s %s round(s) on, %s (its last packet at 0x%llx), %s; %s",
+             w.op, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(value), w.bytes,
+             static_cast<unsigned long long>(there), static_cast<double>(now_ns() - b.added_ns) / 1e6,
+             static_cast<unsigned long long>(at.chunk_lo), static_cast<unsigned long long>(at.chunk_end), at.arena ? " (a GX arena chunk)" : "",
+             rounds,
+             over ? "within what the new round has written" : at.written_to ? "past what the new round has written" : "the new round has written nothing yet",
+             static_cast<unsigned long long>(at.written_to),
+             at.unsubmitted ? "before the new round's submission (its walk reads this)" : "after the new round's submission (its walk has its copy)",
+             g_drop_reused && !at.arena ? "not stored" : "stored");
+}
+
+void store(const Entry& w, const Batch& b) {
     if (g_hooks.mapped && !g_hooks.mapped(w.va, w.bytes)) {
         ++g_unmapped;
         return;
     }
+    if (w.epoch && g_hooks.reused) {
+        Reused at;
+        if (g_hooks.reused(w.va, w.bytes, w.epoch, &at)) {
+            note_reused(w, b, at);
+            // Not into GX's arena chunks: their retirement protocol (the
+            // marker's 0, landed after the chunk's labels) keeps a chunk
+            // from being handed out again before its writes are in memory, so
+            // one found there is counted and stored, never lost.
+            if (g_drop_reused && !at.arena) {
+                ++g_reused_dropped;
+                return;
+            }
+        }
+    }
+    const std::uint64_t serial = b.serial;
     {
         Landed& r = g_recent[g_recent_n++ % kRecent];
         r.va = w.va;
@@ -179,7 +261,7 @@ void land_locked(std::uint64_t completed) {
         const Batch b = g_batches.front();
         g_batches.pop_front();
         for (std::uint32_t k = 0; k < b.count; ++k) {
-            store(g_writes.front(), b.serial);
+            store(g_writes.front(), b);
             g_writes.pop_front();
         }
         g_n_writes += b.count;  // (copies among them counted apart in store)
@@ -265,7 +347,7 @@ void add(std::uint64_t serial, const Write* writes, std::size_t n) {
     std::lock_guard<std::mutex> lk(g_mu);
     Batch& b = batch_locked(serial);  // (added_locked wakes the thread only when it waits for work)
     for (std::size_t k = 0; k < n; ++k) {
-        Entry e{writes[k].va, writes[k].bytes, false, {}, nullptr};
+        Entry e{writes[k].va, writes[k].bytes, false, {}, nullptr, writes[k].epoch, writes[k].op};
         std::memcpy(e.data, writes[k].data, sizeof(e.data));
         g_writes.push_back(e);
     }
@@ -330,6 +412,26 @@ std::string report() {
                   static_cast<unsigned long long>(g_waits.load()), static_cast<unsigned long long>(g_unsubmitted.load()),
                   static_cast<unsigned long long>(g_unmapped), static_cast<unsigned long long>(g_most_batches),
                   static_cast<unsigned long long>(g_most_writes), pct(0.5), pct(0.99), static_cast<unsigned long long>(g_batches.size()));
+    return b;
+}
+
+bool drop_reused() { return g_drop_reused; }
+
+std::string reuse_report() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::string kinds;
+    for (int k = 0; k < kThereKinds; ++k) {
+        if (!g_reused_there[k]) continue;
+        kinds += (kinds.empty() ? "; over " : ", ") + std::string(kThereName[k]) + " " + std::to_string(g_reused_there[k]);
+    }
+    char b[640];
+    std::snprintf(b, sizeof(b),
+                  "command-processor writes into memory the game had written again since their submission (a command buffer begun "
+                  "again): %llu, %llu of them within what its new round had written, %llu before its submission (what the walk reads), "
+                  "%llu in GX arena chunks%s; %llu not stored (BBHOST_LABEL_REUSED_DROP=%d)",
+                  static_cast<unsigned long long>(g_reused), static_cast<unsigned long long>(g_reused_over),
+                  static_cast<unsigned long long>(g_reused_unsubmitted), static_cast<unsigned long long>(g_reused_arena), kinds.c_str(),
+                  static_cast<unsigned long long>(g_reused_dropped), g_drop_reused ? 1 : 0);
     return b;
 }
 

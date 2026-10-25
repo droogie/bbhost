@@ -34,6 +34,22 @@ struct Write {
     std::uint64_t va;
     std::uint32_t bytes;  // 4 or 8
     std::uint8_t data[8];
+    // The command processor's: the chunk round count (host_lists.h
+    // round_seq_now) when the game submitted the range it was walking, and
+    // the packet's opcode. 0: not the command processor's, not checked.
+    std::uint64_t epoch = 0;
+    std::uint32_t op = 0;
+};
+// A write into memory the game has written again since the submission it was
+// made for (Hooks::reused): a command buffer's chunk begun again - on the
+// console the GPU wrote it long before the game reused the memory, so what it
+// meant is gone and what is there now is the game's next round.
+struct Reused {
+    std::uint64_t chunk_lo = 0, chunk_end = 0;
+    int rounds_later = 0;         // -1: four or more
+    std::uint64_t written_to = 0;  // the new round's last packet (0: none yet)
+    bool arena = false;            // in a chunk of one of GX's command arenas
+    bool unsubmitted = false;      // the new round has not submitted that place yet: the walk will read it
 };
 
 // What the landing asks the renderer. All may be called without its lock.
@@ -46,6 +62,10 @@ struct Hooks {
     bool (*wait)(std::uint64_t need, std::uint64_t timeout_ns) = nullptr;
     bool (*mapped)(std::uint64_t va, std::size_t bytes) = nullptr;  // null: everything is
     void (*thread_start)() = nullptr;                               // names the thread, sets its class
+    // Whether [va, va + bytes) is memory the game has written again since
+    // round count `epoch` (a Write's), and where; null: nothing is checked.
+    // Called with the landing's lock held.
+    bool (*reused)(std::uint64_t va, std::uint32_t bytes, std::uint64_t epoch, Reused* out) = nullptr;
 };
 
 bool on();                       // BBHOST_LABEL_LANDING (default 1, 0 on Windows)
@@ -79,6 +99,11 @@ void set_before_land(void (*f)(std::uint64_t completed));
 // Until landed() > seen or the timeout; true when it is.
 bool wait_landed_past(std::uint64_t seen, std::chrono::microseconds timeout);
 std::string report();
+// The writes Hooks::reused found, counted (BBHOST_LABEL_REUSED_DROP).
+std::string reuse_report();
+// BBHOST_LABEL_REUSED_DROP: such a write is not stored - here, nor as a fill
+// (gpu.cpp, with BBHOST_LABEL_LANDING=0).
+bool drop_reused();
 
 // The last kRecent landings, kept for a diagnostic that finds memory a
 // packet was read from written over (hle/gnm_exec.cpp: a WAIT_REG_MEM no

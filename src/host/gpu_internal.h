@@ -250,6 +250,8 @@ struct Gpu {
         std::uint64_t va;
         std::uint32_t bytes;
         std::uint8_t data[8];
+        std::uint64_t epoch = 0;  // host_gpu_set_write_tag: the command processor's
+        std::uint32_t op = 0;
     };
     std::vector<SmallWrite> deferred_writes;
     // CP writes recorded into submissions the GPU has not finished. A draw
@@ -377,6 +379,11 @@ struct Gpu {
         std::vector<std::pair<VkDescriptorPool, VkDescriptorSet>> dead_sets;  // cached sets let go (render.cpp set cache)
         std::vector<VkImageView> dead_views;
         std::vector<UntileCheck> untile_checks;  // BBHOST_GPU_UNTILE=2 pairs, checked once this slot retired
+        // The command processor's writes this submission fills on the GPU
+        // (BBHOST_LABEL_LANDING=0), tagged: checked once it retired for one
+        // the GPU wrote over memory the game had written again since
+        // (note_fill_reused, fills_retired_locked).
+        std::vector<SmallWrite> fill_checks;
         // BBHOST_GLITCH=1 (glitch.cpp): an occlusion query around each draw,
         // and the draw record each one belongs to, read once the slot's fence
         // has signalled.

@@ -81,7 +81,15 @@ chunk, looks again as each label lands. The thread waits in the driver, or
 polls on Windows (`BBHOST_LABEL_WAIT`), where NVIDIA's driver holds its lock
 through that wait; there the labels are still GPU fills at the end of their
 submission's command buffer unless `BBHOST_LABEL_LANDING=1` (`=0` keeps the
-fills anywhere).
+fills anywhere). A label meant for a command buffer the game has begun
+writing again since the label's submission - YEBIS cycles two command buffers
+and reuses one without waiting for the GPU, so a GPU running behind lands the
+old round's fences on the new round's packets - is counted and not written:
+what it was written for is gone (`BBHOST_LABEL_REUSED_DROP=0` writes it
+anyway). As GPU fills, only those found reused when the fill is recorded can
+be left out. The chunk rounds this needs come from the host command lists, and
+the exit report counts what was found (and the CP what it lost: a wait no
+value could pass, a token without its magic).
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other

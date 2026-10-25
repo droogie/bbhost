@@ -12,7 +12,10 @@
 // before any of its writes is stored, and landed() only after all of them.
 // The last landings (recent_into) are each store's address, size, first
 // dword and submission, newest first, inside the range asked for; a skipped
-// write is not among them; and no more than kRecent are kept.
+// write is not among them; and no more than kRecent are kept. A command-
+// processor write (one with an epoch) into memory the game has written again
+// since (Hooks::reused) is counted and, with BBHOST_LABEL_REUSED_DROP, not
+// stored; a write without an epoch is not asked about.
 // Runs with BBHOST_LABEL_LANDING=1 (CMakeLists.txt).
 #include "host/label_landing.cpp"
 
@@ -74,6 +77,27 @@ label_landing::Write w64(const void* p, std::uint64_t v) {
     std::memcpy(w.data, &v, 8);
     return w;
 }
+// A command-processor write, with its epoch.
+label_landing::Write w32e(const void* p, std::uint32_t v, std::uint64_t epoch) {
+    label_landing::Write w = w32(p, v);
+    w.epoch = epoch;
+    w.op = 0x47;
+    return w;
+}
+// The memory the game has written again since an epoch past g_reuse_epoch:
+// [g_reuse_lo, g_reuse_hi). Asked only about writes with an epoch.
+std::uint64_t g_reuse_lo = 0, g_reuse_hi = 0, g_reuse_epoch = 0, g_reuse_arena_lo = ~0ull;
+int g_reuse_asked = 0;
+bool reused(std::uint64_t at, std::uint32_t bytes, std::uint64_t epoch, label_landing::Reused* out) {
+    ++g_reuse_asked;
+    if (!(at < g_reuse_hi && at + bytes > g_reuse_lo) || epoch > g_reuse_epoch) return false;
+    out->chunk_lo = g_reuse_lo;
+    out->chunk_end = g_reuse_hi;
+    out->rounds_later = 1;
+    out->written_to = g_reuse_hi;
+    out->arena = at >= g_reuse_arena_lo && at < g_reuse_hi;  // the range's top: a GX arena chunk's
+    return true;
+}
 
 // Until the thread has landed through `n` (it should, the GPU having run them).
 bool landed_through(std::uint64_t n) {
@@ -91,6 +115,7 @@ int main() {
     h.submitted = submitted;
     h.wait = wait;
     h.mapped = mapped;
+    h.reused = reused;
     start(h);
 
     alignas(8) static std::uint32_t labels[64] = {};
@@ -310,15 +335,57 @@ int main() {
         CHECK(recent_into(va(&labels[0]), va(&labels[8]), kept, 8) == 0);  // older than the last kRecent
     }
 
+    // Into memory the game has written again since: counted, and stored
+    // unless BBHOST_LABEL_REUSED_DROP; an untagged write, or one tagged after
+    // the memory was written again, is not; only tagged writes are asked about.
+    {
+        g_drop_reused = false;  // stored, as with BBHOST_LABEL_REUSED_DROP=0
+        g_reuse_lo = va(&labels[40]);
+        g_reuse_hi = va(&labels[44]);
+        g_reuse_epoch = 5;
+        labels[40] = labels[41] = labels[42] = labels[43] = labels[45] = 0x4c434242u;  // what the game wrote there since
+        const int asked = g_reuse_asked;
+        const Write a[] = {w32e(&labels[40], 31, 5), w32(&labels[41], 32), w32e(&labels[42], 33, 6), w32e(&labels[45], 34, 5)};
+        add(kLast, a, 4);
+        g_gpu.store(kLast + 1);
+        CHECK(landed_through(kLast + 1));
+        CHECK(labels[40] == 31 && labels[41] == 32 && labels[42] == 33 && labels[45] == 34);  // all stored
+        CHECK(g_reused == 1 && g_reused_dropped == 0 && g_reuse_asked == asked + 3);
+        CHECK(g_reused_there[kThereMagic] == 1);  // over 'BBCL': a token's magic
+        g_drop_reused = true;
+        const Write b[] = {w32e(&labels[43], 35, 4), w32e(&labels[46], 36, 4)};
+        add(kLast + 1, b, 2);
+        g_gpu.store(kLast + 2);
+        CHECK(landed_through(kLast + 2));
+        CHECK(labels[43] == 0x4c434242u && labels[46] == 36);  // the first not stored: the game's 'BBCL' stays
+        CHECK(g_reused == 2 && g_reused_dropped == 1);
+        Landed got_d[2] = {};
+        CHECK(recent_into(va(&labels[43]), va(&labels[44]), got_d, 2) == 0);  // not among the landings either
+        // In a GX arena chunk: counted, but stored all the same.
+        g_reuse_hi = va(&labels[48]);
+        g_reuse_arena_lo = va(&labels[47]);
+        labels[47] = 0x4c434242u;
+        const Write c[] = {w32e(&labels[47], 37, 4)};
+        add(kLast + 2, c, 1);
+        g_gpu.store(kLast + 3);
+        CHECK(landed_through(kLast + 3));
+        CHECK(labels[47] == 37 && g_reused == 3 && g_reused_dropped == 1 && g_reused_arena == 1);
+        g_reuse_arena_lo = ~0ull;
+        const std::string r = reuse_report();
+        CHECK(r.find(": 3, ") != std::string::npos && r.find("1 in GX arena chunks") != std::string::npos &&
+              r.find("1 not stored") != std::string::npos);
+        g_drop_reused = true;  // the default
+    }
+
     // No GPU any more: everything lands, and what is added after it too.
     {
         const Write a[] = {w32(&labels[7], 15)};
-        add(kLast, a, 1);
+        add(kLast + 3, a, 1);
         g_dead = true;
         CHECK(landed_through(~0ull));
         CHECK(labels[7] == 15);
         const Write b[] = {w32(&labels[8], 16)};
-        add(kLast + 1, b, 1);
+        add(kLast + 4, b, 1);
         CHECK(labels[8] == 16);
     }
 

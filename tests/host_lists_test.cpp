@@ -263,6 +263,50 @@ int main() {
         CHECK(t.state == Taken::kTaken && t.entries.empty());
     }
 
+    // Rounds: a chunk's first packet begins one, a packet at or before the
+    // last one recorded another, GX handing the chunk out another;
+    // rounds_since counts those begun after a count read before them, for
+    // any address in the chunk (newest first, four at most), and none
+    // outside a chunk or for a count read after them.
+    {
+        Buffer b(1024);
+        for (std::size_t dw : {0, 4, 10, 20}) b.put(dw, 0x47, 6);
+        const u64 s0 = round_seq_now();
+        b.note(0, 0x47);  // the chunk's first packet: its first round
+        const u64 s1 = round_seq_now();
+        CHECK(s1 == s0 + 1);
+        b.note(10, 0x47);  // on in order: the same round
+        CHECK(round_seq_now() == s1);
+        Reuse at;
+        CHECK(rounds_since(b.at(12), 8, s1, &at) == 0);
+        CHECK(rounds_since(b.at(12), 8, s0, &at) == 1 && at.rounds_later == 1 && at.first_seq == s1);
+        CHECK(at.chunk_end == b.object[1] && at.chunk_lo == b.begin() && at.written_to == b.at(10));
+        b.note(4, 0x47);  // at an earlier place: the chunk written again, a new round
+        const u64 s2 = round_seq_now();
+        CHECK(s2 == s1 + 1);
+        CHECK(rounds_since(b.at(500), 4, s1, &at) == 1 && at.first_seq == s2 && at.written_to == b.at(4));
+        CHECK(rounds_since(b.at(500), 4, s0, &at) == 2 && at.first_seq == s1);
+        CHECK(rounds_since(b.at(500), 4, s2, &at) == 0);
+        // What of the round under way is submitted: before it, a write is
+        // what the walk will read; inside it, the walk has its copy.
+        CHECK(rounds_since(b.at(50), 4, s1, &at) == 1 && at.unsubmitted);
+        note_submitted(b.at(0), 100 * 4);
+        CHECK(rounds_since(b.at(50), 4, s1, &at) == 1 && !at.unsubmitted);
+        CHECK(rounds_since(b.at(150), 4, s1, &at) == 1 && at.unsubmitted);
+        note_submitted(b.at(100), 100 * 4);
+        CHECK(rounds_since(b.at(150), 4, s1, &at) == 1 && !at.unsubmitted);
+        for (int k = 0; k < 5; ++k) b.note(0, 0x47);  // five more rounds
+        CHECK(rounds_since(b.at(0), 4, s1, &at) == 4 && at.rounds_later == -1);
+        CHECK(at.unsubmitted);  // a new round: nothing of it submitted
+        CHECK(rounds_since(b.at(0), 4, round_seq_now() - 1, &at) == 1);
+        CHECK(rounds_since(b.begin() + 1030 * 4, 4, s0, &at) == 0);  // in the gap after the chunk: no chunk
+        CHECK(rounds_since(b.at(0), 4, 0, &at) == 0);                 // untagged: never
+        // The arena hands it out again: a round, before any packet of it.
+        const u64 s3 = round_seq_now();
+        chunk_handed_out(b.begin(), 1024 * 4);
+        CHECK(rounds_since(b.at(100), 4, s3, &at) == 1 && at.written_to == 0);
+    }
+
     // GX's arena hands the chunk out again: its list starts over.
     {
         Buffer b(1024);

@@ -386,6 +386,12 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes); 
 // host_gpu_mem_write that also reports the submission serial the write is recorded
 // into: it is in memory once host_gpu_completed_submits() is past that serial.
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// The command processor's thread, for the writes it makes from here on: the
+// chunk round count (host_lists.h round_seq_now) when the game submitted what
+// it walks, and where it keeps the opcode of the packet it is in - a write
+// that lands on memory the game has written again since is told apart
+// (label_landing.h Hooks::reused). 0 / null: untagged.
+void host_gpu_set_write_tag(std::uint64_t epoch, const std::uint32_t* op);
 // The command processor's worker threads' jobs so far: table read masks done
 // and queued (bb-tmask0-3), no-fallback pipeline variants built and queued
 // (bb-lean0-1) - for frame statistics' detail (BBHOST_FRAME_DETAIL=1).

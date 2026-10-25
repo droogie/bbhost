@@ -14,6 +14,7 @@
 #include "host/gxvk.h"
 #include "host/import_mode.h"
 #include "host/import_prefetch.h"
+#include "host/host_lists.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
@@ -233,6 +234,7 @@ struct SubmitJob {
     std::uint64_t ticket = 0;
     std::uint64_t serial = ~0ull;  // a game submission's Gpu::flushes, published once it went (stream_submitted_serial)
     std::uint64_t foreign = 0;     // a kForeignSubmit's id, published the same way (host_gpu_wait_submitted)
+    std::uint64_t enqueued_ns = 0;  // BBHOST_TEST_GPU_DELAY_MS: when it was handed over
 };
 std::mutex g_sub_mu;
 std::condition_variable g_sub_cv, g_sub_idle;
@@ -343,6 +345,18 @@ const std::uint32_t g_submit_hold_us = [] {
     const char* e = std::getenv("BBHOST_TEST_SUBMIT_HOLD_US");
     return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
 }();
+// BBHOST_TEST_GPU_DELAY_MS=<ms> (tests): each submission goes to the queue no
+// sooner than this long after it was handed over - a GPU that runs everything
+// as fast as before but that much later. Its labels land that much later with
+// it, and so does all that waits on them (a flip, a wait for the GPU, a
+// chunk's retirement), whether the host lands them or the GPU fills them: a
+// slow device's timing - the command processor behind, labels landing tens of
+// milliseconds after their submission - at will (the counts of writes into
+// memory written again since, label_landing.h).
+const std::uint64_t g_test_gpu_delay_ns = [] {
+    const char* e = std::getenv("BBHOST_TEST_GPU_DELAY_MS");
+    return e && *e ? static_cast<std::uint64_t>(std::strtoul(e, nullptr, 10)) * 1000000ull : 0ull;
+}();
 // Written by the submission thread only (relaxed stores), read by the report.
 std::atomic<std::uint64_t> g_sub_jobs_done{0}, g_sub_queue_submits{0}, g_sub_jobs_merged{0}, g_sub_fence_submits{0};
 
@@ -418,6 +432,10 @@ void submit_thread() {
                 }
             }
             g_sub_busy = true;
+        }
+        if (g_test_gpu_delay_ns && jobs[0].enqueued_ns) {
+            const std::uint64_t due = jobs[0].enqueued_ns + g_test_gpu_delay_ns, now = host_clock_monotonic_ns();
+            if (due > now) host_sleep_us((due - now) / 1000);
         }
         if (n == 1) {
             submit_job_now(jobs[0]);
@@ -1043,6 +1061,7 @@ void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemap
     job.items = items;
     job.serial = serial;
     job.foreign = foreign_id;
+    if (g_test_gpu_delay_ns) job.enqueued_ns = host_clock_monotonic_ns();
     if (g_sub_running) {
         enqueue_submit(job);
     } else {
@@ -6304,6 +6323,17 @@ void start_label_landing() {
     h.wait = timeline_wait;
     h.mapped = hle_kernel_va_mapped;
     h.thread_start = landing_thread_start;
+    h.reused = [](std::uint64_t va, std::uint32_t bytes, std::uint64_t epoch, label_landing::Reused* out) {
+        host_lists::Reuse at;
+        if (host_lists::rounds_since(va, bytes, epoch, &at) <= 0) return false;
+        out->chunk_lo = at.chunk_lo;
+        out->chunk_end = at.chunk_end;
+        out->rounds_later = at.rounds_later;
+        out->written_to = at.written_to;
+        out->arena = at.arena;
+        out->unsubmitted = at.unsubmitted;
+        return true;
+    };
     label_landing::start(h);
     host_log("gpu: the command processor's labels are written by the host once their submission has run, not filled by the GPU "
              "(BBHOST_LABEL_LANDING=1)");
@@ -6317,7 +6347,7 @@ void hand_labels_to_landing_locked() {
     static std::vector<label_landing::Write> ws;  // under g.mu
     ws.clear();
     for (const Gpu::SmallWrite& w : g.deferred_writes) {
-        label_landing::Write l{w.va, w.bytes, {}};
+        label_landing::Write l{w.va, w.bytes, {}, w.epoch, w.op};
         std::memcpy(l.data, w.data, sizeof(l.data));
         ws.push_back(l);
     }
@@ -6326,6 +6356,7 @@ void hand_labels_to_landing_locked() {
 }
 }  // namespace
 
+void fills_retired_locked(Gpu::Slot& sl);  // below, with the fills
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -6411,6 +6442,7 @@ void retire_slot_locked(int k) {
     // labels the host writes too, landed here if the landing thread has not
     // yet (label_landing.h).
     if (landing_on()) label_landing::land_through(sl.serial + 1);
+    if (!sl.fill_checks.empty()) fills_retired_locked(sl);
     g.completed_submits = std::max(g.completed_submits, sl.serial + 1);
     g_completed_submits_seen.store(g.completed_submits, std::memory_order_relaxed);
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
@@ -10500,6 +10532,66 @@ const bool g_arena_retire_order = [] {
 }();
 std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 
+// CP writes recorded as GPU fills (BBHOST_LABEL_LANDING=0) into memory the game
+// had already written again when the fill was recorded (host_lists.h
+// rounds_since), and those of them within what its new round had written.
+std::atomic<std::uint64_t> g_fills_reused{0}, g_fills_reused_over{0}, g_fills_landed_over{0}, g_fills_landed_unsubmitted{0}, g_fills_dropped{0};
+// Whether `w` goes into memory the game has written again (counted, the first
+// logged) and is to be left out (`drop`, but never in a GX arena chunk: see
+// label_landing.cpp); one that does not is kept to be looked at again once it
+// has run.
+bool note_fill_reused(const Gpu::SmallWrite& w, bool drop) {
+    if (!w.epoch) return false;
+    host_lists::Reuse at;
+    if (host_lists::rounds_since(w.va, w.bytes, w.epoch, &at) <= 0) {
+        if (g.slot_count) g.slots[g.slot].fill_checks.push_back(w);  // fills_retired_locked
+        return false;
+    }
+    drop = drop && !at.arena;
+    const bool over = at.written_to && w.va <= at.written_to;
+    if (over) g_fills_reused_over.fetch_add(1, std::memory_order_relaxed);
+    if (g_fills_reused.fetch_add(1, std::memory_order_relaxed) < 12) {
+        std::uint64_t value = 0, there = 0;
+        std::memcpy(&value, w.data, w.bytes < 8 ? w.bytes : 8);
+        std::memcpy(&there, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(w.va)), w.bytes < 8 ? w.bytes : 8);
+        host_log("gpu: a command-processor write (opcode 0x%02x) recorded as a fill into memory the game has written again since its "
+                 "submission: 0x%llx <- 0x%llx (%u bytes), there now 0x%llx; the command buffer 0x%llx..0x%llx %d round(s) on, %s",
+                 w.op, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(value), w.bytes,
+                 static_cast<unsigned long long>(there), static_cast<unsigned long long>(at.chunk_lo),
+                 static_cast<unsigned long long>(at.chunk_end), at.rounds_later,
+                 over ? "within what the new round has written" : "past what the new round has written");
+    }
+    return drop;
+}
+
+// A retired submission's tagged fills: one whose chunk has begun a round since
+// its submission and that the GPU wrote at a place the new round had written
+// before - its value there now, where the new round's packets were - landed
+// over them, as a late label would.
+void fills_retired_locked(Gpu::Slot& sl) {
+    for (const Gpu::SmallWrite& w : sl.fill_checks) {
+        host_lists::Reuse at;
+        if (host_lists::rounds_since(w.va, w.bytes, w.epoch, &at) <= 0 || !at.written_to || w.va > at.written_to) continue;
+        if (!hle_kernel_va_mapped(w.va, w.bytes) ||
+            std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(w.va)), w.data, w.bytes) != 0)
+            continue;
+        // The new round not submitted up to that place even now: the fill
+        // landed before its submission, so the walk reads it.
+        if (at.unsubmitted) g_fills_landed_unsubmitted.fetch_add(1, std::memory_order_relaxed);
+        if (g_fills_landed_over.fetch_add(1, std::memory_order_relaxed) < 12) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, w.data, w.bytes < 8 ? w.bytes : 8);
+            host_log("gpu: a command-processor write (opcode 0x%02x) the GPU filled over a command buffer the game had written again: "
+                     "0x%llx holds its 0x%llx (%u bytes) inside the new round (its last packet at 0x%llx), the command buffer "
+                     "0x%llx..0x%llx %d round(s) on",
+                     w.op, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(value), w.bytes,
+                     static_cast<unsigned long long>(at.written_to), static_cast<unsigned long long>(at.chunk_lo),
+                     static_cast<unsigned long long>(at.chunk_end), at.rounds_later);
+        }
+    }
+    sl.fill_checks.clear();
+}
+
 // Replays the fence writes held back by host_gpu_mem_write at the end of the
 // command buffer, in the order the command processor made them.
 //
@@ -10521,6 +10613,16 @@ std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 void flush_deferred_writes_locked() {
     if (g.deferred_writes.empty()) return;
     const ImportSite site("a label or CP write, deferred");
+    if (label_landing::drop_reused()) {
+        // Not filled at all: what it was written for is gone (label_landing.h).
+        auto& all = g.deferred_writes;
+        const std::size_t before = all.size();
+        all.erase(std::remove_if(all.begin(), all.end(), [](const Gpu::SmallWrite& w) { return note_fill_reused(w, true); }), all.end());
+        g_fills_dropped.fetch_add(before - all.size(), std::memory_order_relaxed);
+        if (all.empty()) return;
+    } else {
+        for (const Gpu::SmallWrite& w : g.deferred_writes) note_fill_reused(w, false);
+    }
     // Each ordinary run of transfers shares one barrier pair; this one starts
     // its own, so nothing recorded before it can land after it.
     transfer_flush_locked();
@@ -10895,6 +10997,14 @@ void note_gpu_write_over_marker(const char* what, std::uint64_t dst, std::uint64
     }
 }
 
+// The command processor's tag for the writes it makes (host_gpu_set_write_tag).
+thread_local std::uint64_t t_write_epoch = 0;
+thread_local const std::uint32_t* t_write_op = nullptr;
+void host_gpu_set_write_tag(std::uint64_t epoch, const std::uint32_t* op) {
+    t_write_epoch = epoch;
+    t_write_op = op;
+}
+
 bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes) { return host_gpu_mem_write_serial(va, data, bytes, nullptr); }
 
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
@@ -10912,7 +11022,7 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     // it as behind this submission, as it did a GPU fill's.
     if (bytes <= 8 && landing_on()) {
         if ((va & 3) || (bytes & 3) || !hle_kernel_va_mapped(va, bytes)) return false;
-        Gpu::SmallWrite w{va, static_cast<std::uint32_t>(bytes), {}};
+        Gpu::SmallWrite w{va, static_cast<std::uint32_t>(bytes), {}, t_write_epoch, t_write_op ? *t_write_op : 0u};
         std::memcpy(w.data, data, bytes);
         g.deferred_writes.push_back(w);
         begin_recording_locked();  // the submission whose completion lands it
@@ -10930,7 +11040,7 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     // only later, and the command processor no longer stalls on these because
     // WAIT_REG_MEM consults the recorded value.
     if (bytes <= 8) {
-        Gpu::SmallWrite w{va, static_cast<std::uint32_t>(bytes), {}};
+        Gpu::SmallWrite w{va, static_cast<std::uint32_t>(bytes), {}, t_write_epoch, t_write_op ? *t_write_op : 0u};
         std::memcpy(w.data, data, bytes);
         g.deferred_writes.push_back(w);
         begin_recording_locked();
@@ -11758,6 +11868,7 @@ void host_gpu_report() {
         // the other order hung a timed exit with the CP still dispatching.
         const std::string lift = compute_lift_report();
         const std::string landing = label_landing::report();
+        const std::string landing_reused = label_landing::on() ? label_landing::reuse_report() : std::string();
         const std::string label_reads = label_check_report();
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         std::vector<std::pair<std::uint64_t, std::string>> by_count;
@@ -11771,6 +11882,17 @@ void host_gpu_report() {
                  "fills, given a barrier ahead of the marker's 0: %llu",
                  static_cast<unsigned long long>(g_arena_retires_ordered.load()));
         host_log("gpu: %s", landing.c_str());
+        if (!landing_reused.empty()) host_log("gpu: %s", landing_reused.c_str());
+        if (!landing_on()) {
+            host_log("gpu: command-processor writes recorded as fills into memory the game had written again since their submission (a "
+                     "command buffer begun again): %llu, %llu of them within what its new round had written; filled by the GPU over "
+                     "what a new round had written there (found once their submission retired): %llu, %llu of them before that round's "
+                     "submission; not filled %llu (BBHOST_LABEL_REUSED_DROP=%d)",
+                     static_cast<unsigned long long>(g_fills_reused.load()), static_cast<unsigned long long>(g_fills_reused_over.load()),
+                     static_cast<unsigned long long>(g_fills_landed_over.load()),
+                     static_cast<unsigned long long>(g_fills_landed_unsubmitted.load()), static_cast<unsigned long long>(g_fills_dropped.load()),
+                     label_landing::drop_reused() ? 1 : 0);
+        }
         if (!label_reads.empty()) host_log("gpu: %s", label_reads.c_str());
         host_log("gpu: %s", lift.c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "

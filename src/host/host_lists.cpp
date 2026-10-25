@@ -46,7 +46,27 @@ struct Region {
     u32 cap = 0;
     std::atomic<u32> count{0};
     std::atomic<u32> flags{0};
+    // Its rounds: begun (rounds_since), and the last kRoundSeqs ones' places
+    // in g_round_seq - a first packet, one written at or before the last one
+    // recorded (the chunk written again from its start), or GX handing the
+    // chunk out again.
+    std::atomic<u32> rounds{0};
+    std::atomic<u64> round_seq[4] = {};
+    // The round under way's part submitted so far (note_submitted): the
+    // round it was, and the end of the highest range submitted in it.
+    std::atomic<u32> submitted_round{0};
+    std::atomic<u64> submitted_to{0};
 };
+constexpr u32 kRoundSeqs = 4;
+// Every chunk round begun, counted (round_seq_now).
+std::atomic<u64> g_round_seq{0};
+// Leaf-safe: a new round of `r`.
+void new_round(Region& r) {
+    const u64 seq = g_round_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const u32 n = r.rounds.load(std::memory_order_relaxed);
+    r.round_seq[n % kRoundSeqs].store(seq, std::memory_order_release);
+    r.rounds.store(n + 1, std::memory_order_release);
+}
 u64 base_of(u64 end) { return end > kMaxChunkBytes ? end - kMaxChunkBytes : 0; }
 constexpr u32 kRegions = 8192;
 Region g_regions[kRegions];
@@ -100,6 +120,7 @@ u32 make_region(u64 end, u64 begin) {
     }
     r.entry = g_pool + (g_pool_used.load(std::memory_order_relaxed) - cap);
     r.cap = static_cast<u32>(cap);
+    new_round(r);
     r.flags.store(kReady, std::memory_order_release);
     return i + 1;
 }
@@ -260,6 +281,7 @@ void note_slow(u64 cb, u64 va, u32 op) {
     if (n && (r->entry[n - 1] >> 8) >= at) {
         n = 0;
         r->flags.fetch_and(~kOverflow, std::memory_order_relaxed);
+        new_round(*r);
     }
     if (n >= r->cap) {
         if (!(r->flags.fetch_or(kOverflow, std::memory_order_relaxed) & kOverflow)) g_overflowed.fetch_add(1, std::memory_order_relaxed);
@@ -291,7 +313,53 @@ void chunk_handed_out(u64 chunk_va, std::size_t chunk_bytes) {
         r.flags.fetch_and(~kOverflow, std::memory_order_relaxed);
         r.count.store(0, std::memory_order_release);
         r.lo.store(chunk_va, std::memory_order_relaxed);
+        new_round(r);
     }
+}
+
+u64 round_seq_now() { return g_round_seq.load(std::memory_order_acquire); }
+
+void note_submitted(u64 va, std::size_t bytes) {
+    if (!g_mode || !bytes) return;
+    Region* r = containing(va, bytes);
+    if (!r) return;
+    const u32 n = r->rounds.load(std::memory_order_acquire);
+    if (r->submitted_round.load(std::memory_order_relaxed) != n) {
+        r->submitted_to.store(0, std::memory_order_relaxed);
+        r->submitted_round.store(n, std::memory_order_release);
+    }
+    if (va + bytes > r->submitted_to.load(std::memory_order_relaxed)) r->submitted_to.store(va + bytes, std::memory_order_release);
+}
+
+int rounds_since(u64 va, std::size_t bytes, u64 seq, Reuse* out) {
+    if (!g_mode || !seq) return 0;
+    Region* r = containing(va, bytes);
+    if (!r) return 0;
+    const u32 n = r->rounds.load(std::memory_order_acquire);
+    int later = 0;
+    u64 first = ~0ull;
+    for (u32 k = 0; k < kRoundSeqs && k < n; ++k) {
+        const u64 s = r->round_seq[(n - 1 - k) % kRoundSeqs].load(std::memory_order_acquire);
+        if (s <= seq) break;  // newest first: the rest began before too
+        ++later;
+        first = s;
+    }
+    if (!later || !out) return later;
+    out->chunk_end = r->end;
+    out->chunk_lo = r->lo.load(std::memory_order_relaxed);
+    out->rounds_later = later == static_cast<int>(kRoundSeqs) ? -1 : later;
+    out->first_seq = first;
+    // How far the round under way has written: its last packet recorded.
+    const u32 c = r->count.load(std::memory_order_acquire);
+    out->written_to = c ? base_of(r->end) + static_cast<u64>(r->entry[c - 1] >> 8) * 4 : 0;
+    out->arena = false;
+    for (u32 i = 0, na = g_arena_count.load(std::memory_order_acquire); i < na; ++i) {
+        out->arena = out->arena || (va >= g_arenas[i].base && va < g_arenas[i].end);
+    }
+    // Before the round's submission of that place: the walk will read what
+    // lands there (its copy is made at the submission).
+    out->unsubmitted = r->submitted_round.load(std::memory_order_acquire) != n || va >= r->submitted_to.load(std::memory_order_acquire);
+    return later;
 }
 
 void take(u64 va, std::size_t bytes, Taken* out) {
@@ -504,6 +572,30 @@ void shadow_end() {
 void report() {
     if (!g_mode) return;
     const u32 regions = std::min(g_region_count.load(), kRegions);
+    {
+        // The chunks begun again most often (each list's rounds): a ring of
+        // command buffers the game cycles through, by how fast it does.
+        u32 top[4] = {}, n = 0;
+        for (u32 i = 0; i < regions; ++i) {
+            const u32 rounds = g_regions[i].rounds.load(std::memory_order_relaxed);
+            u32 k = n < 4 ? n++ : 4;
+            while (k > 0 && g_regions[top[k - 1]].rounds.load(std::memory_order_relaxed) < rounds) {
+                if (k < 4) top[k] = top[k - 1];
+                --k;
+            }
+            if (k < 4) top[k] = i;
+        }
+        std::string most;
+        for (u32 k = 0; k < n; ++k) {
+            const Region& r = g_regions[top[k]];
+            char b[96];
+            std::snprintf(b, sizeof b, "%s 0x%llx..0x%llx %u", k ? "," : "", static_cast<ull>(r.lo.load()), static_cast<ull>(r.end),
+                          r.rounds.load());
+            most += b;
+        }
+        host_log("host-lists: %llu chunk rounds begun; the chunks begun most often (start..end rounds):%s",
+                 static_cast<ull>(g_round_seq.load()), most.empty() ? " none" : most.c_str());
+    }
     host_log("host-lists: %u chunks' lists (%.1f MiB of entries set aside); packets not recorded: %llu outside their command "
              "buffer's chunk, %llu with no room for another list, %llu lists filled up; %llu entries left from a chunk's earlier round "
              "dropped when taken (BBHOST_HOST_LISTS=%d)",
