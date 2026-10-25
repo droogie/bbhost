@@ -25,7 +25,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/hlsl.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/hlsl.cpp src/gcn/gs_vertex.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
