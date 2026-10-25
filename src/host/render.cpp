@@ -658,6 +658,18 @@ const bool g_set_cache = [] {
 }();
 bool set_cache_on() { return g_set_cache; }
 bool cb_push_on() { return g_set_cache && g.has_push_descriptor; }
+// BBHOST_VLINE_OLD=1: the point sprites' LS as it was before its constant
+// buffers were bound at their own first bytes (the bias taken from the
+// evaluation stage's params, a copy bound over the whole copies' ring) - the
+// vertical line at the frame's centre. A control for this release's tests,
+// to be removed after it.
+bool vline_old() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_VLINE_OLD");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
 // BBHOST_CB_EXACT=0: a draw's constant buffers bound over the V# base aligned
 // down, or a snapshot's over the whole ring, with each one's dword bias in the
 // params (StageParams::cb_bias_dw), as before. Otherwise, pushed and on a
@@ -6576,10 +6588,13 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     // set of their own, 4 from binding 16 as a native hull
                     // pipeline's LS has them, its params still the evaluation
                     // stage's (its user data in their vertex-formats slot).
+                    // Those params' biases are the domain shader's own, so the
+                    // LS reads none: each of its buffers is bound at its own
+                    // first byte (the set-4 write, resolve_stage_buffers exact).
                     gcn::TranslateOptions vo4 = vo;
                     vo4.cb_descriptor_set = static_cast<int>(kTessNativeSet);
                     vo4.cb_binding_base = kTessNativeLsBuffers;
-                    vo4.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
+                    vo4.cb_bias_zero = !vline_old();
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
                     hlsl_name_next(ls->name);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
@@ -13741,6 +13756,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             const VkDeviceSize binding_off = loc.buffer ? loc.offset : (base & (g.ssbo_align - 1));
             const VkDeviceSize start = exact ? binding_off : binding_off & ~(g.ssbo_align - 1);
             const VkDeviceSize bias = binding_off - start;
+            // Exact on a device whose storage buffers bind only on a step
+            // (minStorageBufferOffsetAlignment over 4: the particle LS's set
+            // 4, below): a start off the step takes a copy, bound at its own.
+            const bool off_step = exact && (start & (g.ssbo_align - 1)) != 0;
             outcome = kTooLong;
             // BBHOST_CB_ALIGN16=1: refuse a binding whose base is not a whole
             // number of vec4s into the bound range, and let it take the page
@@ -13771,6 +13790,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // the draw is recorded - a snapshot of the bytes, so a later CPU
             // write to that memory cannot reach a draw still in flight.
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
+            if (off_step) realign = true;
             // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
             // in place, the twin; its guest bytes are stale, so no copy of them.
             const bool twin = !in_heap && !known && twin_covers_locked(base, bytes);
@@ -13971,7 +13991,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             }
             if (outcome == kBound) {
                 // already handled by the realign path
-            } else if (align16 && (bias % 16) != 0) {
+            } else if (off_step || (align16 && (bias % 16) != 0)) {
                 outcome = kUnaligned;
             } else if (bytes <= loc.avail && bias + bytes <= g.ssbo_max_range) {
                 info = {loc.buffer, start, bias + bytes};
@@ -21149,7 +21169,13 @@ static bool draw_impl(const GpuDraw& d) {
         ls_infos.clear();
         ls_writes.clear();
         ls_infos.reserve(lm.buffers.size());
-        resolve_stage_buffers(lm, lp.user_sgpr, lp, ls_infos);
+        // Each at its own first byte, its bias 0: the LS reads its buffers
+        // from dword 0 (cb_bias_zero above), as its params block - the
+        // evaluation stage's - has no biases of the LS's to give. Bound over
+        // the whole copies' ring with the copy's place as its bias, the bias
+        // was dropped: the LS read the ring's first copy, another draw's
+        // constants, and its particles fell at the frame's centre as a line.
+        resolve_stage_buffers(lm, lp.user_sgpr, lp, ls_infos, nullptr, !vline_old());
         if (!every_buffer_bound(lp, lm) || !(tess_set = alloc_set_locked(bind_pl->tess_set_layout))) {
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 4) host_log("render: pipeline %s: its LS's constant buffers do not all bind; draw skipped", bind_pl->name.c_str());
