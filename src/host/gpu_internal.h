@@ -1225,6 +1225,9 @@ ParticlePath particle_path();
 // render.cpp: the check mode's records of the submission `serial`, compared
 // once it is done.
 void particle_check_retired_locked(std::uint64_t serial);
+// render.cpp: after a dispatch (and its barrier), the particles' draws'
+// arguments written from the game's for their live counts (vs and check).
+void particle_args_after_dispatch_locked();
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);

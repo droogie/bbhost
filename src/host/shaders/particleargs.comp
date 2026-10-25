@@ -1,0 +1,56 @@
+#version 460
+// The GPU particles' draws as one vertex stage (render.cpp,
+// BBHOST_GX_PARTICLES=vs), their indexed draw's arguments written on the GPU
+// right after a dispatch: for each emitter of the host's list, its indirect
+// arguments - the simulation's {count, instances, first vertex, first
+// instance}, read where the game keeps them - as the draw over its particles'
+// index list takes them: the count, at most the particles the list and the
+// emitter hold, times a particle's indices; one instance, or none when the
+// game's has none; from the list's start. An entry with no address draws
+// nothing.
+//
+// Compiled offline (tools/build_shaders.sh) into particleargs.spv.h.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Args {
+    uint v[4];
+};
+struct Entry {
+    uint64_t args;  // the device address of the game's arguments (0: none)
+    uint indices;   // a particle's
+    uint most;      // particles the list and the emitter hold
+    uint slot;      // its slot
+    uint pad;
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Entries {
+    Entry e[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Slots {
+    uint v[];  // VkDrawIndexedIndirectCommand a slot, five words
+};
+
+layout(push_constant) uniform Params {
+    Entries entries;
+    Slots slots;
+    uint count;
+};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    const Entry e = entries.e[i];
+    uint n = 0u, instances = 0u;
+    if (e.args != 0ul) {
+        Args a = Args(e.args);
+        n = min(a.v[0], e.most);
+        instances = a.v[1] != 0u ? 1u : 0u;
+    }
+    const uint s = 5u * e.slot;
+    slots.v[s + 0u] = n * e.indices;
+    slots.v[s + 1u] = instances;
+    slots.v[s + 2u] = 0u;
+    slots.v[s + 3u] = 0u;
+    slots.v[s + 4u] = 0u;
+}

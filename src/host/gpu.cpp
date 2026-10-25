@@ -8879,6 +8879,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             }
             if (render_handle_fill_locked(base, bytes, rgba, d.depth_clear, d.stencil_clear)) {
                 t_dispatch_class = kDcFill;
+                particle_args_after_dispatch_locked();  // a fill may reset a particle counter
                 g.dispatches.fetch_add(1);
                 g_dispatch_fills.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -9399,6 +9400,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
                                                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
+    particle_args_after_dispatch_locked();  // the particles' draws' live counts, as this dispatch may have changed them
     g.dispatches.fetch_add(1);
     if (capture_session) capture_dispatch_finish_locked(std::move(capture_session));
     stamp.to(kDpAfter);

@@ -185,10 +185,15 @@ order its strips make them, so the provoking vertex of every triangle is the
 strip's: one strip a particle where the geometry shader cuts only after its
 last emit (the standard particles: up to eight vertices), else strips of four
 (the sparks); a vertex past its particle's emits is its last emit, which leaves
-every triangle it is in without area. It runs its emitter's room, the most records a buffer
-its export shader reads by index holds; the stage reads the simulation's
+every triangle it is in without area. The stage reads the simulation's
 indirect arguments itself and leaves out every particle at or past their
-count. `=check` draws with the geometry shader and runs the vertex stage
+count. The draw takes the live count: right after each dispatch - the
+simulation's run outside any render pass - one more writes every emitter's
+indexed-draw arguments from the game's, its live count times a particle's
+indices, and the draw reads those. An emitter's first draws, before such a
+pass has written its arguments, run its room, the most records a buffer its
+export shader reads by index holds; `BBHOST_GX_PARTICLE_ARGS=0` always runs
+the room. `=check` draws with the geometry shader and runs the vertex stage
 beside it with nothing rasterized: both write what each vertex gets into a
 record, which the host compares word for word once the submission is done,
 and the exit report gives the differences by program set, those at a flat
