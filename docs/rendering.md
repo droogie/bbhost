@@ -642,12 +642,22 @@ Nightmare, Laurence's staircase, Lumenwood and Astral:
   tokens' sources copied just before a submission. Window mode then counts
   one to three more arrival stalls a place than whole imports, and 32-36 a
   12-place tour against 25.
-- The remedy is to let the GPU read those sources again: windows imported
-  ahead of the upload, off the command processor, at the GX resource's
-  creation (as the import prefetch does for buffers), and retired once idle so
-  that the imports stay near a gigabyte, with staging only where no window is
-  there yet. It belongs to the step that makes GX textures Vulkan images at
-  their creation, which removes most of these imports anyway.
+- Most of those waits were for textures made ahead of their first bind, and
+  most of those are never bound. Such a texture's upload is now recorded at
+  the first submission after the prep pool has copied its tiled bytes into
+  staging, with no wait (`BBHOST_GXVK_AHEAD_DEFER=0` records it at the
+  creation, as before). Whatever uses the image before then records it first,
+  and waits for the copy only if it is still running: a binding, an upload
+  token, a fill, a move in the image heap. A carry of a mip chain no longer
+  waits for the upload it has just queued, whose hashes it takes again at
+  once. On lavapipe at Laurence's staircase the waits fall from 227-236 to 11
+  a run.
+- The rest of the remedy is to let the GPU read those sources again: windows
+  imported ahead of the upload, off the command processor, at the GX
+  resource's creation (as the import prefetch does for buffers), and retired
+  once idle so that the imports stay near a gigabyte, with staging only where
+  no window is there yet. It belongs to the step that makes GX textures Vulkan
+  images at their creation, which removes most of these imports anyway.
 
 ### Resolving draws where their command lists are finished (a design note)
 

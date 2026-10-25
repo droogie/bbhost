@@ -6566,6 +6566,33 @@ bool acquire_staging_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
     return true;
 }
 
+DevBuffer staging_hold_locked(VkBuffer buffer) {
+    DevBuffer chunk;
+    if (g.staging_cur.buffer == buffer) {
+        chunk = g.staging_cur;
+    } else {
+        for (const DevBuffer& c : g.slots[g.slot].staging_chunks)
+            if (c.buffer == buffer) chunk = c;
+    }
+    if (chunk.buffer) ++g.staging_users[chunk.buffer];
+    return chunk;
+}
+
+void staging_hold_end_locked(const DevBuffer& chunk, bool recorded) {
+    if (!chunk.buffer) return;
+    if (recorded) {
+        Gpu::Slot& sl = g.slots[g.slot];
+        if (sl.staging_chunks.empty() || sl.staging_chunks.back().buffer != chunk.buffer) {
+            sl.staging_chunks.push_back(chunk);
+            ++g.staging_users[chunk.buffer];
+        }
+    }
+    const auto it = g.staging_users.find(chunk.buffer);
+    if (it == g.staging_users.end() || --it->second) return;
+    g.staging_users.erase(it);
+    if (chunk.buffer != g.staging_cur.buffer) staging_let_go_locked(chunk);
+}
+
 namespace {
 constexpr std::uint64_t kScratchChunkBytes = 64ull << 20;
 constexpr std::uint64_t kScratchKeepBytes = 256ull << 20;
@@ -8088,6 +8115,7 @@ void submit_locked() {
     drain_target_blocks_locked();  // a targets' block holding little, emptied into room elsewhere (one turn a second)
     compact_image_heap_locked();  // in place of the drains where on: the emptiest block of either class, copies a turn a second
     textures_relocate_pinned_locked();  // a textures' block's few GPU-written surfaces, moved so it can drain (lean thresholds)
+    textures_record_ahead_locked();  // made-ahead uploads whose copy into staging is done (BBHOST_GXVK_AHEAD_DEFER)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -11273,7 +11301,7 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c) {
 
 bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    return g.ok && textures_create_ahead_locked(tsharp, gen);
+    return g.ok && textures_create_ahead_locked(tsharp, gen, true);
 }
 
 void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {

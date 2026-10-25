@@ -760,6 +760,12 @@ void defer_destroy(const DevBuffer& b);  // freed once the current command buffe
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to
 // the span; `offset` is the span's offset in it.
 bool acquire_staging_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offset);
+// A staging span a later command buffer reads (a made-ahead texture's upload, recorded once the prep pool has filled
+// its span; textures.cpp): its chunk, which acquire_staging_locked just placed it in, holds one user more until
+// staging_hold_end_locked - recorded (`recorded`: the current command buffer reads it, and the chunk goes with that
+// one's retirement) or not. Returns the chunk (buffer null if none holds `buffer`).
+DevBuffer staging_hold_locked(VkBuffer buffer);
+void staging_hold_end_locked(const DevBuffer& chunk, bool recorded);
 // A span of device-local scratch for this command buffer, 256-byte aligned
 // (b.buffer, b.address at the chunk's start, `offset` into it); free for
 // reuse once the slot retires.
@@ -2238,10 +2244,13 @@ void tex_events_for(std::FILE* f, std::uint64_t lo, std::uint64_t bytes);
 void tex_events_write(std::FILE* f);
 // The guest bytes a cached surface covers (0 when there is none).
 std::size_t texture_src_bytes_locked(std::uint64_t base);
+void textures_record_ahead_locked();                // the made-ahead uploads whose copy is done, recorded into this submission
 void textures_before_submit();                      // the uploads this submission copies are untiled (their prep pool jobs done)
 void textures_prewait_for_submit();                 // without g.mu: the same wait for the jobs queued so far, so the one under it is short
 // Creation-time upload and destruction (see gpu.h's entry points).
-bool textures_create_ahead_locked(const std::uint32_t* tsharp, std::uint64_t gen = 0);
+// `deferrable`: the creating thread's job (host_gpu_texture_create_ahead), whose upload may be recorded once its
+// copy is done (BBHOST_GXVK_AHEAD_DEFER, textures.cpp).
+bool textures_create_ahead_locked(const std::uint32_t* tsharp, std::uint64_t gen = 0, bool deferrable = false);
 bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x,
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes);
 bool textures_copy_image_region_locked(const GpuImageCopy& c);
