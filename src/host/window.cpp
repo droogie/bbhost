@@ -1422,8 +1422,9 @@ void update_pad() {
                 p.buttons |= bit;
             }
         };
-        btn(SDL_GAMEPAD_BUTTON_SOUTH, kCross);
-        btn(SDL_GAMEPAD_BUTTON_EAST, kCircle);
+        const bool swap_ab = config_swap_ab();
+        btn(SDL_GAMEPAD_BUTTON_SOUTH, swap_ab ? kCircle : kCross);
+        btn(SDL_GAMEPAD_BUTTON_EAST, swap_ab ? kCross : kCircle);
         btn(SDL_GAMEPAD_BUTTON_WEST, kSquare);
         btn(SDL_GAMEPAD_BUTTON_NORTH, kTriangle);
         btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL1);
@@ -1494,11 +1495,37 @@ void update_pad() {
     // where the keyboard's Gestures key puts one (bindings.cpp), since the game
     // reads the side from the finger. Its own stable id, so holding it is one
     // touch and it can be held with the key.
-    if (back_held) {
+    //
+    // [input] back_short splits it by how long it is held: released inside
+    // back_long_ms it presses the short side (a short pulse, since the press
+    // is known only at the release); held past it, it gives the long side
+    // (Gestures, the default - or Personal Effects when back_short is
+    // "gestures"), for as long as it stays down.
+    bool back_left = back_held, back_right = false;
+    {
+        const HostConfig& cfg = config();
+        if (!cfg.input_back_short.empty()) {
+            using clk = std::chrono::steady_clock;
+            static bool was_down = false;
+            static clk::time_point down_since{}, pulse_until{};
+            const bool short_is_right = cfg.input_back_short != "gestures";
+            const auto now = clk::now();
+            const auto limit = std::chrono::milliseconds(cfg.input_back_long_ms > 0 ? cfg.input_back_long_ms : 450);
+            if (back_held && !was_down) down_since = now;
+            if (!back_held && was_down && now - down_since < limit) pulse_until = now + std::chrono::milliseconds(120);
+            was_down = back_held;
+            const bool long_now = back_held && now - down_since >= limit;
+            const bool pulse = now < pulse_until;
+            // long side: the opposite of the short one
+            back_left = (long_now && short_is_right) || (pulse && !short_is_right);
+            back_right = (long_now && !short_is_right) || (pulse && short_is_right);
+        }
+    }
+    if (back_left || back_right) {
         p.buttons |= kTouchPad;
         if (p.touch_count < 2) {
             PadState::Touch& t = p.touch[p.touch_count++];
-            t.x = static_cast<std::uint16_t>(kPadTouchW / 4);
+            t.x = static_cast<std::uint16_t>(back_right ? kPadTouchW * 3 / 4 : kPadTouchW / 4);
             t.y = static_cast<std::uint16_t>(kPadTouchH / 2);
             t.id = 201;
             t.down = true;
@@ -1961,8 +1988,9 @@ bool host_window_pump() {
                 // box - still held when it appears - does not close it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (!g_text_on || host_options_open()) break;
-                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
-                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
+                const bool swap_ab = config_swap_ab();
+                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? (swap_ab ? kCircle : kCross)
+                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? (swap_ab ? kCross : kCircle)
                                                                                          : 0u;
                 if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || (bit && bit == menu_confirm_button())) {
                     g_text_result = 1;

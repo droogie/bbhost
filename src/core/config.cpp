@@ -162,6 +162,9 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     num("video.width", &c->width);
     num("video.height", &c->height);
     num("video.fps_cap", &c->fps_cap);
+    str("input.swap_ab", &c->input_swap_ab);
+    str("input.back_short", &c->input_back_short);
+    num("input.back_long_ms", &c->input_back_long_ms);
     str("video.resolution", &c->resolution);
     str("video.window_mode", &c->window_mode);
     str("video.model_detail", &c->model_detail);
@@ -1014,6 +1017,17 @@ bool config_write_template(const std::string& path) {
            "# the network password - are typed in a box over the game (Enter\n"
            "# accepts, Escape cancels). auto: the name is `name` at once.\n"
            "ime = \"type\"\n"
+           "\n[input]\n"
+           "# true: the pad's A and B (Cross and Circle) are exchanged; false: never.\n"
+           "# auto: exchanged only for the Asian release (CUSA03023, CUSA01363), whose A and B are\n"
+           "# the other way round; other releases keep the default.\n"
+           "swap_ab = \"auto\"\n"
+           "# Back / Select / Share split by how long it is held: released before\n"
+           "# back_long_ms it presses \"personal_effects\" (or \"gestures\"); held past it,\n"
+           "# it gives the default, Gestures (the other one when this is \"gestures\").\n"
+           "# Empty: Back is just Gestures, as before.\n"
+           "back_short = \"\"\n"
+           "back_long_ms = 450\n"
            "\n[video]\n"
            "width = 1920\n"
            "height = 1080\n"

@@ -59,6 +59,18 @@ name = "Hunter"
 # still typed. BBHOST_IME=type or auto overrides this.
 ime = "type"
 
+[input]
+# true: the pad's A and B (Cross and Circle) are exchanged; false: never.
+# auto: exchanged only for the Asian release (CUSA03023, CUSA01363), whose A and B are
+# the other way round; other releases keep the default.
+swap_ab = "auto"
+# Back / Select / Share (the two overlapping squares) split by how long it is
+# held: released before back_long_ms it presses "personal_effects" (or
+# "gestures"); held past it, it gives the default, Gestures (the other one when
+# this is "gestures"). Empty: Back is just Gestures, as before.
+back_short = ""
+back_long_ms = 450
+
 [video]
 # The window's size (fullscreen takes the desktop's).
 width = 1920
