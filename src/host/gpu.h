@@ -386,6 +386,10 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes); 
 // host_gpu_mem_write that also reports the submission serial the write is recorded
 // into: it is in memory once host_gpu_completed_submits() is past that serial.
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial);
+// The command processor's worker threads' jobs so far: table read masks done
+// and queued (bb-tmask0-3), no-fallback pipeline variants built and queued
+// (bb-lean0-1) - for frame statistics' detail (BBHOST_FRAME_DETAIL=1).
+void host_render_worker_jobs(std::uint64_t out[4]);
 // A CP write that must land after GPU work already recorded (what the CP writes
 // itself after a wait it passed on a label that work is still to write): on the
 // GPU's timeline in stream order whatever its size, not held back to the end of

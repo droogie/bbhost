@@ -84,6 +84,7 @@ struct State {
     std::unordered_map<int, ThreadTime> threads;
     GpuBusy gpu{};  // host_gpu_busy() when the window opened
     GpuStats stats{};  // host_gpu_stats() when it opened (BBHOST_FRAME_DETAIL=1)
+    std::uint64_t workers[4] = {};  // host_render_worker_jobs() when it opened (BBHOST_FRAME_DETAIL=1)
     std::uint64_t import_waits = 0, import_wait_us = 0;  // host_gpu_import_waits() when it opened
 };
 
@@ -168,7 +169,10 @@ void frame_stats_on_flip() {
         s.window_start = s.last_flip = now;
         s.threads = thread_times();
         s.gpu = host_gpu_busy();
-        if (frame_stats_detail()) s.stats = host_gpu_stats();
+        if (frame_stats_detail()) {
+            s.stats = host_gpu_stats();
+            host_render_worker_jobs(s.workers);
+        }
         host_gpu_import_waits(&s.import_waits, &s.import_wait_us);
         return;
     }
@@ -273,6 +277,26 @@ void frame_stats_on_flip() {
         const GpuStats stats = host_gpu_stats();
         log_detail(s.stats, stats, s.intervals_ms);
         s.stats = stats;
+        // The command processor's workers: their jobs in the second, and each
+        // one's CPU (named bb-tmask0-3 and bb-lean0-1).
+        std::uint64_t w[4];
+        host_render_worker_jobs(w);
+        std::string cpu;
+        for (const auto& [tid, t] : cur) {
+            if (t.name.rfind("bb-tmask", 0) != 0 && t.name.rfind("bb-lean", 0) != 0) continue;
+            const auto it = s.threads.find(tid);
+            const std::uint64_t was = it != s.threads.end() ? it->second.ticks : 0;
+            char b[48];
+            std::snprintf(b, sizeof(b), " %s %.1f ms/s", t.name.c_str(),
+                          1000.0 * static_cast<double>(t.ticks - was) / static_cast<double>(hz) / secs);
+            cpu += b;
+        }
+        host_log("frame detail: command-processor workers: table read masks done %llu (queued %llu), no-fallback builds done %llu "
+                 "(queued %llu); cpu:%s",
+                 static_cast<unsigned long long>(w[0] - s.workers[0]), static_cast<unsigned long long>(w[1] - s.workers[1]),
+                 static_cast<unsigned long long>(w[2] - s.workers[2]), static_cast<unsigned long long>(w[3] - s.workers[3]),
+                 cpu.empty() ? " none named" : cpu.c_str());
+        std::memcpy(s.workers, w, sizeof(w));
     }
     s.intervals_ms.clear();
     s.window_start = now;

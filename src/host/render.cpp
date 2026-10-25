@@ -3361,7 +3361,12 @@ TableMaskWorkers& table_mask_workers() {
     static TableMaskWorkers* const workers = [] {
         auto* w = new TableMaskWorkers;  // never destroyed: its threads run until exit
         for (int i = 0; i < 4; ++i) {
-            std::thread([w] {
+            std::thread([w, i] {
+                // Named, so that they are not counted as the command processor
+                // they would otherwise be named after (bb-cp0).
+                char name[16];
+                std::snprintf(name, sizeof(name), "bb-tmask%d", i);
+                host_thread_set_name(name);
                 for (;;) {
                     TableMaskJob job;
                     {
@@ -9586,7 +9591,10 @@ LeanBuilders& lean_builders() {
     static LeanBuilders* const builders = [] {
         auto* w = new LeanBuilders;  // never destroyed: its threads run until exit
         for (int i = 0; i < 2; ++i) {
-            std::thread([w] {
+            std::thread([w, i] {
+                char name[16];
+                std::snprintf(name, sizeof(name), "bb-lean%d", i);
+                host_thread_set_name(name);
                 for (;;) {
                     std::unique_ptr<LeanBuildJob> job;
                     {
@@ -22944,4 +22952,11 @@ bool host_gpu_draw_window(std::uint64_t dst, const void* data, std::uint32_t byt
     t_given_windows.push_back(w);
     g_windows_given.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void host_render_worker_jobs(std::uint64_t out[4]) {
+    out[0] = g_table_masks_done.load(std::memory_order_relaxed);
+    out[1] = g_table_masks_queued.load(std::memory_order_relaxed);
+    out[2] = g_lean_builds_done.load(std::memory_order_relaxed);
+    out[3] = g_lean_builds_queued.load(std::memory_order_relaxed);
 }

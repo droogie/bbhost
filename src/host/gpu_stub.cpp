@@ -32,6 +32,7 @@ void host_gpu_save_pipeline_cache_at_exit() {}
 std::string host_gpu_compile_report() { return {}; }
 std::string host_gpu_profile_report() { return ""; }
 bool host_gpu_mem_write(std::uint64_t, const void*, std::size_t) { return false; }
+void host_render_worker_jobs(std::uint64_t out[4]) { out[0] = out[1] = out[2] = out[3] = 0; }
 bool host_gpu_mem_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 bool host_gpu_mem_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_gds_counters() { return false; }
