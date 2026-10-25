@@ -281,7 +281,7 @@ memory`), and imports the game's memory a 16 MB window at a time and gives
 its upload staging back in play, as on an integrated GPU (the log says
 `window imports: a graphics card with small video memory`): a whole import
 pins 4-5 GB of system memory beside the card, which Windows counts as shared
-GPU memory. `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
+GPU memory. Its copies of the game's buffers have a budget (below). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
 an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off,
 `BBHOST_IMPORT_WINDOWS=0` imports whole and `BBHOST_STAGING_RETURN=0` keeps
 the staging.
@@ -354,13 +354,21 @@ block back within seconds of an arrival, and the compaction takes what it
 leaves. The exit line `made in play` counts the image heap blocks that had to
 be made while the game played.
 
-On other GPUs, unless memory is tight or video memory small, the game's own
-immutable vertex and index buffers are bound from copies of their own, made
-in video memory as they are first drawn, so the command processor does not
-look each draw's bytes up; one that finds no room keeps the mirrors
-(`BBHOST_GXVK_BUFFERS=0` goes back to the mirrors for all of them; `=1` makes
-the copies on an integrated GPU, with tight memory or small video memory
-too).
+On other GPUs, unless memory is tight, the game's own immutable vertex and
+index buffers are bound from copies of their own, made in video memory as
+they are first drawn, so the command processor does not look each draw's
+bytes up; one that finds no room keeps the mirrors (`BBHOST_GXVK_BUFFERS=0`
+goes back to the mirrors for all of them; `=1` makes the copies on an
+integrated GPU or with tight memory too). With small video memory the
+copies have a budget - an eighth of the video memory free at the start,
+from 256 to 512 MiB (`BBHOST_GXVK_BUFFERS_BUDGET_MB=<n>` sets it on any
+card): at the budget a new copy takes the room of copies not drawn for two
+seconds, the least recently drawn first, else that draw reads the mirrors;
+the copies leave the mirrors' cushion above the reserve alone, and when
+video memory falls under it the idle ones go first and an emptied block
+goes back to the driver. Without them the mirrors carried the meshes, and
+on a 4 GB card a mirror refused room made its draws read their vertices
+across the bus.
 
 **Task Manager shows more GPU memory than shadPS4.** Task Manager's GPU
 columns for a process count two things: *dedicated GPU memory* is the card's

@@ -232,9 +232,10 @@ Buffers buffers_mode() {
                                 : host_gpu_small_vram()   ? BuffersDevice::kSmallVram
                                                           : BuffersDevice::kRoomy;
         const Buffers m = buffers_mode_for(nullptr, d);
-        if (d == BuffersDevice::kSmallVram)
-            host_log("gxvk: GX's buffers on today's path: small video memory, where their copies compete with the targets and textures "
-                     "(BBHOST_GXVK_BUFFERS=1 binds them by handle)");
+        if (d == BuffersDevice::kSmallVram && m == Buffers::kOn)
+            host_log("gxvk: GX's buffers bound by handle within a budget for their copies: small video memory, where the least recently "
+                     "bound copy goes first and the pool gives room back before the mirrors are refused (BBHOST_GXVK_BUFFERS_BUDGET_MB=<n> "
+                     "sets the budget; BBHOST_GXVK_BUFFERS=0 keeps today's path)");
         else if (m == Buffers::kOff)
             host_log("gxvk: GX's buffers on today's path: %s, whose draws read them where they are (BBHOST_GXVK_BUFFERS=1 binds them by handle)",
                      d == BuffersDevice::kIntegrated ? "an integrated GPU" : "tight memory");

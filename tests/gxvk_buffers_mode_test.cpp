@@ -1,7 +1,8 @@
 // BBHOST_GXVK_BUFFERS (host/gxvk.h, buffers_mode_for): unset or empty, GX's
-// buffers are bound by handle on a discrete GPU with room in its video memory
-// and on an integrated GPU with 8 GiB of it or more, and keep today's path on
-// a smaller integrated GPU, with tight memory and with small video memory; a value given holds on every device - 0 today's path,
+// buffers are bound by handle on a discrete GPU with room in its video memory,
+// on one with small video memory (within a budget, host/gxvk_budget.h) and on
+// an integrated GPU with 8 GiB of it or more, and keep today's path on a
+// smaller integrated GPU and with tight memory; a value given holds on every device - 0 today's path,
 // 1 by handle, 2 compared, "census" (the census alone) today's path, and
 // anything else today's path, as before the default changed.
 #include "host/gxvk.h"
@@ -22,7 +23,7 @@ int main() {
     };
     std::vector<Case> cases;
     for (const D d : kAll) {
-        const Buffers unset = d == D::kRoomy || d == D::kIntegratedRoomy ? Buffers::kOn : Buffers::kOff;
+        const Buffers unset = d == D::kRoomy || d == D::kSmallVram || d == D::kIntegratedRoomy ? Buffers::kOn : Buffers::kOff;
         cases.push_back({nullptr, d, unset});
         cases.push_back({"", d, unset});
         cases.push_back({"0", d, Buffers::kOff});

@@ -38,6 +38,9 @@ struct BufferEntry {
     std::uint64_t vk_buffer = 0, vk_offset = 0;
     std::int32_t block = -1;
     std::uint64_t placed_serial = 0;  // the recording whose uploads made the copy
+    // The flip it was last bound at (the copy pool's budget: the least recently bound goes first). Stored by run parts'
+    // draws too (BBHOST_RUN_COMMIT), several threads at once, so an atomic.
+    std::atomic<std::uint32_t> last_flip{0};
     std::uint64_t hash = 0;           // compare mode: the buffer's bytes when copied
     std::uint32_t binds = 0;          // compare mode: bindings so far, for the sampled checks
 };
@@ -83,6 +86,7 @@ enum Fallback : int {
     kFallNoSource,     // the buffer's bytes could not be reached for the copy
     kFallIndirect,     // an indirect draw's indices (their count unknown at the binding)
     kFallMixed,        // a vertex binding the plan shares between this buffer and another's
+    kFallBudget,       // the copy pool at its budget with no idle copy to drop (small video memory): placed later if room comes
     kFalls,
 };
 extern std::atomic<std::uint64_t> g_bound[kUses], g_fallback[kUses][kFalls];

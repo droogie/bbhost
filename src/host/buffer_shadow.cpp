@@ -2888,6 +2888,8 @@ VkSemaphore shadow_bind_sparse_locked() {
     return r == VK_SUCCESS ? sem : VK_NULL_HANDLE;
 }
 
+std::uint64_t shadow_mirror_cushion() { return g_cushion; }
+
 void shadow_budget_locked() {
     const char* e = std::getenv("BBHOST_SHADOW_VRAM_MB");
     // The live share: with the video memory reserve on and no share given,

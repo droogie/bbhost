@@ -1480,6 +1480,9 @@ VkSemaphore shadow_bind_sparse_locked();
 // The video memory the mirrors may hold, from g.local_budget, said once the
 // device is made: what is left above the room the images and targets need.
 void shadow_budget_locked();
+// The room the mirrors keep above the reserve before they grow (the live share's cushion): GX's buffer copies within a
+// budget keep it too, and give room back below it (gxvk_vk.cpp).
+std::uint64_t shadow_mirror_cushion();
 // Video memory ran short (g.vram_short): every mirror goes into `slot` - the
 // submission just made, the last whose work can read them - to be freed when
 // it retires, and draws read vertex and index data from host memory from
