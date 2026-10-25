@@ -1348,9 +1348,11 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
 
 std::atomic<signed char> g_imports_whole{-1};
 std::atomic<signed char> g_integrated_known{-1};  // the chosen device is integrated (1) or not (0); -1 before
+std::atomic<signed char> g_small_known{-1};       // ... a graphics card with small video memory (1) or not (0); -1 before
 // BBHOST_IMPORT_WINDOWS (1 windows, 0 whole spans), else gpu.import_windows
 // (true, false), else by the device and the platform: windows on an
-// integrated GPU under Windows, whole spans elsewhere (host/import_mode.h).
+// integrated GPU under Windows and on a graphics card with small video
+// memory, whole spans elsewhere (host/import_mode.h).
 // Asked before the device is chosen with neither set, it answers whole spans
 // without deciding (nothing is imported before).
 bool imports_whole_decide() {
@@ -1361,7 +1363,8 @@ bool imports_whole_decide() {
 #endif
     const std::string cfg = config_value("gpu.import_windows");
     const import_mode::Mode m = import_mode::decide(std::getenv("BBHOST_IMPORT_WINDOWS"), cfg.c_str(),
-                                                    g_integrated_known.load(std::memory_order_relaxed), kWindowsHost);
+                                                    g_integrated_known.load(std::memory_order_relaxed), kWindowsHost,
+                                                    g_small_known.load(std::memory_order_relaxed));
     if (m == import_mode::Mode::kUndecided) return true;
     const bool whole = m == import_mode::Mode::kWhole;
     g_imports_whole.store(whole ? 1 : 0, std::memory_order_relaxed);
@@ -3091,8 +3094,6 @@ bool init_locked() {
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
         g_integrated_known.store(g.integrated ? 1 : 0, std::memory_order_relaxed);
-        if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // by the device, unless set
-        twins_decide(c.type_rank == 4);
         g.tight = memory_tight(c);
         {
             int unknown = -1;
@@ -3103,6 +3104,17 @@ bool init_locked() {
                          "spare image heap blocks in play, less untile scratch kept",
                          static_cast<unsigned long long>(start_vram_free(c) >> 20));
         }
+        g_small_known.store(g.small_vram ? 1 : 0, std::memory_order_relaxed);
+        if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // by the device, unless set
+        if (g.small_vram && !imports_whole() &&
+            import_mode::by_device(std::getenv("BBHOST_IMPORT_WINDOWS"), config_value("gpu.import_windows").c_str()))
+            host_log("gpu: window imports: a graphics card with small video memory (%llu MiB free at the start, %s) - the game's "
+                     "memory is imported a 16 MB window at a time as the GPU first needs it, not whole, and the upload staging goes back "
+                     "down in play (BBHOST_IMPORT_WINDOWS=0 or import_windows = false imports it whole; BBHOST_STAGING_RETURN=0 keeps the "
+                     "staging)",
+                     static_cast<unsigned long long>(start_vram_free(c) >> 20),
+                     std::getenv("BBHOST_SMALL_VRAM") && *std::getenv("BBHOST_SMALL_VRAM") ? "BBHOST_SMALL_VRAM=1" : "under 7680");
+        twins_decide(c.type_rank == 4);
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
@@ -7595,7 +7607,8 @@ void start_memory_reserve() {
     // BBHOST_STAGING_RETURN, else gpu.staging_return, else the device's default (host/apu_memory.h).
     const std::string staging_return_cfg = config_value("gpu.staging_return");
     const bool staging_return =
-        apu_memory::staging_return(std::getenv("BBHOST_STAGING_RETURN"), staging_return_cfg.c_str(), g.integrated ? 1 : 0, kWindowsHost);
+        apu_memory::staging_return(std::getenv("BBHOST_STAGING_RETURN"), staging_return_cfg.c_str(), g.integrated ? 1 : 0, kWindowsHost,
+                                   g.small_vram ? 1 : 0);
     const bool scratch_return = env("BBHOST_SCRATCH_RETURN", 1) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
@@ -11909,7 +11922,9 @@ void host_gpu_report() {
         host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
                  "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
                  "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
-                 imports_whole() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1, gpu.import_windows or an integrated GPU under Windows",
+                 imports_whole() ? "whole spans"
+                                 : "by window: BBHOST_IMPORT_WINDOWS=1, gpu.import_windows, an integrated GPU under Windows or a graphics card "
+                                   "with small video memory",
                  static_cast<ull>(g_imports_made.load()),
                  mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
                  mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),

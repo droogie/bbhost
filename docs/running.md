@@ -277,8 +277,14 @@ five seconds the log says `video memory: headroom ...`; look there, and for
 `video memory is full`, before anything else. Other programs holding video
 memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
 7.5 GB free bbhost also holds less memory ahead (the log says `small video
-memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
-an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
+memory`), and imports the game's memory a 16 MB window at a time and gives
+its upload staging back in play, as on an integrated GPU (the log says
+`window imports: a graphics card with small video memory`): a whole import
+pins 4-5 GB of system memory beside the card, which Windows counts as shared
+GPU memory. `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
+an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off,
+`BBHOST_IMPORT_WINDOWS=0` imports whole and `BBHOST_STAGING_RETURN=0` keeps
+the staging.
 
 Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
 says where the video memory goes: `gpu: video memory (MiB)`
@@ -305,10 +311,12 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
-With window imports (the default on an integrated GPU under Windows;
+With window imports (the default on an integrated GPU under Windows and on
+a graphics card with under 7.5 GB of video memory free at the start;
 `BBHOST_IMPORT_WINDOWS` or `import_windows` under `[gpu]` decide it; see
-[rendering.md](rendering.md)) the meshes are read in place too, from their
-windows, which a thread of their own imports as the game makes its buffers
+[rendering.md](rendering.md)) an integrated GPU's meshes are read in place
+too, from their windows, which a thread of their own imports as the game
+makes its buffers
 (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
 window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
 windows at their first draw).
@@ -317,7 +325,8 @@ play there: the textures made ahead of their first bind (most are never
 bound), textures not used for a while, free room in the image heap and the
 upload staging held from a load on. Three switches give them back, on any GPU;
 all three are on by default on an integrated GPU under Windows (a 2048 MiB
-budget there) and off elsewhere:
+budget there), the first also on a graphics card with small video memory
+(above), and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
   upload staging goes back down to its floor in play (256 MiB, 128 on an
   integrated GPU under Windows; `BBHOST_STAGING_FLOOR_MB=<n>` sets it), 64 MiB
@@ -373,7 +382,8 @@ on the Memory counter (F10), which shows bbhost's own count under the FPS
 counter: the video memory in use, how much of it is cache that bbhost gives
 back when memory runs short, and the shared memory. With window imports
 (`import_windows = true` under `[gpu]`, the default on an integrated GPU
-under Windows) only the memory the GPU uses is imported: on that laptop the
+under Windows and on a graphics card with under 7.5 GB of video memory free
+at the start) only the memory the GPU uses is imported: on that laptop the
 shared column fell by about 2.7 GB on the RTX and 2.1 GB on the 680M, at the
 cost of waits when a place is first drawn (the log's `imports waited for`).
 With them and the rest of an integrated GPU's defaults under Windows (the

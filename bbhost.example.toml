@@ -97,12 +97,13 @@ fps_cap = 30
 
 [gpu]
 # The game's memory the GPU reaches: imported whole at the start (false, the
-# default on a graphics card of its own and under Linux), or a 16 MB window at
-# a time as something first needs it (true, the default on an integrated GPU
-# under Windows): far less memory pinned for the driver and a start a few
-# seconds sooner, at a little more work while new windows come in. The Steam
-# Deck kit's toml sets true (its shared memory stays under the driver's
-# budget). BBHOST_IMPORT_WINDOWS=0 or 1 overrides this setting.
+# default on a graphics card with 7.5 GB or more of video memory free and on an
+# integrated GPU under Linux), or a 16 MB window at a time as something first
+# needs it (true, the default on an integrated GPU under Windows and on a card
+# with less video memory free than that): far less memory pinned for the driver
+# and a start a few seconds sooner, at a little more work while new windows come
+# in. The Steam Deck kit's toml sets true (its shared memory stays under the
+# driver's budget). BBHOST_IMPORT_WINDOWS=0 or 1 overrides this setting.
 # import_windows = false
 # Memory bbhost keeps in play beyond what it draws with, for integrated GPUs
 # (where no video memory reserve trims it) and any GPU you want leaner:
@@ -114,7 +115,8 @@ fps_cap = 30
 #   drains sooner (0: no budget).
 # - heap_lean: the image heap keeps no spare block in play and drains sooner.
 # All three on by default on an integrated GPU under Windows (a 2048 MB budget
-# there), off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
+# there), staging_return also on a card with under 7.5 GB of video memory free,
+# off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
 # BBHOST_HEAP_LEAN override them.
 # staging_return = false
 # cache_budget_mb = 0
