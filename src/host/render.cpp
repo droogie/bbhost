@@ -5688,7 +5688,7 @@ VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
 // each kept vertex holds, and once the submission is done the host compares
 // them word for word - particle by particle, vertex by vertex - by program set.
 constexpr std::uint64_t kParticleCheckRingBytes = 256ull << 20;
-constexpr std::uint32_t kParticleCheckRoomMax = 2048;  // particles a record has room for
+constexpr std::uint32_t kParticleCheckRoomMin = 2048;  // particles a record has room for, at least
 struct ParticleCheckRecord {
     std::uint64_t serial = 0, offset = 0, bytes = 0;
     const GfxPipeline* pl = nullptr;  // pipelines are never erased
@@ -5700,7 +5700,8 @@ struct ParticleCheckRecord {
 constexpr std::uint64_t kParticleCheckEmpty = 256;
 struct ParticleCheckStats {
     std::uint64_t draws = 0, particles = 0, vertices = 0, vertex_diffs = 0, word_diffs = 0, flat_diffs = 0, count_diffs = 0, left_out = 0,
-                  gs_missing = 0, live = 0, capacity = 0, past_capacity = 0, past_room = 0, not_run = 0, instanced = 0, gs_only = 0;
+                  gs_missing = 0, live = 0, capacity = 0, past_capacity = 0, past_room = 0, past_room_particles = 0, not_run = 0, instanced = 0,
+                  gs_only = 0;
     std::uint32_t max_live = 0, max_capacity = 0;
     std::map<std::uint32_t, std::uint64_t> emits;  // the GS's particles by their emits
 };
@@ -5713,8 +5714,21 @@ struct ParticleCheck {
     std::uint64_t head = 0;
     std::deque<ParticleCheckRecord> pending;
     std::map<std::string, ParticleCheckStats> by_set;
+    std::unordered_map<const GfxPipeline*, std::uint32_t> live_seen;  // the most live particles a draw of each pipeline had
     std::uint64_t unchecked_busy = 0, unchecked_no_args = 0, unchecked_no_pipeline = 0, unrecorded = 0, logged = 0;
 } g_pcheck;  // under g.mu
+
+// The particles a draw's record has room for: a quarter more than the most a
+// draw of its pipeline has had live so far, at least kParticleCheckRoomMin,
+// at most what its emitter has room for and what a quarter of the ring holds.
+std::uint32_t particle_check_room_locked(const GfxPipeline& pl) {
+    std::uint64_t room = kParticleCheckRoomMin;
+    if (const auto it = g_pcheck.live_seen.find(&pl); it != g_pcheck.live_seen.end()) room = std::max<std::uint64_t>(room, it->second + it->second / 4ull);
+    if (pl.gs_capacity_seen) room = std::min<std::uint64_t>(room, pl.gs_capacity_seen);
+    const std::uint64_t per = gcn::gs_check_particle_dwords(pl.gs_vertices, pl.gs_vertex_dwords);
+    const std::uint64_t fit = ((kParticleCheckRingBytes / 4 - 256) / 4 - gcn::kGsCheckHeaderDwords) / (2 * per);
+    return static_cast<std::uint32_t>(std::min(room, fit));
+}
 
 bool particle_check_ready_locked() {
     ParticleCheck& c = g_pcheck;
@@ -5745,8 +5759,9 @@ bool particle_check_ready_locked() {
     c.map = static_cast<std::uint8_t*>(map);
     std::memset(c.map, 0, kParticleCheckEmpty);
     c.head = kParticleCheckEmpty;
-    host_log("render: the particle check keeps %llu MiB of records (each draw up to %u particles)",
-             static_cast<unsigned long long>(kParticleCheckRingBytes >> 20), kParticleCheckRoomMax);
+    host_log("render: the particle check keeps %llu MiB of records (a draw's room for a quarter more particles than its pipeline's "
+             "draws have had live, at least %u)",
+             static_cast<unsigned long long>(kParticleCheckRingBytes >> 20), kParticleCheckRoomMin);
     return true;
 }
 
@@ -5822,7 +5837,12 @@ void particle_check_compare_locked(const ParticleCheckRecord& r) {
     st.max_live = std::max(st.max_live, n);
     st.max_capacity = std::max(st.max_capacity, r.capacity);
     if (n > r.capacity) ++st.past_capacity;
-    if (n > room) ++st.past_room;
+    if (n > room) {
+        ++st.past_room;
+        st.past_room_particles += n - room;
+    }
+    std::uint32_t& seen = c.live_seen[r.pl];
+    seen = std::max(seen, n);
     const std::uint32_t checked = std::min(n, room);
     const std::uint64_t per = gcn::gs_check_particle_dwords(vpp, vd);
     for (std::uint32_t p = 0; p < checked; ++p) {
@@ -5862,18 +5882,19 @@ void particle_check_compare_locked(const ParticleCheckRecord& r) {
 std::string particle_check_line(const std::string& set, const ParticleCheckStats& s) {
     std::string emits;
     for (const auto& [n, count] : s.emits) emits += (emits.empty() ? "" : ", ") + std::to_string(count) + " x " + std::to_string(n);
-    char b[640];
+    char b[768];
     std::snprintf(b, sizeof(b),
                   "%s: %llu draws (%llu whose vertex stage never ran), %llu particles, %llu vertices compared: %llu differ (%llu words), %llu "
                   "at a flat input's provoking vertex; emit counts differ %llu, left out by the vertex stage %llu, no GS record %llu; live "
-                  "%llu against room %llu (most %u of %u), past the room %llu, past the record %llu, instanced %llu",
+                  "%llu against room %llu (most %u of %u), past the room %llu, past the record %llu (%llu particles not compared), instanced %llu",
                   set.c_str(), static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.not_run),
                   static_cast<unsigned long long>(s.particles), static_cast<unsigned long long>(s.vertices),
                   static_cast<unsigned long long>(s.vertex_diffs), static_cast<unsigned long long>(s.word_diffs),
                   static_cast<unsigned long long>(s.flat_diffs), static_cast<unsigned long long>(s.count_diffs),
                   static_cast<unsigned long long>(s.left_out), static_cast<unsigned long long>(s.gs_missing), static_cast<unsigned long long>(s.live),
                   static_cast<unsigned long long>(s.capacity), s.max_live, s.max_capacity, static_cast<unsigned long long>(s.past_capacity),
-                  static_cast<unsigned long long>(s.past_room), static_cast<unsigned long long>(s.instanced));
+                  static_cast<unsigned long long>(s.past_room), static_cast<unsigned long long>(s.past_room_particles),
+                  static_cast<unsigned long long>(s.instanced));
     return std::string(b) + "; particles the GS drew in a draw whose vertex stage never ran " + std::to_string(s.gs_only) +
            "; the GS's particles by their emits: " + (emits.empty() ? "none" : emits);
 }
@@ -12371,7 +12392,8 @@ void render_report() {
                  {&ParticleCheckStats::draws, &ParticleCheckStats::particles, &ParticleCheckStats::vertices, &ParticleCheckStats::vertex_diffs,
                   &ParticleCheckStats::word_diffs, &ParticleCheckStats::flat_diffs, &ParticleCheckStats::count_diffs, &ParticleCheckStats::left_out,
                   &ParticleCheckStats::gs_missing, &ParticleCheckStats::live, &ParticleCheckStats::capacity, &ParticleCheckStats::past_capacity,
-                  &ParticleCheckStats::past_room, &ParticleCheckStats::not_run, &ParticleCheckStats::instanced, &ParticleCheckStats::gs_only})
+                  &ParticleCheckStats::past_room, &ParticleCheckStats::past_room_particles, &ParticleCheckStats::not_run,
+                  &ParticleCheckStats::instanced, &ParticleCheckStats::gs_only})
                 all.*f += s.*f;
             all.max_live = std::max(all.max_live, s.max_live);
             all.max_capacity = std::max(all.max_capacity, s.max_capacity);
@@ -20361,7 +20383,7 @@ static bool draw_impl(const GpuDraw& d) {
         }
         if (pl.gs_check_module) {
             if (!particle_check_ready_locked()) return gs_refuse("the particle check's records were not made");
-            const std::uint32_t room = pl.gs_capacity_seen ? std::min(kParticleCheckRoomMax, pl.gs_capacity_seen) : kParticleCheckRoomMax;
+            const std::uint32_t room = particle_check_room_locked(pl);
             if (particle_args && pl.gs_check_pipeline) particle_record = particle_check_record_locked(pl, room, particle_args);
             particle_checked = particle_record != 0;
             if (!particle_checked) {
