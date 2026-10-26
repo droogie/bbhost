@@ -2,6 +2,7 @@
 
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/perf_meter.h"
 #include "log.h"
 
 #include <algorithm>
@@ -153,6 +154,7 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
 }  // namespace
 
 void frame_stats_on_flip() {
+    perf_meter_flip();  // the bottleneck meter's intervals (host/perf_meter.h), with or without frame statistics
     const bool on = frame_stats_enabled();
     if (!on) return;
     static State s;

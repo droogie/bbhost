@@ -932,6 +932,18 @@ StreamTestCounts stream_test_counts() {
 
 VkCommandBuffer g_cmd() { return in_place(__builtin_return_address(0)); }
 
+}  // namespace gpu
+
+bool host_gpu_recorder_ns(std::uint64_t* replay_ns, std::uint64_t* spin_ns) {
+    using namespace gpu;
+    if (g_mode != kModeThread || !g_blocks) return false;
+    *replay_ns = g_replay_ns.load(std::memory_order_relaxed);
+    *spin_ns = g_spin_ns.load(std::memory_order_relaxed);
+    return true;
+}
+
+namespace gpu {
+
 std::string recorder_report() {
     if (!g_blocks) return std::string();
     struct Last {

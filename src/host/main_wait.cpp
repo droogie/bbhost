@@ -34,6 +34,9 @@ const bool g_detail = [] {
     const char* e = std::getenv("BBHOST_FRAME_DETAIL");
     return g_on && e && *e == '1';
 }();
+// The main thread's waits are timed with frame statistics on, or for the
+// bottleneck meter (host/perf_meter.cpp: frame_stats_time_main_waits).
+std::atomic<bool> g_timing{g_on};
 thread_local bool t_main_loop = false;
 // BBHOST_WAIT_LOG=<prefix>[,<prefix>...]: threads whose names start with one
 // of these log every wait of BBHOST_WAIT_LOG_MS (20) or more, with its call
@@ -66,6 +69,8 @@ bool log_waits() {
     }
     return t_log_waits == 1;
 }
+// Since the start, by kind: each reader keeps its own last value
+// (main_thread_waited_ns for frame statistics, the meter its own).
 std::atomic<std::uint64_t> g_waited_ns[3];
 // BBHOST_HLE_COUNT: the guest return address of the thread's current HLE
 // call (the thunk notes it), and the main loop's waits summed by it.
@@ -93,10 +98,18 @@ bool frame_stats_detail() { return g_detail; }
 
 void frame_stats_mark_main_thread() { t_main_loop = true; }
 
-std::uint64_t main_thread_waited_ns(int kind) { return g_waited_ns[kind].exchange(0); }
+std::uint64_t main_thread_waited_ns(int kind) {
+    static std::uint64_t last[3] = {};  // frame statistics' reader: one thread
+    const std::uint64_t now = g_waited_ns[kind].load(std::memory_order_relaxed);
+    const std::uint64_t d = now - last[kind];
+    last[kind] = now;
+    return d;
+}
+std::uint64_t main_thread_waited_total_ns(int kind) { return g_waited_ns[kind].load(std::memory_order_relaxed); }
+void frame_stats_time_main_waits() { g_timing.store(true, std::memory_order_relaxed); }
 
 MainThreadWait::MainThreadWait(int kind) : kind_(kind) {
-    if ((t_main_loop && g_on) || (!g_log_threads.empty() && log_waits())) t0_ = now_ns();
+    if ((t_main_loop && g_timing.load(std::memory_order_relaxed)) || (!g_log_threads.empty() && log_waits())) t0_ = now_ns();
 }
 
 MainThreadWait::~MainThreadWait() {

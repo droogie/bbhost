@@ -46,6 +46,10 @@ private:
 bool frame_stats_enabled();
 bool frame_stats_detail();  // BBHOST_FRAME_DETAIL=1 as well
 std::uint64_t main_thread_waited_ns(int kind);
+// The same since the start (the bottleneck meter's reader, host/perf_meter.h),
+// and the switch that times the main thread's waits without frame statistics.
+std::uint64_t main_thread_waited_total_ns(int kind);
+void frame_stats_time_main_waits();
 
 // The main loop's work in each frame: from the game's frame-time manager
 // releasing one frame to its being called for the next (engine/frame_rate.cpp),

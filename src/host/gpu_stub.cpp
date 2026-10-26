@@ -65,6 +65,7 @@ void host_gpu_clear_view_check_begin(const GpuClearView&, const GpuClearViewResu
 void host_gpu_clear_view_check_end() {}
 std::string host_gpu_clear_view_report() { return {}; }
 GpuStats host_gpu_stats() { return {}; }
+bool host_gpu_recorder_ns(std::uint64_t*, std::uint64_t*) { return false; }
 void host_gpu_phase_add(int, std::uint64_t) {}
 GpuHandles host_gpu_handles() { return {}; }
 void host_gpu_lock() {}

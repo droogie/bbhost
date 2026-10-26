@@ -37,6 +37,7 @@
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
 #include "host/frame_stats.h"
+#include "host/perf_meter.h"
 #include "host/win_crash.h"
 #include "host/window.h"
 #include "log.h"
@@ -86,6 +87,7 @@ DWORD WINAPI guest_main_thread(void* p) {
     auto* g = static_cast<GuestLaunch*>(p);
     sampler_note_main_thread();
     frame_stats_mark_main_thread();
+    perf_meter_note_main_thread();
     host_thread_set_name("main");  // Windows threads inherit no name, unlike Linux comm
     void* tcb = hle_thread_enter_guest();  // the TCB in this thread's TLS slot, which the rewritten fs:[0] reads
     g->fn(g->argv, nullptr);
@@ -97,6 +99,7 @@ void* guest_main_thread(void* p) {
     auto* g = static_cast<GuestLaunch*>(p);
     sampler_note_main_thread();  // not renamed: the guest threads it creates would inherit the name
     frame_stats_mark_main_thread();
+    perf_meter_note_main_thread();
     void* tcb = hle_thread_enter_guest();
     g->fn(g->argv, nullptr);
     hle_thread_leave_guest(tcb);
@@ -132,6 +135,7 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
             if (host_gpu_device_lost()) device_lost_exit(windowed);
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
+                perf_meter_exit();
                 host_gpu_save_pipeline_cache_at_exit();
                 hle_kernel_memory_report();
                 host_window_stop();
@@ -334,6 +338,7 @@ void device_lost_exit(bool windowed) {
 }
 
 void exit_reports() {
+    perf_meter_exit();
     hle_gx_scaleform_report();
     hle_gnm_cp_report();
     gx_resources_report();
@@ -1055,6 +1060,7 @@ int main(int argc, char** argv) {
         host_log("BBHOST_ANY_EBOOT=1: starting an eboot that is not 1.09");
     }
     sampler_start(image.mem.slide, image.mem.slide + image.mem.size);  // BBHOST_SAMPLE
+    perf_meter_start(image.mem.slide, image.mem.slide + image.mem.size, image.sha256 == kEboot109Sha256);  // which stage limits
     sampler_watchdog_start(image.mem.slide, image.mem.slide + image.mem.size);  // every thread's stack when the flips stop
 #if defined(_WIN32)
     win_crash_note_image(image.mem.slide, image.mem.slide + image.mem.size);

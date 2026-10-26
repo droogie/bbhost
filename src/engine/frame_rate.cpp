@@ -26,6 +26,7 @@
 #include "core/elf.h"
 #include "core/memory.h"
 #include "core/host_clock.h"
+#include "host/perf_meter.h"
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
@@ -939,10 +940,14 @@ struct RealClock final : FlipClock {
     }
     void wait_done() override {
         g_limiter.waits.fetch_add(1, std::memory_order_relaxed);
-        if (spun_from_) g_limiter.spin_us.fetch_add(static_cast<std::uint64_t>(std::max<std::int64_t>(0, now() - spun_from_)), std::memory_order_relaxed);
+        spun_us = spun_from_ ? std::max<std::int64_t>(0, now() - spun_from_) : 0;
+        if (spun_us) g_limiter.spin_us.fetch_add(static_cast<std::uint64_t>(spun_us), std::memory_order_relaxed);
         slept_until_ = 0;
         spun_from_ = 0;
     }
+    // This frame's spin, on a core (the bottleneck meter leaves it out of the
+    // main thread's own work).
+    std::int64_t spun_us = 0;
 
 private:
     // This frame's wait (one RealClock lives for one update): when its last
@@ -1519,7 +1524,13 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
                                                            : "the world's or V-Sync's limit (uncapped_target)");
         }
         g_fast_target = converted && (g_bench_uncapped || loading_fast_now() || unlimited);
-        sprj_flipper_update(f, clock, pace_target());
+        const float target = pace_target();
+        const std::uint64_t wait_t0 = host_clock_monotonic_ns();
+        sprj_flipper_update(f, clock, target);
+        // The bottleneck meter (host/perf_meter.h): the limiter's wait and the
+        // rate it held the frame to (none on a loading screen; the game's own 30).
+        perf_meter_limiter(host_clock_monotonic_ns() - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
+                           g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : g_game_fps == 30 ? 30.0f : 0.0f);
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         g_dt_unfloored = unlimited;

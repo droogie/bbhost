@@ -6,7 +6,9 @@
 #include "hle/common.h"
 #include "core/portable.h"
 #include "engine/yebis_bind.h"
+#include "core/host_clock.h"
 #include "host/frame_stats.h"
+#include "host/perf_meter.h"
 #include "hle/modules.h"
 #include "host/host_lists.h"
 #include "host/label_landing.h"
@@ -3223,7 +3225,13 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
         return static_cast<std::uint64_t>(v > 0 ? v : 1);
     }();
     MainThreadWait timed(0);  // back-pressure from the command processor, for frame stats and BBHOST_WAIT_LOG
-    q->drained.wait(lk, [q] { return q->submitted - q->retired <= max_backlog; });
+    const auto room = [q] { return q->submitted - q->retired <= max_backlog; };
+    if (room()) return;
+    // Any thread's wait here is the game held back by the command processor
+    // (the bottleneck meter's back-pressure, host/perf_meter.h).
+    const std::uint64_t t0 = host_clock_monotonic_ns();
+    q->drained.wait(lk, room);
+    perf_meter_backlog_wait(host_clock_monotonic_ns() - t0);
 }
 
 void hle_gnm_cp_drain() {
@@ -3590,6 +3598,7 @@ GUEST_ABI int hle_gx_arena_acquire(std::uint64_t* allocator, std::uint64_t* out)
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
     g_arena_acquire_waits.fetch_add(1);
     g_arena_acquire_wait_us.fetch_add(static_cast<std::uint64_t>(us));
+    perf_meter_backlog_wait(static_cast<std::uint64_t>(us) * 1000);  // held back until the GPU retires a chunk
     if (status != 0) g_arena_acquire_failed.fetch_add(1);
     // Every failure logs (up to 256); successes are sampled.
     static std::atomic<int> logs{0}, failure_logs{0};

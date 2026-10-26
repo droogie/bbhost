@@ -132,6 +132,7 @@ add_executable(bbhost
   src/host/bindings.cpp
   src/host/audio.cpp
   src/host/frame_stats.cpp
+  src/host/perf_meter.cpp
   src/host/main_wait.cpp
   src/host/sampler.cpp
   src/host/foreign_hooks.cpp
@@ -575,6 +576,10 @@ if(UNIX)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
   # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  # The bottleneck meter's verdict (host/bottleneck.h).
+  add_executable(bottleneck_test tests/bottleneck_test.cpp)
+  target_include_directories(bottleneck_test PRIVATE src)
+  add_test(NAME bottleneck_test COMMAND bottleneck_test)
   add_executable(flip_pacing_test tests/flip_pacing_test.cpp)
   target_include_directories(flip_pacing_test PRIVATE src)
   add_test(NAME flip_pacing_test COMMAND flip_pacing_test)

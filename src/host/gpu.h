@@ -453,6 +453,10 @@ void host_gpu_memory_census_refresh();
 // a binding, a device address or a walk, not by the import thread - and the
 // driver's time they took (the frames and stall lines' "imports waited for").
 void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us);
+// The recorder's thread (bb-record) so far: nanoseconds replaying blocks into
+// Vulkan, and spinning for the next block before it sleeps. False without the
+// thread (recording in place or inline): the bottleneck meter's recorder load.
+bool host_gpu_recorder_ns(std::uint64_t* replay_ns, std::uint64_t* spin_ns);
 // A GX buffer was made over [memory, memory + bytes) with this usage, these
 // bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
 // GPU writes (usage default, unordered-access bind) gets a device-local twin
