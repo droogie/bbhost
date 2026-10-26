@@ -226,6 +226,24 @@ bool primitive_topology(std::uint32_t prim, VkPrimitiveTopology& topo, bool& rec
 
 // ---- images -----------------------------------------------------------------
 std::map<std::uint64_t, RtImage> g_rts;   // by base VA
+// Depth layouts (rt_set_layout_locked, below): their counts, and the managed targets' images and sampled views.
+struct DepthLayoutCounts {
+    std::uint64_t to[5] = {};  // transitions into: attachment, read-only, transfer dst, GENERAL, other
+    std::uint64_t discarded = 0, passes_ended = 0, given_up = 0;
+};
+DepthLayoutCounts g_dl;  // under g.mu
+std::unordered_map<VkImageView, std::uint64_t> g_managed_views;  // a managed target's sampled view -> its base; under g.mu
+std::unordered_map<VkImage, std::uint64_t> g_managed_images;     // a managed target's image -> its base; under g.mu
+
+int layout_slot(VkImageLayout l) {
+    switch (l) {
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return 0;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return 1;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return 2;
+    case VK_IMAGE_LAYOUT_GENERAL: return 3;
+    default: return 4;
+    }
+}
 
 struct ShaderStage {
     VkShaderModule module = VK_NULL_HANDLE;
@@ -1700,6 +1718,7 @@ void destroy_rt_image(RtImage& r) {
         ++g_vc_dropped;
     }
     invalidate_rt_views(r.base);
+    if (r.managed_layout) g_managed_images.erase(r.image);
     defer_destroy_view(r.view);
     for (auto& [layer, view] : r.layer_views) defer_destroy_view(view);
     r.layer_views.clear();
@@ -1920,7 +1939,7 @@ std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint
     return unpadded(g_rt_real_width, base, padded, scissor_right);
 }
 
-void copy_layers_locked(const RtImage& from, RtImage& to);
+void copy_layers_locked(RtImage& from, RtImage& to);
 
 // A draw's or a clear's target named by its view's resource generation
 // (GpuDrawInputs::color_gen / depth_gen, GpuClearView::gen; 0: not known).
@@ -2134,6 +2153,10 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         if (grow || carry) destroy_rt_image(grown_from);
         return nullptr;
     }
+    // A depth target in layouts of its own (rt_set_layout_locked) on a driver that wants them.
+    r.managed_layout = depth && g.depth_layouts;
+    r.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (r.managed_layout) g_managed_images[r.image] = base;
     if (!rt_image_memory(r.image, r.memory)) {
         // Once VRAM is gone this fails every image; a line per failure wrote
         // a gigabyte of log in a three-instance run.
@@ -2364,6 +2387,7 @@ void ensure_initialised(RtImage& r) {
     image_barrier(g_cmd(), r.image, aspect_of(r), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, r.layers);
     r.initialised = true;
+    r.layout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
 // The attachment view of one layer of a layered target (one cube face); layer 0
@@ -2943,6 +2967,107 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
 std::unordered_map<std::uint64_t, gcn::TranslateResult> g_paths_cache;  // never erased: references stay valid
 
 }  // namespace
+
+// ---- Depth layouts (Gpu::depth_layouts, BBHOST_DEPTH_LAYOUTS) --------------------------------
+// Every image lives in VK_IMAGE_LAYOUT_GENERAL, which a driver with
+// VK_KHR_unified_image_layouts treats as well as any other. AMD's Windows
+// driver has not got it, and a depth target in GENERAL there keeps no HTILE:
+// its clears write the whole image (the 4096x4096 shadow map's took 1.3-1.5 ms
+// of a Radeon 680M's frame) and its tests and writes go uncompressed (the
+// G-buffer's pass 0.7 ms longer at 540p, 2.3 ms at 1080p). On AMD's own drivers
+// without that extension (gpu.cpp decides; BBHOST_DEPTH_LAYOUTS forces it either
+// way), as a PC engine does, a depth target is drawn in
+// DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sampled in DEPTH_STENCIL_READ_ONLY_OPTIMAL
+// and cleared by transfer in TRANSFER_DST_OPTIMAL; copies and readbacks take
+// it to GENERAL. Its layout is the one its last use left it in (recording
+// order), and a use that wants another records the transition - one barrier,
+// every aspect and layer, no pass open - before it. Colour targets and
+// textures stay in GENERAL.
+
+void rt_set_layout_locked(RtImage& r, VkImageLayout want, bool discard) {
+    if (!r.managed_layout || !r.image || r.layout == want) return;
+    begin_recording_locked();
+    if (g_pass.active) {
+        render_end_pass_locked();
+        ++g_dl.passes_ended;
+    }
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    // Every access before it, every access after it: the uses around a
+    // transition are few a frame, and the pass ends already drain the GPU.
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : r.layout;
+    b.newLayout = want;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = r.image;
+    b.subresourceRange = {aspect_of(r), 0, 1, 0, r.layers};
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    if (discard) ++g_dl.discarded;
+    ++g_dl.to[layout_slot(want)];
+    r.layout = want;
+    r.initialised = true;
+}
+
+void rt_image_layout_general_locked(VkImage image) {
+    if (!g.depth_layouts || !image) return;
+    const auto it = g_managed_images.find(image);
+    if (it == g_managed_images.end()) return;
+    const auto rt = g_rts.find(it->second);
+    if (rt != g_rts.end() && rt->second.image == image) rt_set_layout_locked(rt->second, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+void note_managed_view(VkImageView view, std::uint64_t base) { g_managed_views[view] = base; }
+void forget_managed_view(VkImageView view) {
+    if (!g_managed_views.empty()) g_managed_views.erase(view);
+}
+VkImageLayout sampled_view_layout(VkImageView view) {
+    if (g_managed_views.empty() || !view) return VK_IMAGE_LAYOUT_GENERAL;
+    return g_managed_views.count(view) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+}
+
+void depth_layouts_for_images_locked(const StageImages* stages, int nstages, RtImage* attachment) {
+    if (g_managed_views.empty()) return;
+    for (int st = 0; st < nstages; ++st) {
+        for (const StageImages::Image& im : stages[st].images) {
+            if (!im.view) continue;
+            const auto v = g_managed_views.find(im.view);
+            if (v == g_managed_views.end()) continue;
+            const auto rt = g_rts.find(v->second);
+            if (rt == g_rts.end() || !rt->second.managed_layout) continue;
+            RtImage& r = rt->second;
+            if (&r == attachment) {
+                // Sampled by a draw that has it as its depth target - a feedback
+                // loop no place has shown (the census). GENERAL serves both: the
+                // target leaves the managed layouts for good, its views made again.
+                static std::atomic<int> logs{0};
+                if (logs.fetch_add(1) < 8)
+                    host_log("render: depth target 0x%llx sampled by a draw that draws into it: back to GENERAL for good",
+                             static_cast<unsigned long long>(r.base));
+                rt_set_layout_locked(r, VK_IMAGE_LAYOUT_GENERAL);
+                r.managed_layout = false;
+                g_managed_images.erase(r.image);
+                invalidate_rt_views(r.base);
+                ++g_dl.given_up;
+                continue;
+            }
+            rt_set_layout_locked(r, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        }
+    }
+}
+
+std::string depth_layouts_report() {
+    if (!g.depth_layouts) return std::string();
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "render: depth targets in layouts of their own: transitions to attachment %llu, read-only %llu, transfer dst %llu, "
+                  "GENERAL %llu (%llu discarding the contents for a clear of all of them); %llu passes ended for one; %llu targets back "
+                  "in GENERAL for good (sampled where drawn); %zu targets, %zu sampled views",
+                  static_cast<unsigned long long>(g_dl.to[0]), static_cast<unsigned long long>(g_dl.to[1]),
+                  static_cast<unsigned long long>(g_dl.to[2]), static_cast<unsigned long long>(g_dl.to[3]),
+                  static_cast<unsigned long long>(g_dl.discarded), static_cast<unsigned long long>(g_dl.passes_ended),
+                  static_cast<unsigned long long>(g_dl.given_up), g_managed_images.size(), g_managed_views.size());
+    return b;
+}
 
 // The per-shader compiles translate each program for its paths as paths_for
 // does, with the registers its binary gives, when GX creates it: a draw of a
@@ -10443,9 +10568,17 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (s.depth) {
         if (!s.depth->initialised && !(s.depth->view_clear && s.depth->view_clear_load)) note_depth_first_pass(*s.depth, s);
-        ensure_initialised(*s.depth);
+        if (s.depth->managed_layout) {
+            // Drawn in the attachment layout (depth layouts); an owed clear of
+            // all of it, the load op below, leaves nothing to keep.
+            RtImage& r = *s.depth;
+            const bool clears_all = r.view_clear && r.view_clear_load && r.view_clear_aspects == aspect_of(r) && r.layers == 1;
+            rt_set_layout_locked(r, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, clears_all);
+        } else {
+            ensure_initialised(*s.depth);
+        }
         depth.imageView = attachment_view(*s.depth, s.depth_layer);
-        depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depth.imageLayout = s.depth->managed_layout ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         stencil = depth;
@@ -10515,13 +10648,21 @@ void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t
                  depth ? 1 : 0, dval, stencil ? 1 : 0, sval);
     }
     render_end_pass_locked();
-    ensure_initialised(r);
     VkClearDepthStencilValue v{dval, sval};
     VkImageSubresourceRange range{0, 0, 1, 0, 1};
     if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!range.aspectMask) return;
-    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    // Depth layouts: cleared in the transfer layout, where the driver can clear
+    // it fast; a clear of every aspect of a one-layer target keeps nothing.
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (r.managed_layout) {
+        rt_set_layout_locked(r, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, range.aspectMask == aspect_of(r) && r.layers == 1);
+        layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    } else {
+        ensure_initialised(r);
+    }
+    rec().clear_depth_stencil_image(r.image, layout, v, 1, &range);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -11070,6 +11211,7 @@ bool rt_remake_locked(RtImage& r, bool existing_room) {
     n.layer_views.clear();
     n.memory = ImageMemory{};
     n.initialised = false;
+    n.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkFormat view_formats[5];
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
@@ -11113,6 +11255,7 @@ bool rt_remake_locked(RtImage& r, bool existing_room) {
         defer_destroy_image(VK_NULL_HANDLE, n.memory);
         return false;
     }
+    if (n.managed_layout) g_managed_images[n.image] = n.base;
     if (r.initialised) copy_layers_locked(r, n);
     destroy_rt_image(r);
     r = std::move(n);
@@ -11517,10 +11660,13 @@ namespace {
 
 // Copies the layers `from` has into the same layers of `to`: a layered target
 // that grew keeps the slices already drawn.
-void copy_layers_locked(const RtImage& from, RtImage& to) {
+void copy_layers_locked(RtImage& from, RtImage& to) {
     begin_recording_locked();
     render_end_pass_locked();
-    ensure_initialised(to);
+    // Depth layouts: copied in GENERAL (the new image's contents are the copy's).
+    rt_set_layout_locked(from, VK_IMAGE_LAYOUT_GENERAL);
+    if (to.managed_layout) rt_set_layout_locked(to, VK_IMAGE_LAYOUT_GENERAL, !to.initialised);
+    else ensure_initialised(to);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -11571,13 +11717,17 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
     }
     begin_recording_locked();
     render_end_pass_locked();
-    if (!r.initialised) {
+    first_layer = std::min(first_layer, r.layers - 1);
+    VkImageSubresourceRange range{aspect_of(r), 0, 1, first_layer, std::min(layer_count, r.layers - first_layer)};
+    if (r.managed_layout) {
+        // Depth layouts: cleared in the transfer layout; every layer cleared keeps nothing.
+        rt_set_layout_locked(r, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, range.baseArrayLayer == 0 && range.layerCount == r.layers);
+    } else if (!r.initialised) {
         image_barrier(g_cmd(), r.image, aspect_of(r), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, r.layers);
         r.initialised = true;
+        r.layout = VK_IMAGE_LAYOUT_GENERAL;
     }
-    first_layer = std::min(first_layer, r.layers - 1);
-    VkImageSubresourceRange range{aspect_of(r), 0, 1, first_layer, std::min(layer_count, r.layers - first_layer)};
     if (r.depth) {
         VkClearDepthStencilValue v{};
         v.depth = rgba[0];
@@ -11586,7 +11736,7 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         if (logs.fetch_add(1) < 12) {
             host_log("render: fill clear of depth target 0x%llx to %g", static_cast<unsigned long long>(r.base), v.depth);
         }
-        rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+        rec().clear_depth_stencil_image(r.image, r.managed_layout ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     } else {
         VkClearColorValue v{};
         const bool bgra = r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB;
@@ -12197,6 +12347,7 @@ void render_report() {
     {
         std::lock_guard<GpuMutex> lk(g.mu);
         if (const std::string s = particle_args_report_locked(); !s.empty()) host_log("%s", s.c_str());
+        if (const std::string s = depth_layouts_report(); !s.empty()) host_log("%s", s.c_str());
     }
     host_log("render: targets re-created in another format: %llu with their pixels carried over, %llu with them lost (another size "
              "or texel size), %llu of those starting with the fill their old image had last taken; new targets nothing "
@@ -12588,7 +12739,10 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
                       height, static_cast<int>(src.format));
         profile_begin_locked(&copy_names.emplace(key, key).first->second);
     }
-    if (by_compute && depth_copy_record_locked(src.image, src.format, dst.image, width, height)) {
+    // Depth layouts: the compute pass samples it read-only; the buffer copies read it in GENERAL.
+    if (by_compute) rt_set_layout_locked(src, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    if (by_compute && depth_copy_record_locked(src.image, src.format, dst.image, width, height,
+                                               src.managed_layout ? src.layout : VK_IMAGE_LAYOUT_GENERAL)) {
         if (g.profile) profile_end_locked();
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -12605,6 +12759,7 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
         rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     if (from_depth) {
+        rt_set_layout_locked(src, VK_IMAGE_LAYOUT_GENERAL);
         // Depth and colour formats cannot be copied image-to-image: go through a
         // buffer. One, kept and grown: a buffer allocated per copy and freed
         // at the slot's retirement was ~4% of the command processor in the
@@ -13136,7 +13291,8 @@ void stage_image_writes(VkDescriptorSet set, const gcn::TranslateResult& meta, c
     for (std::size_t k = 0; k < meta.images.size(); ++k) {
         if (!views[k]) continue;
         const gcn::ImageBinding& b = meta.images[k];
-        infos.push_back({VK_NULL_HANDLE, views[k], VK_IMAGE_LAYOUT_GENERAL});
+        // A managed depth target's view names its read-only layout (depth layouts).
+        infos.push_back({VK_NULL_HANDLE, views[k], b.storage ? VK_IMAGE_LAYOUT_GENERAL : sampled_view_layout(views[k])});
         VkWriteDescriptorSet wi{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wi.dstSet = set;
         wi.dstBinding = b.binding;
@@ -15774,14 +15930,22 @@ void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval,
     if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r, kVcwClear);  // an owed clear is older than this one
     begin_recording_locked();
     render_end_pass_locked();
-    ensure_initialised(r);
     first = std::min(first, r.layers - 1);
     VkImageSubresourceRange range{0, 0, 1, first, std::min(count, r.layers - first)};
     if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!range.aspectMask) return;
+    // Depth layouts: cleared in the transfer layout; every aspect of every layer cleared keeps nothing.
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (r.managed_layout) {
+        rt_set_layout_locked(r, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             range.aspectMask == aspect_of(r) && range.baseArrayLayer == 0 && range.layerCount == r.layers);
+        layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    } else {
+        ensure_initialised(r);
+    }
     const VkClearDepthStencilValue v{dval, sval & 0xff};
-    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    rec().clear_depth_stencil_image(r.image, layout, v, 1, &range);
     if (barrier) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -18018,6 +18182,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     begin_recording_locked();
     transfer_flush_locked();
     render_end_pass_locked();
+    if (g.depth_layouts) depth_layouts_for_images_locked(&images, 1, nullptr);  // a depth target the LS samples, read-only
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
     params.lds_address = t.lds_address;
@@ -21132,6 +21297,10 @@ static bool draw_impl(const GpuDraw& d) {
         // A pass with these targets already open began before the clear.
         if (load && g_pass.active) render_end_pass_locked();
     }
+    // Depth layouts: a depth target the draw samples, read-only before its
+    // pass begins - after the owed clears above, which take it to the
+    // transfer layout.
+    if (g.depth_layouts) depth_layouts_for_images_locked(stage_images, 2, s.depth);
     g_pass_profile_name = &bind_pl->profile_name;
     begin_pass(s, pass_key(s), sample_hazard);
     if (feedback_census_on()) note_feedback_loops(s, stage_images, 2, bind_pl->name);
@@ -23079,6 +23248,7 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     if (!create_dev_buffer(staging, static_cast<std::uint64_t>(r.width) * r.height * out.bpp, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
+    rt_set_layout_locked(r, VK_IMAGE_LAYOUT_GENERAL);  // depth layouts: read back in GENERAL
     VkBufferImageCopy region{};
     region.imageSubresource = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {r.width, r.height, 1};
@@ -23100,6 +23270,7 @@ bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) 
     if (!create_dev_buffer(staging, (static_cast<std::uint64_t>(r.width) * r.height + 3) & ~3ull, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
+    rt_set_layout_locked(r, VK_IMAGE_LAYOUT_GENERAL);  // depth layouts: read back in GENERAL
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
     region.imageExtent = {r.width, r.height, 1};

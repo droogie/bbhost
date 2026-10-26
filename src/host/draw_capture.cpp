@@ -309,6 +309,7 @@ public:
         transfer_flush_locked();
         render_end_pass_locked();
         view_clears_flush_locked(kVcwDump);  // a capture reads what every clear so far made
+        rt_image_layout_general_locked(image);  // a depth target in a layout of its own: read in GENERAL
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

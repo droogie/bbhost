@@ -66,7 +66,8 @@ std::uint64_t handle_bits(H h) {
 }
 
 void write_image(bool storage, std::uint32_t slot, VkImageView view) {
-    VkDescriptorImageInfo ii{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+    // A depth target in a layout of its own is sampled read-only (render.cpp, depth layouts).
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, view, storage ? VK_IMAGE_LAYOUT_GENERAL : sampled_view_layout(view)};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = g.bindless_set;
     w.dstBinding = storage ? gcn::kBindlessStorageImages : gcn::kBindlessImages;

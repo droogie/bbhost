@@ -76,7 +76,8 @@ bool depth_copy_available_locked() {
     return g_pipeline != VK_NULL_HANDLE;
 }
 
-bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst, std::uint32_t width, std::uint32_t height) {
+bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst, std::uint32_t width, std::uint32_t height,
+                              VkImageLayout depth_layout) {
     // A view of the depth plane alone, made for this copy and gone with its
     // command buffer (one a frame).
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -99,7 +100,7 @@ bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst,
         vkDestroyImageView(g.device, dst_view, nullptr);
         return false;
     }
-    const VkDescriptorImageInfo depth_info{VK_NULL_HANDLE, depth_view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo depth_info{VK_NULL_HANDLE, depth_view, depth_layout};
     const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, dst_view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[3] = {};

@@ -306,6 +306,11 @@ struct Gpu {
     std::atomic<bool> vram_short{false};
     // VK_KHR_pipeline_executable_properties enabled, for BBHOST_PIPELINE_STATS (render.cpp)
     bool pipeline_stats = false;
+    // Depth targets in layouts of their own (render.cpp, rt_set_layout_locked):
+    // on AMD's own drivers without VK_KHR_unified_image_layouts, where GENERAL
+    // costs a depth target its compression; BBHOST_DEPTH_LAYOUTS=0/1 decides
+    // instead on any device.
+    bool depth_layouts = false;
     // shaderFloat16 and shaderInt16 enabled: the host's own shaders may do f16
     // math (the half-precision FSR 1, fsr.cpp).
     bool has_f16_math = false;
@@ -1117,7 +1122,9 @@ struct UntileGpuPass {
 // GENERAL layout, both) as one compute pass (depth_copy.cpp); false when it
 // could not be recorded and the caller copies through a buffer instead.
 bool depth_copy_available_locked();
-bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst, std::uint32_t width, std::uint32_t height);
+// `depth_layout`: the layout the depth image is in (rt_set_layout_locked), which its sampled descriptor names.
+bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst, std::uint32_t width, std::uint32_t height,
+                              VkImageLayout depth_layout = VK_IMAGE_LAYOUT_GENERAL);
 bool untile_gpu_available_locked();
 void untile_gpu_record_locked(const UntileGpuPass& pass);
 // A compare run's pair (BBHOST_GPU_UNTILE=2): the GPU's untile and the CPU's
@@ -1400,6 +1407,14 @@ struct RtImage {
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
     VkImageUsageFlags usage = 0;
+    // A depth target in layouts of its own (Gpu::depth_layouts; render.cpp,
+    // rt_set_layout_locked): drawn in DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    // sampled in DEPTH_STENCIL_READ_ONLY_OPTIMAL, cleared by transfer in
+    // TRANSFER_DST_OPTIMAL, GENERAL for copies and readbacks - `layout` the one
+    // its last use left it in, in recording order. Every other image stays
+    // in GENERAL.
+    bool managed_layout = false;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
@@ -1873,6 +1888,26 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
 extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
 // Forget the cached sampled views of a render target before its image dies.
 void invalidate_rt_views(std::uint64_t base);
+// Depth layouts (render.cpp; RtImage::managed_layout): `r` taken to `want`
+// for its next use - a barrier from the layout it is in, every aspect and
+// layer, recorded with no pass open (one open is ended); nothing for an image
+// not managed or already there. `discard`: its contents are not wanted (a
+// clear of all of it follows).
+void rt_set_layout_locked(RtImage& r, VkImageLayout want, bool discard = false);
+// The same for a VkImage when it is a managed target's (diagnostic readbacks
+// that know the image alone).
+void rt_image_layout_general_locked(VkImage image);
+// A sampled view of a managed depth target (render_target_view) and the
+// layout descriptors of it name; GENERAL for every other view.
+void note_managed_view(VkImageView view, std::uint64_t base);
+void forget_managed_view(VkImageView view);
+VkImageLayout sampled_view_layout(VkImageView view);
+// The managed depth targets a draw's or dispatch's stages sample, taken to
+// their read-only layout before its pass begins (a pass open is ended).
+// `attachment`: the draw's own depth target, which a sampled image must not
+// be (it leaves the managed layouts then).
+void depth_layouts_for_images_locked(const StageImages* stages, int nstages, RtImage* attachment);
+std::string depth_layouts_report();  // "" when off
 // Marks where the GPU is: on a device loss the driver reports the last
 // checkpoint each queue stage reached, which names the draw that faulted.
 // kind 1 = draw, 2 = dispatch, kGpuMarkSubmission = a submission's edges:

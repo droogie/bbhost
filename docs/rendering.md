@@ -307,6 +307,23 @@ addresses).
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
+Images are kept in `VK_IMAGE_LAYOUT_GENERAL`, which a driver with
+`VK_KHR_unified_image_layouts` handles as well as any other layout. AMD's own
+drivers without it keep no compression for a depth target in `GENERAL`: a clear
+writes every texel, and depth tests read and write it uncompressed. There depth
+targets have layouts of their own, as a PC engine keeps them: drawn in the
+attachment layout, sampled in the read-only one, cleared in the transfer
+layout, and in `GENERAL` around copies and readbacks. A use that wants another
+layout records the transition just before it, outside any pass, and a clear of
+all of a target discards what it held. Colour targets and textures stay in
+`GENERAL`. On a Radeon 680M at a lamp in Central Yharnam the game ran 14% faster
+at 960x540 (60 to 69 fps) and 15% faster at 1920x1080 (27 to 31 fps): the
+shadow map's pass took 0.3 ms instead of 1.6 (its clear had written all
+4096x4096 texels), and the G-buffer's 5.8 ms instead of 6.5 at 960x540, 10.1
+instead of 12.4 at 1920x1080. Other drivers keep every image in `GENERAL` until
+they are measured; `BBHOST_DEPTH_LAYOUTS=1` uses the layouts on any device,
+`=0` on none. A depth target a draw samples while drawing into it would go back
+to `GENERAL` for good; no place has had one.
 A colour target a draw writes no channel of - its write mask, the game's cut to
 what the pixel shader exports, is empty - gets no blend state either. The game
 leaves blending on for targets a shader does not export: the G-buffer's puddle

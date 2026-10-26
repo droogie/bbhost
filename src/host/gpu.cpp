@@ -3278,6 +3278,30 @@ bool init_locked() {
         g.has_memory_budget = has("VK_EXT_memory_budget");
         // BBHOST_PIPELINE_STATS: the driver's statistics and disassembly of named pipelines (render.cpp).
         g.pipeline_stats = std::getenv("BBHOST_PIPELINE_STATS") && has("VK_KHR_pipeline_executable_properties");
+        // Depth targets in layouts of their own (render.cpp, rt_set_layout_locked) where GENERAL costs
+        // them their compression: AMD's own drivers - the proprietary one and AMDVLK, which share its
+        // layout handling - without VK_KHR_unified_image_layouts. There a depth target in GENERAL has no
+        // fast clear and is tested and written uncompressed: a Radeon 680M drew 14-15% more frames at
+        // 540p and at 1080p with the layouts. Other drivers keep GENERAL until one is measured
+        // (BBHOST_DEPTH_LAYOUTS=1 uses the layouts on any device, =0 nowhere).
+        {
+            const char* e = std::getenv("BBHOST_DEPTH_LAYOUTS");
+            const bool unified = has("VK_KHR_unified_image_layouts");
+            VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            dp.pNext = &drv;
+            vkGetPhysicalDeviceProperties2(g.phys, &dp);
+            const bool amd = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || drv.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+            const bool forced = e && *e;
+            g.depth_layouts = forced ? e[0] == '1' : amd && !unified;
+            host_log("gpu: depth targets %s: %s (BBHOST_DEPTH_LAYOUTS=%s)",
+                     g.depth_layouts ? "in layouts of their own (attachment-optimal drawn, read-only sampled, transfer-dst cleared)"
+                                     : "in GENERAL like every image",
+                     forced ? "BBHOST_DEPTH_LAYOUTS set"
+                     : amd  ? (unified ? "AMD's driver with VK_KHR_unified_image_layouts" : "AMD's driver without VK_KHR_unified_image_layouts")
+                            : "not AMD's driver, where they are not measured yet",
+                     g.depth_layouts ? "0 keeps GENERAL" : "1 uses the layouts");
+        }
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
         // The present mode FIFO_LATEST_READY (window.cpp, vk_create_swapchain):
         // V-Sync with no queue of frames behind the display - at each refresh
@@ -9052,6 +9076,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     render_end_pass_locked();
     view_clears_flush_locked(kVcwDispatch);  // a compute shader may read or write any image: no clear stays owed past it
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
+    if (g.depth_layouts) depth_layouts_for_images_locked(&stage_images, 1, nullptr);  // the depth targets it samples, read-only
     stamp.to(kDpFlush);
     // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so
     // far - the counters' starts too - before this dispatch's set exists, so

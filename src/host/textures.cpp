@@ -1777,6 +1777,7 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     views[key] = view;
+    if (r.managed_layout) note_managed_view(view, r.base);  // its descriptors name the read-only layout (render.cpp)
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = r.format;
@@ -4025,6 +4026,9 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     }
     begin_recording_locked();
     render_end_pass_locked();
+    // Depth layouts (render.cpp): a depth target is copied in GENERAL, as every image here.
+    if (src.rt) rt_set_layout_locked(*src.rt, VK_IMAGE_LAYOUT_GENERAL);
+    if (dst.rt) rt_set_layout_locked(*dst.rt, VK_IMAGE_LAYOUT_GENERAL);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -5336,7 +5340,10 @@ bool texture_dump_locked(std::uint64_t base, const char* path, std::uint32_t lev
 void invalidate_rt_views(std::uint64_t base) {
     auto it = g_rt_views.find(base);
     if (it == g_rt_views.end()) return;
-    for (auto& [key, view] : it->second) defer_destroy_view(view);
+    for (auto& [key, view] : it->second) {
+        forget_managed_view(view);
+        defer_destroy_view(view);
+    }
     g_rt_views.erase(it);
     bump_view_epoch();
 }
