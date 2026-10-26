@@ -13,6 +13,17 @@
 //     and the context's key fields the same;
 //   - the chunk job (sub_2d4a400) whole, its GX calls stubbed: the same calls
 //     in the same order and the same value returned, the census on and off;
+//   - the cut: on the same random queues, the partition with the cut table
+//     against the game's - every game chunk the cut's pieces back to back,
+//     each with the chunk's entry fields - and, where the cut's chunks would
+//     not fit the table, the game's chunks exactly; the cut table the game's
+//     but its two entries;
+//   - ranks by cost: only the ranks change, the dearest six 0, the next six 1;
+//   - the parallel-for (sub_12c7810) against the game's, its job calls
+//     stubbed: the same jobs pushed to the same participants in the same
+//     order, the scene's task sort on and off; longest first, the dearest
+//     chunk pushed first and the rest by cost, each to the participant its
+//     rank and place give it;
 // and each of the source's mutants caught.
 #define DECOMP_GX_RENDER_QUEUE_MUTANTS
 int g_rq_mutant = 0;
@@ -30,6 +41,7 @@ namespace {
 eboot_kit::Rng g_rng(0x26d11d0);
 int g_failed = 0;
 bool g_quiet = false;
+long g_cut_seen = 0;
 
 void fail(const char* what, int trial, const char* why) {
     if (++g_failed <= 30 && !g_quiet) std::printf("FAIL: %s case %d: %s\n", what, trial, why);
@@ -113,6 +125,92 @@ bool partition_case(int t, bool census, bool report) {
     }
     (void)t;
     return same;
+}
+
+// The cut: ours with the cut table refines the game's; where it would not fit,
+// it is the game's.
+bool cut_case(int t, bool report) {
+    int count = 0;
+    build_queue(count);
+    u32 first = 0, last = static_cast<u32>(count);
+    if (g_rng.chance(0.2)) first = static_cast<u32>(g_rng.range(0, count + 3));
+    if (g_rng.chance(0.2)) last = static_cast<u32>(g_rng.range(0, count + 20));
+    const u32 max_chunks = g_rng.chance(0.8) ? 6u : static_cast<u32>(g_rng.range(0, 8));
+    std::memcpy(g_queue_a, g_queue_start, kQueueBytes);
+    std::memcpy(g_queue_b, g_queue_start, kQueueBytes);
+    const u32 at = load<u32>(qa() + kChunkCount);
+    const u32 theirs = eboot_kit::fn<GamePartition>(kPartition)(qa(), first, last, max_chunks);
+    const u32 ours = cut_partition(qb(), first, last, max_chunks, nullptr, nullptr);
+    // the game's chunks, from the queue object the game wrote
+    // the game's own chunks byte for byte, or a refinement of them (and the
+    // queue object past its table untouched)
+    const bool same = std::memcmp(g_queue_a, g_queue_b, kQueueBytes) == 0;
+    bool ok = same;
+    if (!same) {
+        ok = load<u32>(qb() + kChunkCount) == at + ours && load<u32>(qa() + kChunkCount) == at + theirs &&
+             refines(qb(), at, ours, g_queue_a + kChunks, theirs) &&
+             std::memcmp(g_queue_a + kChunkCount + 4, g_queue_b + kChunkCount + 4, kQueueBytes - kChunkCount - 4) == 0;
+        if (ours == theirs && !load<u8>(qa() + kStealing)) ok = false;  // the same count is the game's chunks exactly
+    }
+    if (ours > theirs) ++g_cut_seen;
+    if (!ok && report) {
+        std::size_t off = 0;
+        while (off < kQueueBytes && g_queue_a[off] == g_queue_b[off]) ++off;
+        char why[200];
+        std::snprintf(why, sizeof why, "items %u-%u of %d, limit %u, %u in the table: ours %u chunks, the game's %u; first byte apart +0x%zx "
+                      "(chunk %zd field +0x%zx: ours %u, the game's %u)", first, last, count, max_chunks, at, ours, theirs, off,
+                      off >= kChunks ? static_cast<std::ptrdiff_t>((off - kChunks) / kChunkSize) : -1,
+                      off >= kChunks ? (off - kChunks) % kChunkSize : off, off < kQueueBytes ? g_queue_b[off] : 0,
+                      off < kQueueBytes ? g_queue_a[off] : 0);
+        fail("cut", t, why);
+    }
+    return ok;
+}
+
+// Ranks by cost: random costs by entry, one queue's chunks ranked.
+bool ranks_case(int t, bool report) {
+    int count = 0;
+    build_queue(count);
+    std::memcpy(g_queue_b, g_queue_start, kQueueBytes);
+    store<u32>(qb() + kChunkCount, 0);
+    s8 entries[64];
+    const u32 made = partition(qb(), 0, static_cast<u32>(count), 6, nullptr, 0, nullptr, entries);
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = g_rng.chance(0.1) ? 0 : (g_rng.u32() & 0xfffff) + 1;
+    std::memcpy(g_queue_a, g_queue_b, kQueueBytes);
+    g_ranks = true;
+    rank_by_cost(qb(), 0, made, entries);
+    g_ranks = false;
+    bool ok = true;
+    // only the ranks moved
+    for (u32 k = 0; k < made && ok; ++k) {
+        const u64 a = qa() + kChunks + k * kChunkSize, b = qb() + kChunks + k * kChunkSize;
+        ok = std::memcmp(reinterpret_cast<void*>(a), reinterpret_cast<void*>(b), 0x10) == 0 &&
+             load<u8>(a + 0x14) == load<u8>(b + 0x14);
+    }
+    ok = ok && std::memcmp(g_queue_a + kChunks + made * kChunkSize, g_queue_b + kChunks + made * kChunkSize,
+                           kQueueBytes - kChunks - made * kChunkSize) == 0;
+    // the dearest six 0, the next six 1 (a chunk at the game's rank past 5 and under a twentieth of the dearest kept)
+    if (ok && made >= 2 && made <= 64) {
+        std::vector<std::pair<u64, u32>> by;
+        u64 top = 0;
+        for (u32 k = 0; k < made; ++k) {
+            const u64 c = qb() + kChunks + k * kChunkSize;
+            const u64 cost = chunk_cost(load<u32>(c + 4) - load<u32>(c), entries[k]);
+            by.emplace_back(cost, k);
+            top = std::max(top, cost);
+        }
+        std::stable_sort(by.begin(), by.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        for (u32 pos = 0; pos < made && ok && top; ++pos) {
+            const u32 k = by[pos].second;
+            const u32 was = load<u32>(qa() + kChunks + k * kChunkSize + 0x10), now = load<u32>(qb() + kChunks + k * kChunkSize + 0x10);
+            if (was > 5 && by[pos].first * 20 < top)
+                ok = now == was;
+            else
+                ok = now == std::min<u32>(5, pos / 6);
+        }
+    }
+    if (!ok && report) fail("ranks", t, "a chunk's rank not the one its cost gives it, or more than the ranks changed");
+    return ok;
 }
 
 // ---- The item loop and the chunk job ----
@@ -305,6 +403,120 @@ bool job_case(int t, bool report) {
     return same;
 }
 
+// ---- The parallel-for ----
+
+struct Pushed {
+    u32 first, last, grain, worker;
+    u64 functor_vt, functor_ctx, functor_q;
+    bool operator==(const Pushed&) const = default;
+};
+std::vector<Pushed> g_pushed_jobs;
+std::vector<int> g_pf_calls;  // the order of the other calls: 1 wait first, 2 wake, 3 barrier
+u64 g_job_ids = 0;
+
+GUEST_ABI u64 rec_job_for(u64 functor, u64 range, u32 worker) {
+    g_pushed_jobs.push_back(Pushed{load<u32>(range), load<u32>(range + 4), load<u32>(range + 8), worker, load<u64>(functor),
+                                   load<u64>(functor + 8), load<u64>(functor + 0x10)});
+    return 0x9000000ull + (++g_job_ids);
+}
+GUEST_ABI u64 rec_push(u64 jobs, u64 job, u32 worker) {
+    const Pushed& last = g_pushed_jobs.back();
+    if (job != 0x9000000ull + g_job_ids || worker != last.worker || jobs != base() + kMgr + 0x278) g_pf_calls.push_back(-1);
+    return 0;
+}
+GUEST_ABI u64 rec_wait_first() {
+    g_pf_calls.push_back(1);
+    return 0;
+}
+GUEST_ABI u64 rec_wake(u64 jobs, u32 zero, u32 limit) {
+    g_pf_calls.push_back(jobs == base() + kMgr + 0x278 && zero == 0 ? 2 : -2);
+    g_pf_calls.push_back(static_cast<int>(limit));
+    return 0;
+}
+GUEST_ABI u64 rec_barrier(u64 jobs) {
+    g_pf_calls.push_back(jobs == base() + kMgr + 0x278 ? 3 : -3);
+    return 0;
+}
+
+using GameParallelFor = u64 (*)(u64, u64, u32, u32, u32);
+
+// One queue through the game's parallel-for and ours (the game's partition
+// behind the queue's slot 3 for both). `push`: ours longest first.
+bool parallel_for_case(int t, bool push, bool report) {
+    int count = 0;
+    build_queue(count);
+    const u64 b = base();
+    std::memcpy(g_queue_a, g_queue_start, kQueueBytes);
+    store<u64>(b + kQVt + 0x18, game_address(kPartition));
+    store<u64>(qa(), b + kQVt);
+    store<u32>(qa() + kChunkCount, g_rng.chance(0.8) ? 0u : static_cast<u32>(g_rng.range(1, 20)));
+    std::memcpy(g_queue_b, g_queue_a, kQueueBytes);
+    store<u64>(game_address(kGx), b + kMgr);
+    store<u32>(b + kMgr + 0x280, static_cast<u32>(g_rng.chance(0.8) ? 6 : g_rng.range(1, 8)));
+    const bool sorted = g_rng.chance(0.85);
+    store<u8>(game_address(kTaskSort), sorted ? 1 : 0);
+    const u32 first = g_rng.chance(0.8) ? 0u : static_cast<u32>(g_rng.range(0, count));
+    const u32 last = static_cast<u32>(count);
+    const u32 limit = g_rng.chance(0.8) ? 6u : static_cast<u32>(g_rng.range(0, 8));
+    const u64 ctx = 0x5555000000ull + g_rng.u32();
+    g_pushed_jobs.clear();
+    g_pf_calls.clear();
+    const u32 theirs = static_cast<u32>(eboot_kit::fn<GameParallelFor>(kParallelFor)(qa(), ctx, first, last, limit));
+    const std::vector<Pushed> game = g_pushed_jobs;
+    const std::vector<int> game_calls = g_pf_calls;
+    g_pushed_jobs.clear();
+    g_pf_calls.clear();
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = push ? (g_rng.u32() & 0xfffff) + 1 : 0;
+    g_push = push;
+    const u32 ours = render_queue_parallel_for(qb(), ctx, first, last, limit);
+    g_push = false;
+    bool ok = ours == theirs && g_pf_calls == game_calls && g_pushed_jobs.size() == game.size();
+    for (const Pushed& p : g_pushed_jobs) ok = ok && p.functor_vt == game_address(kFunctorVtable) && p.functor_ctx == ctx && p.functor_q == qb();
+    if (ok && !push) {
+        for (std::size_t k = 0; k < game.size() && ok; ++k) {
+            Pushed a = game[k], c = g_pushed_jobs[k];
+            a.functor_q = c.functor_q = 0;  // the queues are two copies
+            ok = a == c;
+        }
+        ok = ok && std::memcmp(g_queue_a + 8, g_queue_b + 8, kQueueBytes - 8) == 0;
+    } else if (ok && push) {
+        // the same chunks; the sorted range dearest first, the table's last chunk last; each to its participant
+        const u32 total = load<u32>(qb() + kChunkCount), at = total - ours;
+        const u32 n = load<u32>(qb() + kChunkCount) - at;
+        std::vector<std::pair<u32, u32>> a, c;
+        for (const Pushed& p : game) a.emplace_back(p.first, p.last);
+        for (const Pushed& p : g_pushed_jobs) c.emplace_back(p.first, p.last);
+        std::sort(a.begin(), a.end());
+        std::sort(c.begin(), c.end());
+        ok = a == c;
+        const u32 parts = load<u32>(b + kMgr + 0x280);
+        u64 prev = ~0ull;
+        for (u32 k = 0; k < n && ok; ++k) {
+            const Pushed& p = g_pushed_jobs[k];
+            const u64 ch = qb() + kChunks + static_cast<u64>(at + k) * kChunkSize;
+            ok = load<u32>(ch) == p.first && load<u32>(ch + 4) == p.last;
+            const u32 rank = load<u32>(ch + 0x10);
+            ok = ok && p.worker == ((sorted && rank <= 5) ? (at + k) % parts : 0u);
+            if (sorted && k + 1 < n) {
+                const u64 cost = p.last > p.first ? chunk_cost(p.last - p.first, entry_index(entry_of(load<u32>(reinterpret_cast<u64>(g_items_mem) + p.first * 0x18ull), game_address(kTable)), game_address(kTable))) : 0;
+                ok = ok && cost <= prev;
+                prev = cost;
+            }
+        }
+        if (ok && n >= 1) {  // the last chunk: the partition's last, pushed last
+            const Pushed& p = g_pushed_jobs.back();
+            ok = p.first == game.back().first && p.last == game.back().last;
+        }
+    }
+    if (!ok && report) {
+        char why[160];
+        std::snprintf(why, sizeof why, "items %u-%u of %d, sort %d, push %d: %zu jobs (the game's %zu), %u chunks (%u)", first, last, count,
+                      sorted, push, g_pushed_jobs.size(), game.size(), ours, theirs);
+        fail("parallel-for", t, why);
+    }
+    return ok;
+}
+
 // ---- The segment list's note ----
 
 GUEST_ABI u64 rec_append(u64 list, u64 record, u32 key) {
@@ -352,6 +564,22 @@ int main(int argc, char** argv) {
     eboot_kit::stub(kEndRecord, reinterpret_cast<const void*>(&rec_end));
     eboot_kit::stub(kQueueContext, reinterpret_cast<const void*>(&rec_queue));
     eboot_kit::stub(kOwnerOf, reinterpret_cast<const void*>(&rec_owner));
+    eboot_kit::stub(kJobFor, reinterpret_cast<const void*>(&rec_job_for));
+    eboot_kit::stub(kPushJob, reinterpret_cast<const void*>(&rec_push));
+    eboot_kit::stub(kWaitFirst, reinterpret_cast<const void*>(&rec_wait_first));
+    eboot_kit::stub(kWake, reinterpret_cast<const void*>(&rec_wake));
+    eboot_kit::stub(kBarrier, reinterpret_cast<const void*>(&rec_barrier));
+    // the cut table, from the game's; its two entries the PC build's
+    make_cut_table(nullptr);
+    if (!g_cut_ready) fail("cut table", 0, "the game's table not the one the limits were written for");
+    for (u32 k = 0; k < kTableWords; ++k) {
+        const u32 game = load<u32>(game_address(kTable) + 4ull * k);
+        const bool changed = k == 17 * 9 + 3 || k == 17 * 9 + 4 || k == 19 * 9 + 3 || k == 19 * 9 + 4;
+        if ((g_cut_table[k] != game) != changed) fail("cut table", static_cast<int>(k), "not the game's but for entries 17 and 19");
+    }
+    if (g_cut_table[17 * 9 + 3] != 5 || g_cut_table[17 * 9 + 4] != 10 || g_cut_table[19 * 9 + 3] != 3 || g_cut_table[19 * 9 + 4] != 10)
+        fail("cut table", 0, "entries 17 and 19 not at the PC build's limits");
+    g_split = true;
     // the census's rings, for the job's and the note's census
     g_items = static_cast<Item*>(std::calloc(kItemRing, sizeof(Item)));
     g_chunk_ring = static_cast<Chunk*>(std::calloc(kChunkRing, sizeof(Chunk)));
@@ -365,12 +593,20 @@ int main(int argc, char** argv) {
     }
     for (int t = 0; t < cases / 4; ++t, ++n_loop) loop_case(t, true);
     for (int t = 0; t < cases / 4; ++t, ++n_job) job_case(t, true);
+    long n_cut = 0, n_ranks = 0, n_pf = 0;
+    for (int t = 0; t < cases; ++t, ++n_cut) cut_case(t, true);
+    for (int t = 0; t < cases / 4; ++t, ++n_ranks) ranks_case(t, true);
+    for (int t = 0; t < cases / 4; ++t, ++n_pf) parallel_for_case(t, (t & 1) != 0, true);
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = 0;
     if (!append_case()) fail("segment note", 0, "the list's append not passed on as given, or its key not noted");
 
     // Every mutant caught.
     const int kPartitionMutants[] = {1, 2, 3, 4, 10, 11, 12};
     const int kLoopMutants[] = {5, 6, 7};
     const int kJobMutants[] = {8, 9};
+    const int kCutMutants[] = {13};
+    const int kRankMutants[] = {14};
+    const int kPushMutants[] = {15};
     int caught = 0, mutants = 0;
     g_quiet = true;
     const auto catches = [&](int m, auto&& one, int tries) {
@@ -385,13 +621,17 @@ int main(int argc, char** argv) {
     for (int m : kPartitionMutants) catches(m, [](int t) { return partition_case(t, false, false); }, 200000);
     for (int m : kLoopMutants) catches(m, [](int t) { return loop_case(t, false); }, 20000);
     for (int m : kJobMutants) catches(m, [](int t) { return job_case(t, false); }, 20000);
+    for (int m : kCutMutants) catches(m, [](int t) { return cut_case(t, false); }, 200000);
+    for (int m : kRankMutants) catches(m, [](int t) { return ranks_case(t, false); }, 20000);
+    for (int m : kPushMutants) catches(m, [](int t) { return parallel_for_case(t, true, false); }, 20000);
     g_quiet = false;
 
     if (g_failed) {
         std::printf("gx_render_queue_test: %d failures\n", g_failed);
         return 1;
     }
-    std::printf("gx_render_queue_test: ok - partition %ld cases (%ld cut a run), item loop %ld, chunk job %ld; %d of %d mutants caught\n",
-                n_part, split, n_loop, n_job, caught, mutants);
+    std::printf("gx_render_queue_test: ok - partition %ld cases (%ld cut a run), item loop %ld, chunk job %ld; the cut %ld (%ld cut further "
+                "than the game), ranks %ld, parallel-for %ld; %d of %d mutants caught\n",
+                n_part, split, n_loop, n_job, n_cut, g_cut_seen, n_ranks, n_pf, caught, mutants);
     return 0;
 }

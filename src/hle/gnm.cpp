@@ -9,6 +9,7 @@
 #include "hle/hle.h"
 #include "core/imports.h"
 #include "hle/modules.h"
+#include "host/draw_digest.h"
 #include "host/frame_stats.h"
 #include "host/gpu.h"
 #include "hle/platform.h"
@@ -421,6 +422,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                                  host_log("flip-tr #%llu recorded %.2f ms after the call, at tick phase %.2f",
                                           static_cast<unsigned long long>(tl_n), static_cast<double>(t - tl_call) / 1e6, tl_phase_ms(t));
                              }
+                             if (draw_digest_on()) draw_digest_frame();  // BBHOST_DRAW_DIGEST: the frame's draws are all made
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },

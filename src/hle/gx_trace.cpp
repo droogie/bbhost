@@ -23,6 +23,7 @@
 #include "decomp/gx/dma.h"
 #include "decomp/gx/draw.h"
 #include "host/cb_proof.h"
+#include "host/draw_digest.h"
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
@@ -7977,6 +7978,7 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                 }
             }
         }
+        if (draw_digest_on()) draw_digest_note(t_native_in, draw->objects);  // BBHOST_DRAW_DIGEST
         return &t_native_in;
     }
     if (g_native != 1) return nullptr;

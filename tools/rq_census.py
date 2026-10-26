@@ -13,7 +13,12 @@ frame dump after it: --dumps 1). Per place:
     share, the participant it ran on;
   - the checks a cut of a chunk relies on: items that drew with state an earlier item of their chunk set (commands 1,
     2, 6, 7), and other segments of the frame's list whose order keys fall inside a chunk's span (a cut chunk's later
-    pieces would sort after them).
+    pieces would sort after them);
+  - and on a build that cuts (BBHOST_RQ_SPLIT): the parallel-fors cut, their pieces past the game's own cuts; every
+    item of a parallel-for's range in one chunk exactly (gaps only where no table entry covers the keys, which the game
+    draws nothing of); each run's pieces one after another in the frame's sorted segment list - no other segment's
+    key after the run's first piece and up to its last item's, and none equal to a later piece's (the first piece's
+    key is the uncut chunk's: a segment tied with it, as the frame's segments keyed 0 are, keeps its place).
 """
 import argparse
 import bisect
@@ -57,7 +62,7 @@ def read(path):
                 v = PART.unpack(b)
                 runs = [dict(entry=v[13 + 5 * k], how=HOW.get(v[14 + 5 * k]), chunks=v[15 + 5 * k], start=v[16 + 5 * k],
                              n=v[17 + 5 * k]) for k in range(min(v[11], 96))]
-                parts.append(dict(t=v[0], ret=v[2], gen=v[9], flip=v[10], runs=runs))
+                parts.append(dict(t=v[0], ret=v[2], first=v[3], end=v[5], gen=v[9], flip=v[10], cut=bool(v[12] & 0x100), runs=runs))
             elif tag == b'C':
                 b = f.read(CHUNK.size)
                 if len(b) < CHUNK.size:
@@ -143,6 +148,31 @@ def place(parts, chunks, appends, win):
     if cur:
         frames.append(cur)
     inside = 0
+    # coverage: every item of the range in one chunk, gaps only over runs no entry covers
+    uncovered = overlapped = 0
+    for g in gl:
+        p = g['part']
+        none = [(r['start'], r['start'] + r['n']) for r in p['runs'] if r['how'] == 'none']
+        pos = p['first']
+        for c in sorted(g['chunks'], key=lambda c: (c['first'], c['last'])):
+            if c['first'] < pos:
+                overlapped += 1
+            elif c['first'] > pos:
+                gap = (pos, c['first'])
+                if not any(a <= gap[0] and gap[1] <= b for a, b in none):
+                    uncovered += c['first'] - pos
+            pos = max(pos, c['last'])
+        if pos < p['end'] and not any(a <= pos and p['end'] <= b for a, b in none):
+            uncovered += p['end'] - pos
+    cut = sum(1 for g in gl if g['part']['cut'])
+    pieces = 0
+    for g in gl:
+        if not g['part']['cut']:
+            continue
+        for r in g['part']['runs']:
+            if r['how'] == 'split' and r['entry'] in (17, 19):
+                pieces += r['chunks'] - 1
+    run_inside = run_ties = 0
     gl_by_t = sorted(gl, key=lambda g: g['part']['t'])
     starts = [g['part']['t'] for g in gl_by_t]
     n_frames = 0
@@ -160,6 +190,22 @@ def place(parts, chunks, appends, win):
                     continue
                 hi = (c['items'][-1][0] & 0xffff0000) | ((c['first'] + len(c['items']) - 1) & 0xffff)
                 inside += bisect.bisect_right(keys, hi) - bisect.bisect_right(keys, c['key'])
+            # a run's pieces: no other key from the first piece's to the run's last item's, none equal to theirs
+            for r in g['part']['runs']:
+                if not r['chunks']:
+                    continue
+                mine = sorted(c['key'] for c in g['chunks'] if r['start'] <= c['first'] < r['start'] + max(1, r['n']))
+                own = [c for c in g['chunks'] if r['start'] <= c['first'] < r['start'] + max(1, r['n']) and c['items']]
+                if not mine or not own:
+                    continue
+                last = max(own, key=lambda c: c['first'])
+                hi = (last['items'][-1][0] & 0xffff0000) | ((last['first'] + len(last['items']) - 1) & 0xffff)
+                lo = mine[0]
+                # after the run's first piece (whose key is the uncut chunk's): other keys, and ties with a later piece
+                n_in = bisect.bisect_right(keys, hi) - bisect.bisect_right(keys, lo)
+                n_mine = sum(1 for k in mine if lo < k <= hi)
+                run_inside += max(0, n_in - n_mine)
+                run_ties += sum(max(0, keys.count(k) - 1) for k in set(mine) if k != lo)
     n = len(crit)
     top = collections.Counter()
     for c in crit:
@@ -173,7 +219,9 @@ def place(parts, chunks, appends, win):
                               run_items=sum(c['run_items'] for c in crit) / n, run_chunks=sum(c['run_chunks'] for c in crit) / n,
                               by_entry={entry_name(e): t / tpm / flips for e, t in top.most_common(4)},
                               on_main_thread=sum(1 for c in crit if c['worker'] == 0) / n),
-                items_with_inherited_state=inherits, frames=n_frames, others_inside_chunk_spans=inside)
+                items_with_inherited_state=inherits, frames=n_frames, others_inside_chunk_spans=inside,
+                parallel_fors_cut=cut, pieces_past_the_game=pieces / flips, items_uncovered=uncovered, chunks_overlapping=overlapped,
+                others_inside_run_spans=run_inside, ties_with_a_run_piece=run_ties)
 
 
 def main():
@@ -202,6 +250,10 @@ def main():
             print('    %-6s %6.2f %5.1f %6.1f %6.1f %6.2f' % (k, d['work_ms'], d['chunks'], d['items'], d['draws'], d['longest_chunk_ms']))
         print('  a cut keeps: items drawing with an earlier item\'s state %d; other segments inside a chunk\'s span %d (over %d frames)' % (
             r['items_with_inherited_state'], r['others_inside_chunk_spans'], r['frames']))
+        print('  cut: %d of the parallel-fors, %.2f pieces a flip past the game\'s; items not in one chunk %d, chunks overlapping %d; '
+              'other segments inside a run\'s pieces %d, ties with a piece %d' % (
+                  r['parallel_fors_cut'], r['pieces_past_the_game'], r['items_uncovered'], r['chunks_overlapping'],
+                  r['others_inside_run_spans'], r['ties_with_a_run_piece']))
     if a.json:
         json.dump(res, open(a.json, 'w'), indent=1)
 

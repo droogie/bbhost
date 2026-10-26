@@ -133,6 +133,7 @@ add_executable(bbhost
   src/host/bindings.cpp
   src/host/audio.cpp
   src/host/frame_stats.cpp
+  src/host/draw_digest.cpp
   src/host/perf_meter.cpp
   src/host/main_wait.cpp
   src/host/sampler.cpp
