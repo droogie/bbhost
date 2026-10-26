@@ -2,15 +2,21 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
+#include "hle/guest_fs.h"
 #include "host/plugins.h"
 #include "log.h"
 #include "net/account.h"
+#include "net/session.h"
 
 #include <atomic>
 #include <mutex>
+#include <set>
 
 #if defined(BBHOST_HAVE_CURL)
 #include <curl/curl.h>
+#endif
+#if !defined(_WIN32)
+#include <pthread.h>
 #endif
 
 namespace net {
@@ -19,6 +25,33 @@ namespace {
 
 #if defined(BBHOST_HAVE_CURL)
 std::once_flag g_once;
+
+// A request from a thread that runs the game's code - an HLE entry's caller,
+// which the game waits on - instead of one of ours (the dispatcher, the
+// poller, the keepalive, the options' threads): said once per path, so one
+// that comes back shows in the first log that has it.
+// sceNpMatching2LeaveRoom and sceNpSignalingActivateConnection waited so
+// for the server until 2026-10-25.
+void note_game_thread(const std::string& url) {
+    if (!t_guest_fs || on_dispatcher()) return;
+    std::string path = url;
+    if (const std::size_t s = path.find("://"); s != std::string::npos) {
+        const std::size_t slash = path.find('/', s + 3);
+        path = slash == std::string::npos ? "/" : path.substr(slash);
+    }
+    if (const std::size_t q = path.find('?'); q != std::string::npos) path.resize(q);
+    static std::mutex mu;
+    static std::set<std::string> said;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!said.insert(path).second) return;
+    }
+    char name[32] = "?";
+#if !defined(_WIN32)
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
+    host_log("net: %s asked on the game's thread %s, which waits for the server's answer", path.c_str(), name);
+}
 
 std::size_t write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* user) {
     static_cast<std::string*>(user)->append(ptr, size * nmemb);
@@ -42,6 +75,7 @@ struct KeptHandle {
 
 HttpResult perform(const std::string& url, const std::string* post, const HttpCall& call) {
     std::call_once(g_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    note_game_thread(url);
     HttpResult r;
     thread_local KeptHandle kept;
     CURL* c = nullptr;

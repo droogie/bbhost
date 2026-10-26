@@ -100,6 +100,28 @@ GUEST_ABI int sig_delete_ctx(unsigned ctx) {
     }
     return 0;
 }
+// The server's address for a connection whose peer was not known at its
+// activation (sig_activate), on the dispatcher: a provisional peer there and
+// the connection announced, unless it went away or its peer joined the room
+// in the meantime (hle_np_signaling_peer_known announced it then).
+void resolve_conn(unsigned conn_id, const std::string& peer) {
+    std::uint32_t addr = 0;
+    std::uint16_t port = 0;
+    std::string error;
+    const bool ok = net::server_signaling_resolve(peer, &addr, &port, error);
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!ok) {
+        host_log("np: conn %u to %s: not known and not resolved: %s", conn_id, peer.c_str(), error.c_str());
+        return;
+    }
+    auto it = g_conn.find(conn_id);
+    if (it == g_conn.end() || it->second.dead || it->second.member_id) return;
+    it->second.member_id = net::peers_provisional(peer, addr, port).member_id;
+    host_log("np: conn %u to %s resolved %u.%u.%u.%u:%u", conn_id, peer.c_str(), addr & 0xff, (addr >> 8) & 0xff,
+             (addr >> 16) & 0xff, addr >> 24, port);
+    announce_locked(conn_id, it->second);
+}
+
 // (ctxId, const SceNpId* peer, connId*): idempotent per peer, as the fork
 // found the game re-activates.
 GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
@@ -123,28 +145,21 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
     c.online_id = peer;
     net::Peer p;
     if (net::peers_find_online(peer, &p)) c.member_id = p.member_id;
-    std::string how = c.member_id ? "" : " (peer not known yet)";
+    g_conn[id] = c;
+    *conn_out = id;
     if (!c.member_id) {
         // The host activates its connection to the guest it summons before
         // the guest is a room member; on PSN the signaling server resolved
-        // the address, here ours does, from the peer's context_start.
-        std::uint32_t addr = 0;
-        std::uint16_t port = 0;
-        std::string error;
-        if (net::server_signaling_resolve(peer, &addr, &port, error)) {
-            const net::Peer prov = net::peers_provisional(peer, addr, port);
-            c.member_id = prov.member_id;
-            char text[64];
-            std::snprintf(text, sizeof(text), " (resolved %u.%u.%u.%u:%u)", addr & 0xff, (addr >> 8) & 0xff,
-                          (addr >> 16) & 0xff, addr >> 24, port);
-            how = text;
-        } else {
-            how = " (not known and not resolved: " + error + ")";
-        }
+        // the address, here ours does, from the peer's context_start - asked
+        // from the dispatcher (resolve_conn), and the connection is announced
+        // with the answer. Until 2026-10-25 the game's thread waited here for
+        // it, with g_mu held.
+        host_log("sceNpSignalingActivateConnection %s -> conn %u (peer not known yet: asking the server)", peer.c_str(),
+                 id);
+        net::dispatch_after(0, net::Prio::Signaling, [id, peer] { resolve_conn(id, peer); });
+        return 0;
     }
-    g_conn[id] = c;
-    *conn_out = id;
-    host_log("sceNpSignalingActivateConnection %s -> conn %u%s", peer.c_str(), id, how.c_str());
+    host_log("sceNpSignalingActivateConnection %s -> conn %u", peer.c_str(), id);
     announce_locked(id, g_conn[id]);
     return 0;
 }

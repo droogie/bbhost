@@ -424,7 +424,10 @@ void forget_room_locked() {
 }
 
 // Our LeaveRoom (or the context going away): out of the server's room,
-// DEAD for every member, then 0x103 at +300 ms.
+// DEAD for every member, then 0x103 at +300 ms. The leave goes to the server
+// from the dispatcher, ahead of the DEADs and 0x103 queued after it: until
+// 2026-10-25 LeaveRoom's caller, a game thread, waited here under g.mu for
+// the server's answer (a round trip, the whole 5 s timeout for a slow server).
 void end_session_locked(const char* why) {
     if (!g.in_room && !g.leave_pending) return;
     g_restore_world = true;
@@ -432,9 +435,11 @@ void end_session_locked(const char* why) {
     if (!g.session_id.empty()) {
         const std::string sid = g.session_id;
         const int mid = g.member_id;
-        json::Value reply;
-        std::string err;
-        net::server_leave_room(sid, mid, reply, err);
+        net::dispatch_after(0, net::Prio::Context, [sid, mid] {
+            json::Value reply;
+            std::string err;
+            if (!net::server_leave_room(sid, mid, reply, err)) host_log("np: leave_room failed: %s", err.c_str());
+        });
     }
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) ids.push_back(p.member_id);

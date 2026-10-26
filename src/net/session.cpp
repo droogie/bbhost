@@ -255,8 +255,11 @@ void poller_main(std::uint64_t gen) {
 // "off" disables), asked at context_start and again when the cached answer
 // is over two minutes old. The server records it as MappedAddr/MappedPort
 // and hands it to peers instead of the LAN address when the two differ.
+// mu guards the answer and is never held across the exchange; refresh_mu
+// keeps the exchanges to one at a time.
 struct Mapped {
     std::mutex mu;
+    std::mutex refresh_mu;
     std::string addr;
     int port = 0;
     std::int64_t at_ms = 0;
@@ -286,11 +289,24 @@ void stun_server(std::string* host, std::uint16_t* port) {
     *host = spec;
 }
 
+bool mapped_fresh_locked() { return g_mapped.asked && now_ms() - g_mapped.at_ms < 120000; }
+
+// Until 2026-10-25 this held g_mapped.mu through the exchange - three 1 s
+// attempts and a name lookup when the server does not answer - so the
+// dispatcher's create and join (our_endpoint) waited out every keepalive
+// that ran when they did.
 void mapped_refresh(bool force) {
-    std::lock_guard<std::mutex> lk(g_mapped.mu);
-    if (!force && g_mapped.asked && now_ms() - g_mapped.at_ms < 120000) return;
-    g_mapped.asked = true;
-    g_mapped.at_ms = now_ms();
+    if (!force) {
+        std::lock_guard<std::mutex> lk(g_mapped.mu);
+        if (mapped_fresh_locked()) return;
+    }
+    std::lock_guard<std::mutex> one(g_mapped.refresh_mu);
+    {
+        std::lock_guard<std::mutex> lk(g_mapped.mu);
+        if (!force && mapped_fresh_locked()) return;  // asked while this one waited its turn
+        g_mapped.asked = true;
+        g_mapped.at_ms = now_ms();
+    }
     if (config().stun_server == "off") return;
     std::string host;
     std::uint16_t sport = 0;
@@ -314,6 +330,7 @@ void mapped_refresh(bool force) {
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
         }
     }
+    std::lock_guard<std::mutex> lk(g_mapped.mu);
     if (!ok) {
         if (!g_mapped.addr.empty()) return;  // keep the last answer
         host_log("stun: no answer from %s:%u; the server gets the LAN address only (online.p2p_addr)", host.c_str(),
