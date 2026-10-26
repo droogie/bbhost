@@ -14,6 +14,7 @@ Environment:
     GH_TOKEN               a token to read the release (optional for a public repo)
     DISCORD_BOT_TOKEN      the bot's token
     DISCORD_CHANNEL_ID     the channel to post in
+    DISCORD_ROLE_ID        the role the post pings (the server's release alerts); without it nobody is pinged
     DRY_RUN=1              print the message instead of posting it
 """
 import json
@@ -70,7 +71,7 @@ def downloads(assets: list) -> str:
     return " · ".join(out)[:FIELD_MAX]
 
 
-def message(rel: dict) -> dict:
+def message(rel: dict, role: str = "") -> dict:
     tag, url = rel["tag_name"], rel["html_url"]
     embed = {"title": f"bbhost {tag} is out", "url": url,
              "description": notes(rel.get("body", ""), url) or f"[Release notes]({url})",
@@ -82,7 +83,13 @@ def message(rel: dict) -> dict:
         embed["fields"] = fields
     if rel.get("published_at"):
         embed["timestamp"] = rel["published_at"]
-    return {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    msg = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    if role:
+        # The release alerts' role, in the message itself (a mention in an
+        # embed never notifies), and allowed alone: the notes still ping nobody.
+        msg["content"] = f"<@&{role}>"
+        msg["allowed_mentions"]["roles"] = [role]
+    return msg
 
 
 def main() -> int:
@@ -92,7 +99,11 @@ def main() -> int:
     if rel.get("draft") or rel.get("prerelease"):
         print(f"{rel['tag_name']}: a draft or pre-release, not announced")
         return 0
-    payload = message(rel)
+    role = os.environ.get("DISCORD_ROLE_ID", "").strip()
+    if role and not role.isdigit():
+        print(f"DISCORD_ROLE_ID {role!r} is not a role id: posting without the ping", file=sys.stderr)
+        role = ""
+    payload = message(rel, role)
     if os.environ.get("DRY_RUN") == "1":
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0

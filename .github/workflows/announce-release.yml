@@ -10,7 +10,8 @@
 # - A release published by a person (or by an API call with a personal
 #   token), for instance a draft published once its notes are final.
 #
-# Needs the DISCORD_BOT_TOKEN secret. The channel id is not a secret.
+# Needs the DISCORD_BOT_TOKEN secret. The channel id and the id of the role
+# the post pings (@releases, the release alerts) are not secrets.
 name: announce release
 on:
   release:
@@ -33,6 +34,7 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: '1557561169768742986'
+          DISCORD_ROLE_ID: '1564109698104426496'
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: python3 tools/announce_release.py "$TAG"

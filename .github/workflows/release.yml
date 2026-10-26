@@ -221,5 +221,6 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: '1557561169768742986'
+          DISCORD_ROLE_ID: '1564109698104426496'   # @releases, the release alerts' role
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/announce_release.py "$GITHUB_REF_NAME"
