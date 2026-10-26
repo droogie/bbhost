@@ -35,6 +35,7 @@
 #include <linux/perf_event.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -497,6 +498,14 @@ void meter_thread() {
     Snap prev = take_snap(main);
     std::uint64_t last_flip_ns = 0;
     std::uint64_t loading_ticks = 0, ticks = 0;
+#if !defined(_WIN32)
+    std::uint64_t self_last_ns = 0;
+    {
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        self_last_ns = static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+    }
+#endif
     double since_scan = -1;
     auto next = std::chrono::steady_clock::now();
     for (;;) {
@@ -605,7 +614,16 @@ void meter_thread() {
         x.gx_workers = cpu.count[kRoleGx];
         x.cp_workers_ms = cpu.ms[kRoleCpWorker];
         x.record_cpu_ms = cpu.ms[kRoleRecord];
+#if !defined(_WIN32)
+        // Its own thread's CPU time to the nanosecond (the tick counts read 0 or 10 ms a second).
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        const std::uint64_t self_ns = static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+        x.meter_ms = static_cast<double>(self_ns - self_last_ns) / 1e6;
+        self_last_ns = self_ns;
+#else
         x.meter_ms = cpu.ms[kRoleMeter];
+#endif
         x.stopped_ms = static_cast<double>(now.main.stopped_ns - prev.main.stopped_ns) / 1e6;
         const bottleneck::Verdict v = bottleneck::classify(w);
         std::uint32_t block = 0;
@@ -614,10 +632,18 @@ void meter_thread() {
         {
             std::lock_guard<std::mutex> lk(g_summary_mu);
             Summary& s = g_summary;
-            // A summary is one place: the player's map changed, the last one's goes out.
-            if (s.secs > 0 && (block_known != s.block_known || (block_known && block != s.block))) flush_summary_locked("perf summary");
-            g_summary.block = block;
-            g_summary.block_known = block_known;
+            // A summary is one place: the player's map changed (or a load
+            // left it unknown), the last one's goes out - when it has ten
+            // seconds; a shorter one (a load's, a travel's) goes on into the
+            // next place's.
+            const bool moved = block_known != s.block_known || (block_known && block != s.block);
+            if (moved && s.secs >= 10) flush_summary_locked("perf summary");
+            if (moved && block_known) {
+                g_summary.block = block;
+                g_summary.block_known = true;
+            } else if (moved && g_summary.secs == 0) {
+                g_summary.block_known = false;
+            }
             add_window(g_summary, w, v, iv, x);
             g_run_seconds[static_cast<int>(v.limit)] += secs;
             g_run_secs += secs;
