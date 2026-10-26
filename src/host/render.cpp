@@ -10,6 +10,7 @@
 #include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
+#include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
 #include "host/import_fallback.h"
 #include "host/label_landing.h"
@@ -290,6 +291,11 @@ struct GfxPipeline {
     VkShaderModule gs_vs_module = VK_NULL_HANDLE;
     std::uint32_t gs_vertices = 0;  // a particle's vertices: one strip of them (gs_strip), or quads
     bool gs_strip = false;
+    // One strip whose emits past gs_gate.vertices the GS makes only with a
+    // constant-buffer dword above 0 (host/gs_emit_gate.h; the standard
+    // particle's trail): a draw with that dword at 0 or less draws each
+    // particle's first gs_gate.vertices of its strip.
+    GsEmitGate gs_gate;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
@@ -906,6 +912,10 @@ std::atomic<std::uint64_t> g_gs_drawn{0};
 // vertices each) and the most particles one had room for.
 std::atomic<std::uint64_t> g_gs_vs_draws{0}, g_gs_vs_vertices{0};
 std::atomic<std::uint32_t> g_gs_vs_capacity_max{0};
+// Of them, those of a strip GS with an emit gate (GfxPipeline::gs_gate): with
+// the gate shut (each particle's first gs_gate.vertices drawn), open, or its
+// dword not read (both drawn whole).
+std::atomic<std::uint64_t> g_gs_gate_shut{0}, g_gs_gate_open{0}, g_gs_gate_unread{0};
 std::mutex g_gs_mu;
 std::map<std::string, std::uint64_t> g_gs_refused, g_gs_as_vs;  // under g_gs_mu
 std::set<std::string> g_gs_pipelines;                           // under g_gs_mu: the GS pipelines built, by name
@@ -5583,8 +5593,10 @@ bool build_gs_vertex_stage(GfxPipeline& pl, std::string& why) {
 // particle's triangles in Vulkan's strip order, so each one's provoking vertex
 // is the strip's: for quads (key 0) unit j is quad j, 4j+0, 4j+1, 4j+2, 4j+1,
 // 4j+3, 4j+2; for one strip of n vertices (key n) unit p is particle p, its
-// triangle i (p n + i, p n + i+1+i%2, p n + i+2-i%2). Grown by doubling; a
-// replaced buffer stays (draws in flight read it).
+// triangle i (p n + i, p n + i+1+i%2, p n + i+2-i%2); for the first u vertices
+// of such a strip (key n | u << 16: a GS's emit gate shut), its triangles
+// below u - 2, the same indices, so the vertex stage runs for those vertices
+// alone. Grown by doubling; a replaced buffer stays (draws in flight read it).
 struct QuadIndices {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -5592,14 +5604,15 @@ struct QuadIndices {
 };
 std::map<std::uint32_t, std::vector<QuadIndices>> g_quad_indices;  // under g.mu, by key; the last of each is the one drawn with
 constexpr std::uint64_t kQuadIndicesMax = 1ull << 24;  // vertices a list indexes
-// A unit's vertices and indices.
-std::uint32_t particle_unit_vertices(std::uint32_t key) { return key ? key : 4; }
-std::uint32_t particle_unit_indices(std::uint32_t key) { return key ? 3 * (key - 2) : 6; }
+// A unit's vertices (what its indices step by) and indices.
+std::uint32_t particle_unit_vertices(std::uint32_t key) { return key ? key & 0xffff : 4; }
+std::uint32_t particle_unit_drawn(std::uint32_t key) { return key >> 16 ? key >> 16 : particle_unit_vertices(key); }
+std::uint32_t particle_unit_indices(std::uint32_t key) { return key ? 3 * (particle_unit_drawn(key) - 2) : 6; }
 
 VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
     std::vector<QuadIndices>& lists = g_quad_indices[key];
     if (!lists.empty() && lists.back().quads >= quads) return lists.back().buffer;
-    const std::uint32_t uv = particle_unit_vertices(key), ui = particle_unit_indices(key);
+    const std::uint32_t uv = particle_unit_vertices(key), ui = particle_unit_indices(key), drawn = particle_unit_drawn(key);
     if (quads * uv > kQuadIndicesMax) return VK_NULL_HANDLE;
     std::uint64_t n = lists.empty() ? (1ull << 16) / uv : lists.back().quads * 2;
     while (n < quads) n *= 2;
@@ -5629,7 +5642,7 @@ VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
     for (std::uint64_t j = 0; j < n; ++j) {
         const std::uint32_t v = static_cast<std::uint32_t>(uv * j);
         std::uint32_t* out = idx + ui * j;
-        for (std::uint32_t i = 0; i + 2 < uv; ++i) {  // the strip's triangle i (a quad: triangles 0 and 1)
+        for (std::uint32_t i = 0; i + 2 < drawn; ++i) {  // the strip's triangle i (a quad: triangles 0 and 1)
             *out++ = v + i;
             *out++ = v + i + 1 + i % 2;
             *out++ = v + i + 2 - i % 2;
@@ -5638,8 +5651,10 @@ VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
     vkUnmapMemory(g.device, q.memory);
     lists.push_back(q);
     host_log("render: the particles' index list for %s holds %llu of them (%llu KiB)",
-             key ? ("strips of " + std::to_string(key)).c_str() : "quads", static_cast<unsigned long long>(n),
-             static_cast<unsigned long long>(bci.size >> 10));
+             !key ? "quads"
+             : key >> 16 ? ("the first " + std::to_string(key >> 16) + " of strips of " + std::to_string(key & 0xffff)).c_str()
+                         : ("strips of " + std::to_string(key)).c_str(),
+             static_cast<unsigned long long>(n), static_cast<unsigned long long>(bci.size >> 10));
     return q.buffer;
 }
 
@@ -5715,6 +5730,42 @@ bool particle_args_each() {
         return e && std::strcmp(e, "each") == 0;
     }();
     return each;
+}
+
+// BBHOST_GX_PARTICLE_GATE=0: a strip GS's particles drawn whole whatever its
+// emit gate's dword (GfxPipeline::gs_gate).
+bool particle_gate_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GX_PARTICLE_GATE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Of each particle, the vertices a draw of a strip GS with an emit gate
+// draws: the gate's when its dword - in the GS's constant buffer at `bases`,
+// as the draw records - is 0 or less, so no particle can emit more; else all
+// of them. The GPU reads the bytes this does: the snapshot taken as the draw
+// records, or the memory itself, which nothing changes before the draw runs
+// when no GPU write is still to land on it.
+std::uint32_t particle_gate_vertices_locked(const GfxPipeline& pl, const gcn::TranslateResult& gs, const std::uint64_t* bases) {
+    const GsEmitGate& gate = pl.gs_gate;
+    for (std::size_t i = 0; i < gs.buffers.size(); ++i) {
+        const gcn::BufferBinding& b = gs.buffers[i];
+        if (b.path.user_sgpr != static_cast<int>(gate.vsharp_sgpr) || !b.path.immediate || !b.path.loads.empty() || b.pointer) continue;
+        const std::uint64_t at = bases[i] + 4ull * gate.dword;
+        if (!bases[i] || !hle_kernel_va_mapped(at, 4) || gpu_writes_pending_locked(at, 4)) break;
+        std::int32_t v;
+        std::memcpy(&v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), 4);
+        if (v > 0) {
+            g_gs_gate_open.fetch_add(1, std::memory_order_relaxed);
+            return pl.gs_vertices;
+        }
+        g_gs_gate_shut.fetch_add(1, std::memory_order_relaxed);
+        return gate.vertices;
+    }
+    g_gs_gate_unread.fetch_add(1, std::memory_order_relaxed);
+    return pl.gs_vertices;
 }
 
 // A buffer with a device address, its memory of the first type that has
@@ -6569,6 +6620,11 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // The ES and the GS as one vertex stage, or the pipeline is not built
         // (BBHOST_GX_PARTICLES=gs, a debug switch: with the geometry stage).
         if (particle_path() == ParticlePath::kVs && !build_gs_vertex_stage(pl, why)) return fail("geometry-shader pipeline as a vertex stage: " + why);
+        if (pl.gs_as_vs && pl.gs_strip && particle_gate_on()) {
+            const gcn::Program gp = gcn::decode(vs_words.data(), vs_words.size());
+            const GsEmitGate gate = gs_emit_gate(gp, (s.vs_rsrc2 >> 1) & 0x1f);
+            if (gate.vertices >= 3 && gate.vertices < pl.gs_vertices) pl.gs_gate = gate;
+        }
         std::lock_guard<std::mutex> lk(g_gs_mu);
         if (g_gs_pipelines.insert(pl.name).second) {
             host_log("render: geometry-shader pipeline %s: ES 0x%llx as the vertex stage (%u ring dwords), GS as the geometry stage (%u vertices of %u "
@@ -12130,9 +12186,12 @@ void render_report() {
         }
         if (g_gs_vs_draws.load()) {
             host_log("render: of them as one vertex stage (the GPU particles' default; BBHOST_GX_PARTICLES=gs draws them with the geometry "
-                     "shader): %llu, their emitters' room %llu vertices, the most room %u particles",
+                     "shader): %llu, their emitters' room %llu vertices, the most room %u particles; of a GS with an emit gate %llu with "
+                     "it shut (a particle's first vertices drawn), %llu open, %llu whose gate was not read (BBHOST_GX_PARTICLE_GATE=0: "
+                     "every one whole)",
                      static_cast<unsigned long long>(g_gs_vs_draws.load()), static_cast<unsigned long long>(g_gs_vs_vertices.load()),
-                     g_gs_vs_capacity_max.load());
+                     g_gs_vs_capacity_max.load(), static_cast<unsigned long long>(g_gs_gate_shut.load()),
+                     static_cast<unsigned long long>(g_gs_gate_open.load()), static_cast<unsigned long long>(g_gs_gate_unread.load()));
         }
     }
     {
@@ -13633,10 +13692,11 @@ const bool g_cb_prefetch = [] {
 // `exact` (cb_exact_bindings, a pushed stage): every binding starts at its V#
 // base, its bias 0 - a shader translated with cb_bias_zero reads none.
 // `records`, when given: the most records a V# read by index holds (a
-// geometry-shader draw's emitter's room for particles).
+// geometry-shader draw's emitter's room for particles). `bases`, when given:
+// each buffer's V# base (0 for one not resolved), meta.buffers.size() of them.
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
                            std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
-                           std::uint32_t* records = nullptr) {
+                           std::uint32_t* records = nullptr, std::uint64_t* bases = nullptr) {
     // Why V#s end up on the page-table path, logged every 200,000 resolves.
     enum { kBound, kNoBase, kUnaligned, kUnmapped, kTooLong, kOutcomes };
     static std::uint64_t outcomes[kOutcomes] = {};
@@ -13688,6 +13748,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        if (bases) bases[i] = base;
         // A buffer the game writes on the CPU is copied as the draw records
         // (BBHOST_CB_SNAPSHOT, below), from memory a game thread has just
         // written - its lines in that core's cache. Asked for here, ahead of
@@ -20107,6 +20168,7 @@ static bool draw_impl(const GpuDraw& d) {
     // at their device address, which the GS's params hold.
     VkDeviceAddress particle_args = 0;
     std::uint32_t particle_capacity = 0;  // the emitter's room for particles (its ES's buffers, set 4 below)
+    std::uint32_t particle_vertices = pl.gs_vertices;  // of each particle's, the draw's (its GS's emit gate, below)
     if (pl.gs_native && pl.gs_as_vs) {
         if (g.oob.address) return gs_refuse("BBHOST_OOB_COUNT takes the params' LDS address (as a vertex stage)");
         Located in_copy_at;
@@ -20259,7 +20321,11 @@ static bool draw_impl(const GpuDraw& d) {
             std::memcpy(params.vertex_formats, t_tess->hs_user, sizeof(params.vertex_formats));
             if (gx_stage[0]) put_tess_constants(*gx_stage[0], t_tess->tess_vsharp, params.user_sgpr);
         }
-        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings());
+        std::uint64_t gate_bases[16] = {};
+        const bool gate = st == 0 && pl.gs_as_vs && pl.gs_gate.vertices && meta.buffers.size() <= 16;
+        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
+                              gate ? gate_bases : nullptr);
+        if (gate) particle_vertices = particle_gate_vertices_locked(pl, meta, gate_bases);
         if (!meta.buffers.empty()) {
             any_buffers = true;
             all_bound = all_bound && params.cb_valid == (1u << meta.buffers.size()) - 1;
@@ -21440,7 +21506,8 @@ static bool draw_impl(const GpuDraw& d) {
         // slot of live-count arguments when the last pass wrote it, else for
         // the emitter's room of particles. Its arguments are read by the
         // stage itself.
-        const std::uint32_t key = pl.gs_strip ? pl.gs_vertices : 0;
+        // (A strip GS whose emit gate is shut: each particle's first vertices.)
+        const std::uint32_t key = !pl.gs_strip ? 0 : pl.gs_vertices | (particle_vertices < pl.gs_vertices ? particle_vertices << 16 : 0u);
         const std::uint64_t units = pl.gs_strip ? particle_capacity : static_cast<std::uint64_t>(particle_capacity) * (pl.gs_vertices / 4);
         const VkBuffer ib = quad_indices_locked(key, units);
         if (!ib) {
@@ -21473,7 +21540,7 @@ static bool draw_impl(const GpuDraw& d) {
         occlusion_draw_locked(call);
         cmds.draw(call);
         g_gs_vs_draws.fetch_add(1, std::memory_order_relaxed);
-        g_gs_vs_vertices.fetch_add(static_cast<std::uint64_t>(particle_capacity) * pl.gs_vertices, std::memory_order_relaxed);
+        g_gs_vs_vertices.fetch_add(static_cast<std::uint64_t>(particle_capacity) * particle_vertices, std::memory_order_relaxed);
         if (particle_capacity > g_gs_vs_capacity_max.load(std::memory_order_relaxed)) g_gs_vs_capacity_max.store(particle_capacity, std::memory_order_relaxed);
     } else if (d.indirect_va) {
         // What the GPU reads: five dwords for an indexed draw, four otherwise

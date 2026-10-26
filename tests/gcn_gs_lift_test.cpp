@@ -14,6 +14,7 @@
 #include "gcn/lift.h"
 #include "gcn/translate.h"
 #include "host/dxc.h"
+#include "host/gs_emit_gate.h"
 
 #include <spirv-tools/libspirv.hpp>
 
@@ -307,6 +308,27 @@ void splice(const Shader& gs, const gcn::LiftResult& el, const gcn::LiftResult& 
     // the end - one strip of up to eight. The spark: ten strips of four.
     if (std::strstr(gs.name.c_str(), "StandardParticle")) CHECK(vs.vertices == 8 && vs.strip);
     if (std::strstr(gs.name.c_str(), "SparkParticle")) CHECK(vs.vertices == 40 && !vs.strip);
+    // The standard particle's trail (its first four emits) only when its
+    // constant buffer's dword 13 is above 0 (host/gs_emit_gate.h): four vertices
+    // with that shut. The others have no such gate.
+    const GsEmitGate gate = gs_emit_gate(gs.program, (gs.regs[5] >> 1) & 0x1f);
+    std::printf("  emit gate: %u vertices with it shut (%u in its region), CB in user SGPRs %u.., dword %u\n", gate.vertices, gate.gated,
+                gate.vsharp_sgpr, gate.dword);
+    if (std::strstr(gs.name.c_str(), "StandardParticle")) {
+        CHECK(gate.vertices == 4 && gate.gated == 4 && gate.vsharp_sgpr == 4 && gate.dword == 13);
+        // A compare against 1, or a load at an offset in an SGPR, is no gate.
+        gcn::Program cmp1 = gs.program, soff = gs.program;
+        for (gcn::Inst& in : cmp1.insts) {
+            if (in.enc == gcn::Enc::VOP3 && std::strcmp(gcn::mnemonic(in), "v_cmp_gt_i32") == 0 && in.src1 == gcn::kConst0) in.src1 = gcn::kConst0 + 1;
+        }
+        for (gcn::Inst& in : soff.insts) {
+            if (in.enc == gcn::Enc::SMRD && in.imm == 13) in.imm_flag = false;
+        }
+        CHECK(gs_emit_gate(cmp1, (gs.regs[5] >> 1) & 0x1f).vertices == 0);
+        CHECK(gs_emit_gate(soff, (gs.regs[5] >> 1) & 0x1f).vertices == 0);
+        CHECK(gs_emit_gate(gs.program, 4).vertices == 0);  // the V# past the user SGPRs
+    }
+    if (std::strstr(gs.name.c_str(), "SparkParticle") || std::strstr(gs.name.c_str(), "WanderingVision")) CHECK(gate.vertices == 0);
     // A GS one emit short of whole quads on its every path is refused.
     if (particle) {
         const gcn::GsVertexStage cut = gcn::gs_vertex_stage(el.spirv, without_emits(glr.spirv, 1));

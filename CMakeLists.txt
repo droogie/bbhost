@@ -71,6 +71,7 @@ add_executable(bbhost
   src/core/sfo.cpp
   src/core/image_file.cpp
   src/host/tess_lds.cpp
+  src/host/gs_emit_gate.cpp
   src/engine/guest.cpp
   src/engine/patch_manifest.cpp
   src/engine/gx_resources.cpp
@@ -881,7 +882,7 @@ if(UNIX)
     add_test(NAME gcn_tess_lift_test COMMAND gcn_tess_lift_test)
     set_tests_properties(gcn_tess_lift_test PROPERTIES SKIP_RETURN_CODE 77)
     # The geometry-shader lifts (ES and GS) on the effects bundle's particles, through HLSL and DXC where installed.
-    add_executable(gcn_gs_lift_test tests/gcn_gs_lift_test.cpp src/host/dxc.cpp)
+    add_executable(gcn_gs_lift_test tests/gcn_gs_lift_test.cpp src/host/dxc.cpp src/host/gs_emit_gate.cpp)
     target_link_libraries(gcn_gs_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB} ${CMAKE_DL_LIBS})
     add_test(NAME gcn_gs_lift_test COMMAND gcn_gs_lift_test)
     set_tests_properties(gcn_gs_lift_test PROPERTIES SKIP_RETURN_CODE 77)

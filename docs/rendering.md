@@ -166,7 +166,12 @@ so the provoking vertex of every triangle is the strip's: one strip a
 particle where the geometry shader cuts only after its last emit (the
 standard particles), else strips of four (the sparks); a vertex past its
 particle's emits is its last emit, which leaves every triangle it is in
-without area.
+without area. A standard particle's first four emits are its trail's, made
+only when a dword of its geometry shader's constant buffer is above 0
+(`host/gs_emit_gate.h` finds that gate in the program): a draw with the dword at
+0 or less, as the draw records it, draws each particle's first four vertices
+alone - all a particle can emit then - and runs the vertex stage half as often
+(`BBHOST_GX_PARTICLE_GATE=0`: all eight).
 
 The stage reads the simulation's indirect arguments itself and leaves out
 every particle at or past their count. The draw takes the live count: after
