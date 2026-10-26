@@ -26,6 +26,7 @@ void decomp_gx_resources_add();        // gx/resources.cpp: GX's CreateBuffer - 
 void decomp_water_gate_add();          // gx/water_gate.cpp: the water interaction's wave steps at 30 a game second
 void decomp_gx_blink_add();            // gx/blink.cpp: the GX lights' blink, its cycles begun on whole effect steps
 void decomp_gx_upload_heap_add();      // gx/upload_heap.cpp: the upload heap's pool made over its region - the host's, when it gives one
+void decomp_gx_render_queue_add();     // gx/render_queue.cpp: the scene's render queue cut into GX jobs, and its census (BBHOST_RQ_CENSUS=1)
 void decomp_gnmx_cue_add();            // gnmx/cue.cpp: Gnmx's constant update engine around the flip pass's draw
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
 void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
@@ -64,6 +65,7 @@ void decomp_add_areas() {
     decomp_water_gate_add();
     decomp_gx_blink_add();
     decomp_gx_upload_heap_add();
+    decomp_gx_render_queue_add();
     decomp_gnmx_cue_add();
     decomp_yebis_gnm_add();
     decomp_yebis_context_add();

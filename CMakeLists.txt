@@ -387,6 +387,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/water_gate.cpp
   src/decomp/gx/blink.cpp
   src/decomp/gx/upload_heap.cpp
+  src/decomp/gx/render_queue.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
@@ -709,6 +710,7 @@ if(UNIX)
   bbhost_decomp_test(gx_upload_heap)
   bbhost_decomp_test(gx_water_gate)
   bbhost_decomp_test(gx_blink)
+  bbhost_decomp_test(gx_render_queue SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
