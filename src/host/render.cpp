@@ -682,18 +682,6 @@ const bool g_set_cache = [] {
 }();
 bool set_cache_on() { return g_set_cache; }
 bool cb_push_on() { return g_set_cache && g.has_push_descriptor; }
-// BBHOST_VLINE_OLD=1: the point sprites' LS as it was before its constant
-// buffers were bound at their own first bytes (the bias taken from the
-// evaluation stage's params, a copy bound over the whole copies' ring) - the
-// vertical line at the frame's centre. A control for this release's tests,
-// to be removed after it.
-bool vline_old() {
-    static const bool on = [] {
-        const char* e = std::getenv("BBHOST_VLINE_OLD");
-        return e && e[0] == '1';
-    }();
-    return on;
-}
 // BBHOST_CB_EXACT=0: a draw's constant buffers bound over the V# base aligned
 // down, or a snapshot's over the whole ring, with each one's dword bias in the
 // params (StageParams::cb_bias_dw), as before. Otherwise, pushed and on a
@@ -6826,7 +6814,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     gcn::TranslateOptions vo4 = vo;
                     vo4.cb_descriptor_set = static_cast<int>(kTessNativeSet);
                     vo4.cb_binding_base = kTessNativeLsBuffers;
-                    vo4.cb_bias_zero = !vline_old();
+                    vo4.cb_bias_zero = true;
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
                     hlsl_name_next(ls->name);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
@@ -21462,7 +21450,7 @@ static bool draw_impl(const GpuDraw& d) {
         // the whole copies' ring with the copy's place as its bias, the bias
         // was dropped: the LS read the ring's first copy, another draw's
         // constants, and its particles fell at the frame's centre as a line.
-        resolve_stage_buffers(lm, lp.user_sgpr, lp, ls_infos, nullptr, !vline_old());
+        resolve_stage_buffers(lm, lp.user_sgpr, lp, ls_infos, nullptr, true);
         if (!every_buffer_bound(lp, lm) || !(tess_set = alloc_set_locked(bind_pl->tess_set_layout))) {
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 4) host_log("render: pipeline %s: its LS's constant buffers do not all bind; draw skipped", bind_pl->name.c_str());
