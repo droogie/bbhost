@@ -83,17 +83,37 @@ check(not grep(host, r"session over \(last peer left\)|np: room \d+ gone"), "the
 check(len(grep(g1, r"np: joined room")) >= 2, "guest1 joined twice")
 g2_joined = grep(g2, r"np: joined room")
 check(len(g2_joined) == 1, f"guest2 joined once ({len(g2_joined)})")
-# guest2 keeps the room until the host's own run ends (the script stops the
-# host first; its heartbeat then lapses and guest2 hears ROOM_DESTROYED).
-events = [l for l in g2 if re.search(r"np: (member \d+ \(Hunter2\) joined|room \d+ gone)", l)]
-rejoin_at = max((i for i, l in enumerate(events) if "Hunter2) joined" in l), default=-1)
-early_loss = [l for l in events[:rejoin_at] if "gone" in l]
-late_loss = [l for l in events[rejoin_at + 1:] if "gone" in l]
-check(rejoin_at >= 1 and not early_loss, "guest2 kept the room through guest1's leave and return")
+# guest2 keeps the room from its own join through guest1's leave and return.
+# A ring keeps searching, so one ring can summon both cooperators, and either
+# can be first: guest2 may join before guest1 (it then sees guest1 join, leave
+# and join again) or after it (it sees guest1 leave and join again). Either
+# way the return is guest1's first join after a leave that guest2 saw.
+events = [l for l in g2 if re.search(r"np: (joined room|member \d+ \(Hunter2\) (joined|left)|room \d+ gone)", l)]
+own = next((i for i, l in enumerate(events) if "np: joined room" in l), None)
+left_at = next((i for i in range(own + 1, len(events)) if "Hunter2) left" in events[i]), None) if own is not None else None
+back_at = next((i for i in range(left_at + 1, len(events)) if "Hunter2) joined" in events[i]), None) if left_at is not None else None
+early_loss = [l for l in events[own:back_at] if "gone" in l] if back_at is not None else []
+late_loss = [l for l in events[back_at + 1:] if "gone" in l] if back_at is not None else []
+check(back_at is not None and not early_loss, "guest2 kept the room through guest1's leave and return")
 if late_loss:
     notes.append("     guest2 at the end: " + re.sub(r".*np: ", "", late_loss[0]))
 check(not grep(srv, r"join_room: no session found"), "no join went to a room the server no longer had")
-check(not grep(srv, r"MP session closed \(host left\)"), "the server never closed the host's room")
+# The host's room may close once its last cooperator has gone (the host's game
+# leaves an empty room itself), never while one is still in it or before
+# guest1's return.
+closed = [i for i, l in enumerate(srv) if re.search(r"MP session closed \(host left\)", l)]
+gone_at = {}
+for i, l in enumerate(srv):
+    m = re.search(r"MP session joined: .*guest=(Hunter[23])", l)
+    if m:
+        gone_at[m.group(1)] = None
+    m = re.search(r"name=room_member_left .*'OnlineId': '(Hunter[23])'", l)
+    if m and m.group(1) in gone_at and gone_at[m.group(1)] is None:
+        gone_at[m.group(1)] = i
+last_out = max((v for v in gone_at.values() if v is not None), default=-1)
+still_in = [k for k, v in gone_at.items() if v is None]
+check(not closed or (not still_in and closed[0] > last_out),
+      "the server closed the host's room only after its last cooperator left" if closed else "the server never closed the host's room")
 traffic = grep(g2, r"net: p2p port \d+ 60 s: .*vport 30")
 if traffic:
     m = re.search(r"vport 30 \(sock \d+\): in (\d+)/", traffic[-1])

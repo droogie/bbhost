@@ -2,8 +2,9 @@
 # Three real game instances in one co-op session, against a private server
 # on this machine, with a leave and a rejoin in the middle:
 #
-#   host    rings the Beckoning Bell twice (one ring summons one cooperator),
-#           waits for a cooperator to leave, rings again
+#   host    rings the Beckoning Bell twice, waits for a cooperator to
+#           leave, rings again (a ring keeps searching, so one can summon
+#           both cooperators, in either order: the verdict allows for it)
 #   guest1  rings the Small Resonant Bell, plays 90 s in the host's world,
 #           goes home with the Silencing Blank ("Return to Your Own World"),
 #           rings again from home and is summoned back
@@ -58,6 +59,11 @@ scheme = "http"
 verify_tls = false
 online_id = "$2"
 np_server = "http://127.0.0.1:18671"
+# A fresh config folder (BBHOST_CONFIG_DIR) gets require_account = true and
+# the live server as auth_server; this layer keeps both on this machine (a
+# signed-out game never goes online).
+require_account = false
+auth_server = "http://127.0.0.1:18671"
 stun_server = "127.0.0.2:3478"
 p2p_port = $3
 
