@@ -14,7 +14,8 @@ frame dump after it: --dumps 1). Per place:
   - the checks a cut of a chunk relies on: items that drew with state an earlier item of their chunk set (commands 1,
     2, 6, 7), and other segments of the frame's list whose order keys fall inside a chunk's span (a cut chunk's later
     pieces would sort after them);
-  - and on a build that cuts (BBHOST_RQ_SPLIT): the parallel-fors cut, their pieces past the game's own cuts; every
+  - the runs of the two entries the cut table changes (3e/00, 3e/05): those cut and those kept whole, with their items;
+  - and on a build that cuts (BBHOST_RQ_SPLIT): the parallel-fors that cut a run, their pieces past the game's own; every
     item of a parallel-for's range in one chunk exactly (gaps only where no table entry covers the keys, which the game
     draws nothing of); each run's pieces one after another in the frame's sorted segment list - no other segment's
     key after the run's first piece and up to its last item's, and none equal to a later piece's (the first piece's
@@ -166,12 +167,22 @@ def place(parts, chunks, appends, win):
             uncovered += p['end'] - pos
     cut = sum(1 for g in gl if g['part']['cut'])
     pieces = 0
+    # the runs of the two entries the cut table changes: those cut (split) and those that stayed one chunk
+    runs_cut = collections.defaultdict(lambda: [0, 0, 0])  # entry: runs, items, pieces
+    runs_kept = collections.defaultdict(lambda: [0, 0])    # entry: runs, items
     for g in gl:
-        if not g['part']['cut']:
-            continue
         for r in g['part']['runs']:
-            if r['how'] == 'split' and r['entry'] in (17, 19):
-                pieces += r['chunks'] - 1
+            if r['entry'] not in (17, 19):
+                continue
+            if r['how'] == 'split':
+                runs_cut[r['entry']][0] += 1
+                runs_cut[r['entry']][1] += r['n']
+                runs_cut[r['entry']][2] += r['chunks']
+                if g['part']['cut']:
+                    pieces += r['chunks'] - 1
+            elif r['how'] == 'one':
+                runs_kept[r['entry']][0] += 1
+                runs_kept[r['entry']][1] += r['n']
     run_inside = run_ties = 0
     gl_by_t = sorted(gl, key=lambda g: g['part']['t'])
     starts = [g['part']['t'] for g in gl_by_t]
@@ -221,6 +232,8 @@ def place(parts, chunks, appends, win):
                               on_main_thread=sum(1 for c in crit if c['worker'] == 0) / n),
                 items_with_inherited_state=inherits, frames=n_frames, others_inside_chunk_spans=inside,
                 parallel_fors_cut=cut, pieces_past_the_game=pieces / flips, items_uncovered=uncovered, chunks_overlapping=overlapped,
+                runs_cut={entry_name(e): dict(a_flip=v[0] / flips, items=v[1] / v[0], pieces=v[2] / v[0]) for e, v in sorted(runs_cut.items())},
+                runs_kept_whole={entry_name(e): dict(a_flip=v[0] / flips, items=v[1] / v[0]) for e, v in sorted(runs_kept.items())},
                 others_inside_run_spans=run_inside, ties_with_a_run_piece=run_ties)
 
 
@@ -254,6 +267,9 @@ def main():
               'other segments inside a run\'s pieces %d, ties with a piece %d' % (
                   r['parallel_fors_cut'], r['pieces_past_the_game'], r['items_uncovered'], r['chunks_overlapping'],
                   r['others_inside_run_spans'], r['ties_with_a_run_piece']))
+        print('  the cut table\'s entries: cut %s; kept whole %s' % (
+            ', '.join('%s %.2f a flip (%.1f items, %.1f pieces)' % (k, v['a_flip'], v['items'], v['pieces']) for k, v in r['runs_cut'].items()) or 'none',
+            ', '.join('%s %.2f a flip (%.1f items)' % (k, v['a_flip'], v['items']) for k, v in r['runs_kept_whole'].items()) or 'none'))
     if a.json:
         json.dump(res, open(a.json, 'w'), indent=1)
 

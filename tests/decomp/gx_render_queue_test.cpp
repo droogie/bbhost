@@ -139,8 +139,15 @@ bool cut_case(int t, bool report) {
     std::memcpy(g_queue_a, g_queue_start, kQueueBytes);
     std::memcpy(g_queue_b, g_queue_start, kQueueBytes);
     const u32 at = load<u32>(qa() + kChunkCount);
+    // the tail rule's inputs: the costs known or not (then the items decide)
+    const bool costs = g_rng.chance(0.7);
+    g_even_share.store(costs ? (g_rng.u32() & 0x3fffff) + 1 : 0);
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = costs && g_rng.chance(0.9) ? (g_rng.u32() & 0x3ffffff) + 1 : 0;
     const u32 theirs = eboot_kit::fn<GamePartition>(kPartition)(qa(), first, last, max_chunks);
-    const u32 ours = cut_partition(qb(), first, last, max_chunks, nullptr, nullptr);
+    const u64 fallbacks = g_cut_fallbacks.load();
+    u32 runs = 0xdead;
+    const u32 ours = cut_partition(qb(), first, last, max_chunks, nullptr, nullptr, &runs);
+    const bool fell_back = g_cut_fallbacks.load() != fallbacks;
     // the game's chunks, from the queue object the game wrote
     // the game's own chunks byte for byte, or a refinement of them (and the
     // queue object past its table untouched)
@@ -152,6 +159,42 @@ bool cut_case(int t, bool report) {
              std::memcmp(g_queue_a + kChunkCount + 4, g_queue_b + kChunkCount + 4, kQueueBytes - kChunkCount - 4) == 0;
         if (ours == theirs && !load<u8>(qa() + kStealing)) ok = false;  // the same count is the game's chunks exactly
     }
+    // The runs of the entries the cut changes: each is one of the game's chunks
+    // (it gives them one); ours cuts exactly those its rule calls a tail, as far
+    // as the cut table's limits allow, and counts them.
+    u32 cut_seen = 0;
+    bool rule = true;
+    if (ok && !same) {
+        const u64 table = game_address(kTable);
+        u32 o = 0;
+        for (u32 g = 0; g < theirs && rule; ++g) {
+            const u64 gc = qa() + kChunks + static_cast<u64>(at + g) * kChunkSize;
+            const u32 gf = load<u32>(gc), gl = load<u32>(gc + 4);
+            u32 pieces = 0, pos = gf;
+            do {
+                const u64 c = qb() + kChunks + static_cast<u64>(at + o) * kChunkSize;
+                pos = load<u32>(c + 4);
+                ++pieces;
+                ++o;
+            } while (pos < gl && o < ours);
+            const s8 e = gl > gf ? entry_index(entry_of(load<u32>(reinterpret_cast<u64>(g_items_mem) + gf * 0x18ull), table), table) : -1;
+            if (!cut_entry(e)) {
+                rule = pieces == 1;
+                continue;
+            }
+            const u32 n = gl - gf;
+            const bool tail = g_even_share.load() && chunk_cost(n, e) ? chunk_cost(n, e) >= g_even_share.load() : n >= kTailItems;
+            const u32* ce = &g_cut_table[static_cast<u32>(e) * 9];
+            u32 want = (n + ce[4] - 1) / ce[4];
+            if (want > ce[3]) want = ce[3];
+            if (want == 0) want = 1;
+            if (want > n / ce[5]) want = n / ce[5];
+            const bool can = tail && want >= 2 && max_chunks >= 2 && !load<u8>(qa() + kStealing) && g + 1 < theirs && !fell_back;
+            if (pieces > 1) ++cut_seen;
+            rule = pieces > 1 ? tail && pieces == want : !can;
+        }
+    }
+    if (ok && (same ? runs != 0 : !rule || runs != cut_seen)) ok = false;
     if (ours > theirs) ++g_cut_seen;
     if (!ok && report) {
         std::size_t off = 0;
@@ -440,14 +483,23 @@ GUEST_ABI u64 rec_barrier(u64 jobs) {
 
 using GameParallelFor = u64 (*)(u64, u64, u32, u32, u32);
 
-// One queue through the game's parallel-for and ours (the game's partition
-// behind the queue's slot 3 for both). `push`: ours longest first.
-bool parallel_for_case(int t, bool push, bool report) {
+// The queue's slot 3 for both parallel-fors: the game's partition, saying
+// (as ours does when it cuts a run) that it cut when g_stub_cut is set.
+bool g_stub_cut = false;
+GUEST_ABI u32 stub_partition(u64 q, u32 first, u32 last, u32 limit) {
+    g_pf_cut = g_stub_cut;
+    return eboot_kit::fn<u32 (*)(u64, u32, u32, u32)>(kPartition)(q, first, last, limit);
+}
+
+// One queue through the game's parallel-for and ours. Mostly the cut on and
+// the push with it (BBHOST_RQ_PUSH unset); `cut`: the partition cut a run,
+// after which ours pushes longest first and otherwise as the game does.
+bool parallel_for_case(int t, bool cut, bool report) {
     int count = 0;
     build_queue(count);
     const u64 b = base();
     std::memcpy(g_queue_a, g_queue_start, kQueueBytes);
-    store<u64>(b + kQVt + 0x18, game_address(kPartition));
+    store<u64>(b + kQVt + 0x18, reinterpret_cast<u64>(&stub_partition));
     store<u64>(qa(), b + kQVt);
     store<u32>(qa() + kChunkCount, g_rng.chance(0.8) ? 0u : static_cast<u32>(g_rng.range(1, 20)));
     std::memcpy(g_queue_b, g_queue_a, kQueueBytes);
@@ -466,11 +518,16 @@ bool parallel_for_case(int t, bool push, bool report) {
     const std::vector<int> game_calls = g_pf_calls;
     g_pushed_jobs.clear();
     g_pf_calls.clear();
-    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = push ? (g_rng.u32() & 0xfffff) + 1 : 0;
-    // the push as the cut has it this frame (BBHOST_RQ_PUSH unset)
-    g_push_mode = Push::WithCut;
-    g_cut_on.store(push);
+    const bool known = g_rng.chance(0.9);
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = known ? (g_rng.u32() & 0xfffff) + 1 : 0;
+    const int m = g_rng.range(0, 9);
+    g_push_mode = m < 7 ? Push::WithCut : m < 8 ? Push::On : Push::Off;
+    g_cut_on.store(m < 6 || g_rng.chance(0.5));
+    g_stub_cut = cut;
+    // longest first when forced, or with the cut on after a cut
+    const bool push = known && (g_push_mode == Push::On || (g_push_mode == Push::WithCut && g_cut_on.load() && cut));
     const u32 ours = render_queue_parallel_for(qb(), ctx, first, last, limit);
+    g_push_mode = Push::WithCut;
     g_cut_on.store(true);
     bool ok = ours == theirs && g_pf_calls == game_calls && g_pushed_jobs.size() == game.size();
     for (const Pushed& p : g_pushed_jobs) ok = ok && p.functor_vt == game_address(kFunctorVtable) && p.functor_ctx == ctx && p.functor_q == qb();
@@ -512,8 +569,8 @@ bool parallel_for_case(int t, bool push, bool report) {
     }
     if (!ok && report) {
         char why[160];
-        std::snprintf(why, sizeof why, "items %u-%u of %d, sort %d, push %d: %zu jobs (the game's %zu), %u chunks (%u)", first, last, count,
-                      sorted, push, g_pushed_jobs.size(), game.size(), ours, theirs);
+        std::snprintf(why, sizeof why, "items %u-%u of %d, sort %d, cut %d, mode %d, push %d: %zu jobs (the game's %zu), %u chunks (%u)",
+                      first, last, count, sorted, cut, m, push, g_pushed_jobs.size(), game.size(), ours, theirs);
         fail("parallel-for", t, why);
     }
     return ok;
@@ -521,9 +578,10 @@ bool parallel_for_case(int t, bool push, bool report) {
 
 // ---- The cut's choice ----
 
-// BBHOST_RQ_SPLIT unset: the cut, and the push and the costs' learning with
-// it, on while the frame rate's limit is above 60, decided each flip; forced
-// on or off, the limit changes nothing.
+// BBHOST_RQ_SPLIT unset: the cut, and the costs' learning with it, on while
+// the frame rate's limit is above 60, decided each flip; the push longest
+// first after a parallel-for's partition cut a run (BBHOST_RQ_PUSH unset), or
+// always or never when set; forced on or off, the limit changes nothing.
 bool choice_case() {
     const struct {
         float fps;
@@ -536,23 +594,88 @@ bool choice_case() {
     g_push_mode = Push::WithCut;
     for (const auto& r : kRates) {
         render_queue_flip(flip++, r.fps);
-        ok = ok && g_cut_on.load() == r.on && pushing() == r.on && learning() == r.on && cut_this_flip() == r.on &&
-             g_said_cut.load() == (r.on ? 1 : 0);
+        ok = ok && g_cut_on.load() == r.on && learning() == r.on && cut_this_flip() == r.on && g_said_cut.load() == (r.on ? 1 : 0) &&
+             push_after(true) && !push_after(false);
     }
     g_push_mode = Push::Off;
-    ok = ok && !pushing() && !learning();
+    ok = ok && !push_after(true) && !push_after(false) && learning();  // the cut's rule still wants the costs
     g_push_mode = Push::On;
     render_queue_flip(flip++, 60);
-    ok = ok && !g_cut_on.load() && pushing() && learning();
+    ok = ok && !g_cut_on.load() && push_after(false) && learning();
     g_split_mode = Split::Off;
     g_push_mode = Push::WithCut;
     g_cut_on.store(false);
     render_queue_flip(flip++, 120);
-    ok = ok && !g_cut_on.load() && !pushing() && !cut_this_flip();
+    ok = ok && !g_cut_on.load() && !learning() && !cut_this_flip();
     g_split_mode = Split::On;
     g_cut_on.store(true);
     render_queue_flip(flip++, 60);
-    ok = ok && g_cut_on.load() && pushing() && cut_this_flip();
+    ok = ok && g_cut_on.load() && learning() && cut_this_flip();
+    return ok;
+}
+
+// ---- The game's own behind ours ----
+
+u64 g_orig[5];
+int g_orig_calls = 0;
+GUEST_ABI u32 orig_partition(u64 q, u32 first, u32 last, u32 limit) {
+    ++g_orig_calls;
+    g_orig[0] = q, g_orig[1] = first, g_orig[2] = last, g_orig[3] = limit;
+    return 0x1234;
+}
+GUEST_ABI u64 orig_job(u64 functor, u64 range, u32 worker) {
+    ++g_orig_calls;
+    g_orig[0] = functor, g_orig[1] = range, g_orig[2] = worker;
+    return 0x5678;
+}
+GUEST_ABI u64 orig_parallel_for(u64 q, u64 ctx, u32 first, u32 last, u32 limit) {
+    ++g_orig_calls;
+    g_orig[0] = q, g_orig[1] = ctx, g_orig[2] = first, g_orig[3] = last, g_orig[4] = limit;
+    return 0x9a;
+}
+
+// What ours has nothing to add to goes to the game's own as given, and what
+// it returns comes back: a partition not the parallel-for's (or with the cut
+// off), every chunk job but the census's (timed into its entry's costs while
+// the cut is on), and a parallel-for that cannot push.
+bool originals_case() {
+    void* const keep[3] = {g_game_partition, g_game_chunk_job, g_game_parallel_for};
+    g_game_partition = reinterpret_cast<void*>(&orig_partition);
+    g_game_chunk_job = reinterpret_cast<void*>(&orig_job);
+    g_game_parallel_for = reinterpret_cast<void*>(&orig_parallel_for);
+    bool ok = true;
+    g_split_mode = Split::Auto;
+    g_push_mode = Push::WithCut;
+    g_cut_on.store(false);
+    g_orig_calls = 0;
+    ok = ok && render_queue_partition(0x1000, 3, 9, 6) == 0x1234 && g_orig_calls == 1 && g_orig[0] == 0x1000 && g_orig[1] == 3 &&
+         g_orig[2] == 9 && g_orig[3] == 6;
+    ok = ok && render_queue_parallel_for(0x2000, 0x3000, 4, 8, 6) == 0x9a && g_orig_calls == 2 && g_orig[0] == 0x2000 &&
+         g_orig[1] == 0x3000 && g_orig[2] == 4 && g_orig[3] == 8 && g_orig[4] == 6;
+    g_push_mode = Push::Off;
+    g_cut_on.store(true);
+    ok = ok && render_queue_parallel_for(0x2000, 0x3000, 4, 8, 6) == 0x9a && g_orig_calls == 3;
+    g_push_mode = Push::WithCut;
+    // a chunk job: the game's, and with the cut on its ticks and items to its entry
+    int count = 0;
+    while (count < 4) build_queue(count);
+    std::memcpy(g_queue_b, g_queue_start, kQueueBytes);
+    alignas(8) static u64 functor[3];
+    alignas(8) static u32 range[3];
+    functor[0] = 0, functor[1] = 0, functor[2] = qb();
+    range[0] = 1, range[1] = 3, range[2] = 2;
+    const u64 table = game_address(kTable);
+    const s8 e = entry_index(entry_of(load<u32>(reinterpret_cast<u64>(g_items_mem) + 0x18), table), table);
+    for (u32 k = 0; k < kTableEntries; ++k) g_cost_items[k].store(0), g_cost_ticks[k].store(0);
+    g_cut_on.store(false);
+    ok = ok && render_queue_chunk_job(reinterpret_cast<u64>(functor), reinterpret_cast<u64>(range), 2) == 0x5678 && g_orig_calls == 4 &&
+         g_orig[0] == reinterpret_cast<u64>(functor) && g_orig[1] == reinterpret_cast<u64>(range) && g_orig[2] == 2;
+    for (u32 k = 0; k < kTableEntries; ++k) ok = ok && g_cost_items[k].load() == 0;
+    g_cut_on.store(true);
+    ok = ok && render_queue_chunk_job(reinterpret_cast<u64>(functor), reinterpret_cast<u64>(range), 2) == 0x5678 && g_orig_calls == 5;
+    for (u32 k = 0; k < kTableEntries; ++k) ok = ok && g_cost_items[k].load() == (static_cast<s8>(k) == e ? 2u : 0u);
+    for (u32 k = 0; k < kTableEntries; ++k) g_cost_items[k].store(0), g_cost_ticks[k].store(0);
+    g_game_partition = keep[0], g_game_chunk_job = keep[1], g_game_parallel_for = keep[2];
     return ok;
 }
 
@@ -620,6 +743,10 @@ int main(int argc, char** argv) {
         fail("cut table", 0, "entries 17 and 19 not at the PC build's limits");
     g_split_mode = Split::On;
     g_cut_on.store(true);
+    // ours leaves to the game's own through these (their trampolines in the game)
+    g_game_partition = reinterpret_cast<void*>(eboot_kit::fn<GamePartition>(kPartition));
+    g_game_chunk_job = reinterpret_cast<void*>(eboot_kit::fn<GameJob>(kChunkJob));
+    g_game_parallel_for = reinterpret_cast<void*>(eboot_kit::fn<GameParallelFor>(kParallelFor));
     // the census's rings, for the job's and the note's census
     g_items = static_cast<Item*>(std::calloc(kItemRing, sizeof(Item)));
     g_chunk_ring = static_cast<Chunk*>(std::calloc(kChunkRing, sizeof(Chunk)));
@@ -639,7 +766,8 @@ int main(int argc, char** argv) {
     for (int t = 0; t < cases / 4; ++t, ++n_pf) parallel_for_case(t, (t & 1) != 0, true);
     for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = 0;
     if (!append_case()) fail("segment note", 0, "the list's append not passed on as given, or its key not noted");
-    if (!choice_case()) fail("the cut's choice", 0, "not on above 60 fps alone, or the push not with it");
+    if (!choice_case()) fail("the cut's choice", 0, "not on above 60 fps alone, or the push not after a cut");
+    if (!originals_case()) fail("the game's own", 0, "what ours leaves to the game's functions not passed on as given");
     g_split_mode = Split::On;
     g_cut_on.store(true);
 
@@ -647,9 +775,9 @@ int main(int argc, char** argv) {
     const int kPartitionMutants[] = {1, 2, 3, 4, 10, 11, 12};
     const int kLoopMutants[] = {5, 6, 7};
     const int kJobMutants[] = {8, 9};
-    const int kCutMutants[] = {13};
+    const int kCutMutants[] = {13, 16};
     const int kRankMutants[] = {14};
-    const int kPushMutants[] = {15};
+    const int kPushMutants[] = {15, 17};
     int caught = 0, mutants = 0;
     g_quiet = true;
     const auto catches = [&](int m, auto&& one, int tries) {
@@ -666,7 +794,7 @@ int main(int argc, char** argv) {
     for (int m : kJobMutants) catches(m, [](int t) { return job_case(t, false); }, 20000);
     for (int m : kCutMutants) catches(m, [](int t) { return cut_case(t, false); }, 200000);
     for (int m : kRankMutants) catches(m, [](int t) { return ranks_case(t, false); }, 20000);
-    for (int m : kPushMutants) catches(m, [](int t) { return parallel_for_case(t, true, false); }, 20000);
+    for (int m : kPushMutants) catches(m, [m](int t) { return parallel_for_case(t, m == 15, false); }, 20000);
     g_quiet = false;
 
     if (g_failed) {
