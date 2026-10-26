@@ -1,6 +1,7 @@
 #include "host/frame_stats.h"
 
 #include "decomp/gx/render_queue.h"
+#include "engine/frame_rate.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/perf_meter.h"
@@ -156,7 +157,7 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
 
 void frame_stats_on_flip() {
     perf_meter_flip();  // the bottleneck meter's intervals (host/perf_meter.h), with or without frame statistics
-    render_queue_census_flip(static_cast<std::uint32_t>(hle_video_flip_count()));  // BBHOST_RQ_CENSUS
+    render_queue_flip(static_cast<std::uint32_t>(hle_video_flip_count()), frame_rate_limit_fps());  // the cut's choice, BBHOST_RQ_CENSUS
     const bool on = frame_stats_enabled();
     if (!on) return;
     static State s;

@@ -467,9 +467,11 @@ bool parallel_for_case(int t, bool push, bool report) {
     g_pushed_jobs.clear();
     g_pf_calls.clear();
     for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = push ? (g_rng.u32() & 0xfffff) + 1 : 0;
-    g_push = push;
+    // the push as the cut has it this frame (BBHOST_RQ_PUSH unset)
+    g_push_mode = Push::WithCut;
+    g_cut_on.store(push);
     const u32 ours = render_queue_parallel_for(qb(), ctx, first, last, limit);
-    g_push = false;
+    g_cut_on.store(true);
     bool ok = ours == theirs && g_pf_calls == game_calls && g_pushed_jobs.size() == game.size();
     for (const Pushed& p : g_pushed_jobs) ok = ok && p.functor_vt == game_address(kFunctorVtable) && p.functor_ctx == ctx && p.functor_q == qb();
     if (ok && !push) {
@@ -514,6 +516,43 @@ bool parallel_for_case(int t, bool push, bool report) {
                       sorted, push, g_pushed_jobs.size(), game.size(), ours, theirs);
         fail("parallel-for", t, why);
     }
+    return ok;
+}
+
+// ---- The cut's choice ----
+
+// BBHOST_RQ_SPLIT unset: the cut, and the push and the costs' learning with
+// it, on while the frame rate's limit is above 60, decided each flip; forced
+// on or off, the limit changes nothing.
+bool choice_case() {
+    const struct {
+        float fps;
+        bool on;
+    } kRates[] = {{30, false}, {60, false}, {120, true}, {59.94f, false}, {60.01f, false}, {75, true},
+                  {90, true},  {144, true}, {240, true}, {60, false},     {120, true}};
+    bool ok = true;
+    u32 flip = 1;
+    g_split_mode = Split::Auto;
+    g_push_mode = Push::WithCut;
+    for (const auto& r : kRates) {
+        render_queue_flip(flip++, r.fps);
+        ok = ok && g_cut_on.load() == r.on && pushing() == r.on && learning() == r.on && cut_this_flip() == r.on &&
+             g_said_cut.load() == (r.on ? 1 : 0);
+    }
+    g_push_mode = Push::Off;
+    ok = ok && !pushing() && !learning();
+    g_push_mode = Push::On;
+    render_queue_flip(flip++, 60);
+    ok = ok && !g_cut_on.load() && pushing() && learning();
+    g_split_mode = Split::Off;
+    g_push_mode = Push::WithCut;
+    g_cut_on.store(false);
+    render_queue_flip(flip++, 120);
+    ok = ok && !g_cut_on.load() && !pushing() && !cut_this_flip();
+    g_split_mode = Split::On;
+    g_cut_on.store(true);
+    render_queue_flip(flip++, 60);
+    ok = ok && g_cut_on.load() && pushing() && cut_this_flip();
     return ok;
 }
 
@@ -579,7 +618,8 @@ int main(int argc, char** argv) {
     }
     if (g_cut_table[17 * 9 + 3] != 5 || g_cut_table[17 * 9 + 4] != 10 || g_cut_table[19 * 9 + 3] != 3 || g_cut_table[19 * 9 + 4] != 10)
         fail("cut table", 0, "entries 17 and 19 not at the PC build's limits");
-    g_split = true;
+    g_split_mode = Split::On;
+    g_cut_on.store(true);
     // the census's rings, for the job's and the note's census
     g_items = static_cast<Item*>(std::calloc(kItemRing, sizeof(Item)));
     g_chunk_ring = static_cast<Chunk*>(std::calloc(kChunkRing, sizeof(Chunk)));
@@ -599,6 +639,9 @@ int main(int argc, char** argv) {
     for (int t = 0; t < cases / 4; ++t, ++n_pf) parallel_for_case(t, (t & 1) != 0, true);
     for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = 0;
     if (!append_case()) fail("segment note", 0, "the list's append not passed on as given, or its key not noted");
+    if (!choice_case()) fail("the cut's choice", 0, "not on above 60 fps alone, or the push not with it");
+    g_split_mode = Split::On;
+    g_cut_on.store(true);
 
     // Every mutant caught.
     const int kPartitionMutants[] = {1, 2, 3, 4, 10, 11, 12};

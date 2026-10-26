@@ -1316,16 +1316,21 @@ bool menus_unlimited() {
 // frame the display cannot show), and with it off 240 (outside the world
 // none: menus_unlimited). Asked every frame; the refresh rate is cached by
 // the window (once a second) and V-Sync kept by the settings' listener.
-float uncapped_target() {
+float uncapped_limit_fps() {
     const int forced = g_uncapped_forced;
     const bool vsync = !forced && vsync_setting();
     // The display's refresh rate: 0 headless, or when the display does not say.
-    const float limit = uncapped_limit::limit_fps(forced, vsync, vsync ? host_window_refresh_hz() : 0.0f);
+    return uncapped_limit::limit_fps(forced, vsync, vsync ? host_window_refresh_hz() : 0.0f);
+}
+
+// The uncapped pace's target: a frame at that limit, said when it changes.
+float uncapped_target() {
+    const float limit = uncapped_limit_fps();
     static float said = -1.0f;
     if (limit != said) {
         said = limit;
         host_log("frame rate: uncapped, at most %.2f fps (%s)", static_cast<double>(limit),
-                 forced                                          ? "BBHOST_UNCAPPED_FPS"
+                 g_uncapped_forced                               ? "BBHOST_UNCAPPED_FPS"
                  : limit < static_cast<float>(kUncappedMaxFps) ? "V-Sync on: the display's refresh rate"
                                                                  : "the mode's limit");
     }
@@ -2049,6 +2054,8 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 int frame_rate_game_fps() { return g_game_fps; }
+
+float frame_rate_limit_fps() { return g_game_fps != 0 ? static_cast<float>(g_game_fps) : uncapped_limit_fps(); }
 
 void frame_rate_install(ElfImage* image) {
     host_settings_listen(&settings_changed);

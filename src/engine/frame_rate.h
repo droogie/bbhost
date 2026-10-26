@@ -59,6 +59,13 @@ void frame_rate_install(ElfImage* image);
 // The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
 int frame_rate_game_fps();
 
+// The frames a second the pace holds the world to now: the rate the game was
+// started at, or uncapped's limit as its target has it - BBHOST_UNCAPPED_FPS,
+// else the display's refresh rate with V-Sync on (F10 and the PC Settings
+// change V-Sync live), else 240. Any thread. The render queue's cut follows
+// it (decomp/gx/render_queue.cpp).
+float frame_rate_limit_fps();
+
 // AtkParam_Pc new or reloaded (engine/params.cpp): at a converted rate the
 // Bloodletter's L2 self-hit gets the reach its frenzy aura needs above 30
 // (frame_rate.cpp, kBloodletterSelfHit).

@@ -40,43 +40,50 @@
 // first, last, size, the entry's +0x18, its rank (+0x1c), its byte at +0x20)
 // would pass 62. Ours does the same; the census says which runs met which.
 //
-// The cut (BBHOST_RQ_SPLIT, on by default; 0 keeps the game's chunks). The
-// heaviest of a frame's chunks can be one run the table allows one chunk: at
-// the Cainhurst courtyard 88 items of category 0x3e from sub-category 5 (2.7-
-// 3.2 ms), while the other five participants are done in 2 ms and wait. The
-// engine's PC build cuts the same entries further: Dark Souls III's table
-// (1.15.2's 0x14473d5a0, 36 entries) has, against this one's, the entry after
-// the four-way one (0x45/6 there, 0x3e/5 here) at ceil(items / 10) chunks up
-// to 3, and the first of its last category (0x45/0, 0x3e/0) at ceil(items /
-// 10) up to 5; its other entries that have one here cut as these do or less
-// (one more, 0x45/0x33, up to 6 by ceil(items / 15), has none). On the
-// parallel-for's calls ours takes those two limits (the cut table: the
-// game's with entries 17 and 19 changed); a call whose chunks would then
-// pass 62 is made with the game's table instead, so the rest of a queue is
-// never put in one chunk for it. A cut chunk's pieces keep its entry's fields, and the chunk
-// job keys each piece's segment by its own first item as the game's does, so
-// the frame's end plays them one after another where the uncut chunk was:
-// the census found no other segment's key between them at the four places
-// measured, and no item drawing with state an earlier item had set. Each
-// piece's first item sets up its pass on its own context, as in the dozen
-// categories the game cuts itself. BBHOST_RQ_SPLIT_EVERY=N cuts on N flips,
-// then not for N (the draw digest's pair in one run).
+// The cut (BBHOST_RQ_SPLIT; unset, on while the frame rate's limit is above
+// 60, at 90, 120 or uncapped but for V-Sync on a 60 Hz display, and off at 60
+// and below; 1 always, 0 never). The heaviest of a frame's chunks can be one
+// run the table allows one chunk: at the Cainhurst courtyard 88 items of
+// category 0x3e from sub-category 5 (2.7-3.2 ms), while the other five
+// participants are done in 2 ms and wait. The engine's PC build cuts the same
+// entries further: Dark Souls III's table (1.15.2's 0x14473d5a0, 36 entries)
+// has, against this one's, the entry after the four-way one (0x45/6 there,
+// 0x3e/5 here) at ceil(items / 10) chunks up to 3, and the first of its last
+// category (0x45/0, 0x3e/0) at ceil(items / 10) up to 5; its other entries
+// that have one here cut as these do or less (one more, 0x45/0x33, up to 6 by
+// ceil(items/15), has none). On the parallel-for's calls ours takes those two
+// limits (the cut table: the game's with entries 17 and 19 changed); a call
+// whose chunks would then pass 62 is made with the game's table instead, so
+// the rest of a queue is never put in one chunk for it. A cut chunk's pieces
+// keep its entry's fields, and the chunk job keys each piece's segment by its
+// own first item as the game's does, so the frame's end plays them one after
+// another where the uncut chunk was: the census found no other segment's key
+// between them at the four places measured, and no item drawing with state an
+// earlier item had set. Each piece's first item sets up its pass on its own
+// context, as in the dozen categories the game cuts itself.
+// BBHOST_RQ_SPLIT_EVERY=N cuts on N flips, then not for N (the draw digest's
+// pair in one run). At 60 and below the limiter waits out the time the cut
+// saves, so it buys headroom alone, for CPU time an APU's GPU shares its power
+// with: there the partitions stay the game's. The choice is made each flip
+// (render_queue_flip, from the frame rate's frame_rate_limit_fps), so a V-Sync
+// change in F10 or the options takes effect from the next frame's partitions,
+// and each change is logged once.
 //
-// Two orders for the jobs, each its own switch, neither changing what is
-// drawn (the frame's end orders the segments by their keys, not by when a
-// job ran). BBHOST_RQ_PUSH (on with the cut, unless set) places the parallel-
-// for (sub_12c7810) as ours, which pushes the chunks longest first - by their
-// cost, the jobs' own times as a moving mean by entry and item - and pins
-// them by their ranks as the game's does. The game's pinning is by place in
-// the rank order (participant i mod 6), so a cut that adds even two small
-// pieces moves every later chunk to another participant: the cut alone lost
-// 3% at the Nightmare of Mensis that way and gained 4% at Central Yharnam;
+// Two orders for the jobs, each its own switch, neither changing what is drawn
+// (the frame's end orders the segments by their keys, not by when a job ran).
+// BBHOST_RQ_PUSH (unless set, frame by frame with the cut) places the
+// parallel-for (sub_12c7810) as ours, which pushes the chunks longest first -
+// by their cost, the jobs' own times as a moving mean by entry and item - and
+// pins them by their ranks as the game's does. The game's pinning is by place
+// in the rank order (participant i mod 6), so a cut that adds even two small
+// pieces moves every later chunk to another participant: the cut alone lost 3%
+// at the Nightmare of Mensis that way and gained 4% at Central Yharnam;
 // longest first, both gain (+1.7%, +4.5%; the Cainhurst courtyard +12.3%,
 // uncapped on an RTX 4070). BBHOST_RQ_RANKS=1 (off) writes each chunk's rank
 // from its cost instead - the dearest six 0, the next six 1, and only the
-// cheapest keep the ranks that put them on the main thread - and measured
-// as push does but at Central Yharnam, where it gained half as much. Both
-// learn the costs in the chunk job.
+// cheapest keep the ranks that put them on the main thread - and measured as
+// push does but at Central Yharnam, where it gained half as much. Both learn
+// the costs in the chunk job.
 //
 // The census (BBHOST_RQ_CENSUS=1; the segment note is placed only with it):
 // per parallel-for, its runs and the chunks they became; per chunk job,
@@ -99,6 +106,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -259,11 +267,23 @@ std::atomic<u32> g_flip{0};
 bool g_census = false;
 
 // The switches (decomp_gx_render_queue_add).
-bool g_split = false;     // BBHOST_RQ_SPLIT: the cut table on the parallel-for's partitions
+enum class Split : u8 { Auto, On, Off };   // BBHOST_RQ_SPLIT: unset, 1, 0
+enum class Push : u8 { WithCut, On, Off };  // BBHOST_RQ_PUSH: unset, 1, 0
+Split g_split_mode = Split::Auto;  // the cut table on the parallel-for's partitions: Auto above 60 fps
+Push g_push_mode = Push::WithCut;  // the parallel-for as ours, longest first
 u32 g_split_every = 0;    // BBHOST_RQ_SPLIT_EVERY=N: the cut on N flips, off N
 bool g_ranks = false;     // BBHOST_RQ_RANKS=1: ranks by cost
-bool g_push = false;      // BBHOST_RQ_PUSH=1: the parallel-for as ours, longest first
-bool g_learn = false;     // the chunk job times its chunks for the costs (either of the two above)
+bool g_push_placed = false;  // the parallel-for placed: the push could be on
+// The cut now (render_queue_flip: Auto by the frame rate's limit, each flip;
+// On and Off once, at placement); the push and the costs' learning with it.
+std::atomic<bool> g_cut_on{false};
+std::atomic<int> g_said_cut{-1};  // the choice the log last said (Auto)
+
+inline bool pushing() {
+    return g_push_mode == Push::On || (g_push_mode == Push::WithCut && g_cut_on.load(std::memory_order_relaxed));
+}
+// The chunk job times its chunks for the costs (either order by cost).
+inline bool learning() { return g_ranks || pushing(); }
 // Our parallel-for's own call of the partition (BBHOST_RQ_PUSH): its return
 // address is then ours, not the game's 0x12c7846. The parallel-for runs on the
 // main thread alone (the execute's parallel path, sub_26b0c70's).
@@ -460,10 +480,12 @@ DECOMP_LEAF u32 partition(u64 q, u32 first, u32 last, u32 max_chunks, Part* part
 // the cut on (and, with BBHOST_RQ_SPLIT_EVERY, on this flip).
 inline bool from_parallel_for(u32 ret) { return ret == kFromParallelFor || g_in_parallel_for; }
 
-inline bool cutting(u32 ret) {
-    if (!g_split || !g_cut_ready || !from_parallel_for(ret)) return false;
+inline bool cut_this_flip() {
+    if (!g_cut_ready || !g_cut_on.load(std::memory_order_relaxed)) return false;
     return !g_split_every || ((g_flip.load(std::memory_order_relaxed) / g_split_every) & 1) != 0;
 }
+
+inline bool cutting(u32 ret) { return from_parallel_for(ret) && cut_this_flip(); }
 
 // The partition with the cut table, the game's table where the cut's chunks
 // would not fit: either way the chunks appended and how many.
@@ -547,7 +569,7 @@ DECOMP_LEAF void rank_by_cost(u64 q, u32 at, u32 n, const s8* entries) {
 DECOMP_LEAF u32 render_queue_partition(u64 q, u32 first, u32 last, u32 max_chunks) {
     const u32 ret = bn_of(reinterpret_cast<u64>(__builtin_return_address(0)));
     const bool parallel = from_parallel_for(ret);
-    if (g_learn && parallel) fold_costs();
+    if (parallel && learning()) fold_costs();
     const bool cut = cutting(ret);
     Part* p = nullptr;
     if (g_census) {
@@ -674,7 +696,8 @@ DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
     Chunk* rec = nullptr;
     Item* out = nullptr;
     u32 out_n = 0;
-    u64 t0 = g_learn ? ticks() : 0;
+    const bool learn = learning();
+    u64 t0 = learn ? ticks() : 0;
     if (g_census) {
         t0 = ticks();
         rec = &g_chunk_ring[g_chunk_pos.fetch_add(1, std::memory_order_relaxed) & (kChunkRing - 1)];
@@ -721,7 +744,7 @@ DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
         rec->t1 = ticks();
         publish(rec->done, rec->gen + 1);
     }
-    if (g_learn) {
+    if (learn) {
         // The chunk's time by its entry (its first item's), for the next frame's order.
         const u64 table = game_address(kTable);
         const s8 e = entry_index(entry_of(key, table), table);
@@ -795,7 +818,7 @@ DECOMP_LEAF u32 render_queue_parallel_for(u64 q, u64 ctx, u32 first, u32 last, u
         const u64 e = q + kChunks + static_cast<u64>(total - 1) * kChunkSize;
         bool known = false;
         for (u32 k = 0; k < kTableEntries && !known; ++k) known = g_cost_per_item[k] != 0;
-        if (g_push && known && !MUTANT(15))
+        if (known && pushing() && !MUTANT(15))
             sort_by_cost(q, b, e);
         else
             game_function<SortFn>(kSortByRank)(b, e, (e - b) / kChunkSize);
@@ -896,8 +919,7 @@ GUEST_ABI u32 compare_partition(u64 q, u32 first, u32 last, u32 max_chunks) {
     std::memcpy(at_(q + kChunks), before, kBytes);
     store<u32>(q + kChunkCount, count_before);
     // The execute's own calls pass a limit of 1, where no table cuts a run.
-    const bool cut = g_split && g_cut_ready && max_chunks >= 2 &&
-                     (!g_split_every || ((g_flip.load(std::memory_order_relaxed) / g_split_every) & 1) != 0);
+    const bool cut = max_chunks >= 2 && cut_this_flip();
     const u32 ours = cut ? cut_partition(q, first, last, max_chunks, nullptr, nullptr) : partition(q, first, last, max_chunks, nullptr);
     bool same;
     if (!cut) {
@@ -1182,16 +1204,18 @@ void render_queue_report() {
                  static_cast<unsigned long long>(g_part_pos.load()), static_cast<unsigned long long>(g_chunk_pos.load()),
                  static_cast<unsigned long long>(g_item_pos.load()), static_cast<unsigned long long>(g_append_pos.load()));
     }
-    if (g_split)
-        host_log("decomp: the render queue's cut: %llu parallel-fors cut by the PC build's limits%s, %llu made with the game's "
+    if (g_split_mode != Split::Off)
+        host_log("decomp: the render queue's cut (%s): %llu parallel-fors cut by the PC build's limits%s, %llu made with the game's "
                  "table for want of room%s",
+                 g_split_mode == Split::Auto ? "above 60 fps" : "BBHOST_RQ_SPLIT=1",
                  static_cast<unsigned long long>(g_cut_calls.load()), g_cut_ready ? "" : " (the table not the one written against: off)",
                  static_cast<unsigned long long>(g_cut_fallbacks.load()),
                  decomp_comparing() ? (std::string("; compared: ") + std::to_string(g_cut_refined.load()) +
                                        " pieces past the game's chunks, each refining them").c_str()
                                     : "");
     if (g_ranks) host_log("decomp: the render queue's ranks by cost: %llu parallel-fors", static_cast<unsigned long long>(g_ranked.load()));
-    if (g_push) host_log("decomp: the render queue pushed longest first: %llu parallel-fors", static_cast<unsigned long long>(g_pushed.load()));
+    if (g_push_placed)
+        host_log("decomp: the render queue pushed longest first: %llu parallel-fors", static_cast<unsigned long long>(g_pushed.load()));
 }
 
 // The cut table, from the game's (placement, once the image's slide is known):
@@ -1215,9 +1239,17 @@ bool make_cut_table(const std::uint8_t*) {
 
 }  // namespace
 
-void render_queue_census_flip(std::uint32_t flips) {
+void render_queue_flip(std::uint32_t flips, float limit_fps) {
     g_flip.store(flips, std::memory_order_relaxed);
     if (g_census) g_fold.flip(flips);
+    if (g_split_mode != Split::Auto || !g_cut_ready) return;
+    // Above 60: 90, 120, or uncapped's limit (a display's 59.94 or 60.01 Hz is 60).
+    const bool on = std::lround(limit_fps) > 60;
+    g_cut_on.store(on, std::memory_order_relaxed);
+    if (g_said_cut.exchange(on ? 1 : 0, std::memory_order_relaxed) != (on ? 1 : 0))
+        host_log("decomp: the render queue's cut %s at %.0f fps (%s)", on ? "on" : "off", static_cast<double>(limit_fps),
+                 on ? (g_push_mode == Push::WithCut ? "above 60; its jobs pushed longest first" : "above 60")
+                    : "60 or less: the game's partitions");
 }
 
 void decomp_gx_render_queue_add() {
@@ -1225,12 +1257,21 @@ void decomp_gx_render_queue_add() {
         const char* e = std::getenv(name);
         return e && *e ? e[0] != '0' : otherwise;
     };
+    const auto mode = [](const char* name) {
+        const char* e = std::getenv(name);
+        return !e || !*e ? 0 : e[0] != '0' ? 1 : 2;  // unset, on, off
+    };
     g_census = on("BBHOST_RQ_CENSUS", false);
-    g_split = on("BBHOST_RQ_SPLIT", true);
+    const int split = mode("BBHOST_RQ_SPLIT"), push = mode("BBHOST_RQ_PUSH");
+    g_split_mode = split == 1 ? Split::On : split == 2 ? Split::Off : Split::Auto;
+    g_push_mode = push == 1 ? Push::On : push == 2 ? Push::Off : Push::WithCut;
+    g_cut_on.store(g_split_mode == Split::On, std::memory_order_relaxed);
     if (const char* e = std::getenv("BBHOST_RQ_SPLIT_EVERY"); e && std::atoi(e) > 0) g_split_every = static_cast<u32>(std::atoi(e));
     g_ranks = on("BBHOST_RQ_RANKS", false);
-    g_push = on("BBHOST_RQ_PUSH", g_split);
-    g_learn = g_ranks || g_push;
+    // What could be on in this run: Auto follows the frame rate's limit, which V-Sync moves while uncapped.
+    const bool may_cut = g_split_mode != Split::Off;
+    g_push_placed = g_push_mode == Push::On || (g_push_mode == Push::WithCut && may_cut);
+    const bool may_learn = g_ranks || g_push_placed;
     if (g_census) {
         g_items = static_cast<Item*>(std::calloc(kItemRing, sizeof(Item)));
         g_chunk_ring = static_cast<Chunk*>(std::calloc(kChunkRing, sizeof(Chunk)));
@@ -1244,7 +1285,7 @@ void decomp_gx_render_queue_add() {
             host_log("rq census: on (the render queue's partition, chunk job and segment list as ours)");
         }
     }
-    if (!g_census && !g_split && !g_learn) return;
+    if (!g_census && !may_cut && !may_learn) return;
     DecompFunction part{"render_queue_partition", "gx", kPartition, kPartitionEntry, sizeof(kPartitionEntry),
                         reinterpret_cast<void*>(&render_queue_partition), DecompKind::Leaf};
     part.original = &g_game_partition;
@@ -1253,7 +1294,7 @@ void decomp_gx_render_queue_add() {
     part.report = &render_queue_report;
     part.body_ok = &make_cut_table;
     decomp_add(part);
-    if (g_census || g_learn)
+    if (g_census || may_learn)
         decomp_add(DecompFunction{"render_queue_chunk_job", "gx", kChunkJob, kChunkJobEntry, sizeof(kChunkJobEntry),
                                   reinterpret_cast<void*>(&render_queue_chunk_job), DecompKind::Leaf});
     if (g_census) {
@@ -1262,7 +1303,7 @@ void decomp_gx_render_queue_add() {
         append.original = &g_game_append;
         decomp_add(append);
     }
-    if (g_push)
+    if (g_push_placed)
         decomp_add(DecompFunction{"render_queue_parallel_for", "gx", kParallelFor, kParallelForEntry, sizeof(kParallelForEntry),
                                   reinterpret_cast<void*>(&render_queue_parallel_for), DecompKind::Leaf});
 }
