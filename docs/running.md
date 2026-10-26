@@ -164,8 +164,9 @@ every line as it comes.
 
 The setup window's Game tab has **Tooling and logging** (`[debug] tooling`;
 `BBHOST_TOOLING=0` or `1` for one run), on by default: the periodic reports in
-the log, the stall detector, the GPU busy meter beside the FPS counter and the
-history of recent draws. Off gives the game the time they take, and the log
+the log, the stall detector, the GPU busy meter beside the FPS counter, the
+bottleneck meter's `perf summary:` lines, which say what limits the frame rate
+([docs/performance.md](performance.md)), and the history of recent draws. Off gives the game the time they take, and the log
 keeps its start, warnings, errors and the exit summary: in one measured
 session, about 10 lines where it had written about 4,100. Leave it on when
 reporting a problem.
