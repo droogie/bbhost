@@ -9420,6 +9420,32 @@ std::string host_gpu_profile_report() {
                       static_cast<unsigned long long>(v[i].second.second));
         out += buf;
     }
+    if (g.profile_passes) {
+        // =3: every entry - the passes by their first draw's pipeline and
+        // size, the dispatches, copies and uploads - on lines of their own,
+        // six a line with their statistics (k per pair, as below): the top
+        // line ends at 1 KiB, and a frame has ~45 passes.
+        std::string line;
+        int listed = 0;
+        for (const auto& e : v) {
+            char b[320];
+            int k = std::snprintf(b, sizeof(b), " %s=%.3fms(%llu)", e.first.c_str(), e.second.first / 1e6,
+                                  static_cast<unsigned long long>(e.second.second));
+            const auto it = g.profile_stats_sum.find(e.first);
+            if (k > 0 && k < static_cast<int>(sizeof(b)) && it != g.profile_stats_sum.end() && e.second.second) {
+                const double n = static_cast<double>(e.second.second) * 1000.0;
+                const auto& a = it->second;
+                std::snprintf(b + k, sizeof(b) - k, "[%.1f/%.1f/%.1f/%.1f/%.1f/%.1f]", a[0] / n, a[2] / n, a[1] / n, a[3] / n, a[4] / n,
+                              a[5] / n);
+            }
+            line += b;
+            if (++listed % 6 == 0) {
+                host_log("gpu profile all (since the last; k per pair: verts/vs/prims/clip-in/clip-out/fs):%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) host_log("gpu profile all (since the last; k per pair: verts/vs/prims/clip-in/clip-out/fs):%s", line.c_str());
+    }
     if (g.profile_stats) {
         // The same entries' pipeline statistics, per pair, in thousands:
         // vertices in / vertex-shader invocations / primitives in /
