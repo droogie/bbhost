@@ -765,6 +765,8 @@ GUEST_ABI void pc_list_update(std::uint8_t* comp, std::uint8_t* input) {
 
 }  // namespace
 
+bool menu_pointer_front_end() { return front_end(); }
+
 void menu_pointer_install(ElfImage* image) {
     g_slide = image->mem.slide;
     g_log = [] {

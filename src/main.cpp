@@ -31,6 +31,7 @@
 #include "host/plugin_ui.h"
 #endif
 #include "host/settings.h"
+#include "net/discord_presence.h"
 #include "engine/debug_menu.h"
 #include "host/plugins.h"
 #include "host/sampler.h"
@@ -991,6 +992,11 @@ int main(int argc, char** argv) {
     // and they seed from bbhost.toml, so a run with no options file behaves
     // exactly as it did.
     host_options_load();
+    if (net::discord_rpc_enabled()) {
+        net::InitDiscordRPC();
+        net::UpdateDiscordLauncherPresence();
+        net::UpdateDiscordGamePresence(nullptr, nullptr, 0);
+    }
     config_set_skip_intro(host_settings().skip_logos);
     // The PC enhancements are read the same way, once: each installs (or its
     // patch applies) while the guest is prepared, so a change waits for the
@@ -1095,6 +1101,7 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);
     host_log("_start returned");
+    net::ShutdownDiscordRPC();
     host_window_stop();
     engine_bind(nullptr);
     unload_elf(&image);

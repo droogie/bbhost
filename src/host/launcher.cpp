@@ -6,6 +6,7 @@
 #include "engine/patch_manifest.h"
 #include "host/options.h"
 #include "net/account.h"
+#include "net/discord_presence.h"
 #include "host/plugin_ui.h"
 #include "host/shader_compile.h"
 #include "host/updater.h"
@@ -187,6 +188,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
+    bool discord_rpc = host_opt_get("discord_rpc");
+    if (discord_rpc) {
+        net::InitDiscordRPC();
+        net::UpdateDiscordLauncherPresence();
+    }
     bool fullscreen = host_opt_index("window_mode") == 1;
     bool skip_logos = host_opt_get("skip_logos");
     bool debug_camera = host_opt_get("debug_camera");
@@ -360,6 +366,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set_index("window_mode", fullscreen ? 1 : 0);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("debug_camera", debug_camera);
+        host_opt_set("discord_rpc", discord_rpc);
         host_opt_set_frame_cap(kCaps[cap_choice]);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
@@ -837,6 +844,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Checkbox("Debug camera", &debug_camera);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
+        const bool discord_was_enabled = discord_rpc;
+        ImGui::Checkbox("Discord Rich Presence", &discord_rpc);
+        if (discord_rpc != discord_was_enabled) {
+            if (discord_rpc) {
+                net::InitDiscordRPC();
+                net::UpdateDiscordLauncherPresence();
+            } else {
+                net::ShutdownDiscordRPC();
+            }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show your current Bloodborne area and character on Discord.");
         ImGui::SetNextItemWidth(200 * scale);
         static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "120 fps", "Uncapped"};
         static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
