@@ -169,10 +169,12 @@ particle's emits is its last emit, which leaves every triangle it is in
 without area.
 
 The stage reads the simulation's indirect arguments itself and leaves out
-every particle at or past their count. The draw takes the live count: right
-after each dispatch - the simulation's run outside any render pass - one more
-writes every emitter's indexed-draw arguments from the game's, its live count
-times a particle's indices, and the draw reads those. An emitter's first
+every particle at or past their count. The draw takes the live count: after
+the dispatches - the simulation's run outside any render pass - the next draw
+runs one more pass, once for the run of them, that writes every emitter's
+indexed-draw arguments from the game's, its live count times a particle's
+indices, and the draw reads those (`BBHOST_GX_PARTICLE_ARGS=each`: a pass
+after each dispatch). An emitter's first
 draws, before such a pass has written its arguments, run its room, the most
 records a buffer its export shader reads by index holds;
 `BBHOST_GX_PARTICLE_ARGS=0` always runs the room. The pipeline is built on the

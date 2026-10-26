@@ -1224,9 +1224,12 @@ ParticlePath particle_path();
 // render.cpp: the submission `serial` is done: the particles' argument lists
 // its passes read may be written again.
 void particle_args_retired_locked(std::uint64_t serial);
-// render.cpp: after a dispatch (and its barrier), the particles' draws'
-// arguments written from the game's for their live counts.
+// render.cpp: after a dispatch (and its barrier) or a fill, the particles'
+// draws' arguments are stale: the next draw writes them from the game's for
+// their live counts (particle_args_before_draw_locked; with
+// BBHOST_GX_PARTICLE_ARGS=each, written here).
 void particle_args_after_dispatch_locked();
+void particle_args_before_draw_locked();
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);

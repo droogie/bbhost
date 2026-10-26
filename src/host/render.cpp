@@ -5645,11 +5645,11 @@ VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
 
 }  // namespace
 
-// ---- the particles' draw arguments written after each dispatch ----------------------------------
+// ---- the particles' draw arguments written after the dispatches -----------------------------------
 // Drawn for its emitter's room, the vertex stage runs for every particle the
 // emitter has room for, and most are dead: an emitter of 65,536 with a few
 // thousand live. The simulation's dispatches, which write the live count, run
-// outside any render pass, so right after each dispatch one more
+// outside any render pass, so after them one more pass
 // (shaders/particleargs.comp) writes every emitter's indexed-draw arguments
 // from the game's into a slot of its own: the live count, at most the
 // particles its draw has room for, times a particle's indices. A draw whose
@@ -5659,6 +5659,15 @@ VkBuffer quad_indices_locked(std::uint32_t key, std::uint64_t quads) {
 // emitter's arguments with its draw's shape (a particle's indices, the most
 // particles), so the list a draw is bound to always holds the count the slot
 // can give. BBHOST_GX_PARTICLE_ARGS=0 draws the room every time.
+//
+// The pass runs once for a run of dispatches: a dispatch (or a fill) only
+// makes every slot stale, and the first draw after it runs the pass, for the
+// entries the last of them would have listed. A dispatch ends the render pass
+// and no draw comes between the dispatches of a run, so every draw reads what
+// a pass after each dispatch would have left in its slot - with a pass and two
+// barriers for the run, not for each dispatch (25 a frame at the Cainhurst
+// courtyard, each draining the GPU). BBHOST_GX_PARTICLE_ARGS=each: a pass
+// after each dispatch.
 namespace {
 constexpr std::uint32_t kParticleArgsSlots = 4096;
 constexpr std::uint64_t kParticleArgsListBytes = 4ull << 20;
@@ -5684,8 +5693,11 @@ struct ParticleArgs {
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::vector<ParticleArgsEntry> entries;
     std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>, std::uint32_t> by_key;
-    std::uint64_t generation = 1;  // dispatches seen while there are entries
+    std::uint64_t generation = 1;  // runs of dispatches seen while there are entries
+    bool stale = false;            // a dispatch or a fill since the last pass: the next draw runs one
+    std::uint64_t stale_flip = 0;  // the flip of the last of them (which entries the pass lists)
     std::uint64_t passes = 0, written = 0, busy = 0, no_address = 0, from_slot = 0, room_draws = 0, full = 0;
+    std::uint64_t dispatches = 0, ended = 0;  // dispatches and fills that made the slots stale; passes ended for one
 } g_pargs;  // under g.mu
 
 bool particle_args_wanted() {
@@ -5694,6 +5706,15 @@ bool particle_args_wanted() {
         return particle_path() != ParticlePath::kGs && !(e && e[0] == '0');
     }();
     return on;
+}
+
+// BBHOST_GX_PARTICLE_ARGS=each: the arguments' pass after every dispatch.
+bool particle_args_each() {
+    static const bool each = [] {
+        const char* e = std::getenv("BBHOST_GX_PARTICLE_ARGS");
+        return e && std::strcmp(e, "each") == 0;
+    }();
+    return each;
 }
 
 // A buffer with a device address, its memory of the first type that has
@@ -5763,7 +5784,9 @@ bool particle_args_ready_locked() {
         vkDestroyShaderModule(g.device, module, nullptr);
     }
     host_log("render: the particles' draw arguments are %s (BBHOST_GX_PARTICLE_ARGS=0 draws each emitter's room)",
-             a.pipeline ? "written after each dispatch: a draw takes its live count" : "not written (setup failed): each emitter's room is drawn");
+             !a.pipeline ? "not written (setup failed): each emitter's room is drawn"
+             : particle_args_each() ? "written after each dispatch: a draw takes its live count"
+                                    : "written once after a run of dispatches, at the next draw: a draw takes its live count (BBHOST_GX_PARTICLE_ARGS=each: after each)");
     return a.pipeline != VK_NULL_HANDLE;
 }
 
@@ -5803,15 +5826,12 @@ ParticleArgsSlot particle_args_slot_locked(std::uint64_t va, std::uint32_t indic
     return {a.slots, static_cast<VkDeviceSize>(it->second) * 20};
 }
 
-}  // namespace
-
-void particle_args_after_dispatch_locked() {
+// The arguments' pass, for the entries drawn in the two flips before `flip`
+// (the last dispatch's): every slot it lists written for this generation.
+void particle_args_pass_locked(std::uint64_t flip) {
     ParticleArgs& a = g_pargs;
-    if (a.entries.empty() || !a.pipeline) return;
-    ++a.generation;  // every slot is stale until this pass writes it
     // The entries drawn in the last two flips, each with its arguments' device
     // address as guest memory is imported now.
-    const std::uint64_t flip = hle_video_flip_count();
     static thread_local std::vector<std::uint8_t> list;
     list.clear();
     std::uint32_t n = 0;
@@ -5869,17 +5889,48 @@ void particle_args_after_dispatch_locked() {
     a.written += n;
 }
 
+}  // namespace
+
+void particle_args_after_dispatch_locked() {
+    ParticleArgs& a = g_pargs;
+    if (a.entries.empty() || !a.pipeline) return;
+    ++a.dispatches;
+    if (particle_args_each()) {
+        ++a.generation;  // every slot is stale until this pass writes it
+        particle_args_pass_locked(hle_video_flip_count());
+        return;
+    }
+    if (!a.stale) ++a.generation;  // every slot is stale until the next draw's pass writes it
+    a.stale = true;
+    a.stale_flip = hle_video_flip_count();
+}
+
+void particle_args_before_draw_locked() {
+    ParticleArgs& a = g_pargs;
+    if (!a.stale) return;
+    a.stale = false;
+    begin_recording_locked();
+    if (g_pass.active) {  // a fill that left the pass open: the pass cannot run inside it
+        render_end_pass_locked();
+        ++a.ended;
+    }
+    particle_args_pass_locked(a.stale_flip);
+}
+
 std::string particle_args_report_locked() {
     const ParticleArgs& a = g_pargs;
     if (!a.tried || !a.pipeline) return std::string();
-    char b[400];
+    char b[560];
     std::snprintf(b, sizeof(b),
                   "render: the particles' draw arguments: %zu emitters' shapes, %llu passes wrote %llu slots (%llu passes with no room "
-                  "for their list, %llu entries with no address); draws from a slot %llu, of their room %llu (%llu with no slot left)",
+                  "for their list, %llu entries with no address); draws from a slot %llu, of their room %llu (%llu with no slot left); "
+                  "%llu dispatches and fills made them stale, a pass %s (%llu render passes ended for one)",
                   a.entries.size(), static_cast<unsigned long long>(a.passes), static_cast<unsigned long long>(a.written),
                   static_cast<unsigned long long>(a.busy), static_cast<unsigned long long>(a.no_address),
                   static_cast<unsigned long long>(a.from_slot), static_cast<unsigned long long>(a.room_draws),
-                  static_cast<unsigned long long>(a.full));
+                  static_cast<unsigned long long>(a.full), static_cast<unsigned long long>(a.dispatches),
+                  particle_args_each() ? "after each (BBHOST_GX_PARTICLE_ARGS=each)" : "at the draw after a run of them",
+                  static_cast<unsigned long long>(a.ended));
     return b;
 }
 
@@ -18525,6 +18576,7 @@ static bool draw_impl(const GpuDraw& d) {
     apply_lean_builds_locked();
     apply_relinks_locked();
     if (!init_locked()) return false;
+    particle_args_before_draw_locked();  // the particles' arguments after the dispatches before this draw, before its commands
     // The draw's commands (recorder.cpp): its packet starts with its
     // descriptor writes below, or earlier for a region copy (draw_packet_early_locked).
     DrawCmds cmds;
