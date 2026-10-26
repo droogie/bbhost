@@ -49,13 +49,24 @@ bool g_trace = [] {
     return e && e[0] == '1';
 }();
 
-// (ctxId, connId, event, errorCode, arg)
+// (ctxId, connId, event, errorCode, arg). ESTABLISHED and ACTIVE are queued
+// 200 and 400 ms ahead (announce_locked); a connection that died in between
+// (deactivated, its peer gone, a reset) gets neither: the game would take it
+// as live again. DEAD is always delivered, since it is queued for a
+// connection already marked dead.
 void fire(unsigned ctx, unsigned conn, std::uint16_t event, int error) {
     Ctx c;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_ctx.find(ctx);
         if (it == g_ctx.end() || !it->second.cb) return;
+        if (event != kEvDead) {
+            auto ci = g_conn.find(conn);
+            if (ci == g_conn.end() || ci->second.dead) {
+                host_log("np: conn %u is dead: event 0x%x not delivered", conn, event);
+                return;
+            }
+        }
         c = it->second;
     }
     if (g_trace) host_log("np: NpSignaling event 0x%x conn %u", event, conn);
@@ -115,7 +126,15 @@ void resolve_conn(unsigned conn_id, const std::string& peer) {
         return;
     }
     auto it = g_conn.find(conn_id);
-    if (it == g_conn.end() || it->second.dead || it->second.member_id) return;
+    if (it == g_conn.end() || it->second.dead) {
+        host_log("np: conn %u to %s resolved, but the connection went away meanwhile: left alone", conn_id, peer.c_str());
+        return;
+    }
+    if (it->second.member_id) {
+        host_log("np: conn %u to %s resolved, but its peer joined the room meanwhile (member %u): left alone", conn_id,
+                 peer.c_str(), it->second.member_id);
+        return;
+    }
     it->second.member_id = net::peers_provisional(peer, addr, port).member_id;
     host_log("np: conn %u to %s resolved %u.%u.%u.%u:%u", conn_id, peer.c_str(), addr & 0xff, (addr >> 8) & 0xff,
              (addr >> 16) & 0xff, addr >> 24, port);
