@@ -60,6 +60,7 @@ enum SettingId {
     kFrameCap,
     kFpsCounter,
     kMemoryCounter,
+    kPerfOverlay,
     kFov,
     kCameraDistance,
     kCameraHeight,
@@ -133,6 +134,13 @@ Setting g_set[kSettingCount] = {
     {"memory_counter", "Memory counter", {"Off", "On"}, 0,
      "Video memory in use (how much is cache, given back when it runs short) and the game's memory the GPU reads, "
      "which Windows counts as shared GPU memory.", false},
+    // The bottleneck meter's last second (host/perf_meter.h): what limits the
+    // frame rate and what is next, and how busy the main loop, the command
+    // processor and the GPU are. A diagnostic, off by default; it starts the
+    // meter when Tooling and logging is off.
+    {"perf_overlay", "Performance meter", {"Off", "On"}, 0,
+     "What limits the frame rate - the GPU, the main thread, the GX workers, the command processor, the frame cap - "
+     "and how busy each part is, under the FPS counter (docs/performance.md).", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
@@ -279,6 +287,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
+    {Row::Option, nullptr, kPerfOverlay},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -737,6 +746,7 @@ void rebuild_settings() {
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.fps_counter = on_of(kFpsCounter);
     h.memory_counter = on_of(kMemoryCounter);
+    h.perf_overlay = on_of(kPerfOverlay);
     {
         // BBHOST_RES=WxH still wins, so an A/B run started with one behaves
         // the way its command line says.

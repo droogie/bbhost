@@ -61,6 +61,19 @@ it, and the game waited for it half the time.)
 
 At exit, `perf run:` gives the whole session's seconds by verdict.
 
+On screen, F10's **Performance meter** (off by default) shows the last
+second's verdict under the FPS counter, in two lines:
+
+    Limit: GPU 99% | next: command processor 42%
+    main 8.1 ms  GX 0.0  waits 27.8 | CP 42%  GPU 99%
+
+(a Radeon 680M at 1080p). The first line is the verdict and what would limit
+next; the second is the main loop's frame (its own work, the GX barrier, its
+waits) and the command processor's and the GPU's loads. With **Tooling and
+logging** off it starts the meter, and the GPU's load shows when the
+Performance meter was already on as the game started (`GPU -` otherwise: the
+GPU busy meter starts with the game).
+
 `BBHOST_FRAME_STATS=1` adds a `perf:` line every second, with the second's
 verdict and the same fields (the test harnesses turn it on).
 `BBHOST_PERF_METER=0` turns the meter off; `=1` turns it on with Tooling off.

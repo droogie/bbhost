@@ -25,7 +25,8 @@
 //   loads and the main loop's frame;
 //   `perf:` each second, with BBHOST_FRAME_STATS=1: the second's verdict;
 //   a run summary at exit.
-// BBHOST_PERF_METER=0 turns it off; =1 turns it on with tooling off.
+// BBHOST_PERF_METER=0 turns it off; =1 turns it on with tooling off, and so
+// does the performance overlay (F10).
 // BBHOST_PERF_SUMMARY_S sets the summary's period (60).
 
 #include <cstdint>
@@ -46,3 +47,11 @@ void perf_meter_limiter(std::uint64_t wait_ns, std::uint64_t spin_ns, float targ
 void perf_meter_backlog_wait(std::uint64_t ns);
 // The exit reports: the last summary and the run's.
 void perf_meter_exit();
+// The performance overlay (F10's Performance meter, host/window.cpp): the
+// last second's verdict as two short lines - what limits and what is next,
+// then the main loop's frame split and the command processor's and the
+// GPU's loads. False before the meter has had a second.
+bool perf_meter_glance(char (&line1)[96], char (&line2)[96]);
+// The overlay is on: starts the meter if it is not running because tooling is
+// off (BBHOST_PERF_METER=0 still keeps it off). Cheap once it runs.
+void perf_meter_want();

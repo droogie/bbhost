@@ -64,6 +64,7 @@
 // line in the 300-flip report. BBHOST_GPU_BUSY=0 turns all of it off.
 #include "host/gpu.h"
 #include "host/gpu_internal.h"
+#include "host/settings.h"
 #include "log.h"
 
 #include <algorithm>
@@ -226,8 +227,10 @@ void busy_init_locked() {
         host_log("gpu: busy meter off (BBHOST_GPU_BUSY=0)");
         return;
     }
-    if (!host_tooling() && !(e && e[0] == '1')) {
-        host_log("gpu: busy meter off (tooling off; BBHOST_GPU_BUSY=1 turns it on)");
+    // With tooling off it still runs when the performance overlay (F10) is on
+    // at the start: the bottleneck meter's verdict needs the GPU's load.
+    if (!host_tooling() && !(e && e[0] == '1') && !host_settings_ref().perf_overlay) {
+        host_log("gpu: busy meter off (tooling off; BBHOST_GPU_BUSY=1 or the performance overlay turns it on)");
         return;
     }
     std::uint32_t nq = 0;

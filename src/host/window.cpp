@@ -13,6 +13,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
+#include "host/perf_meter.h"
 #include "host/present_pass.h"
 #include "host/ingame_menu.h"
 #include "host/audio.h"
@@ -2131,6 +2132,35 @@ bool host_window_pump() {
             host_overlay_text(x, y, scale, 0xe6e6e6ffu, text);
             corner_y += 24.0f * scale + 16.0f;
         }
+    }
+    if (host_settings_ref().perf_overlay) {
+        // The performance meter, below the memory counter: the bottleneck
+        // meter's last second (host/perf_meter.h) - what limits the frame
+        // rate and what is next, then the main loop's frame split and the
+        // command processor's and the GPU's loads. Read four times a second
+        // (the meter writes once); on with tooling off, it starts the meter.
+        perf_meter_want();
+        static char lines[2][96] = {"Performance meter: measuring", ""};
+        static std::uint64_t read_at = 0;
+        const std::uint64_t now = host_clock_monotonic_ns();
+        if (!read_at || now - read_at >= 250'000'000ull) {
+            read_at = now;
+            perf_meter_glance(lines[0], lines[1]);
+        }
+        float dw = 0.0f;
+        {
+            std::lock_guard<std::mutex> ml(g_mouse_mu);
+            dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+        }
+        for (const char* text : lines) {
+            if (!text[0]) continue;
+            const float scale = 0.8f, w = host_overlay_text_width(scale, text);
+            const float x = dw - w - 20.0f, y = corner_y;
+            host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
+            host_overlay_text(x, y, scale, 0xe6e6e6ffu, text);
+            corner_y += 24.0f * scale + 8.0f;
+        }
+        corner_y += 8.0f;
     }
     {
         // A plugin's banner (host_message_show): centred in the upper third,

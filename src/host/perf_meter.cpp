@@ -439,6 +439,59 @@ void flush_summary_locked(const char* tag) {
     s = Summary{};
 }
 
+// The performance overlay's two lines (perf_meter_glance), from the last second.
+std::mutex g_glance_mu;
+char g_glance[2][96];  // under g_glance_mu
+bool g_glance_set = false;
+
+const char* player_name(Stage s) {
+    switch (s) {
+    case Stage::kMain: return "main thread";
+    case Stage::kGx: return "GX workers";
+    case Stage::kRender: return "render thread";
+    case Stage::kCp: return "command processor";
+    case Stage::kRecord: return "recorder";
+    case Stage::kGpu: return "GPU";
+    case Stage::kPresent: return "presenter";
+    case Stage::kCapped: return "frame cap";
+    case Stage::kStall: return "loading or stalls";
+    default: return "nothing in particular";
+    }
+}
+
+// "Limit: GX workers 100% | next: command processor 85%" and
+// "main 5.1 ms  GX 4.6  waits 1.8 | CP 85%  GPU 48%".
+void set_glance(const bottleneck::Window& w, const bottleneck::Verdict& v) {
+    char a[96], b[96], next[48] = "";
+    if (v.next != Stage::kNone && v.next_load >= 0) std::snprintf(next, sizeof(next), " | next: %s %.0f%%", player_name(v.next), v.next_load * 100.0);
+    if (v.limit_load >= 0) {
+        std::snprintf(a, sizeof(a), "Limit: %s %.0f%%%s", player_name(v.limit), v.limit_load * 100.0, next);
+    } else {
+        std::snprintf(a, sizeof(a), "Limit: %s%s", player_name(v.limit), next);
+    }
+    const double n = w.flips > 0 ? w.flips : 1.0;
+    const double spin = w.gx_spin_ms >= 0 ? w.gx_spin_ms : 0.0;
+    const double own = w.main_cpu_ms >= 0 ? std::max(0.0, w.main_cpu_ms - spin) / n : -1.0;
+    const auto pct_or_dash = [](double load, char* out, std::size_t size) {
+        if (load < 0) std::snprintf(out, size, "-");
+        else std::snprintf(out, size, "%.0f%%", load * 100.0);
+    };
+    char cp[8], gpu[8];
+    pct_or_dash(v.load[static_cast<int>(Stage::kCp)], cp, sizeof(cp));
+    pct_or_dash(v.load[static_cast<int>(Stage::kGpu)], gpu, sizeof(gpu));
+    if (own >= 0 && w.gx_spin_ms >= 0) {
+        std::snprintf(b, sizeof(b), "main %.1f ms  GX %.1f  waits %.1f | CP %s  GPU %s", own, spin / n, w.main_wait_ms / n, cp, gpu);
+    } else if (own >= 0) {
+        std::snprintf(b, sizeof(b), "main %.1f ms  waits %.1f | CP %s  GPU %s", own, w.main_wait_ms / n, cp, gpu);
+    } else {
+        std::snprintf(b, sizeof(b), "CP %s  GPU %s", cp, gpu);
+    }
+    std::lock_guard<std::mutex> lk(g_glance_mu);
+    std::memcpy(g_glance[0], a, sizeof(a));
+    std::memcpy(g_glance[1], b, sizeof(b));
+    g_glance_set = true;
+}
+
 void log_second(const bottleneck::Window& w, const bottleneck::Verdict& v, const std::string& at, const Extra& x) {
     char gx[96] = "";
     if (x.gx_workers_ms >= 0 && x.gx_workers > 0) {
@@ -626,6 +679,7 @@ void meter_thread() {
 #endif
         x.stopped_ms = static_cast<double>(now.main.stopped_ns - prev.main.stopped_ns) / 1e6;
         const bottleneck::Verdict v = bottleneck::classify(w);
+        set_glance(w, v);
         std::uint32_t block = 0;
         const bool block_known = world_player_block(&block);
         if (detail) log_second(w, v, block_name(block_known, block), x);
@@ -657,14 +711,32 @@ void meter_thread() {
 
 }  // namespace
 
+namespace {
+// The meter's thread, started once: at the start with tooling on, or later
+// by the performance overlay (perf_meter_want). BBHOST_PERF_METER=0 never.
+std::atomic<int> g_state{0};  // 0 not configured, 1 configured and stopped, 2 running, 3 off
+std::mutex g_start_mu;
+
+void run_locked(const char* why) {
+    frame_stats_time_main_waits();
+    g_on.store(true, std::memory_order_release);
+    host_log("perf meter: on (bb-meter%s): which stage holds the frame rate, a `perf summary:` line about every %.0f s%s%s", why,
+             g_summary_period_s, frame_stats_enabled() ? " and a `perf:` line each second (BBHOST_FRAME_STATS=1)" : "",
+             g_spin_known ? "" : "; not the 1.09 eboot: the GX barrier's spin is not measured");
+    g_state.store(2, std::memory_order_release);
+    std::thread(meter_thread).detach();
+}
+}  // namespace
+
 void perf_meter_start(std::uint64_t guest_lo, std::uint64_t guest_hi, bool eboot_109) {
     (void)guest_hi;
+    std::lock_guard<std::mutex> lk(g_start_mu);
     const char* e = std::getenv("BBHOST_PERF_METER");
     if (e && e[0] == '0') {
         host_log("perf meter: off (BBHOST_PERF_METER=0)");
+        g_state.store(3, std::memory_order_release);
         return;
     }
-    if (!host_tooling() && !(e && e[0] == '1')) return;
     if (const char* p = std::getenv("BBHOST_PERF_SUMMARY_S")) g_summary_period_s = std::max(5.0, std::atof(p));
     if (eboot_109) {
         for (int k = 0; k < 2; ++k) {
@@ -673,12 +745,22 @@ void perf_meter_start(std::uint64_t guest_lo, std::uint64_t guest_hi, bool eboot
         }
         g_spin_known = true;
     }
-    frame_stats_time_main_waits();
-    g_on.store(true, std::memory_order_release);
-    host_log("perf meter: on (bb-meter): which stage holds the frame rate, a `perf summary:` line about every %.0f s%s%s",
-             g_summary_period_s, frame_stats_enabled() ? " and a `perf:` line each second (BBHOST_FRAME_STATS=1)" : "",
-             eboot_109 ? "" : "; not the 1.09 eboot: the GX barrier's spin is not measured");
-    std::thread(meter_thread).detach();
+    g_state.store(1, std::memory_order_release);
+    if (host_tooling() || (e && e[0] == '1')) run_locked("");
+}
+
+void perf_meter_want() {
+    if (g_state.load(std::memory_order_acquire) != 1) return;  // running, off, or not configured yet
+    std::lock_guard<std::mutex> lk(g_start_mu);
+    if (g_state.load(std::memory_order_relaxed) == 1) run_locked(", for the performance overlay");
+}
+
+bool perf_meter_glance(char (&line1)[96], char (&line2)[96]) {
+    std::lock_guard<std::mutex> lk(g_glance_mu);
+    if (!g_glance_set) return false;
+    std::memcpy(line1, g_glance[0], sizeof(line1));
+    std::memcpy(line2, g_glance[1], sizeof(line2));
+    return true;
 }
 
 void perf_meter_note_main_thread() {
