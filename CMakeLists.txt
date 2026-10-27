@@ -125,6 +125,8 @@ add_executable(bbhost
   src/host/window.cpp
   src/host/text_entry.cpp
   src/host/overlay.cpp
+  src/host/overlay_font.cpp
+  src/host/japanese_font.cpp
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/options.cpp
@@ -173,6 +175,12 @@ target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/pc_option_messages.tsv)
 file(READ ${CMAKE_SOURCE_DIR}/tools/pc_option_messages.tsv BBHOST_PC_MESSAGES)
 file(WRITE ${CMAKE_BINARY_DIR}/gen/pc_option_messages.inc "R\"tsv(${BBHOST_PC_MESSAGES})tsv\"\n")
+# The Japanese font is compiled in; both UI renderers share the same bytes.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/third_party/mplus/mplus-1m-regular.ttf)
+file(READ ${CMAKE_SOURCE_DIR}/third_party/mplus/mplus-1m-regular.ttf BB_JP_FONT_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," BB_JP_FONT_BYTES "${BB_JP_FONT_HEX}")
+file(WRITE ${CMAKE_BINARY_DIR}/gen/japanese_font.inc.new "${BB_JP_FONT_BYTES}\n")
+configure_file(${CMAKE_BINARY_DIR}/gen/japanese_font.inc.new ${CMAKE_BINARY_DIR}/gen/japanese_font.inc COPYONLY)
 target_link_libraries(bbhost PRIVATE ZLIB::ZLIB)
 
 # The git revision the binary logs on its first line (build/gen/bbhost_version.h,
@@ -220,6 +228,10 @@ function(bb_plugin name)
     target_link_options(bb_plugin_${name} PRIVATE -static -static-libgcc -static-libstdc++)
   endif()
 endfunction()
+add_library(bb_plugin_region_switch MODULE plugins/region_switch/region_switch.c)
+set_target_properties(bb_plugin_region_switch PROPERTIES OUTPUT_NAME region_switch PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+
 bb_plugin(randomizer plugins/randomizer/randomizer.cpp)
 bb_plugin(boss_rush plugins/boss_rush/boss_rush.cpp)
 bb_plugin(mutators plugins/mutators/mutators.cpp)
@@ -231,11 +243,6 @@ file(READ ${CMAKE_SOURCE_DIR}/plugins/debug_menu/font14.bin BB_FONT14_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," BB_FONT14_BYTES "${BB_FONT14_HEX}")
 file(WRITE ${CMAKE_BINARY_DIR}/gen/debug_font14.inc.new "${BB_FONT14_BYTES}\n")
 configure_file(${CMAKE_BINARY_DIR}/gen/debug_font14.inc.new ${CMAKE_BINARY_DIR}/gen/debug_font14.inc COPYONLY)
-# ... and its English (plugins/debug_menu/strings_en.tsv) as a string.
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/plugins/debug_menu/strings_en.tsv)
-file(READ ${CMAKE_SOURCE_DIR}/plugins/debug_menu/strings_en.tsv BB_DEBUG_MENU_EN)
-file(WRITE ${CMAKE_BINARY_DIR}/gen/debug_menu_strings_en.inc.new "R\"tsv(${BB_DEBUG_MENU_EN})tsv\"\n")
-configure_file(${CMAKE_BINARY_DIR}/gen/debug_menu_strings_en.inc.new ${CMAKE_BINARY_DIR}/gen/debug_menu_strings_en.inc COPYONLY)
 bb_plugin(debug_menu plugins/debug_menu/debug_menu.cpp)
 target_include_directories(bb_plugin_debug_menu PRIVATE ${CMAKE_BINARY_DIR}/gen)
 
@@ -927,7 +934,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_region_switch bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke
@@ -935,4 +942,30 @@ else()
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS bbhost
     USES_TERMINAL)
+endif()
+
+# Japanese fork: glyph rendering and JP/EU request policy, without game data.
+add_executable(japanese_font_test tests/japanese_font_test.cpp src/host/overlay_font.cpp src/host/japanese_font.cpp)
+target_include_directories(japanese_font_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+add_test(NAME japanese_font_test COMMAND japanese_font_test)
+add_executable(jp_eu_http_test tests/jp_eu_http_test.cpp src/core/futex.cpp src/core/portable.cpp)
+target_include_directories(jp_eu_http_test PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
+add_dependencies(jp_eu_http_test bbhost_version)
+# Only the request construction/policy code is exercised; discard the networking
+# entry points so this test cannot accidentally contact a real server.
+target_compile_options(jp_eu_http_test PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(jp_eu_http_test PRIVATE -Wl,--gc-sections)
+if(WIN32)
+  target_link_libraries(jp_eu_http_test PRIVATE ws2_32 winmm synchronization)
+endif()
+add_test(NAME jp_eu_http_test COMMAND jp_eu_http_test)
+if(WIN32 OR UNIX)
+  add_executable(jp_region_test tests/jp_region_test.cpp)
+  target_include_directories(jp_region_test PRIVATE src include)
+  target_link_libraries(jp_region_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(jp_region_test bb_plugin_region_switch)
+  foreach(case success off wrong-title wrong-region wrong-eboot)
+    add_test(NAME jp_region_${case} COMMAND jp_region_test ${case})
+    set_tests_properties(jp_region_${case} PROPERTIES WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+  endforeach()
 endif()

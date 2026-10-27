@@ -35,51 +35,51 @@ constexpr std::uint32_t kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10, kRight
 // healing item, F for the quick item, Q to lock on, Shift as the strong
 // modifier, the mouse's buttons for the hands - put on Bloodborne's buttons.
 const BindingInfo kInfo[kBindCount] = {
-    {"move_forward", "Move Forward", "Left stick up.", 0, "W", 0},
-    {"move_back", "Move Back", "Left stick down.", 0, "S", 0},
-    {"move_left", "Move Left", "Left stick left.", 0, "A", 0},
-    {"move_right", "Move Right", "Left stick right.", 0, "D", 0},
+    {"move_forward", "前に移動", "左スティックの上方向。", 0, "W", 0},
+    {"move_back", "後ろに移動", "左スティックの下方向。", 0, "S", 0},
+    {"move_left", "左に移動", "左スティックの左方向。", 0, "A", 0},
+    {"move_right", "右に移動", "左スティックの右方向。", 0, "D", 0},
     // Held with the movement keys, as Dark Souls III's Left Alt: a walk.
-    {"walk", "Walk", "Hold with the movement keys to walk.", 0, "Left Alt", 0},
-    {"roll", "Dodge / Sprint", "Circle. Tap to dodge, hold to sprint.", kCircle, "Space", 0},
-    {"lock_on", "Lock On", "R3. Lock on to a target, or reset the camera.", kR3, "Q", 0},
+    {"walk", "歩く", "移動キーと同時に押すと歩きます。", 0, "Left Alt", 0},
+    {"roll", "Dodge / Sprint", "日本版では×ボタン。短く押すと回避、長押しでダッシュします。", kCircle, "Space", 0},
+    {"lock_on", "ロックオン", "R3。敵をロックオン、またはカメラを正面に戻します。", kR3, "Q", 0},
 
-    {"attack", "Attack", "R1. With the strong attack modifier held, R2.", kR1, nullptr, 1},
-    {"strong_attack", "Strong Attack", "R2. Hold to charge.", kR2, "V", 0},
-    {"strong_modifier", "Strong Attack Modifier", "Held with Attack, attacks strong (R2).", 0, "Left Shift", 0},
-    {"transform", "Transform", "L1. Transform the trick weapon.", kL1, "C", 3},
-    {"firearm", "Firearm / Parry", "L2. Shoot the left-hand weapon.", kL2, "X", 2},
-    {"blood_vial", "Blood Vial", "Triangle. Restore HP with a Blood Vial.", kTriangle, "R", 0},
-    {"use_item", "Use Item", "Square. Use the selected quick item.", kSquare, "F", 0},
+    {"attack", "攻撃", "R1。強攻撃の修飾キーと同時に押すと R2。", kR1, nullptr, 1},
+    {"strong_attack", "強攻撃", "R2。長押しで溜め攻撃。", kR2, "V", 0},
+    {"strong_modifier", "強攻撃の修飾キー", "攻撃と同時に押すと強攻撃 (R2) になります。", 0, "Left Shift", 0},
+    {"transform", "武器の変形", "L1。仕掛け武器を変形します。", kL1, "C", 3},
+    {"firearm", "銃撃 / パリィ", "L2。左手武器を使用します。", kL2, "X", 2},
+    {"blood_vial", "輸血液", "△ボタン。輸血液で HP を回復します。", kTriangle, "R", 0},
+    {"use_item", "アイテム使用", "□ボタン。選択中のアイテムを使用します。", kSquare, "F", 0},
 
-    {"interact", "Interact", "Cross. Talk, examine, pick up, open.", kCross, "E", 0},
-    {"switch_item", "Switch Item", "D-pad down. Cycle the quick items.", kDown, "Down", 0},
-    {"switch_right", "Switch Right Weapon", "D-pad right.", kRight, "Right", 0},
-    {"switch_left", "Switch Left Weapon", "D-pad left.", kLeft, "Left", 0},
-    {"dpad_up", "D-pad Up", "D-pad up.", kUp, "Up", 0},
+    {"interact", "Interact", "日本版では○ボタン。話す・調べる・拾う・開ける。", kCross, "E", 0},
+    {"switch_item", "アイテム切替", "方向キーの下。使用アイテムを切り替えます。", kDown, "Down", 0},
+    {"switch_right", "右手武器切替", "方向キーの右。", kRight, "Right", 0},
+    {"switch_left", "左手武器切替", "方向キーの左。", kLeft, "Left", 0},
+    {"dpad_up", "方向キーの上", "方向キーの上。", kUp, "Up", 0},
     // The touchpad is a button with a side: the game's key guide reads
     // "<KG_TP_L> : Gestures" and "<KG_TP_R> : Personal Effects". A press alone
     // cannot say which, so these place a finger as well (apply below).
-    {"gestures", "Gestures", "The touchpad's left side.", kTouchPad, "G", 0},
-    {"personal_effects", "Personal Effects", "The touchpad's right side.", kTouchPad, "T", 0},
+    {"gestures", "ジェスチャー", "タッチパッドの左側。", kTouchPad, "G", 0},
+    {"personal_effects", "携行品", "タッチパッドの右側。", kTouchPad, "T", 0},
 
-    {"look_up", "Look Up", "Right stick up, for the camera without the mouse.", 0, "I", 0},
-    {"look_down", "Look Down", "Right stick down.", 0, "K", 0},
-    {"look_left", "Look Left", "Right stick left.", 0, "J", 0},
-    {"look_right", "Look Right", "Right stick right.", 0, "L", 0},
-    {"menu", "Menu", "Options. Open the menu.", kOptions, "Escape", 0},
+    {"look_up", "上を見る", "右スティックの上。マウスを使わないカメラ操作。", 0, "I", 0},
+    {"look_down", "下を見る", "右スティックの下。", 0, "K", 0},
+    {"look_left", "左を見る", "右スティックの左。", 0, "J", 0},
+    {"look_right", "右を見る", "右スティックの右。", 0, "L", 0},
+    {"menu", "メニュー", "OPTIONS。メニューを開きます。", kOptions, "Escape", 0},
     // Menus need an OK and a Back that are not the gameplay keys sharing their
     // pad bits: nobody reaches for Space to accept or E to back out.
     // Their buttons are the region's (engine/menu_pointer.h), set in apply.
-    {"confirm", "Menu Confirm", "OK, in menus.", 0, "Return", 0},
-    {"back", "Menu Back", "Return, in menus.", 0, "Backspace", 0},
+    {"confirm", "メニューの決定", "メニュー内で決定します。", 0, "Return", 0},
+    {"back", "メニューで戻る", "メニュー内で戻ります。", 0, "Backspace", 0},
 
-    {"l3", "Left Stick Press", "L3.", kL3, "Left Ctrl", 0},
+    {"l3", "左スティック押し込み", "L3.", kL3, "Left Ctrl", 0},
     // The developers' debug menu: not a pad press at all. The patch opens it
     // on the touchpad's left side, which is also Gestures; this key toggles
     // the menu itself (engine/debug_menu.h), when the Debug Menu plugin is
     // on. The Key Bindings screen lists it only then.
-    {"debug_menu", "Debug Menu", "Opens and closes the developers' debug menu (the Debug Menu plugin).", 0, "`", 0},
+    {"debug_menu", "デバッグメニュー", "開発用デバッグメニューを開閉します（プラグインが必要）。", 0, "`", 0},
 };
 
 // Earlier names a bbhost.toml may still use.
@@ -250,7 +250,7 @@ void host_binding_describe(int action, char* out, std::size_t n) {
     if (k && ms) {
         std::snprintf(out, n, "%s  /  %s", k, ms);
     } else {
-        std::snprintf(out, n, "%s", k ? k : ms ? ms : "Unbound");
+        std::snprintf(out, n, "%s", k ? k : ms ? ms : "未割り当て");
     }
 }
 
@@ -473,4 +473,10 @@ void host_bind_capture_note_held(bool any_down) {
         (!any_down || now_ms() - g_hold_ms.load(std::memory_order_relaxed) > 1500)) {
         g_hold.store(false, std::memory_order_relaxed);
     }
+}
+
+const char* host_binding_label(const char* label) {
+    if (!std::strcmp(label, "Dodge / Sprint")) return "回避 / ダッシュ";
+    if (!std::strcmp(label, "Interact")) return "調べる";
+    return label;
 }

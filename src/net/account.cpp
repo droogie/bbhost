@@ -28,7 +28,7 @@ bool auth_call(const std::string& path, const json::Value& body, json::Value& re
     }
     std::string perr;
     if (!json::parse(r.body, reply, perr)) {
-        error = r.status >= 200 && r.status < 300 ? "bad reply" : "HTTP " + std::to_string(r.status);
+        error = r.status >= 200 && r.status < 300 ? "不正な応答" : "HTTP " + std::to_string(r.status);
         return false;
     }
     // Every account reply carries ResKind. A server without the account
@@ -36,7 +36,7 @@ bool auth_call(const std::string& path, const json::Value& body, json::Value& re
     // a bare "refused" - a tester who started bbhost without the playtest
     // config was sent to the live server, which has no accounts yet.
     if (reply.type != json::Value::Type::Object || !reply.find("ResKind")) {
-        error = base + " has no account service (HTTP " + std::to_string(r.status) + ")";
+        error = base + " にアカウントサービスがありません (HTTP " + std::to_string(r.status) + ")";
         host_log("account: %s%s answered HTTP %ld without ResKind", base.c_str(), path.c_str(), r.status);
         return false;
     }
@@ -50,7 +50,7 @@ bool auth_call(const std::string& path, const json::Value& body, json::Value& re
 bool take_token(const json::Value& reply, std::string& error) {
     const std::string token = str_of(reply, "Token"), id = str_of(reply, "OnlineId");
     if (token.empty() || id.empty()) {
-        error = "no token in the reply";
+        error = "応答にトークンがありません";
         return false;
     }
     account_set(id, token);
@@ -127,7 +127,7 @@ bool account_link_start(DeviceLink& out, std::string& error) {
     out.interval = static_cast<int>(int_of(reply, "Interval", 5));
     out.expires_in = static_cast<int>(int_of(reply, "ExpiresIn", 600));
     if (out.device_code.empty() || out.user_code.empty()) {
-        error = "no code in the reply";
+        error = "応答にコードがありません";
         return false;
     }
     if (out.interval < 1) out.interval = 5;
@@ -150,7 +150,7 @@ std::string account_link_poll(const DeviceLink& link, std::string& error) {
 
 bool account_create(const std::string& name, std::string& recovery_code, std::string& error) {
     json::Value body = json::Value::make_object();
-    body.set("Name", name);
+    body.set("名前", name);
     body.set("DeviceName", account_device_name());
     json::Value reply;
     if (!auth_call("/auth/account/create", body, reply, error) || !take_token(reply, error)) return false;
@@ -161,7 +161,7 @@ bool account_create(const std::string& name, std::string& recovery_code, std::st
 
 bool account_recover(const std::string& name, const std::string& code, std::string& new_code, std::string& error) {
     json::Value body = json::Value::make_object();
-    body.set("Name", name);
+    body.set("名前", name);
     body.set("RecoveryCode", code);
     json::Value reply;
     if (!auth_call("/auth/recover", body, reply, error) || !take_token(reply, error)) return false;
@@ -173,7 +173,7 @@ bool account_recover(const std::string& name, const std::string& code, std::stri
 bool account_web_code(std::string& code, std::string& error) {
     const std::string token = account_token();
     if (token.empty()) {
-        error = "not signed in";
+        error = "未ログイン";
         return false;
     }
     json::Value body = json::Value::make_object();

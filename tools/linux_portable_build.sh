@@ -138,6 +138,6 @@ cmake -S /src -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -fuse-ld=lld" \
     -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -fuse-ld=lld" > "$W/bbhost-configure.log"
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
-cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
+cmake --build "$W/build" --target bbhost bb_plugin_region_switch bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
     || { grep -E "error|undefined" "$W/bbhost-build.log" | head -30; exit 1; }
 echo "portable build: $W/build/bbhost"

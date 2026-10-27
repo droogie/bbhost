@@ -9,7 +9,7 @@
 [patch]
 name = "deflate-level"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "the game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s)"
+description = "実行中の圧縮をレベル９から１に変更（約50秒ごとの停止を軽減）"
 
 [site.level]
 address = "0x4d3a79a"

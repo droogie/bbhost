@@ -11,7 +11,7 @@
 [patch]
 name = "hd-motion-blur-360p"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "HD Motion Blur 360p (640x360) - Kyo's patch"
+description = "モーションブラー 360p (640x360) (Kyo)"
 enabled = false
 order = 181
 group = "hd-motion-blur"

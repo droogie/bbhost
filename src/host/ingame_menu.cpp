@@ -1,3 +1,4 @@
+#include "host/japanese_font.h"
 #include "host/ingame_menu.h"
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -168,6 +169,10 @@ bool ingame_menu_init(VkInstance instance, VkPhysicalDevice phys, VkDevice devic
     g_ctx = ImGui::CreateContext();
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO& io = ImGui::GetIO();
+    ImFontConfig jp_font;
+    jp_font.FontDataOwnedByAtlas = false;
+    io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kJapaneseFont),
+        static_cast<int>(kJapaneseFontSize), 18.0f, &jp_font);
     io.IniFilename = nullptr;
     io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
     ImGui::StyleColorsDark();
@@ -262,7 +267,7 @@ bool build_frame(VkExtent2D extent) {
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     bool keep = true;
-    if (ImGui::Begin("Plugins  (F9 or Esc to close)", &keep, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+    if (ImGui::Begin("プラグイン  (F9 / Esc で閉じる)", &keep, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
         plugin_ui_draw(g_ui, scale);
     }
     ImGui::End();

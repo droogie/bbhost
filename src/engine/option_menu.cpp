@@ -14,6 +14,7 @@
 #include "engine/yebis.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "core/utf8.h"
 #include "host/options.h"
 #include "log.h"
 
@@ -712,8 +713,7 @@ constexpr int kRowCount = kToggleCount + 1;
 static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
-              "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
-              "Add slots in engine/menu_assets.cpp (build_option_movie), or split into a second section.");
+              "more rows than the section sprite has slots: the extra ones have nowhere to draw. Add slots in engine/menu_assets.cpp (build_option_movie), or split into a second section.");
 
 // The dialog's row vector, found by reading the row builder: sub_1f2a100 ends
 // with sub_1f2bf60(dialog + 0xe50, &row), and that is a push_back of 0x90-byte
@@ -931,19 +931,26 @@ KeysScreen g_keys;
 // with every other settings write.
 std::atomic<bool> g_keys_save{false};
 
-// ASCII into a row's UTF-16 buffer; the port's strings and SDL's key names
-// are all ASCII.
+// Decode UTF-8; never split a surrogate pair at the fixed buffer boundary.
 template <std::size_t N>
 void to_utf16(char16_t (&out)[N], const char* s) {
     std::size_t i = 0;
-    for (; s && s[i] && i + 1 < N; ++i) out[i] = static_cast<char16_t>(static_cast<unsigned char>(s[i]));
+    while (s && *s) {
+        auto cp = utf8_next(s);
+        if (i + (cp > 0xffff ? 2 : 1) >= N) break;
+        if (cp > 0xffff) {
+            cp -= 0x10000;
+            out[i++] = static_cast<char16_t>(0xd800 + (cp >> 10));
+            out[i++] = static_cast<char16_t>(0xdc00 + (cp & 0x3ff));
+        } else out[i++] = static_cast<char16_t>(cp);
+    }
     out[i] = 0;
 }
 
 // The page names, as the tabs read. Plain ASCII: the line help and values
 // are drawn as HTML text, where an ampersand is not a character.
-const char* const kKeyPageNames[kBindPages] = {"Movement", "Combat", "Items and Gestures", "Camera and Menus",
-                                               "Other"};
+const char* const kKeyPageNames[kBindPages] = {"移動", "戦闘", "アイテムとジェスチャー", "カメラとメニュー",
+                                               "その他"};
 
 // The actions listed: the Debug Menu key only when the menu is there (the
 // Debug Menu plugin, engine/debug_menu.h); it is the last.
@@ -968,9 +975,9 @@ std::chrono::steady_clock::time_point g_keys_reset_at;
 
 void keys_fill_reset_text(int row) {
     // Short: the value column cut "Press again to restore" to "Press again to".
-    to_utf16(g_keys_text[row], g_keys_reset == KeysReset::Armed  ? "Press again"
-                               : g_keys_reset == KeysReset::Done ? "Restored"
-                                                                 : "All actions");
+    to_utf16(g_keys_text[row], g_keys_reset == KeysReset::Armed  ? "もう一度押す"
+                               : g_keys_reset == KeysReset::Done ? "初期化しました"
+                                                                 : "すべての操作");
 }
 
 void keys_fill_value(int row) {
@@ -990,14 +997,13 @@ void keys_fill_value(int row) {
 void keys_fill(int page) {
     g_keys.page = (page % kBindPages + kBindPages) % kBindPages;
     g_keys_page = g_keys.page;
-    to_utf16(g_keys_label[0], "Page");
-    to_utf16(g_keys_help[0], "Left and right change the group of actions shown.");
+    to_utf16(g_keys_label[0], "ページ");
+    to_utf16(g_keys_help[0], "左右で操作のグループを切り替えます。");
     to_utf16(g_keys_text[0], kKeyPageNames[g_keys.page]);
     for (int r = 1; r < kKeysRows; ++r) {
         if (keys_row_reset(r)) {
-            to_utf16(g_keys_label[r], "Restore Defaults");
-            to_utf16(g_keys_help[r], "Every action back to its default key and mouse button. Enter or click, then again "
-                                     "to confirm.");
+            to_utf16(g_keys_label[r], "初期設定に戻す");
+            to_utf16(g_keys_help[r], "すべての操作を初期設定に戻します。Enter またはクリックで選び、もう一度押して確定します。");
             keys_fill_reset_text(r);
             continue;
         }
@@ -1006,9 +1012,9 @@ void keys_fill(int page) {
             continue;
         }
         const BindingInfo& b = host_binding_info(keys_action(r));
-        to_utf16(g_keys_label[r], b.label);
-        char help[160];
-        std::snprintf(help, sizeof(help), "%s Enter or click to rebind, Delete to clear.", b.help);
+        to_utf16(g_keys_label[r], host_binding_label(b.label));
+        char help[512];
+        std::snprintf(help, sizeof(help), "%s Enter / クリックで変更、Delete で解除。", b.help);
         to_utf16(g_keys_help[r], help);
         keys_fill_value(r);
     }
@@ -1097,7 +1103,7 @@ void keys_update(int row, bool focused) {
             redraw(g_keys.widget[row] + kChoiceList);
             g_keys_save.store(true, std::memory_order_relaxed);
         } else if (keys_row_bound(row) && (edge & decide)) {
-            to_utf16(g_keys_text[row], "Press a key...");
+            to_utf16(g_keys_text[row], "キーを押してください...");
             redraw(g_keys.widget[row] + kChoiceList);
             host_bind_capture_begin(keys_action(row));
         } else if (keys_row_reset(row) && (edge & decide)) {

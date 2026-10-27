@@ -108,3 +108,5 @@ void host_bind_note_clear_key();
 bool host_bind_take_debug_toggle();
 bool host_bind_take_clear_key();
 void host_binding_clear(int action);
+
+const char* host_binding_label(const char* label);

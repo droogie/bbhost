@@ -296,24 +296,22 @@ void device_lost_exit(bool windowed) {
     const bool test = std::getenv("BBHOST_TEST_DEVICE_LOST") != nullptr;
     if (windowed) {
         std::string text =
-            "The graphics card stopped responding and the system reset it, so the game cannot draw anything more and "
-            "bbhost has to close.\n\n";
+            "グラフィックカードが応答しなくなり、システムによりリセットされました。描画を続けられないため、bbhost を終了します。\n\n";
         if (host_foreign_hooks_obs()) {
-            text += "OBS's game capture is hooked into bbhost (graphics-hook64.dll), a common cause of this. Try again with "
-                    "obs_capture = \"off\" under [video] in bbhost.toml (OBS's Window Capture still records bbhost), or set "
-                    "DISABLE_VULKAN_OBS_CAPTURE=1 before starting it.\n\n";
+            text += "OBS のゲームキャプチャー（graphics-hook64.dll）が検出されました。これが原因の場合があります。"
+                    "bbhost.toml の [video] に obs_capture = \"off\" を設定し、OBS のウィンドウキャプチャーで再試行してください。"
+                    "起動前に DISABLE_VULKAN_OBS_CAPTURE=1 を設定する方法もあります。\n\n";
         } else if (const std::string hooks = host_foreign_hooks(); !hooks.empty()) {
-            text += "Hooked into bbhost: " + hooks + ". Overlays like these can cause this; try again without them.\n\n";
+            text += "検出されたフック: " + hooks + "。オーバーレイが原因の場合があります。無効にして再試行してください。\n\n";
         }
-        text += "The next starts record where the GPU was, so if it happens again the log says more. Please send the log "
-                "(run-bbhost.bat writes it to the logs folder).";
-        // The box on a thread of its own: the exit goes on after a while even
-        // if nobody closes it.
+        text += "次回から GPU の処理位置を記録します。再発した場合はログを添えて報告してください。"
+                "run-bbhost.bat は logs フォルダーにログを保存します。";
+        // Continue shutdown even if nobody closes the message box.
         static std::atomic<bool> closed{false};
         static std::string box;
         box = text;
         std::thread([] {
-            host_window_error_box("bbhost: the graphics card stopped responding", box.c_str());
+            host_window_error_box("bbhost: グラフィックカードが応答しません", box.c_str());
             closed.store(true);
         }).detach();
         const int ticks = test ? 30 : 1200;  // 3 s / 2 min

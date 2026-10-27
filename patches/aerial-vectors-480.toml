@@ -12,7 +12,7 @@
 [patch]
 name = "aerial-vectors-480"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Aerial Vectors 1/480 fps (Kyo)"
+description = "空中ベクトルを 1/480 fps に調整 (Kyo)"
 enabled = false
 gameplay = true
 order = 218

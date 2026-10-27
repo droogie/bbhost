@@ -135,7 +135,7 @@ Fetch fetch(const std::string& url, bool binary, int timeout_ms, const std::stri
     (void)binary;
     (void)timeout_ms;
     (void)token;
-    r.error = "this build has no HTTP client";
+    r.error = "このビルドには HTTP クライアントがありません";
 #endif
     return r;
 }
@@ -146,18 +146,18 @@ void check_thread(const std::string& source, const std::string& token) {
     const Fetch f = fetch(source, false, 20000, token);
     std::string tag, page;
     if (!f.ok() || !parse_release(f.body, tag, page)) {
-        std::string why = !f.error.empty() ? f.error : f.ok() ? "the answer is not a release" : "HTTP " + std::to_string(f.status);
+        std::string why = !f.error.empty() ? f.error : f.ok() ? "応答にリリース情報がありません" : "HTTP " + std::to_string(f.status);
         if (f.status == 404) {
-            why = token.empty() ? "no releases visible (a private repository needs update.token_file)" : "no release found";
+            why = token.empty() ? "リリースを参照できません（非公開の場合は update.token_file が必要）" : "リリースが見つかりません";
         }
         host_log("update: check failed: %s", why.c_str());
-        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - could not check for updates", why);
+        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - 更新を確認できませんでした", why);
         g_busy.store(false);
         return;
     }
     if (!is_newer(tag, BBHOST_VERSION)) {
         host_log("update: %s is current (latest release %s)", BBHOST_VERSION, tag.c_str());
-        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - up to date", "Latest release: " + tag);
+        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - 最新です", "最新リリース: " + tag);
         g_available.store(false);
         g_busy.store(false);
         return;
@@ -167,7 +167,7 @@ void check_thread(const std::string& source, const std::string& token) {
         std::lock_guard<std::mutex> lk(g_mu);
         g_tag = tag;
         g_page = page;
-        g_status = "bbhost " + tag + " is available (this is " + BBHOST_VERSION + ")";
+        g_status = "bbhost " + tag + " が利用できます（現在: " + BBHOST_VERSION + ")";
         g_detail = page;
     }
     g_available.store(true);
@@ -179,9 +179,13 @@ void check_thread(const std::string& source, const std::string& token) {
 // the configuration again after the setup window's Play, while a check the
 // window began may still be running.
 void begin_check(bool delay) {
+    if (config().update_source.empty()) {
+        set_lines("日本語版の更新先は未設定です", "配布元の日本語版リリースを確認してください。");
+        return;
+    }
     if (g_busy.exchange(true)) return;
     g_checked.store(true);
-    set_lines(std::string("bbhost ") + BBHOST_VERSION + " - checking for updates...", "");
+    set_lines(std::string("bbhost ") + BBHOST_VERSION + " - 更新を確認中...", "");
     std::string source = config().update_source.empty() ? kDefaultSource : config().update_source;
     std::thread([delay, source = std::move(source), token = read_token()] {
         if (delay) std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -222,14 +226,19 @@ constexpr const char* kPluginExt = ".so";
 // (+ .sig) - or <name><ext>.new when that file is in use (a loaded plugin on
 // Windows), which plugins_load puts in place at the next start.
 void fetch_plugins_thread(std::string dir) {
-    set_plugins_status("looking for the latest official plugins...");
+    if (config().update_source.empty()) {
+        set_plugins_status("日本語版の更新先は未設定です。同梱のプラグインを使用してください。");
+        g_plugins_busy.store(false);
+        return;
+    }
+    set_plugins_status("公式プラグインの最新版を検索中...");
     const std::string source = config().update_source.empty() ? kDefaultSource : config().update_source;
     const Fetch f = fetch(source, false, 20000);
     json::Value v;
     std::string err;
     if (!f.ok() || !json::parse(f.body, v, err) || v.type != json::Value::Type::Object) {
-        set_plugins_status("could not read the latest release: " + (!f.error.empty() ? f.error : "HTTP " + std::to_string(f.status)) +
-                           (f.status == 404 && read_token().empty() ? " (a private repository needs update.token_file)" : ""));
+        set_plugins_status("最新リリースを読み込めません: " + (!f.error.empty() ? f.error : "HTTP " + std::to_string(f.status)) +
+                           (f.status == 404 && read_token().empty() ? " （非公開の場合は update.token_file が必要）" : ""));
         g_plugins_busy.store(false);
         return;
     }
@@ -292,10 +301,10 @@ void fetch_plugins_thread(std::string dir) {
         names += (names.empty() ? "" : ", ") + name;
     }
     if (!installed && !failed) {
-        set_plugins_status("release " + tag + " has no official plugins for this platform");
+        set_plugins_status("release " + tag + " にこの OS 用の公式プラグインがありません");
     } else {
         set_plugins_status("release " + tag + ": " + std::to_string(installed) + " installed" + (names.empty() ? "" : " (" + names + ")") +
-                           (failed ? ", " + std::to_string(failed) + " failed (see the log)" : "") + " - active from the next start");
+                           (failed ? ", " + std::to_string(failed) + " 失敗（ログを確認してください）" : "") + " - 次回起動時から有効");
     }
     g_plugins_busy.store(false);
 }
@@ -335,7 +344,7 @@ void start() {
     const int want = test ? 1 : config().update_check;
     set_lines(std::string("bbhost ") + BBHOST_VERSION, "");
     if (want == 0 || (want < 0 && !release)) {
-        if (want < 0) set_lines(std::string("bbhost ") + BBHOST_VERSION, "Built from source: checks only when asked (update.check)");
+        if (want < 0) set_lines(std::string("bbhost ") + BBHOST_VERSION, "ソースからのビルド: 指定時のみ更新確認 (update.check)");
         return;
     }
     begin_check(true);
@@ -385,7 +394,7 @@ bool open_release_page() {
     host_log("update: no browser to open %s in", url.c_str());
 #endif
     std::lock_guard<std::mutex> lk(g_mu);
-    g_detail = "The browser did not open; the page is " + url;
+    g_detail = "ブラウザーを開けませんでした。ページ: " + url;
     return false;
 }
 

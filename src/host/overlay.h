@@ -34,6 +34,7 @@ bool host_overlay_empty();
 // so 1.0 is 12x24 display pixels a character. Returns the width drawn.
 float host_overlay_text(float x, float y, float scale, std::uint32_t rgba, const char* text);
 float host_overlay_text_width(float scale, const char* text);
+void host_overlay_text_wrapped(float x, float y, float scale, std::uint32_t rgba, float max_width, const char* text);
 
 // `queue` and `family` are needed once, to upload the font atlas.
 bool host_overlay_init(VkDevice device, VkPhysicalDevice phys, VkFormat colour_format, VkQueue queue,

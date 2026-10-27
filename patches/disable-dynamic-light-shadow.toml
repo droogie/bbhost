@@ -9,7 +9,7 @@
 [patch]
 name = "disable-dynamic-light-shadow"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster)"
+description = "動的光源の影を無効化して負荷を軽減 (Kyo)"
 enabled = false
 order = 128
 

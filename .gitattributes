@@ -11,3 +11,7 @@
 *.bndb binary
 *.7z binary
 *.zip binary
+
+*.ttf binary
+*.so binary
+*.dll binary

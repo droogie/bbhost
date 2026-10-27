@@ -28,49 +28,49 @@
 # characters, which tests/menu_assets_test.cpp checks.
 #
 # id	menu text (group 0xc8)	line help (group 0xc9)
-110006	PC Settings	Options added by the PC port.
-110007	PC Graphics	Graphics options added by the PC port.
-110008	PC Controls	The mouse: camera, sensitivity and the pointer.
-110009	Key Bindings	Keyboard and mouse bindings.
-110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
-110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
-110012	Steam Deck	Frame rate and model detail for the Steam Deck.
-110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players. Each needs a restart.
-116000	Vertical Sync	Wait for the display. Off can tear.
-116001	Fullscreen	Borderless, at the desktop resolution.
-116002	Mouse in Menus	Move and click to select.
-116003	Draw the Pointer	Show the mouse pointer.
-116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	Applies on the next run. 30 is the game's own pace; higher rates run its logic at that rate.
-116007	FPS Counter	Frames per second actually presented, in the top right corner.
-116020	PC Settings	
+110006	PC 設定	PC 版で追加された設定です。
+110007	PC グラフィックス	PC 版の描画設定です。
+110008	PC 操作設定	マウスのカメラ操作・感度・ポインターを設定します。
+110009	キー設定	キーボードとマウスの割り当てです。
+110010	PC 画面効果	ぼかし、ブルーム、ビネットなどの画面効果です。
+110011	PC カメラ	視野角、距離、高さ、マウス使用時の自動回転です。
+110012	Steam Deck	Steam Deck のフレームレートとモデルの精細度です。
+110013	PC 追加機能	鏡、能力値の振り直し、５人プレイです。再起動が必要です。
+116000	垂直同期	画面の更新に合わせます。無効では映像が裂ける場合があります。
+116001	全画面	デスクトップの解像度でボーダーレス表示します。
+116002	メニューでマウスを使用	移動とクリックで項目を選べます。
+116003	ポインターを表示	マウスポインターを表示します。
+116004	企業ロゴをスキップ	起動時のロゴと終了警告を省略します。次回起動時に反映します。
+116005	フレームレート	30 は原作の速度です。高い値ほど滑らかになります。再起動が必要です。
+116007	FPS 表示	右上に実際の毎秒描画フレーム数を表示します。
+116020	PC 設定
 116030	30	
 116031	60	
 116032	90
 116033	120
-116035	Uncapped
-117000	Ambient Occlusion	Screen-space ambient occlusion.
-117005	Motion Blur	The blur on fast camera and character movement.
-117001	Anti-Aliasing	The game's own anti-aliasing pass.
-117002	Depth of Field	Blurs distant scenery. Off keeps far views sharp.
-117020	PC Graphics	
-117003	Chromatic Aberration	The colour fringing at the edges of the frame.
-117006	Shadow Distance	How far sun and moon shadows reach. 0 is the game's own.
-117007	AO Strength	How dark corners and contact get. 5 is the game's own.
-117008	Fog	How thick the haze over distant streets is. 10 is the game's own.
-117009	HLSL Shaders	Requires a restart. On: shaders compiled from HLSL by DXC on this PC. Off: the translator's own.
-120020	PC Effects	
-120000	Bloom	The glow around bright light. 10 is the game's own.
-120001	Vignette	The darkened frame edges some areas use.
-120002	Saturation	Colour. 5 is the game's own; 0 is black and white.
-121020	PC Camera	
-121000	Camera Distance	How far behind the character the camera sits. 5 is the game's own.
-121001	Camera Height	How high above the character the camera looks. 5 is the game's own.
-121002	Mouse Auto-Rotation	Off: the camera stays where the mouse left it, not swinging behind you. Pads are unaffected.
-121003	Camera Tuning	Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original, the game's own.
+116035	無制限
+117000	アンビエントオクルージョン	画面空間の接触陰影です。
+117005	モーションブラー	カメラやキャラクターの速い動きをぼかします。
+117001	アンチエイリアス	原作の輪郭補正処理です。
+117002	被写界深度	遠景をぼかします。無効では遠くまで鮮明に表示します。
+117020	PC グラフィックス
+117003	色収差	画面端に生じる色ずれです。
+117006	影の描画距離	日光と月光の影が届く距離です。0 が原作の設定です。
+117007	接触陰影の強さ	隅や接触部分の陰影の濃さです。5 が原作の設定です。
+117008	霧	遠くの景色にかかる霧の濃さです。10 が原作の設定です。
+117009	HLSL シェーダー	有効では DXC、無効では独自変換を使います。再起動が必要です。
+120020	PC 画面効果
+120000	ブルーム	明るい光のにじみです。10 が原作の設定です。
+120001	ビネット	一部のエリアで画面の周辺を暗くする効果です。
+120002	彩度	5 が原作の色、0 は白黒です。
+121020	PC カメラ
+121000	カメラの距離	キャラクターの後方への距離です。5 が原作の設定です。
+121001	カメラの高さ	キャラクターに対する高さです。5 が原作の設定です。
+121002	マウス使用時の自動回転	無効ではマウスで指定した向きを維持します。パッド操作には影響しません。
+121003	カメラの調整	30 fps 超で FPS++ の調整値か原作の値を使います。再起動が必要です。
 121030	FPS++ (Kyo)	
-121031	Original	
-117004	Resolution	What the game renders at (it shipped at 1920x1080). Changes at once and asks to be kept.
+121031	原作
+117004	解像度	原作は 1920x1080 です。変更を即時反映し、維持するか確認します。
 117010	1280x720
 117011	1600x900
 117012	1920x1080
@@ -83,8 +83,8 @@
 117033	3840x1080 (32:9)
 117034	5120x1440 (32:9)
 117035	1280x800 (16:10)
-117036	960x600 (16:10, upscaled)
-117037	1024x640 (16:10, upscaled)
+117036	960x600 (16:10、拡大表示)
+117037	1024x640 (16:10、拡大表示)
 117038	640x360
 117039	960x540
 117040	1440x810
@@ -93,42 +93,42 @@
 117043	2560x1600 (16:10)
 117044	1280x960 (4:3)
 117045	1440x1080 (4:3)
-118000	Mouse Camera	The mouse turns the camera outside menus.
-118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
-118001	Camera Sensitivity	How fast the mouse turns the camera.
-118002	Mouse X-Axis	The mouse's horizontal camera direction.
-118003	Mouse Y-Axis	The mouse's vertical camera direction.
-118020	PC Controls
+118000	マウスでカメラ操作	メニュー外でマウスによるカメラ操作を許可します。
+118004	視野角	0 が原作の視野です。１段階につき 5% 広げます。
+118001	カメラ感度	マウスでカメラを回す速さです。
+118002	マウスの横方向	左右のカメラ操作の向きを設定します。
+118003	マウスの縦方向	上下のカメラ操作の向きを設定します。
+118020	PC 操作設定
 # Key Bindings. The seven action rows' captions and line help are replaced by
 # the port at runtime (engine/option_menu.cpp); these are what they stand in
 # for until then.
-119000	Page	Left and right change the group of actions shown.
-119001	Action	
-119002	Action	
-119003	Action	
-119004	Action	
-119005	Action	
-119006	Action	
-119007	Action	
-119020	Key Bindings
-122000	Quit Game	Close the game and return to the desktop.
+119000	ページ	左右で表示する操作のグループを切り替えます。
+119001	操作
+119002	操作
+119003	操作
+119004	操作
+119005	操作
+119006	操作
+119007	操作
+119020	キー設定
+122000	ゲーム終了	ゲームを閉じてデスクトップに戻ります。
 123020	Steam Deck	
-123000	Frame Rate	30 fps: 1280x800. 60 fps: 960x600 upscaled by FSR 1, Model Detail Low. The rate needs a restart.
-123001	Model Detail	Normal is the game's own. Low and Lowest use simpler models sooner, faster; Full never swaps.
+123000	フレームレート	30 fps は 1280x800、60 fps は FSR 1 と簡略モデル。再起動で反映。
+123001	モデルの精細度	標準は原作、低・最低は早めに簡略化、最高は簡略化しません。
 123030	30 fps	
 123031	60 fps	
-123040	Full	
-123041	Normal	
-123042	Low	
-123043	Lowest	
-124020	PC Enhancements	
-124001	Hunter's Dream Mirror	Requires a restart. The Dream's mirror opens the appearance editor (the cut "Put on Disguise").
-124002	Rebirth at the Altar	Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.
-124003	Five Players	Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier, the DLC; all need it.
-920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
-920001	Quit the game and return to the desktop?	
-14000332	Rebirth in the Nightmare	
-14000333	The altar is silent.\nIt awaits one who bears a sacred heirloom,\na consciousness that is only asleep.	
-14000334	Too many Blood Echoes are held to be reborn.\nSpend some, then return to the altar.	
-14000335	Accept Rebirth	
-14000336	Undo Rebirth	
+123040	最高
+123041	標準
+123042	低
+123043	最低
+124020	PC 追加機能
+124001	狩人の夢の鏡	夢の鏡で容姿の編集画面を開きます。再起動が必要です。
+124002	祭壇で生まれ変わる	ヤーナムの石があれば祭壇で能力値を振り直せます。再起動が必要です。
+124003	５人プレイ	終盤と DLC の侵入者を２人に増やします。全員の設定と再起動が必要です。
+920000	この解像度を維持しますか？\n「はい」を選ばなければ10秒後に元に戻ります。
+920001	ゲームを終了してデスクトップに戻りますか？
+14000332	悪夢で生まれ変わる
+14000333	祭壇は沈黙している。\n聖なる遺物を持つ者を待っている。\nその意識は、ただ眠っているだけなのだ。
+14000334	血の遺志が多すぎるため、生まれ変われません。\n少し使用してから祭壇に戻ってください。
+14000335	生まれ変わりを受け入れる
+14000336	生まれ変わりを取り消す

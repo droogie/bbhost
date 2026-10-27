@@ -25,25 +25,25 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION,
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "mutators",
-    "Mutators",
+    "ゲームルール変更",
     "1.0.0",
     "bbhost",
-    "Gravity, game speed, bullet time, one-hit death, blood drain, tougher enemies, echo rate and chaos effects - each a switch.",
+    "重力、速度、スロー効果、一撃死、HP 減少、敵の強化、血の遺志倍率、ランダム効果を個別に設定します。",
 };
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
-    {BB_OPT_HEADING, nullptr, "World", "These change at once in the in-game menu."},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "gravity", "Gravity", "0.2: the moon is close - long falls, floating corpses.", "1.0", 0.05, 2.0},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "speed", "Game speed", "0.75 a slower hunt, 1.25 a frantic one (as far as the machine keeps up).", "1.0", 0.25, 2.0},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "bullet_time", "Bullet time", "Under 30% HP the world slows to half speed.", "false"},
-    {BB_OPT_HEADING, nullptr, "The hunter"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "one_hit", "One hit", "Anything that hurts you kills you.", "false"},
-    {BB_OPT_INT | BB_OPT_LIVE, "blood_drain", "Blood drain", "% of max HP lost every 10 s; rally it back by hitting things.", "0", 0, 20},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "echoes", "Blood Echoes gained", nullptr, "1.0", 0.0, 10.0},
-    {BB_OPT_INT | BB_OPT_LIVE, "chaos", "Chaos every N seconds", "A random consumable's effect lands on you. 0: off.", "0", 0, 120},
-    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "Chaos seed", nullptr, ""},
-    {BB_OPT_HEADING, nullptr, "Enemies"},
-    {BB_OPT_FLOAT, "enemy_hp", "Enemy HP", "Every enemy's HP times this (from the next start).", "1.0", 0.25, 10.0},
+    {BB_OPT_HEADING, nullptr, "ワールド", "ゲーム内メニューで直ちに反映されます。"},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "gravity", "重力", "0.2 では落下が遅くなり、死体も浮くように動きます。", "1.0", 0.05, 2.0},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "speed", "ゲーム速度", "0.75 で遅く、1.25 で速くなります。PC の性能に依存します。", "1.0", 0.25, 2.0},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "bullet_time", "瀕死時のスロー効果", "HP が 30% 未満になるとワールドの速度が半分になります。", "false"},
+    {BB_OPT_HEADING, nullptr, "狩人"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "one_hit", "一撃死", "ダメージを受けると即死します。", "false"},
+    {BB_OPT_INT | BB_OPT_LIVE, "blood_drain", "HP の自然減少", "10秒ごとに最大 HP の指定割合を失います。攻撃のリゲインで取り戻せます。", "0", 0, 20},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "echoes", "獲得する血の遺志", nullptr, "1.0", 0.0, 10.0},
+    {BB_OPT_INT | BB_OPT_LIVE, "chaos", "ランダム効果の間隔（秒）", "消耗品の効果をランダムに受けます。0 で無効。", "0", 0, 120},
+    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "ランダム効果のシード", nullptr, ""},
+    {BB_OPT_HEADING, nullptr, "敵"},
+    {BB_OPT_FLOAT, "enemy_hp", "敵の HP 倍率", "すべての敵の HP に適用します（次回起動時）。", "1.0", 0.25, 10.0},
     {BB_OPT_END}};
 
 namespace {
@@ -140,7 +140,7 @@ void tick() {
 
     if (g_one_hit && g_last_hp > 0 && hp > 0 && hp < g_last_hp) {
         g.set_stat("hp", 0);
-        g.message("One hit.", 3.0f);
+        g.message("一撃死。", 3.0f);
     }
     if (g_drain > 0.0f && g_frame % (10 * kFps) == 0 && hp > 1) {
         const std::int64_t loss = std::max<std::int64_t>(1, static_cast<std::int64_t>(static_cast<float>(max_hp) * g_drain / 100.0f));
@@ -161,7 +161,7 @@ void tick() {
     if (g_chaos > 0 && !g_chaos_pool.empty() && g_frame % static_cast<std::uint64_t>(g_chaos * kFps) == 0) {
         const std::int32_t effect = g_chaos_pool[g_rng.below(static_cast<std::uint32_t>(g_chaos_pool.size()))];
         g.sp_effect(effect);
-        g.message("Chaos!", 2.0f);
+        g.message("ランダム効果！", 2.0f);
         g.log("mutators: chaos applies SpEffect %d", effect);
     }
 }

@@ -14,7 +14,7 @@
 [patch]
 name = "ingame-post-processors"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "all three resource post-processors run in play, not two"
+description = "プレイ中のリソース後処理を２つから３つに増やす"
 option = "streaming.all_post_processors"
 
 # sub_1827e50, play: lock _2; mov dword [rbx+0xe50], 0; unlock

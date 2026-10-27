@@ -25,7 +25,7 @@
 [patch]
 name = "old-hunters"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "The Old Hunters is available: the game takes itself for the edition that includes it"
+description = "DLC 同梱版として認識し、The Old Hunters を利用可能にする"
 
 [site.pkgedition]
 address = "0x023b6d20"

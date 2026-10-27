@@ -168,12 +168,12 @@ GUEST_ABI int hle_user_event(std::int32_t* ev) {
 GUEST_ABI int hle_sysparam_int(int id, int* value) {
     int v = 0;
     if (id == 1) {
-        // SCE_SYSTEM_SERVICE_PARAM_ID_LANG: English (US); BBHOST_SYSTEM_LANG=N
+        // Japanese by default in bbhost-jp; BBHOST_SYSTEM_LANG=N
         // another (2 French, 4 German, 18 English UK, ...) - for testing
         // the other languages' message bundles.
         static const int lang = [] {
             const char* e = std::getenv("BBHOST_SYSTEM_LANG");
-            return e && *e ? std::atoi(e) : 1;
+            return e && *e ? std::atoi(e) : 0;
         }();
         v = lang;
     } else if (id == 1000) {

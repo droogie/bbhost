@@ -20,10 +20,10 @@ int main() {
     ShaderCacheState s;
     // A new install: no caches.
     ShaderCompileAdvice a = shader_compile_advice(s, false, 16);
-    CHECK(a.recommend && a.why == "There are no shader caches yet" && a.time == "about 1-2 minutes on this PC");
-    CHECK(shader_compile_advice(s, true, 8).time == "about 2-3 minutes on a Steam Deck");
-    CHECK(shader_compile_advice(s, false, 8).time == "about 2-3 minutes on this PC");
-    CHECK(shader_compile_advice(s, false, 4).time == "about 3-5 minutes on this PC");
+    CHECK(a.recommend && a.why == "シェーダーキャッシュがありません" && a.time == "この PC で約１～２分");
+    CHECK(shader_compile_advice(s, true, 8).time == "Steam Deck で約２～３分");
+    CHECK(shader_compile_advice(s, false, 8).time == "この PC で約２～３分");
+    CHECK(shader_compile_advice(s, false, 4).time == "この PC で約３～５分");
     // Caches of this translator and this driver: nothing to recommend.
     s.have_caches = true;
     s.translator_current = true;
@@ -35,23 +35,23 @@ int main() {
     // Another GPU or driver.
     s.device_current = 0;
     a = shader_compile_advice(s, false, 16);
-    CHECK(a.recommend && a.why.find("another GPU or graphics driver") != std::string::npos);
+    CHECK(a.recommend && a.why.find("別の GPU またはドライバー") != std::string::npos);
     // An update with another translator: whatever the driver says.
     s.translator_current = false;
     s.device_current = 1;
     a = shader_compile_advice(s, false, 16);
-    CHECK(a.recommend && a.why.find("another bbhost version") != std::string::npos);
+    CHECK(a.recommend && a.why.find("別バージョンの bbhost") != std::string::npos);
     // The last finished compile's time wins over the guess; a cancelled one's does not.
     s.last = {"result done", "when 2026-10-17 08:57", "seconds 148"};
-    CHECK(shader_compile_advice(s, true, 8).time == "about 2-3 minutes (the last compile here took 148 s)");
+    CHECK(shader_compile_advice(s, true, 8).time == "約 2-3 分 （前回の所要時間: 148 秒）");
     s.last = {"result done", "seconds 62"};
-    CHECK(shader_compile_advice(s, false, 80).time == "about 1-2 minutes (the last compile here took 62 s)");
+    CHECK(shader_compile_advice(s, false, 80).time == "約 1-2 分 （前回の所要時間: 62 秒）");
     s.last = {"result cancelled", "seconds 30"};
-    CHECK(shader_compile_advice(s, true, 8).time == "about 2-3 minutes on a Steam Deck");
+    CHECK(shader_compile_advice(s, true, 8).time == "Steam Deck で約２～３分");
     // The minutes: a range of two whole minutes, never "0-1".
-    CHECK(shader_compile_minutes(30) == "about a minute");
-    CHECK(shader_compile_minutes(91) == "about 1-2 minutes");
-    CHECK(shader_compile_minutes(200) == "about 3-4 minutes");
+    CHECK(shader_compile_minutes(30) == "約１分");
+    CHECK(shader_compile_minutes(91) == "約 1-2 分");
+    CHECK(shader_compile_minutes(200) == "約 3-4 分");
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;

@@ -1,3 +1,4 @@
+#include "host/japanese_labels.h"
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
@@ -112,25 +113,25 @@ struct Row {
 };
 
 Setting g_set[kSettingCount] = {
-    {"window_mode", "Window mode", {"Windowed", "Fullscreen"}, 0,
-     "Fullscreen is borderless: the desktop resolution, no mode switch.", false},
-    {"vsync", "V-Sync", {"On", "Off"}, 0,
-     "Off presents as soon as a frame is ready, and can tear.", false},
+    {"window_mode", "画面モード", {"Windowed", "Fullscreen"}, 0,
+     "全画面はデスクトップの解像度を使うボーダーレス表示です。", false},
+    {"vsync", "垂直同期", {"On", "Off"}, 0,
+     "無効では完成したフレームをすぐに表示します。画面が裂けて見える場合があります。", false},
     // The game's own pace (engine/frame_rate.h), the same five the game's Frame
     // Rate pick list offers (engine/option_menu.cpp). The key is the old Frame
     // cap's, so a file keeps its 30 or 60; a file older than version 3 holds a
     // cap on presentation, whose 90, 120, 144 and Off ran the game at 60, and
     // reads as 60 (host_options_load).
-    {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
-     "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
+    {"frame_cap", "フレームレート", {"30", "60", "90", "120", "Uncapped"}, 0,
+     "30 fps は原作の速度です。60・90・120 fps は各速度で動作します。無制限では実時間に合わせ、垂直同期時は画面の更新頻度、無効時はワールド内で最大 240 fps です。次回起動時に反映します。",
      false},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
-    {"fps_counter", "FPS counter", {"Off", "On"}, 0,
-     "The game's frames per second, in the top right corner.", false},
+    {"fps_counter", "FPS 表示", {"Off", "On"}, 0,
+     "画面右上に毎秒の描画フレーム数を表示します。", false},
     // What bbhost holds of video memory and of the memory Windows counts as
     // shared GPU memory (host/window.cpp, host_gpu_memory_glance).
+<<<<<<< HEAD
     {"memory_counter", "Memory counter", {"Off", "On"}, 0,
      "Video memory in use (how much is cache, given back when it runs short) and the game's memory the GPU reads, "
      "which Windows counts as shared GPU memory.", false},
@@ -141,96 +142,100 @@ Setting g_set[kSettingCount] = {
     {"perf_overlay", "Performance meter", {"Off", "On"}, 0,
      "What limits the frame rate - the GPU, the main thread, the GX workers, the command processor, the frame cap - "
      "and how busy each part is, under the FPS counter (docs/performance.md).", false},
+=======
+    {"memory_counter", "メモリー表示", {"Off", "On"}, 0,
+     "ビデオメモリー使用量、解放可能なキャッシュ、GPU が参照するゲームメモリーを表示します。Windows では後者が共有 GPU メモリーに相当します。", false},
+>>>>>>> other-repo/master
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
-    {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
-     "How wide the camera sees. +0% is the game's own; +50% is about 97 degrees across.", false},
+    {"fov", "視野角", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
+     "カメラの視野の広さです。+0% は原作、+50% は水平方向に約 97 度です。", false},
     // The same row's camDistTarget and chrOrgOffset_Y: 5 the game's own, 10%
     // a step either way.
-    {"camera_distance", "Camera distance", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How far behind the character the camera sits. 5 is the game's own.", false},
-    {"camera_height", "Camera height", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How high above the character the camera looks. 5 is the game's own.", false},
+    {"camera_distance", "カメラの距離", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+     "キャラクターからカメラまでの距離です。5 が原作の設定です。", false},
+    {"camera_height", "カメラの高さ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+     "キャラクターに対するカメラの高さです。5 が原作の設定です。", false},
     // The follow camera above 30 fps (engine/frame_rate.cpp camera_original):
     // the game's own values, the same camera at every frame rate, whatever is
     // saved here - the menus no longer offer it, and only
     // BBHOST_CAMERA_TUNING=fps++ runs the retune from Kyo's 60 FPS++ list. So
     // the default is Original, and a save records the camera that runs.
-    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 1,
-     "Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.",
+    {"camera_tuning", "カメラの調整", {"FPS++ (Kyo)", "Original"}, 1,
+     "再起動が必要です。30 fps 超では FPS++ が Kyo の調整値、原作は 30 fps 時の値を使用します。",
      true},
     // On, as in DS3: a click only reaches the menus while one is open
     // (engine/menu_pointer.h), so it cannot swing a weapon in the world.
-    {"mouse_menu", "Mouse in menus", {"Off", "On"}, 1,
-     "Click confirms, right-click goes back, the wheel moves the cursor.", false},
+    {"mouse_menu", "メニューでマウスを使用", {"Off", "On"}, 1,
+     "左クリックで決定、右クリックで戻る、ホイールで選択を移動します。", false},
     // On by default, and it only *disables* the automatic behaviour: the
     // mouse turns the camera whenever a menu is not open, which is what DS3
     // does and what a PC player expects. Off hands the camera back to the pad.
-    {"mouse_camera", "Mouse camera", {"On", "Off"}, 0,
-     "The mouse turns the camera outside menus. Off leaves it to the pad.", false},
+    {"mouse_camera", "マウスでカメラ操作", {"On", "Off"}, 0,
+     "メニュー外でマウスによるカメラ操作を許可します。無効時はパッドで操作します。", false},
     // 0..10, the range of the game's own Camera Sensitivity slider, which is
     // the widget the PC Controls screen draws it with, and DS3's: the same
     // angle a count at each step (engine/mouse_camera.h), 5 its default.
-    {"mouse_sens", "Mouse sensitivity", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How far a given mouse movement turns the camera.", false},
-    {"mouse_invert_x", "Mouse X-axis", {"Off", "On"}, 0,
-     "Reverses the mouse's horizontal camera movement.", false},
-    {"mouse_invert_y", "Mouse Y-axis", {"Off", "On"}, 0,
-     "Reverses the mouse's vertical camera movement.", false},
+    {"mouse_sens", "マウス感度", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+     "マウスの移動量に対するカメラの回転量です。", false},
+    {"mouse_invert_x", "マウスの横方向", {"Off", "On"}, 0,
+     "マウスの左右のカメラ操作を反転します。", false},
+    {"mouse_invert_y", "マウスの縦方向", {"Off", "On"}, 0,
+     "マウスの上下のカメラ操作を反転します。", false},
     // Off by default: with the mouse the camera stays where it is put, as
     // the community's "Disable Camera Auto Rotation" patch has it - but only
     // while the keyboard and mouse were used last; a controller gets the
     // game's own camera back (engine/mouse_camera.h).
-    {"mouse_auto_rotation", "Mouse auto-rotation", {"Off", "On"}, 0,
-     "Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.", false},
-    {"draw_cursor", "Draw the pointer", {"On", "Off"}, 0,
-     "The host draws it; the game has no cursor of its own.", false},
+    {"mouse_auto_rotation", "マウス使用時の自動回転", {"Off", "On"}, 0,
+     "無効時は移動中もカメラの向きを維持します。コントローラー使用時は原作のカメラ動作になります。", false},
+    {"draw_cursor", "ポインターを表示", {"On", "Off"}, 0,
+     "ゲームにはマウスポインターがないため、bbhost が描画します。", false},
     // The game's key guide and its tutorial notes name a pad button as an
     // image tag; the port rewrites the tag into the key bound to it
     // (engine/key_prompts.h). Auto follows the device last used (host_input_device).
-    {"button_prompts", "Button prompts", {"Auto", "Keyboard", "Controller"}, 0,
-     "What the game's own prompts show. Auto follows the device you last used, keys or controller.", false},
+    {"button_prompts", "ボタン表示", {"Auto", "Keyboard", "Controller"}, 0,
+     "ゲーム内の操作表示です。自動では最後に使ったキーボードまたはコントローラーに合わせます。", false},
     // The post-processing switches. They follow their settings live
     // (engine/graphics_patch.cpp, host/shader_patch.h).
-    {"ssao", "Ambient occlusion", {"On", "Off"}, 0,
-     "Screen-space ambient occlusion. Off is faster.", false},
+    {"ssao", "アンビエントオクルージョン", {"On", "Off"}, 0,
+     "画面空間の接触陰影です。無効にすると軽くなります。", false},
     // Not a byte patch: the blur shader passes every pixel through
     // (host/shader_patch.h).
-    {"motion_blur", "Motion blur", {"On", "Off"}, 0,
-     "The blur on fast camera and character movement.", false},
-    {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
-     "The game's own AA pass.", false},
-    {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
-     "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
-    {"chromatic_aberration", "Chromatic aberration", {"On", "Off"}, 0,
-     "The colour fringing at the edges of the frame.", false},
+    {"motion_blur", "モーションブラー", {"On", "Off"}, 0,
+     "カメラやキャラクターの速い動きをぼかします。", false},
+    {"anti_alias", "アンチエイリアス", {"On", "Off"}, 0,
+     "原作の輪郭補正処理です。", false},
+    {"depth_of_field", "被写界深度", {"On", "Off"}, 0,
+     "遠景をぼかします。屋内では効果が小さい場合があります。", false},
+    {"chromatic_aberration", "色収差", {"On", "Off"}, 0,
+     "画面端の色ずれです。", false},
     // Two of the area's draw parameters (param/drawparam), scaled or cleared
     // as the game hands them to YEBIS each frame - engine/graphics_patch.cpp.
     // 10 is the area's own glare; 0 is none.
-    {"bloom", "Bloom", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
-     "The glow around bright light. 10 is the game's own; lower dims it.", false},
-    {"vignette", "Vignette", {"On", "Off"}, 0,
-     "The darkened frame edges some areas use.", false},
+    {"bloom", "ブルーム", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
+     "明るい光のにじみです。10 が原作の設定で、下げると弱まります。", false},
+    {"vignette", "ビネット", {"On", "Off"}, 0,
+     "一部のエリアで画面の周辺を暗くする効果です。", false},
     // The area's shadow cascades, stretched past the first split: 1 + 0.2 a
     // step, so the game's slider row (0..10) is the same setting.
-    {"shadow_distance", "Shadow distance",
+    {"shadow_distance", "影の描画距離",
      {"x1.0", "x1.2", "x1.4", "x1.6", "x1.8", "x2.0", "x2.2", "x2.4", "x2.6", "x2.8", "x3.0"}, 0,
-     "How far the sun and moon cast shadows. Farther spreads each shadow map wider.", false},
+     "日光と月光の影を描く距離です。広げると影の解像感が下がります。", false},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
-    {"ao_strength", "AO strength", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How dark ambient occlusion makes corners and contact. 5 is the game's own.", false},
-    {"saturation", "Saturation", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "Colour. 5 is the game's own; 0 is black and white.", false},
+    {"ao_strength", "陰影の濃さ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+     "隅や接触部分の陰影の濃さです。5 が原作の設定です。", false},
+    {"saturation", "彩度", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+     "色の鮮やかさです。5 が原作、0 は白黒です。", false},
     // The fog table's opacities (engine/graphics_patch.cpp): 10 the area's own.
-    {"fog", "Fog", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
-     "How thick distance and height fog are. 10 is the game's own; 0 clears it.", false},
+    {"fog", "霧", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
+     "遠景と高さによる霧の濃さです。10 が原作、0 で除去します。", false},
     // The game's level-of-detail bias (engine/graphics_patch.cpp): Full keeps
     // every model at its finest mesh, Low and Lowest move each to a coarser
     // one sooner. Lowest is the community "model LOD 2" (-8% GPU, models
     // visibly simpler up close).
-    {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
-     "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
+    {"model_detail", "モデルの精細度", {"Full", "Normal", "Low", "Lowest"}, 1,
+     "標準は原作の設定です。低・最低では簡略モデルへの切り替えを早め、最高では切り替えません。", false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -241,47 +246,45 @@ Setting g_set[kSettingCount] = {
     // other shapes are engine/live_resolution.cpp's. 960x600 and 1024x640 are
     // the Deck's screen at 75% and 80%: it holds 60 fps there (pixel-bound at
     // 1280x800, ~45), and the presenter upscales by FSR 1.
-    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
+    {"resolution", "解像度", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
                                   "1920x1080", "2560x1440", "2880x1620", "3200x1800", "3840x2160",
                                   "960x600", "1024x640", "1280x800", "1920x1200", "2560x1600",
                                   "1280x960", "1440x1080", "2560x1080", "3440x1440", "5120x2160",
                                   "3840x1080", "5120x1440"}, 5,
-     "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
-     "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
+     "ゲームの描画解像度です。原作は 1920x1080。横長と 16:10 画面にも対応し、HUD は 16:9 を維持します。大きな解像度はメモリー確保のため再起動が必要な場合があります。",
      true},
     // The shaders' form on the GPU (host/translation_cache.h): HLSL is the
     // lifted shaders printed as HLSL and compiled by DXC on this machine,
     // taken from the cache while the rest compile behind the game; Lifted is
     // the lifter's own SPIR-V alone. The same pictures either way.
-    {"shaders", "Shaders", {"HLSL", "Lifted"}, 0,
-     "Requires a restart. HLSL: the game's shaders as HLSL, compiled by DXC on this PC in the background and used from the next start. "
-     "Lifted: the translator's own SPIR-V only.",
+    {"shaders", "シェーダー", {"HLSL", "Lifted"}, 0,
+     "再起動が必要です。HLSL はこの PC の DXC でバックグラウンド処理し、次回起動時に使用します。変換済み SPIR-V は独自変換のみです。",
      true},
-    {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
-     "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
+    {"skip_logos", "企業ロゴをスキップ", {"Off", "On"}, 0,
+     "タイトル前の３つのロゴと、前回「ゲーム終了」を使わなかった場合の警告を省略します。", true},
     // The old switch for the developers' debug menu, which the Debug Menu
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
-    {"debug_menu", "Debug menu", {"Off", "On"}, 0, "Replaced by the Debug Menu plugin.", true},
+    {"debug_menu", "デバッグメニュー", {"Off", "On"}, 0, "デバッグメニュープラグインに置き換わりました。", true},
     // Lance McDonald's "Restore Debug Camera" (patches/debug-camera.toml). Its
     // code takes the place of a debug-only load-test step, so the debug menu's
     // LOAD TEST and DUNGEON MOVEMAP TEST crash while it is on.
-    {"debug_camera", "Debug camera", {"Off", "On"}, 0,
-     "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
+    {"debug_camera", "デバッグカメラ", {"Off", "On"}, 0,
+     "再起動が必要です。調べる (E) を押しながら L3 (左 Ctrl) で自由カメラのモードを切り替えます。", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
     // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
     // shipped. (The Old Hunters, a fourth in v0.2.9, is the patch old-hunters.)
-    {"change_appearance", "Hunter's Dream mirror", {"On", "Off"}, 0,
-     "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
-    {"rebirth", "Rebirth at the Altar", {"On", "Off"}, 0,
-     "Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.", true},
-    {"five_players", "Five players", {"On", "Off"}, 0,
-     "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
+    {"change_appearance", "狩人の夢の鏡", {"On", "Off"}, 0,
+     "再起動が必要です。狩人の夢の鏡で未使用の容姿編集画面を開きます。", true},
+    {"rebirth", "祭壇で生まれ変わる", {"On", "Off"}, 0,
+     "再起動が必要です。ヤーナムの石があれば、嘆きの祭壇でレベルと能力値を振り直せます。", true},
+    {"five_players", "５人プレイ", {"On", "Off"}, 0,
+     "再起動が必要です。メンシス・高楼・辺境・DLCで侵入者を２人に増やします。全参加者の有効化が必要です。", true},
 };
 
 const Row g_rows[] = {
-    {Row::Header, "DISPLAY"},
+    {Row::Header, "画面"},
     {Row::Option, nullptr, kWindowMode},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
@@ -291,7 +294,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
-    {Row::Header, "INPUT"},
+    {Row::Header, "入力"},
     {Row::Option, nullptr, kMouseMenu},
     {Row::Option, nullptr, kMouseCamera},
     {Row::Option, nullptr, kMouseSens},
@@ -300,7 +303,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMouseAutoRotation},
     {Row::Option, nullptr, kDrawCursor},
     {Row::Option, nullptr, kButtonPrompts},
-    {Row::Header, "GRAPHICS"},
+    {Row::Header, "グラフィックス"},
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
     {Row::Option, nullptr, kAntiAlias},
@@ -315,32 +318,32 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kShaders},
-    {Row::Header, "PC ENHANCEMENTS"},
+    {Row::Header, "PC 追加機能"},
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
-    {Row::Header, "STARTUP"},
+    {Row::Header, "起動"},
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kDebugCamera},
     // The private server's account. No passwords: link this PC to
     // the account signed into on the website with Discord, or make one held
     // by this PC with a recovery code. The token is kept in the options file.
-    {Row::Header, "ACCOUNT"},
+    {Row::Header, "アカウント"},
     {Row::Info, nullptr, -1, 0},
     {Row::Info, nullptr, -1, 1},
-    {Row::Action, "Link with Discord", -1, 0},
-    {Row::Text, "Name", -1, 0},
-    {Row::Action, "Create account on this PC", -1, 1},
-    {Row::Text, "Recovery code", -1, 1},
-    {Row::Action, "Recover account", -1, 2},
-    {Row::Action, "Website sign-in code", -1, 3},
-    {Row::Action, "Sign out", -1, 4},
-    {Row::Header, "UPDATES"},
+    {Row::Action, "Discord と連携", -1, 0},
+    {Row::Text, "名前", -1, 0},
+    {Row::Action, "この PC でアカウントを作成", -1, 1},
+    {Row::Text, "復旧コード", -1, 1},
+    {Row::Action, "アカウントを復旧", -1, 2},
+    {Row::Action, "ウェブサイトのログインコード", -1, 3},
+    {Row::Action, "ログアウト", -1, 4},
+    {Row::Header, "更新"},
     {Row::Info, nullptr, -1, 10},
     {Row::Info, nullptr, -1, 11},
-    {Row::Action, "Check for updates", -1, 10},
-    {Row::Action, "Open the release page", -1, 11},
-    {Row::Close, "Close"},
+    {Row::Action, "更新を確認", -1, 10},
+    {Row::Action, "リリースページを開く", -1, 11},
+    {Row::Close, "閉じる"},
 };
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
 
@@ -409,9 +412,9 @@ std::string signed_in_line() {
     // The game read its NpId when it went online, so a sign-in after that
     // names the account to the server but not to the game until the next run.
     if (net::account_refused())
-        return "Signed in as " + net::account_name() + " - the server refused it (expired or replaced): link this PC again";
-    return "Signed in as " + net::account_name() +
-           (hle_np_context_started() ? " (in full on the next launch)" : "");
+        return "ログイン中: " + net::account_name() + " - 認証が失効または更新されました。この PC を再連携してください";
+    return "ログイン中: " + net::account_name() +
+           (hle_np_context_started() ? " （次回起動で完全に反映）" : "");
 }
 
 // Link with Discord: a code the player approves on the website's /link page,
@@ -421,13 +424,13 @@ void link_thread() {
     net::DeviceLink link;
     std::string err;
     if (!net::account_link_start(link, err)) {
-        set_account_lines("Link failed: " + err, "");
+        set_account_lines("連携に失敗: " + err, "");
         g_acct_busy.store(false);
         return;
     }
     const std::string uri = link.verification_uri + "?code=" + link.user_code;
-    set_account_lines("Waiting for approval on the website...",
-                      "Code " + link.user_code + "  -  approve it at " + link.verification_uri);
+    set_account_lines("ウェブサイトでの承認を待っています...",
+                      "コード " + link.user_code + "  -  承認先: " + link.verification_uri);
     SDL_OpenURL(uri.c_str());
     int interval = link.interval;
     for (int waited = 0; waited < link.expires_in && !g_link_cancel.load();) {
@@ -443,14 +446,14 @@ void link_thread() {
             set_account_lines(signed_in_line(), "");
             g_acct_save.store(true);
         } else {
-            set_account_lines(status == "denied" ? "The link was denied on the website"
-                              : status == "expired" ? "The code expired; link again"
-                                                    : "Link failed: " + err, "");
+            set_account_lines(status == "denied" ? "ウェブサイトで連携が拒否されました"
+                              : status == "expired" ? "コードが期限切れです。もう一度連携してください"
+                                                    : "連携に失敗: " + err, "");
         }
         g_acct_busy.store(false);
         return;
     }
-    set_account_lines(g_link_cancel.load() ? "Link cancelled" : "The code expired; link again", "");
+    set_account_lines(g_link_cancel.load() ? "連携をキャンセルしました" : "コードが期限切れです。もう一度連携してください", "");
     g_acct_busy.store(false);
 }
 
@@ -476,32 +479,32 @@ void account_action(int which, const std::string& name, const std::string& code)
         g_link_cancel.store(true);
         std::thread([] {
             net::account_logout();
-            set_account_lines("Signed out", "");
+            set_account_lines("ログアウトしました", "");
             g_acct_save.store(true);
         }).detach();
         return;
     }
     if (g_acct_busy.load()) return;
     if ((which == 1 || which == 2) && name.empty()) {
-        set_account_lines("Type a name first", "");
+        set_account_lines("先に名前を入力してください", "");
         return;
     }
     if (which == 2 && code.empty()) {
-        set_account_lines("Type the recovery code first", "");
+        set_account_lines("先に復旧コードを入力してください", "");
         return;
     }
     if (which == 3 && !net::account_logged_in()) {
-        set_account_lines("Sign in first", "");
+        set_account_lines("先にログインしてください", "");
         return;
     }
     g_acct_busy.store(true);
     g_link_cancel.store(false);
     if (which == 0) {
-        set_account_lines("Asking the server for a code...", "");
+        set_account_lines("サーバーにコードを要求中...", "");
         std::thread(link_thread).detach();
         return;
     }
-    set_account_lines(which == 1 ? "Creating the account..." : which == 2 ? "Recovering..." : "Asking for a code...", "");
+    set_account_lines(which == 1 ? "アカウントを作成中..." : which == 2 ? "復旧中..." : "コードを要求中...", "");
     std::thread([which, name, code] {
         std::string err, out;
         bool ok = false;
@@ -515,12 +518,12 @@ void account_action(int which, const std::string& name, const std::string& code)
         if (!ok) {
             // A server without accounts says so itself; anything else is the
             // server's refusal (a name taken, a daily limit) in its words.
-            set_account_lines(err.find("no account service") != std::string::npos ? err : "Refused: " + err, "");
+            set_account_lines(err.find("アカウントサービスがありません") != std::string::npos ? err : "拒否されました: " + err, "");
         } else if (which == 3) {
-            set_account_lines(signed_in_line(), "Website code " + out + "  -  use it on the account page within 10 minutes");
+            set_account_lines(signed_in_line(), "ウェブ用コード " + out + "  -  10分以内にアカウントページで使用してください");
         } else {
             // The recovery code is shown here once and never written anywhere.
-            set_account_lines(signed_in_line(), "Recovery code " + out + "  -  write it down now; it is shown once");
+            set_account_lines(signed_in_line(), "復旧コード " + out + "  -  一度しか表示されません。今すぐ控えてください");
             g_field[1].clear();
             g_acct_save.store(true);
         }
@@ -531,7 +534,7 @@ void account_action(int which, const std::string& name, const std::string& code)
 std::string account_status() {
     std::lock_guard<std::mutex> lk(g_acct_mu);
     if (!g_acct_status.empty()) return g_acct_status;
-    return net::account_logged_in() ? "Signed in as " + net::account_name() : "Not signed in";
+    return net::account_logged_in() ? "ログイン中: " + net::account_name() : "未ログイン";
 }
 
 std::string account_detail() {
@@ -544,11 +547,11 @@ void edit_begin(int field) {
     // is open, it ended the box with this field's text - or, closed with the
     // screen, left the game waiting on a box nobody could type into again.
     if (g_edit_field < 0 && host_text_entry_open()) {
-        set_account_lines("Finish the game's text box first (Enter or Escape)", "");
+        set_account_lines("先にゲームの文字入力を終了してください (Enter または Escape)", "");
         return;
     }
     g_edit_field = field;
-    host_text_entry_begin(g_field[field].c_str(), field == 0 ? 16 : 48, false, field == 0 ? "Account name" : "Recovery code");
+    host_text_entry_begin(g_field[field].c_str(), field == 0 ? 16 : 48, false, field == 0 ? "アカウント名" : "復旧コード");
 }
 
 // Called every frame the screen draws: takes the typed text, ends the entry
@@ -945,7 +948,7 @@ void host_options_load() {
                 continue;
             }
             if (key == "old_hunters") {
-                old_hunters_off = val == "Off";
+                old_hunters_off = val == "無効";
                 continue;
             }
             // Looked at again once the file's version is known (below).
@@ -1262,7 +1265,7 @@ void options_panel_frame(float display_w, float display_h) {
     host_overlay_rect(0.0f, 0.0f, display_w, display_h, 0x00000080u);
     host_overlay_rect(px - 3.0f, py - 3.0f, pw + 6.0f, ph + 6.0f, 0xc8a05affu);
     host_overlay_rect(px, py, pw, ph, 0x0a0a0af2u);
-    host_overlay_text(px + 28.0f, py + 22.0f, 1.0f, 0xc8a05affu, "BLOODBORNE PC OPTIONS");
+    host_overlay_text(px + 28.0f, py + 22.0f, 1.0f, 0xc8a05affu, "BLOODBORNE PC 設定");
     // The online state, always in view whatever the list is scrolled to:
     // who this is signed in as, and the room when there is one.
     {
@@ -1279,7 +1282,7 @@ void options_panel_frame(float display_w, float display_h) {
     g_row_w = pw - 32.0f;
     const float y_end = py + ph - 100.0f;
     if (scrolls && g_scroll > 0) {
-        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "^ more above");
+        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "↑ 上に項目があります");
         y += 24.0f;
     }
     bool more_below = false;
@@ -1322,7 +1325,7 @@ void options_panel_frame(float display_w, float display_h) {
             host_overlay_text(px + 40.0f, y + text_dy, 0.8f, sel ? 0xffffffffu : 0xbbbbbbffu, row.text);
             std::string shown = g_field[row.field];
             if (g_edit_field == row.field) shown += "_";
-            if (shown.empty()) shown = "(type here)";
+            if (shown.empty()) shown = "（ここに入力）";
             const float vw = host_overlay_text_width(0.8f, shown.c_str());
             host_overlay_text(px + pw - 60.0f - vw, y + text_dy, 0.8f,
                               g_edit_field == row.field ? 0xffd88cffu : sel ? 0xffd88cffu : 0x9a9a9affu, shown.c_str());
@@ -1331,7 +1334,7 @@ void options_panel_frame(float display_w, float display_h) {
         }
         const Setting& s = g_set[row.setting];
         host_overlay_text(px + 40.0f, y + text_dy, 0.8f, sel ? 0xffffffffu : 0xbbbbbbffu, s.label);
-        const char* v = s.values[static_cast<std::size_t>(s.index)];
+        const char* v = host_japanese_value(s.values[static_cast<std::size_t>(s.index)]);
         const float vw = host_overlay_text_width(0.8f, v);
         const float vx = px + pw - 60.0f - vw;
         g_row_vl[r] = vx - 30.0f;
@@ -1345,41 +1348,41 @@ void options_panel_frame(float display_w, float display_h) {
         }
         if (s.restart && !(row.setting == kResolution && res_live(s.index))) {
             host_overlay_text(px + 40.0f + host_overlay_text_width(0.8f, s.label) + 14.0f, y + text_dy + 4.0f,
-                              0.52f, 0x7a6a44ffu, "(requires restart)");
+                              0.52f, 0x7a6a44ffu, "（再起動が必要）");
         }
         y += 40.0f * fit;
     }
     if (more_below) {
-        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "v more below");
+        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "↓ 下に項目があります");
     }
     g_laid_out = true;
 
     // The note for whatever is selected, in a fixed place, so the rows above
     // never move as the selection does.
     const int id = g_rows[g_sel].setting;
-    const char* note = id >= 0 ? g_set[id].note : "Saves on close.";
-    if (g_rows[g_sel].kind == Row::Text) note = "Enter or click to type; Enter keeps it, Escape drops it.";
+    const char* note = id >= 0 ? g_set[id].note : "閉じると保存します。";
+    if (g_rows[g_sel].kind == Row::Text) note = "Enter またはクリックで入力。Enter で確定、Escape で取り消します。";
     if (g_rows[g_sel].kind == Row::Action) {
         static const char* const kNotes[] = {
-            "Shows a code and opens the website: sign in there with Discord and approve it.",
-            "Makes an account held by this PC under the name above; write down its recovery code.",
-            "The name and recovery code above give this PC the account back (other PCs are signed out).",
-            "A one-time code to sign in on the website's account page with this PC's account.",
-            "Forgets the token; the game is signed out if the server requires an account.",
+            "コードを表示してサイトを開きます。Discord でログインし、承認してください。",
+            "上の名前でこの PC のアカウントを作成します。復旧コードを控えてください。",
+            "名前と復旧コードで復旧します。他の PC はログアウトされます。",
+            "この PC のアカウントでサイトにログインするための使い切りコードです。",
+            "認証情報を削除します。認証必須のサーバーではゲームからログアウトします。",
         };
         static const char* const kUpdateNotes[] = {
-            "Asks GitHub for the newest release.",
-            "Opens the newer release's page in your browser, to download it from there.",
+            "GitHub で最新リリースを確認します。",
+            "新しいリリースのダウンロードページをブラウザーで開きます。",
         };
         const int f = g_rows[g_sel].field;
         note = f >= 10 ? kUpdateNotes[f - 10] : kNotes[f];
     }
-    host_overlay_rect(px + 28.0f, py + ph - 76.0f, pw - 56.0f, 1.0f, 0x6a5a34ffu);
+    host_overlay_rect(px + 28.0f, py + ph - 100.0f, pw - 56.0f, 1.0f, 0x6a5a34ffu);
     if (note) {
-        host_overlay_text(px + 28.0f, py + ph - 64.0f, 0.62f, 0x9a9a9affu, note);
+        host_overlay_text_wrapped(px + 28.0f, py + ph - 90.0f, 0.62f, 0x9a9a9affu, pw - 56.0f, note);
     }
     host_overlay_text(px + 28.0f, py + ph - 34.0f, 0.62f, 0x7a7a7affu,
-                      "Arrows move and change   Enter toggles   Click sets   Esc or F10 closes");
+                      "方向キー: 選択・変更   Enter: 切替   クリック: 設定   Esc / F10: 閉じる");
 }
 }  // namespace
 
@@ -1582,7 +1585,7 @@ void host_account_action(int which, const std::string& name, const std::string& 
 }
 bool host_account_busy() { return g_acct_busy.load(); }
 std::string host_account_signed_in() {
-    return net::account_logged_in() ? "Signed in as " + net::account_name() : "Not signed in";
+    return net::account_logged_in() ? "ログイン中: " + net::account_name() : "未ログイン";
 }
 std::string host_account_outcome() {
     std::lock_guard<std::mutex> lk(g_acct_mu);

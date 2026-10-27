@@ -17,7 +17,7 @@
 [patch]
 name = "performance-v3-decals-on"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Performance Patch v3 (Decals On) (Kyo)"
+description = "軽量化 v3（デカール有効）(Kyo)"
 enabled = false
 order = 20
 group = "performance-v3"

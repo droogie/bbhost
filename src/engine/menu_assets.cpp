@@ -33,7 +33,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 12;  // 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 13;  // 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -1137,7 +1137,7 @@ const char kMovie[] = "dvdroot_ps4/menu/optionsetting.gfx";
 // engus, a European one enggb, deude, frafr, ... - so a bundle written for
 // one language only left every other showing the repository's "(110006)"
 // placeholders for the port's rows, and opening one then crashed on the
-// missing text. The port's strings are English in all of them.
+// missing text. The Japanese fork writes Japanese strings into all available bundles.
 // The title menu's movies, each with one more line for Quit Game
 // (engine/option_menu.cpp); the DLC edition uses the second.
 const char* const kTitleMovies[] = {"dvdroot_ps4/menu/title.gfx", "dvdroot_ps4/menu/title_dlc.gfx"};

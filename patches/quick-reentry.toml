@@ -18,7 +18,7 @@
 [patch]
 name = "quick-reentry"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "a load after a death or lamp travel ends when the area is ready, not after a 12-second minimum"
+description = "死亡・灯り移動後は、最低12秒を待たずエリアの準備完了時にロードを終了"
 option = "loading.quick_reentry"
 
 # sub_1d38870: cmp byte [r12+0xe4], 0 / je +10 (to the 0) / vmovss xmm0, [12.0f]

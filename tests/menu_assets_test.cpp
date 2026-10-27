@@ -90,7 +90,7 @@ int main() {
     // 2. The strings: HLSL Shaders' id in the built-in table, and in every
     // language's bundle once it is built.
     const auto rows = read_messages();
-    CHECK(rows.count(117009) && rows.at(117009).text == "HLSL Shaders" && rows.at(117009).help.find("restart") != std::string::npos);
+    CHECK(rows.count(117009) && rows.at(117009).text == "HLSL シェーダー" && rows.at(117009).help.find("再起動") != std::string::npos);
     int languages = 0;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(test_app0_file("dvdroot_ps4/msg"), ec)) {
@@ -114,7 +114,7 @@ int main() {
             const Fmg ids = fmg_read(f.data);
             const auto it = ids.find(117009);
             if (it == ids.end() || !it->second) continue;
-            if (f.id == kMenuText) text = *it->second == utf16("HLSL Shaders");
+            if (f.id == kMenuText) text = *it->second == utf16("HLSL シェーダー");
             else help = *it->second == utf16(rows.at(117009).help);
         }
         CHECK(text && help);
@@ -132,13 +132,13 @@ int main() {
         const bool pc_row = (id >= 110006 && id <= 110013) || (id >= 116000 && id < 125000);
         if (!pc_row || row.help.empty()) continue;
         ++helps;
-        if (row.help.size() > 96) {
-            std::fprintf(stderr, "%d's help is %zu characters (96 at most): %s\n", static_cast<int>(id), row.help.size(), row.help.c_str());
+        if (utf16(row.help).size() / 2 > 48) {
+            std::fprintf(stderr, "%d's help is %zu UTF-16 units (48 at most): %s\n", static_cast<int>(id), utf16(row.help).size() / 2, row.help.c_str());
             ++g_failures;
         }
     }
     CHECK(helps > 40);
-    std::printf("%d PC rows' help within 96 characters\n", helps);
+    std::printf("%d PC rows' help within 48 UTF-16 units\n", helps);
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;

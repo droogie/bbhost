@@ -1,207 +1,53 @@
-# Copy to bbhost.toml next to the binary (or pass --config). Running bbhost
-# with no configuration writes this file for you and says what to fill in.
-#
-# On Windows both spellings work and mean the same folder:
-#     app0 = "C:\Games\Bloodborne\CUSA00900"
-#     app0 = "C:/Games/Bloodborne/CUSA00900"
-# A relative path is taken from the folder this file is in.
+# bbhost 日本語版の設定。ゲームと復号済み eboot の場所を指定してください。
+# 相対パスはこのファイルの場所を基準にします。Windows でも / を使用できます。
 [paths]
-# The folder that contains dvdroot_ps4 (the decrypted game dump). An update
-# kept beside it in a folder of its own (CUSA00900-UPDATE or CUSA00900-patch,
-# as shadPS4 keeps one) is read in place of the game folder's files.
+# 日本版 Old Hunters (CUSA03014)、更新 1.09、dvdroot_ps4 を含むフォルダー。
 app0 = "PATH-TO-THE-GAME-DUMP"
-# The decrypted eboot ELF (may also be given on the command line).
+# SHA-256: 941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7
 eboot = "PATH-TO-THE-EBOOT"
-# Writable directory for saves, caches and /data. Default: <eboot dir>/data
-data = "./data"
+# セーブとキャッシュの保存先。省略時は利用者ごとの標準フォルダーです。
+# data = "D:/bbhost-data"
+# mods = "./data/mods"
 
 [online]
 host = "thehuntersdream.com"
-# The live server takes only https, and its certificate is checked. A server
-# on your own network may speak plain http ("http", verify_tls = false).
 scheme = "https"
 verify_tls = true
 online_id = "Hunter"
-# The STUN server the P2P port asks for the address the world sees it at
-# (players behind NAT). Default: the private server's host on 3478; "off"
-# never asks.
-# stun_server = "thehuntersdream.com:3478"
-# true: the game is signed out until this PC is signed in on the F10
-# screen (Account section), and the account's name is the online id. The
-# live server plays only with signed-in players.
 require_account = true
-# Where the account calls (/auth/device/..., /auth/account/create) go. Tokens
-# and recovery codes travel here, so in production this is the server's https
-# origin; without it they go to np_server, fine on a LAN.
 auth_server = "https://thehuntersdream.com"
-# How often, in seconds, the game sends its play log to the server - the
-# site's map, deaths and profiles come from it. The game's own is 300 (and
-# what is left at quitting is lost); 0 keeps that. An upload is a few KB and
-# goes out on a worker thread (measured: 0.7-3.6 KB, the game never waits).
-# The server keeps every upload as a file and asks for 30 s or more.
-playlog_upload_seconds = 30
-# How often, in milliseconds, the game logs the player's position into it
-# (the live map plays these back as walking). The game's own is 1500; 0 keeps it.
-playlog_sample_ms = 500
-# How long, in seconds, the game waits on a summon sign the player touched
-# before giving up on it (engine/sos_signs.h). The game's own is 180; 0 keeps that.
-sign_timeout_seconds = 30
+p2p_port = 9307
+# np_server = "http://127.0.0.1:18671"
+# stun_server = "thehuntersdream.com:3478"
 
 [player]
-# The character's name the name box starts from (the first key typed replaces
-# it). Default: online_id.
 name = "Hunter"
-# type (default): the game's text boxes - the character's name, a chalice
-# glyph, the network password - are typed in a box over the game; Enter
-# accepts, Escape cancels, and the game sees no input while it is up. auto:
-# the name is answered with `name` at once (what a headless run does
-# regardless, since there is no window to type in); a glyph or a password is
-# still typed. BBHOST_IME=type or auto overrides this.
+# type: 手入力、auto: 上の名前を自動入力。
 ime = "type"
 
 [video]
-# The window's size (fullscreen takes the desktop's).
 width = 1920
 height = 1080
-# The default of F10's Frame rate: 30 (the game's own), 60, 90, 120, or 0 for
-# uncapped; what F10 saves wins over it.
 fps_cap = 30
-# Above 30 fps, the effects (the lamps' and candles' flicker among them) and
-# the wind on grass and trees step in whole 1/30 s, 30 times a second as at
-# 30, with what the effects count in updates held on the frames between.
-# smooth (the default): as 30, with what the effects move by time moved by
-# each frame's own time in the effects converted for it. 30: whole 1/30 s
-# steps alone. 60: the effects in whole 1/60 s and the wind by the frame's
-# time; frame: both by the frame's time. BBHOST_SFX_STEP=30, smooth, 60 or
-# frame overrides this. Requires a restart.
-# effect_steps = "smooth"
-# The effects' emission clock: 60 (the default) makes their particles and
-# children as the game's effects do at 60 updates a second, at every frame
-# rate (30 included); 30 keeps the game's one emission an update, 30 a second
-# at 30 - the PS4's density. BBHOST_SFX_EMISSION=60 or 30 overrides this.
-# Requires a restart.
-# effect_emission = "60"
-# The defaults of four F10 settings, by an entry's name; what F10 or the
-# game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
-# "1280x800" and "Fullscreen").
-# resolution = "1920x1080"
-# window_mode = "Windowed"
-# model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
-# shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
-# OBS's game capture hooks Vulkan programs through a layer that loads into
-# every one of them once OBS is installed. On an AMD card bbhost keeps it out
-# (it hung the GPU there); "on" lets it in, "off" keeps it out on any card.
-# OBS's Window Capture records bbhost without it. (Windows only.)
-# obs_capture = "auto"
-
-[gpu]
-# The game's memory the GPU reaches: imported whole at the start (false, the
-# default on a graphics card of its own and under Linux), or a 16 MB window at
-# a time as something first needs it (true, the default on an integrated GPU
-# under Windows): far less memory pinned for the driver and a start a few
-# seconds sooner, at a little more work while new windows come in. The Steam
-# Deck kit's toml sets true (its shared memory stays under the driver's
-# budget). BBHOST_IMPORT_WINDOWS=0 or 1 overrides this setting.
-# import_windows = false
-# Memory bbhost keeps in play beyond what it draws with, for integrated GPUs
-# (where no video memory reserve trims it) and any GPU you want leaner:
-# - staging_return: the upload staging held from a load on (up to 768 MB) goes
-#   back down to 256 MB in play, 64 MB every two seconds from 30 s after the
-#   latest load (a death or a lamp starts the count again).
-# - cache_budget_mb: past this many MB of video memory held, textures are made
-#   when first drawn rather than ahead, unused ones go and the image heap
-#   drains sooner (0: no budget).
-# - heap_lean: the image heap keeps no spare block in play and drains sooner.
-# All three on by default on an integrated GPU under Windows (a 2048 MB budget
-# there), off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
-# BBHOST_HEAP_LEAN override them.
-# staging_return = false
-# cache_budget_mb = 0
-# heap_lean = false
+headless = false
 
 [startup]
-# Bloodborne 1.09: skip FromSoftware, Japan Studio and SCE logos, and the
-# "Exit Game may not have been selected" warning after closing the window.
-# BBHOST_SKIP_INTRO=0 or 1 overrides this setting.
 skip_intro = false
-# The setup window (paths, server, account, PC enhancements, patches,
-# plugins) before the game: a release opens it at every start, a build from
-# source only when something needs setting or with --setup. Its "Show this
-# window every time bbhost starts" box writes this; BBHOST_SETUP_WINDOW=0 or 1
-# overrides it (the test harnesses set 0).
-# setup_window = true
 
-[loading]
-# After a death or lamp travel the game keeps its loading screen up for at
-# least 12 seconds, however soon the area is ready (about 2 s on a PC).
-# true: the load ends when the area is ready. false keeps the game's 12 s.
-# BBHOST_QUICK_REENTRY=0 or 1 overrides this setting.
-quick_reentry = true
+[plugins]
+region_switch = true
 
-[streaming]
-# The game decompresses and builds what it streams in on three threads, two of
-# them while you play. true: all three while you play - areas fill in about a
-# fifth sooner, with a few more hitches while they do. false keeps the game's.
-# BBHOST_ALL_POST_PROCESSORS=0 or 1 overrides this setting.
-all_post_processors = false
-
-# [patches]
-# The patch manifests (patches/*.toml, a mod's <mods>/patches), by name: false
-# leaves one out. The setup window's Patches tab writes these; a manifest tied
-# to a setting (skip-intro, debug-camera, ...) follows that setting instead.
-# old-hunters: the game takes itself for the edition that includes The Old
-# Hunters (Kyo's 1.09 patch) and counts the DLC as installed; its title screen
-# reads "The Old Hunters Edition". false keeps the base game.
-# old-hunters = false
-# fov-uncap = false
-
-[world]
-# The PC enhancements: additions to the game itself, all on by default. The
-# setup window's PC enhancements tab, F10 > PC ENHANCEMENTS and the game's
-# System > PC Enhancements turn each on or off for the next start, and what is
-# chosen there wins over these lines. Turn all three off for the game as it
-# shipped (The Old Hunters is a patch: old-hunters under [patches] above).
-#
-# The mirror in the Hunter's Dream workshop: the developers placed a "Put on
-# Disguise" action there and never enabled it. true: it works - the first time
-# a note, then the game's appearance editor (the character creation's
-# Appearance list). false keeps the mirror the game shipped with.
-# BBHOST_CHANGE_APPEARANCE=0 or 1 overrides this setting.
-change_appearance = true
-# The Altar of Despair: "Rebirth in the Nightmare". With the Yharnam Stone (from
-# Yharnam, Pthumerian Queen), the hunter returns to their origin's level and
-# attributes, the blood echoes those levels cost come back, and the level-up
-# menu opens to spend them; leaving asks to accept or undo (closing that choice
-# goes back to the menu).
-# false keeps the altar as the game shipped it. BBHOST_REBIRTH=0 or 1 overrides.
-rebirth = true
-
-# Online, a host's world takes one invader, except in the chalice dungeons,
-# where two can come. true: the Nightmare of Mensis and Mergo's Loft, the
-# Nightmare Frontier and the Old Hunters' areas take two as well - five
-# players: the host, two cooperators, two invaders. It needs every player in
-# the session to have it; one without keeps the game's rule. false keeps the
-# game's rule. BBHOST_FIVE_PLAYERS=0 or 1 overrides this setting.
-five_players = true
-
-# [plugins]
-# Gameplay plugins (docs/plugins.md): randomizer, boss_rush, mutators - each
-# off unless set true.
-# randomizer = false
-# Summoned into another player's randomizer world, play it by their seed -
-# their enemies - and come home to your own (docs/plugins.md).
-# On unless this says false.
-# join_modded_worlds = true
+[region_switch]
+# 日本版ゲームデータを維持して欧州オンラインを利用。OFF で無効。
+region = "JP"
 
 [update]
-# A release build looks for a newer release at start, and so does the setup
-# window while its Updates box is checked. When there is one, the F10 screen
-# (UPDATES) and the setup window say so, and a button opens its release page
-# in the browser to download it from there. A build from source never looks
-# unless this says true.
-# check = true
-# Where releases are: a GitHub "releases/latest" API URL.
-# source = "https://api.github.com/repos/droogie/bbhost/releases/latest"
-# A private repository's releases need a token: a file holding one with
-# read access to its contents.
-# token_file = "C:/Users/me/bbhost-github-token"
+# この日本語版の更新先を設定するまでは自動確認しません。
+check = false
+
+# 操作の変更: ゲーム中の「キー設定」。値は SDL のキー名です。
+# [keys]
+# roll = "Space"
+# interact = "E"
+# attack = "Mouse1"
+# firearm = "X, Mouse2"

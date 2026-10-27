@@ -9,29 +9,44 @@ set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR AMD64)
 
 set(MINGW_TRIPLE x86_64-w64-mingw32)
-set(MINGW_SYSROOT /usr/${MINGW_TRIPLE} CACHE PATH "mingw-w64 sysroot")
-file(GLOB MINGW_GCC_DIRS /usr/lib/gcc/${MINGW_TRIPLE}/*)
-list(GET MINGW_GCC_DIRS 0 MINGW_GCC_DIR)
+find_program(MINGW_GCC ${MINGW_TRIPLE}-gcc REQUIRED)
+execute_process(COMMAND ${MINGW_GCC} -print-libgcc-file-name
+  OUTPUT_VARIABLE MINGW_LIBGCC OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+get_filename_component(MINGW_GCC_DIR "${MINGW_LIBGCC}" DIRECTORY)
+execute_process(COMMAND ${MINGW_GCC} -print-sysroot
+  OUTPUT_VARIABLE MINGW_DETECTED_SYSROOT OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+if(NOT MINGW_DETECTED_SYSROOT)
+  set(MINGW_DETECTED_SYSROOT /usr/${MINGW_TRIPLE})
+endif()
+set(MINGW_SYSROOT ${MINGW_DETECTED_SYSROOT} CACHE PATH "mingw-w64 sysroot")
+get_filename_component(MINGW_TARGET_ROOT "${MINGW_GCC_DIR}/../../../../${MINGW_TRIPLE}" ABSOLUTE)
 get_filename_component(MINGW_GCC_VERSION ${MINGW_GCC_DIR} NAME)
 
 set(CMAKE_C_COMPILER clang)
 set(CMAKE_CXX_COMPILER clang++)
 set(CMAKE_C_COMPILER_TARGET ${MINGW_TRIPLE})
 set(CMAKE_CXX_COMPILER_TARGET ${MINGW_TRIPLE})
-set(CMAKE_RC_COMPILER llvm-windres)
-set(CMAKE_RC_COMPILER_INIT llvm-windres)
+set(CMAKE_RC_COMPILER ${MINGW_TRIPLE}-windres)
+set(CMAKE_RC_COMPILER_INIT ${MINGW_TRIPLE}-windres)
 set(CMAKE_SYSROOT ${MINGW_SYSROOT})
 
 set(MINGW_CXX_INCLUDES
-  "-isystem ${MINGW_SYSROOT}/include/c++/${MINGW_GCC_VERSION} -isystem ${MINGW_SYSROOT}/include/c++/${MINGW_GCC_VERSION}/${MINGW_TRIPLE}")
+  "-isystem ${MINGW_TARGET_ROOT}/include/c++/${MINGW_GCC_VERSION} -isystem ${MINGW_TARGET_ROOT}/include/c++/${MINGW_GCC_VERSION}/${MINGW_TRIPLE}")
 # -Wno-invalid-constexpr: a libstdc++ header artifact under Clang.
 set(CMAKE_CXX_FLAGS_INIT "${MINGW_CXX_INCLUDES} -Wno-invalid-constexpr")
+# Some static-only GCC distributions keep the SEH unwinder in libgcc.a.
+set(MINGW_UNWIND_FLAG "")
+if(NOT EXISTS "${MINGW_GCC_DIR}/libgcc_eh.a")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/mingw-runtime")
+  configure_file("${MINGW_LIBGCC}" "${CMAKE_BINARY_DIR}/mingw-runtime/libgcc_eh.a" COPYONLY)
+  set(MINGW_UNWIND_FLAG "-L${CMAKE_BINARY_DIR}/mingw-runtime")
+endif()
 set(CMAKE_EXE_LINKER_FLAGS_INIT
-  "-fuse-ld=lld -L${MINGW_GCC_DIR} -static -static-libstdc++ -static-libgcc")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld -L${MINGW_GCC_DIR} -static-libstdc++ -static-libgcc")
+  "${MINGW_UNWIND_FLAG} -fuse-ld=lld -L${MINGW_GCC_DIR} -L${MINGW_TARGET_ROOT}/lib -static -static-libstdc++ -static-libgcc")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "${MINGW_UNWIND_FLAG} -fuse-ld=lld -L${MINGW_GCC_DIR} -L${MINGW_TARGET_ROOT}/lib -static-libstdc++ -static-libgcc")
 # Plugins (add_library MODULE) link like shared libraries. The _INIT form
 # only seeds a fresh cache, so this is the cache entry itself.
-set(CMAKE_MODULE_LINKER_FLAGS "-fuse-ld=lld -L${MINGW_GCC_DIR} -static-libstdc++ -static-libgcc" CACHE STRING "Windows module link flags")
+set(CMAKE_MODULE_LINKER_FLAGS "${MINGW_UNWIND_FLAG} -fuse-ld=lld -L${MINGW_GCC_DIR} -L${MINGW_TARGET_ROOT}/lib -static-libstdc++ -static-libgcc" CACHE STRING "Windows module link flags")
 
 # libstdc++ here is built on winpthreads; every link gets it last. CMake's
 # Windows-Clang platform module overrides the _INIT form, so this is the
@@ -50,7 +65,7 @@ set(ENV{PKG_CONFIG_LIBDIR} "${MINGW_PKG_DIRS}")
 set(ENV{PKG_CONFIG_PATH} "")
 
 # Searches are re-rooted under these, so the dependency prefix must be one.
-set(CMAKE_FIND_ROOT_PATH ${MINGW_SYSROOT} ${CMAKE_PREFIX_PATH})
+set(CMAKE_FIND_ROOT_PATH ${MINGW_TARGET_ROOT} ${MINGW_SYSROOT} ${CMAKE_PREFIX_PATH})
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

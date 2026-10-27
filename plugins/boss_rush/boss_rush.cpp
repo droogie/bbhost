@@ -53,29 +53,29 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION,
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "boss_rush",
-    "Boss rush",
+    "ボスラッシュ",
     "1.1.1",
     "bbhost",
-    "Fight the game's bosses back to back, timed; deaths retry the round and the save's bosses are restored at the end.",
+    "ボスと連続で戦い、時間を計測します。死亡時はそのラウンドを再挑戦し、終了時はボスの状態を元に戻します。",
 };
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
-    {BB_OPT_HEADING, nullptr, "Start it from the in-game plugin menu", "Play it on a save of its own: bosses give their rewards again."},
-    {BB_OPT_ACTION, "start", "Start the boss rush", "Begins in a few seconds, from wherever you are."},
-    {BB_OPT_ACTION, "skip", "Skip this round"},
-    {BB_OPT_ACTION, "stop", "Stop", "Ends the run and puts the save's bosses back as they were."},
-    {BB_OPT_HEADING, nullptr, "The run", "Read when a run starts."},
-    {BB_OPT_CHOICE | BB_OPT_LIVE, "order", "Order", nullptr, "story", 0, 0, "story|random"},
-    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "Seed for the random order", nullptr, ""},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "dlc", "The Old Hunters' bosses", "Skipped on a save that cannot enter their maps.", "true"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "chalice", "Chalice dungeon bosses",
-     "Ten found only in the chalice dungeons, in their fixed dungeons, after the others. An altar's slot is borrowed and given back.", "false"},
-    {BB_OPT_INT | BB_OPT_LIVE, "first", "Start at boss", "1 is the first of the order; with Rounds 1, practice one boss.", "1", 1, 29},
-    {BB_OPT_INT | BB_OPT_LIVE, "rounds", "Rounds", "0: every boss.", "0", 0, 29},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "awake", "Skip the bosses' first entrances", "Each round starts at the fog wall, as on a return. Off: as the first time (cutscenes).", "true"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "refill", "Refill vials and bullets on death", "Off: what you have left, as the game restocks it from storage.", "true"},
-    {BB_OPT_BOOL, "auto_start", "Start by itself", "Begin a run when the world first loads, without the menu.", "false"},
-    {BB_OPT_INT | BB_OPT_LIVE, "start_delay", "Seconds before the first round", nullptr, "10", 3, 60},
+    {BB_OPT_HEADING, nullptr, "ゲーム内のプラグインメニューから開始", "専用セーブを使ってください。ボス報酬を再び受け取ります。"},
+    {BB_OPT_ACTION, "start", "ボスラッシュ開始", "現在地から数秒後に開始します。"},
+    {BB_OPT_ACTION, "skip", "このラウンドをスキップ"},
+    {BB_OPT_ACTION, "stop", "停止", "挑戦を終了し、セーブ内のボスの状態を元に戻します。"},
+    {BB_OPT_HEADING, nullptr, "挑戦の設定", "挑戦開始時に読み込みます。"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "order", "順番", nullptr, "story", 0, 0, "story|random"},
+    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "ランダム順のシード", nullptr, ""},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "dlc", "DLC のボス", "そのマップに入れないセーブではスキップします。", "true"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "chalice", "聖杯ダンジョンのボス",
+     "他のボスの後に、固定聖杯の固有ボス10体と戦います。祭壇の枠を一時使用し、終了後に戻します。", "false"},
+    {BB_OPT_INT | BB_OPT_LIVE, "first", "開始するボス", "1 は最初のボスです。ラウンド数を 1 にすると１体を練習できます。", "1", 1, 29},
+    {BB_OPT_INT | BB_OPT_LIVE, "rounds", "ラウンド数", "0 で全ボス。", "0", 0, 29},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "awake", "ボスの初回演出をスキップ", "再戦時と同様に霧の前から開始します。無効では初回の演出を再生します。", "true"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "refill", "死亡時に輸血液と水銀弾を補充", "無効では原作と同じく保管箱から補充します。", "true"},
+    {BB_OPT_BOOL, "auto_start", "自動開始", "ワールドの初回読み込み時にメニュー操作なしで開始します。", "false"},
+    {BB_OPT_INT | BB_OPT_LIVE, "start_delay", "最初のラウンドまでの秒数", nullptr, "10", 3, 60},
     {BB_OPT_END}};
 
 namespace {
@@ -107,38 +107,38 @@ struct Boss {
 // player_position reads it, and the fog objects, which all 19 face into their
 // arenas. Positions are the MSB's frame, which the warp takes as it is.
 const Boss kBosses[] = {
-    {"Cleric Beast", 12411700, 2412951, false, 500000, 0, {-154.14f, -27.02f, 35.16f}, -135.0f},
-    {"Father Gascoigne", 12411800, 2412951, false, 271000, 0, {-50.18f, -40.82f, 71.02f}, -135.0f},
-    {"Blood-starved Beast", 12301800, 2302950, false, 209000, 0, {-87.654f, -126.44f, 13.512f}, 129.825f},
+    {"聖職者の獣", 12411700, 2412951, false, 500000, 0, {-154.14f, -27.02f, 35.16f}, -135.0f},
+    {"ガスコイン神父", 12411800, 2412951, false, 271000, 0, {-50.18f, -40.82f, 71.02f}, -135.0f},
+    {"血に渇いた獣", 12301800, 2302950, false, 209000, 0, {-87.654f, -126.44f, 13.512f}, 129.825f},
     // The Grand Cathedral is where Eileen's quest ends (m24_00's event 12400650
     // and its flags 1360-1379): her placement there (2400902) and the hunter
     // she comes to fight (2400901) are switched off.
-    {"Vicar Amelia", 12401800, 2402950, false, 502000, 0, {51.51f, 35.71f, 311.57f}, -150.0f, 2, {}, {2400901, 2400902}},
-    {"The Witch of Hemwick", 12201800, 2202950, false, 210000, 0, {-329.75f, 2.466f, 698.21f}, 180.0f},
-    {"Darkbeast Paarl", 12301700, 2302950, false, 508000, 0, {135.444f, -119.83f, -85.772f}, 113.5f},
-    {"Shadow of Yharnam", 12701800, 2702950, false, 212010, 0, {-322.923f, -185.868f, 494.393f}, 44.779f},
+    {"教区長エミーリア", 12401800, 2402950, false, 502000, 0, {51.51f, 35.71f, 311.57f}, -150.0f, 2, {}, {2400901, 2400902}},
+    {"ヘムウィックの魔女", 12201800, 2202950, false, 210000, 0, {-329.75f, 2.466f, 698.21f}, 180.0f},
+    {"黒獣パール", 12301700, 2302950, false, 508000, 0, {135.444f, -119.83f, -85.772f}, 113.5f},
+    {"ヤーナムの影", 12701800, 2702950, false, 212010, 0, {-322.923f, -185.868f, 494.393f}, 44.779f},
     // Rom's fog stands in the doorway to the lake the player drops into: the
     // door (3201120) is opened as its own event keeps it (m32_00's 13200040,
     // slot 0: its flag, and 13200120, the opening's).
-    {"Rom, the Vacuous Spider", 13201800, 3202950, false, 510000, 0, {-452.874f, -175.03f, 392.65f}, 70.0f, 2, {13200040, 13200120}},
-    {"The One Reborn", 12801800, 2802950, false, 507000, 0, {381.167f, -122.49f, -215.583f}, -45.0f},
+    {"白痴の蜘蛛、ロマ", 13201800, 3202950, false, 510000, 0, {-452.874f, -175.03f, 392.65f}, 70.0f, 2, {13200040, 13200120}},
+    {"再誕者", 12801800, 2802950, false, 507000, 0, {381.167f, -122.49f, -215.583f}, -45.0f},
     // A save's first time in Cainhurst plays the carriage's arrival (m25_00's
     // event 12500000, which its own flag ends) - over the round's first
     // seconds.
-    {"Martyr Logarius", 12501800, 2502950, false, 232000, 0, {33.93f, 112.32f, -330.56f}, -35.0f, 2, {12500000}},
-    {"Amygdala", 13301800, 3302950, false, 512000, 0, {-47.183f, 1461.853f, -69.041f}, 112.0f},
-    {"Celestial Emissary", 12421700, 2422950, false, 257000, 0, {-5.47f, 55.336f, 293.41f}, -60.0f},
-    {"Ebrietas, Daughter of the Cosmos", 12421800, 2422950, false, 251000, 0, {94.0f, 4.2f, 387.0f}, -150.741f},
+    {"殉教者ローゲリウス", 12501800, 2502950, false, 232000, 0, {33.93f, 112.32f, -330.56f}, -35.0f, 2, {12500000}},
+    {"アメンドーズ", 13301800, 3302950, false, 512000, 0, {-47.183f, 1461.853f, -69.041f}, 112.0f},
+    {"星界からの使者", 12421700, 2422950, false, 257000, 0, {-5.47f, 55.336f, 293.41f}, -60.0f},
+    {"星の娘、エーブリエタース", 12421800, 2422950, false, 251000, 0, {94.0f, 4.2f, 387.0f}, -150.741f},
     // The Wet Nurse (entity 2600802) is made when the player walks into her
     // arena; 515000/516000 are the doubles that come with her.
-    {"Mergo's Wet Nurse", 12601800, 2602950, false, 551000, 0, {122.14f, 1125.184f, -37.839f}, -90.0f},
-    {"Ludwig, the Holy Blade", 13401800, 3402950, true, 451000, 0, {-407.93f, 1503.8f, -716.45f}, 0.0f, 1},
+    {"メルゴーの乳母", 12601800, 2602950, false, 551000, 0, {122.14f, 1125.184f, -37.839f}, -90.0f},
+    {"聖剣のルドウイーク", 13401800, 3402950, true, 451000, 0, {-407.93f, 1503.8f, -716.45f}, 0.0f, 1},
     // The Living Failures' fog stands in the balcony's doorway (door 3501120,
     // m35_00's 13501200 slot 0, and 13504220), as Rom's does.
-    {"Living Failures", 13501850, 3502950, true, 403000, 0, {-378.54f, 1592.9f, -824.55f}, 90.0f, 1, {13501200, 13504220}},
-    {"Lady Maria of the Astral Clocktower", 13501800, 3502950, true, 452000, 0, {-452.0f, 1595.51f, -824.41f}, 90.0f, 1},
-    {"Laurence, the First Vicar", 13401850, 3402950, true, 450000, 0, {-450.9f, 1535.71f, -292.69f}, -150.0f, 1},
-    {"Orphan of Kos", 13601800, 3602950, true, 453000, 0, {-700.2f, 1580.5f, -906.2f}, 0.0f, 1},
+    {"失敗作たち", 13501850, 3502950, true, 403000, 0, {-378.54f, 1592.9f, -824.55f}, 90.0f, 1, {13501200, 13504220}},
+    {"時計塔のマリア", 13501800, 3502950, true, 452000, 0, {-452.0f, 1595.51f, -824.41f}, 90.0f, 1},
+    {"初代教区長ローレンス", 13401850, 3402950, true, 450000, 0, {-450.9f, 1535.71f, -292.69f}, -150.0f, 1},
+    {"ゴースの遺子", 13601800, 3602950, true, 453000, 0, {-700.2f, 1580.5f, -906.2f}, 0.0f, 1},
     // The chalice dungeons' own bosses (the "chalice" setting), in the fixed
     // dungeons the game ships as whole layouts (m29_XX_90_00, "固定" in
     // map/mapviewlist_fordungeon.loadlistlist), the shallowest that has each.
@@ -149,16 +149,16 @@ const Boss kBosses[] = {
     // its layers are one block, entered at its lamp (2901950: return point
     // 2902950). name_id is the bosses' NpcParam nameId, which can differ from
     // the bar's (the Abhorrent Beast's rows say Loran Darkbeast).
-    {"Undead Giant", 12901800, 2902950, false, 313000, 0, {-22.8f, 31.53f, -91.0f}, 90.0f, 0, {12900532}, {}, 0x1d0a5a00, 12905502},
-    {"Merciless Watchers", 12901801, 2902950, false, 304000, 0, {-130.0f, 10.5f, -55.0f}, 180.0f, 0, {12900536}, {}, 0x1d0a5a00, 12905511},
-    {"Watchdog of the Old Lords", 12901802, 2902950, false, 501000, 0, {-22.637f, -17.5f, 52.0f}, 270.0f, 0, {12900538}, {}, 0x1d0a5a00, 12905516},
-    {"Beast-possessed Soul", 12901800, 2902950, false, 75000, 0, {78.027f, 26.403f, 110.5f}, 270.0f, 0, {12900530}, {}, 0x1d145a00, 12905504},
-    {"Keeper of the Old Lords", 12901801, 2902950, false, 216000, 0, {156.0f, 10.1f, 84.5f}, 90.0f, 0, {12900533}, {}, 0x1d145a00, 12905511},
-    {"Pthumerian Descendant", 12901802, 2902950, false, 305000, 0, {-42.25f, -17.5f, 22.784f}, 0.0f, 0, {12900534}, {}, 0x1d145a00, 12905516},
-    {"Bloodletting Beast", 12901803, 2902950, false, 509000, 0, {-32.422f, -66.5f, -35.75f}, 270.0f, 0, {12900541}, {}, 0x1d1e5a00, 12905525},
-    {"Pthumerian Elder", 12901802, 2902950, false, 305000, 0, {-55.25f, -17.5f, 68.161f}, 0.0f, 0, {12900540}, {}, 0x1d1f5a00, 12905513},
-    {"Abhorrent Beast", 12901802, 2902950, false, 504000, 0, {55.254f, -17.5f, -52.0f}, 90.0f, 0, {12900528}, {}, 0x1d2a5a00, 12905516},
-    {"Yharnam, Pthumerian Queen", 12901802, 2902950, false, 306000, 0, {34.388f, -28.072f, -204.75f}, 90.0f, 0, {12900536}, {}, 0x1d325a00, 12905516},
+    {"死体の巨人", 12901800, 2902950, false, 313000, 0, {-22.8f, 31.53f, -91.0f}, 90.0f, 0, {12900532}, {}, 0x1d0a5a00, 12905502},
+    {"遺跡の番人", 12901801, 2902950, false, 304000, 0, {-130.0f, 10.5f, -55.0f}, 180.0f, 0, {12900536}, {}, 0x1d0a5a00, 12905511},
+    {"旧主の番犬", 12901802, 2902950, false, 501000, 0, {-22.637f, -17.5f, 52.0f}, 270.0f, 0, {12900538}, {}, 0x1d0a5a00, 12905516},
+    {"獣憑き", 12901800, 2902950, false, 75000, 0, {78.027f, 26.403f, 110.5f}, 270.0f, 0, {12900530}, {}, 0x1d145a00, 12905504},
+    {"旧主の番人", 12901801, 2902950, false, 216000, 0, {156.0f, 10.1f, 84.5f}, 90.0f, 0, {12900533}, {}, 0x1d145a00, 12905511},
+    {"トゥメルの末裔", 12901802, 2902950, false, 305000, 0, {-42.25f, -17.5f, 22.784f}, 0.0f, 0, {12900534}, {}, 0x1d145a00, 12905516},
+    {"獣血の主", 12901803, 2902950, false, 509000, 0, {-32.422f, -66.5f, -35.75f}, 270.0f, 0, {12900541}, {}, 0x1d1e5a00, 12905525},
+    {"トゥメルの古老", 12901802, 2902950, false, 305000, 0, {-55.25f, -17.5f, 68.161f}, 0.0f, 0, {12900540}, {}, 0x1d1f5a00, 12905513},
+    {"恐ろしい獣", 12901802, 2902950, false, 504000, 0, {55.254f, -17.5f, -52.0f}, 90.0f, 0, {12900528}, {}, 0x1d2a5a00, 12905516},
+    {"トゥメルの女王、ヤーナム", 12901802, 2902950, false, 306000, 0, {34.388f, -28.072f, -204.75f}, 90.0f, 0, {12900536}, {}, 0x1d325a00, 12905516},
 };
 
 bb::Plugin g;
@@ -288,7 +288,7 @@ void finish() {
     give_back();
     const std::int64_t deaths = g.stat("deaths") - g_deaths_at_start;
     std::ostringstream text;
-    text << "Boss rush complete - " << clock_text(g_now - g_run_start) << ", " << deaths << (deaths == 1 ? " death" : " deaths");
+    text << "ボスラッシュ完了 - " << clock_text(g_now - g_run_start) << ", " << deaths << (deaths == 1 ? " 回死亡" : " 回死亡");
     g.message(text.str(), 10.0f);
     std::ofstream f(g_dir + "/results.txt", std::ios::app);
     f << text.str() << '\n';
@@ -580,7 +580,7 @@ void check_fog(const Boss* b) {
     if (++g_fog_tries >= kFogTries) {
         g_fog = 0;
         g.log("boss_rush: could not reach %s's fog wall (at %.1f %.1f %.1f)", b->name, at[0], at[1], at[2]);
-        g.message("Boss rush: could not reach " + std::string(b->name) + "'s fog wall - walk to it from the lamp", 6.0f);
+        g.message("ボスラッシュ: 到達できません: " + std::string(b->name) + "の霧。灯りから歩いて向かってください", 6.0f);
         return;
     }
     to_fog(b);
@@ -614,7 +614,7 @@ int g_test_drop_travel = 0;
 void travel_failed(const Boss* b, const std::string& why) {
     g.log("boss_rush: %s to %s's arena (lamp %d, asked %d times); the run stops", why.c_str(), b->name, b->lamp, g_travel_asks);
     give_back();
-    g.message("Boss rush stopped: " + why + " to " + b->name + "'s arena", 8.0f);
+    g.message("ボスラッシュ停止: " + why + " / " + b->name + "の闘技場", 8.0f);
     g_state = State::Done;
 }
 
@@ -626,10 +626,10 @@ void travel_tick(const Boss* b) {
     if (settled() < kSettle || (g_travel_at >= 0 && g_world_time - g_travel_at < kTravelWait)) return;
     if (g_travel_at >= 0) {
         g.log("boss_rush: the travel to %s's arena %s; again", b->name,
-              g_travel_began ? "did not arrive (a load, but to another map)" : "was not begun (no loading screen)");
+              g_travel_began ? "別のマップに到着しました" : "移動が始まりませんでした");
     }
     if (g_travel_asks >= kTravelAsks) {
-        travel_failed(b, g_travel_began ? "the game would not travel" : "the game did not begin the travel");
+        travel_failed(b, g_travel_began ? "ゲームが移動を受け付けませんでした" : "ゲームが移動を開始しませんでした");
         return;
     }
     ++g_travel_asks;
@@ -648,7 +648,7 @@ void travel_tick(const Boss* b) {
             g_travel_at = -1;
             return;
         }
-        travel_failed(b, "bbhost refused the travel");
+        travel_failed(b, "bbhost が移動を拒否しました");
     }
 }
 
@@ -731,7 +731,7 @@ void tick() {
         if (g.flag(b->defeat_flag)) {
             const double took = g_round_start >= 0 ? g_now - g_round_start : 0.0;
             g_round_times.push_back(took);
-            g.message(std::string(b->name) + " defeated - " + clock_text(took), 6.0f);
+            g.message(std::string(b->name) + " 撃破 - " + clock_text(took), 6.0f);
             g.log("boss_rush: %s defeated in %s", b->name, clock_text(took).c_str());
             g_state = State::Cleared;
             g_wait = 10.0;  // time to pick up what it dropped
@@ -822,7 +822,7 @@ void build_run() {
         if ((dlc || !b.dlc) && (chalice || !b.dungeon)) g_run.push_back(&b);
     }
     if (g.config("boss_rush.order") == "random") {
-        bb::Rng rng(bb::seed_of(g.config("boss_rush.seed", "boss rush")));
+        bb::Rng rng(bb::seed_of(g.config("boss_rush.seed", "ボスラッシュ")));
         rng.shuffle(g_run);
     }
     if (const int first = static_cast<int>(g.config_number("boss_rush.first", 1)); first > 1 && static_cast<std::size_t>(first) <= g_run.size())
@@ -833,11 +833,11 @@ void build_run() {
 
 void begin() {
     if (g_state != State::Waiting && g_state != State::Done) {
-        g.message("A boss rush is already under way", 3.0f);
+        g.message("ボスラッシュは既に進行中です", 3.0f);
         return;
     }
     if (g.stat("hp", -1) < 0) {
-        g.message("Load into the world first", 3.0f);
+        g.message("先にワールドへ入ってください", 3.0f);
         return;
     }
     build_run();
@@ -850,8 +850,8 @@ void begin() {
     g_state = State::Countdown;
     g_wait = g_start_delay;  // seconds in the world: a loading screen holds it
     g.log("boss_rush: %zu bosses, %s order", g_run.size(), g.config("boss_rush.order", "story").c_str());
-    g.message("Boss rush: " + std::to_string(g_run.size()) + " bosses - the first in " + std::to_string(g_start_delay) +
-                  " seconds",
+    g.message("ボスラッシュ: " + std::to_string(g_run.size()) + " 体 - 開始まで " + std::to_string(g_start_delay) +
+                  " 秒",
               6.0f);
 }
 
@@ -862,7 +862,7 @@ void stop(const char* why) {
     const bool travelled = g_state != State::Countdown;
     give_back();
     g.log("boss_rush: %s at round %zu", why, g_round + 1);
-    g.message("Boss rush " + std::string(why), 4.0f);
+    g.message("ボスラッシュ " + std::string(why), 4.0f);
     g_state = State::Done;
     if (travelled) to_dream();
 }
@@ -891,7 +891,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     g.api->on_action("boss_rush", [](const char* action, void*) {
         const std::string a = action;
         if (a == "start") begin();
-        else if (a == "stop") stop("stopped");
+        else if (a == "stop") stop("停止");
         else if (a == "skip") skip();
     }, nullptr);
     g.every_frame(tick);
@@ -919,7 +919,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 // way in). Twice, and the round is skipped.
                 if (g.stat("deaths") == g_deaths_at_arrival && ++g_refused >= 2) {
                     g.log("boss_rush: %s's map sends the player away on this save; skipped", b->name);
-                    banner("Cannot reach " + std::string(b->name) + " on this save - skipped", 6.0f);
+                    banner("到達できません: " + std::string(b->name) + " （このセーブではスキップ）", 6.0f);
                     g_round_times.push_back(0);
                     g_state = State::Cleared;
                     g_wait = 3.0;
@@ -930,7 +930,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                     g.log("boss_rush: sent away from %s's map without a death; once more", b->name);
                 } else {
                     g.log("boss_rush: died to %s; back to its arena (retry %d)", b->name, g_retries);
-                    banner("Again - " + std::string(b->name), 4.0f);
+                    banner("再挑戦 - " + std::string(b->name), 4.0f);
                 }
                 // The travel back, asked once the respawn's screen has gone and
                 // the world has settled (travel_tick): past its fade-in.
@@ -942,12 +942,12 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 g_round_start = -1;
                 g_deaths_at_arrival = g.stat("deaths");
                 log_flags(b, "arrived");
-                banner("Round " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
+                banner("ラウンド " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
             } else {
                 // A death in the boss's own map: back at the block's lamp.
                 ++g_retries;
-                log_flags(b, "back after a death");
-                banner("Again - " + std::string(b->name), 4.0f);
+                log_flags(b, "死亡後に復帰");
+                banner("再挑戦 - " + std::string(b->name), 4.0f);
             }
             // A death since the last refill (here, or elsewhere before this
             // round's travel): vials and bullets back to the most.

@@ -376,21 +376,21 @@ void slow_loads(const char* so, const fs::path& dir) {
     // The title's load: the player is built inside it (on_world_load) and
     // its screen stays up 50 s. The run waits for it to go.
     CHECK(run_until([] { return screen_end(0) != 0; }, 10000));
-    CHECK(!message("Boss rush: 1 bosses"));
+    CHECK(!message("ボスラッシュ: 1 体"));
     CHECK(G.travels.empty());
     // The countdown (1 s), seen in the world, and the travel once the world
     // has been up 3 s.
     CHECK(run_until([] { return !G.travels.empty(); }, 2000));
-    const auto* begun = message("Boss rush: 1 bosses - the first in 1 seconds");
+    const auto* begun = message("ボスラッシュ: 1 体 - 開始まで 1 秒");
     CHECK(begun && !begun->first.loading && begun->first.frame > screen_end(0));
     CHECK(!G.travels.empty() && G.travels[0].lamp == kLudwigLamp && G.travels[0].frame >= screen_end(0) + 3 * kFps);
     CHECK(G.flags[kLudwigDefeat] == 0 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 0);  // woken, "met"
     // The travel's load: the arrival comes inside it; the fog warp after it.
-    CHECK(run_until([] { return logged("boss_rush: arrived: Ludwig"); }, 2000));
+    CHECK(run_until([] { return logged("boss_rush: arrived: 聖剣のルドウイーク"); }, 2000));
     CHECK(G.loading && G.warps.empty() && G.block == kLudwigBlock);
-    CHECK(run_until([] { return logged("at Ludwig, the Holy Blade's fog wall"); }, kLoadFrames + 500));
+    CHECK(run_until([] { return logged("at 聖剣のルドウイーク's fog wall"); }, kLoadFrames + 500));
     CHECK(!G.warps.empty() && G.warps[0].frame == screen_end(1) + 1 && near_fog(G.warps[0].pos));
-    const auto* round = message("Round 1/1 - Ludwig, the Holy Blade");
+    const auto* round = message("ラウンド 1/1 - 聖剣のルドウイーク");
     CHECK(round && !round->first.loading && round->first.frame > screen_end(1));
     // A death at the fog: the respawn's slow load puts the player back at
     // the lamp (on_world_load in the boss's block, inside the screen), and
@@ -400,26 +400,26 @@ void slow_loads(const char* so, const fs::path& dir) {
     ++G.deaths;
     G.dying = 240;
     const std::size_t warps_before = G.warps.size();
-    CHECK(run_until([] { return logged("back after a death"); }, 1000));
+    CHECK(run_until([] { return logged("死亡後に復帰"); }, 1000));
     CHECK(G.loading && G.warps.size() == warps_before);
-    CHECK(run_until([] { return count_logged("at Ludwig, the Holy Blade's fog wall") == 2; }, kLoadFrames + 500));
+    CHECK(run_until([] { return count_logged("at 聖剣のルドウイーク's fog wall") == 2; }, kLoadFrames + 500));
     CHECK(G.warps.size() > warps_before && G.warps[warps_before].frame == screen_end(2) + 1 && near_fog(G.warps[warps_before].pos));
-    const auto* again = message("Again - Ludwig, the Holy Blade");
+    const auto* again = message("再挑戦 - 聖剣のルドウイーク");
     CHECK(again && !again->first.loading && again->first.frame > screen_end(2));
     // The kill, ten seconds to pick up the drops, then the result and the
     // travel home; the save's flags as they were.
     for (int i = 0; i < 300; ++i) step();
     G.flags[kLudwigDefeat] = 1;
-    CHECK(run_until([] { return logged("Ludwig, the Holy Blade defeated in"); }, 10));
+    CHECK(run_until([] { return logged("聖剣のルドウイーク defeated in"); }, 10));
     const std::uint64_t killed = G.frame;
     CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
     CHECK(G.travels.size() == 2 && G.travels[1].lamp == kDream && G.travels[1].frame >= killed + 10 * kFps);
-    const auto* done = message("Boss rush complete - ");
-    CHECK(done && done->second.find(", 1 death") != std::string::npos);
+    const auto* done = message("ボスラッシュ完了 - ");
+    CHECK(done && done->second.find(", 1 回死亡") != std::string::npos);
     std::ifstream results(G.dir + "/results.txt");
     std::stringstream text;
     text << results.rdbuf();
-    CHECK(text.str().find("Boss rush complete - ") != std::string::npos && text.str().find("  Ludwig, the Holy Blade: ") != std::string::npos);
+    CHECK(text.str().find("ボスラッシュ完了 - ") != std::string::npos && text.str().find("  聖剣のルドウイーク: ") != std::string::npos);
     CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 &&
           G.flags[kLudwigDefeat + 2] == 0);
     CHECK(run_until([] { return screen_end(3) != 0; }, kFadeFrames + kDarkFrames + kLoadFrames + 10));
@@ -441,11 +441,11 @@ void one_dropped(const char* so, const fs::path& dir, std::uint32_t api_version,
     Loaded l = start(so, dir, name, api_version, one_round());
     if (!G.frame_fn) return;
     G.drop = 1;
-    CHECK(run_until([] { return logged("at Ludwig, the Holy Blade's fog wall"); }, 20000));
+    CHECK(run_until([] { return logged("at 聖剣のルドウイーク's fog wall"); }, 20000));
     CHECK(G.travels.size() == 2 && G.travels[0].lamp == kLudwigLamp && G.travels[1].lamp == kLudwigLamp);
     CHECK(G.travels.size() == 2 && G.travels[1].frame >= G.travels[0].frame + 10 * kFps &&
           G.travels[1].frame <= G.travels[0].frame + 10 * kFps + 2);
-    CHECK(logged("the travel to Ludwig, the Holy Blade's arena was not begun (no loading screen); again"));
+    CHECK(logged("the travel to 聖剣のルドウイーク's arena 移動が始まりませんでした; again"));
     CHECK(!G.warps.empty() && G.warps[0].frame == screen_end(1) + (api_version >= 12 ? 1 : 0) && near_fog(G.warps[0].pos));
     check_never_inside_a_screen();
     CHECK(!message("stopped") && G.refused.empty());
@@ -471,10 +471,10 @@ void death_while_travelling(const char* so, const fs::path& dir) {
     CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
     CHECK(G.travels.size() == 2 && G.travels[1].frame >= screen_end(1) + 3 * kFps &&
           G.travels[1].frame >= G.travels[0].frame + 10 * kFps);
-    CHECK(logged("the travel to Ludwig, the Holy Blade's arena did not arrive (a load, but to another map); again"));
-    CHECK(run_until([] { return logged("at Ludwig, the Holy Blade's fog wall"); }, 10000));
+    CHECK(logged("the travel to 聖剣のルドウイーク's arena 別のマップに到着しました; again"));
+    CHECK(run_until([] { return logged("at 聖剣のルドウイーク's fog wall"); }, 10000));
     check_never_inside_a_screen();
-    CHECK(!message("Boss rush stopped") && G.refused.empty());
+    CHECK(!message("ボスラッシュ 停止") && G.refused.empty());
     finish(l, "death while travelling");
     std::printf("death while travelling: %s\n", g_failures == failures ? "ok" : "FAILED");
 }
@@ -493,17 +493,17 @@ void stopped_in_a_load(const char* so, const fs::path& dir) {
     CHECK(G.travels.empty() && G.action_fn);
     if (!G.action_fn) return;
     G.action_fn("start", G.action_user);
-    CHECK(message("Boss rush: 1 bosses - the first in 1 seconds"));
+    CHECK(message("ボスラッシュ: 1 体 - 開始まで 1 秒"));
     CHECK(run_until([] { return !G.travels.empty(); }, 3 * kFps));
     CHECK(G.travels.size() == 1 && G.travels[0].frame >= G.messages.back().first.frame + kFps);
-    CHECK(run_until([] { return logged("boss_rush: arrived: Ludwig"); }, 2000));
+    CHECK(run_until([] { return logged("boss_rush: arrived: 聖剣のルドウイーク"); }, 2000));
     G.action_fn("stop", G.action_user);
-    CHECK(message("Boss rush stopped") && G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 5] == 1);
+    CHECK(message("ボスラッシュ 停止") && G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 5] == 1);
     CHECK(run_until([] { return G.travels.size() == 2; }, kLoadFrames + 10 * kFps));
     CHECK(G.travels.size() == 2 && G.travels[1].lamp == kDream && G.travels[1].frame >= screen_end(1) + 3 * kFps);
     CHECK(G.warps.empty());  // stopped before the fog warp
     check_never_inside_a_screen();
-    CHECK(!message("Boss rush stopped:") && G.refused.empty());
+    CHECK(!message("ボスラッシュ停止:") && G.refused.empty());
     finish(l, "stopped in a load");
     std::printf("stopped in a load: %s\n", g_failures == failures ? "ok" : "FAILED");
 }
@@ -515,16 +515,16 @@ void never_begun(const char* so, const fs::path& dir) {
     Loaded l = start(so, dir, "never-begun", BB_PLUGIN_API_VERSION, one_round());
     if (!G.frame_fn) return;
     G.drop = 1000;
-    CHECK(run_until([] { return message("Boss rush stopped:") != nullptr; }, 20000));
-    const auto* m = message("Boss rush stopped:");
-    CHECK(m && m->second == "Boss rush stopped: the game did not begin the travel to Ludwig, the Holy Blade's arena");
+    CHECK(run_until([] { return message("ボスラッシュ停止:") != nullptr; }, 20000));
+    const auto* m = message("ボスラッシュ停止:");
+    CHECK(m && m->second == "ボスラッシュ停止: ゲームが移動を開始しませんでした / 聖剣のルドウイークの闘技場");
     CHECK(G.travels.size() == 5);
     for (std::size_t i = 1; i < G.travels.size(); ++i) CHECK(G.travels[i].frame - G.travels[i - 1].frame >= 10 * kFps);
     CHECK(m && G.travels.size() == 5 && m->first.frame >= G.travels[4].frame + 10 * kFps);
     CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1);
     for (int i = 0; i < 60 * kFps; ++i) step();
-    CHECK(G.travels.size() == 5 && count_messages("Boss rush stopped:") == 1);
-    CHECK(logged("the game did not begin the travel to Ludwig, the Holy Blade's arena (lamp 3402950, asked 5 times); the run stops"));
+    CHECK(G.travels.size() == 5 && count_messages("ボスラッシュ停止:") == 1);
+    CHECK(logged("ゲームが移動を開始しませんでした to 聖剣のルドウイーク's arena (lamp 3402950, asked 5 times); the run stops"));
     CHECK(logged("boss_rush: 11 flags back as the save had them") && !logged("read back otherwise"));  // the defeat family and +3000
     check_never_inside_a_screen();
     finish(l, "never begun");
@@ -538,12 +538,12 @@ void refused(const char* so, const fs::path& dir) {
     Loaded l = start(so, dir, "refused", BB_PLUGIN_API_VERSION, one_round());
     if (!G.frame_fn) return;
     G.refuse = true;
-    CHECK(run_until([] { return message("Boss rush stopped:") != nullptr; }, 20000));
-    const auto* m = message("Boss rush stopped:");
-    CHECK(m && m->second == "Boss rush stopped: bbhost refused the travel to Ludwig, the Holy Blade's arena");
+    CHECK(run_until([] { return message("ボスラッシュ停止:") != nullptr; }, 20000));
+    const auto* m = message("ボスラッシュ停止:");
+    CHECK(m && m->second == "ボスラッシュ停止: bbhost が移動を拒否しました / 聖剣のルドウイークの闘技場");
     CHECK(G.refused.size() == 1 && !G.refused[0].loading && G.refused[0].player);
     for (int i = 0; i < 30 * kFps; ++i) step();
-    CHECK(G.refused.size() == 1 && count_messages("Boss rush stopped:") == 1);
+    CHECK(G.refused.size() == 1 && count_messages("ボスラッシュ停止:") == 1);
     CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 5] == 1);
     finish(l, "refused");
     std::printf("refused: %s\n", g_failures == failures ? "ok" : "FAILED");

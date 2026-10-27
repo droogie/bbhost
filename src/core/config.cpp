@@ -805,88 +805,23 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
 const HostConfig& config() { return g_cfg; }
 
 std::string config_setup_help(const HostConfig& c) {
-    std::string out;
-    const auto line = [&out](const std::string& s) { out += s + "\n"; };
-    const bool have_eboot = !c.eboot.empty(), have_app0 = !c.app0.empty();
-    if (!have_eboot || !have_app0) {
-        // The per-user config is the one to fill in: every copy of bbhost,
-        // and every update, reads it.
+    if (c.eboot.empty() || c.app0.empty()) {
         const std::string path = user_config_dir() + "/bbhost.toml";
-        if (!file_exists(path)) {
-            const bool wrote = make_dirs(user_config_dir()) && config_write_template(path);
-            line("bbhost: there is no configuration yet, so there is nothing to run.");
-            if (wrote) line("A template has been written to " + path);
-            else line("Create " + path + " (run bbhost --write-config \"" + path + "\").");
-            line("It is read by every copy of bbhost, so this is set once - a new download or an update keeps it.");
-        } else {
-            line("bbhost: " + path + " does not say where the game is.");
-        }
-        line("");
-        line("Open it and set both paths, for example:");
-        line("    [paths]");
-        line("    app0  = \"C:\\Games\\Bloodborne\\CUSA00900\"   # the folder that contains dvdroot_ps4");
-        line("    eboot = \"C:\\Games\\Bloodborne\\eboot.bin\"    # the decrypted eboot ELF");
-        line("");
-        line("Either slash works on Windows, and a relative path is taken from the");
-        line("folder the configuration file is in. The same two can be given on the");
-        line("command line instead:  bbhost --app0 DIR path\\to\\eboot.bin");
-        return out;
+        if (!file_exists(path) && make_dirs(user_config_dir())) config_write_template(path);
+        return "bbhost: ゲームフォルダーと復号済み 1.09 eboot の場所を設定してください。\n"
+               "設定ファイル: " + path + "\n[paths] の app0 と eboot を指定します。\n";
     }
-    // Both are set: say which one is wrong, and where the value came from.
-    const std::string from = c.config_path.empty() ? std::string("the command line") : c.config_path;
-    if (!file_exists(c.eboot)) {
-        line("bbhost: the eboot is not there: " + c.eboot);
-        line("Set paths.eboot in " + from + " to the decrypted eboot ELF.");
-        return out;
-    }
-    if (!dir_exists(c.app0)) {
-        line("bbhost: the game dump is not there: " + c.app0);
-        line("Set paths.app0 in " + from + " to the folder that contains dvdroot_ps4.");
-        return out;
-    }
-    if (!dir_exists(c.app0 + "/dvdroot_ps4")) {
-        line("bbhost: " + c.app0 + " has no dvdroot_ps4 in it.");
-        line("paths.app0 in " + from + " is the folder that contains dvdroot_ps4,");
-        line("not the folder above it and not dvdroot_ps4 itself.");
-        return out;
-    }
-    return out;  // empty: nothing to complain about
+    if (!file_exists(c.eboot)) return "bbhost: eboot が見つかりません: " + c.eboot + "\n";
+    if (!dir_exists(c.app0)) return "bbhost: ゲームフォルダーが見つかりません: " + c.app0 + "\n";
+    if (!dir_exists(c.app0 + "/dvdroot_ps4"))
+        return "bbhost: dvdroot_ps4 を含む親フォルダーを指定してください: " + c.app0 + "\n";
+    return {};
 }
 
 std::string config_eboot_help(const HostConfig& c, const std::string& sha256, const char* want_sha256) {
-    std::string out;
-    const auto line = [&out](const std::string& s) { out += s + "\n"; };
-    const std::string from = c.config_path.empty() ? std::string("the command line") : c.config_path;
-    line("bbhost: this eboot is not the Bloodborne 1.09 build, the only one bbhost runs.");
-    line("    eboot   " + c.eboot);
-    line("    sha256  " + sha256);
-    line("    1.09's  " + std::string(want_sha256));
-    // The dump says which version it is (its update folder, when it has
-    // one); the eboot itself does not.
-    const App0Version v = config_app0_version(c.app0);
-    const std::string ver = v.app_ver;
-    if (ver.empty()) {
-        line("    app0    " + c.app0 + " (no sce_sys/param.sfo could be read in it)");
-    } else {
-        const std::string& cat = v.category;
-        line("    app0    " + (v.update.empty() ? c.app0 : v.update) + " says version " + ver + ", category " + cat +
-             (cat == "gd" ? " (the game without its updates)" : cat == "gp" ? " (the game with an update)" : ""));
-    }
-    line("");
-    if (ver == "01.09") {
-        line("The game in app0 is 1.09, so the eboot is the file that is off: set paths.eboot");
-        line("in " + from + " to that game's eboot.bin, decrypted to an ELF.");
-    } else {
-        line("bbhost needs the eboot.bin of the game's 1.09 update (CUSA00900, APP_VER 01.09),");
-        line("decrypted to an ELF. A dump of the game without the update carries the 1.00 eboot.");
-        line("Copy the update's files over the game's in the app0 folder, so its");
-        line("sce_sys/param.sfo says APP_VER 01.09, and set paths.eboot in " + from);
-        line("to the update's decrypted eboot.bin.");
-    }
-    line("");
-    line("BBHOST_ANY_EBOOT=1 starts this eboot anyway, without any of bbhost's patches;");
-    line("a different version is expected to crash.");
-    return out;
+    return "bbhost: 対応する復号済み 1.09 eboot ではありません。\nファイル: " + c.eboot +
+           "\n検出した SHA-256: " + sha256 + "\n必要な SHA-256: " + want_sha256 +
+           "\nゲームに更新 1.09 を適用し、対応する復号済み ELF を paths.eboot に指定してください。\n";
 }
 
 void config_set_skip_intro(bool on) { g_cfg.skip_intro = on; }
@@ -956,119 +891,60 @@ bool config_write_template(const std::string& path) {
     if (!out) {
         return false;
     }
-    out << "# bbhost configuration. Set the two paths under [paths], then run bbhost.\n"
-           "# On Windows write them either way: \"C:\\Games\\Bloodborne\" or \"C:/Games/Bloodborne\".\n"
-           "# A relative path is taken from the folder this file is in.\n"
-           "# This file is the per-user one (%APPDATA%\\bbhost on Windows, ~/.config/bbhost on\n"
-           "# Linux): every copy of bbhost reads it, so a new download or an update keeps it.\n"
-           "[paths]\n"
-           "# The folder that contains dvdroot_ps4 (the decrypted game dump). An update\n"
-           "# kept beside it in a folder of its own (CUSA00900-UPDATE or CUSA00900-patch,\n"
-           "# as shadPS4 keeps one) is read in place of the game folder's files.\n"
-           "#   app0 = \"C:\\Games\\Bloodborne\\CUSA00900\"\n"
-           "app0 = \"PATH-TO-THE-GAME-DUMP\"\n"
-           "# The decrypted eboot ELF. May also be given on the command line.\n"
-           "#   eboot = \"C:\\Games\\Bloodborne\\eboot.bin\"\n"
-           "eboot = \"PATH-TO-THE-EBOOT\"\n"
-           "# Writable folder for saves, caches and /data. Default: the per-user data\n"
-           "# folder (%LOCALAPPDATA%\\bbhost\\data, ~/.local/share/bbhost/data), which\n"
-           "# outlives any copy of bbhost.\n"
-           "# data = \"D:/bbhost-data\"\n"
-           "# The PC port's asset overlay: files here resolve ahead of the dump, so a\n"
-           "# modified asset never has to be written into it. Default: <data>/mods.\n"
-           "# Ignored when the directory does not exist.\n"
-           "# mods = \"./data/mods\"\n"
-           "\n[online]\n"
-           "# Hostname that replaces the official *.scej-network.jp servers.\n"
-           "host = \"thehuntersdream.com\"\n"
-           "# Force this scheme for those hosts. The live server takes only https; a\n"
-           "# server on your own network may speak plain http.\n"
-           "scheme = \"https\"\n"
-           "# Check the server's certificate.\n"
-           "verify_tls = true\n"
-           "online_id = \"Hunter\"\n"
-           "# true: the game is signed out until this PC is signed in on the F10\n"
-           "# screen (Account section), and the account's name is the online id.\n"
-           "# The live server plays only with signed-in players.\n"
-           "require_account = true\n"
-           "# Where the account calls (/auth/device/..., /auth/account/create) go. Tokens\n"
-           "# and recovery codes travel here, so in production this is the server's https\n"
-           "# origin; without it they go to np_server, fine on a LAN.\n"
-           "auth_server = \"https://thehuntersdream.com\"\n"
-           "# The host's own calls (rooms, events) go to this API base. Default:\n"
-           "# <scheme>://<host>:18671, the same server as the game's own traffic.\n"
-           "# np_server = \"http://127.0.0.1:18671\"\n"
-           "# The address and UDP port other players reach this host at (P2P). Two\n"
-           "# instances on one machine need different ports.\n"
-           "# p2p_addr = \"127.0.0.1\"\n"
-           "p2p_port = 9307\n"
-           "# The STUN server the P2P port asks for the address the world sees it at\n"
-           "# (players behind NAT). Default: the private server's host on 3478;\n"
-           "# \"off\" never asks.\n"
-           "# stun_server = \"thehuntersdream.com:3478\"\n"
-           "\n[player]\n"
-           "# The character's name the name box starts from (the first key typed\n"
-           "# replaces it). Default: online_id.\n"
-           "name = \"Hunter\"\n"
-           "# type: the game's text boxes - the character's name, a chalice glyph,\n"
-           "# the network password - are typed in a box over the game (Enter\n"
-           "# accepts, Escape cancels). auto: the name is `name` at once.\n"
-           "ime = \"type\"\n"
-           "\n[video]\n"
-           "width = 1920\n"
-           "height = 1080\n"
-           "fps_cap = 30\n"
-           "# The rate the flip clock runs at. 0 (default) follows the display the\n"
-           "# window is on; set a number only when the display reports the wrong one.\n"
-           "# vblank_hz = 0\n"
-           "# true: no window, no presentation (smoke tests)\n"
-           "headless = false\n"
-           "\n# Key bindings. The in-game System > Key Bindings screen changes these\n"
-           "# and saves them in bbhost-options.toml, which wins over this file; what\n"
-           "# is here are the defaults for a player who never opens it. Each action\n"
-           "# has a key and a mouse button, either optional: \"E\", \"Mouse2\",\n"
-           "# \"X, Mouse2\", or \"none\". Keys are SDL key names (\"W\", \"Space\",\n"
-           "# \"Left Shift\", \"F1\"); Mouse1..Mouse5 are the left, right and middle\n"
-           "# buttons and the two side buttons, which act while the mouse turns\n"
-           "# the camera. The shape is Dark Souls III's on Bloodborne's buttons:\n"
-           "# R1 attacks, R2 is the strong attack, L1 transforms, L2 is the firearm\n"
-           "# and the parry, Circle dodges, Triangle drinks a Blood Vial, Square\n"
-           "# uses the quick item, Cross interacts, the d-pad switches weapons and\n"
-           "# items. The arrows, Enter, Backspace and Escape work every menu\n"
-           "# whatever is bound to them.\n"
-           "# [keys]\n"
-           "# move_forward = \"W\"\n"
-           "# move_back = \"S\"\n"
-           "# move_left = \"A\"\n"
-           "# move_right = \"D\"\n"
-           "# roll = \"Space\"\n"
-           "# lock_on = \"Q\"\n"
-           "# l3 = \"Left Ctrl\"\n"
-           "# attack = \"Mouse1\"\n"
-           "# strong_attack = \"V\"\n"
-           "# strong_modifier = \"Left Shift\"   # held with attack: the strong one\n"
-           "# transform = \"C, Mouse3\"\n"
-           "# firearm = \"X, Mouse2\"\n"
-           "# blood_vial = \"R\"\n"
-           "# use_item = \"F\"\n"
-           "# interact = \"E\"\n"
-           "# switch_item = \"Down\"\n"
-           "# switch_right = \"Right\"\n"
-           "# switch_left = \"Left\"\n"
-           "# dpad_up = \"Up\"\n"
-           "# gestures = \"G\"                   # the touchpad's left side\n"
-           "# personal_effects = \"T\"           # and its right\n"
-           "# look_up = \"I\"\n"
-           "# look_down = \"K\"\n"
-           "# look_left = \"J\"\n"
-           "# look_right = \"L\"\n"
-           "# menu = \"Escape\"\n"
-           "# confirm = \"Return\"               # menus: OK, the same bit as `roll`\n"
-           "# back = \"Backspace\"               # menus: Return, the same bit as `interact`\n"
-           "\n[startup]\n"
-           "# Skip the three company logos and the Exit Game warning (Bloodborne 1.09 only).\n"
-           "skip_intro = false\n"
-           "";
+    out << R"toml(# bbhost 日本語版の設定。ゲームと復号済み eboot の場所を指定してください。
+# 相対パスはこのファイルの場所を基準にします。Windows でも / を使用できます。
+[paths]
+# 日本版 Old Hunters (CUSA03014)、更新 1.09、dvdroot_ps4 を含むフォルダー。
+app0 = "PATH-TO-THE-GAME-DUMP"
+# SHA-256: 941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7
+eboot = "PATH-TO-THE-EBOOT"
+# セーブとキャッシュの保存先。省略時は利用者ごとの標準フォルダーです。
+# data = "D:/bbhost-data"
+# mods = "./data/mods"
+
+[online]
+host = "thehuntersdream.com"
+scheme = "https"
+verify_tls = true
+online_id = "Hunter"
+require_account = true
+auth_server = "https://thehuntersdream.com"
+p2p_port = 9307
+# np_server = "http://127.0.0.1:18671"
+# stun_server = "thehuntersdream.com:3478"
+
+[player]
+name = "Hunter"
+# type: 手入力、auto: 上の名前を自動入力。
+ime = "type"
+
+[video]
+width = 1920
+height = 1080
+fps_cap = 30
+headless = false
+
+[startup]
+skip_intro = false
+
+[plugins]
+region_switch = true
+
+[region_switch]
+# 日本版ゲームデータを維持して欧州オンラインを利用。OFF で無効。
+region = "JP"
+
+[update]
+# この日本語版の更新先を設定するまでは自動確認しません。
+check = false
+
+# 操作の変更: ゲーム中の「キー設定」。値は SDL のキー名です。
+# [keys]
+# roll = "Space"
+# interact = "E"
+# attack = "Mouse1"
+# firearm = "X, Mouse2"
+)toml";
     return true;
 }
 

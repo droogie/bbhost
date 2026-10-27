@@ -16,7 +16,7 @@
 [patch]
 name = "screen-space-reflections"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Enable Screen Space Reflections (enable only, keeps res) - Kyo's patch"
+description = "画面空間反射を有効化（解像度は維持）(Kyo)"
 enabled = false
 order = 114
 

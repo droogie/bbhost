@@ -111,7 +111,7 @@ std::atomic<int> g_text_end_key{-1};
 // The same for a controller's button (an SDL_GamepadButton), when one ended it.
 std::atomic<int> g_text_end_button{-1};
 TextEntry g_entry;  // the text and what the box takes (host/text_entry.h)
-std::string g_text_label = "Enter name";  // what the box over the game asks for
+std::string g_text_label = "名前を入力";  // what the box over the game asks for
 
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -215,8 +215,7 @@ void note_deck_outside_steam(SDL_Gamepad* g) {
     const char* launched = std::getenv("SteamGameId");
     if (SDL_GetGamepadVendor(g) != 0x28de || SDL_GetGamepadProduct(g) != 0x1205 || (launched && *launched) || !steam_running()) return;
     g_deck_outside_steam = true;
-    host_log("input: the Deck's controls outside Steam - Steam's desktop layout also sends keys and clicks for them, so each "
-             "press does two things; start bbhost from Steam (Add a Non-Steam Game), in Game Mode or Desktop Mode");
+    host_log("input: the Deck's controls outside Steam - Steam's desktop layout also sends keys and clicks for them, so each press does two things; start bbhost from Steam (Add a Non-Steam Game), in Game Mode or Desktop Mode");
 }
 // A key or click right behind a pad press on such a Deck is the desktop
 // layout's twin of it: say so on screen, at most every half minute.
@@ -226,7 +225,7 @@ void warn_deck_double_input() {
     const auto now = std::chrono::steady_clock::now();
     if (now - g_last_pad_press > std::chrono::milliseconds(200) || (said.time_since_epoch().count() && now - said < std::chrono::seconds(30))) return;
     said = now;
-    host_message_show("Start bbhost from Steam: outside it, Deck buttons also send keys", 8.0f);
+    host_message_show("bbhost は Steam から起動してください。外からの起動では Deck のボタンがキー入力を兼ねます。", 8.0f);
 }
 
 void pad_open(SDL_JoystickID id) {
@@ -714,8 +713,7 @@ bool vk_start() {
              g_acquire_fence && g_vk.acquire_fence ? "waited for on this thread (a fence)" : "waited for on the GPU queue (a semaphore)",
              g_present_submit_always ? "before every blit" : "only when the flip's frame is still in it",
              present_own_queue_on() && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
-                 ? "on the presenter's own queue after its frame alone, once the frame's submissions are in the driver "
-                   "(BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
+                 ? "on the presenter's own queue after its frame alone, once the frame's submissions are in the driver (BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
              : g_present_own_queue && host_gpu_vendor_id() == 0x10de
                  ? "behind the game's queued work (NVIDIA: BBHOST_PRESENT_OWN_QUEUE=1 for its own queue)"
                  : "behind the game's queued work",
@@ -1271,8 +1269,7 @@ bool vk_present() {
     ps.cpu_ns += host_thread_cpu_ns() - cpu_enter;
     if (++presents % 300 == 0 && host_tooling()) {
         const auto now = std::chrono::steady_clock::now();
-        host_log("present: 300 frames in %lld ms (display wait %llu ms, work %llu ms: submit queued work %llu, lock wait %llu, blit %llu, "
-                 "queue submit %llu, present %llu), %llu dropped so far",
+        host_log("present: 300 frames in %lld ms (display wait %llu ms, work %llu ms: submit queued work %llu, lock wait %llu, blit %llu, queue submit %llu, present %llu), %llu dropped so far",
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()),
                  static_cast<unsigned long long>(wait_us / 1000), static_cast<unsigned long long>(work_us / 1000),
                  static_cast<unsigned long long>(flush_us / 1000), static_cast<unsigned long long>(lock_us / 1000),
@@ -1286,10 +1283,7 @@ bool vk_present() {
         // rendering of its own for the overlay) and how long this thread slept
         // on the GPU's frame and on the display's image.
         const double n = 300.0;
-        host_log("present: per frame: bb-present CPU %.3f ms; flip to present %.1f ms (max %.1f), %llu of 300 shown on arrival; "
-                 "the renderer's recording submitted here %llu, left to the command processor %llu; one pass %llu, blits %llu, clears %llu, "
-                 "overlay renderings %llu; overlay drawn %llu, F9 menu %llu; slept %.2f ms on the frame's GPU work, %.2f ms on the "
-                 "acquired image; %llu copied on the presenter's own queue; %s, %zu images",
+        host_log("present: per frame: bb-present CPU %.3f ms; flip to present %.1f ms (max %.1f), %llu of 300 shown on arrival; the renderer's recording submitted here %llu, left to the command processor %llu; one pass %llu, blits %llu, clears %llu, overlay renderings %llu; overlay drawn %llu, F9 menu %llu; slept %.2f ms on the frame's GPU work, %.2f ms on the acquired image; %llu copied on the presenter's own queue; %s, %zu images",
                  static_cast<double>(ps.cpu_ns) / 1e6 / n, ps.latency_n ? static_cast<double>(ps.latency_ns) / 1e6 / static_cast<double>(ps.latency_n) : 0.0,
                  static_cast<double>(ps.latency_max_ns) / 1e6, static_cast<unsigned long long>(ps.on_arrival),
                  static_cast<unsigned long long>(ps.submits_forced), static_cast<unsigned long long>(ps.submits_left),
@@ -1319,7 +1313,7 @@ void text_title_locked() {
         std::string shown = g_entry.text;
         if (g_text_hidden) shown.assign(g_entry.length(), '*');
         const std::string t = "Bloodborne (bbhost)  |  " + g_text_label + ": " + shown +
-                              "_   (Enter = OK, Esc = cancel, Ctrl+V = paste)";
+                              "_   (Enter: 決定、Esc: 取消、Ctrl+V: 貼付)";
         SDL_SetWindowTitle(g_window, t.c_str());
     } else {
         SDL_SetWindowTitle(g_window, "Bloodborne (bbhost)");
@@ -2007,9 +2001,9 @@ bool host_window_pump() {
         static bool opened = false;
         if (!opened && g_ime_test_reopen.exchange(false)) {
             opened = true;
-            if (ime_test == 1) host_text_entry_begin("Hunter", 16, false, "Please Enter Name", TextCharset::BasicLatin, true);
-            if (ime_test == 2) host_text_entry_begin("", 8, false, "Enter Chalice Glyph", TextCharset::Glyph);
-            if (ime_test == 3) host_text_entry_begin("", 8, false, "Enter password", TextCharset::BasicLatin);
+            if (ime_test == 1) host_text_entry_begin("Hunter", 16, false, "名前を入力してください", TextCharset::BasicLatin, true);
+            if (ime_test == 2) host_text_entry_begin("", 8, false, "聖杯文字を入力", TextCharset::Glyph);
+            if (ime_test == 3) host_text_entry_begin("", 8, false, "合言葉を入力", TextCharset::BasicLatin);
         }
         if (opened) {
             std::string typed;
@@ -2216,7 +2210,7 @@ bool host_window_pump() {
                 dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
             }
             char text[64];
-            std::snprintf(text, sizeof(text), "Building shaders: %zu left", left);
+            std::snprintf(text, sizeof(text), "シェーダーを作成中: 残り %zu", left);
             const float scale = 0.8f, w = host_overlay_text_width(scale, text);
             const float x = dw - w - 20.0f, y = corner_y;
             host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);
@@ -2255,10 +2249,10 @@ bool host_window_pump() {
             if ((++ticks / 30) % 2 == 0) host_overlay_rect(tx + w + 2.0f, ty, 2.0f, 34.0f, 0xffffffffu);
             // With a controller in hand, the buttons that close the box; the
             // typing itself is the keyboard's, or Steam's on-screen one.
-            const char* help = "Enter accepts    Esc cancels    Backspace deletes    Ctrl+V pastes";
+            const char* help = "Enter: 決定   Esc: 取消   Backspace: 削除   Ctrl+V: 貼付";
             if (host_input_device() == InputDevice::Pad) {
-                help = menu_confirm_button() == kCross ? "Cross / A accepts    Circle / B cancels    Type on a keyboard"
-                                                       : "Circle / B accepts    Cross / A cancels    Type on a keyboard";
+                help = menu_confirm_button() == kCross ? "× / A: 決定   ○ / B: 取消   キーボードで入力"
+                                                       : "○ / B: 決定   × / A: 取消   キーボードで入力";
             }
             host_overlay_text(bx + 20.0f, by + bh - 30.0f, 0.62f, 0x9a9a9aff, help);
         }
@@ -2355,7 +2349,7 @@ void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hi
                            bool select_initial) {
     std::lock_guard<std::mutex> lock(g_text_mu);
     g_entry.begin(initial_utf8, max_chars, charset, select_initial);
-    g_text_label = label && label[0] ? label : "Enter name";
+    g_text_label = label && label[0] ? label : "名前を入力";
     g_text_hidden = hidden;
     g_text_result = 0;
     g_text_want = true;
