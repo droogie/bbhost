@@ -59,6 +59,52 @@ name = "Hunter"
 # still typed. BBHOST_IME=type or auto overrides this.
 ime = "type"
 
+[input]
+# true: the pad's A and B (Cross and Circle) are exchanged; false: never.
+# auto: exchanged only for the Asian release (CUSA03023, CUSA01363), whose A and B are
+# the other way round; other releases keep the default.
+swap_ab = "auto"
+# Back / Select / Share (the two overlapping squares) split by how long it is
+# held: released before back_long_ms it presses "personal_effects" (or
+# "gestures"); held past it, it gives the default, Gestures (the other one when
+# this is "gestures"). Empty: Back is just Gestures, as before.
+back_short = ""
+back_long_ms = 450
+
+[input.pad]
+# All optional: remove the # to use one. Names are written as shown (case is
+# ignored); a wrong one is logged and ignored.
+# Remaps the controller's buttons. The names are SDL's layout, the same on
+# every pad: south east west north (Cross Circle Square Triangle on a
+# DualShock, A B X Y on an Xbox pad), l1 r1 l3 r3 start back touchpad,
+# dpad_up dpad_down dpad_left dpad_right. L2 and R2, and the sticks, are not
+# remapped.
+# The value is what the button presses: cross circle square triangle l1 r1 l3
+# r3 options touchpad up down left right, gestures or personal_effects (the
+# touchpad's left or right side), none (the button does nothing).
+# A button that is not listed keeps its own behaviour: to leave one alone, do
+# not list it (none is not "leave it alone"). south and east then follow
+# swap_ab above; listing either fixes it as written, and swap_ab no longer
+# touches it (south = "cross" with east = "circle" turns the swap off).
+# "<name>_long" splits a button by how long it is held: let go inside long_ms
+# (milliseconds) it gives its own value, held past it gives the _long one.
+# back, back_long and long_ms here win over back_short and back_long_ms above,
+# the older way of splitting Back.
+# The DualShock 4 / DualSense touchpad: leave touchpad alone, and its click
+# goes to the game together with where the finger is; the game takes the left
+# (Gestures) or right (Personal Effects) side from that. touchpad = "none"
+# turns the click off; another button sent to "touchpad" is a click with no
+# finger, so give it gestures or personal_effects to name a side.
+# touchpad_left and touchpad_right split the click by the half the finger is
+# on, each with its own value (and _long): touchpad_left = "personal_effects"
+# makes the left half give Personal Effects. A side that is not listed keeps
+# the default; a listed side no longer gives its default click.
+# south = "circle"
+# east = "cross"
+# l3 = "personal_effects"
+# l3_long = "gestures"
+# long_ms = 450
+
 [video]
 # The window's size (fullscreen takes the desktop's).
 width = 1920

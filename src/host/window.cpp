@@ -33,6 +33,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1352,6 +1355,174 @@ std::uint8_t axis_to_u8(std::int16_t v) {
     return static_cast<std::uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
 }
 
+// ---- [input.pad]: the controller's buttons, remapped ---------------------------
+// Each physical button (SDL's layout: south is Cross on a DualShock, A on an
+// Xbox pad) presses the pad button the config names. With a "<name>_long"
+// entry it splits by how long it is held: let go inside long_ms it presses its
+// own target (a short pulse, since the press is known only at the release);
+// held past it, it gives the long target for as long as it stays down. L2 and
+// R2 (analog) are not remapped. Targets: cross circle square triangle l1 r1 l3
+// r3 options touchpad up down left right, gestures and personal_effects (the
+// touchpad's left and right side, as Back / Select / Share gives), none.
+struct PadTarget {
+    std::uint32_t bits = 0;
+    int side = 0;  // a finger on the touchpad: 1 its left (Gestures), 2 its right (Personal Effects)
+};
+
+struct PadRemapEntry {
+    SDL_GamepadButton button;
+    PadTarget tap, long_target;
+    bool has_long = false;
+    int zone = 0;  // the touchpad's click only: 1 with the finger on its left half, 2 on its right half, 0 either
+};
+
+struct PadRemap {
+    std::vector<PadRemapEntry> entries;
+    int long_ms = 450;
+    bool swap = false;
+    bool left_listed = false, right_listed = false;  // touchpad_left / touchpad_right are in the config
+};
+
+// Whether a remap entry on the touchpad's click is held: the click, and for a
+// side the finger on that half. The click as a whole (touchpad) is not given
+// to a side that has an entry of its own, so it does not press twice.
+bool pad_zone_held(const PadRemap& rm, const PadRemapEntry& e, bool click, bool finger_left, bool finger_right) {
+    if (!click) return false;
+    if (e.zone == 1) return finger_left;
+    if (e.zone == 2) return finger_right;
+    return !((finger_left && rm.left_listed) || (finger_right && rm.right_listed));
+}
+
+// Whether a click is taken by a side that has an entry of its own. The game
+// reads the side from the finger, so the pad's real fingers are then left out
+// of that frame: a finger on the left half would otherwise still say Gestures
+// beside the entry's own (Personal Effects') finger.
+bool pad_zone_takes_click(const PadRemap& rm, bool click, bool finger_left, bool finger_right) {
+    return click && ((finger_left && rm.left_listed) || (finger_right && rm.right_listed));
+}
+
+bool pad_target_named(const std::string& raw, PadTarget* out) {
+    std::string n = raw;
+    for (char& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    static const struct {
+        const char* name;
+        std::uint32_t bits;
+        int side;
+    } names[] = {{"cross", kCross, 0},    {"circle", kCircle, 0},   {"square", kSquare, 0}, {"triangle", kTriangle, 0},
+                 {"l1", kL1, 0},          {"r1", kR1, 0},           {"l3", kL3, 0},         {"r3", kR3, 0},
+                 {"options", kOptions, 0}, {"touchpad", kTouchPad, 0}, {"touch", kTouchPad, 0},
+                 {"up", kUp, 0},          {"dpad_up", kUp, 0},      {"down", kDown, 0},     {"dpad_down", kDown, 0},
+                 {"left", kLeft, 0},      {"dpad_left", kLeft, 0},  {"right", kRight, 0},   {"dpad_right", kRight, 0},
+                 {"gestures", kTouchPad, 1}, {"personal_effects", kTouchPad, 2}, {"none", 0, 0}};
+    for (const auto& e : names) {
+        if (n == e.name) {
+            out->bits = e.bits;
+            out->side = e.side;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The table, rebuilt only when the A/B swap (which depends on the release
+// found in the game folder) changes.
+std::shared_ptr<const PadRemap> pad_remap() {
+    static std::mutex mu;
+    static std::shared_ptr<const PadRemap> cur;
+    const bool swap = config_swap_ab();
+    std::lock_guard<std::mutex> lock(mu);
+    if (cur && cur->swap == swap) return cur;
+    auto rm = std::make_shared<PadRemap>();
+    rm->swap = swap;
+    const HostConfig& cfg = config();
+    auto get = [&](const std::string& key) -> const std::string* {
+        auto it = cfg.input_pad.find(key);
+        return it == cfg.input_pad.end() ? nullptr : &it->second;
+    };
+    rm->long_ms = cfg.input_back_long_ms > 0 ? cfg.input_back_long_ms : 450;
+    if (const std::string* v = get("long_ms")) {
+        const int n = std::atoi(v->c_str());
+        if (n > 0) rm->long_ms = n;
+    }
+    static const struct {
+        const char* name;
+        SDL_GamepadButton button;
+        const char* def;
+        int zone;
+    } srcs[] = {{"south", SDL_GAMEPAD_BUTTON_SOUTH, "cross", 0},
+                {"east", SDL_GAMEPAD_BUTTON_EAST, "circle", 0},
+                {"west", SDL_GAMEPAD_BUTTON_WEST, "square", 0},
+                {"north", SDL_GAMEPAD_BUTTON_NORTH, "triangle", 0},
+                {"l1", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "l1", 0},
+                {"r1", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "r1", 0},
+                {"l3", SDL_GAMEPAD_BUTTON_LEFT_STICK, "l3", 0},
+                {"r3", SDL_GAMEPAD_BUTTON_RIGHT_STICK, "r3", 0},
+                {"start", SDL_GAMEPAD_BUTTON_START, "options", 0},
+                {"back", SDL_GAMEPAD_BUTTON_BACK, "gestures", 0},
+                {"touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD, "touchpad", 0},
+                {"touchpad_left", SDL_GAMEPAD_BUTTON_TOUCHPAD, "touchpad", 1},
+                {"touchpad_right", SDL_GAMEPAD_BUTTON_TOUCHPAD, "touchpad", 2},
+                {"dpad_up", SDL_GAMEPAD_BUTTON_DPAD_UP, "up", 0},
+                {"dpad_down", SDL_GAMEPAD_BUTTON_DPAD_DOWN, "down", 0},
+                {"dpad_left", SDL_GAMEPAD_BUTTON_DPAD_LEFT, "left", 0},
+                {"dpad_right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "right", 0}};
+    // A key that names nothing here is most likely a typo: say so once.
+    for (const auto& kv : cfg.input_pad) {
+        bool known = kv.first == "long_ms";
+        for (const auto& s : srcs) {
+            known = known || kv.first == s.name || kv.first == std::string(s.name) + "_long";
+        }
+        if (!known) host_log("input: [input.pad] %s is not a button name; ignored\n", kv.first.c_str());
+    }
+    for (const auto& s : srcs) {
+        // A side of the touchpad's click is there only when the config lists it.
+        if (s.zone && !get(s.name) && !get(std::string(s.name) + "_long")) continue;
+        if (s.zone == 1) rm->left_listed = true;
+        if (s.zone == 2) rm->right_listed = true;
+        std::string def = s.def;
+        if (swap && s.button == SDL_GAMEPAD_BUTTON_SOUTH) def = "circle";
+        if (swap && s.button == SDL_GAMEPAD_BUTTON_EAST) def = "cross";
+        std::string tap = def, lng;
+        // [input] back_short, as before: Back's short side is that one, its long side the other.
+        if (s.button == SDL_GAMEPAD_BUTTON_BACK && !cfg.input_back_short.empty()) {
+            const bool short_is_gestures = cfg.input_back_short == "gestures";
+            tap = short_is_gestures ? "gestures" : "personal_effects";
+            lng = short_is_gestures ? "personal_effects" : "gestures";
+        }
+        if (const std::string* v = get(s.name)) {
+            if (!v->empty()) tap = *v;
+        }
+        if (const std::string* v = get(std::string(s.name) + "_long")) lng = *v;
+        PadRemapEntry e;
+        e.button = s.button;
+        e.zone = s.zone;
+        if (!pad_target_named(tap, &e.tap)) {
+            host_log("input: [input.pad] %s = \"%s\" is not a pad button; using %s\n", s.name, tap.c_str(), def.c_str());
+            pad_target_named(def, &e.tap);
+        }
+        if (!lng.empty()) {
+            if (pad_target_named(lng, &e.long_target)) {
+                e.has_long = true;
+            } else {
+                host_log("input: [input.pad] %s_long = \"%s\" is not a pad button; ignored\n", s.name, lng.c_str());
+            }
+        }
+        rm->entries.push_back(e);
+    }
+    cur = rm;
+    return cur;
+}
+
+// The pad bits a controller button gives (a text box's confirm and back go by
+// these, as the game's own menus do); 0 for one that gives a touchpad side.
+std::uint32_t pad_button_bits(SDL_GamepadButton b) {
+    const auto remap = pad_remap();
+    for (const PadRemapEntry& e : remap->entries) {
+        if (e.button == b) return e.tap.side ? 0u : e.tap.bits;
+    }
+    return 0u;
+}
+
 void update_pad() {
     PadState p;
     p.timestamp = SDL_GetTicksNS() / 1000;
@@ -1415,29 +1586,15 @@ void update_pad() {
     }
     // Each pad's buttons are or-ed together, and each stick axis and trigger
     // is whichever pad pushes it furthest, so two pads never fight.
-    bool touch_done = false, back_held = false;
+    bool touch_done = false;
+    const std::shared_ptr<const PadRemap> remap = pad_remap();
+    bool held[32] = {};  // each entry of the remap, on any pad
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
-        auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
-            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) {
-                p.buttons |= bit;
-            }
-        };
-        btn(SDL_GAMEPAD_BUTTON_SOUTH, kCross);
-        btn(SDL_GAMEPAD_BUTTON_EAST, kCircle);
-        btn(SDL_GAMEPAD_BUTTON_WEST, kSquare);
-        btn(SDL_GAMEPAD_BUTTON_NORTH, kTriangle);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL1);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR1);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_STICK, kL3);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK, kR3);
-        btn(SDL_GAMEPAD_BUTTON_START, kOptions);
-        back_held |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_BACK);  // below, after the touchpad's own fingers
-        btn(SDL_GAMEPAD_BUTTON_TOUCHPAD, kTouchPad);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_UP, kUp);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight);
+        for (std::size_t i = 0; i < remap->entries.size() && i < 32; ++i) {
+            const SDL_GamepadButton b = remap->entries[i].button;
+            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) held[i] = true;
+        }
         const auto further = [](std::uint8_t have, std::uint8_t v) {
             return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
@@ -1490,18 +1647,65 @@ void update_pad() {
             }
         }
     }
-    // Back / Select / Share is the touchpad's left side - Gestures - on pads
-    // without a touchpad and on those with one alike: the press, and a finger
-    // where the keyboard's Gestures key puts one (bindings.cpp), since the game
-    // reads the side from the finger. Its own stable id, so holding it is one
-    // touch and it can be held with the key.
-    if (back_held) {
-        p.buttons |= kTouchPad;
-        if (p.touch_count < 2) {
+    // The touchpad's click, split by where the finger is (the fingers of the
+    // pad's own touchpad only: the keys' stand-in ones come after).
+    {
+        bool finger_left = false, finger_right = false;
+        for (int k = 0; k < p.touch_count; ++k) {
+            (p.touch[k].x < kPadTouchW / 2 ? finger_left : finger_right) = true;
+        }
+        bool click = false;
+        for (std::size_t i = 0; i < remap->entries.size() && i < 32; ++i) {
+            if (remap->entries[i].button == SDL_GAMEPAD_BUTTON_TOUCHPAD) click = click || held[i];
+        }
+        for (std::size_t i = 0; i < remap->entries.size() && i < 32; ++i) {
+            if (remap->entries[i].button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+                held[i] = pad_zone_held(*remap, remap->entries[i], held[i], finger_left, finger_right);
+            }
+        }
+        if (pad_zone_takes_click(*remap, click, finger_left, finger_right)) p.touch_count = 0;
+    }
+    // The buttons' targets ([input.pad], remap above; Back / Select / Share is
+    // the touchpad's left side - Gestures - unless it says otherwise): the
+    // pad bits, and for a touchpad side the press and a finger where the
+    // keyboard's Gestures key puts one (bindings.cpp), since the game reads
+    // the side from the finger. Each side has its own stable id, so holding it
+    // is one touch and it can be held with the key.
+    bool side_left = false, side_right = false;
+    {
+        using clk = std::chrono::steady_clock;
+        static bool was_down[32];
+        static clk::time_point down_since[32], pulse_until[32];
+        const auto now = clk::now();
+        const auto limit = std::chrono::milliseconds(remap->long_ms);
+        const auto press = [&](const PadTarget& t) {
+            p.buttons |= t.bits;
+            side_left = side_left || t.side == 1;
+            side_right = side_right || t.side == 2;
+        };
+        for (std::size_t i = 0; i < remap->entries.size() && i < 32; ++i) {
+            const PadRemapEntry& e = remap->entries[i];
+            if (!e.has_long) {
+                was_down[i] = false;
+                if (held[i]) press(e.tap);
+                continue;
+            }
+            if (held[i] && !was_down[i]) down_since[i] = now;
+            if (!held[i] && was_down[i] && now - down_since[i] < limit) pulse_until[i] = now + std::chrono::milliseconds(120);
+            was_down[i] = held[i];
+            if (held[i] && now - down_since[i] >= limit) {
+                press(e.long_target);
+            } else if (now < pulse_until[i]) {
+                press(e.tap);
+            }
+        }
+    }
+    for (int side = 1; side <= 2; ++side) {
+        if ((side == 1 ? side_left : side_right) && p.touch_count < 2) {
             PadState::Touch& t = p.touch[p.touch_count++];
-            t.x = static_cast<std::uint16_t>(kPadTouchW / 4);
+            t.x = static_cast<std::uint16_t>(side == 2 ? kPadTouchW * 3 / 4 : kPadTouchW / 4);
             t.y = static_cast<std::uint16_t>(kPadTouchH / 2);
-            t.id = 201;
+            t.id = static_cast<std::uint8_t>(200 + side);
             t.down = true;
         }
     }
@@ -1962,9 +2166,7 @@ bool host_window_pump() {
                 // box - still held when it appears - does not close it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (!g_text_on || host_options_open()) break;
-                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
-                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
-                                                                                         : 0u;
+                const std::uint32_t bit = pad_button_bits(static_cast<SDL_GamepadButton>(e.gbutton.button));
                 if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || (bit && bit == menu_confirm_button())) {
                     g_text_result = 1;
                 } else if (bit && bit == menu_back_button()) {
