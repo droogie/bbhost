@@ -1,3 +1,4 @@
+#include "host/japanese_font.h"
 #include "host/launcher.h"
 
 #include "bbhost_version.h"
@@ -44,8 +45,8 @@ struct Server {
 // Both take only https and signed-in players; the playtest server as the
 // playtest kit's bbhost-playtest.toml has it.
 constexpr Server kServers[] = {
-    {"Live server (thehuntersdream.com)", "thehuntersdream.com", "https", true, true, "https://thehuntersdream.com"},
-    {"Playtest server (dev.thehuntersdream.com)", "dev.thehuntersdream.com", "https", true, true, "https://dev.thehuntersdream.com"},
+    {"本番サーバー (thehuntersdream.com)", "thehuntersdream.com", "https", true, true, "https://thehuntersdream.com"},
+    {"テストサーバー (dev.thehuntersdream.com)", "dev.thehuntersdream.com", "https", true, true, "https://dev.thehuntersdream.com"},
 };
 
 // A text field's buffer.
@@ -142,7 +143,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         return LauncherResult::Quit;
     }
     const float scale = std::max(1.0f, SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay()));
-    SDL_Window* win = SDL_CreateWindow("bbhost setup", static_cast<int>(980 * scale), static_cast<int>(760 * scale),
+    SDL_Window* win = SDL_CreateWindow("bbhost 日本語版の設定", static_cast<int>(980 * scale), static_cast<int>(760 * scale),
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, nullptr) : nullptr;
     if (!win || !ren) {
@@ -155,6 +156,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    ImFontConfig jp_font;
+    jp_font.FontDataOwnedByAtlas = false;
+    io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kJapaneseFont),
+        static_cast<int>(kJapaneseFontSize), 18.0f, &jp_font);
     io.IniFilename = nullptr;  // nothing written beside the exe
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(scale);
@@ -195,8 +200,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // In the setting's order (host/options.cpp): by size within each shape.
     static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
                                                "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
-                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
-                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
+                                               "3200x1800",         "3840x2160",         "960x600 (16:10, 拡大表示)",
+                                               "1024x640 (16:10, 拡大表示)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
                                                "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
                                                "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
@@ -237,15 +242,13 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         bool on;
     };
     Enhancement enhancements[] = {
-        {"change_appearance", "Hunter's Dream mirror",
-         "The workshop's mirror opens the appearance editor: the developers' unused \"Put on Disguise\".", false},
-        {"rebirth", "Rebirth at the Altar of Despair",
-         "With the Yharnam Stone, the altar returns the hunter to their origin's level and gives the blood echoes back "
-         "to spend again; leaving asks to accept or undo.",
+        {"change_appearance", "狩人の夢の鏡",
+         "工房の鏡で容姿の編集画面を開きます。未使用の「変装」機能です。", false},
+        {"rebirth", "嘆きの祭壇で生まれ変わる",
+         "ヤーナムの石を持っていると、出自の初期レベルに戻し、血の遺志を返還して能力値を振り直せます。終了時に確定か取り消しを選べます。",
          false},
-        {"five_players", "Five players in the late areas",
-         "The Nightmare of Mensis, Mergo's Loft, the Nightmare Frontier and the Old Hunters' areas take two invaders, as "
-         "the chalice dungeons do. Every player in a session needs it on.",
+        {"five_players", "終盤エリアの５人プレイ",
+         "メンシスの悪夢、メルゴーの高楼、悪夢の辺境、DLCエリアで聖杯ダンジョンと同様に侵入者を２人まで許可します。全参加者の有効化が必要です。",
          false},
     };
     for (Enhancement& e : enhancements) e.on = host_opt_get(e.key);
@@ -286,11 +289,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     };
     auto patch_note = [&](const PatchRow& r) -> std::string {
         const std::string& o = r.p.option;
-        if (o == "startup.skip_intro") return "The same switch as the Game tab's Skip company logos.";
-        if (o == "debug.free_camera") return "The same switch as the Game tab's Debug camera.";
-        if (o == "loading.quick_reentry") return "Saved as quick_reentry under [loading] in bbhost.toml.";
-        if (o == "streaming.all_post_processors") return "Saved as all_post_processors under [streaming] in bbhost.toml.";
-        return "Saved as " + r.p.name + " under [patches] in bbhost.toml.";
+        if (o == "startup.skip_intro") return "ゲームタブの「企業ロゴをスキップ」と同じ設定です。";
+        if (o == "debug.free_camera") return "ゲームタブの「デバッグカメラ」と同じ設定です。";
+        if (o == "loading.quick_reentry") return "bbhost.toml の [loading] の quick_reentry に保存します。";
+        if (o == "streaming.all_post_processors") return "bbhost.toml の [streaming] の all_post_processors に保存します。";
+        return "保存先: " + r.p.name + " (bbhost.toml の [patches])";
     };
 
     EbootCheck eboot = check_eboot(f[kEboot].str());
@@ -351,7 +354,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             e.push_back({"streaming", "all_post_processors", all_post_processors ? "true" : "false"});
         const std::string file = config_user_file();
         if (!config_set_values(file, e)) {
-            saved_note = "Could not write " + file;
+            saved_note = "書き込めません: " + file;
             return false;
         }
         for (PatchRow& r : patch_rows) r.was = r.on;
@@ -366,7 +369,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
-        saved_note = "Saved to " + file;
+        saved_note = "保存しました: " + file;
         host_log("setup: saved %s", file.c_str());
         return true;
     };
@@ -399,17 +402,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("setup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
-        ImGui::Text("bbhost %s - setup", BBHOST_VERSION);
-        ImGui::TextDisabled("Saved to %s, which every copy of bbhost reads.", config_user_file().c_str());
+        ImGui::Text("bbhost %s - 設定", BBHOST_VERSION);
+        ImGui::TextDisabled("%s に保存しました。すべての bbhost で共有されます。", config_user_file().c_str());
         if (!reason.empty()) ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.30f, 1.0f), "%s", reason.c_str());
         // While the Updates box is checked: one check, on a thread of its own
         // (host/updater.h), and a newer release's page opens in the browser.
         if (check_updates) updater::check_once();
         if (check_updates && updater::update_available()) {
             ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "bbhost %s is available", updater::latest_tag().c_str());
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "bbhost %s が公開されています", updater::latest_tag().c_str());
             ImGui::SameLine();
-            if (ImGui::Button("Open the release page")) updater::open_release_page();
+            if (ImGui::Button("リリースページを開く")) updater::open_release_page();
         }
         ImGui::Separator();
 
@@ -447,17 +450,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
         };
         if (ImGui::BeginTabBar("##tabs")) {
-            if (ImGui::BeginTabItem("Game")) {
+            if (ImGui::BeginTabItem("ゲーム")) {
                 game_tab = true;
                 ImGui::EndTabItem();
             }
             // Additions to the game itself, for players who want it as it
             // shipped: the same three the game's System > PC Enhancements and
             // F10 > PC ENHANCEMENTS have.
-            if (ImGui::BeginTabItem("PC enhancements")) {
+            if (ImGui::BeginTabItem("PC 追加機能")) {
                 ImGui::BeginChild("##enhancements", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
-                ImGui::TextWrapped("Additions to the game itself, all on by default. Turn them off for the game as it shipped.");
-                ImGui::TextDisabled("Each is read when the game starts: one changed in the game waits for the next start.");
+                ImGui::TextWrapped("ゲーム本体への追加機能です。初期設定ではすべて有効です。無効にすると原作の動作になります。");
+                ImGui::TextDisabled("各設定はゲーム起動時に読み込まれます。プレイ中の変更は次回起動時に反映されます。");
                 ImGui::Spacing();
                 for (Enhancement& e : enhancements) {
                     ImGui::Checkbox(e.label, &e.on);
@@ -468,11 +471,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::Unindent();
                     ImGui::Spacing();
                 }
-                if (ImGui::Button("All off (the game as it shipped)")) {
+                if (ImGui::Button("すべて無効（原作の動作）")) {
                     for (Enhancement& e : enhancements) e.on = false;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("All on")) {
+                if (ImGui::Button("すべて有効")) {
                     for (Enhancement& e : enhancements) e.on = true;
                 }
                 ImGui::EndChild();
@@ -484,13 +487,12 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 plugins_tab = false;
             }
             // The patch manifests, as the Plugins tab has the plugins.
-            if (ImGui::BeginTabItem("Patches")) {
+            if (ImGui::BeginTabItem("パッチ")) {
                 ImGui::BeginChild("##patches", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
-                ImGui::TextWrapped("Byte patches to the game's code, applied when it starts: bbhost's own (the patches folder beside "
-                                   "it) and any a mod brings (<mods>/patches).");
-                ImGui::TextDisabled("A patch made for another eboot is never applied.");
+                ImGui::TextWrapped("ゲーム起動時にコードへ適用するパッチです。本体横の patches フォルダーと MOD の <mods>/patches を読み込みます。");
+                ImGui::TextDisabled("異なる eboot 用のパッチは適用しません。");
                 ImGui::Spacing();
-                if (patch_rows.empty()) ImGui::TextDisabled("No patches found.");
+                if (patch_rows.empty()) ImGui::TextDisabled("パッチがありません。");
                 // Whether a row's switch can be changed here.
                 auto switchable = [&](const PatchRow& r) {
                     const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
@@ -518,16 +520,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::Indent();
                     ImGui::PushTextWrapPos(0.0f);
                     if (!r.p.description.empty()) ImGui::TextDisabled("%s", r.p.description.c_str());
-                    std::string why = !r.p.error.empty()        ? "Not read: " + r.p.error + "."
-                                      : other_eboot             ? "Made for another eboot: not applied."
-                                      : unknown_option          ? "Follows " + r.p.option + ", which this bbhost does not know: not applied."
-                                      : r.p.option.empty() && !bare_key(r.p.name) ? "Its name cannot be a bbhost.toml key, so it is always on."
+                    std::string why = !r.p.error.empty()        ? "読み込めません: " + r.p.error + "."
+                                      : other_eboot             ? "別の eboot 用のため適用しません。"
+                                      : unknown_option          ? "連動先: " + r.p.option + "。この bbhost では未対応のため適用しません。"
+                                      : r.p.option.empty() && !bare_key(r.p.name) ? "名前が設定キーとして使えないため常に有効です。"
                                                                                  : patch_note(r);
-                    if (!fixed && !r.p.enabled) why = "Off unless turned on here. " + why;
-                    if (!fixed && !r.p.group.empty()) why = "One of the " + r.p.group + " variants: one is on at a time. " + why;
+                    if (!fixed && !r.p.enabled) why = "ここで選択するまで無効です。 " + why;
+                    if (!fixed && !r.p.group.empty()) why = "種類: " + r.p.group + "。同時に有効にできるのは１つです。 " + why;
                     if (!fixed && r.p.gameplay)
-                        why = "Changes the game: while it is on, your online rules say so, and the server keeps your bloodstains, "
-                              "messages and statistics apart from vanilla players'. " + why;
+                        why = "ゲーム内容を変更します。有効時はオンラインルールに記録され、血痕・手記・統計は未改造のプレイヤーと分離されます。 " + why;
                     const std::string where = generic(fs::path(r.p.path).lexically_normal().string());
                     ImGui::TextDisabled("%s %s", why.c_str(), where.c_str());
                     ImGui::PopTextWrapPos();
@@ -544,55 +545,52 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                             *patch_switch(r) = defaults && r.p.enabled;
                         }
                     };
-                    if (ImGui::Button("All off (the game's code as it shipped)")) set_all(false);
+                    if (ImGui::Button("すべて無効（原作のコード）")) set_all(false);
                     ImGui::SameLine();
-                    if (ImGui::Button("Defaults##patches")) set_all(true);
+                    if (ImGui::Button("初期設定##patches")) set_all(true);
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             const ImGuiTabItemFlags sflags = select_shaders_tab ? ImGuiTabItemFlags_SetSelected : 0;
             select_shaders_tab = false;
-            if (ImGui::BeginTabItem("Shaders", nullptr, sflags)) {
+            if (ImGui::BeginTabItem("シェーダー", nullptr, sflags)) {
                 ImGui::BeginChild("##shaders", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
                 if (recommend_compile) {
-                    ImGui::TextColored(warn, "Recommended: compile the shaders now.");
+                    ImGui::TextColored(warn, "今すぐシェーダーをコンパイルすることを推奨します。");
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextUnformatted((advice.why + ". Compiling now takes " + advice.time +
-                                            "; otherwise the game compiles them while you play.")
+                    ImGui::TextUnformatted((advice.why + "。今すぐコンパイルする場合の所要時間: " + advice.time +
+                                            "。実行しなければプレイ中にコンパイルします。")
                                                .c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::BeginDisabled(!app0_ok || !eboot.ok);
-                    if (ImGui::Button("Compile shaders now##advice")) start_compile();
+                    if (ImGui::Button("今すぐコンパイル##advice")) start_compile();
                     ImGui::EndDisabled();
                     ImGui::Separator();
                     ImGui::Spacing();
                 }
-                ImGui::TextWrapped("bbhost turns the game's shaders into HLSL on this PC and compiles them with DXC. The game does this "
-                                   "itself: a start uses what is ready and compiles the rest in the background for the next start, so "
-                                   "you can play straight away. Compiling now does all of it up front.");
+                ImGui::TextWrapped("ゲームのシェーダーをこの PC で HLSL に変換し、DXC でコンパイルします。起動時は完成済みのキャッシュを使い、残りはバックグラウンドで処理して次回起動時に反映します。ここで事前にすべて処理することもできます。");
                 ImGui::Spacing();
                 ImGui::SetNextItemWidth(200 * scale);
-                static const char* const kShaderModes[] = {"HLSL", "Lifted"};
+                static const char* const kShaderModes[] = {"HLSL", "変換済み SPIR-V"};
                 ImGui::BeginDisabled(cv.running);
-                ImGui::Combo("Shaders", &shaders, kShaderModes, 2);
+                ImGui::Combo("シェーダー", &shaders, kShaderModes, 2);
                 ImGui::EndDisabled();
                 ImGui::PushTextWrapPos(0.0f);
-                ImGui::TextDisabled("HLSL: compiled by DXC on this PC. Lifted: the translator's own SPIR-V only. Saved with Save or Play; "
-                                    "the game reads it at its start.");
+                ImGui::TextDisabled("HLSL はこの PC の DXC でコンパイルします。変換済み SPIR-V は独自変換のみを使います。「保存」または「プレイ」で保存し、次回起動時に反映します。");
                 ImGui::PopTextWrapPos();
-                ImGui::SeparatorText("The caches");
+                ImGui::SeparatorText("キャッシュ");
                 ImGui::TextDisabled("%s", cache_state.dir.c_str());
                 if (!cache_state.have_caches) {
-                    ImGui::TextColored(warn, "No shader caches yet: the first start compiles everything.");
+                    ImGui::TextColored(warn, "シェーダーキャッシュがありません。初回起動時にすべてコンパイルします。");
                 } else {
-                    if (cache_state.translator_current) ImGui::TextColored(good, "Made by this bbhost's shader translator.");
-                    else ImGui::TextColored(warn, "Made by another bbhost version: the next start compiles everything again.");
-                    if (cache_state.device_current == 1) ImGui::TextColored(good, "Made for this graphics driver.");
-                    else if (cache_state.device_current == 0) ImGui::TextColored(warn, "Made for another GPU or driver version: the driver compiles its part again.");
-                    else ImGui::TextDisabled("Checking the graphics driver...");
+                    if (cache_state.translator_current) ImGui::TextColored(good, "この bbhost のシェーダー変換器で作成されています。");
+                    else ImGui::TextColored(warn, "別バージョンの bbhost で作成されています。次回起動時に再コンパイルします。");
+                    if (cache_state.device_current == 1) ImGui::TextColored(good, "現在のグラフィックスドライバー用です。");
+                    else if (cache_state.device_current == 0) ImGui::TextColored(warn, "別の GPU またはドライバー用です。ドライバー側の処理をやり直します。");
+                    else ImGui::TextDisabled("グラフィックスドライバーを確認中...");
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextDisabled("Translations, lifts and DXC's modules %.0f MiB; the driver's pipelines %.0f MiB; what was drawn: %.1f + %.1f MiB.",
+                    ImGui::TextDisabled("変換・DXC モジュール %.0f MiB、ドライバーのパイプライン %.0f MiB、描画履歴 %.1f + %.1f MiB。",
                                         cache_state.translation_bytes / 1048576.0, cache_state.pipeline_bytes / 1048576.0,
                                         cache_state.stage_manifest_bytes / 1048576.0, cache_state.pipeline_manifest_bytes / 1048576.0);
                     ImGui::PopTextWrapPos();
@@ -615,59 +613,59 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                         else if (k == "pipelines") pipelines = v;
                         else if (k == "lift") lift.push_back(v);
                     }
-                    ImGui::Text("The last compile: %s, %s (%s s), bbhost %s", result == "done" ? "finished" : result.c_str(), when.c_str(),
+                    ImGui::Text("前回のコンパイル: %s、%s (%s 秒)、bbhost %s", result == "done" ? "完了" : result == "cancelled" ? "中止" : result.c_str(), when.c_str(),
                                 seconds.c_str(), version.c_str());
                     ImGui::Indent();
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextDisabled("On %s: shaders %s; %s.", device.c_str(), stages.c_str(), hlsl.c_str());
-                    if (!pipelines.empty() && pipelines.rfind("0 of 0", 0) != 0) ImGui::TextDisabled("Pipelines %s.", pipelines.c_str());
+                    ImGui::TextDisabled("%s: シェーダー %s、%s。", device.c_str(), stages.c_str(), hlsl.c_str());
+                    if (!pipelines.empty() && pipelines.rfind("0 of 0", 0) != 0) ImGui::TextDisabled("パイプライン %s。", pipelines.c_str());
                     for (const std::string& r : failed) {
                         if (r.find("LDS use outside a compute shader") != std::string::npos)
-                            ImGui::TextDisabled("Not compiled alone (%s): vertex shaders that write LDS, which only run inside another stage (tessellation); they are compiled when the game draws them.",
+                            ImGui::TextDisabled("単独ではコンパイルしません (%s)。LDS に書き込む頂点シェーダーは別のステージ内で動作するため、描画時にコンパイルします。",
                                                 r.substr(r.rfind(' ') + 1).c_str());
                         else
-                            ImGui::TextDisabled("Failed: %s", r.c_str());
+                            ImGui::TextDisabled("失敗: %s", r.c_str());
                     }
-                    for (const std::string& r : lift) ImGui::TextDisabled("Kept the lift: %s", r.c_str());
+                    for (const std::string& r : lift) ImGui::TextDisabled("変換済み SPIR-V を維持: %s", r.c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::Unindent();
                 }
-                ImGui::SeparatorText("Compile now");
+                ImGui::SeparatorText("今すぐコンパイル");
                 if (!cv.running) {
                     ImGui::BeginDisabled(!app0_ok || !eboot.ok);
-                    if (ImGui::Button("Compile shaders now")) start_compile();
+                    if (ImGui::Button("今すぐシェーダーをコンパイル")) start_compile();
                     ImGui::EndDisabled();
                     ImGui::SameLine();
-                    ImGui::TextDisabled("Every shader the game uses, with this PC's graphics driver. It can be cancelled.");
+                    ImGui::TextDisabled("ゲームで使うすべてのシェーダーを、この PC のドライバーで処理します。途中で中止できます。");
                 } else {
-                    if (ImGui::Button("Cancel")) compile_job.cancel();
+                    if (ImGui::Button("キャンセル")) compile_job.cancel();
                     ImGui::SameLine();
                     ImGui::TextDisabled("%s", cv.phase.c_str());
                 }
                 if (cv.running || cv.finished || cv.cancelled || !cv.error.empty()) {
                     const float frac = cv.total ? static_cast<float>(cv.done) / static_cast<float>(cv.total) : 0.0f;
                     char over[96];
-                    std::snprintf(over, sizeof(over), "%llu of %llu", static_cast<unsigned long long>(cv.done),
+                    std::snprintf(over, sizeof(over), "%llu / %llu", static_cast<unsigned long long>(cv.done),
                                   static_cast<unsigned long long>(cv.total));
                     ImGui::ProgressBar(frac, ImVec2(-1, 0), over);
                     if (cv.eta >= 0 && cv.running)
-                        ImGui::Text("%.0f s so far, about %.0f s left", cv.seconds, cv.eta);
+                        ImGui::Text("経過 %.0f 秒、残り約 %.0f 秒", cv.seconds, cv.eta);
                     else
-                        ImGui::Text("%.0f s", cv.seconds);
-                    ImGui::Text("%llu took DXC's module, %llu kept the lift; %llu failed", static_cast<unsigned long long>(cv.hlsl),
+                        ImGui::Text("%.0f 秒", cv.seconds);
+                    ImGui::Text("DXC 採用 %llu、変換済み SPIR-V 維持 %llu、失敗 %llu", static_cast<unsigned long long>(cv.hlsl),
                                 static_cast<unsigned long long>(cv.lift), static_cast<unsigned long long>(cv.failed));
                     if (cv.recipes_total)
-                        ImGui::Text("Pipelines from your earlier sessions and the shipped list: %llu of %llu",
+                        ImGui::Text("過去のプレイと同梱リストのパイプライン: %llu / %llu",
                                     static_cast<unsigned long long>(cv.recipes_done), static_cast<unsigned long long>(cv.recipes_total));
-                    if (cv.finished) ImGui::TextColored(good, "Done: the next start takes these from the caches.");
-                    if (cv.cancelled) ImGui::TextColored(warn, "Cancelled: what was compiled is kept; the game compiles the rest.");
+                    if (cv.finished) ImGui::TextColored(good, "完了しました。次回起動時はキャッシュを使用します。");
+                    if (cv.cancelled) ImGui::TextColored(warn, "中止しました。完成済みのキャッシュは保持し、残りはゲーム中に処理します。");
                     if (!cv.error.empty()) ImGui::TextColored(warn, "%s", cv.error.c_str());
                     for (const std::string& r : cv.reasons) ImGui::BulletText("%s", r.c_str());
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Plugins", nullptr, pflags)) {
+            if (ImGui::BeginTabItem("プラグイン", nullptr, pflags)) {
                 plugin_ui_draw(plugin_ui, scale, ImGui::GetContentRegionAvail().y - footer);
                 plugin_seen = true;
                 ImGui::EndTabItem();
@@ -676,14 +674,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         }
         if (game_tab) ImGui::BeginChild("##game", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
 
-        const float browse_w = ImGui::CalcTextSize("Browse...").x + ImGui::GetStyle().FramePadding.x * 2;
+        const float browse_w = ImGui::CalcTextSize("参照...").x + ImGui::GetStyle().FramePadding.x * 2;
         auto path_row = [&](const char* label, int field, bool folder, const char* hint) {
             ImGui::TextUnformatted(label);
             ImGui::PushID(field);
             ImGui::SetNextItemWidth(-browse_w - ImGui::GetStyle().ItemSpacing.x);
             const bool changed = ImGui::InputTextWithHint("##p", hint, f[field].text, sizeof(f[field].text));
             ImGui::SameLine();
-            if (ImGui::Button("Browse...")) {
+            if (ImGui::Button("参照...")) {
                 void* ud = reinterpret_cast<void*>(static_cast<std::intptr_t>(field));
                 const std::string at = f[field].str();
                 if (folder) {
@@ -702,22 +700,22 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::TextColored(warn, "%s.", advice.why.c_str());
             ImGui::SameLine();
             ImGui::BeginDisabled(!app0_ok || !eboot.ok);
-            if (ImGui::SmallButton("Compile shaders now##main")) {
+            if (ImGui::SmallButton("今すぐコンパイル##main")) {
                 start_compile();
                 select_shaders_tab = true;
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("%s; optional.", advice.time.c_str());
+            ImGui::TextDisabled("%s（任意）", advice.time.c_str());
         }
-        ImGui::SeparatorText("Game files");
-        path_row("Game folder (the one that contains dvdroot_ps4)", kApp0, true, "C:/Games/Bloodborne/CUSA00900");
-        status_line(app0_ok, "has dvdroot_ps4",
-                    app0.empty()           ? "not set"
-                    : !is_dir(app0)        ? "that folder does not exist"
+        ImGui::SeparatorText("ゲームファイル");
+        path_row("ゲームフォルダー (dvdroot_ps4 を含むフォルダー)", kApp0, true, "C:/Games/Bloodborne/CUSA03014");
+        status_line(app0_ok, "dvdroot_ps4 を確認しました",
+                    app0.empty()           ? "未設定"
+                    : !is_dir(app0)        ? "フォルダーが存在しません"
                     : is_dir(app0 + "/../dvdroot_ps4") || fs::path(app0).filename() == "dvdroot_ps4"
-                                           ? "pick the folder above dvdroot_ps4, not dvdroot_ps4 itself"
-                                           : "no dvdroot_ps4 in it");
+                                           ? "dvdroot_ps4 自体ではなく、その親フォルダーを選んでください"
+                                           : "dvdroot_ps4 がありません");
         if (app0_ok) {
             // Its version: the 1.09 update's files copied over it, or in an
             // update folder beside it (core/config.h), or the game stops when
@@ -727,48 +725,47 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             if (seen != app0) {
                 seen = app0;
                 ver = config_app0_version(app0);
-                good = ver.update.empty() ? std::string("version 01.09 (the update's files are in it)")
-                                          : "version 01.09, the update read from " + fs::path(ver.update).filename().string();
+                good = ver.update.empty() ? std::string("バージョン 01.09（更新データを確認しました）")
+                                          : "バージョン 01.09、更新データの読み込み先: " + fs::path(ver.update).filename().string();
             }
             status_line(ver.app_ver == "01.09", good.c_str(),
-                        ver.app_ver.empty() ? std::string("no sce_sys/param.sfo in it - is it the whole game folder?")
-                                            : "version " + ver.app_ver +
+                        ver.app_ver.empty() ? std::string("sce_sys/param.sfo がありません。ゲーム全体のフォルダーを選んでください")
+                                            : "バージョン " + ver.app_ver +
                                                   (ver.update.empty() ? std::string()
-                                                                      : " (in " + fs::path(ver.update).filename().string() + ")") +
-                                                  " - copy the 1.09 update's files over this folder, or the game stops "
-                                                  "while loading");
+                                                                      : "（" + fs::path(ver.update).filename().string() + " 内）") +
+                                                  " - 1.09 の更新データを重ねてください。古いままではロード中に停止します");
         }
-        if (path_row("Eboot (the 1.09 update's eboot.bin, decrypted)", kEboot, false, "C:/Games/Bloodborne/eboot-109-decrypted.bin") ||
+        if (path_row("eboot（更新 1.09 の復号済み eboot.bin）", kEboot, false, "C:/Games/Bloodborne/eboot-109-decrypted.bin") ||
             (eboot.path != f[kEboot].str() && !ImGui::IsAnyItemActive())) {
             eboot = check_eboot(f[kEboot].str());
         }
-        status_line(eboot.ok, "the 1.09 eboot",
-                    f[kEboot].str().empty() ? "not set"
-                    : !is_file(f[kEboot].str()) ? "that file does not exist"
-                                                : "not the 1.09 eboot (SHA-256 " + eboot.sha.substr(0, 16) + "...)");
-        path_row("Data folder (saves and caches; empty for the default)", kData, true, config_default_data_dir().c_str());
+        status_line(eboot.ok, "1.09 の eboot を確認しました",
+                    f[kEboot].str().empty() ? "未設定"
+                    : !is_file(f[kEboot].str()) ? "ファイルが存在しません"
+                                                : "1.09 の eboot ではありません (SHA-256 " + eboot.sha.substr(0, 16) + "...)");
+        path_row("データフォルダー（セーブとキャッシュ。空欄で標準の場所）", kData, true, config_default_data_dir().c_str());
 
-        ImGui::SeparatorText("Online");
+        ImGui::SeparatorText("オンライン");
         ImGui::SetNextItemWidth(-1);
-        static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "Custom"};
+        static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "カスタム"};
         ImGui::Combo("##server", &server, kServerLabels, 3);
         if (server == 2) {
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
-            ImGui::InputTextWithHint("Host", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
+            ImGui::InputTextWithHint("ホスト", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
             ImGui::SetNextItemWidth(100 * scale);
-            ImGui::InputText("Scheme", scheme, sizeof(scheme));
-            ImGui::Checkbox("Check the server's certificate", &verify_tls);
-            ImGui::Checkbox("Require an account (F10 > Account)", &require_account);
+            ImGui::InputText("通信方式", scheme, sizeof(scheme));
+            ImGui::Checkbox("サーバーの証明書を検証する", &verify_tls);
+            ImGui::Checkbox("アカウントを必須にする (F10 > アカウント)", &require_account);
         }
         if (!cfg.profile.empty()) {
-            ImGui::TextDisabled("This run uses %s, whose own settings may choose another server.", cfg.profile_config.c_str());
+            ImGui::TextDisabled("今回は %s を使用しています。その設定で別のサーバーが指定される場合があります。", cfg.profile_config.c_str());
         }
 
         // The private server's account, as F10 > ACCOUNT in the game has it:
         // no password - this PC linked to the account signed into on the
         // website with Discord, or an account held by this PC with a
         // recovery code. The calls go to the server chosen above.
-        ImGui::SeparatorText("Account");
+        ImGui::SeparatorText("アカウント");
         {
             const bool busy = host_account_busy();
             const std::string signed_in = host_account_signed_in();
@@ -780,10 +777,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             if (!detail.empty()) {
                 ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "%s", detail.c_str());
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Copy")) {
+                if (ImGui::SmallButton("コピー")) {
                     // The code alone: the word after "Code" or "code".
                     std::string code = detail;
-                    for (const char* lead : {"Code ", "Recovery code ", "Website code "}) {
+                    for (const char* lead : {"コード ", "復旧コード ", "ウェブ用コード "}) {
                         if (detail.rfind(lead, 0) == 0) code = detail.substr(std::strlen(lead));
                     }
                     code = code.substr(0, code.find("  "));
@@ -791,30 +788,30 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
             }
             ImGui::BeginDisabled(busy);
-            if (ImGui::Button("Log in with Discord")) {
+            if (ImGui::Button("Discord でログイン")) {
                 apply_server();
                 host_account_action(0, "", "");
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("opens the website: sign in there with Discord and approve the code");
+            ImGui::TextDisabled("ウェブサイトで Discord にログインし、コードを承認してください");
             const float field_w = 220 * scale;
             ImGui::SetNextItemWidth(field_w);
-            ImGui::InputTextWithHint("##acct_name", "Name", acct_name, sizeof(acct_name));
+            ImGui::InputTextWithHint("##acct_name", "名前", acct_name, sizeof(acct_name));
             ImGui::SameLine();
-            if (ImGui::Button("Create account on this PC")) {
+            if (ImGui::Button("この PC でアカウントを作成")) {
                 apply_server();
                 host_account_action(1, acct_name, "");
             }
             ImGui::SetNextItemWidth(field_w);
-            ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
+            ImGui::InputTextWithHint("##acct_code", "復旧コード", acct_code, sizeof(acct_code));
             ImGui::SameLine();
-            if (ImGui::Button("Recover account")) {
+            if (ImGui::Button("アカウントを復旧")) {
                 apply_server();
                 host_account_action(2, acct_name, acct_code);
                 acct_code[0] = 0;
             }
             ImGui::BeginDisabled(!net::account_logged_in());
-            if (ImGui::Button("Website sign-in code")) {
+            if (ImGui::Button("ウェブサイトのログインコード")) {
                 apply_server();
                 host_account_action(3, "", "");
             }
@@ -823,67 +820,65 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::SameLine();
             // Also stops a Discord link that is waiting for approval.
             ImGui::BeginDisabled(!busy && !net::account_logged_in());
-            if (ImGui::Button(busy ? "Cancel" : "Sign out")) {
+            if (ImGui::Button(busy ? "キャンセル" : "ログアウト")) {
                 apply_server();
                 host_account_action(4, "", "");
             }
             ImGui::EndDisabled();
         }
 
-        ImGui::SeparatorText("Start-up and display");
-        ImGui::Checkbox("Fullscreen", &fullscreen);
+        ImGui::SeparatorText("起動と画面");
+        ImGui::Checkbox("全画面", &fullscreen);
         ImGui::SameLine(260 * scale);
-        ImGui::Checkbox("Skip company logos", &skip_logos);
-        ImGui::Checkbox("Debug camera", &debug_camera);
+        ImGui::Checkbox("企業ロゴをスキップ", &skip_logos);
+        ImGui::Checkbox("デバッグカメラ", &debug_camera);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
+            ImGui::SetTooltip("Lance McDonald の自由カメラ。調べる (E) を押しながら L3 (左 Ctrl) で切り替えます。有効時にデバッグメニューの LOAD TEST を使うとクラッシュします。");
         ImGui::SetNextItemWidth(200 * scale);
-        static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "120 fps", "Uncapped"};
+        static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "120 fps", "無制限"};
         static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
-        ImGui::Combo("Frame rate", &cap_choice, kCapLabels, kCapCount);
+        ImGui::Combo("フレームレート", &cap_choice, kCapLabels, kCapCount);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off in the world.");
+            ImGui::SetTooltip("ゲームの動作速度です。無制限では実時間に合わせます。垂直同期時は画面の更新頻度、無効時はワールド内で最大 240 fps です。");
         ImGui::SetNextItemWidth(200 * scale);
-        ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
-        ImGui::TextDisabled("F10 in the game has every other setting.");
+        ImGui::Combo("描画解像度", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
+        ImGui::TextDisabled("その他の設定はゲーム中に F10 で開きます。");
 
-        ImGui::SeparatorText("Diagnostics");
-        ImGui::Checkbox("Tooling and logging", &tooling);
+        ImGui::SeparatorText("診断");
+        ImGui::Checkbox("診断機能と詳細ログ", &tooling);
         ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("The periodic reports in the log, the stall detector, the GPU busy meter (GPU %% beside the FPS counter) "
-                            "and the recent-draw history. Off gives the game that headroom; the log keeps the start, warnings and "
-                            "errors. Leave it on when reporting a problem.");
+        ImGui::TextDisabled("定期ログ、停止検出、GPU 使用率 (GPU %%)、描画履歴を記録します。無効にすると負荷が減り、起動・警告・エラーのみ記録します。不具合の報告時は有効にしてください。");
         ImGui::PopTextWrapPos();
 
-        ImGui::SeparatorText("Updates");
-        ImGui::Checkbox("Check for a newer bbhost at start", &check_updates);
+        ImGui::SeparatorText("更新");
+        ImGui::Checkbox("起動時に新しい bbhost を確認する", &check_updates);
         if (check_updates) {
             ImGui::TextDisabled("%s", updater::status().c_str());
             if (const std::string d = updater::detail(); !d.empty()) ImGui::TextDisabled("%s", d.c_str());
         }
-        path_row("GitHub token file (only while the releases are private)", kToken, false, "");
+        path_row("GitHub トークンのファイル（非公開リリース用）", kToken, false, "");
 
         }
         if (game_tab) ImGui::EndChild();
         ImGui::Separator();
-        ImGui::Checkbox("Show this window every time bbhost starts", &show_every_start);
-        ImGui::TextDisabled("Or start bbhost with --setup to open it once.");
+        ImGui::Checkbox("起動するたびにこの画面を表示", &show_every_start);
+        ImGui::TextDisabled("一度だけ開くには --setup を付けて起動します。");
         ImGui::Spacing();
         const bool compiling = compile_job.running();
         const bool can_play = app0_ok && eboot.ok && !compiling;
         ImGui::BeginDisabled(!can_play);
-        const bool play = ImGui::Button("Play", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "play") && ++frames > 30);
+        const bool play = ImGui::Button("プレイ", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "play") && ++frames > 30);
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Save", ImVec2(140 * scale, 0))) save();
+        if (ImGui::Button("保存", ImVec2(140 * scale, 0))) save();
         ImGui::SameLine();
-        if (ImGui::Button("Quit", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "quit") && ++frames > 30)) done = true;
+        if (ImGui::Button("終了", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "quit") && ++frames > 30)) done = true;
         if (test_link && ++frames > 30) {
             if (!test_created) {
                 test_created = true;
                 apply_server();
                 host_account_action(0, "", "");
-            } else if (host_account_detail().rfind("Code ", 0) == 0 || !host_account_busy()) {
+            } else if (host_account_detail().rfind("コード ", 0) == 0 || !host_account_busy()) {
                 host_log("setup: link test: %s; %s", host_account_outcome().c_str(), host_account_detail().c_str());
                 host_account_action(4, "", "");
                 done = true;
@@ -902,10 +897,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         }
         if (compiling) {
             ImGui::SameLine();
-            ImGui::TextDisabled("Play waits for the compile (Shaders tab).");
+            ImGui::TextDisabled("コンパイル完了後にプレイできます（シェーダータブ）。");
         } else if (!can_play) {
             ImGui::SameLine();
-            ImGui::TextDisabled("Play needs the game folder and the 1.09 eboot.");
+            ImGui::TextDisabled("プレイにはゲームフォルダーと 1.09 の eboot が必要です。");
         }
         if (!saved_note.empty()) ImGui::TextDisabled("%s", saved_note.c_str());
         if (play && can_play && save()) {
@@ -923,6 +918,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         );
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
+        // Test-only screenshot before presentation; never captures game data.
+        if (test && done) {
+            if (const char* shot = std::getenv("BBHOST_SETUP_SCREENSHOT")) {
+                if (SDL_Surface* pixels = SDL_RenderReadPixels(ren, nullptr)) {
+                    SDL_SaveBMP(pixels, shot);
+                    SDL_DestroySurface(pixels);
+                }
+            }
+        }
         SDL_RenderPresent(ren);
     }
 

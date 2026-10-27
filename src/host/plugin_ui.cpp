@@ -15,6 +15,17 @@
 
 namespace {
 
+const char* choice_label(const std::string& value) {
+    static const std::pair<const char*, const char*> labels[] = {
+        {"story", "物語順"}, {"random", "ランダム"}, {"same area", "同じエリア"},
+        {"whole game", "全エリア"}, {"evenly", "均等"}, {"like the original", "原作準拠"},
+        {"none", "なし"}, {"a few", "少数"}, {"many", "多数"}, {"OFF", "無効"},
+        {"JP", "日本語 + 欧州オンライン"}, {"EU", "欧州"}
+    };
+    for (const auto& [key, label] : labels) if (value == key) return label;
+    return value.c_str();
+}
+
 std::vector<std::string> split(const std::string& s, char sep) {
     std::vector<std::string> out;
     std::string cur;
@@ -49,7 +60,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     const std::string id = p.name + "." + o.key;
     ImGui::PushID(id.c_str());
     const bool later = ui.in_game && !o.live && o.type != BB_OPT_ACTION && o.type != BB_OPT_HEADING;
-    const std::string label = o.label + (later ? "  (next start)" : "");
+    const std::string label = o.label + (later ? "  （次回起動時）" : "");
     const std::string value = plugins_option_value(p, o);
     const float width = 260 * scale;
     switch (o.type) {
@@ -96,9 +107,9 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             if (choices[i] == value) cur = static_cast<int>(i);
         }
         ImGui::SetNextItemWidth(width);
-        if (ImGui::BeginCombo(label.c_str(), choices.empty() ? "" : choices[static_cast<std::size_t>(cur)].c_str())) {
+        if (ImGui::BeginCombo(label.c_str(), choices.empty() ? "" : choice_label(choices[static_cast<std::size_t>(cur)]))) {
             for (std::size_t i = 0; i < choices.size(); ++i) {
-                if (ImGui::Selectable(choices[i].c_str(), static_cast<int>(i) == cur)) plugins_set_option(p.name, o.key, choices[i]);
+                if (ImGui::Selectable(choice_label(choices[i]), static_cast<int>(i) == cur)) plugins_set_option(p.name, o.key, choices[i]);
             }
             ImGui::EndCombo();
         }
@@ -116,7 +127,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         // A seed: a new one at the click, shown in the box and saved.
         if (o.key == "seed") {
             ImGui::SameLine();
-            if (ImGui::Button("Random seed")) {
+            if (ImGui::Button("ランダムなシード")) {
                 it->second = random_seed();
                 plugins_set_option(p.name, o.key, it->second);
             }
@@ -131,7 +142,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         ImGui::EndDisabled();
         if (!can) {
             ImGui::SameLine();
-            ImGui::TextDisabled(ui.in_game ? "(turn the plugin on and restart)" : "(in the game: the plugin menu)");
+            ImGui::TextDisabled(ui.in_game ? "（プラグインを有効にして再起動）" : "（ゲーム中のプラグインメニューで操作）");
         }
         break;
     }
@@ -179,14 +190,14 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
     if (was_busy && !busy) plugin_ui_refresh(ui);  // a fetch just ended
     was_busy = busy;
 
-    ImGui::BeginDisabled(busy);
-    if (ImGui::Button("Get the latest official plugins")) updater::fetch_plugins(config_user_dir() + "/plugins");
+    ImGui::BeginDisabled(busy || config().update_source.empty());
+    if (ImGui::Button("公式プラグインの最新版を取得")) updater::fetch_plugins(config_user_dir() + "/plugins");
     ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button("Rescan")) plugin_ui_refresh(ui);
+    if (ImGui::Button("再スキャン")) plugin_ui_refresh(ui);
     ImGui::SameLine();
     bool every = config_value("plugins.show_settings") == "true";
-    if (ImGui::Checkbox("Show plugin settings at every start", &every)) {
+    if (ImGui::Checkbox("起動時にプラグイン設定を表示", &every)) {
         config_set_values(config_user_file(), {{"plugins", "show_settings", every ? "true" : "false"}});
         config_value_set("plugins.show_settings", every ? "true" : "false");
     }
@@ -196,12 +207,12 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
     ImGui::BeginChild("##list", ImVec2(230 * scale, h), ImGuiChildFlags_Borders);
     if (ui.plugins.empty()) {
         ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("No plugins. Get the official ones above, or put plugin files in %s/plugins.", config_user_dir().c_str());
+        ImGui::TextDisabled("プラグインがありません。上から取得するか、%s/plugins に配置してください。", config_user_dir().c_str());
         ImGui::PopTextWrapPos();
     }
     for (std::size_t i = 0; i < ui.plugins.size(); ++i) {
         const PluginEntry& p = ui.plugins[i];
-        std::string line = p.title + (p.enabled ? "" : "  (off)");
+        std::string line = p.title + (p.enabled ? "" : "  （無効）");
         if (ImGui::Selectable(line.c_str(), ui.selected == static_cast<int>(i))) ui.selected = static_cast<int>(i);
     }
     ImGui::EndChild();
@@ -215,10 +226,10 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::TextDisabled("%s", p.version.c_str());
         }
         if (p.official) badge("official", ImVec4(0.45f, 0.80f, 0.45f, 1.0f));
-        else if (p.bad_signature) badge("signature does not match - not loaded", ImVec4(0.95f, 0.35f, 0.30f, 1.0f));
-        else badge("not signed", ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("changes the game", ImVec4(0.95f, 0.70f, 0.30f, 1.0f));
-        if (!p.author.empty()) ImGui::TextDisabled("by %s - %s", p.author.c_str(), p.file.c_str());
+        else if (p.bad_signature) badge("署名が一致しないため読み込みません", ImVec4(0.95f, 0.35f, 0.30f, 1.0f));
+        else badge("署名なし", ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("ゲーム内容を変更", ImVec4(0.95f, 0.70f, 0.30f, 1.0f));
+        if (!p.author.empty()) ImGui::TextDisabled("作者: %s - %s", p.author.c_str(), p.file.c_str());
         if (!p.description.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(p.description.c_str());
@@ -226,23 +237,23 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         }
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;
-        if (ImGui::Checkbox("Turned on", &on)) {
+        if (ImGui::Checkbox("有効", &on)) {
             plugins_set_enabled(p.name, on);
             p.enabled = on;
         }
         ImGui::EndDisabled();
         if (p.visitor && !p.enabled) {
             ImGui::SameLine();
-            ImGui::TextDisabled("off - joins other players' %s worlds when summoned", p.title.c_str());
+            ImGui::TextDisabled("無効 - 召喚時は他プレイヤーの %s ワールドに参加", p.title.c_str());
         } else if (ui.in_game && p.enabled != p.loaded) {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "starts with the next launch" : "stops at the next launch");
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "次回起動時に有効" : "次回起動時に無効");
         }
         if (!p.options.empty()) {
             ImGui::Spacing();
             for (const PluginOptionDesc& o : p.options) option_row(ui, p, o, scale);
         } else {
-            ImGui::TextDisabled("No settings.");
+            ImGui::TextDisabled("設定項目はありません。");
         }
     }
     ImGui::EndChild();

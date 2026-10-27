@@ -17,8 +17,16 @@ cd "$(dirname "$0")/.."
 root=${WIN_DEPS_ROOT:-$PWD/build/win-deps}
 prefix=$root/prefix
 # The mingw-w64 GCC's library directory (libgcc, libstdc++), whatever its version.
-mingw_gcc_dir=$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*/ | sort -V | tail -1)
-mingw_gcc_dir=${mingw_gcc_dir%/}
+mingw_gcc_dir=$(dirname "$(x86_64-w64-mingw32-gcc -print-libgcc-file-name)")
+mingw_sysroot=$(x86_64-w64-mingw32-gcc -print-sysroot)
+mingw_sysroot=${mingw_sysroot:-/usr/x86_64-w64-mingw32}
+mingw_target=$(realpath "$mingw_gcc_dir/../../../../x86_64-w64-mingw32")
+mingw_unwind=""
+if [ ! -f "$mingw_gcc_dir/libgcc_eh.a" ]; then
+  mkdir -p "$root/mingw-runtime"
+  cp "$mingw_gcc_dir/libgcc.a" "$root/mingw-runtime/libgcc_eh.a"
+  mingw_unwind="-L$root/mingw-runtime"
+fi
 tc=$PWD/cmake/mingw-toolchain.cmake
 SDL_TAG=${SDL_TAG:-release-3.4.16}
 ZLIB_TAG=${ZLIB_TAG:-v1.3.1}
@@ -28,7 +36,7 @@ fetch() {  # fetch NAME URL DIR-GLOB
   local name=$1 url=$2 dir=$3
   if ! ls -d "$root/src"/$dir > /dev/null 2>&1; then
     echo "fetching $name" >&2
-    curl -sL -m 300 -o "$root/src/$name.tar.gz" "$url"
+    curl -fsSL -m 300 -o "$root/src/$name.tar.gz" "$url"
     tar xzf "$root/src/$name.tar.gz" -C "$root/src"
   fi
   ls -d "$root/src"/$dir | head -1
@@ -68,13 +76,13 @@ fi
 FFMPEG_VER=${FFMPEG_VER:-7.1.1}
 if ! ls -d "$root/src"/ffmpeg-* > /dev/null 2>&1; then
   echo "fetching ffmpeg"
-  curl -sL -m 600 -o "$root/src/ffmpeg.tar.xz" "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz"
+  curl -fsSL -m 600 -o "$root/src/ffmpeg.tar.xz" "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz"
   tar xJf "$root/src/ffmpeg.tar.xz" -C "$root/src"
 fi
 fsrc=$(ls -d "$root/src"/ffmpeg-* | head -1)
 if [ ! -f "$prefix/lib/libavcodec.a" ]; then
   mkdir -p "$root/ffmpeg"
-  (cd "$root/ffmpeg" && "$fsrc/configure" --prefix="$prefix" --target-os=mingw64 --arch=x86_64     --cc="clang --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"     --cxx="clang++ --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"     --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --windres=llvm-windres     --ld="clang --target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32 -fuse-ld=lld -L$mingw_gcc_dir"     --enable-cross-compile --enable-static --disable-shared --disable-programs --disable-doc --disable-network     --disable-everything --enable-decoder=h264,hevc,aac,mp3 --enable-demuxer=mov,mp3,aac --enable-parser=h264,hevc,aac     --enable-protocol=file --enable-swscale --enable-swresample --disable-avdevice --disable-avfilter     --disable-postproc --disable-debug --extra-cflags="-O2" --pkg-config=false > "$root/ffmpeg-configure.log" 2>&1     && make -j"$(nproc)" > "$root/ffmpeg-build.log" 2>&1 && make install > "$root/ffmpeg-install.log" 2>&1)
+  (cd "$root/ffmpeg" && "$fsrc/configure" --prefix="$prefix" --target-os=mingw64 --arch=x86_64     --cc="clang --target=x86_64-w64-mingw32 --sysroot=$mingw_sysroot"     --cxx="clang++ --target=x86_64-w64-mingw32 --sysroot=$mingw_sysroot"     --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --windres=x86_64-w64-mingw32-windres     --ld="clang --target=x86_64-w64-mingw32 --sysroot=$mingw_sysroot $mingw_unwind -fuse-ld=lld -L$mingw_gcc_dir -L$mingw_target/lib"     --enable-cross-compile --enable-static --disable-shared --disable-programs --disable-doc --disable-network     --disable-everything --enable-decoder=h264,hevc,aac,mp3 --enable-demuxer=mov,mp3,aac --enable-parser=h264,hevc,aac     --enable-protocol=file --enable-swscale --enable-swresample --disable-avdevice --disable-avfilter     --disable-postproc --disable-debug --extra-cflags="-O2" --pkg-config=false > "$root/ffmpeg-configure.log" 2>&1     && make -j"$(nproc)" > "$root/ffmpeg-build.log" 2>&1 && make install > "$root/ffmpeg-install.log" 2>&1)
 fi
 
 # SPIRV-Tools and the SPIR-V headers it is built from, at the Vulkan SDK's tag

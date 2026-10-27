@@ -17,6 +17,6 @@ if [ ! -f "$b/build.ninja" ]; then
     || { tail -40 "$b.configure.log"; exit 1; }
   grep -E "^-- bbhost" "$b.configure.log" || true
 fi
-cmake --build "$b" --target bbhost bb_plugin_debug_menu bb_plugin_mutators bb_plugin_randomizer bb_plugin_boss_rush -j"$(nproc)" 2>&1 | tee "$b.build.log" | grep -E "error|FAILED|warning: unused" | head -60
+cmake --build "$b" --target bbhost bb_plugin_region_switch bb_plugin_debug_menu bb_plugin_mutators bb_plugin_randomizer bb_plugin_boss_rush -j"$(nproc)" 2>&1 | tee "$b.build.log" | grep -E "error|FAILED|warning: unused" | head -60
 [ "${PIPESTATUS[0]}" = 0 ] || { echo "build failed (log: $b.build.log)"; exit 1; }
 ls -la "$b/bbhost.exe"

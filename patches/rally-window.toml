@@ -6,7 +6,7 @@
 [patch]
 name = "rally-window"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Rally Window 2x + Stacking (6s before decay) (Kyo)"
+description = "リゲインの受付時間を２倍にし重ね掛け（減衰まで６秒）(Kyo)"
 enabled = false
 gameplay = true
 order = 13

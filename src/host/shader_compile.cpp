@@ -110,7 +110,7 @@ int shader_compile_session() {
         std::fflush(stdout);
     };
     host_gpu_set_compile_session(true);
-    say("phase starting the GPU");
+    say("phase GPU を起動中");
     if (!host_gpu_init(nullptr, 0, false)) {
         say("error no Vulkan device could be started (see " + log_path + ")");
         std::fflush(stderr);
@@ -134,7 +134,7 @@ int shader_compile_session() {
     }).detach();
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    say("phase compiling");
+    say("phase コンパイル中");
     HostShaderCompileProgress p;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -150,7 +150,7 @@ int shader_compile_session() {
         say(b);
         if (p.finished && (p.listed || cancelled.load())) break;
     }
-    say("phase writing the caches");
+    say("phase キャッシュを保存中");
     host_gpu_save_pipeline_cache_at_exit();
     std::uint64_t taken = 0, compiled = 0, kept = 0;
     std::string hlsl_reasons;
@@ -167,10 +167,10 @@ int shader_compile_session() {
             << "bbhost " << BBHOST_VERSION << "\n"
             << "translator " << BBHOST_TRANSLATOR_FINGERPRINT << "\n"
             << "device " << device << "\n"
-            << "shaders " << (hlsl ? "HLSL" : "Lifted") << "\n"
-            << "stages " << p.done << " of " << p.total << ", " << p.failed << " failed\n"
-            << "hlsl " << taken << " with DXC's module (" << compiled << " compiled now), " << kept << " kept the lift\n"
-            << "pipelines " << p.recipes_done << " of " << p.recipes_total << " from earlier sessions and the shipped list\n"
+            << "shaders " << (hlsl ? "HLSL" : "変換済み SPIR-V") << "\n"
+            << "stages " << p.done << " / " << p.total << "、失敗 " << p.failed << "\n"
+            << "hlsl DXC 採用 " << taken << "（今回 " << compiled << "）、変換済み SPIR-V 維持 " << kept << "\n"
+            << "pipelines " << p.recipes_done << " / " << p.recipes_total << "（前回の記録と同梱リスト）\n"
             << "seconds " << static_cast<long long>(seconds()) << "\n";
         std::istringstream r1(p.reasons), r2(hlsl_reasons);
         for (std::string l; std::getline(r1, l);) out << "failed " << l << "\n";
@@ -198,7 +198,7 @@ int shader_compile_session() {
 
 std::vector<std::string> shader_vulkan_devices() {
     std::vector<std::string> out;
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "bbhost setup", 1, nullptr, 0, VK_API_VERSION_1_1};
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "bbhost 日本語版の設定", 1, nullptr, 0, VK_API_VERSION_1_1};
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &app, 0, nullptr, 0, nullptr};
     VkInstance inst = VK_NULL_HANDLE;
     if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) return out;
@@ -290,7 +290,7 @@ bool ShaderCompileJob::start(std::string& error) {
         std::lock_guard<std::mutex> lk(mu_);
         v_ = View{};
         v_.failed_to_run = true;
-        v_.error = "could not start " + exe + ": " + error;
+        v_.error = exe + " を起動できません: " + error;
         return false;
     }
     proc_ = p;
@@ -298,7 +298,7 @@ bool ShaderCompileJob::start(std::string& error) {
         std::lock_guard<std::mutex> lk(mu_);
         v_ = View{};
         v_.running = true;
-        v_.phase = "starting";
+        v_.phase = "開始中";
     }
     host_log("setup: compile-shaders started (%s)", exe.c_str());
     thread_ = std::thread([this] { reader(); });
@@ -314,7 +314,7 @@ void ShaderCompileJob::cancel() {
         SDL_FlushIO(in);
     }
     std::lock_guard<std::mutex> lk(mu_);
-    v_.phase = "cancelling (writing what is done)";
+    v_.phase = "中止中（完了分を保存しています）";
 }
 
 bool ShaderCompileJob::running() const {
@@ -386,6 +386,6 @@ void ShaderCompileJob::reader() {
     host_log("setup: compile-shaders ended (exit %d)", code);
     std::lock_guard<std::mutex> lk(mu_);
     v_.running = false;
-    if (!v_.finished && !v_.cancelled && v_.error.empty()) v_.error = "the compile ended early (exit " + std::to_string(code) + ")";
-    v_.phase = v_.finished ? "done" : v_.cancelled ? "cancelled" : "stopped";
+    if (!v_.finished && !v_.cancelled && v_.error.empty()) v_.error = "コンパイルが途中で終了しました（終了コード " + std::to_string(code) + ")";
+    v_.phase = v_.finished ? "完了" : v_.cancelled ? "中止" : "停止";
 }

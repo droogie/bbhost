@@ -9,7 +9,7 @@
 [patch]
 name = "bigger-weapons-1-2x"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Bigger Weapons 1.2x (normal size) (Kyo)"
+description = "武器を1.2倍に拡大（通常サイズ）(Kyo)"
 enabled = false
 gameplay = true
 order = 163

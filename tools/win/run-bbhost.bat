@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 rem Starts bbhost and writes its log to the logs folder (the newest ten are kept).
 rem   run-bbhost.bat            the per-user config (%APPDATA%\bbhost\bbhost.toml)
 rem   run-bbhost.bat --setup    the setup window first
@@ -10,14 +11,14 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss
 if "%TS%"=="" set TS=latest
 set LOG=logs\bbhost-%TS%.log
 echo.
-echo  bbhost is starting. Keep this window open while you play.
-echo  Log file: %CD%\%LOG%
-echo  (send that file when you report a problem)
+echo  bbhost を起動しています。プレイ中はこのウィンドウを開いたままにしてください。
+echo  ログ: %CD%\%LOG%
+echo  （不具合報告の際はこのログを添えてください）
 echo.
 bbhost.exe %* > "%LOG%" 2>&1
 set RC=%ERRORLEVEL%
 echo.
-echo  bbhost ended (exit code %RC%). The last lines of the log:
+echo  bbhost が終了しました（終了コード %RC%）。ログの末尾:
 echo.
 powershell -NoProfile -Command "Get-Content -Tail 15 '%LOG%'"
 echo.

@@ -43,25 +43,25 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION,
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY | BB_PLUGIN_ADOPTS_RULES,
     "randomizer",
-    "Randomizer",
+    "ランダマイザー",
     "1.1.0",
     "bbhost",
-    "Shuffles item pickups, shop stock and enemies, based on a seed. Key items never move, so every run can still be finished.",
+    "シードに基づき配置アイテム、店の商品、敵を入れ替えます。重要アイテムは動かさず、クリア可能な状態を維持します。",
 };
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
-    {BB_OPT_HEADING, nullptr, "The seed", "The same seed always gives the same shuffle. Item and shop changes apply at once, enemy changes the next time an area loads. In another randomizer player's world you play their seed."},
-    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "Seed", "Leave empty for a random one, made at the first start and kept in plugins/randomizer/seed.txt. Random seed picks a new one. Share a seed to play the same shuffle as someone else.", ""},
-    {BB_OPT_HEADING, nullptr, "Items"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "items", "Shuffle item pickups", "Each item you find in the world - lying around, on a corpse, in a chest or left by a boss - is swapped with another of them. Keys and story items stay where they are.", "true"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "chalices", "Shuffle chalices too", "Off: every chalice stays where the game puts it.", "true"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "shops", "Shuffle shop stock", "Shops sell each other's goods. Every item keeps its usual price.", "true"},
-    {BB_OPT_HEADING, nullptr, "Enemies"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "enemies", "Shuffle enemies", "Regular enemies become other kinds of enemies. Bosses and NPCs you can talk to stay as they are.", "true"},
-    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_from", "New enemies come from", "Same area: kinds that already live in that area. Whole game: any regular enemy of the game, with its own AI - a late-game enemy keeps its late-game strength.", "same area", 0, 0, "same area|whole game"},
-    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_mix", "How often each kind appears", "Evenly: every kind as likely as the next. Like the original: kinds that were common stay common.", "evenly", 0, 0, "evenly|like the original"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "enemy_npcs", "Include hostile hunters", "Human enemies in hunter gear are shuffled too. NPCs you can talk to never are.", "false"},
-    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_bosses", "Bosses as regular enemies", "A few or many: bosses such as Father Gascoigne, Vicar Amelia or Lady Maria turn up among the enemies, at their full boss strength. The real boss fights stay where they are.", "none", 0, 0, "none|a few|many"},
+    {BB_OPT_HEADING, nullptr, "シードの設定", "同じシードでは同じ配置になります。アイテムと店は即時、敵は次のエリア読み込み時に反映します。他プレイヤーの世界では相手のシードを使います。"},
+    {BB_OPT_TEXT | BB_OPT_LIVE, "seed", "シード", "空欄では初回に生成し plugins/randomizer/seed.txt に保存します。「ランダムなシード」で再生成できます。同じシードを共有すると同じ配置で遊べます。", ""},
+    {BB_OPT_HEADING, nullptr, "アイテム"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "items", "配置アイテムを入れ替える", "地面・遺体・宝箱・ボス報酬のアイテムを入れ替えます。鍵や物語に必要な品は元の場所を維持します。", "true"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "chalices", "聖杯も入れ替える", "無効では聖杯を元の場所に残します。", "true"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "shops", "店の商品を入れ替える", "店同士で商品を入れ替えます。各商品の価格は維持します。", "true"},
+    {BB_OPT_HEADING, nullptr, "敵"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "enemies", "敵を入れ替える", "通常の敵を別種に入れ替えます。ボスと会話できる NPC は維持します。", "true"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_from", "置き換える敵の範囲", "同じエリアでは元からいる種類を使用します。全エリアでは独自の AI を含めて使い、終盤の敵は元の強さを維持します。", "same area", 0, 0, "same area|whole game"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_mix", "各種の出現頻度", "均等では全種類を同じ確率にします。原作準拠では元の多さを維持します。", "evenly", 0, 0, "evenly|like the original"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "enemy_npcs", "敵対する狩人を含める", "狩人装備の人型の敵も入れ替えます。会話できる NPC は変更しません。", "false"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "enemy_bosses", "通常の敵としてボスを出す", "ガスコイン神父、エミーリア、マリアなどが通常の敵に混ざって出現します。能力はボスのままです。本来のボス戦は移動しません。", "none", 0, 0, "none|a few|many"},
     {BB_OPT_END}};
 
 namespace {
@@ -1446,7 +1446,7 @@ void reseed() {
         write_spoiler();
     }
     g.log("randomizer: now seed \"%s\" (%s)", g_seed.c_str(), token.c_str());
-    g.message("Randomizer - seed " + g_seed + ": items now, enemies from the next area", 5.0f);
+    g.message("ランダマイザー - シード " + g_seed + ": アイテムは即時、敵は次のエリアから", 5.0f);
 }
 
 }  // namespace
@@ -1511,14 +1511,14 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         // On screen once the world it is about has loaded: the summons' load,
         // or the one home. A vanilla player in a vanilla world hears nothing.
         if (rules) {
-            if (!host.token.empty()) g_pending_banner = "Randomizer - the host's world: seed " + host.token + (host.key() == mine.key() ? " (yours too)" : "");
-            else if (!mine.token.empty()) g_pending_banner = "Randomizer - the host plays the normal game: its enemies as the game has them";
+            if (!host.token.empty()) g_pending_banner = "ランダマイザー - ホストの世界のシード: " + host.token + (host.key() == mine.key() ? " （自分と同じ）" : "");
+            else if (!mine.token.empty()) g_pending_banner = "ランダマイザー - ホストは通常のゲームです。敵は原作の配置です";
         } else if (was_visiting && (changed || !g_visitor)) {
-            g_pending_banner = mine.token.empty() ? "Randomizer - back in your own world" : "Randomizer - back in your own world: seed " + g_seed;
+            g_pending_banner = mine.token.empty() ? "ランダマイザー - 自分の世界に戻りました" : "ランダマイザー - 自分の世界に戻りました。シード: " + g_seed;
         }
         if (!changed) return;  // already that world
-        g.log("randomizer: %s", rules ? (host.token.empty() ? "the host's world is the game's own" : ("the host's world: seed " + host.token).c_str())
-                                      : (g_visitor ? "home: the game's own world again" : "home: our own world again"));
+        g.log("randomizer: %s", rules ? (host.token.empty() ? "ホストの世界は原作の配置です" : ("ホストの世界のシード: " + host.token).c_str())
+                                      : (g_visitor ? "自分の世界: 原作の配置に戻りました" : "自分の世界に戻りました"));
         write_layouts_locked(want);
     }, nullptr);
     // The seed on screen once, a few seconds into the first world (the player
@@ -1534,7 +1534,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             g_announced = true;  // the join's banner says the seed instead
             countdown = 4 * 60;
         } else if (!g_announced && !g_visitor) {   // a visitor changes nothing of its own: no banner
-            banner = "Randomizer - seed " + g_seed;
+            banner = "ランダマイザー - シード " + g_seed;
             g_announced = true;
             countdown = 5 * 60;
         }

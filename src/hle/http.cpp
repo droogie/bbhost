@@ -14,11 +14,13 @@
 #include "net/account.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -35,7 +37,23 @@
 #include <curl/curl.h>
 #endif
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 namespace {
+// Plugins use the Win32 process environment, which the host CRT may cache.
+bool jp_eu_active() {
+#if defined(_WIN32)
+    char value[8]{};
+    return GetEnvironmentVariableA("BBHOST_JP_EU_ACTIVE", value, sizeof(value)) == 1 && value[0] == '1';
+#else
+    const char* value = std::getenv("BBHOST_JP_EU_ACTIVE");
+    return value && std::strcmp(value, "1") == 0;
+#endif
+}
+
 
 constexpr int kHttpInvalidId = static_cast<int>(0x80431016u);   // SCE_HTTP_ERROR_INVALID_ID
 constexpr int kHttpInvalidValue = static_cast<int>(0x80431019u);
@@ -104,12 +122,21 @@ struct HttpObj {
     std::uint64_t content_len = 0;
     unsigned connect_timeout_us = 0;
     bool sent = false;
+    bool jp_eu_online = false; // region_switch plugin only
     std::shared_ptr<Response> resp;
 };
 std::mutex g_http_mu;
 int g_http_next = 1;
 std::unordered_map<int, HttpObj> g_http;
 std::unordered_set<HttpEpoll*> g_http_eps;
+// A bounded series of eligible server-status bootstrap attempts.  The game can
+// return to the title screen without calling sceHttpTerm or successfully logging
+// in, so a one-shot flag would permanently break in-process reconnection.
+// All accesses are under g_http_mu, including the reset in sceHttpTerm.
+std::deque<std::chrono::steady_clock::time_point> g_jp_eu_bootstrap_history;
+constexpr auto kJpEuBootstrapMinInterval = std::chrono::seconds(1);
+constexpr auto kJpEuBootstrapWindow = std::chrono::minutes(1);
+constexpr std::size_t kJpEuBootstrapMaxPerWindow = 12;
 
 int http_alloc(HttpKind kind, int parent) {
     const int id = g_http_next++;
@@ -228,6 +255,35 @@ std::string rewrite_url(const std::string& url) {
         scheme = cfg.online_scheme;
     }
     return scheme + "://" + host + rest;
+}
+
+// Separate from the reconnect bootstrap: a Japanese-region play-log PUT can
+// contain an empty S3 bucket. Only accept the exact play-log key structure.
+std::string rewrite_jp_eu_missing_s3_playlog(const std::string& url, int method) {
+    const bool marker = jp_eu_active();
+    constexpr const char* missing_bucket = "https://.s3.amazonaws.com/";
+    if (!marker || method != 4 ||
+        url.rfind(missing_bucket, 0) != 0)
+        return url;
+
+    const std::string key = url.substr(std::strlen(missing_bucket));
+    const bool date_ok = key.size() > 9 && key[8] == '/' &&
+        std::all_of(key.begin(), key.begin() + 8, [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+    const bool name_ok = date_ok && std::all_of(key.begin() + 9, key.end(),
+        [](unsigned char c) {
+            return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+        });
+    if (!name_ok)
+        return url;
+
+    const HostConfig& cfg = config();
+    const std::string host = cfg.online_host.empty() ?
+        "thehuntersdream.com" : cfg.online_host;
+    const std::string scheme = cfg.online_scheme.empty() ?
+        "http" : cfg.online_scheme;
+    return scheme + "://" + host + ":18671/" + key;
 }
 
 #if defined(BBHOST_HAVE_CURL)
@@ -363,6 +419,15 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
     std::vector<std::uint8_t> body;
     host_log("http: no libcurl at build time; %s fails", url.c_str());
 #endif
+    // Login success is useful to trace, but must not be the only way to allow
+    // another server-status request: failed logins and title-screen returns also
+    // have to be able to retry.  The bounded retry window is independent.
+    if (!err && method == 1 && status == 200 &&
+        url.find("/basic_utils/login") != std::string::npos) {
+        const bool marker = jp_eu_active();
+        if (marker)
+            host_log("jp-eu-unified: online login OK (bounded bootstrap retries available)");
+    }
     if (g_http_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(g_http_delay_ms));
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     static std::atomic<int> logs{0};
@@ -397,6 +462,8 @@ GUEST_ABI int hle_http_init(int net_mem, int ssl_ctx, std::uint64_t pool) {
 GUEST_ABI int hle_http_term() {
     std::lock_guard<std::mutex> lock(g_http_mu);
     g_http.clear();
+    // A completely new HTTP context starts a fresh bounded retry window.
+    g_jp_eu_bootstrap_history.clear();
     return 0;
 }
 GUEST_ABI int hle_http_create_template(int ctx, const char* ua, int ver, int proxy) {
@@ -406,6 +473,22 @@ GUEST_ABI int hle_http_create_template(int ctx, const char* ua, int ver, int pro
     }
     const int id = http_alloc(HttpKind::Tmpl, ctx);
     g_http[id].ua = ua ? ua : "";
+    // Only when our opt-in region_switch plugin has been loaded in JP mode.
+    const bool jp_eu_marker = jp_eu_active();
+    if (jp_eu_marker) {
+        constexpr const char* jp = "J-JP9000-CUSA03014_00-BLOODBORNE0000JP";
+        constexpr const char* eu = "E-EP9000-CUSA03173_00-BLOODBORNE0000EU";
+        auto idx = g_http[id].ua.find(jp);
+        if (idx != std::string::npos) {
+            g_http[id].ua.replace(idx, std::strlen(jp), eu);
+            g_http[id].jp_eu_online = true;
+            host_log("jp-eu-unified: EU template %d (JP identity replaced)", id);
+        } else if (g_http[id].ua.find(eu) != std::string::npos) {
+            g_http[id].jp_eu_online = true;
+            host_log("jp-eu-unified: EU template %d (already EU)", id);
+        }
+    }
+
     host_log("sceHttpCreateTemplate ctx=%d ua=%s ver=%d proxy=%d -> %d", ctx, ua ? ua : "", ver, proxy, id);
     return id;
 }
@@ -537,6 +620,37 @@ GUEST_ABI int hle_http_request_url(int conn, int method, const char* url, std::u
     r.url = url ? url : "";
     r.content_len = len;
     r.resp = std::make_shared<Response>();
+    // Only the JP/EU plugin's otherwise-empty GETs may bootstrap EU ss.info.
+    // This is a bounded *retry*, not an unconditional substitution for all
+    // empty URLs: one per second, at most 12 per rolling minute.  Returning to
+    // the title screen does not require a successful login to unlock retries.
+    const bool jp_eu_marker = jp_eu_active();
+    if (jp_eu_marker && method == 0 && r.url.empty()) {
+        HttpObj* base = http_get(conn, HttpKind::Conn);
+        HttpObj* tmpl = base ? http_get(base->parent, HttpKind::Tmpl) : nullptr;
+        if (base && base->url.empty() && tmpl && tmpl->jp_eu_online) {
+            const auto now = std::chrono::steady_clock::now();
+            while (!g_jp_eu_bootstrap_history.empty() &&
+                   now - g_jp_eu_bootstrap_history.front() >= kJpEuBootstrapWindow)
+                g_jp_eu_bootstrap_history.pop_front();
+            const bool too_soon = !g_jp_eu_bootstrap_history.empty() &&
+                now - g_jp_eu_bootstrap_history.back() < kJpEuBootstrapMinInterval;
+            const bool budget_exhausted =
+                g_jp_eu_bootstrap_history.size() >= kJpEuBootstrapMaxPerWindow;
+            if (!too_soon && !budget_exhausted) {
+                g_jp_eu_bootstrap_history.push_back(now);
+                r.url = "https://thehuntersdream.com:20443/bb-eu/ss.info";
+                host_log("jp-eu-unified: bootstrap EU ss.info request=%d (bounded retry %zu/%zu)",
+                         id, g_jp_eu_bootstrap_history.size(), kJpEuBootstrapMaxPerWindow);
+            } else {
+                static unsigned suppressed = 0;  // g_http_mu held here
+                if (suppressed++ < 32)
+                    host_log("jp-eu-unified: empty EU GET left untouched request=%d (%s)",
+                             id, too_soon ? "retry cooldown" : "retry budget exhausted");
+            }
+        }
+    }
+
     return id;
 }
 GUEST_ABI int hle_http_set_content_len(int id, std::uint64_t len) {
@@ -596,6 +710,37 @@ GUEST_ABI int hle_http_delete_connection(int id) {
 }
 
 // int sceHttpSendRequest(int reqId, const void* postData, size_t size)
+// Diagnostic only. Observe completed HTTP requests after perform(), regardless of
+// whether they were sent on BBHost's async worker thread or a blocking thread.
+// Never print tokens, upload object names, or the response body.
+void jp_eu_log_completed_http(int req_id, const std::string& url, int method,
+                              const std::shared_ptr<Response>& resp) {
+    const bool eu_info =
+        url == "https://thehuntersdream.com:20443/bb-eu/ss.info";
+    const bool missing_s3_bucket =
+        url.rfind("https://.s3.amazonaws.com/", 0) == 0;
+    if (!eu_info && !missing_s3_bucket) return;
+
+    long status = 0;
+    int error = 0;
+    std::size_t size = 0;
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> lk(resp->mu);
+        status = resp->status;
+        error = resp->error;
+        size = resp->body.size();
+        done = resp->done;
+    }
+    if (eu_info) {
+        host_log("jp-eu-debug-v020: ss.info completed req=%d done=%d status=%ld error=%d bytes=%zu",
+                 req_id, static_cast<int>(done), status, error, size);
+    } else {
+        host_log("jp-eu-debug-v020: missing S3 bucket req=%d method=%d done=%d status=%ld error=%d",
+                 req_id, method, static_cast<int>(done), status, error);
+    }
+}
+
 GUEST_ABI int hle_http_send(int id, const void* post, std::uint64_t size) {
     std::string url;
     int method;
@@ -616,6 +761,13 @@ GUEST_ABI int hle_http_send(int id, const void* post, std::uint64_t size) {
         url = rewrite_url(r->url);
         rewritten = url != r->url;
         method = r->method;
+        // Keep play-log repair separate from region/bootstrap retries.
+        const std::string repaired = rewrite_jp_eu_missing_s3_playlog(url, method);
+        if (repaired != url) {
+            url = repaired;
+            rewritten = true;
+            host_log("jp-eu-unified: repaired missing-bucket play-log PUT request=%d", id);
+        }
         content_len = r->content_len;
         eff = effective_locked(id);
         resp = r->resp;
@@ -629,6 +781,7 @@ GUEST_ABI int hle_http_send(int id, const void* post, std::uint64_t size) {
         void* user = eff.user;
         std::thread([=] {
             perform(url, method, eff, body, content_len, resp, rewritten);
+            jp_eu_log_completed_http(id, url, method, resp);
             std::uint32_t ev = kEvOut | kEvIn;
             std::uint32_t detail = 0;
             {
@@ -645,6 +798,7 @@ GUEST_ABI int hle_http_send(int id, const void* post, std::uint64_t size) {
     // Blocking: the whole request on the caller's thread.
     const auto t0 = std::chrono::steady_clock::now();
     perform(url, method, eff, body, content_len, resp, rewritten);
+    jp_eu_log_completed_http(id, url, method, resp);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     static std::atomic<int> logs{0};
     if (ms >= 5.0 && logs.fetch_add(1) < 32) {

@@ -5,7 +5,7 @@
 [patch]
 name = "fov-uncap"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "the field of view is no longer capped at 48 degrees"
+description = "視野角48度の上限を解除"
 
 [site.clamp]
 address = "0x183af4e"

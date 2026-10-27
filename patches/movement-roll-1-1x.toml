@@ -13,7 +13,7 @@
 [patch]
 name = "movement-roll-1-1x"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Movement + Roll-Dodge 1.1x (normal size) (Kyo)"
+description = "移動とローリング回避を1.1倍（通常サイズ）(Kyo)"
 enabled = false
 gameplay = true
 order = 177

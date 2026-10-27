@@ -11,7 +11,7 @@
 [patch]
 name = "hd-motion-blur-4k"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "HD Motion Blur 4K (3840x2160) - Kyo's patch"
+description = "高解像度モーションブラー 4K (3840x2160) (Kyo)"
 enabled = false
 order = 186
 group = "hd-motion-blur"

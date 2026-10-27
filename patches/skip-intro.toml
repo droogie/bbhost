@@ -13,7 +13,7 @@
 [patch]
 name = "skip-intro"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "the three company logos and the Exit Game warning are skipped at startup"
+description = "起動時の３つの企業ロゴと終了警告を省略"
 option = "startup.skip_intro"
 
 [site.logo-fromsoft]

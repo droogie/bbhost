@@ -62,15 +62,15 @@ struct ShaderCompileAdvice {
     std::string time;  // "about 2-3 minutes on a Steam Deck"
 };
 inline std::string shader_compile_minutes(double seconds) {
-    if (seconds < 50) return "about a minute";
+    if (seconds < 50) return "約１分";
     const int lo = seconds < 120 ? 1 : static_cast<int>(seconds / 60.0);
-    return "about " + std::to_string(lo) + "-" + std::to_string(lo + 1) + " minutes";
+    return "約 " + std::to_string(lo) + "-" + std::to_string(lo + 1) + " 分";
 }
 inline ShaderCompileAdvice shader_compile_advice(const ShaderCacheState& s, bool steam_deck, unsigned hw_threads) {
     ShaderCompileAdvice a;
-    if (!s.have_caches) a.why = "There are no shader caches yet";
-    else if (!s.translator_current) a.why = "The shader caches were made by another bbhost version";
-    else if (s.device_current == 0) a.why = "The shader caches were made for another GPU or graphics driver";
+    if (!s.have_caches) a.why = "シェーダーキャッシュがありません";
+    else if (!s.translator_current) a.why = "別バージョンの bbhost のキャッシュです";
+    else if (s.device_current == 0) a.why = "別の GPU またはドライバーのキャッシュです";
     a.recommend = !a.why.empty();
     double last = -1;
     bool done = false;
@@ -78,11 +78,11 @@ inline ShaderCompileAdvice shader_compile_advice(const ShaderCacheState& s, bool
         if (l == "result done") done = true;
         else if (l.rfind("seconds ", 0) == 0) last = std::atof(l.c_str() + 8);
     }
-    if (done && last > 0) a.time = shader_compile_minutes(last) + " (the last compile here took " + std::to_string(static_cast<long long>(last)) + " s)";
-    else if (steam_deck) a.time = "about 2-3 minutes on a Steam Deck";
-    else if (hw_threads >= 16) a.time = "about 1-2 minutes on this PC";
-    else if (hw_threads >= 8) a.time = "about 2-3 minutes on this PC";
-    else a.time = "about 3-5 minutes on this PC";
+    if (done && last > 0) a.time = shader_compile_minutes(last) + " （前回の所要時間: " + std::to_string(static_cast<long long>(last)) + " 秒）";
+    else if (steam_deck) a.time = "Steam Deck で約２～３分";
+    else if (hw_threads >= 16) a.time = "この PC で約１～２分";
+    else if (hw_threads >= 8) a.time = "この PC で約２～３分";
+    else a.time = "この PC で約３～５分";
     return a;
 }
 // This machine's Vulkan devices, "vendor:device uuid" each (pipelineCacheUUID).

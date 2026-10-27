@@ -51,6 +51,18 @@ while IFS= read -r exe; do
     for l in LICENSE.TXT LICENSE-Apache-2.0-LLVM.txt ThirdPartyNotices.txt LICENSE-SPIRV-Tools.txt; do
         [ -f "$b/licenses/dxc/$l" ] || fail "${b#"$work"/}: no licenses/dxc/$l"
     done
+    # Both platforms retain the complete supplied pack, including the other
+    # platform's original binaries, while loading their rebuilt JP plugin.
+    pack=$b/compat/jp-eu-v020
+    [ -f "$pack/SHA256SUMS.txt" ] || fail "${b#"$work"/}: no compatibility pack"
+    (cd "$pack" && sha256sum -c SHA256SUMS.txt >/dev/null) || fail "${b#"$work"/}: altered compatibility pack"
+    case "$exe" in *.exe) plugin=region_switch.dll ;; *) plugin=region_switch.so ;; esac
+    [ -f "$b/plugins/$plugin" ] || fail "${b#"$work"/}: no active JP plugin"
+    [ -f "$b/licenses/mplus/LICENSE" ] || fail "${b#"$work"/}: no Japanese font licence"
+    [ -f "$b/導入手順_日本語.md" ] || fail "${b#"$work"/}: no Japanese instructions"
+    for want in 'region_switch = true' 'region = "JP"'; do
+        tr -d '\r' < "$b/bbhost.example.toml" | grep -qxF "$want" || fail "${b#"$work"/}: lacks $want"
+    done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
 if find "$work" -iname 'dxil.dll' -o -iname 'libdxil.so*' | grep .; then fail "a bundle carries DXC's DXIL validator"; fi
 # What a first start writes (core/config.cpp's template), in each executable.

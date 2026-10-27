@@ -155,7 +155,7 @@ bool upload_atlas(VkDevice device, VkPhysicalDevice phys, VkQueue queue, std::ui
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory staging_mem = VK_NULL_HANDLE;
     VkBufferCreateInfo sbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    sbci.size = sizeof(overlay_font::kAtlas);
+    sbci.size = overlay_font::kAtlasW * overlay_font::kAtlasH;
     sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (vkCreateBuffer(device, &sbci, nullptr, &staging) != VK_SUCCESS) return false;
     VkMemoryRequirements sreq{};
@@ -168,7 +168,7 @@ bool upload_atlas(VkDevice device, VkPhysicalDevice phys, VkQueue queue, std::ui
     vkBindBufferMemory(device, staging, staging_mem, 0);
     void* map = nullptr;
     if (vkMapMemory(device, staging_mem, 0, sreq.size, 0, &map) != VK_SUCCESS) return false;
-    std::memcpy(map, overlay_font::kAtlas, sizeof(overlay_font::kAtlas));
+    std::memcpy(map, overlay_font::atlas().data(), overlay_font::kAtlasW * overlay_font::kAtlasH);
     vkUnmapMemory(device, staging_mem);
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -246,10 +246,12 @@ bool upload_atlas(VkDevice device, VkPhysicalDevice phys, VkQueue queue, std::ui
 }
 
 float host_overlay_text_width(float scale, const char* text) {
-    if (!text) return 0.0f;
-    std::size_t n = 0;
-    for (const char* c = text; *c; ++c) ++n;
-    return static_cast<float>(n) * overlay_font::kAdvanceW * scale;
+    return overlay_font::width(scale, text);
+}
+
+void host_overlay_text_wrapped(float x, float y, float scale, std::uint32_t rgba, float max_width, const char* text) {
+    const auto wrapped = overlay_font::wrap(scale, max_width, text);
+    host_overlay_text(x, y, scale, rgba, wrapped.c_str());
 }
 
 float host_overlay_text(float x, float y, float scale, std::uint32_t rgba, const char* text) {
@@ -258,15 +260,15 @@ float host_overlay_text(float x, float y, float scale, std::uint32_t rgba, const
     // cell, offset so the ink lands where the box says. The padding is why the
     // quad is bigger than the advance: without it linear filtering reaches into
     // the neighbouring cell and puts an underscore over every 'o'.
-    const float aw = overlay_font::kAdvanceW * scale;
     const float cw = overlay_font::kCellW * scale, ch = overlay_font::kCellH * scale;
     const float ox = overlay_font::kOriginX * scale, oy = overlay_font::kOriginY * scale;
     float pen = x;
     std::lock_guard<std::mutex> lk(g_mu);
-    for (const char* c = text; *c; ++c, pen += aw) {
-        const unsigned ch_code = static_cast<unsigned char>(*c);
-        if (ch_code < overlay_font::kFirst || ch_code > overlay_font::kLast) continue;  // space included, just blank
-        const int idx = static_cast<int>(ch_code) - overlay_font::kFirst;
+    for (const char* c = text; *c;) {
+        const auto cp = overlay_font::next(c);
+        if (cp == '\n') { pen = x; y += overlay_font::kAdvanceH * scale; continue; }
+        const auto glyph = overlay_font::glyph(cp);
+        const int idx = glyph.index;
         const float u0 = static_cast<float>((idx % overlay_font::kCols) * overlay_font::kCellW) / overlay_font::kAtlasW;
         const float v0 = static_cast<float>((idx / overlay_font::kCols) * overlay_font::kCellH) / overlay_font::kAtlasH;
         const float u1 = u0 + static_cast<float>(overlay_font::kCellW) / overlay_font::kAtlasW;
@@ -278,6 +280,7 @@ float host_overlay_text(float x, float y, float scale, std::uint32_t rgba, const
         push(gx + cw, gy, rgba, u1, v0);
         push(gx + cw, gy + ch, rgba, u1, v1);
         push(gx, gy + ch, rgba, u0, v1);
+        pen += glyph.advance * scale;
     }
     return pen - x;
 }

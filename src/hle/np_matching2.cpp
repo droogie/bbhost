@@ -230,14 +230,14 @@ bool hle_np_context_started() {
 }
 
 std::string hle_np_online_status() {
-    std::string s = "Signed in as " + net::online_id();
-    if (net::account_logged_in()) s += " (account)";
-    else if (config().online_require_account) s = "Signed out: log in below";
+    std::string s = "ログイン中: " + net::online_id();
+    if (net::account_logged_in()) s += " （アカウント）";
+    else if (config().online_require_account) s = "未ログイン: 下でログインしてください";
     if (g.in_room) {
-        s += "; room " + std::to_string(g.room_id) + " as member " + std::to_string(g.member_id) +
-             (g.is_host ? " (host)" : " (guest)") + ", " + std::to_string(net::peers_all().size()) + " peer(s)";
+        s += " / ルーム " + std::to_string(g.room_id) + " / メンバー " + std::to_string(g.member_id) +
+             (g.is_host ? " （ホスト）" : " （ゲスト）") + ", " + std::to_string(net::peers_all().size()) + " 人接続";
     } else {
-        s += "; no room";
+        s += " / ルーム未参加";
     }
     return s;
 }

@@ -264,7 +264,15 @@ void win_crash_install() {
     static PVOID h = AddVectoredExceptionHandler(0, crash_veh);  // last of the vectored handlers
     (void)h;
     SetUnhandledExceptionFilter(crash_filter);
-    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    // Older MinGW CRT import libraries do not expose this optional CRT API.
+    // Resolve it from the runtime already loaded by the process.
+    using SetAbortBehavior = unsigned (__cdecl*)(unsigned, unsigned);
+    for (const char* crt : {"ucrtbase.dll", "msvcrt.dll"}) {
+        if (HMODULE module = GetModuleHandleA(crt)) {
+            if (auto set_abort = reinterpret_cast<SetAbortBehavior>(GetProcAddress(module, "_set_abort_behavior")))
+                set_abort(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        }
+    }
     std::signal(SIGABRT, on_abort_signal);
     std::set_terminate(on_terminate);
     _set_invalid_parameter_handler(on_invalid_parameter);

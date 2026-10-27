@@ -8,7 +8,7 @@
 [patch]
 name = "analog-run-range-30"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "+30% analog run range (Kyo)"
+description = "アナログスティックの走行範囲を +30% (Kyo)"
 enabled = false
 gameplay = true
 order = 135

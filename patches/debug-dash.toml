@@ -30,7 +30,7 @@
 [patch]
 name = "debug-dash"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Restore Debug Dash (stagvant)"
+description = "開発用ダッシュを復元 (stagvant)"
 enabled = false
 gameplay = true
 order = 109

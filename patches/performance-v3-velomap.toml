@@ -17,7 +17,7 @@
 [patch]
 name = "performance-v3-velomap"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo)"
+description = "軽量化 v3（速度マップ・カメラぼかし・デカール有効）(Kyo)"
 enabled = false
 order = 22
 group = "performance-v3"
