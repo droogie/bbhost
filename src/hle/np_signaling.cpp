@@ -134,7 +134,7 @@ bool g_trace = [] {
     return e && e[0] == '1';
 }();
 
-std::uint64_t now_us() {
+std::uint64_t sig_now_us() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count());
@@ -276,7 +276,7 @@ void send_handshake_locked(Transport& t) {
     case State::SendingAccept: kind = kAccept; break;
     case State::ConnCheck:
         kind = kCheck;
-        nonce = now_us();
+        nonce = sig_now_us();
         break;
     case State::Established: return;
     case State::WaitOffer:
@@ -667,7 +667,7 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
             if (t.state == State::SendingOffer || t.state == State::WaitAccept || t.state == State::SendingAccept ||
                 t.state == State::WaitOffer) {
                 t.state = State::ConnCheck;
-                send_locked(t, kCheck, kDeactivate, now_us());
+                send_locked(t, kCheck, kDeactivate, sig_now_us());
             }
             break;
         }
