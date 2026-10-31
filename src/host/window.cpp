@@ -81,6 +81,19 @@ unsigned g_display_w = 0, g_display_h = 0;
 std::atomic<bool> g_mouse_visible{true};
 std::atomic<bool> g_mouse_relative{false};
 std::atomic<bool> g_mouse_relative_applied{false};
+
+// A plugin with controls of its own (plugin API 13, host/plugins.cpp): the
+// keys, mouse buttons, wheel and motion it takes from the game while the
+// mouse turns the camera, and its own reads of them - the keys as the last pad
+// update saw them, and the motion, wheel and presses since it last read.
+std::mutex g_take_mu;
+bool g_take_key[512] = {};                     // under g_take_mu
+std::uint8_t g_plugin_keys[512] = {};          // under g_take_mu
+std::atomic<bool> g_take_any_key{false};
+std::atomic<std::uint32_t> g_take_buttons{0};
+std::atomic<bool> g_take_wheel{false}, g_take_motion{false};
+float g_plugin_dx = 0.0f, g_plugin_dy = 0.0f, g_plugin_wheel = 0.0f;  // under g_mouse_mu
+std::uint32_t g_plugin_pressed = 0;                                   // under g_mouse_mu
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
@@ -102,6 +115,13 @@ std::mutex g_text_mu;
 std::mutex g_banner_mu;
 std::string g_banner_text;                                  // under g_banner_mu
 std::chrono::steady_clock::time_point g_banner_until;       // under g_banner_mu
+// A plugin's placed line (host_text_show), under g_banner_mu.
+struct PlacedText {
+    std::string text;
+    std::chrono::steady_clock::time_point until;
+    float x = 0.0f, y = 0.0f, scale = 1.0f;
+    std::uint32_t align = 0;
+} g_placed;
 bool g_text_want = false, g_text_on = false, g_text_hidden = false;
 int g_text_result = 0;
 // The key that ended the text entry (Return or Escape), kept from the pad
@@ -485,6 +505,14 @@ bool surface_size_changed() {
     return changed;
 }
 
+// Whether the surface has nothing to show: a minimized window's is 0x0 on
+// Windows, until the window is back.
+bool surface_empty() {
+    VkSurfaceCapabilitiesKHR caps{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps) != VK_SUCCESS) return false;
+    return caps.currentExtent.width == 0 || caps.currentExtent.height == 0;
+}
+
 bool vk_create_swapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps);
@@ -510,15 +538,22 @@ bool vk_create_swapchain() {
             g_vk.format = f.format;
         }
     }
-    g_vk.extent = caps.currentExtent;
-    if (g_vk.extent.width == 0xFFFFFFFFu) {
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == 0xFFFFFFFFu) {
         int w = 0, h = 0;
         SDL_GetWindowSizeInPixels(g_window, &w, &h);
-        g_vk.extent = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h)};
+        extent = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h)};
     }
-    if (g_vk.extent.width == 0 || g_vk.extent.height == 0) {
+    // A minimized window's surface is 0x0 on Windows, and no swapchain can be
+    // made for it. The one there keeps its size, which is what the present
+    // draws into: taking the 0x0 had every later frame drawn into nothing, and
+    // the restored window - back at that swapchain's size, so the acquire said
+    // nothing and nothing rebuilt it - showed the picture from before the
+    // minimize for good (Kyo, 2026-10-28).
+    if (extent.width == 0 || extent.height == 0) {
         return false;
     }
+    g_vk.extent = extent;
     {
         const std::uint64_t px = static_cast<std::uint64_t>(g_vk.extent.width) << 32 | g_vk.extent.height;
         if (g_window_pixels.exchange(px, std::memory_order_relaxed) != px) {
@@ -841,6 +876,20 @@ bool vk_present() {
     present_step("waiting for the last present");
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
     host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
+    // While the window is minimized nothing is acquired or presented (the
+    // game's flips do not wait for this thread), and once it is back the
+    // swapchain is made again for what the surface is then.
+    static bool hidden = false;
+    if (surface_empty()) {
+        if (!hidden) host_log("present: the window shows nothing (minimized); no frames presented until it is back");
+        hidden = true;
+        return false;
+    }
+    if (hidden) {
+        hidden = false;
+        host_log("present: the window is back; the swapchain is made again");
+        g_swap_dirty.store(true);
+    }
     // A V-Sync change has no surface event behind it, so the options screen
     // asks for the rebuild the acquire would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
@@ -1026,7 +1075,7 @@ bool vk_present() {
             if (present_pass_begin(g_vk.cmd, g_vk.images[idx], g_vk.views[idx], g_vk.extent, shown, have ? &src : nullptr,
                                    have ? black : none)) {
                 const std::uint32_t verts = host_overlay_record(g_vk.cmd, area, overlay_w, overlay_h);
-                // The plugin menu (F9) over everything else (host/ingame_menu.h).
+                // The menus (F9, F10) over everything else (host/ingame_menu.h).
                 const bool menu = ingame_menu_record_in_pass(g_vk.cmd, g_vk.extent);
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
                 recorded = true;
@@ -1100,7 +1149,7 @@ bool vk_present() {
                                                     overlay_w, overlay_h);
             g_pstats.overlay_passes += overlaid;
             g_pstats.overlay_frames += overlaid;
-            // The plugin menu (F9) over everything else (host/ingame_menu.h).
+            // The menus (F9, F10) over everything else (host/ingame_menu.h).
             g_pstats.overlay_passes += ingame_menu_open();
             g_pstats.menu_frames += ingame_menu_open();
             ingame_menu_record(g_vk.cmd, g_vk.views[idx], g_vk.extent);
@@ -1528,18 +1577,30 @@ void update_pad() {
         if (down(SDL_SCANCODE_BACKSPACE)) p.menu_buttons |= menu_back_button();
         if (down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= kOptions;
         if (p.menu_buttons) p.connected = true;
+        // A plugin's own read of the keys, and the ones it takes from the game
+        // while the mouse turns the camera.
+        const bool take = g_take_any_key.load(std::memory_order_relaxed) &&
+                          g_mouse_relative_applied.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_take_mu);
+            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] ? 1 : 0;
+        }
         bool held[kBindCount];
         const int masked_key = g_text_end_key.load(std::memory_order_relaxed);
-        if (masked_key >= 0 && masked_key < nkeys && nkeys <= SDL_SCANCODE_COUNT) {
+        if (((masked_key >= 0 && masked_key < nkeys) || take) && nkeys <= SDL_SCANCODE_COUNT) {
             bool masked[SDL_SCANCODE_COUNT];
             std::memcpy(masked, keys, static_cast<std::size_t>(nkeys) * sizeof(bool));
-            masked[masked_key] = false;
+            if (masked_key >= 0 && masked_key < nkeys) masked[masked_key] = false;
+            if (take) {
+                std::lock_guard<std::mutex> lock(g_take_mu);
+                for (int i = 0; i < nkeys && i < 512; ++i) masked[i] = masked[i] && !g_take_key[i];
+            }
             host_bindings_keys_held(masked, nkeys, held);
         } else {
             host_bindings_keys_held(keys, nkeys, held);
         }
         const bool strong = held[kBindStrongMod];
-        host_bindings_apply(held, strong, p);
+        host_bindings_apply(held, strong, p, 0);
         g_key_strong.store(strong, std::memory_order_relaxed);
     } else {
         g_key_strong.store(false, std::memory_order_relaxed);
@@ -1770,7 +1831,7 @@ bool host_window_pump() {
             text_title_locked();
         }
     }
-    // The plugin menu (F9) takes typing while it is open.
+    // The menus over the game (F9, F10) take typing while one is open.
     {
         static bool menu_text = false;
         const bool want = ingame_menu_open();
@@ -1786,16 +1847,16 @@ bool host_window_pump() {
     const float pixel_ratio = win_w > 0 ? static_cast<float>(px_w) / static_cast<float>(win_w) : 1.0f;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        // F10's screen keeps its keys; the plugin menu takes the rest while open.
-        if (!host_options_open() && ingame_menu_event(e, pixel_ratio)) continue;
+        // F9 and F10 open the menus over the game; while one is open it takes
+        // the keys, the mouse and the typing (host/ingame_menu.h).
+        if (ingame_menu_event(e, pixel_ratio)) continue;
         switch (e.type) {
             case SDL_EVENT_QUIT:
                 return false;
             case SDL_EVENT_TEXT_INPUT: {
-                // Not while F10's screen is up over the game's box, unless
-                // one of the screen's own fields is being typed: it is modal.
+                // Not while a menu is up over the game's box: it is modal.
                 std::lock_guard<std::mutex> lock(g_text_mu);
-                if (g_text_on && e.text.text && (!host_options_open() || host_options_editing())) {
+                if (g_text_on && e.text.text && !ingame_menu_open()) {
                     g_entry.insert(e.text.text);
                     text_title_locked();
                 }
@@ -1814,11 +1875,6 @@ bool host_window_pump() {
                 // the Key Bindings screen has one selected to take it.
                 if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_DELETE) {
                     host_bind_note_clear_key();
-                }
-                // F10 opens the port's options screen, and while it is open it
-                // takes every key: it is modal, so nothing leaks to the pad.
-                if (host_options_key(e.key.scancode, e.key.repeat)) {
-                    break;
                 }
                 if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_F11) {
                     g_ime_test_reopen.store(true, std::memory_order_relaxed);
@@ -1880,9 +1936,14 @@ bool host_window_pump() {
                 g_mouse.dx += e.motion.xrel;
                 g_mouse.dy += e.motion.yrel;
                 // The camera's own, in raw counts, while the mouse turns it
-                // (engine/mouse_camera_step.h): the camera takes them itself.
+                // (engine/mouse_camera_step.h): the camera takes them itself -
+                // unless a plugin has taken the motion, which then reads it.
                 if (g_mouse_relative_applied.load(std::memory_order_relaxed)) {
-                    mouse_camera::add(mouse_camera::g_counts, e.motion.xrel, e.motion.yrel);
+                    if (!g_take_motion.load(std::memory_order_relaxed)) {
+                        mouse_camera::add(mouse_camera::g_counts, e.motion.xrel, e.motion.yrel);
+                    }
+                    g_plugin_dx += e.motion.xrel;
+                    g_plugin_dy += e.motion.yrel;
                 }
                 if (!g_mouse_relative.load(std::memory_order_relaxed)) {
                     mouse_moved_locked(e.motion.x, e.motion.y);
@@ -1911,6 +1972,7 @@ bool host_window_pump() {
                 if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
                     g_mouse.buttons |= bit;
                     g_mouse.pressed |= bit;
+                    g_plugin_pressed |= bit;
                 } else {
                     g_mouse.buttons &= ~bit;
                     g_mouse.released |= bit;
@@ -1928,6 +1990,7 @@ bool host_window_pump() {
                 }
                 std::lock_guard<std::mutex> lock(g_mouse_mu);
                 g_mouse.wheel += e.wheel.y;
+                g_plugin_wheel += e.wheel.y;
                 g_mouse_last_motion = std::chrono::steady_clock::now();
                 break;
             }
@@ -1961,7 +2024,7 @@ bool host_window_pump() {
                 // keyboard can close. A press, so the button that opened the
                 // box - still held when it appears - does not close it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
-                if (!g_text_on || host_options_open()) break;
+                if (!g_text_on || ingame_menu_open()) break;
                 const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
                                           : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
                                                                                          : 0u;
@@ -2193,6 +2256,42 @@ bool host_window_pump() {
         }
     }
     {
+        // A plugin's placed line (host_text_show): where it asked, in the
+        // banner's colours, fading over its last half second.
+        PlacedText t;
+        float alpha = 0.0f;
+        {
+            std::lock_guard<std::mutex> bl(g_banner_mu);
+            const auto now = std::chrono::steady_clock::now();
+            if (!g_placed.text.empty() && now < g_placed.until) {
+                t = g_placed;
+                const float left = std::chrono::duration<float>(g_placed.until - now).count();
+                alpha = left < 0.5f ? left / 0.5f : 1.0f;
+            }
+        }
+        if (!t.text.empty()) {
+            float dw = 0.0f, dh = 0.0f;
+            {
+                std::lock_guard<std::mutex> ml(g_mouse_mu);
+                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+                dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
+            }
+            const float pad_x = 14.0f * t.scale, pad_y = 7.0f * t.scale;
+            const float w = host_overlay_text_width(t.scale, t.text.c_str()), h = 24.0f * t.scale;
+            const float box_w = w + 2.0f * pad_x, box_h = h + 2.0f * pad_y;
+            float bx = t.x * dw, by = t.y * dh;
+            const std::uint32_t side = t.align & 3u;
+            if (side == 1u) bx -= box_w * 0.5f;
+            else if (side == 2u) bx -= box_w;
+            if (t.align & 4u) by -= box_h;
+            const auto a = [&](std::uint32_t rgba) {
+                return (rgba & 0xffffff00u) | static_cast<std::uint32_t>(static_cast<float>(rgba & 0xffu) * alpha);
+            };
+            host_overlay_rect(bx, by, box_w, box_h, a(0x000000a0u));
+            host_overlay_text(bx + pad_x, by + pad_y, t.scale, a(0xe8dcc0ffu), t.text.c_str());
+        }
+    }
+    {
         // The first start after an update that changed the shader translator
         // (and the first ever) builds every shader again. On a few cores that
         // runs past the title into the first minute of play, which stutters
@@ -2267,7 +2366,9 @@ bool host_window_pump() {
     // as the player moves a cursor; this is where such a change becomes a
     // setting (engine/option_menu.h).
     option_menu_poll();
-    // The port's own options screen (F10), under the pointer.
+    // The menus' changes to settings, posted from the presenter (F10's and
+    // F9's switches that are settings), and the resolution's keep-or-revert
+    // answer (host/options.h).
     {
         float dw = 0.0f, dh = 0.0f;
         {
@@ -2277,6 +2378,7 @@ bool host_window_pump() {
         }
         host_options_frame(dw, dh);
     }
+    ingame_menu_pump();  // BBHOST_MENU_TEST's steps
     // The pointer. The game has no cursor asset and needs none - this is the
     // host's own. It draws only once the pointer has been in the window, so a
     // run nobody touches is exactly as it was.
@@ -2342,6 +2444,17 @@ bool host_window_pump() {
 #else
     return true;
 #endif
+}
+
+void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {
+    std::lock_guard<std::mutex> bl(g_banner_mu);
+    g_placed.text = text ? text : "";
+    g_placed.until = std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(static_cast<long long>((seconds > 0.0f ? seconds : 3.0f) * 1000.0f));
+    g_placed.x = std::clamp(x, 0.0f, 1.0f);
+    g_placed.y = std::clamp(y, 0.0f, 1.0f);
+    g_placed.scale = std::clamp(scale, 0.25f, 4.0f);
+    g_placed.align = align;
 }
 
 void host_message_show(const char* text, float seconds) {
@@ -2505,6 +2618,45 @@ MouseState host_mouse_state() {
     g_mouse.dx = g_mouse.dy = 0.0f;
     return m;
 }
+
+bool host_plugin_input(PluginInput& out) {
+    {
+        std::lock_guard<std::mutex> lock(g_take_mu);
+        std::memcpy(out.key, g_plugin_keys, sizeof(out.key));
+    }
+    std::lock_guard<std::mutex> lock(g_mouse_mu);
+    out.buttons = g_mouse.buttons;
+    out.pressed = g_plugin_pressed;
+    out.dx = g_plugin_dx;
+    out.dy = g_plugin_dy;
+    out.wheel = g_plugin_wheel;
+    out.playing = g_mouse_relative_applied.load(std::memory_order_relaxed);
+    g_plugin_pressed = 0;
+    g_plugin_dx = g_plugin_dy = g_plugin_wheel = 0.0f;
+#if defined(BBHOST_HAVE_SDL3)
+    return g_window != nullptr;
+#else
+    return false;
+#endif
+}
+
+void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {
+    {
+        std::lock_guard<std::mutex> lock(g_take_mu);
+        std::memset(g_take_key, 0, sizeof(g_take_key));
+        for (std::size_t i = 0; i < n; ++i) {
+            if (scancodes[i] < 512) g_take_key[scancodes[i]] = true;
+        }
+        g_take_any_key.store(n > 0, std::memory_order_relaxed);
+    }
+    g_take_buttons.store(buttons, std::memory_order_relaxed);
+    g_take_wheel.store(wheel, std::memory_order_relaxed);
+    g_take_motion.store(motion, std::memory_order_relaxed);
+}
+
+std::uint32_t host_plugin_taken_buttons() { return g_take_buttons.load(std::memory_order_relaxed); }
+bool host_plugin_taken_wheel() { return g_take_wheel.load(std::memory_order_relaxed); }
+bool host_plugin_taken_motion() { return g_take_motion.load(std::memory_order_relaxed); }
 
 bool host_mouse_position(float& x, float& y) {
     std::lock_guard<std::mutex> lock(g_mouse_mu);

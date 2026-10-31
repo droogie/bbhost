@@ -1,0 +1,49 @@
+# L3 run-jump: Kyo's patch for 1.09 (2026-10-28): 4 sites, 169 bytes.
+#
+# Bloodborne's run-jump is "let go of Circle while running and press it again": the script (c0000.hks) jumps on a
+# Rolling request while SpEffect 390 is on - the game puts it on for a moment when Circle is let go during the run -
+# and the same request without it is a roll. With this on, L3 pressed while running with Circle held (the run's
+# SpEffect 391 on) makes that request and, for 3 frames, the player's SpEffect 390 counts as on, so the script takes
+# its own jump: L3 jumps as Circle does there, never rolls, and Circle is unchanged. Works with any c0000.hks that
+# keeps the game's run-jump (vanilla, Hyperborne). Not for the Nightreign Movement scripts: L3 is their surge sprint,
+# which their run states check first.
+#
+# Two hooks, into new code in the zero tail of the executable segment (0x054bf000, 0x054bf080):
+# - the call of ActionRequest::Update in PadManipulator::Update (0x01928751): when L3 is pressed this frame (held
+#   now, not the frame before), Circle is held and the character has SpEffect 391, it adds the Rolling request (bit
+#   17 of the held mask) - the request a Circle press makes - opens the 3-frame window (one byte at 0x05ad3d00, the
+#   zeroed tail of .bss) and goes on to the update, which buffers and accepts the request by the animation's own
+#   windows;
+# - the script's SpEffect query (env 56, 0x01e142f1): while the window is open, the player's "SpEffect 390?" takes
+#   the query's own found path.
+# RIP- and register-relative only, so it runs at whatever slide bbhost loads the eboot.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the game (F9), or `l3-run-jump = true` under
+# [patches] in bbhost.toml. The log then says "patch: l3-run-jump: 4 of 4 sites written".
+[patch]
+name = "l3-run-jump"
+title = "L3 run-jump"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "While running (holding Circle), L3 jumps too: the run-jump a second press of Circle makes. Circle still jumps."
+enabled = false
+order = 405
+
+[site.s01928751]
+address = "0x01928751"
+expect = "e8 ba 71 4e 00"
+bytes = "e8 aa 68 b9 03"
+
+[site.s01e142f1]
+address = "0x01e142f1"
+expect = "48 8b 8b c8 01 00 00"
+bytes = "e9 8a ad 6a 03 90 90"
+
+[site.s054bf000]
+address = "0x054bf000"
+expect = "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+bytes = "80 3d f9 4c 61 00 00 74 06 fe 0d f1 4c 61 00 f6 47 11 20 74 44 f6 47 19 20 75 3e f6 47 10 20 74 38 48 8b 47 08 48 85 c0 74 2f 48 8b 80 c8 01 00 00 48 85 c0 74 23 48 8b 40 08 48 85 c0 74 1a 81 78 40 87 01 00 00 74 06 48 8b 40 58 eb ec 80 4f 12 02 c6 05 a7 4c 61 00 03 e9 b2 08 95 fc"
+
+[site.s054bf080]
+address = "0x054bf080"
+expect = "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+bytes = "3d 86 01 00 00 75 2c 80 3d 72 4c 61 00 00 74 23 48 8b 0d e1 f7 47 00 48 85 c9 74 17 48 3b 59 60 75 11 48 8b 3d 37 4b 32 00 be 01 00 00 00 e9 97 66 95 fc 48 8b 8b c8 01 00 00 e9 39 52 95 fc"

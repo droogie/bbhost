@@ -98,7 +98,7 @@ int main() {
         if (!raw) continue;
         Bytes built;
         try {
-            built = build_menu_messages(*raw);
+            built = build_menu_messages(*raw, false);
         } catch (const Fail& f) {
             std::fprintf(stderr, "%s: %s\n", e.path().filename().string().c_str(), f.why.c_str());
             ++g_failures;

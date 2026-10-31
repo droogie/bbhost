@@ -1,5 +1,6 @@
 #include "engine/menu_assets.h"
 
+#include "core/config.h"
 #include "hle/fs.h"
 #include "log.h"
 
@@ -33,7 +34,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 12;  // 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 13;  // 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -789,7 +790,7 @@ Bytes build_option_movie(const Bytes& src) {
     section("PCEffects", 120020, 387, 6, 0, {});
     section("PCCamera", 121020, 388, 4, 0, {"Item_4_0", "Item_5_0"});
     section("PCDeck", 123020, 389, 2, 0, {"Item_2_0", "Item_3_0", "Item_4_0", "Item_5_0"});
-    section("PCEnhance", 124020, 390, 3, 0, {"Item_3_0", "Item_4_0", "Item_5_0"});
+    section("PCEnhance", 124020, 390, 4, 0, {"Item_4_0", "Item_5_0"});
     return add_scrollbar(m, "Top", 1290, 354.5);
 }
 
@@ -1050,9 +1051,14 @@ std::map<std::int32_t, Message> read_messages() {
     return rows;
 }
 
+// The death screen's caption, group 200's "YOU DIED", which the SKILL ISSUE
+// enhancement (world.skill_issue) replaces in every language's bundle.
+constexpr std::int32_t kYouDiedId = 522001;
+const char kSkillIssue[] = "SKILL ISSUE";
+
 // The message bundle: the port's ids in groups 200 and 201, the dialog groups
-// and the event text.
-Bytes build_menu_messages(const Bytes& raw) {
+// and the event text; with `skill_issue`, the death caption too.
+Bytes build_menu_messages(const Bytes& raw, bool skill_issue) {
     Bytes payload, dcx_head;
     if (raw.size() >= 4 && std::memcmp(raw.data(), "DCX\0", 4) == 0) {
         if (raw.size() < 0x2c || std::memcmp(raw.data() + 0x28, "DFLT", 4) != 0) throw Fail{"the message bundle is not DFLT"};
@@ -1080,6 +1086,8 @@ Bytes build_menu_messages(const Bytes& raw) {
             const std::string& s = f.id == kLineHelp ? m.help : m.text;
             ids[mid] = s.empty() ? std::nullopt : std::optional<Bytes>(utf16(s));
         }
+        // (The "japanese" folder's menu text has no such id: left as it is.)
+        if (skill_issue && f.id == kMenuText && ids.count(kYouDiedId)) ids[kYouDiedId] = utf16(kSkillIssue);
         f.data = fmg_write(ids);
         added.insert(f.id);
     }
@@ -1179,6 +1187,8 @@ bool menu_assets_ensure() {
     // What these were made from: the generator, the strings and every source.
     std::uint64_t h = fnv1a(&kGeneratorVersion, sizeof(kGeneratorVersion));
     h = fnv1a(kMessagesTsv, sizeof(kMessagesTsv), h);
+    const bool skill_issue = config().skill_issue;
+    h = fnv1a(&skill_issue, sizeof(skill_issue), h);
     h = fnv1a(movie_src->data(), movie_src->size(), h);
     for (const auto& [rel, src] : langs) {
         h = fnv1a(rel.data(), rel.size(), h);
@@ -1206,7 +1216,7 @@ bool menu_assets_ensure() {
             int made = 0;
             for (const auto& [rel, src] : langs) {
                 try {
-                    if (!write_file(out / rel, build_menu_messages(src))) {
+                    if (!write_file(out / rel, build_menu_messages(src, skill_issue))) {
                         host_log("menu assets: cannot write %s", (out / rel).string().c_str());
                         continue;
                     }

@@ -1,11 +1,16 @@
 # The camera's field of view is clamped to 38-48 degrees where the option
 # table's value is applied (Binary Ninja 0x183af4e, `cmovbe rax, rsi`). Taking
 # the clamp out lets the PC Camera section (F10) set any field of view; the
-# engine/camera.cpp scaler applies the chosen value each frame.
+# engine/camera.cpp scaler applies the chosen value each frame. Off until
+# turned on (the setup window's Patches tab, or fov-uncap = true under
+# [patches] in bbhost.toml): without it a wider field of view stops at 48.
 [patch]
 name = "fov-uncap"
+title = "Uncapped field of view"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the field of view is no longer capped at 48 degrees"
+enabled = false
+order = 1040
 
 [site.clamp]
 address = "0x183af4e"

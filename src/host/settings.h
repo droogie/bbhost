@@ -22,7 +22,7 @@ struct HostSettings {
     // Display
     bool fullscreen = false;
     bool vsync = true;
-    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90, 120; 0 is uncapped
+    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30 to 960; 0 is Display-Limited (the display's rate)
     bool fps_counter = false;
     bool memory_counter = false;  // video memory and shared GPU memory, under the FPS counter (host/window.cpp)
     bool perf_overlay = false;    // the bottleneck meter's verdict under them (host/window.cpp, host/perf_meter.h)
@@ -68,12 +68,14 @@ struct HostSettings {
 
     // Startup (read once by the loader)
     bool skip_logos = false;
+    bool performance_mode = false;  // the post-effects and YEBIS passes off (engine/patch_manifest.cpp)
     bool debug_menu = false;
     bool debug_camera = false;  // patches/debug-camera.toml (Lance McDonald's free camera)
     // The PC enhancements (also read once, through config_set_enhancements)
     bool change_appearance = true;
     bool rebirth = true;
     bool five_players = true;
+    bool skill_issue = false;
 };
 
 // A copy of the current settings (no lock: the snapshot published last).

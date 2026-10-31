@@ -1,3 +1,4 @@
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/plugin_ui.h"
 
 #include "bbhost_plugin.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -38,9 +40,32 @@ std::string random_seed() {
     return text;
 }
 
+// A small rounded label beside the title, its text on the title's line.
 void badge(const char* text, ImVec4 colour) {
     ImGui::SameLine();
-    ImGui::TextColored(colour, "[%s]", text);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 pad(ImGui::GetFontSize() * 0.45f, ImGui::GetFontSize() * 0.1f);
+    const ImVec2 p = ImGui::GetCursorScreenPos() - ImVec2(0, pad.y);
+    dl->AddRectFilled(p, p + ts + pad * 2, ImGui::GetColorU32(ImVec4(colour.x, colour.y, colour.z, 0.16f)), ts.y * 0.5f + pad.y);
+    dl->AddText(p + pad, ImGui::GetColorU32(colour), text);
+    ImGui::Dummy(ImVec2(ts.x + pad.x * 2, ts.y));
+}
+
+// A setting's help: in a bubble over the setting, and over the (?) after it.
+void help(const std::string& text) {
+    auto bubble = [&] {
+        if (ImGui::BeginItemTooltip()) {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+            ImGui::TextUnformatted(text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    };
+    bubble();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    bubble();
 }
 
 // One setting's widget. `value` is what the config holds (or the default);
@@ -50,6 +75,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     ImGui::PushID(id.c_str());
     const bool later = ui.in_game && !o.live && o.type != BB_OPT_ACTION && o.type != BB_OPT_HEADING;
     const std::string label = o.label + (later ? "  (next start)" : "");
+    bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
     const float width = 260 * scale;
     switch (o.type) {
@@ -115,6 +141,8 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         const bool active = ImGui::IsItemActive();
         // A seed: a new one at the click, shown in the box and saved.
         if (o.key == "seed") {
+            if (!o.help.empty()) help(o.help);
+            helped = true;
             ImGui::SameLine();
             if (ImGui::Button("Random seed")) {
                 it->second = random_seed();
@@ -129,25 +157,27 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         ImGui::BeginDisabled(!can);
         if (ImGui::Button(o.label.c_str(), ImVec2(width, 0))) plugins_run_action(p.name, o.key);
         ImGui::EndDisabled();
+        // Why it cannot be pressed, in its bubble with its help.
         if (!can) {
-            ImGui::SameLine();
-            ImGui::TextDisabled(ui.in_game ? "(turn the plugin on and restart)" : "(in the game: the plugin menu)");
+            if (ImGui::BeginItemTooltip()) {
+                ImGui::TextUnformatted(ui.in_game ? "Turn the plugin on and restart." : "In the game: the plugin menu.");
+                if (!o.help.empty()) ImGui::TextDisabled("%s", o.help.c_str());
+                ImGui::EndTooltip();
+            }
+            helped = true;
         }
         break;
     }
     default:
         break;
     }
-    if (!o.help.empty() && o.type != BB_OPT_HEADING) {
-        ImGui::Indent(16 * scale);
+    if (!o.help.empty() && o.type == BB_OPT_HEADING) {
+        // A heading's words say what the settings under it are for: shown.
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("%s", o.help.c_str());
         ImGui::PopTextWrapPos();
-        ImGui::Unindent(16 * scale);
-    } else if (!o.help.empty()) {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", o.help.c_str());
-        ImGui::PopTextWrapPos();
+    } else if (!o.help.empty() && !helped) {
+        help(o.help);
     }
     ImGui::PopID();
 }
@@ -180,50 +210,75 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
     was_busy = busy;
 
     ImGui::BeginDisabled(busy);
-    if (ImGui::Button("Get the latest official plugins")) updater::fetch_plugins(config_user_dir() + "/plugins");
+    if (ImGui::Button("Get the official plugins")) updater::fetch_plugins(config_user_dir() + "/plugins");
     ImGui::EndDisabled();
+    ImGui::SetItemTooltip("The latest signed plugins, from the newest release.");
     ImGui::SameLine();
     if (ImGui::Button("Rescan")) plugin_ui_refresh(ui);
+    ImGui::SetItemTooltip("Read the plugin files again.");
     ImGui::SameLine();
+    // At the right of the line.
+    const char* every_label = "Show at every start";
+    const float every_w = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(every_label).x;
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - every_w));
     bool every = config_value("plugins.show_settings") == "true";
-    if (ImGui::Checkbox("Show plugin settings at every start", &every)) {
+    if (ImGui::Checkbox(every_label, &every)) {
         config_set_values(config_user_file(), {{"plugins", "show_settings", every ? "true" : "false"}});
         config_value_set("plugins.show_settings", every ? "true" : "false");
     }
+    ImGui::SetItemTooltip("Open the launcher on the plugins at every start.");
     if (const std::string st = updater::plugins_status(); !st.empty()) ImGui::TextDisabled("%s", st.c_str());
 
     const float h = height > 0 ? height : ImGui::GetContentRegionAvail().y;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ImGui::GetFontSize() * 0.6f, ImGui::GetFontSize() * 0.6f));
     ImGui::BeginChild("##list", ImVec2(230 * scale, h), ImGuiChildFlags_Borders);
+    ImGui::PopStyleVar();
     if (ui.plugins.empty()) {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("No plugins. Get the official ones above, or put plugin files in %s/plugins.", config_user_dir().c_str());
         ImGui::PopTextWrapPos();
     }
+    // Each plugin a row: a dot, lit when it is on, and its title.
+    const float fs = ImGui::GetFontSize(), row_h = std::round(fs * 1.8f);
     for (std::size_t i = 0; i < ui.plugins.size(); ++i) {
         const PluginEntry& p = ui.plugins[i];
-        std::string line = p.title + (p.enabled ? "" : "  (off)");
-        if (ImGui::Selectable(line.c_str(), ui.selected == static_cast<int>(i))) ui.selected = static_cast<int>(i);
+        ImGui::PushID(static_cast<int>(i));
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable("##row", ui.selected == static_cast<int>(i), 0, ImVec2(0, row_h))) ui.selected = static_cast<int>(i);
+        ImGui::SetItemTooltip("%s", p.enabled ? "On" : "Off");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec4 dot = p.bad_signature ? ImVec4(0.95f, 0.35f, 0.40f, 1.0f) : p.enabled ? ImVec4(0.37f, 0.89f, 0.67f, 1.0f) : ImVec4(0.5f, 0.5f, 0.6f, 0.6f);
+        dl->AddCircleFilled(at + ImVec2(fs * 0.55f, row_h * 0.5f), fs * 0.22f, ImGui::GetColorU32(dot));
+        dl->AddText(at + ImVec2(fs * 1.3f, (row_h - fs) * 0.5f), ImGui::GetColorU32(p.enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled),
+                    p.title.c_str());
+        ImGui::PopID();
     }
     ImGui::EndChild();
     ImGui::SameLine();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fs * 1.0f, fs * 0.8f));
     ImGui::BeginChild("##details", ImVec2(0, h), ImGuiChildFlags_Borders);
+    ImGui::PopStyleVar();
     if (!ui.plugins.empty()) {
         PluginEntry& p = ui.plugins[static_cast<std::size_t>(ui.selected)];
-        ImGui::Text("%s", p.title.c_str());
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.3f);
+        ImGui::TextUnformatted(p.title.c_str());
+        ImGui::PopFont();
         if (!p.version.empty()) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("%s", p.version.c_str());
         }
-        if (p.official) badge("official", ImVec4(0.45f, 0.80f, 0.45f, 1.0f));
-        else if (p.bad_signature) badge("signature does not match - not loaded", ImVec4(0.95f, 0.35f, 0.30f, 1.0f));
-        else badge("not signed", ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("changes the game", ImVec4(0.95f, 0.70f, 0.30f, 1.0f));
+        if (p.official) badge("official", ImVec4(0.37f, 0.89f, 0.67f, 1.0f));
+        else if (p.bad_signature) badge("signature does not match - not loaded", ImVec4(0.95f, 0.35f, 0.40f, 1.0f));
+        else badge("not signed", ImVec4(0.65f, 0.66f, 0.78f, 1.0f));
+        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("changes the game", ImVec4(1.0f, 0.54f, 0.78f, 1.0f));
         if (!p.author.empty()) ImGui::TextDisabled("by %s - %s", p.author.c_str(), p.file.c_str());
         if (!p.description.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(p.description.c_str());
             ImGui::PopTextWrapPos();
         }
+        ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;
         if (ImGui::Checkbox("Turned on", &on)) {

@@ -35,20 +35,26 @@
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
-110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players. Each needs a restart.
+110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players, SKILL ISSUE. Each needs a restart.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Borderless, at the desktop resolution.
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	Applies on the next run. 30 is the game's own pace; higher rates run its logic at that rate.
+116005	Frame Rate	Applies on the next run. 30 is the game's own pace. Display-Limited caps it at your monitor's refresh rate.
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
 116031	60	
 116032	90
 116033	120
-116035	Uncapped
+116036	150
+116037	180
+116038	240
+116039	360
+116040	480
+116041	960
+116035	Display-Limited
 117000	Ambient Occlusion	Screen-space ambient occlusion.
 117005	Motion Blur	The blur on fast camera and character movement.
 117001	Anti-Aliasing	The game's own anti-aliasing pass.
@@ -125,6 +131,7 @@
 124001	Hunter's Dream Mirror	Requires a restart. The Dream's mirror opens the appearance editor (the cut "Put on Disguise").
 124002	Rebirth at the Altar	Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.
 124003	Five Players	Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier, the DLC; all need it.
+124004	SKILL ISSUE	Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.
 920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
 920001	Quit the game and return to the desktop?	
 14000332	Rebirth in the Nightmare	

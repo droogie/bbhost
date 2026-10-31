@@ -61,6 +61,12 @@ bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t*
 // (a rip-relative lea becomes a movabs of the slid address).
 bool engine_prologue_hook_exec(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n,
                                const std::uint8_t* exec, std::size_t m, void* host, std::uint64_t id = 0);  // id: what the stub passes host as its first argument
+// A hook inside a function body, between two instructions: `bytes` (n >= 14,
+// whole instructions, none rip-relative, no branch landing inside them) are
+// moved into the stub, which keeps rsp aligned as a body has it. `host` runs
+// with the argument registers as they are there and must return 0.
+bool engine_site_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* bytes, std::size_t n, void* host,
+                      std::uint64_t id = 0);
 // A `call rel32` (or `jmp rel32`) at `at`, whose destination must be
 // `target`, sent through a stub: `host` runs with the argument registers and,
 // returning nonzero, stands for the call (it made the call itself, around

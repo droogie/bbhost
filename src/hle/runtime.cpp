@@ -11,6 +11,8 @@
 #include "engine/addr.h"
 #include "engine/key_prompts.h"
 #include "engine/menu_pointer.h"
+#include "engine/menu_close.h"
+#include "engine/matching_region.h"
 #include "engine/option_menu.h"
 #include "engine/summon_invite.h"
 #include "engine/np_test.h"
@@ -384,6 +386,11 @@ void hle_patch_guest(ElfImage* image) {
     option_menu_install(image);
     // The mouse in every menu list, DS3's way (engine/menu_pointer.h).
     menu_pointer_install(image);
+    // A closing menu window answers at once, not after its fade-out
+    // (engine/menu_close.h).
+    menu_close_install(image);
+    // Network > Matching Regions starts at Worldwide (engine/matching_region.h).
+    matching_region_install(image);
     // The pad glyphs in the key guide and the tutorial notes become the keys
     // the player bound (engine/key_prompts.h).
     key_prompts_install(image);

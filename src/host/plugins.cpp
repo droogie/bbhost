@@ -10,8 +10,10 @@
 #include "engine/addr.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
+#include "engine/gx_state.h"
 #include "engine/image_text.h"
 #include "decomp/events/flag_store.h"
+#include "decomp/gx/render_queue.h"
 #include "gcn/container.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -27,6 +29,7 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "host/bindings.h"
 #include "host/ruleset.h"
 #include "host/updater.h"
 #include "host/window.h"
@@ -784,6 +787,12 @@ int api_show_message(const char* text, float seconds) {
     return 0;
 }
 
+int api_show_text(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {
+    if (!text) return 1;
+    host_text_show(text, seconds, x, y, scale, align);
+    return 0;
+}
+
 int api_set_time_scale(float scale) {
     frame_rate_set_time_scale(scale);
     return 0;
@@ -1036,6 +1045,104 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
     return 0;
 }
 
+// Version 13: controls and a view of a plugin's own.
+int api_input(BbInput* out) {
+    if (!out) return 1;
+    PluginInput in;
+    const bool ok = host_plugin_input(in);
+    std::memcpy(out->key, in.key, sizeof(out->key));
+    out->buttons = in.buttons;
+    out->pressed = in.pressed;
+    out->dx = in.dx;
+    out->dy = in.dy;
+    out->wheel = in.wheel;
+    out->playing = in.playing ? 1 : 0;
+    return ok ? 0 : 1;
+}
+
+int api_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
+    if (n && !scancodes) return 1;
+    host_plugin_input_take(scancodes, n, buttons, wheel != 0, motion != 0);
+    return 0;
+}
+
+// The camera. The game state's update (sub_1d3ac10) runs the camera
+// manager's blend (sub_18368b0: the follow camera's update and the blend of
+// the cameras the manager owns into its own, at +0x10), then copies the
+// manager's camera into the scene's - which a scripted camera then replaces
+// while one plays. Between the two, at 0x1d3be5a, the manager is still in rdi
+// (sub_18377d0, called in between, is a leaf that leaves it there): a hook
+// there hands the plugins its camera, which BbCamera lays out. The other game
+// state's update (sub_1d39bb0) runs the blend at 0x1d39c2d, and its hook finds
+// the manager from the camera root.
+struct CameraCallback {
+    void (*fn)(BbCamera*, void*);
+    void* user;
+};
+std::vector<CameraCallback> g_camera_callbacks;  // under g_frame_mu
+bool g_camera_hooked = false;
+
+void camera_callbacks(std::uint64_t manager) {
+    if (!manager) return;
+    std::vector<CameraCallback> now;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        now = g_camera_callbacks;
+    }
+    auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(manager + 0x10));
+    for (const CameraCallback& c : now) c.fn(cam, c.user);
+}
+
+GUEST_ABI std::int64_t camera_hook(std::uint64_t, const std::uint64_t* saved) {
+    camera_callbacks(saved[5]);  // rdi
+    return 0;
+}
+
+GUEST_ABI std::int64_t camera_hook_other(std::uint64_t, const std::uint64_t*) {
+    camera_callbacks(world_camera_owner());
+    return 0;
+}
+
+int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
+    if (!fn || !g_image || !api_eboot_is_109()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_camera_callbacks.push_back({fn, user});
+    }
+    if (g_camera_hooked) return 0;
+    g_camera_hooked = true;
+    // mov rax, [r13+0x128]; vmovss xmm0, [rax+0x50]; vmovss [r15+0x50], xmm0 - the copy's start
+    static const std::uint8_t copy[18] = {0x49, 0x8b, 0x85, 0x28, 0x01, 0x00, 0x00, 0xc5, 0xfa,
+                                          0x10, 0x40, 0x50, 0xc4, 0xc1, 0x7a, 0x11, 0x47, 0x50};
+    // mov rax, [r14+0x118]; mov rdi, [rax+0x68]; mov esi, [rax+0x20] - after the other update's blend
+    static const std::uint8_t other[14] = {0x49, 0x8b, 0x86, 0x18, 0x01, 0x00, 0x00, 0x48, 0x8b, 0x78, 0x68, 0x8b, 0x70, 0x20};
+    if (!engine_site_hook(g_image, runtime_of(0x1d3be5a, sizeof copy), copy, sizeof copy,
+                          reinterpret_cast<void*>(&camera_hook))) {
+        host_log("plugin: 0x1d3be5a is not the scene camera's copy; on_camera is not called");
+    }
+    if (!engine_site_hook(g_image, runtime_of(0x1d39c32, sizeof other), other, sizeof other,
+                          reinterpret_cast<void*>(&camera_hook_other))) {
+        host_log("plugin: 0x1d39c32 is not the other game state's blend return; on_camera is not called there");
+    }
+    return 0;
+}
+
+int api_key_bound(std::uint16_t scancode) {
+    if (scancode == 0) return 0;
+    for (int a = 0; a < kBindCount; ++a) {
+        if (host_binding_key(a) == scancode) return 1;
+    }
+    return 0;
+}
+
+void api_draw_style(int style) { gx_draw_style(style & (kGxDrawLines | kGxDrawBlack | kGxDrawSubtract)); }
+
+int api_on_scene_category(std::int32_t pass, void (*fn)(std::uint64_t, void*), void* user) {
+    if (!g_image || !api_eboot_is_109()) return 1;
+    render_queue_scene_insert(pass, fn, user);
+    return 0;
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1049,6 +1156,10 @@ const BbHostApi g_api = {
     &api_set_rules, &api_on_world_rules, &api_visitor,
     &api_replace_text,
     &api_loading_screen,
+    &api_input, &api_input_take, &api_on_camera, &api_key_bound,
+    &api_show_text,
+    &api_on_scene_category,
+    &api_draw_style,
 };
 
 std::string read_file(const std::string& path) {

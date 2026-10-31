@@ -182,6 +182,7 @@ void report(EXCEPTION_POINTERS* ep) {
 
 LONG CALLBACK crash_veh(EXCEPTION_POINTERS* ep) {
     if (!reportable(ep->ExceptionRecord->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    host_log_force_on();  // a crash is reported with Tooling and logging off too (to wherever stderr goes)
     // A fault inside the report itself: say so and let the process go.
     if (t_reporting++ > 0) {
         host_log("crash: a second fault (0x%lx at 0x%llx) while reporting the first",
@@ -202,6 +203,7 @@ LONG CALLBACK crash_veh(EXCEPTION_POINTERS* ep) {
 
 LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    host_log_force_on();
     // 0x20474343 ("CCG "): a C++ exception nothing caught, which reaches this
     // filter before std::terminate would. The vectored handler reports only
     // faults (every thrown exception passes it first), so the report of

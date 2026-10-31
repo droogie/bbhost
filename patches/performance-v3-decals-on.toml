@@ -1,5 +1,13 @@
 # Performance Patch v3 (Decals On): Kyo's patch for 1.09, from Kyo's shadPS4 list
 # (user/patches/shadPS4/Bloodborne.xml), byte for byte: 191 lines, 1319 bytes.
+# The shadPS4 patch list's Performance Patch (Perf Increase) is this one with
+# one site more (skip-block-0, 0x2ab6856), added 2026-10-28: 192 lines.
+# Its note: "Modifies some of the games debug parameters for better
+# performance without affecting visuals."
+#
+# Several of its sites are ones bbhost writes while the game runs (motion
+# blur's velocity switch, the light grid's tile): on or off applies at the
+# next start.
 #
 # Imported whole at Kyo's request (2026-10-08), to be judged in play. A
 # 2026-10-03 review of it, entry by entry in Binary Ninja, found
@@ -12,15 +20,17 @@
 # edit at 0x216fc09 overrides PC Graphics' Model detail while it is on.
 # One variant on at a time (group performance-v3): they share 1,295 bytes.
 #
-# Off until turned on: the setup window's Patches tab, or `performance-v3-decals-on = true` under
-# [patches] in bbhost.toml, turns it on for the next start.
+# On by default: the setup window's Patches tab, or `performance-v3-decals-on = false` under
+# [patches] in bbhost.toml, turns it off for the next start.
 [patch]
 name = "performance-v3-decals-on"
+title = "Performance Patch (Perf Increase)"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Performance Patch v3 (Decals On) (Kyo)"
-enabled = false
-order = 20
+description = "Modifies some of the game's debug parameters for better performance without affecting visuals (Kyo)."
+enabled = true
 group = "performance-v3"
+order = 20
+live = false
 
 [site.s000]
 address = "0x00400170"
@@ -924,3 +934,9 @@ address = "0x05aa6bc0"
 expect = "00"
 bytes = "01"
 kind = "data"
+
+# The list's newer Performance Patch: nop; jmp +0x3ae at 0x2ab6856, over the block after it
+[site.skip-block-0]
+address = "0x02ab6856"
+expect = "0f 84 ae 03 00 00"
+bytes = "90 e9 ae 03 00 00"

@@ -2277,7 +2277,8 @@ def add_run_options(p):
     p.add_argument("--capture-window", type=float, default=DEFAULTS["capture_window"], help="seconds the captures may take at a place")
     p.add_argument("--quiet", type=float, default=QUIET_RADIUS, help="metres around the view whose enemies are switched off; 0: none")
     p.add_argument("--start", type=float, default=DEFAULTS["start"], help="seconds in the world before the first travel")
-    p.add_argument("--fps", type=int, default=DEFAULTS["fps"], choices=(0, 30, 60, 90, 120), help="the game's frame rate (BBHOST_GAME_FPS; 0 uncapped)")
+    p.add_argument("--fps", type=int, default=DEFAULTS["fps"], choices=(0, 30, 60, 90, 120, 150, 180, 240, 360, 480, 960),
+                   help="the game's frame rate (BBHOST_GAME_FPS; 0 Display-Limited: the display's refresh rate, 60 headless)")
     p.add_argument("--pipeline-cache", choices=("seed", "off"), default="seed",
                    help="seed: the seed's shader caches and stage manifest, as a player's after an update (default); "
                         "off: BBHOST_PIPELINE_CACHE=0, every shader compiled when first met")

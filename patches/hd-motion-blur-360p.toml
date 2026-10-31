@@ -10,57 +10,59 @@
 # step aside for this one, as it comes after them in the list.
 [patch]
 name = "hd-motion-blur-360p"
+title = "HD Motion Blur 360p (640x360)"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "HD Motion Blur 360p (640x360) - Kyo's patch"
 enabled = false
-order = 181
 group = "hd-motion-blur"
+order = 815
+live = false
 
 # mov eax, 640
 [site.scene-half-width]
 address = "0x026c3de4"
 expect = "41 8b 07 d1 e8"
 bytes = "b8 80 02 00 00"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov eax, 360
 [site.scene-half-height]
 address = "0x026c3df0"
 expect = "41 8b 47 04 d1 e8"
 bytes = "b8 68 01 00 00 90"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov dword [rsp], 640
 [site.depth-half-width]
 address = "0x0125b1a3"
 expect = "8b 03 d1 e8 89 04 24"
 bytes = "c7 04 24 80 02 00 00"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov dword [rsp+4], 360
 [site.depth-half-height]
 address = "0x0125b1aa"
 expect = "8b 43 04 d1 e8 89 44 24 04"
 bytes = "c7 44 24 04 68 01 00 00 90"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov dword [rsp], 320
 [site.depth-quarter-width]
 address = "0x0125b1d6"
 expect = "8b 03 c1 e8 02 89 04 24"
 bytes = "c7 04 24 40 01 00 00 90"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov dword [rsp+4], 180
 [site.depth-quarter-height]
 address = "0x0125b1de"
 expect = "8b 43 04 c1 e8 02 89 44 24 04"
 bytes = "c7 44 24 04 b4 00 00 00 90 90"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]
 
 # mov byte [rbx+0x2a10], 0 -> 1
 [site.hd-flag]
 address = "0x026c265d"
 expect = "00"
 bytes = "01"
-yields = ["hd-motion-blur-4k"]
+yields = ["hd-motion-blur-4k", "hd-motion-blur-1080p", "hd-motion-blur-1440p"]

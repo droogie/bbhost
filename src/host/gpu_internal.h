@@ -9,6 +9,7 @@
 #include "gcn/translate.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/list_resolve.h"
 #include "host/stream_ops.h"
 
 #include <vulkan/vulkan.h>
@@ -56,11 +57,58 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 
 namespace gpu {
 
+// BBHOST_RUN_COMMIT (render.cpp run_commit): a run worker's counters, kept
+// apart while it commits its part and added to the shared ones by the command
+// processor at the join - the shared counters' lines would otherwise pass
+// between the cores at every draw, and their adds race. Open addressing by
+// the counter's address; a full table adds the rest with a locked add.
+struct BumpSink {
+    static constexpr std::size_t kSlots = 512;
+    std::atomic<std::uint64_t>* key[kSlots] = {};
+    std::uint64_t n[kSlots] = {};
+    std::uint16_t used[kSlots] = {};
+    std::size_t nused = 0;
+    void add(std::atomic<std::uint64_t>* c, std::uint64_t v) {
+        std::size_t i = static_cast<std::size_t>((static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(c)) >> 3) * 0x9E3779B97F4A7C15ull >> 55);
+        for (std::size_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kSlots - 1)) {
+            if (key[i] == c) {
+                n[i] += v;
+                return;
+            }
+            if (!key[i]) {
+                key[i] = c;
+                n[i] = v;
+                used[nused++] = static_cast<std::uint16_t>(i);
+                return;
+            }
+        }
+        c->fetch_add(v, std::memory_order_relaxed);
+    }
+    // At the join, under g.mu: the counts into the counters, and the table emptied.
+    void merge() {
+        for (std::size_t k = 0; k < nused; ++k) {
+            const std::uint16_t i = used[k];
+            key[i]->store(key[i]->load(std::memory_order_relaxed) + n[i], std::memory_order_relaxed);
+            key[i] = nullptr;
+        }
+        nused = 0;
+    }
+};
+extern thread_local constinit BumpSink* t_bump_sink;
+
 // A statistics counter only ever written under g.mu: incremented without a
 // locked instruction. A locked one waits for every earlier store to drain -
 // on the draw path, the params block just written - and the draw path bumps
-// dozens of counters.
+// dozens of counters. On a run worker, into its sink (BumpSink) - looked for
+// only with BBHOST_RUN_COMMIT on: a thread-local read is several loads where
+// the bump is one add, and the draw path bumps at a hundred places.
 inline void bump(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) {
+    if (list_resolve::committing()) [[unlikely]] {
+        if (BumpSink* s = t_bump_sink) {
+            s->add(&c, n);
+            return;
+        }
+    }
     c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
 
@@ -1008,7 +1056,7 @@ void import_windows(std::uint64_t va, std::uint64_t bytes);
 // The path whose locate() or import_windows() is under way (a vertex buffer,
 // a label's write, a copy token...), for the exit report's census of what
 // still takes window imports: set for the call's length, nullptr outside one.
-extern thread_local const char* t_import_site;
+extern thread_local constinit const char* t_import_site;
 struct ImportSite {
     const char* prev;
     explicit ImportSite(const char* site) : prev(t_import_site) { t_import_site = site; }
@@ -1075,6 +1123,11 @@ void gxvk_begin_recording_locked();
 void gxvk_slot_retired_locked(int slot);
 std::string gxvk_report();
 bool twins_on();
+// BBHOST_RUN_COMMIT: at a run's fork, true when no twin is owed a drop (a
+// buffer gone or mapped by the CPU since the last lookup) - the twins' miss
+// filter then made current, so the parts' lookups only read. False: the fork
+// is refused, and the next draw's lookup drops it in order.
+bool twins_settled_locked();
 bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
 // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies
 // write; 3 the GPU particles' buffers alone (BBHOST_PARTICLE_TWINS: on a
@@ -1143,6 +1196,175 @@ std::string untile_gpu_report();
 // recording); `loc` keeps the import otherwise. A write over a range makes the
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
+// The lite path instead, on an integrated GPU with room (BBHOST_SHADOW_LITE):
+// no mirrors, and vertex data a Map handed out lately copied as its draws record.
+bool shadow_lite_on();
+// BBHOST_RUN_BATCH: the draw draw_impl is resolving (its number on this
+// thread, 0 outside one): the lite path drains GX's notices once for it, at
+// its first vertex record, instead of at each.
+extern thread_local constinit std::uint64_t t_lite_draw;
+// BBHOST_RUN_COMMIT: GX's Map notices drained once for a run's parts at its
+// fork (the lite shadow's drain, which its draws then skip).
+void shadow_lite_drain_locked();
+// And GX's texture notices (textures.cpp), which refresh_surface_locked drains
+// in order and a run part's draw does not.
+void textures_drain_gx_writes_locked();
+// BBHOST_RUN_COMMIT=compare: the ring vertex records are copied into as their
+// draws record (its places differ between two commits of one draw).
+VkBuffer shadow_snap_buffer();
+
+// BBHOST_DRAW_CONTEXT=chunks (docs/list-resolve.md, committing per run, step
+// 1): a draw takes its rings' space from chunks a context owns, the way a
+// worker committing part of a run will - the GX ring's tables (gx_ring_place),
+// the constant-buffer copies' ring with its snapshot memo
+// (resolve_stage_buffers) and the vertex copies' ring (buffer_shadow.cpp
+// snap_copy_locked) - each chunk taken from its ring as that ring's own
+// allocation would take it, and dropped when the recording it was taken for is
+// submitted. Off (the default) nothing goes through one.
+struct DrawCtx {
+    std::uint64_t flushes = ~0ull;             // the recording (g.flushes) the chunks were taken for
+    std::uint64_t gx_next = 0, gx_end = 0;     // the GX ring's chunk: addresses
+    VkDeviceSize cb_next = 0, cb_end = 0;      // the constant-buffer copies' ring's chunk: offsets
+    VkDeviceSize snap_next = 0, snap_end = 0;  // the vertex copies' ring's chunk
+    // The constant-buffer snapshots this context made in the recording: a
+    // buffer snapshotted again binds its copy (resolve_stage_buffers' memo).
+    struct CbMemo {
+        std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
+    };
+    static constexpr std::size_t kCbMemo = 256;
+    CbMemo cb_memo[kCbMemo];
+    CbMemo& cb_memo_for(std::uint64_t base) { return cb_memo[((base >> 4) ^ (base >> 14)) & (kCbMemo - 1)]; }
+    // A new recording: the chunks are its predecessor's.
+    void take_recording(std::uint64_t now) {
+        if (flushes == now) return;
+        flushes = now;
+        gx_next = gx_end = 0;
+        cb_next = cb_end = 0;
+        snap_next = snap_end = 0;
+    }
+};
+// The context draw_impl allocates through (null outside one, and with the
+// switch off).
+extern thread_local constinit DrawCtx* t_draw_ctx;
+inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::commit_draws() ? t_draw_ctx : nullptr; }
+// BBHOST_RUN_COMMIT=compare (render.cpp run_commit): what a draw resolved -
+// what it binds and draws - as it would be the same committed in a part or in
+// order: what lives in the rings it copies into (whose places differ) by the
+// guest memory it came from, and its params blocks with their ring addresses
+// left out. Filled as draw_impl records the draw.
+struct RunDigest {
+    bool done = false;  // it reached its draw call
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {};
+    VkViewport vp{};
+    VkRect2D sc{};
+    float bounds[2] = {};
+    std::uint32_t stencil[6] = {};
+    float blend[4] = {};
+    VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_offset = 0;
+    std::uint32_t index_type = 0;
+    std::uint32_t call_kind = 0, count = 0, instances = 0;
+    std::int32_t vertex_offset = 0;
+    std::uint64_t vertex = 0;      // its vertex input: each binding's guest address and stride
+    std::uint64_t params[2] = {};  // each stage's params block
+    std::uint64_t buffers = 0;     // its constant buffers: each binding's guest base, size and outcome
+    std::uint64_t first[6][3] = {};  // the first bindings' (base, size, outcome), for the log
+    std::uint32_t nbuffers = 0;
+    std::uint32_t user[2][16] = {};  // each stage's user data as its params block had it, for the log
+};
+extern thread_local constinit RunDigest t_run_digest;  // the drawing thread's last draw's
+
+// BBHOST_RUN_COMMIT=on (render.cpp run_commit): a draw of a forked run - one
+// a run worker (or the command processor, in its own part) commits off the
+// order, or one the command processor commits in order at the join after a
+// part stopped before it - and what the fork reserved for it. Null outside one.
+// A draw in a part (`part`) takes its params slots from its own reservation and
+// fills its own packet, and stops - before any shared side effect - wherever
+// draw_impl would change what other draws share; the command processor then
+// commits it and the rest of its part itself, in order, at the join.
+struct RunDraw {
+    std::uint32_t params_next = 0, params_end = 0;  // the params slots reserved for it (alloc_params_slot_locked)
+    std::uint64_t packet = 0;                        // its packet's number (DrawCmds::start_reserved)
+    std::uint64_t record = 0;                        // its draw record's number (g_draw_recs), with records on
+    bool part = false;                               // committed in a part, off the order
+    bool started = false;                            // its packet was started (a draw that ends before has none)
+    int stop = -1;                                   // why a part stopped at it (render.cpp RunStop), -1: it did not
+    int part_index = 0;                              // its part (the join's per-part notes)
+    std::uint32_t effects = 0;                       // committed in order: the stops a part would have met in it (bit RunStop)
+    bool fresh_packet = false;                       // compare mode's commit in order: a packet of its own, not the reserved one
+    RunDigest digest;                                // compare mode: what it resolved in its part
+    // What its commit leaves for the join to add where the draws share it: the
+    // pipeline it bound (its draw counts) and the vertex-shader census.
+    void* drew = nullptr;
+    bool drew_gx = false;
+    const std::string* vs_other = nullptr;
+    int vs_other_why = 0;
+};
+extern thread_local constinit RunDraw* t_run_draw;
+// The most parts a run is split into: the command processor's and a run
+// worker's each (BBHOST_RUN_COMMIT_THREADS, at most 16).
+constexpr int kRunMostParts = 17;
+// Why a run part stopped at a draw (RunDraw::stop): where draw_impl would
+// have changed what other draws share, or done something in its order.
+enum RunStop : int {
+    kRunStopParams,     // more params slots than reserved for it
+    kRunStopTargets,    // its targets' inputs differ from the run's first draw's
+    kRunStopTables,     // the page tables to rebuild, particle arguments to make
+    kRunStopProgram,    // a program, fetch shader, translation or stage plan not made yet, or a lazy field unset
+    kRunStopPipeline,   // its pipeline not made, still building, or a variant to queue or create
+    kRunStopImages,     // a texture view or sampler not made yet, a region copy
+    kRunStopBuffers,    // a constant buffer read through the page table, a vertex record in no import
+    kRunStopRefresh,    // a texture not kept fresh in this recording yet (its refresh, maybe an upload)
+    kRunStopStore,      // a binding the shader stores to
+    kRunStopRing,       // a copy ring's chunk past its lap's segments (a wrap, or a segment whose recording is running)
+    kRunStopSets,       // a descriptor set the cache does not hold, or a bindless slot to take
+    kRunStopOrder,      // copies to put in place, owed clears, a hazard's barrier, a query, a pass to change
+    kRunStopIndex,      // its indices not where the mirrors or the imports already hold them
+    kRunStopMirror,     // a mirror's page to copy, its window or the mirror to make, a GX buffer's copy to place, a record to stage
+    kRunStopRare,       // anything else off the common path (a table rebuild, a census, a first bind)
+    kRunStops
+};
+// In a run part's draw: stops it for `why` and says so. In a forked run's
+// draw committed in order: notes `why` among its effects (what a part would
+// have stopped at) and goes on. Outside both: false.
+inline bool run_part_stop(int why) {
+    if (!list_resolve::commit_draws()) return false;  // (no thread-local read with it off)
+    RunDraw* const r = t_run_draw;
+    if (!r) return false;
+    if (!r->part) {
+        r->effects |= 1u << why;
+        return false;
+    }
+    if (r->stop < 0) r->stop = why;
+    return true;
+}
+// The stops whose work, done in order, changes what no other draw is answered:
+// a cache filled (programs, translations, plans, input layouts), a texture
+// refreshed (only draws that sample it, which stop there too, read what it
+// uploads), a copy ring's segment waited for, a params slot past the
+// reservation, a copy into device memory made before the recording's draws
+// (a mirror's page, a GX buffer's copy: a draw that reads it stops there too).
+// After one of those the run's later parts stand.
+constexpr std::uint32_t kRunLocalStops =
+    1u << kRunStopParams | 1u << kRunStopProgram | 1u << kRunStopRefresh | 1u << kRunStopRing | 1u << kRunStopMirror;
+inline bool run_part() {
+    if (!list_resolve::commit_draws()) return false;
+    const RunDraw* const r = t_run_draw;
+    return r && r->part;
+}
+// A run part's draw that has stopped (its first stop kept).
+inline bool run_part_stopped() {
+    if (!list_resolve::commit_draws()) return false;
+    const RunDraw* const r = t_run_draw;
+    return r && r->part && r->stop >= 0;
+}
+// The copy rings' chunks a run part's draws take (the constant buffers' in
+// render.cpp resolve_stage_buffers, the vertex records' in buffer_shadow.cpp
+// snap_ring_take_locked) are taken under this lock, and only inside the
+// segments the ring's lap already holds for the open recording: a wrap round
+// the ring or a new segment, which may wait for the GPU, stops the draw.
+extern HostLock g_part_ring_mu;
 // Whether the shadow reads told pages in place (BBHOST_SHADOW_IN_PLACE and,
 // with window imports, BBHOST_SHADOW_IN_PLACE_WINDOWS): only once the device
 // is made, which it is decided by.
@@ -1166,6 +1388,10 @@ enum : std::uint8_t {
     kLocWhys
 };
 std::uint8_t shadow_locate_why();
+// Counts a range bound in place that shadow_locate_locked was not asked
+// about again (plan_vertex_input: its mirror question answered kLocInPlace
+// for the same range in the same draw).
+void shadow_count_placed_bind();
 // GX's hand-outs over [va]: bit k when a hand-out of kind k was ever over
 // its 4 KiB page - 0 Maps' renamed copies, 1 the upload pool's blocks, 2 ring
 // allocations, 3 YEBIS's renames (1-3 with BBHOST_RESOURCE_CENSUS=1) - and
@@ -1262,6 +1488,13 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot);
 // Whether a loading screen is up (host_gpu_set_loading).
 bool loading_screen_now();
 std::string shadow_report();
+// The memory keeper (gpu.cpp start_memory_reserve) runs: the mirrors' memory
+// is made on its thread from now on (shadow_keeper_work, each of its turns),
+// unless BBHOST_SHADOW_ASYNC=0.
+void shadow_keeper_started();
+void shadow_keeper_work();
+// Wakes the memory keeper for a turn now (gpu.cpp).
+void keeper_wake();
 // What the mirrors hold, for the video memory report: whole mirrors (a guest
 // chunk each, where there is no sparse binding) and sparse 64 MiB blocks, and
 // how much of either holds a page copy; the share (cap, 0 with the live
@@ -1515,7 +1748,7 @@ struct DrawRec {
     std::uint32_t dummies;  // images it read that resolved to nothing (a dummy bound instead)
 };
 // Dummy images bound since the draw being recorded began (render.cpp).
-extern std::uint32_t g_draw_dummies;
+extern thread_local constinit std::uint32_t g_draw_dummies;  // the drawing thread's
 // ~8 world frames: the glitch hunt compares a frame's draws with its
 // neighbours' a few flips after they were recorded.
 constexpr std::size_t kDrawRecs = 16384;
@@ -1606,6 +1839,11 @@ void occlusion_device_features(VkPhysicalDeviceFeatures& enable, std::vector<con
 void occlusion_device_ready_locked();     // after the slots are made
 void occlusion_begin_recording_locked();  // a recording's first commands
 bool occlusion_draw_entry();              // host_gpu_draw's start: false when SET_PREDICATION culls the draw
+// BBHOST_RUN_COMMIT (render.cpp run_commit): whether a run's parts may commit
+// draws - no query interval open, no predication that skips draws - and the
+// draws they committed, counted as issued at the join (occlusion_draw_entry's).
+bool occlusion_run_ok();
+void occlusion_run_issued(std::uint64_t n);
 void occlusion_draw_locked(DrawCall& call);
 void occlusion_submit_locked();  // before the submission's label writes
 void occlusion_record_cond(VkCommandBuffer cmd, const DrawCall& call, bool begin);
@@ -1751,7 +1989,7 @@ void textures_report();
 // What is resolving textures on this thread (a draw token's kind, "dispatch",
 // "upload token", ...), for the census of surfaces no GX resource covers;
 // set for a scope by ResolveKind (textures.cpp defines it).
-extern thread_local const char* t_resolve_kind;
+extern thread_local constinit const char* t_resolve_kind;
 // The host image of one GX resource (engine/gx_resources.h: its memory and
 // generation), a render target's, a copy's snapshot's or a texture surface's:
 // what a copy between resources can copy image to image. False when the host
@@ -2116,7 +2354,7 @@ extern std::atomic<std::uint64_t> g_validation_messages;  // gpu.cpp: what BBHOS
 // ValidationScope lives. Both cost a branch with the layer off.
 bool validation_on();
 void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name);
-extern thread_local const char* t_validation_scope;
+extern thread_local constinit const char* t_validation_scope;
 struct ValidationScope {
     const char* prev;
     explicit ValidationScope(const char* what) : prev(t_validation_scope) { t_validation_scope = what; }
@@ -2236,6 +2474,11 @@ public:
     // The packet, when `deferred` and the recorder is on. One started earlier
     // is kept, or handed to the recorder when `deferred` is false.
     void start(bool deferred);
+    // BBHOST_RUN_COMMIT: the packet numbered `number`, reserved at a run's fork
+    // (recorder_reserve_packets). In a part (`part`) it stays out of the
+    // stream when published - the command processor appends it in its order
+    // at the join (recorder_append_packet) - and never becomes the open draw.
+    void start_reserved(std::uint64_t number, bool part);
     DrawCmds(const DrawCmds&) = delete;
     DrawCmds& operator=(const DrawCmds&) = delete;
     bool deferred() const { return packet_ != nullptr; }
@@ -2299,7 +2542,17 @@ public:
 
 private:
     void* packet_ = nullptr;
+    bool part_ = false;  // a run part's packet (start_reserved)
 };
+// BBHOST_RUN_COMMIT (recorder.cpp): whether draws are recorded on the
+// recorder's thread (the forks need it); `n` packet numbers reserved for a
+// run, waiting for the recorder while its ring has no room for them (under
+// g.mu, nothing open), the first returned; a reserved packet's draw appended
+// to the stream in its order at the join; and the appended ops handed over.
+bool recorder_threaded();
+std::uint64_t recorder_reserve_packets(std::uint32_t n);
+void recorder_append_packet(std::uint64_t number);
+void recorder_publish_appended();
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it
 // with the pass end before it. Null outside a draw, or when it records in place.

@@ -226,7 +226,8 @@ Buffers buffers_mode() {
     // before the game runs - and said once.
     static const Buffers mode = [] {
         if (g_flags.given) return g_flags.mode;
-        const BuffersDevice d = host_gpu_integrated()     ? BuffersDevice::kIntegrated
+        const BuffersDevice d = host_gpu_integrated()     ? (host_gpu_integrated_with_room() && !host_gpu_memory_tight() ? BuffersDevice::kIntegratedRoomy
+                                                                                                                 : BuffersDevice::kIntegrated)
                                 : host_gpu_memory_tight() ? BuffersDevice::kTight
                                 : host_gpu_small_vram()   ? BuffersDevice::kSmallVram
                                                           : BuffersDevice::kRoomy;
@@ -238,7 +239,8 @@ Buffers buffers_mode() {
             host_log("gxvk: GX's buffers on today's path: %s, whose draws read them where they are (BBHOST_GXVK_BUFFERS=1 binds them by handle)",
                      d == BuffersDevice::kIntegrated ? "an integrated GPU" : "tight memory");
         else
-            host_log("gxvk: GX's buffers bound by handle (BBHOST_GXVK_BUFFERS=0: today's path)");
+            host_log("gxvk: GX's buffers bound by handle%s (BBHOST_GXVK_BUFFERS=0: today's path)",
+                     d == BuffersDevice::kIntegratedRoomy ? ", from their copies in an integrated GPU's video memory" : "");
         return m;
     }();
     return mode;

@@ -172,6 +172,11 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         if (it != kv.end()) c->setup_always = it->second == "true" || it->second == "1";
     }
     {
+        auto it = kv.find("startup.setup_animations");
+        if (it != kv.end()) c->setup_animations = it->second == "true" || it->second == "1";
+    }
+    num("startup.setup_text_size", &c->setup_text_size);
+    {
         auto it = kv.find("debug.tooling");
         if (it != kv.end()) c->tooling = it->second == "true" || it->second == "1";
     }
@@ -201,6 +206,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         auto it = kv.find("world.five_players");
         if (it != kv.end()) c->five_players = it->second == "true" || it->second == "1";
     }
+    {
+        auto it = kv.find("world.skill_issue");
+        if (it != kv.end()) c->skill_issue = it->second == "true" || it->second == "1";
+    }
     // Every [keys] entry, whatever it is called: the action names live in
     // window.cpp beside the defaults, and an unknown one is reported there
     // rather than silently dropped here.
@@ -218,6 +227,7 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
 }
 
 std::map<std::string, std::string> g_values;  // the config file's raw values, for config_value
+std::string g_save_file;  // where settings are saved (config_user_file), once the config is loaded
 
 std::string exe_dir() {
 #if defined(_WIN32)
@@ -608,11 +618,12 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     }
     // The configuration in layers, each overriding only what it sets:
     //   the per-user bbhost.toml (config_user_dir: what a player sets once),
-    //   a bbhost.toml in the working directory or beside the exe (a
-    //   developer's tree, an older package), then --config (a package's own
-    //   settings, as the playtest kit's dev server). A user config that does
-    //   not exist yet is imported from the second when that names the game,
-    //   and one that does is given the keys bbhost has since come to expect.
+    //   a bbhost.toml beside the exe or in the working directory (a copy of
+    //   bbhost kept with its own settings, a developer's tree), then --config
+    //   (a package's own settings, as the playtest kit's dev server). A user
+    //   config that does not exist yet is imported from the second when that
+    //   names the game, and one that does is given the keys bbhost has since
+    //   come to expect.
     const std::string user_cfg = user_config_dir() + "/bbhost.toml";
     make_dirs(user_config_dir());  // where the F10 settings are saved, whatever else exists
     std::string local_cfg;
@@ -622,12 +633,19 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         std::error_code ec;
         cwd = std::filesystem::current_path(ec).generic_string();
     }
-    for (const std::string& cand : {cwd.empty() ? std::string("bbhost.toml") : cwd + "/bbhost.toml", exe_dir() + "/bbhost.toml"}) {
+    // Beside the exe first: the folder this copy of bbhost runs from.
+    for (const std::string& cand : {exe_dir() + "/bbhost.toml", cwd.empty() ? std::string("bbhost.toml") : cwd + "/bbhost.toml"}) {
         if (file_exists(cand) && cand != user_cfg) {
             local_cfg = cand;
             break;
         }
     }
+    // Where settings are saved (config_user_file): that local bbhost.toml when
+    // there is one - it is read after the per-user one and has the last word,
+    // so a change saved under it was overridden at the next start - else the
+    // per-user one. Not with a --config profile, whose settings stay its own,
+    // or BBHOST_CONFIG_DIR (a test's folder of its own).
+    g_save_file = !local_cfg.empty() && explicit_cfg.empty() && env_dir("BBHOST_CONFIG_DIR").empty() ? local_cfg : user_cfg;
     if (!file_exists(user_cfg) && !local_cfg.empty()) import_legacy(local_cfg, user_cfg);
     // An older playtest kit kept the game's paths in its --config file: those
     // (only those) carry over too.
@@ -688,8 +706,9 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
 #endif
     apply_values(merged, &c);
     g_values = merged;
-    // The file a player edits: the user config, once there is one.
-    c.config_path = file_exists(user_cfg) ? user_cfg : !explicit_cfg.empty() ? explicit_cfg : local_cfg;
+    // The file a player edits: the one settings are saved to - the local one
+    // when there is one, else the user config once there is one.
+    c.config_path = g_save_file != user_cfg ? g_save_file : file_exists(user_cfg) ? user_cfg : !explicit_cfg.empty() ? explicit_cfg : local_cfg;
     c.config_layers = layers;
     if (!explicit_cfg.empty()) {
         // A --config is a profile (the playtest kit's dev server, a second
@@ -782,6 +801,10 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (const char* e = std::getenv("BBHOST_FIVE_PLAYERS")) {
         if (std::strcmp(e, "1") == 0) c.five_players = true;
         else if (std::strcmp(e, "0") == 0) c.five_players = false;
+    }
+    if (const char* e = std::getenv("BBHOST_SKILL_ISSUE")) {
+        if (std::strcmp(e, "1") == 0) c.skill_issue = true;
+        else if (std::strcmp(e, "0") == 0) c.skill_issue = false;
     }
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
@@ -891,7 +914,7 @@ std::string config_eboot_help(const HostConfig& c, const std::string& sha256, co
 
 void config_set_skip_intro(bool on) { g_cfg.skip_intro = on; }
 
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players) {
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue) {
     const auto set = [](bool* field, bool on, const char* env) {
         const char* e = std::getenv(env);
         if (e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0)) return;  // the environment's, kept
@@ -900,6 +923,7 @@ void config_set_enhancements(bool change_appearance, bool rebirth, bool five_pla
     set(&g_cfg.change_appearance, change_appearance, "BBHOST_CHANGE_APPEARANCE");
     set(&g_cfg.rebirth, rebirth, "BBHOST_REBIRTH");
     set(&g_cfg.five_players, five_players, "BBHOST_FIVE_PLAYERS");
+    set(&g_cfg.skill_issue, skill_issue, "BBHOST_SKILL_ISSUE");
 }
 
 void config_set_online(const std::string& host, const std::string& scheme, bool verify_tls, bool require_account,
@@ -1067,14 +1091,15 @@ bool config_write_template(const std::string& path) {
            "# back = \"Backspace\"               # menus: Return, the same bit as `interact`\n"
            "\n[startup]\n"
            "# Skip the three company logos and the Exit Game warning (Bloodborne 1.09 only).\n"
-           "skip_intro = false\n"
+           "skip_intro = true\n"
            "";
     return true;
 }
 
 std::string config_exe_dir() { return exe_dir(); }
 std::string config_user_dir() { return user_config_dir(); }
-std::string config_user_file() { return user_config_dir() + "/bbhost.toml"; }
+std::string config_user_file() { return g_save_file.empty() ? user_config_dir() + "/bbhost.toml" : g_save_file; }
+bool config_saves_locally() { return !g_save_file.empty() && g_save_file != user_config_dir() + "/bbhost.toml"; }
 std::string config_default_data_dir() { return user_data_dir(); }
 
 bool config_set_values(const std::string& path, const std::vector<ConfigEdit>& edits) {

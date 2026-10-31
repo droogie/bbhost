@@ -7,6 +7,7 @@
 #include "host/apu_memory.h"
 #include "host/heap_compact.h"
 #include "host/heap_place.h"
+#include "host/list_resolve.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -64,7 +65,7 @@ namespace gpu {
 
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
-thread_local const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
+thread_local constinit const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -976,7 +977,7 @@ void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t 
 }
 }  // namespace
 
-thread_local const char* t_validation_scope = nullptr;
+thread_local constinit const char* t_validation_scope = nullptr;
 bool validation_on() { return g_validate; }
 void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name) {
     if (!g_validate || !g_set_object_name || !handle || !name || !g.device) return;
@@ -1255,6 +1256,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
         const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
         if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
         if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
+        if (run_part_stop(kRunStopIndex)) return nullptr;  // imported in order (BBHOST_RUN_COMMIT)
         const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
         const std::uint64_t lo = std::max(d.span_lo, static_cast<std::uint64_t>(w0) << kImportWindowShift);
         const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
@@ -1295,6 +1297,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
     if (in < d.span_lo || in >= reach || bytes > reach - in) return nullptr;  // not GPU-visible: the sink
+    if (run_part_stop(kRunStopIndex)) return nullptr;  // imported in order (BBHOST_RUN_COMMIT)
     constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
     std::uint64_t lo = std::max(d.span_lo, in & ~(kWindow - 1));
     std::uint64_t hi = std::min(reach, ((in + bytes - 1) | (kWindow - 1)) + 1);
@@ -2308,6 +2311,9 @@ bool rebuild_page_tables() {
     if (gen == seen_gen) {
         return true;
     }
+    // A run part's draw (BBHOST_RUN_COMMIT): rebuilt in order, by the command
+    // processor's commit of it.
+    if (run_part_stop(kRunStopTables)) return false;
     seen_gen = gen;
     std::vector<GuestMapInfo> maps;
     hle_kernel_snapshot_maps(maps);
@@ -2944,6 +2950,11 @@ bool small_vram(const Candidate& c) {
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
 std::atomic<int> g_integrated{-1};  // whether the device run on is an integrated GPU, -1 until known
+// And whether, integrated, it has 8 GiB of video memory or more (a Strix
+// Halo's carve-out; buffer_shadow.cpp integrated_with_room asks the same of
+// the device made), -1 until known.
+std::atomic<int> g_integrated_room{-1};
+bool integrated_room(const Candidate& c) { return c.type_rank == 3 && c.local >= (8ull << 30); }
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
@@ -3099,6 +3110,9 @@ bool init_locked() {
         if (g_integrated.exchange(g.integrated ? 1 : 0) == (g.integrated ? 0 : 1))
             host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
                      g.integrated ? "an integrated GPU" : "not an integrated GPU");
+        if (const bool room = integrated_room(c); g_integrated_room.exchange(room ? 1 : 0) == (room ? 0 : 1))
+            host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
+                     room ? "an integrated GPU with room" : "not an integrated GPU with room");
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -4207,7 +4221,21 @@ void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
 }
 
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
-    const std::uint32_t slot = g.queued++;
+    if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutParams);  // BBHOST_DRAW_CONTEXT's census
+    std::uint32_t slot;
+    if (RunDraw* const r = t_run_draw; r && r->part) {
+        // A run part's draw: from its reservation. One past it stops the draw
+        // (render.cpp kRunStopParams), which is then committed again in order:
+        // the block goes over its own last slot meanwhile.
+        if (r->params_next == r->params_end) {
+            if (r->stop < 0) r->stop = kRunStopParams;
+            slot = r->params_end - 1;
+        } else {
+            slot = r->params_next++;
+        }
+    } else {
+        slot = g.queued++;
+    }
     const std::uint32_t index = static_cast<std::uint32_t>(g.slot) * kMaxQueued * kStageSlots + slot;
     put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(index) * kParamsStride, params);
     out = {g.ubo, static_cast<VkDeviceSize>(index) * kParamsStride, sizeof(gcn::StageParams)};
@@ -4223,6 +4251,7 @@ void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescript
 // The spares go with the pool's reset (retire_slot_locked); the pool has room
 // for them (kSpareSets).
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout) {
+    if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutSets);  // BBHOST_DRAW_CONTEXT's census
     if (!layout) layout = g.set_layout;
     auto& spares = g.slots[g.slot].spare_sets;
     std::vector<VkDescriptorSet>* list = nullptr;
@@ -7507,6 +7536,7 @@ std::atomic<bool> g_loading_screen{false};
 bool loading_screen_now() { return g_loading_screen.load(std::memory_order_relaxed); }
 std::mutex g_keeper_mu;
 std::condition_variable g_keeper_cv;
+void keeper_wake() { g_keeper_cv.notify_one(); }
 
 void start_memory_reserve() {
     const auto env = [](const char* name, std::uint64_t fallback) {
@@ -7626,6 +7656,7 @@ void start_memory_reserve() {
                  staging_return ? ", given back to the start's in play (BBHOST_STAGING_RETURN, gpu.staging_return)"
                                 : ", kept in play (BBHOST_STAGING_RETURN=1 or gpu.staging_return = true gives it back)");
         make_staging(floor);
+        shadow_keeper_started();
         // One piece of memory goes back at a time, two seconds apart: freeing
         // half a gigabyte of upload staging in one go (eight vkFreeMemory of
         // pinned, mapped memory) stalled the frames behind it ~100 ms in every
@@ -7643,6 +7674,7 @@ void start_memory_reserve() {
                 std::unique_lock<std::mutex> lk(g_keeper_mu);
                 g_keeper_cv.wait_for(lk, std::chrono::milliseconds(250));
             }
+            shadow_keeper_work();  // the buffer shadow's mirrors, windows and spare block
             if (type == UINT32_MAX) type = find_type();
             const bool loading = g_loading_screen.load(std::memory_order_relaxed);
             const auto now = std::chrono::steady_clock::now();
@@ -8291,7 +8323,7 @@ namespace {
 void probe_before_device() {
     static std::once_flag once;
     std::call_once(once, [] {
-        bool tight = false, small = false, integrated = false;
+        bool tight = false, small = false, integrated = false, room = false;
         if (g_enabled) {
             obs_capture_policy();  // before the first instance, this one
             VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -8308,6 +8340,7 @@ void probe_before_device() {
                     tight = memory_tight(c);
                     small = small_vram(c);
                     integrated = c.type_rank == 3;
+                    room = integrated_room(c);
                 }
                 vkDestroyInstance(instance, nullptr);
             }
@@ -8318,6 +8351,8 @@ void probe_before_device() {
         g_small.compare_exchange_strong(unknown, small ? 1 : 0);
         unknown = -1;
         g_integrated.compare_exchange_strong(unknown, integrated ? 1 : 0);
+        unknown = -1;
+        g_integrated_room.compare_exchange_strong(unknown, room ? 1 : 0);
     });
 }
 }  // namespace
@@ -8338,6 +8373,12 @@ bool host_gpu_integrated() {
     if (const int i = g_integrated.load(); i >= 0) return i == 1;
     probe_before_device();
     return g_integrated.load() == 1;
+}
+
+bool host_gpu_integrated_with_room() {
+    if (const int r = g_integrated_room.load(); r >= 0) return r == 1;
+    probe_before_device();
+    return g_integrated_room.load() == 1;
 }
 
 bool host_gpu_available() {
@@ -10131,8 +10172,12 @@ std::uint64_t g_twin_filter_misses = 0, g_twin_filter_checked = 0, g_twin_filter
 // [va, va + bytes) meets no live twin and no armed range (bytes > 0).
 bool twin_filter_misses_locked(std::uint64_t va, std::uint64_t bytes) {
     if (g_twin_fast_miss == kFastMissOff) return false;
-    g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
+    // A run part's draw (BBHOST_RUN_COMMIT): the filter made current at the
+    // fork (twins_settled_locked), and nothing counted.
+    const bool part = run_part();
+    if (!part) g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
     if (g_twin_filter.meets(va, bytes)) return false;
+    if (part) return true;
     ++g_twin_filter_misses;
     if (g_twin_fast_miss == kFastMissCheck) {
         ++g_twin_filter_checked;
@@ -10150,6 +10195,12 @@ bool twin_filter_misses_locked(std::uint64_t va, std::uint64_t bytes) {
 }  // namespace
 
 bool twins_on() { return g_twins.load(std::memory_order_relaxed) != 0; }
+bool twins_settled_locked() {
+    if (!g_twins) return true;
+    if (twins_drop_pending_locked()) return false;
+    if (g_twin_fast_miss != kFastMissOff) g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
+    return true;
+}
 bool import_census_on() { return g_census; }
 int twins_level() { return g_twins.load(std::memory_order_relaxed); }
 
@@ -10197,10 +10248,16 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
     // Level 3 (the particle twins), no drop pending: a range that meets no live
     // twin and no armed range is refused below by the armed filter, after both
-    // walks - answered here from the filter instead.
-    if (g_twins.load(std::memory_order_relaxed) == 3 && !twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;
-    twins_drain_gone_locked();
-    twins_drop_cpu_mapped_locked();
+    // walks - answered here from the filter instead. A run part's draw
+    // (BBHOST_RUN_COMMIT) owes no drop: the fork settled them, and one owed
+    // since is for a buffer let go after this run was submitted.
+    const bool part = run_part();
+    if (g_twins.load(std::memory_order_relaxed) == 3 && (part || !twins_drop_pending_locked()) && twin_filter_misses_locked(va, bytes))
+        return false;
+    if (!part) {
+        twins_drain_gone_locked();
+        twins_drop_cpu_mapped_locked();
+    }
     // Inside a live twin (the common case): served without the candidates'
     // lock or the registry - a twin lives until its buffer is gone, let go or
     // mapped in place by the CPU, which drop it.
@@ -10221,6 +10278,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
         }
     }
     if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;
+    // A candidate's twin made, let go or dropped, a pass ended: in order.
+    if (run_part_stop(kRunStopBuffers)) return false;
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -10357,11 +10416,14 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
-    if (!twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
+    const bool part = run_part();  // (BBHOST_RUN_COMMIT: as twin_locate_locked)
+    if ((part || !twins_drop_pending_locked()) && twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
     // A twin whose buffer died is dropped first (its memory may be a CPU ring
     // now, which must keep its copies): the registry tells (twins_buffer_gone).
-    twins_drain_gone_locked();
-    twins_drop_cpu_mapped_locked();
+    if (!part) {
+        twins_drain_gone_locked();
+        twins_drop_cpu_mapped_locked();
+    }
     auto it = g_twin_live.upper_bound(va);
     const bool any = (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) ||
                      (it != g_twin_live.end() && it->first < va + bytes);

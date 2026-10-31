@@ -7,14 +7,20 @@
 # 1920x1080, and the scene context's flag at +0x2a10 set
 # (`mov byte [rbx+0x2a10], 0` at 0x26c2657, its immediate at 0x26c265d). The
 # same words as low-res-aux-targets and Enable Screen Space Reflections, which
-# step aside for this one, as it comes after them in the list.
+# step aside for this one, as it comes after them in the list. The
+# shadPS4 list's version (2026-10-28) also sets Increased Graphics Heap
+# Sizes' two words, left out: bbhost grows that heap itself for the render
+# size (engine/live_resolution.cpp, grow_gfx_heap). The targets' sizes are
+# taken as they are made: on or off applies at the next start.
 [patch]
 name = "hd-motion-blur-4k"
+title = "HD Motion Blur 4K (3840x2160)"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "HD Motion Blur 4K (3840x2160) - Kyo's patch"
 enabled = false
-order = 186
 group = "hd-motion-blur"
+order = 840
+live = false
 
 # mov eax, 3840
 [site.scene-half-width]

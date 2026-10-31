@@ -899,8 +899,8 @@ thread_local unsigned t_records_cached = 0;
 // gate at 60 fps: the GX workers 7-9 points of a core busier together for it,
 // and nothing gained - a paced frame does not wait for the command processor.
 // So by default it packs only where the command processor limits the frame
-// rate: Uncapped, 90 and 120 (the game's pace, hle_video_game_pace, chosen
-// before the trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
+// rate: above 60 (the game's pace, hle_video_game_pace, chosen before the
+// trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
 int g_packed_records = 0;
 // The set a GX thread snapshots a draw into before packing it: the same set
 // draw after draw, so in its caches, where a pooled set comes back cold.
@@ -6702,9 +6702,9 @@ void hle_gx_trace_arm(GuestMemory* mem) {
             host_log("gx-native: a draw's records %s (BBHOST_GX_PACKED_RECORDS=%d)", g_packed_records ? "packed at the call" : "handed over as the sparse set",
                      g_packed_records);
         } else if (g_packed_records) {
-            host_log("gx-native: a draw's records packed at the call: the game runs %s, where the command processor limits the frame rate "
-                     "(BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
-                     pace ? (pace == 90 ? "at 90" : "at 120") : "uncapped");
+            host_log("gx-native: a draw's records packed at the call: the game runs at %d, where the command processor limits the frame "
+                     "rate (BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
+                     pace);
         } else {
             host_log("gx-native: a draw's records handed over as the sparse set: the game is paced at %d, where packing costs the GX threads "
                      "more than it saves the command processor (BBHOST_GX_PACKED_RECORDS=1: packed)",
@@ -8247,6 +8247,37 @@ void hle_gx_native_prefetch(std::uint64_t id, bool next) {
         for (const GxStageRecords& s : rec->stage) __builtin_prefetch(&s);  // the headers the bit masks below are read from
         prefetch_records(*rec);
     }
+}
+
+const GpuDrawInputs* hle_gx_native_peek(std::uint64_t id, const GxDrawObjects** objects) {
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return nullptr;
+    if (objects) *objects = &slot.draw.objects;
+    return &slot.draw.in;
+}
+
+bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs& in, GxDrawObjects& objects) {
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return false;
+    const NativeDraw& draw = slot.draw;
+    in = draw.in;
+    objects = draw.objects;
+    // As hle_gx_native_token sets them at the take.
+    if (g_packed_records == 1 && draw.records) {
+        objects.records = unpack_records(draw.records.get());
+    } else if (g_packed_records == 2 && draw.records && draw.packed) {
+        objects.records = unpack_records(draw.packed.get());
+    } else {
+        objects.records = draw.records.get();
+    }
+    if (g_token_user_data_register) {
+        std::memcpy(in.vs_user, &sh[0x4c], sizeof(in.vs_user));
+        std::memcpy(in.ps_user, &sh[0x0c], sizeof(in.ps_user));
+    } else {
+        std::memset(in.vs_user, 0, sizeof(in.vs_user));
+        std::memset(in.ps_user, 0, sizeof(in.ps_user));
+    }
+    return true;
 }
 
 void hle_gx_native_release() {

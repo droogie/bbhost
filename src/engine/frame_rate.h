@@ -2,7 +2,8 @@
 
 #include <string>
 
-// The game's own frame pace: 30, 60, 90, 120 or uncapped.
+// The game's own frame pace: 30, 60, 90, 120, 150, 180, 240, 360, 480, 960 or
+// Uncapped (the display's refresh rate; the options call it Display-Limited).
 //
 // FD4's frame-time manager (0x2434770, called once a frame from the main
 // loop) picks an interval by mode - the int at +8, or +0xc while the one-shot
@@ -13,9 +14,9 @@
 // thread reads ~90% busy at 30 fps while half of that is waiting. Ours
 // replaces it (SprjFlipper::Update, BBHOST_FRAME_SOURCE).
 //
-// The Frame rate option (or BBHOST_GAME_FPS=30/60/90/120/0) when the game starts:
+// The Frame rate option (or BBHOST_GAME_FPS=30/60/.../960/0) when the game starts:
 //  - 30: the game's own.
-//  - 60, 90, 120: mode 2 with a 1/fps target, the game's fixed steps converted
+//  - 60 to 960: mode 2 with a 1/fps target, the game's fixed steps converted
 //    (frame_rate.cpp's tables, from Kyo's FPS++ lists and yogesh1239's high-FPS
 //    fixes, each checked against the eboot): the task step and every step that
 //    used a fixed 1/30 read the measured frame time clamped to [target, 1/30]
@@ -36,15 +37,13 @@
 //    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
-//  - uncapped: the same, with a target of the display's refresh rate with
-//    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
-//    immediates and counts at 120's values. With V-Sync off at the title and
-//    the main menu (no world loaded, no loading screen, not character
-//    creation) there is no target at all: nothing there counts frames, and
-//    what follows the frame's time takes it whole.
-// Above 60 and uncapped flips complete as soon as they are recorded (the game
-// paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,
-// +0x271, +0x272, +0x2c4) are cleared so nothing drops the game back to 30.
+//  - Uncapped: the display's refresh rate when the game starts, to the nearest
+//    whole frame a second (BBHOST_UNCAPPED_FPS=N sets it; 60 with no display),
+//    run as that fixed rate - its target, steps, code immediates and counts,
+//    1/180 s each on a 180 Hz display, V-Sync on or off (engine/uncapped_limit.h).
+// Above 60 flips complete as soon as they are recorded (the game paces itself;
+// hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0, +0x271, +0x272,
+// +0x2c4) are cleared so nothing drops the game back to 30.
 //
 // The choice is made when the game starts: the game's fixed 1/30 s steps are
 // constants in its code, and a rate needs them all changed together.
@@ -56,14 +55,13 @@ struct ElfImage;
 
 void frame_rate_install(ElfImage* image);
 
-// The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
+// The pace the game was started at: 30, or the rate it was converted to (one
+// of the option's, or Uncapped's refresh rate).
 int frame_rate_game_fps();
 
-// The frames a second the pace holds the world to now: the rate the game was
-// started at, or uncapped's limit as its target has it - BBHOST_UNCAPPED_FPS,
-// else the display's refresh rate with V-Sync on (F10 and the PC Settings
-// change V-Sync live), else 240. Any thread. The render queue's cut follows
-// it (decomp/gx/render_queue.cpp).
+// The frames a second the pace holds the world to: the rate the game was
+// started at. Any thread. The render queue's cut follows it
+// (decomp/gx/render_queue.cpp).
 float frame_rate_limit_fps();
 
 // AtkParam_Pc new or reloaded (engine/params.cpp): at a converted rate the

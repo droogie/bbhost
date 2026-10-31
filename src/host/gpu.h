@@ -322,6 +322,9 @@ bool host_gpu_small_vram();
 // Whether the GPU run on is an integrated one (its video memory is the
 // system's RAM). Before the device exists, as host_gpu_memory_tight.
 bool host_gpu_integrated();
+// And, integrated, whether it has 8 GiB of video memory or more (a Strix
+// Halo's carve-out). Before the device exists, as host_gpu_memory_tight.
+bool host_gpu_integrated_with_room();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
@@ -357,6 +360,18 @@ enum GpuDispatchClass : std::uint8_t {
 GpuDispatchClass host_gpu_last_dispatch_class(const char** program = nullptr);
 // Queues one draw.
 bool host_gpu_draw(const GpuDraw& d);
+// BBHOST_RUN_COMMIT=on (host/list_resolve.h): a run's draws after its first,
+// which the command processor has just drawn, committed in parts by the run
+// workers and the command processor and spliced into the stream in their
+// order (render.cpp run_commit). False when the run is not forked - its draws
+// are then drawn as the walk reaches them; true when every one was committed,
+// `failed` counting those host_gpu_draw would have called failed.
+// `ids`: each draw's token, whose draw is prepared from its slot as the walk's
+// take of it would prepare it (hle_gx_native_copy) where it is committed.
+// 1: committed; 0: not, its draws drawn as the walk reaches them; -1: not,
+// because the first draw took no answer a part could share (a tessellated or
+// geometry-shader draw ahead of plain ones): the next draw may start a run.
+int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uint32_t n, std::uint32_t& failed);
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();

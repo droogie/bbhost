@@ -6,6 +6,7 @@ bool host_gpu_available() { return false; }
 bool host_gpu_memory_tight() { return false; }
 bool host_gpu_small_vram() { return false; }
 bool host_gpu_integrated() { return false; }
+bool host_gpu_integrated_with_room() { return false; }
 void host_gpu_queue_lock() {}
 void host_gpu_queue_unlock() {}
 std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*) { return 0; }
@@ -24,6 +25,7 @@ GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
     return kDcNone;
 }
 bool host_gpu_draw(const GpuDraw&) { return false; }
+int host_gpu_run_commit(const GpuDraw*, const std::uint64_t*, std::uint32_t, std::uint32_t&) { return 0; }
 void host_gpu_flush() {}
 void host_gpu_report() {}
 void host_gpu_submit() {}

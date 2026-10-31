@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <mutex>
 #include <thread>
@@ -34,6 +35,10 @@
 #endif
 
 #if defined(BBHOST_HAVE_SDL3)
+#include "host/launcher_ui.h"
+
+#include "imgui.h"
+
 #include <SDL3/SDL.h>
 #endif
 
@@ -88,11 +93,14 @@ enum SettingId {
     kResolution,
     kShaders,
     kSkipLogos,
+    kPerformanceMode,
     kDebugMenu,
     kDebugCamera,
     kChangeAppearance,
     kRebirth,
     kFivePlayers,
+    kSkillIssue,
+    kMenuTextSize,
     kSettingCount,
 };
 
@@ -116,14 +124,14 @@ Setting g_set[kSettingCount] = {
      "Fullscreen is borderless: the desktop resolution, no mode switch.", false},
     {"vsync", "V-Sync", {"On", "Off"}, 0,
      "Off presents as soon as a frame is ready, and can tear.", false},
-    // The game's own pace (engine/frame_rate.h), the same five the game's Frame
-    // Rate pick list offers (engine/option_menu.cpp). The key is the old Frame
-    // cap's, so a file keeps its 30 or 60; a file older than version 3 holds a
-    // cap on presentation, whose 90, 120, 144 and Off ran the game at 60, and
-    // reads as 60 (host_options_load).
-    {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
-     "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
+    // The game's own pace (engine/frame_rate.h), the same eleven the game's
+    // Frame Rate pick list offers (engine/option_menu.cpp). The key is the old
+    // Frame cap's, so a file keeps its 30 or 60; a file older than version 3
+    // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
+    // 60, and reads as 60 (host_options_load).
+    {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
+     "30 is the game's own pace; the others run its logic at that rate. Display-Limited caps it at your monitor's refresh "
+     "rate when the game starts (180 on a 180 Hz monitor) and runs it the same way. Applies on the next run.",
      false},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
@@ -254,11 +262,15 @@ Setting g_set[kSettingCount] = {
     // taken from the cache while the rest compile behind the game; Lifted is
     // the lifter's own SPIR-V alone. The same pictures either way.
     {"shaders", "Shaders", {"HLSL", "Lifted"}, 0,
-     "Requires a restart. HLSL: the game's shaders as HLSL, compiled by DXC on this PC in the background and used from the next start. "
-     "Lifted: the translator's own SPIR-V only.",
+     "Requires a restart. HLSL (recommended) also builds an optimized version of each of the game's shaders in the background "
+     "while you play, used from the next start. Lifted uses bbhost's direct translation only. The picture is the same either way.",
      true},
-    {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
+    {"skip_logos", "Skip company logos", {"Off", "On"}, 1,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
+    // Kyo's Giga Performance Patch's post-effects (engine/patch_manifest.cpp's
+    // performance-mode), and chromatic aberration through its own setting's mask.
+    {"performance_mode", "Performance mode", {"Off", "On"}, 0,
+     "Requires a restart. Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays.", true},
     // The old switch for the developers' debug menu, which the Debug Menu
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
@@ -278,6 +290,17 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.", true},
     {"five_players", "Five players", {"On", "Off"}, 0,
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
+    // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
+    {"skill_issue", "SKILL ISSUE", {"On", "Off"}, 0, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
+     true},
+    // bbhost's own menus - the setup window, F9 and F10 - and everything in
+    // them grow with it (launcher_ui set_scale). 100% is their usual size: the
+    // in-game menus' follows the game's resolution (height / 900), the setup
+    // window's is 1120x720 at Windows' scaling, and grows (host/launcher.cpp).
+    {"menu_text_size", "Menu text size", {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"}, 0,
+     "The text in bbhost's own menus (this one, F9 and the setup window), and the menus with it. 100% is the usual size; "
+     "the setup window grows with it too. A menu larger than the screen scrolls.",
+     false},
 };
 
 const Row g_rows[] = {
@@ -288,6 +311,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
+    {Row::Option, nullptr, kMenuTextSize},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -319,9 +343,10 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
+    {Row::Option, nullptr, kSkillIssue},
     {Row::Header, "STARTUP"},
     {Row::Option, nullptr, kSkipLogos},
-    {Row::Option, nullptr, kDebugCamera},
+    {Row::Option, nullptr, kPerformanceMode},
     // The private server's account. No passwords: link this PC to
     // the account signed into on the website with Discord, or make one held
     // by this PC with a recovery code. The token is kept in the options file.
@@ -345,15 +370,18 @@ const Row g_rows[] = {
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
 
 std::atomic<bool> g_open{false};
-int g_sel = 1;  // the first selectable row
-// Where each row was drawn last frame, so the pointer hit-tests what it sees
-// rather than what the layout would be at some other display size.
-float g_row_y[kRowCount] = {};
-float g_row_h = 0.0f, g_row_x = 0.0f, g_row_w = 0.0f;
-// And where an option row's value was: from just left of its "<" (g_row_vl)
-// to its middle (g_row_vm) is the side a click steps back on.
-float g_row_vl[kRowCount] = {}, g_row_vm[kRowCount] = {};
-bool g_laid_out = false;
+// The in-game menu's changes (host_options_draw_page, on the presenter's
+// thread), run by the window's thread at its next pump (host_options_frame):
+// a setting can touch the window (fullscreen) and the file.
+std::mutex g_post_mu;
+std::vector<std::function<void()>> g_posted;  // under g_post_mu
+// What the menu set and the pump has not applied yet, by setting (-1 none):
+// the menu shows it at once, not the value a pump later.
+std::array<int, kSettingCount> g_pending = [] {
+    std::array<int, kSettingCount> a{};
+    a.fill(-1);
+    return a;
+}();
 bool g_dirty = false;  // something changed since the last save
 
 // What every setting starts with: the table's own indices, taken before
@@ -374,10 +402,6 @@ std::array<int, kSettingCount> g_default_index = [] {
 int g_res_prev = -1;
 bool g_res_reverting = false;  // the change back itself asks nothing
 
-bool selectable(int r) {
-    return r >= 0 && r < kRowCount && g_rows[r].kind != Row::Header && g_rows[r].kind != Row::Info;
-}
-
 // Whether the resolution entry `index` changes while the game runs. One past
 // what this run's render-target heap was grown for at its start (5120x2160
 // after a smaller start) applies on the next run like any restart setting.
@@ -387,11 +411,9 @@ bool res_live(int index) {
            live_resolution_can(w, h);
 }
 
-// The account rows. The fields are typed through the window's text entry
-// (host_text_entry_*), one at a time; the calls run on their own thread so
-// the screen keeps drawing, and their outcome is the two status lines.
+// The account rows. The calls run on their own thread so the menu keeps
+// drawing, and their outcome is the two status lines.
 std::string g_field[2];       // name, recovery code (never saved)
-int g_edit_field = -1;        // which field the text entry is on, -1 none
 std::mutex g_acct_mu;
 std::string g_acct_status;    // the last outcome, for the first status line
 std::string g_acct_detail;    // a code the player needs (link, recovery, website)
@@ -539,35 +561,8 @@ std::string account_detail() {
     return g_acct_detail;
 }
 
-void edit_begin(int field) {
-    // The window has one text entry. Taken from the game's own box while that
-    // is open, it ended the box with this field's text - or, closed with the
-    // screen, left the game waiting on a box nobody could type into again.
-    if (g_edit_field < 0 && host_text_entry_open()) {
-        set_account_lines("Finish the game's text box first (Enter or Escape)", "");
-        return;
-    }
-    g_edit_field = field;
-    host_text_entry_begin(g_field[field].c_str(), field == 0 ? 16 : 48, false, field == 0 ? "Account name" : "Recovery code");
-}
-
-// Called every frame the screen draws: takes the typed text, ends the entry
-// when the player did.
-void edit_poll() {
-    if (g_edit_field < 0) return;
-    std::string text;
-    const int r = host_text_entry_poll(text);
-    if (r == 0) {
-        g_field[g_edit_field] = text;
-        return;
-    }
-    if (r == 1) g_field[g_edit_field] = text;
-    host_text_entry_end();
-    g_edit_field = -1;
-}
-
-// The frame-rate values are the labels themselves: "Uncapped" is 0, anything
-// else is the number.
+// The frame-rate values are the labels themselves: "Display-Limited" is 0,
+// anything else is the number.
 int fps_from_label(const char* v) { return std::atoi(v); }
 
 int fps_index(int fps) {
@@ -593,8 +588,17 @@ std::string options_path() {
     // working directory) is copied over the first time: nobody is signed out.
     static const std::string path = [] {
         const HostConfig& c = config();
-        const std::string mine = config_user_dir() + "/" +
-                                 (c.profile.empty() ? std::string("bbhost-options.toml") : "bbhost-options-" + c.profile + ".toml");
+        const std::string file = c.profile.empty() ? std::string("bbhost-options.toml") : "bbhost-options-" + c.profile + ".toml";
+        // One beside the exe wins, as a bbhost.toml there does
+        // (config_user_file): a copy of bbhost kept with settings of its own.
+        // Not in a test's folder of its own (BBHOST_CONFIG_DIR).
+        const char* sandbox = std::getenv("BBHOST_CONFIG_DIR");
+        if (!(sandbox && sandbox[0])) {
+            const std::string local = config_exe_dir() + "/" + file;
+            std::ifstream here(local);
+            if (here) return local;
+        }
+        const std::string mine = config_user_dir() + "/" + file;
         std::ifstream have(mine);
         if (have) return mine;
         const auto beside = [](const std::string& f) {
@@ -673,12 +677,16 @@ void apply(int id) {
             break;
         }
         case kSkipLogos:
+        case kPerformanceMode:
         case kDebugMenu:
         case kDebugCamera:
         case kChangeAppearance:
         case kRebirth:
         case kFivePlayers:
+        case kSkillIssue:
             break;  // read by the loader before any of this exists
+        case kMenuTextSize:
+            break;  // the menus read it every frame (host_opt_menu_text_scale)
         default: break;
     }
 }
@@ -688,12 +696,16 @@ void apply(int id) {
 // writes every setting - so its "Off" is that old default far more often
 // than a choice, and reads as On (once: the next save writes version 2).
 // 3: frame_cap is the game's frame rate (30, 60, 90, Uncapped; 120 since
-// 2026-10-10, a new value, so the version stays); an older file's 90, 120,
+// 2026-10-10 and 150 to 960 since 2026-10-28, new values, so the version
+// stays - and Uncapped, the display's refresh rate since then, is called
+// Display-Limited: a saved "Uncapped" reads as it); an older file's 90, 120,
 // 144 and Off were caps on presentation that ran the game at 60, and read as
 // 60. camera_tuning (2026-10-10) is a new key whose default, FPS++, is what
 // every older build ran, so a file without it reads as before and the
-// version stays.
-constexpr int kOptionsVersion = 3;
+// version stays. 4: the camera zoom actions (zoom_in, zoom_out, zoom_reset on
+// the wheel and the middle button); an older file's Transform on the middle
+// button, its default until then, gives it to Camera Zoom Reset.
+constexpr int kOptionsVersion = 4;
 
 void save() {
     if (!g_dirty) {
@@ -800,11 +812,13 @@ void rebuild_settings() {
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
     h.skip_logos = on_of(kSkipLogos);
+    h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
     h.debug_camera = on_of(kDebugCamera);
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
+    h.skill_issue = on_of(kSkillIssue);
     settings_store().publish(h);
 }
 
@@ -874,11 +888,16 @@ void host_options_load() {
     g_set[kChangeAppearance].index = config().change_appearance ? 0 : 1;
     g_set[kRebirth].index = config().rebirth ? 0 : 1;
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
-    // video.fps_cap is the frame rate's default: 30, 60, 90, 120 or 0
-    // (uncapped); another number takes the nearest rate below it.
+    g_set[kSkillIssue].index = config().skill_issue ? 0 : 1;
+    // video.fps_cap is the frame rate's default: one of the setting's rates or
+    // 0 (Display-Limited); another number takes the nearest rate below it.
     {
         const int cap = config().fps_cap;
-        const int mode = cap <= 0 ? 0 : cap >= 120 ? 120 : cap >= 90 ? 90 : cap >= 60 ? 60 : 30;
+        int mode = cap <= 0 ? 0 : 30;
+        for (const char* v : g_set[kFrameCap].values) {
+            const int r = fps_from_label(v);
+            if (cap > 0 && r > mode && r <= cap) mode = r;
+        }
         if (mode != cap) host_log("options: video.fps_cap = %d is not a frame rate; %d", cap, mode);
         g_set[kFrameCap].index = std::max(0, fps_index(mode));
     }
@@ -892,9 +911,10 @@ void host_options_load() {
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
     seed(kShaders, config().shaders);
+    if (config().setup_text_size > 0) seed(kMenuTextSize, std::to_string(config().setup_text_size) + "%");
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
-                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers)})
+                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
@@ -950,6 +970,8 @@ void host_options_load() {
             }
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
+            // Display-Limited was called Uncapped until 2026-10-28.
+            if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
@@ -973,6 +995,12 @@ void host_options_load() {
         // Before version 3 the frame_cap was a cap on presentation, and its 90,
         // 120, 144 and Off ran the game at 60: the frame rate that ran is 60
         // (before any save below writes version 3).
+        // Before version 4 there were no camera zoom actions: the middle
+        // button they take was Transform's (host/bindings.h).
+        if (file_version < 4) {
+            host_bindings_migrate_zoom();
+            g_dirty = true;
+        }
         if (file_version < 3 &&
             (frame_cap_val == "90" || frame_cap_val == "120" || frame_cap_val == "144" || frame_cap_val == "Off")) {
             g_set[kFrameCap].index = std::max(0, fps_index(60));
@@ -1054,7 +1082,6 @@ void host_options_load() {
 }
 
 bool host_options_open() { return g_open.load(std::memory_order_relaxed); }
-bool host_options_editing() { return g_edit_field >= 0; }
 
 void host_options_set_open(bool open) {
     if (open == g_open.load(std::memory_order_relaxed)) {
@@ -1062,87 +1089,38 @@ void host_options_set_open(bool open) {
     }
     g_open.store(open, std::memory_order_relaxed);
     if (open) {
-        // Nothing has consumed the pointer while the screen was closed, so a
-        // click from minutes ago is still latched. Drop it: the first click
-        // the screen sees must be one aimed at it.
+        // Nothing has consumed the pointer while the menu was closed, so a
+        // click from minutes ago is still latched. Drop it: the game's menus
+        // behind must not take it when this one closes.
         host_mouse_state();
-        g_laid_out = false;
     } else {
-        if (g_edit_field >= 0) {
-            host_text_entry_end();
-            g_edit_field = -1;
-        }
         save();
     }
     host_log("options: %s", open ? "open" : "closed");
 }
 
-bool host_options_key(int scancode, bool repeat) {
-#if defined(BBHOST_HAVE_SDL3)
-    if (scancode == SDL_SCANCODE_F10) {
-        if (!repeat) {
-            host_options_set_open(!host_options_open());
-        }
-        return true;
-    }
-    if (!host_options_open()) {
-        return false;
-    }
-    // A field being typed: the window's text entry takes the keys (Enter
-    // accepts, Escape cancels); the poll in the frame picks the result up.
-    if (g_edit_field >= 0) {
-        return false;
-    }
-    const int step = scancode == SDL_SCANCODE_UP ? -1 : scancode == SDL_SCANCODE_DOWN ? 1 : 0;
-    if (step) {
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
-            if (selectable(g_sel)) {
-                break;
-            }
-        }
-        return true;
-    }
-    const int id = g_rows[g_sel].setting;
-    if (scancode == SDL_SCANCODE_LEFT && id >= 0) {
-        set_index(id, g_set[id].index - 1, false);
-        return true;
-    }
-    if (scancode == SDL_SCANCODE_RIGHT && id >= 0) {
-        set_index(id, g_set[id].index + 1, false);
-        return true;
-    }
-    if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_KP_ENTER ||
-        scancode == SDL_SCANCODE_SPACE) {
-        if (g_rows[g_sel].kind == Row::Close) {
-            host_options_set_open(false);
-        } else if (g_rows[g_sel].kind == Row::Text) {
-            edit_begin(g_rows[g_sel].field);
-        } else if (g_rows[g_sel].kind == Row::Action) {
-            account_action(g_rows[g_sel].field, g_field[0], g_field[1]);
-        } else if (id >= 0) {
-            set_index(id, g_set[id].index + 1, false);
-        }
-        return true;
-    }
-    if (scancode == SDL_SCANCODE_ESCAPE) {
-        host_options_set_open(false);
-        return true;
-    }
-    // Modal: while it is open it eats every key, so nothing leaks to the pad.
-    return true;
-#else
-    (void)scancode;
-    (void)repeat;
-    return false;
-#endif
+void host_options_close() {
+    if (!g_open.exchange(false)) return;
+    host_options_post([] {
+        save();
+        host_log("options: closed");
+    });
 }
 
-namespace {
-void options_panel_frame(float display_w, float display_h);
+void host_options_post(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(g_post_mu);
+    g_posted.push_back(std::move(fn));
 }
 
-void host_options_frame(float display_w, float display_h) {
+void host_options_frame(float, float) {
+    {
+        std::vector<std::function<void()>> todo;
+        {
+            std::lock_guard<std::mutex> lk(g_post_mu);
+            todo.swap(g_posted);
+        }
+        for (const std::function<void()>& fn : todo) fn();
+    }
     if (g_acct_save.exchange(false)) {
         g_dirty = true;
         save();
@@ -1162,226 +1140,280 @@ void host_options_frame(float display_w, float display_h) {
     if (const int a = live_resolution_take_answer()) {
         if (a == 1) res_keep(); else res_revert();
     }
-    if (host_options_open()) options_panel_frame(display_w, display_h);
 }
 
+#if defined(BBHOST_HAVE_SDL3)
 namespace {
-void options_panel_frame(float display_w, float display_h) {
-    edit_poll();
-    // Tall enough for every row: headers take 32 px, rows 40, and the note and
-    // key guide under them 100. A fixed 620 had been outgrown by the rows, and
-    // then so had 1080 lines - so when the display is shorter than that the
-    // pitch closes up to fit (the text keeps its size), rather than the last
-    // rows running under the key guide and off the panel.
-    // The rows outgrew every display once the account section came, so
-    // rather than closing the pitch up until the lines overlap, the
-    // list scrolls: the rows that fit are drawn, the selection is kept in
-    // view, and a hint says there is more above or below.
-    float rows_h = 0.0f;
-    for (const Row& r : g_rows) rows_h += r.kind == Row::Header ? 32.0f : 40.0f;
-    const float room = display_h - 20.0f - 178.0f;
-    const float fit = 1.0f;
-    const bool scrolls = rows_h > room && room > 0.0f;
-    const float pw = 860.0f, ph = std::fmin(78.0f + rows_h + 100.0f, display_h - 20.0f);
-    const float px = (display_w - pw) * 0.5f, py = (display_h - ph) * 0.5f;
-    static int g_scroll = 0;  // the first row drawn
-    if (!scrolls) {
-        g_scroll = 0;
-    } else {
-        auto height = [](int r) { return g_rows[r].kind == Row::Header ? 32.0f : 40.0f; };
-        const float avail = ph - 78.0f - 100.0f - 24.0f;  // less the two hints
-        // A header just above the selection comes along, so a section never
-        // starts with its title out of view.
-        int top = g_sel;
-        while (top > 0 && (g_rows[top - 1].kind == Row::Header || g_rows[top - 1].kind == Row::Info)) --top;
-        if (g_scroll > top) g_scroll = top;
-        for (;;) {
-            float h = 0.0f;
-            for (int r = g_scroll; r <= g_sel; ++r) h += height(r);
-            if (h <= avail || g_scroll >= g_sel) break;
-            ++g_scroll;
-        }
-    }
 
-    // The pointer, before anything is drawn, against last frame's rows - the
-    // layout does not move between frames unless the display size does, and
-    // hit-testing what was actually drawn is the rule the overlay is for.
-    //
-    // Hover selects only when the pointer **moves** (or clicks). Taken every
-    // frame, a pointer resting on the panel held the selection on its row, and
-    // the arrow keys could not move it.
-    const MouseState m = host_mouse_state();
-    static float last_x = -1.0f, last_y = -1.0f;
-    const bool moved = m.x != last_x || m.y != last_y;
-    last_x = m.x;
-    last_y = m.y;
-    if (g_laid_out && m.in_window && (moved || (m.pressed & 3u))) {
+namespace ui = launcher_ui;
+
+// The menu's pages: the table's sections (g_rows' headers), in its order.
+struct OptionsPage {
+    const char* header;  // the section's header in g_rows
+    const char* name;
+    const char* blurb;
+    int first = 0, end = 0;  // its rows in g_rows, after the header
+};
+
+const std::vector<OptionsPage>& pages() {
+    static const std::vector<OptionsPage> list = [] {
+        static const struct {
+            const char* header;
+            const char* name;
+            const char* blurb;
+        } kNames[] = {
+            {"DISPLAY", "Display", "The window, the frame rate, and what is shown over the game."},
+            {"INPUT", "Input", "The mouse, the pointer and the button prompts."},
+            {"GRAPHICS", "Graphics", "The game's effects and detail. Most change at once."},
+            {"PC ENHANCEMENTS", "PC Enhancements", "Additions to the game itself, read as it starts."},
+            {"STARTUP", "Startup", "What happens as the game starts."},
+            {"ACCOUNT", "Account", "The private server's account. No passwords: this PC keeps a token."},
+            {"UPDATES", "Updates", "Newer releases of bbhost."},
+        };
+        std::vector<OptionsPage> out;
         for (int r = 0; r < kRowCount; ++r) {
-            if (!selectable(r) || m.x < g_row_x || m.x > g_row_x + g_row_w) {
-                continue;
-            }
-            if (m.y >= g_row_y[r] && m.y < g_row_y[r] + g_row_h) {
-                g_sel = r;
-                if (m.pressed & 1u) {
-                    if (g_rows[r].kind == Row::Close) {
-                        host_options_set_open(false);
-                        return;
-                    }
-                    if (g_rows[r].kind == Row::Text) {
-                        if (g_edit_field != g_rows[r].field) edit_begin(g_rows[r].field);
-                    } else if (g_rows[r].kind == Row::Action) {
-                        account_action(g_rows[r].field, g_field[0], g_field[1]);
-                    } else if (g_rows[r].setting >= 0) {
-                        // By where it lands, as the arrows are drawn: on the
-                        // value's "<" half it steps back, on its ">" half
-                        // forward. The label steps forward, as Enter does.
-                        const bool back = m.x >= g_row_vl[r] && m.x < g_row_vm[r];
-                        set_index(g_rows[r].setting, g_set[g_rows[r].setting].index + (back ? -1 : 1), false);
-                    }
-                } else if (m.pressed & 2u) {
-                    if (g_rows[r].kind == Row::Option) {
-                        set_index(g_rows[r].setting, g_set[g_rows[r].setting].index - 1, false);
-                    }
+            if (g_rows[r].kind != Row::Header) continue;
+            OptionsPage pg{g_rows[r].text, g_rows[r].text, "", r + 1, kRowCount};
+            for (const auto& k : kNames) {
+                if (std::strcmp(k.header, g_rows[r].text) == 0) {
+                    pg.name = k.name;
+                    pg.blurb = k.blurb;
                 }
-                break;
             }
+            if (!out.empty()) out.back().end = r;
+            out.push_back(pg);
         }
-    }
-    if (m.wheel != 0.0f) {
-        const int step = m.wheel > 0.0f ? -1 : 1;
-        for (int i = 0; i < kRowCount; ++i) {
-            g_sel = (g_sel + step + kRowCount) % kRowCount;
-            if (selectable(g_sel)) {
-                break;
-            }
-        }
-    }
-
-    // Panel. The game's gold on near-black, the same as the text box, so the
-    // port's own surfaces read as one thing rather than three.
-    host_overlay_rect(0.0f, 0.0f, display_w, display_h, 0x00000080u);
-    host_overlay_rect(px - 3.0f, py - 3.0f, pw + 6.0f, ph + 6.0f, 0xc8a05affu);
-    host_overlay_rect(px, py, pw, ph, 0x0a0a0af2u);
-    host_overlay_text(px + 28.0f, py + 22.0f, 1.0f, 0xc8a05affu, "BLOODBORNE PC OPTIONS");
-    // The online state, always in view whatever the list is scrolled to:
-    // who this is signed in as, and the room when there is one.
-    {
-        const std::string online = hle_np_online_status();
-        const float ow = host_overlay_text_width(0.6f, online.c_str());
-        host_overlay_text(px + pw - 28.0f - ow, py + 30.0f, 0.6f, 0x9a8a64ffu, online.c_str());
-    }
-    host_overlay_rect(px + 28.0f, py + 56.0f, pw - 56.0f, 1.0f, 0x6a5a34ffu);
-
-    float y = py + 78.0f;
-    g_row_h = 34.0f * fit;
-    const float text_dy = (g_row_h - 22.0f) * 0.5f;  // 0.8 text is about 22 px: centred in the row
-    g_row_x = px + 16.0f;
-    g_row_w = pw - 32.0f;
-    const float y_end = py + ph - 100.0f;
-    if (scrolls && g_scroll > 0) {
-        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "^ more above");
-        y += 24.0f;
-    }
-    bool more_below = false;
-    for (int r = 0; r < kRowCount; ++r) {
-        const Row& row = g_rows[r];
-        const float h = (row.kind == Row::Header ? 32.0f : 40.0f) * fit;
-        if (r < g_scroll || y + h > y_end - (scrolls ? 24.0f : 0.0f)) {
-            g_row_y[r] = -10000.0f;  // not drawn: the pointer cannot land on it
-            if (r >= g_scroll) more_below = true;
-            continue;
-        }
-        g_row_y[r] = y;
-        if (row.kind == Row::Header) {
-            host_overlay_text(px + 28.0f, y + 10.0f * fit, 0.62f, 0x8a7a54ffu, row.text);
-            y += 32.0f * fit;
-            continue;
-        }
-        const bool sel = r == g_sel;
-        if (sel) {
-            host_overlay_rect(g_row_x, y, g_row_w, g_row_h, 0x3a3020ffu);
-            host_overlay_rect(g_row_x, y, 3.0f, g_row_h, 0xc8a05affu);
-        }
-        if (row.kind == Row::Close || row.kind == Row::Action) {
-            const bool busy = row.kind == Row::Action && !action_idle(row.field);
-            host_overlay_text(px + 40.0f, y + text_dy, 0.8f, busy ? 0x666666ffu : sel ? 0xffffffffu : 0xbbbbbbffu,
-                              row.text);
-            y += 40.0f * fit;
-            continue;
-        }
-        if (row.kind == Row::Info) {
-            const std::string line = row.field == 11  ? updater::detail()
-                                     : row.field == 10 ? updater::status()
-                                     : row.field == 1  ? account_detail()
-                                                       : account_status();
-            host_overlay_text(px + 40.0f, y + text_dy + 2.0f, 0.66f, 0x9a9a9affu, line.c_str());
-            y += 40.0f * fit;
-            continue;
-        }
-        if (row.kind == Row::Text) {
-            host_overlay_text(px + 40.0f, y + text_dy, 0.8f, sel ? 0xffffffffu : 0xbbbbbbffu, row.text);
-            std::string shown = g_field[row.field];
-            if (g_edit_field == row.field) shown += "_";
-            if (shown.empty()) shown = "(type here)";
-            const float vw = host_overlay_text_width(0.8f, shown.c_str());
-            host_overlay_text(px + pw - 60.0f - vw, y + text_dy, 0.8f,
-                              g_edit_field == row.field ? 0xffd88cffu : sel ? 0xffd88cffu : 0x9a9a9affu, shown.c_str());
-            y += 40.0f * fit;
-            continue;
-        }
-        const Setting& s = g_set[row.setting];
-        host_overlay_text(px + 40.0f, y + text_dy, 0.8f, sel ? 0xffffffffu : 0xbbbbbbffu, s.label);
-        const char* v = s.values[static_cast<std::size_t>(s.index)];
-        const float vw = host_overlay_text_width(0.8f, v);
-        const float vx = px + pw - 60.0f - vw;
-        g_row_vl[r] = vx - 30.0f;
-        g_row_vm[r] = vx + vw * 0.5f;
-        host_overlay_text(vx, y + text_dy, 0.8f, sel ? 0xffd88cffu : 0x9a9a9affu, v);
-        if (s.index > 0) {
-            host_overlay_text(vx - 22.0f, y + text_dy, 0.8f, sel ? 0xc8a05affu : 0x555555ffu, "<");
-        }
-        if (s.index + 1 < static_cast<int>(s.values.size())) {
-            host_overlay_text(px + pw - 50.0f, y + text_dy, 0.8f, sel ? 0xc8a05affu : 0x555555ffu, ">");
-        }
-        if (s.restart && !(row.setting == kResolution && res_live(s.index))) {
-            host_overlay_text(px + 40.0f + host_overlay_text_width(0.8f, s.label) + 14.0f, y + text_dy + 4.0f,
-                              0.52f, 0x7a6a44ffu, "(requires restart)");
-        }
-        y += 40.0f * fit;
-    }
-    if (more_below) {
-        host_overlay_text(px + 40.0f, y, 0.55f, 0x7a6a44ffu, "v more below");
-    }
-    g_laid_out = true;
-
-    // The note for whatever is selected, in a fixed place, so the rows above
-    // never move as the selection does.
-    const int id = g_rows[g_sel].setting;
-    const char* note = id >= 0 ? g_set[id].note : "Saves on close.";
-    if (g_rows[g_sel].kind == Row::Text) note = "Enter or click to type; Enter keeps it, Escape drops it.";
-    if (g_rows[g_sel].kind == Row::Action) {
-        static const char* const kNotes[] = {
-            "Shows a code and opens the website: sign in there with Discord and approve it.",
-            "Makes an account held by this PC under the name above; write down its recovery code.",
-            "The name and recovery code above give this PC the account back (other PCs are signed out).",
-            "A one-time code to sign in on the website's account page with this PC's account.",
-            "Forgets the token; the game is signed out if the server requires an account.",
-        };
-        static const char* const kUpdateNotes[] = {
-            "Asks GitHub for the newest release.",
-            "Opens the newer release's page in your browser, to download it from there.",
-        };
-        const int f = g_rows[g_sel].field;
-        note = f >= 10 ? kUpdateNotes[f - 10] : kNotes[f];
-    }
-    host_overlay_rect(px + 28.0f, py + ph - 76.0f, pw - 56.0f, 1.0f, 0x6a5a34ffu);
-    if (note) {
-        host_overlay_text(px + 28.0f, py + ph - 64.0f, 0.62f, 0x9a9a9affu, note);
-    }
-    host_overlay_text(px + 28.0f, py + ph - 34.0f, 0.62f, 0x7a7a7affu,
-                      "Arrows move and change   Enter toggles   Click sets   Esc or F10 closes");
+        return out;
+    }();
+    return list;
 }
+
+// A setting as the menu shows it: what it set and the pump has not applied
+// yet, else the setting. The presenter's own (g_pending is never the pump's).
+int shown_index(int id) {
+    const int p = g_pending[static_cast<std::size_t>(id)];
+    if (p >= 0 && p != g_set[id].index) return p;
+    g_pending[static_cast<std::size_t>(id)] = -1;
+    return g_set[id].index;
+}
+
+void change(int id, int index) {
+    g_pending[static_cast<std::size_t>(id)] = index;
+    host_options_post([id, index] { set_index(id, index, false); });
+}
+
+// One setting's row: a switch for On and Off, else its label at the left and
+// at the right a choice of a few side by side, a list, or a slider through a
+// scale's steps; the note in the bubble. A setting read only as the game
+// starts says so under its label (the resolution only when it cannot change
+// now).
+void setting_row(int id) {
+    const Setting& s = g_set[id];
+    const float sc = ui::scale();
+    const int n = static_cast<int>(s.values.size());
+    const int cur = std::clamp(shown_index(id), 0, n - 1);
+    const bool restart = s.restart && !(id == kResolution && res_live(cur));
+    ImGui::PushID(id);
+    int on_i = -1, off_i = -1;
+    for (int v = 0; v < n; ++v) {
+        if (std::strcmp(s.values[static_cast<std::size_t>(v)], "On") == 0) on_i = v;
+        if (std::strcmp(s.values[static_cast<std::size_t>(v)], "Off") == 0) off_i = v;
+    }
+    if (n == 2 && on_i >= 0 && off_i >= 0) {
+        bool v = cur == on_i;
+        if (ui::toggle_row(s.label, restart ? "Applies at the next start" : nullptr, &v, s.note)) change(id, v ? on_i : off_i);
+        ImGui::PopID();
+        return;
+    }
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float cw = std::min(std::round(330 * sc), w * 0.55f);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::BeginGroup();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(s.label);
+    if (restart) {
+        ImGui::SameLine();
+        ui::pill("next start", ui::kWarn, ui::alpha(ui::kWarn, 38));
+    }
+    ImGui::EndGroup();
+    if (s.note) ui::tooltip_for_item(s.label, s.note);
+    ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y));
+    int want = cur;
+    if (id == kFrameCap || id == kResolution) {
+        ImGui::SetNextItemWidth(cw);
+        ui::combo("##v", &want, s.values.data(), n);
+    } else if (n <= 4) {
+        ui::segmented("##v", &want, s.values.data(), n, cw, id == kShaders ? kHostShaderModeTips : nullptr,
+                      id == kShaders ? "Applies at the next start." : nullptr);
+    } else {
+        // A scale: the slider shows the step's own name (+10%, x1.4, 5).
+        std::string shown;
+        for (const char* c = s.values[static_cast<std::size_t>(cur)]; *c; ++c) {
+            shown += *c;
+            if (*c == '%') shown += '%';
+        }
+        ImGui::SetNextItemWidth(cw);
+        ImGui::SliderInt("##v", &want, 0, n - 1, shown.c_str(), ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
+    }
+    if (s.note && id != kShaders) ui::tooltip_for_item(s.label, s.note);
+    if (want != cur && want >= 0 && want < n) change(id, want);
+    ImGui::PopID();
+}
+
+// A thin line between two rows of a card.
+void row_rule() {
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    const float y = at.y - ImGui::GetStyle().ItemSpacing.y * 0.5f + 1;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(at.x, y), ImVec2(at.x + ImGui::GetContentRegionAvail().x, y), ui::alpha(ui::kViolet, 40));
+}
+
+// The ACCOUNT actions' bubbles (account_action's `which`).
+const char* const kAccountNotes[] = {
+    "Shows a code and opens the website: sign in there with Discord and approve it.",
+    "Makes an account held by this PC under the name beside it; write down its recovery code.",
+    "The name and recovery code give this PC the account back (other PCs are signed out).",
+    "A one-time code to sign in on the website's account page with this PC's account.",
+    "Forgets the token; the game is signed out if the server requires an account.",
+};
+
+// An ACCOUNT or UPDATES button, run on the window's thread with the fields as
+// typed.
+void action_button(const char* label, int which, bool primary, const char* name = "", const char* code = "") {
+    const bool idle = action_idle(which);
+    bool pressed = false;
+    if (primary) {
+        pressed = ui::primary_button(label, ImVec2(0, 0), idle);
+    } else {
+        ImGui::BeginDisabled(!idle);
+        pressed = ui::ghost_button(label);
+        ImGui::EndDisabled();
+    }
+    const char* note = which < 5 ? kAccountNotes[which] : which == 10 ? "Asks GitHub for the newest release."
+                                                                      : "Opens the newer release's page in your browser.";
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) ui::tooltip(nullptr, note);
+    if (pressed && idle) {
+        host_options_post([which, n = std::string(name), c = std::string(code)] {
+            if (which == 1 || which == 2) {
+                g_field[0] = n;
+                g_field[1] = c;
+            }
+            account_action(which, n, c);
+        });
+    }
+}
+
+char g_name_buf[64] = {};  // the account fields as typed (the presenter's)
+char g_code_buf[64] = {};
+bool g_bufs_seeded = false;
+
+void account_page() {
+    const float sc = ui::scale(), w = ImGui::GetContentRegionAvail().x;
+    if (!g_bufs_seeded) {
+        g_bufs_seeded = true;
+        std::snprintf(g_name_buf, sizeof(g_name_buf), "%s", g_field[0].c_str());
+    }
+    ui::card_begin("##account", ImVec2(w, 0), "SIGNED IN");
+    {
+        const bool in = net::account_logged_in();
+        ui::avatar(in ? net::account_name() : std::string(), std::round(46 * sc));
+        ImGui::SameLine(0, 14 * sc);
+        ImGui::BeginGroup();
+        ImGui::PushFont(ui::font_strong(), 0.0f);
+        ImGui::TextUnformatted(account_status().c_str());
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
+        ImGui::TextUnformatted(hle_np_online_status().c_str());
+        ImGui::PopStyleColor();
+        ImGui::EndGroup();
+    }
+    if (const std::string d = account_detail(); !d.empty()) {
+        ImGui::Spacing();
+        ui::banner(ui::Icon::Info, ui::kIce, d);
+    }
+    ImGui::Spacing();
+    action_button("Link with Discord", 0, true);
+    ImGui::SameLine();
+    action_button("Website sign-in code", 3, false);
+    ImGui::SameLine();
+    action_button("Sign out", 4, false);
+    ui::card_end();
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    ui::card_begin("##own", ImVec2(w, 0), "AN ACCOUNT THIS PC HOLDS");
+    const float bw = std::round(250 * sc);
+    const float fw = ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetNextItemWidth(fw);
+    ImGui::InputTextWithHint("##name", "Account name", g_name_buf, sizeof(g_name_buf));
+    ImGui::SameLine();
+    action_button("Create account on this PC", 1, false, g_name_buf, g_code_buf);
+    ImGui::SetNextItemWidth(fw);
+    ImGui::InputTextWithHint("##code", "Recovery code", g_code_buf, sizeof(g_code_buf));
+    ImGui::SameLine();
+    action_button("Recover account", 2, false, g_name_buf, g_code_buf);
+    ui::card_end();
+}
+
+void updates_page() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ui::card_begin("##updates", ImVec2(w, 0), "THIS BBHOST");
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(updater::status().c_str());
+    if (const std::string d = updater::detail(); !d.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
+        ImGui::TextUnformatted(d.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    action_button("Check for updates", 10, true);
+    ImGui::SameLine();
+    action_button("Open the release page", 11, false);
+    ui::card_end();
+}
+
 }  // namespace
+
+int host_options_page_count() { return static_cast<int>(pages().size()); }
+const char* host_options_page_name(int page) {
+    return page >= 0 && page < host_options_page_count() ? pages()[static_cast<std::size_t>(page)].name : "";
+}
+const char* host_options_page_blurb(int page) {
+    return page >= 0 && page < host_options_page_count() ? pages()[static_cast<std::size_t>(page)].blurb : "";
+}
+
+void host_options_draw_page(int page) {
+    if (page < 0 || page >= host_options_page_count()) return;
+    const OptionsPage& pg = pages()[static_cast<std::size_t>(page)];
+    if (std::strcmp(pg.header, "ACCOUNT") == 0) return account_page();
+    if (std::strcmp(pg.header, "UPDATES") == 0) return updates_page();
+    ui::card_begin("##rows", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+    bool first = true;
+    for (int r = pg.first; r < pg.end; ++r) {
+        if (g_rows[r].kind != Row::Option) continue;
+        if (!first) row_rule();
+        first = false;
+        setting_row(g_rows[r].setting);
+        ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
+    }
+    ui::card_end();
+}
+
+#else  // a build without a window: no menu
+
+int host_options_page_count() { return 0; }
+const char* host_options_page_name(int) { return ""; }
+const char* host_options_page_blurb(int) { return ""; }
+void host_options_draw_page(int) {}
+
+#endif
+
+const char* const kHostShaderModeTips[2] = {
+    "Recommended. bbhost also turns each of the game's shaders - the small programs your graphics card draws every "
+    "surface and effect with - into an optimized version, using Microsoft's shader compiler. It does this in the "
+    "background while you play, and the game uses them from the next start. The picture is the same either way.",
+    "Only bbhost's direct translation of the shaders: nothing is compiled in the background while you play. Try it if "
+    "HLSL gives you trouble. The picture is the same either way.",
+};
 
 HostSettings host_settings() { return settings_store().now(); }
 const HostSettings& host_settings_ref() { return settings_store().now(); }
@@ -1492,6 +1524,12 @@ void host_opt_set(const char* key, bool on) {
         save();
         return;
     }
+}
+
+float host_opt_menu_text_scale() {
+    const Setting& s = g_set[kMenuTextSize];
+    const int i = std::clamp(s.index, 0, static_cast<int>(s.values.size()) - 1);
+    return static_cast<float>(std::atoi(s.values[static_cast<std::size_t>(i)])) / 100.0f;
 }
 
 int host_opt_index(const char* key) {

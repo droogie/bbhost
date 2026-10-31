@@ -40,10 +40,14 @@
 namespace gxvk {
 
 // BBHOST_GXVK_BUFFERS: unset, GX buffers bound by their handles (1) on a
-// discrete GPU with room in its video memory; today's path (0) on an
+// discrete GPU with room in its video memory, and on an integrated GPU with
+// 8 GiB of it or more (a Strix Halo's carve-out): read from the carve-out
+// rather than from the imports, the Radeon 8060S's frame took ~7.5% less GPU
+// time (164.9 against 157.9 fps at 1080p, the GPU the limit, the run commit on;
+// docs/list-resolve.md) for 256 MiB of copies. Today's path (0) on a smaller
 // integrated GPU or with tight memory, where the draws read GX's buffers
 // where they are (the buffer shadow in place there, or no shadow) and a
-// buffer's copy would hold memory and buy nothing, and with small video
+// buffer's copy would hold memory the system needs, and with small video
 // memory, where the copies compete with the targets and textures for it and
 // one dip to the reserve costs far more GPU time than the command processor
 // saves. 0 today's path; 1 by handle on any GPU; 2 both, compared; "census"
@@ -55,10 +59,10 @@ enum class Buffers : int { kOff = 0, kOn = 1, kCompare = 2 };
 Buffers buffers_mode();
 bool census();
 // The device as the default sees it.
-enum class BuffersDevice : int { kRoomy, kIntegrated, kTight, kSmallVram };
+enum class BuffersDevice : int { kRoomy, kIntegrated, kTight, kSmallVram, kIntegratedRoomy };
 // The mode for the switch's value (null or empty: unset) on that device.
 inline Buffers buffers_mode_for(const char* env, BuffersDevice device) {
-    if (!env || !*env) return device == BuffersDevice::kRoomy ? Buffers::kOn : Buffers::kOff;
+    if (!env || !*env) return device == BuffersDevice::kRoomy || device == BuffersDevice::kIntegratedRoomy ? Buffers::kOn : Buffers::kOff;
     return env[0] == '1' ? Buffers::kOn : env[0] == '2' ? Buffers::kCompare : Buffers::kOff;
 }
 

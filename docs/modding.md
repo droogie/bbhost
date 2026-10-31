@@ -203,18 +203,23 @@ later file replacing an earlier one with the same name:
 
 1. `<exe dir>/patches` (the release package)
 2. `<exe dir>/../patches` (a build tree: `build/bbhost` reads the repository's `patches/`)
-3. `<mods>/patches` (a mod's own)
+3. `patches` in the per-user folder (`%APPDATA%\bbhost\patches`,
+   `~/.config/bbhost/patches`): your own, which no release carries and every
+   copy of bbhost reads
+4. `<mods>/patches` (a mod's own)
 
 ```toml
 [patch]
 name = "skip-intro"
+title = "Skip Intro + warning message"  # optional: the name the menus show (else `name`, dashes as spaces)
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the three company logos at startup are skipped"
 option = "startup.skip_intro"      # optional: a setting that switches it
 enabled = true                      # optional, default true; false: off until turned on
 gameplay = false                    # optional: true for a patch that changes the game (online rules)
-order = 49                          # optional: its place in the list it came from (later wins)
-# group = "analog-run-range"        # optional: variants of one patch, one on at a time
+order = 10                          # optional: its place in the list it came from (later wins)
+# group = "hunter-size"             # optional: variants of one patch, one on at a time
+# live = false                      # optional: takes effect only as the game starts
 
 [site.logo-fromsoft]
 address = "0x04d99138"              # Binary Ninja address (image at 0x400000)
@@ -230,8 +235,9 @@ yields = ["other-patch"]            # optional: left alone while one of these is
   refuses the whole file. A site that already holds `bytes` counts as done.
 - Manifests apply in `order`, then by name, and a site is checked against the
   eboot's own bytes under anything an earlier manifest wrote: where two write
-  the same bytes, the later one's stand, as shadPS4 applies a patch list. Kyo's
-  ports carry their place in his list (`Bloodborne.xml`).
+  the same bytes, the later one's stand, as shadPS4 applies a patch list. The
+  ports carry their place in the shadPS4 patch list (`Bloodborne.xml`, ten
+  apart), and the menus list them in that order; bbhost's own come after it.
 - Where a manifest changed a value bbhost's own frame-rate conversion also
   writes (a constant, a redirected load's), the conversion leaves it as the
   manifest wrote it and converts the rest.
@@ -247,44 +253,78 @@ yields = ["other-patch"]            # optional: left alone while one of these is
 - `BBHOST_PATCHES=0` skips all manifests. The log has one line per file:
   written, skipped or refused.
 
-The setup window's Patches tab lists every manifest with a switch. A patch
-that follows an `option` is switched by that setting; any other is turned off
-with `<name> = false` under `[patches]` in `bbhost.toml`, and one whose
-`[patch]` says `enabled = false` is off until `<name> = true` there - the tab
-writes both. Turning on one patch of a `group` turns the others off; a
-`bbhost.toml` with two of a group on applies the later one in `order`.
-Defaults puts every switch back to its file's `enabled`.
+The setup window's Patches tab lists every manifest with a switch, and so
+does the Patches page of the menu in the game (F9). A patch that follows an
+`option` is switched by that setting; any other is turned off with
+`<name> = false` under `[patches]` in `bbhost.toml`, and one whose `[patch]`
+says `enabled = false` is off until `<name> = true` there - both write it.
+Turning on one patch of a `group` turns the others off; a `bbhost.toml` with
+two of a group on applies the later one in `order`. Defaults puts every
+switch back to its file's `enabled`.
+
+In the game the switch also takes effect at once: the patch's bytes are
+written, or the eboot's own put back, while the game runs - new code first
+and the jumps to it last, code added where the eboot had zeros left in when it
+goes, a site within one aligned 8-byte word written in one store. Each site is
+checked first; where bbhost or another patch has changed the bytes since the
+start, or bbhost's frame-rate conversion left a value to the patch, the switch
+is saved and applies at the next start, and the page says so. `live = false`
+marks a patch that only takes effect as the game starts (render targets sized
+as they are made, code bbhost itself rewrites while it runs): the page saves
+its switch for the next start and leaves the code alone.
 
 Two patches may write the same bytes differently (the resolution patches'
 fixed sizes and the HD Motion Blur ones, say). A site that names the other
 patch in `yields` steps aside while that one is on: it is neither checked nor
 written, and the log line says how many sites were left to which patch.
 
-Shipped patches:
+Shipped patches, in their order. Left out are the list's patches bbhost
+does itself - its resolutions and FPS++ (the Resolution and Frame rate
+settings), the light grids, Restore Change Appearance (PC Enhancements), the
+Model LODs and Disable AA, SSAO, DoF, Bloom, Motion Blur and Chromatic
+Aberration (PC Graphics), Increased camera distance (Camera distance),
+Increased Graphics Heap Sizes (bbhost grows that heap for the render size),
+Faster loading screens (bbhost runs loading screens unpaced) and Skip Intro
+(Skip company logos, built into bbhost) - and the ones a release does not
+carry: the debug patches (camera, dash, menu, Enemy Control), the rally and
+weapon-size changes, and the emulator workarounds and extras (FMOD Crash Fix,
+the Intel SFX workaround, Disable HTTP Requests, Disable Facegen, Enable TAA,
+Bookmark and Capture outputs, the low-res motion blur buffers). A player who
+wants one keeps its file in their own patches folder.
 
-| File | Effect |
+| File | Patch |
 |---|---|
-| `skip-intro.toml` | skips the company logos and the "Exit Game may not have been selected" warning (illusion's 1.09 patch) |
-| `fov-uncap.toml` | removes the 38-48 degree limit on the camera's field of view |
-| `quick-reentry.toml` | loads after a death or lamp travel end when the area is ready instead of after 12 seconds (on by default) |
-| `ingame-post-processors.toml` | three resource post-processors during play instead of two: streaming settles sooner, with more hitches meanwhile (off by default) |
-| `deflate-level.toml` | the game's run-time compression at level 1 instead of 9, removing a periodic ~25 ms hitch |
-| `old-hunters.toml` | makes the game treat itself as The Old Hunters edition, so the DLC is available (Kyo's 1.09 patch) |
-| `debug-camera.toml` | restores the debug free camera (Lance McDonald's 1.09 patch): hold Action and press L3 to cycle its modes. Off by default; it replaces a debug-menu test step, which then must not be used |
-| `low-res-aux-targets.toml` | the low-resolution renders of Kyo's shadPS4 resolution patches at every resolution: motion blur's velocity map and its depth at 640x360, the quarter-size depth at 320x180 (off by default: at 1920x1080 the game's own velocity map is 960x540). Not the patches' 80x45 glow buffer, which blacked out the lit world where glow is on |
-| `screen-space-reflections.toml` | Enable Screen Space Reflections (enable only, keeps res), Kyo's patch (off by default) |
-| `disable-misc-renders.toml` | Disable Misc. Renders, Kyo's patch: four of the scene's extra targets are not made (off by default) |
-| `disable-dynamic-light-shadow.toml` | Disable Dynamic Light Shadow, Kyo's patch (off by default) |
-| `hd-motion-blur-360p.toml`, `hd-motion-blur-4k.toml` | HD Motion Blur at 640x360 or 3840x2160, Kyo's patches (off by default; one at a time) |
-| `fxaa2-gs-dlaa-gs.toml` | FXAA2_GS + DLAA_GS, Kyo's patch: both YEBIS anti-aliasing filters (off by default) |
-| `glow-blur.toml` | Glow: force on + Blur 12.5/12.5/30, Kyo's patch (off by default) |
-| `rally-window.toml` | Rally Window 2x + Stacking (6 s before decay), Kyo's patch (off by default; changes the game) |
-| `performance-v3-decals-on.toml`, `performance-v3-velomap.toml` | Performance Patch v3, Kyo's, in its Decals On and Velomap + Camera Blur variants (off by default; one at a time) |
-| `debug-dash.toml` | Restore Debug Dash (stagvant): L3 on and off, L2 up, L1 down, R2 through walls (off by default; changes the game) |
-| `analog-run-range-10.toml` ... `-40.toml` | +10% to +40% analog run range, Kyo's (off by default; one at a time; changes the game) |
-| `bigger-weapons-1-2x.toml` | Bigger Weapons 1.2x, Kyo's patch (off by default; changes the game) |
-| `movement-roll-1-1x.toml` | Movement + Roll-Dodge 1.1x, Kyo's patch (off by default; changes the game) |
-| `aerial-vectors-480.toml` | Aerial Vectors 1/480 fps, Kyo's patch: the momentum's per-frame value fixed at its 480 fps one (off by default; changes the game; bbhost follows the frame time without it) |
+| `performance-v3-decals-on.toml` | **Performance Patch (Perf Increase)**: Modifies some of the game's debug parameters for better performance without affecting visuals (Kyo). (on by default; one of performance v3; at the next start) |
+| `performance-v3-velomap.toml` | **Performance Patch v3 (Velomap + Camera Blur)**: Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo) (off by default; one of performance v3; at the next start) |
+| `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
+| `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
+| `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
+| `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
+| `screen-space-reflections.toml` | **Enable Screen Space Reflections**: Screen space reflections on, with the depth renders back at the game's default resolutions. It loads last, so other patches' render changes give way to it. (off by default; at the next start) |
+| `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
+| `intel-tonemap-fix.toml` | **Intel Black Tonemap Fix**: Fixes the black tonemap colours, most noticeable in the DLC's areas, when using an Intel CPU. (off by default) |
+| `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
+| `lower-object-physics.toml` | **Lower object/corpse physics**: Corpses resist being moved by the player or anything else. (off by default; one of object physics) |
+| `disable-camera-auto-rotation.toml` | **Disable Camera Auto Rotation via Movement**: The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work. (off by default; at the next start) |
+| `easier-run-range.toml` | **Easier run range**: The stick runs from less of its travel: about two-thirds of the way out instead of 90%. (on by default) |
+| `l3-run-jump.toml` | **L3 run-jump**: While running (holding Circle), L3 jumps too: the run-jump a second press of Circle makes. Circle still jumps. (off by default) |
+| `auto-refill-from-storage.toml` | **Auto-Refill From Storage on Any Area Refresh/Reload**: Eligible consumables refill from your storage whenever an area is refreshed or reloaded, taking from storage as the game does, without dying or going back to the Hunter's Dream. The game's own auto-refill; no free items. (off by default) |
+| `smaller-hunter.toml` | **Smaller Hunter**: A smaller hunter (smol). (off by default; one of hunter size) |
+| `smallest-hunter.toml` | **Smallest Hunter**: The smallest hunter (teeny). (off by default; one of hunter size) |
+| `unlock-game-region.toml` | **Unlock Game Region (DISABLES ONLINE PLAY)**: Unlocks the game's region for more language options. Online play does not work while it is on. The Cross and Circle buttons are not swapped. (off by default; at the next start) |
+| `zero-gravity.toml` | **Zero-Gravity Physics**: Havok's gravity at zero: objects and corpses float. (off by default; one of gravity) |
+| `anti-gravity.toml` | **Anti-Gravity Physics**: Havok's gravity reversed: objects and corpses fall upward. (off by default; one of gravity) |
+| `hd-motion-blur-360p.toml` | **HD Motion Blur 360p (640x360)**: HD Motion Blur 360p (640x360) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
+| `hd-motion-blur-1080p.toml` | **HD Motion Blur 1080p (1920x1080)**: Motion blur's velocity map is half the render resolution by default; this makes it 1080p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
+| `hd-motion-blur-1440p.toml` | **HD Motion Blur 1440p (2560x1440)**: Motion blur's velocity map is half the render resolution by default; this makes it 1440p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
+| `hd-motion-blur-4k.toml` | **HD Motion Blur 4K (3840x2160)**: HD Motion Blur 4K (3840x2160) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
+| `lower-specific-renders.toml` | **Lower specific renders (Perf Increase)**: Lowers the resolution of some renders (the velocity map, glow, the scaled depth): faster, with no visual difference unless Enable Screen Space Reflections is on. (off by default; one of low res renders; at the next start) |
+| `old-hunters.toml` | **The Old Hunters**: The Old Hunters is available: the game takes itself for the edition that includes it (on by default; at the next start) |
+| `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
+| `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |
+| `deflate-level.toml` | **Deflate level 1**: The game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s) (off by default) |
+| `fov-uncap.toml` | **Uncapped field of view**: The field of view is no longer capped at 48 degrees (off by default) |
+| `glow-blur.toml` | **Glow: force on + Blur**: Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo) (off by default) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather
 than fixed bytes, are written in code or as plugins.

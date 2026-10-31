@@ -789,7 +789,104 @@ DECOMP_LEAF void learn_chunk(u64 q, u64 range, u64 dt) {
     g_cost_items[static_cast<u32>(e)].fetch_add(end - first, std::memory_order_relaxed);
 }
 
+// ---- A plugin's segment ahead of a scene category (plugin API 15) ----
+//
+// The game's debug draws (RendMan's draw lists: the collision, the hit
+// capsules) are played after the scene into the display buffers, over the
+// effects and the post-processing. A plugin that wants one drawn inside the
+// scene - under the effects, against the scene's depth - is given a command
+// context of its own on the worker that records the first chunk at or after
+// the pass it names - a key's category and sub-category, (bits 22-27 << 6) |
+// bits 16-21: the chunk's first item's pass set up on it (the queue's
+// prepare: its targets bound), then the plugin's recording, queued under the
+// chunk's own key. The frame's end sorts the segments by key, stably, and ours
+// is appended first, so it plays just before the chunk. A chunk whose item
+// before it is already at or after the pass is not the first and gets none;
+// a frame without that pass gets the segment ahead of the next one.
+std::atomic<int> g_insert_pass{-1};
+std::atomic<void (*)(u64, void*)> g_insert_fn{nullptr};
+std::atomic<void*> g_insert_user{nullptr};
+
+// BBHOST_SCENE_CATEGORIES=1: each queue's items by pass, logged every 300
+// flips - which passes a frame's queues hold (what to name above).
+bool g_log_categories = false;
+std::mutex g_categories_mu;
+std::map<u64, std::map<u32, u32>> g_categories;  // queue -> items by pass, under g_categories_mu
+
+DECOMP_LEAF void count_categories(u64 q, u64 range) {
+    const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
+    const u32 end = count > last ? last : count;
+    if (end <= first) return;
+    const u64 items = load<u64>(q + kItems);
+    std::map<u32, u32> n;
+    for (u32 i = first; i != end; ++i) ++n[(load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff];
+    std::lock_guard<std::mutex> lk(g_categories_mu);
+    auto& total = g_categories[q];
+    for (const auto& [pass, k] : n) total[pass] += k;
+}
+
+void log_categories(u32 flips) {
+    std::map<u64, std::map<u32, u32>> now;
+    {
+        std::lock_guard<std::mutex> lk(g_categories_mu);
+        now.swap(g_categories);
+    }
+    for (const auto& [q, n] : now) {
+        std::string line;
+        for (const auto& [pass, k] : n) {
+            char part[32];
+            std::snprintf(part, sizeof(part), " %02x/%02x:%.1f", pass >> 6, pass & 0x3f, k / 300.0);
+            line += part;
+        }
+        host_log("scene categories: queue %llx at flip %u, items a flip by category/sub-category:%s", static_cast<unsigned long long>(q), flips,
+                 line.c_str());
+    }
+}
+
+DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
+    const u64 q = load<u64>(functor + 0x10);
+    if (g_log_categories) count_categories(q, range);
+    const int want = g_insert_pass.load(std::memory_order_acquire);
+    const auto fn = g_insert_fn.load(std::memory_order_acquire);
+    if (want < 0 || !fn) return;
+    const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
+    const u32 end = count > last ? last : count;
+    if (first >= end) return;
+    const u64 items = load<u64>(q + kItems);
+    const auto pass_of = [items](u32 i) { return (load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff; };
+    // The chunk holding the queue's first item at or after the pass: a table
+    // entry can run across passes (3e/21-3e/25 is one), so that item need not
+    // start its chunk.
+    u32 at = first;
+    while (at != end && pass_of(at) < static_cast<u32>(want)) ++at;
+    if (at == end || (at == first && first > 0 && pass_of(first - 1) >= static_cast<u32>(want))) return;
+    const u32 key = load<u32>(items + static_cast<u64>(first) * kItemSize);
+    const u64 gx = load<u64>(game_address(kGx));
+    const u64 per_worker = load<u64>(load<u64>(gx + 0x58) + static_cast<u64>(worker) * 8);
+    const u64 parent = load<u64>(functor + 8);
+    const u64 ctx = method<ContextFn>(parent, 0x80)(parent, per_worker, 0);
+    if (!ctx) return;
+    const u64 cc = load<u64>(ctx + kCtxCommand);
+    game_function<OneFn>(kBeginRecord)(cc);
+    struct {
+        u32 key, pad;
+        u64 a, pass;
+    } state = {0, 0, 0, 0};
+    method<PrepareFn>(q, 0x30)(q, ctx, reinterpret_cast<u64>(&state), key, 0);
+    store<u32>(ctx + kCtxKeyTop, key >> 28);
+    store<u32>(ctx + kCtxCategory, (key >> 22) & 0x3f);
+    store<u32>(ctx + kCtxSub, (key >> 16) & 0x3f);
+    store<u32>(ctx + kCtxLow, key & 0xffff);
+    fn(cc, g_insert_user.load(std::memory_order_acquire));
+    game_function<OneFn>(kEndRecord)(cc);
+    game_function<QueueFn>(kQueueContext)(gx, cc, (key & 0xffff0000u) | (first & 0xffffu));
+    const u64 owner = game_function<OneFn>(kOwnerOf)(ctx);
+    method<OneFn>(ctx, 0)(ctx);
+    method<TwoFn>(owner, 0x70)(owner, ctx);
+}
+
 DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
+    scene_insert(functor, range, worker);
     const bool learn = learning();
     if (!g_census) {
         // The game's job, timed when the costs are wanted.
@@ -1348,6 +1445,7 @@ bool make_cut_table(const std::uint8_t*) {
 void render_queue_flip(std::uint32_t flips, float limit_fps) {
     g_flip.store(flips, std::memory_order_relaxed);
     if (g_census) g_fold.flip(flips);
+    if (g_log_categories && flips % 300 == 0) log_categories(flips);
     if (g_split_mode != Split::Auto || !g_cut_ready) return;
     // Above 60: 90, 120, or uncapped's limit (a display's 59.94 or 60.01 Hz is 60).
     const bool on = std::lround(limit_fps) > 60;
@@ -1357,6 +1455,18 @@ void render_queue_flip(std::uint32_t flips, float limit_fps) {
                  on ? (g_push_mode == Push::WithCut ? "above 60: its tail runs, and those frames' jobs pushed longest first"
                                                     : "above 60: its tail runs")
                     : "60 or less: the game's partitions");
+}
+
+void render_queue_scene_insert(int pass, void (*fn)(std::uint64_t cc, void* user), void* user) {
+    const bool on = pass >= 0 && pass < 0x1000 && fn;
+    g_insert_pass.store(-1, std::memory_order_release);
+    g_insert_fn.store(on ? fn : nullptr, std::memory_order_release);
+    g_insert_user.store(on ? user : nullptr, std::memory_order_release);
+    if (on) g_insert_pass.store(pass, std::memory_order_release);
+    if (on)
+        host_log("decomp: a plugin's segment in the scene ahead of its first chunk at or after %02x/%02x", pass >> 6, pass & 0x3f);
+    else
+        host_log("decomp: the plugin's segment in the scene taken away");
 }
 
 void decomp_gx_render_queue_add() {
@@ -1375,6 +1485,7 @@ void decomp_gx_render_queue_add() {
     g_cut_on.store(g_split_mode == Split::On, std::memory_order_relaxed);
     if (const char* e = std::getenv("BBHOST_RQ_SPLIT_EVERY"); e && std::atoi(e) > 0) g_split_every = static_cast<u32>(std::atoi(e));
     g_ranks = on("BBHOST_RQ_RANKS", false);
+    g_log_categories = on("BBHOST_SCENE_CATEGORIES", false);
     // What could be on in this run: Auto follows the frame rate's limit, which V-Sync moves while uncapped.
     const bool may_cut = g_split_mode != Split::Off;
     g_push_placed = g_push_mode == Push::On || (g_push_mode == Push::WithCut && may_cut);
@@ -1392,7 +1503,8 @@ void decomp_gx_render_queue_add() {
             host_log("rq census: on (the render queue's partition, chunk job and segment list as ours)");
         }
     }
-    if (!g_census && !may_cut && !may_learn) return;
+    // The partition stays the game's unless the census, the cut or the costs
+    // want ours; the chunk job is always placed, for on_scene_category.
     DecompFunction part{"render_queue_partition", "gx", kPartition, kPartitionEntry, sizeof(kPartitionEntry),
                         reinterpret_cast<void*>(&render_queue_partition), DecompKind::Leaf};
     part.original = &g_game_partition;
@@ -1400,8 +1512,8 @@ void decomp_gx_render_queue_add() {
     part.counts = &g_partition_counts;
     part.report = &render_queue_report;
     part.body_ok = &make_cut_table;
-    decomp_add(part);
-    if (g_census || may_learn) {
+    if (g_census || may_cut || may_learn) decomp_add(part);
+    {
         DecompFunction job{"render_queue_chunk_job", "gx", kChunkJob, kChunkJobEntry, sizeof(kChunkJobEntry),
                            reinterpret_cast<void*>(&render_queue_chunk_job), DecompKind::Leaf};
         job.original = &g_game_chunk_job;

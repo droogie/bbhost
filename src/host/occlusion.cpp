@@ -389,6 +389,26 @@ void occlusion_begin_recording_locked() {
     so.ready = true;
 }
 
+// A run's parts commit no draw that takes a query: the interval since the
+// last dump has given out its cap of them (or has no room), so every draw left
+// in it is unmeasured - which the join notes for them all.
+bool occlusion_run_ok() {
+    if (!g_on) return true;
+    if (g_pred_mode.load(std::memory_order_relaxed) == kPredSkip) return false;
+    if (!g_iv.open) return true;
+    const SlotOcc& so = g_occ[g.slot];
+    return !so.ready || g_iv.queries >= g_iv.cap || so.queries >= kQueries || so.nitems + 64 > kItems;
+}
+
+void occlusion_run_issued(std::uint64_t n) {
+    if (!g_on || !n) return;
+    g_issued.fetch_add(n, std::memory_order_relaxed);
+    if (g_iv.open) {
+        g_iv.unmeasured = true;
+        g_counts.unmeasured += n;
+    }
+}
+
 bool occlusion_draw_entry() {
     if (!g_on) return true;
     if (g_pred_mode.load(std::memory_order_relaxed) == kPredSkip) {
@@ -405,12 +425,16 @@ void occlusion_draw_locked(DrawCall& call) {
         case kPredGpu:
             call.cond_buffer = g_preds.buffer;
             call.cond_offset = 8ull * g_pred_index;
-            ++g_counts.pred_gpu_draws;
+            if (!run_part()) ++g_counts.pred_gpu_draws;  // a run part's (BBHOST_RUN_COMMIT): not counted
             break;
-        case kPredDraw: ++g_counts.pred_drawn; break;
+        case kPredDraw:
+            if (!run_part()) ++g_counts.pred_drawn;
+            break;
         default: break;
     }
-    if (!g_iv.open) return;
+    // A run part's draw (BBHOST_RUN_COMMIT): forked only where no draw takes a
+    // query (occlusion_run_ok), and noted unmeasured at the join.
+    if (!g_iv.open || run_part()) return;
     SlotOcc& so = g_occ[g.slot];
     // Room is left for the dumps: a full item buffer must not lose one.
     if (!so.ready || g_iv.queries >= g_iv.cap || so.queries >= kQueries || so.nitems + 64 > kItems) {

@@ -1,0 +1,29 @@
+# DS1-like physics: Kyo's patch for 1.09, from the shadPS4 patch list
+# (Bloodborne.xml), byte for byte: 2 sites, 8 bytes.
+#
+# The list's note:
+# Can fling around corpses and whatnot.
+#
+# One of the two object physics patches at a time: they set the same two
+# values.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `ds1-physics = true` under [patches] in bbhost.toml.
+[patch]
+name = "ds1-physics"
+title = "DS1-like physics"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Corpses and objects can be flung around, as in Dark Souls."
+enabled = false
+order = 230
+group = "object-physics"
+
+[site.s000]
+address = "0x01bf9463"
+expect = "01 01 00 00"
+bytes = "01 00 00 00"
+
+[site.s001]
+address = "0x01bf9439"
+expect = "00 00 a0 40"
+bytes = "00 3c 1c 46"

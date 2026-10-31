@@ -27,7 +27,7 @@ signed_only = false   # true: load only signed official plugins
 ```
 
 The setup window has a Plugins tab with the same switches and each plugin's
-settings. In game, F9 opens the plugin menu over the game.
+settings. In game, F9 opens the patch and plugin menu over the game.
 
 ## A first plugin
 
@@ -153,6 +153,27 @@ gives the Binary Ninja address.
 - `sp_effect_apply`, `sp_effect_has` (v8): apply a SpEffectParam row to a
   character the way the game's scripts do.
 
+**Controls and the view** (v13)
+
+- `input(out)`: the keyboard by SDL scancode (the USB HID usage: 26 is W, 44
+  Space, 224 Left Ctrl), the mouse's buttons held and pressed since the last
+  read, its motion in its own counts and the wheel's notches - and `playing`,
+  1 while the mouse turns the camera (in the world, no menu up). One reader:
+  the motion, presses and notches are the caller's once read.
+- `input_take(scancodes, n, buttons, wheel, motion)`: while the player is
+  playing, those keys and mouse buttons stop pressing what they are bound to,
+  the wheel's notches stay out of the game, and the mouse stops turning the
+  game's camera - the plugin reads them all through `input`. The menus keep
+  every key. A call replaces the last; nothing taken gives everything back.
+- `on_camera(fn, user)`: each frame once the game has placed the player's
+  camera - the follow camera's update and the camera manager's blend of the
+  cameras it owns - and before the scene is drawn from it or a scripted camera
+  (a cutscene's) takes its place, with a `BbCamera`: its basis (right, up,
+  forward) and position in the world, its vertical field of view, aspect and
+  clip planes, all writable. The character's update has run by then; its next
+  one moves by where this camera looks. The Quake plugin is a first-person
+  view this way.
+
 **Settings, UI and files**
 
 - `bb_plugin_options` (v9): a table of headings, switches, numbers, choices,
@@ -161,6 +182,30 @@ gives the Binary Ninja address.
 - `on_option`, `on_action` (v9): callbacks for changes and button presses made
   in the in-game menu.
 - `show_message(text, seconds)` (v8): a banner over the game.
+- `show_text(text, seconds, x, y, scale, align)` (v14): a line of text the
+  plugin places: its box's corner at (x, y), fractions of the window (0,0 the
+  top left), `align` `BB_TEXT_LEFT`, `BB_TEXT_CENTRE` or `BB_TEXT_RIGHT` of the
+  point, `| BB_TEXT_BOTTOM` for a box that rises from it, `scale` the overlay
+  text's (1 the FPS counter's). It fades over its last half second; a new one
+  replaces the last, apart from the banner. The SDK's `text_at` falls back to
+  the banner on an older host. The Quake plugin names the weapon it switches to
+  this way, small, in the bottom left corner.
+- `on_scene_category(pass, fn, user)` (v15): drawing inside the scene.
+  `fn(cc, user)` runs once a frame on the GX worker that records the first
+  chunk of the scene's render queue at or after `pass` - a sort key's category
+  and sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
+  logs those a frame holds) - in a GX command context of its own with that
+  chunk's pass set up, queued just ahead of it: what it records draws into the
+  scene's targets before that pass does. One pass for all plugins; -1 takes it
+  away. The Lo-Hit plugin plays the game's collision debug draw there, under
+  the effects.
+- `draw_style(style)` (v16): inside an `on_scene_category` fn, the draws the
+  game's code records on that thread from then on restyled, until set back to
+  `BB_DRAW_AS_IS` before fn returns: `BB_DRAW_LINES` (each triangle's edges a
+  pixel wide, pulled toward the viewer, no depth written;
+  `BBHOST_WIREFRAME_BIAS` -512 and `BBHOST_WIREFRAME_SLOPE` -1 by default),
+  `BB_DRAW_BLACK` (zero written), `BB_DRAW_SUBTRACT` (the draw's colour less the
+  target's, once a pixel), or-ed.
 - `plugin_dir(name)` (v8): a data folder of the plugin's own.
 - `game_file(path, ...)` (v9): a game file by its `/app0` path, decompressed.
 - `overlay_file(name, path, data, size)` (v9): a file the game reads instead
@@ -190,7 +235,7 @@ C++ plugins can use `include/bbhost/`:
 
 | Header | Contents |
 |---|---|
-| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`), typed params, characters, flags, stats, messages, `loading_screen()` (on a host older than v12 it makes the same test from the game's memory), `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
+| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`, `on_camera`), typed params, characters, flags, stats, messages, `loading_screen()` (on a host older than v12 it makes the same test from the game's memory), `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
 | `bbhost/params.hpp` | a struct for every param row type and a tag for every table, generated from the game's own paramdefs, with offsets checked by `static_assert` |
 | `bbhost/engine/` | engine layouts and addresses for 1.09: characters, the world, matchmaking and sessions, GX, YEBIS and more |
 
@@ -238,8 +283,10 @@ setup window can download the latest signed plugins from the newest release.
 | `randomizer` | Shuffles one-time pickups and shop stock from a seed, and optionally enemies: each regular enemy becomes another kind (model, AI and gear together), drawn from its own area or from the whole game, with optional roaming bosses. Writes a spoiler file. |
 | `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. |
 | `mutators` | Switchable rules: gravity, game speed, bullet time at low HP, one-hit deaths, blood drain, enemy HP, echo rate, random effects. |
+| `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. |
+| `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): the part you stand on and the parts connected to it, one step out (Whole map: every part loaded). It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, in the launcher's deep violet (walls) and dark blue (floors). Pair it with Performance mode (the setup window's main page) for the post-effects off. |
 | `debug_menu` | Restores the developers' debug menu (`` ` `` opens it), in English or the developers' Japanese, and makes the debug font it draws with from the public-domain X11 fonts k14 and 7x14, so nothing has to be downloaded. Cheating against other players with it gets an account banned; trying it out online with friends is fine. |
 
-The gameplay plugins - all four - announce themselves in the session's
+The gameplay plugins - all five - announce themselves in the session's
 ruleset, so the server keeps their players' messages, bloodstains and
 statistics apart from those of players without them.

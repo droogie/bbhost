@@ -229,6 +229,19 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
 void hle_gx_native_release();
 // The command processor's lookahead: a draw token further on in the stream.
 void hle_gx_native_prefetch(std::uint64_t id, bool next);
+// The run look ahead (BBHOST_RUN_COMMIT, host/list_resolve.h): a draw token's
+// inputs in its slot when they are stored and still that token's, without
+// taking them, and its GX objects (`objects`, when asked); nullptr otherwise.
+// Command-processor thread. They stay in place until the walk takes and
+// releases the token.
+const GpuDrawInputs* hle_gx_native_peek(std::uint64_t id, const struct GxDrawObjects** objects = nullptr);
+// BBHOST_RUN_COMMIT: a draw token's draw as the walk's take of it would give
+// it (hle_gx_native_token) - its inputs and objects copied out of its slot,
+// its records unpacked on the calling thread (valid until that thread's next
+// unpack), its user data as a token draw has it (`sh`: the register file at
+// the token) - without taking it. False when the slot is not stored or not
+// this token's.
+bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs& in, struct GxDrawObjects& objects);
 // BBHOST_GX_NATIVE_COPIES: a GX buffer-copy pass's copy token, a type-3 NOP
 // with payload {kGxCopyMagic, id low, id high}; runs the call's copies.
 constexpr std::uint32_t kGxCopyMagic = 0x50434242u;  // "BBCP"

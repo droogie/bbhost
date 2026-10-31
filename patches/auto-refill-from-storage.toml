@@ -1,0 +1,26 @@
+# Auto-Refill From Storage on Any Area Refresh/Reload: johnnycoax's patch for
+# 1.09, from the shadPS4 patch list (Bloodborne.xml), byte for byte: 1 sites,
+# 8 bytes.
+#
+# The list's note:
+# Automatically replenishes eligible consumables from your storage whenever
+# any area is refreshed/reloaded. Lowers your storage inventory the same as
+# the vanilla game, without requiring you to die or return to the Hunter's
+# Dream every time. Uses Bloodborne's native auto-refill-from-storage system.
+# NO free items--just a QoL patch.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `auto-refill-from-storage = true` under [patches] in
+# bbhost.toml.
+[patch]
+name = "auto-refill-from-storage"
+title = "Auto-Refill From Storage on Any Area Refresh/Reload"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Eligible consumables refill from your storage whenever an area is refreshed or reloaded, taking from storage as the game does, without dying or going back to the Hunter's Dream. The game's own auto-refill; no free items."
+enabled = false
+order = 430
+
+[site.s000]
+address = "0x01d398b1"
+expect = "41 80 be e4 00 00 00 00"
+bytes = "eb 26 90 90 90 90 90 90"

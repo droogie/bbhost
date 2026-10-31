@@ -10,6 +10,32 @@ if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     "bbhost must be built with Clang on Windows so guest SysV functions can be implemented with __attribute__((sysv_abi)).")
 endif()
 
+# BBHOST_LTO=ON: ThinLTO across every target. The command processor's draw
+# path crosses files at every step (render.cpp into buffer_shadow.cpp and
+# gpu.cpp - the shadow's lookups, locate, the twins' and copy versions'
+# checks), and calls it cannot inline otherwise: Kyo's Central Yharnam save on
+# the Radeon 8060S, CP-bound, went from ~137 to ~143-144 fps. Off by default.
+option(BBHOST_LTO "build with ThinLTO (-flto=thin)" OFF)
+if(BBHOST_LTO)
+  add_compile_options(-flto=thin)
+  add_link_options(-flto=thin)
+endif()
+
+# BBHOST_PGO=generate: an instrumented build, whose run writes a profile at its
+# exit (LLVM_PROFILE_FILE names it; main.cpp writes it before the process ends,
+# which skips the runtime's own exit handler). BBHOST_PGO=<file.profdata>: a
+# build optimized by such a profile (llvm-profdata merge -o file.profdata
+# *.profraw). Clang's IR profiles; MSYS2 needs mingw-w64-ucrt-x86_64-compiler-rt.
+set(BBHOST_PGO "" CACHE STRING "profile-guided optimization: generate, or the .profdata file to use")
+if(BBHOST_PGO STREQUAL "generate")
+  add_compile_options(-fprofile-generate)
+  add_link_options(-fprofile-generate)
+  add_compile_definitions(BBHOST_PGO_GENERATE=1)
+elseif(BBHOST_PGO)
+  add_compile_options(-fprofile-use=${BBHOST_PGO} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+  add_link_options(-fprofile-use=${BBHOST_PGO})
+endif()
+
 # LibAtrac9 (MIT, https://github.com/Thealexbarney/LibAtrac9): ATRAC9 decoding for sceAjm.
 file(GLOB LIBATRAC9_SOURCES third_party/libatrac9/C/src/*.c)
 add_library(atrac9 STATIC ${LIBATRAC9_SOURCES})
@@ -96,6 +122,8 @@ add_executable(bbhost
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
+  src/engine/menu_close.cpp
+  src/engine/matching_region.cpp
   src/engine/key_prompts.cpp
   src/engine/yebis.cpp
   src/engine/yebis_bind.cpp
@@ -153,6 +181,7 @@ add_executable(bbhost
   src/hle/gnm.cpp
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
+  src/host/list_resolve.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -223,6 +252,8 @@ endfunction()
 bb_plugin(randomizer plugins/randomizer/randomizer.cpp)
 bb_plugin(boss_rush plugins/boss_rush/boss_rush.cpp)
 bb_plugin(mutators plugins/mutators/mutators.cpp)
+bb_plugin(quake plugins/quake/quake.cpp)
+bb_plugin(lohit plugins/lohit/lohit.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -260,6 +291,10 @@ elseif(WIN32)
   # The image must stay out of the guest's fixed windows (4-10 GiB CPU dmem,
   # 0xff00000000 GPU alias): a fixed base above them, no ASLR.
   target_link_options(bbhost PRIVATE -Wl,--image-base=0x600000000 -Wl,--disable-dynamicbase)
+  # A GUI program: Windows opens no console for it. The log takes a file, a
+  # pipe or the terminal it was started with, or a console it makes when
+  # Tooling and logging is on (main.cpp, log_console); off, there is no window.
+  target_link_options(bbhost PRIVATE -Wl,--subsystem,windows)
 endif()
 
 find_package(CURL QUIET)
@@ -346,7 +381,31 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_include_directories(imgui PUBLIC third_party/imgui)
   target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
   target_compile_options(imgui PRIVATE -w)
-  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/plugin_ui.cpp src/host/shader_compile.cpp)
+  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/launcher_ui.cpp src/host/plugin_ui.cpp src/host/shader_compile.cpp)
+  # The setup window's backgrounds (res/launcher-art/*.png: Kyo's screenshots,
+  # their light only, coloured by the palette at load; one picked each start),
+  # taken in whole by the assembler's .incbin: build/gen/launcher_art.inc,
+  # rewritten only when the folder's list changes. Too many bytes for the
+  # hex text the debug menu's font is carried as. The labels are global: under
+  # LTO the code reading them can land in another module than the asm.
+  file(GLOB BB_LAUNCHER_ART CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/res/launcher-art/*.png)
+  list(SORT BB_LAUNCHER_ART)
+  set(BB_LAUNCHER_ART_ASM "")
+  set(BB_LAUNCHER_ART_DECL "")
+  set(BB_LAUNCHER_ART_LIST "")
+  set(i 0)
+  foreach(png IN LISTS BB_LAUNCHER_ART)
+    string(APPEND BB_LAUNCHER_ART_ASM ".globl bb_launcher_art_${i}, bb_launcher_art_${i}_end\nbb_launcher_art_${i}:\n.incbin \"${png}\"\nbb_launcher_art_${i}_end:\n")
+    string(APPEND BB_LAUNCHER_ART_DECL "extern \"C\" const unsigned char bb_launcher_art_${i}[], bb_launcher_art_${i}_end[];\n")
+    string(APPEND BB_LAUNCHER_ART_LIST "    {bb_launcher_art_${i}, bb_launcher_art_${i}_end},\n")
+    math(EXPR i "${i} + 1")
+  endforeach()
+  file(WRITE ${CMAKE_BINARY_DIR}/gen/launcher_art.inc.new
+    "#ifdef _WIN32\n#define BB_ART_SECTION \".section .rdata,\\\"dr\\\"\\n\"\n#else\n#define BB_ART_SECTION \".section .rodata\\n\"\n#endif\n"
+    "asm(BB_ART_SECTION R\"asm(\n.balign 16\n${BB_LAUNCHER_ART_ASM}.text\n)asm\");\n#undef BB_ART_SECTION\n"
+    "${BB_LAUNCHER_ART_DECL}const ArtPng kArtPngs[] = {\n${BB_LAUNCHER_ART_LIST}};\n")
+  configure_file(${CMAKE_BINARY_DIR}/gen/launcher_art.inc.new ${CMAKE_BINARY_DIR}/gen/launcher_art.inc COPYONLY)
+  set_source_files_properties(src/host/launcher_ui.cpp PROPERTIES OBJECT_DEPENDS "${BB_LAUNCHER_ART}")
   target_link_libraries(bbhost PRIVATE imgui)
   set_source_files_properties(src/host/window.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
@@ -927,7 +986,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke

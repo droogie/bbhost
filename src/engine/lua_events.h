@@ -8,11 +8,16 @@
 // manager's hook.
 #pragma once
 
+#include <cstdint>
+
 struct ElfImage;
 
 void lua_events_install(ElfImage* image);
 // Queues a named event; false when the build is not 1.09 or the queue is full.
 bool lua_event_queue(const char* name);
+// Queues a cutscene (Remo) request as an event script's PlayCutscene makes it
+// for the player (entity 10000): the test harness's `remo ID [METHOD]`.
+bool remo_request_queue(std::int32_t id, std::int32_t method);
 // From the frame-time manager's hook, on the main thread: raises the queued
 // events in order.
 void lua_events_tick();

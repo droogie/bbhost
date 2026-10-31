@@ -45,8 +45,14 @@ void* thunk_wrap_capture_frame(void* fn);
 // Without keep_rax the stub also keeps xmm0-7 (a float argument) across the
 // host call - saved - 136 is xmm0, 16 bytes each, rewritable the same way -
 // and saved[-1] is a slot, zero to start, that a skipped call returns.
+//
+// `site` is for a hook inside a function body rather than at its entry: there
+// rsp is 16-byte aligned (an entry's is 8 past), so the stub pads it by 8
+// first and gives the pad back before the displaced bytes. Such a hook's host
+// must return 0 - the skip's ret would leave the function from its middle.
 std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* code, std::uint64_t id, void* host, std::uint64_t resume,
-                                      const std::uint8_t* displaced, std::size_t n, bool keep_rax = false);
+                                      const std::uint8_t* displaced, std::size_t n, bool keep_rax = false,
+                                      bool site = false);
 
 // Per-thread guest TLS block + TCB. Installs guest FS. Returns the TCB.
 void* guest_thread_enter();
@@ -78,6 +84,11 @@ struct GuestCallRegs {
 };
 static_assert(sizeof(GuestCallRegs) == 168, "hle_call_guest_regs reads these offsets");
 GUEST_ABI void hle_call_guest_regs(GuestCallRegs* r);
+// The guest's return address of the outermost HLE call this thread is in,
+// and `depth` frames up the guest's rbp chain from it (0 before any call, or
+// past the chain's end): for logs naming the guest code that called an HLE
+// function.
+std::uint64_t hle_guest_return(int depth = 0);
 // Raw guest call with up to six integer/pointer args. Host FS on return.
 GUEST_ABI std::int64_t hle_call_guest6(void* fn, std::int64_t a0, std::int64_t a1, std::int64_t a2,
                                        std::int64_t a3, std::int64_t a4, std::int64_t a5);

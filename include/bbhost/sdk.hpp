@@ -163,6 +163,13 @@ public:
         flags_.push_back(std::move(fn));
         if (flags_.size() == 1) api->on_event_flag(&Plugin::flag_thunk, this);
     }
+    // fn(camera) each frame once the game has placed the player's camera,
+    // before anything is drawn from it (plugin API 13). False on an older host.
+    bool on_camera(std::function<void(BbCamera&)> fn) {
+        if (api->version < 13 || api->size < offsetof(BbHostApi, on_camera) + sizeof(api->on_camera)) return false;
+        cameras_.push_back(std::move(fn));
+        return cameras_.size() > 1 || api->on_camera(&Plugin::camera_thunk, this) == 0;
+    }
 
     // --- the world -----------------------------------------------------------
     std::vector<BbChr> characters() const {
@@ -184,6 +191,16 @@ public:
     }
     void set_stat(const char* name, std::int64_t v) const { api->player_stat_set(name, v); }
     void message(const std::string& text, float seconds = 4.0f) const { api->show_message(text.c_str(), seconds); }
+    // A line placed by the plugin (plugin API 14): its box's corner at (x, y),
+    // fractions of the window, `align` BB_TEXT_*. False on an older host, which
+    // shows the text as message's banner instead.
+    bool text_at(const std::string& text, float seconds, float x, float y, float scale, std::uint32_t align) const {
+        if (api->version < 14 || api->size < offsetof(BbHostApi, show_text) + sizeof(api->show_text)) {
+            message(text, seconds);
+            return false;
+        }
+        return api->show_text(text.c_str(), seconds, x, y, scale, align) == 0;
+    }
     // A loading screen is up (plugin API 12: the host's own answer, the one
     // its log's "loading:" lines come from). on_world_load comes with a
     // load's screen still up: a plugin that moves the player waits for this to
@@ -212,8 +229,10 @@ public:
     // +0x5b0 by 0x1bfa260; checked here before it is handed out.)
     float* gravity() const {
         std::uint64_t sys = 0, wrap = 0, world = 0;
-        const std::uint64_t slot = api->guest_addr(0x593d700);
-        if (!slot || api->read(slot, &sys, 8) || !sys || api->read(sys + 0x28, &wrap, 8) || !wrap ||
+        // The slot by its Binary Ninja address: read() moves an image address
+        // by the image's slide itself, and refuses a runtime address inside
+        // the slid image (Windows).
+        if (!api->eboot_is_109() || api->read(0x593d700, &sys, 8) || !sys || api->read(sys + 0x28, &wrap, 8) || !wrap ||
             api->read(wrap + 8, &world, 8) || !world)
             return nullptr;
         float v[3];
@@ -250,9 +269,13 @@ private:
     static void flag_thunk(std::uint32_t id, int value, void* self) {
         for (auto& f : static_cast<Plugin*>(self)->flags_) f(id, value != 0);
     }
+    static void camera_thunk(BbCamera* cam, void* self) {
+        for (auto& f : static_cast<Plugin*>(self)->cameras_) f(*cam);
+    }
     std::vector<std::function<void()>> frames_;
     std::vector<std::function<void(std::uint32_t)>> loads_;
     std::vector<std::function<void(std::uint32_t, bool)>> flags_;
+    std::vector<std::function<void(BbCamera&)>> cameras_;
 };
 
 // The packed map block (player_block) as its parts: m24_01_00_00 = {24, 1, 0, 0}.

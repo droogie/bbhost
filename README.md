@@ -65,7 +65,7 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **A setup window** that finds and checks your game files, and the Steam Deck
   as a supported device.
 
-![The setup window](docs/images/setup-window.png)
+![The setup window](docs/images/setup-window.jpg)
 
 ## Status
 
@@ -201,11 +201,12 @@ game's code or data.
 
 ## Acknowledgements
 
-- Community work bbhost builds on: illusion's Skip Intro, Lance McDonald's
-  Restore Debug Camera, stagvant's Restore Debug Dash, and Kyo's The Old
-  Hunters patch and his graphics and gameplay patches (shipped as patch files),
-  and Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes (built into
-  the frame-rate code).
+- Community work bbhost builds on: illusion's Skip Intro (built into Skip
+  company logos); the shadPS4 patch list's patches - Kyo's graphics, physics
+  and gameplay patches and his The Old Hunters patch, johnnycoax's Auto-Refill,
+  Imedved's camera auto-rotation and Lance McDonald's region unlock (shipped as
+  patch files); and Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
+  (built into the frame-rate code).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
 - SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),

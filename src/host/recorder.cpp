@@ -45,9 +45,11 @@
 // to bb-submit (R4).
 
 #include "host/gpu_internal.h"
+#include "host/list_resolve.h"
 #include "host/stream_ops.h"
 
 #include <algorithm>
+#include "core/futex.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 
@@ -272,6 +274,27 @@ alignas(64) std::atomic<std::uint64_t> g_published{0};  // blocks handed over (w
 alignas(64) std::atomic<std::uint64_t> g_done{0};       // blocks replayed (written by the recorder)
 alignas(64) std::atomic<std::uint64_t> g_pk_done{0};    // packets replayed: the last one's number + 1
 alignas(64) std::atomic<bool> g_sleeping{false};        // written by the recorder only as it sleeps and wakes
+// The recorder's sleep on g_published and the producer's wake. std::atomic's
+// wait and notify are, in this build's libstdc++ on Windows, a mutex and a
+// winpthreads condition variable from a shared pool: each wake of a sleeping
+// recorder was a semaphore release, an event set and a thread alert on the
+// command processor - 7.8% of bb-cp0 in Kyo's Central Yharnam save once the
+// command processor ran fast enough to catch up with the game between its
+// submissions (the recorder spins out and sleeps there). WaitOnAddress /
+// WakeByAddressSingle are one system call to wake a sleeper and none when
+// nobody sleeps. BBHOST_RECORDER_WAKE=std: std::atomic's.
+const bool g_native_wake = [] {
+    const char* e = std::getenv("BBHOST_RECORDER_WAKE");
+    return !(e && std::strcmp(e, "std") == 0);
+}();
+void published_sleep(std::uint64_t seen) {
+    if (g_native_wake) host_futex_wait64(&g_published, seen);
+    else g_published.wait(seen, std::memory_order_seq_cst);
+}
+void published_wake() {
+    if (g_native_wake) host_futex_wake_one64(&g_published);
+    else g_published.notify_one();
+}
 alignas(64) std::uint64_t g_pk_taken = 0;               // packets taken (under g.mu)
 std::uint64_t g_done_seen = 0, g_pk_done_seen = 0;      // the producer's last reads of g_done and g_pk_done
 bool g_block_open = false;                  // the block at g_published is being appended to (under g.mu)
@@ -340,10 +363,16 @@ std::unordered_map<void*, std::uint64_t> g_census;  // under g.mu
 // a burst's draws. On a Steam Deck 61% of the recorder's time is this loop and
 // 12% its work, but spinning less did not give its GPU the power: 300 and 50
 // pauses, windowed, 56.7 and 56.6 fps against 57.0 - the command processor
-// waited longer on the recorder's wake-ups instead.
+// waited longer on the recorder's wake-ups instead. With 16 hardware threads
+// or more the spin costs a core nothing else wants, and 20000: each wake of a
+// sleeping recorder is a system call on the command processor, ~2.5-3% of
+// bb-cp0 in Kyo's Central Yharnam save on a Ryzen AI Max+ 395 (CP-bound),
+// which ran 144.8 and 148.9 fps at 20000 against 141.0 and 144.9 at 4000
+// (alternate runs); 200 pauses there cost it a fifth of its frame rate.
 const int g_recorder_spin = [] {
     const char* e = std::getenv("BBHOST_RECORDER_SPIN");
-    return e && *e ? std::max(0, std::atoi(e)) : 4000;
+    if (e && *e) return std::max(0, std::atoi(e));
+    return std::thread::hardware_concurrency() >= 16 ? 20000 : 4000;
 }();
 
 void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
@@ -659,7 +688,7 @@ void recorder_thread() {
             if (published == done) {
                 add_relaxed(g_sleeps, 1);
                 g_sleeping.store(true, std::memory_order_seq_cst);
-                g_published.wait(done, std::memory_order_seq_cst);
+                published_sleep(done);
                 g_sleeping.store(false, std::memory_order_relaxed);
                 continue;
             }
@@ -723,7 +752,7 @@ template <class F> std::uint64_t wait_recorder(F ready) {
     if (ready()) return 0;
     const std::uint64_t t0 = host_clock_monotonic_ns();
     for (std::uint64_t spins = 0; !ready(); ++spins) {
-        if ((spins & 1023) == 0 && g_sleeping.load(std::memory_order_seq_cst)) g_published.notify_one();
+        if ((spins & 1023) == 0 && g_sleeping.load(std::memory_order_seq_cst)) published_wake();
         if (spins < (1u << 16)) {
             cpu_relax();
         } else {
@@ -782,11 +811,11 @@ void publish_block(bool kick) {
         // the recorder must not sleep through it. Against its store of
         // g_sleeping and load of g_published, both sequentially consistent.
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (g_sleeping.load(std::memory_order_relaxed)) g_published.notify_one();
+        if (g_sleeping.load(std::memory_order_relaxed)) published_wake();
     } else if (g_sleeping.load(std::memory_order_relaxed)) {
         // Unfenced: the recorder may go to sleep with this block unseen; the
         // next publish or the drain that needs it wakes it.
-        g_published.notify_one();
+        published_wake();
     }
 }
 
@@ -857,6 +886,35 @@ bool warn_pnext(const char* what) {
 bool stream_on() { return g_mode != kModeOff && g_submit_on; }
 bool recorder_enabled() { return g_mode != kModeOff; }
 
+// ---- BBHOST_RUN_COMMIT: a forked run's packets (render.cpp run_commit) ----
+
+bool recorder_threaded() { return g_mode == kModeThread; }
+
+std::uint64_t recorder_reserve_packets(std::uint32_t n) {
+    ensure_started();
+    if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
+    // The last of them reuses the slot of packet number first + n - 1 - kPackets.
+    if (g_pk_taken + n - g_pk_done_seen > kPackets) g_pk_done_seen = g_pk_done.load(std::memory_order_acquire);
+    if (g_pk_taken + n - g_pk_done_seen > kPackets) {
+        ++g_counts.packet_waits;
+        publish_block(false);  // everything taken before them is in a published block
+        const std::uint64_t need = g_pk_taken + n;
+        wait_recorder([need] { return need - g_pk_done.load(std::memory_order_acquire) <= kPackets; });
+        g_pk_done_seen = g_pk_done.load(std::memory_order_acquire);
+    }
+    const std::uint64_t first = g_pk_taken;
+    g_pk_taken += n;
+    return first;
+}
+
+void recorder_append_packet(std::uint64_t number) {
+    std::uint8_t* at = append_record(Op::kDrawState, sizeof(stream::DrawState));
+    put_struct<stream::DrawState>(at)->packet = number;
+    after_op();
+}
+
+void recorder_publish_appended() { publish_block(false); }
+
 void recorder_drain() {
     if (g_mode != kModeThread || !g_blocks) return;
     const std::uint64_t published = g_published.load(std::memory_order_relaxed);  // only the g.mu holder publishes
@@ -886,7 +944,7 @@ void stream_wait_submitted(std::uint64_t serial) {
     ++g_counts.submitted_waits;
     const std::uint64_t t0 = host_clock_monotonic_ns();
     for (std::uint64_t spins = 0; stream_submitted_serial() <= serial; ++spins) {
-        if ((spins & 1023) == 0 && g_mode == kModeThread && g_sleeping.load(std::memory_order_seq_cst)) g_published.notify_one();
+        if ((spins & 1023) == 0 && g_mode == kModeThread && g_sleeping.load(std::memory_order_seq_cst)) published_wake();
         if (spins < 4096) {
             cpu_relax();
         } else if (spins < 8192) {
@@ -1405,10 +1463,23 @@ void DrawCmds::start(bool deferred) {
     }
     DrawPacket& p = g_packets[g_pk_taken % kPackets];
     p.reset();
+    if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutPackets);  // BBHOST_DRAW_CONTEXT's census
     p.number = g_pk_taken++;
     packet_ = &p;
     g_open = this;
     prefetch_packet_for_write(g_packets[g_pk_taken % kPackets]);
+}
+
+void DrawCmds::start_reserved(std::uint64_t number, bool part) {
+    if (packet_) return;
+    DrawPacket& p = g_packets[number % kPackets];
+    p.reset();
+    p.number = number;
+    packet_ = &p;
+    part_ = part;
+    if (part) return;
+    if (g_open && g_open != this) g_open->publish();
+    g_open = this;
 }
 
 DrawCmds* DrawCmds::open() { return g_open; }
@@ -1425,6 +1496,10 @@ void DrawCmds::publish() {
     if (!packet_) return;
     DrawPacket& p = *static_cast<DrawPacket*>(packet_);
     packet_ = nullptr;
+    if (part_) {  // a run part's: the command processor appends it at the join
+        part_ = false;
+        return;
+    }
     if (g_open == this) g_open = nullptr;
     // The packet's place in the stream: after every op appended before it
     // (they were appended while it held no commands, or it went first).

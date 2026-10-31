@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 12.
+/* bbhost plugin API, version 14.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 12
+#define BB_PLUGIN_API_VERSION 16
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -164,6 +164,31 @@ typedef struct BbText {
     uint64_t bn_addr;      /* the game's UTF-16 string, by its Binary Ninja address */
     const uint16_t* text;  /* UTF-16, ended by a 0 */
 } BbText;
+
+/* Version 13: the keyboard and mouse as a plugin with controls of its own
+ * reads them (input). */
+typedef struct BbInput {
+    uint8_t key[512];  /* by SDL scancode, which is the USB HID usage (4 = A, 26 = W,
+                          44 = Space, 224 = Left Ctrl): 1 while held */
+    uint32_t buttons;  /* the mouse's buttons held: bit 0 left, 1 right, 2 middle, 3 back, 4 forward */
+    uint32_t pressed;  /* the buttons that went down since the last read - latched, so a
+                          click shorter than a frame is still seen */
+    float dx, dy;      /* the mouse's motion since the last read while playing, in its own
+                          counts (right and down positive) */
+    float wheel;       /* the wheel's notches since the last read, up positive */
+    int32_t playing;   /* 1 while the mouse turns the camera: in the world with no menu or
+                          text box up, the window focused */
+} BbInput;
+
+/* Version 13: the player's camera (on_camera) - its basis and where it is, in
+ * the world (y up): x to the right, y up and z the way it looks, each w 0; the
+ * position's w 1. */
+typedef struct BbCamera {
+    float right[4], up[4], forward[4], position[4];
+    float fov_y;           /* vertical field of view, radians */
+    float aspect;          /* width over height */
+    float near_z, far_z;   /* the clip planes' distances */
+} BbCamera;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -392,7 +417,85 @@ typedef struct BbHostApi {
      * the world is ready, a lamp travel is refused once the load replaces
      * the player. Any thread. */
     int (*loading_screen)(void);
+
+    /* Version 13: controls and a view of a plugin's own (a first-person mode). */
+    /* What the keyboard and mouse hold now, and the presses, motion and wheel
+     * since the last read (one reader: two plugins reading would share them).
+     * Main thread. 0 on success; 1 without a window (headless). */
+    int (*input)(BbInput* out);
+    /* Takes inputs from the game while the player is playing
+     * (BbInput.playing): the keys listed (scancodes) no longer press what they
+     * are bound to, nor the mouse buttons in `buttons` (BbInput's bits);
+     * `wheel` nonzero keeps the wheel's notches from the game, and `motion`
+     * nonzero keeps the mouse from turning the game's camera. The menus keep
+     * every key. A call replaces the last; nothing taken gives everything
+     * back. Any thread. 0 on success. */
+    int (*input_take)(const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
+    /* fn(cam, user) each frame once the game has placed the player's camera
+     * (its follow camera and the blend of the cameras it owns) and before
+     * anything is drawn from it or a scripted camera (a cutscene's) takes its
+     * place: the plugin may move it, turn it and change its projection. The
+     * character's own update has run by then; the next frame's movement reads
+     * the direction the camera looks. Main thread. 0 on success; 1 for another
+     * eboot. */
+    int (*on_camera)(void (*fn)(BbCamera* cam, void* user), void* user);
+    /* 1 when the player's key bindings put a game action on this key (an SDL
+     * scancode), 0 when the key is free - for a plugin that offers keys of its
+     * own only where they press nothing else. */
+    int (*key_bound)(uint16_t scancode);
+
+    /* Version 14: text a plugin places itself. */
+    /* A line of text over the game for `seconds`, fading over its last half
+     * second: its box's corner at (x, y), fractions of the window (0,0 the
+     * top left, 1,1 the bottom right), `align` the box's side the point is
+     * (BB_TEXT_LEFT: the box runs right of it, BB_TEXT_CENTRE: centred on it,
+     * BB_TEXT_RIGHT: to its left; with BB_TEXT_BOTTOM the box rises from the
+     * point instead of hanging under it), `scale` the host's text size (1 is
+     * the FPS counter's). One line for all plugins - a new one replaces the
+     * last - apart from show_message's banner. Any thread. 0 on success. */
+    int (*show_text)(const char* text, float seconds, float x, float y, float scale, uint32_t align);
+
+    /* Version 15: drawing inside the scene. */
+    /* fn(cc, user) once a frame on the GX worker that records the first chunk
+     * of the scene's render queue at or after `pass` - a sort key's category
+     * and sub-category, (bits 22-27 << 6) | bits 16-21: 0xf85 is 3e/05;
+     * BBHOST_SCENE_CATEGORIES=1 logs those a frame holds - in a GX command
+     * context of its own: the pass of that chunk's first item set up on it
+     * (its targets bound), queued just ahead of the chunk, so what fn records
+     * there draws into the scene before it. `cc` is the game's GX command
+     * context - what its draw code records into: the debug draw lists' play
+     * takes it as its parameters' first field. fn runs under the guest's
+     * thread state, on a worker: call only the game's draw code (BB_GUEST_ABI
+     * pointers from guest_addr) and nothing of the host's but log. Not called
+     * on a frame whose scene has nothing at or after the pass. One pass for
+     * all plugins - a later call replaces it; -1 takes it away. 0 on success;
+     * 1 for another eboot. */
+    int (*on_scene_category)(int32_t pass, void (*fn)(uint64_t cc, void* user), void* user);
+
+    /* Version 16. */
+    /* Inside an on_scene_category fn: the draws the game's code records on
+     * this thread from then on, restyled until set back to BB_DRAW_AS_IS,
+     * which fn must do before it returns. The or of: BB_DRAW_LINES - each
+     * triangle's edges, a pixel wide, pulled toward the viewer so they show
+     * over the faces they outline (BBHOST_WIREFRAME_BIAS), the depth not
+     * written; BB_DRAW_BLACK - zero written to every target; BB_DRAW_SUBTRACT -
+     * the draw's colour less the target's, once a pixel (the nearest face
+     * there; pulled toward the viewer a little, its depth written). A shader
+     * that shades from the triangle's slope on screen draws its lines dark:
+     * white lines are drawn as black ones over white faces, then the faces
+     * again subtracting. No plugin uses it today. */
+    void (*draw_style)(int style);
 } BbHostApi;
+
+#define BB_DRAW_AS_IS 0
+#define BB_DRAW_LINES 1
+#define BB_DRAW_BLACK 2
+#define BB_DRAW_SUBTRACT 4
+
+#define BB_TEXT_LEFT 0u
+#define BB_TEXT_CENTRE 1u
+#define BB_TEXT_RIGHT 2u
+#define BB_TEXT_BOTTOM 4u
 
 #ifdef __cplusplus
 }

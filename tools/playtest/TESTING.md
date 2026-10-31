@@ -30,15 +30,15 @@ point.
 
 1. Unzip (Windows) or untar (Linux) the package into a folder of its own, for
    example `C:\Games\bbhost` or `~/Games/bbhost`.
-2. Start it (next section). The first time, the **bbhost setup** window
-   opens. Click **Browse...** next to *Game folder* and pick your game folder
-   (the one that **contains** `dvdroot_ps4`), then next to *Eboot* and pick
-   your decrypted 1.09 eboot. Each turns green when it is right. Leave
-   *Online* on the playtest server (the kit chooses it anyway), set anything
-   else you like, and click **Play**.
+2. Start it (next section). The first time, the **bbhost launcher** window
+   opens. Click the folder button next to *Game folder* and pick your game
+   folder (the one that **contains** `dvdroot_ps4`), then the file button next
+   to *Eboot* and pick your decrypted 1.09 eboot. Each gets a green check when
+   it is right. Leave *Online* on the playtest server (the kit chooses it
+   anyway), set anything else you like, and click **Play**.
 3. That's it. To change these later, start bbhost with `--setup` (Windows:
-   `run-bbhost.bat --setup`), or tick *Show this window every time bbhost
-   starts*. The settings are kept in your **per-user config**
+   `run-bbhost.bat --setup`), or turn on *Show this window at every start*
+   (its Settings page). The settings are kept in your **per-user config**
    (`%APPDATA%\bbhost\bbhost.toml` on Windows, `~/.config/bbhost/bbhost.toml`
    on Linux), which you can also edit by hand.
 

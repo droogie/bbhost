@@ -1875,7 +1875,7 @@ void census_upload(Surface& sf, const char* why) {
     sf.cp_dirty = false;
 }
 
-thread_local const char* t_resolve_kind = nullptr;
+thread_local constinit const char* t_resolve_kind = nullptr;
 
 // BBHOST_RES_IDENTITY=0: images are kept and retired by guest address
 // alone, as before (the resource's generation is still recorded).
@@ -1989,15 +1989,30 @@ std::uint64_t g_coarse_ms = 0;
 
 void drain_gx_writes_locked();
 std::atomic<bool>& gx_writes_pending();
-void refresh_surface_locked(Surface& sf) {
+// BBHOST_RUN_COMMIT: GX's texture notices drained at a run's fork, as the next
+// refresh in order would drain them: a surface GX mapped since its refresh in
+// this recording is refreshed again in order (its part's draw stops there),
+// not taken as fresh by a part, which drains nothing.
+void textures_drain_gx_writes_locked() {
     if (gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
+}
+void refresh_surface_locked(Surface& sf) {
+    // A run part's draw (BBHOST_RUN_COMMIT): the notices were drained at its
+    // fork (textures_drain_gx_writes_locked), and a surface not refreshed in
+    // this recording yet is refreshed in order - its upload lands before the
+    // draw's packet.
+    const bool part = run_part();
+    if (!part && gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
     if (g_refresh_once) {
         const std::uint64_t stamp = g.record_serial + 1;  // 0 stays "never"
         if (sf.refreshed_serial == stamp) {
             img_census::refreshed(img_census::kRefStamp);
             return;
         }
+        if (run_part_stop(kRunStopRefresh)) return;
         sf.refreshed_serial = stamp;
+    } else if (run_part_stop(kRunStopRefresh)) {
+        return;
     }
     sf.used_ms = g_coarse_ms;
     if (sf.gx_dirty) {
@@ -3109,7 +3124,7 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         if (e.key != key || e.flags != flags || std::memcmp(e.w, w, static_cast<std::size_t>(nw) * 4) != 0) continue;
         if (e.sf) refresh_surface_locked(*e.sf);
         if (img_census::on()) img_census::g_last = e.sf;
-        ++g_view_memo_hits;
+        if (!run_part()) ++g_view_memo_hits;
         if (g_view_memo_mode == 2) {
             bool real_ok = true;
             std::uint32_t real_dim = 0;
@@ -3134,6 +3149,7 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         arrayed = e.arrayed;
         return e.view;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order (BBHOST_RUN_COMMIT)
     g_last_view_surface = nullptr;
     g_last_view_no_memo = false;
     const VkImageView view = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
@@ -3269,11 +3285,13 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         const bool skip = e.fast && e.static_epoch == g_static_epoch &&
                           (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
                           !gx_writes_pending().load(std::memory_order_acquire);
+        const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no entry and no count
         if (skip && g_images_mode == 1) {
-            ++g_images_skips;
+            if (!part) ++g_images_skips;
         } else {
             const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
             if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
+                if (run_part_stop(kRunStopRefresh)) return VK_NULL_HANDLE;  // refreshed in order
                 if (g_images_mode) {
                     images_refresh(e, skip);
                 } else {
@@ -3294,12 +3312,13 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         if (img_census::on()) img_census::g_last = e.sf;
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
-        ++g_id_view_hits;
+        if (!part) ++g_id_view_hits;
         dims_ok = e.dims_ok;
         dim = e.dim;
         arrayed = e.arrayed;
         return e.view;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order (BBHOST_RUN_COMMIT)
     ++g_id_view_misses;
     if (slot) *slot = 0;
     if (base) *base = 0;
@@ -3504,11 +3523,13 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     key = fnv1a(&compare, 1, key);
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) {
+        if (run_part()) return it->second;  // a run part's draw writes no memo (BBHOST_RUN_COMMIT)
         std::memcpy(m.w, s, 16);
         m.compare = compare;
         m.sampler = it->second;
         return it->second;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
     // BBHOST_SAMPLER_FIXES: mirror-once only where the device enabled it.
     const bool fixes = sampler_fixes_on();
     auto address = [fixes](std::uint32_t c) {

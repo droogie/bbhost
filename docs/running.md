@@ -70,17 +70,24 @@ is read in layers, each overriding only the keys it sets:
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
    `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
    (`BBHOST_CONFIG_DIR` replaces the folder);
-2. `bbhost.toml` in the working directory, or next to the executable;
+2. `bbhost.toml` next to the executable, or in the working directory;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
    eboot as the last argument.
+
+A `bbhost.toml` next to the executable (or in the working directory) wins:
+it is read after the per-user one, and the setup window, the patch menu and
+the plugins save to it instead - a copy of bbhost kept with settings of its
+own. Without one, they save to the per-user file. (`--config` and
+`BBHOST_CONFIG_DIR` keep saving to the per-user one.)
 
 The first log line names every file it read. Paths may use either slash; a
 relative path is taken from the folder of the file it is in.
 
 The in-game settings (F10, or the PC Settings, PC Graphics and Key Bindings
 entries the game's own System menu gains) are saved beside the per-user config
-in `bbhost-options.toml`.
+in `bbhost-options.toml` - or in one next to the executable, when there is
+one there.
 
 ## Saves
 
@@ -117,9 +124,27 @@ A controller works as on the console. Without one, the keyboard and mouse
 take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
 menu) - to a key, any of five mouse buttons, or the wheel turned up or down
-(each notch a press). Hold Left Alt with the movement keys to walk, and two
+(each notch a press). In the world the wheel zooms the camera, each notch a
+step of Camera distance (up closer, down further out), and the middle button
+puts it back at the game's own distance: Camera Zoom In, Out and Reset on the
+Key Bindings menu's Other page, which a player can rebind (Transform, on the
+middle button too until then, keeps C). Hold Left Alt with the movement keys to walk, and two
 opposite keys held together cancel, both as in Dark Souls III. F9 opens the
-plugin menu and F10 bbhost's own settings.
+patch and plugin menu and F10 bbhost's own settings: menus over the game in
+the setup window's look, moved through with the mouse, the arrow keys or a
+controller (the d-pad and A, L1 and R1 for the pages, B or Escape to close).
+In F9's Patches page most patches turn on or off at once; the rest (render
+targets sized as the game starts, code bbhost itself rewrites) at the next
+start, and the page says which.
+
+The menus answer at once. In the game a menu that closes on a choice - backing
+out of the inventory or the pause menu, an item's command menu, Continue on
+the title - holds the choice back until its fade-out has played (a tenth of a
+second, a fifth in some) and drops any press made meanwhile; bbhost passes the
+choice on as the press lands, and the menu behind takes input while it fades
+back in. The message, Yes/No and quantity boxes take OK as soon as they are up
+(the game ignores it for their first half second). The loading screen keeps
+its fade-out. `BBHOST_MENU_FADE_WAIT=1` keeps the game's waits.
 
 The mouse turns the camera the way Dark Souls III's PC version does: by an
 angle for each count the mouse reports, 0.25 degrees at the default
@@ -162,14 +187,19 @@ written once, then as a count every ten seconds while it keeps coming and at
 exit: "the game printed this N more times". `BBHOST_GUEST_PRINTS=all` writes
 every line as it comes.
 
-The setup window's Game tab has **Tooling and logging** (`[debug] tooling`;
-`BBHOST_TOOLING=0` or `1` for one run), on by default: the periodic reports in
-the log, the stall detector, the GPU busy meter beside the FPS counter, the
-bottleneck meter's `perf summary:` lines, which say what limits the frame rate
-([docs/performance.md](performance.md)), and the history of recent draws. Off gives the game the time they take, and the log
-keeps its start, warnings, errors and the exit summary: in one measured
-session, about 10 lines where it had written about 4,100. Leave it on when
-reporting a problem.
+The setup window's Settings page has **Tooling and logging** (`[debug] tooling`;
+`BBHOST_TOOLING=0` or `1` for one run), on by default: the log itself, the
+periodic reports in it, the stall detector, the GPU busy meter beside the FPS
+counter, the bottleneck meter's `perf summary:` lines, which say what limits
+the frame rate ([docs/performance.md](performance.md)), and the history of
+recent draws. Off gives the game the time they take, and nothing is logged -
+not bbhost's lines, not the game's own prints - and on Windows no log window
+opens: bbhost.exe is a GUI program, whose log takes the file or pipe it was
+started with (`run-bbhost.bat`'s), the terminal it was started from, or else a
+console window of its own, all only while the log is on. A crash's report is
+still written to wherever the log would go. `BBHOST_LOG=1` keeps the log with
+tooling off (a test measuring with tooling off that still reads the log).
+Leave it on when reporting a problem.
 
 ## Troubleshooting
 
@@ -389,11 +419,14 @@ bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
 The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60, 90 and 120 run its
-logic at that rate; Uncapped steps it by the measured frame time (1/240 to 1/30
-s), at the display's refresh rate with V-Sync on and up to 240 fps with it off -
-in the world and in character creation: at the title and the main menu V-Sync
-off sets no limit.
+applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
+240, 360, 480 and 960 run its logic at that rate; Display-Limited is the
+display's refresh rate when the game starts, to the nearest whole frame a
+second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
+immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
+off - and 60 when no display says a rate (headless). What counts frames cannot
+follow the frame's time, so a rate that moved with it (the Uncapped of earlier
+builds) ran those too fast or too slow.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -449,18 +482,18 @@ twice as fast at 60). The flicker of the torches, braziers and candles (each
 GX light's blink) begins its cycles on the effects' whole steps, holding the
 light's high on the frames between, so the lights blink as fast as at 30
 (`decomp/gx/blink.cpp`; `BBHOST_BLINK_HOLD=0` begins them on any frame, 5-7%
-faster above 30). Above 60 and
-Uncapped the game paces itself and its frames are shown as they come, so 90
+faster above 30). Above 60
+the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.
 The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
-`BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
-uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
-V-Sync says, the menus included, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
+Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
+the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
-switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
+switch, at the converted rates) moves the target while the game runs:
 `square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks
 a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
 `sine:LO:HI:S` sweeps it - one process at two rates, or at one that never holds
@@ -481,7 +514,7 @@ as at that rate however long the frame took, and a slow renderer runs the
 game in slow motion at the rate's steps. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
-refused: 90, 120 or uncapped falls back to 60).
+refused: a rate other than 60 falls back to 60).
 A frame goes to the screen as soon as the game has finished it; only its flip,
 which the game paces itself on, waits for the next tick of that clock. The game
 keeps two flips queued, and showing each frame at the tick that completed it
@@ -492,7 +525,7 @@ completed.
 A flip completes - and what the frame used goes back to the game - only once
 the GPU has rendered that frame: on the console a flip is the GPU reaching it,
 and the game writes the next frames' data over what a completed frame read. A
-loading screen's flips, and those above 60 and Uncapped, do not wait for the
+loading screen's flips, and those above 60, do not wait for the
 clock, so they complete as soon as their frame has rendered; the log says how
 many of a loading screen's flips waited (`video: the loading screen's ...
 flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,

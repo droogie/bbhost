@@ -9,6 +9,7 @@
 #include "hle/modules.h"
 #include "core/thunk.h"
 #include "core/write_watch.h"
+#include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
 #include "engine/mouse_camera.h"
@@ -1541,6 +1542,23 @@ std::uint32_t wheel_presses(float notches) {
     return bit;
 }
 
+// The wheel's notches on a direction bound to Camera Zoom In or Out go to the
+// zoom whole, every one as it comes (host_bind_queue_zoom), not as presses: a
+// press and its gap take 110 ms, and a spin of the wheel is many notches. What
+// is left - a direction bound to something else - is for wheel_presses.
+float wheel_zoom(float notches) {
+    static float part = 0.0f;
+    const int up = notches > 0.0f ? 6 : 7;  // the mouse input the turn is
+    const int zoom_in = host_binding_mouse(kBindZoomIn), zoom_out = host_binding_mouse(kBindZoomOut);
+    if (notches == 0.0f || (up != zoom_in && up != zoom_out)) return notches;
+    if ((part > 0.0f) != (notches > 0.0f)) part = 0.0f;  // turned back: the other way's fraction goes
+    part += notches;
+    const int whole = static_cast<int>(part);  // toward zero
+    part -= static_cast<float>(whole);
+    if (whole) host_bind_queue_zoom(up == zoom_in ? -std::abs(whole) : std::abs(whole), false);
+    return 0.0f;
+}
+
 GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     if (!st || handle != 1) {
         return static_cast<int>(0x80920002u);  // SCE_PAD_ERROR_INVALID_HANDLE
@@ -1617,7 +1635,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                     ++flogs;
                     host_log("mouse: the lock-on flick on the right stick: %u,%u", p.rx, p.ry);
                 }
-            } else if (!mouse_camera_installed() && (m.dx != 0.0f || m.dy != 0.0f)) {
+            } else if (!mouse_camera_installed() && !host_plugin_taken_motion() && (m.dx != 0.0f || m.dy != 0.0f)) {
                 const float sx = hs.mouse_invert_x ? -1.0f : 1.0f;
                 const float sy = hs.mouse_invert_y ? -1.0f : 1.0f;
                 p.rx = axis(static_cast<float>(p.rx) - kStickRest + sx * m.dx * 1.1f);
@@ -1641,9 +1659,11 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             // wheel, which has no held state of its own: each notch is a
             // press of whatever is bound to it (host/bindings.h), long enough
             // for the game to see at 30 fps and with a gap before the next, so
-            // two notches are two presses.
-            host_bindings_mouse_held(m.buttons | m.pressed | wheel_presses(m.wheel), held);
-            host_bindings_apply(held, host_key_strong(), p);
+            // two notches are two presses. Less what a plugin with controls
+            // of its own has taken (plugin API 13): those it reads itself.
+            const std::uint32_t mine = (m.buttons | m.pressed) & ~host_plugin_taken_buttons();
+            host_bindings_mouse_held(mine | wheel_presses(host_plugin_taken_wheel() ? 0.0f : wheel_zoom(m.wheel)), held);
+            host_bindings_apply(held, host_key_strong(), p, 1);
             // On a change only: a held button is seen on every pad read, and
             // logging each one spent the whole budget on the first press.
             static std::uint32_t last_buttons = 0;
@@ -1977,6 +1997,14 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     if (scripted) debug_pressed = true;
     if (host_bind_take_debug_toggle() || scripted) {
         debug_menu_toggle();
+    }
+    // The camera zoom's presses (the wheel and the middle button by default),
+    // in the world only: one made in a menu is dropped.
+    bool zoom_reset = false;
+    const int zoom_steps = host_bind_take_zoom(&zoom_reset);
+    if ((zoom_steps || zoom_reset) && !host_bind_capture_blocking() && !host_options_open() && !ingame_menu_open() &&
+        !menu_pointer_in_menu() && !host_text_entry_open() && !debug_menu_open()) {
+        camera_zoom(zoom_steps, zoom_reset);
     }
     std::memcpy(st + 0, &p.buttons, 4);
     st[4] = p.lx;

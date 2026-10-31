@@ -347,7 +347,7 @@ void disagree_locked(int kind, std::uint32_t handle, const BufferEntry* e) {
 bool gxvk_buffers_bind_mode() { return gxvk::buffers_mode() == gxvk::Buffers::kOn; }
 
 namespace {
-bool g_last_ended = false;  // the last resolve bound an entry retired by its end (the command processor's)
+thread_local bool g_last_ended = false;  // the last resolve on this thread bound an entry retired by its end
 }  // namespace
 bool gxvk_last_resolve_ended() { return g_last_ended; }
 
@@ -369,6 +369,8 @@ int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std
         bump(g_overrun);
     }
     if (st == gxvk::kEntryMade) {
+        // A run part's draw places no copy (BBHOST_RUN_COMMIT): placed in order.
+        if (run_part_stop(kRunStopMirror)) return gxvk::kFallStale;
         if (const int r = place_locked(*e, handle); r != gxvk::kFalls) return r;
     }
     out.buffer = reinterpret_cast<VkBuffer>(e->vk_buffer);

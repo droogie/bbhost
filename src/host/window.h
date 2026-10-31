@@ -109,6 +109,29 @@ bool host_mouse_stage_position(float& x, float& y);
 void host_mouse_set_relative(bool on);
 bool host_mouse_relative();
 
+// A plugin with controls of its own (plugin API 13): the keys by SDL scancode
+// as the last pad update saw them, the mouse's buttons held, and the presses,
+// motion and wheel since the last call - one reader, the plugins. `playing`
+// while the mouse turns the camera (in the world, no menu or text box up).
+// False without a window.
+struct PluginInput {
+    std::uint8_t key[512] = {};
+    std::uint32_t buttons = 0, pressed = 0;
+    float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
+    bool playing = false;
+};
+bool host_plugin_input(PluginInput& out);
+// What a plugin takes from the game while the mouse turns the camera: these
+// keys no longer press what they are bound to, nor these mouse buttons (bit 0
+// left, 1 right, 2 middle, 3 back, 4 forward), the wheel's notches when
+// `wheel`, and the mouse no longer turns the game's camera when `motion`. A
+// call replaces the last; nothing taken gives everything back.
+void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion);
+// For the pad read (hle/system.cpp).
+std::uint32_t host_plugin_taken_buttons();
+bool host_plugin_taken_wheel();
+bool host_plugin_taken_motion();
+
 // The strong-attack modifier (Shift by default) - see the key table.
 bool host_key_strong();
 // Whether the host draws its own pointer (the game has no cursor asset), which
@@ -118,6 +141,11 @@ void host_mouse_set_visible(bool visible);
 // A line of text over the game for `seconds` (plugins' show_message); a new
 // one replaces the last. Any thread.
 void host_message_show(const char* text, float seconds);
+// A line a plugin places (show_text, plugin API 14): its box's corner at
+// (x, y) as fractions of the window, `align` BB_TEXT_* (left, centre or right
+// of the point, | bottom: rising from it), `scale` the overlay text's. A new
+// one replaces the last; separate from the banner. Any thread.
+void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align);
 // The FPS counter's sample: a game frame starts (the main loop's frame-time
 // manager, engine/frame_rate.cpp, as its limiter lets the frame go). Nothing
 // but a flag load while the counter is off.

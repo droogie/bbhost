@@ -401,7 +401,7 @@ void settings_changed(const HostSettings& hs) {
         blur_was = hs.motion_blur;
         motion_blur_apply(hs.motion_blur);
     }
-    set_chromatic_aberration(hs.chromatic_aberration);
+    set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
     g_fog.store(hs.fog);
@@ -1228,7 +1228,7 @@ namespace {
 // slid address); null runs the prologue itself.
 bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n,
                            void* host, std::uint64_t id = 0, const std::uint8_t* exec = nullptr, std::size_t m = 0,
-                           bool keep_rax = false) {
+                           bool keep_rax = false, bool site = false) {
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     if (n < 14 || std::memcmp(p, prologue, n) != 0) return false;
     if (!exec) {
@@ -1245,7 +1245,7 @@ bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
     if (!placed || !guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
     auto* stub = static_cast<std::uint8_t*>(page);
-    thunk_emit_prologue_stub(stub, id, thunk_wrap(host), at + n, exec, m, keep_rax);
+    thunk_emit_prologue_stub(stub, id, thunk_wrap(host), at + n, exec, m, keep_rax, site);
     const std::uint64_t dest = reinterpret_cast<std::uint64_t>(stub);
     p[0] = 0xff;
     p[1] = 0x25;  // jmp [rip+0]
@@ -1526,6 +1526,11 @@ bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t*
 bool engine_prologue_hook_exec(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n,
                                const std::uint8_t* exec, std::size_t m, void* host, std::uint64_t id) {
     return install_prologue_hook(image, at, prologue, n, host, id, exec, m);
+}
+
+bool engine_site_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* bytes, std::size_t n, void* host,
+                      std::uint64_t id) {
+    return install_prologue_hook(image, at, bytes, n, host, id, nullptr, 0, false, true);
 }
 
 bool engine_call_site_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, void* host) {

@@ -1,0 +1,60 @@
+# Lower specific renders (Perf Increase): Kyo's patch for 1.09, from the
+# shadPS4 patch list (Bloodborne.xml), byte for byte: 7 sites, 66 bytes.
+#
+# The list's note:
+# lowers res of certain renders (Velomap, Glow, ScaledDepth). Gives a perf
+# increase, no visual differences/conflicts unless you enable SSR patch.
+#
+# The words low-res-aux-targets (a port no release carries any more) sets, at
+# other sizes, and the glow buffer too (bbhost leaves a target smaller than
+# its pass out of the pass, so the world is drawn whole; the glow is lost).
+# Its sizes are taken as the targets are made: on or off applies at the next
+# start. Its group's other, where a player keeps it, is low-res-aux-targets.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `lower-specific-renders = true` under [patches] in
+# bbhost.toml.
+[patch]
+name = "lower-specific-renders"
+title = "Lower specific renders (Perf Increase)"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Lowers the resolution of some renders (the velocity map, glow, the scaled depth): faster, with no visual difference unless Enable Screen Space Reflections is on."
+enabled = false
+order = 850
+group = "low-res-renders"
+live = false
+
+[site.s000]
+address = "0x0125b1a3"
+expect = "8b 03 d1 e8 89 04 24"
+bytes = "c7 04 24 50 00 00 00"
+
+[site.s001]
+address = "0x0125b1aa"
+expect = "8b 43 04 d1 e8 89 44 24 04"
+bytes = "c7 44 24 04 2d 00 00 00 90"
+
+[site.s002]
+address = "0x0125b1d6"
+expect = "8b 03 c1 e8 02 89 04 24"
+bytes = "c7 04 24 50 00 00 00 90"
+
+[site.s003]
+address = "0x0125b1de"
+expect = "8b 43 04 c1 e8 02 89 44 24 04"
+bytes = "c7 44 24 04 2d 00 00 00 90 90"
+
+[site.s004]
+address = "0x026c3de4"
+expect = "41 8b 07 d1 e8"
+bytes = "b8 50 00 00 00"
+
+[site.s005]
+address = "0x026c3df0"
+expect = "41 8b 47 04 d1 e8"
+bytes = "b8 2d 00 00 00 90"
+
+[site.s006]
+address = "0x026c45ba"
+expect = "41 8b 07 89 84 24 00 02 00 00 41 8b 47 04 89 84 24 04 02 00 00"
+bytes = "48 b8 50 00 00 00 2d 00 00 00 48 89 84 24 00 02 00 00 90 90 90"

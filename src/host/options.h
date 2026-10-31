@@ -1,16 +1,16 @@
 #pragma once
 
-// The PC port's own options screen, drawn by the host overlay.
+// The PC port's own settings (F10): a menu over the game drawn with the F9
+// menu's frame (host/ingame_menu.h), in the setup window's look.
 //
 // These settings configure *bbhost*, not the game: resolution, pacing, what
 // the pointer does. The PS4 build has nowhere to put them and the dump is
-// never written, so the host draws the screen and owns the file it saves to.
-// Coordinates are display-buffer pixels, the space
-// host_mouse_state() and the overlay already share.
+// never written, so the host draws the menu and owns the file it saves to.
 //
-// The screen is modal: while it is open the game sees no pad and no pointer.
+// The menu is modal: while it is open the game sees no pad and no pointer.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 // Reads the saved settings and applies the ones that take effect at startup.
@@ -21,17 +21,27 @@ void host_options_load();
 void host_options_apply();
 
 bool host_options_open();
-// One of the screen's own text fields (the account rows) is being typed.
-bool host_options_editing();
-// Opening drains the latched pointer edges, so a click from before it opened
-// does not land on a row. Closing saves.
+// The window's thread (F10, host/ingame_menu.cpp). Opening drains the latched
+// pointer edges, so a click from before it opened reaches nothing. Closing saves.
 void host_options_set_open(bool open);
+// The same close from the presenter (the menu's Close, Escape): saved at the
+// window's next pump.
+void host_options_close();
 
-// A key the pump saw, as an SDL scancode. True when the screen consumed it,
-// which includes the key that opens it.
-bool host_options_key(int scancode, bool repeat);
-// One pump: hit-tests the pointer, applies what changed, and draws. Call
-// between host_overlay_reset() and the pointer, so the pointer is on top.
+// F10's settings as pages of the in-game menu (host/ingame_menu.cpp): drawn on
+// the presenter's thread into the current ImGui window, in the setup window's
+// look. A change is handed to the window's thread, which applies it at its
+// next pump (host_options_frame); the file is written when the menu closes.
+int host_options_page_count();
+const char* host_options_page_name(int page);
+const char* host_options_page_blurb(int page);
+void host_options_draw_page(int page);
+// Runs `fn` on the window's thread at its next pump: the menus' changes to
+// settings and to bbhost.toml, which can touch the window or write files.
+void host_options_post(std::function<void()> fn);
+
+// One pump of the window's thread: runs what the menus posted, and answers
+// the resolution's keep-or-revert question.
 void host_options_frame(float display_w, float display_h);
 
 // The live settings are one object, host/settings.h (host_settings()), with
@@ -43,8 +53,9 @@ bool host_opt_get(const char* key);
 bool host_opt_resolution(int* w, int* h);
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
-// The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, or 0 for
-// uncapped; the file's key is still frame_cap. Same setting, same file.
+// The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
+// 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
+// file's key is still frame_cap. Same setting, same file.
 int host_opt_frame_cap();
 void host_opt_set_frame_cap(int fps);
 
@@ -56,6 +67,8 @@ void host_opt_set(const char* key, bool on);
 // A setting as the index of its value (mouse_sens: 0..10), and setting it;
 // -1 for an unknown name. Saved at once, like host_opt_set.
 int host_opt_index(const char* key);
+// Menu text size (menu_text_size) as a factor: 1.0 at 100%, 4.0 at 400%.
+float host_opt_menu_text_scale();
 void host_opt_set_index(const char* key, int index);
 // Writes the options file now: the key bindings changed (host/bindings.h).
 void host_options_save_now();
@@ -80,6 +93,10 @@ void host_set_deck_profile(int profile);
 // Changes whenever any setting does: something that applies a setting live
 // reads it again only when this has moved.
 std::uint64_t host_opt_serial();
+
+// What the Shaders setting's HLSL and Lifted mean, in a player's words: the
+// setup window's bubbles and F10's.
+extern const char* const kHostShaderModeTips[2];
 
 // What each setting ships with - the table's own values, whatever the files
 // say - for the game's Defaults row (engine/option_menu.cpp). Read the way

@@ -32,7 +32,7 @@ enum BindAction : int {
     // Camera and menus
     kBindLookU, kBindLookD, kBindLookL, kBindLookR, kBindMenu, kBindConfirm, kBindBack,
     // Other
-    kBindL3, kBindDebugMenu,
+    kBindL3, kBindZoomIn, kBindZoomOut, kBindZoomReset, kBindDebugMenu,
     kBindCount,
 };
 constexpr int kBindPages = 5, kBindPerPage = 7;
@@ -73,8 +73,9 @@ void host_binding_prompt(int action, char* out, std::size_t n);
 
 // Applies a set of held actions to the pad the game reads. `strong` is the
 // modifier's state, which turns Attack into the strong attack whichever device
-// is holding it.
-void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p);
+// is holding it. `device` is 0 for the keyboard, 1 for the mouse: the
+// keyboard's movement keys ramp up to a full push over 66 ms (host/bindings.cpp).
+void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device);
 // Actions held on the keyboard, from SDL's key state.
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]);
 // Actions held on the mouse, from MouseState::buttons (bit n-1 is button n;
@@ -106,5 +107,15 @@ void host_bind_capture_note_held(bool any_down);
 void host_bind_note_clear_key();
 // The Debug Menu key was pressed since the last call (engine/debug_menu.h).
 bool host_bind_take_debug_toggle();
+// The camera zoom's presses since the last call: Zoom Out's less Zoom In's,
+// each a step of the Camera distance setting, and whether Zoom Reset was
+// pressed (engine/camera.h camera_zoom).
+int host_bind_take_zoom(bool* reset);
+// The same presses from a test request (BBHOST_TEST_REQUESTS "zoom in|out|reset").
+void host_bind_queue_zoom(int steps, bool reset);
+// An options file from before the zoom actions (version 3 or older): the
+// middle button they take by default was Transform's, which gives it up; an
+// action the player put on the wheel keeps it, and the zoom goes without.
+void host_bindings_migrate_zoom();
 bool host_bind_take_clear_key();
 void host_binding_clear(int action);

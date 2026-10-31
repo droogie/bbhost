@@ -68,7 +68,7 @@ void loading_tick(std::uint64_t flip) {
             cutscene = (at<std::uint32_t>(man + 0x168) & 1) != 0 || at<std::uint64_t>(man + 0xf8) != 0;
         }
     }
-    const bool fast = g_fast_enabled && loading && !cutscene && frame_rate_game_fps() != 30;  // 60, 90, uncapped
+    const bool fast = g_fast_enabled && loading && !cutscene && frame_rate_game_fps() != 30;  // every rate above 30
     if (g_fast.exchange(fast, std::memory_order_relaxed) != fast) hle_video_set_loading_uncapped(fast);
     if (loading && !was) {
         began = now;

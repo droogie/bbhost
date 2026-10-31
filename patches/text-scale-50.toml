@@ -1,0 +1,29 @@
+# 50% Text scale: Kyo's patch for 1.09, from the shadPS4 patch list
+# (Bloodborne.xml), byte for byte: 1 sites, 4 bytes.
+#
+# The list's note:
+# Smaller text, looks good on higher resolutions.
+# If you want to try other resolution values:
+# 90%:6666663F
+# 80%:CDCC4C3F
+# 70%:3333333F
+# 60%:9A99193F
+# 50%:0000003F
+#
+# Other scales, as the four bytes at 0x4d2913c: 90% 66 66 66 3f, 80% cd cc 4c
+# 3f, 70% 33 33 33 3f, 60% 9a 99 19 3f, 50% 00 00 00 3f.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `text-scale-50 = true` under [patches] in bbhost.toml.
+[patch]
+name = "text-scale-50"
+title = "50% Text scale"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Smaller text, which looks good at higher resolutions."
+enabled = false
+order = 140
+
+[site.s000]
+address = "0x04d2913c"
+expect = "00 00 80 3f"
+bytes = "00 00 00 3f"

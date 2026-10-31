@@ -147,7 +147,7 @@ sine, cosine and arcsine series - and the rest is plain C++. Its denormals come
 along too: under the game's MXCSR `minss` turns a denormal into zero where a
 branch keeps it, and ours chooses each value the way the game's instruction
 does. Three places in the game's code are rewritten at load - the fov-uncap
-patch and two 60 fps sites - and ours reads them where the game would; any
+patch (when it is on) and two 60 fps sites - and ours reads them where the game would; any
 other change to the function's body, or to a constant it reads, keeps the
 game's version in place.
 

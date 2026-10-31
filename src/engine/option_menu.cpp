@@ -220,9 +220,9 @@ constexpr std::uint32_t kSystemEffectsRowId = 110010;
 constexpr std::uint32_t kSystemCameraRowId = 110011;
 constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
-// PC Enhancements, 124000: three toggles, each for the next start (124000
+// PC Enhancements, 124000: four toggles, each for the next start (124000
 // was The Old Hunters, a patch of its own since: the setup window's Patches tab).
-constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003;
+constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
 // Steam Deck, 123000: its frame rate - the two configurations,
 // host_set_deck_profile - and the model detail.
 constexpr std::uint32_t kDeckFrameRate = 123000, kDeckModelDetail = 123001;
@@ -555,10 +555,12 @@ constexpr int kEffectsRows = kEffectsCount + 2;
 
 // The frame rate (engine/frame_rate.h), as a pick-list. The row stores the
 // chosen entry's int32, so the values are the rates themselves and 0 is
-// uncapped. Five entries of the widget's six slots (the old Frame cap's
-// 30/60/90/120/144/Off had all six; 116034 was its 144).
+// Display-Limited (the display's refresh rate). Eleven entries; the list
+// scrolls past six, as the resolution's does (116034 was the old Frame cap's
+// 144).
 const Choice kFrameCaps[] = {
-    {30, 116030}, {60, 116031}, {90, 116032}, {120, 116033}, {0, 116035},
+    {30, 116030},  {60, 116031},  {90, 116032},  {120, 116033}, {150, 116036}, {180, 116037},
+    {240, 116038}, {360, 116039}, {480, 116040}, {960, 116041}, {0, 116035},
 };
 std::int32_t g_frame_cap = 30;
 
@@ -625,12 +627,13 @@ std::uint64_t g_deck_vtable = 0;
 std::atomic<bool> g_deck_redraw{false};  // the model detail row shows a value the frame rate set
 constexpr int kDeckRows = 2;
 
-// PC Enhancements: three toggles, read at the next start (main.cpp,
+// PC Enhancements: four toggles, read at the next start (main.cpp,
 // config_set_enhancements), so a change here shows at once and applies then.
 Toggle g_enhance[] = {
     {"change_appearance", kEnhMirror, 1, 0xff},
     {"rebirth", kEnhRebirth, 1, 0xff},
     {"five_players", kEnhFivePlayers, 1, 0xff},
+    {"skill_issue", kEnhSkillIssue, 1, 0xff},
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
 

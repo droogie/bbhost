@@ -6,7 +6,10 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "engine/guest.h"
+#include "engine/lua_events.h"
 #include "engine/menu_pointer.h"
+#include "host/bindings.h"
+#include "engine/world_chr.h"
 #include "host/gpu.h"
 #include "core/config.h"
 #include "host/window.h"
@@ -376,6 +379,14 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
         } else if (verb == "f12") {
             host_log("test: F12 capture %s asked for at flip %llu", arg.empty() ? "-" : arg.c_str(), static_cast<unsigned long long>(count));
             host_gpu_request_dump();
+        } else if (verb == "remo" && !arg.empty()) {
+            const bool ok = remo_request_queue(std::atoi(arg.c_str()), arg2.empty() ? 0 : std::atoi(arg2.c_str()));
+            host_log("test: cutscene %s (method %s) at flip %llu%s", arg.c_str(), arg2.empty() ? "0" : arg2.c_str(),
+                     static_cast<unsigned long long>(count), ok ? "" : ": not queued");
+        } else if (verb == "travel" && !arg.empty()) {
+            const bool ok = world_lamp_warp_queue(std::atoi(arg.c_str()));
+            host_log("test: lamp travel to return point %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count),
+                     ok ? "" : ": not queued (BBHOST_TEST_WARP=1, in the world)");
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);
@@ -384,6 +395,11 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             host_gpu_capture_arm(n, arg2.c_str());
             host_log("test: draw captures armed for %d at flip %llu%s%s", n, static_cast<unsigned long long>(count), arg2.empty() ? "" : " into ",
                      arg2.c_str());
+        } else if (verb == "zoom" && (arg == "in" || arg == "out" || arg == "reset")) {
+            // The camera zoom's presses, as the wheel and the middle button make them.
+            const int n = arg2.empty() ? 1 : std::atoi(arg2.c_str());
+            host_bind_queue_zoom(arg == "in" ? -n : arg == "out" ? n : 0, arg == "reset");
+            host_log("test: zoom %s %d at flip %llu", arg.c_str(), n, static_cast<unsigned long long>(count));
         } else if ((verb == "tap" || verb == "menutap") && !arg.empty()) {
             const std::uint32_t button = arg == "confirm" ? menu_confirm_button() : hle_pad_button_named(arg);
             const int hold = arg2.empty() ? 200 : std::atoi(arg2.c_str());

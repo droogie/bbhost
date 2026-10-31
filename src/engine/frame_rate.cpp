@@ -17,7 +17,6 @@
 #include "engine/paramdef.h"
 #include "engine/sprj_flipper.h"
 #include "engine/loading.h"
-#include "engine/menu_steps.h"
 #include "engine/patch_manifest.h"
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
@@ -61,9 +60,9 @@ constexpr std::uint8_t kFrameManagerPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
 constexpr std::uint32_t kModeSixty = 2;
 
-// The game's pace: 30 (its own), a fixed rate (60, 90, 120: the game's mode 2
-// with a 1/fps target), or uncapped (the same with the target the display's
-// refresh rate or 1/240 s). Kyo's FPS++ lists for 1.09 (60 and 90 FPS++ 1.0,
+// The game's pace: 30 (its own) or a fixed rate (60 to 960, or Uncapped's: the
+// display's refresh rate; the game's mode 2 with a 1/fps target). Kyo's FPS++
+// lists for 1.09 (60 and 90 FPS++ 1.0,
 // and his 1.3 lists with yogesh1239's high-FPS fixes) are the source of most
 // of what follows; every value and code site is checked against the eboot's
 // bytes before anything is written, and each is done natively - values for
@@ -252,7 +251,7 @@ constexpr Constant kConstants[] = {
 // the game's task step: each_frame below), so it follows a frame that ran
 // long as the task step does. The others are code immediates
 // or tied to a frame count (0x4cf6420, a tenth of 0x192c405's interval a
-// frame) and take the rate's value (uncapped: its reference rate, 120).
+// frame) and take the rate's value.
 enum class Kind : std::uint8_t {
     Step,    // a frame's seconds: dt
     Amount,  // an amount a frame, the game's own at 30 a second: was * 30 dt
@@ -319,8 +318,8 @@ static_assert(rated_in_constants(), "every rated value is one of kConstants (its
 // +0x8d4 (sub_2bf67f0, strtol base 10; the engine's own default is 16666).
 // Bloodborne ships 33333: at 60 the game posts two frames of sound requests
 // per update, and some attack sounds played half as often as at 30
-// (2026-09-30). The digits, in place: one update a frame at every rate, and
-// at the uncapped mode's 240 (04166).
+// (2026-09-30). The digits, in place: one update a frame at every rate (960:
+// 01041).
 enum class Count : std::uint8_t {
     Frames,  // was * fps / 30
     Micros,  // was * 30 / fps
@@ -363,7 +362,7 @@ constexpr Bytes kBytes[] = {
 //    multiplied in where 0x21bc181 had a fixed step - those systems step by
 //    the frame that ran rather than by 1/30 (the list's author credits the
 //    cloth and jumping fixes at 60 to these). The target is ours (1/60, 1/90,
-//    or the uncapped limit), so this is what makes 90 and uncapped real time;
+//    1/180...), so this is what keeps every rate above 60 real time;
 //  - two runs of parameter reads (0x183ff29, 0x1840799, beside the camera's
 //    field-of-view clamp) replaced by stores of the list's 60 fps values, and
 //    two edits in the camera's update (0x183dc97, 0x183dcfe) - left out with
@@ -376,8 +375,8 @@ constexpr Bytes kBytes[] = {
 // own edits (ours replaces that function), a frame-mode store, the mode-name
 // pointer table, the timed wait turned into a return, and the sound thread's
 // sleep cap (a cave over a live function) - that thread's update time is in
-// kCounts instead. BBHOST_SIXTY_SITES=0 leaves them all out (and so 90 and
-// uncapped, which need them).
+// kCounts instead. BBHOST_SIXTY_SITES=0 leaves them all out (and so every
+// rate but 60, which need them).
 struct Site {
     std::uint32_t at;
     const char* was;
@@ -662,18 +661,14 @@ static_assert(dt_loads_clear_of(kSixtySites) && dt_loads_clear_of(kFrameTimeSite
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
-// The uncapped mode: the game's frame limit and the reference rate for what
-// cannot follow the frame time (code immediates, frame counts) - Kyo's
-// uncapped list takes 120's values too.
-constexpr int kUncappedMaxFps = uncapped_limit::kWorldMaxFps;
-constexpr int kUncappedReferenceFps = 120;
-
-// The rates the Frame rate option offers besides 30 and uncapped
+// The rates the Frame rate option offers besides 30 and Uncapped
 // (host/options.cpp, engine/option_menu.cpp, host/launcher.cpp list the
-// same): each runs the game's mode 2 with a 1/fps target.
-constexpr int kFrameRates[] = {60, 90, 120};
+// same): each runs the game's mode 2 with a 1/fps target. Uncapped runs the
+// display's refresh rate the same way (engine/uncapped_limit.h), whatever it
+// is - 144, 165 - so any rate from 30 to 960 can run.
+constexpr int kFrameRates[] = {60, 90, 120, 150, 180, 240, 360, 480, 960};
 
-// A frame rate as one of the modes: 30, a converted rate, or 0 (uncapped).
+// A frame rate as one of the modes: 30, a converted rate, or 0 (Uncapped).
 // Another number takes the nearest mode below it.
 int mode_of(int fps) {
     if (fps <= 0) return 0;
@@ -684,7 +679,7 @@ int mode_of(int fps) {
     return mode;
 }
 
-std::string mode_name(int fps) { return fps == 0 ? std::string("uncapped") : std::to_string(fps); }
+std::string mode_name(int fps) { return fps == 0 ? std::string("Display-Limited") : std::to_string(fps); }
 
 std::vector<std::uint8_t> hex_bytes(const char* h) {
     std::vector<std::uint8_t> out;
@@ -706,9 +701,9 @@ std::uint32_t float_bits(float f) {
     return u;
 }
 
-// A rated constant at a frame rate (fractional for the uncapped mode's frame
-// time). At 60 the table's own value is written instead (the same within a
-// rounding of Decay's).
+// A rated constant at a frame rate (fractional for a frame's own time). At 60
+// the table's own value is written instead (the same within a rounding of
+// Decay's).
 float rated_value(Kind kind, float was, double fps) {
     switch (kind) {
         case Kind::Step: return static_cast<float>(1.0 / fps);
@@ -749,8 +744,10 @@ void count_was(const Counted& c, std::uint8_t* out) {
     std::memcpy(out, &c.was, c.n);
 }
 
-// The game's pace: 30, a converted rate (60, 90, 120), or 0 for uncapped.
+// The game's pace: 30, or the rate it was converted to (60 to 960; Uncapped's
+// is the display's refresh rate, g_uncapped).
 int g_game_fps = 30;
+bool g_uncapped = false;
 std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};
 // The every-frame values (kRated's each_frame) at every converted rate: where
@@ -833,8 +830,8 @@ T get(std::uint64_t a) {
 // Ours differs in one thing: which mode runs is the host's choice (the
 // Frame rate option), not the game's fields, and above 30 the game's own
 // one-shot resets to 30 (the multiplayer route, the "reset to 30" request)
-// do not apply. At 60 it is the game's own mode 2; at 90 and uncapped the
-// same with our target (1/90, or the uncapped limit). The clock and the sleep
+// do not apply. At 60 it is the game's own mode 2; at the other rates the
+// same with our target (1/90, 1/180...). The clock and the sleep
 // are the host's; the arithmetic is the eboot's, float for float, so compare
 // mode can demand equality.
 
@@ -986,13 +983,6 @@ std::uint64_t g_slide = 0;
 // This frame runs with no target (a loading screen, engine/loading.h); set by
 // the hook for its own update only, never for compare mode's replay.
 bool g_fast_target = false;
-// This frame's values that follow the frame's seconds (each_frame) take its
-// measured time down to kShortestFrame, not to the uncapped limit: set by the
-// hook while the game runs uncapped outside the world (menus_unlimited).
-bool g_dt_unfloored = false;
-// The shortest frame each_frame believes: a guard against a zero or negative
-// measurement, not a limit (the title runs ~0.4 ms frames).
-constexpr float kShortestFrame = 1.0f / 20000.0f;
 // BBHOST_SIM_FRAME_TIME=1 (a test mode for slow devices, converted rates
 // only): each frame counts as its target's length - 1/60 at 60, 1/120 at 120,
 // the swing's (BBHOST_TEST_FPS_SWING) when it moves - instead of the time it
@@ -1010,7 +1000,7 @@ const bool g_sim_frame_time = [] {
 // once): every frame runs with no target - a measure of how fast the machine
 // can run the game's frames, not a way to play it: at 60 and 90 the steps
 // Kyo's lists fix at 1/60 then go by faster than real time. Stand still
-// to measure. The uncapped mode is the way to play it fast.
+// to measure. A rate of the option's - or Uncapped's - is the way to play it fast.
 const bool g_bench_uncapped = [] {
     const char* e = std::getenv("BBHOST_BENCH_UNCAPPED");
     return e && e[0] == '1';
@@ -1250,92 +1240,12 @@ void note_main_frame_work(std::uint64_t m) {
     if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
 }
 
-// BBHOST_UNCAPPED_FPS=N (30..240): the uncapped mode's limit, everywhere; 0
-// when unset.
+// BBHOST_UNCAPPED_FPS=N (30..960): Uncapped's rate whatever the display's
+// refresh rate (engine/uncapped_limit.h); 0 when unset.
 const int g_uncapped_forced = [] {
     const char* e = std::getenv("BBHOST_UNCAPPED_FPS");
     return uncapped_limit::forced_fps(e && *e ? std::atoi(e) : 0);
 }();
-
-// V-Sync, kept by the settings' listener (frame_rate_install): told each
-// change (F10 and the game's PC Settings change it live), never asked for.
-std::atomic<bool> g_vsync{true};
-void settings_changed(const HostSettings& hs) { g_vsync.store(hs.vsync, std::memory_order_relaxed); }
-bool vsync_setting() { return g_vsync.load(std::memory_order_relaxed); }
-
-// Character creation runs at the title with no world loaded, and its model
-// preview turns and zooms by a fixed step a frame while a direction is held
-// (chrmake_bg_controller_update, 0x1f07870: the table at 0x4b349e0), so
-// unlimited it would spin several times as fast as at 240. Its top list - the
-// Contract screen, open until the game starts (chrmake_top_build_command_list,
-// a command list's step: engine/menu_steps.h, type 7, "ChrMakeTop"; the
-// Appearance list change_appearance watches opens over it) - is held while it
-// is open, and the uncapped limit stays meanwhile. Not in the world, where no
-// character creation runs. Without the watch the menus keep the limit too.
-constexpr std::uint64_t kChrMakeListType = 7;
-constexpr char16_t kChrMakeListName[] = u"ChrMakeTop";
-int g_chrmake_watch = -1;
-std::uint64_t g_chrmake_list = 0;  // the list's step while open, a reference ours (main thread)
-
-void chrmake_tick() {
-    if (g_chrmake_watch < 0) return;
-    if (const std::uint64_t made = menu_steps_take(g_chrmake_watch)) {
-        if (!g_chrmake_list && !loading_in_world() && *menu_step_count(made) >= 1) {
-            menu_step_hold(made);  // when ours is the last reference, the list has closed
-            g_chrmake_list = made;
-            host_log("frame rate: character creation is open; the uncapped limit holds until it closes");
-        }
-    }
-    if (g_chrmake_list && *menu_step_count(g_chrmake_list) == 1) {
-        menu_step_release(g_chrmake_list);
-        g_chrmake_list = 0;
-        host_log("frame rate: character creation closed");
-    }
-}
-
-// Uncapped with V-Sync off, no world loaded and no loading screen up - the
-// title and the main menu, not character creation (above): the frame-time
-// manager waits for nothing, as on a loading screen. The uncapped mode's 240
-// is for the world: its code immediates and frame counts hold 120's values
-// (frame_rate.h), so above 240 they run more than twice as fast as real time.
-// At the title nothing runs on them - the menus step by the measured frame
-// time (the task step) and by the values each_frame writes, which then follow
-// the frame unfloored - so there the frame rate is the machine's. A loading
-// screen keeps its own rule (engine/loading.h: fast unless a cutscene follows
-// it), V-Sync on the display's refresh rate, and BBHOST_UNCAPPED_FPS its own
-// limit, everywhere. Asked every frame, so a V-Sync change in F10 takes effect
-// on the next one.
-bool menus_unlimited() {
-    if (g_chrmake_watch < 0) return false;
-    return uncapped_limit::unlimited(g_game_fps, g_uncapped_forced, vsync_setting(), loading_in_world(), loading_screen_up(),
-                                     g_chrmake_list != 0);
-}
-
-// The uncapped mode's frame limit: BBHOST_UNCAPPED_FPS=N (30..240) if set;
-// else, with V-Sync on, the display's refresh rate (a PC game's V-Sync: no
-// frame the display cannot show), and with it off 240 (outside the world
-// none: menus_unlimited). Asked every frame; the refresh rate is cached by
-// the window (once a second) and V-Sync kept by the settings' listener.
-float uncapped_limit_fps() {
-    const int forced = g_uncapped_forced;
-    const bool vsync = !forced && vsync_setting();
-    // The display's refresh rate: 0 headless, or when the display does not say.
-    return uncapped_limit::limit_fps(forced, vsync, vsync ? host_window_refresh_hz() : 0.0f);
-}
-
-// The uncapped pace's target: a frame at that limit, said when it changes.
-float uncapped_target() {
-    const float limit = uncapped_limit_fps();
-    static float said = -1.0f;
-    if (limit != said) {
-        said = limit;
-        host_log("frame rate: uncapped, at most %.2f fps (%s)", static_cast<double>(limit),
-                 g_uncapped_forced                               ? "BBHOST_UNCAPPED_FPS"
-                 : limit < static_cast<float>(kUncappedMaxFps) ? "V-Sync on: the display's refresh rate"
-                                                                 : "the mode's limit");
-    }
-    return 1.0f / limit;
-}
 
 // BBHOST_TEST_FPS_SWING (a test switch, converted rates only): the target
 // moves while the game runs, so one process can be held at two rates or at a
@@ -1346,7 +1256,7 @@ float uncapped_target() {
 //   random:<lo>:<hi>:<s>   a new rate in [lo, hi] every <s> seconds
 //   jitter:<lo>:<hi>       a new rate in [lo, hi] every frame
 //   sine:<lo>:<hi>:<s>     from lo to hi and back over <s> seconds
-// The code immediates and counts keep the mode's values (uncapped: 120's).
+// The code immediates and counts keep the rate's values.
 struct FpsSwing {
     enum Kind { Off, Square, Random, Jitter, Sine } kind = Off;
     float lo = 0, hi = 0, period = 1;
@@ -1413,18 +1323,26 @@ float swing_target(float base) {
 
 // The converted pace's target for this frame; 0 at 30.
 float pace_target() {
-    if (g_game_fps == 0) return swing_target(uncapped_target());
+    if (g_game_fps == 30) return 0.0f;
     if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
-    if (g_game_fps > 60) return swing_target(1.0f / static_cast<float>(g_game_fps));
-    return 0.0f;
+    return swing_target(1.0f / static_cast<float>(g_game_fps));
 }
+
+// BBHOST_TEST_STEP_FPS=N (a test switch): every frame's step is exactly 1/N
+// whatever the frame took - what a machine running N frames a second gives
+// the game, at the speed this one manages (game time runs slower than real).
+const float g_test_step = [] {
+    const char* e = std::getenv("BBHOST_TEST_STEP_FPS");
+    const int n = e && *e ? std::atoi(e) : 0;
+    return n >= 30 && n <= 2000 ? 1.0f / static_cast<float>(n) : 0.0f;
+}();
 
 // After the update, at every converted rate, for the frame about to run: the
 // task step (kStepLoad) - the measured frame time clamped to [target, 1/30]
 // as the 60 FPS++ cave has it (a loading screen has no target: the measured
 // time), times a plugin's time scale, at most 1/30 - the play time's
 // milliseconds from it, and the values that follow the frame's seconds, from
-// dt: the same with the uncapped limit as the floor while a loading screen
+// dt: the same with a frame of the rate as the floor while a loading screen
 // has no target. Above 60 the cloth's stiffness scale: the square of its
 // solver rate (one substep a frame) against the 60 its part files were
 // authored at, (60 dt)^2, at most 1 (below 60 the cloth keeps the 60
@@ -1433,7 +1351,8 @@ float pace_target() {
 void each_frame(const SprjFlipper* f) {
     const float scale = g_scale_by_step.load(std::memory_order_relaxed) ? g_time_scale.load(std::memory_order_relaxed) : 1.0f;
     const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
-    const float step = scaled(std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth));
+    const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
+    const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
         frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
@@ -1467,8 +1386,8 @@ void each_frame(const SprjFlipper* f) {
         }
         decomp_water_step_frame(water_between);
     }
-    const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
-    const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(g_game_fps));
+    const float dt = g_test_step > 0.0f ? scaled(g_test_step) : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
@@ -1520,15 +1439,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     if (g_source == Source::Ours) {
         note_main_frame_work(saved[5]);
         RealClock clock;
-        chrmake_tick();
-        const bool unlimited = converted && menus_unlimited();
-        static int said_unlimited = -1;
-        if (said_unlimited != static_cast<int>(unlimited) && g_game_fps == 0) {
-            said_unlimited = unlimited;
-            host_log("frame rate: uncapped, %s", unlimited ? "no frame limit outside the world (V-Sync off)"
-                                                           : "the world's or V-Sync's limit (uncapped_target)");
-        }
-        g_fast_target = converted && (g_bench_uncapped || loading_fast_now() || unlimited);
+        g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
         const float target = pace_target();
         const std::uint64_t wait_t0 = host_clock_monotonic_ns();
         sprj_flipper_update(f, clock, target);
@@ -1538,9 +1449,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
                            g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : g_game_fps == 30 ? 30.0f : 0.0f);
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
-        g_dt_unfloored = unlimited;
         if (converted) each_frame(f);
-        g_dt_unfloored = false;
         if (g_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("frame source: SprjFlipper::Update is ours (0x%llx, %s); the guest's no longer runs",
                      static_cast<unsigned long long>(saved[5]), converted ? mode_name(g_game_fps).c_str() : "the game's own mode");
@@ -1577,8 +1486,10 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     return 0;
 }
 
-// The Frame rate option as the game started with it. BBHOST_GAME_FPS=30, 60,
-// 90 or 0 (also "uncapped": atoi reads 0) overrides it.
+// The Frame rate option as the game started with it: 30, a rate of
+// kFrameRates, or 0 for Uncapped (frame_rate_install makes that the display's
+// refresh rate). BBHOST_GAME_FPS=30, 60, ... 960 or 0 (also "uncapped": atoi
+// reads 0) overrides it.
 int wanted_fps() {
     if (const char* e = std::getenv("BBHOST_GAME_FPS"); e && *e) return mode_of(std::atoi(e));
     return mode_of(host_settings().frame_cap);
@@ -1643,8 +1554,8 @@ bool sites_hold(ElfImage* image, const Site (&sites)[N], const char* group) {
 
 // Checks every value and site, picks the mode they allow, then writes. 30
 // (nothing written) if a value table does not hold the eboot's values; 60
-// without the code rewrites if those do not hold theirs; 60 if 90's or
-// uncapped's do not. Never part of a group.
+// without the code rewrites if those do not hold theirs; 60 if another rate's
+// do not. Never part of a group.
 int apply_rate(ElfImage* image, int want) {
     const auto va = [&](std::uint32_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
     // A value a patch manifest the player turned on changed (Kyo's Movement +
@@ -1733,9 +1644,9 @@ int apply_rate(ElfImage* image, int want) {
         }
         return n;
     };
-    // The reference rate's values for uncapped's code immediates and frame
-    // counts; the sound thread keeps up with the fastest frame.
-    const int fps = mode == 0 ? kUncappedReferenceFps : mode;
+    // The code immediates and frame counts at the rate's own values - the
+    // sound thread's update time too (one a frame).
+    const int fps = mode;
     // A rated constant's rule gives the table's own value at 60.
     std::size_t rated_fixed = 0, camera_kept = 0;
     for (const Constant& c : kConstants) {
@@ -1754,7 +1665,7 @@ int apply_rate(ElfImage* image, int want) {
     for (const Counted& c : kCounts) {
         if (skipped(c.at)) continue;
         std::uint8_t now[8];
-        count_bytes(c, c.kind == Count::Digits && mode == 0 ? kUncappedMaxFps : fps, now);
+        count_bytes(c, fps, now);
         write(c.at, now, c.n);
     }
     for (const Bytes& b : kBytes) {
@@ -2055,10 +1966,9 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
 
 int frame_rate_game_fps() { return g_game_fps; }
 
-float frame_rate_limit_fps() { return g_game_fps != 0 ? static_cast<float>(g_game_fps) : uncapped_limit_fps(); }
+float frame_rate_limit_fps() { return static_cast<float>(g_game_fps); }
 
 void frame_rate_install(ElfImage* image) {
-    host_settings_listen(&settings_changed);
     const std::uint64_t at = image->mem.slide + (kFrameManager - kPreferredGuestSlide);
     g_slide = image->mem.slide;
     loading_bind(image->mem.slide);
@@ -2068,7 +1978,24 @@ void frame_rate_install(ElfImage* image) {
     if (const char* e = std::getenv("BBHOST_FRAME_SOURCE"); e && e[0]) {
         g_source = e[0] == '0' ? Source::Guest : e[0] == '2' ? Source::Compare : Source::Ours;
     }
-    const int want = wanted_fps();
+    int want = wanted_fps();
+    // Uncapped: the display's refresh rate, read now (the window opens later, on
+    // the primary display: core/portable.h) and run as that fixed rate - its
+    // target, steps, immediates and counts - as if the option had offered it
+    // (engine/uncapped_limit.h). A display changed while the game runs applies
+    // on the next run, as every rate does.
+    if (want == 0) {
+        const float hz = g_uncapped_forced ? 0.0f : host_desktop_refresh_hz();
+        want = uncapped_limit::rate_fps(g_uncapped_forced, hz);
+        g_uncapped = true;
+        if (g_uncapped_forced) {
+            host_log("frame rate: Display-Limited runs at %d (BBHOST_UNCAPPED_FPS)", want);
+        } else if (hz > 0.0f) {
+            host_log("frame rate: Display-Limited runs at %d, the display's refresh rate (%.2f Hz)", want, static_cast<double>(hz));
+        } else {
+            host_log("frame rate: Display-Limited runs at %d: no display says its refresh rate (headless)", want);
+        }
+    }
     // The effects' emission clock ([video] effect_emission, BBHOST_SFX_EMISSION;
     // decomp/sfx/node_emit.cpp): an effect's emission events - the CPU particles
     // and children its nodes make - at 60 a second at every frame rate, 30
@@ -2087,9 +2014,9 @@ void frame_rate_install(ElfImage* image) {
                  std::getenv("BBHOST_SFX_EMISSION") && *std::getenv("BBHOST_SFX_EMISSION") ? "BBHOST_SFX_EMISSION" : "[video] effect_emission",
                  on ? "60" : "30");
     }
-    // 90 and uncapped set a target the game's own modes do not have: ours
-    // runs them (compare and the guest's run at 30 and 60).
-    if ((want > 60 || want == 0) && g_source != Source::Ours) {
+    // The rates but 30 and 60 set a target the game's own modes do not have:
+    // ours runs them (compare and the guest's run at 30 and 60).
+    if (want != 30 && want != 60 && g_source != Source::Ours) {
         host_log("frame source: BBHOST_FRAME_SOURCE runs the guest's update at 30 and 60 only; ours runs %s", mode_name(want).c_str());
         g_source = Source::Ours;
     }
@@ -2125,7 +2052,7 @@ void frame_rate_install(ElfImage* image) {
         return;  // the hook keeps mode 2 only while g_game_fps says 60
     }
     g_game_fps = got;
-    hle_video_set_game_pace(got);  // above 60 and uncapped: flips complete at once (hle/video.cpp)
+    hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
     // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step (30 and smooth), one in a
     // whole 1/60 s step (one event an update is 60 a second already); effect steps frame stays the game's.
     if (sfx_node::emission_clock() > 0) {
@@ -2136,26 +2063,15 @@ void frame_rate_install(ElfImage* image) {
             host_log("frame rate: effect steps frame: the effects' emission stays the game's, one event an update");
         }
     }
-    if (got == 0) {
-        // Uncapped: character creation is told apart from the title's menus
-        // (menus_unlimited); without that the menus keep the limit.
-        g_chrmake_watch = menu_steps_watch(kChrMakeListType, kChrMakeListName);
-        if (g_chrmake_watch >= 0 && !menu_steps_install(image)) g_chrmake_watch = -1;
-        if (g_chrmake_watch < 0) host_log("frame rate: character creation cannot be watched; the title's menus keep the uncapped limit");
-    }
     frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
     char target[96];
-    if (got == 0) {
-        std::snprintf(target, sizeof(target), "the step following the measured frame time, clamped to 1/%d..1/30 s", kUncappedMaxFps);
-    } else {
-        std::snprintf(target, sizeof(target), "a 1/%d s target", got);
-    }
-    host_log("frame rate: %s (the frame-time manager's mode 2, %s; %zu constants and %zu other values converted, %zu 60 FPS++, "
+    std::snprintf(target, sizeof(target), "a 1/%d s target", got);
+    host_log("frame rate: %s%s (the frame-time manager's mode 2, %s; %zu constants and %zu other values converted, %zu 60 FPS++, "
              "%zu frame-time and %zu cloth code sites%s%s)",
-             mode_name(got).c_str(), target, constants, kCountsN + kBytesN, g_sites_applied, g_frame_time_applied, g_cloth_applied,
-             g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
+             mode_name(got).c_str(), g_uncapped ? " (Display-Limited)" : "", target, constants, kCountsN + kBytesN, g_sites_applied,
+             g_frame_time_applied, g_cloth_applied, g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
     if (got != want)
         host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
 }

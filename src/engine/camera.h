@@ -24,3 +24,9 @@ void camera_tick();
 // reloaded at `file` (the .param as the game keeps it): the next view writes
 // its rows, if the settings ask for anything.
 void camera_params_changed(std::uint64_t file);
+// The camera zoom (host/bindings.h: the wheel and the middle button by
+// default): `steps` notches further out (closer when negative), 20% of the
+// distance each, from half the game's own distance to six times it; or with
+// `reset` back to the Camera distance setting's. A multiplier on that
+// setting, not saved; the camera eases there as it does for the setting.
+void camera_zoom(int steps, bool reset);

@@ -50,6 +50,7 @@
 #include "host/copy_runs.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
+#include "host/list_resolve.h"
 #include "host/shadow_place.h"
 #include "log.h"
 
@@ -104,6 +105,13 @@ const int g_shadow_env = [] {
     const char* e = std::getenv("BBHOST_BUFFER_SHADOW");
     return !e || !*e ? -1 : e[0] == '0' ? 0 : 1;
 }();
+// BBHOST_SHADOW_LITE=0: the mirrors on an integrated GPU with room, as before
+// (buffer_shadow_on); otherwise the lite path stands in for them there
+// (shadow_lite_on).
+const bool g_lite_wanted = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_LITE");
+    return !(e && e[0] == '0');
+}();
 
 // A 64 KiB page of a chunk's mirror: everything is tracked here, so a draw's
 // check is an array index per page. Ranges that overlap share their pages, so
@@ -142,12 +150,23 @@ struct Page {
     // placed_checked the recording its placement was last checked in.
     bool placed = false;
     std::uint64_t placed_seq = 0, placed_checked = 0;
+    // place_range_locked's question to GX's registry for the page (whether
+    // GX buffers cover [cover_va, +cover_bytes)), answered once a recording:
+    // kept while the recording, the page's newest told write (gx_written) and
+    // the told epoch (g_told_epoch) are those it was asked under. A buffer
+    // made or let go over the page is a told write there; a range of pages
+    // one of which GX does not cover asked the registry, under its lock, for
+    // every draw that read it (5.5% of bb-cp0 in Kyo's Central Yharnam save).
+    std::uint64_t cover_stamp = 0, cover_gx = 0, cover_epoch = 0, cover_va = 0;
+    std::uint32_t cover_bytes = 0;
+    bool cover = false;
 };
 
 struct Mirror {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool failed = false;
+    bool making = false;  // a whole mirror the memory keeper is making (shadow_keeper_work)
     std::vector<Page> pages;
     // A bit per page: checked in the recording `ok_stamp` and valid. Vertex
     // records span up to hundreds of pages (pools), and a draw whose pages
@@ -162,6 +181,16 @@ struct Mirror {
     // A bit per page: placed in place and checked in the recording `ok_stamp`
     // (BBHOST_SHADOW_IN_PLACE) - a draw on such pages binds the import.
     std::vector<std::uint64_t> placed_ok;
+    // A bit per page: placed in place with no told write over it since
+    // (Page::placed, shadow_place::rewritten false) - what each recording's
+    // first check of a placed page finds, kept across recordings: set where a
+    // page is placed, cleared wherever placement ends or a told write lands.
+    // A range all of whose pages have it is placed_ok for the recording with
+    // no walk over its pages' records (place_range_locked): the command
+    // processor submits after every job, and re-checking every placed page
+    // of every mesh pool once a recording was ~4% of bb-cp0 in Kyo's Central
+    // Yharnam save.
+    std::vector<std::uint64_t> placed_valid;
     // Sparse: a 64 KiB device page is bound the first time the page is
     // copied, from 64 MiB blocks; the binds queue up until the submission.
     bool sparse = false;
@@ -179,6 +208,7 @@ struct Mirror {
     struct Window {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        bool making = false;  // the memory keeper is making it (shadow_keeper_work)
     };
     std::vector<Window> windows;
 };
@@ -253,6 +283,10 @@ bool in_place_on() {
     static const bool on = shadow_place::in_place_wanted(imports_whole(), g_in_place_env, g_in_place_windows, g.integrated);
     return on;
 }
+const bool g_placed_valid_on = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_PLACED_VALID");
+    return !(e && e[0] == '0');
+}();
 std::atomic<std::uint64_t> g_placed_binds{0};    // ranges bound in place
 std::uint64_t g_placed = 0, g_placed_again = 0;  // pages placed, and placed again after a told write
 std::uint64_t g_placed_refused = 0;              // ranges that had a page GX does not tell (to the mirrors)
@@ -300,6 +334,28 @@ std::uint64_t g_gives = 0, g_returns = 0;
 bool g_live = false;
 std::uint64_t g_cushion = 256ull << 20;
 std::uint64_t g_room_refusals = 0;     // copies refused for want of room, counted per draw
+// Made off the command processor (shadow_keeper_work, on the memory keeper's
+// thread): a mirror's memory - a whole one's 1 GiB, a window's (64 MiB on a
+// discrete GPU), a sparse mirror's 64 MiB blocks - was vkCreateBuffer and
+// vkAllocateMemory on the command processor at the draw that first needed
+// it: 29-35 ms for a whole mirror on the Radeon 8060S, four of them as the
+// world first drew and again after each start-over at a load (4508e7e3,
+// before the windows). Now that draw - and its range's until the memory is in
+// place - reads host memory, as at a refusal for want of room, and asks the
+// keeper, which makes it and hands it over under the lock if it is still
+// wanted (freed if the mirrors started over or were given back meanwhile); a
+// sparse mirror's next block comes from a spare the keeper keeps ready while
+// the share has room for it and the next one. BBHOST_SHADOW_ASYNC=0 (or
+// BBHOST_MEMORY_KEEPER=0): made on the command processor, as before.
+bool g_async = false;  // shadow_keeper_started, unless BBHOST_SHADOW_ASYNC=0
+std::uint64_t g_mirrors_async = 0, g_windows_async = 0;  // made off the command processor and handed over
+double g_mirror_async_ms = 0.0, g_window_async_ms = 0.0;  // the time they took the keeper
+std::uint64_t g_async_waits = 0;  // ranges read from host memory while their window or mirror was being made
+std::uint64_t g_blocks_made = 0, g_blocks_spare = 0;  // sparse blocks made on the command processor, taken from the spare
+double g_block_ms_total = 0.0;                        // the time the command processor's took
+VkDeviceMemory g_spare_block = VK_NULL_HANDLE;
+std::uint32_t g_spare_type = UINT32_MAX;  // its memory type: the sparse mirrors' (g_block_type)
+std::uint32_t g_block_type = UINT32_MAX;  // the memory type the last sparse block was made of
 std::uint64_t g_room_retry_ms = 0;     // no room until then: refused without asking (now_ms)
 std::uint64_t g_room_skips = 0;        // draws read from host memory while refused, before arming anything
 std::uint64_t g_first_refusal_ms = 0;  // the first refusal since the mirrors last started over (0: none)
@@ -309,7 +365,7 @@ std::uint64_t g_second_chances = 0;    // dynamic pages given another try at a l
 std::uint64_t g_flush_refusals = 0, g_flush_held_back = 0, g_flush_gives = 0;  // the counts at the last flush
 VkCommandBuffer g_upload_cmd[kSlots] = {};
 int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
-std::size_t g_last_map = 0;  // g.maps index of the last hit
+thread_local std::size_t g_last_map = 0;  // g.maps index of this thread's last hit (a run part's too)
 
 std::atomic<std::uint64_t> g_hits{0}, g_uploads{0}, g_upload_bytes{0}, g_dynamic{0}, g_imports{0}, g_gpu_written{0};
 std::atomic<std::uint64_t> g_staged_pages{0};  // window imports: page copies taken through upload staging
@@ -474,6 +530,15 @@ bool window_ready(Mirror& m, std::uint32_t w) {
     Mirror::Window& win = m.windows[w];
     if (win.buffer) return true;
     if (!mirror_room(window_bytes())) return false;
+    if (g_async) {
+        // The keeper makes it (shadow_keeper_work); until it is in place the
+        // window's ranges read host memory.
+        if (!win.making) {
+            win.making = true;
+            keeper_wake();
+        }
+        return false;
+    }
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = window_bytes();
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -498,9 +563,21 @@ bool window_ready(Mirror& m, std::uint32_t w) {
     return true;
 }
 
+// A whole mirror's page records, as it starts.
+void mirror_pages(Mirror& m) {
+    m.pages.resize(kPagesPerChunk);
+    m.ok.assign(kPagesPerChunk / 64, 0);
+    m.dyn.assign(kPagesPerChunk / 64, 0);
+    m.gpu.assign(kPagesPerChunk / 64, 0);
+}
+
 Mirror* mirror_for(std::uint32_t chunk) {
     Mirror& m = g_mirrors[chunk];
     if (m.buffer || m.windowed || m.failed) return m.failed ? nullptr : &m;
+    if (m.making) {  // the keeper is making it: its ranges read host memory meanwhile
+        ++g_async_waits;
+        return nullptr;
+    }
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = kChunkBytes;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -564,6 +641,13 @@ Mirror* mirror_for(std::uint32_t chunk) {
         }
         return nullptr;
     }
+    if (g_async) {
+        // The keeper makes it (shadow_keeper_work); this draw, and the chunk's
+        // until it is in place, read host memory.
+        m.making = true;
+        keeper_wake();
+        return nullptr;
+    }
     if (vkCreateBuffer(g.device, &bci, nullptr, &m.buffer) != VK_SUCCESS) {
         m.buffer = VK_NULL_HANDLE;
     } else {
@@ -584,10 +668,7 @@ Mirror* mirror_for(std::uint32_t chunk) {
         host_log("buffer shadow: no device-local mirror for chunk %u; its vertex and index data stay in host memory", chunk);
         return nullptr;
     }
-    m.pages.resize(kPagesPerChunk);
-    m.ok.assign(kPagesPerChunk / 64, 0);
-    m.dyn.assign(kPagesPerChunk / 64, 0);
-    m.gpu.assign(kPagesPerChunk / 64, 0);
+    mirror_pages(m);
     host_log("buffer shadow: device-local mirror for chunk %u (%llu MiB)", chunk,
              static_cast<unsigned long long>(kChunkBytes >> 20));
     return &m;
@@ -798,6 +879,18 @@ enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandYebis = 3, kH
 constexpr std::uint64_t kHand4k = (std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> 12;
 std::vector<std::uint64_t> g_hand_bits[kHandKinds];  // under g.mu, made at the first hand-out
 std::uint64_t g_hand_pages[kHandKinds] = {};         // 4 KiB pages marked
+// The lite path's (shadow_lite_on): the flip, plus one, at which a Map last
+// handed out each 64 KiB of direct memory (kHandMap), by physical page; 0 for
+// never, or for memory a GX resource was made over since. Under g.mu.
+std::vector<std::uint32_t> g_handed_flip;
+void note_handed_flip_locked(std::uint64_t phys, std::uint64_t bytes, bool handed) {
+    if (g_handed_flip.empty()) {
+        if (!handed) return;
+        g_handed_flip.assign(static_cast<std::size_t>((std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> kPageShift), 0);
+    }
+    const std::uint32_t flip = handed ? static_cast<std::uint32_t>(hle_video_flip_count()) + 1 : 0;
+    for (std::uint64_t p = phys >> kPageShift; p <= (phys + bytes - 1) >> kPageShift && p < g_handed_flip.size(); ++p) g_handed_flip[p] = flip;
+}
 std::uint64_t g_map_in_pool = 0, g_map_in_ring = 0;  // Map hand-outs whose first page the pool / ring had handed out
 std::uint64_t g_handed_dynamic = 0;                  // told pages that stayed unsettled too long, to host memory
 // The renamed copies handed out and not yet written back, by physical start
@@ -843,6 +936,7 @@ std::vector<GxWrite> g_gx_writes;  // under g_gx_writes_mu
 std::atomic<bool> g_gx_writes_pending{false}, g_gx_writes_overflow{false};
 constexpr std::size_t kGxWritesMax = 1u << 16;
 std::uint64_t g_told_seq = 0;  // under g.mu: one a drained write
+std::uint64_t g_told_epoch = 0;  // under g.mu: one an invalidate_all_told (Page::cover's answers stand within one)
 std::atomic<std::uint64_t> g_gx_records{0};
 std::uint64_t g_told_copies = 0, g_watched_partial = 0, g_watched_none = 0, g_told_invalid = 0, g_told_held = 0, g_told_overflows = 0,
               g_told_unmapped = 0;
@@ -888,6 +982,7 @@ void go_dynamic(Mirror& m, std::uint32_t p, std::uint64_t va, const char* why) {
     pg.valid = false;
     pg.placed = false;
     if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
+    if (!m.placed_valid.empty()) m.placed_valid[p >> 6] &= ~(1ull << (p & 63));
     m.dyn[p >> 6] |= 1ull << (p & 63);
     if (g_dynamic.fetch_add(1, std::memory_order_relaxed) < 8) {
         host_log("buffer shadow: the page at 0x%llx %s; bound from host memory from now on", static_cast<unsigned long long>(va), why);
@@ -912,6 +1007,7 @@ constexpr std::uint64_t kGpuDmemBase = 0xFF00000000ull;
 // onto the pages of the mirrors under them: each page takes the write's
 // sequence and submission count, and leaves this recording's checked set.
 void invalidate_all_told(std::uint64_t seq, std::uint64_t submit) {
+    ++g_told_epoch;
     for (Mirror& m : g_mirrors) {
         if (m.pages.empty()) continue;
         for (Page& pg : m.pages) {
@@ -921,6 +1017,7 @@ void invalidate_all_told(std::uint64_t seq, std::uint64_t submit) {
         }
         std::fill(m.ok.begin(), m.ok.end(), 0);
         std::fill(m.placed_ok.begin(), m.placed_ok.end(), 0);
+        std::fill(m.placed_valid.begin(), m.placed_valid.end(), 0);
     }
 }
 
@@ -976,7 +1073,8 @@ void mark_handed_locked(const GxWrite& w) {
             g_map_in_ring += handed(kHandRing, phys);
         }
     }
-    const bool act = k == kHandMap && g_shadow_handed;
+    // (The lite path keeps no mirror pages and no outstanding copies.)
+    const bool act = k == kHandMap && g_shadow_handed && !shadow_lite_on();
     const std::uint64_t seq = act ? ++g_told_seq : 0;
     std::uint64_t first_phys = ~0ull, first_span = 0;
     std::uint64_t va = w.va;
@@ -993,6 +1091,7 @@ void mark_handed_locked(const GxWrite& w) {
             first_span = seg;
         }
         g_hand_pages[k] += mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, true);
+        if (k == kHandMap) note_handed_flip_locked(phys, seg, true);
         if (k == kHandMap) {
             // Renamed copies are rewritten: no page under them is read in
             // place from now on (shadow_place::eligible).
@@ -1002,6 +1101,7 @@ void mark_handed_locked(const GxWrite& w) {
                 const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
                 m.pages[p].placed = false;
                 if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
+                if (!m.placed_valid.empty()) m.placed_valid[p >> 6] &= ~(1ull << (p & 63));
             }
         }
         if (act) {
@@ -1081,6 +1181,7 @@ void clear_handed_locked(const GxWrite& w) {
             g_hand_pages[k] -= n;
             any |= n != 0;
         }
+        note_handed_flip_locked(phys, seg, false);
         va += seg;
     }
     if (any && g_made_over_handed++ < 4)
@@ -1158,6 +1259,7 @@ void drain_gx_writes_locked() {
                     pg.gx_submit = w.submit;
                     m.ok[p >> 6] &= ~(1ull << (p & 63));
                     if (!m.placed_ok.empty()) m.placed_ok[p >> 6] &= ~(1ull << (p & 63));
+                    if (!m.placed_valid.empty()) m.placed_valid[p >> 6] &= ~(1ull << (p & 63));
                 }
             }
             va += seg;
@@ -1294,8 +1396,20 @@ bool integrated_with_room() {
     return known == 1;
 }
 bool buffer_shadow_on() {
-    return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
+    return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || (integrated_with_room() && !g_lite_wanted));
 }
+
+// Lite: where the mirrors were on only for their page tracking - an
+// integrated GPU with room - they stay off, and the vertex data the game
+// rewrites is told by GX instead. In Kyo's Central Yharnam save on the Radeon
+// 8060S (1080p, the GPU behind), 77,437 of the 77,454 draws whose vertices the
+// CPU rewrote before their submission ran were in memory a Map had handed out
+// (the other 17 under a loading screen) - and the mirrors let 79,218 of 9.2
+// million race there too, in ranges across two of their windows. Their
+// tracking cost the command processor about a third of its time (176 against
+// 115-135 fps at 640x360 without it). Off with BBHOST_SHADOW_LITE=0, or any
+// BBHOST_BUFFER_SHADOW.
+bool shadow_lite_on() { return g_shadow_env < 0 && g_lite_wanted && !g.tight && g.integrated && integrated_with_room(); }
 bool shadow_in_place_on() { return buffer_shadow_on() && in_place_on(); }
 
 namespace {
@@ -1313,6 +1427,14 @@ bool place_range_locked(Mirror& m, std::uint32_t chunk, std::uint64_t va, std::u
     begin_recording(m, stamp);
     if (m.placed_ok.empty()) m.placed_ok.assign(kPagesPerChunk / 64, 0);
     if (all_ok(m.placed_ok, p0, p1)) return true;
+    if (m.placed_valid.empty()) m.placed_valid.assign(kPagesPerChunk / 64, 0);
+    // Every page placed and told of no write since: what the walk below
+    // would find and leave (placed, eligible, placed_ok for the recording).
+    // BBHOST_SHADOW_PLACED_VALID=0 walks them as before.
+    if (g_placed_valid_on && all_ok(m.placed_valid, p0, p1)) {
+        mark_bits(m.placed_ok, p0, p1, true);
+        return true;
+    }
     // Each page's facts: a placed page with no told write since stands as
     // eligible without asking GX again; any other is asked (shadow_place.h).
     thread_local std::vector<shadow_place::PageFacts> facts;
@@ -1333,7 +1455,20 @@ bool place_range_locked(Mirror& m, std::uint32_t chunk, std::uint64_t va, std::u
         }
         const std::uint64_t lo = std::max(page_va(p), map_lo), hi = std::min(page_va(p) + kPageBytes, map_hi);
         f.handed = page_handed(chunk, p);
-        f.told_cover = g_shadow_gx && !f.handed && hi > lo && gx_buffers_cover(lo, hi - lo);
+        if (!g_shadow_gx || f.handed || hi <= lo) {
+            f.told_cover = false;
+        } else if (pg.cover_stamp == stamp && pg.cover_gx == pg.gx_written && pg.cover_epoch == g_told_epoch && pg.cover_va == lo &&
+                   pg.cover_bytes == hi - lo) {
+            f.told_cover = pg.cover;
+        } else {
+            f.told_cover = gx_buffers_cover(lo, hi - lo);
+            pg.cover_stamp = stamp;
+            pg.cover_gx = pg.gx_written;
+            pg.cover_epoch = g_told_epoch;
+            pg.cover_va = lo;
+            pg.cover_bytes = static_cast<std::uint32_t>(hi - lo);
+            pg.cover = f.told_cover;
+        }
         out = !shadow_place::eligible(f);
     }
     const shadow_place::Range r = shadow_place::choose(facts.data(), p1 - p0 + 1);
@@ -1362,8 +1497,121 @@ bool place_range_locked(Mirror& m, std::uint32_t chunk, std::uint64_t va, std::u
             ++g_placed;
         }
         m.placed_ok[p >> 6] |= 1ull << (p & 63);
+        m.placed_valid[p >> 6] |= 1ull << (p & 63);
     }
     return true;
+}
+}  // namespace
+
+namespace {
+// BBHOST_RUN_COMMIT: a run part's draw asks the mirrors (shadow_locate_locked)
+// without changing what they hold for anyone else. A range whose pages the
+// recording has checked (ok) is served, and one with a page bound from host
+// memory for good or written by the GPU in this recording stays in host
+// memory - as in order. A valid page's check for the recording - the first
+// question about it since the recording began, a look at its write watch or
+// its told writes - is made here as in order, under a lock of the parts' own,
+// and the ok bits the parts read while another sets them are atomics. Anything
+// else - the mirror or a window to make, a page to copy, the room for more -
+// stops the draw (kRunStopMirror, a local stop: a draw that reads the page
+// stops there too), and the command processor asks again in order.
+HostLock g_part_mirror_mu;
+bool part_all_ok(std::vector<std::uint64_t>& ok, std::uint32_t p0, std::uint32_t p1) {
+    for (std::uint32_t w = p0 >> 6; w <= p1 >> 6; ++w) {
+        std::uint64_t mask = ~0ull;
+        if (w == p0 >> 6) mask &= ~0ull << (p0 & 63);
+        if (w == p1 >> 6) mask &= ~0ull >> (63 - (p1 & 63));
+        if ((std::atomic_ref<std::uint64_t>(ok[w]).load(std::memory_order_acquire) & mask) != mask) return false;
+    }
+    return true;
+}
+void part_locate_locked(std::uint32_t chunk, std::uint64_t va, std::uint64_t off, std::uint64_t bytes, Located& loc) {
+    Mirror& m = g_mirrors[chunk];
+    if (m.failed) { t_locate_why = kLocNoMirror; return; }  // (mirror_for's answer)
+    if (!m.buffer && !m.windowed) {
+        // Being made by the keeper: host memory meanwhile, as in order (the
+        // waits are the command processor's count). Else asked for in order.
+        if (!m.making) run_part_stop(kRunStopMirror);
+        t_locate_why = m.making ? kLocNoMirror : kLocNotAsked;
+        return;
+    }
+    const std::uint64_t stamp = g.record_serial + 1;
+    const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift);
+    const std::uint32_t p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
+    if (p1 >= m.pages.size()) { t_locate_why = kLocNoMirror; return; }
+    const std::uint32_t win = m.windowed ? p0 / window_pages() : 0;
+    if (m.windowed && p1 / window_pages() != win) {  // (the crossings are the command processor's count)
+        bump(g_imports);
+        t_locate_why = kLocCrossing;
+        return;
+    }
+    const auto serve = [&] {
+        bump(g_hits);
+        loc.buffer = m.windowed ? m.windows[win].buffer : m.buffer;
+        loc.offset = off - static_cast<VkDeviceSize>(win) * window_bytes();
+        loc.avail = bytes;
+        t_locate_why = kLocServed;
+    };
+    if (std::atomic_ref<std::uint64_t>(m.ok_stamp).load(std::memory_order_acquire) == stamp && part_all_ok(m.ok, p0, p1)) {
+        serve();
+        return;
+    }
+    std::lock_guard<HostLock> lk(g_part_mirror_mu);
+    if (m.ok_stamp != stamp) {  // the recording's first question to this mirror (begin_recording)
+        std::fill(m.ok.begin(), m.ok.end(), 0);
+        std::fill(m.gpu.begin(), m.gpu.end(), 0);
+        std::fill(m.placed_ok.begin(), m.placed_ok.end(), 0);
+        std::atomic_ref<std::uint64_t>(m.ok_stamp).store(stamp, std::memory_order_release);
+    }
+    if (part_all_ok(m.ok, p0, p1)) {  // (checked meanwhile by another part)
+        serve();
+        return;
+    }
+    if (any_set(m.dyn, p0, p1) || any_set(m.gpu, p0, p1)) {
+        bump(g_imports);
+        t_locate_why = kLocHost;
+        return;
+    }
+    if (g_live && m.sparse && (m.blocks.empty() || m.block_pages_used == kBlockPages) && !all_ok(m.resident, p0, p1) &&
+        now_ms() < g_room_retry_ms) {  // (the skips are the command processor's count)
+        bump(g_imports);
+        t_locate_why = kLocRoom;
+        return;
+    }
+    if (m.windowed && !m.windows[win].buffer) {
+        // Being made by the keeper: host memory meanwhile, as in order. Else
+        // the window asked for, or the range left in host memory, in order.
+        if (m.windows[win].making) {
+            bump(g_imports);
+            t_locate_why = kLocWindow;
+        } else {
+            run_part_stop(kRunStopMirror);
+            t_locate_why = kLocNotAsked;
+        }
+        return;
+    }
+    const bool staged = !imports_whole();
+    for (std::uint32_t p = p0; p <= p1; ++p) {
+        Page& pg = m.pages[p];
+        if (pg.dynamic || (!pg.valid && pg.gpu_written == stamp) ||
+            (staged && !pg.valid && gpu_writes_pending_locked(va - (off - (static_cast<std::uint64_t>(p) << kPageShift)), kPageBytes))) {
+            bump(g_imports);
+            t_locate_why = kLocHost;
+            return;
+        }
+        if (pg.valid && pg.checked != stamp) {
+            pg.checked = stamp;
+            ++g_page_checks;
+            if (page_written(pg)) pg.valid = false;
+        }
+        if (!pg.valid) {
+            run_part_stop(kRunStopMirror);  // copied in order
+            t_locate_why = kLocNotAsked;
+            return;
+        }
+        std::atomic_ref<std::uint64_t>(m.ok[p >> 6]).fetch_or(1ull << (p & 63), std::memory_order_release);
+    }
+    serve();
 }
 }  // namespace
 
@@ -1373,6 +1621,15 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
     if (!phys_of(va, bytes, chunk, off, &map_lo, &map_hi)) { t_locate_why = kLocNoMirror; return; }
+    if (run_part()) {
+        if (g_verify || in_place_on()) {  // (refused at the fork: BBHOST_SHADOW_VERIFY, the mirrors read in place)
+            run_part_stop(kRunStopMirror);
+            t_locate_why = kLocNotAsked;
+            return;
+        }
+        part_locate_locked(chunk, va, off, bytes, loc);
+        return;
+    }
     Mirror* m = mirror_for(chunk);
     if (!m) { t_locate_why = kLocNoMirror; return; }
     drain_gx_writes_locked();
@@ -1453,7 +1710,8 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (m->windowed && !m->windows[win].buffer) {
         const bool retry_wait = g_live && now_ms() < g_room_retry_ms;
         if (retry_wait || !window_ready(*m, win)) {
-            if (g_live) ++(retry_wait ? g_room_skips : g_room_refusals);
+            if (m->windows[win].making) ++g_async_waits;  // (the keeper making it, not a refusal)
+            else if (g_live) ++(retry_wait ? g_room_skips : g_room_refusals);
             bump(g_imports);
             t_locate_why = kLocWindow;
             return;
@@ -1729,13 +1987,25 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                     return;
                 }
                 MemOwner own_mem("mirror blocks");
-                if (!room || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
+                const auto block_t0 = std::chrono::steady_clock::now();
+                g_block_type = bai.memoryTypeIndex;
+                const bool from_spare = room && g_spare_block != VK_NULL_HANDLE && g_spare_type == bai.memoryTypeIndex;
+                if (from_spare) {
+                    mem = g_spare_block;  // made ahead by the keeper
+                    g_spare_block = VK_NULL_HANDLE;
+                    ++g_blocks_spare;
+                    if (g_async) keeper_wake();  // the next spare
+                } else if (!room || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
                     go_dynamic(*m, p, page_va, !room ? "has no room in the mirrors' share of video memory"
                                                      : "has no device memory for its mirror page");
                     flush();
                     bump(g_imports);
                     t_locate_why = kLocHost;
                     return;
+                } else {
+                    g_block_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - block_t0).count();
+                    ++g_blocks_made;
+                    if (g_async) keeper_wake();  // a spare for the next one
                 }
                 g_mirror_bytes += bai.allocationSize;
                 m->blocks.push_back(mem);
@@ -1776,6 +2046,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 }
 
 std::uint8_t shadow_locate_why() { return t_locate_why; }
+void shadow_count_placed_bind() { bump(g_placed_binds); }
 
 unsigned shadow_hand_kinds_locked(std::uint64_t va) {
     std::uint32_t chunk = 0;
@@ -1799,6 +2070,7 @@ unsigned shadow_hand_kinds_locked(std::uint64_t va) {
 // mirror the GPU will read stale. Pure: `write_watch_dirty` only memoises a
 // clean answer, and a written watch stays written until it is armed again.
 bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
+    t_locate_why = kLocNotAsked;  // (shadow_locate_why: not asked, unless the question below is)
     if (!buffer_shadow_on() || !bytes || !g.sink.buffer || twin_covers_locked(va, bytes)) return false;
     // A stand-in host location: shadow_locate_locked replaces it with the
     // mirror when the mirror serves the range, and leaves it otherwise.
@@ -1811,6 +2083,7 @@ bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
 
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes || twin_covers_locked(va, bytes)) return false;
+    if (run_part_stop(kRunStopMirror)) return false;  // staged in order (BBHOST_RUN_COMMIT)
     if (bytes > kStageMaxBytes) {
         bump(g_stage_refused);
         return false;
@@ -1985,8 +2258,71 @@ bool snap_ring_make() {
 }
 }  // namespace
 
+thread_local constinit std::uint64_t t_lite_draw = 0;
+thread_local constinit DrawCtx* t_draw_ctx = nullptr;
+thread_local constinit BumpSink* t_bump_sink = nullptr;  // BBHOST_RUN_COMMIT: a run worker's counters
+thread_local constinit RunDraw* t_run_draw = nullptr;    // BBHOST_RUN_COMMIT: a forked run's draw
+thread_local constinit RunDigest t_run_digest;           // BBHOST_RUN_COMMIT=compare: the drawing thread's last draw's
+HostLock g_part_ring_mu;                       // BBHOST_RUN_COMMIT: the parts' chunk takes from the copy rings
+
+namespace {
+// The lite path's question (shadow_lite_on): whether a Map handed out a page of
+// [va, va + bytes) within the last kLiteFlips flips. A ring's or a renamed
+// copy's draws come right after the Map that handed their memory out, and the
+// GPU is a few flips behind at most; memory a Map filled once - a mesh
+// streamed in - is read in place from then on.
+// BBHOST_SHADOW_LITE_FLIPS=<n> sets the window (a test aid).
+const std::uint32_t kLiteFlips = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_LITE_FLIPS");
+    const long v = e && *e ? std::strtol(e, nullptr, 10) : 0;
+    return v > 0 ? static_cast<std::uint32_t>(v) : 120u;
+}();
+std::uint64_t g_lite_asked = 0, g_lite_rewritten = 0;
+thread_local std::uint64_t t_lite_drained = 0;  // the draw (t_lite_draw) the notices were last drained for
+bool lite_rewritten_locked(std::uint64_t va, std::uint64_t bytes) {
+    static bool said = false;
+    if (!said) {
+        said = true;
+        host_log("buffer shadow: lite - no mirrors on this integrated GPU; vertex data in memory a Map handed out within the last %u "
+                 "flips is copied as its draws record (BBHOST_SHADOW_LITE=0: the mirrors)",
+                 kLiteFlips);
+    }
+    // BBHOST_RUN_BATCH: once a draw - its vertex records ask one after another.
+    // A run part's draw (BBHOST_RUN_COMMIT): drained at the fork.
+    const bool part = run_part();
+    const std::uint64_t lite_draw = list_resolve::batch_shares() ? t_lite_draw : 0;  // (no thread-local read with batching off)
+    if (!part && (!lite_draw || t_lite_drained != lite_draw)) {
+        drain_gx_writes_locked();
+        if (lite_draw) {
+            t_lite_drained = lite_draw;
+            list_resolve::count(list_resolve::kBatchDrains);
+        }
+    }
+    if (g_handed_flip.empty()) return false;
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return false;
+    if (!part) ++g_lite_asked;
+    const std::uint64_t phys = (std::uint64_t{chunk} << gcn::kDmemChunkShift) | off;
+    const std::uint32_t now = static_cast<std::uint32_t>(hle_video_flip_count()) + 1;
+    for (std::uint64_t p = phys >> kPageShift; p <= (phys + bytes - 1) >> kPageShift && p < g_handed_flip.size(); ++p) {
+        const std::uint32_t at = g_handed_flip[p];
+        if (at && now - at <= kLiteFlips) {
+            if (!part) ++g_lite_rewritten;
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+void shadow_lite_drain_locked() { drain_gx_writes_locked(); }
+VkBuffer shadow_snap_buffer() { return g_snap.buffer; }
+
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || twin_covers_locked(va, bytes)) return false;
+    if (!g_snapshot_on || !bytes) return false;
+    if (shadow_lite_on()) return !twin_covers_locked(va, bytes) && lite_rewritten_locked(va, bytes);
+    if (!buffer_shadow_on() || twin_covers_locked(va, bytes)) return false;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0;
     if (!phys_of(va, bytes, chunk, off) || off + bytes > kChunkBytes) return true;  // not told this cheaply
@@ -1995,20 +2331,27 @@ bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
 }
 
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes || twin_covers_locked(va, bytes)) return false;
-    // Only a range on a page the game keeps rewriting: a static page the
-    // mirrors had no room for is staged as before, not copied by the CPU at
-    // every draw.
-    std::uint32_t chunk = 0;
-    std::uint64_t off = 0;
-    if (!phys_of(va, bytes, chunk, off)) return false;
-    const Mirror& m = g_mirrors[chunk];
-    if (m.pages.empty() || !any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift)))
-        return false;
+    if (!g_snapshot_on || !bytes || bytes > kSnapMaxBytes || twin_covers_locked(va, bytes)) return false;
+    if (shadow_lite_on()) {
+        if (!lite_rewritten_locked(va, bytes)) return false;
+    } else {
+        if (!buffer_shadow_on()) return false;
+        // Only a range on a page the game keeps rewriting: a static page the
+        // mirrors had no room for is staged as before, not copied by the CPU
+        // at every draw.
+        std::uint32_t chunk = 0;
+        std::uint64_t off = 0;
+        if (!phys_of(va, bytes, chunk, off)) return false;
+        const Mirror& m = g_mirrors[chunk];
+        if (m.pages.empty() ||
+            !any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift)))
+            return false;
+    }
     if (gpu_writes_pending_locked(va, bytes)) {
         bump(g_snapshot_pending);
         return false;
     }
+    if (!g_snap.buffer && !g_snap.failed && run_part_stop(kRunStopRing)) return false;  // the ring made in order (BBHOST_RUN_COMMIT)
     if (g_snap.failed || (!g_snap.buffer && !snap_ring_make())) {
         g_snap.failed = true;
         return false;
@@ -2020,14 +2363,34 @@ namespace {
 // [va, va+bytes) copied into the snapshot ring now, `loc` the copy (the ring
 // made already).
 std::uint64_t g_snap_full = 0;  // copies refused: the ring's next segment held the open recording's copies
-bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+// The ring's next `bytes` for the open recording, round the ring when it runs
+// out; false when that would write over what the open recording read.
+bool snap_ring_take_locked(VkDeviceSize bytes, VkDeviceSize& at_out) {
+    // A run part's draw (BBHOST_RUN_COMMIT): under the parts' lock, inside the
+    // lap's segments (g_part_ring_mu).
+    const bool part = run_part();
+    std::unique_lock<HostLock> lk(g_part_ring_mu, std::defer_lock);
+    if (part) lk.lock();
     VkDeviceSize next = g_snap.next;
     std::uint64_t lap = g_snap.lap;
     if (next + bytes + 256 > kSnapRing) {
+        if (run_part_stop(kRunStopRing)) return false;
         next = 0;
         ++lap;
     }
     const VkDeviceSize at = (next + 255) & ~VkDeviceSize{255};
+    if (part) {
+        // A segment new to this lap whose last recording has run needs no wait
+        // (wait_submission_locked's own test); the open recording's own is
+        // refused below as in order; one still running is waited for in order.
+        for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
+            const std::uint64_t ser = g_snap.segment_serial[s];
+            if (g_snap.segment_lap[s] != lap && g_snap.segment_lap[s] && ser < g.flushes && g.completed_submits <= ser) {
+                run_part_stop(kRunStopRing);
+                return false;
+            }
+        }
+    }
     // A segment the open recording's own draws read in the lap before cannot
     // be written until that recording has run, which it has not: one
     // recording that copies a whole ring's worth - every mesh of an area
@@ -2035,7 +2398,7 @@ bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // its earlier draws read. Such a copy is refused.
     for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
         if (g_snap.segment_lap[s] && g_snap.segment_lap[s] != lap && g_snap.segment_serial[s] >= g.flushes) {
-            ++g_snap_full;
+            if (!part) ++g_snap_full;
             return false;
         }
     }
@@ -2050,8 +2413,34 @@ bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         }
         g_snap.segment_serial[s] = g.flushes;
     }
-    std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
     g_snap.next = at + bytes;
+    at_out = at;
+    return true;
+}
+bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    // A ring in host memory stages each copy into device memory (below):
+    // in order, for a run part's draw (BBHOST_RUN_COMMIT).
+    if (!g_snap.device_local && run_part_stop(kRunStopBuffers)) return false;
+    VkDeviceSize at = 0;
+    if (DrawCtx* const c = draw_ctx()) {
+        // BBHOST_DRAW_CONTEXT: from the context's chunk of the ring, taken
+        // as a copy of the chunk's size would be (refused the same way).
+        constexpr VkDeviceSize kSnapCtxChunk = 256u << 10;
+        c->take_recording(g.flushes);
+        at = (c->snap_next + 255) & ~VkDeviceSize{255};
+        if (!c->snap_end || at + bytes > c->snap_end) {
+            const VkDeviceSize n = std::max<VkDeviceSize>(kSnapCtxChunk, bytes);
+            if (!snap_ring_take_locked(n, at)) return false;
+            c->snap_end = at + n;
+            list_resolve::count(list_resolve::kCtxSnapChunks);
+            if (list_resolve::draw_ctx_compare()) list_resolve::check_chunk(2, g.flushes, at, at + n, 0, kSnapRing);
+        }
+        c->snap_next = at + bytes;
+        list_resolve::count(list_resolve::kCtxSnapBytes, bytes);
+    } else if (!snap_ring_take_locked(bytes, at)) {
+        return false;
+    }
+    std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
     bump(g_snapshots);
     bump(g_snapshot_bytes, bytes);  // not a locked add: it would wait for the copy to drain
     loc.buffer = g_snap.buffer;
@@ -2549,6 +2938,10 @@ void shadow_give_back_locked(Gpu::Slot& slot) {
         m.failed = true;
         ++mirrors;
     }
+    if (g_spare_block != VK_NULL_HANDLE) {
+        slot.garbage.push_back(DevBuffer{g_spare_block, VK_NULL_HANDLE});
+        g_spare_block = VK_NULL_HANDLE;
+    }
     const std::uint64_t held = g_mirror_bytes;
     g_mirror_bytes = 0;
     g_mirror_cap = 0;
@@ -2769,6 +3162,155 @@ void shadow_vram_census_locked(ShadowCensus& c) {
     }
 }
 
+void shadow_keeper_started() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SHADOW_ASYNC");
+        return !(e && e[0] == '0');
+    }();
+    std::lock_guard<GpuMutex> lk(g.mu);
+    g_async = on;
+}
+
+namespace {
+// A buffer of `bytes` in device-local memory, bound: what mirror_for makes for
+// a whole mirror and window_ready for a window, made here off the lock.
+bool keeper_make(VkDeviceSize bytes, const char* owner, VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize& size) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    buf = VK_NULL_HANDLE;
+    mem = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &buf) != VK_SUCCESS) {
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, buf, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem(owner);
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS ||
+        vkBindBufferMemory(g.device, buf, mem, 0) != VK_SUCCESS) {
+        if (mem) vkFreeMemory(g.device, mem, nullptr);
+        vkDestroyBuffer(g.device, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        mem = VK_NULL_HANDLE;
+        return false;
+    }
+    size = req.size;
+    return true;
+}
+}  // namespace
+
+void shadow_keeper_work() {
+    std::vector<std::uint32_t> whole;                         // chunks whose whole mirror is wanted
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> wins;  // (chunk, window) wanted
+    bool spare = false;
+    std::uint32_t spare_type = UINT32_MAX;
+    const VkDeviceSize block = static_cast<VkDeviceSize>(kBlockPages) * kPageBytes;
+    {
+        std::lock_guard<GpuMutex> lk(g.mu);
+        if (!g_async) return;
+        for (std::uint32_t c = 0; c < gcn::kDmemChunks; ++c) {
+            const Mirror& m = g_mirrors[c];
+            if (m.making && !m.buffer) whole.push_back(c);
+            for (std::uint32_t w = 0; m.windowed && w < m.windows.size(); ++w) {
+                if (m.windows[w].making && !m.windows[w].buffer) wins.emplace_back(c, w);
+            }
+        }
+        // A spare block while the sparse mirrors use blocks and the share
+        // has room for it and the next one.
+        spare = g.has_sparse && g_spare_block == VK_NULL_HANDLE && g_block_type != UINT32_MAX && !g_given_back &&
+                g_mirror_bytes + 2 * block <= g_mirror_cap && (!g_live || vram_room_for(2 * block, g_cushion));
+        spare_type = g_block_type;
+    }
+    for (const std::uint32_t c : whole) {
+        const auto t0 = std::chrono::steady_clock::now();
+        VkBuffer buf;
+        VkDeviceMemory mem;
+        VkDeviceSize size = 0;
+        const bool made = keeper_make(kChunkBytes, "mirrors", buf, mem, size);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        bool placed = false;
+        {
+            std::lock_guard<GpuMutex> lk(g.mu);
+            Mirror& m = g_mirrors[c];
+            if (made && m.making && !m.buffer && !m.windowed && !m.failed && !g_given_back && g_mirror_bytes + size <= g_mirror_cap) {
+                // Still wanted: in place for the next draw that reads the chunk.
+                m.buffer = buf;
+                m.memory = mem;
+                mirror_pages(m);
+                g_mirror_bytes += size;
+                ++g_mirrors_async;
+                g_mirror_async_ms += ms;
+                placed = true;
+            }
+            if (m.making) {
+                m.making = false;
+                if (!made) m.failed = true;
+            }
+        }
+        if (placed) {
+            host_log("buffer shadow: device-local mirror for chunk %u (%llu MiB), made in %.1f ms off the command processor", c,
+                     static_cast<unsigned long long>(kChunkBytes >> 20), ms);
+        } else if (made) {
+            // Not wanted any more: the mirrors started over or were given back.
+            vkDestroyBuffer(g.device, buf, nullptr);
+            vkFreeMemory(g.device, mem, nullptr);
+        } else {
+            host_log("buffer shadow: no device-local mirror for chunk %u; its vertex and index data stay in host memory", c);
+        }
+    }
+    for (const auto& [c, w] : wins) {
+        const auto t0 = std::chrono::steady_clock::now();
+        VkBuffer buf;
+        VkDeviceMemory mem;
+        VkDeviceSize size = 0;
+        const bool made = keeper_make(window_bytes(), "mirror windows", buf, mem, size);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        bool placed = false;
+        {
+            std::lock_guard<GpuMutex> lk(g.mu);
+            Mirror& m = g_mirrors[c];
+            Mirror::Window* win = m.windowed && w < m.windows.size() ? &m.windows[w] : nullptr;
+            if (made && win && win->making && !win->buffer && !m.failed && !g_given_back && g_mirror_bytes + size <= g_mirror_cap) {
+                win->buffer = buf;
+                win->memory = mem;
+                g_mirror_bytes += size;
+                ++g_windows_made;
+                ++g_windows_async;
+                g_window_async_ms += ms;
+                placed = true;
+            }
+            if (win && win->making) win->making = false;  // (not made: a later draw asks again)
+        }
+        if (!placed && made) {
+            vkDestroyBuffer(g.device, buf, nullptr);
+            vkFreeMemory(g.device, mem, nullptr);
+        }
+    }
+    if (spare && spare_type != UINT32_MAX) {
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = block;
+        mai.memoryTypeIndex = spare_type;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        MemOwner own_mem("mirror blocks");
+        if (vkAllocateMemory(g.device, &mai, nullptr, &mem) == VK_SUCCESS) {
+            bool kept = false;
+            {
+                std::lock_guard<GpuMutex> lk(g.mu);
+                if (g_spare_block == VK_NULL_HANDLE && !g_given_back) {
+                    g_spare_block = mem;
+                    g_spare_type = spare_type;
+                    kept = true;
+                }
+            }
+            if (!kept) vkFreeMemory(g.device, mem, nullptr);
+        }
+    }
+}
+
 std::string shadow_report() {
     std::uint64_t resident = 0;
     for (std::uint32_t c = 0; c < gcn::kDmemChunks; ++c) resident += g_mirrors[c].resident_pages;
@@ -2857,6 +3399,16 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(window_bytes() >> 20), static_cast<unsigned long long>(g_windows_made),
                       static_cast<unsigned long long>(g_window_crossings));
         out += wn;
+    }
+    if (g_mirrors_async || g_windows_async || g_blocks_made || g_blocks_spare || g_async_waits) {
+        char mk[320];
+        std::snprintf(mk, sizeof(mk),
+                      "; made off the command processor: mirrors %llu (%.0f ms there), windows %llu (%.0f ms), ranges read from host "
+                      "memory meanwhile %llu; sparse blocks from the spare %llu, made on the command processor %llu (%.0f ms)",
+                      static_cast<unsigned long long>(g_mirrors_async), g_mirror_async_ms, static_cast<unsigned long long>(g_windows_async),
+                      g_window_async_ms, static_cast<unsigned long long>(g_async_waits), static_cast<unsigned long long>(g_blocks_spare),
+                      static_cast<unsigned long long>(g_blocks_made), g_block_ms_total);
+        out += mk;
     }
     if (g_second_chances) {
         char sc[96];
@@ -2958,6 +3510,13 @@ std::string shadow_report() {
                  static_cast<unsigned long long>(g_written_no_resource.load()));
     }
     if (!in_place_line.empty()) out += "\n" + in_place_line;  // a line of its own (gnm.cpp logs a line a call)
+    if (shadow_lite_on()) {
+        char lite[192];
+        std::snprintf(lite, sizeof(lite), "buffer shadow lite: vertex ranges asked %llu, in memory a Map handed out in the last %u flips %llu",
+                      static_cast<unsigned long long>(g_lite_asked), kLiteFlips, static_cast<unsigned long long>(g_lite_rewritten));
+        out += "\n";
+        out += lite;
+    }
     return out;
 }
 

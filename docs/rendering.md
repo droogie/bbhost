@@ -81,7 +81,13 @@ chunk, looks again as each label lands. The thread waits in the driver, or
 polls on Windows (`BBHOST_LABEL_WAIT`), where NVIDIA's driver holds its lock
 through that wait; there the labels are still GPU fills at the end of their
 submission's command buffer unless `BBHOST_LABEL_LANDING=1` (`=0` keeps the
-fills anywhere). A label meant for a command buffer the game has begun
+fills anywhere). Measured on Windows on the Radeon 8060S (AMD's driver,
+2026-10-29, the run commit on, the GPU the limit at 640x360): fills 200.0
+and 200.8 fps, landed with the thread polling 199.6 and 200.9, waiting in
+the driver (`BBHOST_LABEL_WAIT=block`, no lock trouble on AMD's driver)
+201.2 and 201.0; 2.5 million writes from 146,000 submissions in a 100-s
+run, landed 5.4-5.6 ms after the submit (p99 7.4 ms), none into a reused
+command buffer, the frame pacing the same. A label meant for a command buffer the game has begun
 writing again since the label's submission - YEBIS cycles two command buffers
 and reuses one without waiting for the GPU, so a GPU running behind lands the
 old round's fences on the new round's packets - is counted and not written:
@@ -704,6 +710,13 @@ built yet; the reasoning, as measured on the development machine:
   processor resolves each draw (F12 captures, `tools/glitch_hunt.sh`,
   `BBHOST_GX_COST`, `drawreplay`). Its first step would be a compact command
   per draw, built at the GX call in place of the token's sparse records.
+- **Measured where the command processor limits.** At Kyo's save in Central
+  Yharnam on a Radeon 8060S (165 fps, the command processor 96% busy, the
+  main loop's own work 4.4 ms) 42% of `bb-cp0` is per-list work, 31% per-list
+  work with a check, 20% in order; ~1,390 draws a flip fall into ~67 runs of
+  one GX context each, and the command processor reaches most draws two flips
+  after their GX call. The split, the runs (`BBHOST_LIST_RESOLVE=runs`) and
+  the order to build it in are [list-resolve.md](list-resolve.md).
 
 ### GX's objects as Vulkan objects (a design note)
 
