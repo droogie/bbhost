@@ -19361,13 +19361,87 @@ std::uint64_t run_digest_params(const gcn::StageParams& p, int stage) {
     // copy has.
     std::uint64_t h = 1469598103934665603ull;
     const RingCbNote& n = t_ring_cb[stage & 1];
+    std::uint64_t* const ring_base = t_run_digest.ring_base[stage & 1];
+    std::uint64_t* const ring_bytes = t_run_digest.ring_bytes[stage & 1];
+    std::fill(ring_base, ring_base + 16, 0);
+    std::fill(ring_bytes, ring_bytes + 16, 0);
     for (std::uint32_t left = n.slots; left; left &= left - 1) {
         const int k = __builtin_ctz(left);
         const std::uint64_t what[2] = {q.cb_bias_dw[k] == n.at_dw[k] ? n.base[k] : ~0ull, n.bytes[k]};
         h = fnv1a(what, sizeof(what), h);
+        ring_base[k] = what[0];
+        ring_bytes[k] = n.bytes[k];
         q.cb_bias_dw[k] = 0;
     }
+    t_run_digest.pm[stage & 1] = q;  // for the log of a draw whose params differ
     return fnv1a(&q, sizeof(q), h);
+}
+
+// BBHOST_RUN_COMMIT=compare: which fields of two params blocks, as their
+// digests hashed them (run_digest_params), differ - each with both values (the
+// part's/the commit in order's), up to `most` fields.
+std::string run_params_fields_differing(const RunDigest& a, const RunDigest& b, int st, int most) {
+    const gcn::StageParams& x = a.pm[st];
+    const gcn::StageParams& y = b.pm[st];
+    std::string out;
+    int n = 0;
+    const auto add = [&](const char* field, int k, std::uint64_t u, std::uint64_t v) {
+        if (u == v || n >= most) {
+            n += u != v;
+            return;
+        }
+        ++n;
+        char t[128];
+        if (k >= 0) std::snprintf(t, sizeof(t), " %s[%d] %llx/%llx", field, k, static_cast<unsigned long long>(u), static_cast<unsigned long long>(v));
+        else std::snprintf(t, sizeof(t), " %s %llx/%llx", field, static_cast<unsigned long long>(u), static_cast<unsigned long long>(v));
+        out += t;
+    };
+    add("l1_table", -1, x.l1_table, y.l1_table);
+    add("lds_address", -1, x.lds_address, y.lds_address);
+    for (int k = 0; k < 16; ++k) add("user_sgpr", k, x.user_sgpr[k], y.user_sgpr[k]);
+    add("cb_valid", -1, x.cb_valid, y.cb_valid);
+    add("lds_bytes", -1, x.lds_bytes, y.lds_bytes);
+    add("gds_base", -1, x.gds_base, y.gds_base);
+    add("pad", -1, x.pad, y.pad);
+    for (int k = 0; k < 16; ++k) add("cb_bias_dw", k, x.cb_bias_dw[k], y.cb_bias_dw[k]);
+    for (int k = 0; k < 16; ++k) {
+        add("ring_cb_base", k, a.ring_base[st][k], b.ring_base[st][k]);
+        // Two sources in the GX ring (each commit's own place): their bytes.
+        const std::uint64_t lo = g_gx_ring.base, hi = g_gx_ring.base + g_gx_ring.size, u = a.ring_base[st][k], v = b.ring_base[st][k];
+        const std::uint64_t len = std::min(a.ring_bytes[st][k], b.ring_bytes[st][k]);
+        if (u != v && n <= most && lo && u >= lo && u < hi && v >= lo && v < hi && len && u + len <= hi && v + len <= hi) {
+            const auto* pu = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(u));
+            const auto* pv = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(v));
+            std::uint64_t at = 0;
+            while (at < len && pu[at] == pv[at]) ++at;
+            char t[96];
+            if (at == len) std::snprintf(t, sizeof(t), " (both in the GX ring, %llu bytes the same)", static_cast<unsigned long long>(len));
+            else std::snprintf(t, sizeof(t), " (both in the GX ring, bytes differ from +%llu of %llu)", static_cast<unsigned long long>(at), static_cast<unsigned long long>(len));
+            out += t;
+        }
+    }
+    for (int k = 0; k < 16; ++k) add("cb_stride", k, x.cb_stride[k], y.cb_stride[k]);
+    for (int k = 0; k < 16; ++k) add("cb_w3", k, x.cb_w3[k], y.cb_w3[k]);
+    for (int k = 0; k < 16; ++k) add("vertex_formats", k, x.vertex_formats[k], y.vertex_formats[k]);
+    for (int k = 0; k < 4; ++k) {
+        std::uint32_t u, v;
+        std::memcpy(&u, &x.patch_cull_w[k], 4);
+        std::memcpy(&v, &y.patch_cull_w[k], 4);
+        add("patch_cull_w", k, u, v);
+    }
+    add("patch_stride", -1, x.patch_stride, y.patch_stride);
+    add("patch_base", -1, x.patch_base, y.patch_base);
+    {
+        std::uint32_t u, v;
+        std::memcpy(&u, &x.patch_cull_near, 4);
+        std::memcpy(&v, &y.patch_cull_near, 4);
+        add("patch_cull_near", -1, u, v);
+    }
+    add("patch_pad", -1, x.patch_pad, y.patch_pad);
+    for (int k = 0; k < 16; ++k) add("image_index", k, x.image_index[k], y.image_index[k]);
+    for (int k = 0; k < 16; ++k) add("sampler_index", k, x.sampler_index[k], y.sampler_index[k]);
+    if (n > most) out += " (" + std::to_string(n - most) + " more)";
+    return out;
 }
 
 // BBHOST_RUN_COMMIT: a run part's draw against the owed view clears, read
@@ -19726,6 +19800,8 @@ static bool draw_impl(const GpuDraw& d) {
     if (digest) {
         t_run_digest = RunDigest{};
         t_ring_cb[0] = t_ring_cb[1] = RingCbNote{};
+        t_run_digest.part_first = part && rs.pipeline == VK_NULL_HANDLE;  // for the log: its part bound nothing yet
+        t_run_digest.flip = hle_video_flip_count();
     }
     // BBHOST_RUN_BATCH: how many times the GPU mutex has been taken, this take
     // included - the draw before in the run took it last when this is one more
@@ -22606,6 +22682,7 @@ static bool draw_impl(const GpuDraw& d) {
         RunDigest& dg = t_run_digest;
         dg.done = true;
         dg.pipeline = key;  // the pipeline's identity: its fallback, lean variant or relink alike
+        std::snprintf(dg.name, sizeof(dg.name), "%s", bind_pl->name.c_str());
         dg.sets[0] = sets[0];
         dg.sets[1] = sets[1];
         dg.vp = vp;
@@ -23158,7 +23235,7 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
                 g_run_field_diff[f].fetch_add(1, std::memory_order_relaxed);
                 which += std::string(which.empty() ? "" : ", ") + kRunFieldName[f];
             }
-            if (any && g_run_differed.fetch_add(1, std::memory_order_relaxed) < 16) {
+            if (any && g_run_differed.fetch_add(1, std::memory_order_relaxed) < 64) {  // the first 64 logged
                 host_log("render: run commit compare: draw %u of a run of %u (part %d) differs from its commit in order: %s", i, j.n, k,
                          which.c_str());
                 if (diff[kCmpBuffers]) {
@@ -23188,6 +23265,18 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
                     host_log("render:   its user data differing (part/in order):%s%s; the GX ring at 0x%llx, %llu bytes",
                              u.empty() ? " none (another field of its params)" : "", u.c_str(), static_cast<unsigned long long>(g_gx_ring.base),
                              static_cast<unsigned long long>(g_gx_ring.size));
+                    // The fields that differ as the digest hashed them (GX-ring
+                    // pointer pairs and ring-bound biases cleared), and what
+                    // names the draw.
+                    const std::uint64_t w = world_first_flip();
+                    for (int st = 0; st < 2; ++st) {
+                        if (a.params[st] == b.params[st]) continue;
+                        host_log("render:   its %s params differing as hashed (part/in order):%s", st ? "PS" : "VS",
+                                 run_params_fields_differing(a, b, st, 12).c_str());
+                    }
+                    host_log("render:   part %d of %d, %s; flip %llu, %lld from the world's first frame; pipeline %s (in order: %s)", k, j.parts,
+                             a.part_first ? "its part's first draw" : "not its part's first draw", static_cast<unsigned long long>(a.flip),
+                             w ? static_cast<long long>(a.flip) - static_cast<long long>(w) : -1LL, a.name, b.name);
                 }
             }
         }
@@ -24747,11 +24836,17 @@ void precompile_set_loading(bool loading) {
     g_loading_now.store(loading);
     precompile_boost_update(loading ? "a loading screen" : "the loading screen gone");
 }
+namespace {
+std::atomic<std::uint64_t> g_world_first_flip{0};  // world_first_flip()
+}  // namespace
 void precompile_set_world_reached() {
+    std::uint64_t none = 0;
+    g_world_first_flip.compare_exchange_strong(none, hle_video_flip_count());
     g_world_seen.store(true);
     precompile_boost_update("the first in-game frame");
 }
 bool world_reached() { return g_world_seen.load(std::memory_order_relaxed); }
+std::uint64_t world_first_flip() { return g_world_first_flip.load(std::memory_order_relaxed); }
 
 std::size_t precompile_backlog() {
     Precompiler* w = g_precompiler.load();

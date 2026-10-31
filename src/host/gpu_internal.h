@@ -1278,8 +1278,22 @@ struct RunDigest {
     std::uint64_t first[6][3] = {};  // the first bindings' (base, size, outcome), for the log
     std::uint32_t nbuffers = 0;
     std::uint32_t user[2][16] = {};  // each stage's user data as its params block had it, for the log
+    // For the log of a draw whose params differ (run_compare_join_locked): each
+    // stage's params block as its digest hashed it (GX-ring pointer pairs and
+    // ring-bound buffers' biases cleared), what stood for those biases (the
+    // copy's guest base, ~0 for a bias pointing elsewhere, 0 for none), and
+    // what names the draw.
+    gcn::StageParams pm[2] = {};
+    std::uint64_t ring_base[2][16] = {};
+    std::uint64_t ring_bytes[2][16] = {};  // and the copy's size
+    bool part_first = false;  // a part's draw whose part had bound nothing yet (t_part_recorded empty)
+    std::uint64_t flip = 0;   // the flip it was committed at
+    char name[48] = {};       // its pipeline's name (its programs' ids)
 };
 extern thread_local constinit RunDigest t_run_digest;  // the drawing thread's last draw's
+// The flip of the world's first frame (host_gpu_world_reached), 0 before it: the
+// compare's log counts its draws' flips from there.
+std::uint64_t world_first_flip();
 
 // BBHOST_RUN_COMMIT=on (render.cpp run_commit): a draw of a forked run - one
 // a run worker (or the command processor, in its own part) commits off the
