@@ -1008,6 +1008,9 @@ const bool g_bench_uncapped = [] {
 }();
 
 constexpr float kThirtieth = 0.0333333351f, kSixtieth = 0.0166666675f;  // 0x3d088889, 0x3c888889
+// The shortest frame the frame clock's values believe: a guard against a zero
+// or negative measurement, not a limit.
+constexpr float kShortestFrame = 1.0f / 20000.0f;
 
 // `target`: 0 runs the game's own mode (30); above 0 the converted pace, the
 // game's mode 2 with this target - kSixtieth at 60, so 60 is the eboot's own
@@ -1388,8 +1391,15 @@ void each_frame(const SprjFlipper* f) {
         }
         decomp_water_step_frame(water_between);
     }
+    // With the frame clock on (BBHOST_FRAME_CLOCK=1) these take the task step
+    // itself, the clock's one dt, guarded only against a zero measurement
+    // (Rate's 1/dt), so they and the step agree on every frame: on a loading
+    // screen too, where the step is the measured frame and the rate's floor
+    // would hold them at 1/N.
     const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(g_game_fps));
-    const float dt = g_test_step > 0.0f ? scaled(g_test_step) : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+    const float dt = frame_clock::on()  ? std::max(step, kShortestFrame)
+                     : g_test_step > 0.0f ? scaled(g_test_step)
+                                          : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
