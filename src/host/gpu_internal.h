@@ -1254,7 +1254,7 @@ inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::co
 // left out. Filled as draw_impl records the draw.
 struct RunDigest {
     bool done = false;  // it reached its draw call
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    std::uint64_t pipeline = 0;  // its pipeline's key (draw_impl): the fallback, its lean variant and a relink alike
     VkDescriptorSet sets[2] = {};
     VkViewport vp{};
     VkRect2D sc{};

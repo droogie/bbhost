@@ -13935,6 +13935,15 @@ struct RingCbNote {
 };
 thread_local constinit RingCbNote t_ring_cb[2] = {};  // per stage, reset with t_run_digest at the draw's start
 thread_local constinit int t_ring_cb_stage = -1;      // the stage draw_impl resolves, -1 outside
+// BBHOST_RUN_COMMIT=compare: the join commits a run's draws again in order
+// (run_compare_join_locked) - they leave what the pipeline workers finished
+// since the fork (table masks, lean variants, relinks) to the draw after the
+// run, as a part's draw does, so each meets the masks and variants its part
+// met. Right after a load a mask could arrive between the fork and the join:
+// the commit in order then left out user data and tables the part had built
+// for words the variant never reads, or bound the lean variant where the part
+// bound its fallback - the same draw, but not the same digest.
+thread_local constinit bool t_compare_recommit = false;
 void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, std::uint64_t bytes) {
     if (t_ring_cb_stage < 0 || slot >= 16) return;
     RingCbNote& n = t_ring_cb[t_ring_cb_stage];
@@ -19759,8 +19768,9 @@ static bool draw_impl(const GpuDraw& d) {
     } call_seq(d.gx_objects ? d.gx_objects->call_seq : 0);
     // What the pipeline workers finished, before the draw; a run part's draw
     // leaves it to the command processor's next (BBHOST_RUN_COMMIT), and its
-    // fork had no particle arguments to make.
-    if (!part) {
+    // fork had no particle arguments to make. So does compare mode's commit in
+    // order of a run's draw at the join (t_compare_recommit).
+    if (!part && !t_compare_recommit) {
         apply_table_masks_locked();
         apply_lean_builds_locked();
         apply_relinks_locked();
@@ -22595,7 +22605,7 @@ static bool draw_impl(const GpuDraw& d) {
         // BBHOST_RUN_COMMIT=compare: the rest of what it resolved.
         RunDigest& dg = t_run_digest;
         dg.done = true;
-        dg.pipeline = bind_vk;
+        dg.pipeline = key;  // the pipeline's identity: its fallback, lean variant or relink alike
         dg.sets[0] = sets[0];
         dg.sets[1] = sets[1];
         dg.vp = vp;
@@ -23102,6 +23112,10 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
     // them is that it changes nothing they are answered.
     bool redone = false;
     run_forget_recorded_locked();
+    struct Recommit {  // (t_compare_recommit)
+        Recommit() { t_compare_recommit = true; }
+        ~Recommit() { t_compare_recommit = false; }
+    } recommit;
     for (int k = 0; k < j.parts; ++k) {
         for (std::uint32_t i = j.lo[k]; i < j.lo[k + 1]; ++i) {
             if (i == j.stopped[k] && !((kRunLocalStops >> j.rd[i].stop) & 1)) redone = true;
