@@ -163,6 +163,10 @@ struct Chunk {
     // The idle census (BBHOST_IMPORT_IDLE_CENSUS=1, gpu.cpp): when it was made
     // and last found by dmem_import (steady ms, flip).
     std::uint64_t made_ms = 0, used_ms = 0, used_flip = 0;
+    // Window imports (host/import_table.h): the serial of the recording open
+    // when it was put in place - the submissions before it may not see its
+    // addresses - and when (steady ns), for the page table's view.
+    std::uint64_t made_serial = 0, made_ns = 0;
 };
 // SCE_KERNEL_PROT_GPU_READ | SCE_KERNEL_PROT_GPU_WRITE: a mapping the GPU can reach.
 constexpr int kGuestProtGpu = 0x30;
@@ -178,9 +182,10 @@ inline bool chunk_covers(const Chunk& c, std::uint64_t in, std::uint64_t bytes) 
 // driver's pinned memory - what Windows counts as the process's shared GPU
 // memory. A range across windows gets one import of them all, widened to the
 // whole of every import it overlaps, which it replaces: those retire (their
-// windows and page-table entries move to the new one, and they are freed once
-// the work recorded with them has run), so no page of a chunk is imported
-// twice. An import may run on past its chunk's end into the next chunk's span
+// windows move to the new one at once, their page-table entries once every
+// submission made before it has run - host/import_table.h - and they are freed
+// once the work recorded with them has run), so no page of a chunk stays
+// imported twice. An import may run on past its chunk's end into the next chunk's span
 // (kChunkOverlap), so a buffer across the seam lies in one import, as the
 // whole spans' overlap gives. Only with BBHOST_IMPORT_WINDOWS=1 (the counted
 // fallback of the native path, gpu.cpp); otherwise each span is imported whole
@@ -191,6 +196,11 @@ struct DmemChunk {
     std::uint64_t span_lo = 0, span_hi = 0;      // what may be imported (gpu_span); empty: nothing
     std::vector<std::unique_ptr<Chunk>> imports;  // the live imports (retired ones go to a slot's dead_imports)
     Chunk* window[kImportWindows] = {};           // the import that covers each window
+    // The import each window's page-table entries point into (window imports;
+    // nullptr: the sink page). It lags `window` while the window's newest
+    // import is one a submission still in the queue may not see
+    // (host/import_table.h, gpu.cpp install_import_locked).
+    Chunk* table[kImportWindows] = {};
     // When an import over each window last failed (steady ms; 0: never): the
     // window is not asked of the driver again for a while (import_backoff_ms),
     // its draws read through the page table and the sink meanwhile.
@@ -372,6 +382,7 @@ struct Gpu {
     // each signals the value it registered. Made with `timeline`.
     VkSemaphore present_timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
+    bool has_address_report = false;          // VK_EXT_device_address_binding_report, on for BBHOST_VA_TRACE=2 (gpu.cpp)
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;
     // VK_AMD_buffer_marker: the checkpoint index written as the GPU starts a

@@ -88,6 +88,7 @@ const std::string& owner_key(const Block& b) {
 
 MemOwner::MemOwner(const char* owner) : prev_(t_owner) { t_owner = owner; }
 MemOwner::~MemOwner() { t_owner = prev_; }
+const char* bb_memory_owner_now() { return t_owner; }
 
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes) {
     std::lock_guard<std::mutex> lk(g_mu);

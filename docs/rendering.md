@@ -244,11 +244,17 @@ MB in place; the rest it reads only as the source of a copy (texture
 detiling, the buffer shadow's mirrors). `BBHOST_IMPORT_WINDOWS=1` imports
 only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
-over several windows replaces the ones it covers, so no page is imported
+over several windows replaces the ones it covers, so no page stays imported
 twice, and a dispatch imports what its shader reads and stores (an import a
 draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
 waited for N in M ms`, and the exit report gives the driver's time by the
-thread that waited). It is on by default on an integrated GPU under Windows,
+thread that waited). The page table's entries of a window that named the
+import a newer one replaces keep naming it until every submission made before
+the newer one has run: a shader walking the table reads whatever address an
+entry holds as it runs, and AMD's Linux driver maps a new buffer's addresses
+for the submissions made after it, not for the ones already queued
+(host/import_table.h; `BBHOST_IMPORT_TABLE_DEFER=0` switches them at once, as
+before). It is on by default on an integrated GPU under Windows,
 where whole spans kept about 1.5 GB more of the game's memory resident for the
 GPU, and on a graphics card with small video memory (under 7.5 GiB free at
 the start), whose whole spans pin 4-5 GiB of system memory beside a 4-6 GB
@@ -913,5 +919,6 @@ pacing unchanged.
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
 | `tools/area_check.py` | twelve places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
+| `BBHOST_VA_TRACE=1` | logs every guest-memory import made, put in place, retired and freed, every window whose page-table entries move, every device buffer made through `create_dev_buffer` with its owner and every staging or scratch chunk freed (`va:` lines, the wall clock in seconds and microseconds, to match `journalctl -k -o short-unix`); a device fault report then looks its addresses up in them. `=2` adds the driver's own binds and unbinds where it reports them (VK_EXT_device_address_binding_report) |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |
