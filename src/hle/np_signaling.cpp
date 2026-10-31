@@ -50,6 +50,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <random>
 #include <tuple>
 #include <vector>
 
@@ -131,7 +132,24 @@ std::map<unsigned, Transport> g_tr;  // by transport id
 std::map<unsigned, Conn> g_conn;     // by connection id
 unsigned g_next_ctx = 1;
 unsigned g_next_tr = 1;
-unsigned g_next_conn = 1;
+unsigned g_conn_seed = 0;  // 0 until the first connection: then a random start
+
+// The next free connection id, as shadPS4's AllocateConnectionIdLocked: a
+// random start in 1..0x7fff, then counting up and wrapping, so two games
+// do not hand out the same ids (bbhost used to start every game at 1).
+unsigned alloc_conn_id_locked() {
+    if (g_conn_seed == 0) {
+        std::random_device rd;
+        g_conn_seed = (static_cast<unsigned>(rd()) / 0x4001u) & 0x7fffu;
+        if (g_conn_seed == 0) g_conn_seed = 1;
+    }
+    for (int tried = 0; tried <= 0xffff; ++tried) {
+        const unsigned candidate = g_conn_seed++;
+        if (g_conn_seed == 0 || g_conn_seed > 0x7fff) g_conn_seed = 1;
+        if (candidate != 0 && g_conn.find(candidate) == g_conn.end()) return candidate;
+    }
+    return 0;
+}
 
 bool g_trace = [] {
     const char* e = std::getenv("BBHOST_NP_TRACE");
@@ -521,7 +539,7 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
         const unsigned tid = ensure_transport_locked(peer, 0, 0);
         Transport& t = g_tr[tid];
         if (!id) {
-            id = g_next_conn++;
+            id = alloc_conn_id_locked();
             Conn c;
             c.ctx = ctx;
             c.online_id = peer;
@@ -638,7 +656,7 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
             const unsigned ctx = g_ctx.empty() ? 0 : g_ctx.begin()->first;
             unsigned cid = ctx ? find_conn_locked(from, ctx) : 0;
             if (ctx && !cid) {
-                cid = g_next_conn++;
+                cid = alloc_conn_id_locked();
                 Conn c;
                 c.ctx = ctx;
                 c.online_id = from;
