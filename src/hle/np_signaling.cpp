@@ -91,6 +91,15 @@ constexpr int kGiveUpMs = 30000;
 // (shadPS4's kMatching2EstablishDelay), and its DEAD on a timeout.
 constexpr int kM2EstablishDelayMs = 1000;
 constexpr int kM2ErrTimeout = static_cast<int>(0x80550E11);
+constexpr int kM2ErrTerminatedByPeer = static_cast<int>(0x80550E10);
+constexpr int kM2ErrTerminatedByMyself = static_cast<int>(0x80550E18);
+
+// Matching2's DEAD for that player when its connection closes, after
+// NpSignaling's own DEAD on the same queue (shadPS4's
+// CloseConnectionAndDispatchDead -> QueueMatching2DeadForTransport).
+void queue_m2_dead(const std::string& who, int error) {
+    net::dispatch_after(0, net::Prio::Signaling, [who, error] { hle_np_matching2_transport_dead(who, error); });
+}
 
 enum class State { Inactive, SendingOffer, WaitOffer, SendingAccept, WaitAccept, ConnCheck, Established };
 
@@ -594,6 +603,7 @@ GUEST_ABI int sig_deactivate(unsigned ctx, unsigned conn) {
     }
     hle_np_matching2_peer_closed(peer);
     queue_all(std::move(events));
+    queue_m2_dead(peer, kM2ErrTerminatedByMyself);
     return 0;
 }
 
@@ -726,10 +736,10 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
             const unsigned cid = find_conn_locked(from);
             if (reason == kDeactivate && cid && g_tr[tid].state == State::Established) {
                 events.emplace_back(g_conn[cid].ctx, cid, kEvPeerDeactivated, 0);
-            } else if (cid) {
-                close_conn_dead_locked(cid, kErrTerminatedByPeer, events);
             } else {
-                g_tr[tid].state = State::Inactive;
+                if (cid) close_conn_dead_locked(cid, kErrTerminatedByPeer, events);
+                else g_tr[tid].state = State::Inactive;
+                queue_m2_dead(from, kM2ErrTerminatedByPeer);
             }
             break;
         }

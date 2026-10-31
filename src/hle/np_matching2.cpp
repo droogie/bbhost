@@ -224,6 +224,9 @@ struct M2 {
     // Members whose Matching2 ESTABLISHED (0x5102) went out: once their
     // transport has been up a second (hle_np_matching2_transport_up).
     std::set<std::uint16_t> m2_established;
+    // Members whose Matching2 DEAD went out when their connection closed
+    // (hle_np_matching2_transport_dead): our LeaveRoom does not send it again.
+    std::set<std::uint16_t> m2_dead_sent;
 };
 M2 g;
 
@@ -425,6 +428,7 @@ void forget_room_locked() {
     g.owner_id = 0;
     g.max_slot = 0;
     g.m2_established.clear();
+    g.m2_dead_sent.clear();
     net::peers_clear();
     net::room_clear();
     // NpSignaling's connections are the game's: it closes them itself
@@ -451,6 +455,7 @@ void end_session_locked(const char* why) {
     }
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) {
+        if (g.m2_dead_sent.count(p.member_id)) continue;
         if (hle_np_signaling_live(p.online_id)) {
             g.dead_on_close[p.online_id] = {g.room_id, p.member_id};
         } else {
@@ -1240,7 +1245,8 @@ void hle_np_matching2_transport_dead(const std::string& online_id, int error) {
         for (const net::Peer& p : room_peers()) {
             if (p.online_id == online_id) member = p.member_id;
         }
-        if (!member) return;
+        if (!member || g.m2_dead_sent.count(member)) return;
+        g.m2_dead_sent.insert(member);
         g.m2_established.erase(member);
         room = g.room_id;
     }
