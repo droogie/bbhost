@@ -1,6 +1,7 @@
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
 #include "engine/frame_rate_step.h"
+#include "engine/frame_clock.h"
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
@@ -1354,6 +1355,7 @@ void each_frame(const SprjFlipper* f) {
     const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
     const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
+        if (frame_clock::on()) frame_clock::publish(step);  // the frame clock (engine/frame_clock.h, BBHOST_FRAME_CLOCK=1)
         frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
         if (g_wind_va) put<float>(g_wind_va, wind_pace::step_for(step));
@@ -1977,6 +1979,13 @@ void frame_rate_install(ElfImage* image) {
     // replays each frame beside it.
     if (const char* e = std::getenv("BBHOST_FRAME_SOURCE"); e && e[0]) {
         g_source = e[0] == '0' ? Source::Guest : e[0] == '2' ? Source::Compare : Source::Ours;
+    }
+    // BBHOST_FRAME_CLOCK=1: the frame clock (engine/frame_clock.h), read here,
+    // before the decomps are added (they ask it). Off, nothing here changes.
+    if (const char* e = std::getenv("BBHOST_FRAME_CLOCK"); e && e[0] == '1') {
+        frame_clock::set_on(true);
+        host_log("frame rate: the frame clock is on (BBHOST_FRAME_CLOCK=1): every frame's step, published before the frame "
+                 "runs, converts what follows the frame at any frame length (engine/frame_clock.h)");
     }
     int want = wanted_fps();
     // Uncapped: the display's refresh rate, read now (the window opens later, on
