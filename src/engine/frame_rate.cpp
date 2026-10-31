@@ -310,6 +310,48 @@ constexpr bool rated_in_constants() {
 }
 static_assert(rated_in_constants(), "every rated value is one of kConstants (its old value is checked there)");
 
+// With the frame clock on (BBHOST_FRAME_CLOCK=1, engine/frame_clock.h): the
+// values above that the tables write once, for the rate chosen at start, that
+// keep the game's value instead - the game's is right at every frame length.
+// kConstants leaves them as the game has them. Each has a switch of its own
+// (=0) that writes the start-time value, as with the clock off.
+enum class Handover : std::uint8_t {
+    Game,  // the game's value is right at every rate
+};
+struct HandedOver {
+    std::uint32_t at;
+    Handover how;
+    const char* env;  // =0: the start-time value, as with the clock off
+};
+constexpr HandedOver kHandedOver[] = {
+    // A physics world's expected shortest step (sub_a3fad0's cinfo, +0x70,
+    // beside an expected top speed of 200 at +0x68): the two size how far a
+    // body's bounds grow for a step, so the longest step the clock takes - the
+    // game's 1/30 - is the safe one at every rate (the lists' 1/60 grew them
+    // half as far).
+    {0x0a3fc3f, Handover::Game, "BBHOST_PHYSICS_HINTS"},
+    // hknp's default solver step (sub_f38300's cinfo, +0xd4): a seed. The
+    // world's constructor hands it to the solver's step setup once
+    // (sub_f51670 at 0xf51a28, to 0xf6fa20), and every step sets the solver's
+    // step again from its own input's dt (sub_f597d0 at 0xf59cc0), which the
+    // physics world's frame-time site makes the frame's.
+    {0x0f383ca, Handover::Game, "BBHOST_PHYSICS_HINTS"},
+};
+constexpr bool handed_over_in_constants() {
+    for (const HandedOver& h : kHandedOver) {
+        bool found = false;
+        for (const Constant& c : kConstants) found = found || c.at == h.at;
+        if (!found) return false;
+    }
+    return true;
+}
+static_assert(handed_over_in_constants(), "every value handed back is one of kConstants (its old value is checked there)");
+constexpr const HandedOver* handed_over(std::uint32_t at) {
+    for (const HandedOver& h : kHandedOver)
+        if (h.at == at) return &h;
+    return nullptr;
+}
+
 // The list's other value changes. Counts that follow the rate: a countdown
 // of 10 frames (0x192c3ff's movl into +0xf8), the default of 5 an int setting
 // is read with (0x1929675's mov edx, before sub_24eba00), a worker's
@@ -1659,6 +1701,15 @@ int apply_rate(ElfImage* image, int want) {
     // The code immediates and frame counts at the rate's own values - the
     // sound thread's update time too (one a frame).
     const int fps = mode;
+    // With the frame clock on, the values handed back (kHandedOver) keep the
+    // game's, each unless its own switch is 0; with the start-time value each
+    // would have had beside it, for the log.
+    const auto handed_back = [&](const HandedOver& h) {
+        if (!frame_clock::on()) return false;
+        const char* e = std::getenv(h.env);
+        return !(e && e[0] == '0');
+    };
+    std::vector<std::pair<const HandedOver*, std::uint32_t>> kept;
     // A rated constant's rule gives the table's own value at 60.
     std::size_t rated_fixed = 0, camera_kept = 0;
     for (const Constant& c : kConstants) {
@@ -1668,10 +1719,13 @@ int apply_rate(ElfImage* image, int want) {
             continue;
         }
         std::uint32_t now = c.now;
-        if (const Rated* r = rated(c.at); r && mode != 60) {
-            now = float_bits(rated_value(r->kind, bits_float(c.was), fps));
-            rated_fixed += r->each_frame ? 0 : 1;
+        const Rated* r = rated(c.at);
+        if (r && mode != 60) now = float_bits(rated_value(r->kind, bits_float(c.was), fps));
+        if (const HandedOver* h = handed_over(c.at); h && handed_back(*h)) {
+            kept.push_back({h, now});
+            continue;
         }
+        if (r && mode != 60 && !r->each_frame) ++rated_fixed;
         write(c.at, &now, 4);
     }
     for (const Counted& c : kCounts) {
@@ -1895,6 +1949,11 @@ int apply_rate(ElfImage* image, int want) {
                 }
             }
         }
+    }
+    // The values handed back (kHandedOver), and what keeps each.
+    for (const auto& [h, now] : kept) {
+        host_log("frame rate: 0x%x keeps the game's value (%g), right at every rate (%s=0: the rate's, %g)", h->at,
+                 static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), h->env, static_cast<double>(bits_float(now)));
     }
     // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
     // and his stores with the sites) or, with Original, the game's 30 fps
