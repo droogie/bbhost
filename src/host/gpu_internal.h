@@ -9,6 +9,7 @@
 #include "gcn/translate.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/copy_elide.h"
 #include "host/list_resolve.h"
 #include "host/stream_ops.h"
 
@@ -1745,6 +1746,28 @@ std::string image_reuse_report_locked();
 // The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
 std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
+// copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is
+// the command processor's, under g.mu.
+extern copy_elide::Ledger g_elide;                         // under g.mu
+inline bool copy_elide_live() { return g_elide.live(); }    // a copy is pending (none ever with the switch off)
+inline bool copy_elide_hides(std::uint64_t base) { return base && g_elide.is_dst(base); }  // `base` is a pending copy's destination
+bool copy_elide_hides_tsharp(const std::uint32_t* w);       // the T#'s base or V# base is one
+RtImage* copy_elide_source_locked(const RtImage& dst);      // the pending copy's source a sampled binding of `dst` binds, or null
+void copy_elide_touch_locked(std::uint64_t base, int touch);  // before `touch` (copy_elide::Touch) reaches the target at `base`
+void copy_elide_flush_locked();                             // every pending copy made now
+std::string copy_elide_report_locked();
+RtImage* rt_at_locked(std::uint64_t base);                  // g_rts' target at `base`, else g_snapshots' snapshot, else null
+extern thread_local bool t_elide_lookup;                    // draw_impl's target lookups are on (an attachment bound is a write)
+// The targets at `a` and `b` exchanged their images: their sampled views go with
+// them, and the view memos forget what a T# at either base resolved to (textures.cpp).
+void textures_swap_target_views_locked(std::uint64_t a, std::uint64_t b);
+void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b);
+// BBHOST_COPY_ELIDE=compare (copy_compare.cpp): `a` and `b` (one shape and
+// format) compared texel by texel on the GPU, the differing texels counted
+// when the work has run; the counts by `why` for the report.
+void copy_compare_record_locked(RtImage& a, RtImage& b, const char* why);
+std::string copy_compare_report_locked();
 // BBHOST_LAYOUT_FIXES (on unless 0; textures.cpp): a target's every layer and
 // level leaves UNDEFINED before it is used as GENERAL - a copy into a target
 // nothing has made GENERAL yet, a target carried from a texture - which

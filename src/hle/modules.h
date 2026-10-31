@@ -155,6 +155,8 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
 // timeline (BBHOST_FLIP_TIMELINE=1).
 std::uint64_t hle_video_note_flip_call(std::int64_t arg);
 std::uint64_t hle_video_flip_count();
+// Whether the game registered `va` as a display buffer (any port; lock-free).
+bool hle_video_is_display_buffer(std::uint64_t va);
 std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
 // A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the
 // `exit` request of BBHOST_TEST_REQUESTS): the exit reports and the cache

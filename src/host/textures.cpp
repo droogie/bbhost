@@ -2,6 +2,7 @@
 // stage's user data become Vulkan images (untiled on upload) and samplers.
 // Render targets sampled as textures alias the render target image.
 #include "host/apu_memory.h"
+#include "host/copy_census.h"
 #include "host/gpu_internal.h"
 #include "host/heap_compact.h"
 
@@ -2684,6 +2685,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
         }
     }
     RtRegion& reg = it->second;
+    if (copy_census::on()) copy_census::region_bind(rt, width, height, !reg.img.initialised);
     begin_recording_locked();
     // Into the draw's packet, started for it now, with the pass end before it:
     // recorded in place, the copy waited for the recorder to finish the draws
@@ -2700,7 +2702,15 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
     if (open && open->copy_region(rt.image, reg.img.image, width, height, initialised)) {
         g_rt_region_packets.fetch_add(1, std::memory_order_relaxed);
     } else {
+        // BBHOST_GPU_PROFILE: the region copy as an entry of its own (recorded in place there).
+        static std::map<std::string, std::string> names;  // under g.mu
+        if (g.profile) {
+            char key[64];
+            std::snprintf(key, sizeof(key), "region-copy-%ux%u-f%d", width, height, static_cast<int>(rt.format));
+            profile_begin_locked(&names.emplace(key, key).first->second);
+        }
         record_region_copy(g_cmd(), rt.image, reg.img.image, width, height, initialised);
+        if (g.profile) profile_end_locked();
     }
     g_rt_region_copies.fetch_add(1, std::memory_order_relaxed);
     g_last_view_no_memo = true;
@@ -2879,7 +2889,14 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     // had black macrotile columns while 0x16ab40000 was a clean clinic.
     auto alias_rt = [&](std::uint64_t addr) -> VkImageView {
         RtImage* rt = find_render_target(addr);
-        if (!rt || !rt->initialised || storage) return VK_NULL_HANDLE;
+        // A copy into this target left unmade (BBHOST_COPY_ELIDE, render.cpp): its
+        // source, unchanged since the copy, holds the texels the target would.
+        // The target answers for its identity below; the source's image is the
+        // one bound (one of its shape and format), and the view is not
+        // remembered - once the copy is made or forgotten the target binds as
+        // itself again.
+        RtImage* const elided = rt && !storage && copy_elide_live() ? copy_elide_source_locked(*rt) : nullptr;
+        if (!rt || (!rt->initialised && !elided) || storage) return VK_NULL_HANDLE;
         // By identity: a target that is another resource's image (a dead one's
         // waiting out the idle time) is the bound resource's only if that was
         // made over it without data (target_taken_by); made with texels of
@@ -2890,6 +2907,10 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                 return VK_NULL_HANDLE;
             }
             g_alias_taken.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (elided) {
+            g_last_view_no_memo = true;
+            rt = elided;
         }
         // A cube T# over its target samples the faces as layers (the render
         // target is layered when the game draws faces through CB_COLOR*_VIEW);
@@ -3381,6 +3402,9 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         // The hash is verified against the words, so a collision costs a
         // resolve rather than the wrong texture.
         if (e.key != key || e.flags != flags || std::memcmp(e.w, w, static_cast<std::size_t>(nw) * 4) != 0) continue;
+        // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image
+        // until the copy is made: resolved again, and not remembered.
+        if (!e.sf && copy_elide_live() && copy_elide_hides_tsharp(w)) break;
         if (e.sf) {
             refresh_surface_locked(*e.sf);
             ahead_defer::met_pending(*e.sf, "the words' memo");
@@ -3541,7 +3565,10 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                                bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
-    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) {
+    // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image until the copy is made: resolved
+    // again (by its T#'s base, which stage 2's entries keep), and not remembered.
+    const bool elided = e.id == id && !e.sf && copy_elide_live() && (g_images_mode ? copy_elide_hides(e.base) : copy_elide_hides_tsharp(w));
+    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags && !elided) {
         // Stage 2: an image nothing has changed since the entry last refreshed its surface binds as it is. Compare
         // mode leaves the recheck out (it refreshes anyway), so every refresh a skip stands in for is checked.
         const bool skip = e.fast && e.static_epoch == g_static_epoch &&
@@ -4301,6 +4328,12 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
                       static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), c.src_mip, c.src_layer, why);
         }
     };
+    // Copies left unmade (BBHOST_COPY_ELIDE): a source that is one's destination is
+    // made first, and a destination that is one's source or destination too.
+    if (copy_elide_live()) {
+        copy_elide_touch_locked(tsharp_base(c.src_tsharp), copy_elide::kReadOther);
+        copy_elide_touch_locked(tsharp_base(c.dst_tsharp), copy_elide::kWrite);
+    }
     if (!copy_side_locked(c.src_tsharp, src, c.src_gen)) {
         g_image_copy_no_src.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -4344,6 +4377,20 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     }
     if (src.rt && src.rt->view_clear) view_clear_apply_locked(*src.rt, kVcwCopy);  // owed clears first (render.cpp lazy clears)
     if (dst.rt && dst.rt->view_clear) view_clear_apply_locked(*dst.rt, kVcwCopy);
+    const copy_census::Quiet census_quiet;
+    if (copy_census::on()) {
+        const copy_census::Side a{tsharp_base(c.src_tsharp), src.rt ? rt_size_bytes(*src.rt) : std::uint64_t{src.width} * src.height * src.esize, src.width,
+                                  src.height, static_cast<int>(src.format)};
+        const copy_census::Side b{tsharp_base(c.dst_tsharp), dst.rt ? rt_size_bytes(*dst.rt) : std::uint64_t{dst.width} * dst.height * dst.esize, dst.width,
+                                  dst.height, static_cast<int>(dst.format)};
+        std::uint32_t flags = src.rt ? copy_census::kSrcImage : 0;
+        if (c.dst_x == 0 && c.dst_y == 0 && c.w == dst.width && c.h == dst.height && c.dst_mip == 0 && dst.levels <= 1 && dst.layers <= 1) {
+            flags |= copy_census::kWhole;
+        }
+        if (src.width == dst.width && src.height == dst.height) flags |= copy_census::kSameSize;
+        if (src.format == dst.format) flags |= copy_census::kSameFormat;
+        copy_census::copy(copy_census::kImageRegion, a, b, "copy-image token", flags);
+    }
     if (src.rt) g_image_copy_rt_src.fetch_add(1, std::memory_order_relaxed);
     if (dst.rt) {
         g_image_copy_rt_dst.fetch_add(1, std::memory_order_relaxed);
@@ -4365,7 +4412,14 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     r.dstSubresource = {aspect, c.dst_mip, c.dst_layer, 1};
     r.dstOffset = {static_cast<std::int32_t>(c.dst_x), static_cast<std::int32_t>(c.dst_y), 0};
     r.extent = {c.w, c.h, 1};
+    static std::map<std::string, std::string> profile_names;  // under g.mu: BBHOST_GPU_PROFILE's entry for the copy
+    if (g.profile) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "img-copy-%ux%u-f%d", c.w, c.h, static_cast<int>(dst.format));
+        profile_begin_locked(&profile_names.emplace(key, key).first->second);
+    }
     vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (g.profile) profile_end_locked();
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -4426,6 +4480,9 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     std::uint32_t to_w = 0, to_h = 0, to_levels = 1, to_layers = 1;
     Surface* to_surface = nullptr;
     RtImage* to_rt = nullptr;
+    // Copies left unmade (BBHOST_COPY_ELIDE): a target this writes that is one's source
+    // or destination has it made first (the copy below can still be refused).
+    if (copy_elide_live()) copy_elide_touch_locked(dst, copy_elide::kWrite);
     if (RtImage* rt = find_render_target(dst);
         rt && rt->image && !rt->depth &&
         (static_cast<std::uint32_t>(rt->gx_gen) == static_cast<std::uint32_t>(dst_gen) || target_taken_by(*rt, dst, dst_gen) > 0)) {
@@ -4463,6 +4520,15 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     if (to_rt && to_rt->view_clear) view_clear_apply_locked(*to_rt, kVcwCopy);  // its owed clear first, as any copy into a target
     const std::uint32_t levels = std::min<std::uint32_t>(to_levels, static_cast<std::uint32_t>(std::max<std::size_t>(from.levels.size(), 1)));
     const std::uint32_t layers = std::min(to_layers, from.type == 10 ? 1u : from.layers);
+    const copy_census::Quiet census_quiet;
+    if (copy_census::on()) {
+        const copy_census::Side a{src, std::uint64_t{from.width} * from.height * std::max<std::size_t>(from.esize, 1), from.width, from.height,
+                                  static_cast<int>(from.format)};
+        const copy_census::Side b{dst, to_rt ? rt_size_bytes(*to_rt) : std::uint64_t{to_w} * to_h * std::max<std::size_t>(to_surface->esize, 1), to_w,
+                                  to_h, static_cast<int>(to_format)};
+        copy_census::copy(copy_census::kResource, a, b, to_rt ? "resource copy into a target" : "resource copy",
+                          copy_census::kWhole | copy_census::kSameSize | (to_format == from.format ? copy_census::kSameFormat : 0u));
+    }
     begin_recording_locked();
     render_end_pass_locked();
     if (to_rt && !to_rt->initialised && render_layout_fixes()) {
@@ -4492,8 +4558,15 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
         r.extent = {std::max(1u, from.width >> l), std::max(1u, from.height >> l), 1};
         regions.push_back(r);
     }
+    static std::map<std::string, std::string> profile_names;  // under g.mu: BBHOST_GPU_PROFILE's entry for the copy
+    if (g.profile) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "res-copy-%ux%u-f%d", from.width, from.height, static_cast<int>(to_format));
+        profile_begin_locked(&profile_names.emplace(key, key).first->second);
+    }
     vkCmdCopyImage(g_cmd(), from.image, VK_IMAGE_LAYOUT_GENERAL, to_image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()),
                    regions.data());
+    if (g.profile) profile_end_locked();
     {
         // The first of each source and destination pair, to know what moves this way.
         static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;  // under g.mu
@@ -5702,6 +5775,41 @@ void invalidate_rt_views(std::uint64_t base) {
     }
     g_rt_views.erase(it);
     bump_view_epoch();
+}
+
+// Copies left unmade (render.cpp, BBHOST_COPY_ELIDE). Two targets of one shape
+// that exchange their images: their sampled views go with the images, and the
+// memos' entries a T# at either base made (which name the views by the
+// target they were made for) are forgotten - the next binding of each
+// resolves again, to its target's views. Every other entry stays, which an
+// epoch bump would empty.
+void textures_swap_target_views_locked(std::uint64_t a, std::uint64_t b) {
+    auto ia = g_rt_views.find(a), ib = g_rt_views.find(b);
+    std::map<std::uint64_t, VkImageView> va, vb;
+    if (ia != g_rt_views.end()) va.swap(ia->second);
+    if (ib != g_rt_views.end()) vb.swap(ib->second);
+    if (!vb.empty()) g_rt_views[a].swap(vb);
+    else if (ia != g_rt_views.end()) g_rt_views.erase(ia);
+    if (!va.empty()) g_rt_views[b].swap(va);
+    else if ((ib = g_rt_views.find(b)) != g_rt_views.end()) g_rt_views.erase(ib);
+    textures_forget_target_memos_locked(a, b);
+}
+
+void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
+    if (!g_images_mode) {
+        bump_view_epoch();  // the id memo's entries keep no base without stage 2
+        return;
+    }
+    const auto at = [a, b](std::uint64_t base) { return base && (base == a || base == b); };
+    for (ViewMemoEntry& e : g_view_memo) {
+        if (e.epoch != g_view_epoch || e.sf) continue;
+        const std::uint64_t base = tsharp_base(e.w);
+        const std::uint64_t vbase = static_cast<std::uint64_t>(e.w[0]) | (static_cast<std::uint64_t>(e.w[1] & 0xff) << 32);
+        if (at(base) || at(vbase)) e.epoch = 0;
+    }
+    for (IdViewEntry& e : g_id_views) {
+        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) e.epoch = 0;
+    }
 }
 
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes) {

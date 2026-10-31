@@ -328,6 +328,7 @@ if(Vulkan_FOUND)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+                                src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
@@ -414,7 +415,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/copy_compare.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
@@ -812,6 +813,14 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # Copies left unmade (tests/copy_elide_test.cpp): the ledger against a model in which every copy is made.
+  add_executable(copy_elide_test tests/copy_elide_test.cpp)
+  target_include_directories(copy_elide_test PRIVATE src)
+  add_test(NAME copy_elide_test COMMAND copy_elide_test)
+  # Whether a draw writes every pixel of a target (tests/full_write_test.cpp): the state rules and the geometry.
+  add_executable(full_write_test tests/full_write_test.cpp)
+  target_include_directories(full_write_test PRIVATE src)
+  add_test(NAME full_write_test COMMAND full_write_test)
   # Which draws start a command buffer of their own on lavapipe (tests/lvp_split_test.cpp).
   add_executable(lvp_split_test tests/lvp_split_test.cpp)
   target_include_directories(lvp_split_test PRIVATE src)

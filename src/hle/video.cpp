@@ -972,6 +972,19 @@ GUEST_ABI int hle_video_set_attr(void* attr, unsigned fmt, unsigned tile, unsign
     return 0;
 }
 
+// Every address the game has registered as a display buffer, read without g_vo_mu
+// (hle_video_is_display_buffer: the renderer asks under its own lock).
+std::atomic<std::uint64_t> g_display_bufs[32] = {};
+void note_display_buffer(std::uint64_t va) {
+    if (!va) return;
+    for (std::atomic<std::uint64_t>& b : g_display_bufs) {
+        std::uint64_t v = b.load(std::memory_order_acquire);
+        if (v == va) return;
+        if (!v && b.compare_exchange_strong(v, va, std::memory_order_acq_rel)) return;
+        if (v == va) return;
+    }
+}
+
 GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, const void* attr) {
     std::lock_guard<std::mutex> lock(g_vo_mu);
     if (!vo_get(handle)) {
@@ -985,6 +998,7 @@ GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, con
     for (int i = 0; addrs && i < n; ++i) {
         const int idx = start + i;
         if (idx >= 0 && idx < 16) p->buffers[idx] = reinterpret_cast<std::uint64_t>(addrs[i]);
+        note_display_buffer(reinterpret_cast<std::uint64_t>(addrs[i]));
     }
     if (attr) {
         const auto* a = static_cast<const unsigned*>(attr);
@@ -1079,6 +1093,14 @@ void hle_video_set_picture(unsigned w, unsigned h) {
 }
 
 std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
+bool hle_video_is_display_buffer(std::uint64_t va) {
+    for (const std::atomic<std::uint64_t>& b : g_display_bufs) {
+        const std::uint64_t v = b.load(std::memory_order_acquire);
+        if (!v) return false;
+        if (v == va) return true;
+    }
+    return true;  // more registered than kept: every address counts as one
+}
 std::uint64_t hle_video_last_tick_ns() { return g_last_tick_ns.load(std::memory_order_relaxed); }
 bool hle_video_test_exit_requested() { return g_test_exit.load(std::memory_order_relaxed); }
 

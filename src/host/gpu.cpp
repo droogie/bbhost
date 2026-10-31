@@ -5,6 +5,7 @@
 #include "engine/gx_resources.h"
 #include "engine/live_resolution.h"
 #include "host/apu_memory.h"
+#include "host/copy_census.h"
 #include "host/heap_compact.h"
 #include "host/heap_place.h"
 #include "host/list_resolve.h"
@@ -9342,6 +9343,18 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     }
     static thread_local StageImages stage_images;
     prefetch_stage_images(pl.meta, d.user_data, stage_images);
+    if (copy_census::on()) {
+        // What the dispatch samples and what it stores to (host/copy_census.h).
+        for (std::size_t k = 0; k < stage_images.images.size() && k < pl.meta.images.size(); ++k) {
+            const StageImages::Image& im = stage_images.images[k];
+            if (!im.resolved) continue;
+            if (pl.meta.images[k].storage) {
+                copy_census::touch(image_base(im), copy_census::kTouchDispatch, pl.name.c_str());
+            } else {
+                copy_census::read(image_base(im), pl.name.c_str());
+            }
+        }
+    }
     // On-demand imports (window imports): what the dispatch's shader reaches
     // through the page table is imported before it runs - its stores and its
     // counter words here, what it reads once the variant that runs is known
@@ -11620,6 +11633,7 @@ std::atomic<std::uint64_t> g_token_fills{0}, g_token_fills_unplaced{0};
 bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok || !bytes) return false;
+    const copy_census::As census_as(copy_census::kTouchFill);
     hle_gnm_warn_if_command_buffer("fill token", va, bytes);
     const bool on_rt = find_render_target(va) != nullptr;
     if (mark_surfaces_dirty_locked(va, bytes, false) || on_rt) {
