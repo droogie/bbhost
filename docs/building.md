@@ -41,10 +41,13 @@ whether a newer release is out and offers to open its page in the browser.
 
 `-DBBHOST_LTO=ON` builds every target with ThinLTO (`-flto=thin`), so the
 command processor's calls across files (the render path into the buffer
-shadow and the GPU layer) can be inlined: about 4-5% more frame rate where the
+shadow and the GPU layer) can be inlined: about 3-5% more frame rate where the
 command processor is the limit (Kyo's Central Yharnam save on a Radeon 8060S,
-~137 to ~143-145 fps). Off by default. It applies to the first configure of a
-build directory, as the other `-D` options do.
+~137 to ~143-145 fps; on an RTX 4070 with two Xeon Gold 6230 at 1080p, Old
+Yharnam ~100 to ~104 fps and the Cainhurst courtyard ~107 to ~110). Off by
+default; the release packages (Windows, Linux and the Steam Deck kit) are
+built with it. It applies to the first configure of a build directory, as the
+other `-D` options do.
 
 `-DBBHOST_PGO=generate` builds an instrumented bbhost (Clang's IR profiles;
 MSYS2 needs `mingw-w64-ucrt-x86_64-compiler-rt`, the version of its clang).

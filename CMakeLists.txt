@@ -14,7 +14,10 @@ endif()
 # path crosses files at every step (render.cpp into buffer_shadow.cpp and
 # gpu.cpp - the shadow's lookups, locate, the twins' and copy versions'
 # checks), and calls it cannot inline otherwise: Kyo's Central Yharnam save on
-# the Radeon 8060S, CP-bound, went from ~137 to ~143-144 fps. Off by default.
+# the Radeon 8060S, CP-bound, went from ~137 to ~143-144 fps; on an RTX 4070
+# with two Xeon Gold 6230, 1080p, Old Yharnam +3.7% and the Cainhurst
+# courtyard +3.1%. Off by default; the release packages are built with it
+# (.github/workflows/release.yml).
 option(BBHOST_LTO "build with ThinLTO (-flto=thin)" OFF)
 if(BBHOST_LTO)
   add_compile_options(-flto=thin)
