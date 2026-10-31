@@ -24,8 +24,10 @@
 // effect. Leaves: one call or one store each.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "engine/frame_clock.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 using namespace decomp;
 
@@ -47,6 +49,10 @@ u64 effect() { return load<u64>(game_address(kSinglePostEffect)); }
 // parameter's upper bits for zero, as its own callers leave them, and passes
 // the register on as it came; the game's entry clears them itself.
 u32 low_byte(u32 reg) { return static_cast<u8>(reg); }
+
+// With the frame clock on, the effect's elapsed time follows it
+// (ppfx_sub_fb2800); decomp_yebis_ppfx_setters_add sets it.
+bool g_yebis_step = false;
 
 }  // namespace
 
@@ -390,9 +396,19 @@ DECOMP_LEAF u64 ppfx_sub_fb27e0(u64 /*context*/, u64 matrix, u32 flag) {
     return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8eb0)(effect(), matrix, low_byte(flag));
 }
 
-// A float at +0x6ac (sub_fb2710's fourth).
+// A float at +0x6ac (sub_fb2710's fourth): the effect's elapsed time a frame,
+// which the eye adaptation and the afterimage decays read. Its one caller, the
+// flip pass (0x25d7e56), hands it the post-process context's +4 every frame,
+// set once, at the context's initialisation (0x25df516): the game's 1/60, half
+// a 30 fps frame, which the frame-rate code makes half a frame of the rate
+// chosen at start. With the frame clock on (BBHOST_FRAME_CLOCK=1) it keeps
+// the game's 1/60 (engine/frame_rate.cpp, kHandedOver), and ours stores it as
+// that many 30 fps frames of this one (engine/frame_clock.h): the game's own
+// 1/60 at 30, half that at 60, and the frame's own share at any frame length.
+// Off, or with BBHOST_YEBIS_STEP=0, the value as handed.
 DECOMP_LEAF u64 ppfx_sub_fb2800(u64 /*context*/, float value) {
-    store<float>(effect() + 0x6ac, value);
+    const float frames = frame_clock::frames30();
+    store<float>(effect() + 0x6ac, !g_yebis_step || frames == 1.0f || MUTANT(8) ? value : value * frames);
     return 0;
 }
 
@@ -507,6 +523,8 @@ constexpr u8 kEntry_fb37f0[] = {0x48, 0x8b, 0x3d, 0xd9, 0x26, 0x8b, 0x04};
 }  // namespace
 
 void decomp_yebis_ppfx_setters_add() {
+    const char* e = std::getenv("BBHOST_YEBIS_STEP");
+    g_yebis_step = frame_clock::on() && !(e && e[0] == '0');
     const DecompFunction fns[] = {
         {"ppfx_set_render_scene_luminance_scale", "yebis", 0xfb2710, kEntry_fb2710, sizeof kEntry_fb2710, reinterpret_cast<void*>(&ppfx_set_render_scene_luminance_scale), DecompKind::Leaf},
         {"ppfx_sub_fb2720", "yebis", 0xfb2720, kEntry_fb2720, sizeof kEntry_fb2720, reinterpret_cast<void*>(&ppfx_sub_fb2720), DecompKind::Leaf},

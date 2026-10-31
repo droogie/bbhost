@@ -345,6 +345,10 @@ constexpr HandedOver kHandedOver[] = {
     // 0x1c0ca97): its drive's decomp hands the keyframe step the frame clock's
     // step for it, every frame (decomp/physics/ragdoll_drive.cpp).
     {0x1c0ca9a, Handover::Decomp, "BBHOST_RAGDOLL_STEP", "sub_ae4600"},
+    // YEBIS's elapsed time (the post-process context's +4, set once at
+    // 0x25df516): its setter's decomp stores the game's 1/60 times the frame in
+    // 30 fps frames, every frame (decomp/yebis/ppfx_setters.cpp).
+    {0x25df519, Handover::Decomp, "BBHOST_YEBIS_STEP", "ppfx_sub_fb2800"},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
