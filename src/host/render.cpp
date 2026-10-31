@@ -78,10 +78,11 @@ namespace gpu {
 // copy is pending is not made first - compare mode must find the differences; =2 a draw
 // proven to write all of its target (copy_elide_decide_locked) is drawn with its scissor
 // a row short, =3 with its first triangle only - its coverage canary must find the texels
-// left.
+// left; =4 an exact point copy (copy_elide_point_copy_locked) is drawn with its scissor a
+// row short - the compare of its target with its source must find the row.
 const int g_elide_mutant = [] {
     const char* e = std::getenv("BBHOST_COPY_ELIDE_MUTANT");
-    return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0;
+    return e && e[0] >= '1' && e[0] <= '4' ? e[0] - '0' : 0;
 }();
 // BBHOST_RT_DCC (on unless 0): colour targets made with their view formats listed (rt_image).
 bool rt_dcc_listed() {
@@ -13544,6 +13545,18 @@ struct ElideUndo {
 };
 thread_local ElideUndo t_elide_undo[9];
 thread_local int t_elide_undo_n = 0;
+// compare: exact point copies drawn (B1), their targets compared with their sources after the draw, then left pending.
+struct ElidePointCopy {
+    std::uint64_t src, dst;
+};
+thread_local ElidePointCopy t_elide_point[2];
+thread_local int t_elide_point_n = 0;
+std::uint64_t g_ce_point_copies = 0, g_ce_point_drawn = 0;  // B1: left undrawn; compare: drawn, compared, then left pending
+// B1's point copies drawn as asked, by the first condition that did not hold (the 5-second report).
+enum PointRefusal : int { kPrInput, kPrTargets, kPrDepth, kPrImages, kPrSource, kPrView, kPrSampler, kPrProof, kPrCoords, kPrQuery, kPrDeferral, kPrRefusals };
+const char* const kPrNames[kPrRefusals] = {"vertex input or indexed", "targets", "depth or stencil written", "images", "source", "view",
+                                           "sampler", "proof", "texture coordinates", "a query or predicate", "the copy refused"};
+std::uint64_t g_ce_point_refused[kPrRefusals] = {}, g_ce_point_proof[full_write::kFails] = {};
 thread_local bool t_elide_drawn = false;  // the draw's call was recorded
 std::uint64_t g_ce_decided = 0, g_ce_proven_swaps = 0, g_ce_proven_drops = 0, g_ce_proven_made = 0, g_ce_again = 0, g_ce_canaries = 0,
               g_ce_undone = 0;
@@ -13808,10 +13821,134 @@ void copy_elide_undo_locked() {
     t_elide_canary_n = 0;
 }
 
+// Phase 2 B1: a PointSampleColor1 draw (0b0acf50+f7229091: mrt0 = the f16 round trip of a nearest sample of its image
+// at LOD 0 at the interpolated param0, which ScreenSpaceQuadShader exports from v8..v9 as read) that is an exact texel
+// copy of a render target into one of its size and format, left undrawn: a pending copy of the source into the
+// destination instead (copy_elide_defer_locked, as a copy token's). Exact when: one colour target, no depth or stencil
+// written; one image, a render target other than the target, of its size and a UNORM8 format (k/255 survives the f16
+// round trip); viewed at level 0 of one level, layer 0, the target's format, identity swizzle; a nearest sampler; the
+// draw proven to write all of the target (host/full_write.h, as phase 2 A); w = 1 at every vertex and the texture
+// coordinates the pixel position over the size there (so at every pixel centre: its own texel's centre); the positions
+// and coordinates the bytes the GPU reads; no query or predicate on the draw. compare: drawn as well, its target compared
+// with its source after the draw, then left pending (copy_elide_canary_after_draw).
+bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height);  // below
+bool copy_elide_point_copy_locked(const DrawState& s, const GpuDraw& d, const GfxPipeline& pl, const VertexInputPlan* vi, const StageImages* stages) {
+    if (pl.name.size() < 17 || pl.name.compare(0, 17, "0b0acf50+f7229091") != 0) return false;
+    // A condition that does not hold: counted, and said once with what the draw had.
+    const auto refuse = [&](int why, const char* detail) {
+        ++g_ce_point_refused[why];
+        static bool said[kPrRefusals] = {};  // under g.mu
+        if (!said[why]) {
+            said[why] = true;
+            host_log("copy elision: point copy %s into 0x%llx (%ux%u f%d) drawn as asked: %s (%s; flip %llu)", pl.name.c_str(),
+                     static_cast<unsigned long long>(s.color[0] ? s.color[0]->base : 0), s.color[0] ? s.color[0]->width : 0,
+                     s.color[0] ? s.color[0]->height : 0, s.color[0] ? static_cast<int>(s.color[0]->format) : 0, kPrNames[why], detail,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    };
+    if (!vi || d.index_va) return refuse(kPrInput, !vi ? "no vertex input" : "indexed");
+    if (!s.color[0]) return refuse(kPrTargets, "no colour target 0");
+    for (int k = 1; k < 8; ++k) {
+        if (s.color[k]) return refuse(kPrTargets, "another colour target");
+    }
+    if (s.depth) {
+        GfxFixedState f;
+        fixed_raster_depth(s, f);
+        // Vulkan writes depth only where the depth test is on, stencil only with the stencil test on.
+        if ((f.depth_test && f.depth_write) || f.stencil_test) return refuse(kPrDepth, f.stencil_test ? "stencil test" : "depth written");
+    }
+    RtImage& dst = *s.color[0];
+    if (!stages[0].images.empty() || stages[1].images.size() != 1 || stages[1].samplers.size() != 1) return refuse(kPrImages, "not one image and one sampler");
+    const StageImages::Image& im = stages[1].images[0];
+    if (!im.resolved || !im.view || !stages[1].samplers[0]) return refuse(kPrImages, "image or sampler not resolved");
+    RtImage* const src = rt_at_locked(image_base(im));
+    const bool unorm8 = dst.format == VK_FORMAT_B8G8R8A8_UNORM || dst.format == VK_FORMAT_R8G8B8A8_UNORM;
+    if (!src || src == &dst || src->depth || src->format != dst.format || !unorm8 || src->width != dst.width || src->height != dst.height ||
+        src->layers != 1 || dst.layers != 1) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "source 0x%llx %ux%u f%d", static_cast<unsigned long long>(image_base(im)), src ? src->width : 0,
+                      src ? src->height : 0, src ? static_cast<int>(src->format) : 0);
+        return refuse(kPrSource, b);
+    }
+    ViewRecord vr;
+    if (!describe_view_locked(im.view, vr)) return refuse(kPrView, "view not known");
+    const VkImageSubresourceRange& sr = vr.view_info.subresourceRange;
+    const auto identity = [](VkComponentSwizzle c, VkComponentSwizzle self) { return c == VK_COMPONENT_SWIZZLE_IDENTITY || c == self; };
+    if (vr.view_info.format != dst.format || sr.baseMipLevel != 0 || sr.levelCount != 1 || sr.baseArrayLayer != 0 || sr.layerCount != 1 ||
+        !identity(vr.view_info.components.r, VK_COMPONENT_SWIZZLE_R) || !identity(vr.view_info.components.g, VK_COMPONENT_SWIZZLE_G) ||
+        !identity(vr.view_info.components.b, VK_COMPONENT_SWIZZLE_B) || !identity(vr.view_info.components.a, VK_COMPONENT_SWIZZLE_A) ||
+        vr.image_info.extent.width != src->width || vr.image_info.extent.height != src->height) {
+        return refuse(kPrView, "not level 0 of one, layer 0, the target's format, identity swizzle");
+    }
+    VkSamplerCreateInfo sci{};
+    if (!describe_sampler_locked(stages[1].samplers[0], sci) || sci.magFilter != VK_FILTER_NEAREST || sci.minFilter != VK_FILTER_NEAREST ||
+        sci.anisotropyEnable || sci.compareEnable || sci.unnormalizedCoordinates) {
+        return refuse(kPrSampler, "not a nearest sampler");
+    }
+    // The draw writes all of its target (phase 2's proof, as copy_elide_decide_locked takes it).
+    full_write::Input in = full_write_input(s, 0, pl, d, vi, pl.name);
+    std::uint32_t area_w = dst.width, area_h = dst.height;
+    if (s.depth) {
+        area_w = std::min(area_w, s.depth->width);
+        area_h = std::min(area_h, s.depth->height);
+    }
+    in.area_w = area_w;
+    in.area_h = area_h;
+    in.feedback = image_base(im) == dst.base;
+    const bool lean_possible = g.cb_lean && !pl.tess_native && !pl.gs_native && (!pl.vs.meta().buffers.empty() || !pl.ps.meta().buffers.empty());
+    if (pl.lean_variant && !pl.lean_variant->failed) {
+        pipeline_ps_rules(*pl.lean_variant, in.discard, in.branches);
+    } else if (lean_possible) {
+        in.variant_unknown = true;
+    }
+    if (const int fail = full_write::check(in); fail != full_write::kNone) {
+        ++g_ce_point_proof[fail];
+        return refuse(kPrProof, full_write::fail_name(fail));
+    }
+    // The texture coordinates (v8..v9): at each vertex the window position over the size, w = 1 everywhere.
+    const gcn::VertexElement* uv = nullptr;
+    for (const gcn::VertexElement& e : vi->elements) {
+        if (e.vdata == 8 && e.count >= 2) uv = &e;
+    }
+    std::uint32_t ids[6];
+    if (!uv) return refuse(kPrCoords, "no element in v8..v9");
+    if (draw_vertex_ids(d, in.vertices, ids) || !served_fixed(*vi, *uv, ids[0], in.vertices)) return refuse(kPrCoords, "their bytes not the GPU's");
+    float coords[6][2];
+    for (std::uint32_t v = 0; v < in.vertices; ++v) {
+        float c[4];
+        if (const char* why = read_vertex_element(*vi, *uv, ids[v], c)) return refuse(kPrCoords, why);
+        coords[v][0] = c[0];
+        coords[v][1] = c[1];
+    }
+    if (!full_write::texel_exact(in, coords)) {
+        char b[160];
+        std::snprintf(b, sizeof(b), "not each pixel's own texel: uv (%g %g) (%g %g) (%g %g) (%g %g), viewport %g,%g %gx%g", coords[0][0], coords[0][1],
+                      coords[1][0], coords[1][1], coords[2][0], coords[2][1], coords[3][0], coords[3][1], in.vp_x, in.vp_y, in.vp_w, in.vp_h);
+        return refuse(kPrCoords, b);
+    }
+    if (!occlusion_draw_plain()) return refuse(kPrQuery, "an occlusion query or a predicate");
+    if (g_copy_elide == 2) {
+        if (t_elide_point_n < 2) t_elide_point[t_elide_point_n++] = {src->base, dst.base};
+        if (g_elide_mutant == 4) t_elide_mutant_draw = 2;
+        return false;  // drawn; compared and left pending after it
+    }
+    if (!copy_elide_defer_locked(*src, dst, dst.width, dst.height)) return refuse(kPrDeferral, "copy_elide_refusal");  // drawn as asked
+    ++g_ce_point_copies;
+    t_elide_drawn = true;  // its target overwritten whole all the same: what the decisions took stands
+    static int logs = 0;  // under g.mu
+    if (logs++ < 4) {
+        host_log("copy elision: point copy 0x%llx -> 0x%llx (%ux%u format %d) left undrawn: a pending copy (flip %llu)",
+                 static_cast<unsigned long long>(src->base), static_cast<unsigned long long>(dst.base), dst.width, dst.height,
+                 static_cast<int>(dst.format), static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    return true;
+}
+
 // compare: after an in-order draw (host_gpu_draw, its packet handed over), the canaries of the targets it was proven to
-// write whole counted.
+// write whole counted, and an exact point copy's target compared with its source, then left pending.
 void copy_elide_canary_after_draw() {
-    if (!t_elide_canary_n) return;
+    if (!t_elide_canary_n && !t_elide_point_n) return;
     std::lock_guard<GpuMutex> lock(g.mu);
     for (int i = 0; i < t_elide_canary_n; ++i) {
         if (RtImage* r = rt_at_locked(t_elide_canary[i].base)) {
@@ -13820,6 +13957,14 @@ void copy_elide_canary_after_draw() {
         }
     }
     t_elide_canary_n = 0;
+    for (int i = 0; i < t_elide_point_n; ++i) {
+        RtImage* a = rt_at_locked(t_elide_point[i].src);
+        RtImage* b = rt_at_locked(t_elide_point[i].dst);
+        if (!a || !b) continue;
+        copy_compare_record_locked(*a, *b, "point copy drawn");
+        if (copy_elide_defer_locked(*a, *b, b->width, b->height)) ++g_ce_point_drawn;
+    }
+    t_elide_point_n = 0;
 }
 
 // Why a whole copy of `src` into `dst` must be made where it is asked for (a
@@ -13919,12 +14064,24 @@ std::string copy_elide_report_locked() {
     for (int f = 0; f < full_write::kFails; ++f) {
         if (g_ce_unproven[f]) unproven += (unproven.empty() ? "" : ", ") + std::string(full_write::fail_name(f)) + " " + std::to_string(g_ce_unproven[f]);
     }
-    char draws[400] = "";
+    char draws[900] = "";
     if (g_elide_draws) {
-        std::snprintf(draws, sizeof(draws), "; draws decided %llu: proven %llu exchanged, %llu dropped, %llu made; not proven [%s]; images resolved again %llu",
+        std::snprintf(draws, sizeof(draws), "; draws decided %llu: proven %llu exchanged, %llu dropped, %llu made; not proven [%s]; images resolved again %llu; "
+                      "point copies left undrawn %llu (compare: drawn and compared %llu); undone %llu",
                       static_cast<unsigned long long>(g_ce_decided), static_cast<unsigned long long>(g_ce_proven_swaps),
                       static_cast<unsigned long long>(g_ce_proven_drops), static_cast<unsigned long long>(g_ce_proven_made),
-                      unproven.empty() ? "none" : unproven.c_str(), static_cast<unsigned long long>(g_ce_again));
+                      unproven.empty() ? "none" : unproven.c_str(), static_cast<unsigned long long>(g_ce_again),
+                      static_cast<unsigned long long>(g_ce_point_copies), static_cast<unsigned long long>(g_ce_point_drawn),
+                      static_cast<unsigned long long>(g_ce_undone));
+        std::string pr;
+        for (int r = 0; r < kPrRefusals; ++r) {
+            if (g_ce_point_refused[r]) pr += (pr.empty() ? "" : ", ") + std::string(kPrNames[r]) + " " + std::to_string(g_ce_point_refused[r]);
+        }
+        for (int f = 0; f < full_write::kFails; ++f) {
+            if (g_ce_point_proof[f]) pr += std::string(" (proof: ") + full_write::fail_name(f) + " " + std::to_string(g_ce_point_proof[f]) + ")";
+        }
+        const std::size_t used = std::strlen(draws);
+        std::snprintf(draws + used, sizeof(draws) - used, "; point copies drawn as asked [%s]", pr.empty() ? "none" : pr.c_str());
     }
     char buf[1400];
     std::snprintf(buf, sizeof(buf),
@@ -21626,6 +21783,8 @@ static bool draw_impl(const GpuDraw& d) {
         prefetch_stage_images(pl.ps.meta(), s.ps_user, stage_images[1], gx_stage[1], pl.paths_match[1] ? &key_stages[1] : nullptr);
         t_resolve_site = kSiteBuffers;
     }
+    // Phase 2 B1: an exact point copy left undrawn, a pending copy in its place (in order only).
+    if (!part && g_elide_draws && copy_elide_point_copy_locked(s, d, pl, use_vertex_input ? &vertex_input : nullptr, stage_images)) return true;
     draw_stamp.to(kRenderCostPrefetch);
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.

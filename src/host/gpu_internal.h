@@ -1908,6 +1908,9 @@ bool occlusion_draw_entry();              // host_gpu_draw's start: false when S
 // draws - no query interval open, no predication that skips draws - and the
 // draws they committed, counted as issued at the join (occlusion_draw_entry's).
 bool occlusion_run_ok();
+// A draw no query would count and no GPU predicate decides: one left undrawn changes no count - an interval it would
+// have left unmeasured stays unmeasured (copy elision's exact point copies).
+bool occlusion_draw_plain();
 void occlusion_run_issued(std::uint64_t n);
 void occlusion_draw_locked(DrawCall& call);
 void occlusion_submit_locked();  // before the submission's label writes

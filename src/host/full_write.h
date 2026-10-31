@@ -189,6 +189,22 @@ inline int geometry(const Input& in) {
     return detail::holds_square(q, 4) ? kNone : kGeometry;
 }
 
+// Copy elision's B1 (an exact point copy): whether texture coordinates uv[v] - vertex v's, interpolated across the
+// draw - put every pixel centre of the target on its own texel's centre under nearest sampling: w = 1 at every vertex
+// (linear interpolation) and each vertex's coordinates its window position (the viewport transform) over the target's
+// size, so at the pixel centre (x + 0.5, y + 0.5) they are ((x + 0.5) / W, (y + 0.5) / H), a quarter texel and more from
+// any edge however the interpolation rounds.
+inline bool texel_exact(const Input& in, const float (*uv)[2]) {
+    if (!in.vertices || !in.width || !in.height) return false;
+    for (std::uint32_t v = 0; v < in.vertices; ++v) {
+        if (in.pos[v][3] != 1.0f) return false;
+        const double xw = in.vp_x + (static_cast<double>(in.pos[v][0]) + 1.0) * in.vp_w / 2.0;
+        const double yw = in.vp_y + (static_cast<double>(in.pos[v][1]) + 1.0) * in.vp_h / 2.0;
+        if (std::fabs(uv[v][0] - xw / in.width) > 1e-6 || std::fabs(uv[v][1] - yw / in.height) > 1e-6) return false;
+    }
+    return true;
+}
+
 inline int check(const Input& in) {
     if ((in.mask & in.channels) != in.channels) return kMask;
     if (in.blend) return kBlend;

@@ -137,11 +137,47 @@ void geometry_cases() {
     CHECK_EQ(full_write::check(in), full_write::kClip);
 }
 
+// B1's texel mapping: the game's quad (a strip over the square, uv (0,0) at the top left) on a flipped viewport and on a
+// plain one with v the other way, over sizes; a half-texel offset, the coordinates scaled, v not flipped with the viewport.
+void texel_mapping() {
+    for (std::uint32_t size : {1u, 2u, 3u, 7u, 64u, 320u, 640u, 1080u, 1920u, 2160u, 3840u, 4096u}) {
+        Input in = base();
+        in.width = size;
+        in.height = size / 2 + 1;
+        verts(in, full_write::kPrimTriangleStrip, {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}});
+        for (std::uint32_t v = 0; v < 4; ++v) in.pos[v][2] = 1.0f;
+        const float flipped[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};    // y = +1 at the top row
+        const float plain[4][2] = {{0, 1}, {1, 1}, {0, 0}, {1, 0}};      // y = +1 at the bottom row
+        in.vp_x = 0;
+        in.vp_w = static_cast<float>(in.width);
+        in.vp_y = static_cast<float>(in.height);
+        in.vp_h = -static_cast<float>(in.height);
+        CHECK_EQ(full_write::texel_exact(in, flipped), 1);
+        CHECK_EQ(full_write::texel_exact(in, plain), 0);
+        in.vp_y = 0;
+        in.vp_h = static_cast<float>(in.height);
+        CHECK_EQ(full_write::texel_exact(in, plain), 1);
+        CHECK_EQ(full_write::texel_exact(in, flipped), 0);
+        float half[4][2], scaled[4][2];
+        for (int v = 0; v < 4; ++v) {
+            half[v][0] = plain[v][0] + 0.5f / static_cast<float>(in.width);
+            half[v][1] = plain[v][1];
+            scaled[v][0] = plain[v][0] * 0.5f;
+            scaled[v][1] = plain[v][1];
+        }
+        CHECK_EQ(full_write::texel_exact(in, half), 0);
+        CHECK_EQ(full_write::texel_exact(in, scaled), 0);
+        in.pos[1][3] = 2.0f;  // w not 1: not linear in the window
+        CHECK_EQ(full_write::texel_exact(in, plain), 0);
+    }
+}
+
 }  // namespace
 
 int main() {
     state_rules();
     geometry_cases();
+    texel_mapping();
     if (g_failures) {
         std::fprintf(stderr, "full_write_test: %d failures\n", g_failures);
         return 1;

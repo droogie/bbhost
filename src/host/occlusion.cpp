@@ -389,6 +389,19 @@ void occlusion_begin_recording_locked() {
     so.ready = true;
 }
 
+bool occlusion_draw_plain() {
+    if (!g_on) return true;
+    // Drawn whatever a predicate says (none, or one the CPU read as draw): a GPU predicate could skip it.
+    const int m = g_pred_mode.load(std::memory_order_relaxed);
+    if (m != kPredNone && m != kPredDraw) return false;
+    if (!g_iv.open) return true;
+    // A draw that would take no query (the interval's queries spent, the pool full) leaves its interval unmeasured
+    // (occlusion_draw_locked); left undrawn, it does the same - issued and never measured (the dump's check). One that
+    // would take a query adds its count, which a draw left undrawn cannot.
+    const SlotOcc& so = g_occ[g.slot];
+    return !so.ready || g_iv.queries >= g_iv.cap || so.queries >= kQueries || so.nitems + 64 > kItems;
+}
+
 // A run's parts commit no draw that takes a query: the interval since the
 // last dump has given out its cap of them (or has no room), so every draw left
 // in it is unmeasured - which the join notes for them all.
