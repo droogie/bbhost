@@ -24,8 +24,8 @@ namespace list_resolve {
 
 // BBHOST_LIST_RESOLVE: 0 off, 1 (`runs`) the run census.
 extern const int g_mode;
-// BBHOST_RUN_BATCH: 0 off, 1 on, unset on with the run commit (the default:
-// with BBHOST_RUN_COMMIT on or compare), 2 (`compare`) today's work
+// BBHOST_RUN_BATCH: 0 off, 1 on, unset on with the run commit (with
+// BBHOST_RUN_COMMIT on or compare, so by default on Windows), 2 (`compare`) today's work
 // with every answer a run would have shared checked against it. What a draw
 // of a run takes from the draw before it: its targets' lookups (render.cpp
 // draw_targets); and, on, the lite shadow drains GX's notices once a draw
@@ -55,12 +55,23 @@ void check_chunk(int ring, std::uint64_t recording, std::uint64_t lo, std::uint6
 // BBHOST_RUN_COMMIT_THREADS workers (3) and joined, the workers given nothing
 // to do; 2 (`on`) the run's draws after its first committed in parts by the
 // workers and the command processor (render.cpp run_commit), spliced in their
-// order at the join - the default since 2026-10-29 (unset, or `on`); 3
+// order at the join - the default on Windows since 2026-10-29 (unset, or
+// `on`), and off by default on Linux since 2026-10-31; 3
 // (`compare`) as 2, and each forked run also committed in
 // order as before, the parts' packets compared with those and dropped. The
 // workers spin BBHOST_RUN_COMMIT_SPIN_US (50) after a part before they sleep
 // on the fork's word. On (2, 3) turns BBHOST_RUN_BATCH on unless it is set.
 extern const int g_commit;
+// The default's one line in the log, with why, when BBHOST_RUN_COMMIT is
+// unset (gpu.cpp init_locked). Off on Linux: on an RTX 4070 with two Xeon Gold
+// 6230 the commit lost 14-21% of the frame rate where the command processor
+// limits (1080p, uncapped and 120; 2026-10-30). The runs are ~1 ms apart, so
+// the workers are asleep at nearly every fork, and the join waits for all
+// three to wake: 562 us from fork to join a run against 266 with them kept
+// spinning, which won the loss back. On Windows a run took 288-290 us from
+// fork to join on an RTX 3070 Ti Laptop GPU, where the commit gained 2%, and
+// a Radeon 8060S gained 12%.
+void log_commit_default();
 inline bool committing() { return g_commit != 0; }
 inline bool commit_draws() { return g_commit >= 2; }
 inline bool commit_compare() { return g_commit == 3; }

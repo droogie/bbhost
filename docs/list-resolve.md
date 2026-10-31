@@ -684,15 +684,31 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   command processor takes one more predictable branch a packet.
 - `BBHOST_RUN_BATCH=1|compare`: the batching above, on the census's run
   tracking (`list_resolve::run_serial`, which the per-run commit will start
-  from). On with the run commit (so by default since cc9a46d1); `=0` off.
+  from). On with the run commit (so by default on Windows); `=0` off.
 - `BBHOST_DRAW_CONTEXT=chunks|compare`: the draw's own context above, with its
   census and checks. Off by default.
 - `BBHOST_RUN_COMMIT=fork|on|compare` (`BBHOST_RUN_COMMIT_THREADS`,
   `_MIN`, `_SPIN_US`): the runs committed in parts above, in an integrated
   GPU's configuration (the lite shadow) and a discrete one's (the mirrors, GX
-  buffers by handle, the particles' twins). **On by default since cc9a46d1
-  (2026-10-29)**; `BBHOST_RUN_COMMIT=0` (or `off`) commits every draw in order,
-  the draw path then taking the same branches as before.
+  buffers by handle, the particles' twins). **On by default on Windows since
+  cc9a46d1 (2026-10-29), off by default on Linux since 2026-10-31**;
+  `BBHOST_RUN_COMMIT=on` turns it on anywhere, `=0` (or `off`) commits every
+  draw in order, the draw path then taking the same branches as before. On
+  Linux it was measured to lose: an RTX 4070 with two Xeon Gold 6230 (1920x1080
+  headless, uncapped, alternating runs) ran Old Yharnam at 77.8 fps with it
+  against 95.1 without, the Cainhurst courtyard at 78.7 against 99.7, the
+  Nightmare of Mensis at 74.7 against 87.2. Its runs come ~1 ms apart (11-16
+  forks a flip), so the workers have parked by nearly every fork, and the join
+  waits for all three to wake: 562 us from fork to join a run there, 266 with
+  `BBHOST_RUN_COMMIT_SPIN_US=20000` keeping them awake, which took Old Yharnam
+  from 72.1 to 98.5 fps in the same hold, at the cost of three spinning cores.
+  On Windows it gained:
+  an RTX 3070 Ti Laptop GPU at 1080p, 109.4 against 106.9 fps at Central
+  Yharnam and 92.5 against 91.1 at Mensis (288-290 us from fork to join), and
+  the Radeon 8060S above; a Radeon 680M, held by its GPU, was the same either
+  way. On the Steam Deck it did no better: at its 30 fps profile the same 30 fps
+  for 0.5-0.8 W more of the APU's power, at its 60 fps profile Mensis at 52.8
+  fps against 53.4.
 - With it, `BBHOST_GXVK_BUFFERS` defaults to on for an integrated GPU with
   8 GiB of video memory or more (`host_gpu_integrated_with_room`), as for a
   discrete GPU with room: the section above on the vertex data in video

@@ -3580,6 +3580,7 @@ bool init_locked() {
                                            : !tested && !(e && e[0] == '0') ? "off (not yet run on this vendor's driver; BBHOST_SHADOW_SPARSE=1 tries them)"
                                                                            : "off (no sparse residency, or BBHOST_SHADOW_SPARSE=0)");
     }
+    list_resolve::log_commit_default();  // the run commit's default on this system, and why (host/list_resolve.h)
     // BBHOST_ROBUST=1: bounds-check buffer reads. Off, an out-of-range read of
     // a storage buffer is undefined and in practice returns whatever lies past
     // the binding - and the guest's dynamic buffers rotate between addresses

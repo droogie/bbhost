@@ -31,11 +31,20 @@ const int g_mode = [] {
 }();
 
 namespace {
-// BBHOST_RUN_COMMIT's mode: on (2) unless it says otherwise - 0 or off, fork
-// (1), compare (3), or the number.
+// BBHOST_RUN_COMMIT's default where it is unset: on (2) on Windows, where it
+// was measured to win, and off (0) on Linux, where it was measured to lose
+// (log_commit_default says why).
+#if defined(_WIN32)
+constexpr int kRunCommitDefault = 2;
+#else
+constexpr int kRunCommitDefault = 0;
+#endif
+// BBHOST_RUN_COMMIT's mode: kRunCommitDefault unless it says otherwise - on
+// (2), 0 or off, fork (1), compare (3), or the number.
 int run_commit_from_env() {
     const char* e = std::getenv("BBHOST_RUN_COMMIT");
-    if (!e || !*e || std::strcmp(e, "on") == 0) return 2;
+    if (!e || !*e) return kRunCommitDefault;
+    if (std::strcmp(e, "on") == 0) return 2;
     if (std::strcmp(e, "off") == 0) return 0;
     if (std::strcmp(e, "fork") == 0) return 1;
     if (std::strcmp(e, "compare") == 0) return 3;
@@ -59,6 +68,22 @@ const int g_draw_ctx = [] {
 }();
 
 const int g_commit = run_commit_from_env();
+
+void log_commit_default() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* e = std::getenv("BBHOST_RUN_COMMIT");
+        if (e && *e) return;  // set: the setting's own choice
+        if (kRunCommitDefault)
+            host_log("list-resolve: run commit on by default on Windows (BBHOST_RUN_COMMIT=0 turns it off): measured there at 1080p, "
+                     "+12% on a Radeon 8060S and +2% on an RTX 3070 Ti Laptop GPU");
+        else
+            host_log("list-resolve: run commit off by default on Linux - every draw committed in order, as before it "
+                     "(BBHOST_RUN_COMMIT=on turns it on): on an RTX 4070 with two Xeon Gold 6230 it lost 14-21% of the frame rate "
+                     "where the command processor limits, waking its parked workers at each fork costing the command processor "
+                     "~300 us (562 us from fork to join a run against 266 with the workers kept awake)");
+    });
+}
 
 namespace {
 
