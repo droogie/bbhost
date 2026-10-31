@@ -910,10 +910,13 @@ if(UNIX)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # The PC options' generated menu assets (engine/menu_assets.cpp, which it
-  # includes) against the game's option movie and message bundles.
-  add_executable(menu_assets_test tests/menu_assets_test.cpp)
+  # includes) against the game's option movie and message bundles. The
+  # config is menu_assets_ensure's (SKILL ISSUE in the bundle's stamp): clang
+  # drops that call with the test's empty roots, GCC keeps it.
+  add_executable(menu_assets_test tests/menu_assets_test.cpp src/core/config.cpp src/core/sfo.cpp)
   target_include_directories(menu_assets_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(menu_assets_test PRIVATE ZLIB::ZLIB)
+  add_dependencies(menu_assets_test bbhost_version)
   add_test(NAME menu_assets_test COMMAND menu_assets_test)
   set_tests_properties(menu_assets_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # The setup window's "Compile shaders now" recommendation (host/shader_compile.h).
