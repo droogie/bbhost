@@ -7,7 +7,7 @@
 // gives it - the effect, each integer argument in the width the method reads
 // (a zero-extended byte as 32 bits), the floats' bits - and return what it
 // returns; the five that write in place must write the same bytes and return
-// 0. Six deliberate mistakes must be caught, and the entries hold the
+// 0. Seven deliberate mistakes must be caught, and the entries hold the
 // instructions written against. Skips without the 1.09 eboot.
 #define DECOMP_YEBIS_PPFX_SETTERS_MUTANTS
 int g_ppfx_setters_mutant = 0;
@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
         if (!at || std::memcmp(at, e.code, e.code_len) != 0) fail(e.name, -1, "the entry's instructions");
     }
     const long total = run(cases);
-    for (const int mutant : {1, 2, 3, 4, 5, 6}) {
+    for (const int mutant : {1, 2, 3, 4, 5, 6, 7}) {
         if (!caught(mutant)) {
             ++g_failed;
             std::printf("FAIL: mutant %d not caught\n", mutant);
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
         std::printf("yebis_ppfx_setters_test: %d failures (%ld cases)\n", g_failed, total);
         return 1;
     }
-    std::printf("yebis_ppfx_setters_test: ok - %zu entries, %ld cases, 6 mutants caught\n", sizeof kEntries / sizeof kEntries[0], total);
+    std::printf("yebis_ppfx_setters_test: ok - %zu entries, %ld cases, 7 mutants caught\n", sizeof kEntries / sizeof kEntries[0], total);
     return 0;
 }
 
