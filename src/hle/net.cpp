@@ -290,6 +290,9 @@ constexpr std::uint8_t kProbe[8] = {0xfe, 'b', 'b', 'h', 'p', 0, 0, 0};
 // The game sees none of it: its peers stay server:port both ways.
 constexpr std::uint8_t kRelayMagic = 0xfb, kRelayToServer = 'R', kRelayToClient = 'r';
 constexpr std::size_t kRelayHeader = 12;
+// The largest UDP payload over IPv4. The game's lower network layer batches
+// its frames into datagrams well past 2 KB (5 KB seen on a warp).
+constexpr std::size_t kMaxDatagram = 65507;
 struct RelayLink {
     std::mutex mu;
     bool on = false;
@@ -424,13 +427,14 @@ std::size_t p2p_header(const std::uint8_t* d, std::size_t n, std::uint16_t* src,
 }
 
 void p2p_reader(std::shared_ptr<P2pPort> port) {
-    std::uint8_t buf[2048];
+    std::vector<std::uint8_t> store(kMaxDatagram);
+    std::uint8_t* const buf = store.data();
     int logs = 0;
     while (!port->stop.load(std::memory_order_relaxed)) {
         if (sock_poll(port->fd, POLLIN, 200) <= 0) continue;
         sockaddr_in sa{};
         socklen_type sl = sizeof(sa);
-        ssize_type n = sock_recvfrom(port->fd, buf, sizeof(buf), true, &sa, &sl);
+        ssize_type n = sock_recvfrom(port->fd, buf, store.size(), true, &sa, &sl);
         if (n < 0) continue;
         if (n >= 4 && buf[0] == kRelayMagic && buf[1] == kRelayToClient && from_relay_server(sa)) {
             // A relay delivery: the datagram of the owner of the source
@@ -878,7 +882,11 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
     const sockfd_t fd = sock.port ? sock.port->fd : sock.fd;
     if (!sock_ok(fd)) return static_cast<int>(len);
     if (!to) return net_err(EINVAL);
-    std::uint8_t pkt[2048];
+    // One buffer per thread, with room in front for the relay header so a
+    // relayed send needs no second copy.
+    static thread_local std::vector<std::uint8_t> store(kRelayHeader + kMaxDatagram);
+    std::uint8_t* const frame = store.data();
+    std::uint8_t* const pkt = frame + kRelayHeader;
     std::size_t hdr = 0;
     const std::uint16_t dst_vport = bswap16(to->vport);
     if (sock.p2p) {
@@ -897,7 +905,7 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
             hdr = 6;
         }
     }
-    if (hdr + len > sizeof(pkt)) return net_err(EMSGSIZE);
+    if (hdr + len > kMaxDatagram) return net_err(EMSGSIZE);
     if (buf && len) std::memcpy(pkt + hdr, buf, static_cast<std::size_t>(len));
     sockaddr_in sa{};
     sa.sin_family = AF_INET;
@@ -908,12 +916,10 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
     std::uint8_t token[net::stun::kTokenLen];
     sockaddr_in stun_sa{};
     if (sock.p2p && relay_target(to->addr, to->port, token, &stun_sa)) {
-        std::uint8_t frame[sizeof(pkt) + kRelayHeader];
         frame[0] = kRelayMagic;
         frame[1] = kRelayToServer;
         std::memcpy(frame + 2, token, net::stun::kTokenLen);
         std::memcpy(frame + 10, &to->port, 2);  // network order is the frame's big-endian
-        std::memcpy(frame + kRelayHeader, pkt, hdr + static_cast<std::size_t>(len));
         n = sock_sendto(fd, frame, kRelayHeader + hdr + static_cast<std::size_t>(len), dontwait, &stun_sa);
         if (n >= 0) n -= static_cast<ssize_type>(kRelayHeader);
     } else {
