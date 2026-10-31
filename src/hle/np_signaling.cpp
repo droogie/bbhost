@@ -86,6 +86,10 @@ constexpr std::size_t kNonceAt = kToAt + kIdLen;
 constexpr std::size_t kPacketLen = kNonceAt + 8;
 constexpr int kStepMs = 500;
 constexpr int kGiveUpMs = 30000;
+// Matching2's ESTABLISHED waits this long after the transport is up
+// (shadPS4's kMatching2EstablishDelay), and its DEAD on a timeout.
+constexpr int kM2EstablishDelayMs = 1000;
+constexpr int kM2ErrTimeout = static_cast<int>(0x80550E11);
 
 enum class State { Inactive, SendingOffer, WaitOffer, SendingAccept, WaitAccept, ConnCheck, Established };
 
@@ -313,7 +317,9 @@ void step(unsigned tid) {
             if (t.waited_ms >= kGiveUpMs) {
                 host_log("np: transport %u to %s: handshake not done in %d s: DEAD (timeout)", tid, t.online_id.c_str(),
                          kGiveUpMs / 1000);
+                const std::string who = t.online_id;
                 close_transport_dead_locked(tid, kErrTimeout, events);  // erases the transport
+                net::dispatch_after(0, net::Prio::Signaling, [who] { hle_np_matching2_transport_dead(who, kM2ErrTimeout); });
             } else {
                 send_handshake_locked(t);
                 t.waited_ms += kStepMs;
@@ -336,6 +342,8 @@ void establish_locked(unsigned tid, bool peer_activated_hint, std::vector<Event>
         t.established_fired = true;
         send_locked(t, kEstablishedMsg);
         set_peer_status_locked(tid, 2);
+        const std::string who = t.online_id;
+        net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling, [who] { hle_np_matching2_transport_up(who); });
     }
     for (auto& [id, c] : g_conn) {
         if (c.transport != tid || c.dead) continue;
@@ -717,6 +725,37 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
 bool hle_np_signaling_live(const std::string& online_id) {
     std::lock_guard<std::mutex> lk(g_mu);
     return find_conn_locked(online_id) != 0;
+}
+
+// shadPS4's StartMatching2, for one member.
+void hle_np_signaling_m2_connect(const std::string& online_id) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const unsigned tid = ensure_transport_locked(online_id, 0, 0);
+    Transport& t = g_tr[tid];
+    refresh_addr_locked(t);
+    if (t.state == State::WaitOffer) t.state = State::SendingOffer;
+    if (g_trace) host_log("np: matching2 signaling to %s: transport %u status %d", online_id.c_str(), tid, status_of(t));
+    if (t.state == State::Established) {
+        const std::string who = online_id;
+        net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling, [who] { hle_np_matching2_transport_up(who); });
+        return;
+    }
+    send_handshake_locked(t);
+    start_stepping_locked(tid);
+}
+
+int hle_np_signaling_transport_status(const std::string& online_id) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const unsigned tid = find_transport_locked(online_id);
+    return tid ? status_of(g_tr[tid]) : 0;
+}
+
+// shadPS4's StopMatching2, for one member: the transport closes unless an
+// NpSignaling connection of the game's is on it.
+void hle_np_signaling_m2_stop(const std::string& online_id) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (find_conn_locked(online_id)) return;
+    if (unsigned tid = find_transport_locked(online_id)) g_tr.erase(tid);
 }
 
 // A player is now a room member: its transport and connections know its
