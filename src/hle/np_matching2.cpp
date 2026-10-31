@@ -23,6 +23,7 @@
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -214,6 +215,11 @@ struct M2 {
     RequestOptParam leave_opt{};
     std::vector<std::unique_ptr<Held>> held;
     std::string npid;  // our handle
+    // Players left at our LeaveRoom whose NpSignaling connection the game
+    // still has open: their DEAD goes out when the game closes it, as
+    // shadPS4's StopMatching2 leaves such a transport up (online id ->
+    // room, member).
+    std::map<std::string, std::pair<std::uint64_t, std::uint16_t>> dead_on_close;
 };
 M2 g;
 
@@ -306,9 +312,10 @@ std::vector<net::Peer> room_peers() {
 // The ESTABLISHED event for every member the game must see before
 // signalingPoll runs (ConnObj+0xd8), self included.
 void schedule_established_for_all(int delay_ms) {
+    // Only the other members, as the SDK and shadPS4 do: never our own.
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) ids.push_back(p.member_id);
-    ids.push_back(g.member_id);
+    if (ids.empty()) return;
     net::dispatch_after(delay_ms, net::Prio::Signaling, [ids] {
         for (std::uint16_t m : ids) fire_signaling(m, kEvSignalingEstablished, 0);
     });
@@ -420,7 +427,8 @@ void forget_room_locked() {
     g.max_slot = 0;
     net::peers_clear();
     net::room_clear();
-    hle_np_signaling_reset();
+    // NpSignaling's connections are the game's: it closes them itself
+    // (shadPS4's StopMatching2 leaves a transport with one up).
 }
 
 // Our LeaveRoom (or the context going away): out of the server's room,
@@ -442,7 +450,10 @@ void end_session_locked(const char* why) {
         });
     }
     std::vector<std::uint16_t> ids;
-    for (const net::Peer& p : room_peers()) ids.push_back(p.member_id);
+    for (const net::Peer& p : room_peers()) {
+        if (hle_np_signaling_live(p.online_id)) g.dead_on_close[p.online_id] = {g.room_id, p.member_id};
+        else ids.push_back(p.member_id);
+    }
     schedule_dead(ids, kErrTerminatedByMyself, g.room_id, 0);
     if (g.leave_pending) {
         const unsigned req = g.leave_req;
@@ -646,10 +657,7 @@ void on_server_event(const json::Value& ev) {
             }
             c.run();
         });
-        net::dispatch_after(800, net::Prio::Signaling, [mid] {
-            fire_signaling(mid, kEvSignalingEstablished, 0);
-            fire_signaling(g.member_id, kEvSignalingEstablished, 0);
-        });
+        net::dispatch_after(800, net::Prio::Signaling, [mid] { fire_signaling(mid, kEvSignalingEstablished, 0); });
         return;
     }
     if (name == "room_member_left") {
@@ -1169,4 +1177,19 @@ void hle_register_np_matching2() {
     REG("sceNpMatching2SetRoomDataExternal", m2_set_room_data_external);
     REG("sceNpMatching2SetRoomMemberDataInternal", m2_set_room_member_data_internal);
     REG("sceNpMatching2SignalingGetPingInfo", m2_signaling_get_ping_info);
+}
+
+void hle_np_matching2_peer_closed(const std::string& online_id) {
+    std::uint64_t room = 0;
+    std::uint16_t member = 0;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        auto it = g.dead_on_close.find(online_id);
+        if (it == g.dead_on_close.end()) return;
+        room = it->second.first;
+        member = it->second.second;
+        g.dead_on_close.erase(it);
+    }
+    // Ahead of NpSignaling's own DEAD on the same queue.
+    net::dispatch_after(0, net::Prio::Signaling, [room, member] { fire_signaling(member, kEvSignalingDead, kErrTerminatedByMyself, room); });
 }

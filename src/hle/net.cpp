@@ -3,6 +3,7 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "hle/net_p2p.h"
+#include "hle/np.h"
 #include "net/session.h"
 #include "net/stun.h"
 
@@ -447,6 +448,20 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
             // Not the game's: a peer's hole-punch probe, or the STUN
             // server's answer to our Binding Request. Neither reaches a
             // game socket.
+            if (n >= 4 && std::memcmp(buf, kSignalMagic, 4) == 0) {
+                {
+                    std::lock_guard<std::mutex> lk(port->mu);
+                    ++port->rx;
+                    port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
+                }
+                std::vector<std::uint8_t> pkt(buf, buf + n);
+                const std::uint32_t from_addr = sa.sin_addr.s_addr;
+                const std::uint16_t from_port = sa.sin_port;
+                net::dispatch_after(0, net::Prio::Signaling, [pkt, from_addr, from_port] {
+                    hle_np_signaling_control(pkt.data(), pkt.size(), from_addr, from_port);
+                });
+                continue;
+            }
             if (n >= 8 && std::memcmp(buf, kProbe, 5) == 0) {
                 std::lock_guard<std::mutex> lk(port->mu);
                 ++port->rx;
@@ -1439,6 +1454,34 @@ bool hle_net_p2p_relay(std::uint32_t* server, std::uint16_t* vport) {
     if (server) *server = g_relay.server;
     if (vport) *vport = g_relay.vport;
     return g_relay.on;
+}
+
+void hle_net_p2p_signal(std::uint32_t addr, std::uint16_t port_host, const void* data, std::size_t len) {
+    std::shared_ptr<P2pPort> port;
+    {
+        std::lock_guard<std::mutex> lock(g_net_mu);
+        auto it = g_p2p_ports.find(static_cast<std::uint16_t>(net::p2p_port()));
+        if (it != g_p2p_ports.end()) port = it->second;
+    }
+    if (!port || !addr || !port_host || len > 512) return;
+    std::uint8_t token[net::stun::kTokenLen];
+    sockaddr_in stun_sa{};
+    const std::uint16_t port_nbo = bswap16(port_host);
+    if (relay_target(addr, port_nbo, token, &stun_sa)) {
+        std::uint8_t frame[512 + kRelayHeader];
+        frame[0] = kRelayMagic;
+        frame[1] = kRelayToServer;
+        std::memcpy(frame + 2, token, net::stun::kTokenLen);
+        std::memcpy(frame + 10, &port_nbo, 2);
+        std::memcpy(frame + kRelayHeader, data, len);
+        (void)sock_sendto(port->fd, frame, kRelayHeader + len, true, &stun_sa);
+        return;
+    }
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = addr;
+    to.sin_port = port_nbo;
+    (void)sock_sendto(port->fd, data, len, true, &to);
 }
 
 void hle_net_p2p_punch(const char* label, std::uint32_t addr, std::uint16_t port_host, std::uint32_t local_addr,

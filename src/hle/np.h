@@ -25,3 +25,12 @@ void hle_np_signaling_reset();
 // The peer left or timed out: DEAD (0) on its connection(s), so the game's
 // SocketState closes the link instead of waiting on it.
 void hle_np_signaling_peer_dead(const std::string& online_id);
+// A control datagram from another bbhost's NpSignaling (hle/net.cpp,
+// kSignalMagic), from addr (network order):port (network order).
+void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::uint32_t addr, std::uint16_t port);
+// Whether the game has a live NpSignaling connection to this player
+// (NpMatching2's leave keeps that player's DEAD until the game closes it).
+bool hle_np_signaling_live(const std::string& online_id);
+// NpSignaling closed the game's connection to this player: NpMatching2 sends
+// the DEAD it kept for that player at its LeaveRoom, before NpSignaling's own.
+void hle_np_matching2_peer_closed(const std::string& online_id);
