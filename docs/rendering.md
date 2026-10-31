@@ -351,7 +351,9 @@ follows a depth-only pipeline in the command buffer being recorded, and whose
 attachments' blend states differ where that would change what it draws, starts
 a command buffer of its own, what was recorded before it submitted without
 waiting (`BBHOST_LVP_BLEND_SPLIT=0` records it like any other); other drivers
-draw it correctly.
+draw it correctly. A draw of a run committed in parts (`BBHOST_RUN_COMMIT`)
+that would split, or mark the command buffer, stops, and the command processor
+commits it and the rest of the run in order.
 A draw whose rasterizer state comes from the registers rather than a GX
 description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
 ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth

@@ -3271,29 +3271,27 @@ thread_local std::uint32_t t_masked_blend_changed = 0, t_masked_blend_blending =
 std::atomic<std::uint64_t> g_masked_blend_pipelines{0}, g_masked_blend_blending{0};
 
 // BBHOST_LVP_BLEND_SPLIT (host/lvp_split.h), on unless 0, on lavapipe
-// (VK_DRIVER_ID_MESA_LLVMPIPE) only: whether this draw starts a command buffer
-// of its own - a pipeline without colour attachments was bound earlier in the
-// command buffer being recorded, and drawing every colour slot with slot 0's
-// blend state would change what this draw writes. A draw without colour
-// targets marks the command buffer. The count of such splits is in the exit
-// report.
+// (VK_DRIVER_ID_MESA_LLVMPIPE) only: what this draw does to the command buffer
+// being recorded. A draw without colour targets marks it (kLvpMark, where it
+// is not marked yet); a later draw starts a command buffer of its own
+// (kLvpSplit) where drawing every colour slot with slot 0's blend state would
+// change what it writes. It only reads: the caller marks and splits. The count
+// of such splits is in the exit report.
 std::atomic<std::uint64_t> g_lvp_splits{0};
 std::uint64_t g_lvp_depth_only_serial = ~0ull;  // the recording a depth-only pipeline was bound in
-bool lvp_blend_split(const DrawState& s) {
+enum LvpBlend : int { kLvpNone, kLvpMark, kLvpSplit };
+LvpBlend lvp_blend_split(const DrawState& s) {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_LVP_BLEND_SPLIT");
         return !(e && e[0] == '0');
     }();
-    if (!on || g.driver_id != VK_DRIVER_ID_MESA_LLVMPIPE) return false;
+    if (!on || g.driver_id != VK_DRIVER_ID_MESA_LLVMPIPE) return kLvpNone;
     int count = 0;
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) count = t + 1;
     }
-    if (!count) {
-        g_lvp_depth_only_serial = g.record_serial;
-        return false;
-    }
-    if (g_lvp_depth_only_serial != g.record_serial) return false;
+    if (!count) return g_lvp_depth_only_serial != g.record_serial ? kLvpMark : kLvpNone;
+    if (g_lvp_depth_only_serial != g.record_serial) return kLvpNone;
     LvpSlot slot[8];
     for (int t = 0; t < count; ++t) {
         if (!s.color[t]) continue;
@@ -3312,7 +3310,7 @@ bool lvp_blend_split(const DrawState& s) {
         }
         if (!o.blend) o.eq = 0;
     }
-    return lvp_blend_collapse_changes(slot, count);
+    return lvp_blend_collapse_changes(slot, count) ? kLvpSplit : kLvpNone;
 }
 
 GfxFixedState fixed_state(const DrawState& s) {
@@ -20492,10 +20490,21 @@ static bool draw_impl(const GpuDraw& d) {
     // Lavapipe only (host/lvp_split.h): after a depth-only pipeline, a draw
     // whose colour slots differ where lavapipe would draw them all with slot
     // 0's blend state starts a command buffer of its own, what was recorded
-    // before it submitted (not waited for).
-    if (lvp_blend_split(s)) {
-        submit_locked();
-        g_lvp_splits.fetch_add(1, std::memory_order_relaxed);
+    // before it submitted (not waited for). A run part's draw that would mark
+    // the command buffer or split it stops first (BBHOST_RUN_COMMIT), and the
+    // command processor commits it and the run's later draws in order: the
+    // submit is the GPU mutex holder's to make. Made in a part, on a run worker
+    // beside the command processor's own part, it appended to the command
+    // stream and moved the slots from two threads at once - a replayed kBegin
+    // whose command buffer was garbage, blocks changed after their publish.
+    if (const LvpBlend lvp = lvp_blend_split(s); lvp != kLvpNone) {
+        if (run_part_stop(kRunStopOrder)) return false;
+        if (lvp == kLvpMark) {
+            g_lvp_depth_only_serial = g.record_serial;
+        } else {
+            submit_locked();
+            g_lvp_splits.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     // BBHOST_WATCH_PS_IMAGE=<pipeline prefix>:<image index>: for every draw of
     // that pipeline, resolve the image's T# and hash the memory behind it, and

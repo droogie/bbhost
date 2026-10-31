@@ -514,7 +514,9 @@ order, it stops first (`RunStop`): a program, translation, plan, pipeline,
 set, texture view or sampler to make, a texture to refresh (its upload lands
 before the draw's packet), a store, copies to put in place, an owed clear it
 samples or its targets owe, a depth layout to change, an import to make, a
-page-table walk's windows. At the join the command processor merges the
+page-table walk's windows, lavapipe's command-buffer split or its depth-only
+mark (`render.cpp` `lvp_blend_split`: the split submits, which a part on a run
+worker once did beside the command processor's own part). At the join the command processor merges the
 sinks and the parts' notes (their pipelines' counts, the vertex-shader
 census, the lazy barriers' sampled images), appends the parts' packets in
 their order up to the run's first stop, and commits every draw from there in
