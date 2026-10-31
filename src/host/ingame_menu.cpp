@@ -874,6 +874,11 @@ bool build_frame(VkExtent2D extent) {
         else host_options_close();
     }
     ImGui::Render();
+    // Menu hue and Menu vibrance, on everything the menus draw.
+    float hue = 0.0f, vibrance = 0.0f;
+    host_opt_menu_colour(&hue, &vibrance);
+    ui::set_colour(hue, vibrance);
+    ui::recolour(ImGui::GetDrawData());
     // ImGui's own texture uploads - the font atlas when the menu first opens,
     // and again whenever 1.92 adds glyphs to it - submit on the renderer's
     // queue and then wait for that queue to go idle. Left to RenderDrawData

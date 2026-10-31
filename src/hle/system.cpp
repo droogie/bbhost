@@ -1457,6 +1457,10 @@ GUEST_ABI int hle_lookup_npid(int, const void* online, void* npid, void*) {
 // The buttons the last scePadRead handed the game, for the port's own menu
 // rows, which act on a press the game also sees (engine/option_menu.cpp).
 std::atomic<std::uint32_t> g_pad_delivered{0};
+// When Cross or Circle last went down in g_pad_delivered (steady_clock ticks;
+// 0 = never), so a box can tell a fresh press from one still held from the
+// window before it (engine/menu_close.cpp).
+std::atomic<std::int64_t> g_confirm_down{0};
 
 GUEST_ABI int hle_pad_init() { return 0; }
 GUEST_ABI int hle_pad_open(int user, int type, int index, const void*) {
@@ -1474,6 +1478,13 @@ GUEST_ABI int hle_pad_close(int) { return 0; }
 }  // namespace
 
 std::uint32_t hle_pad_delivered_buttons() { return g_pad_delivered.load(std::memory_order_relaxed); }
+
+double hle_pad_confirm_press_age() {
+    const std::int64_t at = g_confirm_down.load(std::memory_order_relaxed);
+    if (!at) return 1e9;
+    const std::int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::chrono::duration<double>(std::chrono::steady_clock::duration(now - at)).count();
+}
 
 namespace {
 
@@ -1984,7 +1995,11 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         p.connected = connected;
         p.timestamp = ts;
     }
-    g_pad_delivered.store(p.buttons, std::memory_order_relaxed);
+    {
+        const std::uint32_t was = g_pad_delivered.exchange(p.buttons, std::memory_order_relaxed);
+        if (p.buttons & ~was & 0x6000u)  // Cross or Circle went down
+            g_confirm_down.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    }
     // The Debug Menu key, on the thread that reads the pad (engine/debug_menu.h).
     // BBHOST_DEBUG_MENU_AT=N (a test aid) presses it once at flip N; the pad
     // then works the open menu, so BBHOST_AUTOPRESS can walk its pages.

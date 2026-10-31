@@ -28,6 +28,16 @@ inline constexpr ImU32 kBad = IM_COL32(255, 96, 128, 255);
 // A colour with its alpha replaced (0-255).
 ImU32 alpha(ImU32 col, int a);
 
+// Menu hue and Menu vibrance (host/options.cpp): the palette above turned
+// `hue_degrees` round the colour wheel, its brightness kept, and given more or
+// less colour - `vibrance` -1 is black and white, +1 the most. set_colour()
+// once a frame, recolour() on the frame's draw data after ImGui::Render():
+// every vertex but kGood's, kWarn's and kBad's (ok, a warning, a problem keep
+// their meaning). tint() is one colour the same way (a window's clear colour).
+void set_colour(float hue_degrees, float vibrance);
+void recolour(ImDrawData* dd);
+ImU32 tint(ImU32 col);
+
 enum class Icon {
     Game, Online, Enhance, Patches, Shaders, Plugins, Settings,
     Folder, File, Check, Warning, Info, Play, Moon, Search, Copy, User, Download, Refresh, SignIn,

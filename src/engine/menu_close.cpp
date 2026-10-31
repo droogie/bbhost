@@ -67,7 +67,15 @@ GUEST_ABI std::int64_t box_confirm_hook(std::uint64_t, const std::uint64_t* save
         host_log("menus: box %llx (vtable %llx) OK after %.3f s of its %.3f at flip %llu", static_cast<unsigned long long>(saved[5]),
                  vtable_of(saved[5]), static_cast<double>(*shown), static_cast<double>(least),
                  static_cast<unsigned long long>(hle_video_flip_count()));
-    if (*shown < least) *shown = least;  // up long enough: the OK goes through
+    // The minimum time also stops the press that opened the box (the level-up
+    // window's confirm opens its Yes/No box) from answering it while still
+    // held, so only a press that went down after the box came up skips it.
+    const double press_age = hle_pad_confirm_press_age();
+    const bool fresh = press_age < static_cast<double>(*shown);
+    if (g_log)
+        host_log("menus: box %llx: confirm went down %.3f s ago (%s)", static_cast<unsigned long long>(saved[5]), press_age,
+                 fresh ? "after it opened: OK at once" : "before it opened: the game's minimum time");
+    if (fresh && *shown < least) *shown = least;  // up long enough: the OK goes through
     return 0;
 }
 
@@ -110,7 +118,8 @@ void menu_close_install(ElfImage* image) {
         }
         if (engine_prologue_hook(image, at(kBoxConfirm), kBoxConfirmPrologue, sizeof(kBoxConfirmPrologue),
                                  reinterpret_cast<void*>(&box_confirm_hook))) {
-            host_log("menus: a message or Yes/No box takes OK as soon as it is up (BBHOST_MENU_FADE_WAIT=1 waits)");
+            host_log("menus: a message or Yes/No box takes OK from a press made while it is up at once (BBHOST_MENU_FADE_WAIT=1 "
+                     "waits)");
         } else {
             host_log("menus: the boxes' OK (0x%llx) is not the expected code; a box takes OK after its minimum time",
                      static_cast<unsigned long long>(kBoxConfirm));

@@ -171,7 +171,8 @@ bool contains_nocase(const std::string& hay, const char* needle) {
 }
 
 // The title bar in the window's colours (Windows): dark, and on Windows 11
-// the night's ink with ice letters and a violet edge. dwmapi's
+// the night's ink with ice letters and a violet edge - turned by Menu hue
+// and Menu vibrance (launcher_ui::tint) as the rest of the window is. dwmapi's
 // DwmSetWindowAttribute, loaded as SDL loads anything, so nothing more is
 // linked; a Windows without the attribute leaves its bar as it was.
 void dark_title_bar(SDL_Window* win) {
@@ -182,7 +183,9 @@ void dark_title_bar(SDL_Window* win) {
     void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     if (set && hwnd) {
         const int dark = 1;
-        const unsigned caption = 0x00240C10, text = 0x00FFD8BF, edge = 0x00FF4D7C;  // COLORREFs, 0x00BBGGRR
+        // COLORREFs, 0x00BBGGRR: an ImU32's byte order without its alpha.
+        const auto colour = [](unsigned rgb) { return launcher_ui::tint(0xff000000u | rgb) & 0x00ffffffu; };
+        const unsigned caption = colour(0x00240C10), text = colour(0x00FFD8BF), edge = colour(0x00FF4D7C);
         set(hwnd, 20, &dark, sizeof(dark));           // DWMWA_USE_IMMERSIVE_DARK_MODE
         set(hwnd, 35, &caption, sizeof(caption));     // DWMWA_CAPTION_COLOR
         set(hwnd, 36, &text, sizeof(text));           // DWMWA_TEXT_COLOR
@@ -284,7 +287,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 #endif
     bool show_every_start = cfg.setup_always;
     bool animations = cfg.setup_animations;
-    int text_applied = text_choice;  // the size the window has; a new choice goes in before the next frame
+    int text_applied = text_choice;
+    float title_hue = 0.0f, title_vibrance = 0.0f;  // the title bar's colours as last set (dark_title_bar)  // the size the window has; a new choice goes in before the next frame
     bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
@@ -1353,12 +1357,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                            "button's pulse and the light sweeping across it, the page fade and the sliding highlights. Off, the "
                            "window stands still.");
             ImGui::Dummy(ImVec2(0, 2 * scale));
-            {
-                // As a switch's row: its label and a line under it, the choice at the right.
-                const char* label = "Menu text size";
-                const char* sub = "This window, F9 and F10; the window grows with it.";
+            // As a switch's row: its label and a line under it, the control (`cw` wide) at the right.
+            const auto choice_row = [&](const char* label, const char* sub, float cw, const auto& control) {
                 const ImVec2 p = ImGui::GetCursorScreenPos();
-                const float w = ImGui::GetContentRegionAvail().x, cw = 128 * scale;
+                const float w = ImGui::GetContentRegionAvail().x;
                 const float fs = ImGui::GetFontSize(), sub_fs = std::round(fs * 0.86f);
                 ImFont* font = ImGui::GetFont();
                 const float lh = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, label).y;
@@ -1369,15 +1371,45 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 dl->AddText(font, sub_fs, ImVec2(p.x, ty + lh + 2 * scale), ImGui::GetColorU32(ui::kTextDim), sub, nullptr, w - cw - 16 * scale);
                 ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y + (h - ImGui::GetFrameHeight()) * 0.5f));
                 ImGui::SetNextItemWidth(cw);
+                control();
+                ImGui::SetCursorScreenPos(p);
+                ImGui::Dummy(ImVec2(w, h));
+            };
+            choice_row("Menu text size", "This window, F9 and F10; the window grows with it.", 128 * scale, [&] {
                 ui::combo("##textsize", &text_choice, kTextSizeLabels, static_cast<int>(std::size(kTextSizeLabels)));
                 ui::tooltip_for_item("Menu text size",
                                      "The text in bbhost's own menus - this window and the in-game F9 and F10 menus - and everything in "
                                      "them with it, this window's own size included: 150% or 200% for a 1440p or 4K screen. 100% is the "
                                      "usual size (with Windows' display scaling). A window larger than the screen stops at the screen and "
                                      "scrolls. Applies at once; F10 has the same setting.");
-                ImGui::SetCursorScreenPos(p);
-                ImGui::Dummy(ImVec2(w, h));
-            }
+            });
+            // Menu hue and Menu vibrance: F10's sliders (a step each, its value shown),
+            // saved at once; a double click puts one back to 0.
+            const auto colour_slider = [&](const char* id, const char* key, int steps, int origin, int step, const char* unit,
+                                           const char* title, const char* tip) {
+                int i = std::max(0, host_opt_index(key));
+                const int value = origin + step * i;
+                char shown[24];
+                std::snprintf(shown, sizeof(shown), value > 0 ? "+%d%s" : "%d%s", value, unit);
+                if (ImGui::SliderInt(id, &i, 0, steps - 1, shown, ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
+                    host_opt_set_index(key, i);
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    host_opt_set_index(key, -origin / step);
+                ui::tooltip_for_item(title, tip);
+            };
+            ImGui::Dummy(ImVec2(0, 2 * scale));
+            choice_row("Menu hue", "The colours of this window, F9 and F10.", 200 * scale, [&] {
+                colour_slider("##hue", "menu_hue", 24, -165, 15, "°", "Menu hue",
+                              "Turns the colours of bbhost's own menus - this window and the in-game F9 and F10 menus - round the "
+                              "colour wheel: 0 is their own blue and violet. The green, amber and red that mean ok, a warning and a "
+                              "problem stay as they are. Double-click for 0; F10 has the same setting.");
+            });
+            ImGui::Dummy(ImVec2(0, 2 * scale));
+            choice_row("Menu vibrance", "-100% is black and white.", 200 * scale, [&] {
+                colour_slider("##vibrance", "menu_vibrance", 21, -100, 10, "%%", "Menu vibrance",
+                              "How much colour bbhost's own menus have: -100% is black and white, 0 their own, +100% the most. "
+                              "Double-click for 0; F10 has the same setting.");
+            });
             ImGui::Dummy(ImVec2(0, 2 * scale));
             {
                 const std::string sub = check_updates ? updater::status() : std::string("A newer bbhost, from its GitHub releases.");
@@ -1405,7 +1437,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::End();
 
         ImGui::Render();
-        SDL_SetRenderDrawColor(ren, 7, 6, 15, 255);
+        // Menu hue and Menu vibrance, on everything the frame draws.
+        float hue = 0.0f, vibrance = 0.0f;
+        host_opt_menu_colour(&hue, &vibrance);
+        ui::set_colour(hue, vibrance);
+        ui::recolour(ImGui::GetDrawData());
+        if (hue != title_hue || vibrance != title_vibrance) {
+            title_hue = hue;
+            title_vibrance = vibrance;
+            dark_title_bar(win);
+        }
+        const ImU32 ink = ui::tint(ui::kInk);
+        SDL_SetRenderDrawColor(ren, static_cast<Uint8>(ink & 0xff), static_cast<Uint8>(ink >> 8 & 0xff), static_cast<Uint8>(ink >> 16 & 0xff), 255);
         SDL_SetRenderScale(
             ren,
             io.DisplayFramebufferScale.x,

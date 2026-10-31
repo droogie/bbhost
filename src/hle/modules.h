@@ -116,6 +116,9 @@ bool hle_gx_arena_covers_marker(std::uint64_t va, std::uint64_t bytes);  // a ra
 bool hle_gnm_arena_monitor();  // BBHOST_ARENA_MONITOR=1
 // The buttons the last scePadRead handed the game (system.cpp).
 std::uint32_t hle_pad_delivered_buttons();
+// How long ago (seconds) Cross or Circle last went down in what the game was
+// handed; a large value when neither has been pressed (system.cpp).
+double hle_pad_confirm_press_age();
 std::string hle_av_stats();     // " movie-frames=N movie-audio-chunks=N"
 std::string hle_audio_stats();  // " audio-port<h>=<writes>" per open port  // " op:count" per CP packet that forced a flush
 void hle_gnm_exec_stats(std::uint64_t* packets, std::uint64_t* writes);

@@ -57,6 +57,11 @@ struct Art {
     SDL_Texture* soft = nullptr;   // the same, blurred: what glass shows
     SDL_Texture* mild = nullptr;   // blurred a little: what panes show
     int w = 0, h = 0;
+    // Their greys, kept to be coloured again when Menu hue or Menu vibrance
+    // changes (set_colour flags it; backdrop() does it, before the frame's
+    // drawing, so no frame is left holding a texture that has gone).
+    std::vector<float> sharp_grey, soft_grey, mild_grey;
+    bool stale = false;
 } g_art;
 
 // Where the whole painting lands this frame (past the window's edges where it
@@ -74,6 +79,33 @@ std::mt19937 g_rng(7);
 // A colour as ImGui would draw it now: faded by the style's alpha (a page
 // fading in, a disabled control).
 ImU32 c(ImU32 col) { return ImGui::GetColorU32(col); }
+
+// Menu hue and Menu vibrance: the hue turn as a matrix about the grey axis
+// (the luminance kept, as CSS's hue-rotate), the vibrance a factor on each
+// colour's distance from its grey.
+struct Colour {
+    bool on = false;
+    float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    float vibrance = 0.0f;
+} g_colour;
+
+ImU32 recolour_one(ImU32 col) {
+    const ImU32 rgb = col & 0x00ffffffu;
+    if (rgb == (kGood & 0x00ffffffu) || rgb == (kWarn & 0x00ffffffu) || rgb == (kBad & 0x00ffffffu)) return col;
+    const float r = static_cast<float>(col & 0xff), g = static_cast<float>(col >> 8 & 0xff), b = static_cast<float>(col >> 16 & 0xff);
+    const float* m = g_colour.m;
+    float o[3] = {m[0] * r + m[1] * g + m[2] * b, m[3] * r + m[4] * g + m[5] * b, m[6] * r + m[7] * g + m[8] * b};
+    if (g_colour.vibrance != 0.0f) {
+        const float luma = 0.2126f * o[0] + 0.7152f * o[1] + 0.0722f * o[2];
+        const float hi = std::max({o[0], o[1], o[2]}), lo = std::min({o[0], o[1], o[2]});
+        const float sat = hi > 0.0f ? (hi - lo) / hi : 0.0f;
+        // Less colour toward grey; more, most where there was least.
+        const float k = g_colour.vibrance < 0.0f ? 1.0f + g_colour.vibrance : 1.0f + g_colour.vibrance * (2.0f - sat);
+        for (float& v : o) v = luma + (v - luma) * k;
+    }
+    const auto ch = [](float v) { return static_cast<ImU32>(std::clamp(v + 0.5f, 0.0f, 255.0f)); };
+    return (col & 0xff000000u) | ch(o[0]) | ch(o[1]) << 8 | ch(o[2]) << 16;
+}
 
 ImU32 mix(ImU32 a, ImU32 b, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -295,6 +327,12 @@ SDL_Texture* upload(const std::vector<float>& grey, int w, int h) {
             lut[i][0] = static_cast<std::uint8_t>(a.r + (b.r - a.r) * f + 0.5f);
             lut[i][1] = static_cast<std::uint8_t>(a.g + (b.g - a.g) * f + 0.5f);
             lut[i][2] = static_cast<std::uint8_t>(a.b + (b.b - a.b) * f + 0.5f);
+            if (g_colour.on) {  // Menu hue and Menu vibrance
+                const ImU32 col = recolour_one(IM_COL32(lut[i][0], lut[i][1], lut[i][2], 255));
+                lut[i][0] = static_cast<std::uint8_t>(col & 0xff);
+                lut[i][1] = static_cast<std::uint8_t>(col >> 8 & 0xff);
+                lut[i][2] = static_cast<std::uint8_t>(col >> 16 & 0xff);
+            }
             break;
         }
     }
@@ -346,6 +384,7 @@ void load_art() {
     g_art.w = w;
     g_art.h = h;
     g_art.sharp = upload(grey, w, h);
+    g_art.sharp_grey = grey;
     // Glass's copy: a quarter the size, blurred; the GPU's filtering smooths
     // the rest. The panes' copy: half the size, blurred a little.
     auto shrunk = [&](int k) {
@@ -365,12 +404,48 @@ void load_art() {
     std::vector<float> small = shrunk(4);
     blur(small, w / 4, h / 4, 4);
     g_art.soft = upload(small, w / 4, h / 4);
+    g_art.soft_grey = std::move(small);
     std::vector<float> half = shrunk(2);
     blur(half, w / 2, h / 2, 2);
     g_art.mild = upload(half, w / 2, h / 2);
+    g_art.mild_grey = std::move(half);
+}
+
+// The painting coloured again by Menu hue and Menu vibrance.
+void recolour_art() {
+    g_art.stale = false;
+    if (!g_ren || g_art.sharp_grey.empty()) return;
+    const int w = g_art.w, h = g_art.h;
+    for (SDL_Texture* t : {g_art.sharp, g_art.soft, g_art.mild})
+        if (t) SDL_DestroyTexture(t);
+    g_art.sharp = upload(g_art.sharp_grey, w, h);
+    g_art.soft = upload(g_art.soft_grey, w / 4, h / 4);
+    g_art.mild = upload(g_art.mild_grey, w / 2, h / 2);
 }
 
 }  // namespace
+
+void set_colour(float hue_degrees, float vibrance) {
+    const float a = hue_degrees * 3.14159265f / 180.0f, cs = std::cos(a), sn = std::sin(a);
+    const float m[9] = {0.2126f + cs * 0.7874f - sn * 0.2126f, 0.7152f - cs * 0.7152f - sn * 0.7152f, 0.0722f - cs * 0.0722f + sn * 0.9278f,
+                        0.2126f - cs * 0.2126f + sn * 0.143f,  0.7152f + cs * 0.2848f + sn * 0.140f,  0.0722f - cs * 0.0722f - sn * 0.283f,
+                        0.2126f - cs * 0.2126f - sn * 0.7874f, 0.7152f - cs * 0.7152f + sn * 0.7152f, 0.0722f + cs * 0.9278f + sn * 0.0722f};
+    vibrance = std::clamp(vibrance, -1.0f, 1.0f);
+    const bool on = hue_degrees != 0.0f || vibrance != 0.0f;
+    if (on != g_colour.on || vibrance != g_colour.vibrance || !std::equal(std::begin(m), std::end(m), g_colour.m)) g_art.stale = true;
+    std::copy(std::begin(m), std::end(m), g_colour.m);
+    g_colour.vibrance = vibrance;
+    g_colour.on = on;
+}
+
+void recolour(ImDrawData* dd) {
+    if (!dd || !g_colour.on) return;
+    for (ImDrawList* list : dd->CmdLists) {
+        for (ImDrawVert& v : list->VtxBuffer) v.col = recolour_one(v.col);
+    }
+}
+
+ImU32 tint(ImU32 col) { return g_colour.on ? recolour_one(col) : col; }
 
 ImU32 alpha(ImU32 col, int a) {
     return (col & ~IM_COL32_A_MASK) | (static_cast<ImU32>(std::clamp(a, 0, 255)) << IM_COL32_A_SHIFT);
@@ -432,6 +507,7 @@ void backdrop(float sidebar_w) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const ImVec2 o = vp->Pos, size = vp->Size;
     const float t = anim_time();
+    if (g_art.stale) recolour_art();
     dl->AddRectFilled(o, o + size, kInk);
     if (g_art.sharp) {
         const float ia = static_cast<float>(g_art.w) / static_cast<float>(g_art.h), wa = size.x / size.y;
@@ -1010,10 +1086,26 @@ bool play_button(const char* label, ImVec2 size, bool enabled) {
         const float ph = std::fmod(t, 3.6f) / 3.6f;
         const float bw = size.x * 0.16f, x = p.x - bw * 1.5f + ph * (size.x * 2.4f);
         if (x < q.x) {
-            dl->PushClipRect(p + ImVec2(r * 0.3f, 0), q - ImVec2(r * 0.3f, 0), true);
-            dl->AddQuadFilled(ImVec2(x, q.y), ImVec2(x + bw * 0.6f, p.y), ImVec2(x + bw * 1.2f, p.y), ImVec2(x + bw * 0.6f, q.y),
-                              c(IM_COL32(255, 255, 255, 30)));
-            dl->PopClipRect();
+            // The band (slanted 0.6 bw across the height, 0.6 bw wide) cut to
+            // the button's rounded outline, corners included, at any scale.
+            dl->PathRect(p, q, r);
+            ImVector<ImVec2> shape;
+            shape.swap(dl->_Path);
+            dl->PathClear();
+            const float lean = bw * 0.6f / size.y;
+            const auto across = [&](const ImVec2& v) { return v.x - (x + (q.y - v.y) * lean); };  // 0 .. 0.6 bw inside
+            for (int side = 0; side < 2; ++side) {
+                const auto inside = [&](const ImVec2& v) { return side ? bw * 0.6f - across(v) : across(v); };
+                ImVector<ImVec2> kept;
+                for (int i = 0; i < shape.Size; ++i) {
+                    const ImVec2 a = shape[i], b = shape[(i + 1) % shape.Size];
+                    const float da = inside(a), db = inside(b);
+                    if (da >= 0) kept.push_back(a);
+                    if ((da >= 0) != (db >= 0)) kept.push_back(a + (b - a) * (da / (da - db)));
+                }
+                shape.swap(kept);
+            }
+            if (shape.Size >= 3) dl->AddConvexPolyFilled(shape.Data, shape.Size, c(IM_COL32(255, 255, 255, 30)));
         }
     }
     if (held && enabled) dl->AddRectFilled(p, q, c(IM_COL32(0, 0, 0, 44)), r);

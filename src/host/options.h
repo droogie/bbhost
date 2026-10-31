@@ -70,6 +70,9 @@ int host_opt_index(const char* key);
 // Menu text size (menu_text_size) as a factor: 1.0 at 100%, 4.0 at 400%.
 float host_opt_menu_text_scale();
 void host_opt_set_index(const char* key, int index);
+// Menu hue and Menu vibrance (menu_hue, menu_vibrance): degrees round the
+// colour wheel (0 their own blue and violet) and -1 (black and white) to +1.
+void host_opt_menu_colour(float* hue_degrees, float* vibrance);
 // Writes the options file now: the key bindings changed (host/bindings.h).
 void host_options_save_now();
 

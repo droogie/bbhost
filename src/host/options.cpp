@@ -101,6 +101,8 @@ enum SettingId {
     kFivePlayers,
     kSkillIssue,
     kMenuTextSize,
+    kMenuHue,
+    kMenuVibrance,
     kSettingCount,
 };
 
@@ -301,6 +303,18 @@ Setting g_set[kSettingCount] = {
      "The text in bbhost's own menus (this one, F9 and the setup window), and the menus with it. 100% is the usual size; "
      "the setup window grows with it too. A menu larger than the screen scrolls.",
      false},
+    // The colours of the same menus (launcher_ui recolour): 0 degrees and 0 percent
+    // are their own blue and violet. Hue turns every colour in them round the
+    // colour wheel but the green, amber and red that mean ok, a warning and a
+    // problem; vibrance takes colour out (-100%: black and white) or adds it.
+    {"menu_hue", "Menu hue",
+     {"-165°", "-150°", "-135°", "-120°", "-105°", "-90°", "-75°", "-60°", "-45°", "-30°", "-15°", "0°", "+15°", "+30°", "+45°", "+60°", "+75°", "+90°", "+105°", "+120°", "+135°", "+150°", "+165°", "+180°"},
+     11, "Turns the colours of bbhost's own menus (this one, F9 and the setup window) round the colour wheel. 0 degrees "
+     "is their own blue and violet.",
+     false},
+    {"menu_vibrance", "Menu vibrance",
+     {"-100%", "-90%", "-80%", "-70%", "-60%", "-50%", "-40%", "-30%", "-20%", "-10%", "0%", "+10%", "+20%", "+30%", "+40%", "+50%", "+60%", "+70%", "+80%", "+90%", "+100%"},
+     10, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
 };
 
 const Row g_rows[] = {
@@ -312,6 +326,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
     {Row::Option, nullptr, kMenuTextSize},
+    {Row::Option, nullptr, kMenuHue},
+    {Row::Option, nullptr, kMenuVibrance},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -686,7 +702,9 @@ void apply(int id) {
         case kSkillIssue:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
-            break;  // the menus read it every frame (host_opt_menu_text_scale)
+        case kMenuHue:
+        case kMenuVibrance:
+            break;  // the menus read them every frame (host_opt_menu_text_scale, host_opt_menu_colour)
         default: break;
     }
 }
@@ -1530,6 +1548,16 @@ float host_opt_menu_text_scale() {
     const Setting& s = g_set[kMenuTextSize];
     const int i = std::clamp(s.index, 0, static_cast<int>(s.values.size()) - 1);
     return static_cast<float>(std::atoi(s.values[static_cast<std::size_t>(i)])) / 100.0f;
+}
+
+void host_opt_menu_colour(float* hue_degrees, float* vibrance) {
+    const auto value = [](SettingId id) {
+        const Setting& s = g_set[id];
+        const int i = std::clamp(s.index, 0, static_cast<int>(s.values.size()) - 1);
+        return static_cast<float>(std::atoi(s.values[static_cast<std::size_t>(i)]));
+    };
+    *hue_degrees = value(kMenuHue);
+    *vibrance = value(kMenuVibrance) / 100.0f;
 }
 
 int host_opt_index(const char* key) {

@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.10",
+    "0.3.16",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -129,6 +129,15 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "Quake 3's cg_fov: degrees across a 4:3 picture; a wider screen sees more at the sides.", "90", 50.0, 140.0},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "bob", "View bob",
      "Quake 3's bob, roll and landing dip, times this (1 is Quake 3's own, 0 none).", "1.0", 0.0, 2.0},
+    {BB_OPT_HEADING, nullptr, "Crosshair"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "crosshair", "Crosshair",
+     "A dot in a ring at the middle of the view, as Quake 3's cg_drawCrosshair: drawn over the world and under the "
+     "game's own HUD and menus.",
+     "true"},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "crosshair_size", "Crosshair size",
+     "Quake 3's cg_crosshairSize: across, in its 640x480 screen's pixels (24 is Quake 3's own).", "24", 8.0, 64.0},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "crosshair_transparency", "Crosshair transparency",
+     "Percent: 0 is solid, 100 gone (50 by default).", "50", 0.0, 100.0},
     {BB_OPT_HEADING, nullptr, "Gun"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "draw_gun", "Draw the gun",
      "The gun in your hand at the lower right of the view, as Quake 3's cg_drawGun.", "true"},
@@ -146,6 +155,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "0", -40.0, 40.0},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "gun_y", "Gun left", "Quake 3's cg_gun_y: units to the left.", "0", -40.0, 40.0},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "gun_z", "Gun up", "Quake 3's cg_gun_z: units up.", "0", -40.0, 40.0},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "shotgun_spread", "Shotgun spread",
+     "Quake 3's DEFAULT_SHOTGUN_SPREAD: each pellet lands at a random point of a square this many units either way at "
+     "8192 in front (700 is Quake 3's own, about 5 degrees; 2000 is about the Blunderbuss's own width).",
+     "700", 100.0, 2000.0},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "plasma", "Plasma",
      "What the plasma gun fires: one of A Call Beyond's small stars, flying straight and seeking nothing, or Blacksky "
      "Eye's shard.",
@@ -232,11 +245,14 @@ struct Settings {
     bool invert = false;
     float fov = 90.0f;
     float bob = 1.0f;
+    bool crosshair = true;
+    float crosshair_size = 24.0f, crosshair_alpha = 0.5f;
     bool draw_gun = true;
     bool muzzle_flash = false;
     float gun_bob = 1.0f;
     float gun_fov = 90.0f;
     float gun_x = 0.0f, gun_y = 0.0f, gun_z = 0.0f;
+    float shotgun_spread = 700.0f;  // DEFAULT_SHOTGUN_SPREAD, units either way at 8192
     int plasma = 0;  // kPlasmaLooks: A Call Beyond's star, Blacksky Eye's shard
 } s;
 
@@ -260,6 +276,9 @@ void read_options() {
     s.invert = g.config_bool("quake.invert", false);
     s.fov = std::clamp(static_cast<float>(g.config_number("quake.fov", 90.0)), 50.0f, 140.0f);
     s.bob = std::clamp(static_cast<float>(g.config_number("quake.bob", 1.0)), 0.0f, 2.0f);
+    s.crosshair = g.config_bool("quake.crosshair", true);
+    s.crosshair_size = std::clamp(static_cast<float>(g.config_number("quake.crosshair_size", 24.0)), 8.0f, 64.0f);
+    s.crosshair_alpha = 1.0f - std::clamp(static_cast<float>(g.config_number("quake.crosshair_transparency", 50.0)), 0.0f, 100.0f) / 100.0f;
     s.draw_gun = g.config_bool("quake.draw_gun", true);
     s.muzzle_flash = g.config_bool("quake.muzzle_flash", false);
     s.gun_bob = std::clamp(static_cast<float>(g.config_number("quake.gun_bob", 1.0)), 0.0f, 2.0f);
@@ -268,6 +287,7 @@ void read_options() {
     s.gun_y = std::clamp(static_cast<float>(g.config_number("quake.gun_y", 0.0)), -40.0f, 40.0f);
     s.gun_z = std::clamp(static_cast<float>(g.config_number("quake.gun_z", 0.0)), -40.0f, 40.0f);
     s.plasma = g.config("quake.plasma", "A Call Beyond") == "Blacksky Eye" ? 1 : 0;
+    s.shotgun_spread = std::clamp(static_cast<float>(g.config_number("quake.shotgun_spread", 700.0)), 100.0f, 2000.0f);
 }
 
 const char* physics_name() {
@@ -403,8 +423,32 @@ void face(std::uint8_t* phys, float yaw) {
 // props, breakables, ragdolls and every other character fall by, is never
 // touched - and gravity goes back the moment the player dies, so the death
 // falls as the game has it.
+//
+// The Restore Debug Dash patch hooks the character's movement step (a jump at
+// 0x1cbd711 over its vmovss [rbp-0x7c], xmm0) and, with the dash off, clears
+// that same no-gravity bit on the player every step: the game's gravity then
+// holds the hunter to the floor under every jump. While Quake has the player
+// the step's own instruction goes back in place of the jump - the dash is
+// Left Ctrl, Quake's crouch, anyway - and the hook returns with the player.
+constexpr std::uint64_t kDashSite = 0x1cbd711;
+constexpr std::uint8_t kDashOwn[5] = {0xc5, 0xfa, 0x11, 0x45, 0x84};
+constexpr std::uint8_t kDashHook[5] = {0xe9, 0xce, 0xe1, 0x07, 0x03};
+bool g_dash_lifted = false;
+
+void lift_dash(bool lift) {
+    if (lift == g_dash_lifted) return;
+    if (lift) {
+        if (g.api->patch(kDashSite, kDashHook, kDashOwn, sizeof kDashOwn) != 0) return;  // no dash patch
+        g.log("quake: the debug dash's hook set aside while Quake has the player (it clears the no-gravity bit)");
+    } else if (g.api->patch(kDashSite, kDashOwn, kDashHook, sizeof kDashHook) != 0) {
+        g.log("quake: the debug dash's hook could not be put back");
+    }
+    g_dash_lifted = lift;
+}
+
 void hold_body(std::uint8_t* chr, bool weightless, bool hidden) {
     if (!chr) return;
+    lift_dash(weightless);
     std::uint8_t& f1 = at<std::uint8_t>(chr, 0x1e1);
     std::uint8_t& f2 = at<std::uint8_t>(chr, 0x1e2);
     if (weightless) f1 |= 0x40;
@@ -1092,6 +1136,14 @@ void place_view(BbCamera& cam, bool dead, V3 origin, float& out_yaw, float& out_
 // Piercing Rifle's place. Damage stays the game's. Off, every row is as the
 // game loaded it.
 constexpr std::uint32_t kGuns[] = {15000000, 35000000, 36000000, 6000000, 33000000};
+// The shotgun as if it carried Kyo's one-circle blood gem: Blood ATK UP +28.7%
+// and Add blood ATK +7.3 (SpEffects 22519 and 13119 - blood is the game's
+// neutral attack, which the weapon rows have no field for). Approximated on
+// the row: its physical attack x1.287 + 7.3 and its bloodtinge scaling
+// (correctMagic, 100 on the Blunderbuss) x1.287. The gem's third effect, WPN
+// durability DOWN -65.3, does nothing to a gun and is left out.
+constexpr std::uint32_t kShotgunGun = 6000000;
+constexpr float kGemRate = 1.287f, kGemAdd = 7.3f;
 constexpr float kGrenadeSpeed = 700.0f;  // units a second
 constexpr float kRocket = 900.0f * kUnit, kGrenade = kGrenadeSpeed * kUnit;
 struct BulletRule {
@@ -1155,9 +1207,12 @@ void guns_apply() {
     }
     int weapons = 0, bullets = 0;
     for (const std::uint32_t base : kGuns) {
-        const auto* top = g.param<bb::params::EquipParamWeapon>(base + 1000);
-        if (!top) continue;
-        for (std::uint32_t level = 0; level < 10; ++level) {
+        const auto* top_row = g.param<bb::params::EquipParamWeapon>(base + 1000);
+        if (!top_row) continue;
+        const bb::EQUIP_PARAM_WEAPON_ST top_copy = *top_row;
+        const auto* top = &top_copy;
+        // Up to +10 itself: the shotgun's gem goes on the row the shot names too.
+        for (std::uint32_t level = 0; level <= (base == kShotgunGun ? 10u : 9u); ++level) {
             auto* w = g.param<bb::params::EquipParamWeapon>(base + level * 100);
             if (!w) continue;
             g_saved_weapons.emplace_back(base + level * 100, *w);
@@ -1174,6 +1229,13 @@ void guns_apply() {
             w->correctMagic = top->correctMagic;
             w->correctFaith = top->correctFaith;
             w->correctType = top->correctType;
+            if (base == kShotgunGun) {
+                w->attackBasePhysics = static_cast<std::uint16_t>(std::lround(top->attackBasePhysics * kGemRate + kGemAdd));
+                w->correctStrength = top->correctStrength * kGemRate;
+                w->correctAgility = top->correctAgility * kGemRate;
+                w->correctMagic = top->correctMagic * kGemRate;
+                w->correctFaith = top->correctFaith * kGemRate;
+            }
             ++weapons;
         }
     }
@@ -1256,6 +1318,9 @@ void guns_apply() {
     g_guns_table = probe;
     g_guns_quake = true;
     g.log("quake: the guns at +10 whatever their level (%d rows), %d bullets flying as Quake 3's", weapons, bullets);
+    if (const auto* sg = g.param<bb::params::EquipParamWeapon>(kShotgunGun + 1000))
+        g.log("quake: the shotgun's blood gem: physical %u, bloodtinge scaling %.1f", sg->attackBasePhysics,
+              static_cast<double>(sg->correctMagic));
 }
 
 // ---- input -------------------------------------------------------------------------
@@ -1517,7 +1582,6 @@ struct Shot {
     std::int32_t bullet;  // the BulletParam row it is made of
     V3 muzzle, dir, right, up;
     double ms;
-    int fanned = 0;  // the Blunderbuss's emitters turned so far
 };
 std::vector<Shot> g_fired;
 
@@ -1883,8 +1947,8 @@ void fire(std::uint8_t* chr, V3 eye, float yaw, float pitch, float game_yaw) {
 // +0x10 and the last frame's +0x20, orientation quaternion +0x30, velocity
 // +0x40 and +0x50) is taken, the frame it appears, to where a Quake 3 missile
 // would be by then and turned along the view at its own speed - the shotgun's
-// eleven pellets each to a random point of Quake 3's pattern (700 units either
-// way at 8192). And a rocket's or grenade's burst (its HitBulletID bullet) is
+// fifteen pellets each to a random point of Quake 3's pattern (700 units
+// either way at 8192, the shotgun_spread option). And a rocket's or grenade's burst (its HitBulletID bullet) is
 // where the blast that throws the player is.
 constexpr std::uint64_t kBulletNext = 0x868;
 constexpr std::size_t kBulletId = 0x2f4, kBulletOwner = 0x2fc;
@@ -1913,13 +1977,13 @@ V3 quat_z(const float* q) {
     return {2.0f * (q[0] * q[2] + q[3] * q[1]), 2.0f * (q[1] * q[2] - q[3] * q[0]), 1.0f - 2.0f * (q[0] * q[0] + q[1] * q[1])};
 }
 
-void aim_bullet(std::uint8_t* world, std::uint64_t b, const Shot& shot, V3 dir, double ms) {
+void aim_bullet(std::uint8_t* world, std::uint64_t b, const Shot& shot, V3 dir, double ms, bool own_turn = true) {
     auto* f = reinterpret_cast<float*>(static_cast<std::uintptr_t>(b));
     const float speed = std::sqrt(f[16] * f[16] + f[17] * f[17] + f[18] * f[18]);  // +0x40
-    // The bullet's own turn - none for most, a fan's for the Blunderbuss's
-    // five emitters - from the shot's straight ahead (the request's identity
-    // orientation) to the view's.
-    {
+    // The bullet's own turn - none for most - from the shot's straight ahead
+    // (the request's identity orientation) to the view's. A shotgun pellet's
+    // is its emitter's, in the world's frame: it has none of its own here.
+    if (own_turn) {
         const V3 local = quat_z(f + 12);  // +0x30
         V3 up = cross(dir, shot.right);
         normalize(up);
@@ -2045,31 +2109,37 @@ void flights_frame(std::uint8_t* world, std::uint32_t owner, double ms) {
                 if (id == 701 || id == 711) blast(world, at, 100.0f, 120.0f, "rocket");
                 else if (id == 722 || id == 731) blast(world, at, 100.0f, 150.0f, "grenade");
                 else if (id == kPlasmaLooks[s.plasma].burst) blast(world, at, 15.0f, 20.0f, "plasma");
-                // A shot of ours, newest first. The shotgun's pellets come out
-                // of its emitter bullet (600) along the way it was turned.
+                // The shotgun's pellets (601, three from each of the
+                // Blunderbuss's five emitters, its fixed 5 x 3 grid): each to
+                // a random point of Quake 3's pattern (CG_ShotgunPattern:
+                // crandom() * spread right and up at 8192), about the newest
+                // shotgun shot's view.
+                if (id == 601 || id == 611) {
+                    for (auto it = g_fired.rbegin(); it != g_fired.rend(); ++it) {
+                        if (it->bullet != 600) continue;
+                        const float r = (g_spread_rng.unit() * 2.0f - 1.0f) * s.shotgun_spread;
+                        const float u = (g_spread_rng.unit() * 2.0f - 1.0f) * s.shotgun_spread;
+                        V3 dir = it->dir * 8192.0f + it->right * r + it->up * u;
+                        normalize(dir);
+                        aim_bullet(world, b, *it, dir, ms, false);
+                        if (g_log)
+                            g.log("quake: pellet %d at %+.2f %+.2f degrees", id, static_cast<double>(std::atan2(r, 8192.0f) / kDeg),
+                                  static_cast<double>(std::atan2(u, 8192.0f) / kDeg));
+                        break;
+                    }
+                }
+                // A shot of ours, newest first.
                 for (auto it = g_fired.rbegin(); it != g_fired.rend(); ++it) {
                     if (it->bullet == id) {
                         V3 dir = it->dir;
-                        // The Blunderbuss's emitters fan out across the view,
-                        // the first at shootAngle and each next one
-                        // shootAngleInterval on (-12 to 12 degrees): the
-                        // launch without the hand's dummy poly leaves them
-                        // all straight.
-                        if (id == 600) {
-                            if (const auto* row = g.param<bb::params::Bullet>(600)) {
-                                const float a = static_cast<float>(row->shootAngle) +
-                                                static_cast<float>(it->fanned) * static_cast<float>(row->shootAngleInterval);
-                                const float c = std::cos(a * kDeg), sn = std::sin(a * kDeg);
-                                dir = dir * c + it->right * sn;
-                                normalize(dir);
-                            }
-                            ++it->fanned;
-                        }
+                        // The Blunderbuss's five emitters go straight along the
+                        // view (the game fans them -12 to 12 degrees): the
+                        // spread is their pellets' (601, above).
                         if (id == 720) {  // the grenade launcher aims a little up (forward[2] += 0.2)
                             dir.y += 0.2f;
                             normalize(dir);
                         }
-                        aim_bullet(world, b, *it, dir, ms);
+                        aim_bullet(world, b, *it, dir, ms, id != 600);
                         if (id == 720) {
                             const auto* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(b));
                             g_grenades.push_back({b, V3{f[4], f[5], f[6]}, dir * kGrenadeSpeed, false, ms});
@@ -2460,6 +2530,13 @@ V3 g_prev_origin;
 double g_off_dump = 0.0;  // QUAKE_OFF_AFTER: a frame dump due then
 
 bool g_on_ladder = false;
+// Off the rungs, still in the game's hands until its climb-off stops moving
+// the hunter: when that began (-1 none), when they last moved, where they were.
+double g_ladder_exit_ms = -1.0, g_ladder_still_ms = 0.0;
+V3 g_ladder_last;
+constexpr float kLadderStill = 0.002f;     // metres a frame that count as standing still
+constexpr double kLadderSettleMs = 150.0;  // that long still and the climb-off is over
+constexpr double kLadderExitMs = 3000.0;   // and never longer than this
 
 // The barrels turn by the gun model's own animations (parts wp_a_1750's
 // anibnd), which the game plays as the hunter's firing animations play (a150
@@ -2517,7 +2594,9 @@ void take_input(bool on, bool moving = true) {
 
 void release() {
     g_on_ladder = false;
+    g_ladder_exit_ms = -1.0;
     if (g_held) hold_body(g_held, false, false);
+    lift_dash(false);
     vm_release(g_held ? g_held : player());
     g_held = nullptr;
     if (g_active) take_input(false);
@@ -2591,6 +2670,109 @@ void snap_velocity() {
     pm.velocity.x = std::nearbyint(pm.velocity.x);
     pm.velocity.y = std::nearbyint(pm.velocity.y);
     pm.velocity.z = std::nearbyint(pm.velocity.z);
+}
+
+// ---- the crosshair -----------------------------------------------------------
+//
+// RendMan's draw lists take the game's debug shapes (the follow camera's
+// keep-out spheres among them) and are played after the scene - over its
+// effects and post-processing, under the HUD and the menus. The current list's
+// shape object (+0x20 the lists, their [+0x20] the current one at +0x10 + 8 *
+// that, its +0x40) holds the look the next shape takes: colours at +0x20 and
+// +0x30, modes at +0x18, +0x1c and +0x70, each change flagged at +0x8. Its
+// lines are 0x135d8d0(lists, from, to), its spheres 0x135d810(lists, 3x4).
+constexpr std::uint64_t kRendMan = 0x5940298;
+constexpr std::uint64_t kDrawSphere = 0x135d810, kDrawLine = 0x135d8d0;
+constexpr float kCrosshairAhead = 0.25f;  // metres in front of the eye: inside the body, nothing nearer
+
+struct alignas(16) V4 {
+    float x, y, z, w;
+};
+
+std::uint8_t* debug_lists() {
+    std::uint8_t* rendman = ptr_at(kRendMan);
+    return rendman ? at<std::uint8_t*>(rendman, 0x20) : nullptr;
+}
+
+std::uint8_t* debug_shape(std::uint8_t* lists) {
+    std::uint8_t* list = at<std::uint8_t*>(lists, 0x10 + 8 * static_cast<std::int64_t>(at<std::int32_t>(lists, 0x20)));
+    return list ? at<std::uint8_t*>(list, 0x40) : nullptr;
+}
+
+void debug_look(std::uint8_t* lists, V4 colour) {
+    std::uint8_t* shape = debug_shape(lists);
+    if (!shape) return;
+    BbCallRegs r{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(shape);
+    r.arg[1] = 0xffffffffu;
+    g.api->call_guest(bn_of(at<std::uint64_t>(at<std::uint8_t*>(shape, 0), 0x28)), &r);  // begun
+    shape = debug_shape(lists);
+    if (!shape) return;
+    auto set_i = [&](std::size_t off, std::int32_t v, std::uint8_t flag) {
+        if (at<std::int32_t>(shape, off) == v) return;
+        at<std::int32_t>(shape, off) = v;
+        at<std::uint8_t>(shape, 0x8) |= flag;
+    };
+    set_i(0x70, 2, 0x80);
+    set_i(0x1c, 1, 0x8);
+    set_i(0x18, 2, 0x4);
+    for (const auto [off, flag] : {std::pair<std::size_t, std::uint8_t>{0x20, 0x10}, {0x30, 0x20}}) {
+        V4& c = at<V4>(shape, off);
+        if (c.x == colour.x && c.y == colour.y && c.z == colour.z && c.w == colour.w) continue;
+        c = colour;
+        at<std::uint8_t>(shape, 0x8) |= flag;
+    }
+}
+
+void debug_line(std::uint8_t* lists, V3 a, V3 b) {
+    const V4 from{a.x, a.y, a.z, 1.0f}, to{b.x, b.y, b.z, 1.0f};
+    BbCallRegs r{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(lists);
+    r.arg[1] = reinterpret_cast<std::uint64_t>(&from);
+    r.arg[2] = reinterpret_cast<std::uint64_t>(&to);
+    g.api->call_guest(kDrawLine, &r);
+}
+
+// A flat disc: a sphere of radius r across `right` and `up`, none along the view.
+void debug_disc(std::uint8_t* lists, V3 c, V3 right, V3 up, V3 forward, float r) {
+    const V3 x = right * r, y = up * r, z = forward * 1e-4f;
+    const V4 rows[3] = {{x.x, y.x, z.x, c.x}, {x.y, y.y, z.y, c.y}, {x.z, y.z, z.z, c.z}};
+    BbCallRegs regs{};
+    regs.arg[0] = reinterpret_cast<std::uint64_t>(lists);
+    regs.arg[1] = reinterpret_cast<std::uint64_t>(rows);
+    g.api->call_guest(kDrawSphere, &regs);
+}
+
+// Quake 3's crosshair at the middle of the view: a dot in a ring, its size in
+// the 640x480 screen's pixels (cg_crosshairSize), white.
+void draw_crosshair(const BbCamera& cam) {
+    if (!s.crosshair || s.crosshair_alpha <= 0.0f) return;
+    std::uint8_t* lists = debug_lists();
+    if (!lists) return;
+    const V3 eye{cam.position[0], cam.position[1], cam.position[2]};
+    const V3 right{cam.right[0], cam.right[1], cam.right[2]}, up{cam.up[0], cam.up[1], cam.up[2]};
+    const V3 forward{cam.forward[0], cam.forward[1], cam.forward[2]};
+    const V3 c = eye + forward * kCrosshairAhead;
+    // Metres at that distance a 480-line screen's pixel spans.
+    const float pixel = kCrosshairAhead * std::tan(cam.fov_y * 0.5f) / 240.0f;
+    const float ring = s.crosshair_size * 0.5f * pixel * 0.75f, dot_r = s.crosshair_size * pixel * 0.03f;
+    const float a = s.crosshair_alpha;
+    // The ring: a halo of fainter circles round a solid one.
+    constexpr int kSegments = 32;
+    const float widths[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
+    for (const float w : widths) {
+        debug_look(lists, {1.0f, 1.0f, 1.0f, a * (w == 0.0f ? 1.0f : std::fabs(w) < 1.0f ? 0.6f : 0.25f)});
+        const float rr = ring + w * pixel * 0.5f;
+        V3 prev = c + right * rr;
+        for (int i = 1; i <= kSegments; ++i) {
+            const float t = 2.0f * kPi * static_cast<float>(i) / kSegments;
+            const V3 next = c + right * (rr * std::cos(t)) + up * (rr * std::sin(t));
+            debug_line(lists, prev, next);
+            prev = next;
+        }
+    }
+    debug_look(lists, {1.0f, 1.0f, 1.0f, a});
+    debug_disc(lists, c, right, up, forward, dot_r);
 }
 
 void camera(BbCamera& cam) {
@@ -2678,8 +2860,28 @@ void camera(BbCamera& cam) {
     const bool dead = hp == 0;
     // On a ladder (its state 0 and up; -1 off it) the climb is the game's:
     // its gravity, its keys, its placing - the view stays the eye, and Quake
-    // takes the player back at the top or the bottom.
-    const bool ladder = ladder_state(chr) >= 0;
+    // takes the player back at the top or the bottom. The state ends as the
+    // hunter lets go of the rungs, before the climb over the top has carried
+    // them onto the ledge: the game keeps the player while its animation
+    // still moves them, and Quake takes them back once they stand still.
+    const int rungs = ladder_state(chr);
+    static int rungs_was = -1;
+    if (rungs != rungs_was) {
+        if (g_log) g.log("quake: ladder state %d", rungs);
+        rungs_was = rungs;
+    }
+    if (rungs >= 0) {
+        g_ladder_exit_ms = -1.0;
+    } else if (g_on_ladder && g_ladder_exit_ms < 0.0) {
+        g_ladder_exit_ms = g_ladder_still_ms = view.ms;
+    }
+    const V3 now_at = read_position(phys);
+    if (g_ladder_exit_ms >= 0.0 && length(now_at - g_ladder_last) > kLadderStill) g_ladder_still_ms = view.ms;
+    g_ladder_last = now_at;
+    const bool climbing_off = g_ladder_exit_ms >= 0.0 && view.ms - g_ladder_still_ms < kLadderSettleMs &&
+                              view.ms - g_ladder_exit_ms < kLadderExitMs;
+    if (g_ladder_exit_ms >= 0.0 && !climbing_off) g_ladder_exit_ms = -1.0;
+    const bool ladder = rungs >= 0 || climbing_off;
     if (ladder != g_on_ladder) {
         g_on_ladder = ladder;
         take_input(true, !ladder);
@@ -2798,6 +3000,7 @@ void camera(BbCamera& cam) {
     place_view(cam, dead, draw_origin, yaw, pitch, roll);
     vm_frame(chr, !dead);
     if (vm.out) vm_place(cam, yaw, pitch, roll);
+    if (!dead) draw_crosshair(cam);
 
     if (g_log && g_now >= g_next_log) {
         g_next_log = g_now + 0.25;
