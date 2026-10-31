@@ -10572,23 +10572,68 @@ std::uint32_t format_channels(VkFormat f) {
 }
 // Whether the pixel shader may discard (OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation) and whether it has
 // control flow (a conditional branch or a switch: its output store might not run on every path).
+//
+// Control flow is no obstacle when every colour output is stored whole in the
+// block that holds the module's one OpReturn: one function (no calls), no
+// OpUnreachable, so every fragment that is not discarded ends in that block -
+// structured control flow merges every path before the function's return.
 void spirv_discard_branches(const std::vector<std::uint32_t>& spirv, bool& discard, bool& branches) {
     discard = branches = false;
     if (spirv.size() < 5) {
         discard = branches = true;  // not known
         return;
     }
+    std::unordered_set<std::uint32_t> outputs;  // Output variables with a Location (the colour outputs)
+    std::unordered_set<std::uint32_t> located;
     for (std::size_t i = 5; i < spirv.size();) {
         const std::uint32_t n = spirv[i] >> 16, op = spirv[i] & 0xffff;
-        if (n == 0) break;
-        if (op == 252 || op == 4416 || op == 5380) discard = true;
-        if (op == 250 || op == 251) branches = true;
+        if (n == 0 || i + n > spirv.size()) break;
+        if (op == 71 && n >= 3 && spirv[i + 2] == 30) located.insert(spirv[i + 1]);  // OpDecorate .. Location
+        if (op == 59 && n >= 4 && spirv[i + 3] == 3) outputs.insert(spirv[i + 2]);   // OpVariable .. Output
         i += n;
     }
+    bool conditional = false, calls = false, unreachable = false;
+    int functions = 0, returns = 0;
+    std::uint32_t block = 0, return_block = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> stored_in;  // output -> the last block with a whole store to it
+    for (std::size_t i = 5; i < spirv.size();) {
+        const std::uint32_t n = spirv[i] >> 16, op = spirv[i] & 0xffff;
+        if (n == 0 || i + n > spirv.size()) break;
+        if (op == 252 || op == 4416 || op == 5380) discard = true;  // OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation
+        if (op == 250 || op == 251) conditional = true;               // OpBranchConditional, OpSwitch
+        if (op == 54) ++functions;                                    // OpFunction
+        if (op == 57) calls = true;                                   // OpFunctionCall
+        if (op == 255) unreachable = true;                            // OpUnreachable
+        if (op == 248 && n >= 2) block = spirv[i + 1];                // OpLabel
+        if (op == 253 || op == 254) {                                 // OpReturn, OpReturnValue
+            ++returns;
+            return_block = block;
+        }
+        if (op == 62 && n >= 3 && outputs.count(spirv[i + 1]) && located.count(spirv[i + 1])) stored_in[spirv[i + 1]] = block;  // OpStore
+        i += n;
+    }
+    if (!conditional) return;
+    bool final_stores = functions == 1 && !calls && !unreachable && returns == 1;
+    for (const std::uint32_t o : outputs) {
+        if (!located.count(o)) continue;
+        const auto it = stored_in.find(o);
+        if (it == stored_in.end() || it->second != return_block) final_stores = false;
+    }
+    branches = !final_stores;
 }
-// The screen-space quad's vertex shader (ScreenSpaceQuadShader): its position is
-// the vertex element read into v4..v7, as it is.
-bool known_quad_vs(const std::string& name) { return name.size() >= 9 && name.compare(0, 9, "0b0acf50+") == 0; }
+// The screen-space quads' vertex shaders - ScreenSpaceQuadShader (0b0acf50) and
+// FXAA.vpo (dc609f83), read from their code: each exports pos0 from v4..v7 as the
+// vertex element left them, before any other instruction.
+bool known_quad_vs(const std::string& name) {
+    return name.size() >= 9 && (name.compare(0, 9, "0b0acf50+") == 0 || name.compare(0, 9, "dc609f83+") == 0);
+}
+// Why a known quad's positions could not be read, once a pipeline and reason (the phase 2 census).
+void note_quad_unknown(const std::string& name, const char* why, std::uint64_t detail) {
+    static std::set<std::pair<std::string, const char*>> said;  // under g.mu
+    if (said.size() < 32 && said.emplace(name, why).second) {
+        host_log("copy census: %s: the quad's positions not read (%s, 0x%llx)", name.c_str(), why, static_cast<unsigned long long>(detail));
+    }
+}
 // Phase 2's question for colour target t (host/full_write.h), from the draw's state, the bound pipeline's pixel shader and,
 // for the screen-space quad, its vertices as the vertex input reads them.
 full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline& bound, const GpuDraw& d, const VertexInputPlan* vi,
@@ -10622,6 +10667,9 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
     in.sc_h = s.scissor.extent.height;
     // The viewport transform as Vulkan's: x and y scaled and offset, z too, and divided by w (PA_CL_VTE_CNTL 0x43f).
     in.known_vs = known_quad_vs(name) && vi && s.vte_cntl == 0x43f && !s.gs && !s.tess_hw && !s.domain_level;
+    if (known_quad_vs(name) && !in.known_vs) {
+        note_quad_unknown(name, !vi ? "no vertex input" : s.vte_cntl != 0x43f ? "PA_CL_VTE_CNTL" : "geometry or tessellation stage", s.vte_cntl);
+    }
     in.prim = s.rect ? full_write::kPrimRectList
             : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? full_write::kPrimTriangleList
             : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ? full_write::kPrimTriangleStrip
@@ -10635,6 +10683,7 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
         if (e.vdata == 4 && e.count == 4) pos = &e;
     }
     if (!pos || pos->location >= vi->attributes.size() || pos->packed) {
+        note_quad_unknown(name, !pos ? "no element in v4..v7" : "element packed or past the attributes", vi->elements.size());
         in.known_vs = false;
         return in;
     }
@@ -10651,6 +10700,7 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
         if (bd.binding == a.binding) b = &bd;
     }
     if (!comps || !b || a.binding >= 16 || !vi->va[a.binding] || b->inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
+        note_quad_unknown(name, !comps ? "attribute format" : "binding", static_cast<std::uint64_t>(a.format));
         in.known_vs = false;
         return in;
     }
@@ -10668,6 +10718,17 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
             const float fetched[4] = {c[0], comps > 1 ? c[1] : 0.0f, comps > 2 ? c[2] : 0.0f, comps > 3 ? c[3] : 1.0f};
             in.pos[v][k] = sel == 0 ? 0.0f : sel == 1 ? 1.0f : sel >= 4 ? fetched[sel - 4] : std::nanf("");
         }
+    }
+    static std::set<std::string> shown;  // under g.mu: each quad pipeline's vertices once (the phase 2 census)
+    if (shown.size() < 24 && shown.insert(name).second) {
+        std::string v;
+        for (std::uint32_t i = 0; i < in.vertices; ++i) {
+            char b[96];
+            std::snprintf(b, sizeof(b), " (%g %g %g %g)", in.pos[i][0], in.pos[i][1], in.pos[i][2], in.pos[i][3]);
+            v += b;
+        }
+        host_log("copy census: %s: prim %d, %u vertices:%s; geometry %s", name.c_str(), in.prim, in.vertices, v.c_str(),
+                 full_write::fail_name(full_write::geometry(in)));
     }
     return in;
 }
