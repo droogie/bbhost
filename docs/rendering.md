@@ -250,10 +250,13 @@ draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
 waited for N in M ms`, and the exit report gives the driver's time by the
 thread that waited). It is on by default on an integrated GPU under Windows,
 where whole spans kept about 1.5 GB more of the game's memory resident for the
-GPU. It is off on a graphics card of its own, and under Linux, where window
-imports have not been measured on an integrated GPU yet (AMD's imports go
+GPU, and on a graphics card with small video memory (under 7.5 GiB free at
+the start), whose whole spans pin 4-5 GiB of system memory beside a 4-6 GB
+card. It is off on a graphics card with room, and on an integrated GPU under
+Linux, where window imports have not been measured yet (AMD's imports go
 through udmabuf there). `gpu.import_windows`, true or false, decides it either
-way. The work under way moves each of those uses off guest memory, and
+way. The log's `gpu: memory:` line gives the decision with the others made
+for the device (host/memory_policy.h). The work under way moves each of those uses off guest memory, and
 windows are then only the fallback for what is not moved yet. The Steam Deck
 kit turns it on: there the
 memory shared with the GPU stays under the driver's budget and the start is
@@ -784,14 +787,19 @@ buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
 
-GX's buffers are bound by handle by default (`BBHOST_GXVK_BUFFERS=0` keeps
-today's path), except on an integrated GPU or with tight memory, where the
-draws read GX's buffers where they are - the buffer shadow in place, or no
-shadow - so a copy would hold memory and buy nothing, and with small video
-memory (under 7.5 GiB free at the start), where the copies compete with the
-targets and textures for it and one dip to the reserve costs far more GPU
-time than the command processor saves; there today's path stays unless
-`BBHOST_GXVK_BUFFERS=1`. On an RTX 4070, uncapped, the frame rate goes from
+GX's buffers are bound by handle by default on a discrete GPU and on an
+integrated GPU with 8 GiB of video memory or more (`BBHOST_GXVK_BUFFERS=0`
+keeps today's path). With small video memory (under 7.5 GiB free at the
+start) their copies have a budget - an eighth of what is free, 256-512 MiB
+(`BBHOST_GXVK_BUFFERS_BUDGET_MB`) - where the least recently bound goes
+first and the pool gives room back before the buffer shadow's mirrors are
+refused: without the copies the mirrors carried the meshes, and at a 4 GB
+card's budget they were refused room and the draws read their vertices
+across the bus. A smaller integrated GPU and tight memory keep today's path,
+where the draws read GX's buffers where they are - the buffer shadow in
+place, or no shadow - so a copy would hold memory the system needs, unless
+`BBHOST_GXVK_BUFFERS=1`. The log's `gpu: memory:` line says which
+(host/memory_policy.h). On an RTX 4070, uncapped, the frame rate goes from
 83.6 to 94.6 at Old Yharnam and from 82.2 to 95.0 at the Nightmare of Mensis
 by handle, the command processor taking 1.4-1.6 ms a flip less; at 60 it
 takes up to 1 ms a flip less, with the GPU's time and the frame pacing

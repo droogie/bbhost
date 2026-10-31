@@ -30,7 +30,4 @@ inline Mode decide(const char* env, const char* config, int integrated, bool win
     return small_vram == 1 ? Mode::kWindows : Mode::kWhole;
 }
 
-// Whether the device decided it (neither the environment nor the config set).
-inline bool by_device(const char* env, const char* config) { return !(env && *env) && !(config && *config); }
-
 }  // namespace import_mode

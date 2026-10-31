@@ -7,6 +7,7 @@
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
 #include "host/label_landing.h"
+#include "host/memory_policy.h"
 #include "log.h"
 
 #include <algorithm>
@@ -24,17 +25,11 @@ namespace {
 using ull = unsigned long long;
 
 struct Flags {
-    bool given = false;  // BBHOST_GXVK_BUFFERS set: its mode on any device
-    Buffers mode = Buffers::kOff;
-    bool census = false;
+    bool census = false;  // BBHOST_GXVK_BUFFERS=census or BBHOST_GXVK_CENSUS=1 (the mode itself is the memory policy's)
 };
 const Flags g_flags = [] {
     Flags f;
-    if (const char* e = std::getenv("BBHOST_GXVK_BUFFERS"); e && *e) {
-        f.given = true;
-        f.mode = buffers_mode_for(e, BuffersDevice::kRoomy);
-        if (std::strcmp(e, "census") == 0) f.census = true;
-    }
+    if (const char* e = std::getenv("BBHOST_GXVK_BUFFERS"); e && std::strcmp(e, "census") == 0) f.census = true;
     if (const char* e = std::getenv("BBHOST_GXVK_CENSUS"); e && e[0] == '1') f.census = true;
     return f;
 }();
@@ -222,28 +217,9 @@ void heap_bound(Use use, std::uint64_t va, std::uint64_t bytes, std::uint64_t ca
 }  // namespace
 
 Buffers buffers_mode() {
-    // Decided at the first ask - the GX hooks' install, on the host's thread
-    // before the game runs - and said once.
-    static const Buffers mode = [] {
-        if (g_flags.given) return g_flags.mode;
-        const BuffersDevice d = host_gpu_integrated()     ? (host_gpu_integrated_with_room() && !host_gpu_memory_tight() ? BuffersDevice::kIntegratedRoomy
-                                                                                                                 : BuffersDevice::kIntegrated)
-                                : host_gpu_memory_tight() ? BuffersDevice::kTight
-                                : host_gpu_small_vram()   ? BuffersDevice::kSmallVram
-                                                          : BuffersDevice::kRoomy;
-        const Buffers m = buffers_mode_for(nullptr, d);
-        if (d == BuffersDevice::kSmallVram && m == Buffers::kOn)
-            host_log("gxvk: GX's buffers bound by handle within a budget for their copies: small video memory, where the least recently "
-                     "bound copy goes first and the pool gives room back before the mirrors are refused (BBHOST_GXVK_BUFFERS_BUDGET_MB=<n> "
-                     "sets the budget; BBHOST_GXVK_BUFFERS=0 keeps today's path)");
-        else if (m == Buffers::kOff)
-            host_log("gxvk: GX's buffers on today's path: %s, whose draws read them where they are (BBHOST_GXVK_BUFFERS=1 binds them by handle)",
-                     d == BuffersDevice::kIntegrated ? "an integrated GPU" : "tight memory");
-        else
-            host_log("gxvk: GX's buffers bound by handle%s (BBHOST_GXVK_BUFFERS=0: today's path)",
-                     d == BuffersDevice::kIntegratedRoomy ? ", from their copies in an integrated GPU's video memory" : "");
-        return m;
-    }();
+    // The memory policy's (host/memory_policy.h, BBHOST_GXVK_BUFFERS first): decided at the first ask - the GX hooks'
+    // install, on the host's thread before the game runs, from the device's kind - and said once there.
+    static const Buffers mode = host_gpu_memory_policy().buffers;
     return mode;
 }
 bool census() { return g_flags.census; }
@@ -301,7 +277,7 @@ void census_buffer_gone(std::uint64_t holder) {
     if (!g_flags.census || !holder) return;
     g_gone_buffers.fetch_add(1, std::memory_order_relaxed);
     std::uint32_t a = 0, b = 0;
-    if (g_flags.mode == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {
+    if (buffers_mode() == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {  // (the spare dword is free only on today's path)
         g_spare_checked[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
         if (a != canary(holder, 0x14)) g_spare_broken[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
     }

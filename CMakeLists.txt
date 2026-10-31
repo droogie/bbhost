@@ -673,6 +673,10 @@ if(UNIX)
   add_executable(gxvk_budget_test tests/gxvk_budget_test.cpp)
   target_include_directories(gxvk_budget_test PRIVATE src)
   add_test(NAME gxvk_budget_test COMMAND gxvk_budget_test)
+  # The memory policy: GX's buffers, their budget, the imports and the staging, decided once for the device.
+  add_executable(memory_policy_test tests/memory_policy_test.cpp)
+  target_include_directories(memory_policy_test PRIVATE src)
+  add_test(NAME memory_policy_test COMMAND memory_policy_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)

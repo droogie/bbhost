@@ -36,6 +36,7 @@
 // the first times, and retires the entry.
 #include "host/gpu_internal.h"
 #include "host/gxvk_budget.h"
+#include "host/memory_policy.h"
 #include "host/gxvk_table.h"
 #include "hle/modules.h"
 #include "log.h"
@@ -326,19 +327,10 @@ bool fill_locked(BufferEntry& e, std::uint32_t handle) {
     return true;
 }
 
-// The pool's budget, decided at the first placement: small video memory's (gxvk_budget.h), or
-// BBHOST_GXVK_BUFFERS_BUDGET_MB on any discrete GPU; none on an integrated GPU.
+// The pool's budget, read at the first placement: the memory policy's (host/memory_policy.h) - small video memory's,
+// or BBHOST_GXVK_BUFFERS_BUDGET_MB on any discrete GPU; none on an integrated GPU.
 std::uint64_t budget_locked() {
-    if (g_budget == ~0ull) {
-        g_budget = g.integrated ? 0 : gxvk_budget::budget_bytes(std::getenv("BBHOST_GXVK_BUFFERS_BUDGET_MB"), g.small_vram, g.local_budget);
-        if (g_budget)
-            host_log("gxvk buffers: copies within a budget of %llu MiB (%s; the mirrors' cushion %llu MiB kept above the reserve)",
-                     static_cast<ull>(g_budget >> 20),
-                     std::getenv("BBHOST_GXVK_BUFFERS_BUDGET_MB") && *std::getenv("BBHOST_GXVK_BUFFERS_BUDGET_MB")
-                         ? "BBHOST_GXVK_BUFFERS_BUDGET_MB"
-                         : "small video memory: an eighth of the budget at the start, 256-512 MiB",
-                     static_cast<ull>(shadow_mirror_cushion() >> 20));
-    }
+    if (g_budget == ~0ull) g_budget = host_gpu_memory_policy().budget;
     return g_budget;
 }
 
@@ -606,9 +598,11 @@ std::string gxvk_report() {
         std::snprintf(b, sizeof b,
                       "\ngxvk buffers: the copy pool's budget %llu MiB (small video memory, or BBHOST_GXVK_BUFFERS_BUDGET_MB): held at most "
                       "%llu MiB; copies dropped for room %llu (%llu MiB), bindings left on today's path at the budget %llu; dropped below the "
-                      "mirrors' cushion %llu times (%llu MiB); emptied blocks given back %llu; run parts stopped at a copy to place %llu",
+                      "mirrors' cushion (%llu MiB above the reserve) %llu times (%llu MiB); emptied blocks given back %llu; run parts stopped "
+                      "at a copy to place %llu",
                       static_cast<ull>(g_budget >> 20), static_cast<ull>(g_live_peak >> 20), static_cast<ull>(g_dropped.load()),
-                      static_cast<ull>(g_dropped_bytes.load() >> 20), static_cast<ull>(g_over_budget.load()), static_cast<ull>(g_shrinks.load()),
+                      static_cast<ull>(g_dropped_bytes.load() >> 20), static_cast<ull>(g_over_budget.load()),
+                      static_cast<ull>(shadow_mirror_cushion() >> 20), static_cast<ull>(g_shrinks.load()),
                       static_cast<ull>(g_shrunk_bytes.load() >> 20), static_cast<ull>(g_blocks_given_back.load()),
                       static_cast<ull>(g_part_place_stops.load()));
         s += b;

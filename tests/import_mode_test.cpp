@@ -56,11 +56,6 @@ void test_small_video_memory() {
         CHECK(decide("1", "false", 0, host, 0) == Mode::kWindows);
         CHECK(decide(nullptr, "true", 0, host, 0) == Mode::kWindows);
     }
-    // by_device: neither set.
-    CHECK(import_mode::by_device(nullptr, nullptr));
-    CHECK(import_mode::by_device("", ""));
-    CHECK(!import_mode::by_device("0", ""));
-    CHECK(!import_mode::by_device(nullptr, "false"));
 }
 
 void test_environment() {

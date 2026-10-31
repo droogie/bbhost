@@ -1,5 +1,6 @@
 // No Vulkan at build time: GPU work is skipped.
 #include "host/gpu.h"
+#include "host/memory_policy.h"
 
 bool host_gpu_init(const char* const*, std::uint32_t, bool) { return false; }
 bool host_gpu_available() { return false; }
@@ -7,6 +8,10 @@ bool host_gpu_memory_tight() { return false; }
 bool host_gpu_small_vram() { return false; }
 bool host_gpu_integrated() { return false; }
 bool host_gpu_integrated_with_room() { return false; }
+const memory_policy::Policy& host_gpu_memory_policy() {
+    static const memory_policy::Policy p;
+    return p;
+}
 void host_gpu_queue_lock() {}
 void host_gpu_queue_unlock() {}
 std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*) { return 0; }

@@ -325,6 +325,15 @@ bool host_gpu_integrated();
 // And, integrated, whether it has 8 GiB of video memory or more (a Strix
 // Halo's carve-out). Before the device exists, as host_gpu_memory_tight.
 bool host_gpu_integrated_with_room();
+// How bbhost holds the game's memory on the GPU it runs on (host/memory_policy.h:
+// GX's buffers by handle or not, their copies' budget, the imports whole or by
+// window, the upload staging kept or given back): decided once, at the first
+// ask - the GX hooks' install, from the device's kind before the device exists
+// (as host_gpu_memory_tight) - else at the device's choice, and logged once.
+namespace memory_policy {
+struct Policy;
+}
+const memory_policy::Policy& host_gpu_memory_policy();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().

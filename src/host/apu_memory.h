@@ -49,7 +49,8 @@ inline bool flag(const char* env, const char* config, bool fallback) {
 // GPU under Windows and on a graphics card with small video memory
 // (`small_vram` 1, which imports by window too: its shared GPU memory is the
 // staging and the windows), off elsewhere: on an RTX 4070 each chunk's free
-// stalled the frame it fell in (29-47 ms against 14-17).
+// stalled the frame it fell in (29-47 ms against 14-17), so the memory policy
+// (host/memory_policy.h) passes `small_vram` 1 only off NVIDIA's driver.
 inline bool staging_return(const char* env, const char* config, int integrated, bool windows_host, int small_vram = 0) {
     return flag(env, config, apu_defaults(integrated, windows_host) || (integrated == 0 && small_vram == 1));
 }

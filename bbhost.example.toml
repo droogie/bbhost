@@ -115,8 +115,9 @@ fps_cap = 30
 #   drains sooner (0: no budget).
 # - heap_lean: the image heap keeps no spare block in play and drains sooner.
 # All three on by default on an integrated GPU under Windows (a 2048 MB budget
-# there), staging_return also on a card with under 7.5 GB of video memory free,
-# off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
+# there), staging_return also on a card with under 7.5 GB of video memory free
+# but NVIDIA's (each chunk's free stalls a frame there), off elsewhere;
+# BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
 # BBHOST_HEAP_LEAN override them.
 # staging_return = false
 # cache_budget_mb = 0

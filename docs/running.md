@@ -276,15 +276,31 @@ once there is room. Every
 five seconds the log says `video memory: headroom ...`; look there, and for
 `video memory is full`, before anything else. Other programs holding video
 memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
-7.5 GB free bbhost also holds less memory ahead (the log says `small video
-memory`), and imports the game's memory a 16 MB window at a time and gives
-its upload staging back in play, as on an integrated GPU (the log says
-`window imports: a graphics card with small video memory`): a whole import
-pins 4-5 GB of system memory beside the card, which Windows counts as shared
-GPU memory. Its copies of the game's buffers have a budget (below). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
-an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off,
-`BBHOST_IMPORT_WINDOWS=0` imports whole and `BBHOST_STAGING_RETURN=0` keeps
-the staging.
+7.5 GB free bbhost also holds less memory ahead, and imports the game's
+memory a 16 MB window at a time and (but on NVIDIA's driver) gives its
+upload staging back in play, as on an integrated GPU: a whole import pins
+4-5 GB of system memory beside the card, which Windows counts as shared GPU
+memory. Its copies of the
+game's buffers have a budget (below). `BBHOST_VRAM_RESERVE_MB=0` goes back
+to placing everything until an allocation fails, `BBHOST_SMALL_VRAM=0`
+turns the small mode off, `BBHOST_IMPORT_WINDOWS=0` imports whole and
+`BBHOST_STAGING_RETURN=0` keeps the staging.
+
+**How bbhost holds memory on your GPU.** The log's `gpu: memory:` line, near
+the start, says which of these the GPU is and what decided each part:
+
+| The GPU | The game's vertex and index buffers | The game's memory | Upload staging |
+|---|---|---|---|
+| A graphics card with 7.5 GB or more of video memory free | copies in video memory | imported whole | kept |
+| One with less free | copies in video memory, within a budget | imported a 16 MB window at a time | given back in play (kept on NVIDIA's driver, whose free of each chunk stalls a frame) |
+| One with under 12 GB in all its memory heaps | read where they are | imported whole | kept |
+| An integrated GPU with 8 GB of video memory or more | copies in video memory | a window at a time under Windows, whole under Linux | given back under Windows |
+| A smaller integrated GPU (a Steam Deck too) | read where they are | a window at a time under Windows, whole under Linux | given back under Windows |
+
+`BBHOST_GXVK_BUFFERS`, `BBHOST_GXVK_BUFFERS_BUDGET_MB`,
+`BBHOST_IMPORT_WINDOWS` (or `import_windows` under `[gpu]`) and
+`BBHOST_STAGING_RETURN` (or `staging_return`) each change one part, on any
+GPU. The Steam Deck kit's toml turns window imports on.
 
 Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
 says where the video memory goes: `gpu: video memory (MiB)`
@@ -326,7 +342,7 @@ bound), textures not used for a while, free room in the image heap and the
 upload staging held from a load on. Three switches give them back, on any GPU;
 all three are on by default on an integrated GPU under Windows (a 2048 MiB
 budget there), the first also on a graphics card with small video memory
-(above), and off elsewhere:
+(above) but for NVIDIA's, and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
   upload staging goes back down to its floor in play (256 MiB, 128 on an
   integrated GPU under Windows; `BBHOST_STAGING_FLOOR_MB=<n>` sets it), 64 MiB
@@ -354,13 +370,14 @@ block back within seconds of an arrival, and the compaction takes what it
 leaves. The exit line `made in play` counts the image heap blocks that had to
 be made while the game played.
 
-On other GPUs, unless memory is tight, the game's own immutable vertex and
-index buffers are bound from copies of their own, made in video memory as
-they are first drawn, so the command processor does not look each draw's
-bytes up; one that finds no room keeps the mirrors (`BBHOST_GXVK_BUFFERS=0`
-goes back to the mirrors for all of them; `=1` makes the copies on an
-integrated GPU or with tight memory too). With small video memory the
-copies have a budget - an eighth of the video memory free at the start,
+On other GPUs, unless memory is tight, and on an integrated GPU with 8 GB of
+video memory or more, the game's own immutable vertex and index buffers are
+bound from copies of their own, made in video memory as they are first
+drawn, so the command processor does not look each draw's bytes up; one
+that finds no room keeps the mirrors (`BBHOST_GXVK_BUFFERS=0` goes back to
+the mirrors for all of them; `=1` makes the copies on a smaller integrated
+GPU or with tight memory too). With small video memory the copies have a
+budget - an eighth of the video memory free at the start,
 from 256 to 512 MiB (`BBHOST_GXVK_BUFFERS_BUDGET_MB=<n>` sets it on any
 card): at the budget a new copy takes the room of copies not drawn for two
 seconds, the least recently drawn first, else that draw reads the mirrors;

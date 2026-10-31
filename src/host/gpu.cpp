@@ -14,6 +14,7 @@
 #include "host/gxvk.h"
 #include "host/import_mode.h"
 #include "host/import_prefetch.h"
+#include "host/memory_policy.h"
 #include "host/host_lists.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
@@ -1347,26 +1348,29 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
 }
 
 std::atomic<signed char> g_imports_whole{-1};
-std::atomic<signed char> g_integrated_known{-1};  // the chosen device is integrated (1) or not (0); -1 before
-std::atomic<signed char> g_small_known{-1};       // ... a graphics card with small video memory (1) or not (0); -1 before
-// BBHOST_IMPORT_WINDOWS (1 windows, 0 whole spans), else gpu.import_windows
-// (true, false), else by the device and the platform: windows on an
-// integrated GPU under Windows and on a graphics card with small video
-// memory, whole spans elsewhere (host/import_mode.h).
-// Asked before the device is chosen with neither set, it answers whole spans
-// without deciding (nothing is imported before).
+std::atomic<bool> g_policy_known{false};  // host_gpu_memory_policy decided
+// The memory policy's (host/memory_policy.h): BBHOST_IMPORT_WINDOWS (1
+// windows, 0 whole spans), else gpu.import_windows (true, false), else by the
+// device and the platform - windows on an integrated GPU under Windows and on
+// a graphics card with small video memory, whole spans elsewhere. Asked
+// before the policy is decided, the switches alone answer; with neither set,
+// whole spans without deciding (nothing is imported before the device is
+// made, whose choice decides the policy at the latest).
 bool imports_whole_decide() {
 #if defined(_WIN32)
     constexpr bool kWindowsHost = true;
 #else
     constexpr bool kWindowsHost = false;
 #endif
-    const std::string cfg = config_value("gpu.import_windows");
-    const import_mode::Mode m = import_mode::decide(std::getenv("BBHOST_IMPORT_WINDOWS"), cfg.c_str(),
-                                                    g_integrated_known.load(std::memory_order_relaxed), kWindowsHost,
-                                                    g_small_known.load(std::memory_order_relaxed));
-    if (m == import_mode::Mode::kUndecided) return true;
-    const bool whole = m == import_mode::Mode::kWhole;
+    bool whole = true;
+    if (g_policy_known.load(std::memory_order_acquire)) {
+        whole = !host_gpu_memory_policy().windows;
+    } else {
+        const std::string cfg = config_value("gpu.import_windows");
+        const import_mode::Mode m = import_mode::decide(std::getenv("BBHOST_IMPORT_WINDOWS"), cfg.c_str(), -1, kWindowsHost);
+        if (m == import_mode::Mode::kUndecided) return true;
+        whole = m == import_mode::Mode::kWhole;
+    }
     g_imports_whole.store(whole ? 1 : 0, std::memory_order_relaxed);
     return whole;
 }
@@ -2808,6 +2812,7 @@ struct Candidate {
     // now: the driver's budget less its usage (VK_EXT_memory_budget), else the
     // heap's size (small_vram).
     VkDeviceSize local_free = 0;
+    std::uint32_t vendor = 0;  // its PCI vendor (the memory policy: NVIDIA's driver stalls a frame at a staging chunk's free)
 };
 
 // The usable devices of `instance` and the index of the one to run on in
@@ -2843,6 +2848,7 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
         }
         VkPhysicalDeviceProperties dp{};
         vkGetPhysicalDeviceProperties(d, &dp);
+        c.vendor = dp.vendorID;
         VkPhysicalDeviceMemoryProperties mp{};
         vkGetPhysicalDeviceMemoryProperties(d, &mp);
         for (std::uint32_t h = 0; h < mp.memoryHeapCount; ++h) {
@@ -2952,6 +2958,8 @@ bool small_vram(const Candidate& c) {
     return start_vram_free(c) < (7680ull << 20);
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
+std::atomic<std::int64_t> g_start_free{-1};  // ... and its start_vram_free (the memory policy's budget base), -1 until known
+std::atomic<std::int64_t> g_vendor{-1};      // ... and its PCI vendor, -1 until known
 std::atomic<int> g_integrated{-1};  // whether the device run on is an integrated GPU, -1 until known
 // And whether, integrated, it has 8 GiB of video memory or more (a Strix
 // Halo's carve-out; buffer_shadow.cpp integrated_with_room asks the same of
@@ -3093,38 +3101,37 @@ bool init_locked() {
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
-        g_integrated_known.store(g.integrated ? 1 : 0, std::memory_order_relaxed);
         g.tight = memory_tight(c);
         {
             int unknown = -1;
             g_small.compare_exchange_strong(unknown, small_vram(c) ? 1 : 0);
             g.small_vram = g_small.load() == 1;
-            if (g.small_vram)
-                host_log("gpu: %llu MiB of video memory free at the start: small video memory (BBHOST_SMALL_VRAM=0 says otherwise) - no "
-                         "spare image heap blocks in play, less untile scratch kept",
-                         static_cast<unsigned long long>(start_vram_free(c) >> 20));
+            std::int64_t none = -1;
+            g_start_free.compare_exchange_strong(none, static_cast<std::int64_t>(start_vram_free(c)));
+            none = -1;
+            g_vendor.compare_exchange_strong(none, static_cast<std::int64_t>(c.vendor));
         }
-        g_small_known.store(g.small_vram ? 1 : 0, std::memory_order_relaxed);
-        if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // by the device, unless set
-        if (g.small_vram && !imports_whole() &&
-            import_mode::by_device(std::getenv("BBHOST_IMPORT_WINDOWS"), config_value("gpu.import_windows").c_str()))
-            host_log("gpu: window imports: a graphics card with small video memory (%llu MiB free at the start, %s) - the game's "
-                     "memory is imported a 16 MB window at a time as the GPU first needs it, not whole, and the upload staging goes back "
-                     "down in play (BBHOST_IMPORT_WINDOWS=0 or import_windows = false imports it whole; BBHOST_STAGING_RETURN=0 keeps the "
-                     "staging)",
-                     static_cast<unsigned long long>(start_vram_free(c) >> 20),
-                     std::getenv("BBHOST_SMALL_VRAM") && *std::getenv("BBHOST_SMALL_VRAM") ? "BBHOST_SMALL_VRAM=1" : "under 7680");
-        twins_decide(c.type_rank == 4);
+        // The device's kind, for the memory policy unless the GX hooks' install decided it from the probe first: then a
+        // device of another kind than the probe's is said.
+        const bool decided = g_policy_known.load(std::memory_order_acquire);
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
                               static_cast<unsigned long long>(c.heaps >> 20));
-        if (g_integrated.exchange(g.integrated ? 1 : 0) == (g.integrated ? 0 : 1))
-            host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
+        if (g_integrated.exchange(g.integrated ? 1 : 0) == (g.integrated ? 0 : 1) && decided)
+            host_log("gpu: the device chosen is %s, unlike the one the memory policy was decided for (host/memory_policy.h)",
                      g.integrated ? "an integrated GPU" : "not an integrated GPU");
-        if (const bool room = integrated_room(c); g_integrated_room.exchange(room ? 1 : 0) == (room ? 0 : 1))
-            host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
+        if (const bool room = integrated_room(c); g_integrated_room.exchange(room ? 1 : 0) == (room ? 0 : 1) && decided)
+            host_log("gpu: the device chosen is %s, unlike the one the memory policy was decided for (host/memory_policy.h)",
                      room ? "an integrated GPU with room" : "not an integrated GPU with room");
+        // The memory policy (host/memory_policy.h), here at the latest; the imports follow it unless their switch decided
+        // them already (the same answer).
+        {
+            const memory_policy::Policy& mp = host_gpu_memory_policy();
+            signed char undecided = -1;
+            g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
+        }
+        twins_decide(c.type_rank == 4);
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -7604,11 +7611,8 @@ void start_memory_reserve() {
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     g_spare_play_blocks.store(spare_play, std::memory_order_relaxed);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
-    // BBHOST_STAGING_RETURN, else gpu.staging_return, else the device's default (host/apu_memory.h).
-    const std::string staging_return_cfg = config_value("gpu.staging_return");
-    const bool staging_return =
-        apu_memory::staging_return(std::getenv("BBHOST_STAGING_RETURN"), staging_return_cfg.c_str(), g.integrated ? 1 : 0, kWindowsHost,
-                                   g.small_vram ? 1 : 0);
+    // BBHOST_STAGING_RETURN, else gpu.staging_return, else the device's default: the memory policy's (host/memory_policy.h).
+    const bool staging_return = host_gpu_memory_policy().staging_return;
     const bool scratch_return = env("BBHOST_SCRATCH_RETURN", 1) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
@@ -8366,6 +8370,7 @@ void probe_before_device() {
     static std::once_flag once;
     std::call_once(once, [] {
         bool tight = false, small = false, integrated = false, room = false;
+        std::int64_t free = 0, vendor = 0;
         if (g_enabled) {
             obs_capture_policy();  // before the first instance, this one
             VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -8383,6 +8388,8 @@ void probe_before_device() {
                     small = small_vram(c);
                     integrated = c.type_rank == 3;
                     room = integrated_room(c);
+                    free = static_cast<std::int64_t>(start_vram_free(c));
+                    vendor = c.vendor;
                 }
                 vkDestroyInstance(instance, nullptr);
             }
@@ -8395,6 +8402,10 @@ void probe_before_device() {
         g_integrated.compare_exchange_strong(unknown, integrated ? 1 : 0);
         unknown = -1;
         g_integrated_room.compare_exchange_strong(unknown, room ? 1 : 0);
+        std::int64_t none = -1;
+        g_start_free.compare_exchange_strong(none, free);
+        none = -1;
+        g_vendor.compare_exchange_strong(none, vendor);
     });
 }
 }  // namespace
@@ -8421,6 +8432,36 @@ bool host_gpu_integrated_with_room() {
     if (const int r = g_integrated_room.load(); r >= 0) return r == 1;
     probe_before_device();
     return g_integrated_room.load() == 1;
+}
+
+// Decided at the first ask - the GX hooks' install (gxvk::buffers_mode), before the game runs, from the probe; else the
+// device's choice (init_locked) - from the device's kind as first known, the platform and the switches; said once.
+const memory_policy::Policy& host_gpu_memory_policy() {
+    static const memory_policy::Policy policy = [] {
+#if defined(_WIN32)
+        constexpr bool kWindowsHost = true;
+#else
+        constexpr bool kWindowsHost = false;
+#endif
+        const memory_policy::Device d =
+            memory_policy::device_of(host_gpu_integrated(), host_gpu_integrated_with_room(), host_gpu_memory_tight(), host_gpu_small_vram());
+        const std::string imports_cfg = config_value("gpu.import_windows"), staging_cfg = config_value("gpu.staging_return");
+        memory_policy::Switches sw;
+        sw.buffers = std::getenv("BBHOST_GXVK_BUFFERS");
+        sw.budget = std::getenv("BBHOST_GXVK_BUFFERS_BUDGET_MB");
+        sw.imports_env = std::getenv("BBHOST_IMPORT_WINDOWS");
+        sw.imports_cfg = imports_cfg.c_str();
+        sw.staging_env = std::getenv("BBHOST_STAGING_RETURN");
+        sw.staging_cfg = staging_cfg.c_str();
+        sw.small = std::getenv("BBHOST_SMALL_VRAM");
+        const std::int64_t free = g_start_free.load();
+        const bool nvidia = g_vendor.load() == 0x10de;
+        const memory_policy::Policy p = memory_policy::decide(d, kWindowsHost, free > 0 ? static_cast<std::uint64_t>(free) : 0, nvidia, sw);
+        host_log("gpu: memory: %s", memory_policy::describe(p, sw).c_str());
+        return p;
+    }();
+    g_policy_known.store(true, std::memory_order_release);
+    return policy;
 }
 
 bool host_gpu_available() {
