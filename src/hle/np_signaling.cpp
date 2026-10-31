@@ -291,9 +291,18 @@ GUEST_ABI int sig_status(unsigned ctx, unsigned conn, int* st, std::uint32_t* ad
         if (it != g_conn.end() && it->second.ctx == ctx && !it->second.dead) {
             net::Peer peer;
             status = it->second.established ? 2 : 1;
-            if (it->second.established && it->second.member_id && net::peers_get(it->second.member_id, &peer)) {
-                a = peer.addr;
-                p = static_cast<std::uint16_t>((peer.port << 8) | (peer.port >> 8));
+            if (it->second.established) {
+                // The room's peer table, else the address the connection kept
+                // (the table is cleared when the room ends; the connection is
+                // the game's until it closes it).
+                std::uint32_t pa = it->second.addr;
+                std::uint16_t pp = it->second.port;
+                if (it->second.member_id && net::peers_get(it->second.member_id, &peer) && peer.addr) {
+                    pa = peer.addr;
+                    pp = peer.port;
+                }
+                a = pa;
+                p = static_cast<std::uint16_t>((pp << 8) | (pp >> 8));
             }
         }
     }
