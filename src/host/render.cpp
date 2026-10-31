@@ -13433,20 +13433,20 @@ enum ElideRefusal : int {
     kErShape,        // not a whole copy into an image of the source's size and format
     kErViews,        // the two take different view formats (mutable, listed)
     kErUndrawn,      // the source not drawn yet
-    kErInPass,       // either an attachment of the open pass
     kErDisplay,      // into a display buffer (the presenter reads it as it is)
     kErBarriers,     // the lazy pass barriers track sampled images by base
     kErNoIds,        // no stage 2: the id memo keeps no T# bases
     kErSame,         // the same image
     kErRefusals
 };
-const char* const kErNames[kErRefusals] = {"depth", "layered", "shape", "view formats", "undrawn source", "in the open pass",
-                                           "display buffer", "lazy barriers", "no stage 2", "same image"};
+const char* const kErNames[kErRefusals] = {"depth", "layered", "shape", "view formats", "undrawn source", "display buffer",
+                                           "lazy barriers", "no stage 2", "same image"};
 const char* const kCeEndNames[copy_elide::kEnds] = {"source written", "source retired", "destination written", "destination read",
                                                     "a copy out of it", "limit", "flush", "dropped", "images exchanged"};
 std::uint64_t g_ce_deferred = 0, g_ce_refused[kErRefusals] = {}, g_ce_swapped = 0, g_ce_redirects = 0, g_ce_lost = 0,
               g_ce_compared = 0, g_ce_swap_refused = 0;
 std::uint64_t g_ce_made_bytes = 0, g_ce_saved_bytes = 0;
+std::uint64_t g_ce_pass_ended = 0;  // copies left unmade whose source or destination was an attachment of the open pass
 thread_local bool t_elide_lookup = false;  // a draw's target lookups (draw_impl): an attachment bound is a write
 
 
@@ -13578,9 +13578,6 @@ int copy_elide_refusal(const RtImage& src, const RtImage& dst, std::uint32_t wid
     if (src.mutable_format != dst.mutable_format) return kErViews;
     if (!src.initialised || !src.image) return kErUndrawn;
     if (src.image == dst.image) return kErSame;
-    for (int t = 0; g_pass.active && t < g_pass.ntargets; ++t) {
-        if (g_pass.targets[t] == src.base || g_pass.targets[t] == dst.base) return kErInPass;
-    }
     if (hle_video_is_display_buffer(dst.base)) return kErDisplay;
     if (g_lazy_barriers) return kErBarriers;
     if (!textures_images_mode()) return kErNoIds;
@@ -13596,17 +13593,25 @@ bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, st
         // Which copies are refused, once a reason, source and destination (up to 32): what a later phase could take.
         static std::set<std::tuple<int, std::uint64_t, std::uint64_t>> said;  // under g.mu
         if (said.size() < 32 && said.emplace(why, src.base, dst.base).second) {
-            int slot = -1;
-            for (int t = 0; why == kErInPass && t < g_pass.ntargets; ++t) {
-                if (g_pass.targets[t] == src.base || g_pass.targets[t] == dst.base) slot = t;
-            }
-            host_log("copy elision: a copy of 0x%llx %ux%u f%d into 0x%llx %ux%u f%d made where asked (%s%s%s) (flip %llu)",
+            host_log("copy elision: a copy of 0x%llx %ux%u f%d into 0x%llx %ux%u f%d made where asked (%s) (flip %llu)",
                      static_cast<unsigned long long>(src.base), src.width, src.height, static_cast<int>(src.format),
                      static_cast<unsigned long long>(dst.base), dst.width, dst.height, static_cast<int>(dst.format), kErNames[why],
-                     slot < 0 ? "" : g_pass.targets[slot] == src.base ? ": the source is attachment " : ": the destination is attachment ",
-                     slot < 0 ? "" : std::to_string(slot).c_str(), static_cast<unsigned long long>(hle_video_flip_count()));
+                     static_cast<unsigned long long>(hle_video_flip_count()));
         }
         return false;
+    }
+    // Either an attachment of the open pass (mostly the source, drawn up to the token): the pass ends here, where the
+    // copy made now would end it (record_target_copy_raw_locked ends any open pass). A later draw into either begins a
+    // new pass whose target lookup - in order: a copy token ends a run (list_split_of) - ends the pending copy first,
+    // and a sampled read of the destination, bound to the source's image, is no feedback loop once the pass that drew
+    // the source has ended.
+    for (int t = 0; g_pass.active && t < g_pass.ntargets; ++t) {
+        if (g_pass.targets[t] == src.base || g_pass.targets[t] == dst.base) {
+            begin_recording_locked();
+            render_end_pass_locked();
+            ++g_ce_pass_ended;
+            break;
+        }
     }
     if (copy_census::on()) census_target_copy_locked(src, dst, width, height);
     // What the copy does before it writes: the clears owed to either image made.
@@ -13655,16 +13660,17 @@ std::string copy_elide_report_locked() {
     for (int r = 0; r < kErRefusals; ++r) {
         if (g_ce_refused[r]) refused += (refused.empty() ? "" : ", ") + std::string(kErNames[r]) + " " + std::to_string(g_ce_refused[r]);
     }
-    char buf[640];
+    char buf[1000];
     std::snprintf(buf, sizeof(buf),
                   "copy elision%s: %llu copies left unmade (%zu pending), %llu exchanged images, ends [%s]; %llu bindings of a destination bound "
-                  "its source; made later %.1f MiB, never made %.1f MiB; made where asked [%s]; swaps refused %llu, lost %llu%s",
+                  "its source; made later %.1f MiB, never made %.1f MiB; made where asked [%s]; swaps refused %llu, lost %llu; open passes "
+                  "ended at a copy left unmade %llu%s",
                   g_copy_elide == 2 ? " (compare)" : "", static_cast<unsigned long long>(g_ce_deferred), g_elide.size(),
                   static_cast<unsigned long long>(g_ce_swapped), ends.empty() ? "none" : ends.c_str(),
                   static_cast<unsigned long long>(g_ce_redirects), static_cast<double>(g_ce_made_bytes) / (1 << 20),
                   static_cast<double>(g_ce_saved_bytes) / (1 << 20), refused.empty() ? "none" : refused.c_str(),
                   static_cast<unsigned long long>(g_ce_swap_refused), static_cast<unsigned long long>(g_ce_lost),
-                  g_copy_elide == 2 ? ("; " + copy_compare_report_locked()).c_str() : "");
+                  static_cast<unsigned long long>(g_ce_pass_ended), g_copy_elide == 2 ? ("; " + copy_compare_report_locked()).c_str() : "");
     return buf;
 }
 
