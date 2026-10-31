@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -220,6 +221,9 @@ struct M2 {
     // shadPS4's StopMatching2 leaves such a transport up (online id ->
     // room, member).
     std::map<std::string, std::pair<std::uint64_t, std::uint16_t>> dead_on_close;
+    // Members of the current room whose DEAD already went out (the game
+    // closed its NpSignaling connection to them): not again at LeaveRoom.
+    std::set<std::uint16_t> dead_members;
 };
 M2 g;
 
@@ -425,6 +429,7 @@ void forget_room_locked() {
     g.room_id = 0;
     g.owner_id = 0;
     g.max_slot = 0;
+    g.dead_members.clear();
     net::peers_clear();
     net::room_clear();
     // NpSignaling's connections are the game's: it closes them itself
@@ -451,6 +456,7 @@ void end_session_locked(const char* why) {
     }
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) {
+        if (g.dead_members.count(p.member_id)) continue;
         if (hle_np_signaling_live(p.online_id)) g.dead_on_close[p.online_id] = {g.room_id, p.member_id};
         else ids.push_back(p.member_id);
     }
@@ -1180,16 +1186,30 @@ void hle_register_np_matching2() {
 }
 
 void hle_np_matching2_peer_closed(const std::string& online_id) {
+    // The game closed its NpSignaling connection to this player. As shadPS4
+    // does (CloseConnectionAndDispatchDead -> QueueMatching2DeadForTransport:
+    // one transport per player), the player's Matching2 signaling is gone
+    // too: DEAD for it, ahead of NpSignaling's own on the same queue - in the
+    // room we are in, or the one LeaveRoom kept it for.
     std::uint64_t room = 0;
     std::uint16_t member = 0;
     {
         std::lock_guard<std::mutex> lk(g.mu);
         auto it = g.dead_on_close.find(online_id);
-        if (it == g.dead_on_close.end()) return;
-        room = it->second.first;
-        member = it->second.second;
-        g.dead_on_close.erase(it);
+        if (it != g.dead_on_close.end()) {
+            room = it->second.first;
+            member = it->second.second;
+            g.dead_on_close.erase(it);
+        } else if (g.in_room) {
+            for (const net::Peer& p : room_peers()) {
+                if (p.online_id != online_id || g.dead_members.count(p.member_id)) continue;
+                g.dead_members.insert(p.member_id);
+                room = g.room_id;
+                member = p.member_id;
+                break;
+            }
+        }
     }
-    // Ahead of NpSignaling's own DEAD on the same queue.
+    if (!member) return;
     net::dispatch_after(0, net::Prio::Signaling, [room, member] { fire_signaling(member, kEvSignalingDead, kErrTerminatedByMyself, room); });
 }
