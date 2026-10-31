@@ -7946,6 +7946,9 @@ void note_oob_compute_slot(std::uint32_t slot, const std::string& name) {
     g_oob_names[slot].insert("CS " + name);
 }
 }  // namespace gpu
+
+// BBHOST_RUN_COMMIT=compare's totals (defined with the run commit, below).
+static void run_compare_log();
 namespace {
 void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
 }  // namespace
@@ -12236,6 +12239,7 @@ void cross_vendor_report() {
 
 void render_report() {
     cross_vendor_report();
+    if (list_resolve::commit_compare()) ::run_compare_log();
     host_log("%s", gx_state_report().c_str());
     cb_proof::report();
     if (const std::string b = bindless_report(); !b.empty()) host_log("render: %s", b.c_str());
@@ -13917,6 +13921,33 @@ const bool g_cb_prefetch = [] {
 // `records`, when given: the most records a V# read by index holds (a
 // geometry-shader draw's emitter's room for particles). `bases`, when given:
 // each buffer's V# base (0 for one not resolved), meta.buffers.size() of them.
+namespace {
+// BBHOST_RUN_COMMIT=compare: the constant buffers each stage of this thread's
+// draw bound through the whole snapshot ring (resolve_stage_buffers). Such a
+// binding's cb_bias_dw is its copy's offset in the ring, which a run part and
+// the commit in order place apart, so the params' digest (run_digest_params)
+// takes the guest range the copy was made from in its place - while the bias
+// points at that copy - rather than the offset.
+struct RingCbNote {
+    std::uint32_t slots = 0;                      // bit n: buffers[n] bound through the whole ring
+    std::uint32_t at_dw[16] = {};                 // its copy's offset in the ring, in dwords
+    std::uint64_t base[16] = {}, bytes[16] = {};  // the guest range the copy was made from
+};
+thread_local constinit RingCbNote t_ring_cb[2] = {};  // per stage, reset with t_run_digest at the draw's start
+thread_local constinit int t_ring_cb_stage = -1;      // the stage draw_impl resolves, -1 outside
+void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, std::uint64_t bytes) {
+    if (t_ring_cb_stage < 0 || slot >= 16) return;
+    RingCbNote& n = t_ring_cb[t_ring_cb_stage];
+    n.slots |= 1u << slot;
+    n.at_dw[slot] = static_cast<std::uint32_t>(at / 4);
+    // A table GX built in its ring (placed apart by a part and in order): by its bytes, as the constant buffers' digest
+    // takes it (resolve_stage_buffers).
+    const bool in_ring = g_gx_ring.base && base >= g_gx_ring.base && base + bytes <= g_gx_ring.base + g_gx_ring.size;
+    n.base[slot] = in_ring ? fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes) : base;
+    n.bytes[slot] = bytes;
+}
+}  // namespace
+
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
                            std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
                            std::uint32_t* records = nullptr, std::uint64_t* bases = nullptr) {
@@ -14284,6 +14315,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         info = whole_ring ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, memo->at, bytes};
                         params.cb_valid |= 1u << i;
                         params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
+                        if (whole_ring && list_resolve::commit_compare()) run_digest_ring_cb(i, memo->at, base, bytes);
                         outcome = kBound;
                         if (!whole_ring) note_copy_binding_locked(info, base);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
@@ -14377,6 +14409,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
+                    if (whole && list_resolve::commit_compare()) run_digest_ring_cb(i, at, base, bytes);
                     outcome = kBound;
                     // The guest bytes, unless a copy-back's copy laid over them
                     // (never a snapshot's: its range has no copy version, as
@@ -19303,7 +19336,7 @@ void run_digest_call(const DrawCall& call) {
     d.instances = call.instances;
     d.vertex_offset = call.vertex_offset;
 }
-std::uint64_t run_digest_params(const gcn::StageParams& p) {
+std::uint64_t run_digest_params(const gcn::StageParams& p, int stage) {
     gcn::StageParams q = p;
     const std::uint64_t lo = g_gx_ring.base, hi = g_gx_ring.base + g_gx_ring.size;
     for (int k = 0; k + 1 < 16; k += 2) {
@@ -19313,7 +19346,19 @@ std::uint64_t run_digest_params(const gcn::StageParams& p) {
         const std::uint64_t a8 = q.user_sgpr[k] | (static_cast<std::uint64_t>(q.user_sgpr[k + 1] & 0xff) << 32);
         if (lo && ((a16 >= lo && a16 < hi) || (a8 >= lo && a8 < hi))) q.user_sgpr[k] = q.user_sgpr[k + 1] = 0;
     }
-    return fnv1a(&q, sizeof(q));
+    // A constant buffer bound through the whole snapshot ring: the guest range
+    // its copy was made from in place of its bias (the copy's place in the
+    // ring) - or, should the bias point anywhere but at that copy, a value no
+    // copy has.
+    std::uint64_t h = 1469598103934665603ull;
+    const RingCbNote& n = t_ring_cb[stage & 1];
+    for (std::uint32_t left = n.slots; left; left &= left - 1) {
+        const int k = __builtin_ctz(left);
+        const std::uint64_t what[2] = {q.cb_bias_dw[k] == n.at_dw[k] ? n.base[k] : ~0ull, n.bytes[k]};
+        h = fnv1a(what, sizeof(what), h);
+        q.cb_bias_dw[k] = 0;
+    }
+    return fnv1a(&q, sizeof(q), h);
 }
 
 // BBHOST_RUN_COMMIT: a run part's draw against the owed view clears, read
@@ -19669,7 +19714,10 @@ static bool draw_impl(const GpuDraw& d) {
     timer.next(kPhaseDraw);
     RecordedState& rs = part ? t_part_recorded : g_recorded;  // what the recording has bound
     const bool digest = list_resolve::commit_compare();  // BBHOST_RUN_COMMIT=compare: what it resolved (RunDigest)
-    if (digest) t_run_digest = RunDigest{};
+    if (digest) {
+        t_run_digest = RunDigest{};
+        t_ring_cb[0] = t_ring_cb[1] = RingCbNote{};
+    }
     // BBHOST_RUN_BATCH: how many times the GPU mutex has been taken, this take
     // included - the draw before in the run took it last when this is one more
     // (run_targets) - and, switched on (not compare), this draw's number for the
@@ -21195,8 +21243,10 @@ static bool draw_impl(const GpuDraw& d) {
         }
         std::uint64_t gate_bases[16] = {};
         const bool gate = st == 0 && pl.gs_as_vs && pl.gs_gate.vertices && meta.buffers.size() <= 16;
+        if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate ? gate_bases : nullptr);
+        if (digest) t_ring_cb_stage = -1;
         if (gate) particle_vertices = particle_gate_vertices_locked(pl, meta, gate_bases);
         if (!meta.buffers.empty()) {
             any_buffers = true;
@@ -22568,7 +22618,7 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         for (int st = 0; st < 2; ++st) {
-            dg.params[st] = run_digest_params(stage_params[st]);
+            dg.params[st] = run_digest_params(stage_params[st], st);
             std::memcpy(dg.user[st], stage_params[st].user_sgpr, sizeof(dg.user[st]));
         }
     }
@@ -23147,14 +23197,7 @@ void run_report() {
         if (const std::uint64_t v = g_run_refused[k].load(std::memory_order_relaxed))
             refused += std::string(refused.empty() ? "" : ", ") + kRunRefusalName[k] + " " + std::to_string(v);
     }
-    if (list_resolve::commit_compare()) {
-        std::string fields;
-        for (int f = 0; f < kCmpFields; ++f) {
-            fields += std::string(f ? ", " : "") + kRunFieldName[f] + " " + std::to_string(g_run_field_diff[f].load());
-        }
-        host_log("render: run commit compare: %llu draws committed in parts compared with their commits in order, %llu differed (%s)",
-                 static_cast<unsigned long long>(g_run_compared.load()), static_cast<unsigned long long>(g_run_differed.load()), fields.c_str());
-    }
+    if (list_resolve::commit_compare()) ::run_compare_log();
     host_log("render: run commit: fallback variants bound in parts: no buffers %llu, not all bound %llu, no variant yet %llu, failed or "
              "not fitting %llu",
              static_cast<unsigned long long>(g_run_fallback[0].load()), static_cast<unsigned long long>(g_run_fallback[1].load()),
@@ -23173,6 +23216,17 @@ void run_report() {
 }
 
 }  // namespace
+
+// BBHOST_RUN_COMMIT=compare's totals: every 1,000 flips with tooling (run_report), and at the exit (render_report) - a
+// slow device's run (lavapipe) never reaches the 1,000th flip.
+static void run_compare_log() {
+    std::string fields;
+    for (int f = 0; f < kCmpFields; ++f) {
+        fields += std::string(f ? ", " : "") + kRunFieldName[f] + " " + std::to_string(g_run_field_diff[f].load());
+    }
+    host_log("render: run commit compare: %llu draws committed in parts compared with their commits in order, %llu differed (%s)",
+             static_cast<unsigned long long>(g_run_compared.load()), static_cast<unsigned long long>(g_run_differed.load()), fields.c_str());
+}
 
 int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uint32_t n, std::uint32_t& failed) {
     failed = 0;
