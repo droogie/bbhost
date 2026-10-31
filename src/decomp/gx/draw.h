@@ -50,10 +50,22 @@ extern bool g_yebis_dispatch_hooked;
 // (note_writer_caller, as it is added to the decomp list), and a return
 // address inside the section is read as that game address. Any other address
 // is itself. A guest address either way.
-#ifdef _WIN32
-#define DECOMP_GX_WRITER_CALLER __attribute__((section("bbgxm$m")))
+//
+// Never inlined, and (GCC) never cloned: a copy in a caller outside the
+// section would make the writer call from there, and the trace would take
+// that host address for the caller. A section does not stop either compiler
+// from inlining - clang put two of YEBIS's wrappers into the kit test's
+// dispatcher, and GCC inlines a small enough one. The game reaches ours only
+// through the jump at its entry; direct calls are the kit tests'.
+#ifdef __clang__
+#define DECOMP_GX_WRITER_CALLER_KEEP noinline
 #else
-#define DECOMP_GX_WRITER_CALLER __attribute__((section("bbhost_gx_methods")))
+#define DECOMP_GX_WRITER_CALLER_KEEP noinline, noclone
+#endif
+#ifdef _WIN32
+#define DECOMP_GX_WRITER_CALLER __attribute__((section("bbgxm$m"), DECOMP_GX_WRITER_CALLER_KEEP))
+#else
+#define DECOMP_GX_WRITER_CALLER __attribute__((section("bbhost_gx_methods"), DECOMP_GX_WRITER_CALLER_KEEP))
 #endif
 void note_writer_caller(const void* ours, std::uint64_t game_return_bn);
 extern std::uint64_t g_method_code_lo, g_method_code_hi;
