@@ -41,6 +41,7 @@ void decomp_sfx_node_update_add();     // sfx/node_update.cpp: the effects' node
 void decomp_sfx_node_emit_add();       // sfx/node_emit.cpp: the effects' node emission
 void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMutex::Lock
 void decomp_ez_work_add();             // sync/ez_work.cpp: CSEzWork::ProcessOne - the work pools' job pop, and their node caches
+void decomp_physics_ragdoll_drive_add();  // physics/ragdoll_drive.cpp: the ragdoll keyframe controller's drive, by the frame clock's step
 
 void decomp_add_areas() {
     decomp_flag_store_add();
@@ -80,4 +81,5 @@ void decomp_add_areas() {
     decomp_sfx_node_emit_add();
     decomp_adaptive_mutex_add();
     decomp_ez_work_add();
+    decomp_physics_ragdoll_drive_add();
 }

@@ -19,6 +19,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/graphics_patch.h"
+#include "engine/frame_rate.h"
 #include "engine/mouse_camera.h"
 #include "engine/frame_pool.h"
 #include "engine/yebis.h"
@@ -428,6 +429,10 @@ void hle_patch_guest(ElfImage* image) {
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
     decomp_add_areas();
     decomp_install(image);
+    // After the list: with the frame clock on, the frame rate's values a decomp
+    // converts every frame keep the game's only where that decomp is in place
+    // (engine/frame_rate.h).
+    frame_rate_install_late(image);
     // After the list: GX's CreateBuffer tells the registry itself when it is
     // ours, else it is hooked (engine/gx_resources.h).
     gx_resources_install_late(image);

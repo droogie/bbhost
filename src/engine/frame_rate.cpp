@@ -6,6 +6,7 @@
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
 #include "engine/wind_pace.h"
+#include "decomp/decomp.h"
 #include "decomp/sfx/step_gate.h"
 #include "decomp/sfx/node_emit.h"
 #include "decomp/gx/water_gate.h"
@@ -312,16 +313,20 @@ static_assert(rated_in_constants(), "every rated value is one of kConstants (its
 
 // With the frame clock on (BBHOST_FRAME_CLOCK=1, engine/frame_clock.h): the
 // values above that the tables write once, for the rate chosen at start, that
-// keep the game's value instead - the game's is right at every frame length.
-// kConstants leaves them as the game has them. Each has a switch of its own
-// (=0) that writes the start-time value, as with the clock off.
+// keep the game's value instead - the game's is right at every frame length,
+// or what reads it converts it every frame from the clock. kConstants leaves
+// them as the game has them. Each has a switch of its own (=0) that writes the
+// start-time value, as with the clock off, and so does a decomp that is not in
+// place (frame_rate_install_late).
 enum class Handover : std::uint8_t {
-    Game,  // the game's value is right at every rate
+    Game,    // the game's value is right at every rate
+    Decomp,  // its reader is a decomp of ours that converts it every frame
 };
 struct HandedOver {
     std::uint32_t at;
     Handover how;
-    const char* env;  // =0: the start-time value, as with the clock off
+    const char* env;               // =0: the start-time value, as with the clock off
+    const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
 };
 constexpr HandedOver kHandedOver[] = {
     // A physics world's expected shortest step (sub_a3fad0's cinfo, +0x70,
@@ -336,6 +341,10 @@ constexpr HandedOver kHandedOver[] = {
     // step again from its own input's dt (sub_f597d0 at 0xf59cc0), which the
     // physics world's frame-time site makes the frame's.
     {0x0f383ca, Handover::Game, "BBHOST_PHYSICS_HINTS"},
+    // The ragdoll keyframe controller's step (the constructor's 1/30 at
+    // 0x1c0ca97): its drive's decomp hands the keyframe step the frame clock's
+    // step for it, every frame (decomp/physics/ragdoll_drive.cpp).
+    {0x1c0ca9a, Handover::Decomp, "BBHOST_RAGDOLL_STEP", "sub_ae4600"},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
@@ -845,6 +854,9 @@ struct DtSlot {
 };
 std::vector<DtSlot> g_dt_slots;
 std::size_t g_dt_loads_applied = 0;
+// The values handed back to a decomp (kHandedOver), with the start-time value
+// each takes if that decomp is not placed (frame_rate_install_late).
+std::vector<std::pair<const HandedOver*, std::uint32_t>> g_late;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1703,11 +1715,13 @@ int apply_rate(ElfImage* image, int want) {
     const int fps = mode;
     // With the frame clock on, the values handed back (kHandedOver) keep the
     // game's, each unless its own switch is 0; with the start-time value each
-    // would have had beside it, for the log.
+    // would have had beside it, for the log and for a mechanism not in place.
+    // A decomp's needs our SprjFlipper::Update, which publishes the clock.
     const auto handed_back = [&](const HandedOver& h) {
         if (!frame_clock::on()) return false;
         const char* e = std::getenv(h.env);
-        return !(e && e[0] == '0');
+        if (e && e[0] == '0') return false;
+        return h.how != Handover::Decomp || g_source == Source::Ours;
     };
     std::vector<std::pair<const HandedOver*, std::uint32_t>> kept;
     // A rated constant's rule gives the table's own value at 60.
@@ -1950,10 +1964,17 @@ int apply_rate(ElfImage* image, int want) {
             }
         }
     }
-    // The values handed back (kHandedOver), and what keeps each.
+    // The values handed back (kHandedOver), and what keeps each. A decomp's
+    // takes its start-time value after all if the decomp is not placed
+    // (frame_rate_install_late, once the decomp list is).
     for (const auto& [h, now] : kept) {
-        host_log("frame rate: 0x%x keeps the game's value (%g), right at every rate (%s=0: the rate's, %g)", h->at,
-                 static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), h->env, static_cast<double>(bits_float(now)));
+        const char* how = "right at every rate";
+        if (h->how == Handover::Decomp) {
+            g_late.push_back({h, now});
+            how = "converted every frame by its decomp";
+        }
+        host_log("frame rate: 0x%x keeps the game's value (%g), %s (%s=0: the rate's, %g)", h->at,
+                 static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), how, h->env, static_cast<double>(bits_float(now)));
     }
     // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
     // and his stores with the sites) or, with Original, the game's 30 fps
@@ -2152,6 +2173,22 @@ void frame_rate_install(ElfImage* image) {
              g_frame_time_applied, g_cloth_applied, g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
     if (got != want)
         host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
+}
+
+void frame_rate_install_late(ElfImage* image) {
+    constexpr std::uint32_t kCodeEnd = 0x54d96dc;  // the 1.09 image's executable segment's end (apply_rate)
+    for (const auto& [h, now] : g_late) {
+        if (decomp_placed(h->decomp) != 0) continue;  // ours (or its compare stand-in) converts it every frame
+        const std::uint64_t at = image->mem.slide + (h->at - kPreferredGuestSlide), lo = at & ~0xfffull,
+                            hi = (at + 4 + 0xfff) & ~0xfffull;
+        guest_protect_rwx(&image->mem, lo, hi - lo);
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), &now, 4);
+        if (h->at < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
+        else guest_protect_rw(&image->mem, lo, hi - lo);
+        host_log("frame rate: %s is not in place; 0x%x takes the rate's value at start (%g), as with the frame clock off",
+                 h->decomp, h->at, static_cast<double>(bits_float(now)));
+    }
+    g_late.clear();
 }
 
 void frame_rate_atk_params_loaded() {

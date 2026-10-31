@@ -465,6 +465,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/sfx/node_emit.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
+  src/decomp/physics/ragdoll_drive.cpp
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -795,6 +796,7 @@ if(UNIX)
   bbhost_decomp_test(gnmx_cue)
   bbhost_decomp_test(gnmx_cue_ccb SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_clear SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(physics_ragdoll_drive SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
   add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
   target_include_directories(host_lists_test PRIVATE src include)

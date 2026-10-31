@@ -55,6 +55,11 @@ struct ElfImage;
 
 void frame_rate_install(ElfImage* image);
 
+// After the decomp list is placed (hle/runtime.cpp): with the frame clock on, a
+// value handed back to a decomp that is not in place takes the rate's value at
+// start after all (frame_rate.cpp, kHandedOver).
+void frame_rate_install_late(ElfImage* image);
+
 // The pace the game was started at: 30, or the rate it was converted to (one
 // of the option's, or Uncapped's refresh rate).
 int frame_rate_game_fps();
