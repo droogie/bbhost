@@ -480,17 +480,28 @@ GUEST_ABI int hle_np_presence_status(int, int* st) {
     }
     return 0;
 }
+// As shadPS4's (np_common.cpp): the name up to its terminator, then opt and
+// reserved; anything after the name's terminator is not compared. A plain
+// memcmp of the whole 36 bytes called the same player two different ones
+// whenever two copies differed past the name, and the game then kept a
+// second record and connection for that player.
+constexpr int kNpUtilErrorNotMatch = static_cast<int>(0x80550609);
 GUEST_ABI int hle_np_cmp_online(const void* a, const void* b) {
     if (!a || !b) {
         return static_cast<int>(0x80550003);
     }
-    return std::memcmp(a, b, 16);
+    return std::strncmp(static_cast<const char*>(a), static_cast<const char*>(b), 16) != 0 ? kNpUtilErrorNotMatch : 0;
 }
 GUEST_ABI int hle_np_cmp_npid(const void* a, const void* b) {
     if (!a || !b) {
         return static_cast<int>(0x80550003);
     }
-    return std::memcmp(a, b, 36);
+    const auto* x = static_cast<const std::uint8_t*>(a);
+    const auto* y = static_cast<const std::uint8_t*>(b);
+    if (std::strncmp(reinterpret_cast<const char*>(x), reinterpret_cast<const char*>(y), 16) != 0) return kNpUtilErrorNotMatch;
+    if (std::memcmp(x + 20, y + 20, 8) != 0) return kNpUtilErrorNotMatch;   // opt
+    if (std::memcmp(x + 28, y + 28, 8) != 0) return kNpUtilErrorNotMatch;   // reserved
+    return 0;
 }
 GUEST_ABI int hle_np_unreg_state(void*) {
     g_np_state_cb = nullptr;
