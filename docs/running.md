@@ -524,6 +524,23 @@ runs slower than real time in the few places that count frames.
 The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
+
+`BBHOST_FRAME_CLOCK=1` (a test switch, off by default while it is proven)
+converts each frame, from that frame's own length, the few values the frame
+rate otherwise sets once for the rate chosen at start, so a rate the machine
+cannot hold, a variable refresh rate or a dip keeps them right too:
+- a ragdoll's bodies follow its animation by each frame's step
+  (`BBHOST_RAGDOLL_STEP=0` for the rate's step);
+- YEBIS's eye adaptation and afterimage follow each frame's length
+  (`BBHOST_YEBIS_STEP=0`);
+- its lens simulation takes each frame's rate, above 60 too
+  (`BBHOST_LENS_BLUR_RATE=0` keeps 60's);
+- the physics worlds' two step hints keep the game's 1/30
+  (`BBHOST_PHYSICS_HINTS=0` for the rate's).
+
+With it on, the values that follow the frame's seconds also take the game's
+step itself, a loading screen's included.
+
 `BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
 Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
 the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
