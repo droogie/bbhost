@@ -73,12 +73,15 @@ bool hs_constant_factors(const gcn::Program& p, float out[6]);
 }  // namespace
 
 namespace gpu {
-// BBHOST_COPY_ELIDE_MUTANT=1 (a check of BBHOST_COPY_ELIDE=compare, never for play):
-// a draw's attachments are left out of the copy ledger, so a source drawn into while
-// its copy is pending is not made first - compare mode must find the differences.
-const bool g_elide_mutant = [] {
+// BBHOST_COPY_ELIDE_MUTANT (checks of BBHOST_COPY_ELIDE=compare, never for play): =1 a
+// draw's attachments are left out of the copy ledger, so a source drawn into while its
+// copy is pending is not made first - compare mode must find the differences; =2 a draw
+// proven to write all of its target (copy_elide_decide_locked) is drawn with its scissor
+// a row short, =3 with its first triangle only - its coverage canary must find the texels
+// left.
+const int g_elide_mutant = [] {
     const char* e = std::getenv("BBHOST_COPY_ELIDE_MUTANT");
-    return e && e[0] == '1';
+    return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0;
 }();
 // BBHOST_RT_DCC (on unless 0): colour targets made with their view formats listed (rt_image).
 bool rt_dcc_listed() {
@@ -2020,7 +2023,17 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     // source's old image is the one the copy reads.
     if (copy_elide_live()) {
         if (t_elide_lookup) {
-            if (!g_elide_mutant) copy_elide_touch_locked(base, copy_elide::kWrite);
+            // An attachment of an in-order draw: noted for its decision (copy_elide_bound_locked) while the lookup keeps
+            // the target; one it replaces (another shape) or makes over a snapshot has the copy made first, as below.
+            if (g_elide_mutant != 1) {
+                const auto it = g_rts.find(base);
+                const RtImage* r = it != g_rts.end() ? &it->second : nullptr;
+                if (r && r->format == format && r->width == width && r->height == height && r->layers >= layers && r->depth == depth) {
+                    copy_elide_bound_locked(base);
+                } else {
+                    copy_elide_touch_locked(base, copy_elide::kWrite);
+                }
+            }
         } else if (copy_elide_hides(base) || g_elide.is_src(base)) {
             const RtImage* r = rt_at_locked(base);
             if (!r || r->format != format || r->width != width || r->height != height || r->layers < layers || r->depth != depth) {
@@ -2350,7 +2363,7 @@ bool g_target_memo_hit = false;  // whether target_image's last answer came from
 // pending clears and the write stamp. Also for a draw that takes the answers
 // of the draw before it in its run (BBHOST_RUN_BATCH, draw_impl).
 void target_hit(RtImage& rt, std::uint32_t res_gen) {
-    if (t_elide_lookup && copy_elide_live() && !g_elide_mutant) copy_elide_touch_locked(rt.base, copy_elide::kWrite);  // bound as an attachment (rt_image)
+    if (t_elide_lookup && copy_elide_live() && g_elide_mutant != 1) copy_elide_bound_locked(rt.base);  // bound as an attachment (rt_image)
     if (res_gen) ++g_draw_gen_same;
     apply_pending_clear(rt);
     rt_written(rt);
@@ -3566,6 +3579,24 @@ std::uint32_t vertex_packing_of(std::uint32_t w3, VkFormat format) {
 // Vulkan vertex input for one GX draw: the translator's elements,
 // the pipeline's bindings and attributes (attribute n is element n, at
 // location n), and each binding's buffer and offset.
+// How a vertex element's bytes reach the GPU (plan_vertex_input): copy elision's phase 2 reads a quad's positions only
+// where they are the bytes the GPU reads.
+enum VertexServed : std::uint8_t {
+    kServedUnknown,
+    kServedHandle,    // a GX buffer's device-local copy, by handle (GX on Vulkan)
+    kServedHeap,      // GX's upload heap, in place (stage 1c: the copy holds the bytes until the GPU is done)
+    kServedVersion,   // a copy version (a renamed buffer's copy)
+    kServedWindow,    // the draw's CPU-written window, copied as the draw records
+    kServedMirror,    // the buffer shadow's device-local mirror
+    kServedSnapshot,  // a snapshot of a ring the game rewrites, copied as the draw records
+    kServedStaged,    // copied into device memory for this draw
+    kServedInPlace,   // read in place from guest memory
+    kServedKinds
+};
+inline const char* vertex_served_name(int k) {
+    static const char* const names[kServedKinds] = {"unknown", "handle", "heap", "copy version", "window", "mirror", "snapshot", "staged", "in place"};
+    return k >= 0 && k < kServedKinds ? names[k] : "?";
+}
 struct VertexInputPlan {
     std::vector<gcn::VertexElement> elements;
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -3574,6 +3605,7 @@ struct VertexInputPlan {
     VkDeviceSize offset[16] = {};
     std::uint64_t va[16] = {};  // guest address of each binding's first byte (draw captures copy from there)
     std::uint64_t hash = 0;     // pipeline identity: elements, bindings and attributes
+    std::uint8_t served[16] = {};  // by element (its location): VertexServed
 };
 std::uint64_t vertex_plan_hash(const VertexInputPlan& p) {
     std::uint64_t h = fnv1a("vertex input", 12);
@@ -10682,6 +10714,33 @@ const char* read_vertex_element(const VertexInputPlan& vi, const gcn::VertexElem
     }
     return nullptr;
 }
+// Whether element e's bytes for vertices first .. first + n - 1, as read_vertex_element reads them from guest memory, are
+// the bytes the GPU reads for the draw: GX's upload heap (stage 1c holds them until the GPU is done with them); a GX
+// buffer's device-local copy by handle (GX on Vulkan keeps no dynamic buffer, made it from these bytes and retires it at
+// any write GX hears of - a Map, an update, a GPU copy - so the draw's resolve found it current; not one bound after its
+// buffer's end, plan_vertex_input); memory read in place or through a mirror that
+// the buffer shadow does not count as rewritten - the host's own reason for reading it there - with no GPU write pending
+// over it. A copy made as the draw records (a window, a snapshot, a staging copy) or a copy version: not known here
+// (read from guest memory, not from the copy).
+bool served_fixed(const VertexInputPlan& vi, const gcn::VertexElement& e, std::uint32_t first, std::uint32_t n) {
+    if (!n || e.location >= vi.attributes.size()) return false;
+    const VkVertexInputAttributeDescription& a = vi.attributes[e.location];
+    const VkVertexInputBindingDescription* b = nullptr;
+    for (const VkVertexInputBindingDescription& bd : vi.bindings) {
+        if (bd.binding == a.binding) b = &bd;
+    }
+    if (!b || a.binding >= 16 || !vi.va[a.binding]) return false;
+    const std::uint64_t va = vi.va[a.binding] + static_cast<std::uint64_t>(first) * b->stride + a.offset;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(n - 1) * b->stride + 16;
+    switch (vi.served[e.location & 15]) {
+        case kServedHeap: case kServedHandle:
+            return true;
+        case kServedInPlace: case kServedMirror:
+            return !shadow_snapshot_maybe_locked(va, bytes) && !gpu_writes_pending_locked(va, bytes);
+        default:
+            return false;
+    }
+}
 // The vertex ids of draw d's first n vertices: its indices (16- or 32-bit, from the index buffer) or 0..n-1, plus
 // VGT_INDX_OFFSET; null when they cannot be read, with why.
 const char* draw_vertex_ids(const GpuDraw& d, std::uint32_t n, std::uint32_t* ids) {
@@ -10768,6 +10827,15 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
             return in;
         }
     }
+    // Whether those are the bytes the GPU reads (served_fixed), over the vertices' span.
+    {
+        std::uint32_t lo = ~0u, hi = 0;
+        for (std::uint32_t v = 0; v < in.vertices; ++v) {
+            lo = std::min(lo, ids[v]);
+            hi = std::max(hi, ids[v]);
+        }
+        in.bytes_unknown = !in.vertices || !served_fixed(*vi, *pos, lo, hi - lo + 1);
+    }
     static std::set<std::string> shown;  // under g.mu: each quad pipeline's vertices once (the phase 2 census)
     if (shown.size() < 24 && shown.insert(name).second) {
         std::string v;
@@ -10776,8 +10844,9 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
             std::snprintf(b, sizeof(b), " (%g %g %g %g)", in.pos[i][0], in.pos[i][1], in.pos[i][2], in.pos[i][3]);
             v += b;
         }
-        host_log("copy census: %s: prim %d, %u vertices:%s; geometry %s", name.c_str(), in.prim, in.vertices, v.c_str(),
-                 full_write::fail_name(full_write::geometry(in)));
+        host_log("copy census: %s: prim %d, %u vertices:%s; geometry %s; positions %s (%s)%s", name.c_str(), in.prim, in.vertices, v.c_str(),
+                 full_write::fail_name(full_write::geometry(in)), vertex_served_name(vi->served[pos->location & 15]),
+                 in.bytes_unknown ? "not known to be the GPU's" : "the GPU's", d.index_va ? ", indexed" : "");
     }
     return in;
 }
@@ -10843,7 +10912,7 @@ std::string point_copy_detail_locked(const DrawState& s, const StageImages* stag
     }
     if (vi) {
         for (const gcn::VertexElement& e : vi->elements) {
-            std::snprintf(b, sizeof(b), "; v%u..%u:", e.vdata, e.vdata + e.count - 1);
+            std::snprintf(b, sizeof(b), "; v%u..%u (%s):", e.vdata, e.vdata + e.count - 1, vertex_served_name(vi->served[e.location & 15]));
             out += b;
             const std::uint32_t nv = std::min<std::uint32_t>(draw.index_count, 6);
             std::uint32_t ids[6];
@@ -13448,6 +13517,37 @@ std::uint64_t g_ce_deferred = 0, g_ce_refused[kErRefusals] = {}, g_ce_swapped = 
 std::uint64_t g_ce_made_bytes = 0, g_ce_saved_bytes = 0;
 std::uint64_t g_ce_pass_ended = 0;  // copies left unmade whose source or destination was an attachment of the open pass
 thread_local bool t_elide_lookup = false;  // a draw's target lookups (draw_impl): an attachment bound is a write
+// Phase 2 (BBHOST_COPY_ELIDE_DRAWS, on with elision unless 0): an in-order draw's attachments that are a pending copy's
+// source or destination, noted at its target lookup (copy_elide_bound_locked) and decided once its pipeline, vertex input
+// and images are known (copy_elide_decide_locked): proven to be written whole (host/full_write.h), the source's copy is
+// exchanged for the images (the destination's is never made); else the copy is made there, before the pass begins.
+const bool g_elide_draws = [] {
+    const char* e = std::getenv("BBHOST_COPY_ELIDE_DRAWS");
+    return g_copy_elide && !(e && e[0] == '0');
+}();
+thread_local std::uint64_t t_elide_bound[9];  // the draw's noted attachments (bases)
+thread_local int t_elide_bound_n = 0;
+thread_local std::uint64_t t_elide_redirected[8];  // sources the draw's sampled reads of a destination were bound to
+thread_local int t_elide_redirected_n = 0;
+thread_local int t_elide_mutant_draw = 0;  // BBHOST_COPY_ELIDE_MUTANT=2/3 for the draw being recorded (a proven one)
+struct ElideCanary {
+    std::uint64_t base;
+    const char* who;
+};
+thread_local ElideCanary t_elide_canary[8];  // compare: proven draws' targets whose canary is counted after the draw
+thread_local int t_elide_canary_n = 0;
+// What a proven decision did that its draw must follow: if the draw is not recorded after all (a failure or a skip on the
+// way to its draw call), a copy puts back what the copy semantics leave - the destination into the source (exchanged, or
+// the source given the canary), or the source into the destination (a copy never made).
+struct ElideUndo {
+    std::uint64_t from, to;
+};
+thread_local ElideUndo t_elide_undo[9];
+thread_local int t_elide_undo_n = 0;
+thread_local bool t_elide_drawn = false;  // the draw's call was recorded
+std::uint64_t g_ce_decided = 0, g_ce_proven_swaps = 0, g_ce_proven_drops = 0, g_ce_proven_made = 0, g_ce_again = 0, g_ce_canaries = 0,
+              g_ce_undone = 0;
+std::uint64_t g_ce_unproven[full_write::kFails] = {};
 
 
 RtImage* rt_at_locked(std::uint64_t base) {
@@ -13471,6 +13571,8 @@ RtImage* copy_elide_source_locked(const RtImage& dst) {
         return nullptr;
     }
     ++g_ce_redirects;
+    // (phase 2: a draw whose decision makes this copy resolves its images again)
+    if (t_elide_redirected_n < 8) t_elide_redirected[t_elide_redirected_n++] = src;
     return s;
 }
 
@@ -13567,6 +13669,159 @@ void copy_elide_flush_locked() {
     g_elide.flush(copy_elide_make_locked);
 }
 
+void copy_elide_bound_locked(std::uint64_t base) {
+    if (!copy_elide_live()) return;
+    if (g_elide_draws && (g_elide.is_src(base) || copy_elide_hides(base))) {
+        for (int i = 0; i < t_elide_bound_n; ++i) {
+            if (t_elide_bound[i] == base) return;
+        }
+        if (t_elide_bound_n < 9) {
+            t_elide_bound[t_elide_bound_n++] = base;
+            return;
+        }
+    }
+    copy_elide_touch_locked(base, copy_elide::kWrite);
+}
+
+// Whether a pipeline's pixel shader cannot discard and stores its colour outputs on every path (spirv_discard_branches).
+void pipeline_ps_rules(const GfxPipeline& p, bool& discard, bool& branches) {
+    bool d = false, b = false;
+    spirv_discard_branches(p.ps.meta().spirv, d, b);
+    discard = discard || d || p.clip_discard;
+    branches = branches || b;
+}
+
+// Phase 2: the attachments the draw's target lookup noted, decided now that its pipeline, vertex input and images are
+// known (draw_impl, after the images' prefetch, before the pass begins: the command processor's draws only - a run part
+// notes nothing). Proven to be written whole with what it held lost (host/full_write.h, from the state the draw is
+// recorded with), a pending copy's source is overwritten whole - the two images exchanged - and a destination's copy is
+// never made; else the copy is made here. True when a copy was made whose source a sampled read of this draw was bound
+// to: the draw's images are resolved again (they would read the image the draw writes).
+bool copy_elide_decide_locked(const DrawState& s, const GpuDraw& d, const GfxPipeline& pl, const VertexInputPlan* vi, const StageImages* stages) {
+    bool again = false;
+    const int n = t_elide_bound_n;
+    t_elide_bound_n = 0;
+    // The render area: the smallest of the draw's attachments (begin_pass).
+    std::uint32_t area_w = ~0u, area_h = ~0u;
+    for (int k = 0; k < 8; ++k) {
+        if (!s.color[k]) continue;
+        area_w = std::min(area_w, s.color[k]->width);
+        area_h = std::min(area_h, s.color[k]->height);
+    }
+    if (s.depth) {
+        area_w = std::min(area_w, s.depth->width);
+        area_h = std::min(area_h, s.depth->height);
+    }
+    // The variant without the page-table fallback is bound once built when every constant buffer binds (draw_impl's
+    // bind_pl): its pixel shader must pass too, and before it is built the draw is not decided whole.
+    const bool lean_possible = g.cb_lean && !pl.tess_native && !pl.gs_native && (!pl.vs.meta().buffers.empty() || !pl.ps.meta().buffers.empty());
+    const GfxPipeline* const lean = pl.lean_variant && !pl.lean_variant->failed ? pl.lean_variant : nullptr;
+    for (int i = 0; i < n; ++i) {
+        const std::uint64_t base = t_elide_bound[i];
+        const bool src = g_elide.is_src(base), dst = copy_elide_hides(base);
+        if (!src && !dst) continue;  // ended since the lookup
+        int t = -1;
+        for (int k = 0; k < 8 && t < 0; ++k) {
+            if (s.color[k] && s.color[k]->base == base && s.color_mask[k]) t = k;
+        }
+        int fail = full_write::kMask;  // not a colour target the draw writes
+        if (t >= 0) {
+            full_write::Input in = full_write_input(s, t, pl, d, vi, pl.name);
+            in.area_w = area_w;
+            in.area_h = area_h;
+            for (int st = 0; st < 2 && !in.feedback; ++st) {
+                for (const StageImages::Image& im : stages[st].images) {
+                    if (im.resolved && image_base(im) == base) in.feedback = true;
+                }
+            }
+            if (lean) {
+                pipeline_ps_rules(*lean, in.discard, in.branches);
+            } else if (lean_possible) {
+                in.variant_unknown = true;
+            }
+            if (d.index_va) in.bytes_unknown = true;  // its indices are bytes too, not read as the GPU reads them
+            fail = full_write::check(in);
+        }
+        ++g_ce_decided;
+        static std::set<std::pair<std::string, int>> said;  // under g.mu
+        if (said.size() < 48 && said.emplace(pl.name, fail).second) {
+            host_log("copy elision: draw %s into 0x%llx (target %d, a pending copy's %s): %s (flip %llu)", pl.name.c_str(),
+                     static_cast<unsigned long long>(base), t, src ? "source" : "destination", full_write::fail_name(fail),
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        if (fail == full_write::kNone) {
+            const std::uint64_t swaps = g_ce_swapped;
+            const std::uint64_t partner = src ? g_elide.find_src(base)->dst : g_elide.redirect(base);
+            copy_elide_touch_locked(base, copy_elide::kOverwrite);
+            bool undo_into_source = false;
+            if (!src) {
+                ++g_ce_proven_drops;
+                t_elide_undo[t_elide_undo_n++] = {partner, base};  // not drawn: the copy made after all
+            } else if (g_ce_swapped > swaps) {
+                ++g_ce_proven_swaps;
+                undo_into_source = true;  // not drawn: the source's texels back from the destination, which now holds them
+            } else {
+                ++g_ce_proven_made;  // more than one copy of the source pending, or images unlike: made
+            }
+            // compare: the image the draw writes holds the canary until the draw, which must leave none of it.
+            if (g_copy_elide == 2 && t_elide_canary_n < 8) {
+                copy_canary_fill_locked(*s.color[t]);
+                t_elide_canary[t_elide_canary_n++] = {base, pl.name.c_str()};
+                if (src) undo_into_source = true;
+            }
+            if (undo_into_source) t_elide_undo[t_elide_undo_n++] = {partner, base};
+            if (g_elide_mutant >= 2) t_elide_mutant_draw = g_elide_mutant;
+        } else {
+            ++g_ce_unproven[fail];
+            copy_elide_touch_locked(base, copy_elide::kWrite);
+            for (int r = 0; r < t_elide_redirected_n; ++r) {
+                if (t_elide_redirected[r] == base) again = true;
+            }
+        }
+    }
+    t_elide_redirected_n = 0;
+    if (again) ++g_ce_again;
+    return again;
+}
+
+// At the end of a draw that decided (draw_impl's guard): if its draw call was not recorded, what the proven decisions did
+// put back by copies (t_elide_undo), and their canaries dropped.
+void copy_elide_undo_locked() {
+    const int n = t_elide_undo_n;
+    t_elide_undo_n = 0;
+    if (t_elide_drawn || !n) return;
+    for (int i = 0; i < n; ++i) {
+        RtImage* a = rt_at_locked(t_elide_undo[i].from);
+        RtImage* b = rt_at_locked(t_elide_undo[i].to);
+        if (a && b && a->format == b->format && a->width == b->width && a->height == b->height) {
+            const copy_census::Quiet census_quiet;
+            record_target_copy_raw_locked(*a, *b, a->width, a->height);
+            ++g_ce_undone;
+            static int logs = 0;  // under g.mu
+            if (logs++ < 8) {
+                host_log("copy elision: a draw proven to write 0x%llx was not drawn: 0x%llx copied into it (flip %llu)",
+                         static_cast<unsigned long long>(b->base), static_cast<unsigned long long>(a->base),
+                         static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
+    }
+    t_elide_canary_n = 0;
+}
+
+// compare: after an in-order draw (host_gpu_draw, its packet handed over), the canaries of the targets it was proven to
+// write whole counted.
+void copy_elide_canary_after_draw() {
+    if (!t_elide_canary_n) return;
+    std::lock_guard<GpuMutex> lock(g.mu);
+    for (int i = 0; i < t_elide_canary_n; ++i) {
+        if (RtImage* r = rt_at_locked(t_elide_canary[i].base)) {
+            copy_canary_check_locked(*r, t_elide_canary[i].who);
+            ++g_ce_canaries;
+        }
+    }
+    t_elide_canary_n = 0;
+}
+
 // Why a whole copy of `src` into `dst` must be made where it is asked for (a
 // refusal), or -1.
 int copy_elide_refusal(const RtImage& src, const RtImage& dst, std::uint32_t width, std::uint32_t height) {
@@ -13660,7 +13915,18 @@ std::string copy_elide_report_locked() {
     for (int r = 0; r < kErRefusals; ++r) {
         if (g_ce_refused[r]) refused += (refused.empty() ? "" : ", ") + std::string(kErNames[r]) + " " + std::to_string(g_ce_refused[r]);
     }
-    char buf[1000];
+    std::string unproven;  // phase 2's draws not proven, by the first rule that failed
+    for (int f = 0; f < full_write::kFails; ++f) {
+        if (g_ce_unproven[f]) unproven += (unproven.empty() ? "" : ", ") + std::string(full_write::fail_name(f)) + " " + std::to_string(g_ce_unproven[f]);
+    }
+    char draws[400] = "";
+    if (g_elide_draws) {
+        std::snprintf(draws, sizeof(draws), "; draws decided %llu: proven %llu exchanged, %llu dropped, %llu made; not proven [%s]; images resolved again %llu",
+                      static_cast<unsigned long long>(g_ce_decided), static_cast<unsigned long long>(g_ce_proven_swaps),
+                      static_cast<unsigned long long>(g_ce_proven_drops), static_cast<unsigned long long>(g_ce_proven_made),
+                      unproven.empty() ? "none" : unproven.c_str(), static_cast<unsigned long long>(g_ce_again));
+    }
+    char buf[1400];
     std::snprintf(buf, sizeof(buf),
                   "copy elision%s: %llu copies left unmade (%zu pending), %llu exchanged images, ends [%s]; %llu bindings of a destination bound "
                   "its source; made later %.1f MiB, never made %.1f MiB; made where asked [%s]; swaps refused %llu, lost %llu; open passes "
@@ -13670,8 +13936,8 @@ std::string copy_elide_report_locked() {
                   static_cast<unsigned long long>(g_ce_redirects), static_cast<double>(g_ce_made_bytes) / (1 << 20),
                   static_cast<double>(g_ce_saved_bytes) / (1 << 20), refused.empty() ? "none" : refused.c_str(),
                   static_cast<unsigned long long>(g_ce_swap_refused), static_cast<unsigned long long>(g_ce_lost),
-                  static_cast<unsigned long long>(g_ce_pass_ended), g_copy_elide == 2 ? ("; " + copy_compare_report_locked()).c_str() : "");
-    return buf;
+                  static_cast<unsigned long long>(g_ce_pass_ended), draws);
+    return g_copy_elide == 2 ? std::string(buf) + "; " + copy_compare_report_locked() : std::string(buf);
 }
 
 // The bytes of one texel of a T#'s data format (IMG_DATA_FORMAT), 0 for the
@@ -14525,7 +14791,18 @@ std::string host_gpu_target_copy_report() {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (g.ok && copy_census::on()) copy_census::report_locked();
     if (!g.ok) return std::string();
-    if (const std::string e = copy_elide_report_locked(); !e.empty()) host_log("  %s", e.c_str());
+    if (const std::string e = copy_elide_report_locked(); !e.empty()) {
+        // A log line ends at 1 KiB: the report on as many as it takes, cut after a "; ".
+        for (std::size_t at = 0; at < e.size();) {
+            std::size_t n = std::min<std::size_t>(e.size() - at, 960);
+            if (at + n < e.size()) {
+                const std::size_t cut = e.rfind("; ", at + n);
+                if (cut != std::string::npos && cut > at) n = cut + 2 - at;
+            }
+            host_log("  %s%s", at ? "copy elision (more): " : "", e.substr(at, n).c_str());
+            at += n;
+        }
+    }
     return render_target_copy_report();
 }
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) { render_pipeline_time_us(out); }
@@ -15971,6 +16248,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint32_t* w;
         Located whole;
         bool snapped = false;  // whole is the record's snapshot (shadow_snapshot_locked)
+        std::uint8_t served = kServedUnknown;  // how its bytes reach the GPU (VertexServed)
     } shadows[16];
     std::size_t n_shadows = 0;
     // The mirrors' answer for each record this draw asked them about
@@ -16044,6 +16322,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 ve.count = fe.count;
                 ve.w3 = w[3];
                 p.elements.push_back(ve);
+                // (bound after its buffer's end, the copy holds what the draw recorded and guest memory may be another's)
+                p.served[e] = ended_el[e] ? kServedUnknown : kServedHandle;
                 placed[e] = {gxvk_plan_buffer(va), va, stride, fmt, va};
                 continue;
             }
@@ -16214,15 +16494,19 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 // The heap's import, from the record's start, as far as it holds.
                 ns.whole = {loc.buffer, loc.offset - fe.offset, std::min<std::uint64_t>(record_bytes, loc.avail + fe.offset)};
                 in_place = true;
+                ns.served = kServedHeap;
             } else if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
                 shadow_served = vb_race_wide_on();  // =3: counted as the mirrors' too
+                ns.served = kServedMirror;
             } else if (snapped) {
                 ns.whole = snap;  // the snapshot already (window imports)
                 ns.snapped = true;
                 bump(g_vertex_snapshot_records);
+                ns.served = kServedSnapshot;
             } else if (windowed) {
                 bump(g_vertex_window_records);
+                ns.served = kServedWindow;
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 // Placed in place when this draw asked the mirrors about the
@@ -16268,6 +16552,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     }
                 }
                 shadow_served = ns.whole.buffer != loc.buffer;
+                ns.served = shadow_served ? kServedMirror : kServedInPlace;
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
                     // A ring the game rewrites: the bytes as the draw records
                     // (shadow_snapshot_locked); otherwise staged as the GPU
@@ -16275,6 +16560,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     if (version == kCopyVersionNone && shadow_snapshot_maybe_locked(record_va, record_bytes) &&
                         shadow_snapshot_locked(record_va, read_bytes(), ns.whole)) {
                         bump(g_vertex_snapshot_records);
+                        ns.served = kServedSnapshot;
                     } else if (vb_race_on() && read_bytes() > (1u << 20)) {
                         static int logs = 0;
                         if (logs++ < 12) {
@@ -16289,6 +16575,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         in_place = true;
                     } else if (vertex_stage_on() && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
                         bump(g_vertex_staged_records);
+                        ns.served = kServedStaged;
                     } else {
                         ns.whole = {};
                         in_place = true;
@@ -16296,6 +16583,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 }
             } else {
                 in_place = true;
+                ns.served = kServedInPlace;
             }
             // BBHOST_VB_RACE: the bytes the draw reads where the GPU reads
             // them in place - not a window's, a copy version's or a snapshot's
@@ -16333,6 +16621,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         ve.count = fe.count;
         ve.w3 = w[3];
         p.elements.push_back(ve);
+        // A copy version's bytes stand where the record shadow kept the version's location.
+        p.served[e] = version == kCopyVersionInside && rs->served == kServedInPlace ? kServedVersion : rs->served;
         placed[e] = {loc.buffer, loc.offset, stride, fmt, va};
     }
     // Every element reads address + v0 * stride, so elements in one buffer
@@ -19665,6 +19955,11 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
 }
 
 bool host_gpu_draw(const GpuDraw& d) {
+    // Copy elision's compare: the canaries of the targets the draw was proven to write whole, counted once it is
+    // recorded (its packet handed over) - before a run's parts follow it.
+    struct CanaryAfter {
+        ~CanaryAfter() { copy_elide_canary_after_draw(); }
+    } canary_after;
     const ResolveKind resolve_kind(d.gx_token ? (d.gx_token_kind ? d.gx_token_kind : "token draw") : "packet draw");
     // The windows given since the last draw are this one's (host_gpu_draw_window).
     t_draw_windows.swap(t_given_windows);
@@ -20808,6 +21103,7 @@ static bool draw_impl(const GpuDraw& d) {
     {
         const copy_census::Quiet census_quiet;  // the lookups' write stamps: census_draw_locked says what the draw writes
         t_elide_lookup = !part;  // an attachment bound ends the pending copies it is part of (BBHOST_COPY_ELIDE)
+        t_elide_bound_n = t_elide_redirected_n = t_elide_mutant_draw = 0;  // phase 2: this draw's notes (copy_elide_decide_locked)
         struct LookupEnd {
             ~LookupEnd() { t_elide_lookup = false; }
         } lookup_end;
@@ -21315,6 +21611,21 @@ static bool draw_impl(const GpuDraw& d) {
         t_resolve_site = kSiteBuffers;
     }
     if (part && run->stop >= 0) return false;  // its images stopped it (BBHOST_RUN_COMMIT)
+    // Copy elision's phase 2: the attachments its lookup noted decided now, in order (a run part notes none). A copy
+    // made whose source one of its images was bound to: the images resolved again.
+    t_elide_drawn = false;
+    struct ElideUndoGuard {
+        ~ElideUndoGuard() {
+            if (t_elide_undo_n) copy_elide_undo_locked();
+        }
+    } elide_undo_guard;
+    if (t_elide_bound_n && !part &&
+        copy_elide_decide_locked(s, d, pl, use_vertex_input ? &vertex_input : nullptr, stage_images)) {
+        t_resolve_site = kSitePrefetch;
+        prefetch_stage_images(pl.vs.meta(), s.vs_user, stage_images[0], gx_stage[0], pl.paths_match[0] ? &key_stages[0] : nullptr);
+        prefetch_stage_images(pl.ps.meta(), s.ps_user, stage_images[1], gx_stage[1], pl.paths_match[1] ? &key_stages[1] : nullptr);
+        t_resolve_site = kSiteBuffers;
+    }
     draw_stamp.to(kRenderCostPrefetch);
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
@@ -23267,6 +23578,7 @@ static bool draw_impl(const GpuDraw& d) {
         rs.viewport_set = true;
     }
     VkRect2D sc = s.scissor;
+    if (t_elide_mutant_draw == 2 && sc.extent.height > 1) --sc.extent.height;  // BBHOST_COPY_ELIDE_MUTANT=2: a proven draw a row short
     sc.extent.width = std::min<std::uint32_t>(sc.extent.width, g_pass.extent.width > static_cast<std::uint32_t>(sc.offset.x) ? g_pass.extent.width - sc.offset.x : 0);
     sc.extent.height = std::min<std::uint32_t>(sc.extent.height, g_pass.extent.height > static_cast<std::uint32_t>(sc.offset.y) ? g_pass.extent.height - sc.offset.y : 0);
     if (!sc.extent.width || !sc.extent.height) {
@@ -23465,6 +23777,7 @@ static bool draw_impl(const GpuDraw& d) {
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
         g_gs_vs_draws.fetch_add(1, std::memory_order_relaxed);
         g_gs_vs_vertices.fetch_add(static_cast<std::uint64_t>(particle_capacity) * particle_vertices, std::memory_order_relaxed);
@@ -23497,6 +23810,7 @@ static bool draw_impl(const GpuDraw& d) {
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     } else if (d.index_va) {
         DrawCall call;
@@ -23504,9 +23818,11 @@ static bool draw_impl(const GpuDraw& d) {
         call.count = d.index_count;
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
+        if (t_elide_mutant_draw == 3 && call.count == 6) call.count = 3;  // BBHOST_COPY_ELIDE_MUTANT=3: a proven draw's first triangle
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     } else {
         DrawCall call;
@@ -23514,9 +23830,11 @@ static bool draw_impl(const GpuDraw& d) {
         call.count = d.index_count;
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
+        if (t_elide_mutant_draw == 3 && (call.count == 4 || call.count == 6)) call.count = 3;  // BBHOST_COPY_ELIDE_MUTANT=3: a proven draw's first triangle
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     }
     if (!g.profile_passes) profile_end_locked();

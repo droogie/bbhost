@@ -1755,6 +1755,9 @@ inline bool copy_elide_hides(std::uint64_t base) { return base && g_elide.is_dst
 bool copy_elide_hides_tsharp(const std::uint32_t* w);       // the T#'s base or V# base is one
 RtImage* copy_elide_source_locked(const RtImage& dst);      // the pending copy's source a sampled binding of `dst` binds, or null
 void copy_elide_touch_locked(std::uint64_t base, int touch);  // before `touch` (copy_elide::Touch) reaches the target at `base`
+// An in-order draw's attachment at `base` (its target lookup): a pending copy's source or destination noted for the draw's
+// decision (render.cpp copy_elide_decide_locked) with phase 2 on, else written now.
+void copy_elide_bound_locked(std::uint64_t base);
 void copy_elide_flush_locked();                             // every pending copy made now
 std::string copy_elide_report_locked();
 RtImage* rt_at_locked(std::uint64_t base);                  // g_rts' target at `base`, else g_snapshots' snapshot, else null
@@ -1768,6 +1771,11 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b);
 // when the work has run; the counts by `why` for the report.
 void copy_compare_record_locked(RtImage& a, RtImage& b, const char* why);
 std::string copy_compare_report_locked();
+// compare: a coverage canary for a draw proven to write all of target `t` (copy_elide_decide_locked) - `t` filled with the
+// canary before the draw, and after it the texels still holding it counted on the GPU (against an image of the canary
+// alone); the counts for the report.
+void copy_canary_fill_locked(RtImage& t);
+void copy_canary_check_locked(RtImage& t, const char* who);
 // BBHOST_LAYOUT_FIXES (on unless 0; textures.cpp): a target's every layer and
 // level leaves UNDEFINED before it is used as GENERAL - a copy into a target
 // nothing has made GENERAL yet, a target carried from a texture - which

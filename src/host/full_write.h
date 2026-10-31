@@ -12,14 +12,18 @@
 //     stencil test, no depth bounds, no alpha to coverage, no rasterizer
 //     discard, no face culling, solid fill, and a pixel shader that cannot
 //     discard and writes its output on every path (straight-line code);
-//   - one layer, and the viewport and the scissor cover the target;
+//   - one layer, and the viewport, the scissor and the render area (every
+//     attachment of the draw at least the target's size) cover the target;
 //   - the geometry covers the viewport's whole square: one or two triangles
 //     (a rectangle list's one rectangle, a strip or list of two triangles that
 //     share a diagonal, or one triangle), every vertex in front of the eye and
 //     inside the depth range (or depth clamped), whose union - convex - holds
 //     the four corners of [-1, 1]^2. A pixel's centre lies strictly inside
 //     that square, so inside the union, and the rasterizer's fill rule gives
-//     each such pixel to exactly one of the triangles.
+//     each such pixel to exactly one of the triangles;
+//   - and for copy elision's decision (render.cpp copy_elide_decide_locked):
+//     those positions are the bytes the GPU reads, the draw samples none of
+//     its own targets, and the pipeline variant it may be bound with is known.
 // tests/full_write_test.cpp checks each rule and the geometry's edge cases.
 #pragma once
 
@@ -48,13 +52,18 @@ enum Fail : int {
     kPrimitive,     // not one or two triangles of the kinds above (or indexed, indirect, instanced)
     kGeometry,      // the triangles leave part of the square out
     kClip,          // a vertex behind the eye or outside the depth range
+    kArea,          // an attachment smaller than the target: the render area leaves part of it out
+    kBytes,         // the positions read are not known to be the bytes the GPU reads
+    kFeedback,      // the draw samples its own target
+    kVariant,       // a pipeline variant the draw may be bound with is not built yet (its pixel shader not known)
     kFails
 };
 inline const char* fail_name(int f) {
     static const char* const names[kFails] = {"proven", "write mask", "blending", "depth test", "stencil test", "depth bounds",
                                               "alpha to coverage", "may discard", "pixel shader branches", "rasterizer discard",
                                               "culling", "fill mode", "layers", "viewport", "scissor", "vertex shader",
-                                              "primitive", "geometry", "clipped vertex"};
+                                              "primitive", "geometry", "clipped vertex", "render area", "vertex bytes",
+                                              "samples its target", "pipeline variant"};
     return f >= 0 && f < kFails ? names[f] : "?";
 }
 
@@ -69,6 +78,10 @@ struct Input {
     float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0;  // the viewport in pixels (vp_h may be negative)
     std::int32_t sc_x = 0, sc_y = 0;
     std::uint32_t sc_w = 0, sc_h = 0;
+    std::uint32_t area_w = ~0u, area_h = ~0u;  // the render area: the smallest of the draw's attachments
+    bool bytes_unknown = false;  // the positions are not known to be the bytes the GPU reads
+    bool feedback = false;       // a texture of the draw is its target
+    bool variant_unknown = false;  // a pipeline variant it may be bound with is not built
     bool known_vs = false;  // the positions below are what the vertex shader outputs
     int prim = kPrimOther;
     bool simple = true;     // not indexed, not indirect, one instance
@@ -194,8 +207,12 @@ inline int check(const Input& in) {
     if (in.sc_x > 0 || in.sc_y > 0 || in.sc_x + static_cast<std::int64_t>(in.sc_w) < in.width || in.sc_y + static_cast<std::int64_t>(in.sc_h) < in.height) {
         return kScissor;
     }
+    if (in.area_w < in.width || in.area_h < in.height) return kArea;
+    if (in.feedback) return kFeedback;
+    if (in.variant_unknown) return kVariant;
     if (!in.known_vs) return kShader;
-    return geometry(in);
+    if (const int g = geometry(in); g != kNone) return g;
+    return in.bytes_unknown ? kBytes : kNone;
 }
 
 }  // namespace full_write

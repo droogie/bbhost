@@ -75,6 +75,19 @@ void state_rules() {
     { Input t = in; t.sc_y = 1; CHECK_EQ(full_write::check(t), full_write::kScissor); }
     { Input t = in; t.known_vs = false; CHECK_EQ(full_write::check(t), full_write::kShader); }
     { Input t = in; t.simple = false; CHECK_EQ(full_write::check(t), full_write::kPrimitive); }
+    // The render area (the smallest attachment), a texture at the target, a pipeline variant not built, bytes not known.
+    { Input t = in; t.area_w = 1919; CHECK_EQ(full_write::check(t), full_write::kArea); }
+    { Input t = in; t.area_h = 1079; CHECK_EQ(full_write::check(t), full_write::kArea); }
+    { Input t = in; t.area_w = 3840; t.area_h = 2160; CHECK_EQ(full_write::check(t), full_write::kNone); }  // larger attachments
+    { Input t = in; t.feedback = true; CHECK_EQ(full_write::check(t), full_write::kFeedback); }
+    { Input t = in; t.variant_unknown = true; CHECK_EQ(full_write::check(t), full_write::kVariant); }
+    { Input t = in; t.bytes_unknown = true; CHECK_EQ(full_write::check(t), full_write::kBytes); }
+    {
+        Input t = in;  // bytes not known and the geometry short: the geometry is said first
+        t.bytes_unknown = true;
+        verts(t, full_write::kPrimRectList, {{-1, -1}, {0.5f, -1}, {-1, 1}});
+        CHECK_EQ(full_write::check(t), full_write::kGeometry);
+    }
 }
 
 void geometry_cases() {
