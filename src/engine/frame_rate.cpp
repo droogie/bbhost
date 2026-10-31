@@ -321,6 +321,7 @@ static_assert(rated_in_constants(), "every rated value is one of kConstants (its
 enum class Handover : std::uint8_t {
     Game,    // the game's value is right at every rate
     Decomp,  // its reader is a decomp of ours that converts it every frame
+    Load,    // its one load reads a slot of ours instead (kClockLoads)
 };
 struct HandedOver {
     std::uint32_t at;
@@ -349,6 +350,12 @@ constexpr HandedOver kHandedOver[] = {
     // 0x25df516): its setter's decomp stores the game's 1/60 times the frame in
     // 30 fps frames, every frame (decomp/yebis/ppfx_setters.cpp).
     {0x25df519, Handover::Decomp, "BBHOST_YEBIS_STEP", "ppfx_sub_fb2800"},
+    // YEBIS's lens simulation (LensSimu, sub_125d370) takes a frame rate - the
+    // 30 here, in s = 30 / p[0x1c] x p[0x18] - which the 60 FPS++ list holds at
+    // 60 at every rate above 30: its one load reads the frame's 1/dt through a
+    // slot instead (kClockLoads, Rate). What reads s is not known yet: a camera
+    // turn at 144 blurs the same with 144 or 60 there (2026-10-31).
+    {0x4c9f358, Handover::Load, "BBHOST_LENS_BLUR_RATE"},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
@@ -714,6 +721,47 @@ constexpr bool dt_loads_clear_of(const Site (&sites)[N]) {
 }
 static_assert(dt_loads_clear_of(kSixtySites) && dt_loads_clear_of(kFrameTimeSites) && dt_loads_clear_of(kClothSites),
               "a redirected load is not rewritten by another table");
+
+// With the frame clock on: the loads of the values handed back to a slot
+// (kHandedOver, Load), redirected as kDtLoads' are, and only then - beside
+// the generated table, which stays as it is.
+constexpr DtLoad kClockLoads[] = {
+    // sub_125d370, YEBIS's lens simulation (LensSimu): vmovss xmm0, [30.0];
+    // vdivss xmm0, [p+0x1c]; vmulss xmm3, xmm0, [p+0x18] - s = fps / p[0x1c] x
+    // p[0x18], uploaded with 1/s at +0x100 - so the 30 is a frame rate (a Rate:
+    // 1/dt). Not the camera's motion blur, whose streak is the same with 144 or
+    // 60 there; what reads s is still to be found.
+    {0x0125d6e1, 8, 4, 0x04c9f358, Kind::Rate, 1, "c5fa10056f1ca403"},
+};
+constexpr bool clock_loads_handed_over() {
+    for (const DtLoad& d : kClockLoads) {
+        const HandedOver* h = handed_over(d.constant);
+        if (!h || h->how != Handover::Load) return false;
+    }
+    return true;
+}
+static_assert(clock_loads_handed_over(), "a clock load reads a value handed back to it (kHandedOver, Load)");
+template <std::size_t N>
+constexpr bool clock_loads_clear_of(const Site (&sites)[N]) {
+    for (const DtLoad& d : kClockLoads) {
+        for (const Site& site : sites) {
+            if (d.insn < site.at + hex_len(site.was) && site.at < d.insn + d.len) return false;
+        }
+    }
+    return true;
+}
+constexpr bool clock_loads_apart() {
+    for (const DtLoad& c : kClockLoads) {
+        for (const DtLoad& d : kDtLoads) {
+            if (c.insn < d.insn + d.len && d.insn < c.insn + c.len) return false;
+            if (c.constant == d.constant) return false;
+        }
+    }
+    return true;
+}
+static_assert(clock_loads_clear_of(kSixtySites) && clock_loads_clear_of(kFrameTimeSites) && clock_loads_clear_of(kClothSites) &&
+                  clock_loads_apart(),
+              "a clock load is not rewritten by another table, nor one of the redirected loads");
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
@@ -1755,6 +1803,8 @@ int apply_rate(ElfImage* image, int want) {
     for (const Bytes& b : kBytes) {
         if (!skipped(b.at)) write(b.at, b.now, b.n);
     }
+    // The constants whose loads the frame clock redirected (kClockLoads).
+    std::vector<std::uint32_t> redirected;
     // After the constants: two frame-time sites rewrite instructions whose
     // immediates kConstants converts (0x1bf9b74, 0x222bcd7, for a run
     // without the code rewrites).
@@ -1967,6 +2017,41 @@ int apply_rate(ElfImage* image, int want) {
                 }
             }
         }
+        // The frame clock's own loads (kClockLoads), for the values handed back
+        // to a slot: each checked as kDtLoads' are, its slot placed beside
+        // theirs and rewritten with them every frame.
+        for (const DtLoad& d : kClockLoads) {
+            if (std::none_of(kept.begin(), kept.end(), [&](const auto& k) { return k.first->at == d.constant; })) continue;
+            const std::vector<std::uint8_t> was = hex_bytes(d.bytes);
+            const auto* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va(d.insn)));
+            std::int32_t disp;
+            std::memcpy(&disp, p + d.disp, 4);
+            if (was.size() != d.len || std::memcmp(p, was.data(), was.size()) != 0 ||
+                static_cast<std::int64_t>(d.insn) + d.len + disp != static_cast<std::int64_t>(d.constant)) {
+                host_log("frame rate: 0x%x is not the load of 0x%x the frame clock expects; left as it is", d.insn, d.constant);
+                continue;
+            }
+            const std::uint64_t start = (image->tail_used + 15) & ~std::uint64_t(15);
+            const std::uint64_t slot_bn = image->tail_va + start + kPreferredGuestSlide;  // as a BN address
+            const std::int64_t nd = static_cast<std::int64_t>(slot_bn) - (static_cast<std::int64_t>(d.insn) + d.len);
+            if (start + 16 > image->tail_size || nd < INT32_MIN || nd > INT32_MAX) {
+                host_log("frame rate: no room in the image's tail for the frame clock's load of 0x%x; left as it is", d.constant);
+                continue;
+            }
+            image->tail_used = start + 16;
+            DtSlot slot{};
+            slot.va = va(static_cast<std::uint32_t>(slot_bn));
+            slot.src = va(d.constant);
+            slot.kind = d.kind;
+            slot.lanes = d.lanes;
+            for (std::uint8_t k = 0; k < slot.lanes; ++k)
+                put<float>(slot.va + 4u * k, rated_value(slot.kind, get<float>(slot.src + 4u * k), fps));
+            g_dt_slots.push_back(slot);
+            const auto d32 = static_cast<std::int32_t>(nd);
+            write(d.insn + d.disp, &d32, 4);
+            ++g_dt_loads_applied;
+            redirected.push_back(d.constant);
+        }
     }
     // The values handed back (kHandedOver), and what keeps each. A decomp's
     // takes its start-time value after all if the decomp is not placed
@@ -1976,6 +2061,15 @@ int apply_rate(ElfImage* image, int want) {
         if (h->how == Handover::Decomp) {
             g_late.push_back({h, now});
             how = "converted every frame by its decomp";
+        } else if (h->how == Handover::Load) {
+            how = "read every frame through a slot of the frame clock's";
+            if (std::find(redirected.begin(), redirected.end(), h->at) == redirected.end()) {
+                write(h->at, &now, 4);
+                host_log("frame rate: 0x%x's load is not redirected; it takes the rate's value at start (%g), as with the frame clock "
+                         "off",
+                         h->at, static_cast<double>(bits_float(now)));
+                continue;
+            }
         }
         host_log("frame rate: 0x%x keeps the game's value (%g), %s (%s=0: the rate's, %g)", h->at,
                  static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), how, h->env, static_cast<double>(bits_float(now)));
