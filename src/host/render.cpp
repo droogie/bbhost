@@ -2024,6 +2024,15 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         } else if (copy_elide_hides(base) || g_elide.is_src(base)) {
             const RtImage* r = rt_at_locked(base);
             if (!r || r->format != format || r->width != width || r->height != height || r->layers < layers || r->depth != depth) {
+                static int logs = 0;  // under g.mu
+                if (logs < 16) {
+                    ++logs;
+                    host_log("copy elision: a lookup of 0x%llx as %ux%u f%d x%u%s replaces the image of a pending copy's %s (%ux%u f%d x%u): "
+                             "the copy made first (flip %llu)",
+                             static_cast<unsigned long long>(base), width, height, static_cast<int>(format), layers, depth ? " depth" : "",
+                             g_elide.is_src(base) ? "source" : "destination", r ? r->width : 0, r ? r->height : 0, r ? static_cast<int>(r->format) : 0,
+                             r ? r->layers : 0, static_cast<unsigned long long>(hle_video_flip_count()));
+                }
                 copy_elide_touch_locked(base, copy_elide::kWrite);
             }
         }
@@ -10634,6 +10643,65 @@ void note_quad_unknown(const std::string& name, const char* why, std::uint64_t d
         host_log("copy census: %s: the quad's positions not read (%s, 0x%llx)", name.c_str(), why, static_cast<unsigned long long>(detail));
     }
 }
+// Vertex v's value of element e as the vertex input reads it (a 32-bit float attribute, one component a channel), with
+// the record's DST_SEL applied; null when it cannot be read, with why.
+const char* read_vertex_element(const VertexInputPlan& vi, const gcn::VertexElement& e, std::uint32_t v, float out[4]) {
+    if (e.location >= vi.attributes.size() || e.packed) return "element packed or past the attributes";
+    const VkVertexInputAttributeDescription& a = vi.attributes[e.location];
+    // 32-bit float components: an SFLOAT attribute, or a 32-bit integer one (the host converts in the shader) whose
+    // record says FLOAT (word 3: data format [18:15] 32/32_32/32_32_32/32_32_32_32, number format [14:12] 7).
+    std::uint32_t comps = 0;
+    switch (a.format) {
+        case VK_FORMAT_R32G32B32A32_SFLOAT: comps = 4; break;
+        case VK_FORMAT_R32G32B32_SFLOAT: comps = 3; break;
+        case VK_FORMAT_R32G32_SFLOAT: comps = 2; break;
+        case VK_FORMAT_R32_SFLOAT: comps = 1; break;
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: comps = 4; break;
+        case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: comps = 3; break;
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: comps = 2; break;
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: comps = 1; break;
+        default: return "attribute format";
+    }
+    const std::uint32_t dfmt = (e.w3 >> 15) & 0xf, nfmt = (e.w3 >> 12) & 7;
+    const std::uint32_t record_comps = dfmt == 4 ? 1 : dfmt == 11 ? 2 : dfmt == 13 ? 3 : dfmt == 14 ? 4 : 0;
+    if (nfmt != 7 || record_comps != comps) return "not 32-bit float data";
+    const VkVertexInputBindingDescription* b = nullptr;
+    for (const VkVertexInputBindingDescription& bd : vi.bindings) {
+        if (bd.binding == a.binding) b = &bd;
+    }
+    if (!b || a.binding >= 16 || !vi.va[a.binding] || b->inputRate != VK_VERTEX_INPUT_RATE_VERTEX) return "binding";
+    const std::uint64_t at = vi.va[a.binding] + static_cast<std::uint64_t>(v) * b->stride + a.offset;
+    if (!hle_kernel_va_mapped(at, comps * 4)) return "not mapped";
+    float c[4] = {0, 0, 0, 1};
+    std::memcpy(c, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), comps * 4);
+    // DST_SEL (the record's word 3) picks each of x, y, z, w: 0, 1, or a fetched component (absent ones 0, 0, 0, 1).
+    const float fetched[4] = {c[0], comps > 1 ? c[1] : 0.0f, comps > 2 ? c[2] : 0.0f, comps > 3 ? c[3] : 1.0f};
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t sel = (e.w3 >> (3 * k)) & 7;
+        out[k] = sel == 0 ? 0.0f : sel == 1 ? 1.0f : sel >= 4 ? fetched[sel - 4] : std::nanf("");
+    }
+    return nullptr;
+}
+// The vertex ids of draw d's first n vertices: its indices (16- or 32-bit, from the index buffer) or 0..n-1, plus
+// VGT_INDX_OFFSET; null when they cannot be read, with why.
+const char* draw_vertex_ids(const GpuDraw& d, std::uint32_t n, std::uint32_t* ids) {
+    const std::int64_t base = d.gx && d.gx_render ? static_cast<std::int32_t>(d.gx->base_vertex) : d.ctx ? static_cast<std::int32_t>(d.ctx[0x102]) : 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::int64_t id = i;
+        if (d.index_va) {
+            const std::uint32_t size = d.index_type ? 4 : 2;
+            const std::uint64_t at = d.index_va + static_cast<std::uint64_t>(i) * size;
+            if (!hle_kernel_va_mapped(at, size)) return "indices not mapped";
+            std::uint32_t x = 0;
+            std::memcpy(&x, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), size);
+            id = x;
+        }
+        id += base;
+        if (id < 0 || id > 0xffffffffll) return "vertex id out of range";
+        ids[i] = static_cast<std::uint32_t>(id);
+    }
+    return nullptr;
+}
 // Phase 2's question for colour target t (host/full_write.h), from the draw's state, the bound pipeline's pixel shader and,
 // for the screen-space quad, its vertices as the vertex input reads them.
 full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline& bound, const GpuDraw& d, const VertexInputPlan* vi,
@@ -10674,7 +10742,7 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
             : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? full_write::kPrimTriangleList
             : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ? full_write::kPrimTriangleStrip
                                                              : full_write::kPrimOther;
-    in.simple = !d.index_va && !d.indirect_va && d.instance_count <= 1 && d.index_count <= 6;
+    in.simple = !d.indirect_va && d.instance_count <= 1 && d.index_count <= 6;
     in.vertices = d.index_count;
     if (!in.known_vs || !in.simple) return in;
     // The element the vertex shader reads into v4..v7, its attribute and binding.
@@ -10682,41 +10750,22 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
     for (const gcn::VertexElement& e : vi->elements) {
         if (e.vdata == 4 && e.count == 4) pos = &e;
     }
-    if (!pos || pos->location >= vi->attributes.size() || pos->packed) {
-        note_quad_unknown(name, !pos ? "no element in v4..v7" : "element packed or past the attributes", vi->elements.size());
+    if (!pos) {
+        note_quad_unknown(name, "no element in v4..v7", vi->elements.size());
         in.known_vs = false;
         return in;
     }
-    const VkVertexInputAttributeDescription& a = vi->attributes[pos->location];
-    std::uint32_t comps = 0;
-    switch (a.format) {
-        case VK_FORMAT_R32G32B32A32_SFLOAT: comps = 4; break;
-        case VK_FORMAT_R32G32B32_SFLOAT: comps = 3; break;
-        case VK_FORMAT_R32G32_SFLOAT: comps = 2; break;
-        default: break;
-    }
-    const VkVertexInputBindingDescription* b = nullptr;
-    for (const VkVertexInputBindingDescription& bd : vi->bindings) {
-        if (bd.binding == a.binding) b = &bd;
-    }
-    if (!comps || !b || a.binding >= 16 || !vi->va[a.binding] || b->inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
-        note_quad_unknown(name, !comps ? "attribute format" : "binding", static_cast<std::uint64_t>(a.format));
+    std::uint32_t ids[6];
+    if (const char* why = draw_vertex_ids(d, in.vertices, ids)) {
+        note_quad_unknown(name, why, d.index_va);
         in.known_vs = false;
         return in;
     }
     for (std::uint32_t v = 0; v < in.vertices; ++v) {
-        const std::uint64_t at = vi->va[a.binding] + static_cast<std::uint64_t>(v) * b->stride + a.offset;
-        float c[4] = {0, 0, 0, 1};
-        if (!hle_kernel_va_mapped(at, comps * 4)) {
+        if (const char* why = read_vertex_element(*vi, *pos, ids[v], in.pos[v])) {
+            note_quad_unknown(name, why, pos->location < vi->attributes.size() ? static_cast<std::uint64_t>(vi->attributes[pos->location].format) : 0);
             in.known_vs = false;
             return in;
-        }
-        std::memcpy(c, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), comps * 4);
-        // DST_SEL (the record's word 3) picks each of x, y, z, w: 0, 1, or a fetched component (absent ones 0, 0, 0, 1).
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t sel = (pos->w3 >> (3 * k)) & 7;
-            const float fetched[4] = {c[0], comps > 1 ? c[1] : 0.0f, comps > 2 ? c[2] : 0.0f, comps > 3 ? c[3] : 1.0f};
-            in.pos[v][k] = sel == 0 ? 0.0f : sel == 1 ? 1.0f : sel >= 4 ? fetched[sel - 4] : std::nanf("");
         }
     }
     static std::set<std::string> shown;  // under g.mu: each quad pipeline's vertices once (the phase 2 census)
@@ -10731,6 +10780,93 @@ full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline&
                  full_write::fail_name(full_write::geometry(in)));
     }
     return in;
+}
+// A writer of a pending copy's source or destination whose draw the proof could not pass (or did), with the state the
+// proof read, once a pipeline and verdict (the phase 2 census).
+void note_writer_locked(const DrawState& s, int t, const std::string& name, int fail, const full_write::Input& in, const GpuDraw& d) {
+    static std::set<std::pair<std::string, int>> said;  // under g.mu
+    if (said.size() >= 96 || !said.emplace(name, fail).second) return;
+    const RtImage& r = *s.color[t];
+    char blend[112];
+    if (s.gx_blend) {
+        const GxBlendTarget& b = s.gx_blend->rt[t];
+        std::snprintf(blend, sizeof(blend), "blend (GX) %u: colour src %u dst %u op %u, alpha src %u dst %u op %u", b.enable, b.src, b.dst, b.op,
+                      b.src_alpha, b.dst_alpha, b.op_alpha);
+    } else {
+        std::snprintf(blend, sizeof(blend), "CB_BLEND%d_CONTROL %08x", t, s.blend[t]);
+    }
+    host_log("copy census: writer %s, %s: target %d 0x%llx %ux%u f%d x%u, mask %x of %x, %s; depth test %d stencil %d bounds %d a2c %d; "
+             "PS discard %d branches %d; raster kill %d cull %d solid %d; viewport %g,%g %gx%g, scissor %d,%d %ux%u; VTE %x quad VS %d; "
+             "prim %d (rect %d topo %d), %u vertices, index %d indirect %d instances %u (flip %llu)",
+             name.c_str(), full_write::fail_name(fail), t, static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format), r.layers,
+             in.mask, in.channels, blend, in.depth_rejects ? 1 : 0, in.stencil ? 1 : 0, in.bounds ? 1 : 0, in.coverage ? 1 : 0, in.discard ? 1 : 0,
+             in.branches ? 1 : 0, in.raster_kill ? 1 : 0, in.cull ? 1 : 0, in.solid ? 1 : 0, in.vp_x, in.vp_y, in.vp_w, in.vp_h, in.sc_x, in.sc_y, in.sc_w,
+             in.sc_h, s.vte_cntl, in.known_vs ? 1 : 0, in.prim, s.rect ? 1 : 0, static_cast<int>(s.topo), d.index_count, d.index_va ? 1 : 0,
+             d.indirect_va ? 1 : 0, d.instance_count, static_cast<unsigned long long>(hle_video_flip_count()));
+}
+// A point copy's own draw (phase 2's B1): whether it covers its destination, its sampler and view, and its vertices'
+// elements (positions and texture coordinates).
+std::string point_copy_detail_locked(const DrawState& s, const StageImages* stage_images, const std::string& name, const GfxPipeline& bound,
+                                     const GpuDraw& draw, const VertexInputPlan* vi) {
+    std::string out = "covers: ";
+    out += full_write::fail_name(full_write::check(full_write_input(s, 0, bound, draw, vi, name)));
+    char b[200];
+    VkSamplerCreateInfo sci{};
+    if (!stage_images[1].samplers.empty() && stage_images[1].samplers[0] && describe_sampler_locked(stage_images[1].samplers[0], sci)) {
+        std::snprintf(b, sizeof(b), "; sampler mag %d min %d mip %d lod %g..%g bias %g aniso %d addr %d %d unnormalized %d", static_cast<int>(sci.magFilter),
+                      static_cast<int>(sci.minFilter), static_cast<int>(sci.mipmapMode), sci.minLod, sci.maxLod, sci.mipLodBias, sci.anisotropyEnable,
+                      static_cast<int>(sci.addressModeU), static_cast<int>(sci.addressModeV), sci.unnormalizedCoordinates);
+        out += b;
+    } else {
+        out += "; sampler not known";
+    }
+    ViewRecord vr;
+    if (!stage_images[1].images.empty() && stage_images[1].images[0].view && describe_view_locked(stage_images[1].images[0].view, vr)) {
+        const VkImageSubresourceRange& sr = vr.view_info.subresourceRange;
+        std::snprintf(b, sizeof(b), "; view f%d levels %u+%u of %u, layers %u+%u, swizzle %d %d %d %d, image %ux%u", static_cast<int>(vr.view_info.format),
+                      sr.baseMipLevel, sr.levelCount, vr.image_info.mipLevels, sr.baseArrayLayer, sr.layerCount, static_cast<int>(vr.view_info.components.r),
+                      static_cast<int>(vr.view_info.components.g), static_cast<int>(vr.view_info.components.b), static_cast<int>(vr.view_info.components.a),
+                      vr.image_info.extent.width, vr.image_info.extent.height);
+        out += b;
+    } else {
+        out += "; view not known";
+    }
+    {
+        const std::uint32_t nv = std::min<std::uint32_t>(draw.index_count, 6);
+        std::uint32_t ids[6];
+        const char* why = draw_vertex_ids(draw, nv, ids);
+        std::snprintf(b, sizeof(b), "; %u vertices, %s, prim %d (rect %d), ids", draw.index_count,
+                      draw.index_va ? (draw.index_type ? "32-bit indices" : "16-bit indices") : "not indexed", static_cast<int>(s.topo), s.rect ? 1 : 0);
+        out += b;
+        for (std::uint32_t v = 0; !why && v < nv; ++v) out += " " + std::to_string(ids[v]);
+        if (why) out += std::string(" (") + why + ")";
+    }
+    if (vi) {
+        for (const gcn::VertexElement& e : vi->elements) {
+            std::snprintf(b, sizeof(b), "; v%u..%u:", e.vdata, e.vdata + e.count - 1);
+            out += b;
+            const std::uint32_t nv = std::min<std::uint32_t>(draw.index_count, 6);
+            std::uint32_t ids[6];
+            if (const char* why = draw_vertex_ids(draw, nv, ids)) {
+                out += " (";
+                out += why;
+                out += ")";
+                continue;
+            }
+            for (std::uint32_t v = 0; v < nv; ++v) {
+                float c[4];
+                if (const char* why = read_vertex_element(*vi, e, ids[v], c)) {
+                    out += " (";
+                    out += why;
+                    out += ")";
+                    break;
+                }
+                std::snprintf(b, sizeof(b), " (%g %g %g %g)", c[0], c[1], c[2], c[3]);
+                out += b;
+            }
+        }
+    }
+    return out;
 }
 void census_draw_locked(const DrawState& s, const StageImages* stage_images, const std::string& name, const GfxPipeline& bound, const GpuDraw& draw,
                         const VertexInputPlan* vi) {
@@ -10754,9 +10890,13 @@ void census_draw_locked(const DrawState& s, const StageImages* stage_images, con
             copy_census::touch(s.color[t]->base, copy_census::kTouchBound, who);
             continue;
         }
-        const int fail = full_write::check(full_write_input(s, t, bound, draw, vi, name));
+        const full_write::Input in = full_write_input(s, t, bound, draw, vi, name);
+        const int fail = full_write::check(in);
         const int kind = fail == full_write::kNone ? copy_census::kTouchDrawProven : may_write_all(t) ? copy_census::kTouchDrawFull : copy_census::kTouchDraw;
-        if (copy_census::touch(s.color[t]->base, kind, who)) copy_census::proof(who, fail);
+        if (copy_census::touch(s.color[t]->base, kind, who)) {
+            copy_census::proof(who, fail);
+            note_writer_locked(s, t, name, fail, in, draw);
+        }
     }
     if (s.depth) {
         GfxFixedState f;
@@ -10818,6 +10958,12 @@ void census_draw_locked(const DrawState& s, const StageImages* stage_images, con
                  flags, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, y0, vw, vh, s.scissor.offset.x, s.scissor.offset.y,
                  s.scissor.extent.width, s.scissor.extent.height, blend ? 1 : 0, s.blend[0], s.color_mask[0], stage_images[1].images.size(),
                  stage_images[1].samplers.size(), static_cast<unsigned long long>(hle_video_flip_count()));
+        // Its own draw's detail on lines of their own (a log line ends at 1 KiB).
+        const std::string detail = point_copy_detail_locked(s, stage_images, name, bound, draw, vi);
+        for (std::size_t at = 0; at < detail.size(); at += 900) {
+            host_log("copy census: point copy %s 0x%llx -> 0x%llx detail %zu: %s", who, static_cast<unsigned long long>(a.base),
+                     static_cast<unsigned long long>(b.base), at / 900, detail.substr(at, 900).c_str());
+        }
     }
 }
 
@@ -13380,7 +13526,15 @@ bool rt_swappable(const RtImage& a, const RtImage& b) {
 // The source of exactly one pending copy, about to be overwritten whole: it
 // and the destination exchange images instead of the copy being made.
 bool copy_elide_swap_locked(std::uint64_t src) {
-    if (g_elide.sources(src) != 1) return false;
+    if (const std::size_t n = g_elide.sources(src); n != 1) {
+        static int logs = 0;  // under g.mu
+        if (logs < 8) {
+            ++logs;
+            host_log("copy elision: 0x%llx overwritten whole is the source of %zu pending copies: no exchange, the copies made (flip %llu)",
+                     static_cast<unsigned long long>(src), n, static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    }
     const copy_elide::Pending* p = g_elide.find_src(src);
     RtImage* s = rt_at_locked(src);
     RtImage* d = p ? rt_at_locked(p->dst) : nullptr;
@@ -13439,6 +13593,19 @@ bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, st
     if (!g_copy_elide) return false;
     if (const int why = copy_elide_refusal(src, dst, width, height); why >= 0) {
         ++g_ce_refused[why];
+        // Which copies are refused, once a reason, source and destination (up to 32): what a later phase could take.
+        static std::set<std::tuple<int, std::uint64_t, std::uint64_t>> said;  // under g.mu
+        if (said.size() < 32 && said.emplace(why, src.base, dst.base).second) {
+            int slot = -1;
+            for (int t = 0; why == kErInPass && t < g_pass.ntargets; ++t) {
+                if (g_pass.targets[t] == src.base || g_pass.targets[t] == dst.base) slot = t;
+            }
+            host_log("copy elision: a copy of 0x%llx %ux%u f%d into 0x%llx %ux%u f%d made where asked (%s%s%s) (flip %llu)",
+                     static_cast<unsigned long long>(src.base), src.width, src.height, static_cast<int>(src.format),
+                     static_cast<unsigned long long>(dst.base), dst.width, dst.height, static_cast<int>(dst.format), kErNames[why],
+                     slot < 0 ? "" : g_pass.targets[slot] == src.base ? ": the source is attachment " : ": the destination is attachment ",
+                     slot < 0 ? "" : std::to_string(slot).c_str(), static_cast<unsigned long long>(hle_video_flip_count()));
+        }
         return false;
     }
     if (copy_census::on()) census_target_copy_locked(src, dst, width, height);
