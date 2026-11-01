@@ -63,6 +63,12 @@ command processor is the limit on a Radeon 8060S: 148 and 136 fps against 134
 and 124 for the same build without it, alternating (+10%). A profile outlives
 small changes: a function it no longer matches is built as without one.
 
+A ThreadSanitizer build (`-DCMAKE_CXX_FLAGS=-fsanitize=thread`, the same in
+`CMAKE_C_FLAGS` and the linker flags) runs with the write watch off unless
+`BBHOST_WRITE_WATCH=1`: a write fault inside one of ThreadSanitizer's atomics on
+guest memory makes it wait on its own lock, which stopped such builds at the
+first loading screen.
+
 ## Windows (cross-compiled)
 
 Requirements on the Linux machine: Clang, lld and llvm tools, the mingw-w64
