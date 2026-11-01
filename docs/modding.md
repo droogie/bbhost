@@ -300,7 +300,7 @@ wants one keeps its file in their own patches folder.
 | `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
 | `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
-| `screen-space-reflections.toml` | **Enable Screen Space Reflections**: Screen space reflections on, at the render's full size, with the depth they read at full and half size (the game's are half and a quarter): sharper reflections, more GPU time. It loads last, so other patches' render changes give way to it. (off by default; at the next start) |
+| `screen-space-reflections.toml` | **Enable Screen Space Reflections**: Screen space reflections on, with the depth renders back at the game's default resolutions. It loads last, so other patches' render changes give way to it. (off by default; at the next start) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
 | `intel-tonemap-fix.toml` | **Intel Black Tonemap Fix**: Fixes the black tonemap colours, most noticeable in the DLC's areas, when using an Intel CPU. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
