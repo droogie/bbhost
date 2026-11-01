@@ -21,9 +21,10 @@
 //
 // At a converted rate the frame-rate tables make that 10 x N/30 frames and a
 // tenth x 30/N, the recording's pace while the frames take 1/N s and no
-// other length. With the frame clock on (BBHOST_FRAME_CLOCK=1) both keep the
-// game's (engine/frame_rate.cpp, kHandedOver and kCountsHandedOver) and ours
-// plays the recording by game time at any frame length:
+// other length. By default at a converted rate (and with the frame clock on,
+// BBHOST_FRAME_CLOCK=1, at every rate) both keep the game's
+// (engine/frame_rate.cpp, kHandedOver and kCountsHandedOver) and ours plays
+// the recording by game time at any frame length:
 //   - a frame in which no 30 fps frame of game time begins (frame_clock's
 //     ticks30: 0 or 1 a frame) holds the countdown - the game's update sees
 //     2 there, which its decrement leaves above 0, and the countdown is put
@@ -39,8 +40,11 @@
 //
 // A leaf: entered straight from the game's code, ours runs the game's update
 // through the trampoline around its own work, touching only the
-// manipulator's fields. It is on the decomp list only with the frame clock
-// on; BBHOST_REPLAY_STEP=0 leaves it off (and the tables' values at start).
+// manipulator's fields. It is on the decomp list by default at a converted
+// rate, where the frame-time manager publishes the clock's 30 fps frames for
+// it with the clock off too (frame_clock::publishing), and at every rate with
+// the clock on; at the game's own 30 with the clock off the game's update
+// stays. BBHOST_REPLAY_STEP=0 leaves it off (and the tables' values at start).
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 #include "engine/frame_clock.h"
@@ -149,10 +153,11 @@ bool replay_manipulator_body_ok(const std::uint8_t* entry) {
 }
 
 void decomp_chr_replay_manipulator_add() {
-    // Only with the frame clock on (engine/frame_rate.cpp keeps the game's
-    // countdown and tenths for it then), and not with BBHOST_REPLAY_STEP=0.
+    // Where the clock is published - a converted rate by default, every rate
+    // with the clock on (engine/frame_rate.cpp keeps the game's countdown and
+    // tenths for it then) - and not with BBHOST_REPLAY_STEP=0.
     const char* e = std::getenv("BBHOST_REPLAY_STEP");
-    if (!frame_clock::on() || (e && e[0] == '0')) return;
+    if ((!frame_clock::on() && !frame_clock::publishing()) || (e && e[0] == '0')) return;
     DecompFunction fn{"sub_192c390", "chr", kUpdate, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&replay_manipulator_update),
                       DecompKind::Leaf, &g_game_update};
     fn.report = &report;

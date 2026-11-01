@@ -19,7 +19,9 @@
 //     module handed the packet every frame; the game's own sync unconverted
 //     at 120 sends 4 times as often.
 // Each of the source's mutants caught; the function's bytes the ones ours
-// runs around. Skips without the 1.09 eboot.
+// runs around; and the list takes it where the frame clock is published - by
+// default at a converted rate, at every rate with the clock on - unless
+// BBHOST_CHR_SYNC_STEP=0. Skips without the 1.09 eboot.
 #define DECOMP_CHR_SYNC_MUTANTS
 int g_chr_sync_mutant = 0;
 #include "decomp/chr/chr_sync.cpp"
@@ -33,6 +35,15 @@ int g_chr_sync_mutant = 0;
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+// What the source's add function put on the list (the kit's weak decomp_add
+// stands aside for this one).
+int g_added = 0;
+const char* g_added_name = nullptr;
+void decomp_add(const DecompFunction& fn) {
+    ++g_added;
+    g_added_name = fn.name;
+}
 
 namespace {
 
@@ -331,6 +342,27 @@ int main(int argc, char** argv) {
     eboot_kit::stub(kStringInit, reinterpret_cast<const void*>(&string_init));
     eboot_kit::stub(kSetting, reinterpret_cast<const void*>(&setting_lookup));
     g_game = eboot_kit::fn<Sync>(kSync);
+    // On the list where the clock is published - by default at a converted
+    // rate (publishing), at every rate with the clock on - unless its own
+    // switch is 0; the game's own at 30 with the clock off.
+    for (int clock = 0; clock < 2; ++clock) {
+        for (int pub = 0; pub < 2; ++pub) {
+            for (int sw = 0; sw < 3; ++sw) {
+                frame_clock::set_on(clock != 0);
+                frame_clock::set_publishing(pub != 0);
+                if (sw == 0) unsetenv("BBHOST_CHR_SYNC_STEP");
+                else setenv("BBHOST_CHR_SYNC_STEP", sw == 1 ? "0" : "1", 1);
+                g_added = 0;
+                decomp_chr_sync_add();
+                const bool want = (clock || pub) && sw != 1;
+                if (g_added != (want ? 1 : 0) || (want && std::strcmp(g_added_name, "sub_1929470") != 0))
+                    fail(-1, "placed where it should not be, or not where it should");
+            }
+        }
+    }
+    frame_clock::set_on(false);
+    frame_clock::set_publishing(false);
+    unsetenv("BBHOST_CHR_SYNC_STEP");
     g_game_sync = reinterpret_cast<void*>(g_game);
 
     const long thirty = at_thirty(cases);

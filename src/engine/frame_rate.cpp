@@ -330,6 +330,7 @@ struct HandedOver {
     Handover how;
     const char* env;               // =0: the start-time value, as with the clock off
     const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
+    bool by_default = false;       // handed back with the clock off too (its decomp is on by default)
 };
 constexpr HandedOver kHandedOver[] = {
     // A physics world's expected shortest step (sub_a3fad0's cinfo, +0x70,
@@ -363,11 +364,12 @@ constexpr HandedOver kHandedOver[] = {
     // ghost by that tenth times the frame in 30 fps frames, every frame, and
     // counts the samples in 30 fps frames of game time (kCountsHandedOver),
     // so it plays at the 3 samples a game second it was recorded at
-    // (decomp/chr/replay_manipulator.cpp).
-    {0x4cf6420, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
-    {0x4cf6424, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
-    {0x4cf6428, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
-    {0x4cf642c, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    // (decomp/chr/replay_manipulator.cpp). On by default, the clock on or
+    // off.
+    {0x4cf6420, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf6424, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf6428, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf642c, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
@@ -423,17 +425,19 @@ struct CountHandedOver {
     Handover how;
     const char* env;
     const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
+    bool by_default = false;       // handed back with the clock off too (its decomp is on by default)
 };
 constexpr CountHandedOver kCountsHandedOver[] = {
     // The replay ghosts' 10 frames a sample: its decomp counts them in the
     // 30 fps frames of game time its frames begin (frame_clock's ticks30), 3
     // samples a game second, as the recorder took them (sub_1d09b40 takes one
     // each 1/3 s of the steps it is handed).
-    {0x192c405, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    {0x192c405, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
     // ChrSync's 5 frames between the local player's sync packets (the default
     // ChrSync.FrameSkipCount is read with): its decomp counts them in 30 fps
-    // frames of game time the same way, 6 packets a game second as at 30.
-    {0x1929676, Handover::Decomp, "BBHOST_CHR_SYNC_STEP", "sub_1929470"},
+    // frames of game time the same way, 6 packets a game second as at 30. These
+    // two on by default, the clock on or off.
+    {0x1929676, Handover::Decomp, "BBHOST_CHR_SYNC_STEP", "sub_1929470", true},
     // The user-service event thread's usleep(33000) while no event waits: the
     // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
     {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},
@@ -1527,7 +1531,9 @@ void each_frame(const SprjFlipper* f) {
     const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
     const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
-        if (frame_clock::on()) frame_clock::publish(step);  // the frame clock (engine/frame_clock.h, BBHOST_FRAME_CLOCK=1)
+        // The frame clock (engine/frame_clock.h): with BBHOST_FRAME_CLOCK=1, or
+        // for what counts game time by default (frame_clock::publishing).
+        if (frame_clock::on() || frame_clock::publishing()) frame_clock::publish(step);
         frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
         if (g_wind_va) put<float>(g_wind_va, wind_pace::step_for(step));
@@ -1834,7 +1840,7 @@ int apply_rate(ElfImage* image, int want) {
     // would have had beside it, for the log and for a mechanism not in place.
     // A decomp's needs our SprjFlipper::Update, which publishes the clock.
     const auto handed_back = [&](const HandedOver& h) {
-        if (!frame_clock::on()) return false;
+        if (!frame_clock::on() && !h.by_default) return false;
         const char* e = std::getenv(h.env);
         if (e && e[0] == '0') return false;
         return h.how != Handover::Decomp || g_source == Source::Ours;
@@ -1860,7 +1866,7 @@ int apply_rate(ElfImage* image, int want) {
     }
     // The counts handed back (kCountsHandedOver) keep the game's the same way.
     const auto count_handed_back = [&](const CountHandedOver& h) {
-        if (!frame_clock::on()) return false;
+        if (!frame_clock::on() && !h.by_default) return false;
         const char* e = std::getenv(h.env);
         if (e && e[0] == '0') return false;
         return h.how != Handover::Decomp || g_source == Source::Ours;
@@ -2359,6 +2365,23 @@ void frame_rate_install(ElfImage* image) {
     }
     g_game_fps = got;
     hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
+    // The replay ghosts and the local player's character sync count game time by
+    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
+    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
+    // our frame-time manager then publishes every frame although nothing else
+    // of the clock is on. Each has its own switch.
+    {
+        const auto off = [](const char* k) {
+            const char* e = std::getenv(k);
+            return e && e[0] == '0';
+        };
+        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
+        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
+        if (frame_clock::publishing() && !frame_clock::on())
+            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
+                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
+                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
+    }
     // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step (30 and smooth), one in a
     // whole 1/60 s step (one event an update is 60 a second already); effect steps frame stays the game's.
     if (sfx_node::emission_clock() > 0) {

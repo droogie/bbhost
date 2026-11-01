@@ -27,12 +27,18 @@ int g_fail = 0;
 
 int main() {
     using namespace frame_clock;
-    // Off until BBHOST_FRAME_CLOCK=1 turns it on.
+    // Off until BBHOST_FRAME_CLOCK=1 turns it on; not published without it
+    // until the frame-rate code says something counts game time by default.
     CHECK(!on());
     set_on(true);
     CHECK(on());
     set_on(false);
     CHECK(!on());
+    CHECK(!publishing());
+    set_publishing(true);
+    CHECK(publishing() && !on());
+    set_publishing(false);
+    CHECK(!publishing());
     // The game's own 30: nothing published.
     CHECK(std::bit_cast<std::uint32_t>(dt()) == kThirtiethBits);
     CHECK(frames30() == 1.0f);

@@ -15,7 +15,9 @@
 // reads it.
 //
 // At the game's own 30 nothing publishes, and the clock holds the game's 1/30:
-// whatever converts a value by it gets the game's own value back there.
+// whatever converts a value by it gets the game's own value back there. With
+// the switch off it is published at a converted rate all the same for what
+// counts game time by default (publishing(), below).
 //
 // Plain atomics, read relaxed and defined here: decomp leaves read it on the
 // game's threads (no host thread-locals, no libm), and the eboot kit's tests
@@ -42,6 +44,14 @@ inline constexpr float kThirtieth = std::bit_cast<float>(kThirtiethBits);
 // BBHOST_FRAME_CLOCK=1, as frame_rate_install read it (before the decomps are
 // added, which ask it).
 inline std::atomic<bool> g_on{false};
+// Whether the frame-time manager publishes the clock every frame although the
+// switch is off: at a converted rate, for what counts game time by default -
+// the replay ghosts and the local player's character sync
+// (decomp/chr/replay_manipulator.cpp, decomp/chr/chr_sync.cpp; their own
+// switches, BBHOST_REPLAY_STEP=0 and BBHOST_CHR_SYNC_STEP=0, turn them off).
+// Publishing alone converts nothing: everything else that reads the clock
+// asks on(). Set by frame_rate_install, before the decomps are added.
+inline std::atomic<bool> g_publishing{false};
 // This frame's step in game seconds.
 inline std::atomic<float> g_dt{kThirtieth};
 // The same in 30 fps frames.
@@ -64,6 +74,8 @@ inline double g_tick_carry = 0.0;
 
 [[gnu::always_inline]] inline bool on() { return g_on.load(std::memory_order_relaxed); }
 inline void set_on(bool on) { g_on.store(on, std::memory_order_relaxed); }
+[[gnu::always_inline]] inline bool publishing() { return g_publishing.load(std::memory_order_relaxed); }
+inline void set_publishing(bool on) { g_publishing.store(on, std::memory_order_relaxed); }
 
 // Once a frame, from the frame-time manager (engine/frame_rate.cpp), on the
 // main thread before the frame's tasks run.

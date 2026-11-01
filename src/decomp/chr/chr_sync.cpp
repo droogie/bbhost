@@ -13,9 +13,10 @@
 //
 // At a converted rate the frame-rate tables make the default 5 x N/30
 // updates, which sends 6 a second while the frames take 1/N s and no other
-// length, and not at all where the setting is given. With the frame clock on
-// (BBHOST_FRAME_CLOCK=1) the default keeps the game's 5
-// (engine/frame_rate.cpp, kCountsHandedOver) and ours counts the countdown in
+// length, and not at all where the setting is given. By default at a
+// converted rate (and with the frame clock on, BBHOST_FRAME_CLOCK=1, at every
+// rate) the default keeps the game's 5 (engine/frame_rate.cpp,
+// kCountsHandedOver) and ours counts the countdown in
 // 30 fps frames of game time: a frame in which none begins (frame_clock's
 // ticks30, 0 or 1 a frame) holds it - the game's update sees 2 there, which
 // is no send frame and which its decrement leaves at 1, and the countdown is
@@ -28,7 +29,10 @@
 //
 // A leaf: entered straight from the game's code, ours runs the game's update
 // through the trampoline around its own work, touching only the countdown.
-// It is on the decomp list only with the frame clock on;
+// It is on the decomp list by default at a converted rate, where the
+// frame-time manager publishes the clock's 30 fps frames for it with the clock
+// off too (frame_clock::publishing), and at every rate with the clock on; at
+// the game's own 30 with the clock off the game's sync stays.
 // BBHOST_CHR_SYNC_STEP=0 leaves it off (and the tables' count at start).
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
@@ -105,10 +109,11 @@ bool chr_sync_body_ok(const std::uint8_t* entry) {
 }
 
 void decomp_chr_sync_add() {
-    // Only with the frame clock on (engine/frame_rate.cpp keeps the game's
-    // default count for it then), and not with BBHOST_CHR_SYNC_STEP=0.
+    // Where the clock is published - a converted rate by default, every rate
+    // with the clock on (engine/frame_rate.cpp keeps the game's default count
+    // for it then) - and not with BBHOST_CHR_SYNC_STEP=0.
     const char* e = std::getenv("BBHOST_CHR_SYNC_STEP");
-    if (!frame_clock::on() || (e && e[0] == '0')) return;
+    if ((!frame_clock::on() && !frame_clock::publishing()) || (e && e[0] == '0')) return;
     DecompFunction fn{"sub_1929470", "chr", kSync, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&chr_sync_update),
                       DecompKind::Leaf, &g_game_sync};
     fn.report = &report;
