@@ -41,7 +41,7 @@
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	Applies on the next run. 30 is the game's own pace. Display-Limited caps it at your monitor's refresh rate.
+116005	Frame Rate	Applies on the next run. 30 is the game's own pace. Display-Limited runs at your refresh rate.
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
