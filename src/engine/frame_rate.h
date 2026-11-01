@@ -32,7 +32,7 @@
 //    (decomp/sfx/step_gate.cpp, BBHOST_SFX_GATE; [video] effect_steps or
 //    BBHOST_SFX_STEP: auto, the default, for whole 1/60 s at every rate above
 //    30, smooth for whole steps of the frame rate (1/120 s at 120), a number
-//    (30 to 960) for that many a second - 30 also steps the wind in whole
+//    (1 to 960) for that many a second - 30 also steps the wind in whole
 //    1/30 s, the rest leave it on the frame's time - and frame for both by the
 //    frame's time).
 //    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
