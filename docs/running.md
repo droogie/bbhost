@@ -536,10 +536,21 @@ cannot hold, a variable refresh rate or a dip keeps them right too:
 - its lens simulation takes each frame's rate, above 60 too
   (`BBHOST_LENS_BLUR_RATE=0` keeps 60's);
 - the physics worlds' two step hints keep the game's 1/30
-  (`BBHOST_PHYSICS_HINTS=0` for the rate's).
+  (`BBHOST_PHYSICS_HINTS=0` for the rate's);
+- the replay ghosts (bloodstains and other players' ghosts) take their
+  samples and move by game time, 3 samples a game second as recorded
+  (`BBHOST_REPLAY_STEP=0` for the rate's frames);
+- the local player's character sync sends its packets by game time, 6 a
+  second as at 30 (`BBHOST_CHR_SYNC_STEP=0`);
+- the sound thread runs a pass for each frame's sound requests, woken as the
+  frame's work ends, and the game's own 33 ms at the longest
+  (`BBHOST_SOUND_WAKE=0` for the rate's period);
+- the user-service event poll keeps the game's 33 ms (`BBHOST_USER_POLL=0`).
 
 With it on, the values that follow the frame's seconds also take the game's
-step itself, a loading screen's included.
+step itself, a loading screen's included. `BBHOST_SOUND_CENSUS=1` (a test
+switch, at any rate) counts the sound thread's passes against the frames in
+the 300-flip report: how many frames began between one pass and the next.
 
 `BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
 Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
