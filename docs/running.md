@@ -525,6 +525,14 @@ The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
 
+Two things the game counts in its own frames count game time at every
+converted rate, so a rate the machine cannot hold keeps them at the game's
+pace: the replay ghosts (bloodstains and other players' ghosts) take their
+samples and move by game time, 3 samples a game second as recorded
+(`BBHOST_REPLAY_STEP=0` for the rate's frames), and the local player's
+character sync sends 6 packets a second as at 30, which other players see
+(`BBHOST_CHR_SYNC_STEP=0`).
+
 `BBHOST_FRAME_CLOCK=1` (a test switch, off by default while it is proven)
 converts each frame, from that frame's own length, the few values the frame
 rate otherwise sets once for the rate chosen at start, so a rate the machine
@@ -537,11 +545,6 @@ cannot hold, a variable refresh rate or a dip keeps them right too:
   (`BBHOST_LENS_BLUR_RATE=0` keeps 60's);
 - the physics worlds' two step hints keep the game's 1/30
   (`BBHOST_PHYSICS_HINTS=0` for the rate's);
-- the replay ghosts (bloodstains and other players' ghosts) take their
-  samples and move by game time, 3 samples a game second as recorded
-  (`BBHOST_REPLAY_STEP=0` for the rate's frames);
-- the local player's character sync sends its packets by game time, 6 a
-  second as at 30 (`BBHOST_CHR_SYNC_STEP=0`);
 - the sound thread runs a pass for each frame's sound requests, woken as the
   frame's work ends, and the game's own 33 ms at the longest
   (`BBHOST_SOUND_WAKE=0` for the rate's period);
