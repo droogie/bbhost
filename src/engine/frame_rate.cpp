@@ -356,6 +356,16 @@ constexpr HandedOver kHandedOver[] = {
     // slot instead (kClockLoads, Rate). What reads s is not known yet: a camera
     // turn at 144 blurs the same with 144 or 60 there (2026-10-31).
     {0x4c9f358, Handover::Load, "BBHOST_LENS_BLUR_RATE"},
+    // The replay ghosts' move and turn a frame, a tenth of a sample's change
+    // (0x192c57d's vmovaps, ReplayManipulator's update): its decomp moves a
+    // ghost by that tenth times the frame in 30 fps frames, every frame, and
+    // counts the samples in 30 fps frames of game time (kCountsHandedOver),
+    // so it plays at the 3 samples a game second it was recorded at
+    // (decomp/chr/replay_manipulator.cpp).
+    {0x4cf6420, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    {0x4cf6424, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    {0x4cf6428, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    {0x4cf642c, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
@@ -413,6 +423,11 @@ struct CountHandedOver {
     const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
 };
 constexpr CountHandedOver kCountsHandedOver[] = {
+    // The replay ghosts' 10 frames a sample: its decomp counts them in the
+    // 30 fps frames of game time its frames begin (frame_clock's ticks30), 3
+    // samples a game second, as the recorder took them (sub_1d09b40 takes one
+    // each 1/3 s of the steps it is handed).
+    {0x192c405, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
     // The user-service event thread's usleep(33000) while no event waits: the
     // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
     {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},
