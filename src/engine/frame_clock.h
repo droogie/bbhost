@@ -48,6 +48,19 @@ inline std::atomic<float> g_dt{kThirtieth};
 inline std::atomic<float> g_frames30{1.0f};
 // Frames published: 0 while the game runs its own 30.
 inline std::atomic<std::uint64_t> g_seq{0};
+// The 30 fps frames of game time this frame begins: what counts the game's
+// own frames - a countdown, a cadence - takes a step for each, so it counts
+// 30 of them a game second at any frame length, each in the frame where the
+// game at 30 would take it (the one in which a 30 fps frame's time starts).
+// The frames' steps in 30 fps frames are summed: a frame begins a 30 fps
+// frame when a whole number lies in [the sum before it, the sum after it) -
+// the first frame and every 1/30 one, every other frame of 1/60 (the first,
+// the third...), one in 4.8 of 1/144. At most 1 a frame, since a step is at
+// most 1/30; 1 while the game runs its own 30.
+inline std::atomic<int> g_ticks30{1};
+// How far the sum is past the last whole number begun, less 1 (in (-1, 0]):
+// the publisher's (the main thread's) alone. 0 before the first frame.
+inline double g_tick_carry = 0.0;
 
 [[gnu::always_inline]] inline bool on() { return g_on.load(std::memory_order_relaxed); }
 inline void set_on(bool on) { g_on.store(on, std::memory_order_relaxed); }
@@ -55,12 +68,18 @@ inline void set_on(bool on) { g_on.store(on, std::memory_order_relaxed); }
 // Once a frame, from the frame-time manager (engine/frame_rate.cpp), on the
 // main thread before the frame's tasks run.
 inline void publish(float dt) {
+    const float frames = frames30_of(dt);
     g_dt.store(dt, std::memory_order_relaxed);
-    g_frames30.store(frames30_of(dt), std::memory_order_relaxed);
+    g_frames30.store(frames, std::memory_order_relaxed);
+    const double sum = g_tick_carry + static_cast<double>(frames);
+    const int ticks = sum > 0.0 ? 1 : 0;
+    g_tick_carry = sum - ticks;
+    g_ticks30.store(ticks, std::memory_order_relaxed);
     g_seq.fetch_add(1, std::memory_order_relaxed);
 }
 
 [[gnu::always_inline]] inline float dt() { return g_dt.load(std::memory_order_relaxed); }
 [[gnu::always_inline]] inline float frames30() { return g_frames30.load(std::memory_order_relaxed); }
+[[gnu::always_inline]] inline int ticks30() { return g_ticks30.load(std::memory_order_relaxed); }
 
 }  // namespace frame_clock
