@@ -67,15 +67,15 @@ height = 1080
 # 240, 360, 480, 960, or 0 for Display-Limited (the display's refresh rate
 # when the game starts); what F10 saves wins over it.
 fps_cap = 30
-# Above 30 fps, the effects (the lamps' and candles' flicker among them) and
-# the wind on grass and trees step in whole 1/30 s, 30 times a second as at
-# 30, with what the effects count in updates held on the frames between.
-# smooth (the default): as 30, with what the effects move by time moved by
-# each frame's own time in the effects converted for it. 30: whole 1/30 s
-# steps alone. 60: the effects in whole 1/60 s and the wind by the frame's
-# time; frame: both by the frame's time. BBHOST_SFX_STEP=30, smooth, 60 or
-# frame overrides this. Requires a restart.
-# effect_steps = "smooth"
+# Above 30 fps, how many times a second the effects (fire, blood, magic, the
+# lamps' and candles' flicker) step, with what they count in updates held on
+# the frames between. auto (the default): 60 at every frame rate above 30 -
+# the effects as at 60 whether you play at 60, 120 or 180. smooth: the frame
+# rate itself (1/120 s steps at 120). A number from 30 to 960 ("120") steps
+# them that many times a second at any frame rate; 30 is the game's cadence
+# at 30 and steps the wind on grass and trees with it. frame: by each frame's
+# time. BBHOST_SFX_STEP overrides this. Requires a restart.
+# effect_steps = "auto"
 # The effects' emission clock: 60 (the default) makes their particles and
 # children as the game's effects do at 60 updates a second, at every frame
 # rate (30 included); 30 keeps the game's one emission an update, 30 a second

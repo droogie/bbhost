@@ -16,7 +16,7 @@ bool decomp_sfx_between_steps();
 // (engine/sfx_schedule.h's frame, from and into): what the smooth steps' frame
 // domain steps the effects by and puts on their nodes' times.
 void decomp_sfx_frame_time(float frame, float from, float into);
-// The smooth effect steps on or off ([video] effect_steps = "smooth", the default): an
+// The smooth effect steps on or off (BBHOST_SFX_SMOOTH=1, with effect steps 30): an
 // instance whose classes are all on the gate's converted list steps what it
 // counts in whole 1/30 s and what it integrates by the frame's own time.
 void decomp_sfx_smooth(bool on);
