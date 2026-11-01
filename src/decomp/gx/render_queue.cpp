@@ -808,39 +808,68 @@ std::atomic<void (*)(u64, void*)> g_insert_fn{nullptr};
 std::atomic<void*> g_insert_user{nullptr};
 
 // BBHOST_SCENE_CATEGORIES=1: each queue's items by pass, logged every 300
-// flips - which passes a frame's queues hold (what to name above).
+// flips - which passes a frame's queues hold (what to name above). The chunk
+// jobs count on the game's threads, so like the census they take no lock and
+// allocate nothing: a queue takes one of kCategoryQueues rows by its address
+// (and keeps it), and each run of items of one pass adds to its counter once.
 bool g_log_categories = false;
-std::mutex g_categories_mu;
-std::map<u64, std::map<u32, u32>> g_categories;  // queue -> items by pass, under g_categories_mu
+constexpr u32 kCategoryQueues = 16, kPasses = 0x1000;
+std::atomic<u64> g_category_queue[kCategoryQueues];  // a row's queue; 0: free
+std::atomic<u32> g_category_items[kCategoryQueues][kPasses];
+std::atomic<u64> g_category_dropped{0};  // items of queues that found no row
 
 DECOMP_LEAF void count_categories(u64 q, u64 range) {
     const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
     const u32 end = count > last ? last : count;
     if (end <= first) return;
+    u32 row = 0;
+    for (; row < kCategoryQueues; ++row) {
+        u64 at = g_category_queue[row].load(std::memory_order_acquire);
+        if (at == 0 && g_category_queue[row].compare_exchange_strong(at, q, std::memory_order_acq_rel)) break;
+        if (at == q) break;
+    }
+    if (row == kCategoryQueues) {
+        g_category_dropped.fetch_add(end - first, std::memory_order_relaxed);
+        return;
+    }
     const u64 items = load<u64>(q + kItems);
-    std::map<u32, u32> n;
-    for (u32 i = first; i != end; ++i) ++n[(load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff];
-    std::lock_guard<std::mutex> lk(g_categories_mu);
-    auto& total = g_categories[q];
-    for (const auto& [pass, k] : n) total[pass] += k;
+    u32 pass = 0, n = 0;
+    for (u32 i = first; i != end; ++i) {
+        const u32 p = (load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff;
+        if (n && p != pass) {
+            g_category_items[row][pass].fetch_add(n, std::memory_order_relaxed);
+            n = 0;
+        }
+        pass = p;
+        ++n;
+    }
+    g_category_items[row][pass].fetch_add(n, std::memory_order_relaxed);
 }
 
 void log_categories(u32 flips) {
-    std::map<u64, std::map<u32, u32>> now;
-    {
-        std::lock_guard<std::mutex> lk(g_categories_mu);
-        now.swap(g_categories);
-    }
-    for (const auto& [q, n] : now) {
+    // The queues in address order, and each one's passes in order, as the
+    // map this counted into printed them; a queue with no items in these 300
+    // flips has no line.
+    std::vector<std::pair<u64, u32>> rows;
+    for (u32 r = 0; r < kCategoryQueues; ++r)
+        if (const u64 q = g_category_queue[r].load(std::memory_order_acquire)) rows.emplace_back(q, r);
+    std::sort(rows.begin(), rows.end());
+    for (const auto& [q, r] : rows) {
         std::string line;
-        for (const auto& [pass, k] : n) {
+        for (u32 pass = 0; pass < kPasses; ++pass) {
+            const u32 k = g_category_items[r][pass].exchange(0, std::memory_order_relaxed);
+            if (!k) continue;
             char part[32];
             std::snprintf(part, sizeof(part), " %02x/%02x:%.1f", pass >> 6, pass & 0x3f, k / 300.0);
             line += part;
         }
+        if (line.empty()) continue;
         host_log("scene categories: queue %llx at flip %u, items a flip by category/sub-category:%s", static_cast<unsigned long long>(q), flips,
                  line.c_str());
     }
+    if (const u64 dropped = g_category_dropped.exchange(0, std::memory_order_relaxed))
+        host_log("scene categories: %llu items of queues past the first %u not counted", static_cast<unsigned long long>(dropped),
+                 kCategoryQueues);
 }
 
 DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
