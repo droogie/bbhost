@@ -428,6 +428,10 @@ constexpr CountHandedOver kCountsHandedOver[] = {
     // samples a game second, as the recorder took them (sub_1d09b40 takes one
     // each 1/3 s of the steps it is handed).
     {0x192c405, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390"},
+    // ChrSync's 5 frames between the local player's sync packets (the default
+    // ChrSync.FrameSkipCount is read with): its decomp counts them in 30 fps
+    // frames of game time the same way, 6 packets a game second as at 30.
+    {0x1929676, Handover::Decomp, "BBHOST_CHR_SYNC_STEP", "sub_1929470"},
     // The user-service event thread's usleep(33000) while no event waits: the
     // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
     {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},

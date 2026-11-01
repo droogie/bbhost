@@ -44,6 +44,7 @@ void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMut
 void decomp_ez_work_add();             // sync/ez_work.cpp: CSEzWork::ProcessOne - the work pools' job pop, and their node caches
 void decomp_physics_ragdoll_drive_add();  // physics/ragdoll_drive.cpp: the ragdoll keyframe controller's drive, by the frame clock's step
 void decomp_chr_replay_manipulator_add();  // chr/replay_manipulator.cpp: the replay ghosts' update, by game time with the frame clock
+void decomp_chr_sync_add();               // chr/chr_sync.cpp: the local player's character sync, by game time with the frame clock
 
 void decomp_add_areas() {
     decomp_flag_store_add();
@@ -86,4 +87,5 @@ void decomp_add_areas() {
     decomp_ez_work_add();
     decomp_physics_ragdoll_drive_add();
     decomp_chr_replay_manipulator_add();
+    decomp_chr_sync_add();
 }
