@@ -5,6 +5,7 @@
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
+#include "engine/sound_wake.h"
 #include "engine/wind_pace.h"
 #include "decomp/decomp.h"
 #include "decomp/sfx/step_gate.h"
@@ -322,6 +323,7 @@ enum class Handover : std::uint8_t {
     Game,    // the game's value is right at every rate
     Decomp,  // its reader is a decomp of ours that converts it every frame
     Load,    // its one load reads a slot of ours instead (kClockLoads)
+    Wake,    // its thread is woken by the frame instead (engine/sound_wake.h)
 };
 struct HandedOver {
     std::uint32_t at;
@@ -435,6 +437,9 @@ constexpr CountHandedOver kCountsHandedOver[] = {
     // The user-service event thread's usleep(33000) while no event waits: the
     // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
     {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},
+    // The sound thread's update time: its sleep waits for the next frame
+    // instead, at most this long (engine/sound_wake.h).
+    {0x4b33c51, Handover::Wake, "BBHOST_SOUND_WAKE"},
 };
 constexpr bool counts_handed_over_in_counts() {
     for (const CountHandedOver& h : kCountsHandedOver) {
@@ -1600,6 +1605,7 @@ void each_frame(const SprjFlipper* f) {
 
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
+    sound_wake_frame();  // the frame's work is done: its sound requests go to a pass now (engine/sound_wake.h)
     np_test_tick();  // the online test hook wants the main thread, once a frame
     params_tick();   // the param repository walk (engine/params.h)
     lua_events_tick();  // named Lua events queued from any thread (engine/lua_events.h)
@@ -2146,7 +2152,9 @@ int apply_rate(ElfImage* image, int want) {
         host_log("frame rate: 0x%x keeps the game's value (%g), %s (%s=0: the rate's, %g)", h->at,
                  static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), how, h->env, static_cast<double>(bits_float(now)));
     }
-    // The counts handed back (kCountsHandedOver), the same way.
+    // The counts handed back (kCountsHandedOver), the same way. The sound
+    // thread's wake is placed here; where it cannot be, the rate's count is
+    // written after all.
     for (const auto& [h, c] : kept_counts) {
         std::uint8_t now[8] = {};
         count_bytes(*c, fps, now);
@@ -2158,6 +2166,15 @@ int apply_rate(ElfImage* image, int want) {
             std::memcpy(late.now, now, c->n);
             g_late.push_back(late);
             how = "counted in game time by its decomp";
+        } else if (h->how == Handover::Wake) {
+            how = "its thread woken once a frame, at most this long apart";
+            if (!sound_wake_install(image)) {
+                write(h->at, now, c->n);
+                host_log("frame rate: the sound thread's wake could not be placed; 0x%x takes the rate's count at start (%.0f), as "
+                         "with the frame clock off",
+                         h->at, std::floor(then));
+                continue;
+            }
         }
         host_log("frame rate: 0x%x keeps the game's count (%.0f), %s (%s=0: the rate's, %.0f)", h->at, was, how, h->env,
                  std::floor(then));
@@ -2263,6 +2280,10 @@ void frame_rate_install(ElfImage* image) {
         host_log("frame rate: the frame clock is on (BBHOST_FRAME_CLOCK=1): every frame's step, published before the frame "
                  "runs, converts what follows the frame at any frame length (engine/frame_clock.h)");
     }
+    // BBHOST_SOUND_CENSUS=1 (a test switch): the sound thread's passes counted
+    // against the frames at any rate, its sleep left as it is unless the frame
+    // clock's wake takes it over below (engine/sound_wake.h).
+    if (const char* e = std::getenv("BBHOST_SOUND_CENSUS"); e && e[0] == '1') sound_wake_census_install(image);
     int want = wanted_fps();
     // Uncapped: the display's refresh rate, read now (the window opens later, on
     // the primary display: core/portable.h) and run as that fixed rate - its

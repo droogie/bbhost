@@ -142,6 +142,7 @@ add_executable(bbhost
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
   src/engine/frame_tick.cpp
+  src/engine/sound_wake.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
   src/engine/debug_menu.cpp
