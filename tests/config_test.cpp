@@ -271,13 +271,15 @@ int main() {
         CHECK(c.ime_mode == "auto");
         unsetenv("BBHOST_IME");
     }
-    // [video] effect_steps: smooth when the file has no such key (the
+    // [video] effect_steps: auto when the file has no such key (the
     // template ships it commented out and nothing saves it), and an explicit
     // value - 30 among them - kept as written at any config version, the file
     // untouched; BBHOST_SFX_STEP over either.
     {
         load("[player]\nname = \"Hunter\"\n");
-        CHECK(config_effect_steps() == "smooth");
+        CHECK(config_effect_steps() == "auto");
+        load("[video]\neffect_steps = \"120\"\n");
+        CHECK(config_effect_steps() == "120");
         load("[video]\n# whole steps\neffect_steps = 30\n");
         CHECK(config_effect_steps() == "30");
         CHECK(read(g_dir / "config" / "bbhost.toml").find("effect_steps = 30") != std::string::npos);

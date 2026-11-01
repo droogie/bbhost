@@ -639,7 +639,9 @@ static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions
 // against 4.27, none left). Effect steps 60 (whole 1/60 s: 0, 1/60 at 120 -
 // 60 updates a second at every rate above 60, the frames between left to
 // count) and frame (both by the frame's time) remain ([video] effect_steps,
-// or BBHOST_SFX_STEP).
+// or BBHOST_SFX_STEP). Since 2026-11-01 the default (auto) is 60 above 30:
+// 1/60 s steps at every rate, the frames between held by the gate as 30's
+// are; smooth is the frame rate (1/120 s at 120) and a number that many.
 constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
 constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
 
@@ -932,8 +934,8 @@ double g_play_ms_carry = 0.0;
 std::uint64_t g_step_va = 0;
 std::atomic<bool> g_scale_by_step{false};
 // The effects' step (kSfxStepLoad) and the part of a step carried: whole
-// 1/30 s (effect steps 30, the default, which the wind's loads read too) or
-// whole 1/60 s (60).
+// 1/N s for effect steps N - 60 by default, the frame rate with smooth; at 30
+// the wind's loads read it too.
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
 // The water interaction's own schedule of whole 1/30 s, while the effects
@@ -952,8 +954,8 @@ int g_sfx_steps_a_second = 30;
 // it.
 double g_sfx_sim_frame = 0.0;
 // The frames between whole effect steps hold the effects' counts
-// (decomp/sfx/step_gate.cpp): on with effect steps 30, BBHOST_SFX_GATE=0|1
-// either way.
+// (decomp/sfx/step_gate.cpp): on with fewer effect steps a second than
+// frames, BBHOST_SFX_GATE=0|1 either way.
 bool g_sfx_gate = false;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
@@ -1683,32 +1685,34 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
-// The effects' and the wind's step above 30 fps: 30 (whole 1/30 s for both,
-// the frames between holding the effects' counts; smooth, the default, and
-// 30), 60 (whole 1/60 s for the effects, the frame's time for the wind) or 0
-// for frame (both by the frame's time). BBHOST_SFX_STEP=30|smooth|60|frame
-// wins over the config's [video] effect_steps.
-int effect_steps() {
+// The effects' whole steps a second at `fps` frames a second: auto, the
+// default, is 60 (30 at 30), so whatever rate a player picks the effects run
+// as at 60; smooth is the frame rate itself (1/120 s steps at 120); a number
+// (30 to 960, "120" or 120) is that many; frame (0) steps them by the frame's
+// time. Whole 1/30 s steps also move the wind's; the rest leave the wind on the
+// frame's time. BBHOST_SFX_STEP wins over the config's [video] effect_steps.
+int effect_steps(int fps) {
     const std::string v = config_effect_steps();
     const char* env = std::getenv("BBHOST_SFX_STEP");
     const char* from = env && *env ? "BBHOST_SFX_STEP" : "[video] effect_steps";
-    if (v == "30" || v == "smooth") return 30;
-    if (v == "60") return 60;
+    const int automatic = fps > 30 ? 60 : 30;
+    if (v == "auto") return automatic;
+    if (v == "smooth") return fps;
     if (v == "frame") return 0;
-    host_log("frame rate: %s = %s is none of 30, smooth, 60 and frame; 30 runs", from, v.c_str());
-    return 30;
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 10);
+    if (end != v.c_str() && *end == '\0' && n >= 30 && n <= 960) return static_cast<int>(n);
+    host_log("frame rate: %s = %s is none of auto, smooth, frame and 30 to 960; auto (%d) runs", from, v.c_str(), automatic);
+    return automatic;
 }
 
-// Effect steps smooth, the default: whole 1/30 s for what the effects count in
-// updates, as 30, and the frame's own time for what they integrate, in every
-// instance whose classes the step gate has converted (decomp/sfx/step_gate.cpp;
-// the rest hold as 30). [video] effect_steps = 30, 60 or frame (or
-// BBHOST_SFX_STEP) turns it off; BBHOST_SFX_SMOOTH=0|1 overrides either for a
-// harness.
+// The step gate's smooth steps (a test mode, BBHOST_SFX_SMOOTH=1, with whole
+// 1/30 s steps): whole 1/30 s for what the effects count in updates and the
+// frame's own time for what they integrate, in every instance whose classes
+// the step gate has converted (decomp/sfx/step_gate.cpp; the rest hold as 30).
 bool effect_steps_smooth() {
-    bool on = config_effect_steps() == "smooth";
-    if (const char* e = std::getenv("BBHOST_SFX_SMOOTH"); e && (e[0] == '0' || e[0] == '1')) on = e[0] == '1';
-    return on;
+    const char* e = std::getenv("BBHOST_SFX_SMOOTH");
+    return e && e[0] == '1';
 }
 
 // The follow camera's tuning above 30 fps: the game's own (Original) unless
@@ -1968,7 +1972,7 @@ int apply_rate(ElfImage* image, int want) {
                          "(sub_2713870's loads at 0x%x and 0x%x; BBHOST_WIND_PACE=0 for the frame's step)",
                          kWindStepAt, kWindForceAt);
             }
-            const int steps = effect_steps();
+            const int steps = effect_steps(fps);
             if (steps == 0) {
                 host_log("frame rate: effect steps frame: the effects and the wind step by the frame's time");
             } else if (holds(kSfxStepLoad, kSfxStepLoadSixty)) {
@@ -1984,11 +1988,13 @@ int apply_rate(ElfImage* image, int want) {
                         host_log("frame rate: BBHOST_SFX_SIM_FPS=%s is not 30 to 1000; the frames' own time counts", e);
                     }
                 }
-                g_sfx_gate = steps == 30;
+                // Frames between whole steps (fewer steps a second than frames) hold what the effects count: left to count
+                // there, Ebrietas's attacks left effects that never ended (1/30 s steps at 60, 1/60 s at 120).
+                g_sfx_gate = steps < fps;
                 if (const char* e = std::getenv("BBHOST_SFX_GATE"); e && (e[0] == '0' || e[0] == '1')) g_sfx_gate = e[0] == '1';
                 // The smooth steps hold what they cannot convert as 30 does: the gate stays on with them.
                 const bool smooth = effect_steps_smooth();
-                if (smooth && steps != 30) host_log("frame rate: effect steps smooth needs whole 1/30 s steps; effect steps %d runs as asked", steps);
+                if (smooth && steps != 30) host_log("frame rate: BBHOST_SFX_SMOOTH=1 needs whole 1/30 s steps; effect steps %d runs as asked", steps);
                 if (smooth && steps == 30) {
                     g_sfx_gate = true;
                     decomp_sfx_smooth(true);
@@ -2002,13 +2008,13 @@ int apply_rate(ElfImage* image, int want) {
                                     : "run the effects' whole update with a step of 0, as before",
                          g_sfx_gate ? 0 : 1, g_sfx_gate ? "let them count" : "hold the counts");
                 g_sfx_step_va = va(static_cast<std::uint32_t>(sfx_bn));
-                put<float>(g_sfx_step_va, steps == 30 ? kThirtieth : kSixtieth);
+                put<float>(g_sfx_step_va, steps == 30 ? kThirtieth : steps == 60 ? kSixtieth : 1.0f / static_cast<float>(steps));
                 std::uint8_t disp[4];
                 le(sfx_disp, disp);
                 write(kSfxStepLoad + 4, disp, sizeof(disp));
-                host_log("frame rate: the effects step in whole 1/%d s, the rest carried (SprjSfx::Update's load at 0x%x; effect steps "
-                         "%s, [video] effect_steps or BBHOST_SFX_STEP: smooth (the default), 30, 60 or frame)",
-                         steps, kSfxStepLoad, smooth && steps == 30 ? "smooth" : steps == 30 ? "30" : "60");
+                host_log("frame rate: the effects step in whole 1/%d s, the rest carried (SprjSfx::Update's load at 0x%x; [video] "
+                         "effect_steps or BBHOST_SFX_STEP = %s: auto (the default, 60), smooth (the frame rate), 30 to 960 or frame)",
+                         steps, kSfxStepLoad, config_effect_steps().c_str());
                 if (steps == 30) {
                     // The wind's three loads, at the frame-time slot by the 60
                     // FPS++ sites, to the effects' step: each checked first.
@@ -2392,11 +2398,12 @@ void frame_rate_install(ElfImage* image) {
                      "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
                      replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
     }
-    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step (30 and smooth), one in a
-    // whole 1/60 s step (one event an update is 60 a second already); effect steps frame stays the game's.
+    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step, one in any other (a
+    // whole 1/60 s step's one event an update is 60 a second already; a shorter step's events wait for their
+    // interval); effect steps frame stays the game's.
     if (sfx_node::emission_clock() > 0) {
-        const int steps = effect_steps();
-        if (steps == 60) sfx_node::set_emission_clock(1);
+        const int steps = effect_steps(got);
+        if (steps != 30) sfx_node::set_emission_clock(1);
         if (steps == 0) {
             sfx_node::set_emission_clock(0);
             host_log("frame rate: effect steps frame: the effects' emission stays the game's, one event an update");

@@ -1167,7 +1167,7 @@ std::string config_value(const std::string& key) {
 std::string config_effect_steps() {
     if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) return e;
     const std::string v = config_value("video.effect_steps");
-    return v.empty() ? "smooth" : v;
+    return v.empty() ? "auto" : v;
 }
 
 bool config_frame_clock(bool setting, bool saved, const char** from) {

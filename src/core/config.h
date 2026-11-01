@@ -196,8 +196,8 @@ std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
 // The effects' steps above 30 fps as asked for: BBHOST_SFX_STEP, else [video]
-// effect_steps, else "smooth" (the default). The frame rate code reads 30,
-// smooth, 60 and frame (engine/frame_rate.cpp).
+// effect_steps, else "auto" (the default). The frame rate code reads auto,
+// smooth, a number of steps a second and frame (engine/frame_rate.cpp).
 std::string config_effect_steps();
 // The effects' emission clock as asked for: BBHOST_SFX_EMISSION, else [video]
 // effect_emission, else "60" (the default): "60" for emission events at 60 a

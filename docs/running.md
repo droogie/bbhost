@@ -487,9 +487,10 @@ the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 120). The effects - fire, lamps', candles' and braziers' flicker, blood,
-magic, every effect the game's effect manager runs - step in whole 1/30 s
-above 30, as many times a second as at 30 (every other frame at 60, every
-fourth at 120), the flicker keeping the cadence the game has at 30. The wind
+magic, every effect the game's effect manager runs - step in whole steps of
+their own above 30: by default (`[video] effect_steps = "auto"`) 1/60 s at
+every rate (every frame at 60, every other at 120, every third at 180), so a
+player who picks any frame rate gets the effects as they run at 60. The wind
 that sways grass and trees moves every frame at 30's pace: the game steps it a
 fixed 1/60 s each 1/30 s frame, so above 30 it takes half each frame's step,
 and its bend keeps the game's weight of 1/60 (`engine/wind_pace.h`;
@@ -504,18 +505,20 @@ motion's turns and its lag toward what it follows
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
 with 60 too). The wind's warm-up after a load (the grass and trees settling)
 counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
-before). By default (`[video] effect_steps = "smooth"`) the effects keep
-30's whole steps for what they count and move what they move by time - a
-particle's path, a motion's turn, the GPU particles' clock, a ribbon's head
-(its points still inserted once a whole step), the wind sources' gusts - by
-each frame's own time, in the effects whose every part has been converted
-for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
-1/30 s steps alone, the cadence the game has at 30; `60` steps the effects in
-whole 1/60 s instead (60
-updates a second above 60); `frame` steps them by the frame's time. A
-bbhost.toml that sets `effect_steps` keeps its value; one without it gets
-smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
-`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. An
+before). `effect_steps = "smooth"` steps the effects at the frame rate itself
+(whole 1/120 s at 120, 1/144 s at 144); a number, `effect_steps = "120"` (or
+`120`, 30 to 960), steps them that many times a second whatever the frame
+rate (1/120 s at 360, say); `30` is the cadence the game has at 30, and with
+it the wind's grass and trees step in whole 1/30 s too (every other value
+leaves the wind on the frame's time); `frame` steps them by the frame's
+time. A value the frame rate code cannot read runs auto. A bbhost.toml that
+sets `effect_steps` keeps its value; one without it gets auto.
+`BBHOST_SFX_STEP` overrides the setting with the same values, and
+`BBHOST_SFX_SMOOTH=1` with effect steps 30 turns on the step gate's older
+smooth steps for a test run - 30's whole steps for what the effects count,
+the frame's own time for what they move (a particle's path, a motion's turn,
+the GPU particles' clock, a ribbon's head, the wind sources' gusts) in the
+effects whose every part has been converted for it. An
 effect's emissions - the particles and children its nodes make - follow a
 clock of their own (`[video] effect_emission`, `BBHOST_SFX_EMISSION`): with
 `60`, the default, they come as the game's effects make them at 60 updates a
