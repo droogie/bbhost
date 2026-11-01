@@ -13507,10 +13507,16 @@ enum ElideRefusal : int {
     kErBarriers,     // the lazy pass barriers track sampled images by base
     kErNoIds,        // no stage 2: the id memo keeps no T# bases
     kErSame,         // the same image
+    kErMade,         // its last copies of this source into this destination made after all (Ledger::worth_deferring)
     kErRefusals
 };
 const char* const kErNames[kErRefusals] = {"depth", "layered", "shape", "view formats", "undrawn source", "display buffer",
-                                           "lazy barriers", "no stage 2", "same image"};
+                                           "lazy barriers", "no stage 2", "same image", "made the last times"};
+// BBHOST_COPY_ELIDE_HISTORY=0: a copy is left unmade whenever it may be, however its last ones ended (phase 1c off).
+const bool g_elide_history = [] {
+    const char* e = std::getenv("BBHOST_COPY_ELIDE_HISTORY");
+    return !(e && e[0] == '0');
+}();
 const char* const kCeEndNames[copy_elide::kEnds] = {"source written", "source retired", "destination written", "destination read",
                                                     "a copy out of it", "limit", "flush", "dropped", "images exchanged"};
 std::uint64_t g_ce_deferred = 0, g_ce_refused[kErRefusals] = {}, g_ce_swapped = 0, g_ce_redirects = 0, g_ce_lost = 0,
@@ -13997,6 +14003,19 @@ bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, st
                      static_cast<unsigned long long>(src.base), src.width, src.height, static_cast<int>(src.format),
                      static_cast<unsigned long long>(dst.base), dst.width, dst.height, static_cast<int>(dst.format), kErNames[why],
                      static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    }
+    // Phase 1c: a copy of this source into this destination whose last ones, two or more in a row, were made after all
+    // is made where it is asked, today's path (copy_elide::Ledger::worth_deferring: one in a window of 2 to 64 is left
+    // unmade again).
+    if (g_elide_history && !g_elide.worth_deferring(src.base, dst.base)) {
+        ++g_ce_refused[kErMade];
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> said;  // under g.mu
+        if (said.size() < 16 && said.emplace(src.base, dst.base).second) {
+            host_log("copy elision: copies of 0x%llx into 0x%llx (%ux%u f%d) made where asked: the last ones made after all (flip %llu)",
+                     static_cast<unsigned long long>(src.base), static_cast<unsigned long long>(dst.base), dst.width, dst.height,
+                     static_cast<int>(dst.format), static_cast<unsigned long long>(hle_video_flip_count()));
         }
         return false;
     }

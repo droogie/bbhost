@@ -21,13 +21,16 @@
 // written - every source write, attachment bind, clear, fill, copy into it or
 // retire goes through `touch` first. A pending copy's source is never itself
 // a pending copy's destination (that one is made first), so redirection is
-// one step.
+// one step. It also remembers how the last copies of each source into each
+// destination ended, so that a copy the game's frames always need made after
+// all is made where it is asked instead (`worth_deferring`).
 //
 // tests/copy_elide_test.cpp drives the ledger against a model of the images'
 // contents in which every copy is made at once, and checks that every read
 // sees what that model sees.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -116,11 +119,33 @@ public:
     bool take(std::uint64_t src) {
         for (std::size_t i = 0; i < pending_.size(); ++i) {
             if (pending_[i].src != src) continue;
+            note_end(pending_[i], kEndSwapped);
             pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(i));
             ++ends_[kEndSwapped];
             return true;
         }
         return false;
+    }
+
+    // A copy of `src` into `dst` about to be left unmade: whether that is
+    // worth it. When the last copies of this source into this destination,
+    // two or more in a row, were all made after all (any end but dropped or
+    // exchanged), leaving them unmade bought nothing but the bookkeeping -
+    // the destination's bindings redirected, the draws that write the source
+    // decided, their images resolved again - so this one is made where it is
+    // asked (false), and one in a window is left unmade again to see whether
+    // that still holds: a window of 2 after two made, doubling with each one
+    // made again up to kRetry, back to none at the first one dropped or
+    // exchanged (the first frames after a load can differ from the rest).
+    // Making a copy where it is asked is always exact.
+    static constexpr std::uint32_t kRetry = 64;
+    bool worth_deferring(std::uint64_t src, std::uint64_t dst) {
+        History* h = find_history(src, dst);
+        if (!h || h->made < 2) return true;
+        const std::uint32_t window = std::min<std::uint32_t>(kRetry, 1u << (h->made - 1 < 6 ? h->made - 1 : 6));
+        if (++h->skips < window) return false;
+        h->skips = 0;
+        return true;
     }
 
     // Before `t` happens to the image at `base`: the pending copies it ends,
@@ -192,6 +217,7 @@ public:
             const Pending p = pending_.front();
             pending_.erase(pending_.begin());
             ++ends_[why];
+            note_end(p, why);
             make(p, why);
         }
     }
@@ -211,6 +237,7 @@ private:
         now.swap(ended_);
         for (const Ended& e : now) {
             ++ends_[e.end];
+            note_end(e.p, e.end);
             if (e.end == kEndDropped) {
                 drop(e.p);
             } else {
@@ -220,10 +247,53 @@ private:
         now.clear();
         if (ended_.empty()) ended_.swap(now);  // keep the storage
     }
+    // How the last copies of one source into one destination ended (worth_deferring).
+    struct History {
+        std::uint64_t src = 0, dst = 0;
+        std::uint64_t used = 0;   // the ledger's clock at its last use: the least recently used goes first
+        std::uint32_t skips = 0;  // copies made where asked since the last one left unmade
+        std::uint8_t made = 0;    // its copies made after all in a row (dropped or exchanged: 0)
+    };
+    static constexpr std::size_t kHistory = 64;
+    History* find_history(std::uint64_t src, std::uint64_t dst) {
+        for (History& h : history_) {
+            if (h.src == src && h.dst == dst) {
+                h.used = ++clock_;
+                return &h;
+            }
+        }
+        return nullptr;
+    }
+    void note_end(const Pending& p, int end) {
+        History* h = find_history(p.src, p.dst);
+        if (!h) {
+            if (history_.size() < kHistory) {
+                history_.push_back(History{});
+                h = &history_.back();
+            } else {
+                h = &history_[0];
+                for (History& x : history_) {
+                    if (x.used < h->used) h = &x;
+                }
+                *h = History{};
+            }
+            h->src = p.src;
+            h->dst = p.dst;
+            h->used = ++clock_;
+        }
+        if (end == kEndDropped || end == kEndSwapped) {
+            h->made = 0;
+            h->skips = 0;
+        } else if (h->made < 255) {
+            ++h->made;
+        }
+    }
     std::vector<Ended> ended_;
     std::vector<Pending> pending_;  // oldest first
+    std::vector<History> history_;
     std::size_t most_;
     std::uint64_t deferred_ = 0;
+    std::uint64_t clock_ = 0;
     std::uint64_t ends_[kEnds] = {};
 };
 

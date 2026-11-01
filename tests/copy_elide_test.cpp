@@ -8,7 +8,8 @@
 // limit), and four mutants of the renderer's side of the rule - a source
 // write that skips the ledger, a partial write of a destination taken for a
 // whole one, a readback that skips it, a sampled read bound without asking -
-// each of which the random runs must catch.
+// each of which the random runs must catch. The random runs go again with
+// the ledger's history on (worth_deferring: some copies made where asked).
 #include "host/copy_elide.h"
 
 #include <cstdint>
@@ -85,10 +86,12 @@ std::vector<std::uint64_t> model(const std::vector<Event>& ev) {
 enum Mutant { kNone, kSkipSrcWrite, kPartialAsWhole, kSkipReadOther, kSkipRedirect };
 
 struct Stats {
-    std::uint64_t made = 0, dropped = 0, redirected = 0, deferred = 0;
+    std::uint64_t made = 0, dropped = 0, redirected = 0, deferred = 0, asked = 0;
 };
 
-std::vector<std::uint64_t> elided(const std::vector<Event>& ev, Mutant m, Stats* st = nullptr, std::size_t most = 16) {
+// `history`: the renderer's phase 1c - a copy the ledger says is not worth leaving unmade (worth_deferring) is made
+// where it is asked, as record_target_copy_locked makes it: the source read as it is, the destination overwritten whole.
+std::vector<std::uint64_t> elided(const std::vector<Event>& ev, Mutant m, Stats* st = nullptr, std::size_t most = 16, bool history = false) {
     std::uint64_t phys[kImages];
     for (int i = 0; i < kImages; ++i) phys[i] = 1000 + i;
     Ledger ledger(most);
@@ -105,6 +108,13 @@ std::vector<std::uint64_t> elided(const std::vector<Event>& ev, Mutant m, Stats*
         const std::uint64_t a = base_of(e.a);
         switch (e.op) {
             case kCopy:
+                if (history && !ledger.worth_deferring(a, base_of(e.b))) {
+                    ledger.touch(a, copy_elide::kReadOther, make, drop);
+                    ledger.touch(base_of(e.b), copy_elide::kOverwrite, make, drop);
+                    phys[e.b] = phys[e.a];
+                    ++s.asked;
+                    break;
+                }
                 ledger.defer(a, base_of(e.b), 0, make, drop);
                 ++s.deferred;
                 break;
@@ -156,6 +166,9 @@ void random_runs() {
         Stats s;
         const std::vector<std::uint64_t> got = elided(ev, kNone, &s, 1 + r % 6);
         CHECK(got == want);
+        Stats sh;
+        CHECK(elided(ev, kNone, &sh, 1 + r % 6, true) == want);
+        total.asked += sh.asked;
         total.made += s.made;
         total.dropped += s.dropped;
         total.redirected += s.redirected;
@@ -166,10 +179,12 @@ void random_runs() {
     }
     // Every copy is either made or dropped or still pending at the end.
     CHECK(total.made + total.dropped <= total.deferred);
-    CHECK(total.dropped > 0 && total.redirected > 0 && total.made > 0);
-    std::printf("random: %d runs, %llu copies left unmade, %llu made later, %llu never made, %llu reads redirected\n", runs,
-                static_cast<unsigned long long>(total.deferred), static_cast<unsigned long long>(total.made),
-                static_cast<unsigned long long>(total.dropped), static_cast<unsigned long long>(total.redirected));
+    CHECK(total.dropped > 0 && total.redirected > 0 && total.made > 0 && total.asked > 0);
+    std::printf("random: %d runs, %llu copies left unmade, %llu made later, %llu never made, %llu reads redirected; with the history, "
+                "%llu made where asked\n",
+                runs, static_cast<unsigned long long>(total.deferred), static_cast<unsigned long long>(total.made),
+                static_cast<unsigned long long>(total.dropped), static_cast<unsigned long long>(total.redirected),
+                static_cast<unsigned long long>(total.asked));
     const char* const names[5] = {"", "a source write that skips the ledger", "a partial write taken for a whole one",
                                   "a readback that skips the ledger", "a sampled read bound without asking"};
     for (int m = kSkipSrcWrite; m <= kSkipRedirect; ++m) {
@@ -260,6 +275,50 @@ void cases() {
         CHECK(!l.is_dst(D) && l.is_dst(E));
         l.flush(make);
         CHECK(made == 3 && !l.live());
+    }
+    {
+        // Phase 1c: a pair made after all twice in a row is made where asked, one in a window left unmade again - 2
+        // after two made, doubling with each made again up to kRetry; one exchanged or dropped starts over; other
+        // pairs are not affected.
+        made = dropped = 0;
+        ends.clear();
+        Ledger l;
+        CHECK(l.worth_deferring(S, D));
+        l.defer(S, D, 0, make, drop);
+        l.touch(S, copy_elide::kWrite, make, drop);
+        CHECK(made == 1 && l.worth_deferring(S, D));
+        l.defer(S, D, 0, make, drop);
+        l.touch(S, copy_elide::kWrite, make, drop);
+        CHECK(made == 2);
+        // Each window: the copies asked for until one is left unmade again, which is made after all once more.
+        for (std::uint32_t want : {2u, 4u, 8u, 16u, 32u, 64u, 64u}) {
+            std::uint32_t n = 1;
+            while (!l.worth_deferring(S, D) && n < 1000) ++n;
+            CHECK(n == want);
+            l.defer(S, D, 0, make, drop);
+            l.touch(S, copy_elide::kWrite, make, drop);
+        }
+        CHECK(l.worth_deferring(S, E) && l.worth_deferring(D, S));
+        while (!l.worth_deferring(S, D)) {
+        }
+        l.defer(S, D, 0, make, drop);
+        CHECK(l.take(S));  // exchanged
+        CHECK(l.worth_deferring(S, D) && l.worth_deferring(S, D));
+        // made twice again, then dropped: starts over
+        for (int k = 0; k < 2; ++k) {
+            l.defer(S, D, 0, make, drop);
+            l.touch(D, copy_elide::kReadOther, make, drop);
+        }
+        CHECK(!l.worth_deferring(S, D));
+        l.defer(S, D, 0, make, drop);
+        l.touch(D, copy_elide::kOverwrite, make, drop);
+        CHECK(dropped == 1 && l.worth_deferring(S, D));
+        // a flush counts as made
+        l.defer(S, D, 0, make, drop);
+        l.flush(make);
+        l.defer(S, D, 0, make, drop);
+        l.flush(make);
+        CHECK(!l.worth_deferring(S, D));
     }
 }
 
