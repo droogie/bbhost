@@ -93,15 +93,17 @@ bool rt_dcc_listed() {
     return listed;
 }
 // BBHOST_COPY_ELIDE: 0 every copy made where asked (the default), 1 copies left unmade, 2 compare (below, with the ledger).
-int copy_elide_mode() {
+// BBHOST_COPY_ELIDE as set - 0, 1, compare (2) - or -1 when it is not (copy_elide_decide: the device's default).
+int copy_elide_env() {
     static const int mode = [] {
         const char* e = std::getenv("BBHOST_COPY_ELIDE");
-        if (!e || !*e) return 0;
+        if (!e || !*e) return -1;
         if (std::strcmp(e, "compare") == 0) return 2;
         return std::atoi(e) == 1 ? 1 : 0;
     }();
     return mode;
 }
+int copy_elide_mode();  // below (g_copy_elide)
 bool dump_rt_locked(RtImage& r, const char* path);
 bool rt_float_max_locked(RtImage& r, float* out3);
 void apply_pending_clear(RtImage& r);
@@ -13489,12 +13491,14 @@ bool record_target_copy_raw_locked(RtImage& src, RtImage& dst, std::uint32_t wid
 //     destination keeps the texels the copy would have left it, and the
 //     clear or copy lands on the other image, which nothing reads before it.
 // Every write path of a target image goes through copy_elide_touch_locked
-// first (the ledger's invariant). 0 (the default for now): every copy made
-// where it is asked for. 1: left unmade. compare (2): left unmade as 1, and
-// made at once as well; at each pending copy's end the source is compared
-// with the destination on the GPU (copy_compare.cpp) - a difference is a
-// write that reached the source without the ledger, counted and logged.
-const int g_copy_elide = copy_elide_mode();
+// first (the ledger's invariant). 0: every copy made where it is asked
+// for. 1: left unmade. compare (2): left unmade as 1, and made at once as
+// well; at each pending copy's end the source is compared with the
+// destination on the GPU (copy_compare.cpp) - a difference is a write that
+// reached the source without the ledger, counted and logged. Unset, the
+// default (copy_elide_decide): 1 on an integrated GPU, 0 elsewhere.
+int g_copy_elide = 0;  // copy_elide_decide, at the device's choice, before anything is drawn
+int copy_elide_mode() { return g_copy_elide; }
 copy_elide::Ledger g_elide(16);  // under g.mu
 // Why a copy was made where it was asked for (the exit report's fallbacks).
 enum ElideRefusal : int {
@@ -13528,10 +13532,25 @@ thread_local bool t_elide_lookup = false;  // a draw's target lookups (draw_impl
 // source or destination, noted at its target lookup (copy_elide_bound_locked) and decided once its pipeline, vertex input
 // and images are known (copy_elide_decide_locked): proven to be written whole (host/full_write.h), the source's copy is
 // exchanged for the images (the destination's is never made); else the copy is made there, before the pass begins.
-const bool g_elide_draws = [] {
-    const char* e = std::getenv("BBHOST_COPY_ELIDE_DRAWS");
-    return g_copy_elide && !(e && e[0] == '0');
-}();
+bool g_elide_draws = false;  // copy_elide_decide
+
+// BBHOST_COPY_ELIDE, or when it is not set the default for the device chosen: on for an integrated GPU, whose video
+// memory is system RAM and whose bandwidth the copies take (+4-5% on a Radeon 680M at 1080p), off elsewhere for now: a
+// discrete GPU at 1080p is mostly limited by the CPU, where elision has not been shown to pay yet. Decided once, before
+// anything is drawn, and said once.
+void copy_elide_decide(bool integrated) {
+    static bool decided = false;
+    if (decided) return;
+    decided = true;
+    const int env = copy_elide_env();
+    g_copy_elide = env >= 0 ? env : integrated ? 1 : 0;
+    const char* const e = std::getenv("BBHOST_COPY_ELIDE_DRAWS");
+    g_elide_draws = g_copy_elide && !(e && e[0] == '0');
+    host_log("render: copy elision %s (%s)", g_copy_elide == 2 ? "in compare mode" : g_copy_elide ? "on" : "off",
+             env >= 0          ? "BBHOST_COPY_ELIDE"
+             : integrated      ? "the default for an integrated GPU; BBHOST_COPY_ELIDE=0 turns it off"
+                               : "the default for a GPU that is not integrated; BBHOST_COPY_ELIDE=1 turns it on");
+}
 thread_local std::uint64_t t_elide_bound[9];  // the draw's noted attachments (bases)
 thread_local int t_elide_bound_n = 0;
 thread_local std::uint64_t t_elide_redirected[8];  // sources the draw's sampled reads of a destination were bound to

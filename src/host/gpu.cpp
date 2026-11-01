@@ -3369,6 +3369,7 @@ bool init_locked() {
             g.has_address_report = ar.reportAddressBinding == VK_TRUE;
         }
         g.integrated = c.type_rank == 3;
+        copy_elide_decide(g.integrated);
         g.tight = memory_tight(c);
         {
             int unknown = -1;

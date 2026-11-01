@@ -1760,6 +1760,7 @@ void copy_elide_touch_locked(std::uint64_t base, int touch);  // before `touch` 
 void copy_elide_bound_locked(std::uint64_t base);
 void copy_elide_flush_locked();                             // every pending copy made now
 std::string copy_elide_report_locked();
+void copy_elide_decide(bool integrated);  // BBHOST_COPY_ELIDE, or the default for the device chosen (render.cpp): said once
 RtImage* rt_at_locked(std::uint64_t base);                  // g_rts' target at `base`, else g_snapshots' snapshot, else null
 extern thread_local bool t_elide_lookup;                    // draw_impl's target lookups are on (an attachment bound is a write)
 // The targets at `a` and `b` exchanged their images: their sampled views go with
