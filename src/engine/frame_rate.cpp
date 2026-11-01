@@ -1618,9 +1618,10 @@ int wanted_fps() {
 // The effects' whole steps a second at `fps` frames a second: auto, the
 // default, is 60 (30 at 30), so whatever rate a player picks the effects run
 // as at 60; smooth is the frame rate itself (1/120 s steps at 120); a number
-// (30 to 960, "120" or 120) is that many; frame (0) steps them by the frame's
-// time. Whole 1/30 s steps also move the wind's; the rest leave the wind on the
-// frame's time. BBHOST_SFX_STEP wins over the config's [video] effect_steps.
+// (1 to 960, "120" or 120; below 30 to test coarse steps) is that many;
+// frame (0) steps them by the frame's time. Whole 1/30 s steps also move the
+// wind's; the rest leave the wind on the frame's time. BBHOST_SFX_STEP wins
+// over the config's [video] effect_steps.
 int effect_steps(int fps) {
     const std::string v = config_effect_steps();
     const char* env = std::getenv("BBHOST_SFX_STEP");
@@ -1631,8 +1632,8 @@ int effect_steps(int fps) {
     if (v == "frame") return 0;
     char* end = nullptr;
     const long n = std::strtol(v.c_str(), &end, 10);
-    if (end != v.c_str() && *end == '\0' && n >= 30 && n <= 960) return static_cast<int>(n);
-    host_log("frame rate: %s = %s is none of auto, smooth, frame and 30 to 960; auto (%d) runs", from, v.c_str(), automatic);
+    if (end != v.c_str() && *end == '\0' && n >= 1 && n <= 960) return static_cast<int>(n);
+    host_log("frame rate: %s = %s is none of auto, smooth, frame and 1 to 960; auto (%d) runs", from, v.c_str(), automatic);
     return automatic;
 }
 
@@ -1931,7 +1932,7 @@ int apply_rate(ElfImage* image, int want) {
                 le(sfx_disp, disp);
                 write(kSfxStepLoad + 4, disp, sizeof(disp));
                 host_log("frame rate: the effects step in whole 1/%d s, the rest carried (SprjSfx::Update's load at 0x%x; [video] "
-                         "effect_steps or BBHOST_SFX_STEP = %s: auto (the default, 60), smooth (the frame rate), 30 to 960 or frame)",
+                         "effect_steps or BBHOST_SFX_STEP = %s: auto (the default, 60), smooth (the frame rate), 1 to 960 or frame)",
                          steps, kSfxStepLoad, config_effect_steps().c_str());
                 if (steps == 30) {
                     // The wind's three loads, at the frame-time slot by the 60

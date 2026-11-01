@@ -489,7 +489,7 @@ with 60 too). The wind's warm-up after a load (the grass and trees settling)
 counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
 before). `effect_steps = "smooth"` steps the effects at the frame rate itself
 (whole 1/120 s at 120, 1/144 s at 144); a number, `effect_steps = "120"` (or
-`120`, 30 to 960), steps them that many times a second whatever the frame
+`120`, 1 to 960 - below 30 to test them in coarse steps, `5` a 1/5 s step five times a second), steps them that many times a second whatever the frame
 rate (1/120 s at 360, say); `30` is the cadence the game has at 30, and with
 it the wind's grass and trees step in whole 1/30 s too (every other value
 leaves the wind on the frame's time); `frame` steps them by the frame's

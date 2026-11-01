@@ -104,6 +104,16 @@ int main() {
     CHECK(pattern(1.0 / 360, 120, 6) == "001001");
     CHECK(pattern(1.0 / 30, 120, 3) == "444");
     CHECK(sfx_schedule::most(45) == 2);
+    // Below 30 (a test): whole 1/5 s every sixth frame at 30, every twelfth at 60.
+    CHECK(pattern(1.0 / 30, 5, 12) == "000001000001");
+    CHECK(pattern(1.0 / 60, 5, 12) == "000000000001");
+    {
+        double c = 0.0;
+        CHECK(bits(next(c, 1.0 / 30, 5).seconds) == 0u);
+        c = 1.0 / 5 - 1.0 / 30;
+        CHECK(bits(next(c, 1.0 / 30, 5).seconds) == bits(0.2f));
+    }
+    CHECK(sfx_schedule::most(1) == 1);
     CHECK(sfx_schedule::most(960) == 32);
     // 144: a whole 1/30 s every 4.8 frames - 30 a second, never two in a row.
     {
@@ -141,6 +151,8 @@ int main() {
         steady(1.0 / fps, 45, 200000);
         steady(1.0 / fps, 120, 200000);
         steady(1.0 / fps, 360, 200000);
+        steady(1.0 / fps, 5, 200000);
+        steady(1.0 / fps, 1, 200000);
     }
     // BBHOST_SFX_SIM_FPS's float frame time (1/N as a double of a float).
     steady(static_cast<float>(1.0 / 60), 30, 200000);
