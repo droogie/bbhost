@@ -62,11 +62,14 @@ GUEST_ABI std::int64_t sleep_hook(std::uint64_t, const std::uint64_t* saved) {
     const int mode = g_mode.load(std::memory_order_relaxed);
     const auto asked = static_cast<std::int32_t>(static_cast<std::uint32_t>(saved[5]));
     std::unique_lock<std::mutex> lock(g_mu);
-    const std::uint64_t frames = g_frames - g_ended_at;
+    // (The first pass's end only starts the count: every frame before it would
+    // be its.)
+    if (g_end_t) {
+        g_passes.fetch_add(1, std::memory_order_relaxed);
+        g_by_frames[std::min<std::uint64_t>(g_frames - g_ended_at, 3)].fetch_add(1, std::memory_order_relaxed);
+        g_period_ns.fetch_add(now - g_end_t, std::memory_order_relaxed);
+    }
     g_ended_at = g_frames;
-    g_passes.fetch_add(1, std::memory_order_relaxed);
-    g_by_frames[std::min<std::uint64_t>(frames, 3)].fetch_add(1, std::memory_order_relaxed);
-    if (g_end_t) g_period_ns.fetch_add(now - g_end_t, std::memory_order_relaxed);
     g_end_t = now;
     if (mode != kWake) return 0;
     if (g_pass_t0) {
