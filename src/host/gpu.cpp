@@ -4464,8 +4464,26 @@ bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, s
     return true;
 }
 
+// submit_locked from the end of its recording (g.recording = false) until the
+// next command buffer is current (g.cmd_): a recording begun in between begins
+// the command buffer just ended again, and the next submission ends the one
+// after it, never begun - RADV dereferences a null IB there. Nothing may
+// record there (submit_locked); one that does is named once.
+namespace {
+bool g_submit_ending = false;  // under g.mu
+void begin_recording_while_ending(const void* site) {
+    static bool said = false;  // under g.mu
+    if (said) return;
+    said = true;
+    host_log("gpu: a recording begun while a submission ends (from bbhost+0x%llx, submission %llu): its commands go to the command buffer "
+             "just ended - a bug",
+             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(site) - host_image_base()), static_cast<unsigned long long>(g.flushes));
+}
+}  // namespace
+
 void begin_recording_locked() {
     if (!g.recording) {
+        if (g_submit_ending) begin_recording_while_ending(__builtin_return_address(0));
         if (stream_on()) {
             rec().begin(g.cmd_);  // the recorder begins it (kBegin)
         } else {
@@ -8426,6 +8444,18 @@ void submit_locked() {
     compact_image_heap_locked();  // in place of the drains where on: the emptiest block of either class, copies a turn a second
     textures_relocate_pinned_locked();  // a textures' block's few GPU-written surfaces, moved so it can drain (lean thresholds)
     textures_record_ahead_locked();  // made-ahead uploads whose copy into staging is done (BBHOST_GXVK_AHEAD_DEFER)
+    // The staging spans this recording's uploads read are filled, and the
+    // images the game is done with go: retired textures, targets and
+    // snapshots (the reuse sweep), evictions, drains. Here, while the
+    // recording is open: a target that goes can record - a pending copy out
+    // of it is made first (BBHOST_COPY_ELIDE), and compare mode compares one
+    // into it too - and those commands belong in this submission, whose
+    // retirement frees the images they read. After g.recording = false below
+    // such a recording began the ended command buffer again, the slot moved
+    // on with the recording still open, and the next submission ended a
+    // command buffer never begun: RADV's vkEndCommandBuffer dereferenced a
+    // null IB (Steam Deck, copy elision in compare mode, Central Yharnam).
+    textures_before_submit();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -8451,6 +8481,7 @@ void submit_locked() {
         bump(g_stream_stats.endbegin_n);
     }
     g.recording = false;
+    g_submit_ending = true;  // until the next command buffer is current: nothing records (begin_recording_locked)
     // The vertex and index copies this recording's draws read go first.
     const VkCommandBuffer cmds[2] = {shadow_end_uploads_locked(), g.cmd_};
     const VkSemaphore bind_sem = shadow_bind_sparse_locked();
@@ -8479,7 +8510,6 @@ void submit_locked() {
         last_dispatches = dispatches;
         last_tess = tess;
     }
-    textures_before_submit();  // the staging spans its copies read are filled
     // BBHOST_TEST_DEVICE_LOST=<flip>: from that flip on, act as if the device
     // were lost (it is not; the GPU only gets no more work) - the reports, the
     // note for the next starts and the window's ending, tested.
@@ -8495,6 +8525,7 @@ void submit_locked() {
         // reuse what that one may still read. The recording is dropped; bbhost
         // is ending.
         g.queued = 0;
+        g_submit_ending = false;
         return;
     }
     if (streamed) {
@@ -8549,11 +8580,14 @@ void submit_locked() {
     ++g.flushes;
     g.slot = (g.slot + 1) % g.slot_count;
     retire_slot_locked(g.slot);
-    publish_import_tables_locked();  // window imports the queue sees now take over their windows' entries
-    stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
+    // The slot's command buffer is current as soon as its last submission has
+    // retired: what follows would begin that one, not the one just ended.
     g.cmd_ = g.slots[g.slot].cmd;
     g.fence = g.slots[g.slot].fence;
     g.desc_pool = g.slots[g.slot].pool;
+    g_submit_ending = false;
+    publish_import_tables_locked();  // window imports the queue sees now take over their windows' entries
+    stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
 }
 
 // Submits and waits for everything in flight (frame dumps, resource
