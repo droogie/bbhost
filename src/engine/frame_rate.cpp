@@ -401,6 +401,37 @@ constexpr Counted kCounts[] = {
     {0x4b33c51, 5, 33333, Count::Digits},
 };
 
+// With the frame clock on, as kHandedOver for the values: the counts above
+// that keep the game's, because what counts them counts game time instead,
+// or because they never followed the frame. Each has a switch of its own
+// (=0) that writes the rate's count at start, as with the clock off, and so
+// does a decomp or a hook that is not in place.
+struct CountHandedOver {
+    std::uint32_t at;
+    Handover how;
+    const char* env;
+    const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
+};
+constexpr CountHandedOver kCountsHandedOver[] = {
+    // The user-service event thread's usleep(33000) while no event waits: the
+    // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
+    {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},
+};
+constexpr bool counts_handed_over_in_counts() {
+    for (const CountHandedOver& h : kCountsHandedOver) {
+        bool found = false;
+        for (const Counted& c : kCounts) found = found || c.at == h.at;
+        if (!found || h.how == Handover::Load) return false;
+    }
+    return true;
+}
+static_assert(counts_handed_over_in_counts(), "every count handed back is one of kCounts (its old value is checked there)");
+constexpr const CountHandedOver* count_handed_over(std::uint32_t at) {
+    for (const CountHandedOver& h : kCountsHandedOver)
+        if (h.at == at) return &h;
+    return nullptr;
+}
+
 // And the same at every rate: the frame-time manager's catch-up allowance
 // zeroed (its movabs rcx, 0x1e0000000n into +0x268/+0x26c) - inside the
 // function ours replaces, where it only matters with BBHOST_FRAME_SOURCE=0.
@@ -906,9 +937,17 @@ struct DtSlot {
 };
 std::vector<DtSlot> g_dt_slots;
 std::size_t g_dt_loads_applied = 0;
-// The values handed back to a decomp (kHandedOver), with the start-time value
-// each takes if that decomp is not placed (frame_rate_install_late).
-std::vector<std::pair<const HandedOver*, std::uint32_t>> g_late;
+// The values and counts handed back to a decomp (kHandedOver,
+// kCountsHandedOver), with the start-time bytes each takes if that decomp is
+// not placed (frame_rate_install_late).
+struct Late {
+    std::uint32_t at;
+    std::uint8_t n;
+    std::uint8_t now[8];
+    const char* decomp;
+    double shown;  // the start-time value, for the log
+};
+std::vector<Late> g_late;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1794,8 +1833,20 @@ int apply_rate(ElfImage* image, int want) {
         if (r && mode != 60 && !r->each_frame) ++rated_fixed;
         write(c.at, &now, 4);
     }
+    // The counts handed back (kCountsHandedOver) keep the game's the same way.
+    const auto count_handed_back = [&](const CountHandedOver& h) {
+        if (!frame_clock::on()) return false;
+        const char* e = std::getenv(h.env);
+        if (e && e[0] == '0') return false;
+        return h.how != Handover::Decomp || g_source == Source::Ours;
+    };
+    std::vector<std::pair<const CountHandedOver*, const Counted*>> kept_counts;
     for (const Counted& c : kCounts) {
         if (skipped(c.at)) continue;
+        if (const CountHandedOver* h = count_handed_over(c.at); h && count_handed_back(*h)) {
+            kept_counts.push_back({h, &c});
+            continue;
+        }
         std::uint8_t now[8];
         count_bytes(c, fps, now);
         write(c.at, now, c.n);
@@ -2059,7 +2110,9 @@ int apply_rate(ElfImage* image, int want) {
     for (const auto& [h, now] : kept) {
         const char* how = "right at every rate";
         if (h->how == Handover::Decomp) {
-            g_late.push_back({h, now});
+            Late late{h->at, 4, {}, h->decomp, static_cast<double>(bits_float(now))};
+            std::memcpy(late.now, &now, 4);
+            g_late.push_back(late);
             how = "converted every frame by its decomp";
         } else if (h->how == Handover::Load) {
             how = "read every frame through a slot of the frame clock's";
@@ -2073,6 +2126,22 @@ int apply_rate(ElfImage* image, int want) {
         }
         host_log("frame rate: 0x%x keeps the game's value (%g), %s (%s=0: the rate's, %g)", h->at,
                  static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), how, h->env, static_cast<double>(bits_float(now)));
+    }
+    // The counts handed back (kCountsHandedOver), the same way.
+    for (const auto& [h, c] : kept_counts) {
+        std::uint8_t now[8] = {};
+        count_bytes(*c, fps, now);
+        const double was = c->was, then = c->kind == Count::Frames ? static_cast<double>(c->was) * fps / 30
+                                                                   : static_cast<double>(c->was) * 30 / fps;
+        const char* how = "right at every rate";
+        if (h->how == Handover::Decomp) {
+            Late late{h->at, c->n, {}, h->decomp, std::floor(then)};
+            std::memcpy(late.now, now, c->n);
+            g_late.push_back(late);
+            how = "counted in game time by its decomp";
+        }
+        host_log("frame rate: 0x%x keeps the game's count (%.0f), %s (%s=0: the rate's, %.0f)", h->at, was, how, h->env,
+                 std::floor(then));
     }
     // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
     // and his stores with the sites) or, with Original, the game's 30 fps
@@ -2275,16 +2344,16 @@ void frame_rate_install(ElfImage* image) {
 
 void frame_rate_install_late(ElfImage* image) {
     constexpr std::uint32_t kCodeEnd = 0x54d96dc;  // the 1.09 image's executable segment's end (apply_rate)
-    for (const auto& [h, now] : g_late) {
-        if (decomp_placed(h->decomp) != 0) continue;  // ours (or its compare stand-in) converts it every frame
-        const std::uint64_t at = image->mem.slide + (h->at - kPreferredGuestSlide), lo = at & ~0xfffull,
-                            hi = (at + 4 + 0xfff) & ~0xfffull;
+    for (const Late& l : g_late) {
+        if (decomp_placed(l.decomp) != 0) continue;  // ours (or its compare stand-in) converts it every frame
+        const std::uint64_t at = image->mem.slide + (l.at - kPreferredGuestSlide), lo = at & ~0xfffull,
+                            hi = (at + l.n + 0xfff) & ~0xfffull;
         guest_protect_rwx(&image->mem, lo, hi - lo);
-        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), &now, 4);
-        if (h->at < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), l.now, l.n);
+        if (l.at < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
         else guest_protect_rw(&image->mem, lo, hi - lo);
         host_log("frame rate: %s is not in place; 0x%x takes the rate's value at start (%g), as with the frame clock off",
-                 h->decomp, h->at, static_cast<double>(bits_float(now)));
+                 l.decomp, l.at, l.shown);
     }
     g_late.clear();
 }
