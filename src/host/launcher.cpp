@@ -255,6 +255,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     }
     SDL_SetWindowMinimumSize(win, std::min(win_w, static_cast<int>(860 * scale)), std::min(win_h, static_cast<int>(580 * scale)));
     dark_title_bar(win);
+    // V-Sync paces the window where the driver keeps it; the loop below caps
+    // it at 60 a second besides, for where it does not.
     SDL_SetRenderVSync(ren, 1);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -512,6 +514,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         return true;
     };
 
+    // The window's pace: 60 frames a second at most. V-Sync alone left the loop
+    // drawing as fast as it could wherever the driver ignores it - a driver
+    // setting that turns it off, a backend without it, a window the compositor
+    // stopped showing - a whole core spent on a settings page. Each frame's
+    // deadline moves on by a sixtieth of a second on SDL's nanosecond clock,
+    // and what is left of it is slept after the present; a frame that ran a
+    // whole frame past it starts the count again rather than hurrying to
+    // catch up.
+    constexpr Uint64 kFrameNs = SDL_NS_PER_SECOND / 60;
+    Uint64 frame_due = SDL_GetTicksNS();
     while (!done) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -531,6 +543,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 if (g_pick_for == kEboot) eboot = check_eboot(f[kEboot].str());
                 g_pick_for = -1;
             }
+        }
+        // Minimized, hidden or covered: nothing is drawn, and the loop waits
+        // for the next event, a tenth of a second at most (a sign-in finished
+        // in the browser is still saved above). A test's window draws on, so
+        // its frames still count.
+        if (!test && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))) {
+            SDL_WaitEventTimeout(nullptr, 100);
+            frame_due = SDL_GetTicksNS();
+            continue;
         }
         // A new text size: the style and fonts take it, and the window
         // grows or shrinks to what it opens at with that size.
@@ -1499,6 +1520,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
         }
         SDL_RenderPresent(ren);
+        frame_due += kFrameNs;
+        const Uint64 now = SDL_GetTicksNS();
+        if (now < frame_due) SDL_DelayNS(frame_due - now);
+        else if (now - frame_due > kFrameNs) frame_due = now;
     }
 
     // Closing the window while a compile runs: it is told to stop and write
