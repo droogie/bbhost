@@ -13,6 +13,7 @@
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
+#include "host/gxvk_table.h"
 #include "host/import_mode.h"
 #include "host/import_prefetch.h"
 #include "host/memory_policy.h"
@@ -69,6 +70,7 @@ namespace gpu {
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 thread_local constinit const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
+thread_local constinit int t_import_fall = -1;                  // gpu_internal.h: the census by window
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -862,17 +864,23 @@ struct SiteUse {
     const char* site = nullptr;
     std::uint64_t n = 0, bytes = 0;
 };
-SiteUse g_site_uses[64];  // under g.mu
+constexpr int kSiteSlots = 64;
+SiteUse g_site_uses[kSiteSlots];  // under g.mu
+// The slot of a path (its name's pointer: ImportSite's literal), -1 once every slot is taken.
+int site_slot_locked(const char* site) {
+    for (int k = 0; k < kSiteSlots; ++k) {
+        SiteUse& u = g_site_uses[k];
+        if (!u.site) u.site = site;
+        if (u.site == site) return k;
+    }
+    return -1;
+}
 void note_site_use_locked(std::uint64_t bytes) {
     if (!g_census) return;
-    const char* const site = t_import_site ? t_import_site : "other";
-    for (SiteUse& u : g_site_uses) {
-        if (!u.site) u.site = site;
-        if (u.site != site) continue;
-        ++u.n;
-        u.bytes += bytes;
-        return;
-    }
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    if (k < 0) return;
+    ++g_site_uses[k].n;
+    g_site_uses[k].bytes += bytes;
 }
 // The GX buffers GPU copies wrote (copy tokens' destinations, copy versions'):
 // by generation, with their usage, bind flags and size - candidates for a
@@ -1259,12 +1267,14 @@ void count_lagging_tables_locked() {
 // job cannot see yet (amdgpu maps a new buffer for the submissions after it) -
 // they keep it until publish_import_tables_locked finds the queue has. The
 // imports neither view names any more retire (host/import_table.h).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who);  // the census by window, below
 void install_import_locked(std::uint32_t index, Chunk* c) {
     DmemChunk& d = g.dmem[index];
     const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
     if (end <= c->lo) return;
     const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
     const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    if (g_census) window_made_locked(index, a, b, t_import_who);
     c->made_serial = g.flushes;  // the recording open now goes to the queue after it was made
     c->made_ns = host_clock_monotonic_ns();
     bool replaces = false;
@@ -1453,6 +1463,286 @@ std::string import_idle_report_locked() {
     return buf;
 }
 
+// ---- The census by window (BBHOST_IMPORT_CENSUS=1; off, nothing is counted) ----
+// Every use of direct memory an import answers or is made for (dmem_import),
+// by the 16 MiB window it falls in: the path that asked (t_import_site), what
+// lies at the address it asked for - its owner: GX's upload heap, a GX buffer
+// kept by handle (stage 1b; such a binding took today's path), another GX
+// buffer by kind, a GX texture, the middleware (BBHOST_RESOURCE_CENSUS=1),
+// nothing of GX's - and when. At a report, every window imported: those that
+// serve GX-owned memory alone and those a handle covers - what stage 6 may stop
+// importing - and those a minute (or 3,600 flips) without a use - what retiring
+// idle windows would give back - in bytes, with what lies in them. With whole
+// spans the same uses say which windows window imports would need.
+namespace {
+enum WinOwner : int {
+    kWoHeap,         // GX's upload heap (renamed copies, Map renames, the ring allocator's)
+    kWoKept,         // a GX buffer kept by handle (stage 1b)
+    kWoDynamic,      // a dynamic GX buffer, in its own memory
+    kWoGpuWritten,   // a GX buffer the GPU writes (unordered access, stream output)
+    kWoConstant,     // a GX constant buffer, in its own memory
+    kWoBuffer,       // another GX buffer (default without data, staging)
+    kWoTexture,      // a GX texture
+    kWoYebis,        // YEBIS's device's (BBHOST_RESOURCE_CENSUS=1)
+    kWoScaleform,    // a Scaleform texture's plane (BBHOST_RESOURCE_CENSUS=1)
+    kWoNone,         // no GX object
+    kWoUnnamed,      // the path named no address (the buffer shadow's mirror pages)
+    kWinOwners
+};
+const char* const kWinOwnerName[kWinOwners] = {"GX's upload heap", "a GX buffer kept by handle", "a dynamic GX buffer",
+                                               "a GX buffer the GPU writes", "a GX constant buffer", "another GX buffer", "a GX texture",
+                                               "YEBIS", "Scaleform", "no GX object", "no address named"};
+constexpr std::uint32_t kWoGx = (1u << kWoHeap) | (1u << kWoKept) | (1u << kWoDynamic) | (1u << kWoGpuWritten) | (1u << kWoConstant) |
+                                (1u << kWoBuffer) | (1u << kWoTexture);
+struct WindowUses {
+    std::uint64_t sites = 0;   // bit k: the path in g_site_uses[k] used it
+    std::uint32_t owners = 0;  // bit per WinOwner met at its uses
+    std::uint64_t uses = 0, bytes = 0;
+    std::uint64_t first_ms = 0, last_ms = 0, last_flip = 0;
+    int maker = -1;  // the ImportWho of the first import that covered it (window imports)
+};
+WindowUses g_wuse[gcn::kDmemChunks][kImportWindows];                                    // under g.mu
+std::uint64_t g_wuse_n[kSiteSlots][kWinOwners], g_wuse_bytes[kSiteSlots][kWinOwners];  // by path and owner, under g.mu
+// The uses of GX buffers' memory (a GX buffer kept by handle, another GX buffer) by why the binding took today's path
+// (stage 1b's result, t_import_fall; the last: none asked), under g.mu.
+constexpr int kWinFalls = 12;
+const char* const kWinFallName[kWinFalls] = {"no GX object", "not kept", "a stale handle", "taken back since the call", "retired by a write",
+                                             "past the buffer's end", "no memory for the copy", "its bytes out of reach", "indirect indices",
+                                             "shared with another buffer", "the copies' budget", "none asked, or compared"};
+static_assert(gxvk::kFalls == kWinFalls - 1, "a name for each of stage 1b's results");
+std::uint64_t g_wuse_fall_n[2][kWinFalls], g_wuse_fall_bytes[2][kWinFalls];
+
+int win_owner_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!va) return kWoUnnamed;
+    if (!bytes) bytes = 1;
+    std::uint64_t lo = 0, hi = 0;
+    if (gxvk::upload_heap(&lo, &hi) && va < hi && va + bytes > lo) return kWoHeap;
+    GxResourceInfo info;
+    if (gx_resource_overlapping(va, bytes, &info) && info.alive) {
+        if (info.type != 1) return kWoTexture;
+        if (gxvk::kept_at(va, bytes)) return kWoKept;
+        if (info.usage == 2) return kWoDynamic;
+        if (info.bind & 0x90) return kWoGpuWritten;
+        if (info.bind & 0x4) return kWoConstant;
+        return kWoBuffer;
+    }
+    const int mw = gx_middleware_at(va, bytes);
+    return mw == 1 ? kWoYebis : mw == 2 ? kWoScaleform : kWoNone;
+}
+
+// A use of [in, in + bytes) of chunk `index` (the caller asks g_census).
+void window_use_locked(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+    if (index >= gcn::kDmemChunks || in >= kChunkBytes) return;
+    if (!bytes) bytes = 1;
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    const int own = win_owner_locked(t_import_va, bytes);
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+    const std::uint32_t w1 = static_cast<std::uint32_t>((std::min(in + bytes, kChunkBytes) - 1) >> kImportWindowShift);
+    for (std::uint32_t w = w0; w <= w1; ++w) {
+        WindowUses& u = g_wuse[index][w];
+        if (k >= 0) u.sites |= 1ull << k;
+        u.owners |= 1u << own;
+        ++u.uses;
+        if (w == w0) u.bytes += bytes;
+        if (!u.first_ms) u.first_ms = now;
+        u.last_ms = now;
+        u.last_flip = flip;
+    }
+    if (k >= 0) {
+        ++g_wuse_n[k][own];
+        g_wuse_bytes[k][own] += bytes;
+    }
+    if (own == kWoKept || own == kWoBuffer) {
+        const int f = t_import_fall >= 0 && t_import_fall < kWinFalls - 1 ? t_import_fall : kWinFalls - 1;
+        ++g_wuse_fall_n[own == kWoKept ? 0 : 1][f];
+        g_wuse_fall_bytes[own == kWoKept ? 0 : 1][f] += bytes;
+    }
+}
+// Windows [a, b] of chunk `index` covered by an import `who` made (window imports).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who) {
+    if (index >= gcn::kDmemChunks) return;
+    for (std::uint32_t w = a; w <= b && w < kImportWindows; ++w) {
+        if (g_wuse[index][w].maker < 0) g_wuse[index][w].maker = who;
+    }
+}
+}  // namespace
+
+// The census's lines: a summary at every video memory report; at exit also the
+// uses by path and owner, and every window imported.
+std::string import_window_census_report_locked(bool at_exit) {
+    if (!g_census) return {};
+    using ull = unsigned long long;
+    const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    // The windows' classes by what their uses met.
+    enum Cls : int { kClGx, kClHandle, kClMixed, kClNotGx, kClUnnamed, kClNever, kClasses };
+    static const char* const kClName[kClasses] = {"GX-owned alone", "a handle's alone", "GX's and others'", "nothing of GX's",
+                                                  "no address named", "never used"};
+    std::uint64_t n[kClasses] = {}, bytes[kClasses] = {}, idle[kClasses] = {}, idle_f[kClasses] = {};
+    std::uint64_t lies[kGxBytesKinds] = {}, lies_heap = 0, lies_none = 0, windows = 0, wbytes = 0, live = 0;
+    std::uint64_t cls_lies[kClasses][kGxBytesKinds + 2] = {};  // + the heap, + nothing of GX's
+    std::size_t nlive = 0;
+    std::uint64_t heap_lo = 0, heap_hi = 0;
+    const bool have_heap = gxvk::upload_heap(&heap_lo, &heap_hi);
+    static const char* const whos[] = {"a binding", "a device address", "a walk", "the prefetch", "a whole span"};
+    std::string detail;
+    char b[2048];
+    for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+        const DmemChunk& d = g.dmem[k];
+        for (const auto& c : d.imports) live += c->size;
+        nlive += d.imports.size();
+        for (std::uint32_t w = 0; w < kImportWindows; ++w) {
+            const Chunk* c = d.window[w];
+            if (!c) continue;
+            const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+            const std::uint64_t hi = std::min({c->lo + c->size, static_cast<std::uint64_t>(w + 1) << kImportWindowShift, kChunkBytes});
+            if (hi <= lo) continue;
+            const WindowUses& u = g_wuse[k][w];
+            const std::uint32_t gx = u.owners & kWoGx, other = u.owners & ~kWoGx;
+            const int cls = !u.uses ? kClNever
+                            : !other ? (gx == (1u << kWoKept) ? kClHandle : kClGx)
+                            : !gx    ? (other == (1u << kWoUnnamed) ? kClUnnamed : kClNotGx)
+                                     : kClMixed;
+            ++windows;
+            wbytes += hi - lo;
+            ++n[cls];
+            bytes[cls] += hi - lo;
+            if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) idle[cls] += hi - lo;
+            if (!u.last_ms || flip - u.last_flip >= 3600) idle_f[cls] += hi - lo;
+            // What lies there: the live resources over its pages, by the first
+            // mapping of each (a page mapped twice counted once).
+            std::uint64_t here[kGxBytesKinds] = {}, here_heap = 0;
+            const std::uint64_t plo = static_cast<std::uint64_t>(k) * kChunkBytes + lo, phi = static_cast<std::uint64_t>(k) * kChunkBytes + hi;
+            struct Piece {
+                std::uint64_t lo, hi, va;  // physical [lo, hi), mapped at va
+            };
+            std::vector<Piece> pieces;
+            for (const GuestMapInfo& mi : g.maps) {
+                if (!mi.dmem || mi.phys < 0) continue;
+                const std::uint64_t mlo = static_cast<std::uint64_t>(mi.phys), mhi = mlo + mi.len;
+                if (mhi <= plo || mlo >= phi) continue;
+                pieces.push_back({std::max(mlo, plo), std::min(mhi, phi), mi.va + (std::max(mlo, plo) - mlo)});
+            }
+            std::sort(pieces.begin(), pieces.end(), [](const Piece& x, const Piece& y) { return x.lo < y.lo; });
+            std::uint64_t covered = plo;
+            for (const Piece& pc : pieces) {
+                const std::uint64_t a = std::max(pc.lo, covered);
+                if (pc.hi <= a) continue;
+                const std::uint64_t va = pc.va + (a - pc.lo), len = pc.hi - a;
+                gx_resources_bytes_by_kind(va, len, here);
+                if (have_heap && va < heap_hi && va + len > heap_lo) here_heap += std::min(va + len, heap_hi) - std::max(va, heap_lo);
+                covered = pc.hi;
+            }
+            std::uint64_t gx_here = here_heap;
+            for (int q = 0; q < kGxBytesKinds; ++q) {
+                lies[q] += here[q];
+                cls_lies[cls][q] += here[q];
+                gx_here += here[q];
+            }
+            lies_heap += here_heap;
+            cls_lies[cls][kGxBytesKinds] += here_heap;
+            const std::uint64_t none_here = hi - lo > gx_here ? hi - lo - gx_here : 0;
+            lies_none += none_here;
+            cls_lies[cls][kGxBytesKinds + 1] += none_here;
+            if (!at_exit) continue;
+            std::string owners, paths;
+            for (int o = 0; o < kWinOwners; ++o) {
+                if (u.owners & (1u << o)) owners += std::string(owners.empty() ? "" : ", ") + kWinOwnerName[o];
+            }
+            for (int s = 0; s < kSiteSlots; ++s) {
+                if ((u.sites >> s) & 1) paths += std::string(paths.empty() ? "" : "; ") + (g_site_uses[s].site ? g_site_uses[s].site : "?");
+            }
+            const int mk = u.maker >= 0 && u.maker < kImportWhos ? u.maker : imports_whole() ? kIwSpan : -1;
+            std::snprintf(b, sizeof(b),
+                          "\n[bbhost]     window %u.%02u (%llu MiB, %s; made by %s): %llu uses (%llu MiB asked), the last %.0f s and %llu "
+                          "flips ago; owners: %s; paths: %s; lies there (MiB): kept-able %llu, dynamic %llu, GPU-written %llu, constant %llu, "
+                          "other buffers %llu, textures %llu, the upload heap %llu",
+                          k, w, mib(hi - lo), kClName[cls], mk >= 0 ? whos[mk] : "?", static_cast<ull>(u.uses), mib(u.bytes),
+                          u.last_ms ? static_cast<double>(now - u.last_ms) / 1e3 : -1.0, static_cast<ull>(u.last_ms ? flip - u.last_flip : 0),
+                          owners.empty() ? "none" : owners.c_str(), paths.empty() ? "none" : paths.substr(0, 400).c_str(), mib(here[0]),
+                          mib(here[1]), mib(here[2]), mib(here[3]), mib(here[4]), mib(here[5]), mib(here_heap));
+            detail += b;
+        }
+    }
+    std::uint64_t flex = 0;
+    for (const auto& kv : g.anon_imports) flex += kv.second.size;
+    std::uint64_t idle_all = 0, idle_f_all = 0;
+    for (int q = 0; q < kClasses; ++q) {
+        idle_all += idle[q];
+        idle_f_all += idle_f[q];
+    }
+    std::snprintf(b, sizeof(b),
+                  "import census by window (BBHOST_IMPORT_CENSUS=1, %s): %llu windows imported now, %llu MiB (live imports %llu MiB in %zu, "
+                  "flexible %llu MiB) - by what their uses met: GX-owned alone %llu (%llu MiB), a handle's alone %llu (%llu), GX's and others' "
+                  "%llu (%llu), nothing of GX's %llu (%llu), no address named %llu (%llu), never used %llu (%llu); idle 60 s or more %llu MiB "
+                  "(GX-owned alone %llu, a handle's %llu, GX's and others' %llu, nothing of GX's %llu, no address %llu, never used %llu), "
+                  "3,600 flips or more %llu MiB\n[bbhost]   import census by window: what lies in the windows imported now (MiB): GX buffers 1b "
+                  "keeps %llu, dynamic %llu, the GPU writes %llu, constant %llu, other %llu, textures %llu, GX's upload heap %llu, nothing of "
+                  "GX's %llu",
+                  imports_whole() ? "whole spans: the windows window imports would need" : "window imports", static_cast<ull>(windows),
+                  mib(wbytes), mib(live), nlive, mib(flex), static_cast<ull>(n[kClGx]), mib(bytes[kClGx]), static_cast<ull>(n[kClHandle]),
+                  mib(bytes[kClHandle]), static_cast<ull>(n[kClMixed]), mib(bytes[kClMixed]), static_cast<ull>(n[kClNotGx]), mib(bytes[kClNotGx]),
+                  static_cast<ull>(n[kClUnnamed]), mib(bytes[kClUnnamed]), static_cast<ull>(n[kClNever]), mib(bytes[kClNever]), mib(idle_all),
+                  mib(idle[kClGx]), mib(idle[kClHandle]), mib(idle[kClMixed]), mib(idle[kClNotGx]), mib(idle[kClUnnamed]), mib(idle[kClNever]),
+                  mib(idle_f_all), mib(lies[0]), mib(lies[1]), mib(lies[2]), mib(lies[3]), mib(lies[4]), mib(lies[5]), mib(lies_heap),
+                  mib(lies_none));
+    std::string out = b;
+    if (!at_exit) return out;
+    // What lies in each class's windows.
+    for (int q = 0; q < kClasses; ++q) {
+        if (!n[q]) continue;
+        const std::uint64_t* l = cls_lies[q];
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]     the %s windows' %llu MiB hold (MiB): GX buffers 1b keeps %llu, dynamic %llu, the GPU writes %llu, constant "
+                      "%llu, other %llu, textures %llu, GX's upload heap %llu, nothing of GX's %llu",
+                      kClName[q], mib(bytes[q]), mib(l[0]), mib(l[1]), mib(l[2]), mib(l[3]), mib(l[4]), mib(l[5]), mib(l[kGxBytesKinds]),
+                      mib(l[kGxBytesKinds + 1]));
+        out += b;
+    }
+    // The uses by path and owner, the most used path first.
+    std::vector<int> order;
+    for (int s = 0; s < kSiteSlots; ++s) {
+        if (g_site_uses[s].site) order.push_back(s);
+    }
+    std::sort(order.begin(), order.end(), [](int x, int y) {
+        std::uint64_t a = 0, c = 0;
+        for (int o = 0; o < kWinOwners; ++o) a += g_wuse_n[x][o], c += g_wuse_n[y][o];
+        return a > c;
+    });
+    out += "\n[bbhost]     uses an import answered or was made for, by path and what lies at the address:";
+    for (const int s : order) {
+        std::string line;
+        std::uint64_t total = 0;
+        for (int o = 0; o < kWinOwners; ++o) {
+            if (!g_wuse_n[s][o]) continue;
+            total += g_wuse_n[s][o];
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinOwnerName[o], static_cast<ull>(g_wuse_n[s][o]),
+                          mib(g_wuse_bytes[s][o]));
+            line += b;
+        }
+        if (!total) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]       %s: %llu - %s", g_site_uses[s].site, static_cast<ull>(total), line.c_str());
+        out += b;
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        std::string line;
+        for (int f = 0; f < kWinFalls; ++f) {
+            if (!g_wuse_fall_n[kind][f]) continue;
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinFallName[f], static_cast<ull>(g_wuse_fall_n[kind][f]),
+                          mib(g_wuse_fall_bytes[kind][f]));
+            line += b;
+        }
+        if (line.empty()) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]     uses of %s by why the binding took today's path (stage 1b): ", kind ? "another GX buffer" : "a GX buffer kept by handle");
+        out += b;
+        out += line;
+    }
+    out += "\n[bbhost]     the windows imported now, one by one:";
+    out += detail;
+    return out;
+}
+
 // A window whose import failed less than kImportBackoffMs ago is not asked of
 // the driver again (counted); and a failure's time, over its windows.
 bool import_backing_off(const DmemChunk& d, std::uint32_t w0, std::uint32_t w1) {
@@ -1479,7 +1769,10 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
         // windows do not cover lies outside every GPU-visible mapping.
         if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
         const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
-        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
+            if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
+            return c;
+        }
         if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
         if (run_part_stop(kRunStopIndex)) return nullptr;  // imported in order (BBHOST_RUN_COMMIT)
         const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
@@ -1503,6 +1796,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
             }
             d.window[w] = c;
         }
+        if (g_census) window_use_locked(index, in, bytes);
         return c;
     }
     // Windows (BBHOST_IMPORT_WINDOWS=1): the whole windows the range touches,
@@ -1518,6 +1812,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
     if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
         idle_note_use_locked(*c);
+        if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
         return c;
     }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
@@ -1549,6 +1844,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     install_import_locked(index, c);
     if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
     idle_note_use_locked(*c);
+    if (g_census) window_use_locked(index, in, bytes);
     return c;
 }
 
@@ -7849,6 +8145,8 @@ std::string video_memory_report_locked(bool at_exit) {
     }
     // The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1).
     if (const std::string idle = import_idle_report_locked(); !idle.empty()) out += "\n[bbhost]   " + idle;
+    // The census by window (BBHOST_IMPORT_CENSUS=1).
+    if (const std::string wc = import_window_census_report_locked(at_exit); !wc.empty()) out += "\n[bbhost]   " + wc;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
     out += buf;

@@ -16500,12 +16500,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
+        int handle_result = -1;            // stage 1b's for the record (the import census)
         if (handles) {
             const std::uint64_t holder = o.vtx_obj[fe.slot];
             const std::uint32_t h = o.vtx_handle[fe.slot];
             const int r = !holder ? gxvk::kFallNoObject
                           : !h    ? gxvk::kFallNoHandle
                                   : gxvk_resolve_locked(gxvk::kUseVertex, h, holder, va, need, by_handle[e]);
+            handle_result = r;
             if (run_part_stopped()) return false;  // its copy placed in order (BBHOST_RUN_COMMIT)
             if (slot_result[fe.slot] < 0 || slot_result[fe.slot] == gxvk::kFalls) slot_result[fe.slot] = static_cast<std::int8_t>(r);
             handle_el[e] = r == gxvk::kFalls;
@@ -16613,6 +16615,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         placed_need = std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
                     }
                 }
+                const ImportFall fall(handle_result);
                 loc = locate(va, placed_need);
             }
         }
@@ -23834,6 +23837,7 @@ static bool draw_impl(const GpuDraw& d) {
         // BBHOST_GXVK_BUFFERS=2 takes today's path and checks the handle's.
         bool by_handle = false;
         std::uint32_t index_handle = 0;
+        int index_result = -1;  // stage 1b's for the indices (the import census)
         if (gxvk::buffers_on()) {
             const GxDrawObjects* go = d.gx_objects;
             Located hl;
@@ -23843,6 +23847,7 @@ static bool draw_impl(const GpuDraw& d) {
                                             : gxvk_resolve_locked(gxvk::kUseIndex, go->ib_handle, go->ib_obj, d.index_va, index_bytes, hl);
             if (run_part_stopped()) return false;  // its copy placed in order (BBHOST_RUN_COMMIT)
             gxvk_count_locked(gxvk::kUseIndex, r);
+            index_result = r;
             if (r == gxvk::kFalls) {
                 index_handle = go->ib_handle;
                 if (gxvk_buffers_bind_mode()) {
@@ -23864,6 +23869,7 @@ static bool draw_impl(const GpuDraw& d) {
                 // same answer for the import's binding, not asked again.
                 const std::uint8_t probe_why = probe ? shadow_locate_why() : kLocNotAsked;
                 const ImportSite site("an index buffer");
+                const ImportFall fall(index_result);
                 loc = locate(d.index_va, index_bytes);
                 if (!d.indirect_va) {
                     if (probe_why == kLocInPlace && loc.buffer) {

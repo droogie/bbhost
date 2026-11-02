@@ -506,6 +506,7 @@ bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::u
     // the range needs no import, only to lie in a GPU-visible span - and the
     // same with whole imports for a range whose import failed (t_force_staged).
     if (!imports_whole() || t_force_staged) return off >= g.dmem[chunk].span_lo && off + bytes <= g.dmem[chunk].span_hi;
+    const ImportSite site("the buffer shadow's mirror range (whole spans)");
     return dmem_import(chunk, off, bytes) != nullptr;
 }
 
@@ -1792,6 +1793,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // window imports, each page copied into upload staging here (after its
     // write watch is armed) and from there into the mirror: no import of it.
     const bool staged = !imports_whole() || t_force_staged;
+    const ImportSite site("the buffer shadow's mirror pages' copies (whole spans)");
     const Chunk* source = staged ? nullptr
                                  : dmem_import(chunk, static_cast<std::uint64_t>(p0) << kPageShift,
                                                static_cast<std::uint64_t>(p1 - p0 + 1) << kPageShift);

@@ -1082,6 +1082,17 @@ struct ImportSite {
     ImportSite(const ImportSite&) = delete;
     ImportSite& operator=(const ImportSite&) = delete;
 };
+// The census by window's (gpu.cpp, BBHOST_IMPORT_CENSUS=1): why the binding
+// whose locate() is under way did not go by its GX buffer's handle - stage 1b's
+// result for it (gxvk::Fallback), -1 for none asked - set for the call's length.
+extern thread_local constinit int t_import_fall;
+struct ImportFall {
+    int prev;
+    explicit ImportFall(int fall) : prev(t_import_fall) { t_import_fall = fall; }
+    ~ImportFall() { t_import_fall = prev; }
+    ImportFall(const ImportFall&) = delete;
+    ImportFall& operator=(const ImportFall&) = delete;
+};
 // BBHOST_IMPORT_AUDIT=1 (gpu.cpp): counts the GPU side's resolutions per guest
 // mapping - kind 0 locate, 1 a device address, 2 a vertex/index mirror source.
 extern const bool g_import_audit;
