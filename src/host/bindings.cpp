@@ -313,19 +313,29 @@ constexpr float kWalkPush = 0.6f;
 
 // The keyboard's movement keys - whichever keys Move Forward, Back, Left and
 // Right are bound to - push the stick from rest to their full push over 66 ms,
-// as a thumb moves a stick, rather than in one step; letting go of all of them
-// puts it back at rest at once. The keyboard's only (device 0, the window's
-// thread): the mouse's buttons push at once, and a pad's sticks are its own
-// and never come through here.
+// as a thumb moves a stick, rather than in one step. Letting go of all of them
+// puts the stick back at rest at once, but the push is kept for kMoveRestMs:
+// a change of direction is typed as one key let go and the next pressed a few
+// milliseconds later, and starting the ramp again there took the stick through
+// the walk for several frames - a sprint turning from W to D slowed and broke
+// (v0.2.22). The next key pushes in full, as it did before the ramp and as a
+// thumb sweeping the stick round its rim does; only a start from standing ramps.
+// The keyboard's only (device 0, the window's thread): the mouse's buttons push
+// at once, and a pad's sticks are its own and never come through here.
 constexpr float kMoveRampMs = 66.0f;
+constexpr float kMoveRestMs = 150.0f;
 float g_move_ramp = 0.0f;  // 0 at rest, 1 the full push
-std::chrono::steady_clock::time_point g_move_ramp_at{};
+std::chrono::steady_clock::time_point g_move_ramp_at{}, g_move_held_at{};
 
-float move_ramp(bool moving) {
-    const auto now = std::chrono::steady_clock::now();
+float move_ramp(bool moving, std::chrono::steady_clock::time_point now) {
     const float ms = std::chrono::duration<float, std::milli>(now - g_move_ramp_at).count();
     g_move_ramp_at = now;
-    g_move_ramp = moving ? std::min(1.0f, g_move_ramp + std::clamp(ms, 0.0f, kMoveRampMs) / kMoveRampMs) : 0.0f;
+    if (moving) {
+        g_move_ramp = std::min(1.0f, g_move_ramp + std::clamp(ms, 0.0f, kMoveRampMs) / kMoveRampMs);
+        g_move_held_at = now;
+    } else if (std::chrono::duration<float, std::milli>(now - g_move_held_at).count() > kMoveRestMs) {
+        g_move_ramp = 0.0f;
+    }
     return g_move_ramp;
 }
 
@@ -354,7 +364,8 @@ void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
     note_zoom_keys(1, held);
 }
 
-void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device) {
+void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device,
+                         std::chrono::steady_clock::time_point now) {
     bool any = false;
     for (int a = 0; a < kBindCount; ++a) {
         // The Debug Menu key and the zoom set no pad bit: their presses were
@@ -399,7 +410,7 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, 
     // The keyboard's push ramps up (move_ramp).
     const int x = (held[kBindMoveR] ? 1 : 0) - (held[kBindMoveL] ? 1 : 0);
     const int y = (held[kBindMoveB] ? 1 : 0) - (held[kBindMoveF] ? 1 : 0);
-    const float ramp = device == 0 ? move_ramp(x != 0 || y != 0) : 1.0f;
+    const float ramp = device == 0 ? move_ramp(x != 0 || y != 0, now) : 1.0f;
     if (x != 0 || y != 0) {
         float r = static_cast<float>(kStickHigh - kStickRest) * ramp;
         if (held[kBindWalk]) r *= kWalkPush / (x != 0 && y != 0 ? std::sqrt(2.0f) : 1.0f);

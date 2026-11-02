@@ -16,6 +16,7 @@
 // "none". Mouse1..Mouse5 are the left, right and middle buttons and the two
 // side buttons; WheelUp and WheelDown the wheel, each notch a short press.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -74,8 +75,11 @@ void host_binding_prompt(int action, char* out, std::size_t n);
 // Applies a set of held actions to the pad the game reads. `strong` is the
 // modifier's state, which turns Attack into the strong attack whichever device
 // is holding it. `device` is 0 for the keyboard, 1 for the mouse: the
-// keyboard's movement keys ramp up to a full push over 66 ms (host/bindings.cpp).
-void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device);
+// keyboard's movement keys ramp up to a full push over 66 ms from standing
+// still (host/bindings.cpp), on `now`'s clock (tests/key_move_test.cpp runs
+// one of its own).
+void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device,
+                         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 // Actions held on the keyboard, from SDL's key state.
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]);
 // Actions held on the mouse, from MouseState::buttons (bit n-1 is button n;

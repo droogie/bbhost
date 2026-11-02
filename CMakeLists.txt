@@ -725,6 +725,10 @@ if(UNIX)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
+  # The keyboard's movement keys on the stick, frame by frame at 30, 60 and 120 fps.
+  add_executable(key_move_test tests/key_move_test.cpp src/host/bindings.cpp)
+  target_include_directories(key_move_test PRIVATE src)
+  add_test(NAME key_move_test COMMAND key_move_test)
   # The settings' publication and two of its listeners: applied on a change,
   # never asked for per frame (host/settings_store.h).
   add_executable(settings_store_test tests/settings_store_test.cpp src/host/shader_patch.cpp)
