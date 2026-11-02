@@ -186,6 +186,8 @@ add_executable(bbhost
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
   src/host/list_resolve.cpp
+  src/host/gxvk_lists.cpp
+  src/host/gxvk_lists_leaf.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -476,6 +478,8 @@ target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 # The host lists record from decomp leaves, on the game's threads with the game's FS.
 set_source_files_properties(src/host/host_lists.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+# Stage 4's census records from decomp leaves too (host/gxvk_lists.h).
+set_source_files_properties(src/host/gxvk_lists_leaf.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The follow camera's step is the game's own AVX, intrinsic for intrinsic
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
@@ -803,7 +807,7 @@ if(UNIX)
   bbhost_decomp_test(gx_dma SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_constant_engine SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_draw SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
-  bbhost_decomp_test(gx_command_list)
+  bbhost_decomp_test(gx_command_list SOURCES src/host/gxvk_lists_leaf.cpp)
   bbhost_decomp_test(gx_present)
   bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_upload_heap)

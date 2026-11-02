@@ -3583,7 +3583,10 @@ Located locate(std::uint64_t va, std::uint64_t bytes) {
     // A GX buffer the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1).
     if (twins_on()) {
         Located t;
-        if (twin_locate_locked(va, bytes, t)) return t;
+        if (twin_locate_locked(va, bytes, t)) {
+            gxvk_lists::note_order(gxvk_lists::kOrderTwin);  // stage 4's census (host/gxvk_lists.h)
+            return t;
+        }
     }
     return locate_guest(va, bytes);
 }

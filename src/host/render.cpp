@@ -15362,6 +15362,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         } else if (!in_heap && outcome == kUnmapped && !known) {
             version = copy_version_lookup_locked(base, bytes, &loc);
             if (check && version != kCopyVersionNone) gxvk::heap_snap_disagree(gxvk::kHeapDiffCopyVersion, base, bytes);
+            if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
         }
         if (version == kCopyVersionStraddles) {
             if (run_part_stop(kRunStopOrder)) return;
@@ -15378,7 +15379,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // land on the range is asked once, for both.)
         int pending_known = known ? 0 : -1;  // (the heap's answer: none)
         const auto gpu_pending = [&]() {
-            if (pending_known < 0) pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+            if (pending_known < 0) {
+                pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+                if (pending_known) gxvk_lists::note_order(gxvk_lists::kOrderCbGpuWrite);
+            }
             return pending_known == 1;
         };
         if (check) {  // =compare: today's lookups, against the heap's answers
@@ -16548,6 +16552,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             }
         }
         const int version = heap_record ? kCopyVersionNone : copy_version_lookup_locked(va, need, &loc);
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderVertexVersion);
         if (version == kCopyVersionStraddles) {
             if (run_part_stop(kRunStopOrder)) return false;
             copy_versions_put_in_place_locked(kCvStraddle);
@@ -23857,6 +23862,7 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderIndexVersion);
         if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
         // index_why: whether a mirror serves them, for the race census.
@@ -23992,6 +23998,7 @@ static bool draw_impl(const GpuDraw& d) {
         if (g_import_audit) audit_range(d.indirect_va, args_bytes, kUseIndex);
         Located loc;
         const int version = copy_version_lookup_locked(d.indirect_va, args_bytes, &loc);  // a straddle ended the pass above
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderIndexVersion);
         if (version != kCopyVersionInside) {
             const ImportSite site("a draw's indirect arguments");
             loc = locate(d.indirect_va, args_bytes);

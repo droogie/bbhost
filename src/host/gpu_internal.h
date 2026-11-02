@@ -11,6 +11,7 @@
 #include "host/gpu.h"
 #include "host/copy_elide.h"
 #include "host/list_resolve.h"
+#include "host/gxvk_lists.h"
 #include "host/stream_ops.h"
 
 #include <vulkan/vulkan.h>
@@ -1379,6 +1380,7 @@ enum RunStop : int {
 // draw committed in order: notes `why` among its effects (what a part would
 // have stopped at) and goes on. Outside both: false.
 inline bool run_part_stop(int why) {
+    if (gxvk_lists::census()) gxvk_lists::t_effects |= 1u << why;  // stage 4's census: what the draw needed in order
     if (!list_resolve::commit_draws()) return false;  // (no thread-local read with it off)
     RunDraw* const r = t_run_draw;
     if (!r) return false;

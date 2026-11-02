@@ -31,6 +31,7 @@
 
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "host/gxvk_lists.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -157,6 +158,7 @@ DECOMP_LEAF u64 gx_finish_command_list_impl(u64 ctx, u64 state, u64 list, u64 re
     call1(kCommandBufferFlush, cb);
     const u32 result = game_function<Ret2>(kFinishRecording)(cb, list);
     if (result && !MUTANT(3)) return result;
+    if (gxvk_lists::census()) gxvk_lists::finished(ctx, list);  // stage 4's census (host/gxvk_lists.h)
     game_function<Ctx3>(kSnapshotOutputs)(ctx + 0xb558, list + offsetof(GxCommandList, first_records),
                                            list + offsetof(GxCommandList, last_colour));
     reset_caches(ctx);
@@ -171,6 +173,7 @@ DECOMP_LEAF u64 gx_finish_command_list_impl(u64 ctx, u64 state, u64 list, u64 re
 // Returns what the game's returns: where its last clear began.
 DECOMP_LEAF u64 gx_context_execute_command_list(u64 ctx, u64 unused, u64 list) {
     const u64 cb = ctx + 0x10;
+    if (gxvk_lists::census()) gxvk_lists::executed(list, 0, 1);
     clear_pending_byte(ctx);
     call2(kRenameResolveB, ctx + 0xb6f8, cb);
     call2(kRenameResolve, ctx + 0xb3c0, ctx);
@@ -202,6 +205,7 @@ DECOMP_LEAF void gx_context_execute_command_lists(u64 ctx, u64 unused, u64 lists
     call1(kSpanStreamBegin, cb);
     for (u64 i = 0;;) {
         if (const u64 list = load<u64>(lists + 8 * i)) {
+            if (gxvk_lists::census()) gxvk_lists::executed(list, static_cast<u32>(i), n);
             call2(kRenameResolveB, ctx + 0xb6f8, cb);
             call2(kRenameResolve, ctx + 0xb3c0, ctx);
             game_function<Ctx3>(kOutputTransition)(ctx + 0xb558, ctx, list + offsetof(GxCommandList, first_records));

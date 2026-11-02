@@ -210,6 +210,9 @@ struct GxDrawObjects {
     // of the index buffer, as their holders carried it at the call (0: none).
     std::uint32_t vtx_handle[16] = {};
     std::uint32_t ib_handle = 0;
+    // BBHOST_GXVK_LISTS=census (host/gxvk_lists.h): the list of its context
+    // the draw went into (1 the context's first), 0 without the census.
+    std::uint32_t list_seq = 0;
 };
 
 // One stage's resource records as the GX commit wrote them for a draw, copied

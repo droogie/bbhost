@@ -28,6 +28,7 @@
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
+#include "host/gxvk_lists.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "log.h"
@@ -2625,6 +2626,7 @@ bool native_draw_call(GxRec& r) {
     int free_state = 0;
     GxDrawObjects objects;
     build_objects(r, objects);
+    if (gxvk_lists::census()) objects.list_seq = gxvk_lists::draw_recorded(r.ctx);
     // BBHOST_GX_PACKED_RECORDS: the records packed into a pooled set, after
     // everything on this thread that reads them; =1 hands the command
     // processor only those (this thread's own set goes back to being its own),

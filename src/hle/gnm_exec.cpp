@@ -13,6 +13,7 @@
 #include "host/host_lists.h"
 #include "host/label_landing.h"
 #include "host/list_resolve.h"
+#include "host/gxvk_lists.h"
 #include "hle/wait_reg_mem.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
@@ -1980,6 +1981,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
     t_next_packet = b + n;
     if (g_cp_census) census_packet(op, b, n);
     if (list_resolve::on()) note_list_packet(op, b, n);
+    if (gxvk_lists::census()) gxvk_lists::cp_packet(list_split_of(op, b, n));
     switch (op) {
         case kEventWriteEop:
             // [0] event, [1] addr_lo, [2] addr_hi[15:0] | data_sel[31:29] | int_sel[25:24], [3] data_lo, [4] data_hi
@@ -2597,7 +2599,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     }
                 }
                 if (in && !committed) {
+                    const bool lists_census = gxvk_lists::census() && !list_resolve::commit_draws();
+                    if (lists_census) {
+                        if (const GxDrawObjects* o = hle_gx_trace_objects()) gxvk_lists::cp_draw_begin(*in, *o);
+                    }
                     native_draw(in, "native");
+                    if (lists_census) gxvk_lists::cp_draw_end();
                     if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
                 }
                 hle_gx_native_release();
@@ -3186,6 +3193,7 @@ void cp_thread(Queue* q, int id) {
         apply_arena_frees();  // the job's buffers are all walked
         t_job_free_event = ~0ull;
         if (list_resolve::on()) list_resolve::split(list_resolve::kSplitSubmission);
+        if (gxvk_lists::census() && id == 0) gxvk_lists::cp_submission_end();
         // Submit after every job: its labels - held back to the end of the
         // command buffer (host_gpu_mem_write) - then land when its own work
         // has run, as on the console. Recording on into one command buffer
@@ -3955,6 +3963,7 @@ void hle_gnm_exec_histogram() {
     }
     host_gpu_report();
     list_resolve::report(true);
+    gxvk_lists::report(true);
     for (int op = 0; op < 256; ++op) {
         const std::uint64_t n = g_op_hist[op].load();
         if (n) {
