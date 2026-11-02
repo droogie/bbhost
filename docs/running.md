@@ -487,45 +487,67 @@ the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 120). The effects - fire, lamps', candles' and braziers' flicker, blood,
-magic, every effect the game's effect manager runs - step in whole steps of
-their own above 30: by default (`[video] effect_steps = "auto"`) 1/60 s at
-every rate (every frame at 60, every other at 120, every third at 180), so a
-player who picks any frame rate gets the effects as they run at 60. The wind
+magic, every effect the game's effect manager runs - step in whole 1/30 s
+above 30 by default, as many times a second as at 30 (every other frame at
+60, every fourth at 120), the flicker keeping the cadence the game has at 30
+(the Effect timing setting, below, chooses others). The wind
 that sways grass and trees moves every frame at 30's pace: the game steps it a
 fixed 1/60 s each 1/30 s frame, so above 30 it takes half each frame's step,
 and its bend keeps the game's weight of 1/60 (`engine/wind_pace.h`;
 `BBHOST_WIND_PACE=0` steps it by the frame's time with a weight of 1/30, twice
 30's pace and bend). The frames between whole steps still
 run the effects' update, so effects follow what they ride on and are drawn
-every frame, but with what the game counts in updates held for the next
-whole step - a node's state, its emissions and the definitions its
+every frame, but - wherever there are fewer whole steps than frames - with
+what the game counts in updates held for the next whole step: a node's
+state, its emissions and the definitions its
 conditions pick, the controllers, a light's flicker phase, a wobbling
 motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
-Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
-with 60 too). The wind's warm-up after a load (the grass and trees settling)
+Ebrietas's attacks left sparks that never ended - 1/30 s steps at 60, 1/60 s
+steps at 120). The wind's warm-up after a load (the grass and trees settling)
 counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
-before). `effect_steps = "smooth"` steps the effects at the frame rate itself
-(whole 1/120 s at 120, 1/144 s at 144); a number, `effect_steps = "120"` (or
-`120`, 1 to 960 - below 30 to test them in coarse steps, `5` a 1/5 s step five times a second), steps them that many times a second whatever the frame
-rate (1/120 s at 360, say); `30` is the cadence the game has at 30, and with
-it the wind's grass and trees step in whole 1/30 s too (every other value
-leaves the wind on the frame's time); `frame` steps them by the frame's
-time. A value the frame rate code cannot read runs auto. A bbhost.toml that
-sets `effect_steps` keeps its value; one without it gets auto.
-`BBHOST_SFX_STEP` overrides the setting with the same values, and
-`BBHOST_SFX_SMOOTH=1` with effect steps 30 turns on the step gate's older
-smooth steps for a test run - 30's whole steps for what the effects count,
-the frame's own time for what they move (a particle's path, a motion's turn,
-the GPU particles' clock, a ribbon's head, the wind sources' gusts) in the
-effects whose every part has been converted for it. An
+before). How the effects keep time is the Effect timing setting (F10's
+DISPLAY page, or the same row on the setup window's Game page; it applies
+when the game starts):
+- Smooth, the default, keeps 30's whole steps for what the effects count and
+  moves what they move by time - a particle's path, a motion's turn, the GPU
+  particles' clock, a ribbon's head (its points still inserted once a whole
+  step), the wind sources' gusts - by each frame's own time, in the effects
+  whose every part has been converted for it; the rest run as at 30.
+- Original (30) runs them all on whole 1/30 s steps alone, the cadence the
+  game has at 30: above 30 fps what moves moves less smoothly than with
+  Smooth.
+- 60 a second steps them in whole 1/60 s at every rate above 30 (every frame
+  at 60, every other at 120, every third at 180), so what they count - the
+  flicker, a wobble's turns, a node's states - runs twice as fast as the
+  game's own.
+- Your frame rate steps them once a frame (1/120 s at 120, 1/144 s at 144),
+  with no frames between: what they count runs twice as fast at 60, four
+  times at 120.
+
+`[video] effect_steps` in bbhost.toml is the setting's default, with the same
+choices as `smooth`, `30`, `auto` and `fps`, and two more: a number of steps
+a second (`"120"` or `120`, 1 to 960 - below 30 to test them in coarse
+steps, `5` a 1/5 s step five times a second; `60` is auto above 30), and
+`frame`, which steps them by the frame's time. It decides until a choice is
+made in F10 or the setup window: bbhost-options.toml holds Effect timing only
+once it has been chosen, so the file's value stays in force, and a later
+default reaches whoever never chose. The row shows what will run: a value
+none of its four is, from bbhost.toml or `BBHOST_SFX_STEP`, as a fifth entry
+(Custom: 5 (bbhost.toml)). With smooth and 30 the wind's grass and
+trees step in whole 1/30 s too (every other value leaves the wind on the
+frame's time). A value the frame rate code cannot read runs the default.
+`BBHOST_SFX_STEP` overrides the setting and the file with the same values,
+and `BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run.
+The log's `frame rate: effect timing ...` line names the timing that runs
+and what decided it. An
 effect's emissions - the particles and children its nodes make - follow a
 clock of their own (`[video] effect_emission`, `BBHOST_SFX_EMISSION`): with
 `60`, the default, they come as the game's effects make them at 60 updates a
 second, every 1/60 s of the node's time at every frame rate, 30 included -
 with the smooth steps each on the frame its time falls in (a node's children
 on its whole steps' frames), otherwise on the whole step's frame; the rest of
-what the effects count keeps 30's steps. Most of the game's emitters (8,421 of its 15,330 CPU particle
+what the effects count keeps their whole steps. Most of the game's emitters (8,421 of its 15,330 CPU particle
 records) ask for an emission every 1/60 s, and an update makes at most one,
 so at 30 updates a second the game makes half of them - the PS4's look,
 which `effect_emission = 30` keeps (`decomp/sfx/node_emit.cpp`). The wakes
@@ -594,7 +616,7 @@ still, as a variable-refresh display or a busy scene makes it.
 `BBHOST_FIXED_TICK=<address>:<bytes>[,...]` (a test switch, same rates) runs
 a game function as a 30 Hz tick - once every other frame at 60, and so on, with
 the remainder carried - for logic that counts frames (`engine/frame_tick.h`). `BBHOST_SFX_SIM_FPS=N`
-(a test switch, 30-1000, with effect steps 30 or 60) lays out the effects'
+(a test switch, 30-1000, with any effect timing but frame) lays out the effects'
 whole steps as at N fps whatever the frame's time - the carry grows 1/N a
 frame - so a renderer far below N (lavapipe) runs the cadence N has, 1/30, 0,
 1/30, 0 ... at 60 with whole 1/30 s steps; the rest of the game keeps the

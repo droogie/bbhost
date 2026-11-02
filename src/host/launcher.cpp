@@ -300,6 +300,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
     bool frame_clock = host_opt_get("frame_clock");
+    // Effect timing (Smooth by default): F10's DISPLAY row, read as the game
+    // starts (engine/frame_rate.cpp; BBHOST_SFX_STEP wins). The row shows what
+    // will run (host_effect_timing_row); a pick, one of the four, is the
+    // player's own from Save or Play on.
+    int effect_timing = -1;  // the pick, -1 none
     int resolution = host_opt_resolution_index();
     // In the setting's order (host/options.cpp): by size within each shape.
     static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
@@ -495,6 +500,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
         host_opt_set("frame_clock", frame_clock);
+        if (effect_timing >= 0) host_opt_choose_effect_timing(effect_timing);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
         host_opt_set_resolution_index(resolution);
@@ -836,7 +842,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(6)), "DISPLAY");
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(7)), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
                 static const char* const kModes[] = {"Windowed", "Fullscreen"};
@@ -850,6 +856,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                      "180 Hz monitor).");
                 ui::toggle_row("Native frame clock (experimental)", nullptr, &frame_clock,
                                "Requires a restart. Timing follows each frame's real length, for PCs that do not hold their chosen frame rate.");
+                ui::row_label("Effect timing", row_lw);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                {
+                    const HostEffectTimingRow et = host_effect_timing_row();
+                    const char* labels[5] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
+                                             kHostEffectTimingLabels[3], et.custom.c_str()};
+                    const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
+                                           kHostEffectTimingTips[3], et.tip.c_str()};
+                    int shown = effect_timing >= 0 ? effect_timing : et.index;
+                    if (ui::combo("##effects", &shown, labels, et.index == 4 ? 5 : 4, tips) && shown < 4) effect_timing = shown;
+                }
+                ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
                 ui::row_label("Resolution", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
@@ -861,7 +879,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(6)), "ONLINE");
+            ui::card_begin("##online", ImVec2(0, card_h(7)), "ONLINE");
             {
                 ui::row_label("Server", 72 * scale);
                 static const char* const kShort[] = {"Live", "Playtest", "Custom"};

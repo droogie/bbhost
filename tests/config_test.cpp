@@ -271,32 +271,82 @@ int main() {
         CHECK(c.ime_mode == "auto");
         unsetenv("BBHOST_IME");
     }
-    // [video] effect_steps: auto when the file has no such key (the
-    // template ships it commented out and nothing saves it), and an explicit
-    // value - 30 among them - kept as written at any config version, the file
-    // untouched; BBHOST_SFX_STEP over either.
+    // The effects' timing (config_effect_timing): what was asked for and what
+    // decided - BBHOST_SFX_STEP, else the Effect timing setting once the player
+    // chose it, else [video] effect_steps (kept as written at any config
+    // version, the file untouched; the template ships it commented out),
+    // else kEffectTimingDefault - and what each value means at a frame rate.
     {
+        unsetenv("BBHOST_SFX_STEP");
+        const auto is = [](const EffectTiming& t, const char* value, const char* from) {
+            return t.value == value && std::string(t.from) == from && t.readable;
+        };
+        // Nothing asks: the default, whatever the setting holds until chosen.
         load("[player]\nname = \"Hunter\"\n");
-        CHECK(config_effect_steps() == "auto");
+        CHECK(is(config_effect_timing(120, nullptr, false), kEffectTimingDefault, "the default"));
+        CHECK(is(config_effect_timing(120, "fps", false), kEffectTimingDefault, "the default"));
+        // The default the docs name (docs/running.md, bbhost.example.toml): a
+        // new one changes them with it.
+        CHECK(std::string(kEffectTimingDefault) == "smooth");
+        // The values, each at the frame rates where it differs.
+        const auto at = [](int fps, const char* v) { return config_effect_timing(fps, v, true); };
+        EffectTiming t = at(120, "smooth");
+        CHECK(t.steps == 30 && t.smooth && t.readable);
+        t = at(120, "30");
+        CHECK(t.steps == 30 && !t.smooth && t.readable);
+        CHECK(at(30, "auto").steps == 30 && at(60, "auto").steps == 60 && at(120, "auto").steps == 60 && !at(120, "auto").smooth);
+        CHECK(at(120, "60").steps == 60 && !at(120, "60").smooth);
+        CHECK(at(60, "fps").steps == 60 && at(144, "fps").steps == 144 && at(960, "fps").steps == 960 && !at(144, "fps").smooth);
+        CHECK(at(60, "120").steps == 120 && at(360, "120").steps == 120);
+        CHECK(at(120, "1").steps == 1 && at(120, "5").steps == 5 && at(120, "960").steps == 960);
+        t = at(120, "frame");
+        CHECK(t.steps == 0 && !t.smooth && t.readable);
+        // None of them: the default runs, the value kept for the log.
+        const EffectTiming d = at(120, kEffectTimingDefault);
+        for (const char* bad : {"0", "961", "-30", "60.5", "12x", "Smooth", "fast"}) {
+            t = at(120, bad);
+            CHECK(!t.readable && t.value == bad && std::string(t.from) == "the Effect timing setting" && t.steps == d.steps &&
+                  t.smooth == d.smooth);
+        }
+        // The file's key: kept as written (30 among them), the file untouched.
         load("[video]\neffect_steps = \"120\"\n");
-        CHECK(config_effect_steps() == "120");
+        CHECK(is(config_effect_timing(60, nullptr, false), "120", "bbhost.toml's [video] effect_steps"));
+        CHECK(config_effect_timing(60, nullptr, false).steps == 120);
         load("[video]\n# whole steps\neffect_steps = 30\n");
-        CHECK(config_effect_steps() == "30");
+        CHECK(is(config_effect_timing(60, nullptr, false), "30", "bbhost.toml's [video] effect_steps"));
         CHECK(read(g_dir / "config" / "bbhost.toml").find("effect_steps = 30") != std::string::npos);
         for (const char* ver : {"2", "4", "5"}) {
             load(std::string("[video]\neffect_steps = 30\n\n[bbhost]\nconfig_version = ") + ver + "\n");
-            CHECK(config_effect_steps() == "30");
+            CHECK(is(config_effect_timing(60, nullptr, false), "30", "bbhost.toml's [video] effect_steps"));
             CHECK(read(g_dir / "config" / "bbhost.toml").find("effect_steps = 30") != std::string::npos);
         }
-        load("[video]\neffect_steps = \"60\"\n");
-        CHECK(config_effect_steps() == "60");
         load("[video]\neffect_steps = \"frame\"\n");
-        CHECK(config_effect_steps() == "frame");
+        CHECK(is(config_effect_timing(60, nullptr, false), "frame", "bbhost.toml's [video] effect_steps"));
+        load("[video]\neffect_steps = \"bogus\"\n");
+        t = config_effect_timing(60, nullptr, false);
+        CHECK(!t.readable && t.value == "bogus" && std::string(t.from) == "bbhost.toml's [video] effect_steps" &&
+              t.steps == at(60, kEffectTimingDefault).steps);
+        // The setting once chosen, over the file's key either way.
+        load("[video]\neffect_steps = \"120\"\n");
+        t = config_effect_timing(60, "fps", true);
+        CHECK(is(t, "fps", "the Effect timing setting") && t.steps == 60);
+        CHECK(is(config_effect_timing(60, "smooth", true), "smooth", "the Effect timing setting"));
         load("[video]\neffect_steps = \"smooth\"\n");
-        CHECK(config_effect_steps() == "smooth");
+        CHECK(is(config_effect_timing(60, "30", true), "30", "the Effect timing setting"));
+        CHECK(is(config_effect_timing(60, "30", false), "smooth", "bbhost.toml's [video] effect_steps"));
+        CHECK(is(config_effect_timing(60, nullptr, true), "smooth", "bbhost.toml's [video] effect_steps"));
+        // BBHOST_SFX_STEP over both; empty, it is not there.
         setenv("BBHOST_SFX_STEP", "60", 1);
         load("[video]\neffect_steps = 30\n");
-        CHECK(config_effect_steps() == "60");
+        t = config_effect_timing(120, "fps", true);
+        CHECK(is(t, "60", "BBHOST_SFX_STEP") && t.steps == 60);
+        CHECK(is(config_effect_timing(120, nullptr, false), "60", "BBHOST_SFX_STEP"));
+        setenv("BBHOST_SFX_STEP", "nonsense", 1);
+        t = config_effect_timing(120, "fps", true);
+        CHECK(!t.readable && t.value == "nonsense" && std::string(t.from) == "BBHOST_SFX_STEP" && t.steps == d.steps);
+        setenv("BBHOST_SFX_STEP", "", 1);
+        CHECK(is(config_effect_timing(120, "fps", true), "fps", "the Effect timing setting"));
+        CHECK(is(config_effect_timing(120, "fps", false), "30", "bbhost.toml's [video] effect_steps"));
         unsetenv("BBHOST_SFX_STEP");
     }
     // [video] frame_clock: the Native frame clock setting's default - off when
