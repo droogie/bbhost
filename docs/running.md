@@ -384,7 +384,9 @@ On other GPUs, unless memory is tight, and on an integrated GPU with 8 GB of
 video memory or more, the game's own immutable vertex and index buffers are
 bound from copies of their own, made in video memory as they are first
 drawn, so the command processor does not look each draw's bytes up; one
-that finds no room keeps the mirrors (`BBHOST_GXVK_BUFFERS=0` goes back to
+that finds no room keeps the mirrors until a later draw finds room for it
+(`BBHOST_GXVK_ROOM_RETRY=0` leaves it on the mirrors for good, as before;
+`BBHOST_GXVK_BUFFERS=0` goes back to
 the mirrors for all of them; `=1` makes the copies on a smaller integrated
 GPU or with tight memory too). With small video memory the copies have a
 budget - an eighth of the video memory free at the start,

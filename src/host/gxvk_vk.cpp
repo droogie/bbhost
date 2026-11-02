@@ -100,6 +100,24 @@ std::atomic<std::uint64_t> g_overrun{0};  // vertex records whose V# counts past
 const char* const kFallName[gxvk::kFalls] = {"no GX object", "not kept", "a handle of no entry", "taken back since the call",
                                              "retired by a write", "past the buffer's end", "no memory", "bytes out of reach",
                                              "indirect", "a binding shared with another buffer", "the copy pool at its budget"};
+// BBHOST_GXVK_ROOM_RETRY (on unless 0): a copy that finds no room - video
+// memory down to the reserve, or under a budget to the mirrors' cushion above
+// it - leaves its entry made and its binding on today's path, and a later
+// binding places it once there is room: that entry's next try waits
+// kRoomHoldFlips flips, so a dip costs it a block scan every half second, not
+// one a binding (another buffer's copy may still fit in a block's free room
+// meanwhile). The entry used to be retired: taken back at the next recording,
+// its holder's handle no longer named it, and every draw of the buffer read it
+// from guest memory for the rest of the session - on a 4 GB card 109 such
+// buffers, 9.9 M vertex records and 1.9 M index ranges over a 3.5-minute tour,
+// their windows imported for them and their vertices read across the bus. =0
+// retires it, as before.
+const bool g_room_retry = [] {
+    const char* e = std::getenv("BBHOST_GXVK_ROOM_RETRY");
+    return !(e && e[0] == '0');
+}();
+constexpr std::uint32_t kRoomHoldFlips = 30;
+std::atomic<std::uint64_t> g_room_refused{0}, g_room_held{0}, g_room_placed_later{0};
 // Entries retired by their end, kept bindable for the draws recorded before
 // it, until the flip given (8 on from the retirement's taking).
 constexpr std::uint64_t kEndFlips = 8;
@@ -389,11 +407,22 @@ bool budget_room_locked(VkDeviceSize need) {
 // at the budget - the entry stays made, placed when there is room).
 int place_locked(BufferEntry& e, std::uint32_t handle) {
     const std::uint32_t index = gxvk::handle_index(handle), gen = gxvk::handle_gen(handle);
+    // (Before the budget's room is made: a refused copy's hold drops no idle copy for a placement it then refuses.)
+    if (e.room_refused && g_cur_flip < e.room_retry_flip) {
+        g_room_held.fetch_add(1, std::memory_order_relaxed);
+        return gxvk::kFallNoRoom;
+    }
     if (budget_locked() && !budget_room_locked((std::max<VkDeviceSize>(e.bytes, 1) + kAlign - 1) & ~(kAlign - 1))) {
         g_over_budget.fetch_add(1, std::memory_order_relaxed);
         return gxvk::kFallBudget;
     }
     if (!pool_place_locked(e.bytes, e)) {
+        if (g_room_retry) {  // kept made: placed by a binding once there is room
+            g_room_refused.fetch_add(1, std::memory_order_relaxed);
+            e.room_refused = true;
+            e.room_retry_flip = g_cur_flip + kRoomHoldFlips;
+            return gxvk::kFallNoRoom;
+        }
         gxvk::retire(index, gen, gxvk::kRetireNoRoom);
         return gxvk::kFallNoRoom;
     }
@@ -407,6 +436,10 @@ int place_locked(BufferEntry& e, std::uint32_t handle) {
     if (!e.word.compare_exchange_strong(want, (gen << 8) | gxvk::kEntryPlaced, std::memory_order_acq_rel)) {
         let_go_locked(e);  // retired while it was placed: the range goes back once this recording has run
         return gxvk::kFallRetired;
+    }
+    if (e.room_refused) {
+        e.room_refused = false;
+        g_room_placed_later.fetch_add(1, std::memory_order_relaxed);
     }
     const Block& bl = g_blocks[static_cast<std::size_t>(e.block)];
     g_placed[bl.host].fetch_add(1, std::memory_order_relaxed);
@@ -594,6 +627,13 @@ std::string gxvk_report() {
                   g.integrated ? "host memory once video memory is short (an integrated GPU)"
                                : ("no copy in host memory (a discrete GPU): blocks refused there " + std::to_string(g_blocks_refused.load())).c_str());
     s += b;
+    if (const std::uint64_t refused = g_room_refused.load()) {
+        std::snprintf(b, sizeof b,
+                      "\ngxvk buffers: copies that found no room %llu times (their entries kept; BBHOST_GXVK_ROOM_RETRY=0 retires them), "
+                      "placed later %llu; bindings that waited out a refusal's hold on today's path %llu",
+                      static_cast<ull>(refused), static_cast<ull>(g_room_placed_later.load()), static_cast<ull>(g_room_held.load()));
+        s += b;
+    }
     if (budgeted()) {
         std::snprintf(b, sizeof b,
                       "\ngxvk buffers: the copy pool's budget %llu MiB (small video memory, or BBHOST_GXVK_BUFFERS_BUDGET_MB): held at most "

@@ -788,7 +788,10 @@ reserve kept for render targets and device buffers; short of room a buffer
 keeps today's path - never a copy in host memory on a discrete GPU, where
 one placed during a dip stayed for the session and every draw of it read
 across the bus (on an integrated GPU, whose host memory is the same RAM,
-host-visible memory is taken). `BBHOST_GXVK_BUFFERS=2` keeps today's path
+host-visible memory is taken) - until a draw half a second or more after the
+refusal finds room for its copy (`BBHOST_GXVK_ROOM_RETRY=0`: for the rest of
+the session, as before, when a 4 GB card read 109 such buffers' 9.9 M vertex
+records from guest memory over a 3.5-minute tour). `BBHOST_GXVK_BUFFERS=2` keeps today's path
 and checks the handles
 beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -

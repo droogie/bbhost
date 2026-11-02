@@ -226,6 +226,8 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
             e.vk_offset = 0;
             e.block = -1;
             e.placed_serial = 0;
+            e.room_refused = false;
+            e.room_retry_flip = 0;
             e.hash = 0;
             e.binds = 0;
             e.watch_slot = static_cast<std::int8_t>(slot);
