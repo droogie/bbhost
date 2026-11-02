@@ -512,6 +512,7 @@ void free_import(Chunk& c) {
     c = Chunk{};
 }
 
+
 // [ptr, ptr + size) of the mirror into c as one host-pointer import.
 VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -940,9 +941,105 @@ std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImpo
 // else wants it waits too), the mapping thread's for a whole span.
 std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
-// Retired imports freed once their slot's work has run (the driver's time of each: on the command processor, under the
-// renderer's lock - an import's pages unpinned).
+// Retired imports freed once their slot's work has run (the driver's time of each - an import's pages unpinned - on the
+// thread that frees them), and the command processor's part of it: the free itself without the free thread, the hand-over
+// with it.
 std::atomic<std::uint64_t> g_import_freed{0}, g_import_freed_bytes{0}, g_import_free_us{0}, g_import_free_max_us{0};
+std::atomic<std::uint64_t> g_import_free_cp_us{0}, g_import_free_cp_max_us{0};
+
+// ---- Retired window imports freed off the command processor (BBHOST_IMPORT_FREE_THREAD, on unless 0) ----
+// A window import a merge replaced, or one let go while idle, is freed once
+// every submission that could name it has run - its slot's retirement - and
+// the free itself is the driver unpinning its pages: on an RTX 4070 up to 14 ms
+// for one, 95-181 ms over a 3.5-minute tour, on the command processor under the
+// renderer's lock. The slot's retirement now hands each to a thread of its own
+// (bb-import-free) that frees it: the order stays - nothing is handed over
+// before that retirement - and Vulkan lets memory and buffers be freed on any
+// thread, as the import thread already does with a raced import. =0 frees
+// them at the retirement, on the command processor, as before.
+const bool g_free_thread_on = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_THREAD");
+    return !(e && e[0] == '0');
+}();
+// The thread runs in the background (host_thread_background) and waits
+// BBHOST_IMPORT_FREE_GAP_MS (50) after each free before the next: freed back
+// to back beside the game, the frees took ~1.7 times as long and the main
+// loop's work at Laurence's staircase rose 0.23 ms (uncapped -2.5%, an RTX
+// 4070 as a 4 GB card) - spread out and yielding, they are meant to meet
+// nothing. A burst of retired imports (a merge's, an area's) is freed over a
+// second or two instead.
+const std::uint32_t g_free_gap_ms = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_GAP_MS");
+    return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 50u;
+}();
+struct DeadImport {
+    Chunk chunk;
+    int slot = 0;
+    std::uint64_t serial = 0;
+};
+std::mutex g_free_mu;
+std::condition_variable g_free_cv;
+std::deque<DeadImport> g_free_q;  // under g_free_mu
+bool g_free_started = false;      // under g_free_mu
+std::atomic<std::uint64_t> g_free_queue_most{0};
+
+// One import freed, timed (va trace, counts); `cp`: on the command processor.
+void free_dead_import_now(Chunk& c, int slot, std::uint64_t serial, bool cp) {
+    va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(slot), serial);
+    const std::uint64_t size = c.size;
+    const auto t0 = std::chrono::steady_clock::now();
+    free_import(c);
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_import_freed.fetch_add(1, std::memory_order_relaxed);
+    g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_import_free_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_max_us.load(std::memory_order_relaxed)) g_import_free_max_us.store(us, std::memory_order_relaxed);
+    if (cp) {
+        g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+        if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+    }
+}
+
+void import_free_thread() {
+    host_thread_set_name("bb-import-free");
+    host_thread_background();
+    for (;;) {
+        DeadImport d;
+        {
+            std::unique_lock<std::mutex> lk(g_free_mu);
+            g_free_cv.wait(lk, [] { return !g_free_q.empty(); });
+            d = std::move(g_free_q.front());
+            g_free_q.pop_front();
+        }
+        free_dead_import_now(d.chunk, d.slot, d.serial, false);
+        if (g_free_gap_ms) std::this_thread::sleep_for(std::chrono::milliseconds(g_free_gap_ms));
+    }
+}
+
+// At a slot's retirement (every submission that could name it has run): the
+// import freed on the free thread, or here (BBHOST_IMPORT_FREE_THREAD=0).
+void free_dead_import(Chunk& c, int slot, std::uint64_t serial) {
+    if (!g_free_thread_on) {
+        free_dead_import_now(c, slot, serial, true);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_free_mu);
+        g_free_q.push_back(DeadImport{std::move(c), slot, serial});
+        c = Chunk{};
+        const std::uint64_t n = g_free_q.size();
+        if (n > g_free_queue_most.load(std::memory_order_relaxed)) g_free_queue_most.store(n, std::memory_order_relaxed);
+        if (!g_free_started) {
+            g_free_started = true;
+            std::thread(import_free_thread).detach();
+        }
+    }
+    g_free_cv.notify_one();
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+}
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
 // An import can fail on a player's machine as well as from a full card: the
@@ -7306,17 +7403,7 @@ void retire_slot_locked(int k) {
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
-    for (Chunk& c : sl.dead_imports) {  // window imports a merged one replaced
-        va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(k), sl.serial);
-        const std::uint64_t size = c.size;
-        const auto t0 = std::chrono::steady_clock::now();
-        free_import(c);
-        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-        g_import_freed.fetch_add(1, std::memory_order_relaxed);
-        g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
-        g_import_free_us.fetch_add(us, std::memory_order_relaxed);
-        if (us > g_import_free_max_us.load(std::memory_order_relaxed)) g_import_free_max_us.store(us, std::memory_order_relaxed);
-    }
+    for (Chunk& c : sl.dead_imports) free_dead_import(c, k, sl.serial);  // window imports replaced by a merge or let go while idle
     sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
         va_note("buffer freed", b.address, b.size, static_cast<std::uint64_t>(k), sl.serial);
@@ -12875,8 +12962,12 @@ void host_gpu_report() {
         }
         if (const std::uint64_t freed = g_import_freed.load())
             host_log("gpu: window imports freed once their work had run (replaced by a merge, or let go while idle): %llu (%llu MiB) in %.1f ms of the "
-                     "driver's time on the command processor, the longest %.1f ms",
-                     static_cast<ull>(freed), mib(g_import_freed_bytes), g_import_free_us.load() / 1e3, g_import_free_max_us.load() / 1e3);
+                     "driver's time %s, the longest %.1f ms; the command processor's part %.1f ms, the longest %.3f ms%s",
+                     static_cast<ull>(freed), mib(g_import_freed_bytes), g_import_free_us.load() / 1e3,
+                     g_free_thread_on ? ("on their own thread (bb-import-free, in the background, " + std::to_string(g_free_gap_ms) + " ms apart)").c_str()
+                                      : "on the command processor (BBHOST_IMPORT_FREE_THREAD=0)",
+                     g_import_free_max_us.load() / 1e3, g_import_free_cp_us.load() / 1e3, g_import_free_cp_max_us.load() / 1e3,
+                     g_free_thread_on ? (", handing them over; at most " + std::to_string(g_free_queue_most.load()) + " waiting").c_str() : "");
         if (!imports_whole()) {
             std::lock_guard<GpuMutex> lock(g.mu);
             host_log("gpu: the page table's view of the window imports (host/import_table.h, BBHOST_IMPORT_TABLE_DEFER%s): windows whose "
