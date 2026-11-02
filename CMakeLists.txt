@@ -188,6 +188,8 @@ add_executable(bbhost
   src/host/list_resolve.cpp
   src/host/gxvk_lists.cpp
   src/host/gxvk_lists_leaf.cpp
+  src/host/gxvk_lists_pool.cpp
+  src/host/cache_rw.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -654,6 +656,11 @@ if(UNIX)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
   # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  # Stage 4b.1a's lock: readers on eight threads beside one writer (host/cache_rw.h).
+  add_executable(cache_rw_test tests/cache_rw_test.cpp src/host/cache_rw.cpp)
+  target_include_directories(cache_rw_test PRIVATE src)
+  target_link_libraries(cache_rw_test PRIVATE Threads::Threads)
+  add_test(NAME cache_rw_test COMMAND cache_rw_test)
   # The bottleneck meter's verdict (host/bottleneck.h).
   add_executable(bottleneck_test tests/bottleneck_test.cpp)
   target_include_directories(bottleneck_test PRIVATE src)

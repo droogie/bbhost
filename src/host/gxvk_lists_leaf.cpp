@@ -8,14 +8,35 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include <x86intrin.h>
 
 namespace gxvk_lists {
 
+// Stage 4b.1a's pool (host/gxvk_lists.h): its threads, 0 when it is off.
+int pool_threads() {
+    static const int n = [] {
+        const char* e = std::getenv("BBHOST_GXVK_LISTS");
+        if (!e || (e[0] != '1' && e[0] != '2') || e[1]) return 0;
+        if (const char* t = std::getenv("BBHOST_GXVK_LIST_THREADS")) {
+            const int k = std::atoi(t);
+            return k < 0 ? 0 : k > 4 ? 4 : k;
+        }
+        const unsigned hw = std::thread::hardware_concurrency();
+        return hw >= 16 ? 2 : hw >= 8 ? 1 : 0;
+    }();
+    return n;
+}
+
 const bool g_census = [] {
     const char* e = std::getenv("BBHOST_GXVK_LISTS");
-    return e && (std::strcmp(e, "census") == 0 || e[0] == '1');
+    return e && std::strcmp(e, "census") == 0;
+}();
+const int g_pool_mode = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS");
+    if (!e || (e[0] != '1' && e[0] != '2') || e[1]) return 0;
+    return pool_threads() > 0 ? e[0] - '0' : 0;
 }();
 
 namespace detail {

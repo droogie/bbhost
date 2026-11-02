@@ -2603,7 +2603,11 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (lists_census) {
                         if (const GxDrawObjects* o = hle_gx_trace_objects()) gxvk_lists::cp_draw_begin(*in, *o);
                     }
+                    // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the draw's lookups against the pool's.
+                    const bool look = gxvk_lists::compare() && !list_resolve::commit_draws() && gxvk_lists::look_due();
+                    if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                     native_draw(in, "native");
+                    if (look) gxvk_lists::cp_look_end();
                     if (lists_census) gxvk_lists::cp_draw_end();
                     if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
                 }

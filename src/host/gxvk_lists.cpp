@@ -573,6 +573,7 @@ void cp_submission_end() {
 }
 
 void report(bool at_exit) {
+    pool_report(at_exit);  // stage 4b.1a's pool (gxvk_lists_pool.cpp)
     if (!g_census) return;
     g_fold.report(at_exit);
 }

@@ -29,9 +29,75 @@ struct GxDrawObjects;
 
 namespace gxvk_lists {
 
-// BBHOST_GXVK_LISTS=census (or 1), read before any of the game's code runs.
+// BBHOST_GXVK_LISTS=census, read before any of the game's code runs.
 extern const bool g_census;
 inline bool census() { return g_census; }
+
+// Stage 4b.1a (BBHOST_GXVK_LISTS=1 or 2): a pool of
+// host threads (bb-list*) looks ahead of the command processor at each
+// GX-native draw a GX thread has stored - its programs, fetch shader,
+// translations, stage plans, views and samplers - through the caches' reader
+// paths (host/cache_rw.h), committing nothing. =2 also has the command
+// processor compare its own answers at each draw with the pool's: equal, the
+// pool's "not made yet" (made since), changed since (a write between), or
+// different (a reader's wrong answer: must stay 0). The pool's threads:
+// BBHOST_GXVK_LIST_THREADS, else 2 on 16 or more hardware threads, 1 on 8-15,
+// none below (the pool off). Read before any of the game's code runs.
+extern const int g_pool_mode;  // 0 off, 1 the pool's lookups, 2 and the compare
+int pool_threads();             // 0 when the pool is off
+inline bool pool() { return g_pool_mode != 0; }
+inline bool compare() { return g_pool_mode == 2; }
+
+// The recording thread stored GX-native draw token `id`'s slot
+// (gx_trace.cpp native_draw_call; a host function, not a leaf).
+void draw_stored(std::uint64_t id);
+
+// The pool's answers, and the command processor's in compare mode: a lookup's
+// kind, its key (the cache's own key, folded to 56 bits) and what it answered
+// (0: not found / not made yet).
+enum LookKind : std::uint8_t { kLookProgram, kLookFetch, kLookPaths, kLookPlan, kLookView, kLookSampler, kLookKinds };
+struct LookEntry {
+    std::uint64_t key;  // kind << 56 | the key's low 56 bits
+    std::uint64_t answer;
+};
+inline std::uint64_t look_key(LookKind kind, std::uint64_t key) {
+    return static_cast<std::uint64_t>(kind) << 56 | (key & 0x00ffffffffffffffull);
+}
+constexpr int kLookMost = 56;
+struct LookSink {
+    std::uint32_t n = 0;
+    std::uint32_t lost = 0;  // entries past kLookMost
+    LookEntry e[kLookMost];
+    void add(LookKind kind, std::uint64_t key, std::uint64_t answer) {
+        if (n < kLookMost) {
+            e[n++] = {look_key(kind, key), answer};
+        } else {
+            ++lost;
+        }
+    }
+};
+
+// The command processor (bb-cp0), compare mode: around a GX-native draw
+// token's draw (gnm_exec.cpp), and each lookup's answer inside it. With
+// BBHOST_GXVK_LISTS_SAMPLE=N only every N-th draw is compared (1, every draw,
+// by default), so a timing run can keep the compare on at a small cost.
+extern const unsigned g_look_every;
+inline bool look_due() {
+    static thread_local unsigned n = 0;
+    if (++n < g_look_every) return false;
+    n = 0;
+    return true;
+}
+void cp_look_begin(std::uint64_t id);
+void cp_look_end();
+extern thread_local constinit bool t_cp_look;
+void cp_note_slow(LookKind kind, std::uint64_t key, std::uint64_t answer);
+inline void cp_note(LookKind kind, std::uint64_t key, std::uint64_t answer) {
+    if (g_pool_mode == 2 && t_cp_look) cp_note_slow(kind, key, answer);
+}
+// The pool's lines (report): every 1,000 flips with tooling from its first
+// thread, and at the exit - its threads stopped and joined first.
+void pool_report(bool at_exit);
 
 // Leaf-safe - the decomp leaves call them on the game's threads with the
 // game's FS: no locks, no allocation, no host thread-locals. A deferred

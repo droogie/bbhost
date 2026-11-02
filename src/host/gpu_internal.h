@@ -11,6 +11,7 @@
 #include "host/gpu.h"
 #include "host/copy_elide.h"
 #include "host/list_resolve.h"
+#include "host/cache_rw.h"
 #include "host/gxvk_lists.h"
 #include "host/stream_ops.h"
 
@@ -2061,6 +2062,16 @@ void textures_census_report();
 // registry saw made names it (its resource's generation known), and whether target_image's slot memo answered.
 void textures_census_target(int depth, bool gx_view, bool memo_hit);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
+// Stage 4b.1a's reader paths (host/cache_rw.h, under its shared lock; a pool
+// thread's): what the view entry for `id` (texture_view_flags' `flags`) and the
+// sampler cache hold, without a refresh, a count or anything made; null when
+// not made yet.
+VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
+VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
+// render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
+// translations, stage plans, views, samplers) through the reader paths, under
+// cache_rw::Read, into `out` (stage 4b.1a's pool).
+void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists::LookSink& out);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
