@@ -103,6 +103,7 @@ add_executable(bbhost
   src/host/gs_emit_gate.cpp
   src/engine/guest.cpp
   src/engine/patch_manifest.cpp
+  src/engine/patch_manifest_file.cpp
   src/engine/gx_resources.cpp
   src/engine/gx_state.cpp
   src/engine/params.cpp
@@ -651,6 +652,13 @@ if(UNIX)
   target_compile_definitions(ruleset_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(ruleset_test bbhost_version)
   add_test(NAME ruleset_test COMMAND ruleset_test)
+  # The shipped manifests read as the game reads them: the ones on by default
+  # are exactly the expected list (Screen Space Reflections stays off).
+  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/sfo.cpp)
+  target_include_directories(patch_defaults_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_compile_definitions(patch_defaults_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
+  add_dependencies(patch_defaults_test bbhost_version)
+  add_test(NAME patch_defaults_test COMMAND patch_defaults_test)
   # The rings in video memory the CPU writes only within the heap's budget.
   add_executable(ring_budget_test tests/ring_budget_test.cpp)
   target_include_directories(ring_budget_test PRIVATE src)
