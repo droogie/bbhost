@@ -911,6 +911,9 @@ std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImpo
 // else wants it waits too), the mapping thread's for a whole span.
 std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
+// Retired imports freed once their slot's work has run (the driver's time of each: on the command processor, under the
+// renderer's lock - an import's pages unpinned).
+std::atomic<std::uint64_t> g_import_freed{0}, g_import_freed_bytes{0}, g_import_free_us{0}, g_import_free_max_us{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
 // An import can fail on a player's machine as well as from a full card: the
@@ -7075,7 +7078,14 @@ void retire_slot_locked(int k) {
     sl.spare_sets.clear();
     for (Chunk& c : sl.dead_imports) {  // window imports a merged one replaced
         va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(k), sl.serial);
+        const std::uint64_t size = c.size;
+        const auto t0 = std::chrono::steady_clock::now();
         free_import(c);
+        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_import_freed.fetch_add(1, std::memory_order_relaxed);
+        g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
+        g_import_free_us.fetch_add(us, std::memory_order_relaxed);
+        if (us > g_import_free_max_us.load(std::memory_order_relaxed)) g_import_free_max_us.store(us, std::memory_order_relaxed);
     }
     sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -12613,6 +12623,10 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        if (const std::uint64_t freed = g_import_freed.load())
+            host_log("gpu: window imports freed once their work had run (retired: replaced by a merge): %llu (%llu MiB) in %.1f ms of the "
+                     "driver's time on the command processor, the longest %.1f ms",
+                     static_cast<ull>(freed), mib(g_import_freed_bytes), g_import_free_us.load() / 1e3, g_import_free_max_us.load() / 1e3);
         if (!imports_whole()) {
             std::lock_guard<GpuMutex> lock(g.mu);
             host_log("gpu: the page table's view of the window imports (host/import_table.h, BBHOST_IMPORT_TABLE_DEFER%s): windows whose "
