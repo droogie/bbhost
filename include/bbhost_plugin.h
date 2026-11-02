@@ -441,7 +441,9 @@ typedef struct BbHostApi {
     int (*on_camera)(void (*fn)(BbCamera* cam, void* user), void* user);
     /* 1 when the player's key bindings put a game action on this key (an SDL
      * scancode), 0 when the key is free - for a plugin that offers keys of its
-     * own only where they press nothing else. */
+     * own only where they press nothing else. Actions that work in menus only
+     * (Menu Confirm, the menu pages and options) do not count: in play they
+     * press nothing. */
     int (*key_bound)(uint16_t scancode);
 
     /* Version 14: text a plugin places itself. */

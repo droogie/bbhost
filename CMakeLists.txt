@@ -729,6 +729,14 @@ if(UNIX)
   add_executable(key_move_test tests/key_move_test.cpp src/host/bindings.cpp)
   target_include_directories(key_move_test PRIVATE src)
   add_test(NAME key_move_test COMMAND key_move_test)
+  # The menus' own keys: their tabs, shortcuts and switches, apart from play's.
+  add_executable(menu_keys_test tests/menu_keys_test.cpp src/host/bindings.cpp)
+  target_include_directories(menu_keys_test PRIVATE src)
+  if(SDL3_FOUND)
+    target_compile_definitions(menu_keys_test PRIVATE BBHOST_HAVE_SDL3=1)
+    target_link_libraries(menu_keys_test PRIVATE SDL3::SDL3)
+  endif()
+  add_test(NAME menu_keys_test COMMAND menu_keys_test)
   # The settings' publication and two of its listeners: applied on a change,
   # never asked for per frame (host/settings_store.h).
   add_executable(settings_store_test tests/settings_store_test.cpp src/host/shader_patch.cpp)

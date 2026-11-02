@@ -129,7 +129,17 @@ step of Camera distance (up closer, down further out), and the middle button
 puts it back at the game's own distance: Camera Zoom In, Out and Reset on the
 Key Bindings menu's Other page, which a player can rebind (Transform, on the
 middle button too until then, keeps C). Hold Left Alt with the movement keys to walk, and two
-opposite keys held together cancel, both as in Dark Souls III. F9 opens the
+opposite keys held together cancel, both as in Dark Souls III. The game's
+menus take keys of their own, as Dark Souls III keeps a menu's apart from
+play's: the arrows or the movement keys move, Return or Interact confirms,
+Backspace or Dodge goes back, Page Up and Page Down turn the page or the tab
+(L1 and R1), Home and End are a menu's two shortcuts (L2 and R2: the storage
+box's Show Storage and Show Inventory) and F and R its display and status
+switches (Square and Triangle) - the Key Bindings menu's Menu Pages and
+Options page. The attacks,
+the firearm, Transform, the Blood Vial and the quick item work in play only,
+so their keys do nothing in a menu, and a menu's key may also be one of
+theirs. F9 opens the
 patch and plugin menu and F10 bbhost's own settings: menus over the game in
 the setup window's look, moved through with the mouse, the arrow keys or a
 controller (the d-pad and A, L1 and R1 for the pages, B or Escape to close).

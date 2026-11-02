@@ -32,11 +32,15 @@ enum BindAction : int {
     kBindInteract, kBindSwitchItem, kBindSwitchRight, kBindSwitchLeft, kBindDpadUp, kBindGestures, kBindEffects,
     // Camera and menus
     kBindLookU, kBindLookD, kBindLookL, kBindLookR, kBindMenu, kBindConfirm, kBindBack,
+    // Menu pages and options: the pad buttons a menu reads for its own pages
+    // and commands, which in play are the shoulders' and two face buttons'
+    // actions (host_binding_in_menus)
+    kBindMenuPageL, kBindMenuPageR, kBindMenuShortL, kBindMenuShortR, kBindMenuDisplay, kBindMenuStatus,
     // Other
     kBindL3, kBindZoomIn, kBindZoomOut, kBindZoomReset, kBindDebugMenu,
     kBindCount,
 };
-constexpr int kBindPages = 5, kBindPerPage = 7;
+constexpr int kBindPages = 6, kBindPerPage = 7;
 static_assert(kBindPages * kBindPerPage >= kBindCount && (kBindPages - 1) * kBindPerPage < kBindCount,
               "every action on a page, and no page empty");
 
@@ -49,6 +53,15 @@ struct BindingInfo {
     int def_mouse;         // 1..5, or 0
 };
 const BindingInfo& host_binding_info(int action);
+// Where an action works, as Dark Souls III keeps a menu's key assignment apart
+// from play's (SprjMenuViewerKeyAssign beside SprjKeyAssign): 1 in menus only
+// (Menu Confirm and Back, the menu pages and options), -1 in play only (the
+// actions whose pad buttons a menu reads as something else: the attacks, the
+// firearm, Transform, the Blood Vial and the quick item), 0 both (moving,
+// which a menu reads as its directions, Interact and Dodge, its confirm and
+// back, the rest). Two actions may share a key only when they never work at
+// the same time.
+int host_binding_in_menus(int action);
 
 // Called by host_options_load(): the defaults, then bbhost.toml's [keys].
 void host_bindings_load_defaults();
@@ -74,12 +87,18 @@ void host_binding_prompt(int action, char* out, std::size_t n);
 
 // Applies a set of held actions to the pad the game reads. `strong` is the
 // modifier's state, which turns Attack into the strong attack whichever device
-// is holding it. `device` is 0 for the keyboard, 1 for the mouse: the
+// is holding it. A menu action's button goes to `menu_buttons`, which the pad
+// read adds only while a menu has the input; a play-only action's button goes
+// to `buttons` and is noted in `play_buttons` as well, which the pad read takes
+// out again while a menu has it (host/window.h PadState). `device` is 0 for the keyboard, 1 for the mouse: the
 // keyboard's movement keys ramp up to a full push over 66 ms from standing
 // still (host/bindings.cpp), on `now`'s clock (tests/key_move_test.cpp runs
 // one of its own).
 void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device,
                          std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+// The pad as a menu reads it, while one has the input: the play-only actions'
+// buttons the keyboard put there taken out, the menu's own keys put in.
+void host_bindings_menu_pad(PadState& p);
 // Actions held on the keyboard, from SDL's key state.
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]);
 // Actions held on the mouse, from MouseState::buttons (bit n-1 is button n;
@@ -121,5 +140,10 @@ void host_bind_queue_zoom(int steps, bool reset);
 // middle button they take by default was Transform's, which gives it up; an
 // action the player put on the wheel keeps it, and the zoom goes without.
 void host_bindings_migrate_zoom();
+// An options file from before the menu pages and options (version 4 or
+// older): they start on their default keys, but a key the player gave an
+// action that works in menus too stays that action's, and the menu's goes
+// without.
+void host_bindings_migrate_menu_keys();
 bool host_bind_take_clear_key();
 void host_binding_clear(int action);

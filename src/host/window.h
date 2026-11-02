@@ -47,7 +47,14 @@ struct PadState {
     // Enter, Backspace and Escape as the d-pad, Circle, Cross and Options. The
     // pad read adds these only while a menu is open, so rebinding what an
     // arrow does in play can never leave the menus without a way to move.
+    // The menu actions' keys (Menu Confirm and Back, the menu pages and
+    // options: host/bindings.h) come here too.
     std::uint32_t menu_buttons = 0;
+    // What the keyboard's play-only actions put in `buttons` and no controller
+    // holds as well: the pad read takes these out while a menu is open, so the
+    // menu reads its pages and options from their own keys, never from Strong
+    // Attack's or the firearm's.
+    std::uint32_t play_buttons = 0;
 };
 
 // Creates the window (and Vulkan presenter when possible). Returns false when

@@ -76,6 +76,25 @@ const BindingInfo kInfo[kBindCount] = {
     {"confirm", "Menu Confirm", "OK, in menus.", 0, "Return", 0},
     {"back", "Menu Back", "Return, in menus.", 0, "Backspace", 0},
 
+    // What a menu reads from the shoulders and two face buttons - its pages,
+    // its two shortcuts, its display and status switches - on keys of its own.
+    // In play those buttons are the attacks, the firearm, Transform, the Blood
+    // Vial and the quick item, whose keys stay out of the menus
+    // (host_binding_in_menus): the storage box's Show Storage / Show Inventory
+    // (L2 and R2) was on the firearm's X and Strong Attack's V, and a menu's
+    // next page or tab (R1) on Attack's left mouse button, which in a menu is
+    // the pointer's click. The game's own key guides name them
+    // (engine/key_prompts.cpp).
+    {"menu_page_left", "Menu Previous Page", "L1 in menus: the previous page, tab or category.", kL1, "PageUp", 0},
+    {"menu_page_right", "Menu Next Page", "R1 in menus: the next page, tab or category.", kR1, "PageDown", 0},
+    {"menu_shortcut_left", "Menu Shortcut (L2)", "L2 in menus: the storage box's Show Storage, the rankings' top.", kL2,
+     "Home", 0},
+    {"menu_shortcut_right", "Menu Shortcut (R2)", "R2 in menus: the storage box's Show Storage, your own grades.", kR2,
+     "End", 0},
+    {"menu_display", "Menu Toggle Display", "Square in menus: Toggle Display, Unequip, Remove, Delete.", kSquare, "F",
+     0},
+    {"menu_status", "Menu Toggle Status", "Triangle in menus: Toggle Status, Switch, Initialize.", kTriangle, "R", 0},
+
     {"l3", "Left Stick Press", "L3.", kL3, "Left Ctrl", 0},
     // The follow camera's distance, in the world: each press a step of the
     // Camera distance setting (10%), Reset the game's own. No pad press.
@@ -227,6 +246,30 @@ std::uint64_t host_bindings_serial() { return g_serial.load(std::memory_order_re
 
 const BindingInfo& host_binding_info(int action) { return kInfo[action < 0 || action >= kBindCount ? 0 : action]; }
 
+int host_binding_in_menus(int action) {
+    switch (action) {
+        case kBindConfirm:
+        case kBindBack:
+        case kBindMenuPageL:
+        case kBindMenuPageR:
+        case kBindMenuShortL:
+        case kBindMenuShortR:
+        case kBindMenuDisplay:
+        case kBindMenuStatus:
+            return 1;
+        case kBindAttack:
+        case kBindStrong:
+        case kBindStrongMod:
+        case kBindTransform:
+        case kBindFirearm:
+        case kBindBloodVial:
+        case kBindUseItem:
+            return -1;
+        default:
+            return 0;
+    }
+}
+
 void host_bindings_load_defaults() {
     for (int a = 0; a < kBindCount; ++a) {
         g_key[a].store(kInfo[a].def_key ? scancode_from_name(kInfo[a].def_key) : 0, std::memory_order_relaxed);
@@ -367,6 +410,7 @@ void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
 void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device,
                          std::chrono::steady_clock::time_point now) {
     bool any = false;
+    const std::uint32_t before = p.buttons;  // what a controller holds, which a menu keeps
     for (int a = 0; a < kBindCount; ++a) {
         // The Debug Menu key and the zoom set no pad bit: their presses were
         // queued when they were read, and the pad read acts on them on the
@@ -379,7 +423,14 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, 
         if (a == kBindAttack && strong) bit = kR2;
         if (a == kBindConfirm) bit = menu_confirm_button();
         if (a == kBindBack) bit = menu_back_button();
+        const int where = host_binding_in_menus(a);
+        if (where > 0) {
+            // A menu's alone: the pad read adds it while a menu has the input.
+            p.menu_buttons |= bit;
+            continue;
+        }
         p.buttons |= bit;
+        if (where < 0) p.play_buttons |= bit & ~before;
         if (bit == kR2) p.r2 = 255;  // the triggers are analogue as well as buttons
         if (bit == kL2) p.l2 = 255;
         switch (a) {
@@ -421,6 +472,15 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, 
     if (any) p.connected = true;
 }
 
+void host_bindings_menu_pad(PadState& p) {
+    // The triggers are analogue as well as buttons.
+    if (p.play_buttons & kL2) p.l2 = 0;
+    if (p.play_buttons & kR2) p.r2 = 0;
+    p.buttons = (p.buttons & ~p.play_buttons) | p.menu_buttons;
+    if (p.menu_buttons & kL2) p.l2 = 255;
+    if (p.menu_buttons & kR2) p.r2 = 255;
+}
+
 void host_bind_capture_begin(int action) {
     if (action < 0 || action >= kBindCount) return;
     g_capture_ms.store(now_ms(), std::memory_order_relaxed);
@@ -432,6 +492,9 @@ void host_bind_capture_begin(int action) {
 int host_bind_capturing() { return g_capture.load(std::memory_order_relaxed); }
 
 namespace {
+// Whether two actions can work at the same time, so must not share a key.
+bool contexts_meet(int a, int b) { return host_binding_in_menus(a) * host_binding_in_menus(b) != -1; }
+
 void finish(int a, const char* what) {
     g_serial.fetch_add(1, std::memory_order_relaxed);
     g_capture.store(-1, std::memory_order_relaxed);
@@ -460,9 +523,10 @@ bool host_bind_capture_key(int scancode) {
     }
 #endif
     // One key, one action: whatever had it gives it up, which is what a
-    // player rebinding a key means.
+    // player rebinding a key means - but a menu's action and play's may share
+    // one, since they never work at the same time.
     for (int b = 0; b < kBindCount; ++b) {
-        if (b != a && g_key[b].load(std::memory_order_relaxed) == scancode) {
+        if (b != a && g_key[b].load(std::memory_order_relaxed) == scancode && contexts_meet(a, b)) {
             g_key[b].store(0, std::memory_order_relaxed);
             host_log("keys: %s gives up that key", kInfo[b].key);
         }
@@ -485,7 +549,7 @@ bool host_bind_capture_mouse(int button) {
         return true;
     }
     for (int b = 0; b < kBindCount; ++b) {
-        if (b != a && g_mouse[b].load(std::memory_order_relaxed) == button) {
+        if (b != a && g_mouse[b].load(std::memory_order_relaxed) == button && contexts_meet(a, b)) {
             g_mouse[b].store(0, std::memory_order_relaxed);
             host_log("keys: %s gives up that button", kInfo[b].key);
         }
@@ -523,6 +587,23 @@ void host_bindings_migrate_zoom() {
             if (a == z || g_mouse[a].load() != m) continue;
             g_mouse[z].store(0);
             host_log("keys: %s is %s's: %s left without it", kMouseNames[m], kInfo[a].key, kInfo[z].key);
+            break;
+        }
+    }
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+}
+
+void host_bindings_migrate_menu_keys() {
+    // The menu pages and options are new: an options file from before them
+    // carries none, so they start on their defaults - unless the player put a
+    // key there on an action that works in menus too, which keeps it.
+    for (int a = kBindMenuPageL; a <= kBindMenuStatus; ++a) {
+        const int k = g_key[a].load();
+        if (!k) continue;
+        for (int b = 0; b < kBindCount; ++b) {
+            if (b == a || g_key[b].load() != k || !contexts_meet(a, b)) continue;
+            g_key[a].store(0);
+            host_log("keys: %s is %s's: %s left without it", scancode_name(k) ? scancode_name(k) : "?", kInfo[b].key, kInfo[a].key);
             break;
         }
     }

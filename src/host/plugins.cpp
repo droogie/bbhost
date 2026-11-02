@@ -1129,8 +1129,11 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
 
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
+    // A plugin's own keys work in play, where a menu's actions press nothing
+    // (host/bindings.h host_binding_in_menus): a menu's keys leave a
+    // plugin free to use them in play.
     for (int a = 0; a < kBindCount; ++a) {
-        if (host_binding_key(a) == scancode) return 1;
+        if (host_binding_in_menus(a) <= 0 && host_binding_key(a) == scancode) return 1;
     }
     return 0;
 }

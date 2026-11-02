@@ -159,16 +159,32 @@ int resolve(int action) {
     return cross_confirms ? kBindBack : kBindConfirm;
 }
 
+// In a menu the shoulders and two face buttons are the menu's own pages,
+// shortcuts and switches, on keys of their own (host/bindings.h
+// host_binding_in_menus): a glyph a menu formats names those.
+int in_menu(int action) {
+    switch (action) {
+        case kBindTransform: return kBindMenuPageL;
+        case kBindAttack: return kBindMenuPageR;
+        case kBindFirearm: return kBindMenuShortL;
+        case kBindStrong: return kBindMenuShortR;
+        case kBindUseItem: return kBindMenuDisplay;
+        case kBindBloodVial: return kBindMenuStatus;
+        default: return action;
+    }
+}
+
 // The label for a tag, in UTF-8. Empty when nothing is bound to it, which
-// leaves the game's own glyph in place.
-void label_for(const Tag& t, bool mouse_camera, char* out, std::size_t n) {
+// leaves the game's own glyph in place. `menu`: the glyph is a menu's.
+void label_for(const Tag& t, bool mouse_camera, char* out, std::size_t n, bool menu = false) {
     out[0] = '\0';
     char names[4][24];
     int count = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.action[i] == kNone) continue;
         char one[24];
-        host_binding_prompt(resolve(t.action[i]), one, sizeof(one));
+        const int a = resolve(t.action[i]);
+        host_binding_prompt(menu ? in_menu(a) : a, one, sizeof(one));
         if (!one[0]) continue;
         std::snprintf(names[count], sizeof(names[count]), "%s", one);
         ++count;
@@ -308,7 +324,7 @@ bool mend_line(const char16_t* text, bool keys, std::u16string& out) {
                 }
             }
             char utf8[96] = "";
-            if (found) label_for(*found, mouse_is_camera(), utf8, sizeof(utf8));
+            if (found) label_for(*found, mouse_is_camera(), utf8, sizeof(utf8), menu_pointer_in_menu());
             out.append(in, at, open - at);
             if (utf8[0]) {
                 char16_t w[96];
@@ -393,7 +409,7 @@ GUEST_ABI std::int64_t formatter_hook(std::uint64_t, std::uint64_t* saved) {
         return 0;
     }
     char utf8[96];
-    label_for(*found, mouse_is_camera(), utf8, sizeof(utf8));
+    label_for(*found, mouse_is_camera(), utf8, sizeof(utf8), menu_pointer_in_menu());
     if (!utf8[0]) return 0;  // nothing bound: the glyph says it better than "[]"
     // The guest reads both while it formats, and the formatter copies the
     // result before it returns, so one buffer per thread is enough.
@@ -453,21 +469,23 @@ const Placeholder kPlaceholders[] = {
     {"selectUD", "Up/Down", {kNone, kNone, kNone, kNone}},
     {"selectLR", "Left/Right", {kNone, kNone, kNone, kNone}},
     {"selectAll", "Arrow Keys", {kNone, kNone, kNone, kNone}},
-    // The rows the guide gives a face button: Toggle Display is Triangle and
-    // Remove / Delete is Square, which is the same pair as KG_R_U / KG_R_L.
-    {"viewChange", nullptr, {kBindBloodVial, kNone, kNone, kNone}},
-    {"commando", nullptr, {kBindUseItem, kNone, kNone, kNone}},
+    // The rows the guide gives a face button: Toggle Status is Triangle and
+    // Toggle Display / Remove / Delete is Square, which is the same pair as
+    // KG_R_U / KG_R_L - the menu's own switches (host/bindings.h).
+    {"viewChange", nullptr, {kBindMenuStatus, kNone, kNone, kNone}},
+    {"commando", nullptr, {kBindMenuDisplay, kNone, kNone, kNone}},
     // Rotate Face is the right stick, which the mouse stands in for.
     {"spin", nullptr, {kBindLookU, kBindLookD, kBindLookL, kBindLookR}},
     {"spinReset", nullptr, {kBindLockOn, kNone, kNone, kNone}},
     {"move", nullptr, {kBindMoveF, kBindMoveL, kBindMoveB, kBindMoveR}},
-    // The shoulders: category change is L1/R1, the box shortcuts L2/R2.
-    {"categoryChangeL", nullptr, {kBindTransform, kNone, kNone, kNone}},
-    {"categoryChangeR", nullptr, {kBindAttack, kNone, kNone, kNone}},
-    {"shortCutL", nullptr, {kBindFirearm, kNone, kNone, kNone}},
-    {"shortCutR", nullptr, {kBindStrong, kNone, kNone, kNone}},
-    {"pageUp", nullptr, {kBindTransform, kNone, kNone, kNone}},
-    {"pageDown", nullptr, {kBindAttack, kNone, kNone, kNone}},
+    // The shoulders: category change is L1/R1, the box shortcuts L2/R2 - the
+    // menu's pages and shortcuts, never the attacks' or the firearm's keys.
+    {"categoryChangeL", nullptr, {kBindMenuPageL, kNone, kNone, kNone}},
+    {"categoryChangeR", nullptr, {kBindMenuPageR, kNone, kNone, kNone}},
+    {"shortCutL", nullptr, {kBindMenuShortL, kNone, kNone, kNone}},
+    {"shortCutR", nullptr, {kBindMenuShortR, kNone, kNone, kNone}},
+    {"pageUp", nullptr, {kBindMenuPageL, kNone, kNone, kNone}},
+    {"pageDown", nullptr, {kBindMenuPageR, kNone, kNone, kNone}},
     {"startMenuSwitch", nullptr, {kBindMenu, kNone, kNone, kNone}},
     {"slectMenuSwitch", nullptr, {kBindGestures, kNone, kNone, kNone}},
 };

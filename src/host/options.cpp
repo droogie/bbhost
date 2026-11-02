@@ -723,7 +723,7 @@ void apply(int id) {
 // version stays. 4: the camera zoom actions (zoom_in, zoom_out, zoom_reset on
 // the wheel and the middle button); an older file's Transform on the middle
 // button, its default until then, gives it to Camera Zoom Reset.
-constexpr int kOptionsVersion = 4;
+constexpr int kOptionsVersion = 5;
 
 void save() {
     if (!g_dirty) {
@@ -1017,6 +1017,11 @@ void host_options_load() {
         // button they take was Transform's (host/bindings.h).
         if (file_version < 4) {
             host_bindings_migrate_zoom();
+            g_dirty = true;
+        }
+        // Before version 5 there were no menu pages and options (host/bindings.h).
+        if (file_version < 5) {
+            host_bindings_migrate_menu_keys();
             g_dirty = true;
         }
         if (file_version < 3 &&

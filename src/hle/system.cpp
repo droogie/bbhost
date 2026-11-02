@@ -1686,10 +1686,14 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             }
         }
     }
-    // The keys that always work a menu (host/window.h), only while one is -
-    // the debug menu included, which is up over the world.
-    if (p.menu_buttons && (menu_pointer_in_menu() || debug_menu_open())) {
-        p.buttons |= p.menu_buttons;
+    // The keys that always work a menu and the menu actions' keys
+    // (host/window.h), only while one is - the debug menu included, which is
+    // up over the world - and then without the keyboard's play-only actions:
+    // what the shoulders and two face buttons do in a menu (its tabs, its
+    // shortcuts, its switches) comes from the menu's own keys, not from Strong
+    // Attack's or the firearm's (host/bindings.h host_binding_in_menus).
+    if ((p.menu_buttons || p.play_buttons) && (menu_pointer_in_menu() || debug_menu_open())) {
+        host_bindings_menu_pad(p);
     }
     // A text box over the game (the IME dialog's, host/window.h) holds the
     // pointer as it holds the pad: a click or a wheel notch there is the
