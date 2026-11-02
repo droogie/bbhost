@@ -952,6 +952,31 @@ take today's copy, counted by reason. `BBHOST_GXVK_HEAP_COPY=compare` copies
 as today, runs the proof over the sources as 1 would, and compares each
 version with its source at its batch.
 
+**Copy-backs captured where GX hands them over, and put in place by GPU
+copies (`BBHOST_GXVK_HOMES`, off by default while it is measured).** The
+copy-backs' bytes are copied when GX resolves them, on the GX thread that
+resolves, into a ring the GPU reads: a segment per GX thread, a resolve's
+copy-backs in one piece, a piece written again only once the command
+processor has walked its tokens and the submissions that read it have run.
+That is before GX can take a source's block back - its retire label lands
+only behind work the command processor walks later - so nothing reads a
+rename after GX may have reused it. With `BBHOST_GXVK_HOMES=1` the command
+processor makes no CPU copy: a home kept as a device-local twin (the
+copy-backs' homes are twins at `BBHOST_GX_TWINS=2`, which this switch selects
+on a discrete GPU) takes a GPU copy from its capture, put in place with every
+other since the last pass before the next pass starts (or before a dispatch,
+a transfer that writes it, or the submission's end); a draw in the same pass
+after the copy-back binds the capture, every later one binds the twin itself.
+Any other home takes a copy version whose bytes are the capture. A copy-back
+the capture missed (a piece still in use, over 64 KiB) goes as today.
+`BBHOST_GXVK_HOMES=compare` keeps today's path and compares each capture with
+the bytes today's copy takes at the token. With
+`BBHOST_GXVK_COPYBACK_CHECK=1` each dynamic constant buffer's
+UpdateSubresource notes a hash of the bytes the rename gets, and each capture
+is compared with it and its source's block classed: the update's own block, a
+block handed out since on the same thread, or one handed out again to
+another thread before the capture read it.
+
 ## Tools
 
 | Tool | What it does |

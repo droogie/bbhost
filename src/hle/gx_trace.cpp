@@ -22,6 +22,7 @@
 #include "decomp/gx/dead_packets.h"
 #include "decomp/gx/dma.h"
 #include "decomp/gx/draw.h"
+#include "host/cb_capture.h"
 #include "host/cb_proof.h"
 #include "host/draw_digest.h"
 #include "host/host_lists.h"
@@ -2211,6 +2212,11 @@ void note_update(const std::uint64_t* f) {
                      hi, static_cast<ull>(data), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
         }
     }
+    // Stage 4b.3a(i)'s check (BBHOST_GXVK_COPYBACK_CHECK with BBHOST_GXVK_HOMES): what the rename gets, for the capture
+    // to compare with - 0x2aadb90 copies the buffer's whole size from `data`, a box or not; the copy-back takes its
+    // whole dwords.
+    if ((flags & 4) && cb_capture::check_on() && data)
+        cb_capture::note_update(f[5] + 0x10, addr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(data)), (size >> 2) * 4ull);
     if (flags & 4) {
         g_updates_dynamic.add();
     } else if (type == 1) {
@@ -2844,6 +2850,9 @@ struct GuestCopy {
     std::uint64_t src_gen = 0, dst_gen = 0;
     // BBHOST_GXVK_COPYBACK_CHECK: the upload heap's hand-outs so far as the GX thread recorded the copy-back.
     std::uint64_t seq = 0;
+    // Stage 4b.3a(i) (BBHOST_GXVK_HOMES, host/cb_capture.h): the copy-back's bytes captured at the resolve - its place in
+    // the captures' ring and the piece the batch's captures are in (cb_capture::kNone: not captured).
+    std::uint32_t cap = 0xffffffffu, piece = 0xffffffffu;
 };
 // The live GX texture whose memory starts at `va` and covers `bytes`: its generation, or 0.
 std::uint64_t whole_texture_gen(std::uint64_t va, std::uint64_t bytes) {
@@ -2949,6 +2958,26 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
     if (!id) {
         g_copy_unwritten.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    // Stage 4b.3a(i): the copy-backs' bytes taken now, on the GX thread, before GX can take their blocks back.
+    if (kind == kCopyBuffers && cb_capture::on()) {
+        static thread_local std::vector<std::uint64_t> cd, cs, cn;
+        static thread_local std::vector<std::uint32_t> at;
+        const std::size_t n = copies.size();
+        cd.resize(n);
+        cs.resize(n);
+        cn.resize(n);
+        at.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            cd[i] = copies[i].dst;
+            cs[i] = copies[i].src;
+            cn[i] = copies[i].bytes;
+        }
+        const std::uint32_t piece = cb_capture::capture(cb, cd.data(), cs.data(), cn.data(), static_cast<std::uint32_t>(n), at.data(), hle_video_flip_count());
+        for (std::size_t i = 0; i < n; ++i) {
+            copies[i].cap = at[i];
+            copies[i].piece = piece;
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_copies_mu);
@@ -6770,7 +6799,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census && !gxvk::census() &&
-            !gxvk::watch_writes())
+            !gxvk::watch_writes() && !cb_capture::check_on())
             continue;
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
@@ -7214,20 +7243,27 @@ void hle_gx_copy_token(std::uint64_t id) {
     // bytes to leave the write-combining buffers.
     std::uint64_t ranges = 0, bytes = 0;
     static thread_local std::vector<std::uint64_t> run_dst, run_src, run_bytes;
+    static thread_local std::vector<std::uint32_t> run_at;
+    // Stage 4b.3a(i): the batch's captures (one piece for the token), released once the token is walked.
+    const std::uint32_t piece = !copies.empty() ? copies[0].piece : 0xffffffffu;
     for (std::size_t i = 0; i < copies.size();) {
         bool refused = false;
         if (copies[i].back && copies[i].bytes) {
             run_dst.clear();
             run_src.clear();
             run_bytes.clear();
+            run_at.clear();
             static const bool check = gxvk::copyback_check_wanted();
             for (std::size_t j = i; j < copies.size() && copies[j].back; ++j) {
                 run_dst.push_back(copies[j].dst);
                 run_src.push_back(copies[j].src);
                 run_bytes.push_back(copies[j].bytes);
+                run_at.push_back(copies[j].cap);
                 if (check) gxvk::copyback_check(copies[j].src, copies[j].bytes, copies[j].seq);
             }
-            const std::size_t took = host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
+            const std::size_t took = cb_capture::on() ? host_gpu_copy_backs_captured(run_dst.data(), run_src.data(), run_bytes.data(), run_at.data(),
+                                                                                    piece, run_dst.size())
+                                                      : host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
             for (std::size_t k = 0; k < took; ++k) bytes += copies[i + k].bytes;
             ranges += took;
             i += took;
@@ -7238,13 +7274,16 @@ void hle_gx_copy_token(std::uint64_t id) {
         ++ranges;
         bytes += c.bytes;
         if (!c.bytes ||
-            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen)))
+            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes)
+                                : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen,
+                                                      cb_capture::g_mode == cb_capture::Mode::kOn ? c.cap : cb_capture::kNone, c.piece)))
             continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),
                      static_cast<ull>(c.dst), static_cast<ull>(c.bytes));
         }
     }
+    cb_capture::release(piece);
     g_copy_ranges.fetch_add(ranges, std::memory_order_relaxed);
     g_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
     static std::atomic<std::uint64_t> walked{0};

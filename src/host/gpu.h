@@ -505,7 +505,10 @@ void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
 // resource's image when the host holds one (textures_copy_resource_locked,
 // the render-target path for a target), and the memory copy stays the
 // fallback.
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0);
+// `cap_at`/`cap_piece` (stage 4b.3a(i), BBHOST_GXVK_HOMES=1): a copy-back's capture at the GX resolve, read in place of
+// the source (host/cb_capture.h; 0xffffffff: none).
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0,
+                         std::uint32_t cap_at = 0xffffffffu, std::uint32_t cap_piece = 0xffffffffu);
 // A GX dynamic buffer's renamed bytes copied back to its own address (a copy
 // token's batched copies): inside a render pass, the draws after it read a
 // copy of the bytes taken now and the copy into place waits for the pass's
@@ -518,6 +521,11 @@ bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes)
 // a token's copies: each release waited for the copy just made to leave the
 // write-combining buffers of the staging memory.
 std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n);
+// The same, stage 4b.3a(i) (BBHOST_GXVK_HOMES, host/cb_capture.h): the copy-backs' bytes captured at the GX resolve, at[i]
+// each one's place in the captures' ring (cb_capture::kNone: not captured, today's copy) in `piece`. A home kept as a
+// device-local twin takes a GPU copy from its capture in stream order; any other a copy version of its capture.
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at,
+                                         std::uint32_t piece, std::size_t n);
 // A constant window a YEBIS draw reads, given at its token on the command
 // processor's thread (engine/yebis_bind.cpp): written into guest memory by
 // the CPU, and the next draw binds a copy of it taken as it records, so no

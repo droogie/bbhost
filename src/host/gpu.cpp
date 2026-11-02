@@ -27,6 +27,7 @@
 #include "host/shader_bundles.h"
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
+#include "host/cb_capture.h"
 #include "host/options.h"
 
 #include "gcn/container.h"
@@ -10884,6 +10885,8 @@ void transfer_begin_locked() {
 // records it through rec(), not into the open packet; the barrier goes there too.
 void transfer_order_locked(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes,
                            bool in_place = false) {
+    // A pending twin-home copy (stage 4b.3a(i)) into the bytes this transfer writes: put in place first, as it came first.
+    if (gpu::home_copies_before_transfer_locked(dst, dst_off, bytes)) g_batch_spans.clear();
     bool wait = false;
     for (const BatchSpan& s : g_batch_spans) {
         if ((s.buffer == dst && s.lo < dst_off + bytes && dst_off < s.hi) ||
@@ -10978,6 +10981,16 @@ std::atomic<std::uint64_t> g_twin_armed{0};
 // candidate's range, perhaps more (one let go or gone since). Its inserts and
 // erases move its shape, as the live twins' do: the miss filter's rebuild.
 twins::ShapedMap<std::uint64_t> g_twin_armed_ranges;
+// Levels 1 and 2: every candidate's range joins the armed ranges too, so the miss filter answers a binding that meets
+// no candidate and no live twin without the candidates' lock (at level 2 every locate() took it: the copy-backs' homes
+// make thousands of candidates). A candidate the registry makes (twins_buffer_made, no renderer's lock) joins when the
+// next recording begins; one a GPU copy makes, at once. BBHOST_TWIN_FAST_MISS12=0: as before (only level 3's filter).
+std::vector<std::uint64_t> g_twin_arm_q;  // under g_twin_cand_mu
+std::atomic<std::uint64_t> g_twin_arm_q_n{0};
+const bool g_twin_fast_miss12 = [] {
+    const char* e = std::getenv("BBHOST_TWIN_FAST_MISS12");
+    return !(e && e[0] == '0');
+}();
 bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) { return twins::ranges_meet(g_twin_armed_ranges, va, bytes); }
 // Its range out of the filter, unless an armed candidate (a newer resource's)
 // still holds that memory. Not under g_twin_cand_mu (it takes it).
@@ -10996,6 +11009,35 @@ struct Twin {
     DevBuffer own;
 };
 twins::ShapedMap<Twin> g_twin_live;  // by memory, under g.mu (inserts and erases move its shape: twin_filter.h)
+// The live map's answer for an address - the twin holding it (its memory and entry) and the next twin's memory - kept
+// per thread by address while the map keeps its shape: a binding asks two or three times, and the same buffers are
+// bound draw after draw (at BBHOST_GX_TWINS=2 some 7,000 live twins, ~1,200 twin bindings and ~2,500 refusals a flip,
+// each a walk of the map).
+struct TwinAt {
+    std::uint64_t va = 0, shape = ~0ull;
+    std::uint64_t memory = 0, next = ~0ull;  // the holding twin's memory (twin set), the next twin's memory (~0: none)
+    const Twin* twin = nullptr;
+};
+thread_local TwinAt t_twin_at[256];
+const TwinAt& twin_live_at_locked(std::uint64_t va) {
+    TwinAt& a = t_twin_at[(va >> 4) & 255];
+    const std::uint64_t shape = g_twin_live.shape();
+    if (a.shape == shape && a.va == va) return a;
+    a.va = va;
+    a.shape = shape;
+    a.twin = nullptr;
+    a.memory = 0;
+    auto it = g_twin_live.upper_bound(va);
+    a.next = it != g_twin_live.end() ? it->first : ~0ull;
+    if (it != g_twin_live.begin()) {
+        --it;
+        if (va < it->first + it->second.bytes) {
+            a.twin = &it->second;
+            a.memory = it->first;
+        }
+    }
+    return a;
+}
 enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
     g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_edge_ended_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
@@ -11276,7 +11318,11 @@ void twins_decide(bool discrete) {
     const char* cap_w = std::getenv("BBHOST_CAPTURE_DRAW");
     const bool capture = (cap_d && cap_d[0]) || (cap_w && cap_w[0]);
     const bool on = !capture && (p && p[0] == '1' ? true : discrete);
-    if (!g_twins.compare_exchange_strong(undecided, on ? 3 : 0)) return;  // set already (BBHOST_GX_TWINS, or =0)
+    // Stage 4b.3a(i) (BBHOST_GXVK_HOMES=1, host/cb_capture.h): the copy-backs' homes device-local too - level 2 - on a
+    // discrete GPU, unless BBHOST_GX_TWINS says otherwise.
+    const bool homes = on && discrete && cb_capture::g_mode == cb_capture::Mode::kOn;
+    if (!g_twins.compare_exchange_strong(undecided, homes ? 2 : on ? 3 : 0)) return;  // set already (BBHOST_GX_TWINS, or =0)
+    if (homes) host_log("gpu: GX buffers the GPU writes, and the copy-backs' homes, as device-local twins (BBHOST_GX_TWINS=2: BBHOST_GXVK_HOMES=1)");
     host_log("gpu: the GPU particles' buffers %s (BBHOST_PARTICLE_TWINS%s)",
              on ? "as device-local twins once a dispatch that counts binds them" : "in guest memory",
              p && p[0] ? (p[0] == '1' ? "=1" : "=0") : capture ? ": off under a capture" : discrete ? ": on for a discrete GPU" : ": off on this GPU");
@@ -11297,6 +11343,15 @@ void twins_want_locked(std::uint64_t va) {
 }
 
 void twins_arm_wanted_locked() {
+    if (g_twin_arm_q_n.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        for (const std::uint64_t memory : g_twin_arm_q) {
+            if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end() && c->second.armed && !c->second.let_go)
+                g_twin_armed_ranges.assign(memory, memory + c->second.bytes);
+        }
+        g_twin_arm_q.clear();
+        g_twin_arm_q_n.store(0, std::memory_order_relaxed);
+    }
     if (g_twin_want.empty()) return;
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     for (const std::uint64_t memory : g_twin_want) {
@@ -11317,7 +11372,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     // (BBHOST_RUN_COMMIT) owes no drop: the fork settled them, and one owed
     // since is for a buffer let go after this run was submitted.
     const bool part = run_part();
-    if (g_twins.load(std::memory_order_relaxed) == 3 && (part || !twins_drop_pending_locked()) && twin_filter_misses_locked(va, bytes))
+    if ((g_twins.load(std::memory_order_relaxed) == 3 || g_twin_fast_miss12) && (part || !twins_drop_pending_locked()) &&
+        twin_filter_misses_locked(va, bytes))
         return false;
     if (!part) {
         twins_drain_gone_locked();
@@ -11326,15 +11382,14 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     // Inside a live twin (the common case): served without the candidates'
     // lock or the registry - a twin lives until its buffer is gone, let go or
     // mapped in place by the CPU, which drop it.
-    if (auto lt = g_twin_live.upper_bound(va); lt != g_twin_live.begin()) {
-        --lt;
-        const std::uint64_t m = lt->first;
-        if (va >= m && va + bytes <= m + lt->second.bytes) {
-            out.buffer = lt->second.buffer;
-            out.offset = lt->second.offset + (va - m);
-            out.avail = lt->second.bytes - (va - m);
+    if (const TwinAt& lt = twin_live_at_locked(va); lt.twin) {
+        const std::uint64_t m = lt.memory;
+        if (va >= m && va + bytes <= m + lt.twin->bytes) {
+            out.buffer = lt.twin->buffer;
+            out.offset = lt.twin->offset + (va - m);
+            out.avail = lt.twin->bytes - (va - m);
             if (address) {
-                *address = lt->second.address + (va - m);
+                *address = lt.twin->address + (va - m);
                 g_twin_addresses.fetch_add(1, std::memory_order_relaxed);
             } else {
                 g_twin_served.fetch_add(1, std::memory_order_relaxed);
@@ -11489,9 +11544,8 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
         twins_drain_gone_locked();
         twins_drop_cpu_mapped_locked();
     }
-    auto it = g_twin_live.upper_bound(va);
-    const bool any = (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) ||
-                     (it != g_twin_live.end() && it->first < va + bytes);
+    const TwinAt& a = twin_live_at_locked(va);
+    const bool any = a.twin || a.next < va + bytes;
     if (any) g_twin_refused.fetch_add(1, std::memory_order_relaxed);
     return any;
 }
@@ -11499,10 +11553,21 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
     if (twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
-    auto it = g_twin_live.upper_bound(va);
-    if (it == g_twin_live.begin()) return false;
-    --it;
-    return va >= it->first && va + bytes <= it->first + it->second.bytes;
+    const TwinAt& a = twin_live_at_locked(va);
+    return a.twin && va + bytes <= a.memory + a.twin->bytes;
+}
+
+bool twin_live_holding_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
+    if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    // (A twin whose buffer died, or that the CPU now maps in place, is dropped first, as twin_locate_locked does.)
+    twins_drain_gone_locked();
+    twins_drop_cpu_mapped_locked();
+    const TwinAt& a = twin_live_at_locked(va);
+    if (!a.twin || va + bytes > a.memory + a.twin->bytes) return false;
+    out.buffer = a.twin->buffer;
+    out.offset = a.twin->offset + (va - a.memory);
+    out.avail = a.twin->bytes - (va - a.memory);
+    return true;
 }
 
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
@@ -11543,6 +11608,7 @@ void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes) {
     if (g_twin_cpu_mapped.count(info.gen)) return;
     g_twin_cand[info.memory] = TwinCandidate{info.bytes, info.gen, false};
     g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    if (g_twin_fast_miss12) g_twin_armed_ranges.assign(info.memory, info.memory + info.bytes);  // (the miss filter's: levels 1-2)
     g_twin_copy_cands.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -11704,6 +11770,10 @@ void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t u
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     g_twin_cand[memory] = TwinCandidate{bytes, gen, false, level == 1 || level == 2};
     g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    if ((level == 1 || level == 2) && g_twin_fast_miss12) {  // its range for the miss filter at the next recording's start
+        g_twin_arm_q.push_back(memory);
+        g_twin_arm_q_n.store(g_twin_arm_q.size(), std::memory_order_release);
+    }
 }
 
 // BBHOST_ARENA_WATCH: the last deferred writes replayed, with where each
@@ -12468,7 +12538,14 @@ std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(s
 constexpr std::size_t kStagedCopyMax = 4u << 20;
 std::atomic<std::uint64_t> g_copy_src_staged{0}, g_copy_src_staged_bytes{0};
 
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
+namespace {
+// Stage 4b.3a(i): the copy-back captures' ring (host/cb_capture.h), made at the first copy token with the captures on.
+gpu::DevBuffer g_capture_ring;  // under g.mu
+bool g_capture_ring_tried = false;
+}  // namespace
+
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen,
+                         std::uint32_t cap_at, std::uint32_t cap_piece) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return false;
     if (!bytes) return true;
@@ -12550,8 +12627,14 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     // its bytes as this point in the stream has them, the pending versions
     // laid over guest memory's - and needs no import.
     Located staged;
-    if (!imports_whole() && bytes <= kStagedCopyMax && !twin_covers_locked(src, bytes) && !gpu_writes_pending_locked(src, bytes) &&
-        !find_render_target(src) && !surfaces_may_cover_locked(src, bytes)) {
+    // A copy-back captured at the GX resolve (stage 4b.3a(i)): its capture is the source - never the rename, which GX may
+    // have taken back by the time this copy runs.
+    if (cap_at != cb_capture::kNone && g_capture_ring.buffer && cb_capture::piece_live(cap_piece)) {
+        staged = {g_capture_ring.buffer, cb_capture::offset(cap_at), bytes};
+        cb_capture::bound(cap_piece, g.flushes);
+        cb_capture::count(cb_capture::kUseGuestCopy);
+    } else if (!imports_whole() && bytes <= kStagedCopyMax && !twin_covers_locked(src, bytes) && !gpu_writes_pending_locked(src, bytes) &&
+               !find_render_target(src) && !surfaces_may_cover_locked(src, bytes)) {
         DevBuffer sb;
         VkDeviceSize so = 0;
         if (acquire_staging_locked(sb, bytes, so)) {
@@ -12618,8 +12701,40 @@ struct CopyVersion {
     // with the source at the batch.
     std::uint64_t src = 0;
     bool heap = false, check = false;
+    bool ring = false;  // stage 4b.3a(i): `copy` is the copy-back's capture in the captures' ring (no CPU copy)
 };
 std::vector<CopyVersion> g_copy_versions;  // under g.mu: the pending ones, oldest first
+// ---- Stage 4b.3a(i): a copy-back into a twin home as a GPU copy from its capture (BBHOST_GXVK_HOMES=1) ----
+// The captures' ring (host/cb_capture.h: the GX threads write it at the resolve, the GPU reads it), made at the first
+// copy token with the captures on. A copy-back whose home is a live device-local twin (BBHOST_GX_TWINS=2) is copied
+// ring -> twin in stream order: at the token when no pass is open (into the open transfer batch), else when the pass
+// ends - a binding of the home before that, in the same pass, binds the capture as it would a copy version. From the
+// next pass on a binding of the home is the twin, by handle: no version, no GPU write to ask about.
+struct HomeCopy {
+    std::uint64_t dst = 0, bytes = 0;
+    VkDeviceSize ring_off = 0;
+    Located twin;
+};
+std::vector<HomeCopy> g_home_copies;  // under g.mu: pending until the next pass starts, oldest first
+std::uint64_t g_hc_lo = ~0ull, g_hc_hi = 0;
+// The same by destination (index into g_home_copies), and the longest: a binding's lookup is a binary search.
+std::vector<std::pair<std::uint64_t, std::uint32_t>> g_hc_sorted;
+std::uint64_t g_hc_maxlen = 0;
+void home_copies_index_rebuild() {
+    g_hc_sorted.clear();
+    g_hc_maxlen = 0;
+    g_hc_lo = ~0ull;
+    g_hc_hi = 0;
+    for (std::uint32_t i = 0; i < g_home_copies.size(); ++i) {
+        const HomeCopy& h = g_home_copies[i];
+        g_hc_sorted.emplace_back(h.dst, i);
+        g_hc_maxlen = std::max(g_hc_maxlen, h.bytes);
+        g_hc_lo = std::min(g_hc_lo, h.dst);
+        g_hc_hi = std::max(g_hc_hi, h.dst + h.bytes);
+    }
+    std::sort(g_hc_sorted.begin(), g_hc_sorted.end());
+}
+std::atomic<std::uint64_t> g_hc_bound{0}, g_hc_straddled{0}, g_hc_batches{0}, g_hc_copies{0}, g_hc_overwritten{0}, g_hc_now{0}, g_hc_pending{0};
 // The same by destination, for lookups at every binding: a scan of the list
 // was a tenth of the command processor (BBHOST_COPY_VERSIONS=2, ~80 pending).
 struct CopyVersionKey {
@@ -12669,7 +12784,105 @@ void copy_version_add(const CopyVersion& v) {
 }
 }  // namespace
 
-bool copy_versions_pending_locked() { return !g_copy_versions.empty(); }
+bool copy_versions_pending_locked() { return !g_copy_versions.empty() || !g_home_copies.empty(); }
+
+namespace {
+// Whether a pending twin-home copy writes [off, off + bytes) of `buffer` (a transfer about to write it waits for them).
+bool home_copies_write_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSize bytes) {
+    for (const HomeCopy& h : g_home_copies) {
+        if (h.twin.buffer == buffer && h.twin.offset < off + bytes && off < h.twin.offset + h.bytes) return true;
+    }
+    return false;
+}
+}  // namespace
+
+// The pending twin-home copies into their twins: a batch of their own, as the versions' (no pass is open; the callers
+// see to it). Newest first, each byte from the newest copy that has it: copies in one batch run in any order.
+void home_copies_flush_locked() {
+    if (g_home_copies.empty()) return;
+    begin_recording_locked();  // made between recordings, their copies go in the next
+    std::vector<HomeCopy> pending;
+    pending.swap(g_home_copies);
+    g_hc_lo = ~0ull;
+    g_hc_hi = 0;
+    g_hc_sorted.clear();
+    g_hc_maxlen = 0;
+    std::optional<DrawCmds> own;
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_begin()) rec().transfer_barrier(true);
+    static std::map<std::uint64_t, std::uint64_t> covered;  // start -> end, disjoint, of the newer copies
+    covered.clear();
+    std::size_t copies = 0;
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+        const HomeCopy& h = *it;
+        const std::uint64_t end = h.dst + h.bytes;
+        auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
+            const VkBufferCopy region{h.ring_off + (lo - h.dst), h.twin.offset + (lo - h.dst), hi - lo};
+            DrawCmds* c = DrawCmds::open();
+            if (!c || !c->copy_buffer(g_capture_ring.buffer, h.twin.buffer, region))
+                rec().copy_buffer(g_capture_ring.buffer, h.twin.buffer, 1, &region);
+            transfer_end_locked();
+            ++copies;
+        };
+        auto c = covered.upper_bound(h.dst);
+        if (c != covered.begin() && std::prev(c)->second > h.dst) --c;
+        for (std::uint64_t at = h.dst; at < end;) {
+            if (c == covered.end() || c->first >= end) {
+                copy_piece(at, end);
+                break;
+            }
+            if (c->first > at) copy_piece(at, c->first);
+            at = std::max(at, c->second);
+            ++c;
+        }
+        std::uint64_t lo = h.dst, hi = end;
+        auto m = covered.upper_bound(lo);
+        if (m != covered.begin() && std::prev(m)->second >= lo) --m;
+        while (m != covered.end() && m->first <= hi) {
+            lo = std::min(lo, m->first);
+            hi = std::max(hi, m->second);
+            m = covered.erase(m);
+        }
+        covered.emplace(lo, hi);
+    }
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_end()) rec().transfer_barrier(false);
+    g_hc_overwritten.fetch_add(pending.size() > copies ? pending.size() - copies : 0, std::memory_order_relaxed);
+    g_hc_batches.fetch_add(1, std::memory_order_relaxed);
+    g_hc_copies.fetch_add(copies, std::memory_order_relaxed);
+}
+
+bool home_copies_before_transfer_locked(VkBuffer dst, VkDeviceSize off, VkDeviceSize bytes) {
+    if (g_home_copies.empty() || !home_copies_write_locked(dst, off, bytes)) return false;
+    home_copies_flush_locked();
+    return true;
+}
+
+namespace {
+int home_copy_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
+    if (g_home_copies.empty() || !bytes || base + bytes <= g_hc_lo || base >= g_hc_hi) return kCopyVersionNone;
+    // The newest pending copy sharing bytes with the binding: those starting within the longest's reach below it.
+    const std::uint64_t from = base > g_hc_maxlen ? base - g_hc_maxlen + 1 : 0;
+    auto it = std::lower_bound(g_hc_sorted.begin(), g_hc_sorted.end(), std::make_pair(from, std::uint32_t{0}));
+    const HomeCopy* best = nullptr;
+    std::uint32_t best_i = 0;
+    for (; it != g_hc_sorted.end() && it->first < base + bytes; ++it) {
+        const HomeCopy& h = g_home_copies[it->second];
+        if (h.dst + h.bytes <= base) continue;
+        if (!best || it->second > best_i) {
+            best = &h;
+            best_i = it->second;
+        }
+    }
+    if (!best) return kCopyVersionNone;
+    if (base < best->dst || base + bytes > best->dst + best->bytes) {
+        g_hc_straddled.fetch_add(1, std::memory_order_relaxed);
+        return kCopyVersionStraddles;
+    }
+    if (out) *out = {g_capture_ring.buffer, best->ring_off + (base - best->dst), best->bytes - (base - best->dst)};
+    g_hc_bound.fetch_add(1, std::memory_order_relaxed);
+    return kCopyVersionInside;
+}
+}  // namespace
 
 void copy_versions_pass_end_locked() {
     if (g_copy_versions_mode == 1) copy_versions_flush_locked();
@@ -12677,13 +12890,19 @@ void copy_versions_pass_end_locked() {
 
 std::atomic<std::uint64_t> g_cv_put[kCvPutReasons] = {};
 void copy_versions_put_in_place_locked(int why) {
-    if (g_copy_versions.empty()) return;
+    if (g_copy_versions.empty() && g_home_copies.empty()) return;
     g_cv_put[why].fetch_add(1, std::memory_order_relaxed);
     render_end_pass_locked();
+    home_copies_flush_locked();
     copy_versions_flush_locked();
 }
 
 bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi) {
+    if (!g_home_copies.empty() && hi > g_hc_lo && lo < g_hc_hi) {
+        for (const HomeCopy& h : g_home_copies) {
+            if (h.dst < hi && h.dst + h.bytes > lo) return true;
+        }
+    }
     if (g_copy_versions.empty() || hi <= g_cv_lo || lo >= g_cv_hi) return false;
     for (const CopyVersion& v : g_copy_versions) {
         if (v.dst < hi && v.dst + v.bytes > lo) return true;
@@ -12692,6 +12911,9 @@ bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi) {
 }
 
 bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi) {
+    for (const HomeCopy& h : g_home_copies) {
+        if (h.twin.buffer == buffer && h.twin.offset < hi && h.twin.offset + h.bytes > lo) return true;
+    }
     for (const CopyVersion& v : g_copy_versions) {
         if (v.canon.buffer == buffer && v.canon.offset < hi && v.canon.offset + v.bytes > lo) return true;
     }
@@ -12707,6 +12929,9 @@ bool copy_versions_name_buffer_locked(VkBuffer buffer) {
 
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src) {
     if (heap_src) *heap_src = 0;
+    // A twin home's copy pending in this pass (stage 4b.3a(i)) is newer than any version over it: versions are made only
+    // for homes that are not live twins, and a twin made since takes no version's copy.
+    if (const int h = home_copy_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;
     if (g_copy_versions.empty() || !bytes) return kCopyVersionNone;
     const CopyVersion* v = copy_version_over(base, bytes);
     if (!v) return kCopyVersionNone;
@@ -12730,7 +12955,7 @@ void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::
     }
 }
 
-bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes) {
+bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes, const CopyCapture* cap) {
     // Outside a pass the copy ends nothing; inside an open transfer batch it
     // costs nothing more, and a later transfer of the batch could read it.
     if (!g_copy_versions_mode || (g_copy_versions_mode == 1 && !render_pass_open_locked()) || g.in_transfer) return false;
@@ -12747,6 +12972,18 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
+    // A twin home's copy still pending in this pass (stage 4b.3a(i)) under the new version: the version is newer and its
+    // batch writes the same twin later, so it takes the pending copy's place (bindings from now on take the version); one
+    // it covers in part sends this copy-back to the GPU as it stands (the pass ended first).
+    if (!g_home_copies.empty() && dst < g_hc_hi && dst + bytes > g_hc_lo) {
+        for (const HomeCopy& h : g_home_copies) {
+            if (h.dst < dst + bytes && dst < h.dst + h.bytes && (h.dst < dst || h.dst + h.bytes > dst + bytes)) return refuse(kCvOther);
+        }
+        g_home_copies.erase(std::remove_if(g_home_copies.begin(), g_home_copies.end(),
+                                           [&](const HomeCopy& h) { return h.dst < dst + bytes && dst < h.dst + h.bytes; }),
+                            g_home_copies.end());
+        home_copies_index_rebuild();
+    }
     const ImportSite site("a copy version's destination");
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
     twin_note_copy_target_locked(dst, bytes);
@@ -12759,7 +12996,8 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     const auto* from = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(src));
     const CopyVersion* earlier = copy_version_over(src, bytes);
     if (earlier) {
-        if (src < earlier->dst || src + bytes > earlier->dst + earlier->bytes) return refuse(kCvSource);
+        // (A capture holds GX's bytes at the resolve, not a pending version's: never expected over a rename.)
+        if (cap || src < earlier->dst || src + bytes > earlier->dst + earlier->bytes) return refuse(kCvSource);
         from = static_cast<const std::uint8_t*>(earlier->copy.map) + (src - earlier->dst);
         bump(g_cv_from_version);
     }
@@ -12774,7 +13012,14 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     // has completed (proven per run). With =compare the copy is made as today
     // and checked against the source at the batch. Anything else, or a source
     // the arena does not hold: today's copy (heap_copy_decide counts why).
-    if (gxvk::heap_copy_wanted()) {
+    if (cap) {
+        v.ring = true;
+        v.copy = DevBuffer{};
+        v.copy.buffer = cap->buffer;
+        v.copy.map = const_cast<void*>(cap->map);
+        v.copy.size = bytes;
+        v.offset = cap->offset;
+    } else if (gxvk::heap_copy_wanted()) {
         Located s;
         // (Whole spans only: with window imports locate would import a window
         // of the heap for it.)
@@ -12796,7 +13041,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
             }
         }
     }
-    if (!v.heap) {
+    if (!v.heap && !v.ring) {
         if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
         std::memcpy(v.copy.map, from, bytes);
     }
@@ -12810,6 +13055,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
 // A batch of its own, closed here: the callers that end a pass go on to
 // record other work without looking for an open transfer batch.
 void copy_versions_flush_locked() {
+    home_copies_flush_locked();  // (stage 4b.3a(i): none pending outside a pass; a batch of their own if one is)
     if (g_copy_versions.empty()) return;
     begin_recording_locked();  // made between recordings, their copies go in the next
     std::vector<CopyVersion> pending;
@@ -12916,6 +13162,81 @@ std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* s
         if (bytes[i] && !copy_version_make_locked(dst[i], src[i], bytes[i])) break;
     }
     return i;
+}
+
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at,
+                                         std::uint32_t piece, std::size_t n) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return 0;
+    if (!g_capture_ring.buffer && !g_capture_ring_tried) {
+        g_capture_ring_tried = true;
+        if (create_upload_buffer(g_capture_ring, cb_capture::kRingBytes, "the copy-back captures (BBHOST_GXVK_HOMES)") && g_capture_ring.map) {
+            cb_capture::set_ring(g_capture_ring.map);
+            host_log("gxvk homes: the copy-back captures' ring made (%llu MiB)", static_cast<unsigned long long>(cb_capture::kRingBytes >> 20));
+        } else {
+            host_log("gxvk homes: the copy-back captures' ring could not be made: copy-backs as today");
+        }
+    }
+    const bool live = g_capture_ring.buffer && cb_capture::piece_live(piece);
+    const bool compare = cb_capture::g_mode == cb_capture::Mode::kCompare;
+    std::size_t i = 0;
+    for (; i < n; ++i) {
+        if (!bytes[i]) continue;
+        if (at[i] == cb_capture::kNone || !live) {
+            cb_capture::count(at[i] == cb_capture::kNone ? cb_capture::kUseNotCaptured : cb_capture::kUseStale);
+            if (!copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+            continue;
+        }
+        if (compare) {  // today's path, and the capture against the bytes it takes
+            cb_capture::compared(std::memcmp(cb_capture::bytes_at(at[i]), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src[i])),
+                                             bytes[i]) == 0,
+                                 dst[i], src[i], bytes[i]);
+            if (!copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+            continue;
+        }
+        const VkDeviceSize ring_off = cb_capture::offset(at[i]);
+        // A home kept as a live device-local twin, with no version of an older copy-back still to go into its guest
+        // memory: the copy goes ring -> twin, now or at the pass's end.
+        Located twin;
+        if (!copy_version_over(dst[i], bytes[i]) && twin_live_holding_locked(dst[i], bytes[i], twin)) {
+            // Pending until the next pass starts (or a dispatch, transfer or submission comes first): one batch for
+            // every copy-back between two passes, and the next pass binds the twin.
+            cb_capture::bound(piece, g.flushes);
+            const bool in_pass = render_pass_open_locked();
+            g_home_copies.push_back(HomeCopy{dst[i], bytes[i], ring_off, twin});
+            g_hc_lo = std::min(g_hc_lo, dst[i]);
+            g_hc_hi = std::max(g_hc_hi, dst[i] + bytes[i]);
+            const std::pair<std::uint64_t, std::uint32_t> key{dst[i], static_cast<std::uint32_t>(g_home_copies.size() - 1)};
+            g_hc_sorted.insert(std::upper_bound(g_hc_sorted.begin(), g_hc_sorted.end(), key), key);
+            g_hc_maxlen = std::max(g_hc_maxlen, bytes[i]);
+            (in_pass ? g_hc_pending : g_hc_now).fetch_add(1, std::memory_order_relaxed);
+            cb_capture::count(in_pass ? cb_capture::kUseHomePending : cb_capture::kUseHomeNow);
+            continue;
+        }
+        // Any other home: a copy version whose bytes are the capture.
+        const CopyCapture cap{g_capture_ring.buffer, ring_off, cb_capture::bytes_at(at[i])};
+        if (!copy_version_make_locked(dst[i], src[i], bytes[i], &cap)) {
+            cb_capture::count(cb_capture::kUseRefused);
+            break;
+        }
+        cb_capture::bound(piece, g.flushes);
+        cb_capture::count(cb_capture::kUseVersion);
+    }
+    return i;
+}
+
+std::string gpu::home_copies_report() {
+    if (!cb_capture::on()) return "";
+    using ull = unsigned long long;
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "gxvk homes: twin homes' copies made outside a pass %llu, inside one %llu; put in place at the next pass's start or "
+                  "before a dispatch, transfer or submission: %llu copies in %llu batches (%llu all overwritten by newer ones); "
+                  "bindings that took a pending one's capture %llu, across one's edge %llu",
+                  static_cast<ull>(g_hc_now.load()), static_cast<ull>(g_hc_pending.load()), static_cast<ull>(g_hc_copies.load()),
+                  static_cast<ull>(g_hc_batches.load()), static_cast<ull>(g_hc_overwritten.load()), static_cast<ull>(g_hc_bound.load()),
+                  static_cast<ull>(g_hc_straddled.load()));
+    return b;
 }
 
 std::uint64_t host_gpu_work_needs() {

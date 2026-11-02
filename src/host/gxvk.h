@@ -224,6 +224,17 @@ void arena_label(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
 // A copy-back from [src, +bytes) as the command processor reaches its token; `seq`: the hand-outs so far when the GX
 // thread recorded it.
 void copyback_check(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq);
+// This thread's tag (a hand-out records the tag of the thread GX handed it out on, with the check on).
+std::uint32_t arena_thread_tag();
+// Stage 4b.3a(i) with the check: the GX thread that captures a copy-back (host/cb_capture.h) classes its source's block
+// against what UpdateSubresource noted when it wrote the rename - `seq` the hand-outs so far then, `tid` its thread's tag:
+// the hand-out that held the source then (seq <= `seq`: the update's block, its bytes GX's), a hand-out since on the same
+// thread (the update's own new block, or that block handed out again to the same thread), one since on another thread
+// (handed out again: a miss), none. *landed: the block's retire label had landed (GX may take it back any time).
+// A hand-out since on the same thread whose first bytes are the rename is the update's own new block (the pool carves
+// a fresh block from its start); one the rename lies deeper in was handed out again since.
+enum CaptureClass : int { kCapUpdateBlock, kCapNewBlock, kCapSinceSameThread, kCapSinceOtherThread, kCapNoRecord, kCapNotHeap, kCapClasses };
+int capture_class(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq, std::uint32_t tid, bool* landed);
 // The pool's init (decomp/gx/upload_heap.cpp's entry): the pool and the
 // region it is made over, which stays the game's.
 void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes);

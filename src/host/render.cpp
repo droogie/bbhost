@@ -11156,6 +11156,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     transfer_flush_locked();
     if (hazard && g_pass.active && g_pass.key == key) g_barriers_mid_pass.fetch_add(1, std::memory_order_relaxed);
     end_pass_for_draw_locked();
+    home_copies_flush_locked();  // stage 4b.3a(i): the copy-backs into twin homes since the last pass, before this one
     if (g_hazards.owed) {
         bool need = hazard;
         for (int t = 0; t < 8 && !need; ++t) {
@@ -15575,8 +15576,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || from_heap || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() &&
-                        (known || (hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes)));
+            // (A twin is asked about before a GPU write still to land on it: a twin is bound where it is, in stream
+            // order, whatever is still to land - stage 4b.3a(i)'s homes read no answer of the order.)
+            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
+                        (known || (hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes))) && !gpu_pending();
             if (!copy_only) {
                 // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
                 const ImportSite site(b.written                         ? "a shader's buffer, stored to"

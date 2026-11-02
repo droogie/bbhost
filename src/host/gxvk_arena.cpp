@@ -89,6 +89,7 @@ struct Record {
     // BBHOST_GXVK_COPYBACK_CHECK: the pool's node (its first dword is the status a retire's label writes), the
     // hand-out's number, and the submissions that must have completed for that label to have landed (0: not written).
     std::uint64_t node = 0, seq = 0, retire = 0;
+    std::uint32_t tid = 0;  // (and the tag of the thread GX handed it out on: arena_thread_tag)
 };
 std::mutex g_mu;
 std::vector<Record> g_records;            // under g_mu
@@ -304,6 +305,32 @@ void copyback_check(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq) {
     g_chk[c].fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint32_t arena_thread_tag() {
+    static std::atomic<std::uint32_t> next{1};
+    thread_local std::uint32_t tag = 0;
+    if (!tag) tag = next.fetch_add(1, std::memory_order_relaxed);
+    return tag;
+}
+
+int capture_class(std::uint64_t src, std::uint64_t bytes, std::uint64_t seq, std::uint32_t tid, bool* landed) {
+    *landed = false;
+    if (!g_check || !bytes) return kCapNoRecord;
+    const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
+    if (!lo || src < lo || src >= hi) return kCapNotHeap;
+    const std::uint64_t done = done_submissions();
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_released) return kCapNoRecord;
+    const std::uint64_t p = (src - lo) >> kPageShift;
+    if (p >= g_pages.size()) return kCapNoRecord;
+    for (const std::uint32_t r : g_pages[p]) {
+        const Record& rec = g_records[r];
+        if (!rec.live || src < rec.start || src >= rec.end) continue;
+        *landed = rec.retire && done >= rec.retire;
+        return rec.seq <= seq ? kCapUpdateBlock : rec.tid != tid ? kCapSinceOtherThread : src == rec.start ? kCapNewBlock : kCapSinceSameThread;
+    }
+    return kCapNoRecord;
+}
+
 void arena_unrecorded() {
     if (proof_wanted()) g_unrecorded.fetch_add(1, std::memory_order_relaxed);
 }
@@ -469,6 +496,7 @@ void arena_handout(std::uint64_t pool, std::uint64_t node, bool top) {
         rec.node = node;
         rec.seq = g_handout_seq;
         rec.retire = 0;
+        rec.tid = arena_thread_tag();
         g_node_rec[node] = r;
         if (node < g_node_lo.load(std::memory_order_relaxed)) g_node_lo.store(node, std::memory_order_relaxed);
         if (node > g_node_hi.load(std::memory_order_relaxed)) g_node_hi.store(node, std::memory_order_relaxed);

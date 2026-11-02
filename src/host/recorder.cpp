@@ -1432,6 +1432,7 @@ std::string host_gpu_recorder_report() {
     std::string r = gpu::recorder_report();
     if (gpu::set_cache_on()) r += "; " + gpu::set_cache_report();
     if (const std::string cv = gpu::copy_versions_report(); !cv.empty()) r += "; " + cv;
+    if (const std::string hc = gpu::home_copies_report(); !hc.empty()) host_log("  %s", hc.c_str());
     if (const std::string pb = gpu::render_barriers_report(); !pb.empty()) r += "; " + pb;
     // A line of its own: the recorder's runs past the log's 1 KiB a line.
     if (const std::string sm = gpu::submit_merge_report(); !sm.empty()) host_log("  %s", sm.c_str());

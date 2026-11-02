@@ -1183,6 +1183,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
+// Stage 4b.3a(i): the live twin holding [va, +bytes) whole, its place in `out` - none made, none let go.
+bool twin_live_holding_locked(std::uint64_t va, std::uint64_t bytes, Located& out);
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
 void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site);  // logs a few imports over a candidate's kind
 // A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
@@ -2185,9 +2187,21 @@ bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // the copies into place wait for the next transfer batch, dispatch or
 // submission - no pass end or barrier at the token. False when this copy must
 // go to the GPU as it stands.
-bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes);
+// `cap` (stage 4b.3a(i), BBHOST_GXVK_HOMES=1): the copy-back's bytes captured at the GX resolve - the version is that
+// range of the captures' ring, no CPU copy.
+struct CopyCapture {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    const void* map = nullptr;
+};
+bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes, const CopyCapture* cap = nullptr);
 // The pending versions' copies into place, recorded once no pass is open.
 void copy_versions_flush_locked();
+// Stage 4b.3a(i) (BBHOST_GXVK_HOMES=1): the twin homes' pending GPU copies from their captures, put in place as a batch of
+// their own - at the next pass's start, before a dispatch, transfer or submission, or a put-in-place (no pass open).
+void home_copies_flush_locked();
+// ...first if one writes [off, +bytes) of `dst`, which a transfer is about to write; whether it did.
+bool home_copies_before_transfer_locked(VkBuffer dst, VkDeviceSize off, VkDeviceSize bytes);
 // A render pass ended: the flush, when they wait for that (BBHOST_COPY_VERSIONS=1).
 void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
@@ -2225,6 +2239,7 @@ std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, Vk
 void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::uint8_t* to);
 bool copy_versions_pending_locked();
 std::string copy_versions_report();  // "" when none were made or refused
+std::string home_copies_report();     // stage 4b.3a(i): "" with BBHOST_GXVK_HOMES off
 bool render_pass_open_locked();
 std::string render_barriers_report();  // "" unless BBHOST_PASS_BARRIERS=lazy
 // Clears the sampled textures a fill covers whole, where no render target took

@@ -44,6 +44,7 @@
 #include "guest_abi.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
+#include "host/cb_capture.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
 #include "log.h"
@@ -2121,4 +2122,5 @@ void gx_resources_report() {
     gxvk::arena_report();
     gxvk::heap_snap_report();
     gxvk::heap_copy_report();
+    cb_capture::report();
 }
