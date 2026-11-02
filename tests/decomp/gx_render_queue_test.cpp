@@ -27,6 +27,11 @@
 //   - the scene categories' counts (BBHOST_SCENE_CATEGORIES=1) against a map
 //     of the same items, a row a queue and the rest dropped, from one thread
 //     and four;
+//   - the task-stealing jobs cut finer late (BBHOST_RQ_GUIDED): the game's own
+//     splits inside ours on random jobs - a pop's piece and a steal's half by
+//     the rule, the job's grain kept, the half's and the run's vtables - and
+//     random pops and steals running every item of a few jobs once; and the
+//     parallel-for giving our vtable to the task-stealing jobs alone;
 // and each of the source's mutants caught.
 #define DECOMP_GX_RENDER_QUEUE_MUTANTS
 int g_rq_mutant = 0;
@@ -579,6 +584,272 @@ bool parallel_for_case(int t, bool cut, bool report) {
     return ok;
 }
 
+// ---- The guided split (BBHOST_RQ_GUIDED) ----
+//
+// GX's range job (vtable 0x575fbf0): the game's own pop and steal splits run
+// inside ours, their job pool (sub_25b7f60) stubbed by fresh objects carrying
+// the pool's vtable, the participant they read from the guest's TLS a test
+// object. Ours must cut as the rule says - a pop max(M, min(G, ceil(n / K)))
+// items off the front of a job of n >= twice that (G its grain, the game's),
+// a steal the upper half of a job of n >= 2 M - keep the job's grain G, give
+// a stolen half our vtable and G, and give the pool's vtable back before the
+// game's run; and over random pops and steals every item of a job is run
+// once, in pieces of at least M but for a job shorter than M.
+constexpr u64 kPoolAlloc = 0x25b7f60;  // (the participant's pool): a job object
+constexpr u64 kPools = 0x5aa6c28;      // the job pools' holder: [0] the pools, 0x60 bytes a participant
+constexpr u64 kParticipantTls = 0x57e4658;  // the current participant's TLS offset (-0x698 in the file)
+constexpr int kJobObjs = 4096;
+alignas(64) u8 g_job_objs[kJobObjs * 0x28];
+alignas(64) u8 g_participant[0x530];
+alignas(64) u8 g_pools[8 * 0x60];
+u64 g_pools_holder[2];
+int g_job_next = 0;
+u64 g_pool_seen = 0;
+
+GUEST_ABI u64 stub_pool_alloc(u64 pool) {
+    g_pool_seen = pool;
+    const u64 j = reinterpret_cast<u64>(g_job_objs) + static_cast<u64>(g_job_next++ % kJobObjs) * 0x28;
+    std::memset(reinterpret_cast<void*>(j), 0, 0x28);
+    store<u64>(j, game_address(kJobVtable));
+    return j;
+}
+u64 g_run_vt = 0, g_run_job = 0;
+u32 g_run_participant = 0;
+GUEST_ABI u64 rec_job_run(u64 job, u32 participant) {
+    g_run_job = job;
+    g_run_vt = load<u64>(job);
+    g_run_participant = participant;
+    return 0x1234;
+}
+
+u64 guided_job(u32 f, u32 l, u32 m) {
+    const u64 j = stub_pool_alloc(0);
+    store<u64>(j, host_address(g_rq_job_vt));
+    store<u64>(j + 8, 0x4444000000ull);
+    store<u32>(j + 0x10, f);
+    store<u32>(j + 0x14, l);
+    store<u32>(j + 0x18, m);
+    return j;
+}
+
+void guided_setup() {
+    g_rq_job_vt[3] = load<u64>(game_address(kJobVtable) + 0x18);
+    g_rq_job_vt[2] = host_address(reinterpret_cast<void*>(&rq_job_split_steal));
+    g_rq_job_vt[1] = host_address(reinterpret_cast<void*>(&rq_job_split_pop));
+    g_rq_job_vt[0] = host_address(reinterpret_cast<void*>(&rq_job_run));
+    store<u32>(reinterpret_cast<u64>(g_participant) + 0xa0, 3);
+    store<u64>(reinterpret_cast<u64>(eboot_kit::tcb()) + load<u64>(game_address(kParticipantTls)), reinterpret_cast<u64>(g_participant));
+    g_pools_holder[0] = reinterpret_cast<u64>(g_pools);
+    g_pools_holder[1] = 6;
+    store<u64>(game_address(kPools), reinterpret_cast<u64>(g_pools_holder));
+}
+
+// One pop's split and one steal's on a random job, against the rule.
+bool guided_split_case(int t, bool report) {
+    const u32 k = static_cast<u32>(g_rng.range(2, 8)), m = static_cast<u32>(g_rng.range(1, 12));
+    g_guided_k = k;
+    g_guided_least = m;
+    const u32 g = static_cast<u32>(g_rng.chance(0.7) ? g_rng.range(10, 40) : g_rng.range(1, 12));
+    const u32 f = static_cast<u32>(g_rng.range(0, 1000));
+    const u32 n = static_cast<u32>(g_rng.chance(0.1) ? g_rng.range(0, 3) : g_rng.range(0, 300));
+    const u32 l = f + n;
+    bool ok = true;
+    char why[256] = "";
+    {
+        const u64 j = guided_job(f, l, g);
+        u64 out = 0xdead;
+        const u64 r = rq_job_split_pop(j, reinterpret_cast<u64>(&out));
+        u32 take = (n + k - 1) / k;
+        if (take > g) take = g;
+        if (take < m) take = m;
+        const bool split = n >= 2 * take;
+        if ((r & 0xff) != (split ? 1u : 0u) || load<u32>(j + 0x18) != g || load<u64>(j) != host_address(g_rq_job_vt)) ok = false;
+        if (ok && split)
+            ok = out && load<u32>(out + 0x10) == f && load<u32>(out + 0x14) == f + take && load<u32>(out + 0x18) == take &&
+                 load<u64>(out + 8) == load<u64>(j + 8) && load<u64>(out) == game_address(kJobVtable) && load<u32>(j + 0x10) == f + take &&
+                 load<u32>(j + 0x14) == l && g_pool_seen == reinterpret_cast<u64>(g_pools) + 3 * 0x60;
+        if (ok && !split) ok = out == 0 && load<u32>(j + 0x10) == f && load<u32>(j + 0x14) == l;
+        if (!ok)
+            std::snprintf(why, sizeof why, "pop: %u items from %u, K %u M %u G %u: split %llu (piece %u-%u grain %u, vt %d, job %u-%u, pool %d)", n, f,
+                          k, m, g, static_cast<ull>(r & 0xff), out && out != 0xdead ? load<u32>(out + 0x10) : 0, out && out != 0xdead ? load<u32>(out + 0x14) : 0,
+                          out && out != 0xdead ? load<u32>(out + 0x18) : 0, out && out != 0xdead ? load<u64>(out) == game_address(kJobVtable) : -1,
+                          load<u32>(j + 0x10), load<u32>(j + 0x14), g_pool_seen == reinterpret_cast<u64>(g_pools) + 3 * 0x60);
+    }
+    if (ok) {
+        const u64 j = guided_job(f, l, g);
+        u64 out = 0;  // the steal zeroes it before the split (sub_1247d20); the pop's split does itself
+        const u64 r = rq_job_split_steal(j, reinterpret_cast<u64>(&out));
+        const bool split = n >= 2 * m;
+        const s32 sum = static_cast<s32>(f + l);
+        const u32 mid = static_cast<u32>((sum + static_cast<s32>(static_cast<u32>(sum) >> 31)) >> 1);
+        if ((r & 0xff) != (split ? 1u : 0u) || load<u32>(j + 0x18) != g) ok = false;
+        if (ok && split)
+            ok = out && load<u32>(out + 0x10) == mid && load<u32>(out + 0x14) == l && load<u32>(out + 0x18) == g &&
+                 load<u64>(out) == host_address(g_rq_job_vt) && load<u32>(j + 0x10) == f && load<u32>(j + 0x14) == mid;
+        if (ok && !split) ok = out == 0 && load<u32>(j + 0x10) == f && load<u32>(j + 0x14) == l;
+        if (!ok) std::snprintf(why, sizeof why, "steal: %u items from %u, M %u: split %llu", n, f, m, static_cast<ull>(r & 0xff));
+    }
+    if (ok) {
+        const u64 j = guided_job(f, l, g);
+        const u32 who = static_cast<u32>(g_rng.range(0, 5));
+        const u64 r = rq_job_run(j, who);
+        ok = r == 0x1234 && g_run_job == j && g_run_vt == game_address(kJobVtable) && g_run_participant == who;
+        if (!ok) std::snprintf(why, sizeof why, "run: the vtable %llx at the game's run", static_cast<ull>(g_run_vt));
+    }
+    if (!ok && report) fail("guided split", t, why);
+    return ok;
+}
+
+// Random pops and steals over a few jobs, as the deques make them (a pop
+// splits the front job or takes it whole; a steal from a deque of one job
+// splits it or takes it whole), until every piece has run: each item once,
+// every piece but a job's last at least M items, every job run with the
+// pool's vtable.
+bool guided_cover_case(int t, bool report) {
+    const u32 k = static_cast<u32>(g_rng.range(2, 8)), m = static_cast<u32>(g_rng.range(1, 10));
+    g_guided_k = k;
+    g_guided_least = m;
+    struct Q {
+        std::vector<u64> jobs;
+    };
+    std::vector<Q> deques(static_cast<std::size_t>(g_rng.range(1, 6)));
+    std::vector<int> seen;
+    u32 at = 0;
+    const int njobs = g_rng.range(1, 6);
+    for (int i = 0; i < njobs; ++i) {
+        const u32 n = static_cast<u32>(g_rng.range(0, 200));
+        const u32 g = std::max<u32>(10, n / static_cast<u32>(g_rng.range(1, 12)));  // the partition's grain
+        deques[static_cast<std::size_t>(g_rng.range(0, static_cast<int>(deques.size()) - 1))].jobs.push_back(guided_job(at, at + n, g));
+        at += n;
+    }
+    seen.assign(at, 0);
+    bool ok = true;
+    int small = 0;
+    for (int step = 0; step < 100000 && ok; ++step) {
+        std::vector<std::size_t> busy;
+        for (std::size_t d = 0; d < deques.size(); ++d)
+            if (!deques[d].jobs.empty()) busy.push_back(d);
+        if (busy.empty()) break;
+        Q& q = deques[busy[static_cast<std::size_t>(g_rng.range(0, static_cast<int>(busy.size()) - 1))]];
+        u64 piece = 0;
+        if (g_rng.chance(0.6) || deques.size() == 1) {
+            // a pop: the front job's split (its vtable +8), else the job whole
+            const u64 j = q.jobs.front();
+            u64 out = 0;
+            const u64 r = reinterpret_cast<SplitFn>(load<u64>(load<u64>(j) + 8))(j, reinterpret_cast<u64>(&out));
+            if (r & 0xff) piece = out;
+            else {
+                piece = j;
+                q.jobs.erase(q.jobs.begin());
+            }
+        } else {
+            // a steal into an empty deque: a lone job's split (+0x10), else jobs whole from the front
+            std::size_t to = 0;
+            while (to < deques.size() && !deques[to].jobs.empty()) ++to;
+            if (to == deques.size()) continue;
+            if (q.jobs.size() == 1) {
+                const u64 j = q.jobs.front();
+                u64 out = 0;
+                const u64 r = reinterpret_cast<SplitFn>(load<u64>(load<u64>(j) + 0x10))(j, reinterpret_cast<u64>(&out));
+                if (r & 0xff) deques[to].jobs.push_back(out);
+                else {
+                    deques[to].jobs.push_back(j);
+                    q.jobs.clear();
+                }
+            } else {
+                const std::size_t take = (q.jobs.size() + 1) / 2;
+                for (std::size_t i = 0; i < take; ++i) deques[to].jobs.push_back(q.jobs[i]);
+                q.jobs.erase(q.jobs.begin(), q.jobs.begin() + static_cast<long>(take));
+            }
+            continue;
+        }
+        // the piece runs: its vtable's slot 0 (ours or the game's, which the test stands in for)
+        const u32 pf = load<u32>(piece + 0x10), pl = load<u32>(piece + 0x14);
+        const u64 vt = load<u64>(piece);
+        if (vt == host_address(g_rq_job_vt)) rq_job_run(piece, 0);
+        else if (vt == game_address(kJobVtable)) rec_job_run(piece, 0);
+        else ok = false;
+        if (g_run_vt != game_address(kJobVtable)) ok = false;
+        if (pl - pf < m) ++small;
+        for (u32 i = pf; i < pl && ok; ++i) ok = i < at && ++seen[i] == 1;
+    }
+    for (u32 i = 0; i < at && ok; ++i) ok = seen[i] == 1;
+    // a piece under M items is only ever a whole job shorter than 2 M - at most one a job
+    ok = ok && small <= njobs;
+    if (!ok && report) {
+        char why[96];
+        std::snprintf(why, sizeof why, "%d jobs, %u items, K %u M %u: an item not run once, or %d short pieces", njobs, at, k, m, small);
+        fail("guided cover", t, why);
+    }
+    return ok;
+}
+
+// The parallel-for with guided on: the jobs of task-stealing chunks (their
+// size field under their span) get grain M and our vtable, the rest as the
+// game's; the same jobs to the same participants otherwise.
+std::vector<std::pair<u64, u32>> g_guided_pushed;  // job, its grain when made
+GUEST_ABI u64 rec_job_for_mem(u64 functor, u64 range, u32 worker) {
+    const u64 j = stub_pool_alloc(0);
+    store<u64>(j + 8, functor);
+    store<u64>(j + 0x10, load<u64>(range));
+    store<u32>(j + 0x18, load<u32>(range + 8));
+    g_pushed_jobs.push_back(Pushed{load<u32>(range), load<u32>(range + 4), load<u32>(range + 8), worker, load<u64>(functor),
+                                   load<u64>(functor + 8), load<u64>(functor + 0x10)});
+    return j;
+}
+GUEST_ABI u64 rec_push_mem(u64, u64 job, u32) {
+    g_guided_pushed.emplace_back(job, load<u32>(job + 0x18));
+    return 0;
+}
+
+bool guided_pf_case(int t, bool report) {
+    int count = 0;
+    build_queue(count);
+    store<u8>(reinterpret_cast<u64>(g_queue_start) + kStealing, 1);
+    const u64 b = base();
+    std::memcpy(g_queue_a, g_queue_start, kQueueBytes);
+    store<u64>(b + kQVt + 0x18, reinterpret_cast<u64>(&stub_partition));
+    store<u64>(qa(), b + kQVt);
+    store<u32>(qa() + kChunkCount, 0);
+    store<u64>(game_address(kGx), b + kMgr);
+    store<u32>(b + kMgr + 0x280, 6);
+    store<u8>(game_address(kTaskSort), 1);
+    g_push_mode = Push::WithCut;
+    g_cut_on.store(true);
+    g_stub_cut = false;
+    for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = 0;
+    const u32 k = static_cast<u32>(g_rng.range(2, 8)), m = static_cast<u32>(g_rng.range(1, 12));
+    g_guided_k = k;
+    g_guided_least = m;
+    g_pushed_jobs.clear();
+    g_guided_pushed.clear();
+    g_pf_calls.clear();
+    eboot_kit::stub(kJobFor, reinterpret_cast<const void*>(&rec_job_for_mem));
+    eboot_kit::stub(kPushJob, reinterpret_cast<const void*>(&rec_push_mem));
+    const u32 made = render_queue_parallel_for(qa(), 0x5555000000ull, 0, static_cast<u32>(count), 6);
+    eboot_kit::stub(kJobFor, reinterpret_cast<const void*>(&rec_job_for));
+    eboot_kit::stub(kPushJob, reinterpret_cast<const void*>(&rec_push));
+    g_guided_k = 0;
+    bool ok = g_guided_pushed.size() == g_pushed_jobs.size() && g_guided_pushed.size() == made;
+    int guided = 0;
+    const u32 total = load<u32>(qa() + kChunkCount);
+    for (std::size_t i = 0; i < g_guided_pushed.size() && ok; ++i) {
+        const u64 c = qa() + kChunks + static_cast<u64>(total - made + i) * kChunkSize;
+        const u32 span = load<u32>(c + 4) - load<u32>(c), size = load<u32>(c + 8);
+        const bool want = static_cast<s32>(size) < static_cast<s32>(span);
+        const u64 j = g_guided_pushed[i].first;
+        const u64 vt = load<u64>(j);
+        ok = (want ? vt == host_address(g_rq_job_vt) : vt == game_address(kJobVtable)) && g_guided_pushed[i].second == std::min(span, size);
+        guided += want;
+    }
+    if (!ok && report) {
+        char why[96];
+        std::snprintf(why, sizeof why, "%d items, %u chunks (%d task-stealing): a job's vtable or grain", count, made, guided);
+        fail("guided parallel-for", t, why);
+    }
+    return ok;
+}
+
 // ---- The cut's choice ----
 
 // BBHOST_RQ_SPLIT unset: the cut, and the costs' learning with it, on while
@@ -781,6 +1052,7 @@ bool append_case() {
 
 int main(int argc, char** argv) {
     eboot_kit::load("gx_render_queue_test");
+    g_guided_k = 0;  // the cases before the guided split's own: the game's splits (their jobs are stand-ins)
     const int cases = argc > 1 ? std::atoi(argv[1]) : 40000;
     // the entries' instructions
     const struct {
@@ -847,6 +1119,15 @@ int main(int argc, char** argv) {
     if (!originals_case()) fail("the game's own", 0, "what ours leaves to the game's functions not passed on as given");
     g_split_mode = Split::On;
     g_cut_on.store(true);
+    // the guided split
+    eboot_kit::stub(kPoolAlloc, reinterpret_cast<const void*>(&stub_pool_alloc));
+    eboot_kit::stub(kJobRun, reinterpret_cast<const void*>(&rec_job_run));
+    guided_setup();
+    long n_guided = 0;
+    for (int t = 0; t < cases / 4; ++t, ++n_guided) guided_split_case(t, true);
+    for (int t = 0; t < cases / 40; ++t) guided_cover_case(t, true);
+    for (int t = 0; t < cases / 40; ++t) guided_pf_case(t, true);
+    g_guided_k = 0;
 
     // Every mutant caught.
     const int kPartitionMutants[] = {1, 2, 3, 4, 10, 11, 12};
@@ -872,6 +1153,9 @@ int main(int argc, char** argv) {
     for (int m : kCutMutants) catches(m, [](int t) { return cut_case(t, false); }, 200000);
     for (int m : kRankMutants) catches(m, [](int t) { return ranks_case(t, false); }, 20000);
     for (int m : kPushMutants) catches(m, [m](int t) { return parallel_for_case(t, m == 15, false); }, 20000);
+    for (int m : {18, 19, 20, 21, 23}) catches(m, [](int t) { return guided_split_case(t, false); }, 20000);
+    catches(22, [](int t) { return guided_pf_case(t, false); }, 2000);
+    g_guided_k = 0;
     g_quiet = false;
 
     if (g_failed) {
@@ -879,7 +1163,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("gx_render_queue_test: ok - partition %ld cases (%ld cut a run), item loop %ld, chunk job %ld; the cut %ld (%ld cut further "
-                "than the game), ranks %ld, parallel-for %ld; %d of %d mutants caught\n",
-                n_part, split, n_loop, n_job, n_cut, g_cut_seen, n_ranks, n_pf, caught, mutants);
+                "than the game), ranks %ld, parallel-for %ld; the guided split %ld (+ %d covers, %d parallel-fors); %d of %d mutants caught\n",
+                n_part, split, n_loop, n_job, n_cut, g_cut_seen, n_ranks, n_pf, n_guided, cases / 40, cases / 40, caught, mutants);
     return 0;
 }
