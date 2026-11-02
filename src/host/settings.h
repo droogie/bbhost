@@ -23,6 +23,9 @@ struct HostSettings {
     bool fullscreen = false;
     bool vsync = true;
     int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30 to 960; 0 is Display-Limited (the display's rate)
+    // The Native frame clock (experimental, off): read once as the game starts
+    // (engine/frame_rate.cpp, config_frame_clock; BBHOST_FRAME_CLOCK=0|1 wins).
+    bool frame_clock = false;
     bool fps_counter = false;
     bool memory_counter = false;  // video memory and shared GPU memory, under the FPS counter (host/window.cpp)
     bool perf_overlay = false;    // the bottleneck meter's verdict under them (host/window.cpp, host/perf_meter.h)

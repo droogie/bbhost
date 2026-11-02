@@ -2279,12 +2279,22 @@ void frame_rate_install(ElfImage* image) {
     if (const char* e = std::getenv("BBHOST_FRAME_SOURCE"); e && e[0]) {
         g_source = e[0] == '0' ? Source::Guest : e[0] == '2' ? Source::Compare : Source::Ours;
     }
-    // BBHOST_FRAME_CLOCK=1: the frame clock (engine/frame_clock.h), read here,
-    // before the decomps are added (they ask it). Off, nothing here changes.
-    if (const char* e = std::getenv("BBHOST_FRAME_CLOCK"); e && e[0] == '1') {
-        frame_clock::set_on(true);
-        host_log("frame rate: the frame clock is on (BBHOST_FRAME_CLOCK=1): every frame's step, published before the frame "
-                 "runs, converts what follows the frame at any frame length (engine/frame_clock.h)");
+    // The frame clock (engine/frame_clock.h), read here, before the decomps are
+    // added (they ask it): BBHOST_FRAME_CLOCK=1 or 0, else the Native frame
+    // clock setting (F10, the setup window; bbhost.toml's [video] frame_clock
+    // its default), off by default (config_frame_clock). Off, nothing here
+    // changes; the line says what turned it on, or the switch that kept it off.
+    {
+        const char* from = "";
+        const bool setting = host_settings().frame_clock;
+        if (config_frame_clock(setting, host_opt_saved("frame_clock"), &from)) {
+            frame_clock::set_on(true);
+            host_log("frame rate: the frame clock is on (%s): every frame's step, published before the frame runs, converts "
+                     "what follows the frame at any frame length (engine/frame_clock.h)",
+                     from);
+        } else if (setting) {
+            host_log("frame rate: the frame clock is off (%s, over the Native frame clock setting's On)", from);
+        }
     }
     // BBHOST_SOUND_CENSUS=1 (a test switch): the sound thread's passes counted
     // against the frames at any rate, its sleep left as it is unless the frame

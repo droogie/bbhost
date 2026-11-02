@@ -48,6 +48,9 @@ void host_options_frame(float display_w, float display_h);
 // typed fields; the calls below are the front ends' way in, by name.
 // Read one by the same name host_opt_set() takes. Unknown names read false.
 bool host_opt_get(const char* key);
+// Whether the options file held a value for it when it was read; false, the
+// setting is its default (the table's, or what bbhost.toml sets for it).
+bool host_opt_saved(const char* key);
 // The render resolution the player chose, or what BBHOST_RES says. False when
 // neither parses. Read once by the loader - it is a patch on the image.
 bool host_opt_resolution(int* w, int* h);

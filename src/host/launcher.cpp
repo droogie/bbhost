@@ -297,6 +297,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool performance_mode = host_opt_get("performance_mode");
     bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
+    // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
+    // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
+    bool frame_clock = host_opt_get("frame_clock");
     int resolution = host_opt_resolution_index();
     // In the setting's order (host/options.cpp): by size within each shape.
     static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
@@ -491,6 +494,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set("frame_clock", frame_clock);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
         host_opt_set_resolution_index(resolution);
@@ -832,7 +836,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(5)), "DISPLAY");
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(6)), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
                 static const char* const kModes[] = {"Windowed", "Fullscreen"};
@@ -844,6 +848,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ui::tooltip_for_item("Frame rate",
                                      "The game's own speed. Display-Limited caps it at your monitor's refresh rate when the game starts (180 fps on a "
                                      "180 Hz monitor).");
+                ui::toggle_row("Native frame clock (experimental)", nullptr, &frame_clock,
+                               "Requires a restart. Timing follows each frame's real length, for PCs that do not hold their chosen frame rate.");
                 ui::row_label("Resolution", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
@@ -855,7 +861,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(5)), "ONLINE");
+            ui::card_begin("##online", ImVec2(0, card_h(6)), "ONLINE");
             {
                 ui::row_label("Server", 72 * scale);
                 static const char* const kShort[] = {"Live", "Playtest", "Custom"};

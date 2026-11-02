@@ -44,6 +44,11 @@ struct HostConfig {
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
+    // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,
+    // the setup window's Game page), off; what they save in bbhost-options.toml
+    // wins over it, and BBHOST_FRAME_CLOCK=0|1 over both (config_frame_clock).
+    // The file's value, before either.
+    bool frame_clock = false;
     bool headless = false;     // video.headless / --headless / BBHOST_HEADLESS=1
     bool skip_intro = true;    // startup.skip_intro / BBHOST_SKIP_INTRO=0|1: the three company logos only
     // loading.quick_reentry / BBHOST_QUICK_REENTRY=0|1: a load after a death or
@@ -199,6 +204,11 @@ std::string config_effect_steps();
 // second at every frame rate, "30" for the game's one an update
 // (decomp/sfx/node_emit.cpp, engine/frame_rate.cpp).
 std::string config_effect_emission();
+// The frame clock (engine/frame_clock.h), decided once as the game starts
+// (engine/frame_rate.cpp): BBHOST_FRAME_CLOCK=1 or 0, else `setting` - the
+// Native frame clock setting, the options file's when it holds one (`saved`),
+// else video.frame_clock's. *from names what decided, for the start log.
+bool config_frame_clock(bool setting, bool saved, const char** from);
 // Changes a loaded value in memory (raw, as config_set_values writes it): a
 // setting changed while running (the plugin menu), so config_value agrees
 // with the file just written. Main thread.

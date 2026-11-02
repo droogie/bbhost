@@ -168,6 +168,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("video.shaders", &c->shaders);
     num("video.vblank_hz", &c->vblank_hz);
     {
+        auto it = kv.find("video.frame_clock");
+        if (it != kv.end()) c->frame_clock = it->second == "true" || it->second == "1";
+    }
+    {
         auto it = kv.find("startup.setup_window");
         if (it != kv.end()) c->setup_always = it->second == "true" || it->second == "1";
     }
@@ -1164,6 +1168,20 @@ std::string config_effect_steps() {
     if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) return e;
     const std::string v = config_value("video.effect_steps");
     return v.empty() ? "smooth" : v;
+}
+
+bool config_frame_clock(bool setting, bool saved, const char** from) {
+    const char* e = std::getenv("BBHOST_FRAME_CLOCK");
+    if (e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "0") == 0)) {
+        if (from) *from = e[0] == '1' ? "BBHOST_FRAME_CLOCK=1" : "BBHOST_FRAME_CLOCK=0";
+        return e[0] == '1';
+    }
+    if (from) {
+        *from = saved                                       ? "the Native frame clock setting"
+                : !config_value("video.frame_clock").empty() ? "bbhost.toml's [video] frame_clock"
+                                                             : "the default";
+    }
+    return setting;
 }
 
 std::string config_effect_emission() {

@@ -6,7 +6,9 @@
 // measured frame time clamped to [target, 1/30], the game's own rule (a long
 // frame slows the game, it never jumps), times a plugin's time scale.
 //
-// BBHOST_FRAME_CLOCK=1 turns it on (off by default while it is being proven):
+// The Native frame clock setting turns it on (F10, the setup window;
+// bbhost.toml's [video] frame_clock its default; BBHOST_FRAME_CLOCK=0|1 over
+// both - core/config.h's config_frame_clock), experimental and off by default:
 // what the frame-rate code would otherwise convert once, for the rate chosen
 // at start, it converts from this clock every frame instead, so a frame of any
 // length - a rate the PC does not hold, a variable refresh rate, a dip - is
@@ -41,8 +43,8 @@ inline constexpr float kThirtieth = std::bit_cast<float>(kThirtiethBits);
     return std::bit_cast<std::uint32_t>(dt) == kThirtiethBits ? 1.0f : static_cast<float>(30.0 * static_cast<double>(dt));
 }
 
-// BBHOST_FRAME_CLOCK=1, as frame_rate_install read it (before the decomps are
-// added, which ask it).
+// On, as frame_rate_install decided it (config_frame_clock: the setting or
+// BBHOST_FRAME_CLOCK) before the decomps are added, which ask it.
 inline std::atomic<bool> g_on{false};
 // Whether the frame-time manager publishes the clock every frame although the
 // switch is off: at a converted rate, for what counts game time by default -
