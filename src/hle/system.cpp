@@ -1751,6 +1751,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (m.pressed & 2u) want |= menu_back_button();  // right returns
             if (m.wheel > 0.0f) want |= 0x10u;     // wheel up -> Up
             if (m.wheel < 0.0f) want |= 0x40u;     // wheel down -> Down
+            if (m.wheel != 0.0f) menu_pointer_wheel();  // and hover waits for the pointer to move off
             if (want) {
                 held = want;
                 hold_polls = 8;

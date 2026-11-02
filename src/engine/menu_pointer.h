@@ -28,6 +28,10 @@ void menu_pointer_install(ElfImage* image);
 // A left click while the pointer owns the menus. It does nothing on its own:
 // the next list update that finds an item under the pointer claims it.
 void menu_pointer_click();
+// The wheel turned while the pointer owns the menus: the list scrolls under a
+// pointer that stays put, so hover waits until the pointer moves away from
+// where it was then (more than a twitch of the hand on the wheel).
+void menu_pointer_wheel();
 
 // A click that landed on an item, once, as the ScePad button it means: decide
 // (Circle), or Left / Right when it hit one side of an option row's value.

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,28 @@ std::atomic<std::int64_t> g_focus_ms{0};
 std::atomic<bool> g_click{false};
 std::atomic<std::int64_t> g_click_ms{0};
 std::atomic<std::uint32_t> g_press{0};
+
+// The wheel's hold on hover (menu_pointer_wheel): where the pointer was on the
+// stage when the wheel last turned, set by the pad read, read by the list
+// updates. A list scrolls under a pointer that stays put, and the hand on the
+// wheel twitches the mouse a pixel or two as it turns it: read as a movement,
+// that hovered onto the row now under the pointer and the scroll stopped there.
+// So hover waits until the pointer is further from that place than a twitch.
+constexpr float kWheelSlop = 16.0f;  // stage pixels: under half a row (the System list's pitch is 40)
+std::mutex g_wheel_mu;
+bool g_wheel_hold = false;              // under g_wheel_mu
+float g_wheel_x = 0.0f, g_wheel_y = 0.0f;  // under g_wheel_mu
+
+// Whether the wheel still holds hover with the pointer at (sx, sy); the hold
+// ends for good once the pointer has left the slop.
+bool wheel_holds(float sx, float sy) {
+    std::lock_guard<std::mutex> lock(g_wheel_mu);
+    if (!g_wheel_hold) return false;
+    const float dx = sx - g_wheel_x, dy = sy - g_wheel_y;
+    if (dx * dx + dy * dy <= kWheelSlop * kWheelSlop) return true;
+    g_wheel_hold = false;
+    return false;
+}
 
 std::uint64_t guest(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
 void* guest_fn(std::uint64_t bn) {
@@ -685,6 +708,19 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
             click = true;
         }
     }
+    // The wheel scrolls a list under a pointer that stays put: until the
+    // pointer has moved off, a twitch is not a movement (menu_pointer_wheel).
+    if (moved && !click && wheel_holds(sx, sy)) {
+        if (g_log) {
+            static std::int64_t last_ms = 0;
+            if (now_ms() - last_ms >= 500) {
+                last_ms = now_ms();
+                host_log("pointer: list %p at %.0f,%.0f not hovered: the wheel scrolled and the pointer has not moved off since",
+                         static_cast<void*>(c), static_cast<double>(sx), static_cast<double>(sy));
+            }
+        }
+        return;
+    }
     if (depository_tabs(c, sx, sy, moved, click)) return;
     // A list of one cell on one line is a spinner - the value of an option
     // row, which Left and Right step. It is DS3's arrow selector, and a click
@@ -908,6 +944,15 @@ std::uint32_t menu_back_button() { return menu_confirm_button() == 0x2000u ? 0x4
 void menu_pointer_click() {
     g_click_ms.store(now_ms(), std::memory_order_relaxed);
     g_click.store(true, std::memory_order_relaxed);
+}
+
+void menu_pointer_wheel() {
+    float sx = 0.0f, sy = 0.0f;
+    if (!host_mouse_stage_position(sx, sy)) return;
+    std::lock_guard<std::mutex> lock(g_wheel_mu);
+    g_wheel_hold = true;
+    g_wheel_x = sx;
+    g_wheel_y = sy;
 }
 
 std::uint32_t menu_pointer_take_press() { return g_press.exchange(0); }
