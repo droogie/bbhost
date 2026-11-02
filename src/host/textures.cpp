@@ -3505,6 +3505,16 @@ struct alignas(64) IdViewEntry {
 static_assert(sizeof(IdViewEntry) == 64, "an entry is one line");
 constexpr std::size_t kIdViewSlots = 8192;
 IdViewEntry g_id_views[kIdViewSlots];
+// Stage 4b.1a's readers' copy of each entry's key and view (texture_view_find), written with the entry under
+// cache_rw's lock and nowhere else: the command processor writes an entry's own line at every refresh (refreshed,
+// fast, static_epoch, recheck_ms, key_dim), and a reader on that line took it from the command processor's cache
+// each time.
+struct IdViewPub {
+    std::uint32_t id = 0, epoch = 0;
+    VkImageView view = VK_NULL_HANDLE;
+    std::uint8_t flags = 0;
+};
+IdViewPub g_id_views_pub[kIdViewSlots];
 std::uint64_t g_id_view_hits = 0, g_id_view_misses = 0;
 // Stage 2's counts (under g.mu): bindings that skipped the refresh; refreshes run, by why the skip did not apply;
 // compare mode's refreshes the skip would have left out (and of them the hash backstop's catches, which a skip only
@@ -3642,6 +3652,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
+        if (cache_rw::g_readers) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
@@ -3655,7 +3666,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
 // or made; null when it is not made yet (the command processor makes it, and
 // refreshes its surface, in order).
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
-    const IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    const IdViewPub& e = g_id_views_pub[id & (kIdViewSlots - 1)];
     if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags) return VK_NULL_HANDLE;
     return e.view;
 }
@@ -5847,8 +5858,12 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         if (at(base) || at(vbase)) e.epoch = 0;
     }
     cache_rw::Write cw(cache_rw::kViews);  // stage 4b.1a's readers see the entries go
-    for (IdViewEntry& e : g_id_views) {
-        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) e.epoch = 0;
+    for (std::size_t i = 0; i < kIdViewSlots; ++i) {
+        IdViewEntry& e = g_id_views[i];
+        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
+            e.epoch = 0;
+            if (cache_rw::g_readers) g_id_views_pub[i].epoch = 0;
+        }
     }
 }
 

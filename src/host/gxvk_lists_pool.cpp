@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +115,12 @@ std::atomic<int> g_diff_logs{0}, g_miss_logs{0};
 
 // ---- the pool's threads ------------------------------------------------------
 std::once_flag g_started;
+// The pool's parking: its threads sleep on g_park_cv while the feed is empty, counted in g_sleepers, which a
+// recording thread reads after each store (sequentially consistent on both sides, so a store that a thread about
+// to sleep has not seen wakes it).
+std::mutex g_park_mu;
+std::condition_variable g_park_cv;
+std::atomic<int> g_sleepers{0};
 std::atomic<bool> g_ready{false};
 std::atomic<bool> g_stop{false};
 std::vector<std::thread> g_threads;
@@ -160,11 +167,20 @@ void pool_main(int index) {
         u64 pos = g_feed_next.load(std::memory_order_relaxed);
         const u64 end = g_feed_pos.load(std::memory_order_acquire);
         if (pos >= end) {
-            // Nothing stored since: spin a little (a burst of draws goes on), then sleep.
-            if (++idle < 2000) {
+            // Nothing stored since: a few pauses (the next draw of a burst is microseconds off), then parked
+            // until a recording thread stores one (draw_stored wakes it only while a thread sleeps) or 2 ms
+            // pass. Spinning longer took the hyperthread siblings of the command processor and bb-record
+            // (on an RTX 4070, bb-cp0 +0.13-0.48 ms a flip with the pool on).
+            if (++idle < 64) {
                 pause();
             } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::unique_lock<std::mutex> lk(g_park_mu);
+                g_sleepers.fetch_add(1, std::memory_order_seq_cst);
+                if (g_feed_next.load(std::memory_order_seq_cst) >= g_feed_pos.load(std::memory_order_seq_cst) &&
+                    !g_stop.load(std::memory_order_acquire))
+                    g_park_cv.wait_for(lk, std::chrono::milliseconds(2));
+                g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+                idle = 0;
             }
             if (index == 0 && host_tooling()) {
                 const u64 flip = hle_video_flip_count();
@@ -335,10 +351,14 @@ u32 slot_of(u64 key) { return static_cast<u32>((key * 0x9e3779b97f4a7c15ull) >> 
 
 void draw_stored(std::uint64_t id) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    const u64 pos = g_feed_pos.fetch_add(1, std::memory_order_acq_rel);
+    const u64 pos = g_feed_pos.fetch_add(1, std::memory_order_seq_cst);
     Feed& f = g_feed[pos & (kFeed - 1)];
     f.id.store(id, std::memory_order_relaxed);
-    f.seq.store(pos + 1, std::memory_order_release);
+    f.seq.store(pos + 1, std::memory_order_seq_cst);
+    if (g_sleepers.load(std::memory_order_seq_cst)) {  // a parked pool thread: once a burst, not once a draw
+        std::lock_guard<std::mutex> lk(g_park_mu);
+        g_park_cv.notify_one();
+    }
     g_fed.add();
 }
 
@@ -431,6 +451,10 @@ void pool_report(bool at_exit) {
     if (at_exit) {
         // Stopped and joined first: an exit through std::exit must not race them.
         g_stop.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(g_park_mu);
+            g_park_cv.notify_all();
+        }
         for (std::thread& t : g_threads) {
             if (t.joinable()) t.join();
         }
