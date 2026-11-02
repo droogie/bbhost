@@ -3,6 +3,7 @@
 #include "core/portable.h"
 #include "engine/graphics_patch.h"
 #include "engine/rebirth.h"
+#include "engine/sound_wake.h"
 #include "engine/frame_rate.h"
 #include "hle/equeue.h"
 #include "hle/fs.h"
@@ -702,6 +703,9 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (const std::string r = hle_fs_overlay_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = rebirth_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = graphics_glare_report(); !r.empty()) host_log("  %s", r.c_str());
+        // The sound thread's passes against the frames, while its wake or its
+        // census is placed (engine/sound_wake.h).
+        if (const std::string r = sound_wake_report(); !r.empty()) host_log("  %s", r.c_str());
         static const bool count_calls = std::getenv("BBHOST_HLE_COUNT") != nullptr;
         if (count_calls) hle_call_counts_report();
         last = now;

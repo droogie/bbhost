@@ -1,0 +1,44 @@
+# Disable Camera Auto Rotation via Movement: Imedved, Kyo's patch for 1.09,
+# from the shadPS4 patch list (Bloodborne.xml), byte for byte: 4 sites, 36
+# bytes.
+#
+# The list's note:
+# Disables the camera from auto rotating when you move your character around,
+# manual camera movement and lock-on still work.
+#
+# The four stores it takes out are the ones bbhost's mouse camera holds while
+# the mouse turns the camera (Mouse auto-rotation off), which writes them as
+# it goes: on or off applies at the next start, and then the mouse camera
+# leaves them to it.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `disable-camera-auto-rotation = true` under [patches] in
+# bbhost.toml.
+[patch]
+name = "disable-camera-auto-rotation"
+title = "Disable Camera Auto Rotation via Movement"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work."
+enabled = false
+order = 360
+live = false
+
+[site.s000]
+address = "0x0183c6e8"
+expect = "c4 c1 7a 11 85 44 01 00 00"
+bytes = "90 90 90 90 90 90 90 90 90"
+
+[site.s001]
+address = "0x0183c984"
+expect = "c4 c1 7a 11 8d 30 01 00 00"
+bytes = "90 90 90 90 90 90 90 90 90"
+
+[site.s002]
+address = "0x0183dde6"
+expect = "c4 c1 7a 11 85 94 02 00 00"
+bytes = "90 90 90 90 90 90 90 90 90"
+
+[site.s003]
+address = "0x0183c870"
+expect = "c4 c1 7a 11 ad 44 01 00 00"
+bytes = "90 90 90 90 90 90 90 90 90"

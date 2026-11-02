@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,28 @@ std::atomic<std::int64_t> g_focus_ms{0};
 std::atomic<bool> g_click{false};
 std::atomic<std::int64_t> g_click_ms{0};
 std::atomic<std::uint32_t> g_press{0};
+
+// The wheel's hold on hover (menu_pointer_wheel): where the pointer was on the
+// stage when the wheel last turned, set by the pad read, read by the list
+// updates. A list scrolls under a pointer that stays put, and the hand on the
+// wheel twitches the mouse a pixel or two as it turns it: read as a movement,
+// that hovered onto the row now under the pointer and the scroll stopped there.
+// So hover waits until the pointer is further from that place than a twitch.
+constexpr float kWheelSlop = 16.0f;  // stage pixels: under half a row (the System list's pitch is 40)
+std::mutex g_wheel_mu;
+bool g_wheel_hold = false;              // under g_wheel_mu
+float g_wheel_x = 0.0f, g_wheel_y = 0.0f;  // under g_wheel_mu
+
+// Whether the wheel still holds hover with the pointer at (sx, sy); the hold
+// ends for good once the pointer has left the slop.
+bool wheel_holds(float sx, float sy) {
+    std::lock_guard<std::mutex> lock(g_wheel_mu);
+    if (!g_wheel_hold) return false;
+    const float dx = sx - g_wheel_x, dy = sy - g_wheel_y;
+    if (dx * dx + dy * dy <= kWheelSlop * kWheelSlop) return true;
+    g_wheel_hold = false;
+    return false;
+}
 
 std::uint64_t guest(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
 void* guest_fn(std::uint64_t bn) {
@@ -559,6 +582,65 @@ Seen& seen(std::uint8_t* c, bool* fresh) {
     return s;
 }
 
+// The storage box (the depository dialog: vtable 0x579bd80, built by
+// sub_1f9e110) shows which of its two boxes the item list below is - the
+// inventory or the box - as two tabs at the upper right: the `RepositoryType`
+// clip, whose wrapper the dialog keeps at +0x1498 (its value as in a list's
+// root wrapper: type +0x40, data +0x48). That is not a list, so the pointer
+// found nothing there to hover or click. L2 and R2 switch them ("Show
+// Storage", "Show Inventory" in its key guide; sub_1f9e3b0 binds both to each
+// of two toggles, sub_1f9f810 and sub_1f9fb50), and which one shows is
+// +0x1490: +0x1390 the inventory, +0x1410 the box (the clip's frames
+// "Inventory" and "Depository" light its left and right tab). The dialog's
+// ItemCategory list, the category strip along the top, is the component at
+// +0xae0, and its update is where this is looked at. A hover onto the other
+// tab, or a click on it, presses the trigger on that side once - the game
+// switches with its own sound - and nothing more until the switch has shown
+// (or half a second has passed).
+constexpr std::uint64_t kDepositoryVTable = 0x579bd80;
+constexpr std::size_t kDepositoryCategory = 0xae0;
+constexpr std::size_t kDepositoryShown = 0x1490, kDepositoryInventory = 0x1390, kDepositoryBox = 0x1410;
+constexpr std::size_t kDepositoryTabsType = 0x1498 + 0x40, kDepositoryTabsData = 0x1498 + 0x48;
+std::int64_t g_tabs_pressed_ms = 0;  // the list update's thread
+std::uint64_t g_tabs_pressed_from = 0;
+
+// For the storage box's category list: the pointer over its two tabs hovers or
+// clicks them. True when the pointer is on them (the list's own hover is not
+// wanted there).
+bool depository_tabs(std::uint8_t* c, float sx, float sy, bool moved, bool click) {
+    std::uint64_t vt = 0;
+    const std::uint64_t d = reinterpret_cast<std::uint64_t>(c) - kDepositoryCategory;
+    if (!safe_read(d, &vt, sizeof(vt)) || (vt != guest(kDepositoryVTable) && vt != guest(kDepositoryVTable) + 0x10)) {
+        return false;
+    }
+    std::uint32_t type = 0;
+    std::uint64_t data = 0, obj = 0, which = 0;
+    if (!safe_read(d + kDepositoryTabsType, &type, sizeof(type)) || (type & 0x8f) != 10 ||
+        !safe_read(d + kDepositoryTabsData, &data, sizeof(data)) || !data || !safe_read(data + kNative, &obj, sizeof(obj)) ||
+        !obj || !shown(obj) || !safe_read(d + kDepositoryShown, &which, sizeof(which))) {
+        return false;
+    }
+    Rect w{};
+    if (!hit(obj, sx, sy, &w)) return false;
+    // The left tab is the inventory's, the right the box's.
+    const bool want_box = sx >= (w.x1 + w.x2) * 0.5f;
+    const bool is_box = which == d + kDepositoryBox;
+    if (!is_box && which != d + kDepositoryInventory) return true;  // neither: not the layout this knows
+    if (click) g_click.store(false, std::memory_order_relaxed);
+    const bool waiting = g_tabs_pressed_from == which && now_ms() - g_tabs_pressed_ms < 500;
+    if ((moved || click) && want_box != is_box && !waiting) {
+        g_press.store(want_box ? 0x200u : 0x100u, std::memory_order_relaxed);  // R2 to the right, L2 to the left
+        g_tabs_pressed_ms = now_ms();
+        g_tabs_pressed_from = which;
+        if (g_log) {
+            host_log("pointer: storage tabs at %.0f,%.0f-%.0f,%.0f: %s the %s's -> pad %04x", static_cast<double>(w.x1),
+                     static_cast<double>(w.y1), static_cast<double>(w.x2), static_cast<double>(w.y2),
+                     click ? "click on" : "hover onto", want_box ? "box" : "inventory", want_box ? 0x200u : 0x100u);
+        }
+    }
+    return true;
+}
+
 void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
     if (g_log && input && !*input) {
         static std::uint8_t* told[64] = {};
@@ -626,6 +708,20 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
             click = true;
         }
     }
+    // The wheel scrolls a list under a pointer that stays put: until the
+    // pointer has moved off, a twitch is not a movement (menu_pointer_wheel).
+    if (moved && !click && wheel_holds(sx, sy)) {
+        if (g_log) {
+            static std::int64_t last_ms = 0;
+            if (now_ms() - last_ms >= 500) {
+                last_ms = now_ms();
+                host_log("pointer: list %p at %.0f,%.0f not hovered: the wheel scrolled and the pointer has not moved off since",
+                         static_cast<void*>(c), static_cast<double>(sx), static_cast<double>(sy));
+            }
+        }
+        return;
+    }
+    if (depository_tabs(c, sx, sy, moved, click)) return;
     // A list of one cell on one line is a spinner - the value of an option
     // row, which Left and Right step. It is DS3's arrow selector, and a click
     // on it steps toward the side it landed on. The component's own root clip
@@ -848,6 +944,15 @@ std::uint32_t menu_back_button() { return menu_confirm_button() == 0x2000u ? 0x4
 void menu_pointer_click() {
     g_click_ms.store(now_ms(), std::memory_order_relaxed);
     g_click.store(true, std::memory_order_relaxed);
+}
+
+void menu_pointer_wheel() {
+    float sx = 0.0f, sy = 0.0f;
+    if (!host_mouse_stage_position(sx, sy)) return;
+    std::lock_guard<std::mutex> lock(g_wheel_mu);
+    g_wheel_hold = true;
+    g_wheel_x = sx;
+    g_wheel_y = sy;
 }
 
 std::uint32_t menu_pointer_take_press() { return g_press.exchange(0); }

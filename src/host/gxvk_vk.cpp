@@ -4,7 +4,13 @@
 // An entry's copy is placed at the first draw that binds it: a range of a
 // device-local pool block (64 MiB blocks, first fit at 256-byte steps; a
 // larger buffer a block of its own) while video memory is above the reserve
-// kept for render targets and device buffers. Short of room the entry is
+// kept for render targets and device buffers. With small video memory the
+// pool has a budget (host/gxvk_budget.h): a copy over it takes the room of
+// copies not bound for two seconds, the least recently bound first - the
+// entry goes back to made, and its next binding copies it again - else its
+// draw takes today's path that time; the pool keeps the mirrors' cushion
+// above the reserve, drops idle copies when video memory falls under it,
+// and gives an emptied block back. Short of room the entry is
 // retired and its buffer keeps today's path - resolved by address, as the
 // buffer shadow serves it, which gives its mirrors back and takes them again
 // as memory comes and goes - never a copy in host memory on a discrete GPU:
@@ -29,6 +35,8 @@
 // when the recording has run). A disagreement is counted by kind, logged
 // the first times, and retires the entry.
 #include "host/gpu_internal.h"
+#include "host/gxvk_budget.h"
+#include "host/memory_policy.h"
 #include "host/gxvk_table.h"
 #include "hle/modules.h"
 #include "log.h"
@@ -71,6 +79,16 @@ std::deque<Dead> g_dead;  // under g.mu, oldest first
 std::atomic<std::uint64_t> g_placed[2], g_placed_bytes[2], g_blocks_made[2], g_block_bytes[2], g_uploads{0}, g_upload_bytes{0},
     g_staged{0}, g_ranges_freed{0}, g_taken_back{0};
 std::atomic<std::uint64_t> g_blocks_refused{0};  // device-local blocks that went to host memory, given back (discrete GPU)
+// The pool's budget (gxvk_budget.h; small video memory), under g.mu: ~0 until the first placement asks, 0 none.
+std::uint64_t g_budget = ~0ull;
+bool budgeted() { return g_budget && g_budget != ~0ull; }  // a budget decided, and one there is
+std::uint64_t g_live_bytes = 0, g_live_peak = 0;  // device-local copies' ranges held now (dropped ones at once), and at most
+std::vector<std::pair<std::uint32_t, std::uint32_t>> g_placed_list;  // copies placed under a budget: (index, generation)
+std::uint32_t g_cur_flip = 0;                       // the flip at the current recording's start
+std::uint64_t g_room_scan_serial = ~0ull;           // a recording whose room scan found too little idle: no second scan in it
+std::uint64_t g_last_shrink_flip = 0;
+std::atomic<std::uint64_t> g_dropped{0}, g_dropped_bytes{0}, g_over_budget{0}, g_shrinks{0}, g_shrunk_bytes{0}, g_blocks_given_back{0};
+std::atomic<std::uint64_t> g_part_place_stops{0};  // under a budget: run parts' draws that stopped at a copy to place (BBHOST_RUN_COMMIT)
 std::atomic<std::uint64_t> g_disagree[gxvk_kDisagrees], g_checks{0}, g_readbacks{0}, g_readback_bytes{0}, g_readbacks_skipped{0};
 std::atomic<int> g_disagree_logged{0};
 std::uint64_t g_barrier_serial = ~0ull;  // the recording whose uploads have the source barrier
@@ -81,7 +99,7 @@ const char* const kDisagreeName[gxvk_kDisagrees] = {"a copy version over the byt
 std::atomic<std::uint64_t> g_overrun{0};  // vertex records whose V# counts past the buffer's end, bound to its copy's end
 const char* const kFallName[gxvk::kFalls] = {"no GX object", "not kept", "a handle of no entry", "taken back since the call",
                                              "retired by a write", "past the buffer's end", "no memory", "bytes out of reach",
-                                             "indirect", "a binding shared with another buffer"};
+                                             "indirect", "a binding shared with another buffer", "the copy pool at its budget"};
 // Entries retired by their end, kept bindable for the draws recorded before
 // it, until the flip given (8 on from the retirement's taking).
 constexpr std::uint64_t kEndFlips = 8;
@@ -118,8 +136,10 @@ void range_free_locked(int block, VkDeviceSize offset, VkDeviceSize size) {
         }
     }
     g_ranges_freed.fetch_add(1, std::memory_order_relaxed);
-    // A block of one buffer's goes once that buffer's range is free.
-    if (bl.dedicated && bl.free_bytes == bl.buf.size) {
+    // A block of one buffer's goes once that buffer's range is free; under a budget (small video memory) any block does,
+    // so what the pool drops goes back to the driver and the mirrors.
+    if ((bl.dedicated || (budgeted() && !bl.host)) && bl.free_bytes == bl.buf.size) {
+        if (!bl.dedicated) g_blocks_given_back.fetch_add(1, std::memory_order_relaxed);
         defer_destroy(bl.buf);
         g_block_bytes[bl.host].fetch_sub(bl.buf.size, std::memory_order_relaxed);
         bl = Block{};
@@ -142,6 +162,7 @@ bool take_from_locked(int b, VkDeviceSize need, BufferEntry& e) {
         bl.free.erase(it);
         if (rest) bl.free.emplace(off + need, rest);
         bl.free_bytes -= need;
+        if (!bl.host) g_live_peak = std::max(g_live_peak, g_live_bytes += need);
         e.vk_buffer = reinterpret_cast<std::uint64_t>(bl.buf.buffer);
         e.vk_offset = off;
         e.block = b;
@@ -187,6 +208,7 @@ bool pool_short_locked(VkDeviceSize need) {
     }();
     if (after >= 0 && static_cast<long long>(g_placed[0].load(std::memory_order_relaxed) + g_placed[1].load(std::memory_order_relaxed)) >= after)
         return true;
+    if (budgeted()) return !vram_room_for(need, shadow_mirror_cushion());  // the mirrors' cushion kept
     return vram_within_reserve(need);
 }
 
@@ -220,7 +242,9 @@ bool pool_place_locked(VkDeviceSize bytes, BufferEntry& e) {
 
 void let_go_locked(BufferEntry& e) {
     if (e.block >= 0) {
-        g_dead.push_back({g.flushes, e.block, e.vk_offset, (std::max<VkDeviceSize>(e.bytes, 1) + kAlign - 1) & ~(kAlign - 1)});
+        const VkDeviceSize size = (std::max<VkDeviceSize>(e.bytes, 1) + kAlign - 1) & ~(kAlign - 1);
+        g_dead.push_back({g.flushes, e.block, e.vk_offset, size});
+        if (!g_blocks[static_cast<std::size_t>(e.block)].host) g_live_bytes -= std::min<std::uint64_t>(g_live_bytes, size);
     }
     e.block = -1;
     e.vk_buffer = 0;
@@ -303,10 +327,72 @@ bool fill_locked(BufferEntry& e, std::uint32_t handle) {
     return true;
 }
 
+// The pool's budget, read at the first placement: the memory policy's (host/memory_policy.h) - small video memory's,
+// or BBHOST_GXVK_BUFFERS_BUDGET_MB on any discrete GPU; none on an integrated GPU.
+std::uint64_t budget_locked() {
+    if (g_budget == ~0ull) g_budget = host_gpu_memory_policy().budget;
+    return g_budget;
+}
+
+// Copies placed under the budget and still placed (stale pairs dropped as they are met), with when each was last bound.
+void live_copies_locked(std::vector<gxvk_budget::Copy>& copies, std::vector<std::pair<std::uint32_t, std::uint32_t>>& who) {
+    std::size_t keep = 0;
+    for (const auto& p : g_placed_list) {
+        BufferEntry* e = gxvk::entry_at(p.first);
+        if (!e) continue;
+        const std::uint32_t w = e->word.load(std::memory_order_acquire);
+        if (gxvk::entry_gen(w) != p.second || gxvk::entry_state(w) != gxvk::kEntryPlaced || e->block < 0) continue;
+        g_placed_list[keep++] = p;
+        copies.push_back({e->last_flip.load(std::memory_order_relaxed), (std::max<VkDeviceSize>(e->bytes, 1) + kAlign - 1) & ~(kAlign - 1)});
+        who.push_back(p);
+    }
+    g_placed_list.resize(keep);
+}
+
+// Idle copies dropped, the least recently bound first, until `want` bytes went (or no idle one is left): each entry
+// back to made - its next binding copies it again - and its range free once this recording has run. The bytes dropped.
+// BBHOST_TEST_GXVK_IDLE_FLIPS=N (tests): idle after N flips, not two seconds' - lavapipe draws a flip in seconds.
+std::uint64_t drop_idle_locked(std::uint64_t want) {
+    static const std::uint32_t idle_flips = [] {
+        const char* e = std::getenv("BBHOST_TEST_GXVK_IDLE_FLIPS");
+        return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : gxvk_budget::kIdleFlips;
+    }();
+    std::vector<gxvk_budget::Copy> copies;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> who;
+    live_copies_locked(copies, who);
+    std::uint64_t dropped = 0;
+    for (const std::size_t i : gxvk_budget::victims(copies, g_cur_flip, want, idle_flips)) {
+        BufferEntry* e = gxvk::entry_at(who[i].first);
+        std::uint32_t placed = (who[i].second << 8) | gxvk::kEntryPlaced;
+        // A writer may retire it meanwhile (any thread): then its taking back lets the copy go.
+        if (!e || !e->word.compare_exchange_strong(placed, (who[i].second << 8) | gxvk::kEntryMade, std::memory_order_acq_rel)) continue;
+        let_go_locked(*e);
+        dropped += copies[i].bytes;
+        g_dropped.fetch_add(1, std::memory_order_relaxed);
+        g_dropped_bytes.fetch_add(copies[i].bytes, std::memory_order_relaxed);
+    }
+    return dropped;
+}
+
+// Room under the budget for `need` more bytes, idle copies dropped for it; one scan a recording when too little is idle.
+bool budget_room_locked(VkDeviceSize need) {
+    if (g_live_bytes + need <= g_budget) return true;
+    if (g_room_scan_serial == g.flushes) return false;
+    drop_idle_locked(g_live_bytes + need - g_budget);
+    if (g_live_bytes + need <= g_budget) return true;
+    g_room_scan_serial = g.flushes;
+    return false;
+}
+
 // The entry's copy placed and filled: gxvk::kFalls, else why not (no
-// memory, its bytes out of reach - the entry retired - or retired meanwhile).
+// memory, its bytes out of reach - the entry retired - or retired meanwhile;
+// at the budget - the entry stays made, placed when there is room).
 int place_locked(BufferEntry& e, std::uint32_t handle) {
     const std::uint32_t index = gxvk::handle_index(handle), gen = gxvk::handle_gen(handle);
+    if (budget_locked() && !budget_room_locked((std::max<VkDeviceSize>(e.bytes, 1) + kAlign - 1) & ~(kAlign - 1))) {
+        g_over_budget.fetch_add(1, std::memory_order_relaxed);
+        return gxvk::kFallBudget;
+    }
     if (!pool_place_locked(e.bytes, e)) {
         gxvk::retire(index, gen, gxvk::kRetireNoRoom);
         return gxvk::kFallNoRoom;
@@ -325,6 +411,7 @@ int place_locked(BufferEntry& e, std::uint32_t handle) {
     const Block& bl = g_blocks[static_cast<std::size_t>(e.block)];
     g_placed[bl.host].fetch_add(1, std::memory_order_relaxed);
     g_placed_bytes[bl.host].fetch_add(e.bytes, std::memory_order_relaxed);
+    if (g_budget) g_placed_list.emplace_back(index, gen);
     return gxvk::kFalls;
 }
 
@@ -347,7 +434,7 @@ void disagree_locked(int kind, std::uint32_t handle, const BufferEntry* e) {
 bool gxvk_buffers_bind_mode() { return gxvk::buffers_mode() == gxvk::Buffers::kOn; }
 
 namespace {
-bool g_last_ended = false;  // the last resolve bound an entry retired by its end (the command processor's)
+thread_local bool g_last_ended = false;  // the last resolve on this thread bound an entry retired by its end
 }  // namespace
 bool gxvk_last_resolve_ended() { return g_last_ended; }
 
@@ -369,8 +456,16 @@ int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std
         bump(g_overrun);
     }
     if (st == gxvk::kEntryMade) {
+        // A run part's draw places no copy (BBHOST_RUN_COMMIT): placed in order.
+        if (run_part_stop(kRunStopMirror)) {
+            if (budgeted()) g_part_place_stops.fetch_add(1, std::memory_order_relaxed);
+            return gxvk::kFallStale;
+        }
         if (const int r = place_locked(*e, handle); r != gxvk::kFalls) return r;
     }
+    // Under a budget, the flip it was bound at - by a run part's draw too, which places no copy but keeps the one it
+    // binds from looking idle - stored only when it moves: once a flip for a copy many draws bind.
+    if (budgeted() && e->last_flip.load(std::memory_order_relaxed) != g_cur_flip) e->last_flip.store(g_cur_flip, std::memory_order_relaxed);
     out.buffer = reinterpret_cast<VkBuffer>(e->vk_buffer);
     out.offset = e->vk_offset + (va - e->memory);
     out.avail = e->bytes - (va - e->memory);
@@ -406,6 +501,16 @@ void gxvk_disagree_locked(int kind, std::uint32_t handle) {
 void gxvk_begin_recording_locked() {
     if (!gxvk::buffers_on()) return;
     const std::uint64_t flip = hle_video_flip_count();
+    g_cur_flip = static_cast<std::uint32_t>(flip);
+    // Under a budget: with video memory under the mirrors' cushion above the reserve, idle copies go - a block's worth
+    // at most, twice a second - before the mirrors are refused room; an emptied block goes back once its ranges are free.
+    if (budgeted() && flip >= g_last_shrink_flip + 30 && !vram_room_for(0, shadow_mirror_cushion())) {
+        g_last_shrink_flip = flip;
+        if (const std::uint64_t n = drop_idle_locked(kBlockBytes)) {
+            g_shrinks.fetch_add(1, std::memory_order_relaxed);
+            g_shrunk_bytes.fetch_add(n, std::memory_order_relaxed);
+        }
+    }
     const auto take_back = [](std::uint32_t index) {
         if (BufferEntry* e = gxvk::entry_at(index)) let_go_locked(*e);
         gxvk::recycle(index);
@@ -489,6 +594,19 @@ std::string gxvk_report() {
                   g.integrated ? "host memory once video memory is short (an integrated GPU)"
                                : ("no copy in host memory (a discrete GPU): blocks refused there " + std::to_string(g_blocks_refused.load())).c_str());
     s += b;
+    if (budgeted()) {
+        std::snprintf(b, sizeof b,
+                      "\ngxvk buffers: the copy pool's budget %llu MiB (small video memory, or BBHOST_GXVK_BUFFERS_BUDGET_MB): held at most "
+                      "%llu MiB; copies dropped for room %llu (%llu MiB), bindings left on today's path at the budget %llu; dropped below the "
+                      "mirrors' cushion (%llu MiB above the reserve) %llu times (%llu MiB); emptied blocks given back %llu; run parts stopped "
+                      "at a copy to place %llu",
+                      static_cast<ull>(g_budget >> 20), static_cast<ull>(g_live_peak >> 20), static_cast<ull>(g_dropped.load()),
+                      static_cast<ull>(g_dropped_bytes.load() >> 20), static_cast<ull>(g_over_budget.load()),
+                      static_cast<ull>(shadow_mirror_cushion() >> 20), static_cast<ull>(g_shrinks.load()),
+                      static_cast<ull>(g_shrunk_bytes.load() >> 20), static_cast<ull>(g_blocks_given_back.load()),
+                      static_cast<ull>(g_part_place_stops.load()));
+        s += b;
+    }
     if (compare_mode()) {
         std::uint64_t total = 0;
         std::string kinds;

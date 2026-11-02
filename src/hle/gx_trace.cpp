@@ -732,6 +732,11 @@ std::uint32_t rd32(std::uint64_t va) {
     std::memcpy(&v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 4);
     return v;
 }
+std::uint16_t rd16(std::uint64_t va) {
+    std::uint16_t v;
+    std::memcpy(&v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 2);
+    return v;
+}
 std::uint8_t rd8(std::uint64_t va) { return *reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va)); }
 void wr8(std::uint64_t va, std::uint8_t v) { *reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va)) = v; }
 // Reads of objects we only have a pointer to: a bad pointer fails the call
@@ -899,8 +904,8 @@ thread_local unsigned t_records_cached = 0;
 // gate at 60 fps: the GX workers 7-9 points of a core busier together for it,
 // and nothing gained - a paced frame does not wait for the command processor.
 // So by default it packs only where the command processor limits the frame
-// rate: Uncapped, 90 and 120 (the game's pace, hle_video_game_pace, chosen
-// before the trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
+// rate: above 60 (the game's pace, hle_video_game_pace, chosen before the
+// trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
 int g_packed_records = 0;
 // The set a GX thread snapshots a draw into before packing it: the same set
 // draw after draw, so in its caches, where a pooled set comes back cold.
@@ -1349,13 +1354,19 @@ bool build_inputs(const GxRec& r, GpuDrawInputs& in, bool allow_tess = false) {
         // semantic in the low byte. Each entry: the register of the VS output
         // with that semantic or 0x20, bit 12 of the word as bit 5, the high
         // byte's low two bits at 8, bit 12 or 10 at 10.
-        const auto u8 = [](std::uint64_t va) { return rd32(va) & 0xff; };
+        //
+        // The bytes and words are read at their own width, as 0x14873a0
+        // reads them: the two tables end their structure, and a 4-byte read
+        // of a last entry reads up to 3 bytes past it - past the block where
+        // the structure is a heap copy of its own size, as YEBIS's are
+        // (0x15e7300 and 0x15e73a0 malloc each to its last table's end).
+        const auto u8 = [](std::uint64_t va) { return static_cast<std::uint32_t>(rd8(va)); };
         const std::uint64_t vs_out = vs_gnm + ((static_cast<std::uint64_t>(u8(vs_gnm + 0x24)) + u8(vs_gnm + 3)) << 2) + 0x28;
         const std::uint32_t vs_outs = u8(vs_gnm + 0x25);
         const std::uint64_t ps_in = ps_gnm + (static_cast<std::uint64_t>(u8(ps_gnm + 3)) << 2) + 0x3c;
         in.ps_input_count = std::min<std::uint32_t>(u8(ps_gnm + 0x38), 32);
         for (std::uint32_t i = 0; i < in.ps_input_count; ++i) {
-            const std::uint32_t word = rd32(ps_in + 2 * static_cast<std::uint64_t>(i)) & 0xffff;
+            const std::uint32_t word = rd16(ps_in + 2 * static_cast<std::uint64_t>(i));
             std::uint32_t reg = 0x20;
             for (std::uint32_t j = 0; j < vs_outs; ++j) {
                 if (u8(vs_out + 2 * static_cast<std::uint64_t>(j)) == (word & 0xff)) {
@@ -1420,13 +1431,13 @@ shaders_done:
             in.gs_copy_pgm[1] = rd32(copy + 0xc);
             in.gs_vs_out_cntl = rd32(copy + 8 + 0x18);
             in.gs_es_dwords = rd32(es_gnm + 0x1c);
-            const auto u8 = [](std::uint64_t va) { return rd32(va) & 0xff; };
+            const auto u8 = [](std::uint64_t va) { return static_cast<std::uint32_t>(rd8(va)); };
             const std::uint64_t vs_out = copy + ((static_cast<std::uint64_t>(u8(copy + 0x24)) + u8(copy + 3)) << 2) + 0x28;
             const std::uint32_t vs_outs = u8(copy + 0x25);
             const std::uint64_t ps_in = ps_gnm + (static_cast<std::uint64_t>(u8(ps_gnm + 3)) << 2) + 0x3c;
             const std::uint32_t count = std::min<std::uint32_t>(u8(ps_gnm + 0x38), 32);
             for (std::uint32_t i = 0; i < count; ++i) {
-                const std::uint32_t word = rd32(ps_in + 2 * static_cast<std::uint64_t>(i)) & 0xffff;
+                const std::uint32_t word = rd16(ps_in + 2 * static_cast<std::uint64_t>(i));
                 std::uint32_t reg = 0x20;
                 for (std::uint32_t j = 0; j < vs_outs; ++j) {
                     if (u8(vs_out + 2 * static_cast<std::uint64_t>(j)) == (word & 0xff)) {
@@ -3667,15 +3678,17 @@ bool build_yebis_inputs(std::uint64_t state, GpuDrawInputs& in, std::uint32_t pr
     in.cb_shader_mask = rd32(ps_gnm + 8 + 0x2c);
     in.ps_col_format = rd32(ps_gnm + 8 + 0x14);
     // SPI_PS_INPUT_CNTL, matched to the VS outputs exactly as build_inputs()
-    // does it: the Gnm shader structure is the same one.
+    // does it: the Gnm shader structure is the same one, and these are heap
+    // copies of their own size (0x15e7300, 0x15e73a0), so the tables at their
+    // end are read at their entries' width.
     {
-        const auto u8 = [](std::uint64_t va) { return rd32(va) & 0xff; };
+        const auto u8 = [](std::uint64_t va) { return static_cast<std::uint32_t>(rd8(va)); };
         const std::uint64_t vs_out = vs_gnm + ((static_cast<std::uint64_t>(u8(vs_gnm + 0x24)) + u8(vs_gnm + 3)) << 2) + 0x28;
         const std::uint32_t vs_outs = u8(vs_gnm + 0x25);
         const std::uint64_t ps_in = ps_gnm + (static_cast<std::uint64_t>(u8(ps_gnm + 3)) << 2) + 0x3c;
         in.ps_input_count = std::min<std::uint32_t>(u8(ps_gnm + 0x38), 32);
         for (std::uint32_t i = 0; i < in.ps_input_count; ++i) {
-            const std::uint32_t word = rd32(ps_in + 2 * static_cast<std::uint64_t>(i)) & 0xffff;
+            const std::uint32_t word = rd16(ps_in + 2 * static_cast<std::uint64_t>(i));
             std::uint32_t reg = 0x20;
             for (std::uint32_t j = 0; j < vs_outs; ++j) {
                 if (u8(vs_out + 2 * static_cast<std::uint64_t>(j)) == (word & 0xff)) {
@@ -3700,14 +3713,15 @@ bool build_yebis_inputs(std::uint64_t state, GpuDrawInputs& in, std::uint32_t pr
     }
     // The prep (0x15f9f30) writes the draw's last two arguments into the two
     // user-data slots named by the nibbles of a byte in the first bound
-    // vertex-side stage's object - LS and ES at +0x19, the VS at +0x27.
+    // vertex-side stage's object - LS and ES at +0x19, the VS at +0x27 (one
+    // byte, as the prep reads it: a VS without tables ends at +0x28).
     std::uint32_t slots = 0;
     if (const std::uint64_t ls = rd64(state + 0x160)) {
-        slots = rd32(ls + 0x19) & 0xff;
+        slots = rd8(ls + 0x19);
     } else if (const std::uint64_t es = rd64(state + 0x170)) {
-        slots = rd32(es + 0x19) & 0xff;
+        slots = rd8(es + 0x19);
     } else {
-        slots = rd32(vs_gnm + 0x27) & 0xff;
+        slots = rd8(vs_gnm + 0x27);
     }
     if ((slots & 0xf) != 0 && (slots & 0xf) < 16) in.vs_user[slots & 0xf] = prep_a;
     if (((slots >> 4) & 0xf) != 0 && ((slots >> 4) & 0xf) < 16) in.vs_user[(slots >> 4) & 0xf] = prep_b;
@@ -4482,13 +4496,13 @@ bool sf_record_then_token(std::uint64_t ctx, ScaleformDraw&& d) {
 // does it for GX (the shader bind 0x2ace1e0 and the wrapper's flush both
 // compute it through 0x14873a0 from the same structures).
 void sf_ps_inputs(std::uint64_t vs_gnm, std::uint64_t ps_gnm, GpuDrawInputs& in) {
-    const auto u8 = [](std::uint64_t va) { return rd32(va) & 0xff; };
+    const auto u8 = [](std::uint64_t va) { return static_cast<std::uint32_t>(rd8(va)); };
     const std::uint64_t vs_out = vs_gnm + ((static_cast<std::uint64_t>(u8(vs_gnm + 0x24)) + u8(vs_gnm + 3)) << 2) + 0x28;
     const std::uint32_t vs_outs = u8(vs_gnm + 0x25);
     const std::uint64_t ps_in = ps_gnm + (static_cast<std::uint64_t>(u8(ps_gnm + 3)) << 2) + 0x3c;
     in.ps_input_count = std::min<std::uint32_t>(u8(ps_gnm + 0x38), 32);
     for (std::uint32_t i = 0; i < in.ps_input_count; ++i) {
-        const std::uint32_t word = rd32(ps_in + 2 * static_cast<std::uint64_t>(i)) & 0xffff;
+        const std::uint32_t word = rd16(ps_in + 2 * static_cast<std::uint64_t>(i));
         std::uint32_t reg = 0x20;
         for (std::uint32_t j = 0; j < vs_outs; ++j) {
             if (u8(vs_out + 2 * static_cast<std::uint64_t>(j)) == (word & 0xff)) {
@@ -6702,9 +6716,9 @@ void hle_gx_trace_arm(GuestMemory* mem) {
             host_log("gx-native: a draw's records %s (BBHOST_GX_PACKED_RECORDS=%d)", g_packed_records ? "packed at the call" : "handed over as the sparse set",
                      g_packed_records);
         } else if (g_packed_records) {
-            host_log("gx-native: a draw's records packed at the call: the game runs %s, where the command processor limits the frame rate "
-                     "(BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
-                     pace ? (pace == 90 ? "at 90" : "at 120") : "uncapped");
+            host_log("gx-native: a draw's records packed at the call: the game runs at %d, where the command processor limits the frame "
+                     "rate (BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
+                     pace);
         } else {
             host_log("gx-native: a draw's records handed over as the sparse set: the game is paced at %d, where packing costs the GX threads "
                      "more than it saves the command processor (BBHOST_GX_PACKED_RECORDS=1: packed)",
@@ -8247,6 +8261,37 @@ void hle_gx_native_prefetch(std::uint64_t id, bool next) {
         for (const GxStageRecords& s : rec->stage) __builtin_prefetch(&s);  // the headers the bit masks below are read from
         prefetch_records(*rec);
     }
+}
+
+const GpuDrawInputs* hle_gx_native_peek(std::uint64_t id, const GxDrawObjects** objects) {
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return nullptr;
+    if (objects) *objects = &slot.draw.objects;
+    return &slot.draw.in;
+}
+
+bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs& in, GxDrawObjects& objects) {
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return false;
+    const NativeDraw& draw = slot.draw;
+    in = draw.in;
+    objects = draw.objects;
+    // As hle_gx_native_token sets them at the take.
+    if (g_packed_records == 1 && draw.records) {
+        objects.records = unpack_records(draw.records.get());
+    } else if (g_packed_records == 2 && draw.records && draw.packed) {
+        objects.records = unpack_records(draw.packed.get());
+    } else {
+        objects.records = draw.records.get();
+    }
+    if (g_token_user_data_register) {
+        std::memcpy(in.vs_user, &sh[0x4c], sizeof(in.vs_user));
+        std::memcpy(in.ps_user, &sh[0x0c], sizeof(in.ps_user));
+    } else {
+        std::memset(in.vs_user, 0, sizeof(in.vs_user));
+        std::memset(in.ps_user, 0, sizeof(in.ps_user));
+    }
+    return true;
 }
 
 void hle_gx_native_release() {

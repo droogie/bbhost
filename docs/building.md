@@ -39,6 +39,36 @@ and the developer tools (`gcn2spv`, `gcndis`, `drawreplay`, ...).
 `-DBBHOST_RELEASE=ON` makes a release build, which by default checks at start
 whether a newer release is out and offers to open its page in the browser.
 
+`-DBBHOST_LTO=ON` builds every target with ThinLTO (`-flto=thin`), so the
+command processor's calls across files (the render path into the buffer
+shadow and the GPU layer) can be inlined: about 3-5% more frame rate where the
+command processor is the limit (Kyo's Central Yharnam save on a Radeon 8060S,
+~137 to ~143-145 fps; on an RTX 4070 with two Xeon Gold 6230 at 1080p, Old
+Yharnam ~100 to ~104 fps and the Cainhurst courtyard ~107 to ~110). Off by
+default; the release packages (Windows, Linux and the Steam Deck kit) are
+built with it. It applies to the first configure of a build directory, as the
+other `-D` options do.
+
+`-DBBHOST_PGO=generate` builds an instrumented bbhost (Clang's IR profiles;
+MSYS2 needs `mingw-w64-ucrt-x86_64-compiler-rt`, the version of its clang).
+Run it through the places that matter with
+`LLVM_PROFILE_FILE=<dir>/run-%p.profraw`; a timed exit (`BBHOST_EXIT_SECONDS`)
+or closing the window writes the profile - bbhost writes it itself, since it
+ends the process without the runtime's exit handler. Then
+`llvm-profdata merge -o bbhost.profdata <dir>/*.profraw`, and
+`-DBBHOST_PGO=<absolute path>/bbhost.profdata` (with `-DBBHOST_LTO=ON`) builds
+the optimized one in a build directory of its own. With two headless runs at
+Kyo's Central Yharnam save (640x360 and 1080p) as the profile, where the
+command processor is the limit on a Radeon 8060S: 148 and 136 fps against 134
+and 124 for the same build without it, alternating (+10%). A profile outlives
+small changes: a function it no longer matches is built as without one.
+
+A ThreadSanitizer build (`-DCMAKE_CXX_FLAGS=-fsanitize=thread`, the same in
+`CMAKE_C_FLAGS` and the linker flags) runs with the write watch off unless
+`BBHOST_WRITE_WATCH=1`: a write fault inside one of ThreadSanitizer's atomics on
+guest memory makes it wait on its own lock, which stopped such builds at the
+first loading screen.
+
 ## Windows (cross-compiled)
 
 Requirements on the Linux machine: Clang, lld and llvm tools, the mingw-w64

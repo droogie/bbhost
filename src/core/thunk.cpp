@@ -33,7 +33,14 @@
 
 // Plain byte emission, the same on every platform; see the header.
 std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* c, std::uint64_t id, void* host, std::uint64_t resume,
-                                      const std::uint8_t* displaced, std::size_t n, bool keep_rax) {
+                                      const std::uint8_t* displaced, std::size_t n, bool keep_rax, bool site) {
+    // Inside a body rsp is 16-byte aligned: the entry's 8 made up here.
+    static constexpr std::uint8_t kPad[] = {0x48, 0x83, 0xec, 0x08};    // sub rsp, 8
+    static constexpr std::uint8_t kUnpad[] = {0x48, 0x83, 0xc4, 0x08};  // add rsp, 8 (flags: the host's test follows)
+    if (site) {
+        std::memcpy(c, kPad, sizeof(kPad));
+        c += sizeof(kPad);
+    }
     // Below the six registers: a return slot (zeroed; what a skipped call
     // returns, saved[-1] to the host) and xmm0-7, which carry a hooked
     // function's float arguments and which host code would otherwise clobber.
@@ -103,6 +110,10 @@ std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* c, std::uint64_t id, void* 
     } else {
         std::memcpy(c, kRestore, sizeof(kRestore));
         c += sizeof(kRestore);
+    }
+    if (site) {
+        std::memcpy(c, kUnpad, sizeof(kUnpad));
+        c += sizeof(kUnpad);
     }
     static constexpr std::uint8_t kReturn[] = {
         0x4d, 0x85, 0xdb,  // test r11, r11
@@ -325,6 +336,11 @@ extern "C" GUEST_ABI void hle_host_stack_leave() {
 }
 #endif
 
+// The save area of the last HLE call made from guest code on this thread
+// (not a nested one from the host stack): hle_guest_return() reads the
+// guest's return address out of it.
+thread_local const std::uint8_t* t_guest_save = nullptr;
+
 // Called from the trampoline with host FS installed. cur is the trampoline's
 // save area on whatever stack the guest was running on. Returns the 16-byte
 // aligned stack pointer the HLE function should run on. If the guest was
@@ -344,6 +360,7 @@ extern "C" GUEST_ABI void* hle_host_stack_enter(std::uint8_t* cur) {
 #endif
         return reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(cur - 256) & ~15ull);
     }
+    t_guest_save = cur;
 #if defined(_WIN32)
     auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
     t_guest_stack_base = tib->StackBase;
@@ -353,6 +370,24 @@ extern "C" GUEST_ABI void* hle_host_stack_enter(std::uint8_t* cur) {
     t_host_stack_depth = 1;
 #endif
     return t_host_stack + kHostStack - 64;
+}
+
+// The trampoline's frame over `cur`: 192 bytes of saved registers, then rbx,
+// r12 and rbp pushed (the guest's rbp, so its frame chain goes on from there),
+// then the return address the guest's call pushed. `depth` frames up that
+// chain, as hle_count_call walks it; 0 where it ends.
+std::uint64_t hle_guest_return(int depth) {
+    if (!t_guest_save) return 0;
+    const auto* f = reinterpret_cast<const std::uint64_t*>(t_guest_save + 192 + 16);
+    for (int i = 0; i < depth; ++i) {
+        const auto* up = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(f[0]));
+        if (up <= f || reinterpret_cast<std::uintptr_t>(up) - reinterpret_cast<std::uintptr_t>(f) > (1u << 20) ||
+            (reinterpret_cast<std::uintptr_t>(up) & 7)) {
+            return 0;
+        }
+        f = up;
+    }
+    return f[1];
 }
 
 // Shared trampoline. Entered with r11 = real function, on the guest stack,

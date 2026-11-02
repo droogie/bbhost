@@ -6,6 +6,7 @@
 #include "host/window.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -47,7 +48,8 @@ const BindingInfo kInfo[kBindCount] = {
     {"attack", "Attack", "R1. With the strong attack modifier held, R2.", kR1, nullptr, 1},
     {"strong_attack", "Strong Attack", "R2. Hold to charge.", kR2, "V", 0},
     {"strong_modifier", "Strong Attack Modifier", "Held with Attack, attacks strong (R2).", 0, "Left Shift", 0},
-    {"transform", "Transform", "L1. Transform the trick weapon.", kL1, "C", 3},
+    // The middle button is Camera Zoom Reset's, beside the wheel's zoom.
+    {"transform", "Transform", "L1. Transform the trick weapon.", kL1, "C", 0},
     {"firearm", "Firearm / Parry", "L2. Shoot the left-hand weapon.", kL2, "X", 2},
     {"blood_vial", "Blood Vial", "Triangle. Restore HP with a Blood Vial.", kTriangle, "R", 0},
     {"use_item", "Use Item", "Square. Use the selected quick item.", kSquare, "F", 0},
@@ -74,7 +76,31 @@ const BindingInfo kInfo[kBindCount] = {
     {"confirm", "Menu Confirm", "OK, in menus.", 0, "Return", 0},
     {"back", "Menu Back", "Return, in menus.", 0, "Backspace", 0},
 
+    // What a menu reads from the shoulders and two face buttons - its pages,
+    // its two shortcuts, its display and status switches - on keys of its own.
+    // In play those buttons are the attacks, the firearm, Transform, the Blood
+    // Vial and the quick item, whose keys stay out of the menus
+    // (host_binding_in_menus): the storage box's Show Storage / Show Inventory
+    // (L2 and R2) was on the firearm's X and Strong Attack's V, and a menu's
+    // next page or tab (R1) on Attack's left mouse button, which in a menu is
+    // the pointer's click. The game's own key guides name them
+    // (engine/key_prompts.cpp).
+    {"menu_page_left", "Menu Previous Page", "L1 in menus: the previous page, tab or category.", kL1, "PageUp", 0},
+    {"menu_page_right", "Menu Next Page", "R1 in menus: the next page, tab or category.", kR1, "PageDown", 0},
+    {"menu_shortcut_left", "Menu Shortcut (L2)", "L2 in menus: the storage box's Show Storage, the rankings' top.", kL2,
+     "Home", 0},
+    {"menu_shortcut_right", "Menu Shortcut (R2)", "R2 in menus: the storage box's Show Storage, your own grades.", kR2,
+     "End", 0},
+    {"menu_display", "Menu Toggle Display", "Square in menus: Toggle Display, Unequip, Remove, Delete.", kSquare, "F",
+     0},
+    {"menu_status", "Menu Toggle Status", "Triangle in menus: Toggle Status, Switch, Initialize.", kTriangle, "R", 0},
+
     {"l3", "Left Stick Press", "L3.", kL3, "Left Ctrl", 0},
+    // The follow camera's distance, in the world: each press a step of the
+    // Camera distance setting (10%), Reset the game's own. No pad press.
+    {"zoom_in", "Camera Zoom In", "Brings the camera a step closer.", 0, nullptr, 6},
+    {"zoom_out", "Camera Zoom Out", "Takes the camera a step further out.", 0, nullptr, 7},
+    {"zoom_reset", "Camera Zoom Reset", "The camera back to the game's own distance.", 0, nullptr, 3},
     // The developers' debug menu: not a pad press at all. The patch opens it
     // on the touchpad's left side, which is also Gestures; this key toggles
     // the menu itself (engine/debug_menu.h), when the Debug Menu plugin is
@@ -103,6 +129,24 @@ void note_debug_key(int device, bool down) {
         g_debug_held[device].store(false, std::memory_order_relaxed);
     } else if (!g_debug_held[device].exchange(true) && debug_menu_active()) {
         g_debug_toggle.store(true);
+    }
+}
+// The zoom actions likewise: held per device, each press queued for the pad
+// read as a step (Out +1, In -1) or a reset (host_bind_take_zoom).
+std::atomic<bool> g_zoom_held[2][3];
+std::atomic<int> g_zoom_steps{0};
+std::atomic<bool> g_zoom_reset{false};
+
+void note_zoom_keys(int device, const bool held[kBindCount]) {
+    const int actions[3] = {kBindZoomIn, kBindZoomOut, kBindZoomReset};
+    for (int k = 0; k < 3; ++k) {
+        const bool down = held[actions[k]];
+        if (g_zoom_held[device][k].exchange(down) || !down) continue;
+        if (k == 2) {
+            g_zoom_reset.store(true);
+        } else {
+            g_zoom_steps.fetch_add(k == 0 ? -1 : 1);
+        }
     }
 }
 std::atomic<int> g_capture_done{-1};
@@ -202,6 +246,30 @@ std::uint64_t host_bindings_serial() { return g_serial.load(std::memory_order_re
 
 const BindingInfo& host_binding_info(int action) { return kInfo[action < 0 || action >= kBindCount ? 0 : action]; }
 
+int host_binding_in_menus(int action) {
+    switch (action) {
+        case kBindConfirm:
+        case kBindBack:
+        case kBindMenuPageL:
+        case kBindMenuPageR:
+        case kBindMenuShortL:
+        case kBindMenuShortR:
+        case kBindMenuDisplay:
+        case kBindMenuStatus:
+            return 1;
+        case kBindAttack:
+        case kBindStrong:
+        case kBindStrongMod:
+        case kBindTransform:
+        case kBindFirearm:
+        case kBindBloodVial:
+        case kBindUseItem:
+            return -1;
+        default:
+            return 0;
+    }
+}
+
 void host_bindings_load_defaults() {
     for (int a = 0; a < kBindCount; ++a) {
         g_key[a].store(kInfo[a].def_key ? scancode_from_name(kInfo[a].def_key) : 0, std::memory_order_relaxed);
@@ -276,15 +344,85 @@ namespace {
 constexpr int kOpposites[4][2] = {
     {kBindMoveF, kBindMoveB}, {kBindMoveL, kBindMoveR}, {kBindLookU, kBindLookD}, {kBindLookL, kBindLookR}};
 
-// Walk held on a mouse button, for the keyboard's movement keys (the mouse is
-// read on the pad read, the keyboard on the window's update).
-std::atomic<bool> g_walk_on_mouse{false};
+// Walk and Dodge / Sprint held on a mouse button, for the keyboard's movement
+// keys (the mouse is read on the pad read, the keyboard on the window's update).
+std::atomic<bool> g_walk_on_mouse{false}, g_roll_on_mouse{false};
 
 // How far the movement keys push the stick while Walk is held, of a full push.
 // Measured in the Hunter's Dream: under 35% the character stands, from 40% to
 // 80% it walks (1.65 m/s), at a full push it runs (3.7 m/s) - so the middle of
 // the walk, with room either side.
 constexpr float kWalkPush = 0.6f;
+
+// The keyboard's movement keys - whichever keys Move Forward, Back, Left and
+// Right are bound to - move the stick as a thumb does rather than in one step.
+// The keyboard's only (device 0, the window's thread): the mouse's buttons push
+// at once, and a pad's sticks are its own and never come through here.
+//  - From standing the push ramps up to full over kMoveRampMs.
+//  - While Dodge / Sprint is held, a change of direction turns the stick
+//    round the edge at its push, by at most 90 degrees in kMoveTurnMs (about
+//    45 between two of the game's frames at 30 fps, as much as D added to W
+//    always turned at once), and right round by the front (W+A to S+D goes
+//    through W+D). The character script stops a sprint whose stick swings 90
+//    degrees or more between two frames: W+A and W+D swapped at once ended
+//    it, and W+D meeting A spun the hunter round (f9227ee5).
+//  - A straight reversal - a key to its opposite with the other axis idle, A
+//    to D or W to S, typed with a gap (up to kMoveRestMs) or with the two
+//    cancelling between - flips the stick at once, as a thumb flicks a stick
+//    across: the game's quick turn, as with a pad and v0.2.21's push. The keys
+//    decide it, not where the stick is, so a reversal that comes while the
+//    stick is still turning (W, D, then A at once) flips as well.
+//  - Without it the stick points where the keys do at once, as it always has,
+//    so letting go - the dodge - goes the way the keys point, never part of
+//    the way round.
+//  - Letting go of every movement key puts the stick at rest at once, but the
+//    push and the direction are kept for kMoveRestMs: a change of direction is
+//    typed as one key let go and the next pressed a few milliseconds later,
+//    and starting from rest there took the stick through the walk for several
+//    frames (v0.2.22) - a sprint turning from W to D slowed. Longer than that,
+//    the next key is a start from standing.
+constexpr float kMoveRampMs = 66.0f;
+constexpr float kMoveTurnMs = 70.0f;
+constexpr float kMoveRestMs = 150.0f;
+constexpr float kQuarterTurn = 1.5707963f, kHalfTurn = 3.1415927f, kFullTurn = 6.2831853f;
+float g_move_push = 0.0f;   // 0 at rest, 1 the full push
+float g_move_angle = 0.0f;  // where the stick points: 0 forward, positive to the right (radians)
+int g_move_x = 0, g_move_y = 0;  // the keys' last direction, kept over a gap as the push is
+std::chrono::steady_clock::time_point g_move_at{}, g_move_held_at{};
+
+// The stick for the movement keys held (x, y each -1, 0 or 1) at `now`, in a
+// sprint or not: how far it is pushed (0..1) and which way (g_move_angle).
+float move_stick(int x, int y, bool sprint, std::chrono::steady_clock::time_point now) {
+    const float ms = std::clamp(std::chrono::duration<float, std::milli>(now - g_move_at).count(), 0.0f, kMoveTurnMs);
+    g_move_at = now;
+    if (x == 0 && y == 0) {
+        if (std::chrono::duration<float, std::milli>(now - g_move_held_at).count() > kMoveRestMs) g_move_push = 0.0f;
+        return 0.0f;
+    }
+    const float want = std::atan2(static_cast<float>(x), static_cast<float>(-y));
+    const bool flip = (x != 0 && y == 0 && g_move_y == 0 && x == -g_move_x) ||
+                      (y != 0 && x == 0 && g_move_x == 0 && y == -g_move_y);
+    g_move_x = x;
+    g_move_y = y;
+    if (g_move_push <= 0.0f || !sprint || flip) {
+        g_move_angle = want;  // from standing, not sprinting, or a straight reversal: where the keys point
+    } else {
+        float turn = std::remainder(want - g_move_angle, kFullTurn);
+        if (std::fabs(turn) > kHalfTurn - 0.01f) {
+            // Right round, both axes (W+A to S+D): by the front, whichever side that is.
+            turn = std::fabs(std::remainder(g_move_angle + kQuarterTurn, kFullTurn)) <=
+                           std::fabs(std::remainder(g_move_angle - kQuarterTurn, kFullTurn))
+                       ? kHalfTurn
+                       : -kHalfTurn;
+        }
+        const float step = kQuarterTurn * ms / kMoveTurnMs;
+        g_move_angle =
+            std::fabs(turn) <= step ? want : std::remainder(g_move_angle + std::copysign(step, turn), kFullTurn);
+    }
+    g_move_push = std::min(1.0f, g_move_push + std::min(ms, kMoveRampMs) / kMoveRampMs);
+    g_move_held_at = now;
+    return g_move_push;
+}
 
 }  // namespace
 
@@ -298,6 +436,7 @@ void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount])
     }
     held[kBindWalk] = held[kBindWalk] || g_walk_on_mouse.load(std::memory_order_relaxed);
     note_debug_key(0, held[kBindDebugMenu]);
+    note_zoom_keys(0, held);
 }
 
 void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
@@ -306,16 +445,20 @@ void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
         held[a] = m >= 1 && m <= kMouseInputs && (buttons & (1u << (m - 1)));
     }
     g_walk_on_mouse.store(held[kBindWalk], std::memory_order_relaxed);
+    g_roll_on_mouse.store(held[kBindRoll], std::memory_order_relaxed);
     note_debug_key(1, held[kBindDebugMenu]);
+    note_zoom_keys(1, held);
 }
 
-void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) {
+void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, int device,
+                         std::chrono::steady_clock::time_point now) {
     bool any = false;
+    const std::uint32_t before = p.buttons;  // what a controller holds, which a menu keeps
     for (int a = 0; a < kBindCount; ++a) {
-        // The Debug Menu key sets no pad bit: its press was queued when it was
-        // read, and the pad read toggles the menu on the game's thread
-        // (host_bind_take_debug_toggle).
-        if (!held[a] || a == kBindDebugMenu) continue;
+        // The Debug Menu key and the zoom set no pad bit: their presses were
+        // queued when they were read, and the pad read acts on them on the
+        // game's thread (host_bind_take_debug_toggle, host_bind_take_zoom).
+        if (!held[a] || a == kBindDebugMenu || a == kBindZoomIn || a == kBindZoomOut || a == kBindZoomReset) continue;
         any = true;
         std::uint32_t bit = kInfo[a].button;
         // Shift is the strong-attack modifier, as in DS3: one key rather than
@@ -323,7 +466,14 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) 
         if (a == kBindAttack && strong) bit = kR2;
         if (a == kBindConfirm) bit = menu_confirm_button();
         if (a == kBindBack) bit = menu_back_button();
+        const int where = host_binding_in_menus(a);
+        if (where > 0) {
+            // A menu's alone: the pad read adds it while a menu has the input.
+            p.menu_buttons |= bit;
+            continue;
+        }
         p.buttons |= bit;
+        if (where < 0) p.play_buttons |= bit & ~before;
         if (bit == kR2) p.r2 = 255;  // the triggers are analogue as well as buttons
         if (bit == kL2) p.l2 = 255;
         switch (a) {
@@ -351,18 +501,39 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) 
     // (as Dark Souls III's keys give) - or, with Walk held, a gentle push the
     // game reads as a walk, a diagonal's two axes shortened so that its reach,
     // and so the walk, is the same. Opposite keys cancel (keys_held above).
+    // The keyboard's stick ramps, and in a sprint turns, as a thumb moves it
+    // (move_stick): between the keys' own directions it runs along the
+    // square's edge (the walk's circle), never inside it.
     const int x = (held[kBindMoveR] ? 1 : 0) - (held[kBindMoveL] ? 1 : 0);
     const int y = (held[kBindMoveB] ? 1 : 0) - (held[kBindMoveF] ? 1 : 0);
-    if (x != 0 || y != 0) {
-        int reach = kStickHigh - kStickRest;
-        if (held[kBindWalk]) {
-            const float r = static_cast<float>(reach) * kWalkPush / (x != 0 && y != 0 ? std::sqrt(2.0f) : 1.0f);
-            reach = static_cast<int>(std::lround(r));
+    if (device == 0) {
+        const float push = move_stick(x, y, held[kBindRoll] || g_roll_on_mouse.load(std::memory_order_relaxed), now);
+        if (push > 0.0f) {
+            const float sx = std::sin(g_move_angle), sy = -std::cos(g_move_angle);
+            const float edge = held[kBindWalk] ? kWalkPush : 1.0f / std::max(std::fabs(sx), std::fabs(sy));
+            const float r = static_cast<float>(kStickHigh - kStickRest) * push * edge;
+            // An axis the keys do not push is left as a controller has it.
+            const long ix = std::lround(sx * r), iy = std::lround(sy * r);
+            if (ix != 0) p.lx = static_cast<std::uint8_t>(kStickRest + ix);
+            if (iy != 0) p.ly = static_cast<std::uint8_t>(kStickRest + iy);
         }
+    } else if (x != 0 || y != 0) {
+        float r = static_cast<float>(kStickHigh - kStickRest);
+        if (held[kBindWalk]) r *= kWalkPush / (x != 0 && y != 0 ? std::sqrt(2.0f) : 1.0f);
+        const int reach = static_cast<int>(std::lround(r));
         if (x != 0) p.lx = static_cast<std::uint8_t>(kStickRest + x * reach);
         if (y != 0) p.ly = static_cast<std::uint8_t>(kStickRest + y * reach);
     }
     if (any) p.connected = true;
+}
+
+void host_bindings_menu_pad(PadState& p) {
+    // The triggers are analogue as well as buttons.
+    if (p.play_buttons & kL2) p.l2 = 0;
+    if (p.play_buttons & kR2) p.r2 = 0;
+    p.buttons = (p.buttons & ~p.play_buttons) | p.menu_buttons;
+    if (p.menu_buttons & kL2) p.l2 = 255;
+    if (p.menu_buttons & kR2) p.r2 = 255;
 }
 
 void host_bind_capture_begin(int action) {
@@ -376,6 +547,9 @@ void host_bind_capture_begin(int action) {
 int host_bind_capturing() { return g_capture.load(std::memory_order_relaxed); }
 
 namespace {
+// Whether two actions can work at the same time, so must not share a key.
+bool contexts_meet(int a, int b) { return host_binding_in_menus(a) * host_binding_in_menus(b) != -1; }
+
 void finish(int a, const char* what) {
     g_serial.fetch_add(1, std::memory_order_relaxed);
     g_capture.store(-1, std::memory_order_relaxed);
@@ -404,9 +578,10 @@ bool host_bind_capture_key(int scancode) {
     }
 #endif
     // One key, one action: whatever had it gives it up, which is what a
-    // player rebinding a key means.
+    // player rebinding a key means - but a menu's action and play's may share
+    // one, since they never work at the same time.
     for (int b = 0; b < kBindCount; ++b) {
-        if (b != a && g_key[b].load(std::memory_order_relaxed) == scancode) {
+        if (b != a && g_key[b].load(std::memory_order_relaxed) == scancode && contexts_meet(a, b)) {
             g_key[b].store(0, std::memory_order_relaxed);
             host_log("keys: %s gives up that key", kInfo[b].key);
         }
@@ -429,7 +604,7 @@ bool host_bind_capture_mouse(int button) {
         return true;
     }
     for (int b = 0; b < kBindCount; ++b) {
-        if (b != a && g_mouse[b].load(std::memory_order_relaxed) == button) {
+        if (b != a && g_mouse[b].load(std::memory_order_relaxed) == button && contexts_meet(a, b)) {
             g_mouse[b].store(0, std::memory_order_relaxed);
             host_log("keys: %s gives up that button", kInfo[b].key);
         }
@@ -442,6 +617,53 @@ bool host_bind_capture_mouse(int button) {
 int host_bind_capture_take_done() { return g_capture_done.exchange(-1); }
 
 bool host_bind_take_debug_toggle() { return g_debug_toggle.exchange(false); }
+
+int host_bind_take_zoom(bool* reset) {
+    *reset = g_zoom_reset.exchange(false);
+    return g_zoom_steps.exchange(0);
+}
+
+void host_bind_queue_zoom(int steps, bool reset) {
+    g_zoom_steps.fetch_add(steps);
+    if (reset) g_zoom_reset.store(true);
+}
+
+void host_bindings_migrate_zoom() {
+    // Transform's old default, the middle button: Camera Zoom Reset's now.
+    if (g_mouse[kBindTransform].load() == 3 && g_mouse[kBindZoomReset].load() == 3) {
+        g_mouse[kBindTransform].store(0);
+        host_log("keys: the middle button is Camera Zoom Reset's now; Transform keeps its key");
+    }
+    // A wheel the player bound to an action stays that action's.
+    for (const int z : {static_cast<int>(kBindZoomIn), static_cast<int>(kBindZoomOut)}) {
+        const int m = g_mouse[z].load();
+        if (m < 1 || m > kMouseInputs) continue;
+        for (int a = 0; a < kBindCount; ++a) {
+            if (a == z || g_mouse[a].load() != m) continue;
+            g_mouse[z].store(0);
+            host_log("keys: %s is %s's: %s left without it", kMouseNames[m], kInfo[a].key, kInfo[z].key);
+            break;
+        }
+    }
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+}
+
+void host_bindings_migrate_menu_keys() {
+    // The menu pages and options are new: an options file from before them
+    // carries none, so they start on their defaults - unless the player put a
+    // key there on an action that works in menus too, which keeps it.
+    for (int a = kBindMenuPageL; a <= kBindMenuStatus; ++a) {
+        const int k = g_key[a].load();
+        if (!k) continue;
+        for (int b = 0; b < kBindCount; ++b) {
+            if (b == a || g_key[b].load() != k || !contexts_meet(a, b)) continue;
+            g_key[a].store(0);
+            host_log("keys: %s is %s's: %s left without it", scancode_name(k) ? scancode_name(k) : "?", kInfo[b].key, kInfo[a].key);
+            break;
+        }
+    }
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+}
 
 bool host_bind_capture_blocking() {
     return g_capture.load(std::memory_order_relaxed) >= 0 || g_hold.load(std::memory_order_relaxed);

@@ -525,11 +525,15 @@ GUEST_ABI void hle_xbad_alloc() {
     std::abort();
 }
 GUEST_ABI void hle_xlength(const char* s) {
-    host_log("length_error %s", s ? s : "");
+    host_log("length_error %s (called from 0x%llx < 0x%llx < 0x%llx < 0x%llx)", s ? s : "",
+             static_cast<unsigned long long>(hle_guest_return(0)), static_cast<unsigned long long>(hle_guest_return(1)),
+             static_cast<unsigned long long>(hle_guest_return(2)), static_cast<unsigned long long>(hle_guest_return(3)));
     std::abort();
 }
 GUEST_ABI void hle_xrange(const char* s) {
-    host_log("out_of_range %s", s ? s : "");
+    host_log("out_of_range %s (called from 0x%llx < 0x%llx < 0x%llx < 0x%llx)", s ? s : "",
+             static_cast<unsigned long long>(hle_guest_return(0)), static_cast<unsigned long long>(hle_guest_return(1)),
+             static_cast<unsigned long long>(hle_guest_return(2)), static_cast<unsigned long long>(hle_guest_return(3)));
     std::abort();
 }
 GUEST_ABI void hle_xbad_function() {

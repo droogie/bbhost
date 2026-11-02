@@ -9,6 +9,7 @@
 #include "hle/modules.h"
 #include "core/thunk.h"
 #include "core/write_watch.h"
+#include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
 #include "engine/mouse_camera.h"
@@ -1467,6 +1468,10 @@ GUEST_ABI int hle_lookup_npid(int, const void* online, void* npid, void*) {
 // The buttons the last scePadRead handed the game, for the port's own menu
 // rows, which act on a press the game also sees (engine/option_menu.cpp).
 std::atomic<std::uint32_t> g_pad_delivered{0};
+// When Cross or Circle last went down in g_pad_delivered (steady_clock ticks;
+// 0 = never), so a box can tell a fresh press from one still held from the
+// window before it (engine/menu_close.cpp).
+std::atomic<std::int64_t> g_confirm_down{0};
 
 GUEST_ABI int hle_pad_init() { return 0; }
 GUEST_ABI int hle_pad_open(int user, int type, int index, const void*) {
@@ -1484,6 +1489,13 @@ GUEST_ABI int hle_pad_close(int) { return 0; }
 }  // namespace
 
 std::uint32_t hle_pad_delivered_buttons() { return g_pad_delivered.load(std::memory_order_relaxed); }
+
+double hle_pad_confirm_press_age() {
+    const std::int64_t at = g_confirm_down.load(std::memory_order_relaxed);
+    if (!at) return 1e9;
+    const std::int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::chrono::duration<double>(std::chrono::steady_clock::duration(now - at)).count();
+}
 
 namespace {
 
@@ -1550,6 +1562,23 @@ std::uint32_t wheel_presses(float notches) {
         }
     }
     return bit;
+}
+
+// The wheel's notches on a direction bound to Camera Zoom In or Out go to the
+// zoom whole, every one as it comes (host_bind_queue_zoom), not as presses: a
+// press and its gap take 110 ms, and a spin of the wheel is many notches. What
+// is left - a direction bound to something else - is for wheel_presses.
+float wheel_zoom(float notches) {
+    static float part = 0.0f;
+    const int up = notches > 0.0f ? 6 : 7;  // the mouse input the turn is
+    const int zoom_in = host_binding_mouse(kBindZoomIn), zoom_out = host_binding_mouse(kBindZoomOut);
+    if (notches == 0.0f || (up != zoom_in && up != zoom_out)) return notches;
+    if ((part > 0.0f) != (notches > 0.0f)) part = 0.0f;  // turned back: the other way's fraction goes
+    part += notches;
+    const int whole = static_cast<int>(part);  // toward zero
+    part -= static_cast<float>(whole);
+    if (whole) host_bind_queue_zoom(up == zoom_in ? -std::abs(whole) : std::abs(whole), false);
+    return 0.0f;
 }
 
 GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
@@ -1628,7 +1657,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                     ++flogs;
                     host_log("mouse: the lock-on flick on the right stick: %u,%u", p.rx, p.ry);
                 }
-            } else if (!mouse_camera_installed() && (m.dx != 0.0f || m.dy != 0.0f)) {
+            } else if (!mouse_camera_installed() && !host_plugin_taken_motion() && (m.dx != 0.0f || m.dy != 0.0f)) {
                 const float sx = hs.mouse_invert_x ? -1.0f : 1.0f;
                 const float sy = hs.mouse_invert_y ? -1.0f : 1.0f;
                 p.rx = axis(static_cast<float>(p.rx) - kStickRest + sx * m.dx * 1.1f);
@@ -1652,9 +1681,11 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             // wheel, which has no held state of its own: each notch is a
             // press of whatever is bound to it (host/bindings.h), long enough
             // for the game to see at 30 fps and with a gap before the next, so
-            // two notches are two presses.
-            host_bindings_mouse_held(m.buttons | m.pressed | wheel_presses(m.wheel), held);
-            host_bindings_apply(held, host_key_strong(), p);
+            // two notches are two presses. Less what a plugin with controls
+            // of its own has taken (plugin API 13): those it reads itself.
+            const std::uint32_t mine = (m.buttons | m.pressed) & ~host_plugin_taken_buttons();
+            host_bindings_mouse_held(mine | wheel_presses(host_plugin_taken_wheel() ? 0.0f : wheel_zoom(m.wheel)), held);
+            host_bindings_apply(held, host_key_strong(), p, 1);
             // On a change only: a held button is seen on every pad read, and
             // logging each one spent the whole budget on the first press.
             static std::uint32_t last_buttons = 0;
@@ -1666,10 +1697,14 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             }
         }
     }
-    // The keys that always work a menu (host/window.h), only while one is -
-    // the debug menu included, which is up over the world.
-    if (p.menu_buttons && (menu_pointer_in_menu() || debug_menu_open())) {
-        p.buttons |= p.menu_buttons;
+    // The keys that always work a menu and the menu actions' keys
+    // (host/window.h), only while one is - the debug menu included, which is
+    // up over the world - and then without the keyboard's play-only actions:
+    // what the shoulders and two face buttons do in a menu (its tabs, its
+    // shortcuts, its switches) comes from the menu's own keys, not from Strong
+    // Attack's or the firearm's (host/bindings.h host_binding_in_menus).
+    if ((p.menu_buttons || p.play_buttons) && (menu_pointer_in_menu() || debug_menu_open())) {
+        host_bindings_menu_pad(p);
     }
     // A text box over the game (the IME dialog's, host/window.h) holds the
     // pointer as it holds the pad: a click or a wheel notch there is the
@@ -1731,6 +1766,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (m.pressed & 2u) want |= menu_back_button();  // right returns
             if (m.wheel > 0.0f) want |= 0x10u;     // wheel up -> Up
             if (m.wheel < 0.0f) want |= 0x40u;     // wheel down -> Down
+            if (m.wheel != 0.0f) menu_pointer_wheel();  // and hover waits for the pointer to move off
             if (want) {
                 held = want;
                 hold_polls = 8;
@@ -1747,6 +1783,10 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (hold_polls > 0 || hle_video_flip_count() < hold_until_flip) {
                 if (hold_polls > 0) --hold_polls;
                 p.buttons |= held;
+                // The triggers are analogue as well as buttons (the storage
+                // box's two tabs press L2 and R2).
+                if (held & 0x100u) p.l2 = 255;
+                if (held & 0x200u) p.r2 = 255;
             }
             p.buttons |= repeat;
             // Hover is not here: it happens inside the menu's own list update, where
@@ -1975,7 +2015,11 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         p.connected = connected;
         p.timestamp = ts;
     }
-    g_pad_delivered.store(p.buttons, std::memory_order_relaxed);
+    {
+        const std::uint32_t was = g_pad_delivered.exchange(p.buttons, std::memory_order_relaxed);
+        if (p.buttons & ~was & 0x6000u)  // Cross or Circle went down
+            g_confirm_down.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    }
     // The Debug Menu key, on the thread that reads the pad (engine/debug_menu.h).
     // BBHOST_DEBUG_MENU_AT=N (a test aid) presses it once at flip N; the pad
     // then works the open menu, so BBHOST_AUTOPRESS can walk its pages.
@@ -1988,6 +2032,14 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     if (scripted) debug_pressed = true;
     if (host_bind_take_debug_toggle() || scripted) {
         debug_menu_toggle();
+    }
+    // The camera zoom's presses (the wheel and the middle button by default),
+    // in the world only: one made in a menu is dropped.
+    bool zoom_reset = false;
+    const int zoom_steps = host_bind_take_zoom(&zoom_reset);
+    if ((zoom_steps || zoom_reset) && !host_bind_capture_blocking() && !host_options_open() && !ingame_menu_open() &&
+        !menu_pointer_in_menu() && !host_text_entry_open() && !debug_menu_open()) {
+        camera_zoom(zoom_steps, zoom_reset);
     }
     std::memcpy(st + 0, &p.buttons, 4);
     st[4] = p.lx;

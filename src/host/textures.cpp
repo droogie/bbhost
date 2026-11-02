@@ -2,6 +2,7 @@
 // stage's user data become Vulkan images (untiled on upload) and samplers.
 // Render targets sampled as textures alias the render target image.
 #include "host/apu_memory.h"
+#include "host/copy_census.h"
 #include "host/gpu_internal.h"
 #include "host/heap_compact.h"
 
@@ -593,6 +594,10 @@ struct Surface {
     // The last upload's untile and hashes, while the prep pool still has them
     // (TexturePrep); settle_prep() takes the hashes.
     std::shared_ptr<struct TexturePrep> prep;
+    // Made ahead, its upload's GPU work not recorded yet: it is recorded once its prep has copied the tiled bytes
+    // (BBHOST_GXVK_AHEAD_DEFER, PendingUpload). Until then the image is UNDEFINED, and whatever uses it records the
+    // upload first (record_pending_locked).
+    std::shared_ptr<struct PendingUpload> pending;
 };
 
 std::uint64_t now_ms() {
@@ -868,6 +873,8 @@ struct TexturePrep {
     // well, the GPU untile's source in place of an import of guest memory.
     std::uint8_t* src_copy = nullptr;
     std::atomic<int> state{0};  // 0 queued, 1 running, 2 done; changed under PrepPool's mutex
+    // Stage 2d's census (prep_census::tag): where the upload came from and what the prep does.
+    std::uint8_t origin = 0, kind = 0;
 };
 
 const bool g_tex_async = [] {
@@ -1040,17 +1047,56 @@ inline bool on() {
 void blocked(Class c) {
     if (on()) g_waits[c].fetch_add(1, std::memory_order_relaxed);
 }
+// Stage 2d's census: every prep by where its upload came from - a bind's first upload (the command processor), made
+// ahead at the GX resource's creation (the creating thread), or a re-upload - and what it does: copy the tiled bytes
+// into staging for the GPU's untile (window imports), untile on the CPU, or only hash (the GPU untiles from guest
+// memory); queued, and the waits that blocked - at the submission (a batch's) or at a refresh (settle_prep) - with how
+// long they blocked.
+enum Origin : int { kOrBind, kOrAhead, kOrAgain, kOrigins };
+enum Kind : int { kKindWindowCopy, kKindCpuUntile, kKindHashOnly, kKinds };
+const char* const kOriginName[kOrigins] = {"a bind's first upload", "made ahead at creation", "a re-upload"};
+const char* const kKindName[kKinds] = {"copy for the GPU untile (window imports)", "CPU untile", "hash only"};
+std::atomic<std::uint64_t> g_queued[kOrigins][kKinds] = {}, g_queued_bytes[kOrigins][kKinds] = {};
+std::atomic<std::uint64_t> g_blocked[2][kOrigins][kKinds] = {}, g_blocked_us[2][kOrigins][kKinds] = {}, g_blocked_max_us[2] = {};
+void tag(TexturePrep& p, int origin, std::size_t bytes) {
+    p.origin = static_cast<std::uint8_t>(origin);
+    p.kind = static_cast<std::uint8_t>(p.src_copy ? kKindWindowCopy : p.hash_only ? kKindHashOnly : kKindCpuUntile);
+    if (!on()) return;
+    g_queued[p.origin][p.kind].fetch_add(1, std::memory_order_relaxed);
+    g_queued_bytes[p.origin][p.kind].fetch_add(bytes, std::memory_order_relaxed);
+}
+// A wait at `site` (0 the submission's, 1 a refresh's) for p, timed when it blocks.
+void timed_wait(TexturePrep& p, int site) {
+    if (!on() || prep_done(p)) {
+        PrepPool::get().wait(p);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    PrepPool::get().wait(p);
+    const std::uint64_t us = us_since(t0);
+    g_blocked[site][p.origin][p.kind].fetch_add(1, std::memory_order_relaxed);
+    g_blocked_us[site][p.origin][p.kind].fetch_add(us, std::memory_order_relaxed);
+    for (std::uint64_t m = g_blocked_max_us[site].load(std::memory_order_relaxed);
+         us > m && !g_blocked_max_us[site].compare_exchange_weak(m, us, std::memory_order_relaxed);) {
+    }
+}
 }  // namespace prep_census
 
-// The surface's last upload, finished: its hashes are the surface's.
-void settle_prep(Surface& sf) {
+// The surface's last upload, finished: its hashes are the surface's. `site`: who asks (the 2d census's settles).
+namespace prep_census {
+enum SettleSite : int { kSettleOther, kSettleWatchVerify, kSettleRefresh, kSettleCarry, kSettleWriteback, kSettleSites };
+const char* const kSettleName[kSettleSites] = {"another", "the write watch's check", "a refresh's hash", "a carry", "a writeback"};
+std::atomic<std::uint64_t> g_settle_blocked[kSettleSites] = {};
+}  // namespace prep_census
+void settle_prep(Surface& sf, int site = prep_census::kSettleOther) {
     if (!sf.prep) return;
+    if (prep_census::on() && !prep_done(*sf.prep)) prep_census::g_settle_blocked[site].fetch_add(1, std::memory_order_relaxed);
     if (prep_census::on() && !prep_done(*sf.prep))
         prep_census::blocked(!sf.gx_registered ? prep_census::kNotGx
                              : sf.ahead       ? prep_census::kGxAhead
                              : sf.uploads > 1 ? prep_census::kGxAgain
                                               : prep_census::kGxFirst);
-    PrepPool::get().wait(*sf.prep);
+    prep_census::timed_wait(*sf.prep, 1);
     sf.content_hash = sf.prep->content_hash;
     sf.exact_hash = sf.prep->exact_hash;
     sf.prep.reset();
@@ -1155,10 +1201,280 @@ void static_changed(Surface& sf) {
     ++g_static_epoch;
     ++g_static_changes;
 }
-bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
+// An upload's GPU work: what upload_surface (or a made-ahead upload's record) planned, recorded by
+// record_upload_locked.
+struct UploadRecord {
+    bool in_vram = false, on_gpu = false;
+    Located vram_src;                  // in_vram: the tiled bytes (upload staging the prep fills, or the import)
+    DevBuffer vram;                    // in_vram: the scratch span - the tiled copy, then the linear result
+    VkDeviceSize vram_off = 0;
+    std::uint64_t vram_src_span = 0;
+    DevBuffer staging;                 // otherwise: the linear result (the GPU untile's or the CPU's)
+    VkDeviceSize staging_offset = 0;
+    DevBuffer cpu_copy;                // BBHOST_GPU_UNTILE=2: the CPU's untile of the same upload, compared later
+    std::vector<UntileGpuPass> passes;
+};
+
+// The upload recorded into the current recording: the tiled bytes across the bus into scratch, the GPU's untile,
+// the copy into the image. `undefined`: the image holds nothing yet.
+void record_upload_locked(Surface& sf, const UploadRecord& u, VkImageAspectFlags aspect, bool undefined) {
+    const auto t_part = std::chrono::steady_clock::now();
+    begin_recording_locked();
+    render_end_pass_locked();
+    if (u.in_vram) {
+        // Whatever wrote the guest bytes on the GPU before this is done, then
+        // they cross the bus once.
+        VkMemoryBarrier rb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, nullptr, 0, nullptr);
+        static const std::string fetch_name = "tex-fetch";
+        profile_begin_locked(&fetch_name);
+        const VkBufferCopy fetch{u.vram_src.offset, u.vram_off, sf.total_src};
+        vkCmdCopyBuffer(g_cmd(), u.vram_src.buffer, u.vram.buffer, 1, &fetch);
+        profile_end_locked();
+        VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0, nullptr);
+        g_untiled_vram.fetch_add(1, std::memory_order_relaxed);
+        g_untiled_vram_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
+    }
+    if (u.on_gpu) {
+        if (u.cpu_copy.map) {
+            // A compare: the GPU's span starts from zeros as the CPU's copy
+            // did, so elements neither writes (past a 2D slice) agree.
+            vkCmdFillBuffer(g_cmd(), u.staging.buffer, u.staging_offset, (sf.total_dst + 3) & ~std::size_t{3}, 0);
+            VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0,
+                                 nullptr);
+            g.slots[g.slot].untile_checks.push_back(
+                {static_cast<const std::uint8_t*>(u.staging.map), static_cast<const std::uint8_t*>(u.cpu_copy.map), sf.total_dst, sf.base});
+        }
+        // BBHOST_GPU_PROFILE: the untile and the copy as entries of their own.
+        static const std::string untile_name = "tex-untile";
+        profile_begin_locked(&untile_name);
+        for (const UntileGpuPass& pass : u.passes) untile_gpu_record_locked(pass);
+        profile_end_locked();
+        VkMemoryBarrier ub{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ub.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        ub.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ub, 0, nullptr, 0, nullptr);
+        g_gpu_untiled.fetch_add(1, std::memory_order_relaxed);
+        g_gpu_untiled_bytes.fetch_add(sf.total_dst, std::memory_order_relaxed);
+    }
+    const std::uint32_t layers = sf.type == 10 ? 1 : sf.layers;
+    const std::uint32_t nlevels = static_cast<std::uint32_t>(sf.levels.size());
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = undefined ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = sf.image;
+    b.subresourceRange = {aspect, 0, nlevels, 0, layers};
+    b.srcAccessMask = undefined ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t l = 0; l < nlevels; ++l) {
+        const Surface::Level& lv = sf.levels[l];
+        for (std::uint32_t sl = 0; sl < layers; ++sl) {
+            VkBufferImageCopy r{};
+            r.bufferOffset = (u.in_vram ? u.vram_off + u.vram_src_span : u.staging_offset) + lv.dst_off + sl * lv.dst_slice_bytes;
+            r.imageSubresource = {aspect, l, sl, 1};
+            r.imageExtent = {std::max(1u, sf.width >> l), (sf.type == 8 || sf.type == 12) ? 1u : std::max(1u, sf.height >> l),
+                             sf.type == 10 ? std::max(1u, sf.depth >> l) : 1u};
+            regions.push_back(r);
+        }
+    }
+    static const std::string upload_copy_name = "tex-upload-copy";
+    profile_begin_locked(&upload_copy_name);
+    vkCmdCopyBufferToImage(g_cmd(), u.in_vram ? u.vram.buffer : u.staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<std::uint32_t>(regions.size()), regions.data());
+    profile_end_locked();
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    // The staging span is free for reuse once this command buffer retired.
+    g_tex_record_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
+}
+
+// An upload's prep: the surface's source and layout (the caller says where the untile goes, or that it only hashes).
+std::shared_ptr<TexturePrep> new_prep(const Surface& sf, const std::uint8_t* src) {
+    auto prep = std::make_shared<TexturePrep>();
+    prep->src = src;
+    prep->base = sf.base;
+    prep->levels = sf.levels;
+    prep->slices = sf.slices;
+    prep->esize = sf.esize;
+    prep->width = sf.width;
+    prep->height = sf.height;
+    prep->tiling = sf.tiling;
+    prep->total_src = sf.total_src;
+    prep->total_dst = sf.total_dst;
+    return prep;
+}
+
+// What every upload leaves on its surface, recorded now or later.
+void uploaded(Surface& sf) {
+    sf.exact_at_ms = now_ms();
+    sf.checked_at_ms = now_ms();
+    ++sf.uploads;
+    static_changed(sf);
+    g_uploads.fetch_add(1);
+    g_upload_bytes.fetch_add(sf.total_dst);
+}
+
+// Stage 2d, BBHOST_GXVK_AHEAD_DEFER: 1 (the default) a texture made ahead at its GX resource's creation whose tiled
+// bytes reach the GPU through upload staging (window imports) has its upload's GPU work - the copy into scratch, the
+// untile and the image copy - recorded once the prep pool has copied those bytes into staging: at the first
+// submission after that, or before anything uses the image (a binding, an upload token, a fill, a move, a dump), which
+// waits for the copy if it is still running. Recorded at the creation, as with 0, the submission it went into waited
+// for the copy: an arrival makes hundreds ahead at once, and most are never bound. 1 also drops the carry's wait for
+// the upload it has just queued (carry_surface_locked takes its hashes again at once). 2 as 1, and counts every
+// binding that meets an image whose upload is still to be recorded (none should).
+const int g_ahead_defer = [] {
+    const char* e = std::getenv("BBHOST_GXVK_AHEAD_DEFER");
+    return e && *e ? std::atoi(e) : 1;
+}();
+// Made ahead with window imports: it may wait for its copy with its recording, and does.
+thread_local bool t_defer_ok = false;
+
+struct PendingUpload {
+    std::shared_ptr<TexturePrep> prep;  // copies the tiled bytes into the span, and hashes them
+    DevBuffer chunk;                    // the upload staging chunk the span is in, held (staging_hold_locked)
+    VkDeviceSize offset = 0;            // the span's offset in it
+    std::uint64_t base = 0;             // its surface's
+    std::uint64_t made_in = 0;          // the submission it was made in (Gpu::flushes)
+    bool dropped = false;               // its surface went first: the hold ends once the prep has written the span
+    bool done = false;                  // recorded, or its hold ended
+};
+// In the order they were made; the done ones leave at the next submission's sweep (textures_record_ahead_locked).
+std::vector<std::shared_ptr<PendingUpload>> g_pending_uploads;
+
+namespace ahead_defer {
+enum Site : int { kAtSubmission, kAtBind, kAtAhead, kAtUploadToken, kAtFill, kAtMove, kAtDump, kAtStore, kSites };
+const char* const kSiteName[kSites] = {"a submission", "a binding",  "the creating thread", "an upload token",
+                                       "a fill",       "a move",     "a dump",              "a shader's store"};
+std::atomic<std::uint64_t> g_deferred{0}, g_deferred_bytes{0}, g_recorded[kSites] = {}, g_waited[kSites] = {}, g_wait_us[kSites] = {};
+std::atomic<std::uint64_t> g_bound_in_made{0};  // recorded at a binding in the submission they were made in
+std::atomic<std::uint64_t> g_dropped{0}, g_no_scratch{0}, g_failed{0}, g_most{0}, g_met_pending{0}, g_lost{0};
+std::atomic<std::uint64_t> g_part_stops{0};  // run parts' draws (BBHOST_RUN_COMMIT) that stopped at one, recorded in order
+// BBHOST_GXVK_AHEAD_DEFER=2: a binding that found its image's upload still to be recorded (`where`). A run part's
+// draw that stopped (BBHOST_RUN_COMMIT) leaves it for its commit in order, which records it: not counted.
+void met_pending(const Surface& sf, const char* where) {
+    if (g_ahead_defer != 2 || !sf.pending || run_part_stopped()) return;
+    if (g_met_pending.fetch_add(1, std::memory_order_relaxed) < 8)
+        host_log("texture: made ahead 0x%llx %ux%u bound by %s with its upload still to be recorded", static_cast<unsigned long long>(sf.base),
+                 sf.width, sf.height, where);
+}
+}  // namespace ahead_defer
+
+// p's upload (its prep done) recorded into the current recording, through scratch as upload_surface would have.
+// Without scratch (video memory down to the reserve) the untile reads the staged copy and writes upload staging (the
+// layout is one the GPU untile takes: defer_upload_locked asked). False: no staging for that.
+bool record_pending_upload_locked(Surface& sf, const PendingUpload& p) {
+    UploadRecord u;
+    u.on_gpu = true;
+    u.vram_src_span = (sf.total_src + 255) & ~std::uint64_t{255};
+    if (acquire_scratch_locked(u.vram, u.vram_src_span + sf.total_dst, u.vram_off) &&
+        gpu_untile_plan(sf, u.vram.address + u.vram_off + u.vram_src_span, u.passes, u.vram.address + u.vram_off)) {
+        u.in_vram = true;
+        u.vram_src = Located{p.chunk.buffer, p.offset, sf.total_src};
+    } else {
+        u.passes.clear();
+        ahead_defer::g_no_scratch.fetch_add(1, std::memory_order_relaxed);
+        if (!acquire_staging_locked(u.staging, sf.total_dst, u.staging_offset) ||
+            !gpu_untile_plan(sf, u.staging.address + u.staging_offset, u.passes, p.chunk.address + p.offset))
+            return false;
+    }
+    record_upload_locked(sf, u, VK_IMAGE_ASPECT_COLOR_BIT, true);
+    return true;
+}
+
+// Before anything uses sf's image: its made-ahead upload recorded, its copy waited for if still running (`site`).
+void record_pending_locked(Surface& sf, int site) {
+    if (!sf.pending) return;
+    const std::shared_ptr<PendingUpload> p = std::move(sf.pending);
+    sf.pending.reset();
+    if (!prep_done(*p->prep)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        prep_census::blocked(prep_census::kGxAhead);
+        prep_census::timed_wait(*p->prep, 1);
+        ahead_defer::g_waited[site].fetch_add(1, std::memory_order_relaxed);
+        ahead_defer::g_wait_us[site].fetch_add(us_since(t0), std::memory_order_relaxed);
+    }
+    const bool recorded = record_pending_upload_locked(sf, *p);
+    staging_hold_end_locked(p->chunk, recorded);
+    p->done = true;
+    if (!recorded) {
+        // No staging for the untile's result: the image would stay UNDEFINED, so the surface fails, as an upload with
+        // no staging does.
+        sf.failed = true;
+        if (ahead_defer::g_failed.fetch_add(1, std::memory_order_relaxed) < 4)
+            host_log("texture: made ahead 0x%llx %ux%u: no upload staging to record its upload in; the surface fails",
+                     static_cast<unsigned long long>(sf.base), sf.width, sf.height);
+        return;
+    }
+    ahead_defer::g_recorded[site].fetch_add(1, std::memory_order_relaxed);
+    if (site == ahead_defer::kAtBind && p->made_in == g.flushes) ahead_defer::g_bound_in_made.fetch_add(1, std::memory_order_relaxed);
+}
+
+// p's surface goes (erased, or a new upload replaces this one) with it never recorded: its staging goes back once
+// the prep is done writing it.
+void drop_pending_locked(PendingUpload& p) {
+    if (p.done || p.dropped) return;
+    p.dropped = true;
+    ahead_defer::g_dropped.fetch_add(1, std::memory_order_relaxed);
+    if (!prep_done(*p.prep)) return;  // the sweep ends the hold
+    staging_hold_end_locked(p.chunk, false);
+    p.done = true;
+}
+
+// Made ahead with window imports (upload_surface): the tiled bytes copied into upload staging by the prep pool, and
+// the upload's GPU work recorded once that is done. False: not here (upload_surface goes on as before).
+bool defer_upload_locked(Surface& sf, const std::uint8_t* src) {
+    std::vector<UntileGpuPass> probe;
+    if (!gpu_untile_plan(sf, 256, probe, 256)) return false;  // a layout the GPU untile takes (the addresses come later)
+    DevBuffer span;
+    VkDeviceSize offset = 0;
+    if (!acquire_staging_locked(span, sf.total_src, offset)) return false;
+    auto p = std::make_shared<PendingUpload>();
+    p->chunk = staging_hold_locked(span.buffer);
+    if (!p->chunk.buffer) return false;  // (the span goes with this recording, unused)
+    p->offset = offset;
+    p->base = sf.base;
+    p->made_in = g.flushes;
+    std::shared_ptr<TexturePrep> prep = new_prep(sf, src);
+    prep->src_copy = static_cast<std::uint8_t*>(span.map);
+    prep->hash_only = true;
+    prep_census::tag(*prep, prep_census::kOrAhead, sf.total_src);
+    PrepPool::get().submit(prep);
+    sf.prep = prep;
+    p->prep = std::move(prep);
+    sf.pending = p;
+    g_pending_uploads.push_back(std::move(p));
+    ahead_defer::g_deferred.fetch_add(1, std::memory_order_relaxed);
+    ahead_defer::g_deferred_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
+    if (g_pending_uploads.size() > ahead_defer::g_most.load(std::memory_order_relaxed))
+        ahead_defer::g_most.store(g_pending_uploads.size(), std::memory_order_relaxed);
+    return true;
+}
+
+bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first, bool deferrable = false) {
     // An earlier upload still being prepared fills its own staging span (the
     // submission waits for it); its hashes are superseded by this one's.
     sf.prep.reset();
+    // A made-ahead upload never recorded is superseded too: the image still holds nothing.
+    bool undefined = first;
+    if (sf.pending) {
+        drop_pending_locked(*sf.pending);
+        sf.pending.reset();
+        undefined = true;
+    }
     if (!hle_kernel_va_mapped(sf.base, sf.total_src)) return false;
     if (sf.width >= 16 && sf.height >= 16) {
         tex_event(sf.base, sf.total_src, "upload 0x%llx %ux%u vkformat %d %zu level(s)%s%s", static_cast<unsigned long long>(sf.base), sf.width,
@@ -1220,6 +1536,12 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     DevBuffer src_stage;
     VkDeviceSize src_stage_off = 0;
     const ImportSite site("a texture's source");
+    if (deferrable && g_ahead_defer && first && t_force_async && staged_src && g_gpu_untile == 1 && g_untile_vram && !g_untile_check &&
+        sf.base != tex_probe_base() && untile_gpu_available_locked() && defer_upload_locked(sf, src)) {
+        g_tex_staging_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
+        uploaded(sf);
+        return true;
+    }
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
         (staged_src || guest_device_address(sf.base, sf.total_src))) {
         if (staged_src) {
@@ -1235,18 +1557,8 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     }
     if (!in_vram && !acquire_staging_locked(staging, sf.total_dst, staging_offset)) return false;
     g_tex_staging_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
-    auto prep = std::make_shared<TexturePrep>();
-    prep->src = src;
+    std::shared_ptr<TexturePrep> prep = new_prep(sf, src);
     prep->dst = static_cast<std::uint8_t*>(staging.map);  // null on the device-local route: the prep only hashes
-    prep->base = sf.base;
-    prep->levels = sf.levels;
-    prep->slices = sf.slices;
-    prep->esize = sf.esize;
-    prep->width = sf.width;
-    prep->height = sf.height;
-    prep->tiling = sf.tiling;
-    prep->total_src = sf.total_src;
-    prep->total_dst = sf.total_dst;
     if (in_vram && staged_src) prep->src_copy = static_cast<std::uint8_t*>(src_stage.map);  // (the map is the placement's own)
     // On the GPU where it can: the prep only hashes the source, off this
     // thread, and nothing waits for it before the submission - unless it
@@ -1270,6 +1582,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     if (on_gpu) {
         if (!cpu_copy.map) {
             prep->hash_only = true;
+            prep_census::tag(*prep, t_force_async ? prep_census::kOrAhead : first ? prep_census::kOrBind : prep_census::kOrAgain, sf.total_src);
             PrepPool::get().submit(prep);
             if (prep->src_copy) g_batch_preps.push_back(prep);  // the staged source is read by this submission
             sf.prep = prep;
@@ -1278,6 +1591,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     // The checks compare two snapshots of the memory; the probe reads it
     // here: both as the command processor always did.
     if ((g_tex_async || t_force_async) && !g_untile_check && sf.base != tex_probe_base()) {
+        prep_census::tag(*prep, t_force_async ? prep_census::kOrAhead : first ? prep_census::kOrBind : prep_census::kOrAgain, sf.total_src);
         PrepPool::get().submit(prep);
         g_batch_preps.push_back(prep);
         sf.prep = prep;
@@ -1289,94 +1603,19 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
         sf.content_hash = prep->content_hash;
         sf.exact_hash = prep->exact_hash;
     }
-    t_part = std::chrono::steady_clock::now();
-    begin_recording_locked();
-    render_end_pass_locked();
-    if (in_vram) {
-        // Whatever wrote the guest bytes on the GPU before this is done, then
-        // they cross the bus once.
-        VkMemoryBarrier rb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        rb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, nullptr, 0, nullptr);
-        static const std::string fetch_name = "tex-fetch";
-        profile_begin_locked(&fetch_name);
-        const VkBufferCopy fetch{vram_src.offset, vram_off, sf.total_src};
-        vkCmdCopyBuffer(g_cmd(), vram_src.buffer, vram.buffer, 1, &fetch);
-        profile_end_locked();
-        VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0, nullptr);
-        g_untiled_vram.fetch_add(1, std::memory_order_relaxed);
-        g_untiled_vram_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
-    }
-    if (on_gpu) {
-        if (cpu_copy.map) {
-            // A compare: the GPU's span starts from zeros as the CPU's copy
-            // did, so elements neither writes (past a 2D slice) agree.
-            vkCmdFillBuffer(g_cmd(), staging.buffer, staging_offset, (sf.total_dst + 3) & ~std::size_t{3}, 0);
-            VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            fb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0,
-                                 nullptr);
-            g.slots[g.slot].untile_checks.push_back(
-                {static_cast<const std::uint8_t*>(staging.map), static_cast<const std::uint8_t*>(cpu_copy.map), sf.total_dst, sf.base});
-        }
-        // BBHOST_GPU_PROFILE: the untile and the copy as entries of their own.
-        static const std::string untile_name = "tex-untile";
-        profile_begin_locked(&untile_name);
-        for (const UntileGpuPass& pass : passes) untile_gpu_record_locked(pass);
-        profile_end_locked();
-        VkMemoryBarrier ub{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        ub.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        ub.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ub, 0, nullptr, 0, nullptr);
-        g_gpu_untiled.fetch_add(1, std::memory_order_relaxed);
-        g_gpu_untiled_bytes.fetch_add(sf.total_dst, std::memory_order_relaxed);
-    }
-    const std::uint32_t layers = sf.type == 10 ? 1 : sf.layers;
-    const std::uint32_t nlevels = static_cast<std::uint32_t>(sf.levels.size());
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.oldLayout = first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = sf.image;
-    b.subresourceRange = {aspect, 0, nlevels, 0, layers};
-    b.srcAccessMask = first ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    std::vector<VkBufferImageCopy> regions;
-    for (std::uint32_t l = 0; l < nlevels; ++l) {
-        const Surface::Level& lv = sf.levels[l];
-        for (std::uint32_t sl = 0; sl < layers; ++sl) {
-            VkBufferImageCopy r{};
-            r.bufferOffset = (in_vram ? vram_off + vram_src_span : staging_offset) + lv.dst_off + sl * lv.dst_slice_bytes;
-            r.imageSubresource = {aspect, l, sl, 1};
-            r.imageExtent = {std::max(1u, sf.width >> l), (sf.type == 8 || sf.type == 12) ? 1u : std::max(1u, sf.height >> l),
-                             sf.type == 10 ? std::max(1u, sf.depth >> l) : 1u};
-            regions.push_back(r);
-        }
-    }
-    static const std::string upload_copy_name = "tex-upload-copy";
-    profile_begin_locked(&upload_copy_name);
-    vkCmdCopyBufferToImage(g_cmd(), in_vram ? vram.buffer : staging.buffer, sf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           static_cast<std::uint32_t>(regions.size()), regions.data());
-    profile_end_locked();
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    // The staging span is free for reuse once this command buffer retired.
-    g_tex_record_us.fetch_add(us_since(t_part), std::memory_order_relaxed);
-    sf.exact_at_ms = now_ms();
-    sf.checked_at_ms = now_ms();
-    ++sf.uploads;
-    static_changed(sf);
-    g_uploads.fetch_add(1);
-    g_upload_bytes.fetch_add(sf.total_dst);
+    UploadRecord u;
+    u.in_vram = in_vram;
+    u.on_gpu = on_gpu;
+    u.vram_src = vram_src;
+    u.vram = vram;
+    u.vram_off = vram_off;
+    u.vram_src_span = vram_src_span;
+    u.staging = staging;
+    u.staging_offset = staging_offset;
+    u.cpu_copy = cpu_copy;
+    u.passes = std::move(passes);
+    record_upload_locked(sf, u, aspect, undefined);
+    uploaded(sf);
     return true;
 }
 std::map<std::uint64_t, Surface> g_surfaces;        // by base VA
@@ -1539,6 +1778,7 @@ void note_surface_added(Surface& sf) {
     g_max_large_src = std::max(g_max_large_src, sf.total_src);
 }
 void note_surface_erased(const Surface& sf) {
+    if (sf.pending) drop_pending_locked(*sf.pending);
     if (surface_in_host(sf) && g_host_surfaces) --g_host_surfaces;
     occupancy_add(sf, ~0u);
     g_large_surfaces.erase(sf.base);
@@ -1875,7 +2115,7 @@ void census_upload(Surface& sf, const char* why) {
     sf.cp_dirty = false;
 }
 
-thread_local const char* t_resolve_kind = nullptr;
+thread_local constinit const char* t_resolve_kind = nullptr;
 
 // BBHOST_RES_IDENTITY=0: images are kept and retired by guest address
 // alone, as before (the resource's generation is still recorded).
@@ -1989,15 +2229,41 @@ std::uint64_t g_coarse_ms = 0;
 
 void drain_gx_writes_locked();
 std::atomic<bool>& gx_writes_pending();
-void refresh_surface_locked(Surface& sf) {
+// BBHOST_RUN_COMMIT: GX's texture notices drained at a run's fork, as the next
+// refresh in order would drain them: a surface GX mapped since its refresh in
+// this recording is refreshed again in order (its part's draw stops there),
+// not taken as fresh by a part, which drains nothing.
+void textures_drain_gx_writes_locked() {
     if (gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
+}
+void refresh_surface_locked(Surface& sf) {
+    // A made-ahead upload still to be recorded (BBHOST_GXVK_AHEAD_DEFER) is
+    // recorded before the image is used, in order: a run part's draw stops
+    // there, as at a refresh's own upload (a local stop - only draws that
+    // sample the image read what it records, and they stop there too).
+    if (sf.pending) {
+        if (run_part_stop(kRunStopRefresh)) {
+            ahead_defer::g_part_stops.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        record_pending_locked(sf, t_force_async ? ahead_defer::kAtAhead : ahead_defer::kAtBind);
+    }
+    // A run part's draw (BBHOST_RUN_COMMIT): the notices were drained at its
+    // fork (textures_drain_gx_writes_locked), and a surface not refreshed in
+    // this recording yet is refreshed in order - its upload lands before the
+    // draw's packet.
+    const bool part = run_part();
+    if (!part && gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
     if (g_refresh_once) {
         const std::uint64_t stamp = g.record_serial + 1;  // 0 stays "never"
         if (sf.refreshed_serial == stamp) {
             img_census::refreshed(img_census::kRefStamp);
             return;
         }
+        if (run_part_stop(kRunStopRefresh)) return;
         sf.refreshed_serial = stamp;
+    } else if (run_part_stop(kRunStopRefresh)) {
+        return;
     }
     sf.used_ms = g_coarse_ms;
     if (sf.gx_dirty) {
@@ -2038,7 +2304,7 @@ void refresh_surface_locked(Surface& sf) {
             g_watch_sooner_ms.fetch_add(sooner, std::memory_order_relaxed);
             g_watch_uploads.fetch_add(1, std::memory_order_relaxed);
             if (g_watch_verify && hle_kernel_va_mapped(sf.base, sf.total_src)) {
-                settle_prep(sf);
+                settle_prep(sf, prep_census::kSettleWatchVerify);
                 const bool changed = content_hash_of(sf.base, sf.total_src, true) != sf.exact_hash;
                 g_watch_verify_n[sf.gx_registered ? 1 : 0][changed ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }
@@ -2122,7 +2388,7 @@ void refresh_surface_locked(Surface& sf) {
     // against yet, and waiting for it here serialized a surface rewritten
     // every frame back onto the command processor.
     if (sf.prep && !prep_done(*sf.prep)) return;
-    settle_prep(sf);
+    settle_prep(sf, prep_census::kSettleRefresh);
     // The census of what is hashed: which kind of surface each check is for.
     const int hash_class = !sf.gx_registered ? (sf.gpu_written ? 4 : sf.watched ? 5 : 6)
                            : sf.gpu_written    ? 1
@@ -2276,8 +2542,14 @@ bool carry_surface_locked(Surface& dst, const Surface& src) {
                    static_cast<std::uint32_t>(regions.size()), regions.data());
     barrier(dst.image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     // The memory underneath is what it was; only a change to it from here on
-    // is a new upload.
-    settle_prep(dst);
+    // is a new upload. Its hashes are taken again here, so the prep the
+    // partial upload queued is not waited for (BBHOST_GXVK_AHEAD_DEFER=0: it
+    // was): a staging span it fills is still waited for by the submission.
+    if (g_ahead_defer) {
+        dst.prep.reset();
+    } else {
+        settle_prep(dst, prep_census::kSettleCarry);
+    }
     dst.content_hash = content_hash_of(dst.base, dst.total_src);
     dst.exact_hash = content_hash_of(dst.base, dst.total_src, true);
     dst.exact_at_ms = now_ms();
@@ -2413,6 +2685,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
         }
     }
     RtRegion& reg = it->second;
+    if (copy_census::on()) copy_census::region_bind(rt, width, height, !reg.img.initialised);
     begin_recording_locked();
     // Into the draw's packet, started for it now, with the pass end before it:
     // recorded in place, the copy waited for the recorder to finish the draws
@@ -2429,7 +2702,15 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
     if (open && open->copy_region(rt.image, reg.img.image, width, height, initialised)) {
         g_rt_region_packets.fetch_add(1, std::memory_order_relaxed);
     } else {
+        // BBHOST_GPU_PROFILE: the region copy as an entry of its own (recorded in place there).
+        static std::map<std::string, std::string> names;  // under g.mu
+        if (g.profile) {
+            char key[64];
+            std::snprintf(key, sizeof(key), "region-copy-%ux%u-f%d", width, height, static_cast<int>(rt.format));
+            profile_begin_locked(&names.emplace(key, key).first->second);
+        }
         record_region_copy(g_cmd(), rt.image, reg.img.image, width, height, initialised);
+        if (g.profile) profile_end_locked();
     }
     g_rt_region_copies.fetch_add(1, std::memory_order_relaxed);
     g_last_view_no_memo = true;
@@ -2608,7 +2889,14 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     // had black macrotile columns while 0x16ab40000 was a clean clinic.
     auto alias_rt = [&](std::uint64_t addr) -> VkImageView {
         RtImage* rt = find_render_target(addr);
-        if (!rt || !rt->initialised || storage) return VK_NULL_HANDLE;
+        // A copy into this target left unmade (BBHOST_COPY_ELIDE, render.cpp): its
+        // source, unchanged since the copy, holds the texels the target would.
+        // The target answers for its identity below; the source's image is the
+        // one bound (one of its shape and format), and the view is not
+        // remembered - once the copy is made or forgotten the target binds as
+        // itself again.
+        RtImage* const elided = rt && !storage && copy_elide_live() ? copy_elide_source_locked(*rt) : nullptr;
+        if (!rt || (!rt->initialised && !elided) || storage) return VK_NULL_HANDLE;
         // By identity: a target that is another resource's image (a dead one's
         // waiting out the idle time) is the bound resource's only if that was
         // made over it without data (target_taken_by); made with texels of
@@ -2619,6 +2907,10 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                 return VK_NULL_HANDLE;
             }
             g_alias_taken.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (elided) {
+            g_last_view_no_memo = true;
+            rt = elided;
         }
         // A cube T# over its target samples the faces as layers (the render
         // target is layered when the game draws faces through CB_COLOR*_VIEW);
@@ -2821,6 +3113,8 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     if (it != g_surfaces.end()) {
         Surface& sf = it->second;
         if (sf.failed) return VK_NULL_HANDLE;
+        record_pending_locked(sf, t_force_async ? ahead_defer::kAtAhead : ahead_defer::kAtBind);
+        if (sf.failed) return VK_NULL_HANDLE;
         const std::uint32_t want_levels = (type == 10 || tiling == 19) ? 1u : std::min<std::uint32_t>(last_level + 1, 16u);
         bool other_gen = false;
         if (res_identity_on() && expect_gen && sf.gx_gen && sf.gx_gen != expect_gen) {
@@ -2955,7 +3249,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                       std::min(sf.levels.size(), replaced.levels.size()), sf.levels.size());
         }
         if (!sf.gx_registered) census_unregistered_new(sf, dfmt, nfmt);
-        if (!carried && !upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, true)) {
+        if (!carried && !upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, true, t_defer_ok)) {
             sf.failed = true;
             note_surface_added(g_surfaces[base] = sf);
             return VK_NULL_HANDLE;
@@ -3008,6 +3302,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     }
     Surface& sf = it->second;
     g_last_view_surface = &sf;
+    if (!t_force_async) ahead_defer::met_pending(sf, "a lookup");
     if (!t_force_async || !sf.used_ms) sf.used_ms = now_ms();
     if (sf.ahead && !sf.ahead_used && !t_force_async) {
         sf.ahead_used = true;
@@ -3107,9 +3402,15 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         // The hash is verified against the words, so a collision costs a
         // resolve rather than the wrong texture.
         if (e.key != key || e.flags != flags || std::memcmp(e.w, w, static_cast<std::size_t>(nw) * 4) != 0) continue;
-        if (e.sf) refresh_surface_locked(*e.sf);
+        // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image
+        // until the copy is made: resolved again, and not remembered.
+        if (!e.sf && copy_elide_live() && copy_elide_hides_tsharp(w)) break;
+        if (e.sf) {
+            refresh_surface_locked(*e.sf);
+            ahead_defer::met_pending(*e.sf, "the words' memo");
+        }
         if (img_census::on()) img_census::g_last = e.sf;
-        ++g_view_memo_hits;
+        if (!run_part()) ++g_view_memo_hits;
         if (g_view_memo_mode == 2) {
             bool real_ok = true;
             std::uint32_t real_dim = 0;
@@ -3134,6 +3435,7 @@ VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, st
         arrayed = e.arrayed;
         return e.view;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order (BBHOST_RUN_COMMIT)
     g_last_view_surface = nullptr;
     g_last_view_no_memo = false;
     const VkImageView view = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
@@ -3212,7 +3514,7 @@ std::uint64_t g_images_missed = 0, g_images_backstop = 0, g_images_wrong_gen = 0
 // has touched since its upload. refresh_surface_locked has nothing to do for it but its hash schedule.
 bool images_static(const Surface& sf) {
     return by_identity(sf) && !g_hash_registered && sf.image && !sf.failed && !sf.watched && !sf.gpu_written && !sf.cp_dirty &&
-           !sf.copied_mips && !sf.gx_dirty;
+           !sf.copied_mips && !sf.gx_dirty && !sf.pending;
 }
 // After the entry's surface was refreshed: whether its bindings skip the refresh from here.
 void images_settle(IdViewEntry& e) {
@@ -3263,17 +3565,22 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                                bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
-    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) {
+    // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image until the copy is made: resolved
+    // again (by its T#'s base, which stage 2's entries keep), and not remembered.
+    const bool elided = e.id == id && !e.sf && copy_elide_live() && (g_images_mode ? copy_elide_hides(e.base) : copy_elide_hides_tsharp(w));
+    if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags && !elided) {
         // Stage 2: an image nothing has changed since the entry last refreshed its surface binds as it is. Compare
         // mode leaves the recheck out (it refreshes anyway), so every refresh a skip stands in for is checked.
         const bool skip = e.fast && e.static_epoch == g_static_epoch &&
                           (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
                           !gx_writes_pending().load(std::memory_order_acquire);
+        const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no entry and no count
         if (skip && g_images_mode == 1) {
-            ++g_images_skips;
+            if (!part) ++g_images_skips;
         } else {
             const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
             if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
+                if (run_part_stop(kRunStopRefresh)) return VK_NULL_HANDLE;  // refreshed in order
                 if (g_images_mode) {
                     images_refresh(e, skip);
                 } else {
@@ -3282,6 +3589,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                 e.refreshed = stamp;
             }
         }
+        if (e.sf) ahead_defer::met_pending(*e.sf, "its view's entry");
         if (g_images_mode == 2 && e.sf && e.sf->gx_registered) {
             // The handle names its view's image: the surface is the resource's the view was made over, by generation.
             const std::uint64_t gen = gx_view_gen_by_id(id);
@@ -3294,12 +3602,13 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         if (img_census::on()) img_census::g_last = e.sf;
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
-        ++g_id_view_hits;
+        if (!part) ++g_id_view_hits;
         dims_ok = e.dims_ok;
         dim = e.dim;
         arrayed = e.arrayed;
         return e.view;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order (BBHOST_RUN_COMMIT)
     ++g_id_view_misses;
     if (slot) *slot = 0;
     if (base) *base = 0;
@@ -3416,6 +3725,39 @@ void textures_census_report() {
         pw += b;
     }
     host_log("gxvk census: texture prep waits that blocked, by surface: %s", pw.c_str());
+    {
+        using namespace prep_census;
+        std::string q, b;
+        for (int o = 0; o < kOrigins; ++o) {
+            for (int k = 0; k < kKinds; ++k) {
+                char t[200];
+                if (const std::uint64_t n = g_queued[o][k].load()) {
+                    std::snprintf(t, sizeof t, "%s%s, %s %llu (%llu MiB)", q.empty() ? "" : "; ", kOriginName[o], kKindName[k],
+                                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_queued_bytes[o][k].load() >> 20));
+                    q += t;
+                }
+                for (int site = 0; site < 2; ++site) {
+                    if (const std::uint64_t n = g_blocked[site][o][k].load()) {
+                        std::snprintf(t, sizeof t, "%s%s: %s, %s %llu (%.1f ms)", b.empty() ? "" : "; ", site ? "a refresh" : "the submission",
+                                      kOriginName[o], kKindName[k], static_cast<unsigned long long>(n),
+                                      static_cast<double>(g_blocked_us[site][o][k].load()) / 1000.0);
+                        b += t;
+                    }
+                }
+            }
+        }
+        host_log("gxvk census: texture preps queued by where their upload came from and what they do: %s", q.empty() ? "none" : q.c_str());
+        std::string st;
+        for (int k = 0; k < kSettleSites; ++k) {
+            char t[96];
+            std::snprintf(t, sizeof t, "%s%s %llu", k ? ", " : "", kSettleName[k], static_cast<unsigned long long>(g_settle_blocked[k].load()));
+            st += t;
+        }
+        host_log("gxvk census: settles that blocked on a prep, by who asked: %s", st.c_str());
+        host_log("gxvk census: texture prep waits that blocked, by where they waited, the upload's origin and the prep's kind: %s (the longest "
+                 "at the submission %.1f ms, at a refresh %.1f ms)", b.empty() ? "none" : b.c_str(),
+                 static_cast<double>(g_blocked_max_us[0].load()) / 1000.0, static_cast<double>(g_blocked_max_us[1].load()) / 1000.0);
+    }
     if (images_census()) {
         std::uint64_t total = 0, by_id = 0, gx = 0;
         for (int c = 0; c < kS2Classes; ++c) total += g_s2[c].load(), by_id += g_s2_by_id[c].load();
@@ -3504,11 +3846,13 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     key = fnv1a(&compare, 1, key);
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) {
+        if (run_part()) return it->second;  // a run part's draw writes no memo (BBHOST_RUN_COMMIT)
         std::memcpy(m.w, s, 16);
         m.compare = compare;
         m.sampler = it->second;
         return it->second;
     }
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
     // BBHOST_SAMPLER_FIXES: mirror-once only where the device enabled it.
     const bool fixes = sampler_fixes_on();
     auto address = [fixes](std::uint32_t c) {
@@ -3584,6 +3928,8 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
 void surface_queue_writeback(std::uint64_t base) {
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() || it->second.failed || it->second.thick) return;
+    ahead_defer::met_pending(it->second, "a shader's store");  // its binding recorded the upload first
+    record_pending_locked(it->second, ahead_defer::kAtStore);
     it->second.gpu_written = true;
     static_changed(it->second);
     surface_written(it->second);
@@ -3619,7 +3965,7 @@ bool ahead_held_back() {
 
 std::atomic<std::uint64_t> g_ahead_replaced_gen{0}, g_ahead_adopted{0};
 
-bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
+bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen, bool deferrable) {
     const std::uint64_t base = tsharp_base(w);
     if (auto old = g_surfaces.find(base); old != g_surfaces.end()) {
         // Another resource's image (the memory's previous owner, whose
@@ -3660,8 +4006,10 @@ bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
     bool dims_ok = true, arrayed = false;
     std::uint32_t dim = 0;
     t_force_async = true;
+    t_defer_ok = deferrable;
     const VkImageView v = texture_view_uncached(w, false, dims_ok, dim, arrayed, false, false);
     t_force_async = false;
+    t_defer_ok = false;
     auto it = g_surfaces.find(base);
     if (v == VK_NULL_HANDLE || it == g_surfaces.end() || it->second.failed) {
         g_ahead_failed.fetch_add(1, std::memory_order_relaxed);
@@ -3710,6 +4058,8 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
             g_fill_surfaces_skipped.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        record_pending_locked(sf, ahead_defer::kAtFill);
+        if (sf.failed) continue;
         begin_recording_locked();
         render_end_pass_locked();
         VkClearColorValue v{};
@@ -3774,6 +4124,8 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
         return false;
     }
     Surface& sf = it->second;
+    record_pending_locked(sf, ahead_defer::kAtUploadToken);
+    if (sf.failed) return false;
     const std::uint32_t layers = sf.type == 10 ? 1 : sf.layers;
     const std::uint32_t mw = std::max(1u, sf.width >> mip), mh = std::max(1u, sf.height >> mip);
     if (mip >= sf.levels.size() || layer >= layers || !w || !h || x + w > mw || y + h > mh || (x % sf.block) || (y % sf.block) ||
@@ -3976,6 +4328,12 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
                       static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), c.src_mip, c.src_layer, why);
         }
     };
+    // Copies left unmade (BBHOST_COPY_ELIDE): a source that is one's destination is
+    // made first, and a destination that is one's source or destination too.
+    if (copy_elide_live()) {
+        copy_elide_touch_locked(tsharp_base(c.src_tsharp), copy_elide::kReadOther);
+        copy_elide_touch_locked(tsharp_base(c.dst_tsharp), copy_elide::kWrite);
+    }
     if (!copy_side_locked(c.src_tsharp, src, c.src_gen)) {
         g_image_copy_no_src.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -4019,6 +4377,20 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     }
     if (src.rt && src.rt->view_clear) view_clear_apply_locked(*src.rt, kVcwCopy);  // owed clears first (render.cpp lazy clears)
     if (dst.rt && dst.rt->view_clear) view_clear_apply_locked(*dst.rt, kVcwCopy);
+    const copy_census::Quiet census_quiet;
+    if (copy_census::on()) {
+        const copy_census::Side a{tsharp_base(c.src_tsharp), src.rt ? rt_size_bytes(*src.rt) : std::uint64_t{src.width} * src.height * src.esize, src.width,
+                                  src.height, static_cast<int>(src.format)};
+        const copy_census::Side b{tsharp_base(c.dst_tsharp), dst.rt ? rt_size_bytes(*dst.rt) : std::uint64_t{dst.width} * dst.height * dst.esize, dst.width,
+                                  dst.height, static_cast<int>(dst.format)};
+        std::uint32_t flags = src.rt ? copy_census::kSrcImage : 0;
+        if (c.dst_x == 0 && c.dst_y == 0 && c.w == dst.width && c.h == dst.height && c.dst_mip == 0 && dst.levels <= 1 && dst.layers <= 1) {
+            flags |= copy_census::kWhole;
+        }
+        if (src.width == dst.width && src.height == dst.height) flags |= copy_census::kSameSize;
+        if (src.format == dst.format) flags |= copy_census::kSameFormat;
+        copy_census::copy(copy_census::kImageRegion, a, b, "copy-image token", flags);
+    }
     if (src.rt) g_image_copy_rt_src.fetch_add(1, std::memory_order_relaxed);
     if (dst.rt) {
         g_image_copy_rt_dst.fetch_add(1, std::memory_order_relaxed);
@@ -4040,7 +4412,14 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     r.dstSubresource = {aspect, c.dst_mip, c.dst_layer, 1};
     r.dstOffset = {static_cast<std::int32_t>(c.dst_x), static_cast<std::int32_t>(c.dst_y), 0};
     r.extent = {c.w, c.h, 1};
+    static std::map<std::string, std::string> profile_names;  // under g.mu: BBHOST_GPU_PROFILE's entry for the copy
+    if (g.profile) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "img-copy-%ux%u-f%d", c.w, c.h, static_cast<int>(dst.format));
+        profile_begin_locked(&profile_names.emplace(key, key).first->second);
+    }
     vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (g.profile) profile_end_locked();
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -4101,6 +4480,9 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     std::uint32_t to_w = 0, to_h = 0, to_levels = 1, to_layers = 1;
     Surface* to_surface = nullptr;
     RtImage* to_rt = nullptr;
+    // Copies left unmade (BBHOST_COPY_ELIDE): a target this writes that is one's source
+    // or destination has it made first (the copy below can still be refused).
+    if (copy_elide_live()) copy_elide_touch_locked(dst, copy_elide::kWrite);
     if (RtImage* rt = find_render_target(dst);
         rt && rt->image && !rt->depth &&
         (static_cast<std::uint32_t>(rt->gx_gen) == static_cast<std::uint32_t>(dst_gen) || target_taken_by(*rt, dst, dst_gen) > 0)) {
@@ -4138,6 +4520,15 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     if (to_rt && to_rt->view_clear) view_clear_apply_locked(*to_rt, kVcwCopy);  // its owed clear first, as any copy into a target
     const std::uint32_t levels = std::min<std::uint32_t>(to_levels, static_cast<std::uint32_t>(std::max<std::size_t>(from.levels.size(), 1)));
     const std::uint32_t layers = std::min(to_layers, from.type == 10 ? 1u : from.layers);
+    const copy_census::Quiet census_quiet;
+    if (copy_census::on()) {
+        const copy_census::Side a{src, std::uint64_t{from.width} * from.height * std::max<std::size_t>(from.esize, 1), from.width, from.height,
+                                  static_cast<int>(from.format)};
+        const copy_census::Side b{dst, to_rt ? rt_size_bytes(*to_rt) : std::uint64_t{to_w} * to_h * std::max<std::size_t>(to_surface->esize, 1), to_w,
+                                  to_h, static_cast<int>(to_format)};
+        copy_census::copy(copy_census::kResource, a, b, to_rt ? "resource copy into a target" : "resource copy",
+                          copy_census::kWhole | copy_census::kSameSize | (to_format == from.format ? copy_census::kSameFormat : 0u));
+    }
     begin_recording_locked();
     render_end_pass_locked();
     if (to_rt && !to_rt->initialised && render_layout_fixes()) {
@@ -4167,8 +4558,15 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
         r.extent = {std::max(1u, from.width >> l), std::max(1u, from.height >> l), 1};
         regions.push_back(r);
     }
+    static std::map<std::string, std::string> profile_names;  // under g.mu: BBHOST_GPU_PROFILE's entry for the copy
+    if (g.profile) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "res-copy-%ux%u-f%d", from.width, from.height, static_cast<int>(to_format));
+        profile_begin_locked(&profile_names.emplace(key, key).first->second);
+    }
     vkCmdCopyImage(g_cmd(), from.image, VK_IMAGE_LAYOUT_GENERAL, to_image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()),
                    regions.data());
+    if (g.profile) profile_end_locked();
     {
         // The first of each source and destination pair, to know what moves this way.
         static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;  // under g.mu
@@ -4359,11 +4757,38 @@ void retire_surfaces_locked() {
     if (any) bump_view_epoch();
 }
 
+void textures_record_ahead_locked() {
+    if (g_pending_uploads.empty()) return;
+    for (const std::shared_ptr<PendingUpload>& sp : g_pending_uploads) {
+        PendingUpload& p = *sp;
+        if (p.done || !prep_done(*p.prep)) continue;
+        if (p.dropped) {
+            staging_hold_end_locked(p.chunk, false);
+            p.done = true;
+            continue;
+        }
+        auto it = g_surfaces.find(p.base);
+        if (it != g_surfaces.end() && it->second.pending == sp) {
+            record_pending_locked(it->second, ahead_defer::kAtSubmission);
+            continue;
+        }
+        // Its surface lost it without a drop: nothing records it, and the hold ends.
+        if (ahead_defer::g_lost.fetch_add(1, std::memory_order_relaxed) < 4)
+            host_log("texture: made ahead 0x%llx: its upload still to be recorded, but its surface no longer has it",
+                     static_cast<unsigned long long>(p.base));
+        staging_hold_end_locked(p.chunk, false);
+        p.done = true;
+    }
+    g_pending_uploads.erase(std::remove_if(g_pending_uploads.begin(), g_pending_uploads.end(),
+                                           [](const std::shared_ptr<PendingUpload>& p) { return p->done; }),
+                            g_pending_uploads.end());
+}
+
 void textures_before_submit() {
     g_coarse_ms = now_ms();
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) {
         if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
-        PrepPool::get().wait(*p);
+        prep_census::timed_wait(*p, 0);
     }
     g_batch_preps.clear();
     retire_surfaces_locked();
@@ -4510,6 +4935,8 @@ bool relocate_on() {
 // in the open recording; the old image and views go behind the submissions
 // that may still read them.
 bool relocate_surface_locked(Surface& sf, int cls = kHeapTargets) {
+    record_pending_locked(sf, ahead_defer::kAtMove);
+    if (sf.failed) return false;
     VkImageCreateInfo ici = sf.info;
     ici.pNext = nullptr;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -5034,7 +5461,7 @@ void textures_prewait_for_submit() {
     }
     for (const std::shared_ptr<TexturePrep>& p : preps) {
         if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
-        PrepPool::get().wait(*p);
+        prep_census::timed_wait(*p, 0);
     }
 }
 
@@ -5055,7 +5482,7 @@ void textures_retired(int slot) {
                                 sf.tiling, sf.width_e, sf.height_e, sf.pitch_e, sf.esize);
             }
             if (ok) {
-                settle_prep(sf);
+                settle_prep(sf, prep_census::kSettleWriteback);
                 sf.content_hash = content_hash_of(sf.base, sf.total_src);
                 sf.exact_hash = content_hash_of(sf.base, sf.total_src, true);
             }
@@ -5247,6 +5674,8 @@ bool texture_dump_locked(std::uint64_t base, const char* path, std::uint32_t lev
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() || it->second.failed) return false;
     Surface& sf = it->second;
+    record_pending_locked(sf, ahead_defer::kAtDump);
+    if (sf.failed) return false;
     if (level >= sf.levels.size() || layer >= std::max(1u, sf.info.arrayLayers)) return false;
     const std::uint32_t lw = std::max(1u, sf.width >> level), lh = std::max(1u, sf.height >> level);
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -5346,6 +5775,41 @@ void invalidate_rt_views(std::uint64_t base) {
     }
     g_rt_views.erase(it);
     bump_view_epoch();
+}
+
+// Copies left unmade (render.cpp, BBHOST_COPY_ELIDE). Two targets of one shape
+// that exchange their images: their sampled views go with the images, and the
+// memos' entries a T# at either base made (which name the views by the
+// target they were made for) are forgotten - the next binding of each
+// resolves again, to its target's views. Every other entry stays, which an
+// epoch bump would empty.
+void textures_swap_target_views_locked(std::uint64_t a, std::uint64_t b) {
+    auto ia = g_rt_views.find(a), ib = g_rt_views.find(b);
+    std::map<std::uint64_t, VkImageView> va, vb;
+    if (ia != g_rt_views.end()) va.swap(ia->second);
+    if (ib != g_rt_views.end()) vb.swap(ib->second);
+    if (!vb.empty()) g_rt_views[a].swap(vb);
+    else if (ia != g_rt_views.end()) g_rt_views.erase(ia);
+    if (!va.empty()) g_rt_views[b].swap(va);
+    else if ((ib = g_rt_views.find(b)) != g_rt_views.end()) g_rt_views.erase(ib);
+    textures_forget_target_memos_locked(a, b);
+}
+
+void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
+    if (!g_images_mode) {
+        bump_view_epoch();  // the id memo's entries keep no base without stage 2
+        return;
+    }
+    const auto at = [a, b](std::uint64_t base) { return base && (base == a || base == b); };
+    for (ViewMemoEntry& e : g_view_memo) {
+        if (e.epoch != g_view_epoch || e.sf) continue;
+        const std::uint64_t base = tsharp_base(e.w);
+        const std::uint64_t vbase = static_cast<std::uint64_t>(e.w[0]) | (static_cast<std::uint64_t>(e.w[1] & 0xff) << 32);
+        if (at(base) || at(vbase)) e.epoch = 0;
+    }
+    for (IdViewEntry& e : g_id_views) {
+        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) e.epoch = 0;
+    }
 }
 
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes) {
@@ -5747,6 +6211,34 @@ void textures_report() {
              static_cast<unsigned long long>(g_ahead_bind_before_prep.load()), static_cast<unsigned long long>(g_ahead_replaced.load()),
              static_cast<unsigned long long>(g_retired_surfaces.load()), static_cast<unsigned long long>(g_retired_bytes.load() >> 20),
              static_cast<unsigned long long>(g_retire_kept_live.load()));
+    {
+        using namespace ahead_defer;
+        std::string at, waited;
+        std::uint64_t before_use = 0;
+        for (int k = 1; k < kSites; ++k) {
+            before_use += g_recorded[k].load();
+            char t[96];
+            std::snprintf(t, sizeof t, "%s%s %llu", k > 1 ? ", " : "", kSiteName[k], static_cast<unsigned long long>(g_recorded[k].load()));
+            at += t;
+            if (const std::uint64_t n = g_waited[k].load()) {
+                std::snprintf(t, sizeof t, "%s%s %llu (%.1f ms)", waited.empty() ? "" : ", ", kSiteName[k], static_cast<unsigned long long>(n),
+                              static_cast<double>(g_wait_us[k].load()) / 1000.0);
+                waited += t;
+            }
+        }
+        host_log("texture: ahead, uploads recorded once their copy was done (BBHOST_GXVK_AHEAD_DEFER=%d%s): %llu (%llu MiB); recorded at a "
+                 "submission %llu, before a use %llu (%s; %llu bindings in the submission they were made in), dropped with their surface %llu; "
+                 "waited for their copy: %s; no scratch at the record %llu, failed %llu; pending at most %llu; run parts stopped at one "
+                 "%llu; bindings that met one still to be recorded %llu, lost without a drop %llu",
+                 g_ahead_defer, g_ahead_defer ? "" : ", off: recorded at their creation",
+                 static_cast<unsigned long long>(g_deferred.load()), static_cast<unsigned long long>(g_deferred_bytes.load() >> 20),
+                 static_cast<unsigned long long>(g_recorded[kAtSubmission].load()), static_cast<unsigned long long>(before_use), at.c_str(),
+                 static_cast<unsigned long long>(g_bound_in_made.load()), static_cast<unsigned long long>(g_dropped.load()),
+                 waited.empty() ? "none" : waited.c_str(), static_cast<unsigned long long>(g_no_scratch.load()),
+                 static_cast<unsigned long long>(g_failed.load()),
+                 static_cast<unsigned long long>(g_most.load()), static_cast<unsigned long long>(g_part_stops.load()),
+                 static_cast<unsigned long long>(g_met_pending.load()), static_cast<unsigned long long>(g_lost.load()));
+    }
     host_log("texture: made by a bind on the binding thread, none made ahead to find: %llu (%llu MiB) - %llu held back from ahead creation "
              "(%llu holds: the reserve or the caches' budget), %llu evicted or drained since they were made, %llu the rest%s; evicted over the "
              "caches' budget %llu",

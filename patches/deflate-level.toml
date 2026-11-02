@@ -5,11 +5,16 @@
 # container on the main thread every ~50 s of play (Binary Ninja 0x1dc97a0):
 # at level 9 that is ~23 ms of zlib's longest_match inside one frame
 # (sampled). Level 1 does the same job in a fraction of the time;
-# inflate reads either, so the data only grows a little.
+# inflate reads either, so the data only grows a little. Off until turned on
+# (the setup window's Patches tab, or deflate-level = true under [patches] in
+# bbhost.toml).
 [patch]
 name = "deflate-level"
+title = "Deflate level 1"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s)"
+enabled = false
+order = 1030
 
 [site.level]
 address = "0x4d3a79a"

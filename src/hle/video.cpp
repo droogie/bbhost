@@ -6,7 +6,10 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "engine/guest.h"
+#include "engine/lua_events.h"
 #include "engine/menu_pointer.h"
+#include "host/bindings.h"
+#include "engine/world_chr.h"
 #include "host/gpu.h"
 #include "core/config.h"
 #include "host/window.h"
@@ -376,6 +379,14 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
         } else if (verb == "f12") {
             host_log("test: F12 capture %s asked for at flip %llu", arg.empty() ? "-" : arg.c_str(), static_cast<unsigned long long>(count));
             host_gpu_request_dump();
+        } else if (verb == "remo" && !arg.empty()) {
+            const bool ok = remo_request_queue(std::atoi(arg.c_str()), arg2.empty() ? 0 : std::atoi(arg2.c_str()));
+            host_log("test: cutscene %s (method %s) at flip %llu%s", arg.c_str(), arg2.empty() ? "0" : arg2.c_str(),
+                     static_cast<unsigned long long>(count), ok ? "" : ": not queued");
+        } else if (verb == "travel" && !arg.empty()) {
+            const bool ok = world_lamp_warp_queue(std::atoi(arg.c_str()));
+            host_log("test: lamp travel to return point %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count),
+                     ok ? "" : ": not queued (BBHOST_TEST_WARP=1, in the world)");
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);
@@ -384,6 +395,15 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             host_gpu_capture_arm(n, arg2.c_str());
             host_log("test: draw captures armed for %d at flip %llu%s%s", n, static_cast<unsigned long long>(count), arg2.empty() ? "" : " into ",
                      arg2.c_str());
+        } else if (verb == "keys" && !arg.empty()) {
+            // Keys typed from a script (host/window.h host_test_keys_play).
+            const bool ok = host_test_keys_play(arg.c_str());
+            host_log("test: keys %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count), ok ? "" : ": no key in it");
+        } else if (verb == "zoom" && (arg == "in" || arg == "out" || arg == "reset")) {
+            // The camera zoom's presses, as the wheel and the middle button make them.
+            const int n = arg2.empty() ? 1 : std::atoi(arg2.c_str());
+            host_bind_queue_zoom(arg == "in" ? -n : arg == "out" ? n : 0, arg == "reset");
+            host_log("test: zoom %s %d at flip %llu", arg.c_str(), n, static_cast<unsigned long long>(count));
         } else if ((verb == "tap" || verb == "menutap") && !arg.empty()) {
             const std::uint32_t button = arg == "confirm" ? menu_confirm_button() : hle_pad_button_named(arg);
             const int hold = arg2.empty() ? 200 : std::atoi(arg2.c_str());
@@ -956,6 +976,19 @@ GUEST_ABI int hle_video_set_attr(void* attr, unsigned fmt, unsigned tile, unsign
     return 0;
 }
 
+// Every address the game has registered as a display buffer, read without g_vo_mu
+// (hle_video_is_display_buffer: the renderer asks under its own lock).
+std::atomic<std::uint64_t> g_display_bufs[32] = {};
+void note_display_buffer(std::uint64_t va) {
+    if (!va) return;
+    for (std::atomic<std::uint64_t>& b : g_display_bufs) {
+        std::uint64_t v = b.load(std::memory_order_acquire);
+        if (v == va) return;
+        if (!v && b.compare_exchange_strong(v, va, std::memory_order_acq_rel)) return;
+        if (v == va) return;
+    }
+}
+
 GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, const void* attr) {
     std::lock_guard<std::mutex> lock(g_vo_mu);
     if (!vo_get(handle)) {
@@ -969,6 +1002,7 @@ GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, con
     for (int i = 0; addrs && i < n; ++i) {
         const int idx = start + i;
         if (idx >= 0 && idx < 16) p->buffers[idx] = reinterpret_cast<std::uint64_t>(addrs[i]);
+        note_display_buffer(reinterpret_cast<std::uint64_t>(addrs[i]));
     }
     if (attr) {
         const auto* a = static_cast<const unsigned*>(attr);
@@ -1063,6 +1097,14 @@ void hle_video_set_picture(unsigned w, unsigned h) {
 }
 
 std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
+bool hle_video_is_display_buffer(std::uint64_t va) {
+    for (const std::atomic<std::uint64_t>& b : g_display_bufs) {
+        const std::uint64_t v = b.load(std::memory_order_acquire);
+        if (!v) return false;
+        if (v == va) return true;
+    }
+    return true;  // more registered than kept: every address counts as one
+}
 std::uint64_t hle_video_last_tick_ns() { return g_last_tick_ns.load(std::memory_order_relaxed); }
 bool hle_video_test_exit_requested() { return g_test_exit.load(std::memory_order_relaxed); }
 

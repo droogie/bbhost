@@ -198,7 +198,7 @@ int shader_compile_session() {
 
 std::vector<std::string> shader_vulkan_devices() {
     std::vector<std::string> out;
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "bbhost setup", 1, nullptr, 0, VK_API_VERSION_1_1};
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "bbhost launcher", 1, nullptr, 0, VK_API_VERSION_1_1};
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &app, 0, nullptr, 0, nullptr};
     VkInstance inst = VK_NULL_HANDLE;
     if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) return out;

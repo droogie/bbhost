@@ -44,11 +44,16 @@ struct HostConfig {
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
+    // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,
+    // the setup window's Game page), off; what they save in bbhost-options.toml
+    // wins over it, and BBHOST_FRAME_CLOCK=0|1 over both (config_frame_clock).
+    // The file's value, before either.
+    bool frame_clock = false;
     bool headless = false;     // video.headless / --headless / BBHOST_HEADLESS=1
-    bool skip_intro = false;   // startup.skip_intro / BBHOST_SKIP_INTRO=0|1: the three company logos only
+    bool skip_intro = true;    // startup.skip_intro / BBHOST_SKIP_INTRO=0|1: the three company logos only
     // loading.quick_reentry / BBHOST_QUICK_REENTRY=0|1: a load after a death or
     // lamp travel ends when the area is ready, not after the game's 12-second
-    // minimum (engine/loading.h).
+    // minimum (engine/loading.h). On unless turned off.
     bool quick_reentry = true;
     // streaming.all_post_processors / BBHOST_ALL_POST_PROCESSORS=0|1: all three
     // resource post-processors in play, not two (patches/ingame-post-processors.toml).
@@ -64,6 +69,9 @@ struct HostConfig {
     // Nightmare Frontier and the Old Hunters' areas take two invaders, as the
     // chalice dungeons do (engine/five_players.h).
     bool five_players = true;
+    // world.skill_issue / BBHOST_SKILL_ISSUE=0|1: the death message reads
+    // SKILL ISSUE instead of YOU DIED (engine/menu_assets.h). Off by default.
+    bool skill_issue = false;
     // [keys] from the config, action name -> SDL key name. Empty unless the
     // player has rebound something; window.cpp holds the defaults and the
     // list of action names.
@@ -77,7 +85,15 @@ struct HostConfig {
     // is true, a build from source's false (its harnesses never stop there);
     // BBHOST_SETUP_WINDOW=0|1 overrides.
     bool setup_always = false;
-    // debug.tooling / BBHOST_TOOLING=0|1 (the setup window's Game tab): the
+    // startup.setup_animations: the setup window's motion - the drifting
+    // painting and its motes, the moon's breathing, the Play button's pulse
+    // and shine, the page fade, the eased highlights. Off, it stands still.
+    bool setup_animations = true;
+    // startup.setup_text_size: Menu text size's default in percent (100-400;
+    // 0 none), for the setup window, F9 and F10 alike; the options file
+    // (menu_text_size, host/options.cpp) holds the player's choice.
+    int setup_text_size = 0;
+    // debug.tooling / BBHOST_TOOLING=0|1 (the setup window's Settings page): the
     // periodic reports and the instrumentation behind them (log.h,
     // host_tooling). Off, a run logs its start, warnings and errors only.
     bool tooling = true;
@@ -136,9 +152,9 @@ struct App0Version {
 App0Version config_app0_version(const std::string& app0);
 // The PC enhancements, the same way: the options file's choices (F10, the
 // System menu's PC Enhancements, the setup window's tab) once it is read. A
-// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH or BBHOST_FIVE_PLAYERS of 0 or 1
-// still wins over the options file.
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players);
+// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS or
+// BBHOST_SKILL_ISSUE of 0 or 1 still wins over the options file.
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue);
 // The setup window's server, in memory before it is saved: its account calls
 // (net::auth_server_base) go where its dropdown says. Main thread, before
 // the game starts.
@@ -163,8 +179,13 @@ struct ConfigEdit {
 // section, else in a new section - leaving every other line, comments
 // included, as it was. Creates the file (with its folder) when missing.
 bool config_set_values(const std::string& path, const std::vector<ConfigEdit>& edits);
-// The per-user bbhost.toml (config_user_dir()/bbhost.toml).
+// The bbhost.toml settings are saved to: one beside the exe (or in the working
+// directory) when there is one - read last, it has the last word over the
+// per-user one - else the per-user config_user_dir()/bbhost.toml. A --config
+// profile and BBHOST_CONFIG_DIR keep the per-user one.
 std::string config_user_file();
+// Whether that is the local one, beside the exe.
+bool config_saves_locally();
 // The folder saves go to when paths.data is not set (the per-user data folder).
 std::string config_default_data_dir();
 // The per-user folder the config and the F10 settings live in: %APPDATA%/bbhost,
@@ -183,6 +204,11 @@ std::string config_effect_steps();
 // second at every frame rate, "30" for the game's one an update
 // (decomp/sfx/node_emit.cpp, engine/frame_rate.cpp).
 std::string config_effect_emission();
+// The frame clock (engine/frame_clock.h), decided once as the game starts
+// (engine/frame_rate.cpp): BBHOST_FRAME_CLOCK=1 or 0, else `setting` - the
+// Native frame clock setting, the options file's when it holds one (`saved`),
+// else video.frame_clock's. *from names what decided, for the start log.
+bool config_frame_clock(bool setting, bool saved, const char** from);
 // Changes a loaded value in memory (raw, as config_set_values writes it): a
 // setting changed while running (the plugin menu), so config_value agrees
 // with the file just written. Main thread.

@@ -7,10 +7,12 @@
 # drawn.
 [patch]
 name = "disable-misc-renders"
+title = "Disable Misc. Renders"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn"
 enabled = false
-order = 132
+order = 22
+live = false
 
 # call 0x2666420 -> xor eax, eax
 [site.target-a]

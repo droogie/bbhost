@@ -24,6 +24,9 @@
 //     order, the scene's task sort on and off; longest first, the dearest
 //     chunk pushed first and the rest by cost, each to the participant its
 //     rank and place give it;
+//   - the scene categories' counts (BBHOST_SCENE_CATEGORIES=1) against a map
+//     of the same items, a row a queue and the rest dropped, from one thread
+//     and four;
 // and each of the source's mutants caught.
 #define DECOMP_GX_RENDER_QUEUE_MUTANTS
 int g_rq_mutant = 0;
@@ -686,6 +689,79 @@ GUEST_ABI u64 rec_append(u64 list, u64 record, u32 key) {
     return 0x71;
 }
 
+// ---- The scene categories (BBHOST_SCENE_CATEGORIES=1) ----
+
+// count_categories against a map of the same items: random queues (sorted or
+// not) behind 20 queue objects, random ranges, the first 16 queues counted a
+// row each and the rest dropped; then four threads counting one range at
+// once; and log_categories leaving every counter at 0.
+bool categories_case() {
+    constexpr int kObjects = 20;
+    alignas(64) static u8 objects[kObjects][0x20];
+    std::map<u64, std::map<u32, u64>> want;
+    std::vector<u64> rows;
+    u64 want_dropped = 0;
+    alignas(8) static u32 range[2];
+    const auto count_one = [&](u64 q, u32 first, u32 last) {
+        range[0] = first, range[1] = last;
+        count_categories(q, reinterpret_cast<u64>(range));
+        const u32 count = load<u32>(q + kCount), end = count > last ? last : count;
+        if (end <= first) return;
+        if (std::find(rows.begin(), rows.end(), q) == rows.end()) {
+            if (rows.size() == kCategoryQueues) {
+                want_dropped += end - first;
+                return;
+            }
+            rows.push_back(q);
+        }
+        const u64 items = load<u64>(q + kItems);
+        for (u32 i = first; i != end; ++i) ++want[q][(load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff];
+    };
+    for (int t = 0; t < 4000; ++t) {
+        int count = 0;
+        build_queue(count);
+        const u64 q = reinterpret_cast<u64>(objects[g_rng.range(0, t < 400 ? 9 : kObjects - 1)]);
+        store<u64>(q + kItems, load<u64>(reinterpret_cast<u64>(g_queue_start) + kItems));
+        store<u32>(q + kCount, static_cast<u32>(count));
+        const u32 first = static_cast<u32>(g_rng.range(0, count + 2));
+        const u32 last = g_rng.chance(0.3) ? static_cast<u32>(g_rng.range(0, count + 4)) : static_cast<u32>(count);
+        count_one(q, first, last);
+    }
+    if (rows.size() != kCategoryQueues || want_dropped == 0) return false;
+    bool ok = true;
+    // four threads on one queue's range
+    {
+        int count = 0;
+        while (count < 100) build_queue(count);
+        const u64 q = rows[0];
+        store<u64>(q + kItems, load<u64>(reinterpret_cast<u64>(g_queue_start) + kItems));
+        store<u32>(q + kCount, static_cast<u32>(count));
+        alignas(8) static u32 shared_range[2];
+        shared_range[0] = 0, shared_range[1] = static_cast<u32>(count);
+        std::vector<std::thread> threads;
+        for (int k = 0; k < 4; ++k)
+            threads.emplace_back([q] {
+                for (int n = 0; n < 500; ++n) count_categories(q, reinterpret_cast<u64>(shared_range));
+            });
+        for (auto& th : threads) th.join();
+        const u64 items = load<u64>(q + kItems);
+        for (int i = 0; i < count; ++i) want[q][(load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff] += 4 * 500;
+    }
+    for (u32 r = 0; r < kCategoryQueues; ++r) {
+        const u64 q = g_category_queue[r].load();
+        ok = ok && q == rows[r];
+        for (u32 pass = 0; pass < kPasses; ++pass) {
+            const auto w = want[q].find(pass);
+            ok = ok && g_category_items[r][pass].load() == (w == want[q].end() ? 0 : w->second);
+        }
+    }
+    ok = ok && g_category_dropped.load() == want_dropped;
+    log_categories(300);
+    for (u32 r = 0; r < kCategoryQueues; ++r)
+        for (u32 pass = 0; pass < kPasses; ++pass) ok = ok && g_category_items[r][pass].load() == 0;
+    return ok && g_category_dropped.load() == 0;
+}
+
 bool append_case() {
     alignas(16) static u8 list[0x100];
     store<u32>(reinterpret_cast<u64>(list) + 0x40, 0x0fc12345u);
@@ -766,6 +842,7 @@ int main(int argc, char** argv) {
     for (int t = 0; t < cases / 4; ++t, ++n_pf) parallel_for_case(t, (t & 1) != 0, true);
     for (u32 e = 0; e < kTableEntries; ++e) g_cost_per_item[e] = 0;
     if (!append_case()) fail("segment note", 0, "the list's append not passed on as given, or its key not noted");
+    if (!categories_case()) fail("scene categories", 0, "the counts by queue and pass not the items', or not cleared by the log");
     if (!choice_case()) fail("the cut's choice", 0, "not on above 60 fps alone, or the push not after a cut");
     if (!originals_case()) fail("the game's own", 0, "what ours leaves to the game's functions not passed on as given");
     g_split_mode = Split::On;

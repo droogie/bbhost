@@ -23,6 +23,8 @@ public:
 private:
     const char* prev_;
 };
+// The owner set on this thread now (MemOwner), or null.
+const char* bb_memory_owner_now();
 
 // What our allocations hold for one owner (or one site without an owner), by
 // heap class: [0] the video memory heap (bb_memory_set_local_types), [1] other

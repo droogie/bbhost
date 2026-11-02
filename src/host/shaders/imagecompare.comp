@@ -1,0 +1,32 @@
+#version 460
+// Two images of one shape and format compared texel by texel
+// (BBHOST_COPY_ELIDE=compare, copy_compare.cpp): a copy left unmade read its
+// source in place of its destination, which compare mode also made; at the
+// end of each such copy the two must hold the same texels. Every texel whose
+// fetched bits differ adds one to the compare's slot. A fetch converts the
+// stored texel the same way for both images, so equal texels give equal bits
+// (NaNs included).
+//
+// Compiled offline (tools/build_shaders.sh) into imagecompare.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D image_a;
+layout(set = 0, binding = 1) uniform texture2D image_b;
+layout(set = 0, binding = 2) uniform sampler any_sampler;
+layout(set = 0, binding = 3, std430) buffer Result {
+    uint counts[];
+};
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint slot;
+};
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(width) || xy.y >= int(height)) return;
+    const uvec4 a = floatBitsToUint(texelFetch(sampler2D(image_a, any_sampler), xy, 0));
+    const uvec4 b = floatBitsToUint(texelFetch(sampler2D(image_b, any_sampler), xy, 0));
+    if (any(notEqual(a, b))) atomicAdd(counts[slot], 1u);
+}

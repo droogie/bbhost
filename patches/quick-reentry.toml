@@ -14,12 +14,15 @@
 # wait and the readiness check stay the game's. Measured: respawns 2.2-2.7 s,
 # a lamp's travel 2.6 s; the first frames after arrival hitch no more than
 # after a 12 s load. On unless `quick_reentry = false` under [loading] in
-# bbhost.toml (BBHOST_QUICK_REENTRY=0 or 1 overrides).
+# bbhost.toml (the setup window's Patches tab writes it; BBHOST_QUICK_REENTRY=0
+# or 1 overrides).
 [patch]
 name = "quick-reentry"
+title = "Quick re-entry"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "a load after a death or lamp travel ends when the area is ready, not after a 12-second minimum"
 option = "loading.quick_reentry"
+order = 1010
 
 # sub_1d38870: cmp byte [r12+0xe4], 0 / je +10 (to the 0) / vmovss xmm0, [12.0f]
 [site.reentry-minimum]

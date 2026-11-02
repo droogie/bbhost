@@ -22,7 +22,8 @@ draw them, place by place. Two builds can be run against each other.
 | `hunters-nightmare` | Ludwig's arena | the first lamp, then the arena's edge |
 | `laurence-staircase` | The staircase up to the Nightmare Grand Cathedral, Laurence's arena | the first lamp, then the staircase's upper flight |
 
-The last five are The Old Hunters' and need it on (bbhost's default). An
+The last five are The Old Hunters' and need it on (on by default; the run
+turns it on for them if a config has it off). An
 arena view stands just outside the boss's fog wall, facing in, where the boss
 rush plugin starts its rounds, without walking in. Two arenas are behind
 doors, which the run opens with the flags the boss rush uses.
@@ -156,7 +157,8 @@ These are for test runs and off by default.
 |---|---|
 | `BBHOST_FRAME_DETAIL=1` | with `BBHOST_FRAME_STATS=1`: after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
 | `BBHOST_TEST_WARP=1` | lets plugins move the player (the probe) |
-| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a sequence of consecutive frames (`dumpseq <dir> <n>`: the next n flips, one file each), a capture budget |
+| `BBHOST_TEST_STEP_FPS=<n>` | every frame's step is exactly 1/n, whatever the frame took: what a machine running n frames a second hands the game, at this one's speed |
+| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a sequence of consecutive frames (`dumpseq <dir> <n>`: the next n flips, one file each), a capture budget, a cutscene (`remo <id> [<method>]`: the event scripts' PlayCutscene for the player), a lamp travel (`travel <return point>`, with `BBHOST_TEST_WARP=1`) |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
 

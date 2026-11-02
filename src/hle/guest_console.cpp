@@ -1,6 +1,7 @@
 // The game's console prints, a repeating line written once and then counted
 // (guest_console.h).
 #include "hle/guest_console.h"
+#include "log.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -147,6 +148,7 @@ Stream* stream_of(std::FILE* f) {
 bool write(std::FILE* f, const char* data, std::size_t n) {
     Stream* s = stream_of(f);
     if (!s) return false;
+    if (!host_logging()) return true;  // Tooling and logging off: the game's prints are not written either
     if (!collapse_on()) {
         std::fwrite(data, 1, n, f);
         return true;
@@ -164,7 +166,7 @@ bool write(std::FILE* f, const char* data, std::size_t n) {
 
 void flush(std::FILE* f) {
     Stream* s = stream_of(f);
-    if (!s || !collapse_on()) return;
+    if (!s || !collapse_on() || !host_logging()) return;
     std::string out;
     {
         std::lock_guard<std::mutex> lk(s->mu);
@@ -174,7 +176,7 @@ void flush(std::FILE* f) {
 }
 
 void flush_all() {
-    if (!collapse_on()) return;
+    if (!collapse_on() || !host_logging()) return;
     for (std::FILE* f : {stdout, stderr}) {
         Stream* s = stream_of(f);
         std::string out;

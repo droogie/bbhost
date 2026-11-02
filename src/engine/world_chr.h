@@ -23,6 +23,9 @@ void world_chr_install(ElfImage* image);
 // False before the world has a player (the title, a load).
 bool world_player_position(float xyz[3], float* yaw);
 bool world_camera(float pos[3], float focus[3]);
+// The camera manager the follow camera belongs to (ChrCamOwner: its own camera
+// at +0x10, the follow camera at +0x60); 0 when there is none.
+std::uint64_t world_camera_owner();
 // The map block the main player is in, packed as the game keeps it at ChrIns
 // +0x3f8 (m24_01_00_00 = 0x18010000). False before the world has a player.
 bool world_player_block(std::uint32_t* block);

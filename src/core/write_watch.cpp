@@ -7,6 +7,7 @@
 #include <chrono>
 #include <vector>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
@@ -59,9 +60,31 @@ std::atomic<std::uint64_t> g_fault_ticks{0}, g_arm_ns{0};
 std::atomic<std::uint64_t> g_tsc0{0};
 std::atomic<std::int64_t> g_ns0{0};
 
+// A ThreadSanitizer build leaves it off unless BBHOST_WRITE_WATCH=1: such a
+// build stopped at its first loading screen. ThreadSanitizer does a guest-memory
+// atomic - hle_gx_arena_acquire's compare-and-swap on a chunk marker, the label
+// thread's stores - while holding the thread's slot lock; on a watched page it
+// faults there, and the handler's own atomics are instrumented too (even with
+// the handler itself excluded, the std::atomic calls it makes are not inlined
+// into it and stay instrumented), so they take that slot lock again and the
+// thread waits on itself, and every thread that needs its slot after it. A
+// build without ThreadSanitizer is unaffected: the handler takes no lock.
+#if defined(__SANITIZE_THREAD__)
+#define WRITE_WATCH_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define WRITE_WATCH_UNDER_TSAN 1
+#endif
+#endif
 const bool g_enabled = [] {
     const char* e = std::getenv("BBHOST_WRITE_WATCH");
+#ifdef WRITE_WATCH_UNDER_TSAN
+    const bool on = e && e[0] == '1';
+    std::fprintf(stderr, "write-watch: %s (a ThreadSanitizer build; BBHOST_WRITE_WATCH=1 arms it anyway)\n", on ? "on" : "off");
+    return on;
+#else
     return !e || e[0] != '0';
+#endif
 }();
 // BBHOST_WATCH_AHEAD=0: a write fault releases its own page only.
 const bool g_ahead_on = [] {

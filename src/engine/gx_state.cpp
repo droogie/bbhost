@@ -266,9 +266,91 @@ void gx_state_install(ElfImage* image) {
 }
 
 int gx_state_mode() { return g_mode; }
-std::uint32_t gx_blend_id(std::uint64_t object) { return lookup(kBlend, object); }
-std::uint32_t gx_depth_stencil_id(std::uint64_t object) { return lookup(kDepthStencil, object); }
-std::uint32_t gx_raster_id(std::uint64_t object) { return lookup(kRaster, object); }
+
+namespace {
+// A plugin's own draws restyled (gx_draw_style): each state's copy, made once
+// and remembered per thread for the last id and style asked.
+thread_local int t_style = 0;
+struct Restyled {
+    std::uint32_t from = 0, to = 0;
+    int style = 0;
+};
+thread_local Restyled t_restyled[4];
+
+// BBHOST_WIREFRAME_BIAS / BBHOST_WIREFRAME_SLOPE: the lines' constant and
+// slope-scaled depth bias (D3D11 units; negative is toward the viewer with the
+// game's depth, less-equal from near 0).
+const std::int32_t g_wire_bias = [] {
+    const char* e = std::getenv("BBHOST_WIREFRAME_BIAS");
+    return e ? std::atoi(e) : -512;
+}();
+const float g_wire_slope = [] {
+    const char* e = std::getenv("BBHOST_WIREFRAME_SLOPE");
+    return e ? static_cast<float>(std::atof(e)) : -1.0f;
+}();
+
+template <typename D, typename F> std::uint32_t restyled(Kind kind, std::uint32_t id, const char* what, F&& change) {
+    Restyled& r = t_restyled[kind];
+    if (id == r.from && t_style == r.style) return r.to;
+    const auto* d = static_cast<const D*>(desc_of(kind, id));
+    if (!d) return id;
+    D c = *d;
+    change(c);
+    bool made = false;
+    const std::uint32_t to = intern(kind, c, &made);
+    if (made) host_log("gx-state: %s %08x restyled (%d): %08x", what, id, t_style, to);
+    if (!to) return id;
+    r = {id, to, t_style};
+    return to;
+}
+
+// GX's blend factors are D3D11's 0-based (ZERO 0, ONE 1), its ops Vulkan's (ADD 0, SUBTRACT 1).
+void blend_all(GxBlendDesc& b, std::uint8_t src, std::uint8_t dst, std::uint8_t op) {
+    for (GxBlendTarget& t : b.rt) {
+        t.enable = 1;
+        t.src = t.src_alpha = src;
+        t.dst = t.dst_alpha = dst;
+        t.op = t.op_alpha = op;
+    }
+}
+}  // namespace
+
+// Subtracting is not idempotent: a pixel two faces cover at one depth (the
+// hi-hit has coplanar ones) would come out at the second face's colour. So a
+// subtracting draw is pulled toward the viewer a little and tested less-than,
+// its depth written: the first face at a pixel passes, the next one there not.
+std::uint32_t gx_depth_stencil_id(std::uint64_t object) {
+    const std::uint32_t id = lookup(kDepthStencil, object);
+    if (!(t_style & (kGxDrawLines | kGxDrawSubtract)) || !id) return id;
+    return restyled<GxDepthStencilDesc>(kDepthStencil, id, "depth-stencil", [](GxDepthStencilDesc& d) {
+        if (t_style & kGxDrawLines) {
+            d.depth_write = 0;
+        } else {
+            d.depth_write = 1;
+            d.depth_func = 1;  // LESS (GX's compare functions are Vulkan's)
+        }
+    });
+}
+std::uint32_t gx_blend_id(std::uint64_t object) {
+    const std::uint32_t id = lookup(kBlend, object);
+    if (!(t_style & (kGxDrawBlack | kGxDrawSubtract)) || !id) return id;
+    return restyled<GxBlendDesc>(kBlend, id, "blend", [](GxBlendDesc& b) {
+        if (t_style & kGxDrawBlack) blend_all(b, 0, 0, 0);  // src * 0 + dst * 0
+        else blend_all(b, 1, 1, 1);                         // src - dst
+    });
+}
+std::uint32_t gx_raster_id(std::uint64_t object) {
+    const std::uint32_t id = lookup(kRaster, object);
+    if (!(t_style & (kGxDrawLines | kGxDrawSubtract)) || !id) return id;
+    return restyled<GxRasterDesc>(kRaster, id, "rasterizer", [](GxRasterDesc& r) {
+        const bool lines = t_style & kGxDrawLines;
+        r.fill = lines ? 1 : r.fill;
+        r.depth_bias = lines ? g_wire_bias : -16;
+        r.slope_bias = lines ? g_wire_slope : 0.0f;
+        r.bias_clamp = 0.0f;
+    });
+}
+void gx_draw_style(int style) { t_style = style; }
 const GxBlendDesc* gx_blend_desc(std::uint32_t id) { return static_cast<const GxBlendDesc*>(desc_of(kBlend, id)); }
 const GxDepthStencilDesc* gx_depth_stencil_desc(std::uint32_t id) {
     return static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, id));

@@ -12,6 +12,13 @@
 #   tools/fetch_pipeline_list.sh --sha256     the pinned SHA-256 (tools/check_release_bundle.sh)
 #   tools/fetch_pipeline_list.sh --url        where it is published
 #   PIPELINE_LIST_CACHE=DIR (default build/pipeline-list)   where the download is kept
+#   PIPELINE_LIST_WAITS="15 30 60 120 240"                  the pauses before each try again
+#
+# GitHub's release downloads fail now and then for minutes at a time (v0.2.21's
+# first release run failed on a 504 for every try curl made in seven seconds),
+# so an answer other than 200 or 404 is tried again after each pause in
+# PIPELINE_LIST_WAITS, in seconds: about eight minutes in all before the run
+# fails. A 404 fails at once.
 #
 # The download is checked against the pin and its record format against the
 # one tools/pipeline_list.py writes (bbhost reads that one and the one before);
@@ -44,12 +51,29 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 format() { od -An -tu4 -j4 -N4 "$1" | tr -d ' '; }
 
 cache=${PIPELINE_LIST_CACHE:-build/pipeline-list}
+waits=${PIPELINE_LIST_WAITS:-15 30 60 120 240}
 mkdir -p "$cache"
 file=$cache/$LIST_TAG-$LIST_ASSET
+# One try (curl's own retries included): the final answer's HTTP code in
+# `code`, 000 for none.
+download() {
+    code=$(curl -sSL --retry 3 --retry-connrefused -m 600 -w '%{http_code}' -o "$file.part" "$url") || code=${code:-000}
+    [ "$code" = 200 ] && return 0
+    rm -f "$file.part"
+    return 1
+}
 if [ ! -f "$file" ] || [ "$(sha "$file")" != "$LIST_SHA256" ]; then
     rm -f "$file"
     echo "fetch_pipeline_list: $url"
-    curl -sSL --fail --retry 3 -m 600 -o "$file.part" "$url" || { rm -f "$file.part"; fail "download failed: $url (is the release published?)"; }
+    if ! download; then
+        for w in $waits; do
+            [ "$code" != 404 ] || break
+            echo "fetch_pipeline_list: HTTP $code; trying again in ${w}s"
+            sleep "$w"
+            if download; then break; fi
+        done
+    fi
+    [ "$code" = 200 ] || fail "download failed (HTTP $code): $url (is the release published?)"
     got=$(sha "$file.part")
     if [ "$got" != "$LIST_SHA256" ]; then
         rm -f "$file.part"

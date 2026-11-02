@@ -14,15 +14,20 @@ enum class Mode { kWhole, kWindows, kUndecided };
 // anything else whole spans), then the device: windows on an integrated GPU
 // under Windows, whose driver pins the whole spans resident and counts them
 // as the process's shared GPU memory (a Radeon 680M: 8.0 -> 6.2 GB at the
-// same frame rate), and whole spans on a discrete GPU and on Linux, where an
-// integrated GPU imports through udmabuf dma-bufs with tight memory - not
-// measured with window imports yet (the Steam Deck kit sets them itself).
-// `integrated` is -1 until the device is chosen: undecided then.
-inline Mode decide(const char* env, const char* config, int integrated, bool windows_host) {
+// same frame rate), and on a graphics card of its own with small video
+// memory (`small_vram` 1: under 7.5 GiB free at the start, gpu.cpp
+// small_vram), whose whole spans - 4-5 GiB of shared GPU memory pinned beside
+// a 4-6 GB card - cost a laptop's RAM where the card itself has no room to
+// spare; whole spans on a larger card and on a Linux integrated GPU, which
+// imports through udmabuf dma-bufs with tight memory - not measured with
+// window imports yet (the Steam Deck kit sets them itself). `integrated` is
+// -1 until the device is chosen: undecided then.
+inline Mode decide(const char* env, const char* config, int integrated, bool windows_host, int small_vram = 0) {
     if (env && *env) return env[0] == '1' ? Mode::kWindows : Mode::kWhole;
     if (config && *config) return std::strcmp(config, "true") == 0 ? Mode::kWindows : Mode::kWhole;
     if (integrated < 0) return Mode::kUndecided;
-    return integrated == 1 && windows_host ? Mode::kWindows : Mode::kWhole;
+    if (integrated == 1) return windows_host ? Mode::kWindows : Mode::kWhole;
+    return small_vram == 1 ? Mode::kWindows : Mode::kWhole;
 }
 
 }  // namespace import_mode

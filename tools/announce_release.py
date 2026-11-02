@@ -117,11 +117,25 @@ def main() -> int:
                  "User-Agent": "DiscordBot (https://github.com/droogie/bbhost, 1) announce-release"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
+            posted = json.load(r)
             print(f"{rel['tag_name']}: announced (HTTP {r.status})")
     except urllib.error.HTTPError as e:
         print(f"{rel['tag_name']}: Discord refused the post: HTTP {e.code} {e.read()[:300]!r}", file=sys.stderr)
         return 1
+    if role:
+        print(ping_report(posted, role))
     return 0
+
+
+def ping_report(posted: dict, role: str) -> str:
+    """What Discord made of the role mention: the message it sends back lists the roles it pinged. A mention it
+    shows but does not count (the role is not mentionable and the bot may not mention it in this channel) is
+    left out of that list, and nobody who holds the role is alerted."""
+    if role in posted.get("mention_roles", []):
+        return f"the post pinged role {role}: everyone holding it is alerted, as their notification settings allow"
+    return (f"WARNING: Discord did not count the mention of role {role}: nobody was alerted. The bot needs \"Mention "
+            f"@everyone, @here, and All Roles\" in channel {posted.get('channel_id', '?')}, or the role \"Allow anyone "
+            f"to @mention this role\"")
 
 
 if __name__ == "__main__":

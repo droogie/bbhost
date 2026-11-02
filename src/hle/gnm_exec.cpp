@@ -12,6 +12,7 @@
 #include "hle/modules.h"
 #include "host/host_lists.h"
 #include "host/label_landing.h"
+#include "host/list_resolve.h"
 #include "hle/wait_reg_mem.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
@@ -1824,11 +1825,161 @@ void zpass_dump(std::uint64_t va, bool zpass_trace) {
     }
 }
 
+// BBHOST_LIST_RESOLVE=runs: what a packet the walk acts on is to the runs of
+// GX-native draws a list's resolution would cover (host/list_resolve.h). The
+// draw tokens themselves are counted where they draw; register packets, which
+// only draw packets read, NOPs without a token and barrier tokens (counted)
+// end nothing.
+// What a packet is to the runs: the split it makes, kSplitNone for nothing,
+// or kSplitBarrier for a barrier token (counted, no split).
+constexpr int kSplitNone = -1, kSplitBarrier = -2;
+int list_split_of(std::uint32_t op, const std::uint32_t* b, std::size_t n) {
+    using namespace list_resolve;
+    switch (op) {
+        case kNop:
+            if (n < 1) return kSplitNone;
+            switch (b[0]) {
+                case kGxBarrierMagic: return kSplitBarrier;
+                case kGxQueryMagic: return kSplitQuery;
+                case kGxYebisMagic: case kGxScaleformMagic: return kSplitOtherDraw;
+                case kGxCopyMagic: case kGxFillMagic: case kGxUploadMagic: case kGxImageCopyMagic: case kGxClearMagic:
+                case kGxCountCopyMagic:
+                    return kSplitCopy;
+                case kGxDispatchMagic: return kSplitDispatch;
+                default: return kSplitNone;
+            }
+        case kWaitRegMem: return kSplitWait;
+        case kEventWriteEop: case kEventWriteEos: case kReleaseMem: return kSplitLabel;
+        case kEventWrite: return kSplitQuery;
+        case kWriteData: case kDmaData: return kSplitCpWrite;
+        case kSetPredication: return kSplitPredication;
+        case kWriteConstRam: case kDumpConstRam: case kIncrementCeCounter: case kIncrementDeCounter: case kWaitOnCeCounter:
+        case kWaitOnDeCounterDiff:
+            return kSplitConstantEngine;
+        case kIndirectBuffer: case kIndirectBufferConst: return kSplitCall;
+        case kDrawIndex2: case kDrawIndexAuto: case kDrawIndexOffset2: case kDrawIndirect: case kDrawIndexIndirect:
+            return kSplitPacketDraw;
+        case kDispatchDirect: case kDispatchIndirect: return kSplitDispatch;
+        default: return kSplitNone;
+    }
+}
+
+void note_list_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n) {
+    const int s = list_split_of(op, b, n);
+    if (s == kSplitBarrier) list_resolve::note_barrier();
+    else if (s >= 0) list_resolve::split(static_cast<list_resolve::Split>(s));
+}
+
+// BBHOST_RUN_COMMIT: the draws after a run's first draw token (inputs
+// `first`, the packets after it from p) that belong to its run - the GX-native
+// draw tokens that follow in the command buffer with nothing between them the
+// command processor does in order (list_split_of) and into the same targets,
+// peeked in their slots without taking them. A token whose slot is not stored
+// yet ends the look; so does the command buffer's end. With `draws` (=on), the
+// run also ends at a draw a part does not take (a tessellated one, a geometry
+// shader's, an indirect one), and each token's draw is built as native_draw
+// builds it (none for a token that draws nothing). At most kRunMost tokens: the
+// fork reserves a packet for each in the recorder's ring of 1,024.
+constexpr std::uint32_t kRunMost = 384;
+std::uint32_t run_following(const std::uint32_t* p, const GpuDrawInputs& first, list_resolve::LookStop& stop,
+                            std::vector<GpuDraw>* draws = nullptr, std::vector<std::uint64_t>* ids = nullptr) {
+    const auto* end = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_cb_hi));
+    const std::uint64_t key = list_resolve::targets_of(first);
+    std::uint32_t n = 0;
+    stop = list_resolve::kLookEnd;
+    while (p + 1 < end && n < kRunMost) {
+        const std::uint32_t hdr = p[0];
+        if ((hdr >> 30) != 3) break;
+        const std::size_t cnt = ((hdr >> 16) & 0x3fff) + 1;
+        if (p + 1 + cnt > end) break;
+        const std::uint32_t op = (hdr >> 8) & 0xff;
+        const std::uint32_t* b = p + 1;
+        if (op == kNop && cnt >= 3 && b[0] == kGxNativeMagic) {
+            const GxDrawObjects* o = nullptr;
+            const std::uint64_t id = b[1] | (static_cast<std::uint64_t>(b[2]) << 32);
+            const GpuDrawInputs* in = hle_gx_native_peek(id, &o);
+            if (!in) {
+                stop = list_resolve::kLookNotReady;
+                break;
+            }
+            if (list_resolve::targets_of(*in) != key) {
+                stop = list_resolve::kLookTargets;
+                break;
+            }
+            if (draws) {
+                if ((in->stages & 0x7) || (in->gs && o->shader[3]) || o->indirect_va) {
+                    stop = list_resolve::kLookKind;
+                    break;
+                }
+                if (o->geometry && o->count) {
+                    GpuDraw d;
+                    d.gx = in;
+                    d.gx_render = true;
+                    d.gx_objects = o;
+                    d.gx_token = true;
+                    d.gx_token_kind = "native";
+                    d.registers = cp_registers();
+                    d.sh = t_regs.sh;
+                    d.ctx = t_regs.ctx;
+                    d.uconfig = t_regs.uconfig;
+                    d.index_count = o->count;
+                    d.instance_count = o->instances ? o->instances : 1;
+                    d.index_va = o->indexed && o->index_known ? o->index_va : 0;
+                    d.index_type = o->index_type;
+                    draws->push_back(d);
+                    if (ids) ids->push_back(id);
+                }
+            }
+            ++n;
+        } else if (list_split_of(op, b, cnt) >= 0) {
+            stop = list_resolve::kLookSplit;
+            break;
+        }
+        p += 1 + cnt;
+    }
+    return n;
+}
+
+// BBHOST_RUN_COMMIT=on: after a run's first draw (just drawn, inputs `first`),
+// the rest of the run committed in parts (host_gpu_run_commit); the walk then
+// passes over their tokens.
+void run_commit_after(const std::uint32_t* p, const GpuDrawInputs& first) {
+    static thread_local std::vector<GpuDraw> draws;
+    static thread_local std::vector<std::uint64_t> ids;
+    draws.clear();
+    ids.clear();
+    const auto t0 = std::chrono::steady_clock::now();
+    list_resolve::LookStop stop;
+    const std::uint32_t following = run_following(p, first, stop, &draws, &ids);
+    const auto t1 = std::chrono::steady_clock::now();
+    list_resolve::note_look(stop, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    std::uint32_t failed = 0;
+    const int committed = following + 1 < list_resolve::run_min() || draws.empty()
+                              ? 0
+                              : host_gpu_run_commit(draws.data(), ids.data(), static_cast<std::uint32_t>(draws.size()), failed);
+    if (committed <= 0) {
+        list_resolve::note_commit(following + 1, 0, false);
+        // Its draws drawn as the walk reaches them, none looking ahead again -
+        // unless the first took no answer to share: the next starts its own.
+        if (committed == 0) list_resolve::run_hold(following);
+        list_resolve::report_commit();
+        return;
+    }
+    g_draws.fetch_add(draws.size());
+    if (failed) g_draw_failed.fetch_add(failed);
+    list_resolve::run_set(following);
+    list_resolve::note_commit(following + 1,
+                              static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count()),
+                              true);
+    list_resolve::report_commit();
+}
+
 void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int depth) {
     t_packet_va = reinterpret_cast<std::uintptr_t>(b) - 4;
     t_packet_op = op;
     t_next_packet = b + n;
     if (g_cp_census) census_packet(op, b, n);
+    if (list_resolve::on()) note_list_packet(op, b, n);
     switch (op) {
         case kEventWriteEop:
             // [0] event, [1] addr_lo, [2] addr_hi[15:0] | data_sel[31:29] | int_sel[25:24], [3] data_lo, [4] data_hi
@@ -2427,7 +2578,28 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
                 lookahead_tokens(b + n);
                 const GpuDrawInputs* in = hle_gx_native_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.sh, t_regs.ctx);
-                if (in) native_draw(in, "native");
+                if (in && list_resolve::census()) {
+                    if (const GxDrawObjects* o = hle_gx_trace_objects()) list_resolve::note_draw(*in, *o);
+                }
+                // BBHOST_RUN_COMMIT: a token of a run a fork covered was drawn
+                // there (=on); the pricing step (=fork) forks at the first.
+                bool committed = false;
+                if (in && list_resolve::committing()) {
+                    if (list_resolve::run_left()) {
+                        list_resolve::run_take();
+                        committed = list_resolve::commit_draws();
+                    } else if (!list_resolve::commit_draws()) {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        list_resolve::LookStop stop;
+                        const std::uint32_t following = run_following(b + n, *in, stop);
+                        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                        list_resolve::run_fork(following, stop, static_cast<std::uint64_t>(ns));
+                    }
+                }
+                if (in && !committed) {
+                    native_draw(in, "native");
+                    if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
+                }
                 hle_gx_native_release();
             }
             // A YEBIS draw's token. With the flip on the method wrote no draw
@@ -2812,6 +2984,9 @@ struct Queue {
     std::uint64_t submitted = 0;
     std::uint64_t retired = 0;
     bool started = false;
+    // `submitted` as last published, read without the lock (the idle census,
+    // BBHOST_CP_IDLE_LOG).
+    std::atomic<std::uint64_t> pushed{0};
 };
 std::mutex g_queues_mu;
 std::atomic<std::uint64_t> g_submitted_total{0}, g_retired_total{0};
@@ -2898,13 +3073,47 @@ void cp_thread(Queue* q, int id) {
         host_thread_set_class(HostThreadClass::GpuFeed, name);
     }
     CpuProfile profile = id == 0 ? cpu_profile_config() : CpuProfile{};
+    // BBHOST_CP_IDLE_LOG=1: every 10 s for queue 0, how many jobs it took,
+    // how often it found its queue empty and how long it slept on the
+    // queue's condition variable then. In Kyo's Central Yharnam save it took
+    // ~1,700 jobs a second (12 a frame) and never found its queue empty in
+    // the world: the command processor is busy all of the frame there, and
+    // the time between the game's submissions is no part of its cost.
+    static const bool idle_log = [] {
+        const char* e = std::getenv("BBHOST_CP_IDLE_LOG");
+        return e && e[0] == '1';
+    }();
+    std::uint64_t taken = 0, taken_at = 0, idle_empty = 0, idle_sleeps = 0, idle_ns = 0, idle_max_ns = 0;
+    std::uint64_t idle_since = host_clock_monotonic_ns();
     for (;;) {
         Job job;
+        if (idle_log && q->pushed.load(std::memory_order_acquire) <= taken) ++idle_empty;
         {
             std::unique_lock<std::mutex> lk(q->mu);
+            if (idle_log && q->jobs.empty()) {
+                const std::uint64_t t0 = host_clock_monotonic_ns();
+                q->cv.wait(lk, [q] { return !q->jobs.empty(); });
+                const std::uint64_t d = host_clock_monotonic_ns() - t0;
+                ++idle_sleeps;
+                idle_ns += d;
+                idle_max_ns = std::max(idle_max_ns, d);
+            }
             q->cv.wait(lk, [q] { return !q->jobs.empty(); });
             job = std::move(q->jobs.front());
             q->jobs.pop_front();
+        }
+        ++taken;
+        if (idle_log && id == 0) {
+            const std::uint64_t now = host_clock_monotonic_ns();
+            if (now - idle_since >= 10'000'000'000ull) {
+                host_log("cp: in %.1f s, %llu jobs; the queue empty %llu times, slept %llu: %.1f ms, avg %.1f us, max %.1f us",
+                         (now - idle_since) / 1e9, static_cast<unsigned long long>(taken - taken_at), static_cast<unsigned long long>(idle_empty),
+                         static_cast<unsigned long long>(idle_sleeps), idle_ns / 1e6,
+                         idle_sleeps ? idle_ns / 1e3 / static_cast<double>(idle_sleeps) : 0.0, idle_max_ns / 1e3);
+                idle_since = now;
+                taken_at = taken;
+                idle_empty = idle_sleeps = idle_ns = idle_max_ns = 0;
+            }
         }
         cpu_profile_tick(profile);
         t_job_free_event = g_arena_monitor ? job.free_event : ~0ull;
@@ -2976,6 +3185,7 @@ void cp_thread(Queue* q, int id) {
         }
         apply_arena_frees();  // the job's buffers are all walked
         t_job_free_event = ~0ull;
+        if (list_resolve::on()) list_resolve::split(list_resolve::kSplitSubmission);
         // Submit after every job: its labels - held back to the end of the
         // command buffer (host_gpu_mem_write) - then land when its own work
         // has run, as on the console. Recording on into one command buffer
@@ -3197,6 +3407,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
     q->jobs.back().round_seq = round_seq;
     ++q->submitted;
+    q->pushed.store(q->submitted, std::memory_order_release);
     q->jobs.back().seq = g_submitted_total.fetch_add(1, std::memory_order_release) + 1;
     q->cv.notify_all();
     // Do not let the game get far ahead of the command processor. On hardware
@@ -3743,6 +3954,7 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(n > slow ? (g_cp_dispatch_ns[k].load() - slow_ns) / (n - slow) : 0));
     }
     host_gpu_report();
+    list_resolve::report(true);
     for (int op = 0; op < 256; ++op) {
         const std::uint64_t n = g_op_hist[op].load();
         if (n) {

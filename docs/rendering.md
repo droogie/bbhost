@@ -81,7 +81,13 @@ chunk, looks again as each label lands. The thread waits in the driver, or
 polls on Windows (`BBHOST_LABEL_WAIT`), where NVIDIA's driver holds its lock
 through that wait; there the labels are still GPU fills at the end of their
 submission's command buffer unless `BBHOST_LABEL_LANDING=1` (`=0` keeps the
-fills anywhere). A label meant for a command buffer the game has begun
+fills anywhere). Measured on Windows on the Radeon 8060S (AMD's driver,
+2026-10-29, the run commit on, the GPU the limit at 640x360): fills 200.0
+and 200.8 fps, landed with the thread polling 199.6 and 200.9, waiting in
+the driver (`BBHOST_LABEL_WAIT=block`, no lock trouble on AMD's driver)
+201.2 and 201.0; 2.5 million writes from 146,000 submissions in a 100-s
+run, landed 5.4-5.6 ms after the submit (p99 7.4 ms), none into a reused
+command buffer, the frame pacing the same. A label meant for a command buffer the game has begun
 writing again since the label's submission - YEBIS cycles two command buffers
 and reuses one without waiting for the GPU, so a GPU running behind lands the
 old round's fences on the new round's packets - is counted and not written:
@@ -238,16 +244,25 @@ MB in place; the rest it reads only as the source of a copy (texture
 detiling, the buffer shadow's mirrors). `BBHOST_IMPORT_WINDOWS=1` imports
 only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
-over several windows replaces the ones it covers, so no page is imported
+over several windows replaces the ones it covers, so no page stays imported
 twice, and a dispatch imports what its shader reads and stores (an import a
 draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
 waited for N in M ms`, and the exit report gives the driver's time by the
-thread that waited). It is on by default on an integrated GPU under Windows,
+thread that waited). The page table's entries of a window that named the
+import a newer one replaces keep naming it until every submission made before
+the newer one has run: a shader walking the table reads whatever address an
+entry holds as it runs, and AMD's Linux driver maps a new buffer's addresses
+for the submissions made after it, not for the ones already queued
+(host/import_table.h; `BBHOST_IMPORT_TABLE_DEFER=0` switches them at once, as
+before). It is on by default on an integrated GPU under Windows,
 where whole spans kept about 1.5 GB more of the game's memory resident for the
-GPU. It is off on a graphics card of its own, and under Linux, where window
-imports have not been measured on an integrated GPU yet (AMD's imports go
+GPU, and on a graphics card with small video memory (under 7.5 GiB free at
+the start), whose whole spans pin 4-5 GiB of system memory beside a 4-6 GB
+card. It is off on a graphics card with room, and on an integrated GPU under
+Linux, where window imports have not been measured yet (AMD's imports go
 through udmabuf there). `gpu.import_windows`, true or false, decides it either
-way. The work under way moves each of those uses off guest memory, and
+way. The log's `gpu: memory:` line gives the decision with the others made
+for the device (host/memory_policy.h). The work under way moves each of those uses off guest memory, and
 windows are then only the fallback for what is not moved yet. The Steam Deck
 kit turns it on: there the
 memory shared with the GPU stays under the driver's budget and the start is
@@ -342,7 +357,9 @@ follows a depth-only pipeline in the command buffer being recorded, and whose
 attachments' blend states differ where that would change what it draws, starts
 a command buffer of its own, what was recorded before it submitted without
 waiting (`BBHOST_LVP_BLEND_SPLIT=0` records it like any other); other drivers
-draw it correctly.
+draw it correctly. A draw of a run committed in parts (`BBHOST_RUN_COMMIT`)
+that would split, or mark the command buffer, stops, and the command processor
+commits it and the rest of the run in order.
 A draw whose rasterizer state comes from the registers rather than a GX
 description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
 ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth
@@ -636,12 +653,22 @@ Nightmare, Laurence's staircase, Lumenwood and Astral:
   tokens' sources copied just before a submission. Window mode then counts
   one to three more arrival stalls a place than whole imports, and 32-36 a
   12-place tour against 25.
-- The remedy is to let the GPU read those sources again: windows imported
-  ahead of the upload, off the command processor, at the GX resource's
-  creation (as the import prefetch does for buffers), and retired once idle so
-  that the imports stay near a gigabyte, with staging only where no window is
-  there yet. It belongs to the step that makes GX textures Vulkan images at
-  their creation, which removes most of these imports anyway.
+- Most of those waits were for textures made ahead of their first bind, and
+  most of those are never bound. Such a texture's upload is now recorded at
+  the first submission after the prep pool has copied its tiled bytes into
+  staging, with no wait (`BBHOST_GXVK_AHEAD_DEFER=0` records it at the
+  creation, as before). Whatever uses the image before then records it first,
+  and waits for the copy only if it is still running: a binding, an upload
+  token, a fill, a move in the image heap. A carry of a mip chain no longer
+  waits for the upload it has just queued, whose hashes it takes again at
+  once. On lavapipe at Laurence's staircase the waits fall from 227-236 to 11
+  a run.
+- The rest of the remedy is to let the GPU read those sources again: windows
+  imported ahead of the upload, off the command processor, at the GX
+  resource's creation (as the import prefetch does for buffers), and retired
+  once idle so that the imports stay near a gigabyte, with staging only where
+  no window is there yet. It belongs to the step that makes GX textures Vulkan
+  images at their creation, which removes most of these imports anyway.
 
 ### Resolving draws where their command lists are finished (a design note)
 
@@ -704,6 +731,13 @@ built yet; the reasoning, as measured on the development machine:
   processor resolves each draw (F12 captures, `tools/glitch_hunt.sh`,
   `BBHOST_GX_COST`, `drawreplay`). Its first step would be a compact command
   per draw, built at the GX call in place of the token's sparse records.
+- **Measured where the command processor limits.** At Kyo's save in Central
+  Yharnam on a Radeon 8060S (165 fps, the command processor 96% busy, the
+  main loop's own work 4.4 ms) 42% of `bb-cp0` is per-list work, 31% per-list
+  work with a check, 20% in order; ~1,390 draws a flip fall into ~67 runs of
+  one GX context each, and the command processor reaches most draws two flips
+  after their GX call. The split, the runs (`BBHOST_LIST_RESOLVE=runs`) and
+  the order to build it in are [list-resolve.md](list-resolve.md).
 
 ### GX's objects as Vulkan objects (a design note)
 
@@ -761,14 +795,19 @@ buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
 
-GX's buffers are bound by handle by default (`BBHOST_GXVK_BUFFERS=0` keeps
-today's path), except on an integrated GPU or with tight memory, where the
-draws read GX's buffers where they are - the buffer shadow in place, or no
-shadow - so a copy would hold memory and buy nothing, and with small video
-memory (under 7.5 GiB free at the start), where the copies compete with the
-targets and textures for it and one dip to the reserve costs far more GPU
-time than the command processor saves; there today's path stays unless
-`BBHOST_GXVK_BUFFERS=1`. On an RTX 4070, uncapped, the frame rate goes from
+GX's buffers are bound by handle by default on a discrete GPU and on an
+integrated GPU with 8 GiB of video memory or more (`BBHOST_GXVK_BUFFERS=0`
+keeps today's path). With small video memory (under 7.5 GiB free at the
+start) their copies have a budget - an eighth of what is free, 256-512 MiB
+(`BBHOST_GXVK_BUFFERS_BUDGET_MB`) - where the least recently bound goes
+first and the pool gives room back before the buffer shadow's mirrors are
+refused: without the copies the mirrors carried the meshes, and at a 4 GB
+card's budget they were refused room and the draws read their vertices
+across the bus. A smaller integrated GPU and tight memory keep today's path,
+where the draws read GX's buffers where they are - the buffer shadow in
+place, or no shadow - so a copy would hold memory the system needs, unless
+`BBHOST_GXVK_BUFFERS=1`. The log's `gpu: memory:` line says which
+(host/memory_policy.h). On an RTX 4070, uncapped, the frame rate goes from
 83.6 to 94.6 at Old Yharnam and from 82.2 to 95.0 at the Nightmare of Mensis
 by handle, the command processor taking 1.4-1.6 ms a flip less; at 60 it
 takes up to 1 ms a flip less, with the GPU's time and the frame pacing
@@ -880,5 +919,6 @@ pacing unchanged.
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
 | `tools/area_check.py` | twelve places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
+| `BBHOST_VA_TRACE=1` | logs every guest-memory import made, put in place, retired and freed, every window whose page-table entries move, every device buffer made through `create_dev_buffer` with its owner and every staging or scratch chunk freed (`va:` lines, the wall clock in seconds and microseconds, to match `journalctl -k -o short-unix`); a device fault report then looks its addresses up in them. `=2` adds the driver's own binds and unbinds where it reports them (VK_EXT_device_address_binding_report) |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |

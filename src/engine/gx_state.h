@@ -70,6 +70,15 @@ int gx_state_mode();
 std::uint32_t gx_blend_id(std::uint64_t object);
 std::uint32_t gx_depth_stencil_id(std::uint64_t object);
 std::uint32_t gx_raster_id(std::uint64_t object);
+// A plugin's own draws restyled (plugin API 16), on this thread until set back
+// to 0, as the or of: kGxDrawLines - the rasterizer state's copy that draws
+// lines (fill 1), pulled toward the viewer by a depth bias so the lines win
+// over the faces they outline, and the depth not written; kGxDrawBlack - the
+// blend state's copy that writes zero to every target; kGxDrawSubtract - the
+// blend state's copy that writes the draw's colour less the target's, once a
+// pixel (pulled toward the viewer a little, tested less-than, depth written).
+constexpr int kGxDrawLines = 1, kGxDrawBlack = 2, kGxDrawSubtract = 4;
+void gx_draw_style(int style);
 // The description behind an id; null for 0 or an unknown id. Stable for the run.
 const GxBlendDesc* gx_blend_desc(std::uint32_t id);
 const GxDepthStencilDesc* gx_depth_stencil_desc(std::uint32_t id);

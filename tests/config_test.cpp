@@ -297,6 +297,45 @@ int main() {
         CHECK(config_effect_steps() == "60");
         unsetenv("BBHOST_SFX_STEP");
     }
+    // [video] frame_clock: the Native frame clock setting's default - off when
+    // the file has no such key, true or false as written - and
+    // config_frame_clock: the setting (the options file's when it holds one,
+    // else that default), BBHOST_FRAME_CLOCK=1 or 0 over it either way, and
+    // what decided, for the start line.
+    {
+        unsetenv("BBHOST_FRAME_CLOCK");
+        const char* from = nullptr;
+        HostConfig c = load("[player]\nname = \"Hunter\"\n");
+        CHECK(!c.frame_clock);
+        CHECK(!config_frame_clock(c.frame_clock, false, &from) && std::string(from) == "the default");
+        c = load("[video]\nframe_clock = true\n");
+        CHECK(c.frame_clock);
+        CHECK(config_frame_clock(c.frame_clock, false, &from) && std::string(from) == "bbhost.toml's [video] frame_clock");
+        c = load("[video]\nframe_clock = false\n");
+        CHECK(!c.frame_clock);
+        CHECK(!config_frame_clock(c.frame_clock, false, &from) && std::string(from) == "bbhost.toml's [video] frame_clock");
+        // The options file's choice over the file's default, both ways.
+        CHECK(config_frame_clock(true, true, &from) && std::string(from) == "the Native frame clock setting");
+        c = load("[video]\nframe_clock = true\n");
+        CHECK(!config_frame_clock(false, true, &from) && std::string(from) == "the Native frame clock setting");
+        // The environment over both, either way; the field stays the file's.
+        setenv("BBHOST_FRAME_CLOCK", "1", 1);
+        c = load("[video]\nframe_clock = false\n");
+        CHECK(!c.frame_clock);
+        CHECK(config_frame_clock(false, true, &from) && std::string(from) == "BBHOST_FRAME_CLOCK=1");
+        CHECK(config_frame_clock(false, false, &from) && std::string(from) == "BBHOST_FRAME_CLOCK=1");
+        setenv("BBHOST_FRAME_CLOCK", "0", 1);
+        c = load("[video]\nframe_clock = true\n");
+        CHECK(c.frame_clock);
+        CHECK(!config_frame_clock(true, true, &from) && std::string(from) == "BBHOST_FRAME_CLOCK=0");
+        CHECK(!config_frame_clock(c.frame_clock, false, &from) && std::string(from) == "BBHOST_FRAME_CLOCK=0");
+        // Anything else is not a switch: the setting stands.
+        setenv("BBHOST_FRAME_CLOCK", "yes", 1);
+        CHECK(config_frame_clock(true, true, &from) && std::string(from) == "the Native frame clock setting");
+        setenv("BBHOST_FRAME_CLOCK", "", 1);
+        CHECK(!config_frame_clock(false, true, &from));
+        unsetenv("BBHOST_FRAME_CLOCK");
+    }
     // The template a first start writes types in the window.
     {
         const fs::path t = g_dir / "template.toml";

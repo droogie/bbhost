@@ -7,8 +7,10 @@
 // gives it - the effect, each integer argument in the width the method reads
 // (a zero-extended byte as 32 bits), the floats' bits - and return what it
 // returns; the five that write in place must write the same bytes and return
-// 0. Six deliberate mistakes must be caught, and the entries hold the
-// instructions written against. Skips without the 1.09 eboot.
+// 0 - but the effect's elapsed time (0xfb2800), which takes the frame clock's
+// length: the game's at 1/30, the value times the frame in 30 fps frames at
+// any other. Eight deliberate mistakes must be caught, and the entries hold
+// the instructions written against. Skips without the 1.09 eboot.
 #define DECOMP_YEBIS_PPFX_SETTERS_MUTANTS
 int g_ppfx_setters_mutant = 0;
 #include "decomp/yebis/ppfx_setters.cpp"
@@ -221,11 +223,69 @@ long run(int cases) {
     return n;
 }
 
+// The effect's elapsed time (ppfx_sub_fb2800) at frames of other lengths, the
+// frame clock published as the frame-rate code publishes it: +0x6ac holds the
+// value handed times the frame in 30 fps frames - one float multiply, the
+// clock's frames30 - and every other byte of the effect is what the game's
+// entry leaves; at the game's 1/30, and with the clock off or
+// BBHOST_YEBIS_STEP=0 at any frame, the game's bytes throughout.
+long elapsed_time(int cases) {
+    const float kSteps[] = {frame_clock::kThirtieth, 1.0f / 60.0f, 1.0f / 90.0f, 1.0f / 120.0f, 1.0f / 144.0f,
+                            1.0f / 165.0f, 1.0f / 240.0f, 1.0f / 360.0f, 1.0f / 1000.0f};
+    const Entry* e = nullptr;
+    for (const Entry& k : kEntries) {
+        if (k.bn == 0xfb2800) e = &k;
+    }
+    if (!e) {
+        fail("ppfx_sub_fb2800", -1, "not in the table");
+        return 0;
+    }
+    long n = 0;
+    for (int c = 0; c < cases; ++c) {
+        const bool off = c % 7 == 6;
+        g_yebis_step = !off;
+        // The step: one of the rates', or any between 1/1000 and 1/30 s.
+        const int k = g_rng.range(0, static_cast<int>(sizeof kSteps / sizeof kSteps[0]));
+        const float dt = k < static_cast<int>(sizeof kSteps / sizeof kSteps[0]) ? kSteps[k] : g_rng.uniform(0.001f, frame_clock::kThirtieth);
+        frame_clock::publish(dt);
+        // The context's +4: the game's 1/60, or anything (zeros, denormals, infinities, NaNs).
+        const float value = g_rng.chance(0.5) ? 1.0f / 60.0f : g_rng.value(-10.0f, 10.0f);
+        u64 r[6], x[8];
+        for (u64& v : r) v = g_rng.next();
+        for (u64& v : x) v = g_rng.next();
+        u32 vb;
+        std::memcpy(&vb, &value, 4);
+        x[0] = (x[0] & ~0xffffffffull) | vb;
+        store<u64>(kSinglePostEffect, reinterpret_cast<u64>(g_effect));
+        for (u8& b : g_start) b = static_cast<u8>(g_rng.u32());
+
+        std::memcpy(g_effect, g_start, sizeof g_effect);
+        const u64 game_ret = call(eboot_kit::at(e->bn), r, x);
+        std::memcpy(g_after_game, g_effect, sizeof g_effect);
+        std::memcpy(g_effect, g_start, sizeof g_effect);
+        const u64 our_ret = call(e->ours, r, x);
+        ++n;
+
+        const float frames = frame_clock::frames30_of(dt);
+        const float want = off || frames == 1.0f ? value : value * frames;
+        std::memcpy(g_after_game + 0x6ac, &want, 4);
+        if (our_ret != game_ret) fail(e->name, c, "the return value at another frame length");
+        if (std::memcmp(g_effect, g_after_game, sizeof g_effect) != 0) {
+            fail(e->name, c, off ? "the effect's bytes with the step off" : "the elapsed time (value x frames30) or another byte");
+        }
+    }
+    g_yebis_step = false;
+    frame_clock::g_dt.store(frame_clock::kThirtieth);
+    frame_clock::g_frames30.store(1.0f);
+    return n;
+}
+
 bool caught(int mutant) {
     const int before = g_failed;
     g_ppfx_setters_mutant = mutant;
     g_quiet = true;
     run(200);
+    elapsed_time(200);
     g_quiet = false;
     g_ppfx_setters_mutant = 0;
     const bool found = g_failed > before;
@@ -244,17 +304,20 @@ int main(int argc, char** argv) {
         if (!at || std::memcmp(at, e.code, e.code_len) != 0) fail(e.name, -1, "the entry's instructions");
     }
     const long total = run(cases);
-    for (const int mutant : {1, 2, 3, 4, 5, 6}) {
+    const long timed = elapsed_time(cases);
+    for (const int mutant : {1, 2, 3, 4, 5, 6, 7, 8}) {
         if (!caught(mutant)) {
             ++g_failed;
             std::printf("FAIL: mutant %d not caught\n", mutant);
         }
     }
     if (g_failed) {
-        std::printf("yebis_ppfx_setters_test: %d failures (%ld cases)\n", g_failed, total);
+        std::printf("yebis_ppfx_setters_test: %d failures (%ld cases, %ld at other frame lengths)\n", g_failed, total, timed);
         return 1;
     }
-    std::printf("yebis_ppfx_setters_test: ok - %zu entries, %ld cases, 6 mutants caught\n", sizeof kEntries / sizeof kEntries[0], total);
+    std::printf("yebis_ppfx_setters_test: ok - %zu entries, %ld cases, %ld of the elapsed time at other frame lengths, 8 mutants "
+                "caught\n",
+                sizeof kEntries / sizeof kEntries[0], total, timed);
     return 0;
 }
 

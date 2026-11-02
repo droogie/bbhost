@@ -45,10 +45,14 @@ inline bool flag(const char* env, const char* config, bool fallback) {
 
 // Part 1: upload staging over the floor goes back in play, a 64 MiB chunk
 // every two seconds once the world has settled (staging_give_now)
-// (BBHOST_STAGING_RETURN, gpu.staging_return). Off by default: on an RTX 4070
-// each chunk's free stalled the frame it fell in (29-47 ms against 14-17).
-inline bool staging_return(const char* env, const char* config, int integrated, bool windows_host) {
-    return flag(env, config, apu_defaults(integrated, windows_host));
+// (BBHOST_STAGING_RETURN, gpu.staging_return). On by default on an integrated
+// GPU under Windows and on a graphics card with small video memory
+// (`small_vram` 1, which imports by window too: its shared GPU memory is the
+// staging and the windows), off elsewhere: on an RTX 4070 each chunk's free
+// stalled the frame it fell in (29-47 ms against 14-17), so the memory policy
+// (host/memory_policy.h) passes `small_vram` 1 only off NVIDIA's driver.
+inline bool staging_return(const char* env, const char* config, int integrated, bool windows_host, int small_vram = 0) {
+    return flag(env, config, apu_defaults(integrated, windows_host) || (integrated == 0 && small_vram == 1));
 }
 
 // The world has settled once no loading screen is up and `settle_ms` have

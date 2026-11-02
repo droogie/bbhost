@@ -17,14 +17,17 @@
 // as offsets in the effect, say what each is. Parameter names likewise: the
 // asserts' (fGlareRemapFactor, fExposure, eMatrixType, iEffectViewIndex ...)
 // where there are any. A byte the entry zero-extends before the method reads
-// its 32 bits is a u8 here, passed on as a u32 (as movzx does). The first
+// its 32 bits comes here as the whole register and goes on as its low byte,
+// zero-extended (low_byte, as the entry's movzx does). The first
 // argument of each is the PPFX context the flip pass passes (+0x2670 of the
 // object it works on), which the entries leave unread: there is one post
 // effect. Leaves: one call or one store each.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "engine/frame_clock.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 using namespace decomp;
 
@@ -40,6 +43,16 @@ namespace {
 constexpr u64 kSinglePostEffect = 0x5865ed0;  // s_pSinglePostEffect
 
 u64 effect() { return load<u64>(game_address(kSinglePostEffect)); }
+
+// A byte argument as the entry makes it: the register's low byte, the rest
+// cleared. The parameter is the register, not a u8: clang takes a u8
+// parameter's upper bits for zero, as its own callers leave them, and passes
+// the register on as it came; the game's entry clears them itself.
+u32 low_byte(u32 reg) { return static_cast<u8>(reg); }
+
+// With the frame clock on, the effect's elapsed time follows it
+// (ppfx_sub_fb2800); decomp_yebis_ppfx_setters_add sets it.
+bool g_yebis_step = false;
 
 }  // namespace
 
@@ -62,26 +75,26 @@ DECOMP_LEAF u64 ppfx_sub_fb2740(u64 /*context*/, float near_z, float far_z, floa
 }
 
 // A 4x4 matrix (a pointer to it) to +0x5ac - its z axis mirrored (0xfb8890) unless the flag - and what is made from it to +0x5ec.
-DECOMP_LEAF u64 ppfx_sub_fb27d0(u64 /*context*/, u64 matrix, u8 flag) {
-    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8cb0)(effect(), matrix, static_cast<u32>(flag));
+DECOMP_LEAF u64 ppfx_sub_fb27d0(u64 /*context*/, u64 matrix, u32 flag) {
+    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8cb0)(effect(), matrix, MUTANT(7) ? flag : low_byte(flag));
 }
 
 // The same for the matrix at +0x62c.
-DECOMP_LEAF u64 ppfx_sub_fb27f0(u64 /*context*/, u64 matrix, u8 flag) {
-    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd90f0)(effect(), matrix, static_cast<u32>(flag));
+DECOMP_LEAF u64 ppfx_sub_fb27f0(u64 /*context*/, u64 matrix, u32 flag) {
+    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd90f0)(effect(), matrix, low_byte(flag));
 }
 
 // A byte at +0x150 of the object at the effect's +0x128, when the effect's +0x140 is set (else 1 back).
-DECOMP_LEAF u64 ppfx_sub_fb3fb0(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xff90a0)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_sub_fb3fb0(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xff90a0)(effect(), low_byte(enable));
 }
 
 
 // ---- Auto exposure (per view: -1 the current one) ----
 
 // CPostEffect::SetAutoExposureEnable (view index, -1 the current one).
-DECOMP_LEAF u64 ppfx_set_auto_exposure_enable(u64 /*context*/, u32 view, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd4fc0)(effect(), view, MUTANT(4) ? static_cast<u32>(static_cast<s32>(static_cast<s8>(enable))) : static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_set_auto_exposure_enable(u64 /*context*/, u32 view, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd4fc0)(effect(), view, MUTANT(4) ? static_cast<u32>(static_cast<s32>(static_cast<s8>(enable))) : low_byte(enable));
 }
 
 // CPostEffect::SetAutoExposureMiddleGray.
@@ -126,8 +139,8 @@ DECOMP_LEAF u64 ppfx_sub_fb3560(u64 /*context*/, float value) {
 // ---- Chromatic aberration ----
 
 // CPostEffect::SetChromaticAberrationEnable(enable, false).
-DECOMP_LEAF u64 ppfx_set_chromatic_aberration_enable(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd3320)(effect(), static_cast<u32>(enable), MUTANT(2) ? 1u : 0u);
+DECOMP_LEAF u64 ppfx_set_chromatic_aberration_enable(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd3320)(effect(), low_byte(enable), MUTANT(2) ? 1u : 0u);
 }
 
 // The chromatic aberration's parameters: a to +0x9a4, false to +0x9a8, two 8-byte values from p and q to +0x9ac/+0x9b4.
@@ -144,8 +157,8 @@ DECOMP_LEAF u64 ppfx_initialize_matrix(u64 /*context*/, u32 matrix_type) {
 }
 
 // CPostEffect::MultiplyMatrix, the variant that takes a flag.
-DECOMP_LEAF u64 ppfx_multiply_matrix_fb4360(u64 /*context*/, u32 matrix_type, u8 flag) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xff6700)(effect(), matrix_type, static_cast<u32>(flag));
+DECOMP_LEAF u64 ppfx_multiply_matrix_fb4360(u64 /*context*/, u32 matrix_type, u32 flag) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xff6700)(effect(), matrix_type, low_byte(flag));
 }
 
 // CPostEffect::MultiplyMatrix by a saturation (GPUMath_ColorMatrixSaturation).
@@ -234,8 +247,8 @@ DECOMP_LEAF u64 ppfx_sub_fb41a0(u64 /*context*/, float value) {
 }
 
 // The glare object's byte at +0x16c.
-DECOMP_LEAF u64 ppfx_sub_fb4160(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd4c20)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_sub_fb4160(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd4c20)(effect(), low_byte(enable));
 }
 
 // The glare object's +0x170 and +0x184.
@@ -257,8 +270,8 @@ DECOMP_LEAF u64 ppfx_set_active_light_shaft(u64 /*context*/, u32 light) {
 }
 
 // CPostEffect::SetLightShaftSourceEnable.
-DECOMP_LEAF u64 ppfx_set_light_shaft_source_enable(u64 /*context*/, u32 light, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd9ac0)(effect(), light, static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_set_light_shaft_source_enable(u64 /*context*/, u32 light, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd9ac0)(effect(), light, low_byte(enable));
 }
 
 // A light shaft's two values.
@@ -277,21 +290,21 @@ DECOMP_LEAF u64 ppfx_sub_fb2920(u64 /*context*/, u32 light, u64 p, float a, floa
 }
 
 // A byte at +0x940 (0 unless the effect's +0x140 is set).
-DECOMP_LEAF u64 ppfx_sub_fb2960(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd2a90)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_sub_fb2960(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd2a90)(effect(), low_byte(enable));
 }
 
 
 // ---- Depth of field and auto focus ----
 
 // CPostEffect::SetAutoFocusEnable.
-DECOMP_LEAF u64 ppfx_set_auto_focus_enable(u64 /*context*/, u32 view, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd5be0)(effect(), view, static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_set_auto_focus_enable(u64 /*context*/, u32 view, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd5be0)(effect(), view, low_byte(enable));
 }
 
 // CPostEffect::SetAutoFocusAdjustment.
-DECOMP_LEAF u64 ppfx_set_auto_focus_adjustment(u64 /*context*/, u32 view, u8 flag, float a, float b) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32, float, float)>(0xfd5d50)(effect(), view, static_cast<u32>(flag), a, b);
+DECOMP_LEAF u64 ppfx_set_auto_focus_adjustment(u64 /*context*/, u32 view, u32 flag, float a, float b) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32, float, float)>(0xfd5d50)(effect(), view, low_byte(flag), a, b);
 }
 
 // CPostEffect::SetAutoFocusDelay.
@@ -340,8 +353,8 @@ DECOMP_LEAF u64 ppfx_set_depth_of_field_edge_quality(u64 /*context*/, u32 edge_q
 }
 
 // A byte at +0x70, beside the depth remap's parameters.
-DECOMP_LEAF u64 ppfx_sub_fb3600(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd4650)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_sub_fb3600(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd4650)(effect(), low_byte(enable));
 }
 
 // CPostEffect::SetDepthOfFieldDepthRemapLutParameters (eRemapLutSourceChannel must be R).
@@ -353,8 +366,8 @@ DECOMP_LEAF u64 ppfx_set_depth_of_field_depth_remap_lut_parameters(u64 /*context
 // ---- Motion blur ----
 
 // CPostEffect::SetMotionBlurEnable.
-DECOMP_LEAF u64 ppfx_set_motion_blur_enable(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd3b00)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_set_motion_blur_enable(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd3b00)(effect(), low_byte(enable));
 }
 
 // A byte at +0x9e8.
@@ -374,18 +387,28 @@ DECOMP_LEAF u64 ppfx_sub_fb38e0(u64 /*context*/, float a, float b) {
 }
 
 // A 4x4 matrix (a pointer to it) for +0x5ac and what is made from it, with the flag: sub_fb27d0's other form.
-DECOMP_LEAF u64 ppfx_sub_fb27c0(u64 /*context*/, u64 matrix, u8 flag) {
-    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8a70)(effect(), matrix, static_cast<u32>(flag));
+DECOMP_LEAF u64 ppfx_sub_fb27c0(u64 /*context*/, u64 matrix, u32 flag) {
+    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8a70)(effect(), matrix, low_byte(flag));
 }
 
 // The same for the matrix at +0x62c.
-DECOMP_LEAF u64 ppfx_sub_fb27e0(u64 /*context*/, u64 matrix, u8 flag) {
-    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8eb0)(effect(), matrix, static_cast<u32>(flag));
+DECOMP_LEAF u64 ppfx_sub_fb27e0(u64 /*context*/, u64 matrix, u32 flag) {
+    return game_function<GUEST_ABI u64 (*)(u64, u64, u32)>(0xfd8eb0)(effect(), matrix, low_byte(flag));
 }
 
-// A float at +0x6ac (sub_fb2710's fourth).
+// A float at +0x6ac (sub_fb2710's fourth): the effect's elapsed time a frame,
+// which the eye adaptation and the afterimage decays read. Its one caller, the
+// flip pass (0x25d7e56), hands it the post-process context's +4 every frame,
+// set once, at the context's initialisation (0x25df516): the game's 1/60, half
+// a 30 fps frame, which the frame-rate code makes half a frame of the rate
+// chosen at start. With the frame clock on (BBHOST_FRAME_CLOCK=1) it keeps
+// the game's 1/60 (engine/frame_rate.cpp, kHandedOver), and ours stores it as
+// that many 30 fps frames of this one (engine/frame_clock.h): the game's own
+// 1/60 at 30, half that at 60, and the frame's own share at any frame length.
+// Off, or with BBHOST_YEBIS_STEP=0, the value as handed.
 DECOMP_LEAF u64 ppfx_sub_fb2800(u64 /*context*/, float value) {
-    store<float>(effect() + 0x6ac, value);
+    const float frames = frame_clock::frames30();
+    store<float>(effect() + 0x6ac, !g_yebis_step || frames == 1.0f || MUTANT(8) ? value : value * frames);
     return 0;
 }
 
@@ -395,16 +418,16 @@ DECOMP_LEAF u64 ppfx_sub_fb38f0(u64 /*context*/, u32 samples, u32 b, float a, fl
 }
 
 // Two floats (not negative) and a byte at +0xa00..+0xa08.
-DECOMP_LEAF u64 ppfx_sub_fb3900(u64 /*context*/, u8 flag, float a, float b) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, float, float)>(0xfd3be0)(effect(), static_cast<u32>(flag), a, b);
+DECOMP_LEAF u64 ppfx_sub_fb3900(u64 /*context*/, u32 flag, float a, float b) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, float, float)>(0xfd3be0)(effect(), low_byte(flag), a, b);
 }
 
 
 // ---- Feedback (the afterimage) ----
 
 // CPostEffect::SetFeedbackEnable.
-DECOMP_LEAF u64 ppfx_set_feedback_enable(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd40e0)(effect(), static_cast<u32>(enable));
+DECOMP_LEAF u64 ppfx_set_feedback_enable(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32)>(0xfd40e0)(effect(), low_byte(enable));
 }
 
 // The feedback's three floats at +0x944..+0x94c.
@@ -422,8 +445,8 @@ DECOMP_LEAF u64 ppfx_sub_fb34e0(u64 /*context*/, float value) {
 // ---- Post-process antialiasing ----
 
 // CPostEffect::SetAntialiasEnable(enable, false).
-DECOMP_LEAF u64 ppfx_set_antialias_enable(u64 /*context*/, u8 enable) {
-    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd31f0)(effect(), static_cast<u32>(enable), 0u);
+DECOMP_LEAF u64 ppfx_set_antialias_enable(u64 /*context*/, u32 enable) {
+    return game_function<GUEST_ABI u64 (*)(u64, u32, u32)>(0xfd31f0)(effect(), low_byte(enable), 0u);
 }
 
 
@@ -500,6 +523,8 @@ constexpr u8 kEntry_fb37f0[] = {0x48, 0x8b, 0x3d, 0xd9, 0x26, 0x8b, 0x04};
 }  // namespace
 
 void decomp_yebis_ppfx_setters_add() {
+    const char* e = std::getenv("BBHOST_YEBIS_STEP");
+    g_yebis_step = frame_clock::on() && !(e && e[0] == '0');
     const DecompFunction fns[] = {
         {"ppfx_set_render_scene_luminance_scale", "yebis", 0xfb2710, kEntry_fb2710, sizeof kEntry_fb2710, reinterpret_cast<void*>(&ppfx_set_render_scene_luminance_scale), DecompKind::Leaf},
         {"ppfx_sub_fb2720", "yebis", 0xfb2720, kEntry_fb2720, sizeof kEntry_fb2720, reinterpret_cast<void*>(&ppfx_sub_fb2720), DecompKind::Leaf},

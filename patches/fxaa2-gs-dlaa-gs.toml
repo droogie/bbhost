@@ -9,10 +9,11 @@
 # beside it.
 [patch]
 name = "fxaa2-gs-dlaa-gs"
+title = "Better AA"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters"
 enabled = false
-order = 188
+order = 120
 
 [site.setup-a]
 address = "0x026a07a6"

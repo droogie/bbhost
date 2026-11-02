@@ -27,6 +27,7 @@ void decomp_water_gate_add();          // gx/water_gate.cpp: the water interacti
 void decomp_gx_blink_add();            // gx/blink.cpp: the GX lights' blink, its cycles begun on whole effect steps
 void decomp_gx_upload_heap_add();      // gx/upload_heap.cpp: the upload heap's pool made over its region - the host's, when it gives one
 void decomp_gx_render_queue_add();     // gx/render_queue.cpp: the scene's render queue cut into GX jobs, and its census (BBHOST_RQ_CENSUS=1)
+void decomp_gx_job_barrier_add();      // gx/job_barrier.cpp: the job barrier's step on the main thread, which keeps stealing
 void decomp_gnmx_cue_add();            // gnmx/cue.cpp: Gnmx's constant update engine around the flip pass's draw
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
 void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
@@ -41,6 +42,9 @@ void decomp_sfx_node_update_add();     // sfx/node_update.cpp: the effects' node
 void decomp_sfx_node_emit_add();       // sfx/node_emit.cpp: the effects' node emission
 void decomp_adaptive_mutex_add();      // sync/adaptive_mutex.cpp: DLAdaptiveMutex::Lock
 void decomp_ez_work_add();             // sync/ez_work.cpp: CSEzWork::ProcessOne - the work pools' job pop, and their node caches
+void decomp_physics_ragdoll_drive_add();  // physics/ragdoll_drive.cpp: the ragdoll keyframe controller's drive, by the frame clock's step
+void decomp_chr_replay_manipulator_add();  // chr/replay_manipulator.cpp: the replay ghosts' update, by game time with the frame clock
+void decomp_chr_sync_add();               // chr/chr_sync.cpp: the local player's character sync, by game time with the frame clock
 
 void decomp_add_areas() {
     decomp_flag_store_add();
@@ -66,6 +70,7 @@ void decomp_add_areas() {
     decomp_gx_blink_add();
     decomp_gx_upload_heap_add();
     decomp_gx_render_queue_add();
+    decomp_gx_job_barrier_add();
     decomp_gnmx_cue_add();
     decomp_yebis_gnm_add();
     decomp_yebis_context_add();
@@ -80,4 +85,7 @@ void decomp_add_areas() {
     decomp_sfx_node_emit_add();
     decomp_adaptive_mutex_add();
     decomp_ez_work_add();
+    decomp_physics_ragdoll_drive_add();
+    decomp_chr_replay_manipulator_add();
+    decomp_chr_sync_add();
 }

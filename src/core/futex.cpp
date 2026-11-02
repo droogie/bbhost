@@ -173,6 +173,30 @@ void host_futex_wake_one(std::atomic<std::uint32_t>* word) {
 #endif
 }
 
+void host_futex_wait64(std::atomic<std::uint64_t>* word, std::uint64_t expected) {
+#if defined(_WIN32)
+    WaitOnAddress(reinterpret_cast<volatile VOID*>(word), &expected, sizeof(expected), INFINITE);
+#else
+    word->wait(expected, std::memory_order_seq_cst);
+#endif
+}
+
+void host_futex_wake_one64(std::atomic<std::uint64_t>* word) {
+#if defined(_WIN32)
+    WakeByAddressSingle(reinterpret_cast<PVOID>(word));
+#else
+    word->notify_one();
+#endif
+}
+
+void host_futex_wake_all64(std::atomic<std::uint64_t>* word) {
+#if defined(_WIN32)
+    WakeByAddressAll(reinterpret_cast<PVOID>(word));
+#else
+    word->notify_all();
+#endif
+}
+
 void host_futex_wake_all(std::atomic<std::uint32_t>* word) {
     g_wakes.fetch_add(1, std::memory_order_relaxed);
     if (!native_on()) {

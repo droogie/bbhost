@@ -8,10 +8,11 @@
 # [patches] in bbhost.toml, turns it on for the next start.
 [patch]
 name = "glow-blur"
+title = "Glow: force on + Blur"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo)"
 enabled = false
-order = 1
+order = 1050
 
 [site.s000]
 address = "0x0125c680"

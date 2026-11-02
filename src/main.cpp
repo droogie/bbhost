@@ -110,6 +110,17 @@ void* guest_main_thread(void* p) {
 // Boot thread: GX walk leaks ~8 bytes/node and visits millions of nodes.
 constexpr std::size_t kGuestMainStack = 128ull * 1024 * 1024;
 
+#if defined(BBHOST_PGO_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+// An instrumented build's profile (BBHOST_PGO=generate), which the profile
+// runtime writes at exit - and the ends below skip the exit handlers.
+void write_pgo_profile() {
+#if defined(BBHOST_PGO_GENERATE)
+    host_log("pgo: profile %s", __llvm_profile_write_file() == 0 ? "written" : "not written");
+#endif
+}
+
 // Runs the guest on its own thread; the caller pumps the window until the
 // guest returns or the user closes the window.
 void run_guest_start(GuestStart fn, void* argv, bool windowed) {
@@ -139,6 +150,7 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 host_gpu_save_pipeline_cache_at_exit();
                 hle_kernel_memory_report();
                 host_window_stop();
+                write_pgo_profile();
                 _exit(0);
             }
             if (fault_flip && hle_video_flip_count() >= fault_flip) {
@@ -174,6 +186,7 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 }).detach();
                 for (int i = 0; i < 100 && !saved.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 if (!saved.load()) host_log("exit: the pipeline cache save did not finish in 5 s; leaving without it");
+                write_pgo_profile();
                 std::fflush(nullptr);
 #if defined(_WIN32)
                 // Not ExitProcess: it detaches every DLL under the loader
@@ -374,6 +387,54 @@ BOOL WINAPI on_console_ctrl(DWORD) {
     return TRUE;
 }
 #endif
+
+namespace {
+#if defined(_WIN32)
+// bbhost.exe is a GUI program: Windows opens no console for it. The log gets
+// one only when it is written (host_log_decide) and stderr goes nowhere
+// already - a file or a pipe it was started with (run-bbhost.bat, the test
+// harnesses), or the terminal it was started from, take the log as they are:
+// the terminal it was started from when it has one, else a window of its
+// own, as the console program it was had. With Tooling and logging off there
+// is no window, and a console made for an earlier decision (the setup window
+// can change the setting) is let go.
+bool g_log_console = false;  // the console is one this process attached or made
+void log_console(bool on) {
+    if (on) {
+        if (g_log_console) return;
+        // A file or a pipe is the log's already; anything else - none, or a
+        // handle of a console this process is not attached to - is not.
+        const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        const DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
+        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) return;
+        if (!AttachConsole(ATTACH_PARENT_PROCESS) && !AllocConsole()) return;
+        g_log_console = true;
+        std::FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
+    } else if (g_log_console) {
+        std::fflush(nullptr);
+        std::FILE* f = nullptr;
+        freopen_s(&f, "NUL", "w", stderr);
+        freopen_s(&f, "NUL", "w", stdout);
+        FreeConsole();
+        g_log_console = false;
+    }
+}
+#endif
+
+// The log on or off for this run: Tooling and logging ([debug] tooling,
+// BBHOST_TOOLING), or BBHOST_LOG=1 to keep it whatever that says (a test that
+// measures with tooling off and still reads the log).
+void decide_log(bool tooling) {
+    const char* e = std::getenv("BBHOST_LOG");
+    const bool on = tooling || (e && e[0] == '1');
+#if defined(_WIN32)
+    log_console(on);
+#endif
+    host_log_decide(on);
+}
+}  // namespace
 
 #if !defined(_WIN32)
 
@@ -608,6 +669,7 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
     hle_fs_host();  // the faulting thread may be running guest code with guest FS
     sampler_recover();  // a fault in the profiler's unwind drops its sample
     host_read_safe_recover();  // a fault in host_read_safe's copy fails the read
+    host_log_force_on();  // a crash is reported with Tooling and logging off too
     const std::uint64_t pc = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
     const std::uint64_t addr = reinterpret_cast<std::uint64_t>(info->si_addr);
     host_log("SIGSEGV pc=0x%llx addr=0x%llx (guest pc 0x%llx)", static_cast<unsigned long long>(pc),
@@ -936,6 +998,7 @@ int main(int argc, char** argv) {
     HostConfig cfg;
     std::string err;
     if (!config_load(argc, argv, &cfg, &err)) {
+        decide_log(true);  // what is wrong is said whatever the setting
         host_log("%s", err.c_str());
         host_log("usage: %s [--config bbhost.toml] [--app0 DIR] [--data DIR] [--eboot FILE]"
                  " [--write-config PATH] [--headless] [--setup] [eboot]",
@@ -943,6 +1006,7 @@ int main(int argc, char** argv) {
         host_log("docs/running.md: where the configuration is looked for and what to put in it");
         return 2;
     }
+    decide_log(cfg.tooling);  // the lines so far written or dropped, and the console, as the configuration says
 #if defined(BBHOST_HAVE_SDL3)
     {
         // The setup window (host/launcher.h): when the game's paths are
@@ -958,6 +1022,7 @@ int main(int argc, char** argv) {
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;
             if (!config_load(argc, argv, &cfg, &err)) {
+                decide_log(true);
                 host_log("%s", err.c_str());
                 return 2;
             }
@@ -968,12 +1033,14 @@ int main(int argc, char** argv) {
     // come from bbhost.toml or the command line. Say plainly what to set when
     // they are missing, and write a template when there is no file at all.
     if (const std::string help = config_setup_help(cfg); !help.empty()) {
+        decide_log(true);
         std::fputs(help.c_str(), stderr);
         std::fflush(stderr);
         return 2;
     }
     g_host_tooling = cfg.tooling;  // log.h: before any of the game's threads
-    if (!cfg.tooling) host_log("tooling off ([debug] tooling, BBHOST_TOOLING): no periodic reports or instrumentation; warnings and errors still logged");
+    decide_log(cfg.tooling);       // again: the setup window may have changed it
+    if (!cfg.tooling) host_log("tooling off ([debug] tooling, BBHOST_TOOLING): no periodic reports or instrumentation; the log kept by BBHOST_LOG=1");
     // Updates (host/updater.h): an older build's update leftover removed, a
     // release build's check begun on a thread of its own (not in a headless
     // run, nor when the setup window has checked).
@@ -997,10 +1064,10 @@ int main(int argc, char** argv) {
     // next start.
     {
         const HostSettings h = host_settings();
-        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players);
+        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue);
         const HostConfig& c = config();
-        host_log("pc enhancements: mirror %s, rebirth %s, five players %s", c.change_appearance ? "on" : "off", c.rebirth ? "on" : "off",
-                 c.five_players ? "on" : "off");
+        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s", c.change_appearance ? "on" : "off",
+                 c.rebirth ? "on" : "off", c.five_players ? "on" : "off", c.skill_issue ? "on" : "off");
         // The debug menu was a PC Settings switch before the Debug Menu plugin
         // took its place: a player who had it on gets the plugin turned on,
         // once, and the old switch goes off.

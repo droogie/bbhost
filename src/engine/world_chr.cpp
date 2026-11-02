@@ -71,9 +71,13 @@ bool world_player_position(float xyz[3], float* yaw) {
     return true;
 }
 
-bool world_camera(float pos[3], float focus[3]) {
+std::uint64_t world_camera_owner() {
     const std::uint64_t root = ptr(slot(kCameraRoot));
-    const std::uint64_t owner = root ? ptr(root + 0x2830) : 0;
+    return root ? ptr(root + 0x2830) : 0;
+}
+
+bool world_camera(float pos[3], float focus[3]) {
+    const std::uint64_t owner = world_camera_owner();
     const std::uint64_t cam = owner ? ptr(owner + 0x60) : 0;
     float p[3] = {}, f[3] = {};
     if (!cam || !rd(cam + 0x40, &p) || !rd(cam + 0xd0, &f) || !finite3(p) || !finite3(f)) return false;

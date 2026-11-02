@@ -29,6 +29,18 @@ void test_defaults() {
     CHECK(staging_return(nullptr, "", 1, true) == kWindowsApuDefaults);
     CHECK(heap_lean(nullptr, "", 1, true) == kWindowsApuDefaults);
     CHECK(cache_budget_mib(nullptr, "", 1, true) == (kWindowsApuDefaults ? kWindowsApuBudgetMiB : 0));
+    // A graphics card with small video memory gives its staging back too, on either platform (it imports by window); the
+    // other two stay off there, and the flag means nothing on an integrated GPU or before the device is known.
+    for (int host = 0; host < 2; ++host) {
+        CHECK(staging_return(nullptr, "", 0, host, 1));
+        CHECK(!staging_return("0", "", 0, host, 1));
+        CHECK(!staging_return(nullptr, "false", 0, host, 1));
+        CHECK(!staging_return(nullptr, "", 0, host, 0));
+        CHECK(!staging_return(nullptr, "", -1, host, 1));
+        CHECK(!heap_lean(nullptr, "", 0, host));
+        CHECK(cache_budget_mib(nullptr, "", 0, host) == 0);
+    }
+    CHECK(!staging_return(nullptr, "", 1, false, 1));
     // Linux, a discrete GPU, the device not chosen yet: off.
     for (int integrated = -1; integrated <= 1; ++integrated) {
         for (int host = 0; host < 2; ++host) {

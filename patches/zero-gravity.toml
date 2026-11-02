@@ -1,0 +1,43 @@
+# Zero-Gravity Physics: Kyo's patch for 1.09, from the shadPS4 patch list
+# (Bloodborne.xml), byte for byte: 5 sites, 44 bytes.
+#
+# The list's note:
+# me and my homies HATE havok
+#
+# One gravity patch at a time.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `zero-gravity = true` under [patches] in bbhost.toml.
+[patch]
+name = "zero-gravity"
+title = "Zero-Gravity Physics"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Havok's gravity at zero: objects and corpses float."
+enabled = false
+order = 470
+group = "gravity"
+
+[site.s000]
+address = "0x04d00894"
+expect = "cd cc 1c c1"
+bytes = "00 00 00 00"
+
+[site.s001]
+address = "0x01e4acae"
+expect = "c5 f8 59 80 b0 05 00 00"
+bytes = "c5 f8 59 05 3a 10 ef 02"
+
+[site.s002]
+address = "0x01e4b388"
+expect = "c5 f8 28 80 b0 05 00 00"
+bytes = "c5 f8 28 05 60 09 ef 02"
+
+[site.s003]
+address = "0x0223fa45"
+expect = "c5 f8 28 81 b0 05 00 00"
+bytes = "c5 f8 28 05 a3 c2 af 02"
+
+[site.s004]
+address = "0x04d3bcf0"
+expect = "72 6e 65 6c 5c 53 6f 75 72 63 65 5c 70 73 34 5c"
+bytes = "00 00 00 00 cd cc 1c c1 00 00 00 00 00 00 00 00"

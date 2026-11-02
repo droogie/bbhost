@@ -10,9 +10,11 @@
 #include "host/settings.h"
 #include "log.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -77,6 +79,13 @@ Scales g_applied = kGame;  // under g_mu: what the rows were last given
 // (camera_params_changed); a view with nothing to do reads this one flag.
 std::mutex g_want_mu;
 Scales g_want = kGame;  // under g_want_mu
+// The wheel's zoom (camera_zoom): a multiplier on the Camera distance
+// setting's distance, 1 until the wheel turns. Under g_want_mu.
+float g_zoom = 1.0f;
+// Each notch 20% further or closer, and the distance the setting and the
+// zoom make together kept from half the game's own to six times it (the
+// setting alone reaches 0.5 to 1.5).
+constexpr float kZoomStep = 1.2f, kZoomNear = 0.5f, kZoomFar = 6.0f;
 std::atomic<bool> g_pending{false};
 // LockCamParam's file as the param repository holds it - the buffer the
 // camera's update reads - from engine/params.cpp's walk, which sees it as the
@@ -182,7 +191,9 @@ void settings_changed(const HostSettings& hs) {
 
 Scales wanted_scales() {
     std::lock_guard<std::mutex> lock(g_want_mu);
-    return g_want;
+    Scales k = g_want;
+    if (g_zoom != 1.0f) k[0] = std::clamp(k[0] * g_zoom, std::min(k[0], kZoomNear), std::max(k[0], kZoomFar));
+    return k;
 }
 
 }  // namespace
@@ -235,6 +246,23 @@ void camera_install(ElfImage* image) {
         host_log("camera: the field of view stays capped at 48 degrees (patches/fov-uncap.toml not applied)");
     }
     host_settings_listen(&settings_changed);
+}
+
+void camera_zoom(int steps, bool reset) {
+    std::lock_guard<std::mutex> lock(g_want_mu);
+    const float was = g_zoom;
+    if (reset) {
+        g_zoom = 1.0f;
+    } else {
+        // Kept to what the clamp lets through (wanted_scales), so turning
+        // back after a long spin past the end moves at once.
+        const float base = std::max(g_want[0], 0.01f);
+        g_zoom = std::clamp(g_zoom * std::pow(kZoomStep, static_cast<float>(steps)), kZoomNear / base, kZoomFar / base);
+    }
+    if (g_zoom == was) return;
+    g_pending.store(true, std::memory_order_release);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) host_log("camera: zoom x%.2f (the Camera distance setting's x%.2f)", g_zoom, g_want[0]);
 }
 
 void camera_params_changed(std::uint64_t file) {

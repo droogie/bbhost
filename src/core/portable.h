@@ -47,8 +47,13 @@ void host_thread_background();
 // pixels (each display's current mode). False when the platform does not say:
 // a headless run (host_set_headless), or a build without SDL off Windows.
 bool host_desktop_max_size(int* w, int* h);
+// The refresh rate of the display the window opens on (the primary one), as
+// the display gives it (59.94, 143.998), asked before the window shell starts:
+// the Uncapped frame rate's (engine/frame_rate.cpp). 0 when nothing says: a
+// headless run, or a build without SDL off Windows.
+float host_desktop_refresh_hz();
 // Whether this run opens no window (main, once the configuration is final):
-// host_desktop_max_size then asks no display server.
+// host_desktop_max_size and host_desktop_refresh_hz then ask no display server.
 void host_set_headless(bool headless);
 // The name Linux can hold (15 characters): leading dotted parts dropped
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.

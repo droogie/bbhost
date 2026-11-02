@@ -42,6 +42,12 @@ using HostDeadline = std::chrono::steady_clock::time_point;
 bool host_futex_wait(std::atomic<std::uint32_t>* word, std::uint32_t expected, const HostDeadline* deadline);
 void host_futex_wake_one(std::atomic<std::uint32_t>* word);
 void host_futex_wake_all(std::atomic<std::uint32_t>* word);
+// A 64-bit word, untimed, always the native sleep (WaitOnAddress takes 8
+// bytes; on Linux, whose futex takes 4, std::atomic's own wait): sleeps while
+// *word == expected, may return spuriously. Not counted in host_futex_counts.
+void host_futex_wait64(std::atomic<std::uint64_t>* word, std::uint64_t expected);
+void host_futex_wake_one64(std::atomic<std::uint64_t>* word);
+void host_futex_wake_all64(std::atomic<std::uint64_t>* word);
 // The spin budget (BBHOST_FUTEX_SPIN), and whether the native sleep is in use.
 unsigned host_futex_spin();
 bool host_futex_native();

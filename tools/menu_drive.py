@@ -20,6 +20,7 @@ Steps (run in order):
     clicknow:N     click item N of the newest list
     hover          hover every item of the lists that last appeared, one
                    screenshot each (hover-<n>-<list>-<item>.png)
+    item:K,I       move to item I of the K-th list that last appeared (-1 the last)
     at:X,Y         click at a stage point      move:X,Y   move there
     dclick:X,Y     double click there (two presses 120 ms apart)
     hold:X,Y,S     press there for S seconds   rclick     right click
@@ -42,6 +43,8 @@ Steps (run in order):
                    thumb does (+-32767; a step every 8 ms), and leave it there
     padstick:AXIS,VALUE,S  hold an axis (lx ly rx ry: +-32767, lt rt: 0-255,
                    dx dy: +-1 for the d-pad) for S seconds
+    req:VERB[,ARG[,ARG2]]  a test request (BBHOST_TEST_REQUESTS): req:keys,FILE
+                   types FILE's key script into the game (host/window.h)
     shot:NAME      screenshot NAME.png         sleep:S
     stamp:LABEL    print 'stamp LABEL <CLOCK_MONOTONIC s>' - the host's clock
                    (ajm t=, host_log ms): marks a stretch of play in its log
@@ -335,6 +338,15 @@ for step in sys.argv[2:]:
         if i not in items: print('no item', i, flush=True); continue
         move(*items[i]); time.sleep(0.8); shot('before-click-%d' % seen)
         x('click', '1'); print('clicked', i, items[i], flush=True)
+    elif kind == 'item':
+        # item:K,I - move to item I of the K-th list that appeared in the last wait (K -1: the last one)
+        k, i = (int(v) for v in arg.split(','))
+        lists = batch or blocks()[-1:]
+        items = dict((n, (px, py)) for n, px, py in lists[k]['items']) if lists else {}
+        if i in items:
+            move(*items[i]); print('moved to item', i, 'of list', k, items[i], flush=True)
+        else:
+            print('no item', i, 'in list', k, flush=True)
     elif kind == 'hover':
         for k, b in enumerate(batch or blocks()[-1:]):
             for i, px, py in b['items']:
@@ -507,6 +519,19 @@ for step in sys.argv[2:]:
             if len(re.findall(rx, open(log, errors='replace').read())) >= int(n): break
             time.sleep(0.5)
         print('waitn', n, rx, 'ok' if time.time() - t < 400 else 'timeout', flush=True)
+    elif kind == 'req':
+        # req:VERB[,ARG[,ARG2]] - a test request into BBHOST_TEST_REQUESTS
+        # (hle/video.cpp), carried out at the game's next flip:
+        # req:keys,/abs/script plays a key script (host/window.h).
+        reqs = os.environ.get('BBHOST_TEST_REQUESTS', '')
+        if not reqs:
+            print('req', arg, 'refused: BBHOST_TEST_REQUESTS is not set', flush=True); continue
+        req_n = globals().get('req_n', 0) + 1
+        globals()['req_n'] = req_n
+        tmp = os.path.join(reqs, 'drive-%04d.tmp' % req_n)
+        with open(tmp, 'w') as f: f.write(' '.join(arg.split(',')) + '\n')
+        os.rename(tmp, os.path.join(reqs, 'drive-%04d.req' % req_n))  # whole when the host lists it
+        print('req', arg, flush=True)
     elif kind == 'sleep':
         time.sleep(float(arg))
     elif kind == 'stamp':

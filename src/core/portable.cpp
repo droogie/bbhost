@@ -13,7 +13,7 @@
 #include <mutex>
 #include <vector>
 
-#if !defined(_WIN32) && defined(BBHOST_HAVE_SDL3)
+#if defined(BBHOST_HAVE_SDL3)
 #include <SDL3/SDL.h>
 #endif
 
@@ -347,6 +347,31 @@ bool host_desktop_max_size(int* w, int* h) {
     (void)w;
     (void)h;
     return false;
+#endif
+}
+
+float host_desktop_refresh_hz() {
+#if defined(BBHOST_HAVE_SDL3)
+    // The primary display, where SDL makes a window it is given no position
+    // for (host_window_start), and its desktop mode's rate, which SDL keeps as
+    // the display's ratio - Windows' DEVMODE rounds 59.94 down to 59. The
+    // video subsystem is brought up for the question alone and let go, as
+    // above; not for a headless run.
+    if (g_headless.load()) return 0.0f;
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return 0.0f;
+    float hz = 0.0f;
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) hz = m->refresh_rate;
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return hz;
+#elif defined(_WIN32)
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (g_headless.load() || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1) return 0.0f;
+    return static_cast<float>(dm.dmDisplayFrequency);
+#else
+    return 0.0f;
 #endif
 }
 

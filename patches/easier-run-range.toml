@@ -1,0 +1,21 @@
+# Easier run range: Kyo's patch for 1.09 (his +40% analog run range), from his
+# shadPS4 list, in the place of the list's Sensitive Analog Input (easier to
+# run), which is +20%, byte for byte: 1 sites, 4 bytes.
+#
+# The float the stick's tilt is scaled by before the walk/run threshold
+# (0x4d27714): 1.0 -> 1.4.
+#
+# On by default: the setup window's Patches tab, the patch menu in the game
+# (F9), or `easier-run-range = false` under [patches] in bbhost.toml turns it off.
+[patch]
+name = "easier-run-range"
+title = "Easier run range"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "The stick runs from less of its travel: about two-thirds of the way out instead of 90%."
+enabled = true
+order = 400
+
+[site.s000]
+address = "0x04d27714"
+expect = "00 00 80 3f"
+bytes = "33 33 b3 3f"

@@ -70,17 +70,24 @@ is read in layers, each overriding only the keys it sets:
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
    `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
    (`BBHOST_CONFIG_DIR` replaces the folder);
-2. `bbhost.toml` in the working directory, or next to the executable;
+2. `bbhost.toml` next to the executable, or in the working directory;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
    eboot as the last argument.
+
+A `bbhost.toml` next to the executable (or in the working directory) wins:
+it is read after the per-user one, and the setup window, the patch menu and
+the plugins save to it instead - a copy of bbhost kept with settings of its
+own. Without one, they save to the per-user file. (`--config` and
+`BBHOST_CONFIG_DIR` keep saving to the per-user one.)
 
 The first log line names every file it read. Paths may use either slash; a
 relative path is taken from the folder of the file it is in.
 
 The in-game settings (F10, or the PC Settings, PC Graphics and Key Bindings
 entries the game's own System menu gains) are saved beside the per-user config
-in `bbhost-options.toml`.
+in `bbhost-options.toml` - or in one next to the executable, when there is
+one there.
 
 ## Saves
 
@@ -117,9 +124,37 @@ A controller works as on the console. Without one, the keyboard and mouse
 take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
 menu) - to a key, any of five mouse buttons, or the wheel turned up or down
-(each notch a press). Hold Left Alt with the movement keys to walk, and two
-opposite keys held together cancel, both as in Dark Souls III. F9 opens the
-plugin menu and F10 bbhost's own settings.
+(each notch a press). In the world the wheel zooms the camera, each notch a
+step of Camera distance (up closer, down further out), and the middle button
+puts it back at the game's own distance: Camera Zoom In, Out and Reset on the
+Key Bindings menu's Other page, which a player can rebind (Transform, on the
+middle button too until then, keeps C). Hold Left Alt with the movement keys to walk, and two
+opposite keys held together cancel, both as in Dark Souls III. The game's
+menus take keys of their own, as Dark Souls III keeps a menu's apart from
+play's: the arrows or the movement keys move, Return or Interact confirms,
+Backspace or Dodge goes back, Page Up and Page Down turn the page or the tab
+(L1 and R1), Home and End are a menu's two shortcuts (L2 and R2: the storage
+box's Show Storage and Show Inventory) and F and R its display and status
+switches (Square and Triangle) - the Key Bindings menu's Menu Pages and
+Options page. The attacks,
+the firearm, Transform, the Blood Vial and the quick item work in play only,
+so their keys do nothing in a menu, and a menu's key may also be one of
+theirs. F9 opens the
+patch and plugin menu and F10 bbhost's own settings: menus over the game in
+the setup window's look, moved through with the mouse, the arrow keys or a
+controller (the d-pad and A, L1 and R1 for the pages, B or Escape to close).
+In F9's Patches page most patches turn on or off at once; the rest (render
+targets sized as the game starts, code bbhost itself rewrites) at the next
+start, and the page says which.
+
+The menus answer at once. In the game a menu that closes on a choice - backing
+out of the inventory or the pause menu, an item's command menu, Continue on
+the title - holds the choice back until its fade-out has played (a tenth of a
+second, a fifth in some) and drops any press made meanwhile; bbhost passes the
+choice on as the press lands, and the menu behind takes input while it fades
+back in. The message, Yes/No and quantity boxes take OK as soon as they are up
+(the game ignores it for their first half second). The loading screen keeps
+its fade-out. `BBHOST_MENU_FADE_WAIT=1` keeps the game's waits.
 
 The mouse turns the camera the way Dark Souls III's PC version does: by an
 angle for each count the mouse reports, 0.25 degrees at the default
@@ -162,14 +197,19 @@ written once, then as a count every ten seconds while it keeps coming and at
 exit: "the game printed this N more times". `BBHOST_GUEST_PRINTS=all` writes
 every line as it comes.
 
-The setup window's Game tab has **Tooling and logging** (`[debug] tooling`;
-`BBHOST_TOOLING=0` or `1` for one run), on by default: the periodic reports in
-the log, the stall detector, the GPU busy meter beside the FPS counter, the
-bottleneck meter's `perf summary:` lines, which say what limits the frame rate
-([docs/performance.md](performance.md)), and the history of recent draws. Off gives the game the time they take, and the log
-keeps its start, warnings, errors and the exit summary: in one measured
-session, about 10 lines where it had written about 4,100. Leave it on when
-reporting a problem.
+The setup window's Settings page has **Tooling and logging** (`[debug] tooling`;
+`BBHOST_TOOLING=0` or `1` for one run), on by default: the log itself, the
+periodic reports in it, the stall detector, the GPU busy meter beside the FPS
+counter, the bottleneck meter's `perf summary:` lines, which say what limits
+the frame rate ([docs/performance.md](performance.md)), and the history of
+recent draws. Off gives the game the time they take, and nothing is logged -
+not bbhost's lines, not the game's own prints - and on Windows no log window
+opens: bbhost.exe is a GUI program, whose log takes the file or pipe it was
+started with (`run-bbhost.bat`'s), the terminal it was started from, or else a
+console window of its own, all only while the log is on. A crash's report is
+still written to wherever the log would go. `BBHOST_LOG=1` keeps the log with
+tooling off (a test measuring with tooling off that still reads the log).
+Leave it on when reporting a problem.
 
 ## Troubleshooting
 
@@ -246,9 +286,31 @@ once there is room. Every
 five seconds the log says `video memory: headroom ...`; look there, and for
 `video memory is full`, before anything else. Other programs holding video
 memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
-7.5 GB free bbhost also holds less memory ahead (the log says `small video
-memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
-an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
+7.5 GB free bbhost also holds less memory ahead, and imports the game's
+memory a 16 MB window at a time and (but on NVIDIA's driver) gives its
+upload staging back in play, as on an integrated GPU: a whole import pins
+4-5 GB of system memory beside the card, which Windows counts as shared GPU
+memory. Its copies of the
+game's buffers have a budget (below). `BBHOST_VRAM_RESERVE_MB=0` goes back
+to placing everything until an allocation fails, `BBHOST_SMALL_VRAM=0`
+turns the small mode off, `BBHOST_IMPORT_WINDOWS=0` imports whole and
+`BBHOST_STAGING_RETURN=0` keeps the staging.
+
+**How bbhost holds memory on your GPU.** The log's `gpu: memory:` line, near
+the start, says which of these the GPU is and what decided each part:
+
+| The GPU | The game's vertex and index buffers | The game's memory | Upload staging |
+|---|---|---|---|
+| A graphics card with 7.5 GB or more of video memory free | copies in video memory | imported whole | kept |
+| One with less free | copies in video memory, within a budget | imported a 16 MB window at a time | given back in play (kept on NVIDIA's driver, whose free of each chunk stalls a frame) |
+| One with under 12 GB in all its memory heaps | read where they are | imported whole | kept |
+| An integrated GPU with 8 GB of video memory or more | copies in video memory | a window at a time under Windows, whole under Linux | given back under Windows |
+| A smaller integrated GPU (a Steam Deck too) | read where they are | a window at a time under Windows, whole under Linux | given back under Windows |
+
+`BBHOST_GXVK_BUFFERS`, `BBHOST_GXVK_BUFFERS_BUDGET_MB`,
+`BBHOST_IMPORT_WINDOWS` (or `import_windows` under `[gpu]`) and
+`BBHOST_STAGING_RETURN` (or `staging_return`) each change one part, on any
+GPU. The Steam Deck kit's toml turns window imports on.
 
 Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
 says where the video memory goes: `gpu: video memory (MiB)`
@@ -275,10 +337,12 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
-With window imports (the default on an integrated GPU under Windows;
+With window imports (the default on an integrated GPU under Windows and on
+a graphics card with under 7.5 GB of video memory free at the start;
 `BBHOST_IMPORT_WINDOWS` or `import_windows` under `[gpu]` decide it; see
-[rendering.md](rendering.md)) the meshes are read in place too, from their
-windows, which a thread of their own imports as the game makes its buffers
+[rendering.md](rendering.md)) an integrated GPU's meshes are read in place
+too, from their windows, which a thread of their own imports as the game
+makes its buffers
 (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
 window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
 windows at their first draw).
@@ -287,7 +351,8 @@ play there: the textures made ahead of their first bind (most are never
 bound), textures not used for a while, free room in the image heap and the
 upload staging held from a load on. Three switches give them back, on any GPU;
 all three are on by default on an integrated GPU under Windows (a 2048 MiB
-budget there) and off elsewhere:
+budget there), the first also on a graphics card with small video memory
+(above) but for NVIDIA's, and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
   upload staging goes back down to its floor in play (256 MiB, 128 on an
   integrated GPU under Windows; `BBHOST_STAGING_FLOOR_MB=<n>` sets it), 64 MiB
@@ -315,13 +380,22 @@ block back within seconds of an arrival, and the compaction takes what it
 leaves. The exit line `made in play` counts the image heap blocks that had to
 be made while the game played.
 
-On other GPUs, unless memory is tight or video memory small, the game's own
-immutable vertex and index buffers are bound from copies of their own, made
-in video memory as they are first drawn, so the command processor does not
-look each draw's bytes up; one that finds no room keeps the mirrors
-(`BBHOST_GXVK_BUFFERS=0` goes back to the mirrors for all of them; `=1` makes
-the copies on an integrated GPU, with tight memory or small video memory
-too).
+On other GPUs, unless memory is tight, and on an integrated GPU with 8 GB of
+video memory or more, the game's own immutable vertex and index buffers are
+bound from copies of their own, made in video memory as they are first
+drawn, so the command processor does not look each draw's bytes up; one
+that finds no room keeps the mirrors (`BBHOST_GXVK_BUFFERS=0` goes back to
+the mirrors for all of them; `=1` makes the copies on a smaller integrated
+GPU or with tight memory too). With small video memory the copies have a
+budget - an eighth of the video memory free at the start,
+from 256 to 512 MiB (`BBHOST_GXVK_BUFFERS_BUDGET_MB=<n>` sets it on any
+card): at the budget a new copy takes the room of copies not drawn for two
+seconds, the least recently drawn first, else that draw reads the mirrors;
+the copies leave the mirrors' cushion above the reserve alone, and when
+video memory falls under it the idle ones go first and an emptied block
+goes back to the driver. Without them the mirrors carried the meshes, and
+on a 4 GB card a mirror refused room made its draws read their vertices
+across the bus.
 
 **Task Manager shows more GPU memory than shadPS4.** Task Manager's GPU
 columns for a process count two things: *dedicated GPU memory* is the card's
@@ -343,7 +417,8 @@ on the Memory counter (F10), which shows bbhost's own count under the FPS
 counter: the video memory in use, how much of it is cache that bbhost gives
 back when memory runs short, and the shared memory. With window imports
 (`import_windows = true` under `[gpu]`, the default on an integrated GPU
-under Windows) only the memory the GPU uses is imported: on that laptop the
+under Windows and on a graphics card with under 7.5 GB of video memory free
+at the start) only the memory the GPU uses is imported: on that laptop the
 shared column fell by about 2.7 GB on the RTX and 2.1 GB on the 680M, at the
 cost of waits when a place is first drawn (the log's `imports waited for`).
 With them and the rest of an integrated GPU's defaults under Windows (the
@@ -389,11 +464,14 @@ bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
 The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60, 90 and 120 run its
-logic at that rate; Uncapped steps it by the measured frame time (1/240 to 1/30
-s), at the display's refresh rate with V-Sync on and up to 240 fps with it off -
-in the world and in character creation: at the title and the main menu V-Sync
-off sets no limit.
+applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
+240, 360, 480 and 960 run its logic at that rate; Display-Limited is the
+display's refresh rate when the game starts, to the nearest whole frame a
+second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
+immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
+off - and 60 when no display says a rate (headless). What counts frames cannot
+follow the frame's time, so a rate that moved with it (the Uncapped of earlier
+builds) ran those too fast or too slow.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -449,18 +527,55 @@ twice as fast at 60). The flicker of the torches, braziers and candles (each
 GX light's blink) begins its cycles on the effects' whole steps, holding the
 light's high on the frames between, so the lights blink as fast as at 30
 (`decomp/gx/blink.cpp`; `BBHOST_BLINK_HOLD=0` begins them on any frame, 5-7%
-faster above 30). Above 60 and
-Uncapped the game paces itself and its frames are shown as they come, so 90
+faster above 30). Above 60
+the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.
 The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
-`BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
-uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
-V-Sync says, the menus included, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+
+Two things the game counts in its own frames count game time at every
+converted rate, so a rate the machine cannot hold keeps them at the game's
+pace: the replay ghosts (bloodstains and other players' ghosts) take their
+samples and move by game time, 3 samples a game second as recorded
+(`BBHOST_REPLAY_STEP=0` for the rate's frames), and the local player's
+character sync sends 6 packets a second as at 30, which other players see
+(`BBHOST_CHR_SYNC_STEP=0`).
+
+The native frame clock (experimental, off by default: Native frame clock
+(experimental) under F10's Frame rate, or the same switch on the setup
+window's Game page; it applies when the game starts) converts each frame,
+from that frame's own length, the few values the frame rate otherwise sets
+once for the rate chosen at start, so a rate the machine cannot hold, a
+variable refresh rate or a dip keeps them right too:
+- a ragdoll's bodies follow its animation by each frame's step
+  (`BBHOST_RAGDOLL_STEP=0` for the rate's step);
+- YEBIS's eye adaptation and afterimage follow each frame's length
+  (`BBHOST_YEBIS_STEP=0`);
+- its lens simulation takes each frame's rate, above 60 too
+  (`BBHOST_LENS_BLUR_RATE=0` keeps 60's);
+- the physics worlds' two step hints keep the game's 1/30
+  (`BBHOST_PHYSICS_HINTS=0` for the rate's);
+- the sound thread runs a pass for each frame's sound requests, woken as the
+  frame's work ends, and the game's own 33 ms at the longest
+  (`BBHOST_SOUND_WAKE=0` for the rate's period);
+- the user-service event poll keeps the game's 33 ms (`BBHOST_USER_POLL=0`).
+
+With it on, the values that follow the frame's seconds also take the game's
+step itself, a loading screen's included. `[video] frame_clock = true` in
+bbhost.toml is the switch's default (what F10 or the setup window saves wins
+over it, as with `fps_cap`), and `BBHOST_FRAME_CLOCK=1` or `=0` overrides both
+for a run; the log's `frame rate: the frame clock is on (...)` line names what
+turned it on. `BBHOST_SOUND_CENSUS=1` (a test
+switch, at any rate) counts the sound thread's passes against the frames in
+the 300-flip report: how many frames began between one pass and the next.
+
+`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
+Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
+the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
-switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
+switch, at the converted rates) moves the target while the game runs:
 `square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks
 a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
 `sine:LO:HI:S` sweeps it - one process at two rates, or at one that never holds
@@ -481,7 +596,7 @@ as at that rate however long the frame took, and a slow renderer runs the
 game in slow motion at the rate's steps. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
-refused: 90, 120 or uncapped falls back to 60).
+refused: a rate other than 60 falls back to 60).
 A frame goes to the screen as soon as the game has finished it; only its flip,
 which the game paces itself on, waits for the next tick of that clock. The game
 keeps two flips queued, and showing each frame at the tick that completed it
@@ -492,7 +607,7 @@ completed.
 A flip completes - and what the frame used goes back to the game - only once
 the GPU has rendered that frame: on the console a flip is the GPU reaching it,
 and the game writes the next frames' data over what a completed frame read. A
-loading screen's flips, and those above 60 and Uncapped, do not wait for the
+loading screen's flips, and those above 60, do not wait for the
 clock, so they complete as soon as their frame has rendered; the log says how
 many of a loading screen's flips waited (`video: the loading screen's ...
 flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,

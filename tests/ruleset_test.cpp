@@ -55,11 +55,11 @@ void test_token() {
     CHECK(ruleset_chars_ok(patch_rule_token("Weird/Name:\\x")));
 }
 
-// bbhost's own manifests: exactly the ones that change the game say so.
+// bbhost's own manifests: each parses and names a usable rules token, and
+// exactly the ones listed here say they change the game - none since
+// 2026-10-28 (Kyo: the gameplay flags do not ship); a mod's still can.
 void test_manifests() {
-    const std::set<std::string> gameplay = {"aerial-vectors-480", "analog-run-range-10", "analog-run-range-20",
-                                            "analog-run-range-30", "analog-run-range-40", "bigger-weapons-1-2x",
-                                            "debug-dash",        "movement-roll-1-1x",  "rally-window"};
+    const std::set<std::string> gameplay = {};
     std::set<std::string> seen, marked;
     for (const auto& e : std::filesystem::directory_iterator(BB_PATCHES_DIR)) {
         if (e.path().extension() != ".toml") continue;
