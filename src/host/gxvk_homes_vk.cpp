@@ -70,6 +70,8 @@ struct Home {
     bool indexed = false;      // in the index by address
     bool end_queued = false;   // on its way to being taken back
     std::uint32_t pending = 0;  // copies into it still to be put in place
+    std::uint32_t pend_at = 0;      // ... the newest one's place in the pending list, valid in pend_epoch's batch
+    std::uint64_t pend_epoch = 0;
     std::uint8_t* mirror = nullptr;  // compare: what the home holds at this point of the walk
 };
 inline std::uint32_t state_of(std::uint32_t w) { return w & 0xff; }
@@ -115,7 +117,8 @@ std::atomic<std::uint64_t> g_made_n{0}, g_made_bytes{0}, g_no_home[kNoHomes] = {
 std::atomic<std::uint64_t> g_bound{0}, g_bound_pending{0}, g_bound_addr{0}, g_bound_ended{0}, g_fall[kFalls] = {}, g_fills{0},
     g_fill_skipped{0}, g_copies_in{0}, g_copies_staged{0}, g_copies_refused{0}, g_flushes{0}, g_flush_copies{0},
     g_flush_overwritten{0}, g_syncs{0}, g_sync_walk{0}, g_sync_edge{0}, g_sync_map{0}, g_taken_back{0}, g_ranges_freed{0},
-    g_cmp_same{0}, g_cmp_diff{0}, g_cmp_none{0}, g_cmp_gpu{0}, g_bound_past{0}, g_cmp_past{0};
+    g_cmp_same{0}, g_cmp_diff{0}, g_cmp_none{0}, g_cmp_gpu{0}, g_bound_past{0}, g_cmp_past{0}, g_copies_replaced{0}, g_bound_flushed{0},
+    g_addr_pending{0};
 std::atomic<int> g_cmp_logged{0};
 
 // ---- The command processor's (under g.mu) ----
@@ -150,16 +153,46 @@ struct Pending {
 };
 std::vector<Pending> g_pending;
 std::uint64_t g_pend_lo = ~0ull, g_pend_hi = 0;
+// The same by destination, for the lookups by address (a vertex record, a constant buffer without a handle, any
+// binding copy_version_lookup_locked is asked about): a binary search, not a walk of the list - homes lie all over
+// GX's heaps, so the pending copies' bounds take in nearly every binding (OY: 16% of vertex records have no handle).
+std::vector<std::pair<std::uint64_t, std::uint32_t>> g_pend_sorted;  // (dst, index into g_pending), by dst
+std::uint64_t g_pend_maxlen = 0;
+std::vector<VkBuffer> g_pend_bufs;  // the buffers the pending copies read or write (a few): a transfer's test
+std::uint64_t g_pend_epoch = 1;  // moves at each flush: a home's pend_at is good in its own batch only
+bool g_pend_overlap = false;     // two pending copies may share bytes: the flush keeps the newest's bytes
 
 void index_erase(std::uint32_t index, Home& e) {
     g_ix.erase(index, e.memory);
     e.indexed = false;
 }
 
+// The index's answer for [va, va + bytes), kept per thread while the index stands (its version): a vertex record without
+// a handle asks it three times a draw (the straddle test, locate's two), and the same records draw after draw, so the
+// map is walked once per record and index change. The page filter's "no" comes first, uncached.
+struct MeetMemo {
+    std::uint64_t va = ~0ull, bytes = 0, version = ~0ull;
+    bool hit = false;
+    HomeIndex::Hit h;
+};
+thread_local MeetMemo t_meet[64];
+bool ix_meets(std::uint64_t va, std::uint64_t bytes, HomeIndex::Hit* out) {
+    if (!g_ix.may_meet(va, bytes)) return false;
+    MeetMemo& m = t_meet[((va >> 4) ^ (va >> 10) ^ bytes) & 63];
+    if (m.va != va || m.bytes != bytes || m.version != g_ix.version()) {
+        m.hit = g_ix.meets(va, bytes, &m.h);
+        m.va = va;
+        m.bytes = bytes;
+        m.version = g_ix.version();
+    }
+    if (m.hit && out) *out = m.h;
+    return m.hit;
+}
+
 // A live home whose range meets [va, va + bytes): the one at or below va, else the first above it.
 Home* index_meets(std::uint64_t va, std::uint64_t bytes, std::uint32_t* out_index) {
     HomeIndex::Hit hit;
-    if (!g_ix.meets(va, bytes, &hit)) return nullptr;
+    if (!ix_meets(va, bytes, &hit)) return nullptr;
     if (out_index) *out_index = hit.index;
     return home_at(hit.index);
 }
@@ -242,13 +275,23 @@ void recycle(std::uint32_t index) {
 // whole, kCopyVersionStraddles when it holds part of it.
 int pending_lookup(std::uint64_t base, std::uint64_t bytes, Located* out) {
     if (g_pending.empty() || base >= g_pend_hi || base + bytes <= g_pend_lo) return kCopyVersionNone;
-    for (auto it = g_pending.rbegin(); it != g_pending.rend(); ++it) {
-        if (it->dst >= base + bytes || it->dst + it->bytes <= base) continue;
-        if (base < it->dst || base + bytes > it->dst + it->bytes) return kCopyVersionStraddles;
-        if (out) *out = {it->src, it->src_off + (base - it->dst), it->bytes - (base - it->dst)};
-        return kCopyVersionInside;
+    // The newest pending copy meeting the range: those starting within the longest's reach below it.
+    const std::uint64_t from = base > g_pend_maxlen ? base - g_pend_maxlen + 1 : 0;
+    auto it = std::lower_bound(g_pend_sorted.begin(), g_pend_sorted.end(), std::make_pair(from, std::uint32_t{0}));
+    const Pending* best = nullptr;
+    std::uint32_t best_i = 0;
+    for (; it != g_pend_sorted.end() && it->first < base + bytes; ++it) {
+        const Pending& p = g_pending[it->second];
+        if (p.dst + p.bytes <= base) continue;
+        if (!best || it->second > best_i) {
+            best = &p;
+            best_i = it->second;
+        }
     }
-    return kCopyVersionNone;
+    if (!best) return kCopyVersionNone;
+    if (base < best->dst || base + bytes > best->dst + best->bytes) return kCopyVersionStraddles;
+    if (out) *out = {best->src, best->src_off + (base - best->dst), best->bytes - (base - best->dst)};
+    return kCopyVersionInside;
 }
 
 // A home's bytes from its buffer's memory, in this recording's uploads (run
@@ -507,6 +550,7 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
     if (!e || va < e->memory || va + bytes > e->memory + e->bytes) return false;
     if (env_mode() != Mode::kHandle) return false;  // compare: today's path is bound
     if (!e->filled && (run_part_stop(kRunStopRefresh) || !fill_locked(*e))) return false;
+    if (e->pending) bump(g_addr_pending);  // (a copy into it pending: the callers that bind ask the copies first - counted)
     if (out) *out = {e->buffer, e->offset + (va - e->memory), class_bytes(e->cls) - (va - e->memory)};
     if (address) *address = e->address + (va - e->memory);
     g_bound_addr.fetch_add(1, std::memory_order_relaxed);
@@ -516,13 +560,14 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
 bool homes_meet_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_bind.load(std::memory_order_relaxed) || !bytes) return false;
     drain_locked();
-    return g_ix.meets(va, bytes, nullptr);
+    return ix_meets(va, bytes, nullptr);
 }
 
 bool homes_straddle_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_bind.load(std::memory_order_relaxed) || !bytes) return false;
     drain_locked();
-    return g_ix.straddles(va, bytes);
+    HomeIndex::Hit h;
+    return ix_meets(va, bytes, &h) && (va < h.memory || va + bytes > h.memory + h.bytes);
 }
 
 void homes_sync_locked(std::uint64_t va, std::uint64_t bytes, int why) {
@@ -597,6 +642,7 @@ int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t by
         }
         render_end_pass_locked();
         homes_flush_locked();
+        bump(g_bound_flushed);
     }
     out = {e->buffer, e->offset + (base - e->memory), class_bytes(e->cls) - (base - e->memory)};
     bump(st == kEnded ? g_bound_ended : g_bound);
@@ -623,12 +669,35 @@ int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, V
         return kHomeCopyRefused;
     }
     if (e->mirror && src_map) std::memcpy(e->mirror + (dst - e->memory), src_map, bytes);
-    // A newer copy over the same bytes takes an older one's place, as its batch would leave only it.
+    bump(g_copies_in);
+    // A newer copy over the same bytes takes the older one's place, as its batch would leave only it (a copy-back writes
+    // its buffer whole: a constant buffer copied back twice between two passes is one copy). A draw that bound the older
+    // one's source keeps it.
+    if (e->pending && e->pend_epoch == g_pend_epoch && e->pend_at < g_pending.size()) {
+        Pending& p = g_pending[e->pend_at];
+        if (p.index == index && p.dst == dst && p.bytes == bytes) {
+            p.src = src;
+            p.src_off = src_off;
+            if (src && std::find(g_pend_bufs.begin(), g_pend_bufs.end(), src) == g_pend_bufs.end()) g_pend_bufs.push_back(src);
+            bump(g_copies_replaced);
+            return kHomeCopyTaken;
+        }
+        g_pend_overlap = true;
+    }
+    e->pend_at = static_cast<std::uint32_t>(g_pending.size());
+    e->pend_epoch = g_pend_epoch;
     g_pending.push_back({dst, bytes, src, src_off, e->buffer, e->offset + (dst - e->memory), index});
+    {
+        const std::pair<std::uint64_t, std::uint32_t> key{dst, static_cast<std::uint32_t>(g_pending.size() - 1)};
+        g_pend_sorted.insert(std::upper_bound(g_pend_sorted.begin(), g_pend_sorted.end(), key), key);
+        g_pend_maxlen = std::max(g_pend_maxlen, bytes);
+        for (const VkBuffer b : {src, e->buffer}) {
+            if (b && std::find(g_pend_bufs.begin(), g_pend_bufs.end(), b) == g_pend_bufs.end()) g_pend_bufs.push_back(b);
+        }
+    }
     g_pend_lo = std::min(g_pend_lo, dst);
     g_pend_hi = std::max(g_pend_hi, dst + bytes);
     ++e->pending;
-    bump(g_copies_in);
     return kHomeCopyTaken;
 }
 
@@ -663,6 +732,7 @@ bool homes_settled_locked() {
 }
 
 bool homes_before_transfer_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSize bytes) {
+    if (std::find(g_pend_bufs.begin(), g_pend_bufs.end(), buffer) == g_pend_bufs.end()) return false;
     for (const Pending& p : g_pending) {
         if ((p.to == buffer && p.to_off < off + bytes && off < p.to_off + p.bytes) ||
             (p.src == buffer && p.src_off < off + bytes && off < p.src_off + p.bytes)) {
@@ -678,16 +748,39 @@ bool homes_before_transfer_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSiz
 void homes_flush_locked() {
     if (g_pending.empty()) return;
     begin_recording_locked();
-    std::vector<Pending> pending;
+    static std::vector<Pending> pending;
+    pending.clear();
     pending.swap(g_pending);
+    g_pend_sorted.clear();
+    g_pend_bufs.clear();
+    g_pend_maxlen = 0;
     g_pend_lo = ~0ull;
     g_pend_hi = 0;
+    ++g_pend_epoch;
+    const bool overlap = g_pend_overlap;
+    g_pend_overlap = false;
     std::optional<DrawCmds> own;
     if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);
     if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_begin()) rec().transfer_barrier(true);
+    std::size_t copies = 0;
+    if (!overlap) {
+        // One pending copy a home (the usual batch): no two share bytes, so they run in any order.
+        for (const Pending& p : pending) {
+            if (Home* e = home_at(p.index); e && e->pending) --e->pending;
+            const VkBufferCopy region{p.src_off, p.to_off, p.bytes};
+            DrawCmds* c = DrawCmds::open();
+            if (!c || !c->copy_buffer(p.src, p.to, region)) rec().copy_buffer(p.src, p.to, 1, &region);
+            g.transfers.fetch_add(1);
+            ++copies;
+        }
+        pending.clear();
+        if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_end()) rec().transfer_barrier(false);
+        g_flushes.fetch_add(1, std::memory_order_relaxed);
+        g_flush_copies.fetch_add(copies, std::memory_order_relaxed);
+        return;
+    }
     static std::map<std::uint64_t, std::uint64_t> covered;  // start -> end, disjoint, of the newer copies
     covered.clear();
-    std::size_t copies = 0;
     for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
         const Pending& p = *it;
         if (Home* e = home_at(p.index); e && e->pending) --e->pending;
@@ -724,6 +817,7 @@ void homes_flush_locked() {
     g_flushes.fetch_add(1, std::memory_order_relaxed);
     g_flush_copies.fetch_add(copies, std::memory_order_relaxed);
     g_flush_overwritten.fetch_add(pending.size() > copies ? pending.size() - copies : 0, std::memory_order_relaxed);
+    pending.clear();
 }
 
 void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, const void* today) {
@@ -804,17 +898,20 @@ std::string homes_report() {
                   "gxvk homes: %s; made %llu (%llu KiB of constants), none for: %s; %zu live; the pool %llu blocks (%llu MiB), ranges held %llu KiB "
                   "now, %llu KiB at most; ended: %s; taken back %llu, ranges freed %llu\n"
                   "gxvk homes: bindings by handle %llu (%llu after their buffer's end, %llu reading past the buffer's bytes), of a pending "
-                  "copy's source %llu, by address %llu; by handle to today's path: %s; filled from their memory %llu, a whole copy-back first "
-                  "%llu; copies in %llu (%llu staged, %llu refused) in %llu batches (%llu copies, %llu overwritten); copied back to their memory "
-                  "%llu (walks %llu, edges %llu, CPU maps %llu)",
+                  "copy's source %llu, after putting the copies in place first %llu, by address %llu (%llu with a copy pending); by handle to "
+                  "today's path: %s; filled from their memory %llu, a whole copy-back first "
+                  "%llu; copies in %llu (%llu staged, %llu refused, %llu taking a pending one's place) in %llu batches (%llu copies, %llu "
+                  "overwritten); copied back to their memory %llu (walks %llu, edges %llu, CPU maps %llu)",
                   m == Mode::kHandle ? "bound by handle (BBHOST_GXVK_HOMES=1)" : "compared beside today's path (BBHOST_GXVK_HOMES=compare)",
                   static_cast<ull>(g_made_n.load()), static_cast<ull>(g_made_bytes.load() >> 10), nh.empty() ? "none" : nh.c_str(), live,
                   static_cast<ull>(blocks), static_cast<ull>((blocks * kBlockBytes) >> 20), static_cast<ull>(held >> 10),
                   static_cast<ull>(peak >> 10), en.empty() ? "none" : en.c_str(), static_cast<ull>(g_taken_back.load()),
                   static_cast<ull>(g_ranges_freed.load()), static_cast<ull>(g_bound.load()), static_cast<ull>(g_bound_ended.load()),
-                  static_cast<ull>(g_bound_past.load()), static_cast<ull>(g_bound_pending.load()), static_cast<ull>(g_bound_addr.load()), fl.empty() ? "none" : fl.c_str(),
+                  static_cast<ull>(g_bound_past.load()), static_cast<ull>(g_bound_pending.load()), static_cast<ull>(g_bound_flushed.load()),
+                  static_cast<ull>(g_bound_addr.load()), static_cast<ull>(g_addr_pending.load()), fl.empty() ? "none" : fl.c_str(),
                   static_cast<ull>(g_fills.load()), static_cast<ull>(g_fill_skipped.load()), static_cast<ull>(g_copies_in.load()),
-                  static_cast<ull>(g_copies_staged.load()), static_cast<ull>(g_copies_refused.load()), static_cast<ull>(g_flushes.load()),
+                  static_cast<ull>(g_copies_staged.load()), static_cast<ull>(g_copies_refused.load()), static_cast<ull>(g_copies_replaced.load()),
+                  static_cast<ull>(g_flushes.load()),
                   static_cast<ull>(g_flush_copies.load()), static_cast<ull>(g_flush_overwritten.load()), static_cast<ull>(g_syncs.load()),
                   static_cast<ull>(g_sync_walk.load()), static_cast<ull>(g_sync_edge.load()), static_cast<ull>(g_sync_map.load()));
     std::string s = out;

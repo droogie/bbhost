@@ -38,6 +38,7 @@ public:
         count(memory, bytes, 1);
         lo_ = std::min(lo_, memory);
         hi_ = std::max(hi_, memory + bytes);
+        ++version_;
     }
     // Home `index` out of the index, if it is there at `memory`.
     bool erase(std::uint32_t index, std::uint64_t memory) {
@@ -45,6 +46,7 @@ public:
         if (it == map_.end() || it->second.index != index) return false;
         count(memory, it->second.bytes, -1);
         map_.erase(it);
+        ++version_;
         return true;
     }
     // Whether [va, va + bytes) may meet a home: false only where none does.
@@ -88,6 +90,8 @@ public:
         return meets(va, bytes, &h) && (va < h.memory || va + bytes > h.memory + h.bytes);
     }
     std::size_t size() const { return map_.size(); }
+    // Moves at every insert and erase: an answer kept beside it is good while it stands.
+    std::uint64_t version() const { return version_; }
 
 private:
     static constexpr std::uint32_t kBits = 20, kSlots = 1u << kBits;
@@ -105,6 +109,7 @@ private:
     std::map<std::uint64_t, Value> map_;
     std::unique_ptr<std::uint16_t[]> filter_;
     std::uint64_t lo_ = ~0ull, hi_ = 0;  // every indexed home lies inside
+    std::uint64_t version_ = 0;
 };
 
 }  // namespace gxvk_homes
