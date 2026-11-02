@@ -1767,6 +1767,10 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (hold_polls > 0 || hle_video_flip_count() < hold_until_flip) {
                 if (hold_polls > 0) --hold_polls;
                 p.buttons |= held;
+                // The triggers are analogue as well as buttons (the storage
+                // box's two tabs press L2 and R2).
+                if (held & 0x100u) p.l2 = 255;
+                if (held & 0x200u) p.r2 = 255;
             }
             p.buttons |= repeat;
             // Hover is not here: it happens inside the menu's own list update, where
