@@ -1691,6 +1691,48 @@ std::string import_window_census_report_locked(bool at_exit) {
                   mib(idle_f_all), mib(lies[0]), mib(lies[1]), mib(lies[2]), mib(lies[3]), mib(lies[4]), mib(lies[5]), mib(lies_heap),
                   mib(lies_none));
     std::string out = b;
+    // By import: the live imports idle as a whole (every window of theirs a
+    // minute without a use) - what letting go of whole imports gives back -
+    // and the idle windows inside imports a window of which is still used -
+    // what only splitting an import would.
+    {
+        std::uint64_t whole_n = 0, whole_bytes = 0, held_windows = 0, held_bytes = 0, hot_n = 0;
+        for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+            const DmemChunk& d = g.dmem[k];
+            for (const auto& c : d.imports) {
+                const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+                if (end <= c->lo) continue;
+                const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
+                const std::uint32_t z = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+                std::uint64_t idle_w = 0, idle_wb = 0;
+                bool hot = false;
+                for (std::uint32_t w = a; w <= z; ++w) {
+                    const WindowUses& u = g_wuse[k][w];
+                    const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                    const std::uint64_t hi = std::min(end, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                    if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) {
+                        ++idle_w;
+                        idle_wb += hi - lo;
+                    } else {
+                        hot = true;
+                    }
+                }
+                if (!hot) {
+                    ++whole_n;
+                    whole_bytes += c->size;
+                } else {
+                    ++hot_n;
+                    held_windows += idle_w;
+                    held_bytes += idle_wb;
+                }
+            }
+        }
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]   import census by window, by import: idle as a whole (every window a minute without a use) %llu imports "
+                      "(%llu MiB); in the %llu imports a window of which was used within the minute, idle windows %llu (%llu MiB)",
+                      static_cast<ull>(whole_n), mib(whole_bytes), static_cast<ull>(hot_n), static_cast<ull>(held_windows), mib(held_bytes));
+        out += b;
+    }
     if (!at_exit) return out;
     // What lies in each class's windows.
     for (int q = 0; q < kClasses; ++q) {
