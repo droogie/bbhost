@@ -773,16 +773,19 @@ VKAPI_ATTR VkBool32 VKAPI_CALL va_binding_callback(VkDebugUtilsMessageSeverityFl
     return VK_FALSE;
 }
 
-// BBHOST_IMPORT_RETIRE (window imports, host/import_retire.h): 1 lets go of a
+// Idle window imports let go (host/import_retire.h; the memory policy decides
+// it, host/memory_policy.h, BBHOST_IMPORT_RETIRE winning): 1 lets go of a
 // window import none of whose windows anything has used for
 // BBHOST_IMPORT_RETIRE_S seconds (60), at most BBHOST_IMPORT_RETIRE_MB (128)
 // MiB a second, so the frees - each an unpinning in the driver, at a slot's
 // retirement on the command processor - spread over the seconds after an
 // area's change; 2 counts what 1 would let go and the windows it would have
 // imported again, and lets go of nothing; 0 keeps every window imported once
-// made.
+// made. 0 until the policy is decided: a window used before has no stamp, which
+// the first check gives it.
 const import_retire::Switch g_retire =
-    import_retire::parse(std::getenv("BBHOST_IMPORT_RETIRE"), std::getenv("BBHOST_IMPORT_RETIRE_S"), std::getenv("BBHOST_IMPORT_RETIRE_MB"));
+    import_retire::parse(nullptr, std::getenv("BBHOST_IMPORT_RETIRE_S"), std::getenv("BBHOST_IMPORT_RETIRE_MB"));
+std::atomic<int> g_retire_mode{0};
 // The command processor's clock at its last submission (steady ms): what a use
 // stamps on its windows, without a clock read of its own.
 std::atomic<std::uint64_t> g_import_now_ms{0};
@@ -1317,7 +1320,7 @@ void install_import_locked(std::uint32_t index, Chunk* c) {
     const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
     const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
     if (g_census) window_made_locked(index, a, b, t_import_who);
-    if (g_retire.mode) {
+    if (g_retire_mode.load(std::memory_order_relaxed)) {
         const std::uint64_t now = g_import_now_ms.load(std::memory_order_relaxed);
         for (std::uint32_t w = a; w <= b; ++w) {
             d.used_ms[w].store(now, std::memory_order_relaxed);
@@ -1468,7 +1471,7 @@ void let_go_idle_import_locked(std::uint32_t index, Chunk* c, std::uint64_t now)
 // page-table view still moves over, or a copy version names, waits for a later
 // check.
 void retire_idle_imports_locked() {
-    if (!g_retire.mode || imports_whole()) return;
+    if (!g_retire_mode.load(std::memory_order_relaxed) || imports_whole()) return;
     const std::uint64_t now = static_cast<std::uint64_t>(std::max<std::int64_t>(steady_ms(), 1));
     g_import_now_ms.store(now, std::memory_order_relaxed);
     static std::uint64_t last = 0;
@@ -1493,7 +1496,7 @@ void retire_idle_imports_locked() {
         }
         for (Chunk* c : idle) {
             idle_now += c->size;
-            if (g_retire.mode == 1) {
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
                 if (!import_retire::fits(let_go, g_retire.per_check)) continue;  // the next check's
                 let_go += c->size;
                 let_go_idle_import_locked(k, c, now);
@@ -1514,7 +1517,7 @@ void retire_idle_imports_locked() {
             }
         }
     }
-    if (g_retire.mode == 1) count_lagging_tables_locked();
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) count_lagging_tables_locked();
     g_would_idle_most = std::max(g_would_idle_most, idle_now);
 }
 
@@ -1527,7 +1530,7 @@ void note_windows_used(DmemChunk& d, std::uint32_t index, std::uint64_t in, std:
     for (std::uint32_t w = w0; w <= w1; ++w) {
         if (d.used_ms[w].load(std::memory_order_relaxed) != now) d.used_ms[w].store(now, std::memory_order_relaxed);
         // (=2's count on the command processor alone: a run part's use counts at its commit's.)
-        if (g_retire.mode == 2 && g_would_ms[index][w] && !t_bump_sink) {
+        if (g_retire_mode.load(std::memory_order_relaxed) == 2 && g_would_ms[index][w] && !t_bump_sink) {
             g_would_ms[index][w] = 0;
             ++g_would_again_n;
             g_would_again_bytes += 1ull << kImportWindowShift;
@@ -2020,7 +2023,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
         idle_note_use_locked(*c);
         if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
-        if (g_retire.mode) note_windows_used(d, index, in, bytes);
+        if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
         return c;
     }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
@@ -2046,7 +2049,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     // A window let go while idle (BBHOST_IMPORT_RETIRE=1), wanted again: the
     // driver's time of this import is the path's wait for it.
     bool again = false;
-    if (g_retire.mode == 1) {
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
         for (std::uint32_t w = wa; w <= wb; ++w) again |= d.retired_ms[w] != 0;
     }
     const auto t_again = again ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2067,7 +2070,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
     idle_note_use_locked(*c);
     if (g_census) window_use_locked(index, in, bytes);
-    if (g_retire.mode) note_windows_used(d, index, in, bytes);
+    if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
     return c;
 }
 
@@ -9320,8 +9323,10 @@ const memory_policy::Policy& host_gpu_memory_policy() {
         sw.small = std::getenv("BBHOST_SMALL_VRAM");
         const std::int64_t free = g_start_free.load();
         const bool nvidia = g_vendor.load() == 0x10de;
+        sw.retire = std::getenv("BBHOST_IMPORT_RETIRE");
         const memory_policy::Policy p = memory_policy::decide(d, kWindowsHost, free > 0 ? static_cast<std::uint64_t>(free) : 0, nvidia, sw);
         host_log("gpu: memory: %s", memory_policy::describe(p, sw).c_str());
+        g_retire_mode.store(p.retire, std::memory_order_relaxed);
         return p;
     }();
     g_policy_known.store(true, std::memory_order_release);
@@ -12851,9 +12856,9 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
-        if (g_retire.mode && !imports_whole()) {
+        if (g_retire_mode.load(std::memory_order_relaxed) && !imports_whole()) {
             std::lock_guard<GpuMutex> lock(g.mu);
-            if (g_retire.mode == 1)
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1)
                 host_log("gpu: idle window imports let go (BBHOST_IMPORT_RETIRE=1, after %.0f s without a use): %llu (%llu MiB) in %llu checks, "
                          "%llu put off while a copy version named them; windows wanted again and imported again by the paths that asked %llu "
                          "(%llu MiB) in %.1f ms of the driver's time, the longest %.1f ms; by the import thread %llu",

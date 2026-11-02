@@ -254,7 +254,15 @@ the newer one has run: a shader walking the table reads whatever address an
 entry holds as it runs, and AMD's Linux driver maps a new buffer's addresses
 for the submissions made after it, not for the ones already queued
 (host/import_table.h; `BBHOST_IMPORT_TABLE_DEFER=0` switches them at once, as
-before). It is on by default on an integrated GPU under Windows,
+before). An import none of whose windows anything has used for a minute - an
+area's meshes and copy-backs once the game has gone elsewhere, a buffer the
+import thread imported that the draws never read in place - is let go: its
+windows' entries point at the sink at once (no work in flight reads them, and
+the sink is memory every submission sees), it is freed once the work recorded
+with it has run, and a later use imports it again (host/import_retire.h,
+`BBHOST_IMPORT_RETIRE`; on by default with window imports on a graphics card,
+kept on an integrated GPU until one has run it). Window imports are on by
+default on an integrated GPU under Windows,
 where whole spans kept about 1.5 GB more of the game's memory resident for the
 GPU, and on a graphics card with small video memory (under 7.5 GiB free at
 the start), whose whole spans pin 4-5 GiB of system memory beside a 4-6 GB

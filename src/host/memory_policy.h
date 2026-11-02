@@ -11,19 +11,26 @@
 //   (BBHOST_IMPORT_WINDOWS, gpu.import_windows; host/import_mode.h decide);
 // - the upload staging kept or given back down to its floor in play
 //   (BBHOST_STAGING_RETURN, gpu.staging_return; host/apu_memory.h
-//   staging_return).
+//   staging_return);
+// - with window imports, a window import idle a minute let go
+//   (BBHOST_IMPORT_RETIRE; host/import_retire.h).
 // Each part's switch wins on any device. Unset, the device decides:
 //
-//   the device                                  GX's buffers         imports          upload staging
-//   a discrete GPU with room (7.5 GiB+ free)    by handle            whole            kept
-//   one with small video memory                 by handle, budgeted  by window        given back (**)
-//   one with tight memory (heaps under 12 GiB)  today's path         whole            kept
-//   an integrated GPU with 8 GiB or more        by handle            by platform (*)  by platform (*)
-//   a smaller integrated GPU (a Steam Deck)     today's path         by platform (*)  by platform (*)
+//   the device                                  GX's buffers         imports          upload staging   idle windows
+//   a discrete GPU with room (7.5 GiB+ free)    by handle            whole            kept             (no windows)
+//   one with small video memory                 by handle, budgeted  by window        given back (**)  let go
+//   one with tight memory (heaps under 12 GiB)  today's path         whole            kept             (no windows)
+//   an integrated GPU with 8 GiB or more        by handle            by platform (*)  by platform (*)  kept (***)
+//   a smaller integrated GPU (a Steam Deck)     today's path         by platform (*)  by platform (*)  kept (***)
 //   (*) by window and given back under Windows; whole and kept under Linux,
 //   where the Steam Deck's kit asks for window imports in its own toml.
 //   (**) kept on NVIDIA's driver, whose free of a 64 MiB staging chunk stalls
 //   the frame it falls in.
+//   (***) until an integrated GPU has run it: a window wanted again is
+//   imported again on the command processor, 5-46 ms a 16 MiB window on a
+//   Radeon 680M under Windows against ~4 on an RTX 4070.
+//   Window imports asked for on a discrete GPU (BBHOST_IMPORT_WINDOWS,
+//   gpu.import_windows) let idle windows go too.
 //
 // Why: a card with room has the video memory for the copies and the PCIe
 // link for whole imports, and its staging is kept: each 64 MiB chunk's
@@ -56,6 +63,7 @@
 #include "host/gxvk.h"
 #include "host/gxvk_budget.h"
 #include "host/import_mode.h"
+#include "host/import_retire.h"
 
 namespace memory_policy {
 
@@ -82,6 +90,7 @@ struct Switches {
     const char* staging_env = nullptr;  // BBHOST_STAGING_RETURN
     const char* staging_cfg = nullptr;  // gpu.staging_return
     const char* small = nullptr;        // BBHOST_SMALL_VRAM (only said: gpu.cpp small_vram reads it for the device's kind)
+    const char* retire = nullptr;       // BBHOST_IMPORT_RETIRE
 };
 inline bool given(const char* s) { return s && *s; }
 
@@ -94,6 +103,7 @@ struct Policy {
     std::uint64_t budget = 0;                   // their copies' budget in bytes, 0 none
     bool windows = false;                       // the game's memory imported a window at a time
     bool staging_return = false;                // the upload staging given back in play
+    int retire = 0;                             // window imports idle a while let go: 0 kept, 1 let go, 2 counted (host/import_retire.h)
 };
 
 // `nvidia`: the device's driver is NVIDIA's (PCI vendor 0x10de).
@@ -111,6 +121,8 @@ inline Policy decide(Device d, bool windows_host, std::uint64_t free_at_start, b
     p.windows = import_mode::decide(s.imports_env, s.imports_cfg, integrated, windows_host, small) == import_mode::Mode::kWindows;
     // The staging's return on a small card only where the driver frees a chunk without stalling a frame.
     p.staging_return = apu_memory::staging_return(s.staging_env, s.staging_cfg, integrated, windows_host, small && !nvidia ? 1 : 0);
+    // Idle windows let go wherever windows are imported on a discrete GPU.
+    p.retire = !p.windows ? 0 : import_retire::parse(s.retire, nullptr, nullptr, integrated ? import_retire::kOff : import_retire::kOn).mode;
     return p;
 }
 
@@ -177,7 +189,18 @@ inline std::string describe(const Policy& p, const Switches& s) {
                       ? ", as NVIDIA's driver stalls the frame a staging chunk's free falls in"
                       : "");
     out += b;
-    out += " - BBHOST_GXVK_BUFFERS, BBHOST_GXVK_BUFFERS_BUDGET_MB, BBHOST_IMPORT_WINDOWS and BBHOST_STAGING_RETURN change a part (docs/running.md)";
+    // Idle windows (with window imports).
+    if (p.windows) {
+        const char* rt = given(s.retire) ? " (BBHOST_IMPORT_RETIRE)" : "";
+        std::snprintf(b, sizeof b, "; %s%s",
+                      p.retire == import_retire::kOn      ? "a window import a minute without a use let go"
+                      : p.retire == import_retire::kCount ? "idle window imports counted, none let go"
+                                                          : "every window import kept",
+                      rt[0] ? rt : p.retire == import_retire::kOff ? ", as on every integrated GPU until one has run it" : "");
+        out += b;
+    }
+    out += " - BBHOST_GXVK_BUFFERS, BBHOST_GXVK_BUFFERS_BUDGET_MB, BBHOST_IMPORT_WINDOWS, BBHOST_STAGING_RETURN and BBHOST_IMPORT_RETIRE change a part "
+           "(docs/running.md)";
     return out;
 }
 

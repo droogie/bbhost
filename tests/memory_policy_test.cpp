@@ -138,6 +138,58 @@ void test_switches() {
     }
 }
 
+void test_retire() {
+    const Switches none;
+    for (int host = 0; host < 2; ++host) {
+        const bool win = host == 1;
+        // Idle windows let go where windows are imported on a discrete GPU: a small card's by default...
+        CHECK(decide(Device::kSmallVram, win, kSmallFree, false, none).retire == import_retire::kOn);
+        CHECK(decide(Device::kSmallVram, win, kSmallFree, true, none).retire == import_retire::kOn);  // NVIDIA's too
+        // ... nothing to let go with whole imports ...
+        CHECK(decide(Device::kRoomy, win, 10800 * kMiB, false, none).retire == import_retire::kOff);
+        CHECK(decide(Device::kTight, win, kSmallFree, false, none).retire == import_retire::kOff);
+        // ... and kept on an integrated GPU, with windows (under Windows, or the Deck's toml) or without.
+        CHECK(decide(Device::kIntegrated, win, 2048 * kMiB, false, none).retire == import_retire::kOff);
+        CHECK(decide(Device::kIntegratedRoomy, win, 8192 * kMiB, false, none).retire == import_retire::kOff);
+        Switches s;
+        s.imports_cfg = "true";  // the Steam Deck kit's toml
+        CHECK(decide(Device::kIntegrated, win, 2048 * kMiB, false, s).windows);
+        CHECK(decide(Device::kIntegrated, win, 2048 * kMiB, false, s).retire == import_retire::kOff);
+        // Windows asked for on a card with room: let go too.
+        s = Switches{};
+        s.imports_env = "1";
+        CHECK(decide(Device::kRoomy, win, 10800 * kMiB, false, s).retire == import_retire::kOn);
+        // The switch wins wherever windows are imported, and means nothing with whole ones.
+        s.retire = "0";
+        CHECK(decide(Device::kRoomy, win, 10800 * kMiB, false, s).retire == import_retire::kOff);
+        s.retire = "2";
+        CHECK(decide(Device::kRoomy, win, 10800 * kMiB, false, s).retire == import_retire::kCount);
+        s.imports_env = nullptr;
+        s.retire = "1";
+        CHECK(decide(Device::kRoomy, win, 10800 * kMiB, false, s).retire == import_retire::kOff);  // whole: nothing to let go
+        CHECK(decide(Device::kIntegrated, true, 2048 * kMiB, false, s).retire == import_retire::kOn);   // Windows' windows
+        CHECK(decide(Device::kIntegrated, false, 2048 * kMiB, false, s).retire == import_retire::kOff);  // Linux: whole
+        s.imports_cfg = "true";
+        CHECK(decide(Device::kIntegrated, false, 2048 * kMiB, false, s).retire == import_retire::kOn);   // the Deck's, asked
+        s.retire = "0";
+        CHECK(decide(Device::kSmallVram, win, kSmallFree, false, s).retire == import_retire::kOff);
+    }
+    // The log's words.
+    std::string d = memory_policy::describe(decide(Device::kSmallVram, true, kSmallFree, false, none), none);
+    CHECK(has(d, "a window import a minute without a use let go") && !has(d, "(BBHOST_IMPORT_RETIRE)"));
+    d = memory_policy::describe(decide(Device::kRoomy, true, 10800 * kMiB, false, none), none);
+    CHECK(!has(d, "let go") && !has(d, "window import kept"));  // whole imports: no part said
+    d = memory_policy::describe(decide(Device::kIntegrated, true, 2048 * kMiB, false, none), none);
+    CHECK(has(d, "every window import kept, as on every integrated GPU until one has run it"));
+    Switches s;
+    s.retire = "2";
+    d = memory_policy::describe(decide(Device::kSmallVram, true, kSmallFree, false, s), s);
+    CHECK(has(d, "idle window imports counted, none let go (BBHOST_IMPORT_RETIRE)"));
+    s.retire = "0";
+    d = memory_policy::describe(decide(Device::kSmallVram, true, kSmallFree, false, s), s);
+    CHECK(has(d, "every window import kept (BBHOST_IMPORT_RETIRE)"));
+}
+
 void test_describe() {
     const Switches none;
     std::string d = memory_policy::describe(decide(Device::kSmallVram, true, kSmallFree, false, none), none);
@@ -187,6 +239,7 @@ int main() {
     test_device_of();
     test_defaults();
     test_switches();
+    test_retire();
     test_describe();
     if (g_fail) {
         std::printf("memory_policy_test: %d failure(s)\n", g_fail);
