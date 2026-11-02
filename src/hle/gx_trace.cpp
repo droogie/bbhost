@@ -29,6 +29,7 @@
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
+#include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
@@ -1661,7 +1662,7 @@ struct PackedHead {
 };
 static_assert(sizeof(PackedHead) == 16);
 static_assert(offsetof(GxStageRecords, desc) == 64, "a stage's first line is what the bits and counts are");
-constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 16 + 0xc0 + 2 * 14 * 8);
+constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 20 + 0xc0 + 2 * 14 * 8);
 static_assert(kPackedMax <= sizeof(GxDrawRecords));
 std::atomic<std::uint64_t> g_packed_draws{0}, g_packed_bytes{0}, g_packed_most{0};
 
@@ -1680,6 +1681,7 @@ std::uint32_t pack_records(const GxDrawRecords& src, int stages, void* dst) {
         for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(&s.obj_tex_id[__builtin_ctzll(m)], 4);
         for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) put(s.obj_smp + __builtin_ctz(m) * 32, 32);
         for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(&s.cb_home[__builtin_ctz(m)], 4);
         if (s.has_ctx_block) put(s.ctx_block, sizeof(s.ctx_block));
         for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) put(&s.cb_proof[__builtin_ctz(m)], 8);
         for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) put(&s.cb_hash[__builtin_ctz(m)], 8);
@@ -1717,6 +1719,7 @@ const GxDrawRecords* unpack_records(const void* packed) {
         for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(&s.obj_tex_id[__builtin_ctzll(m)], 4);
         for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) get(s.obj_smp + __builtin_ctz(m) * 32, 32);
         for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(&s.cb_home[__builtin_ctz(m)], 4);
         if (s.has_ctx_block) get(s.ctx_block, sizeof(s.ctx_block));
         for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) get(&s.cb_proof[__builtin_ctz(m)], 8);
         for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) get(&s.cb_hash[__builtin_ctz(m)], 8);
@@ -1760,6 +1763,7 @@ void compare_unpacked(const GxDrawRecords& made, const GxDrawRecords& got) {
         }
         for (std::uint32_t m = a.obj_cb_set; m; m &= m - 1) {
             if (std::memcmp(a.obj_cb + __builtin_ctz(m) * 16, b.obj_cb + __builtin_ctz(m) * 16, 16) != 0) differ(kPfCb);
+            if (a.cb_home[__builtin_ctz(m)] != b.cb_home[__builtin_ctz(m)]) differ(kPfCb);
         }
         if (a.has_ctx_block && std::memcmp(a.ctx_block, b.ctx_block, sizeof(a.ctx_block)) != 0) differ(kPfCtx);
         for (std::uint32_t m = a.cb_proofed; m; m &= m - 1) {
@@ -2035,6 +2039,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
             std::uint64_t key, table, addr;
             std::uint32_t size;
             std::uint16_t index1;
+            std::uint64_t own = 0;  // the buffer's own memory (+0x20): its home's (stage 4b.3c)
         };
         Cb cbs[14];
         int ncb = 0;
@@ -2052,7 +2057,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
             if (g_gx_cost_enabled) g_dynbuf_table.fetch_add(static_cast<std::uint64_t>(ncb), std::memory_order_relaxed);
             for (int i = 0; i < ncb; ++i) {
                 cbs[i].table = rd64(cbs[i].key + 0x38);
-                cbs[i].addr = rd64(cbs[i].key + 8);  // no entry: the buffer's own address
+                cbs[i].addr = cbs[i].own = rd64(cbs[i].key + 8);  // no entry: the buffer's own address
             }
             for (int i = 0; i < ncb; ++i) {
                 // The buffers' per-context index tables sit in a few heaps too:
@@ -2074,8 +2079,13 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                 if (page && rd64(entry) == cbs[i].key) cbs[i].addr = rd64(entry + 8);
             }
         } else {
-            for (int i = 0; i < ncb; ++i) cbs[i].addr = dynamic_buffer_address(map, cbs[i].key);
+            for (int i = 0; i < ncb; ++i) {
+                cbs[i].addr = dynamic_buffer_address(map, cbs[i].key);
+                cbs[i].own = rd64(cbs[i].key + 8);
+            }
         }
+        // Stage 4b.3c: a record that names the buffer's own memory names its home, whose handle the holder carries.
+        static const bool homes = gxvk_homes::env_mode() == gxvk_homes::Mode::kHandle || gxvk_homes::env_mode() == gxvk_homes::Mode::kCompare;
         for (int i = 0; i < ncb; ++i) {
             const std::uint64_t addr = cbs[i].addr;
             const std::uint32_t rec[4] = {static_cast<std::uint32_t>(addr),
@@ -2083,6 +2093,12 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                                           0x20077fac & 0xc7ffffff};
             std::memcpy(s.obj_cb + cbs[i].j * 16, rec, sizeof(rec));
             s.obj_cb_set |= 1u << cbs[i].j;
+            std::uint32_t home = 0;
+            if (homes && addr && addr == cbs[i].own && gxvk_homes::made_on()) {
+                home = rd32(cbs[i].key - 0x18 + gxvk::kHolderSpareA);
+                if (!gxvk_homes::is_handle(home)) home = 0;
+            }
+            s.cb_home[cbs[i].j] = home;
         }
         // BBHOST_GXVK_CENSUS: each one by what holds its bytes (host/gxvk.h).
         if (gxvk::census()) {

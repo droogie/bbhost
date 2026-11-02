@@ -952,25 +952,36 @@ take today's copy, counted by reason. `BBHOST_GXVK_HEAP_COPY=compare` copies
 as today, runs the proof over the sources as 1 would, and compares each
 version with its source at its batch.
 
-**Copy-backs captured where GX hands them over, and put in place by GPU
-copies (`BBHOST_GXVK_HOMES`, off by default while it is measured).** The
-copy-backs' bytes are copied when GX resolves them, on the GX thread that
-resolves, into a ring the GPU reads: a segment per GX thread, a resolve's
-copy-backs in one piece, a piece written again only once the command
-processor has walked its tokens and the submissions that read it have run.
-That is before GX can take a source's block back - its retire label lands
-only behind work the command processor walks later - so nothing reads a
-rename after GX may have reused it. With `BBHOST_GXVK_HOMES=1` the command
-processor makes no CPU copy: a home kept as a device-local twin (the
-copy-backs' homes are twins at `BBHOST_GX_TWINS=2`, which this switch selects
-on a discrete GPU) takes a GPU copy from its capture, put in place with every
-other since the last pass before the next pass starts (or before a dispatch,
-a transfer that writes it, or the submission's end); a draw in the same pass
-after the copy-back binds the capture, every later one binds the twin itself.
-Any other home takes a copy version whose bytes are the capture. A copy-back
-the capture missed (a piece still in use, over 64 KiB) goes as today.
-`BBHOST_GXVK_HOMES=compare` keeps today's path and compares each capture with
-the bytes today's copy takes at the token. With
+**Constant buffers in device-local homes made at their creation, bound by
+handle (`BBHOST_GXVK_HOMES`, off by default while it is measured).** A
+constant buffer's own memory is written only by GX's GPU copies: every
+UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
+copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
+each constant buffer of default or dynamic usage gets a home when GX creates
+it - a range of a device-local pool, fixed for the buffer's life - and the
+home's handle in its holder. GX's draw records carry the handle beside the
+constant buffer's record when the record names the buffer's own memory, and
+the command processor binds the home by it: no copy version, no twin, no
+pending GPU write and no snapshot asked about. The copy-backs' bytes are
+copied when GX resolves them, on the GX thread that resolves, into a ring
+the GPU reads (a segment per GX thread, a resolve's copy-backs in one piece,
+a piece written again only once its tokens are walked and the submissions
+that read it have run), and land in the home as GPU copies in stream order,
+put in place together before the next pass starts (or before a dispatch, a
+transfer that touches them, or the submission's end); a draw in the same pass
+after the copy-back binds its capture. A home is filled from its buffer's
+memory at its first use, unless that use is a copy-back over all of it.
+What reads a home without a handle - a dispatch, a copy, a device address -
+finds it by address; a CPU copy of its stale guest bytes is refused; a
+page-table walk that reads it gets it copied back to its memory first, and
+it stays the home. A home ends with its buffer, and a buffer made past the
+pool's budget (128 MiB, 64 MiB with small video memory,
+`BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for its life. Off on an
+integrated GPU. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+the homes beside it with a CPU mirror of each, and checks each binding of a
+home against its mirror (and each capture against the bytes today's copy
+takes at the token); `=twins` keeps the homes as device-local twins
+(`BBHOST_GX_TWINS=2`), as measured before. With
 `BBHOST_GXVK_COPYBACK_CHECK=1` each dynamic constant buffer's
 UpdateSubresource notes a hash of the bytes the rename gets, and each capture
 is compared with it and its source's block classed: the update's own block, a

@@ -2200,6 +2200,52 @@ void copy_versions_flush_locked();
 // Stage 4b.3a(i) (BBHOST_GXVK_HOMES=1): the twin homes' pending GPU copies from their captures, put in place as a batch of
 // their own - at the next pass's start, before a dispatch, transfer or submission, or a put-in-place (no pass open).
 void home_copies_flush_locked();
+// Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h): GX's constant buffers' device-local homes, the command
+// processor's side (gxvk_homes_vk.cpp), every one under g.mu.
+// At the device's choice: homes on (1, compare) unless the GPU is integrated or its memory tight; the pool's budget.
+void homes_decide(bool integrated, bool small_vram, bool tight);
+// A recording begins: the homes GX made and ended since are in the index by address, ended ones taken back once no
+// draw recorded before their end is still to come, their ranges freed once the work that read them has run.
+void homes_begin_recording_locked();
+// A binding of [base, +bytes) by the handle a GX draw's records carried: kHomeBound (`out` the home, filled first if
+// it is new), kHomePending (`out` the source of a copy into it still to land in this pass), or kHomeFall + why
+// (gxvk_homes::BindFall: today's path).
+enum { kHomeBound = 0, kHomePending = 1, kHomeFall = 16 };
+int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, Located& out);
+// By address (no handle): [va, +bytes) inside a live home - `out` the home (filled first), `address` its device
+// address. With =compare, false (today's path is bound).
+bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, VkDeviceAddress* address = nullptr);
+// [va, +bytes) meets a live home (its guest bytes stale: no CPU copy of them), or runs across one's edge.
+bool homes_meet_locked(std::uint64_t va, std::uint64_t bytes);
+bool homes_straddle_locked(std::uint64_t va, std::uint64_t bytes);
+// The live homes meeting [va, +bytes) copied back to their memory at this point of the stream (a page-table walk,
+// `why` 0; a range across an edge, 1; a CPU read, 2): they stay the homes.
+void homes_sync_locked(std::uint64_t va, std::uint64_t bytes, int why);
+// ...and ended (gxvk_homes::kEndEdge): a GPU access of guest memory across a home's edge, or a walk's stores over it -
+// the buffer takes today's path from now on.
+void homes_end_meeting_locked(std::uint64_t va, std::uint64_t bytes);
+// A copy of `bytes` into [dst, ...) from (src, src_off) - a capture, or staging (`src_map` its bytes, for =compare's
+// mirrors) - queued into the home holding it, put in place with the twin homes' copies. kHomeCopyNotHome: no home
+// there (the copy as today); kHomeCopyRefused: one across a home's edge (that home copied back and ended; the copy as
+// today).
+enum { kHomeCopyNotHome = 0, kHomeCopyTaken = 1, kHomeCopyRefused = 2 };
+int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, VkDeviceSize src_off, const void* src_map);
+// ...from the CPU bytes at `from` (a copy the captures missed), staged now.
+int homes_copy_in_staged_locked(std::uint64_t dst, std::uint64_t bytes, const void* from);
+// A binding by address against the copies into homes still to land (as copy_version_lookup_locked's answers).
+int homes_pending_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+bool homes_pending_locked();
+// BBHOST_RUN_COMMIT's fork: no event waits to be drained (a run part's draws read the index, and never change it).
+bool homes_settled_locked();
+void homes_flush_locked();
+// A transfer about to read or write [off, +bytes) of `buffer`: pending copies into homes that meet it go first.
+bool homes_before_transfer_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSize bytes);
+// =compare: a binding today's path made of [base, +bytes) of the home `handle` names, its bytes `today` (null: not on
+// the CPU) against the home's mirror.
+void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, const void* today);
+std::string homes_report();
+// A buffer copy at this point of the stream, in a transfer batch (no pass open after it).
+bool copy_in_stream_locked(VkBuffer src, VkDeviceSize so, VkBuffer dst, VkDeviceSize dso, VkDeviceSize bytes);
 // ...first if one writes [off, +bytes) of `dst`, which a transfer is about to write; whether it did.
 bool home_copies_before_transfer_locked(VkBuffer dst, VkDeviceSize off, VkDeviceSize bytes);
 // A render pass ended: the flush, when they wait for that (BBHOST_COPY_VERSIONS=1).
@@ -2228,6 +2274,8 @@ bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // would be (its copy is today's) - else 0.
 enum { kCopyVersionNone, kCopyVersionInside, kCopyVersionStraddles };
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src = nullptr);
+// The CPU bytes of the newest pending version holding [base, +bytes) whole, else null (stage 4b.3c's compare).
+const void* copy_version_bytes_locked(std::uint64_t base, std::uint64_t bytes);
 // Draw captures take a binding's bytes from the guest memory it imports. A
 // binding resolved to a copy of guest memory taken as the draw records (a
 // YEBIS window's, the aligned scratch) is noted with the guest address its

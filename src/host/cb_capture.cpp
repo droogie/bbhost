@@ -1,5 +1,6 @@
 // Stage 4b.3a(i): copy-backs captured at the GX resolve (host/cb_capture.h).
 #include "host/cb_capture.h"
+#include "host/gxvk_homes.h"
 
 #include "hle/modules.h"
 #include "host/gpu.h"
@@ -20,10 +21,12 @@
 
 namespace cb_capture {
 
+// (1 and twins capture and put the captures in place; compare captures beside today's path: host/gxvk_homes.h.)
 const Mode g_mode = [] {
     const char* e = std::getenv("BBHOST_GXVK_HOMES");
     if (!e || !*e) return Mode::kOff;
     if (std::strcmp(e, "compare") == 0) return Mode::kCompare;
+    if (std::strcmp(e, "twins") == 0) return Mode::kOn;
     return e[0] == '1' ? Mode::kOn : Mode::kOff;
 }();
 
@@ -352,3 +355,20 @@ void report() {
 }
 
 }  // namespace cb_capture
+
+namespace gxvk_homes {
+
+std::atomic<bool> g_made{false}, g_bind{false};
+
+Mode env_mode() {
+    static const Mode m = [] {
+        const char* e = std::getenv("BBHOST_GXVK_HOMES");
+        if (!e || !*e) return Mode::kOff;
+        if (std::strcmp(e, "compare") == 0) return Mode::kCompare;
+        if (std::strcmp(e, "twins") == 0) return Mode::kTwins;
+        return e[0] == '1' ? Mode::kHandle : Mode::kOff;
+    }();
+    return m;
+}
+
+}  // namespace gxvk_homes

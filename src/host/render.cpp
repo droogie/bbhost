@@ -28,6 +28,7 @@
 
 #include "host/cb_proof.h"
 #include "host/gxvk.h"
+#include "host/gxvk_homes.h"
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
@@ -15474,6 +15475,43 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             }
         }
         if (gxvk::census() && base) gxvk::census_constant_bound(base, bytes, t_gxvk_call_seq, g.flushes, gx != nullptr);
+        // Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h): a constant buffer GX's records name by its home's
+        // handle is bound in its home - no copy version, twin, GPU write still to land or snapshot asked about: the
+        // GPU's queue order puts each copy-back there before the draws after it. A new home's fill (before-work in this
+        // recording's uploads) and a copy into it still pending in this pass (the draw binds that copy's source) are all
+        // it meets. =compare binds today's path, and checks what it binds against the home's mirror below.
+        std::uint32_t home_handle = 0;
+        if (gx && plan && base && !b.pointer && i < plan->buffers.size() && plan->buffers[i].source == GxBindingPlan::kCb &&
+            ((gx->obj_cb_set >> plan->buffers[i].slot) & 1))
+            home_handle = gx->cb_home[plan->buffers[i].slot];
+        if (home_handle && gxvk_homes::bind_on() && !b.written && bytes && !(base & 3) && shape && !t_snapshot_cbs && !glitch_watching_draw()) {
+            Located hl;
+            const int r = homes_bind_locked(home_handle, base, bytes, hl);
+            // Its block bound whole, the home's place the bias: one descriptor for every home in the block, as the
+            // snapshots bind their ring (each at its own offset, every draw would want a set of its own).
+            if (r == kHomeBound && !exact && bytes <= hl.avail && g.ssbo_max_range >= gxvk_homes::kBlockBytes && !(hl.offset & 3) &&
+                hl.offset + bytes <= gxvk_homes::kBlockBytes) {
+                info = {hl.buffer, 0, gxvk_homes::kBlockBytes};
+                params.cb_valid |= 1u << i;
+                params.cb_bias_dw[i] = static_cast<std::uint32_t>(hl.offset / 4);
+                if (!run_part()) ++outcomes[kBound];
+                infos.push_back(info);
+                continue;
+            }
+            if (r == kHomeBound || r == kHomePending) {
+                if (r == kHomePending) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
+                const VkDeviceSize start = exact ? hl.offset : hl.offset & ~(g.ssbo_align - 1);
+                const VkDeviceSize bias = hl.offset - start;
+                if (bytes <= hl.avail && bias + bytes <= g.ssbo_max_range && !(exact && (start & (g.ssbo_align - 1)))) {
+                    info = {hl.buffer, start, bias + bytes};
+                    params.cb_valid |= 1u << i;
+                    params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
+                    if (!run_part()) ++outcomes[kBound];
+                    infos.push_back(info);
+                    continue;
+                }
+            }
+        }
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
         Located loc;
@@ -15572,6 +15610,15 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (gpu_pending()) gxvk::heap_snap_disagree(gxvk::kHeapDiffGpuWrite, base, bytes);
             if (!hle_kernel_va_mapped(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffUnmapped, base, bytes);
             if (twin_covers_locked(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffTwin, base, bytes);
+        }
+        // BBHOST_GXVK_HOMES=compare: the bytes today's path binds - a copy version's, else guest memory's when nothing is
+        // still to land on it - against what the home would hold here.
+        if (home_handle && !gxvk_homes::bind_on() && gxvk_homes::made_on() && outcome == kUnmapped && !b.written && !in_window) {
+            const void* today = version == kCopyVersionInside ? copy_version_bytes_locked(base, bytes)
+                                : version == kCopyVersionNone && !gpu_pending() && hle_kernel_va_mapped(base, bytes)
+                                    ? reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base))
+                                    : nullptr;
+            homes_compare_locked(home_handle, base, bytes, today);
         }
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&

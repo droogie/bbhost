@@ -274,6 +274,10 @@ struct alignas(64) GxStageRecords {
     std::uint8_t obj_tex[64 * 32];
     std::uint8_t obj_smp[16 * 32];
     std::uint8_t obj_cb[14 * 16];
+    // Stage 4b.3c (host/gxvk_homes.h): per obj_cb record, the handle of the
+    // buffer's device-local home when the record names the home (no rename of
+    // the buffer in the draw's context), else 0 - written with each record.
+    std::uint32_t cb_home[14];
     // The id of the shader-resource view behind each obj_tex
     // record (engine/gx_resources.h; 0 when not registered). A view's T# never
     // changes after it is made, so the id stands for the record.
@@ -494,6 +498,16 @@ void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uin
 void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t bytes, std::uint64_t gen);
 // That buffer was destroyed (gx twins drop its device-local copy).
 void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
+// Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h), on the thread that made or ended the buffer: GX made a buffer
+// (its holder, memory, size, usage, CPU access and bind flags as the holder holds them) - a constant buffer of default
+// or dynamic usage gets its device-local home and the home's handle at the holder's +0x14 (0 for any other); the
+// buffer at `holder` ended (`why` gxvk_homes::End: released, replaced, mapped in place by the CPU); [va, +bytes)
+// covered - unmapped, or given to a new resource (`why` kEndUnmapped, kEndReplaced): the homes over it end.
+// `spare`: the holder's +0x14 before anything wrote it this time (a home's handle there is an older buffer's).
+void host_gpu_home_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes, std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind,
+                        std::uint32_t spare);
+void host_gpu_home_end(std::uint64_t holder, int why);
+void host_gpu_home_covered(std::uint64_t va, std::uint64_t bytes, int why);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
