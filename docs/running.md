@@ -543,10 +543,12 @@ samples and move by game time, 3 samples a game second as recorded
 character sync sends 6 packets a second as at 30, which other players see
 (`BBHOST_CHR_SYNC_STEP=0`).
 
-`BBHOST_FRAME_CLOCK=1` (a test switch, off by default while it is proven)
-converts each frame, from that frame's own length, the few values the frame
-rate otherwise sets once for the rate chosen at start, so a rate the machine
-cannot hold, a variable refresh rate or a dip keeps them right too:
+The native frame clock (experimental, off by default: Native frame clock
+(experimental) under F10's Frame rate, or the same switch on the setup
+window's Game page; it applies when the game starts) converts each frame,
+from that frame's own length, the few values the frame rate otherwise sets
+once for the rate chosen at start, so a rate the machine cannot hold, a
+variable refresh rate or a dip keeps them right too:
 - a ragdoll's bodies follow its animation by each frame's step
   (`BBHOST_RAGDOLL_STEP=0` for the rate's step);
 - YEBIS's eye adaptation and afterimage follow each frame's length
@@ -561,7 +563,11 @@ cannot hold, a variable refresh rate or a dip keeps them right too:
 - the user-service event poll keeps the game's 33 ms (`BBHOST_USER_POLL=0`).
 
 With it on, the values that follow the frame's seconds also take the game's
-step itself, a loading screen's included. `BBHOST_SOUND_CENSUS=1` (a test
+step itself, a loading screen's included. `[video] frame_clock = true` in
+bbhost.toml is the switch's default (what F10 or the setup window saves wins
+over it, as with `fps_cap`), and `BBHOST_FRAME_CLOCK=1` or `=0` overrides both
+for a run; the log's `frame rate: the frame clock is on (...)` line names what
+turned it on. `BBHOST_SOUND_CENSUS=1` (a test
 switch, at any rate) counts the sound thread's passes against the frames in
 the 300-flip report: how many frames began between one pass and the next.
 
