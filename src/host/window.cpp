@@ -1401,7 +1401,59 @@ std::uint8_t axis_to_u8(std::int16_t v) {
     return static_cast<std::uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
 }
 
+// A test harness's keys (the request "keys FILE", BBHOST_TEST_REQUESTS in
+// hle/video.cpp): FILE's lines "<ms> +<key>" and "<ms> -<key>" in SDL's key
+// names, played from the request on and read at this thread's pump (every
+// 4 ms). The keys they hold are or-ed into SDL's own as typed ones would be,
+// with or without the keyboard focus a virtual display's window may never get,
+// so they take the whole way a key takes - the bindings, the opposite keys,
+// the movement keys' push. Nothing is played without that request.
+struct ScriptKey {
+    std::int64_t ms;
+    int scancode;
+    bool down;
+};
+std::mutex g_script_mu;
+std::vector<ScriptKey> g_script;                    // under g_script_mu
+std::size_t g_script_next = 0;                      // under g_script_mu
+std::chrono::steady_clock::time_point g_script_t0;  // under g_script_mu
+bool g_script_fresh = false;                        // under g_script_mu: a new script lets go of the last one's keys
+bool g_script_held[SDL_SCANCODE_COUNT] = {};        // the pump thread's
+
+// The script's keys up to now applied to g_script_held: true while it plays
+// or holds a key.
+bool script_keys_step() {
+    std::lock_guard<std::mutex> lock(g_script_mu);
+    if (g_script_fresh) {
+        g_script_fresh = false;
+        std::memset(g_script_held, 0, sizeof(g_script_held));
+    }
+    if (g_script.empty()) return false;
+    const auto now = std::chrono::steady_clock::now();
+    const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_script_t0).count();
+    bool logged = false;
+    while (g_script_next < g_script.size() && g_script[g_script_next].ms <= ms) {
+        const ScriptKey& k = g_script[g_script_next++];
+        g_script_held[k.scancode] = k.down;
+        // The clock paddump: and the probes stamp their lines with.
+        host_log("test keys: %c%s at %lld ms (%lld late), t=%.4f", k.down ? '+' : '-',
+                 SDL_GetScancodeName(static_cast<SDL_Scancode>(k.scancode)), static_cast<long long>(ms),
+                 static_cast<long long>(ms - k.ms), std::chrono::duration<double>(now.time_since_epoch()).count());
+        logged = true;
+    }
+    bool held = false;
+    for (const bool h : g_script_held) held = held || h;
+    if (g_script_next >= g_script.size() && !held) {
+        g_script.clear();
+        if (logged) host_log("test keys: done");
+        return false;
+    }
+    return true;
+}
+
 void update_pad() {
+    // Before anything that returns early, so a script keeps its own time.
+    const bool scripted = script_keys_step();
     PadState p;
     p.timestamp = SDL_GetTicksNS() / 1000;
     // Once, from 20 s in: no window of ours has the keyboard focus, so the
@@ -1562,10 +1614,16 @@ void update_pad() {
     // whichever device the player reaches for wins without a mode anywhere.
     int nkeys = 0;
     const bool* keys = SDL_GetKeyboardState(&nkeys);
+    // A test harness's keys, as if typed (script_keys_step).
+    bool with_script[SDL_SCANCODE_COUNT];
+    if (scripted && keys && nkeys <= SDL_SCANCODE_COUNT) {
+        for (int i = 0; i < nkeys; ++i) with_script[i] = keys[i] || g_script_held[i];
+        keys = with_script;
+    }
     // The key that ended a text entry stays out of the pad until released.
     const int end_key = g_text_end_key.load(std::memory_order_relaxed);
     if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
-    if (keys && SDL_GetKeyboardFocus() == g_window) {
+    if (keys && (SDL_GetKeyboardFocus() == g_window || scripted)) {
         auto down = [&](SDL_Scancode sc) { return sc < nkeys && keys[sc] && static_cast<int>(sc) != g_text_end_key.load(std::memory_order_relaxed); };
         if (down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
         if (down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
@@ -1631,6 +1689,41 @@ void update_pad() {
 #endif
 
 }  // namespace
+
+bool host_test_keys_play(const char* path) {
+#if defined(BBHOST_HAVE_SDL3)
+    std::FILE* f = path ? std::fopen(path, "r") : nullptr;
+    if (!f) return false;
+    std::vector<ScriptKey> keys;
+    char line[160];
+    while (std::fgets(line, sizeof(line), f)) {
+        long long ms = 0;
+        char sign = 0;
+        int used = 0;
+        if (line[0] == '#' || std::sscanf(line, "%lld %c%n", &ms, &sign, &used) != 2 || (sign != '+' && sign != '-')) continue;
+        std::string name(line + used);
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' ')) name.pop_back();
+        const SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
+        if (sc == SDL_SCANCODE_UNKNOWN || sc >= SDL_SCANCODE_COUNT) {
+            host_log("test keys: %s: \"%s\" is not an SDL key name", path, name.c_str());
+            continue;
+        }
+        keys.push_back(ScriptKey{ms, static_cast<int>(sc), sign == '+'});
+    }
+    std::fclose(f);
+    std::stable_sort(keys.begin(), keys.end(), [](const ScriptKey& a, const ScriptKey& b) { return a.ms < b.ms; });
+    if (keys.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_script_mu);
+    g_script = std::move(keys);
+    g_script_next = 0;
+    g_script_fresh = true;
+    g_script_t0 = std::chrono::steady_clock::now();
+    return true;
+#else
+    (void)path;
+    return false;
+#endif
+}
 
 
 void host_window_set_fullscreen(bool on) {

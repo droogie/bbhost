@@ -170,6 +170,11 @@ int host_text_entry_poll(std::string& text_utf8);
 void host_text_entry_end();
 // Whether a text entry is open (begun and not yet ended), whoever opened it.
 bool host_text_entry_open();
+// A test harness's keys (the request "keys FILE", hle/video.cpp): the file's
+// "<ms> +<key>" / "<ms> -<key>" lines (SDL key names) played from now on, the
+// keys held or-ed into the keyboard's as if typed. False when the file holds
+// no key it can play.
+bool host_test_keys_play(const char* path);
 void host_pad_rumble(std::uint8_t small, std::uint8_t large);
 // A gamepad is open. What the port shows for a button prompt follows it when
 // the setting is on Auto (engine/key_prompts.h).

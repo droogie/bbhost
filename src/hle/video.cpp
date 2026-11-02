@@ -395,6 +395,10 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             host_gpu_capture_arm(n, arg2.c_str());
             host_log("test: draw captures armed for %d at flip %llu%s%s", n, static_cast<unsigned long long>(count), arg2.empty() ? "" : " into ",
                      arg2.c_str());
+        } else if (verb == "keys" && !arg.empty()) {
+            // Keys typed from a script (host/window.h host_test_keys_play).
+            const bool ok = host_test_keys_play(arg.c_str());
+            host_log("test: keys %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count), ok ? "" : ": no key in it");
         } else if (verb == "zoom" && (arg == "in" || arg == "out" || arg == "reset")) {
             // The camera zoom's presses, as the wheel and the middle button make them.
             const int n = arg2.empty() ? 1 : std::atoi(arg2.c_str());
