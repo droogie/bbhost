@@ -972,6 +972,12 @@ const std::uint32_t g_free_gap_ms = [] {
     const char* e = std::getenv("BBHOST_IMPORT_FREE_GAP_MS");
     return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 50u;
 }();
+// BBHOST_IMPORT_FREE_LOG=1: each free logged with its flip and wall clock, so a
+// harness can line frees up with the frame intervals.
+const bool g_free_log = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_LOG");
+    return e && e[0] == '1';
+}();
 struct DeadImport {
     Chunk chunk;
     int slot = 0;
@@ -990,6 +996,11 @@ void free_dead_import_now(Chunk& c, int slot, std::uint64_t serial, bool cp) {
     const auto t0 = std::chrono::steady_clock::now();
     free_import(c);
     const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (g_free_log) {
+        const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        host_log("gpu: import freed: %llu MiB in %.2f ms at flip %llu %.3f, %s", static_cast<unsigned long long>(size >> 20), us / 1e3,
+                 static_cast<unsigned long long>(hle_video_flip_count()), wall, cp ? "on the command processor" : "on bb-import-free");
+    }
     g_import_freed.fetch_add(1, std::memory_order_relaxed);
     g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
     g_import_free_us.fetch_add(us, std::memory_order_relaxed);
