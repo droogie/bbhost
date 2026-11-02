@@ -344,9 +344,9 @@ namespace {
 constexpr int kOpposites[4][2] = {
     {kBindMoveF, kBindMoveB}, {kBindMoveL, kBindMoveR}, {kBindLookU, kBindLookD}, {kBindLookL, kBindLookR}};
 
-// Walk held on a mouse button, for the keyboard's movement keys (the mouse is
-// read on the pad read, the keyboard on the window's update).
-std::atomic<bool> g_walk_on_mouse{false};
+// Walk and Dodge / Sprint held on a mouse button, for the keyboard's movement
+// keys (the mouse is read on the pad read, the keyboard on the window's update).
+std::atomic<bool> g_walk_on_mouse{false}, g_roll_on_mouse{false};
 
 // How far the movement keys push the stick while Walk is held, of a full push.
 // Measured in the Hunter's Dream: under 35% the character stands, from 40% to
@@ -355,31 +355,65 @@ std::atomic<bool> g_walk_on_mouse{false};
 constexpr float kWalkPush = 0.6f;
 
 // The keyboard's movement keys - whichever keys Move Forward, Back, Left and
-// Right are bound to - push the stick from rest to their full push over 66 ms,
-// as a thumb moves a stick, rather than in one step. Letting go of all of them
-// puts the stick back at rest at once, but the push is kept for kMoveRestMs:
-// a change of direction is typed as one key let go and the next pressed a few
-// milliseconds later, and starting the ramp again there took the stick through
-// the walk for several frames - a sprint turning from W to D slowed and broke
-// (v0.2.22). The next key pushes in full, as it did before the ramp and as a
-// thumb sweeping the stick round its rim does; only a start from standing ramps.
+// Right are bound to - move the stick as a thumb does rather than in one step.
 // The keyboard's only (device 0, the window's thread): the mouse's buttons push
 // at once, and a pad's sticks are its own and never come through here.
+//  - From standing the push ramps up to full over kMoveRampMs.
+//  - While Dodge / Sprint is held, a change of direction turns the stick
+//    round the edge at its push, by at most 90 degrees in kMoveTurnMs (about
+//    45 between two of the game's frames at 30 fps, as much as D added to W
+//    always turned at once), and right round by the front: A to D sweeps
+//    through W, W to S goes by the right. The character script stops a
+//    sprint whose stick swings 90 degrees or more between two frames: W+A
+//    and W+D swapped at once ended it, W+D meeting A spun the hunter round
+//    (f9227ee5), and A then D - one rest read between - stopped them in
+//    their tracks to turn round on the spot, with v0.2.21's push and v0.2.22's
+//    ramp alike (the ramp only started the push from rest again).
+//  - Without it the stick points where the keys do at once, as it always has,
+//    so letting go - the dodge - goes the way the keys point, never part of
+//    the way round.
+//  - Letting go of every movement key puts the stick at rest at once, but the
+//    push and the direction are kept for kMoveRestMs: a change of direction is
+//    typed as one key let go and the next pressed a few milliseconds later,
+//    and starting from rest there took the stick through the walk for several
+//    frames (v0.2.22) - a sprint turning from W to D slowed. Longer than that,
+//    the next key is a start from standing.
 constexpr float kMoveRampMs = 66.0f;
+constexpr float kMoveTurnMs = 70.0f;
 constexpr float kMoveRestMs = 150.0f;
-float g_move_ramp = 0.0f;  // 0 at rest, 1 the full push
-std::chrono::steady_clock::time_point g_move_ramp_at{}, g_move_held_at{};
+constexpr float kQuarterTurn = 1.5707963f, kHalfTurn = 3.1415927f, kFullTurn = 6.2831853f;
+float g_move_push = 0.0f;   // 0 at rest, 1 the full push
+float g_move_angle = 0.0f;  // where the stick points: 0 forward, positive to the right (radians)
+std::chrono::steady_clock::time_point g_move_at{}, g_move_held_at{};
 
-float move_ramp(bool moving, std::chrono::steady_clock::time_point now) {
-    const float ms = std::chrono::duration<float, std::milli>(now - g_move_ramp_at).count();
-    g_move_ramp_at = now;
-    if (moving) {
-        g_move_ramp = std::min(1.0f, g_move_ramp + std::clamp(ms, 0.0f, kMoveRampMs) / kMoveRampMs);
-        g_move_held_at = now;
-    } else if (std::chrono::duration<float, std::milli>(now - g_move_held_at).count() > kMoveRestMs) {
-        g_move_ramp = 0.0f;
+// The stick for the movement keys held (x, y each -1, 0 or 1) at `now`, in a
+// sprint or not: how far it is pushed (0..1) and which way (g_move_angle).
+float move_stick(int x, int y, bool sprint, std::chrono::steady_clock::time_point now) {
+    const float ms = std::clamp(std::chrono::duration<float, std::milli>(now - g_move_at).count(), 0.0f, kMoveTurnMs);
+    g_move_at = now;
+    if (x == 0 && y == 0) {
+        if (std::chrono::duration<float, std::milli>(now - g_move_held_at).count() > kMoveRestMs) g_move_push = 0.0f;
+        return 0.0f;
     }
-    return g_move_ramp;
+    const float want = std::atan2(static_cast<float>(x), static_cast<float>(-y));
+    if (g_move_push <= 0.0f || !sprint) {
+        g_move_angle = want;  // from standing, or not sprinting: where the keys point
+    } else {
+        float turn = std::remainder(want - g_move_angle, kFullTurn);
+        if (std::fabs(turn) > kHalfTurn - 0.01f) {
+            // Right round: by the front, whichever side that is (W to S: by the right).
+            turn = std::fabs(std::remainder(g_move_angle + kQuarterTurn, kFullTurn)) <=
+                           std::fabs(std::remainder(g_move_angle - kQuarterTurn, kFullTurn))
+                       ? kHalfTurn
+                       : -kHalfTurn;
+        }
+        const float step = kQuarterTurn * ms / kMoveTurnMs;
+        g_move_angle =
+            std::fabs(turn) <= step ? want : std::remainder(g_move_angle + std::copysign(step, turn), kFullTurn);
+    }
+    g_move_push = std::min(1.0f, g_move_push + std::min(ms, kMoveRampMs) / kMoveRampMs);
+    g_move_held_at = now;
+    return g_move_push;
 }
 
 }  // namespace
@@ -403,6 +437,7 @@ void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
         held[a] = m >= 1 && m <= kMouseInputs && (buttons & (1u << (m - 1)));
     }
     g_walk_on_mouse.store(held[kBindWalk], std::memory_order_relaxed);
+    g_roll_on_mouse.store(held[kBindRoll], std::memory_order_relaxed);
     note_debug_key(1, held[kBindDebugMenu]);
     note_zoom_keys(1, held);
 }
@@ -458,12 +493,24 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p, 
     // (as Dark Souls III's keys give) - or, with Walk held, a gentle push the
     // game reads as a walk, a diagonal's two axes shortened so that its reach,
     // and so the walk, is the same. Opposite keys cancel (keys_held above).
-    // The keyboard's push ramps up (move_ramp).
+    // The keyboard's stick ramps, and in a sprint turns, as a thumb moves it
+    // (move_stick): between the keys' own directions it runs along the
+    // square's edge (the walk's circle), never inside it.
     const int x = (held[kBindMoveR] ? 1 : 0) - (held[kBindMoveL] ? 1 : 0);
     const int y = (held[kBindMoveB] ? 1 : 0) - (held[kBindMoveF] ? 1 : 0);
-    const float ramp = device == 0 ? move_ramp(x != 0 || y != 0, now) : 1.0f;
-    if (x != 0 || y != 0) {
-        float r = static_cast<float>(kStickHigh - kStickRest) * ramp;
+    if (device == 0) {
+        const float push = move_stick(x, y, held[kBindRoll] || g_roll_on_mouse.load(std::memory_order_relaxed), now);
+        if (push > 0.0f) {
+            const float sx = std::sin(g_move_angle), sy = -std::cos(g_move_angle);
+            const float edge = held[kBindWalk] ? kWalkPush : 1.0f / std::max(std::fabs(sx), std::fabs(sy));
+            const float r = static_cast<float>(kStickHigh - kStickRest) * push * edge;
+            // An axis the keys do not push is left as a controller has it.
+            const long ix = std::lround(sx * r), iy = std::lround(sy * r);
+            if (ix != 0) p.lx = static_cast<std::uint8_t>(kStickRest + ix);
+            if (iy != 0) p.ly = static_cast<std::uint8_t>(kStickRest + iy);
+        }
+    } else if (x != 0 || y != 0) {
+        float r = static_cast<float>(kStickHigh - kStickRest);
         if (held[kBindWalk]) r *= kWalkPush / (x != 0 && y != 0 ? std::sqrt(2.0f) : 1.0f);
         const int reach = static_cast<int>(std::lround(r));
         if (x != 0) p.lx = static_cast<std::uint8_t>(kStickRest + x * reach);
