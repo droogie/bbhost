@@ -975,9 +975,10 @@ What reads a home without a handle - a dispatch, a copy, a device address -
 finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
 it stays the home. A home ends with its buffer, and a buffer made past the
-pool's budget (128 MiB, 64 MiB with small video memory,
-`BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for its life. Off on an
-integrated GPU. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
+its life. Off on an integrated GPU, and with small video memory unless a
+budget is given (on a 4 GB card the pool's ~80 MiB pushed images into host
+memory). `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
 the homes beside it with a CPU mirror of each, and checks each binding of a
 home against its mirror (and each capture against the bytes today's copy
 takes at the token); `=twins` keeps the homes as device-local twins

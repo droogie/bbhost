@@ -362,8 +362,18 @@ void homes_decide(bool integrated, bool small_vram, bool tight) {
                  integrated ? "an integrated GPU" : "tight memory");
         return;
     }
-    std::uint64_t mib = small_vram ? 64 : 128;
-    if (const char* e = std::getenv("BBHOST_GXVK_HOMES_BUDGET_MB"); e && *e) mib = std::strtoull(e, nullptr, 10);
+    // Small video memory: off unless a budget is given. Acting out a 4 GB card (BBHOST_TEST_VRAM_MB=2950) the pool's
+    // 80 MiB left the GX copies' pool under the mirrors' cushion, the mirrors grew and images went to host memory: OY's
+    // GPU time 4.7 -> 11.1 ms a flip, 99 -> 80 fps. A budget under the ~60 MiB a world's constant buffers take would
+    // leave most of them on today's path anyway.
+    const char* budget_env = std::getenv("BBHOST_GXVK_HOMES_BUDGET_MB");
+    if (small_vram && !(budget_env && *budget_env)) {
+        host_log("gxvk homes: off with small video memory (their pool would take the room the images and the mirrors need) - "
+                 "BBHOST_GXVK_HOMES takes today's path; BBHOST_GXVK_HOMES_BUDGET_MB=N turns them on with that budget");
+        return;
+    }
+    std::uint64_t mib = 128;
+    if (budget_env && *budget_env) mib = std::strtoull(budget_env, nullptr, 10);
     {
         std::lock_guard<std::mutex> lk(g_mu);
         g_budget = mib << 20;

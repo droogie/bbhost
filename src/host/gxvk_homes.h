@@ -60,11 +60,13 @@
 // mirror of what each holds - and each binding today's path makes of a home is
 // checked against its mirror, a sample of homes read back from the GPU after
 // their copies; twins: stage 4b.3a(i) as it was (the homes as level-2 twins).
-// Off on an integrated GPU (its video memory is the system's); on a discrete
-// GPU the pool has a budget (128 MiB, 64 MiB with small video memory,
-// BBHOST_GXVK_HOMES_BUDGET_MB): a buffer made past it gets no home and takes
-// today's path for its life - decided at its creation, so no home is ever
-// taken from a buffer that has one.
+// Off on an integrated GPU (its video memory is the system's) and with small
+// video memory (the pool's ~80 MiB pushed a 4 GB card's images into host
+// memory); elsewhere the pool has a budget (128 MiB, or
+// BBHOST_GXVK_HOMES_BUDGET_MB, which also turns the homes on with small video
+// memory): a buffer made past it gets no home and takes today's path for its
+// life - decided at its creation, so no home is ever taken from a buffer that
+// has one.
 #pragma once
 
 #include <atomic>
