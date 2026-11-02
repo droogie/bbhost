@@ -362,13 +362,16 @@ constexpr float kWalkPush = 0.6f;
 //  - While Dodge / Sprint is held, a change of direction turns the stick
 //    round the edge at its push, by at most 90 degrees in kMoveTurnMs (about
 //    45 between two of the game's frames at 30 fps, as much as D added to W
-//    always turned at once), and right round by the front: A to D sweeps
-//    through W, W to S goes by the right. The character script stops a
-//    sprint whose stick swings 90 degrees or more between two frames: W+A
-//    and W+D swapped at once ended it, W+D meeting A spun the hunter round
-//    (f9227ee5), and A then D - one rest read between - stopped them in
-//    their tracks to turn round on the spot, with v0.2.21's push and v0.2.22's
-//    ramp alike (the ramp only started the push from rest again).
+//    always turned at once), and right round by the front (W+A to S+D goes
+//    through W+D). The character script stops a sprint whose stick swings 90
+//    degrees or more between two frames: W+A and W+D swapped at once ended
+//    it, and W+D meeting A spun the hunter round (f9227ee5).
+//  - A straight reversal - a key to its opposite with the other axis idle, A
+//    to D or W to S, typed with a gap (up to kMoveRestMs) or with the two
+//    cancelling between - flips the stick at once, as a thumb flicks a stick
+//    across: the game's quick turn, as with a pad and v0.2.21's push. The keys
+//    decide it, not where the stick is, so a reversal that comes while the
+//    stick is still turning (W, D, then A at once) flips as well.
 //  - Without it the stick points where the keys do at once, as it always has,
 //    so letting go - the dodge - goes the way the keys point, never part of
 //    the way round.
@@ -384,6 +387,7 @@ constexpr float kMoveRestMs = 150.0f;
 constexpr float kQuarterTurn = 1.5707963f, kHalfTurn = 3.1415927f, kFullTurn = 6.2831853f;
 float g_move_push = 0.0f;   // 0 at rest, 1 the full push
 float g_move_angle = 0.0f;  // where the stick points: 0 forward, positive to the right (radians)
+int g_move_x = 0, g_move_y = 0;  // the keys' last direction, kept over a gap as the push is
 std::chrono::steady_clock::time_point g_move_at{}, g_move_held_at{};
 
 // The stick for the movement keys held (x, y each -1, 0 or 1) at `now`, in a
@@ -396,12 +400,16 @@ float move_stick(int x, int y, bool sprint, std::chrono::steady_clock::time_poin
         return 0.0f;
     }
     const float want = std::atan2(static_cast<float>(x), static_cast<float>(-y));
-    if (g_move_push <= 0.0f || !sprint) {
-        g_move_angle = want;  // from standing, or not sprinting: where the keys point
+    const bool flip = (x != 0 && y == 0 && g_move_y == 0 && x == -g_move_x) ||
+                      (y != 0 && x == 0 && g_move_x == 0 && y == -g_move_y);
+    g_move_x = x;
+    g_move_y = y;
+    if (g_move_push <= 0.0f || !sprint || flip) {
+        g_move_angle = want;  // from standing, not sprinting, or a straight reversal: where the keys point
     } else {
         float turn = std::remainder(want - g_move_angle, kFullTurn);
         if (std::fabs(turn) > kHalfTurn - 0.01f) {
-            // Right round: by the front, whichever side that is (W to S: by the right).
+            // Right round, both axes (W+A to S+D): by the front, whichever side that is.
             turn = std::fabs(std::remainder(g_move_angle + kQuarterTurn, kFullTurn)) <=
                            std::fabs(std::remainder(g_move_angle - kQuarterTurn, kFullTurn))
                        ? kHalfTurn

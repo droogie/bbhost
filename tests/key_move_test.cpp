@@ -12,11 +12,15 @@
 //  - No sprint turn while Dodge / Sprint is held: the stick never swings 90
 //    degrees or more at a full push between two of the game's reads (with
 //    nothing but rest between them) - where the character script stops a
-//    sprint, spins the hunter round (f9227ee5) or turns them on the spot. Not
-//    when A and D alternate without W (a), nor with W held (b), nor when W+D
-//    meets A (c), nor when W is let go and D pressed a moment later (d). The
-//    stick goes round at a full push, 90 degrees in 70 ms (about 45 a read at
-//    30 fps), and right round (A to D) by the front.
+//    sprint or spins the hunter round (f9227ee5). Not with W held and A and D
+//    alternating (b), nor when W+D meets A (c), nor when W is let go and D
+//    pressed a moment later (d). The stick goes round at a full push, 90
+//    degrees in 70 ms (about 45 a read at 30 fps), and right round (W+A to
+//    S+D) by the front.
+//  - But a straight reversal - A and D in turn without W or S (a), W and S
+//    without A or D - flips the stick at once, as v0.2.21's push did and a
+//    thumb flicking a pad's stick does: the game's quick turn. Also when it
+//    comes while the stick is still turning.
 //  - No dip into the walk on a turn: between the keys' directions the push stays
 //    full, so a typed W to D keeps the sprint (v0.2.22's ramp went through the
 //    walk there and the sprint came back late).
@@ -318,20 +322,46 @@ int main() {
             CHECK(partial(c.now, c, 500) == 0);
             CHECK(largest_step(c.now, c, 500) <= step_max);
         }
-        // (a) A and D in turn: right round, by the front, at a full push.
+        // (a) A and D in turn: a straight reversal flips at once, as v0.2.21's
+        // push did - the quick turn.
         for (const auto* alt : {&alt_typed, &alt_overlap}) {
             const Run a = run(*alt, fps, 2100);
-            const int d_at = alt == &alt_typed ? 1016 : 1030;
             show(alt == &alt_typed ? "(a) Sprinting on A, then D, A, D typed (16 ms gaps)"
                                    : "(a) Sprinting on A, then D, A, D overlapping (30 ms both held)",
                  fps, a, 950, 1250);
-            CHECK(sprint_turns(a.v21, a, 500) >= 1);  // v0.2.21's push turned back
-            CHECK(partial(a.v22, a, d_at) >= 1);      // v0.2.22's ramp went through the walk
-            CHECK(sprint_turns(a.now, a, 500) == 0);
-            CHECK(partial(a.now, a, 500) == 0);
-            CHECK(largest_step(a.now, a, 500) <= step_max);
-            CHECK(near(a.now, a, d_at, d_at + 140, 0.0f, step_max) >= 1);  // by the front
-            CHECK(reaches(a.now, a, d_at, 90.0f) <= d_at + 140 + 4 + frame);
+            CHECK(sprint_turns(a.v21, a, 500) >= 1);
+            CHECK(same(a.now, a.v21, a, 900));
+            CHECK(sprint_turns(a.now, a, 500) >= 1);
+        }
+        // W and S in turn, the same.
+        {
+            const Run w = run({sprinting(0, "W"), sprinting(1000, ""), sprinting(1016, "S"), sprinting(1400, ""),
+                               sprinting(1416, "W")},
+                              fps, 1700);
+            show("Sprinting on W, then S, W typed (16 ms gaps)", fps, w, 950, 1100);
+            CHECK(same(w.now, w.v21, w, 900));
+        }
+        // A reversal that comes while the stick is still turning flips too:
+        // W, D, and 30 ms later A in D's place.
+        {
+            const Run m = run({sprinting(0, "W"), sprinting(1000, "D"), sprinting(1030, "A")}, fps, 1300);
+            show("Sprinting on W, D at 1000 ms, A in its place at 1030 ms", fps, m, 950, 1100);
+            CHECK(reaches(m.now, m, 1030, -90.0f) <= 1030 + 4 + frame);
+            CHECK(same(m.now, m.v21, m, static_cast<int>(1034 + frame)));
+        }
+        // Both axes reversed - W+A to S+D, swapped or typed - is no straight
+        // reversal: right round by the front (through W+D), at a full push.
+        for (const bool typed : {false, true}) {
+            const Run d = run(typed ? std::vector<Keys>{sprinting(0, "WA"), sprinting(1000, ""), sprinting(1016, "SD")}
+                                    : std::vector<Keys>{sprinting(0, "WA"), sprinting(1000, "SD")},
+                              fps, 1400);
+            const int at = typed ? 1016 : 1000;
+            show(typed ? "Sprinting on W+A, then S+D typed" : "Sprinting on W+A, then S+D at once", fps, d, 950, 1200);
+            CHECK(sprint_turns(d.now, d, 500) == 0);
+            CHECK(partial(d.now, d, 500) == 0);
+            CHECK(largest_step(d.now, d, 500) <= step_max);
+            CHECK(near(d.now, d, at, at + 140, 45.0f, step_max) >= 1);
+            CHECK(reaches(d.now, d, at, 135.0f) <= at + 140 + 4 + frame);
         }
         // (b) W held, A and D alternating: round at a full push.
         for (const auto* wad : {&wad_snap, &wad_typed}) {
@@ -366,10 +396,11 @@ int main() {
         // keys point at once, for the dodge the game makes on that release.
         {
             const Run r =
-                run({sprinting(0, "A"), sprinting(1000, ""), sprinting(1016, "D"), running(1066, "D")}, fps, 1300);
-            show("Sprinting on A, D pressed at 1016 ms, Dodge / Sprint let go at 1066 ms", fps, r, 1000, 1150);
-            CHECK(reaches(r.now, r, 1066, 90.0f) <= 1066 + 4 + frame);
-            CHECK(same(r.now, r.v21, r, 1070));
+                run({sprinting(0, "W"), sprinting(1000, ""), sprinting(1016, "D"), running(1046, "D")}, fps, 1300);
+            show("Sprinting on W, D pressed at 1016 ms, Dodge / Sprint let go at 1046 ms", fps, r, 1000, 1150);
+            CHECK(near(r.now, r, 1016, 1045, 45.0f, 44.0f) >= 1);  // still turning
+            CHECK(reaches(r.now, r, 1046, 90.0f) <= 1046 + 4 + frame);
+            CHECK(same(r.now, r.v21, r, 1050));
         }
         // From standing the ramp is kept: the first reads after the press are a
         // partial push, and the push is full within 66 ms and a frame.
