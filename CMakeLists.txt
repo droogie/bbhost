@@ -714,6 +714,10 @@ if(UNIX)
   add_executable(import_table_test tests/import_table_test.cpp)
   target_include_directories(import_table_test PRIVATE src)
   add_test(NAME import_table_test COMMAND import_table_test)
+  # Window imports let go while idle: the switch, which imports a check finds idle, the check's cap.
+  add_executable(import_retire_test tests/import_retire_test.cpp)
+  target_include_directories(import_retire_test PRIVATE src)
+  add_test(NAME import_retire_test COMMAND import_retire_test)
   # The image heap's placement in its blocks and its compaction's policy: the block chosen, the room kept, the pace, the stop.
   add_executable(heap_compact_test tests/heap_compact_test.cpp)
   target_include_directories(heap_compact_test PRIVATE src)

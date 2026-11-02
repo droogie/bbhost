@@ -206,6 +206,13 @@ struct DmemChunk {
     // window is not asked of the driver again for a while (import_backoff_ms),
     // its draws read through the page table and the sink meanwhile.
     std::uint64_t failed_ms[kImportWindows] = {};
+    // Idle windows let go (BBHOST_IMPORT_RETIRE, gpu.cpp): when each window
+    // was last used - a binding, a copy, a device address, a walk, its import's
+    // making (steady ms, the command processor's clock at its last
+    // submission; stored by run parts too) - and when it was let go (0: not
+    // since it was last imported), for the windows imported again.
+    std::atomic<std::uint64_t> used_ms[kImportWindows] = {};
+    std::uint64_t retired_ms[kImportWindows] = {};
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
