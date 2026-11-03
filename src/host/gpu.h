@@ -410,6 +410,8 @@ const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count
 bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word);
 void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word);
 void host_gpu_segment_skipped(std::uint64_t ns, bool lost);
+void host_gpu_segment_follows(bool follows);  // BBHOST_GXVK_SEGMENTS_FLAGS=needed: a ready segment follows this draw
+bool host_gpu_segment_flags_needed();
 std::string host_gpu_segment_report(bool spliced_part);  // the builder's line (false), the splices' (true)
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.

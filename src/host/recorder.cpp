@@ -79,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw",    "execute commands"};
+                                        "push buffers",   "list draw",    "execute commands", "list run"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -592,6 +592,21 @@ void replay_block(const Block& b) {
         case Op::kExecuteCommands: {
             const auto* r = reinterpret_cast<const stream::ExecuteCommands*>(p);
             vkCmdExecuteCommands(cmd, 1, &r->cmd);
+            break;
+        }
+        case Op::kListRun: {
+            const auto* r = reinterpret_cast<const stream::ListRun*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            const auto* d = tail<stream::ListRunDraw>(q, r->n);
+            const DrawPacket* prev = nullptr;
+            const std::uint32_t* prev_dyn = nullptr;
+            for (std::uint32_t k = 0; k < r->n; ++k) {
+                DrawPacket& pk = g_list_packets[d[k].index % kListPackets];
+                replay_packet(pk, cmd, prev, d[k].dyn, prev_dyn);
+                g_list_replayed[d[k].index % kListPackets].store(d[k].id, std::memory_order_release);
+                prev = &pk;
+                prev_dyn = d[k].dyn;
+            }
             break;
         }
         case Op::kBarrier: {
@@ -1113,6 +1128,28 @@ void recorder_splice_segment(VkCommandBuffer secondary) {
     if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
     std::uint8_t* at = append_record(Op::kExecuteCommands, sizeof(stream::ExecuteCommands));
     put_struct<stream::ExecuteCommands>(at)->cmd = secondary;
+    after_op();
+    publish_block(false);
+}
+
+// The command processor: a segment's list packets replayed here inline, chained
+// (BBHOST_GXVK_SEGMENTS_REPLAY=inline) - `n` of them, packet indices[k] spliced
+// for token ids[k] with dynamic offsets dyn[k]. Each packet is held from the
+// pool until the recorder has replayed it (recorder_list_packet_free).
+void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t* ids, const std::uint32_t (*dyn)[2], std::uint32_t n) {
+    if (g_open) g_open->publish();
+    for (std::uint32_t k = 0; k < n; ++k) g_list_spliced[indices[k] % kListPackets].store(ids[k], std::memory_order_release);
+    std::uint8_t* at = append_record(Op::kListRun, round8(sizeof(stream::ListRun)) + round8(n * sizeof(stream::ListRunDraw)));
+    stream::ListRun* r = put_struct<stream::ListRun>(at);
+    r->n = n;
+    r->pad = 0;
+    auto* d = reinterpret_cast<stream::ListRunDraw*>(at);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        d[k].index = indices[k] % kListPackets;
+        d[k].id = ids[k];
+        d[k].dyn[0] = dyn[k][0];
+        d[k].dyn[1] = dyn[k][1];
+    }
     after_op();
     publish_block(false);
 }

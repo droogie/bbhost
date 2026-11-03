@@ -476,14 +476,29 @@ Pass g_pass;
 // Stage 4b.2: the flags a pass begins with - inline and secondary contents
 // both while the segments are on and the device mixes them (VK_KHR_maintenance7;
 // BBHOST_GXVK_SEGMENTS_MIXED=0 acts out a device that does not), else inline.
+// BBHOST_GXVK_SEGMENTS_REPLAY=inline: a segment's packets replayed by the
+// recorder into the command buffer itself (one op, kListRun), not recorded into
+// a secondary on the pool - its passes then hold inline contents only.
+const bool g_seg_inline = [] {
+    const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_REPLAY");
+    return e && std::strcmp(e, "inline") == 0;
+}();
 bool segments_mixed() {
     static const bool off = [] {
         const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_MIXED");
         return e && e[0] == '0';
     }();
-    return gxvk_lists::segments() && g.has_maint7 && !off;
+    return gxvk_lists::segments() && g.has_maint7 && !off && !g_seg_inline;
 }
 constexpr VkRenderingFlags kPassMixed = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT | VK_RENDERING_CONTENTS_INLINE_BIT_KHR;
+// Which passes begin able to hold secondaries (BBHOST_GXVK_SEGMENTS_FLAGS): every pass (all), or only one whose first
+// draw a ready segment follows in the stream (needed: the walk says so, t_segment_follows) - another that meets a
+// segment later is begun again for it.
+const bool g_seg_flags_all = [] {
+    const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_FLAGS");
+    return !(e && std::strcmp(e, "needed") == 0);
+}();
+thread_local bool t_segment_follows = false;
 // Passes ended and begun again for the other kind of contents (no maintenance7): [0] for a segment, [1] for a draw.
 std::atomic<std::uint64_t> g_pass_restarts[2] = {};
 const std::string* g_pass_profile_name = nullptr;  // the profile name of the draw beginning the next pass (BBHOST_GPU_PROFILE=3)
@@ -11416,7 +11431,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         ri.pDepthAttachment = &depth;
         if (s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM) ri.pStencilAttachment = &stencil;
     }
-    ri.flags = segments_mixed() ? kPassMixed : 0;  // stage 4b.2: the segments' secondary command buffers go into it too
+    ri.flags = segments_mixed() && (g_seg_flags_all || t_segment_follows) ? kPassMixed : 0;  // stage 4b.2: the segments' secondaries too
     g_pass.flags = ri.flags;
     g_pass.ncolor = std::min<std::uint32_t>(ri.colorAttachmentCount, 8);
     for (std::uint32_t k = 0; k < g_pass.ncolor; ++k) g_pass.colors[k] = colors[k];
@@ -15588,19 +15603,25 @@ void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, 
 }  // namespace
 
 // Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the constant-buffer copies of
-// list-mode draws (lists_commit), apart from the command processor's ring,
+// list-mode draws (lists_commit), apart from the command processor's ones,
 // whose segments are stamped with the recording that copies into them - which
-// a commit ahead of its splice does not know. 64 MiB in 4 MiB segments, the
-// ring's own size, so a copy binds the whole buffer at the same biases. A pool
-// thread takes a segment whole and copies into it; a segment is taken again
-// only once every commit made in it is too old to splice (kListMaxAge flips)
-// and every recording one was spliced into has completed. The splice stamps
-// the segments a commit used (list_arena_spliced) and refuses one taken again.
+// a commit ahead of its splice does not know. The last kBytes of the
+// constant-buffer copies' ring's own buffer (stage 4b.2: the command
+// processor's copies keep to the rest while the pool runs), so the pool's copies
+// are in video memory where the ring is - in a buffer of their own they were in
+// host memory on a card whose window of video memory the CPU writes the rings
+// fill, and the GPU read them across the bus - and a whole-ring binding is the
+// ring's own. 1 MiB segments: a pool thread takes a segment whole and copies into
+// it; a segment is taken again only once every commit made in it is too old to
+// splice (kListMaxAge flips) and every recording one was spliced into has
+// completed. The splice stamps the segments a commit used and refuses one taken
+// again.
 constexpr std::uint64_t kListMaxAge = 4;  // flips a commit may wait for its splice
 struct ListCbArena {
-    static constexpr VkDeviceSize kBytes = 64ull << 20, kSegment = 4ull << 20;
+    static constexpr VkDeviceSize kBytes = 16ull << 20, kSegment = 1ull << 20;
     static constexpr std::uint32_t kSegments = static_cast<std::uint32_t>(kBytes / kSegment);
-    DevBuffer buf;
+    DevBuffer* ring = nullptr;  // the constant-buffer copies' ring (made by the command processor's draws)
+    VkDeviceSize base = 0;      // where the arena begins in it
     std::atomic<bool> made{false};
     std::mutex mu;                                        // the pool threads' segment takes
     std::uint64_t last_flip[kSegments] = {};              // its last commit's flip (under mu)
@@ -16072,6 +16093,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
                     g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
                     if (g_cb_ring_made) gxvk::heap_copy_ring_made();  // (and 1d.2a's versions from the heap need it for their homes' bindings)
+                    if (g_cb_ring_made && gxvk_lists::splice()) {  // stage 4b.1b/4b.2: the pool's copies in its last 16 MiB
+                        g_list_arena.ring = &scratch;
+                        g_list_arena.base = kScratch - ListCbArena::kBytes;
+                        g_list_arena.made.store(true, std::memory_order_release);
+                    }
                 }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
@@ -16188,16 +16214,17 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                             run_part_stop(kRunStopRing);
                             return;
                         }
-                        std::memcpy(static_cast<std::uint8_t*>(g_list_arena.buf.map) + at,
+                        std::memcpy(static_cast<std::uint8_t*>(g_list_arena.ring->map) + g_list_arena.base + at,
                                     reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
                         am = ArenaMemo{copy_from, copy_bytes, ln.call_flip, t_list_cb.lap, t_list_cb.seg, at};
                     }
                     const bool whole = whole_ring;
-                    info = whole ? VkDescriptorBufferInfo{g_list_arena.buf.buffer, 0, kScratch}
-                                 : VkDescriptorBufferInfo{g_list_arena.buf.buffer, at, bytes};
+                    const VkDeviceSize in_ring = g_list_arena.base + at;  // (the arena lies in the ring's buffer)
+                    info = whole ? VkDescriptorBufferInfo{g_list_arena.ring->buffer, 0, kScratch}
+                                 : VkDescriptorBufferInfo{g_list_arena.ring->buffer, in_ring, bytes};
                     params.cb_valid |= 1u << i;
-                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
-                    if (whole && run_digest_on()) run_digest_ring_cb(i, at, base, bytes);
+                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(in_ring / 4) : 0;
+                    if (whole && run_digest_on()) run_digest_ring_cb(i, in_ring, base, bytes);
                     outcome = kBound;
                 } else if (scratch.map && outcome != kBound) {
                     // The ring is write-combined memory: a copy whose last line
@@ -16221,7 +16248,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         const bool part = run_part();
                         std::unique_lock<HostLock> lk(g_part_ring_mu, std::defer_lock);
                         if (part) lk.lock();
-                        if (scratch_next + n + 256 > kScratch) {
+                        // (The pool's copies keep the ring's last 16 MiB while it runs: g_list_arena.)
+                        const VkDeviceSize ring_end = g_list_arena.made.load(std::memory_order_relaxed) ? g_list_arena.base : kScratch;
+                        if (scratch_next + n + 256 > ring_end) {
                             if (run_part_stop(kRunStopRing)) return ~VkDeviceSize{0};
                             scratch_next = 0;
                             ++scratch_lap;
@@ -25962,15 +25991,6 @@ void splice_compare_locked(const ListCommit& c) {
 // splice-compare: always false, and host_gpu_splice_compare compares the draw
 // in order with the commit.
 bool host_gpu_splice(std::uint64_t id) {
-    if (!g_list_arena.made.load(std::memory_order_acquire)) {  // the list arena, before the pool's first copy needs it
-        static std::once_flag once;
-        std::call_once(once, [] {
-            std::lock_guard<GpuMutex> lock(g.mu);
-            MemOwner own_mem("stage 4b.1b's constant-buffer copies");
-            create_upload_buffer(g_list_arena.buf, ListCbArena::kBytes, "the list-mode constant-buffer copies");
-            g_list_arena.made.store(g_list_arena.buf.map != nullptr, std::memory_order_release);
-        });
-    }
     ListCommit* const all = g_list_commits;
     if (!all) {
         g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
@@ -26233,7 +26253,18 @@ std::string host_gpu_splice_report(bool window) {
 
 namespace {
 
-constexpr std::uint32_t kSegMin = 2;  // members a segment takes (a shorter run stays per draw)
+// Members a segment takes (a shorter run stays per draw): BBHOST_GXVK_SEGMENT_MIN, 2 by default.
+const std::uint32_t kSegMin = [] {
+    const char* e = std::getenv("BBHOST_GXVK_SEGMENT_MIN");
+    const long n = e ? std::strtol(e, nullptr, 10) : 2;
+    return static_cast<std::uint32_t>(n < 2 ? 2 : n > 255 ? 255 : n);
+}();
+// BBHOST_GXVK_SEGMENTS_SPLICE=0 (a diagnostic): the segments built, none spliced - their draws back to their own
+// splices - to tell the passes' contents flags and the pool's work apart from the secondaries' execution.
+const bool g_seg_splice_off = [] {
+    const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_SPLICE");
+    return e && e[0] == '0';
+}();
 constexpr std::uint32_t kSegMost = gxvk_lists::detail::kRecMost;
 constexpr std::uint32_t kSegRing = 1024;  // a pool thread's segment records
 
@@ -26288,6 +26319,7 @@ struct Segment {
     std::vector<VsOther> vs_other;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     std::uint64_t serial = 0;  // spliced into this recording
+    std::uint32_t dyn[kSegMost][2] = {};  // replayed inline: each member's dynamic offsets
 };
 
 // A pool thread's segments and the command pool their secondaries come from.
@@ -26428,11 +26460,12 @@ enum SegFall : int {
     kSfOcclusion,    // a predicate or a query would take its draws here
     kSfOther,        // windows given, a run commit, a diagnostic, the configuration
     kSfCompare,      // segments-compare: drawn in order by design
+    kSfOff,          // BBHOST_GXVK_SEGMENTS_SPLICE=0
     kSegFalls
 };
 const char* const kSegFallName[kSegFalls] = {"stream",  "record lost", "too old",  "a run's first", "a split",   "run generations",
                                              "other targets", "another pass", "a hazard", "an owed clear", "a view", "a set",
-                                             "a home",  "an arena",     "occlusion", "other",        "compare"};
+                                             "a home",  "an arena",     "occlusion", "other",        "compare",  "off"};
 
 std::atomic<std::uint64_t> g_sg_lists{0}, g_sg_draws{0}, g_sg_not[kSegNots] = {};
 std::atomic<std::uint64_t> g_sg_made{0}, g_sg_members{0}, g_sg_record_ns{0}, g_sg_by_len[8] = {};
@@ -26454,7 +26487,7 @@ SegRing& seg_ring() {
 // A segment record of this pool thread's to build into (its state building, its
 // generation new), with a secondary command buffer; null when none is free.
 Segment* take_segment(SegRing& ring) {
-    if (!ring.pool) return nullptr;
+    if (!ring.pool && !g_seg_inline) return nullptr;
     const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
     const std::uint64_t flip = hle_video_flip_count();
     for (std::uint32_t t = 0; t < kSegRing; ++t) {
@@ -26467,7 +26500,7 @@ Segment* take_segment(SegRing& ring) {
         if (!reuse || !sg.word.compare_exchange_strong(w, sg_word(sg.gen + 1, kSgBuilding), std::memory_order_acq_rel)) continue;
         ++sg.gen;
         ring.next = (at + 1) % kSegRing;
-        if (!sg.cmd) {
+        if (!sg.cmd && !g_seg_inline) {
             VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             ai.commandPool = ring.pool;
             ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
@@ -26567,7 +26600,7 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
     bi.pInheritanceInfo = &ii;
-    if (vkBeginCommandBuffer(sg.cmd, &bi) != VK_SUCCESS) return drop(kSnRecording);
+    if (!g_seg_inline && vkBeginCommandBuffer(sg.cmd, &bi) != VK_SUCCESS) return drop(kSnRecording);
     // Each member recorded under the readers' lock, the cached sets it binds checked first: a set leaves the cache
     // only with the lock taken exclusive, and is freed only after that, once the recording then current has run. One
     // that left since its member's commit - or was made again since, even with the same handle - ends the segment
@@ -26585,11 +26618,18 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
             if (c.notes.set[i]) live = set_cache_ready_locked(c.notes.set_key[i], c.notes.set[i], c.notes.set_serial[i]);
         }
         if (!live) break;
+        if (g_seg_inline) {  // (replayed by the recorder at the splice)
+            sg.dyn[recorded][0] = dyn[recorded][0];
+            sg.dyn[recorded][1] = dyn[recorded][1];
+            continue;
+        }
         recorder_record_segment_draw(sg.cmd, index, dyn[recorded], recorded ? r.id[m0 + recorded - 1] & (kListCommits - 1) : ~0ull,
                                      recorded ? dyn[recorded - 1] : nullptr);
     }
-    if (vkEndCommandBuffer(sg.cmd) != VK_SUCCESS) return drop(kSnRecording);
-    write_combine_fence();  // the commands in memory before another thread submits them
+    if (!g_seg_inline) {
+        if (vkEndCommandBuffer(sg.cmd) != VK_SUCCESS) return drop(kSnRecording);
+        write_combine_fence();  // the commands in memory before another thread submits them
+    }
     if (recorded < kSegMin) return drop(kSnGone);
     give_back(recorded, n - recorded, kSnGone);
     n = recorded;
@@ -26851,6 +26891,7 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
         segment_drop(sg, !gxvk_lists::segments_compare() || why != kSfCompare);
         return false;
     };
+    if (g_seg_splice_off) return fall(kSfOff);
     if (!g.ok || !g.recording || !t_draw_windows.empty() || !t_given_windows.empty() || !list_config_ok_locked()) return fall(kSfOther);
     if (sg.flip + kListMaxAge < hle_video_flip_count()) return fall(kSfOld);
     // The run open: its first draw drawn (or spliced) with these names, nothing done in order since, its lookups
@@ -26914,9 +26955,19 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
         return fall(kSfCompare);
     }
     begin_recording_locked();
-    // Its pass holds secondary command buffers - begun so with maintenance7; without, ended and begun again so.
-    if (!(g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) pass_restart_locked(VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT);
-    recorder_splice_segment(sg.cmd);
+    if (g_seg_inline) {
+        // Replayed by the recorder into the command buffer itself, chained (a pass begun for secondaries ends first).
+        if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
+            pass_restart_locked(0);
+        static thread_local std::uint64_t index[kSegMost];
+        for (std::uint32_t k = 0; k < sg.count; ++k) index[k] = sg.ids[k] & (kListCommits - 1);
+        recorder_splice_list_run(index, sg.ids, sg.dyn, sg.count);
+    } else {
+        // Its pass holds secondary command buffers - begun so with maintenance7; without, ended and begun again so.
+        if (!(g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
+            pass_restart_locked(segments_mixed() ? kPassMixed : VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT);
+        recorder_splice_segment(sg.cmd);
+    }
     for (const auto& [s2, lap] : sg.cb_segs) {
         std::atomic<std::uint64_t>& ms = g_list_arena.max_serial[s2];
         std::uint64_t cur = ms.load(std::memory_order_relaxed);
@@ -26954,6 +27005,12 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
     }
     return true;
 }
+
+// The walk, around a GX-native draw drawn or spliced alone: whether a segment
+// ready to splice follows it (BBHOST_GXVK_SEGMENTS_FLAGS=needed: its pass may
+// begin able to hold secondaries).
+void host_gpu_segment_follows(bool follows) { t_segment_follows = follows; }
+bool host_gpu_segment_flags_needed() { return gxvk_lists::segments() && !g_seg_flags_all; }
 
 // The walk gave back a spliced segment's member token without its take (`ns`:
 // its time, 0 untimed; `lost`: its slot was not as stored).

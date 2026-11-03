@@ -1911,7 +1911,31 @@ void segment_give_back(std::uint64_t id) {
     if (!ok && hle_gx_native_token(id, t_regs.sh, t_regs.ctx)) hle_gx_native_release();
     g_draws.fetch_add(1);
     host_gpu_segment_skipped(
-        timed ? 16 * static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()) : 0, !ok);
+        timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()) + 1 : 0, !ok);
+}
+
+// BBHOST_GXVK_SEGMENTS_FLAGS=needed: whether the next GX-native draw token after
+// the packets from p (none between that the command processor does in order)
+// is the first member of a segment ready to splice - the draw before it begins
+// its pass able to hold the segment's secondary.
+bool segment_follows_next(const std::uint32_t* p) {
+    const auto* end = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_cb_hi));
+    for (int packets = 0; packets < 8 && p + 1 < end; ++packets) {
+        const std::uint32_t hdr = p[0];
+        if ((hdr >> 30) != 3) return false;
+        const std::size_t cnt = ((hdr >> 16) & 0x3fff) + 1;
+        if (p + 1 + cnt > end) return false;
+        const std::uint32_t op = (hdr >> 8) & 0xff;
+        const std::uint32_t* body = p + 1;
+        if (op == kNop && cnt >= 3 && body[0] == kGxNativeMagic) {
+            std::uint32_t count = 0;
+            std::uint64_t word = 0;
+            return host_gpu_segment_ids(body[1] | (static_cast<std::uint64_t>(body[2]) << 32), &count, &word) != nullptr;
+        }
+        if (list_split_of(op, body, cnt) >= 0) return false;
+        p += 1 + cnt;
+    }
+    return false;
 }
 
 // The walk at GX-native draw token b (its n dwords): true when it is a spliced
@@ -2694,7 +2718,10 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the draw's lookups against the pool's.
                     const bool look = gxvk_lists::compare() && !list_resolve::commit_draws() && gxvk_lists::look_due();
                     if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+                    const bool flags_needed = host_gpu_segment_flags_needed();
+                    if (flags_needed) host_gpu_segment_follows(segment_follows_next(b + n));
                     native_draw(in, "native");
+                    if (flags_needed) host_gpu_segment_follows(false);
                     if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
                     if (look) gxvk_lists::cp_look_end();
                     if (lists_census) gxvk_lists::cp_draw_end();

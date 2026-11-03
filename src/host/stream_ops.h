@@ -50,6 +50,7 @@ enum class Op : std::uint16_t {
     kPushBuffers,        // vkCmdPushDescriptorSetKHR of storage buffers (a dispatch's)
     kListDraw,           // a draw packet a pool thread committed ahead (stage 4b.1b), replayed here
     kExecuteCommands,    // vkCmdExecuteCommands of a segment a pool thread recorded (stage 4b.2)
+    kListRun,            // a segment's list packets replayed here one after another (stage 4b.2, inline)
     kCount
 };
 
@@ -101,6 +102,16 @@ struct ListDraw {
 // (render.cpp lists_segment), executed in the pass open here.
 struct ExecuteCommands {
     VkCommandBuffer cmd;
+};
+// Stage 4b.2 replayed inline (BBHOST_GXVK_SEGMENTS_REPLAY=inline): a segment's
+// list packets, each chained to the one before, with its dynamic offsets.
+struct ListRun {
+    std::uint32_t n, pad;
+    // + ListRunDraw[n]
+};
+struct ListRunDraw {
+    std::uint64_t index, id;  // the list packet, and the token it was spliced for
+    std::uint32_t dyn[2];
 };
 struct Barrier {
     VkPipelineStageFlags src, dst;
@@ -224,7 +235,7 @@ struct PushBuffers {
 
 template <class T> constexpr bool kRecordable = std::is_trivially_copyable_v<T> && alignof(T) <= 8;
 static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<ListDraw> &&
-                  kRecordable<ExecuteCommands> && kRecordable<Barrier> &&
+                  kRecordable<ExecuteCommands> && kRecordable<ListRun> && kRecordable<ListRunDraw> && kRecordable<Barrier> &&
                   kRecordable<Flag> && kRecordable<BeginRendering> && kRecordable<Fill> && kRecordable<CopyBuffer> &&
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&

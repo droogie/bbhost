@@ -1023,8 +1023,11 @@ void begin_recording_locked();
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out);
 // A params block into params-ring memory at `dst` as whole 64-byte lines (gpu.cpp).
 void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params);
-// Stage 4b.2: the params blocks of the segments' region (Gpu::ubo_list_blocks).
-constexpr std::uint32_t kListParamsBlocks = 32768;  // 16 MiB
+// Stage 4b.2: the params blocks of the segments' region (Gpu::ubo_list_blocks):
+// 8 MiB, ~13 flips of segments. 16 MiB took the params ring past what an
+// RTX 4070's 246 MiB window of video memory the CPU writes leaves the
+// constant-buffer copies' ring (in host memory then: +11% GPU time a flip).
+constexpr std::uint32_t kListParamsBlocks = 16384;
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
@@ -2903,6 +2906,7 @@ bool recorder_packet_replayed(std::uint64_t number);  // the recorder replayed d
 std::uint32_t recorder_list_packet_dynamic(std::uint64_t index, std::uint32_t (&out)[2]);
 void recorder_record_segment_draw(VkCommandBuffer cmd, std::uint64_t index, const std::uint32_t* dyn, std::uint64_t prev, const std::uint32_t* prev_dyn);
 void recorder_splice_segment(VkCommandBuffer secondary);
+void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t* ids, const std::uint32_t (*dyn)[2], std::uint32_t n);
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it
 // with the pass end before it. Null outside a draw, or when it records in place.
