@@ -29,6 +29,7 @@
 #include "host/cb_proof.h"
 #include "host/gxvk.h"
 #include "host/gxvk_homes.h"
+#include "host/gxvk_lists.h"
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
@@ -74,6 +75,14 @@ bool hs_constant_factors(const gcn::Program& p, float out[6]);
 }  // namespace
 
 namespace gpu {
+// What a draw resolved, as its digest (RunDigest) keeps it: the run commit's
+// compare mode, and stage 4b.1b's (BBHOST_GXVK_LISTS=splice-compare).
+inline bool run_digest_on() { return list_resolve::commit_compare() || gxvk_lists::splice_compare(); }
+// Stage 4b.1b: a pool thread's draw in list mode, beside the command processor
+// (render.cpp lists_commit): its lookups take the caches' reader paths
+// (host/cache_rw.h, under the shared lock the commit holds), never the command
+// processor's memos.
+inline bool list_draw() { return list_resolve::parts() && t_run_draw && t_run_draw->list; }
 // BBHOST_COPY_ELIDE_MUTANT (checks of BBHOST_COPY_ELIDE=compare, never for play): =1 a
 // draw's attachments are left out of the copy ledger, so a source drawn into while its
 // copy is pending is not made first - compare mode must find the differences; =2 a draw
@@ -778,6 +787,7 @@ void set_cache_drop(std::unordered_map<std::uint64_t, CachedSet>::iterator it) {
 }
 
 void set_cache_flush() {
+    cache_rw::Write cw(cache_rw::kSets);  // stage 4b.1b's readers never meet a set half let go
     for (auto it = g_cached_sets.begin(); it != g_cached_sets.end(); it = g_cached_sets.begin()) set_cache_drop(it);
     g_cached_set_views.clear();
     ++g_sc_flushes;
@@ -831,7 +841,7 @@ VkDescriptorSet set_cache_alloc(VkDescriptorSetLayout layout, VkDescriptorPool& 
 VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_t>& material) {
     SetFront& f = g_set_front[key & (kSetFront - 1)];
     const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no front and no count
-    if (f.set && f.key == key && f.set->material == material) {
+    if (!list_draw() && f.set && f.key == key && f.set->material == material) {  // (stage 4b.1b's: the map, never the front)
         if (!part) {
             ++g_sc_hits;
             ++g_sc_front_hits;
@@ -846,8 +856,16 @@ VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_
     return it->second.set;
 }
 
+// Stage 4b.1b's splice: the set the cache holds for `key` now (a list-mode
+// draw found its material there when it was committed), or null.
+VkDescriptorSet set_cache_find_key_locked(std::uint64_t key) {
+    const auto it = g_cached_sets.find(key);
+    return it == g_cached_sets.end() ? VK_NULL_HANDLE : it->second.set;
+}
+
 void set_cache_insert(std::uint64_t key, const std::vector<std::uint64_t>& material, VkDescriptorSet set, VkDescriptorPool pool,
                       const std::vector<VkImageView>& views) {
+    cache_rw::Write cw(cache_rw::kSets);  // stage 4b.1b's readers find it whole
     if (g_cached_sets.size() >= kCachedSetsMax) set_cache_flush();
     if (auto old = g_cached_sets.find(key); old != g_cached_sets.end()) set_cache_drop(old);  // a hash collision: the newer wins
     CachedSet& c = g_cached_sets[key];
@@ -868,6 +886,7 @@ void set_cache_drop_all_locked() {
 void set_cache_forget_view_locked(VkImageView view) {
     auto it = g_cached_set_views.find(view);
     if (it == g_cached_set_views.end()) return;
+    cache_rw::Write cw(cache_rw::kSets);  // stage 4b.1b's readers
     for (const std::uint64_t key : it->second) {
         if (auto c = g_cached_sets.find(key); c != g_cached_sets.end()) set_cache_drop(c);
     }
@@ -1876,7 +1895,12 @@ bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
 // Bumped whenever what rt_image() would answer for the same registers can
 // change: a target or snapshot made, dropped or replaced, or an unpadded
 // extent learned. target_image() reuses its last answer until then.
-std::uint64_t g_rt_gen = 1;
+std::atomic<std::uint64_t> g_rt_gen{1};  // (atomic: stage 4b.1b's pool reads it)
+// Stage 4b.1b: moved only where a target is let go or overwritten (g_rts'
+// erases, under cache_rw's exclusive lock) - a pool thread's published target
+// pointers stand while it has not moved, as the same objects (a target's
+// format and size are its object's for life).
+std::atomic<std::uint64_t> g_rt_erase_gen{1};
 
 // Milliseconds of a monotonic clock, for ages of a second and more (the
 // reuse retire's idle times, the once-a-second sweeps). On Linux the kernel's
@@ -2081,6 +2105,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             // pixels: destroying the snapshot and allocating a new image
             // left 0x1508e0000 black while 0x16ab40000 held the clinic.
             if (auto it = g_rts.find(base); it != g_rts.end()) {
+                cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+                g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
                 destroy_rt_image(it->second);
                 g_rts.erase(it);
                 ++g_rt_gen;
@@ -2099,6 +2125,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
                          static_cast<unsigned long long>(base), width, height, format);
             }
             ++g_rt_gen;
+            cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+            g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
             RtImage& kept = (g_rts[base] = std::move(promoted));
             g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(kept));
             rt_written(kept);
@@ -2173,6 +2201,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             take_fill(r);
             destroy_rt_image(r);
         }
+        cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+        g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
         g_rts.erase(it);
         ++g_rt_gen;
         bump_view_epoch();
@@ -2259,6 +2289,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
                  width, height, r.layers, format);
     }
     ++g_rt_gen;
+    cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+    g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
     RtImage& created = (g_rts[base] = r);
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(created));
     rt_written(created);
@@ -2659,6 +2691,11 @@ std::uint64_t g_by_id_hits = 0, g_by_id_misses = 0, g_by_id_disagree = 0, g_by_i
 CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va);
 // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the command processor's answer noted for the pool's.
 CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
+    if (list_draw()) {  // stage 4b.1b: by address, through the reader path
+        const CachedProgram* const found = program_find(va);
+        if (!found) run_part_stop(kRunStopProgram);
+        return const_cast<CachedProgram*>(found);
+    }
     CachedProgram* const cp = program_for_impl(id, va);
     gxvk_lists::cp_note(gxvk_lists::kLookProgram, va, cp ? cp->hash : 0);
     return cp;
@@ -2687,6 +2724,11 @@ CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va) {
 
 FetchById* fetch_for_impl(std::uint32_t id, std::uint64_t va, const FetchProgram*& out);
 FetchById* fetch_for(std::uint32_t id, std::uint64_t va, const FetchProgram*& out) {
+    if (list_draw()) {  // stage 4b.1b: by address, through the reader path; no input layout's entry
+        out = fetch_find(va);
+        if (!out) run_part_stop(kRunStopProgram);
+        return nullptr;
+    }
     FetchById* const e = fetch_for_impl(id, va, out);
     gxvk_lists::cp_note(gxvk_lists::kLookFetch, va, out ? out->hash : 0);  // stage 4b.1a's compare
     return e;
@@ -3171,6 +3213,8 @@ void depth_layouts_for_images_locked(const StageImages* stages, int nstages, RtI
             const auto rt = g_rts.find(v->second);
             if (rt == g_rts.end() || !rt->second.managed_layout) continue;
             RtImage& r = rt->second;
+            // Stage 4b.1b's list mode: the layout at its splice is not this one's - drawn in order.
+            if (t_run_draw && t_run_draw->list && run_part_stop(kRunStopOrder)) return;
             // A run part's draw (BBHOST_RUN_COMMIT): a layout to change ends the pass, in order.
             if ((&r == attachment || r.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) && run_part_stop(kRunStopOrder)) return;
             if (&r == attachment) {
@@ -3229,8 +3273,15 @@ void offer_paths(const std::vector<std::uint32_t>& words, const gcn::TranslateRe
 
 const gcn::TranslateResult& paths_for_impl(std::uint64_t hash, const std::vector<std::uint32_t>& words, gcn::Stage stage,
                                            std::uint32_t rsrc1, std::uint32_t rsrc2);
+const gcn::TranslateResult* paths_find(std::uint64_t hash);
 const gcn::TranslateResult& paths_for(std::uint64_t hash, const std::vector<std::uint32_t>& words, gcn::Stage stage,
                                       std::uint32_t rsrc1, std::uint32_t rsrc2) {
+    if (list_draw()) {  // stage 4b.1b: through the reader path
+        if (const gcn::TranslateResult* found = paths_find(hash)) return *found;
+        run_part_stop(kRunStopProgram);
+        static const gcn::TranslateResult none;
+        return none;
+    }
     const gcn::TranslateResult& paths = paths_for_impl(hash, words, stage, rsrc1, rsrc2);
     gxvk_lists::cp_note(gxvk_lists::kLookPaths, hash, reinterpret_cast<std::uintptr_t>(&paths));  // stage 4b.1a's compare
     return paths;
@@ -3774,6 +3825,7 @@ void apply_table_masks_locked() {
         done.swap(w.results);
         g_table_masks_ready.store(false, std::memory_order_relaxed);
     }
+    cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers never meet a mask half set
     for (const TableMaskResult& r : done) {
         r.pipeline->table_reads[r.stage] = r.mask;
         r.pipeline->user_reads[r.stage] = r.any;
@@ -10279,6 +10331,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
 
 // g_gfx by key with the last hits in front (entries are never erased).
 GfxPipeline* gfx_lookup(std::uint64_t key) {
+    if (list_draw()) {  // stage 4b.1b: the map under the readers' lock (inserts take it exclusive), no memo
+        const auto it = g_gfx.find(key);
+        return it == g_gfx.end() ? nullptr : &it->second;
+    }
     struct Memo {
         std::uint64_t key = 0;
         GfxPipeline* pl = nullptr;
@@ -10313,7 +10369,12 @@ GfxPipeline& gfx_pipeline(const DrawState& s, std::uint64_t key, const std::vect
         (void)marked;
         return none;
     }
-    return build_gfx_pipeline(g_gfx[key], s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
+    GfxPipeline* entry = nullptr;
+    {
+        cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
+        entry = &g_gfx[key];
+    }
+    return build_gfx_pipeline(*entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
                               ps_sampler_modes, cb_no_fallback, vertex_input, create, layout_only);
 }
 
@@ -10519,7 +10580,12 @@ void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawSta
                         const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                         const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
                         const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
-    queue_pipeline_build(base, g_gfx[lean_key], s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes,
+    GfxPipeline* lean_entry = nullptr;
+    {
+        cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
+        lean_entry = &g_gfx[lean_key];
+    }
+    queue_pipeline_build(base, *lean_entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes,
                          vertex_input);
 }
 
@@ -10551,7 +10617,10 @@ void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vec
                            const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                            const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
                            const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
-    GfxPipeline& entry = g_gfx[key];
+    GfxPipeline& entry = [&]() -> GfxPipeline& {
+        cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
+        return g_gfx[key];
+    }();
     queue_pipeline_build(entry, entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input,
                          program_at(s.ls_va), program_at(s.hs_va));
 }
@@ -10567,7 +10636,10 @@ bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<
     const CachedProgram* copy = program_at(s.gs_copy_va);
     if (!es || !copy) return false;
     static const std::vector<std::uint32_t> no_fetch;
-    GfxPipeline& entry = g_gfx[key];
+    GfxPipeline& entry = [&]() -> GfxPipeline& {
+        cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
+        return g_gfx[key];
+    }();
     queue_pipeline_build(entry, entry, s, vs_words, no_fetch, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, nullptr, nullptr, nullptr,
                          es, copy);
     return true;
@@ -11694,6 +11766,13 @@ const GxStagePlan* stage_plan_find(const gcn::TranslateResult& meta, const GxSta
 
 const GxStagePlan& stage_plan_impl(const gcn::TranslateResult& meta, const GxStageRecords& st);
 const GxStagePlan& stage_plan(const gcn::TranslateResult& meta, const GxStageRecords& st) {
+    if (list_draw()) {  // stage 4b.1b: through the reader path
+        if (const GxStagePlan* found = stage_plan_find(meta, st)) return *found;
+        run_part_stop(kRunStopProgram);
+        static thread_local GxStagePlan none;
+        none = GxStagePlan{};
+        return none;
+    }
     const GxStagePlan& plan = stage_plan_impl(meta, st);
     gxvk_lists::cp_note(gxvk_lists::kLookPlan, stage_plan_key(meta, st), reinterpret_cast<std::uintptr_t>(&plan));  // stage 4b.1a's compare
     return plan;
@@ -14388,6 +14467,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         // still prefer it over the snapshot. Drop it.
         if (auto rt = g_rts.find(dst_base); rt != g_rts.end()) {
             g.rt_replacements.fetch_add(1);
+            cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+            g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
             destroy_rt_image(rt->second);
             g_rts.erase(rt);
             ++g_rt_gen;
@@ -15396,6 +15477,87 @@ void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, 
 }
 }  // namespace
 
+// Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the constant-buffer copies of
+// list-mode draws (lists_commit), apart from the command processor's ring,
+// whose segments are stamped with the recording that copies into them - which
+// a commit ahead of its splice does not know. 64 MiB in 4 MiB segments, the
+// ring's own size, so a copy binds the whole buffer at the same biases. A pool
+// thread takes a segment whole and copies into it; a segment is taken again
+// only once every commit made in it is too old to splice (kListMaxAge flips)
+// and every recording one was spliced into has completed. The splice stamps
+// the segments a commit used (list_arena_spliced) and refuses one taken again.
+constexpr std::uint64_t kListMaxAge = 4;  // flips a commit may wait for its splice
+struct ListCbArena {
+    static constexpr VkDeviceSize kBytes = 64ull << 20, kSegment = 4ull << 20;
+    static constexpr std::uint32_t kSegments = static_cast<std::uint32_t>(kBytes / kSegment);
+    DevBuffer buf;
+    std::atomic<bool> made{false};
+    std::mutex mu;                                        // the pool threads' segment takes
+    std::uint64_t last_flip[kSegments] = {};              // its last commit's flip (under mu)
+    std::atomic<std::uint64_t> max_serial[kSegments] = {};  // the newest recording a commit of it was spliced into
+    std::atomic<std::uint64_t> lap[kSegments] = {};         // its takes so far
+    std::uint32_t next = 0;                               // where the next take looks first (under mu)
+    std::atomic<std::uint64_t> takes{0}, full{0};
+};
+ListCbArena g_list_arena;
+struct ListCbCursor {  // a pool thread's segment
+    std::uint32_t seg = ~0u;
+    std::uint64_t lap = 0;
+    VkDeviceSize next = 0;
+};
+thread_local ListCbCursor t_list_cb;
+// `bytes` of the list arena for the list-mode draw under way on this thread,
+// 256-aligned: its offset in the arena; the segment noted in its notes. False
+// when no segment is free (the draw is drawn in order).
+bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
+    ListCbArena& a = g_list_arena;
+    if (!a.made.load(std::memory_order_acquire) || bytes > ListCbArena::kSegment) return false;
+    ListCbCursor& c = t_list_cb;
+    const std::uint64_t flip = hle_video_flip_count();
+    VkDeviceSize off = (c.next + 255) & ~VkDeviceSize{255};
+    if (c.seg == ~0u || off + bytes > ListCbArena::kSegment) {
+        std::lock_guard<std::mutex> lk(a.mu);
+        const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
+        std::uint32_t found = ~0u;
+        for (std::uint32_t k = 0; k < ListCbArena::kSegments; ++k) {
+            const std::uint32_t s = (a.next + k) % ListCbArena::kSegments;
+            if (s == c.seg) continue;
+            const bool old = !a.last_flip[s] || a.last_flip[s] + kListMaxAge + 2 < flip;
+            if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (a.last_flip[s] ? 0 : 1)) {
+                found = s;
+                break;
+            }
+        }
+        if (found == ~0u) {
+            a.full.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        a.next = (found + 1) % ListCbArena::kSegments;
+        a.last_flip[found] = flip;
+        a.max_serial[found].store(0, std::memory_order_relaxed);
+        c.seg = found;
+        c.lap = a.lap[found].fetch_add(1, std::memory_order_acq_rel) + 1;
+        a.takes.fetch_add(1, std::memory_order_relaxed);
+        off = 0;
+    } else {
+        std::lock_guard<std::mutex> lk(a.mu);
+        a.last_flip[c.seg] = flip;
+    }
+    c.next = off + bytes;
+    at = static_cast<VkDeviceSize>(c.seg) * ListCbArena::kSegment + off;
+    bool noted = false;
+    for (std::uint32_t k = 0; k < notes.nsegs; ++k) noted |= notes.seg[k] == c.seg && notes.seg_lap[k] == c.lap;
+    if (!noted) {
+        if (notes.nsegs == 4) {
+            notes.full = true;
+        } else {
+            notes.seg[notes.nsegs] = c.seg;
+            notes.seg_lap[notes.nsegs++] = c.lap;
+        }
+    }
+    return true;
+}
+
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
                            std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
                            std::uint32_t* records = nullptr, std::uint64_t* bases = nullptr) {
@@ -15484,7 +15646,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         if (gx && plan && base && !b.pointer && i < plan->buffers.size() && plan->buffers[i].source == GxBindingPlan::kCb &&
             ((gx->obj_cb_set >> plan->buffers[i].slot) & 1))
             home_handle = gx->cb_home[plan->buffers[i].slot];
-        if (home_handle && gxvk_homes::bind_on() && !b.written && bytes && !(base & 3) && shape && !t_snapshot_cbs && !glitch_watching_draw()) {
+        if (home_handle && gxvk_homes::bind_on() && !b.written && bytes && !(base & 3) && shape && !t_snapshot_cbs &&
+            (list_draw() || !glitch_watching_draw())) {  // (a list-mode draw: the glitch hunt is off - lists_commit's refusals)
             Located hl;
             const int r = homes_bind_locked(home_handle, base, bytes, hl);
             // Its block bound whole, the home's place the bias: one descriptor for every home in the block, as the
@@ -15553,6 +15716,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // stores to - the store changes what later draws are answered - and at
         // copies to put in place.
         if (b.written && run_part_stop(kRunStopStore)) return;
+        // Stage 4b.1b's list mode: a range neither a home nor GX's upload heap
+        // holds is answered by the copy versions, the GPU writes and the twins
+        // as they stand at its splice's place, not this one's: in order.
+        if (t_run_draw && t_run_draw->list && !in_heap && outcome == kUnmapped && !known && base && run_part_stop(kRunStopBuffers)) return;
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
@@ -15764,6 +15931,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             std::uint64_t& scratch_lap = g_scratch_lap;
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || known || hle_kernel_va_mapped(base, bytes))) {
+                if (!scratch.buffer && t_run_draw && t_run_draw->list) {  // (made by the command processor's draws)
+                    run_part_stop(kRunStopRing);
+                    return;
+                }
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
@@ -15801,7 +15972,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
-                if (dedupe && snapshot && (whole_ring || exact) && scratch.map) {
+                const bool list = t_run_draw && t_run_draw->list;
+                if (dedupe && snapshot && (whole_ring || exact) && scratch.map && !list) {
                     memo = draw_ctx() ? &draw_ctx()->cb_memo_for(copy_from) : &snap_memo_for(copy_from);
                     bool share = memo->base == copy_from && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
                     // A run part's draw (BBHOST_RUN_COMMIT) binds the copy the
@@ -15842,14 +16014,40 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         info = whole_ring ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, memo->at, bytes};
                         params.cb_valid |= 1u << i;
                         params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
-                        if (whole_ring && list_resolve::commit_compare()) run_digest_ring_cb(i, memo->at, base, bytes);
+                        if (whole_ring && run_digest_on()) run_digest_ring_cb(i, memo->at, base, bytes);
                         outcome = kBound;
                         if (!whole_ring) note_copy_binding_locked(info, copy_from);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
                         if (draw_ctx()) list_resolve::count(list_resolve::kCtxCbShared);
                     }
                 }
-                if (scratch.map && outcome != kBound) {
+                if (list && scratch.map && outcome != kBound) {
+                    // Stage 4b.1b's list mode: into the list arena (list_cb_take),
+                    // bound as the ring is.
+                    if (!snapshot && !known) {
+                        run_part_stop(kRunStopBuffers);
+                        return;
+                    }
+                    VkDeviceSize copy_bytes = bytes;
+                    if (g_wc_whole_lines) {
+                        const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
+                        if (((copy_from + bytes - 1) >> 12) == ((copy_from + lines - 1) >> 12)) copy_bytes = lines;
+                    }
+                    VkDeviceSize at = 0;
+                    if (!list_cb_take(copy_bytes, at, *t_run_draw->list)) {
+                        run_part_stop(kRunStopRing);
+                        return;
+                    }
+                    std::memcpy(static_cast<std::uint8_t*>(g_list_arena.buf.map) + at,
+                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
+                    const bool whole = whole_ring;
+                    info = whole ? VkDescriptorBufferInfo{g_list_arena.buf.buffer, 0, kScratch}
+                                 : VkDescriptorBufferInfo{g_list_arena.buf.buffer, at, bytes};
+                    params.cb_valid |= 1u << i;
+                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
+                    if (whole && run_digest_on()) run_digest_ring_cb(i, at, base, bytes);
+                    outcome = kBound;
+                } else if (scratch.map && outcome != kBound) {
                     // The ring is write-combined memory: a copy whose last line
                     // is partly written leaves that line in a write-combining
                     // buffer, flushed in pieces at the next store fence (the
@@ -15936,7 +16134,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
-                    if (whole && list_resolve::commit_compare()) run_digest_ring_cb(i, at, base, bytes);
+                    if (whole && run_digest_on()) run_digest_ring_cb(i, at, base, bytes);
                     outcome = kBound;
                     // The guest bytes, unless a copy-back's copy laid over them
                     // (never a snapshot's: its range has no copy version, as
@@ -16033,7 +16231,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             }
         }
         if (!run_part()) ++outcomes[outcome];
-        if (list_resolve::commit_compare()) {
+        if (run_digest_on()) {
             // One in the GX ring (a table GX built, placed apart by a part and
             // in order) by its bytes.
             const bool in_ring = g_gx_ring.base && base >= g_gx_ring.base && base + bytes <= g_gx_ring.base + g_gx_ring.size;
@@ -16355,7 +16553,7 @@ std::uint64_t gx_ring_place(const std::uint8_t* data, std::uint64_t bytes, std::
     DrawCtx* const ctx = draw_ctx();
     if (ctx) {
         if (!bytes) return 0;
-        ctx->take_recording(g.flushes);
+        ctx->take_recording(list_draw() ? 1 : g.flushes);  // (a pool thread's chunk is its own: no recording to follow)
         va = (ctx->gx_next + align - 1) & ~(align - 1);
     }
     if (!ctx || !ctx->gx_end || va + bytes > ctx->gx_end) {
@@ -16622,7 +16820,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             ParsedFetch r;
             std::string stop;
             r.ok = o.vtx_ud < 15 && parse_fetch_elements(fetch_words, o.vtx_ud, r.elements, &stop);
-            it = parsed.emplace(pkey, std::move(r)).first;
+            {
+                cache_rw::Write cw(cache_rw::kFetch);  // stage 4b.1b's readers find it whole
+                it = parsed.emplace(pkey, std::move(r)).first;
+            }
             if (!it->second.ok) {
                 static std::atomic<int> shapes{0};
                 if (shapes.fetch_add(1) < 24) {
@@ -16761,6 +16962,13 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 placed[e] = {gxvk_plan_buffer(va), va, stride, fmt, va};
                 continue;
             }
+        }
+        // Stage 4b.1b's list mode: a vertex record not bound by its GX buffer's
+        // handle is answered by the mirrors, the copy versions and the twins as
+        // they stand at its splice's place: in order.
+        if (t_run_draw && t_run_draw->list) {
+            run_part_stop(kRunStopMirror);
+            return false;
         }
         // GX's upload heap (stage 1c, BBHOST_GXVK_ARENA=1): a record in a renamed
         // copy is bound where GX wrote it, as far as its draw reads - no copy
@@ -17332,7 +17540,9 @@ GxUserResult build_gx_user_data(const GxStageRecords& st, GxUserData& out, std::
         const std::uint64_t key = ((st.desc_fp ^ (static_cast<std::uint64_t>(read_mask) << 32) ^ table_mask) * 0x9e3779b97f4a7c15ull) | 1;
         list_key = key;
         UserBuildList& e = g_user_lists[(key >> 40) & 1023];
-        if (e.key == key) {
+        if (list_draw()) {
+            list = nullptr;  // stage 4b.1b's list mode: the command processor's lists are its own - walked without one
+        } else if (e.key == key) {
             list = &e;
             if (!run_part()) ++g_user_lists_used;
         } else if (run_part()) {
@@ -21133,11 +21343,16 @@ void run_first_names(const RunTargets& m) {
 // writes, its blends, its viewport scissor, the layers it draws, its depth and
 // stencil state, and so which targets too small for it its pass leaves out
 // (drop_small_targets). Other images: the part stops.
+// Stage 4b.1b's list mode (lists_commit): the targets the command processor
+// published for the draw's names, and those names.
+thread_local const RunTargets* t_list_targets = nullptr;
+thread_local std::uint32_t t_list_names[kTargetNames];
 void run_targets_part(const GpuDrawInputs& in, DrawState& s) {
-    const RunTargets& m = *g_run_shared_targets;
+    const bool list = t_run_draw && t_run_draw->list;
+    const RunTargets& m = list ? *t_list_targets : *g_run_shared_targets;
     std::uint32_t now[kTargetNames];
     target_names(in, now);
-    if (std::memcmp(now, g_run_first_names, sizeof(now)) != 0) {
+    if (std::memcmp(now, list ? t_list_names : g_run_first_names, sizeof(now)) != 0) {
         run_part_stop(kRunStopTargets);
         return;
     }
@@ -21307,6 +21522,7 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
 
 }  // namespace
 
+void publish_run_targets_locked(const RunTargets& m);  // stage 4b.1b (below)
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
@@ -21341,7 +21557,7 @@ static bool draw_impl(const GpuDraw& d) {
     // and the fence waits, not this draw.
     // One draw in kPhaseSample is timed, and booked that many times over.
     static thread_local std::uint32_t phase_seq = 0;
-    const std::uint32_t phase_weight = ++phase_seq % kPhaseSample == 0 ? kPhaseSample : 0;
+    const std::uint32_t phase_weight = ++phase_seq % kPhaseSample == 0 && !list_draw() ? kPhaseSample : 0;  // (a pool's draw: not the command processor's phases)
     GpuPhaseTimer timer(kPhaseLock, phase_weight);
     // A forked run's draw (BBHOST_RUN_COMMIT): the command processor holds the
     // mutex for it, in a part or committing it in order at the join.
@@ -21351,7 +21567,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (!run) lock.lock();
     timer.next(kPhaseDraw);
     RecordedState& rs = part ? t_part_recorded : g_recorded;  // what the recording has bound
-    const bool digest = list_resolve::commit_compare();  // BBHOST_RUN_COMMIT=compare: what it resolved (RunDigest)
+    const bool digest = run_digest_on();  // BBHOST_RUN_COMMIT=compare, BBHOST_GXVK_LISTS=splice-compare: what it resolved (RunDigest)
     if (digest) {
         t_run_digest = RunDigest{};
         t_ring_cb[0] = t_ring_cb[1] = RingCbNote{};
@@ -21548,6 +21764,7 @@ static bool draw_impl(const GpuDraw& d) {
             if (run->stop >= 0) return false;
         } else if (list_resolve::batching()) {
             run_targets(d, in, s, mu_taken);
+            if (gxvk_lists::splice()) publish_run_targets_locked(t_run_targets);  // stage 4b.1b: for the pool's draws
         } else {
             DrawTargetsOut targets;
             draw_targets(d, in, s, targets);
@@ -21981,7 +22198,11 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // A pipeline that reads memory through the page table could read a
     // copy-back's destination before its copy is in place (copy versions).
-    if (copy_versions_pending_locked() && (!pl.vs.meta().walks.empty() || !pl.ps.meta().walks.empty())) {
+    if ((run && run->list) && (!pl.vs.meta().walks.empty() || !pl.ps.meta().walks.empty())) {
+        run_part_stop(kRunStopOrder);  // stage 4b.1b: page-table walks read the copy versions at their splice's place
+        return false;
+    }
+    if (!(run && run->list) && copy_versions_pending_locked() && (!pl.vs.meta().walks.empty() || !pl.ps.meta().walks.empty())) {
         if (run_part_stop(kRunStopOrder)) return false;
         copy_versions_put_in_place_locked(kCvWalks);
     }
@@ -22714,7 +22935,7 @@ static bool draw_impl(const GpuDraw& d) {
         }
         submit_locked();
     }
-    begin_recording_locked();
+    if (!(run && run->list)) begin_recording_locked();  // (stage 4b.1b: the splice's, on the command processor)
     // Descriptor sets: VS (set 0) and PS (set 1). The write lists are reused
     // from draw to draw (host_gpu_draw does not nest), and reserved before they
     // fill: writes point into infos and buffer_infos, which must not move.
@@ -23103,6 +23324,10 @@ static bool draw_impl(const GpuDraw& d) {
             const std::uint64_t key = fnv1a(material.data(), material.size() * sizeof(std::uint64_t));
             if (const VkDescriptorSet hit = set_cache_find(key, material)) {
                 sets[st] = hit;
+                if (run && run->list) {  // stage 4b.1b: still the cache's at its splice
+                    run->list->set_key[st] = key;
+                    run->list->set[st] = hit;
+                }
                 stage_reused[st] = true;  // a table rebuild takes a set of its own
                 draw_stamp.to(kRenderCostSets);
                 draw_stamp.to(kRenderCostImages);
@@ -23323,7 +23548,13 @@ static bool draw_impl(const GpuDraw& d) {
     // device recorded every draw in place, draining the stream at each one -
     // 2.2 million drains a 300-flip window against ~360, on the Radeon 8060S
     // at 60 fps (2026-10-08).
-    if (run && !run->fresh_packet) {
+    if (run && run->list) {
+        // Stage 4b.1b's list mode: its token slot's list packet, which the
+        // command processor splices (host_gpu_splice).
+        if (run->stop >= 0) return false;
+        cmds.start_list(recorder_list_packet(run->list->packet_index));
+        run->started = true;
+    } else if (run && !run->fresh_packet) {
         // A forked run's draw (BBHOST_RUN_COMMIT): the packet reserved for it
         // at the fork, kept out of the stream until the join in a part.
         if (part && run->stop >= 0) return false;  // its sets or buffers stopped it
@@ -23621,7 +23852,7 @@ static bool draw_impl(const GpuDraw& d) {
     draw_stamp.to(kRenderCostVariant);
     // Indices or indirect arguments across a copy-back's edge: its copies go
     // in place before the pass, which a copy cannot be recorded inside.
-    if (copy_versions_pending_locked() &&
+    if (!(run && run->list) && copy_versions_pending_locked() &&  // (stage 4b.1b's indices are by handle: the splice asks)
         ((d.index_va && copy_version_lookup_locked(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2),
                                                    nullptr) == kCopyVersionStraddles) ||
          (d.indirect_va && copy_version_lookup_locked(d.indirect_va, d.index_va ? 20 : 16, nullptr) == kCopyVersionStraddles))) {
@@ -23636,6 +23867,10 @@ static bool draw_impl(const GpuDraw& d) {
             for (const StageImages::Image& im : stage_images[st].images) {
                 if (!im.resolved) continue;
                 const std::uint64_t base = image_base(im);
+                if (run && run->list) {  // stage 4b.1b: the hazards at its splice's place, not this one's
+                    run->list->note_sampled(base);
+                    continue;
+                }
                 if (g_hazards.owed && g_hazards.written.count(base)) sample_hazard = true;
                 // A run part's draw notes it for its join (BBHOST_RUN_COMMIT).
                 if (part) run_note_sampled(*run, base);
@@ -23644,7 +23879,10 @@ static bool draw_impl(const GpuDraw& d) {
         }
         if (sample_hazard && run_part_stop(kRunStopOrder)) return false;
     }
-    if (!g_view_clear_list.empty() && part) {
+    if (run && run->list) {
+        // Stage 4b.1b's list mode: the owed clears at its splice's place
+        // (host_gpu_splice checks the images it samples against them).
+    } else if (!g_view_clear_list.empty() && part) {
         // A run part's draw (BBHOST_RUN_COMMIT): the owed clears read, none
         // taken or made - its attachments are the run's first draw's, which
         // took theirs, and one it samples is made in order (a stop).
@@ -23769,11 +24007,19 @@ static bool draw_impl(const GpuDraw& d) {
     // Depth layouts: a depth target the draw samples, read-only before its
     // pass begins - after the owed clears above, which take it to the
     // transfer layout.
-    if (g.depth_layouts) {
+    if (g.depth_layouts && !(run && run->list)) {  // (stage 4b.1b: the splice draws one that samples a managed depth view in order)
         depth_layouts_for_images_locked(stage_images, 2, s.depth);
         if (part && run->stop >= 0) return false;
     }
-    if (part) {
+    if (run && run->list) {
+        // Stage 4b.1b's list mode: the pass it draws in, which the splice finds
+        // open (its run's first draw, in order, began it).
+        if (feedback_census_on() || copy_census::on()) {
+            run_part_stop(kRunStopOrder);
+            return false;
+        }
+        run->list->pass_key = pass_key(s);
+    } else if (part) {
         // The run's pass is open - its first draw began it - and a draw into
         // its targets with no hazard begins none (BBHOST_RUN_COMMIT).
         if (!g_pass.active || g_pass.key != pass_key(s) || feedback_census_on() || copy_census::on()) {
@@ -23838,7 +24084,10 @@ static bool draw_impl(const GpuDraw& d) {
                      pl.ps.meta().untraced_stores);
         }
     }
-    if (rs.serial != g.record_serial) {
+    if (run && run->list) {
+        // Stage 4b.1b's list mode: its packet binds everything (lists_commit
+        // emptied its recorded state); the command processor's serial is not its.
+    } else if (rs.serial != g.record_serial) {
         rs = RecordedState{};
         rs.serial = g.record_serial;
     }
@@ -23992,6 +24241,24 @@ static bool draw_impl(const GpuDraw& d) {
     }
     draw_stamp.to(kRenderCostBindCmds);
     // Viewport: screen = offset + ndc * scale (y scale is negative on GCN for a y-down framebuffer).
+    // The pass the draw records in: the one open - or, a list-mode draw
+    // (stage 4b.1b), the one its splice finds open, begun by its run's first
+    // draw over the same attachments (its pass key): its extent as begin_pass
+    // works it out, the smallest attachment's.
+    VkExtent2D pass_ext{0, 0};
+    if (!(run && run->list)) {
+        pass_ext = g_pass.extent;
+    } else {
+        for (int t = 0; t < 8; ++t) {
+            if (!s.color[t]) continue;
+            if (!pass_ext.width || s.color[t]->width < pass_ext.width) pass_ext.width = s.color[t]->width;
+            if (!pass_ext.height || s.color[t]->height < pass_ext.height) pass_ext.height = s.color[t]->height;
+        }
+        if (s.depth) {
+            if (!pass_ext.width || s.depth->width < pass_ext.width) pass_ext.width = s.depth->width;
+            if (!pass_ext.height || s.depth->height < pass_ext.height) pass_ext.height = s.depth->height;
+        }
+    }
     VkViewport vp{};
     const bool vport_enabled = (s.vte_cntl & 0x1) != 0 || s.vte_cntl == 0;
     if (vport_enabled && s.vport[0] != 0.0f) {
@@ -24004,8 +24271,8 @@ static bool draw_impl(const GpuDraw& d) {
     } else {
         vp.x = 0;
         vp.y = 0;
-        vp.width = static_cast<float>(g_pass.extent.width);
-        vp.height = static_cast<float>(g_pass.extent.height);
+        vp.width = static_cast<float>(pass_ext.width);
+        vp.height = static_cast<float>(pass_ext.height);
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
     }
@@ -24020,8 +24287,8 @@ static bool draw_impl(const GpuDraw& d) {
     }
     VkRect2D sc = s.scissor;
     if (t_elide_mutant_draw == 2 && sc.extent.height > 1) --sc.extent.height;  // BBHOST_COPY_ELIDE_MUTANT=2: a proven draw a row short
-    sc.extent.width = std::min<std::uint32_t>(sc.extent.width, g_pass.extent.width > static_cast<std::uint32_t>(sc.offset.x) ? g_pass.extent.width - sc.offset.x : 0);
-    sc.extent.height = std::min<std::uint32_t>(sc.extent.height, g_pass.extent.height > static_cast<std::uint32_t>(sc.offset.y) ? g_pass.extent.height - sc.offset.y : 0);
+    sc.extent.width = std::min<std::uint32_t>(sc.extent.width, pass_ext.width > static_cast<std::uint32_t>(sc.offset.x) ? pass_ext.width - sc.offset.x : 0);
+    sc.extent.height = std::min<std::uint32_t>(sc.extent.height, pass_ext.height > static_cast<std::uint32_t>(sc.offset.y) ? pass_ext.height - sc.offset.y : 0);
     if (!sc.extent.width || !sc.extent.height) {
         return true;  // fully scissored out
     }
@@ -24097,6 +24364,7 @@ static bool draw_impl(const GpuDraw& d) {
                 }
             }
         }
+        if (!by_handle && run && run->list && run_part_stop(kRunStopIndex)) return false;  // stage 4b.1b: its indices by handle only
         const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
         if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderIndexVersion);
         if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
@@ -24161,7 +24429,7 @@ static bool draw_impl(const GpuDraw& d) {
     draw_stamp.to(kRenderCostGeometry);
     if (g.cmd_buffer_marker) {
         cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
-    } else {
+    } else if (!(run && run->list)) {  // (stage 4b.1b: refused with checkpoints - lists_commit)
         gpu_checkpoint(1, g_draw_rec_next);  // (a run is not forked with checkpoints recorded in place)
     }
     if (bind_pl->profile_name.empty()) {
@@ -24567,7 +24835,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // The recent-draw ring (gpu_internal.h): tooling, the glitch hunt's, and
     // the GPU's progress markers, whose draw numbers are its places.
-    if (host_tooling() || glitch_on() || g.has_checkpoints) {
+    if ((host_tooling() || glitch_on() || g.has_checkpoints) && !(run && run->list)) {  // (a list-mode draw keeps none)
         DrawRec& r = g_draw_recs[(part ? run->record : g_draw_rec_next++) % kDrawRecs];  // a run part's: its reserved number
         const std::size_t name_len = std::min<std::size_t>(pl.name.size(), sizeof(r.name) - 1);  // no snprintf: every draw
         std::memcpy(r.name, pl.name.data(), name_len);
@@ -25105,6 +25373,565 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
 }
 
 
+// ---- Stage 4b.1b (BBHOST_GXVK_LISTS=splice): draws committed ahead, spliced ----
+//
+// (host/gxvk_lists.h.) A pool thread commits each GX-native draw a GX thread
+// stored (lists_commit) through draw_impl in its list mode: a run part's draw
+// (RunDraw part) with a list's notes (RunDraw::list) - its packet the token
+// slot's list packet, its params blocks kept as contents, its constant-buffer
+// copies in the list arena, its targets those the command processor last
+// published for the draw's target names (publish_run_targets), and what only
+// the walk's place answers noted for the splice instead of read. At the token
+// the command processor splices it (host_gpu_splice) where the draw falls in
+// the run it has open - the run's first draw drawn in order, its targets
+// looked up and its pass begun - and nothing the draw would meet in order
+// says otherwise: the same target names, pass and generations, no hazard on
+// what it samples, no owed clear, no refresh, no predicate or query, its
+// cached sets still the cache's, its homes without a copy pending. Its params
+// go into slots of the recording it lands in, its packet into the stream (a
+// kListDraw op), and what it shares with other draws is added as a run's join
+// adds it. Everything else is drawn in order, counted by why.
+
+namespace {
+
+enum ListState : std::uint32_t { kLcFree, kLcCommitting, kLcCommitted, kLcNot };
+// Why a draw was not committed, past RunStop's reasons (RunDraw::stop).
+enum ListWhy : int {
+    kLwLate = kRunStops,  // its slot not stored by the time the pool got to it (taken already, or moved on)
+    kLwKind,              // not a plain GX-native draw (tessellated, a geometry shader, indirect, partial)
+    kLwConfig,            // the configuration or a diagnostic (as the run commit refuses)
+    kLwTargets,           // no published run with its target names
+    kLwRemade,            // a target made or let go since the run with its names was published
+    kLwBusy,              // its record or its list packet still in use
+    kLwNotes,             // more to note than its notes hold
+    kLwFailed,            // draw_impl gave up on it (a draw that fails in order too)
+    kLwNothing,           // it records nothing (an empty draw)
+    kListWhys
+};
+const char* const kListWhyName[kListWhys - kRunStops] = {"late", "kind", "configuration", "targets", "remade", "busy", "notes", "failed", "nothing"};
+// Why a draw was drawn in order at its token.
+enum SpliceWhy : int {
+    kSwNotCommitted,  // the pool did not commit it (ListWhy)
+    kSwPending,       // the pool had not committed it yet
+    kSwRunFirst,      // no run open with its target names (a run's first draw, or another run's)
+    kSwChanged,       // something done in order since its run's first draw (a split)
+    kSwRunGens,       // a target made or resized, a fill or clear noted since its run's first draw
+    kSwOtherTargets,  // its run's targets are not the objects it was committed with
+    kSwPass,          // the pass open is not the one it was committed for
+    kSwOld,           // committed too long ago
+    kSwHazard,        // it samples an image written since the last barrier
+    kSwClear,         // it samples an image that owes a clear
+    kSwView,          // a view it binds changed or would refresh here
+    kSwSet,           // a cached set it binds is no longer the cache's
+    kSwHome,          // a home it binds has a copy pending
+    kSwArena,         // its constant-buffer copies' segment was taken again
+    kSwOcclusion,     // a predicate or a query would take it here
+    kSwOther,         // windows given, a run commit or a diagnostic at the walk
+    kSwCompare,       // splice-compare: drawn in order by design
+    kSpliceWhys
+};
+const char* const kSpliceWhyName[kSpliceWhys] = {"not committed", "not committed yet", "a run's first draw", "a split since its run's first",
+                                                 "its run's targets remade or owed work", "other target objects",
+                                                 "another pass",  "too old",           "a hazard",           "an owed clear",
+                                                 "a view",        "a set",             "a home",             "its copies' segment",
+                                                 "occlusion",     "other",             "compare"};
+
+struct ListCommit {
+    std::atomic<std::uint32_t> state{kLcFree};
+    std::uint64_t id = 0;
+    std::uint64_t flip = 0;
+    int why = -1;
+    ListNotes notes;
+    std::uint32_t names[kTargetNames] = {};
+    std::uint64_t erase_gen = 0;  // g_rt_erase_gen its targets were published at
+    RtImage* looked[9] = {};      // and those targets (the published run's lookups)
+    std::uint32_t reached = 0;
+    void* drew = nullptr;
+    bool drew_gx = false;
+    const std::string* vs_other = nullptr;
+    int vs_other_why = 0;
+    RunDigest digest;
+};
+constexpr std::uint64_t kListCommits = 16384;  // as the token slots: token `id`'s record is id's slot index
+ListCommit* g_list_commits = nullptr;
+std::once_flag g_list_commits_made;
+ListCommit* list_commits() {
+    std::call_once(g_list_commits_made, [] { g_list_commits = new ListCommit[kListCommits]; });
+    return g_list_commits;
+}
+
+// The run targets the command processor published, by the target names of
+// the draws that looked them up (publish_run_targets): a pool thread's draw
+// takes those whose names its own inputs give, as a run part's takes its run's
+// first draw's. A seqlock: written under g.mu by the command processor, read
+// by the pool without it.
+struct PubTargets {
+    std::atomic<std::uint64_t> seq{0};
+    std::uint32_t names[kTargetNames] = {};
+    RunTargets m;
+    std::uint64_t erase_gen = 0;  // g_rt_erase_gen when published
+};
+constexpr std::uint32_t kPubTargets = 2048;  // (direct-mapped: ~80 runs a flip)
+PubTargets g_pub_targets[kPubTargets];
+std::atomic<std::uint64_t> g_pub_writes{0};
+std::uint32_t pub_slot(const std::uint32_t* names) {
+    return static_cast<std::uint32_t>(fnv1a(names, sizeof(std::uint32_t) * kTargetNames)) & (kPubTargets - 1);
+}
+void names_of(const RunTargets& m, std::uint32_t (&n)[kTargetNames]) {
+    GpuDrawInputs f{};
+    std::memcpy(&f.target_mask, m.in.targets, sizeof(m.in.targets));
+    f.z_read_base = m.in.depth[0];
+    f.depth_size = m.in.depth[1];
+    f.depth_view = m.in.depth[2];
+    f.z_info = m.in.depth[3];
+    f.stencil_info = m.in.depth[4];
+    f.htile_base = m.in.depth[5];
+    f.depth_control = m.in.depth[6] & 3;
+    f.render_control = (m.in.depth[6] >> 2) & 3;
+    f.screen_scissor[0] = m.in.scissors[0];
+    f.screen_scissor[1] = m.in.scissors[1];
+    f.generic_scissor[0] = m.in.scissors[2];
+    f.generic_scissor[1] = m.in.scissors[3];
+    target_names(f, n);
+}
+
+// The splice's and the pool's counts.
+std::atomic<std::uint64_t> g_lc_committed{0}, g_lc_why[kListWhys] = {}, g_lc_ns{0}, g_lc_looked{0};
+std::atomic<std::uint64_t> g_sp_spliced{0}, g_sp_why[kSpliceWhys] = {}, g_sp_ns{0}, g_sp_timed{0};
+std::atomic<std::uint64_t> g_sp_compared{0}, g_sp_differed{0}, g_sp_field_diff[kCmpFields] = {};
+std::atomic<int> g_sp_diff_logs{0};
+thread_local std::uint64_t t_splice_would = 0;  // splice-compare: the token whose commit passed every check
+
+}  // namespace
+
+// The command processor, under g.mu: a run's first draw just looked its
+// targets up (t_run_targets): published for the pool's draws with the same
+// names, unless the slot already holds them.
+void publish_run_targets_locked(const RunTargets& m) {
+    if (!m.valid) return;
+    std::uint32_t n[kTargetNames];
+    names_of(m, n);
+    PubTargets& p = g_pub_targets[pub_slot(n)];
+    const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
+    if (p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && std::memcmp(p.names, n, sizeof(n)) == 0 &&
+        std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 && p.m.out.reached == m.out.reached)
+        return;
+    const std::uint64_t s = p.seq.load(std::memory_order_relaxed);
+    p.seq.store(s + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    std::memcpy(p.names, n, sizeof(n));
+    p.m = m;
+    p.erase_gen = erase_gen;
+    p.seq.store(s + 2, std::memory_order_release);
+    g_pub_writes.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+
+bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, std::uint64_t& erase_gen) {
+    PubTargets& p = g_pub_targets[pub_slot(n)];
+    for (int tries = 0; tries < 4; ++tries) {
+        const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
+        if (!s0 || (s0 & 1)) continue;
+        const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
+        if (same) {
+            out = p.m;
+            erase_gen = p.erase_gen;
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (p.seq.load(std::memory_order_relaxed) == s0) return same;
+    }
+    return false;
+}
+
+// Whether the list-mode commit takes draws in this configuration at all (as
+// host_gpu_run_commit's refusals): read under g.mu.
+bool list_config_ok_locked() {
+    if (!g.ok || !recorder_threaded() || g.profile || g.profile_passes || g.has_checkpoints || g.cmd_buffer_marker || !set_cache_on() || !cb_push_on() ||
+        capture_wanted() || g_trace || glitch_on() || g_render_cost_enabled || run_diagnostics_on())
+        return false;
+    if (g.bindless || (gxvk::buffers_on() && !gxvk_buffers_bind_mode()) || gxvk::arena_wanted() || shadow_in_place_on()) return false;
+    return true;
+}
+
+}  // namespace
+
+namespace gpu {
+void lists_commit(std::uint64_t id) {
+    ListCommit* const all = list_commits();
+    ListCommit& c = all[id & (kListCommits - 1)];
+    const auto t0 = std::chrono::steady_clock::now();
+    g_lc_looked.fetch_add(1, std::memory_order_relaxed);
+    std::uint32_t st = c.state.load(std::memory_order_acquire);
+    if (st == kLcCommitting || !c.state.compare_exchange_strong(st, kLcCommitting, std::memory_order_acq_rel)) {
+        g_lc_why[kLwBusy].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    c.id = id;
+    c.why = -1;
+    c.flip = hle_video_flip_count();
+    bool pinned = false;
+    const auto finish = [&](int why) {
+        // The slot given back first: a committed record says the pool reads
+        // its slot no more (the command processor's take then needs no CAS).
+        if (pinned) hle_gx_native_unpin(id);
+        pinned = false;
+        c.why = why;
+        if (why < 0) g_lc_committed.fetch_add(1, std::memory_order_relaxed);
+        else g_lc_why[why].fetch_add(1, std::memory_order_relaxed);
+        g_lc_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                          std::memory_order_relaxed);
+        c.state.store(why < 0 ? kLcCommitted : kLcNot, std::memory_order_release);
+    };
+    if (!recorder_list_packet_free(id)) return finish(kLwBusy);
+    static thread_local GpuDrawInputs in;
+    static thread_local GxDrawObjects o;
+    if (!hle_gx_native_pin_copy(id, in, o)) return finish(kLwLate);
+    pinned = true;
+    if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) return finish(kLwKind);
+    // The draw as the walk's take of its token gives it (gnm_exec.cpp native_draw).
+    static const std::uint32_t no_registers[0x1000] = {};
+    GpuDraw d;
+    d.gx = &in;
+    d.gx_render = true;
+    d.gx_objects = &o;
+    d.gx_token = true;
+    d.gx_token_kind = "native";
+    d.registers = false;
+    d.sh = no_registers;
+    d.ctx = no_registers;
+    d.uconfig = no_registers;
+    d.index_count = o.count;
+    d.instance_count = o.instances ? o.instances : 1;
+    d.index_va = o.indexed && o.index_known ? o.index_va : 0;
+    d.index_type = o.index_type;
+    target_names(in, c.names);
+    static thread_local RunTargets targets;
+    std::uint64_t erase_gen = 0;
+    if (!find_run_targets(c.names, targets, erase_gen)) return finish(kLwTargets);
+    c.erase_gen = erase_gen;
+    std::memcpy(c.looked, targets.out.looked, sizeof(c.looked));
+    c.reached = targets.out.reached;
+    // Beside the command processor: the caches and maps it reads under the
+    // readers' lock (host/cache_rw.h), which every change they could see takes
+    // exclusive - a target let go, a pipeline, set, program or view made.
+    // BBHOST_GXVK_LISTS_LOCKED=1: under g.mu as well, as a run part's draw.
+    static const bool locked = [] {
+        const char* e = std::getenv("BBHOST_GXVK_LISTS_LOCKED");
+        return e && e[0] == '1';
+    }();
+    std::unique_lock<GpuMutex> lock(g.mu, std::defer_lock);
+    if (locked) lock.lock();
+    cache_rw::Read rd;
+    if (!list_config_ok_locked()) return finish(kLwConfig);
+    if (g_rt_erase_gen.load(std::memory_order_acquire) != erase_gen) return finish(kLwRemade);  // a target let go since it was published
+    c.notes.clear();
+    c.notes.packet_index = id & (kListCommits - 1);
+    RunDraw r;
+    r.part = true;
+    r.list = &c.notes;
+    t_part_recorded = RecordedState{};  // its packet binds everything it draws with
+    static thread_local BumpSink sink;
+    t_bump_sink = &sink;
+    t_list_targets = &targets;
+    std::memcpy(t_list_names, c.names, sizeof(c.names));
+    t_run_draw = &r;
+    const bool ok = draw_impl(d);
+    t_run_draw = nullptr;
+    t_list_targets = nullptr;
+    t_bump_sink = nullptr;
+    if (locked) sink.merge();
+    else sink.merge_atomic();
+    if (run_digest_on()) c.digest = t_run_digest;
+    __builtin_ia32_sfence();  // its copies into write-combined memory leave this core first
+    if (r.stop >= 0) return finish(r.stop);
+    if (c.notes.full) return finish(kLwNotes);
+    if (!ok) return finish(kLwFailed);
+    if (!r.started) return finish(kLwNothing);
+    c.drew = r.drew;
+    c.drew_gx = r.drew_gx;
+    c.vs_other = r.vs_other;
+    c.vs_other_why = r.vs_other_why;
+    finish(-1);
+}
+}  // namespace gpu
+
+namespace {
+
+void splice_compare_locked(const ListCommit& c) {
+    const RunDigest& a = c.digest;
+    const RunDigest& b = t_run_digest;
+    bool diff[kCmpFields] = {};
+    diff[kCmpDone] = a.done != b.done;
+    if (a.done && b.done) {
+        diff[kCmpPipeline] = a.pipeline != b.pipeline;
+        diff[kCmpSets] = a.sets[0] != b.sets[0] || a.sets[1] != b.sets[1];
+        diff[kCmpDynamic] = std::memcmp(&a.vp, &b.vp, sizeof(a.vp)) != 0 || std::memcmp(&a.sc, &b.sc, sizeof(a.sc)) != 0 ||
+                            std::memcmp(a.bounds, b.bounds, sizeof(a.bounds)) != 0 || std::memcmp(a.stencil, b.stencil, sizeof(a.stencil)) != 0 ||
+                            std::memcmp(a.blend, b.blend, sizeof(a.blend)) != 0;
+        diff[kCmpIndex] = a.index_buffer != b.index_buffer || a.index_offset != b.index_offset || a.index_type != b.index_type;
+        diff[kCmpCall] = a.call_kind != b.call_kind || a.count != b.count || a.instances != b.instances || a.vertex_offset != b.vertex_offset;
+        diff[kCmpVertex] = a.vertex != b.vertex;
+        diff[kCmpParams] = a.params[0] != b.params[0] || a.params[1] != b.params[1];
+        diff[kCmpBuffers] = a.buffers != b.buffers;
+    }
+    g_sp_compared.fetch_add(1, std::memory_order_relaxed);
+    std::string which;
+    for (int f = 0; f < kCmpFields; ++f) {
+        if (!diff[f]) continue;
+        g_sp_field_diff[f].fetch_add(1, std::memory_order_relaxed);
+        which += std::string(which.empty() ? "" : ", ") + kRunFieldName[f];
+    }
+    if (which.empty()) return;
+    g_sp_differed.fetch_add(1, std::memory_order_relaxed);
+    if (g_sp_diff_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        host_log("gxvk-lists: splice compare: token %llu (committed at flip %llu, now %llu) differs from its draw in order: %s; "
+                 "pipeline %s / %s",
+                 static_cast<unsigned long long>(c.id), static_cast<unsigned long long>(c.flip),
+                 static_cast<unsigned long long>(hle_video_flip_count()), which.c_str(), a.name, b.name);
+        if (diff[kCmpParams]) {
+            for (int st = 0; st < 2; ++st) {
+                if (a.params[st] != b.params[st])
+                    host_log("gxvk-lists:   its %s params differing as hashed (commit/in order):%s", st ? "PS" : "VS",
+                             run_params_fields_differing(a, b, st, 12).c_str());
+            }
+        }
+    }
+}
+
+}  // namespace
+
+// The command processor at GX-native draw token `id` (gnm_exec.cpp), its slot
+// taken: true when the pool's commit of its draw was spliced into the stream -
+// the draw is done; false when it is to be drawn in order (counted by why).
+// splice-compare: always false, and host_gpu_splice_compare compares the draw
+// in order with the commit.
+bool host_gpu_splice(std::uint64_t id) {
+    if (!g_list_arena.made.load(std::memory_order_acquire)) {  // the list arena, before the pool's first copy needs it
+        static std::once_flag once;
+        std::call_once(once, [] {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            MemOwner own_mem("stage 4b.1b's constant-buffer copies");
+            create_upload_buffer(g_list_arena.buf, ListCbArena::kBytes, "the list-mode constant-buffer copies");
+            g_list_arena.made.store(g_list_arena.buf.map != nullptr, std::memory_order_release);
+        });
+    }
+    ListCommit* const all = g_list_commits;
+    if (!all) {
+        g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint32_t st = c.state.load(std::memory_order_acquire);
+    if (c.id != id || st == kLcCommitting || st == kLcFree) {
+        g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (st != kLcCommitted) {
+        g_sp_why[kSwNotCommitted].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto fall = [&](SpliceWhy why) {
+        g_sp_why[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    // The command processor's draw phase books the splices as it books its draws (one in kPhaseSample timed).
+    static thread_local std::uint32_t phase_seq = 0;
+    GpuPhaseTimer timer(kPhaseLock, ++phase_seq % kPhaseSample == 0 ? kPhaseSample : 0);
+    std::lock_guard<GpuMutex> lock(g.mu);
+    timer.next(kPhaseDraw);
+    if (!g.ok || !g.recording || !t_draw_windows.empty() || !t_given_windows.empty() || !list_config_ok_locked()) return fall(kSwOther);
+    if (c.flip + kListMaxAge < hle_video_flip_count()) return fall(kSwOld);
+    // The run open on this thread: its first draw drawn in order with these
+    // names, nothing done in order since, no target made, no fill or clear.
+    const RunTargets& m = t_run_targets;
+    if (!m.valid) return fall(kSwRunFirst);
+    // The run's names, worked out again only when its first draw's inputs change.
+    static thread_local TargetInputs names_in{};
+    static thread_local std::uint32_t now[kTargetNames];
+    static thread_local bool names_made = false;
+    if (!names_made || std::memcmp(&names_in, &m.in, sizeof(names_in)) != 0) {
+        names_in = m.in;
+        names_of(m, now);
+        names_made = true;
+    }
+    if (std::memcmp(now, c.names, sizeof(now)) != 0) return fall(kSwRunFirst);
+    // The run open: its first draw's lookups still stand (as batching shares
+    // them) - and its targets are the very objects the commit drew with.
+    if (m.serial != list_resolve::run_serial()) return fall(kSwChanged);
+    if (g_rt_gen != m.rt_gen || g_pending_htile_gen != m.htile_gen || g_pending_gen != m.pending_gen ||
+        (m.depth && m.depth->htile_clear_pending))
+        return fall(kSwRunGens);
+    if (g_rt_erase_gen.load(std::memory_order_acquire) != c.erase_gen || m.out.reached != c.reached ||
+        std::memcmp(m.out.looked, c.looked, sizeof(c.looked)) != 0)
+        return fall(kSwOtherTargets);
+    if (!g_pass.active || g_pass.key != c.notes.pass_key) return fall(kSwPass);
+    // What it samples: no hazard (written since the last barrier), no owed clear.
+    const ListNotes& n = c.notes;
+    if (g_lazy_barriers && g_hazards.owed) {
+        for (std::uint32_t k = 0; k < n.nsampled; ++k) {
+            if (g_hazards.written.count(n.sampled[k])) return fall(kSwHazard);
+        }
+    }
+    if (!g_view_clear_list.empty()) {
+        for (const std::uint64_t base : g_view_clear_list) {
+            const auto it = g_rts.find(base);
+            if (it == g_rts.end()) continue;
+            const RtImage& r = it->second;
+            if (!r.view_clear || r.view_clear_load) continue;
+            const std::uint64_t end = r.base + std::max<std::size_t>(rt_size_bytes(r), 1);
+            for (std::uint32_t k = 0; k < n.nsampled; ++k) {
+                if (n.sampled[k] >= r.base && n.sampled[k] < end) return fall(kSwClear);
+            }
+        }
+    }
+    for (std::uint32_t k = 0; k < n.nviews; ++k) {
+        // A depth target's view in the managed layouts: its layout before the pass is set in order.
+        if (!g_managed_views.empty() && g_managed_views.count(n.view[k])) return fall(kSwView);
+    }
+    // Its views' refreshes in this recording, as in order (an upload goes into
+    // the recording's uploads, ahead of its draws; a pass a refresh ended is
+    // begun again by the draw in order).
+    for (std::uint32_t k = 0; k < n.nviews; ++k) {
+        if (!texture_view_splice_ok(n.view_id[k], n.view_flags[k], n.view[k])) return fall(kSwView);
+    }
+    if (!g_pass.active || g_pass.key != c.notes.pass_key) return fall(kSwPass);
+    for (int s2 = 0; s2 < 2; ++s2) {
+        if (n.set[s2] && set_cache_find_key_locked(n.set_key[s2]) != n.set[s2]) return fall(kSwSet);
+    }
+    for (std::uint32_t k = 0; k < n.nhomes; ++k) {
+        if (!homes_splice_ok(n.home[k])) return fall(kSwHome);
+    }
+    for (std::uint32_t k = 0; k < n.nsegs; ++k) {
+        if (g_list_arena.lap[n.seg[k]].load(std::memory_order_acquire) != n.seg_lap[k]) return fall(kSwArena);
+    }
+    if (!occlusion_draw_plain()) return fall(kSwOcclusion);
+    if (g.queued + 2 >= kMaxQueued * kStageSlots) return fall(kSwOther);  // (a mid-frame submit: in order)
+    if (gxvk_lists::splice_compare()) {  // drawn in order, and compared with this commit after (host_gpu_splice_compare)
+        t_splice_would = id;
+        return fall(kSwCompare);
+    }
+    // Spliced: its params into this recording's slots, its packet into the stream.
+    if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
+    begin_recording_locked();
+    std::uint32_t offsets[2] = {};
+    for (std::uint32_t k = 0; k < n.params.n; ++k) {
+        VkDescriptorBufferInfo out{};
+        alloc_params_slot_locked(n.params.p[k], out);
+        offsets[k] = static_cast<std::uint32_t>(out.offset);
+    }
+    recorder_splice_list_packet(n.packet_index, id, offsets, n.params.n);
+    for (std::uint32_t k = 0; k < n.nsegs; ++k) {
+        std::atomic<std::uint64_t>& ms = g_list_arena.max_serial[n.seg[k]];
+        std::uint64_t cur = ms.load(std::memory_order_relaxed);
+        while (cur < g.flushes && !ms.compare_exchange_weak(cur, g.flushes, std::memory_order_acq_rel)) {}
+    }
+    // What a run's join adds where the draws share it.
+    for (std::uint32_t k = 0; k < n.nsampled; ++k) g_hazards.sampled.insert(n.sampled[k]);
+    if (GfxPipeline* const p = static_cast<GfxPipeline*>(c.drew)) {
+        ++p->draws;
+        if (c.drew_gx) ++p->gx_draws;
+        ++p->token_draws;
+    }
+    if (c.vs_other) ++g_vs_other[*c.vs_other][static_cast<std::size_t>(c.vs_other_why)];
+    run_targets_written_locked();
+    run_forget_recorded_locked();  // its packet bound what the next draw finds bound
+    g_sp_spliced.fetch_add(1, std::memory_order_relaxed);
+    g_sp_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                      std::memory_order_relaxed);
+    return true;
+}
+
+// Whether token `id`'s draw has a commit (the pool reads its slot no more):
+// gx_trace.cpp's take of the slot is then a plain load.
+bool host_gpu_list_committed(std::uint64_t id) {
+    const ListCommit* const all = g_list_commits;
+    if (!all) return false;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    return c.state.load(std::memory_order_acquire) == kLcCommitted && c.id == id;
+}
+
+// splice-compare: after the draw of token `id` drawn in order (its digest in
+// t_run_digest), the pool's commit of it compared with that.
+void host_gpu_splice_compare(std::uint64_t id) {
+    ListCommit* const all = g_list_commits;
+    if (!all || t_splice_would != id) return;
+    t_splice_would = 0;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    if (c.id != id || c.state.load(std::memory_order_acquire) != kLcCommitted) return;
+    splice_compare_locked(c);
+}
+
+// The lines: every 1,000 flips with tooling from the pool's first thread (gxvk_lists::pool_report), and at the exit.
+// The periodic ones begin with the window's own shares (since the line before).
+std::string host_gpu_splice_report(bool window) {
+    char buf[256];
+    std::string out;
+    if (window) {
+        static std::uint64_t last[6] = {};  // committed, looked, spliced, in order, splice ns, commit ns (the one caller's)
+        std::uint64_t not_c = 0, in_o = 0;
+        for (int k = 0; k < kListWhys; ++k) not_c += g_lc_why[k].load(std::memory_order_relaxed);
+        for (int k = 0; k < kSpliceWhys; ++k) in_o += g_sp_why[k].load(std::memory_order_relaxed);
+        const std::uint64_t now[6] = {g_lc_committed.load(), not_c, g_sp_spliced.load(), in_o, g_sp_ns.load(), g_lc_ns.load()};
+        std::uint64_t d[6];
+        for (int k = 0; k < 6; ++k) {
+            d[k] = now[k] - last[k];
+            last[k] = now[k];
+        }
+        std::snprintf(buf, sizeof(buf), "window: committed %.1f%% of %llu draws, %.2f us a commit; spliced %.1f%% of %llu tokens, %.2f us a splice | ",
+                      d[0] + d[1] ? 100.0 * static_cast<double>(d[0]) / static_cast<double>(d[0] + d[1]) : 0.0,
+                      static_cast<unsigned long long>(d[0] + d[1]), d[0] + d[1] ? static_cast<double>(d[5]) / 1000.0 / static_cast<double>(d[0] + d[1]) : 0.0,
+                      d[2] + d[3] ? 100.0 * static_cast<double>(d[2]) / static_cast<double>(d[2] + d[3]) : 0.0,
+                      static_cast<unsigned long long>(d[2] + d[3]), d[2] ? static_cast<double>(d[4]) / 1000.0 / static_cast<double>(d[2]) : 0.0);
+        out += buf;
+    }
+    const auto pct = [](std::uint64_t a, std::uint64_t b) { return b ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
+    std::uint64_t not_total = 0;
+    for (int k = 0; k < kListWhys; ++k) not_total += g_lc_why[k].load(std::memory_order_relaxed);
+    const std::uint64_t committed = g_lc_committed.load(std::memory_order_relaxed);
+    std::snprintf(buf, sizeof(buf), "the pool committed %llu of %llu draws (%.1f%%), %.2f us a draw; not, by why:", static_cast<unsigned long long>(committed),
+                  static_cast<unsigned long long>(committed + not_total), pct(committed, committed + not_total),
+                  committed + not_total ? static_cast<double>(g_lc_ns.load()) / 1000.0 / static_cast<double>(committed + not_total) : 0.0);
+    out += buf;
+    for (int k = 0; k < kListWhys; ++k) {
+        const std::uint64_t v = g_lc_why[k].load(std::memory_order_relaxed);
+        if (!v) continue;
+        const char* name = k < kRunStops ? kRunStopName[k] : kListWhyName[k - kRunStops];
+        std::snprintf(buf, sizeof(buf), " %s %llu;", name, static_cast<unsigned long long>(v));
+        out += buf;
+    }
+    std::uint64_t in_order = 0;
+    for (int k = 0; k < kSpliceWhys; ++k) in_order += g_sp_why[k].load(std::memory_order_relaxed);
+    const std::uint64_t spliced = g_sp_spliced.load(std::memory_order_relaxed);
+    std::snprintf(buf, sizeof(buf), " | the command processor spliced %llu of %llu tokens (%.1f%%), %.2f us a splice; in order, by why:",
+                  static_cast<unsigned long long>(spliced), static_cast<unsigned long long>(spliced + in_order), pct(spliced, spliced + in_order),
+                  spliced ? static_cast<double>(g_sp_ns.load()) / 1000.0 / static_cast<double>(spliced) : 0.0);
+    out += buf;
+    for (int k = 0; k < kSpliceWhys; ++k) {
+        const std::uint64_t v = g_sp_why[k].load(std::memory_order_relaxed);
+        if (!v) continue;
+        std::snprintf(buf, sizeof(buf), " %s %llu;", kSpliceWhyName[k], static_cast<unsigned long long>(v));
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf), " | targets published %llu; arena segments taken %llu, none free %llu; image stops: by words %llu, a view "
+                  "by id not made %llu, a sampler %llu",
+                  static_cast<unsigned long long>(g_pub_writes.load()), static_cast<unsigned long long>(g_list_arena.takes.load()),
+                  static_cast<unsigned long long>(g_list_arena.full.load()), static_cast<unsigned long long>(g_list_image_stops[0].load()),
+                  static_cast<unsigned long long>(g_list_image_stops[1].load()), static_cast<unsigned long long>(g_list_image_stops[2].load()));
+    out += buf;
+    if (gxvk_lists::splice_compare()) {
+        std::string fields;
+        for (int f = 0; f < kCmpFields; ++f) fields += std::string(f ? ", " : "") + kRunFieldName[f] + " " + std::to_string(g_sp_field_diff[f].load());
+        std::snprintf(buf, sizeof(buf), " | compare: %llu committed draws compared with their draws in order, %llu differed (",
+                      static_cast<unsigned long long>(g_sp_compared.load()), static_cast<unsigned long long>(g_sp_differed.load()));
+        out += buf;
+        out += fields + ")";
+    }
+    return out;
+}
+
+
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height, std::uint32_t src_x,
                            std::uint32_t src_y, void* dst_storage_view) {
@@ -25307,6 +26134,8 @@ void host_gpu_refill_selftest() {
     };
     auto drop = [&] {
         if (auto it = g_rts.find(kBase); it != g_rts.end()) {
+            cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+            g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
             destroy_rt_image(it->second);
             g_rts.erase(it);
             ++g_rt_gen;
@@ -25377,6 +26206,8 @@ void host_gpu_refill_selftest() {
         }
         for (const std::uint64_t b : {kBase, kInside}) {
             if (auto it = g_rts.find(b); it != g_rts.end()) {
+                cache_rw::Write rts_cw(cache_rw::kTargets);  // stage 4b.1b's readers never meet a target let go or overwritten
+                g_rt_erase_gen.fetch_add(1, std::memory_order_acq_rel);  // (published targets are old from here: lists_commit checks)
                 destroy_rt_image(it->second);
                 g_rts.erase(it);
             }

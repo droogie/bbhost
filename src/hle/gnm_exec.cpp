@@ -2598,6 +2598,13 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         list_resolve::run_fork(following, stop, static_cast<std::uint64_t>(ns));
                     }
                 }
+                // Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the pool's commit of the
+                // draw spliced in, where it falls in the run open here.
+                const std::uint64_t token_id = b[1] | (static_cast<std::uint64_t>(b[2]) << 32);
+                if (in && !committed && gxvk_lists::splice() && !list_resolve::commit_draws() && host_gpu_splice(token_id)) {
+                    committed = true;
+                    g_draws.fetch_add(1);
+                }
                 if (in && !committed) {
                     const bool lists_census = gxvk_lists::census() && !list_resolve::commit_draws();
                     if (lists_census) {
@@ -2607,6 +2614,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     const bool look = gxvk_lists::compare() && !list_resolve::commit_draws() && gxvk_lists::look_due();
                     if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                     native_draw(in, "native");
+                    if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
                     if (look) gxvk_lists::cp_look_end();
                     if (lists_census) gxvk_lists::cp_draw_end();
                     if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
@@ -3097,6 +3105,7 @@ void cp_thread(Queue* q, int id) {
     std::uint64_t taken = 0, taken_at = 0, idle_empty = 0, idle_sleeps = 0, idle_ns = 0, idle_max_ns = 0;
     std::uint64_t idle_since = host_clock_monotonic_ns();
     for (;;) {
+        if (gxvk_lists::splice()) gxvk_lists::keep_off_pool_cpus();  // stage 4b.1b: off the pool's cores, once it has them
         Job job;
         if (idle_log && q->pushed.load(std::memory_order_acquire) <= taken) ++idle_empty;
         {

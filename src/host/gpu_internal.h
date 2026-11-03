@@ -87,6 +87,17 @@ struct BumpSink {
         }
         c->fetch_add(v, std::memory_order_relaxed);
     }
+    // Stage 4b.1b's pool, beside the command processor: the counts added with
+    // locked adds (a statistic the command processor bumps meanwhile may lose
+    // one of them), and the table emptied.
+    void merge_atomic() {
+        for (std::size_t k = 0; k < nused; ++k) {
+            const std::uint16_t i = used[k];
+            key[i]->fetch_add(n[i], std::memory_order_relaxed);
+            key[i] = nullptr;
+        }
+        nused = 0;
+    }
     // At the join, under g.mu: the counts into the counters, and the table emptied.
     void merge() {
         for (std::size_t k = 0; k < nused; ++k) {
@@ -106,7 +117,7 @@ extern thread_local constinit BumpSink* t_bump_sink;
 // only with BBHOST_RUN_COMMIT on: a thread-local read is several loads where
 // the bump is one add, and the draw path bumps at a hundred places.
 inline void bump(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) {
-    if (list_resolve::committing()) [[unlikely]] {
+    if (list_resolve::committing() || list_resolve::parts()) [[unlikely]] {
         if (BumpSink* s = t_bump_sink) {
             s->add(&c, n);
             return;
@@ -1286,7 +1297,7 @@ struct DrawCtx {
 // The context draw_impl allocates through (null outside one, and with the
 // switch off).
 extern thread_local constinit DrawCtx* t_draw_ctx;
-inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::commit_draws() ? t_draw_ctx : nullptr; }
+inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::parts() ? t_draw_ctx : nullptr; }
 // BBHOST_RUN_COMMIT=compare (render.cpp run_commit): what a draw resolved -
 // what it binds and draws - as it would be the same committed in a part or in
 // order: what lives in the rings it copies into (whose places differ) by the
@@ -1354,6 +1365,79 @@ struct RunDraw {
     bool drew_gx = false;
     const std::string* vs_other = nullptr;
     int vs_other_why = 0;
+    // Stage 4b.1b: a draw a pool thread commits ahead of the command
+    // processor (render.cpp lists_commit) - `part` too, with what its list mode
+    // changes: its params blocks kept as contents (alloc_params_slot_locked),
+    // its packet the token slot's list packet, and what only the walk's place
+    // answers (the pass, the hazards, the owed clears, the refreshes) noted
+    // for the splice rather than read. Null outside one.
+    struct ListNotes* list = nullptr;
+};
+// Stage 4b.1b: the params blocks a list-mode draw keeps (alloc_params_slot_locked
+// fills them; the splice copies them into slots of the recording it lands in).
+struct ListParams {
+    std::uint32_t n = 0;
+    gcn::StageParams p[2];
+};
+// Stage 4b.1b: what a list-mode draw notes for its splice - what in order it
+// would have read at its place in the walk: the pass it draws in (its key),
+// the images it samples (the lazy barriers' hazards, the owed clears), the
+// texture views it binds by id (their refresh in the recording it lands in),
+// and the cached sets it binds (still the cache's at the splice).
+struct ListNotes {
+    static constexpr std::uint32_t kMost = 32;
+    ListParams params;
+    std::uint64_t pass_key = 0;
+    std::uint32_t nsampled = 0;
+    std::uint64_t sampled[kMost] = {};
+    std::uint32_t nviews = 0;
+    std::uint32_t view_id[kMost] = {};
+    std::uint8_t view_flags[kMost] = {};
+    VkImageView view[kMost] = {};
+    std::uint32_t nhomes = 0;
+    std::uint32_t home[kMost] = {};   // constant buffers' homes it binds by handle (none with a copy pending)
+    std::uint32_t nsegs = 0;
+    std::uint32_t seg[4] = {};        // the list arena's segments its constant-buffer copies went into
+    std::uint64_t seg_lap[4] = {};
+    std::uint64_t packet_index = 0;  // its token slot's list packet (recorder_list_packet)
+    std::uint64_t set_key[2] = {};
+    VkDescriptorSet set[2] = {};
+    bool full = false;  // more to note than fits: not committed
+    void clear() {
+        params.n = 0;
+        pass_key = 0;
+        nsampled = nviews = 0;
+        set_key[0] = set_key[1] = 0;
+        set[0] = set[1] = VK_NULL_HANDLE;
+        nhomes = nsegs = 0;
+        full = false;
+    }
+    void note_home(std::uint32_t handle) {
+        for (std::uint32_t k = 0; k < nhomes; ++k) {
+            if (home[k] == handle) return;
+        }
+        if (nhomes < kMost) home[nhomes++] = handle;
+        else full = true;
+    }
+    void note_sampled(std::uint64_t base) {
+        for (std::uint32_t k = 0; k < nsampled; ++k) {
+            if (sampled[k] == base) return;
+        }
+        if (nsampled < kMost) sampled[nsampled++] = base;
+        else full = true;
+    }
+    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v) {
+        for (std::uint32_t k = 0; k < nviews; ++k) {
+            if (view_id[k] == id && view_flags[k] == flags) return;
+        }
+        if (nviews < kMost) {
+            view_id[nviews] = id;
+            view[nviews] = v;
+            view_flags[nviews++] = flags;
+        } else {
+            full = true;
+        }
+    }
 };
 extern thread_local constinit RunDraw* t_run_draw;
 // The most parts a run is split into: the command processor's and a run
@@ -1384,7 +1468,7 @@ enum RunStop : int {
 // have stopped at) and goes on. Outside both: false.
 inline bool run_part_stop(int why) {
     if (gxvk_lists::census()) gxvk_lists::t_effects |= 1u << why;  // stage 4's census: what the draw needed in order
-    if (!list_resolve::commit_draws()) return false;  // (no thread-local read with it off)
+    if (!list_resolve::parts()) return false;  // (no thread-local read with it off)
     RunDraw* const r = t_run_draw;
     if (!r) return false;
     if (!r->part) {
@@ -1404,13 +1488,13 @@ inline bool run_part_stop(int why) {
 constexpr std::uint32_t kRunLocalStops =
     1u << kRunStopParams | 1u << kRunStopProgram | 1u << kRunStopRefresh | 1u << kRunStopRing | 1u << kRunStopMirror;
 inline bool run_part() {
-    if (!list_resolve::commit_draws()) return false;
+    if (!list_resolve::parts()) return false;
     const RunDraw* const r = t_run_draw;
     return r && r->part;
 }
 // A run part's draw that has stopped (its first stop kept).
 inline bool run_part_stopped() {
-    if (!list_resolve::commit_draws()) return false;
+    if (!list_resolve::parts()) return false;
     const RunDraw* const r = t_run_draw;
     return r && r->part && r->stop >= 0;
 }
@@ -2069,11 +2153,24 @@ VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
 // sampler cache hold, without a refresh, a count or anything made; null when
 // not made yet.
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
+// Stage 4b.1b's splice (render.cpp host_gpu_splice, under g.mu): whether view
+// `id` (its flags) still binds `view` and a bind of it here would refresh
+// nothing - the entry unchanged, its surface skipped or refreshed in this
+// recording already, no made-ahead upload owed - as texture_view_by_id would
+// answer it in order.
+bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view);
+// Stage 4b.1b's list mode: its draws' image stops, by kind (textures.cpp) - a view by its T#'s words, a view by
+// id not made yet, a sampler not made yet.
+extern std::atomic<std::uint64_t> g_list_image_stops[3];
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
 // cache_rw::Read, into `out` (stage 4b.1a's pool).
 void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists::LookSink& out);
+// Stage 4b.1b's pool (host/gxvk_lists.h splice): GX-native draw token `id`'s
+// draw committed ahead of the command processor, in its list mode, into the
+// record the command processor's splice reads (render.cpp host_gpu_splice).
+void lists_commit(std::uint64_t id);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
@@ -2212,6 +2309,10 @@ void homes_begin_recording_locked();
 // (gxvk_homes::BindFall: today's path).
 enum { kHomeBound = 0, kHomePending = 1, kHomeFall = 16 };
 int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, Located& out);
+// Stage 4b.1b's splice (under g.mu): whether home `handle` still binds as a
+// list-mode draw bound it - live (or ended, within its grace), filled, and no
+// copy into it pending in this pass.
+bool homes_splice_ok(std::uint32_t handle);
 // By address (no handle): [va, +bytes) inside a live home - `out` the home (filled first), `address` its device
 // address. With =compare, false (today's path is bound).
 bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, VkDeviceAddress* address = nullptr);
@@ -2652,6 +2753,9 @@ public:
     // stream when published - the command processor appends it in its order
     // at the join (recorder_append_packet) - and never becomes the open draw.
     void start_reserved(std::uint64_t number, bool part);
+    // Stage 4b.1b: a pool thread's list packet (recorder_list_packet), kept
+    // out of the stream when published - the command processor splices it.
+    void start_list(void* packet);
     DrawCmds(const DrawCmds&) = delete;
     DrawCmds& operator=(const DrawCmds&) = delete;
     bool deferred() const { return packet_ != nullptr; }
@@ -2726,6 +2830,15 @@ bool recorder_threaded();
 std::uint64_t recorder_reserve_packets(std::uint32_t n);
 void recorder_append_packet(std::uint64_t number);
 void recorder_publish_appended();
+// Stage 4b.1b (gxvk_lists.h splice): the list packet of token slot `index`,
+// filled by the pool thread that commits the token's draw; whether the
+// recorder has replayed what was last spliced from it (a pool thread reuses it
+// only then); and its splice into the stream at the command processor's
+// place (under g.mu), its params blocks' offsets patched in first: the commit
+// put block k's index k where the offset goes.
+void* recorder_list_packet(std::uint64_t index);
+bool recorder_list_packet_free(std::uint64_t index);
+void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams);
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it
 // with the pass end before it. Null outside a draw, or when it records in place.

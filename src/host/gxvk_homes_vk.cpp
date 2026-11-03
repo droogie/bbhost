@@ -640,7 +640,16 @@ int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t by
             return kHomeFall + static_cast<int>(kFallFill);
         }
     }
-    if (e->pending) {
+    if (t_run_draw && t_run_draw->list) {
+        // Stage 4b.1b's list mode: bound by handle, with no copy pending into
+        // it at its splice either (homes_splice_ok); one pending now is in order.
+        if (e->pending) {
+            run_part_stop(kRunStopOrder);
+            bump(g_fall[kFallPart]);
+            return kHomeFall + static_cast<int>(kFallPart);
+        }
+        t_run_draw->list->note_home(handle);
+    } else if (e->pending) {
         // A copy into it pending in this pass: the draw reads what the copy writes, from its source.
         if (pending_lookup(base, bytes, &out) == kCopyVersionInside) {
             bump(g_bound_pending);
@@ -658,6 +667,14 @@ int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t by
     bump(st == kEnded ? g_bound_ended : g_bound);
     if (bytes > e->bytes - (base - e->memory)) bump(g_bound_past);  // (a shader reading past the buffer's end: its class's room)
     return kHomeBound;
+}
+
+bool homes_splice_ok(std::uint32_t handle) {
+    const Home* e = home_at(gxvk_homes::handle_index(handle));
+    if (!e) return false;
+    const std::uint32_t w = e->word.load(std::memory_order_acquire);
+    const std::uint32_t st = state_of(w);
+    return gen_of(w) == gxvk_homes::handle_gen(handle) && (st == kLive || st == kEnded) && e->filled && !e->pending;
 }
 
 int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, VkDeviceSize src_off, const void* src_map) {

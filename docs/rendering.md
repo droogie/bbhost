@@ -751,6 +751,34 @@ built yet; the reasoning, as measured on the development machine:
   after their GX call. The split, the runs (`BBHOST_LIST_RESOLVE=runs`) and
   the order to build it in are [list-resolve.md](list-resolve.md).
 
+**Draws committed ahead and spliced (`BBHOST_GXVK_LISTS=splice`, off by
+default while it is measured).** A first form of it is built: a pool of host
+threads (`bb-list0`, `bb-list1`) takes each GX-native draw a GX thread has
+stored and commits it ahead of the command processor through the draw path
+itself, in a list mode - a run part's draw (as the run commit's parts make
+them) with its own packet, its params blocks kept as contents, its constant
+buffers' copies in an arena of its own, the targets the command processor last
+looked up for the same target names, and the caches read through their readers'
+paths under a lock their writers take exclusive (`src/host/cache_rw.h`).
+Whatever only the command processor's place in the walk answers - the pass,
+the barriers owed for what the draw samples, owed clears, a texture's refresh in
+the recording it lands in, occlusion queries and predicates, a cached set
+still being the cache's, a home with a copy pending - is noted, not read. At
+the draw's token the command processor checks those notes against the run it
+has open (the run's first draw drawn as before: its targets looked up, its
+pass begun), makes the refreshes as it would, copies the params into the
+recording's slots and appends the packet; any draw not committed, or whose
+checks fail, is drawn as before, counted by why. A draw that reads an answer of
+the walk's order (copy versions, GPU writes, the buffer shadow's mirrors,
+twins) is not committed, so the constant buffers' homes
+(`BBHOST_GXVK_HOMES=1`) are what give it most of its draws.
+`BBHOST_GXVK_LISTS=splice-compare` draws every draw as before and compares
+each draw the splice would have taken with the commit, field by field; the
+pool's threads keep cores of their own (`BBHOST_GXVK_LIST_CPUS=off`: anywhere).
+On lavapipe at Central Yharnam with the homes on, the pool committed 64% of
+the draws and the command processor spliced 55%; the compare found 0 of 52,269
+draws different, and the frames were within the noise of the homes alone.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in

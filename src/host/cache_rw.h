@@ -44,11 +44,14 @@ void lock_shared_slow();
 void unlock_shared_slow();
 
 // The caches, as the writes name them (gxvk_lists::LookKind's order).
-enum Cache : int { kPrograms, kFetch, kPaths, kPlans, kViews, kSamplers, kCaches };
+enum Cache : int { kPrograms, kFetch, kPaths, kPlans, kViews, kSamplers, kCaches,
+                   // Stage 4b.1b's list mode reads these too: the render targets (g_rts), the
+                   // pipelines (g_gfx), the descriptor set cache.
+                   kTargets = kCaches, kPipelines, kSets, kKinds };
 
 // Each cache's writes so far (moved under the exclusive lock; a reader reads
 // them under the shared one).
-extern std::atomic<std::uint64_t> g_gen[kCaches];
+extern std::atomic<std::uint64_t> g_gen[kKinds];
 inline std::uint64_t gen(int cache) { return g_gen[cache].load(std::memory_order_relaxed); }
 
 // A writer around a change of `cache` a reader could see.

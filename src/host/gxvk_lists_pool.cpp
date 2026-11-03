@@ -37,6 +37,10 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
+#if !defined(_WIN32)
+#include <fstream>
+#include <sched.h>
+#endif
 
 namespace gxvk_lists {
 
@@ -217,19 +221,90 @@ void pool_main(int index) {
             g_feed_lapped.add();
             continue;
         }
-        look(id);
+        if (splice()) {
+            gpu::lists_commit(id);  // stage 4b.1b
+        } else {
+            look(id);
+        }
     }
 }
+
+// ---- the pool's cores (keep_off_pool_cpus) ----
+#if !defined(_WIN32)
+cpu_set_t g_pool_cpu[4];          // pool thread i's own CPU
+cpu_set_t g_off_pool;             // the process's CPUs less the pool's cores (both hardware threads)
+std::atomic<bool> g_off_ready{false};
+// The pool's cores from the process's CPUs, its last `n` physical cores; false
+// when there are too few to spare them (four cores at least must remain).
+bool choose_pool_cpus(int n) {
+    const char* e = std::getenv("BBHOST_GXVK_LIST_CPUS");
+    if (e && std::strcmp(e, "off") == 0) return false;
+    if (!splice() && !(e && std::strcmp(e, "auto") == 0)) return false;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+    // Each allowed CPU's core: the lowest CPU among its siblings.
+    std::vector<int> core_of(CPU_SETSIZE, -1);
+    std::vector<int> cores;  // a core's lowest allowed CPU, in order
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) continue;
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+        std::string list;
+        std::getline(f, list);
+        const int first = list.empty() ? cpu : std::atoi(list.c_str());  // "a,b" or "a-b": the lowest first
+        core_of[cpu] = first;
+        bool known = false;
+        for (const int c : cores) known |= c == first;
+        if (!known) cores.push_back(first);
+    }
+    if (static_cast<int>(cores.size()) < n + 4) return false;
+    CPU_ZERO(&g_off_pool);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) CPU_SET(cpu, &g_off_pool);
+    }
+    std::string said;
+    for (int i = 0; i < n; ++i) {
+        const int core = cores[cores.size() - 1 - static_cast<std::size_t>(i)];
+        CPU_ZERO(&g_pool_cpu[i]);
+        CPU_SET(core, &g_pool_cpu[i]);
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (core_of[cpu] == core) CPU_CLR(cpu, &g_off_pool);
+        }
+        said += (said.empty() ? "" : ", ") + std::to_string(core);
+    }
+    host_log("gxvk-lists: the pool's threads on CPUs %s, their cores' other hardware threads left idle; the command processor and the "
+             "recorder kept off those cores (BBHOST_GXVK_LIST_CPUS=off: anywhere)",
+             said.c_str());
+    return true;
+}
+#endif
 
 void start() {
     g_feed = new Feed[kFeed];
     g_look.store(new LookRecord[kLookSlots], std::memory_order_release);
     const int n = pool_threads();
-    host_log("gxvk-lists: stage 4b.1a's pool: %d thread%s look ahead of the command processor at each stored GX-native draw "
-             "(BBHOST_GXVK_LISTS=%d%s, 1 draw in %u)",
-             n, n == 1 ? "" : "s", g_pool_mode, g_pool_mode == 2 ? ": the command processor compares its answers with the pool's" : "",
-             g_look_every);
-    for (int i = 0; i < n; ++i) g_threads.emplace_back(pool_main, i);
+    if (splice()) {
+        host_log("gxvk-lists: stage 4b.1b's pool: %d thread%s commit each stored GX-native draw ahead of the command processor, which "
+                 "splices them (BBHOST_GXVK_LISTS=%s)",
+                 n, n == 1 ? "" : "s", splice_compare() ? "splice-compare: drawn in order too, and compared" : "splice");
+    } else {
+        host_log("gxvk-lists: stage 4b.1a's pool: %d thread%s look ahead of the command processor at each stored GX-native draw "
+                 "(BBHOST_GXVK_LISTS=%d%s, 1 draw in %u)",
+                 n, n == 1 ? "" : "s", g_pool_mode, g_pool_mode == 2 ? ": the command processor compares its answers with the pool's" : "",
+                 g_look_every);
+    }
+#if !defined(_WIN32)
+    const bool pinned = choose_pool_cpus(n < 4 ? n : 4);
+#endif
+    for (int i = 0; i < n; ++i) {
+        g_threads.emplace_back(pool_main, i);
+#if !defined(_WIN32)
+        if (pinned && i < 4) pthread_setaffinity_np(g_threads.back().native_handle(), sizeof(cpu_set_t), &g_pool_cpu[i]);
+#endif
+    }
+#if !defined(_WIN32)
+    if (pinned) g_off_ready.store(true, std::memory_order_release);
+#endif
     g_ready.store(true, std::memory_order_release);
 }
 
@@ -304,6 +379,10 @@ void report_line(bool at_exit) {
                       pct(d.kind_found[k], d.kind_looked[k]).c_str(), k + 1 < kLookKinds ? ", " : "");
         kinds += buf;
     }
+    if (splice()) {
+        host_log("gxvk-lists (%s): stage 4b.1b: %s", what, host_gpu_splice_report(!at_exit).c_str());
+        return;
+    }
     host_log("gxvk-lists (%s): the pool looked at %llu draws, %.2f us a draw (fed %llu; the command processor first %llu; feed lapped "
              "%llu, skipped %llu; answers past a record %llu); its lookups: %s; cache_rw: writes %llu (%llu waited for a reader), "
              "reads %llu (%llu waited for the writer)",
@@ -348,6 +427,15 @@ thread_local u64 t_cp_stamp = 0;
 u32 slot_of(u64 key) { return static_cast<u32>((key * 0x9e3779b97f4a7c15ull) >> 56) & (kCpTable - 1); }
 
 }  // namespace
+
+void keep_off_pool_cpus() {
+#if !defined(_WIN32)
+    static thread_local bool applied = false;
+    if (applied || !g_off_ready.load(std::memory_order_acquire)) return;
+    applied = true;
+    sched_setaffinity(0, sizeof(g_off_pool), &g_off_pool);
+#endif
+}
 
 void draw_stored(std::uint64_t id) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);

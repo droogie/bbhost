@@ -45,6 +45,7 @@
 // to bb-submit (R4).
 
 #include "host/gpu_internal.h"
+#include "host/gxvk_lists.h"
 #include "host/list_resolve.h"
 #include "host/stream_ops.h"
 
@@ -58,6 +59,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -77,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers"};
+                                        "push buffers",   "list draw"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -264,6 +266,16 @@ enum Mode : int { kModeOff, kModeInline, kModeThread };
 Block* g_blocks = nullptr;
 Block g_inline_block;  // kModeInline: replayed as it is published
 DrawPacket* g_packets = nullptr;
+// Stage 4b.1b: the packets the pool's threads commit ahead (render.cpp
+// lists_commit), one a token slot (the same index), spliced into the stream
+// as kListDraw ops. The token's id each was last spliced for, and replayed
+// for: a pool thread reuses one only once the recorder has replayed what was
+// spliced (recorder_list_packet_free).
+constexpr std::uint64_t kListPackets = 16384;
+DrawPacket* g_list_packets = nullptr;
+std::atomic<std::uint64_t>* g_list_spliced = nullptr;
+std::atomic<std::uint64_t>* g_list_replayed = nullptr;
+std::once_flag g_list_made;
 // Each counter on a cache line of its own: the producer writes g_published
 // at every draw and the recorder g_done and g_pk_done after every block, and
 // sharing a line with them made every publish a miss across the cores (two
@@ -503,6 +515,12 @@ void replay_block(const Block& b) {
             g_pk_done.store(r->packet + 1, std::memory_order_release);
             break;
         }
+        case Op::kListDraw: {
+            const auto* r = reinterpret_cast<const stream::ListDraw*>(p);
+            replay_packet(g_list_packets[r->index], cmd);
+            g_list_replayed[r->index].store(r->id, std::memory_order_release);
+            break;
+        }
         case Op::kBarrier: {
             const auto* r = reinterpret_cast<const stream::Barrier*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
@@ -675,6 +693,7 @@ void recorder_thread() {
     const int spin = g_recorder_spin;
     std::uint64_t done = g_done.load(std::memory_order_acquire);
     for (;;) {
+        if (gxvk_lists::splice()) gxvk_lists::keep_off_pool_cpus();  // (once the pool has its cores)
         std::uint64_t published = g_published.load(std::memory_order_acquire);
         if (published == done) {
             // Draws come in bursts a few microseconds apart: spin through
@@ -914,6 +933,50 @@ void recorder_append_packet(std::uint64_t number) {
 }
 
 void recorder_publish_appended() { publish_block(false); }
+
+// ---- Stage 4b.1b: the pool's list packets (render.cpp lists_commit / host_gpu_splice) ----
+
+void list_packets_make() {
+    std::call_once(g_list_made, [] {
+        g_list_packets = new DrawPacket[kListPackets];
+        g_list_spliced = new std::atomic<std::uint64_t>[kListPackets];
+        g_list_replayed = new std::atomic<std::uint64_t>[kListPackets];
+        for (std::uint64_t k = 0; k < kListPackets; ++k) {
+            g_list_spliced[k].store(0, std::memory_order_relaxed);
+            g_list_replayed[k].store(0, std::memory_order_relaxed);
+        }
+    });
+}
+
+void* recorder_list_packet(std::uint64_t index) {
+    list_packets_make();
+    return &g_list_packets[index % kListPackets];
+}
+
+bool recorder_list_packet_free(std::uint64_t index) {
+    list_packets_make();
+    const std::uint64_t k = index % kListPackets;
+    const std::uint64_t spliced = g_list_spliced[k].load(std::memory_order_acquire);
+    return !spliced || g_list_replayed[k].load(std::memory_order_acquire) == spliced;
+}
+
+void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams) {
+    const std::uint64_t k = index % kListPackets;
+    DrawPacket& p = g_list_packets[k];
+    // Its params blocks' offsets: the commit put each block's index in the
+    // set binding's dynamic offsets (gpu.cpp alloc_params_slot_locked).
+    for (std::uint32_t i = 0; i < p.dynamic_count && i < 2; ++i) {
+        if (p.dynamic[i] < nparams) p.dynamic[i] = params_offsets[p.dynamic[i]];
+    }
+    if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
+    g_list_spliced[k].store(id, std::memory_order_release);
+    std::uint8_t* at = append_record(Op::kListDraw, sizeof(stream::ListDraw));
+    auto* r = put_struct<stream::ListDraw>(at);
+    r->index = k;
+    r->id = id;
+    after_op();
+    publish_block(false);  // as a draw's own publish
+}
 
 void recorder_drain() {
     if (g_mode != kModeThread || !g_blocks) return;
@@ -1481,6 +1544,14 @@ void DrawCmds::start_reserved(std::uint64_t number, bool part) {
     if (part) return;
     if (g_open && g_open != this) g_open->publish();
     g_open = this;
+}
+
+void DrawCmds::start_list(void* packet) {
+    if (packet_) return;
+    DrawPacket& p = *static_cast<DrawPacket*>(packet);
+    p.reset();
+    packet_ = &p;
+    part_ = true;  // out of the stream when published: the command processor splices it (recorder_splice_list_packet)
 }
 
 DrawCmds* DrawCmds::open() { return g_open; }

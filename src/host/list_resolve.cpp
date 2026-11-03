@@ -55,7 +55,12 @@ int run_commit_from_env() {
 const int g_batch = [] {
     const char* e = std::getenv("BBHOST_RUN_BATCH");
     // A run's parts take its targets as batching shares them: on with the commit.
-    if (!e || !*e) return run_commit_from_env() >= 2 ? 1 : 0;
+    if (!e || !*e) {
+        if (run_commit_from_env() >= 2) return 1;
+        // And with stage 4b.1b's splice: a run's later draws find its first's targets.
+        const char* l = std::getenv("BBHOST_GXVK_LISTS");
+        return l && std::strncmp(l, "splice", 6) == 0 ? 1 : 0;
+    }
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
 }();
@@ -68,6 +73,14 @@ const int g_draw_ctx = [] {
 }();
 
 const int g_commit = run_commit_from_env();
+
+// (Read from the environment, not from g_commit or gxvk_lists: no order
+// between the two modules' initialisers.)
+const bool g_parts = [] {
+    if (run_commit_from_env() >= 2) return true;
+    const char* e = std::getenv("BBHOST_GXVK_LISTS");
+    return e && std::strncmp(e, "splice", 6) == 0;
+}();
 
 void log_commit_default() {
     static std::once_flag once;

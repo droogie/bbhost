@@ -3181,15 +3181,15 @@ static void shader_caches_check_build() {
 
 // Rebuild the guest page tables when the mapping list changed.
 bool rebuild_page_tables() {
-    static std::uint64_t seen_gen = 0;
+    static std::atomic<std::uint64_t> seen_gen{0};  // (atomic: stage 4b.1b's pool asks it beside the command processor)
     const std::uint64_t gen = hle_kernel_maps_generation();
-    if (gen == seen_gen) {
+    if (gen == seen_gen.load(std::memory_order_acquire)) {
         return true;
     }
     // A run part's draw (BBHOST_RUN_COMMIT): rebuilt in order, by the command
     // processor's commit of it.
     if (run_part_stop(kRunStopTables)) return false;
-    seen_gen = gen;
+    seen_gen.store(gen, std::memory_order_release);
     std::vector<GuestMapInfo> maps;
     hle_kernel_snapshot_maps(maps);
     std::uint64_t h = 1469598103934665603ull;
@@ -5196,7 +5196,21 @@ void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
     if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutParams);  // BBHOST_DRAW_CONTEXT's census
     std::uint32_t slot;
-    if (RunDraw* const r = t_run_draw; r && r->part) {
+    RunDraw* const r = t_run_draw;
+    if (r && r->list) {
+        // Stage 4b.1b: a list-mode draw keeps its blocks; the splice copies
+        // them into slots of the recording it lands in and puts their offsets
+        // where block k's index k stands now (recorder_splice_list_packet).
+        ListParams& lp = r->list->params;
+        if (lp.n == 2) {
+            if (r->stop < 0) r->stop = kRunStopParams;
+            out = {g.ubo, 1, sizeof(gcn::StageParams)};
+            return 1;
+        }
+        lp.p[lp.n] = params;
+        out = {g.ubo, lp.n, sizeof(gcn::StageParams)};
+        return lp.n++;
+    } else if (r && r->part) {
         // A run part's draw: from its reservation. One past it stops the draw
         // (render.cpp kRunStopParams), which is then committed again in order:
         // the block goes over its own last slot meanwhile.
@@ -5216,6 +5230,10 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 }
 
 void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescriptorBufferInfo& slot) {
+    if (RunDraw* const r = t_run_draw; r && r->list) {  // a list-mode draw's kept block (alloc_params_slot_locked)
+        if (slot.offset < r->list->params.n) r->list->params.p[slot.offset] = params;
+        return;
+    }
     put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), params);
 }
 

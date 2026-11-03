@@ -2237,6 +2237,12 @@ void textures_drain_gx_writes_locked() {
     if (gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
 }
 void refresh_surface_locked(Surface& sf) {
+    // Stage 4b.1b's list mode: a surface bound other than by its view's id is
+    // refreshed in order (the splice asks only views by id).
+    if (t_run_draw && t_run_draw->list) {
+        run_part_stop(kRunStopRefresh);
+        return;
+    }
     // A made-ahead upload still to be recorded (BBHOST_GXVK_AHEAD_DEFER) is
     // recorded before the image is used, in order: a run part's draw stops
     // there, as at a refresh's own upload (a local stop - only draws that
@@ -3385,6 +3391,11 @@ std::uint64_t view_epoch() { return g_view_epoch; }
 // what it may and may not skip.
 VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
                          bool shader_arrayed, bool r128) {
+    if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: views by their GX id only (the splice asks those)
+        g_list_image_stops[0].fetch_add(1, std::memory_order_relaxed);
+        run_part_stop(kRunStopImages);
+        return VK_NULL_HANDLE;
+    }
     if (!g_view_memo_mode) {
         const VkImageView v = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
         if (img_census::on()) img_census::g_last = g_last_view_surface;
@@ -3578,6 +3589,24 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                                bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    if (t_run_draw && t_run_draw->list) {
+        // Stage 4b.1b's list mode, under the readers' lock: the entry as it was
+        // made (its view, dims, surface and slot are written only with the lock
+        // held), its refresh asked at the splice (texture_view_splice_ok).
+        const VkImageView found = texture_view_find(id, flags);
+        if (!found || copy_elide_live()) {
+            g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
+            run_part_stop(kRunStopImages);
+            return VK_NULL_HANDLE;
+        }
+        t_run_draw->list->note_view(id, flags, found);
+        if (slot) *slot = e.slot;
+        if (base) *base = e.base;
+        dims_ok = e.dims_ok;
+        dim = e.dim;
+        arrayed = e.arrayed;
+        return found;
+    }
     // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image until the copy is made: resolved
     // again (by its T#'s base, which stage 2's entries keep), and not remembered.
     const bool elided = e.id == id && !e.sf && copy_elide_live() && (g_images_mode ? copy_elide_hides(e.base) : copy_elide_hides_tsharp(w));
@@ -3588,7 +3617,11 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                           (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
                           !gx_writes_pending().load(std::memory_order_acquire);
         const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no entry and no count
-        if (skip && g_images_mode == 1) {
+        if (t_run_draw && t_run_draw->list) {
+            // Stage 4b.1b's list mode: its refresh is asked at its splice, in
+            // the recording it lands in (texture_view_splice_ok).
+            t_run_draw->list->note_view(id, flags, e.view);
+        } else if (skip && g_images_mode == 1) {
             if (!part) ++g_images_skips;
         } else {
             const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
@@ -3661,6 +3694,37 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
     return view;
 }
 
+bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view) {
+    IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags || e.view != view) return false;
+    const bool elided = !e.sf && copy_elide_live();  // (its image's source bound until a copy is made: in order)
+    if (elided) return false;
+    if (e.sf && e.sf->pending) return false;  // a made-ahead upload to record first
+    const bool skip = e.fast && e.static_epoch == g_static_epoch &&
+                      (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
+                      !gx_writes_pending().load(std::memory_order_acquire);
+    if (skip && g_images_mode == 1) {
+        ++g_images_skips;
+        return true;
+    }
+    // Its refresh in this recording, made here as texture_view_by_id makes it
+    // in order: the gate's checks, an upload into the recording's uploads
+    // (before its draws), its stamp.
+    const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
+    if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
+        if (g_images_mode) {
+            images_refresh(e, skip);
+        } else {
+            refresh_surface_locked(*e.sf);
+        }
+        e.refreshed = stamp;
+        if (e.view != view || e.id != id) return false;  // (remade by its refresh: in order)
+    }
+    if (e.sf) ahead_defer::met_pending(*e.sf, "its view's entry");
+    ++g_id_view_hits;
+    return true;
+}
+
 // Stage 4b.1a's reader path (host/cache_rw.h, under its shared lock): the view
 // the entry for `id` holds while it stands - no refresh asked, nothing counted
 // or made; null when it is not made yet (the command processor makes it, and
@@ -3672,6 +3736,7 @@ VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
 }
 
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
+    if (t_run_draw && t_run_draw->list) return false;  // stage 4b.1b: key_dim is written without the readers' lock
     const IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
     if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags || e.key_dim == kNoKeyDim) return false;
     dim = e.key_dim & (depth ? 0xffu : 0x7fffffffu);  // a depth compare's has no texel kind (image_dim_of)
@@ -3680,6 +3745,7 @@ bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, st
 }
 
 void texture_key_dims_note(std::uint32_t id, std::uint8_t flags, std::uint32_t dim, bool arrayed) {
+    if (t_run_draw && t_run_draw->list) return;  // (the command processor's to note)
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
     if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) e.key_dim = (dim & 0x7fffffffu) | (arrayed ? 0x80000000u : 0u);
 }
@@ -3860,7 +3926,16 @@ bool sampler_fixes_on() {
     return on;
 }
 
+std::atomic<std::uint64_t> g_list_image_stops[3] = {};  // stage 4b.1b's list mode: by words, a view by id not found, a sampler
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
+    if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: the reader path (made in order)
+        const VkSampler found = sampler_find(s, compare);
+        if (!found) {
+            g_list_image_stops[2].fetch_add(1, std::memory_order_relaxed);
+            run_part_stop(kRunStopImages);
+        }
+        return found;
+    }
     // The last sampler made for these words, in front of the map (samplers
     // are never destroyed).
     struct Memo {

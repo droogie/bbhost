@@ -75,6 +75,14 @@ void log_commit_default();
 inline bool committing() { return g_commit != 0; }
 inline bool commit_draws() { return g_commit >= 2; }
 inline bool commit_compare() { return g_commit == 3; }
+// Whether draws are committed off the order at all: a run's parts (the
+// commit on or compare) or stage 4b.1b's pool committing draws ahead of the
+// command processor (BBHOST_GXVK_LISTS=splice or splice-compare,
+// host/gxvk_lists.h). The part machinery (render.cpp RunDraw, run_part_stop,
+// the draw contexts, the counters' sinks) reads it; the run commit's own
+// fork and join read commit_draws().
+extern const bool g_parts;
+inline bool parts() { return g_parts; }
 // Whether the command processor tells this module what it walks.
 inline bool on() { return g_mode != 0 || g_batch != 0 || g_commit != 0; }
 // Whether the run census counts.

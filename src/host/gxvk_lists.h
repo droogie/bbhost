@@ -43,10 +43,31 @@ inline bool census() { return g_census; }
 // different (a reader's wrong answer: must stay 0). The pool's threads:
 // BBHOST_GXVK_LIST_THREADS, else 2 on 16 or more hardware threads, 1 on 8-15,
 // none below (the pool off). Read before any of the game's code runs.
-extern const int g_pool_mode;  // 0 off, 1 the pool's lookups, 2 and the compare
+extern const int g_pool_mode;  // 0 off, 1 the pool's lookups, 2 and the compare, 3 splice, 4 splice-compare
 int pool_threads();             // 0 when the pool is off
 inline bool pool() { return g_pool_mode != 0; }
 inline bool compare() { return g_pool_mode == 2; }
+
+// Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the pool commits each stored
+// GX-native draw ahead of the command processor - through draw_impl in its
+// list mode (render.cpp lists_commit: a run part's commit with its own
+// packet, its params kept as contents, and what only the walk's place
+// answers noted for the splice instead of read) - and the command processor,
+// at a token whose draw falls in the run it has open (the run's first draw
+// drawn in order: its targets looked up, its pass begun), checks the commit
+// and splices its packet (host_gpu_splice). A draw not committed, not yet
+// committed, or whose checks fail is drawn in order, counted by why.
+// splice-compare: every draw drawn in order (its packet submitted), each
+// committed one compared with it field by field (RunDigest) and dropped.
+inline bool splice() { return g_pool_mode >= 3; }
+inline bool splice_compare() { return g_pool_mode == 4; }
+
+// The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
+// with splice - the last physical cores of the process's CPUs, one a pool
+// thread, both of a core's hardware threads kept for it; off): the command
+// processor and the recorder call this in their loops, and keep off them from
+// the first call after the pool has started (one sched_setaffinity each).
+void keep_off_pool_cpus();
 
 // The recording thread stored GX-native draw token `id`'s slot
 // (gx_trace.cpp native_draw_call; a host function, not a leaf).

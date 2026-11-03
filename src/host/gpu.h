@@ -388,6 +388,15 @@ bool host_gpu_draw(const GpuDraw& d);
 // because the first draw took no answer a part could share (a tessellated or
 // geometry-shader draw ahead of plain ones): the next draw may start a run.
 int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uint32_t n, std::uint32_t& failed);
+// Stage 4b.1b (BBHOST_GXVK_LISTS=splice, host/gxvk_lists.h): at GX-native
+// draw token `id`, its slot taken - true when the pool's commit of its draw
+// was spliced into the stream (the draw is done), false when it is to be
+// drawn in order. splice-compare: false, and after the draw in order
+// host_gpu_splice_compare(id) compares the commit with it. The lines.
+bool host_gpu_splice(std::uint64_t id);
+bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
+void host_gpu_splice_compare(std::uint64_t id);
+std::string host_gpu_splice_report(bool window = false);
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();
