@@ -1394,12 +1394,14 @@ struct ListNotes {
     std::uint32_t view_id[kMost] = {};
     std::uint8_t view_flags[kMost] = {};
     VkImageView view[kMost] = {};
+    std::uint32_t view_target = 0;    // bit k: view k is a render target's (no texture surface): it may be a managed depth view
     std::uint32_t nhomes = 0;
     std::uint32_t home[kMost] = {};   // constant buffers' homes it binds by handle (none with a copy pending)
     std::uint32_t nsegs = 0;
     std::uint32_t seg[4] = {};        // the list arena's segments its constant-buffer copies went into
     std::uint64_t seg_lap[4] = {};
     std::uint64_t packet_index = 0;  // its token slot's list packet (recorder_list_packet)
+    std::uint64_t call_flip = 0;     // its GX call's flip (the list arena's copies are shared within one)
     std::uint64_t set_key[2] = {};
     VkDescriptorSet set[2] = {};
     bool full = false;  // more to note than fits: not committed
@@ -1407,6 +1409,7 @@ struct ListNotes {
         params.n = 0;
         pass_key = 0;
         nsampled = nviews = 0;
+        view_target = 0;
         set_key[0] = set_key[1] = 0;
         set[0] = set[1] = VK_NULL_HANDLE;
         nhomes = nsegs = 0;
@@ -1426,11 +1429,12 @@ struct ListNotes {
         if (nsampled < kMost) sampled[nsampled++] = base;
         else full = true;
     }
-    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v) {
+    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v, bool target = true) {
         for (std::uint32_t k = 0; k < nviews; ++k) {
             if (view_id[k] == id && view_flags[k] == flags) return;
         }
         if (nviews < kMost) {
+            if (target) view_target |= 1u << nviews;
             view_id[nviews] = id;
             view[nviews] = v;
             view_flags[nviews++] = flags;
@@ -2838,6 +2842,7 @@ void recorder_publish_appended();
 // put block k's index k where the offset goes.
 void* recorder_list_packet(std::uint64_t index);
 bool recorder_list_packet_free(std::uint64_t index);
+std::string recorder_list_report();  // chained list packets replayed, and the binds they left out
 void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams);
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it

@@ -91,6 +91,10 @@ struct DrawState {
 // again, which the pool waits for the recorder to have replayed it.
 struct ListDraw {
     std::uint64_t index, id;
+    // The op before it in the stream is the list packet spliced just before it,
+    // with nothing recorded in place between: the recorder leaves out the binds
+    // that one already made (recorder.cpp replay_packet's `prev`).
+    std::uint64_t chained;
 };
 struct Barrier {
     VkPipelineStageFlags src, dst;
