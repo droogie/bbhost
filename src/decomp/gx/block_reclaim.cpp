@@ -20,9 +20,14 @@
 // use still waiting. So ours does the game's walk and, only when it freed
 // nothing, lets the GPU catch up on what is recorded and walks again, and if
 // that is not enough, lets the command processor walk what it holds first.
+// The catch-up goes a submission at a time first (decomp_gx_gpu_step): the
+// GPU keeps the rest of what it was handed to run while the walk finds what
+// came free (BBHOST_GX_RECLAIM_STEP=0: everything recorded at once, as before).
 // From anywhere else (the flip's own reclaim) it is the game's walk alone.
 // The wait is bounded: a few milliseconds where there was a draw with its
 // textures and constants missing.
+#include "decomp/gx/block_reclaim.h"
+
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
@@ -35,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 
@@ -60,8 +66,29 @@ const bool g_wait = [] {
     return !(e && e[0] == '0');
 }();
 
+// BBHOST_GX_RENAME_WAIT=0 (rename_wait.cpp, the discard rename's wait off):
+// the caller's return address read through the guest's map list, as before.
+const bool g_host_read = [] {
+    const char* e = std::getenv("BBHOST_GX_RENAME_WAIT");
+    return !(e && e[0] == '0');
+}();
+// BBHOST_GX_RECLAIM_STEP=0: no step at a time - the catch-up waits for
+// everything recorded at once (a flush), as before.
+const bool g_steps = [] {
+    const char* e = std::getenv("BBHOST_GX_RECLAIM_STEP");
+    return !(e && e[0] == '0');
+}();
+// The step-at-a-time catch-up's bounds: steps, and time before the flush.
+constexpr int kMaxSteps = 64;
+constexpr auto kStepBudget = std::chrono::milliseconds(200);
+
 void* g_game = nullptr;
-std::atomic<std::uint64_t> g_calls{0}, g_stuck{0}, g_freed_by_gpu{0}, g_freed_by_cp{0}, g_still{0};
+std::atomic<std::uint64_t> g_calls{0}, g_stuck{0}, g_freed_by_step{0}, g_steps_taken{0}, g_freed_by_gpu{0}, g_freed_by_cp{0}, g_still{0};
+// The walks from the discard rename's empty path (kFromAllocator2), on this
+// thread and in all: the rename's wait (rename_wait.cpp) tells by them that a
+// rename failed for want of room, not for its table.
+thread_local std::uint64_t t_rename_walks = 0;
+std::atomic<std::uint64_t> g_rename_walks{0};
 std::atomic<std::uint64_t> g_waited_us{0}, g_longest_us{0};
 
 // The pool's count of blocks in use: the walk takes one off for each block
@@ -81,8 +108,22 @@ std::uint64_t in_use(std::uint64_t pool) {
 GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std::uint64_t rsp, std::uint64_t) {
     // rsp comes from the frame-capturing thunk; were that skipped (its page
     // full), it would be whatever the caller left in rcx - read nothing then.
-    const std::uint64_t from = rsp && hle_kernel_va_mapped(rsp, 8) ? *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp)) : 0;
+    // It is the calling thread's own stack: a GX thread's, which the host
+    // made, lies outside the guest's map list, and asking that list refused
+    // every call made on one - the waits below never ran for them. So the
+    // word is read as a host read that cannot fault (BBHOST_GX_RENAME_WAIT=0:
+    // through the map list as before).
+    std::uint64_t from = 0;
+    if (g_host_read) {
+        if (rsp && !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rsp)), &from, sizeof(from))) from = 0;
+    } else if (rsp && hle_kernel_va_mapped(rsp, 8)) {
+        from = *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp));
+    }
     const bool empty_pool = from == game_address(kFromAllocator) || from == game_address(kFromAllocator2);
+    if (from == game_address(kFromAllocator2)) {
+        ++t_rename_walks;
+        g_rename_walks.fetch_add(1, std::memory_order_relaxed);
+    }
     const std::uint64_t before = empty_pool ? in_use(pool) : 0;
     hle_call_guest<std::int64_t>(g_game, pool, cb);
     if (!empty_pool) return;
@@ -92,11 +133,25 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
     if (!g_wait) return;
     const auto t0 = std::chrono::steady_clock::now();
     const std::uint64_t backlog = hle_gnm_submitted_total() - hle_gnm_retired_total();
-    // 1. What is recorded: submitted and run, its labels written.
-    host_gpu_flush();
-    hle_call_guest<std::int64_t>(g_game, pool, cb);
-    int stage = 1;
-    if (in_use(pool) >= before) {
+    // 0. The GPU a submission further at a time, the walk after each: the
+    //    oldest blocks' labels land first, and the GPU keeps the rest of what
+    //    it was handed to run meanwhile.
+    int stage = 0, steps = 0;
+    bool freed = false;
+    while (g_steps && !freed && steps < kMaxSteps && std::chrono::steady_clock::now() - t0 < kStepBudget && decomp_gx_gpu_step()) {
+        ++steps;
+        hle_call_guest<std::int64_t>(g_game, pool, cb);
+        freed = in_use(pool) < before;
+    }
+    g_steps_taken.fetch_add(static_cast<std::uint64_t>(steps), std::memory_order_relaxed);
+    if (!freed) {
+        // 1. What is recorded: submitted and run, its labels written.
+        stage = 1;
+        host_gpu_flush();
+        hle_call_guest<std::int64_t>(g_game, pool, cb);
+        freed = in_use(pool) < before;
+    }
+    if (!freed) {
         // 2. What the command processor still holds, walked first.
         stage = 2;
         const std::uint64_t target = hle_gnm_submitted_total();
@@ -105,21 +160,25 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
         }
         host_gpu_flush();
         hle_call_guest<std::int64_t>(g_game, pool, cb);
+        freed = in_use(pool) < before;
     }
-    const bool freed = in_use(pool) < before;
-    (stage == 1 ? g_freed_by_gpu : freed ? g_freed_by_cp : g_still).fetch_add(1, std::memory_order_relaxed);
+    (!freed ? g_still : stage == 0 ? g_freed_by_step : stage == 1 ? g_freed_by_gpu : g_freed_by_cp).fetch_add(1, std::memory_order_relaxed);
     const auto us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     g_waited_us.fetch_add(us, std::memory_order_relaxed);
     std::uint64_t longest = g_longest_us.load(std::memory_order_relaxed);
     while (us > longest && !g_longest_us.compare_exchange_weak(longest, us, std::memory_order_relaxed)) {
     }
-    if (n < 40) {
+    // The first 40, and the long ones (100 ms and more, 40 of them).
+    static std::atomic<int> long_said{0};
+    if (n < 40 || (us >= 100000 && long_said.fetch_add(1, std::memory_order_relaxed) < 40)) {
+        char how[96];
+        std::snprintf(how, sizeof(how), "the GPU %d submission%s further freed some", steps, steps == 1 ? "" : "s");
         host_log("decomp: the GX resource-table blocks were all waiting on the GPU at flip %llu (%llu jobs queued); %s after "
                  "%llu us",
                  static_cast<ull>(hle_video_flip_count()), static_cast<ull>(backlog),
-                 stage == 1 ? "the GPU's catching up freed some" : freed ? "the command processor's and the GPU's catching up freed some"
-                                                                 : "still none free",
+                 !freed ? "still none free" : stage == 0 ? how : stage == 1 ? "the GPU's catching up freed some"
+                                                                 : "the command processor's and the GPU's catching up freed some",
                  static_cast<ull>(us));
     }
 }
@@ -127,15 +186,24 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
 void report() {
     if (!g_calls.load()) return;
     host_log("decomp: the GX resource-table blocks: %llu walks from an empty pool, %llu of them freeing nothing%s; %llu freed "
-             "once the GPU caught up, %llu once the command processor and the GPU had, %llu still not (the allocation failed); "
-             "%llu ms waited in all, the longest %llu ms",
+             "a submission at a time (%llu steps), %llu once the GPU caught up, %llu once the command processor and the GPU had, "
+             "%llu still not (the allocation failed); %llu ms waited in all, the longest %llu ms",
              static_cast<ull>(g_calls.load()), static_cast<ull>(g_stuck.load()),
-             g_wait ? "" : " (BBHOST_GX_RECLAIM_WAIT=0: each an allocation that failed)", static_cast<ull>(g_freed_by_gpu.load()),
-             static_cast<ull>(g_freed_by_cp.load()), static_cast<ull>(g_still.load()), static_cast<ull>(g_waited_us.load() / 1000),
-             static_cast<ull>(g_longest_us.load() / 1000));
+             g_wait ? "" : " (BBHOST_GX_RECLAIM_WAIT=0: each an allocation that failed)", static_cast<ull>(g_freed_by_step.load()),
+             static_cast<ull>(g_steps_taken.load()), static_cast<ull>(g_freed_by_gpu.load()), static_cast<ull>(g_freed_by_cp.load()),
+             static_cast<ull>(g_still.load()), static_cast<ull>(g_waited_us.load() / 1000), static_cast<ull>(g_longest_us.load() / 1000));
 }
 
 }  // namespace
+
+std::uint64_t decomp_gx_rename_reclaims_here() { return t_rename_walks; }
+
+bool decomp_gx_gpu_step() {
+    const std::uint64_t done = host_gpu_submissions_completed();
+    if (done + 1 >= host_gpu_work_needs()) return false;  // none handed over still running: what is left takes a flush
+    return host_gpu_wait_completed(done + 1, 50'000'000ull);
+}
+std::uint64_t decomp_gx_rename_reclaims() { return g_rename_walks.load(std::memory_order_relaxed); }
 
 void decomp_gx_block_reclaim_add() {
     DecompFunction fn{"sub_2aaa860", "gx", 0x2aaa860, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&reclaim),

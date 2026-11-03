@@ -444,6 +444,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/camera/follow_camera.cpp
   src/decomp/gx/flush_wait.cpp
   src/decomp/gx/block_reclaim.cpp
+  src/decomp/gx/rename_wait.cpp
   src/decomp/gx/drain_token.cpp
   src/decomp/gx/query_token.cpp
   src/decomp/gx/dead_packets.cpp
