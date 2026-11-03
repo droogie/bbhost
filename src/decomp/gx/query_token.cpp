@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace decomp;
 
@@ -40,7 +41,30 @@ constexpr std::uint8_t kEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x5
 
 using Refill = GUEST_ABI u8 (*)(u64 cb, u32 dwords, u64 arg, u32 room);
 
-std::atomic<std::uint64_t> g_begins{0}, g_ends{0}, g_others{0}, g_refused{0};
+std::atomic<std::uint64_t> g_begins{0}, g_ends{0}, g_others{0}, g_refused{0}, g_cleared{0};
+
+// BBHOST_OCCLUSION_FRESH (on by default; =0 leaves the block as it was): a
+// begin also clears the query's 128-byte block on the CPU, as YEBIS's own
+// begin does before it calls here (sub_15db2b0: memset 0x80) and as GX's End
+// does for its other query kinds (their first word). Without it the block
+// keeps its previous query's sixteen valid words until the GPU reaches this
+// query's reset - and Bloodborne's culler asks GetData for the block on the
+// frames after it recorded the query (sub_122f190), so with the GPU a frame
+// or more behind it took that previous answer as this query's: the same
+// object's earlier test, or, on a query entry its pool had given another
+// object, that object's - an "occluded" one hid a visible object until the
+// object's own answer came. Cleared, the block reads not ready until this
+// query's own counts land, as D3D11's GetData does for Dark Souls III's GX on
+// PC: the culler waits for its own answer and keeps the object as it was
+// meanwhile. A GPU that keeps up changes nothing (the answer is in by the
+// next poll). The game begins a block again only once it has taken the
+// block's last answer, so no older count is still on its way to it; and only
+// a begin whose token went in clears, so a refused one cannot leave a block
+// waiting for counts that never come.
+const bool g_fresh = [] {
+    const char* e = std::getenv("BBHOST_OCCLUSION_FRESH");
+    return !(e && e[0] == '0');
+}();
 
 }  // namespace
 
@@ -70,6 +94,11 @@ DECOMP_LEAF void gx_query_token(u64 cb, u32 kind, u64 block) {
     store<u32>(wp + 12, static_cast<u32>(block >> 32));
     store<u64>(cb + 0x10, wp + 16);
     host_lists::note(cb, wp, 0x10);
+    if (k == 0 && g_fresh) {
+        const u64 b = block & ~7ull;
+        for (u32 i = 0; i < 16; ++i) store<u64>(b + 8ull * i, 0);
+        g_cleared.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 namespace {
@@ -77,9 +106,9 @@ namespace {
 void report() {
     if (!g_begins.load() && !g_ends.load() && !g_others.load()) return;
     host_log("decomp: occlusion queries written as query tokens: %llu begins, %llu ends, %llu other dumps; %llu not written (the refill gave "
-             "no room)",
+             "no room); %llu blocks cleared at their begin%s",
              static_cast<ull>(g_begins.load()), static_cast<ull>(g_ends.load()), static_cast<ull>(g_others.load()),
-             static_cast<ull>(g_refused.load()));
+             static_cast<ull>(g_refused.load()), static_cast<ull>(g_cleared.load()), g_fresh ? "" : " (BBHOST_OCCLUSION_FRESH=0)");
 }
 
 }  // namespace
