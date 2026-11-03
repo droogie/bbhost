@@ -13,8 +13,10 @@
 // - stops the run, with a message that says so; on an older host (plugin API
 // 11) the SDK's own loading test does the same. Practice: one boss twice from
 // phase 2 (its characters put under the threshold once the fight has begun,
-// both wins on file, the save's flags back at the end), and a loop with a
-// death, a win, phase 2's time from phase 1, and a stop.
+// both wins on file, a refill after each, the save's flags back at the end);
+// N times counting attempts - a death, a Restart (not one), a win, and done
+// after two; Once ended by a death as it respawns; and a loop with a death, a
+// win, phase 2's time from phase 1, and a stop.
 //
 //   boss_rush_test <boss_rush.so>
 #include "bbhost_plugin.h"
@@ -637,13 +639,14 @@ bool walk_in(std::size_t nth) {
 // Practice Ludwig twice (Repeat N times, N = 2) from phase 2: each fight's
 // characters - the beast and the Holy Blade it changes into, which the fight
 // links - just under half their HP once the fight has begun, once; each win
-// on file; after the second, the summary and home, the save's flags back.
+// on file and refilled after; after the second, the summary and home, the
+// save's flags back.
 void practice_twice(const char* so, const fs::path& dir) {
     const int failures = g_failures;
     Loaded l = start(so, dir, "practice-twice", BB_PLUGIN_API_VERSION, practice_config("N times", "2", "2"));
     if (!G.frame_fn) return;
     CHECK(practice_from_menu());
-    CHECK(message("Practice: Ludwig, the Holy Blade from phase 2, 2 wins - the first fight in 1 seconds"));
+    CHECK(message("Practice: Ludwig, the Holy Blade from phase 2, 2 attempts - the first fight in 1 seconds"));
     for (int fight = 1; fight <= 2; ++fight) {
         CHECK(walk_in(static_cast<std::size_t>(fight)));
         CHECK(g_chrs[kLudwigBeast].hp() == 2400);  // nothing before the fight's start
@@ -656,8 +659,9 @@ void practice_twice(const char* so, const fs::path& dir) {
         if (fight == 1) {
             // Woken again for the next: its defeat off and his own defeated flag
             // (9471: else his defeat event kills him as the map loads), "met" on,
-            // the fight's start off.
+            // the fight's start off; vials and bullets topped up first.
             CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
+            CHECK(count_logged("boss_rush: refilled after a win") == 1);
             CHECK(G.flags[kLudwigDefeat] == 0 && G.flags[kLudwigDefeated] == 0 && G.flags[kLudwigDefeat + 1] == 1 &&
                   G.flags[kLudwigBegun] == 0);
             CHECK(G.travels.size() == 2 && G.travels[1].lamp == kLudwigLamp);
@@ -666,15 +670,18 @@ void practice_twice(const char* so, const fs::path& dir) {
         }
     }
     CHECK(count_logged("practice: Ludwig, the Holy Blade put at phase 2 (HP under 0.50): 3400800 2400 -> 1188/2400, 3400801 2400 -> 1188/2400") == 2);
-    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best) - 1 win in 1 attempt, 0 deaths"));
-    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best 0:20) - 2 wins in 2 attempts, 0 deaths"));
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best) - 1 win in 1 of 2 attempts, 0 deaths"));
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best 0:20) - 2 wins in 2 of 2 attempts, 0 deaths"));
     CHECK(run_until([] { return G.travels.size() == 3; }, 20 * kFps));
     CHECK(G.travels.size() == 3 && G.travels[2].lamp == kDream);
-    CHECK(message("Practice done - Ludwig, the Holy Blade: 2 wins in 2 attempts, 0 deaths, best 0:20"));
+    CHECK(message("Practice done - Ludwig, the Holy Blade: 2 wins in 2 of 2 attempts, 0 deaths, best 0:20"));
+    // Refilled for the first attempt as it arrived, and after each win.
+    CHECK(count_logged("boss_rush: refilled for the first attempt") == 1 && count_logged("boss_rush: refilled after a win") == 2);
     const std::string r = results_of();
     CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 1 in 0:20, attempt 1\n") != std::string::npos);
     CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 2 in 0:20, attempt 2\n") != std::string::npos);
-    CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: 2 wins in 2 attempts, 0 deaths; best 0:20, last 0:20\n") != std::string::npos);
+    CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: 2 wins in 2 of 2 attempts, 0 deaths; best 0:20, last 0:20\n") !=
+          std::string::npos);
     // The save's flags exactly: the family, 9471 and the Nightmare's 3400..3403
     // that the wins set again, as they were.
     CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 &&
@@ -685,6 +692,133 @@ void practice_twice(const char* so, const fs::path& dir) {
     CHECK(G.refused.empty() && !message("stopped"));
     finish(l, "practice twice");
     std::printf("practice twice: %s\n", g_failures == failures ? "ok" : "FAILED");
+}
+
+// The player dies: the death screen, then the respawn's load.
+void die() {
+    G.hp = 0;
+    ++G.deaths;
+    G.dying = 240;
+}
+
+// Repeat N times counts attempts, N = 2: a death is the first; the second
+// fight is restarted - neither a win nor a death, so not an attempt, and the
+// same attempt again from the fog wall, the boss woken and the player
+// refilled; then a win is the second, and the practice is done: no third
+// fight, the summary, home, the save's flags back. Restart with no practice
+// under way says so.
+void practice_attempts(const char* so, const fs::path& dir) {
+    const int failures = g_failures;
+    Loaded l = start(so, dir, "practice-attempts", BB_PLUGIN_API_VERSION, practice_config("N times", "2", "1"));
+    if (!G.frame_fn) return;
+    CHECK(run_until([] { return screen_end(0) != 0; }, 10000));
+    G.action_fn("restart", G.action_user);
+    CHECK(message("No practice is under way"));
+    CHECK(practice_from_menu());
+    CHECK(message("Practice: Ludwig, the Holy Blade, 2 attempts - the first fight in 1 seconds"));
+    CHECK(walk_in(1));
+    for (int i = 0; i < 5 * kFps; ++i) step();
+    die();
+    // Restart while dead does nothing: the death is the attempt, and its
+    // respawn brings the next to the fog wall (a travel now would cut it short).
+    for (int i = 0; i < 60; ++i) step();
+    const std::size_t before = G.travels.size();
+    G.action_fn("restart", G.action_user);
+    CHECK(logged("restart refused - the player is dead") && message("A death restarts it - back at the fog wall after the respawn"));
+    CHECK(run_until([] { return logged("back after a death"); }, 1000));
+    CHECK(G.travels.size() == before);
+    CHECK(logged("boss_rush: refilled after a death"));
+    CHECK(walk_in(2));
+    CHECK(run_until([] { return message("Again - Ludwig, the Holy Blade (0 wins in 1 of 2 attempts, 1 death)") != nullptr; }, 10));
+    CHECK(logged("practice: Ludwig, the Holy Blade, attempt 2 (at the fog wall)"));
+    for (int i = 0; i < 5 * kFps; ++i) step();
+    const std::size_t travels = G.travels.size();
+    G.action_fn("restart", G.action_user);
+    CHECK(logged("practice: Ludwig, the Holy Blade's fight restarted, not counted; attempt 2 again from the fog wall"));
+    CHECK(message("Restart - Ludwig, the Holy Blade"));
+    // Back from the lamp: the fight woken anew (its start off), refilled as it
+    // arrives, the same attempt at the fog wall again.
+    CHECK(run_until([&] { return G.travels.size() == travels + 1; }, 20 * kFps));
+    CHECK(G.travels.back().lamp == kLudwigLamp && G.flags[kLudwigBegun] == 0);
+    CHECK(walk_in(3));
+    CHECK(logged("boss_rush: refilled after a restart"));
+    CHECK(count_logged("practice: Ludwig, the Holy Blade, attempt 2 (at the fog wall)") == 2);
+    for (int i = 0; i < 10 * kFps; ++i) step();
+    ludwig_killed();
+    CHECK(run_until([] { return logged("practice: Ludwig, the Holy Blade defeated in"); }, 10));
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:10 (best) - 1 win in 2 of 2 attempts, 1 death"));
+    // Done after the second attempt: refilled after the win, then home - no
+    // third fight.
+    CHECK(run_until([] { return message("Practice done") != nullptr; }, 15 * kFps));
+    CHECK(message("Practice done - Ludwig, the Holy Blade: 1 win in 2 of 2 attempts, 1 death, best 0:10"));
+    CHECK(logged("boss_rush: refilled after a win"));
+    CHECK(run_until([&] { return G.travels.size() == travels + 2; }, 20 * kFps));
+    CHECK(G.travels.size() == travels + 2 && G.travels.back().lamp == kDream);
+    for (int i = 0; i < 30 * kFps; ++i) step();
+    CHECK(G.travels.size() == travels + 2 && !logged("attempt 3"));
+    CHECK(results_of().find("Practice - Ludwig, the Holy Blade: 1 win in 2 of 2 attempts, 1 death; best 0:10, last 0:10\n") !=
+          std::string::npos);
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 && G.flags[kLudwigBegun] == 0 &&
+          G.flags[kLudwigDefeated] == 0);
+    CHECK(logged("boss_rush: 17 flags back as the save had them") && !logged("read back otherwise"));
+    check_never_inside_a_screen();
+    finish(l, "practice attempts");
+    std::printf("practice attempts: %s\n", g_failures == failures ? "ok" : "FAILED");
+}
+
+// Repeat Once ended by a death: the attempt is made, and the practice is done
+// as the player respawns - no fight again, the summary once the world is up,
+// home, the save's flags back.
+void practice_last_death(const char* so, const fs::path& dir) {
+    const int failures = g_failures;
+    Loaded l = start(so, dir, "practice-last-death", BB_PLUGIN_API_VERSION, practice_config("Once", "3", "1"));
+    if (!G.frame_fn) return;
+    CHECK(practice_from_menu());
+    CHECK(message("Practice: Ludwig, the Holy Blade, once - the first fight in 1 seconds"));
+    CHECK(walk_in(1));
+    for (int i = 0; i < 5 * kFps; ++i) step();
+    die();
+    CHECK(run_until([] { return logged("ended in a death, the last"); }, 1000));
+    CHECK(logged("practice: Ludwig, the Holy Blade's attempt 1 ended in a death, the last"));
+    CHECK(run_until([] { return message("Practice done") != nullptr; }, kLoadFrames + 10 * kFps));
+    const auto* done = message("Practice done - Ludwig, the Holy Blade: 0 wins in 1 attempt, 1 death");
+    CHECK(done && !done->first.loading);  // shown once the respawn's screen has gone
+    CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
+    CHECK(G.travels.size() == 2 && G.travels[1].lamp == kDream);
+    CHECK(!logged("back after a death") && !logged("refilled after a death") && count_logged("at Ludwig, the Holy Blade's fog wall") == 1);
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 && G.flags[kLudwigBegun] == 0);
+    CHECK(logged("boss_rush: 17 flags back as the save had them") && !logged("read back otherwise"));
+    check_never_inside_a_screen();
+    finish(l, "practice last death");
+    std::printf("practice last death: %s\n", g_failures == failures ? "ok" : "FAILED");
+}
+
+// Stop during the death screen: the save's flags back at once, and the way
+// home waits for the respawn (a travel asked while dead cuts the respawn
+// short, and the game plays the death again after it).
+void stop_while_dead(const char* so, const fs::path& dir) {
+    const int failures = g_failures;
+    Loaded l = start(so, dir, "stop-while-dead", BB_PLUGIN_API_VERSION, practice_config("Loop until stopped", "3", "1"));
+    if (!G.frame_fn) return;
+    CHECK(practice_from_menu());
+    CHECK(walk_in(1));
+    for (int i = 0; i < 5 * kFps; ++i) step();
+    die();
+    for (int i = 0; i < 60; ++i) step();
+    const std::size_t travels = G.travels.size();
+    G.action_fn("stop", G.action_user);
+    CHECK(logged("boss_rush: practice stopped") && logged("boss_rush: 17 flags back as the save had them"));
+    for (int i = 0; i < 150; ++i) step();  // the rest of the death screen
+    CHECK(G.travels.size() == travels);
+    const std::size_t screens = G.screen_ends.size();
+    CHECK(run_until([&] { return G.screen_ends.size() > screens; }, kDarkFrames + kLoadFrames + 100));  // the respawn
+    CHECK(G.travels.size() == travels);
+    CHECK(run_until([&] { return G.travels.size() == travels + 1; }, 20 * kFps));
+    CHECK(G.travels.size() == travels + 1 && G.travels.back().lamp == kDream && G.travels.back().frame > G.screen_ends.back());
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigBegun] == 0);
+    check_never_inside_a_screen();
+    finish(l, "stop while dead");
+    std::printf("stop while dead: %s\n", g_failures == failures ? "ok" : "FAILED");
 }
 
 // Practice Ludwig in a loop from phase 1: phase 2's time (the boss under half
@@ -749,6 +883,9 @@ int main(int argc, char** argv) {
     never_begun(argv[1], dir);
     refused(argv[1], dir);
     practice_twice(argv[1], dir);
+    practice_attempts(argv[1], dir);
+    practice_last_death(argv[1], dir);
+    stop_while_dead(argv[1], dir);
     practice_loop(argv[1], dir);
     fs::remove_all(dir);
     std::printf("%s\n", g_failures ? "FAILED" : "ok");
