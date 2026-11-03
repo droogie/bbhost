@@ -138,6 +138,12 @@ struct Boss {
     std::int32_t keep_out[2] = {};    // characters (entity ids) switched off for the round: NPCs a save's quests put in the arena
     std::uint32_t dungeon = 0;        // a chalice boss: its fixed dungeon, by map id (m29_10_90_00: 0x1d0a5a00)
     std::uint32_t begun = 0;          // a chalice boss: its "the fight has begun" flag, which stays on
+    // A flag outside the family that the boss's own events take for its
+    // defeat: Ludwig's defeat event sets 9471, and while it is on every event
+    // of his fight ends at once and the defeat event kills him as the map
+    // loads (2004[4]) - woken with it on, he came back dead. Cleared with the
+    // family, put back after the run.
+    std::uint32_t defeated = 0;
 };
 
 // Story order (the usual first playthrough's). Each round travels to the
@@ -176,7 +182,7 @@ constexpr Boss kBosses[] = {
     // The Wet Nurse (entity 2600802) is made when the player walks into her
     // arena; 515000/516000 are the doubles that come with her.
     {"Mergo's Wet Nurse", 12601800, 2602950, false, 551000, 0, {122.14f, 1125.184f, -37.839f}, -90.0f},
-    {"Ludwig, the Holy Blade", 13401800, 3402950, true, 451000, 0, {-407.93f, 1503.8f, -716.45f}, 0.0f, 1},
+    {"Ludwig, the Holy Blade", 13401800, 3402950, true, 451000, 0, {-407.93f, 1503.8f, -716.45f}, 0.0f, 1, {}, {}, 0, 0, 9471},
     // The Living Failures' fog stands in the balcony's doorway (door 3501120,
     // m35_00's 13501200 slot 0, and 13504220), as Rom's does.
     {"Living Failures", 13501850, 3502950, true, 403000, 0, {-378.54f, 1592.9f, -824.55f}, 90.0f, 1, {13501200, 13504220}},
@@ -302,6 +308,61 @@ const Fight* fight_of(const Boss* b) {
     }
     return nullptr;
 }
+// The flags a story boss's defeat event sets outside its family (2003[2] in
+// the event the defeat flag is the id of, from the event scripts): the
+// map's progress (2411, 3400..3403), the boss's own global flag (9456 ..
+// 9471) and others (72400512, 5910, 6675). A win sets them again; a run keeps
+// them as the save had them and puts them back with the family, so the save
+// is left exactly as it was.
+struct Aftermath {
+    const char* boss;  // kBosses' name
+    std::uint32_t flags[5];
+};
+constexpr Aftermath kAftermath[] = {
+    {"Cleric Beast", {2411, 9456}},
+    {"Father Gascoigne", {2412, 5910, 9457}},
+    {"Blood-starved Beast", {2300, 9453, 72400512}},
+    {"Vicar Amelia", {2400, 2401, 2402, 9455, 72400512}},
+    {"The Witch of Hemwick", {2200, 5911, 9452, 72400512}},
+    {"Darkbeast Paarl", {2301, 9454}},
+    {"Shadow of Yharnam", {2700, 2701, 9463}},
+    {"Rom, the Vacuous Spider", {3200, 9465}},
+    {"The One Reborn", {2800, 9464}},
+    {"Martyr Logarius", {2500, 9460}},
+    {"Amygdala", {3300, 9466}},
+    {"Celestial Emissary", {2420, 9458}},
+    {"Ebrietas, Daughter of the Cosmos", {2421, 9459}},
+    {"Mergo's Wet Nurse", {2601, 9462}},
+    {"Ludwig, the Holy Blade", {3400, 3401, 3402, 3403, 9471}},
+    {"Living Failures", {3510, 3511, 3512, 3517}},
+    {"Lady Maria of the Astral Clocktower", {3510, 3511, 3512, 3513, 6675}},
+    {"Laurence, the First Vicar", {3400, 3401, 3402, 3403}},
+    {"Orphan of Kos", {3600}},
+};
+constexpr bool aftermath_is_story_bosses() {
+    for (const Aftermath& a : kAftermath) {
+        bool found = false;
+        for (const Boss& b : kBosses) found = found || (same(a.boss, b.name) && !b.dungeon);
+        if (!found) return false;
+    }
+    for (const Boss& b : kBosses) {
+        if (b.defeated) {  // its defeated flag among its defeat's flags
+            bool in = false;
+            for (const Aftermath& a : kAftermath)
+                for (const std::uint32_t f : a.flags) in = in || (same(a.boss, b.name) && f == b.defeated);
+            if (!in) return false;
+        }
+    }
+    return true;
+}
+static_assert(aftermath_is_story_bosses(), "kAftermath names story bosses; a boss's defeated flag is one of its defeat's");
+const Aftermath* aftermath_of(const Boss* b) {
+    for (const Aftermath& a : kAftermath) {
+        if (same(a.boss, b->name)) return &a;
+    }
+    return nullptr;
+}
+
 // The latest phase, up to `wanted`, the game can be started at for this boss.
 int phase_for(const Boss* b, int wanted) {
     const Fight* f = fight_of(b);
@@ -583,6 +644,7 @@ bool wake(const Boss* b) {
         write_bits(kAltarSlots + static_cast<std::uint32_t>(g_altar) * kAltarSlotStride, 32, b->dungeon);
     } else {
         for (std::uint32_t i = 0; i < 10; ++i) failed += g.api->event_flag_set(b->defeat_flag + i, 0) != 0;
+        if (b->defeated) failed += g.api->event_flag_set(b->defeated, 0) != 0;
         if (g_skip_intro) failed += g.api->event_flag_set(b->defeat_flag + b->met, 1) != 0;
         // A practice fight's start is that flag coming on: off for each one.
         if (g_practice) failed += g.api->event_flag_set(begun_flag(b), 0) != 0;
@@ -820,8 +882,8 @@ bool phase2_reached(const Fight* f) {
         }
         ++n;
         const float r = hp_ratio(d);
-        all = all && r < f->below[0];
-        any = any || (f->any_below > 0 && r < f->any_below);
+        all = all && r < f->below[0] && d->hp > 0;  // alive under it: a kill that skips phase 2 is not phase 2
+        any = any || (f->any_below > 0 && r < f->any_below && d->hp > 0);
     }
     return n && (all || any);
 }
@@ -1033,6 +1095,12 @@ void tick() {
                     for (std::uint32_t i = 0; i < 10; ++i) g_original[b->defeat_flag + i] = g.flag(b->defeat_flag + i);
                     g_original[b->defeat_flag + 3000] = g.flag(b->defeat_flag + 3000);
                     if (g_practice) g_original[begun_flag(b)] = g.flag(begun_flag(b));
+                    if (b->defeated) g_original[b->defeated] = g.flag(b->defeated);
+                    if (const Aftermath* a = aftermath_of(b)) {
+                        for (const std::uint32_t f : a->flags) {
+                            if (f) g_original[f] = g.flag(f);
+                        }
+                    }
                 }
                 for (const std::uint32_t f : b->set_flags) {
                     if (f) g_original[f] = g.flag(f);

@@ -112,10 +112,18 @@ struct FakeChr {
     }
 };
 constexpr std::int32_t kLudwigBeast = 3400800, kLudwigHolyBlade = 3400801;
-constexpr std::uint32_t kLudwigBegun = kLudwigDefeat + 3002;
+constexpr std::uint32_t kLudwigBegun = kLudwigDefeat + 3002, kLudwigDefeated = 9471;
 std::map<std::int32_t, FakeChr> g_chrs;
 void chrs_full() {
     for (const std::int32_t e : {kLudwigBeast, kLudwigHolyBlade}) g_chrs[e].full(2400);
+}
+// What Ludwig's defeat event sets: his defeat flag, 9471 and the Hunter's
+// Nightmare's 3400..3403.
+void ludwig_killed() {
+    for (auto& [e, c] : g_chrs) c.hp() = 0;
+    G.flags[kLudwigDefeat] = 1;
+    G.flags[kLudwigDefeated] = 1;
+    for (std::uint32_t f = 3400; f <= 3403; ++f) G.flags[f] = 1;
 }
 
 Call now_call(std::int32_t lamp = 0, const float* xyz = nullptr) {
@@ -270,6 +278,12 @@ void step() {
         G.pos[2] = kFog[2] + 40.0f;
         G.hp = 100;
         chrs_full();
+        // As the game: while Ludwig's own defeated flag (9471, which his defeat
+        // event sets) is on, that event kills his two as the map loads.
+        if (G.block == kLudwigBlock && G.flags[kLudwigDefeated]) {
+            for (auto& [e, c] : g_chrs) c.hp() = 0;
+            G.flags[kLudwigDefeat] = 1;
+        }
         G.lit = kLoadFrames;
         if (G.load_fn) G.load_fn(G.block, G.load_user);
     } else if (G.lit > 0 && --G.lit == 0) {
@@ -566,7 +580,7 @@ void never_begun(const char* so, const fs::path& dir) {
     for (int i = 0; i < 60 * kFps; ++i) step();
     CHECK(G.travels.size() == 5 && count_messages("Boss rush stopped:") == 1);
     CHECK(logged("the game did not begin the travel to Ludwig, the Holy Blade's arena (lamp 3402950, asked 5 times); the run stops"));
-    CHECK(logged("boss_rush: 11 flags back as the save had them") && !logged("read back otherwise"));  // the defeat family and +3000
+    CHECK(logged("boss_rush: 16 flags back as the save had them") && !logged("read back otherwise"));  // the family, +3000, 9471, 3400..3403
     check_never_inside_a_screen();
     finish(l, "never begun");
     std::printf("never begun: %s\n", g_failures == failures ? "ok" : "FAILED");
@@ -637,13 +651,18 @@ void practice_twice(const char* so, const fs::path& dir) {
         CHECK(g_chrs[kLudwigBeast].hp() == 1188 && g_chrs[kLudwigHolyBlade].hp() == 1188);
         for (int i = 0; i < 20 * kFps; ++i) step();
         CHECK(g_chrs[kLudwigBeast].hp() == 1188);
-        G.flags[kLudwigDefeat] = 1;
+        ludwig_killed();
         CHECK(run_until([&] { return count_logged("practice: Ludwig, the Holy Blade defeated in") == static_cast<std::size_t>(fight); }, 10));
         if (fight == 1) {
-            // Woken again for the next: its defeat off, "met" on, the fight's start off.
+            // Woken again for the next: its defeat off and his own defeated flag
+            // (9471: else his defeat event kills him as the map loads), "met" on,
+            // the fight's start off.
             CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
-            CHECK(G.flags[kLudwigDefeat] == 0 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigBegun] == 0);
+            CHECK(G.flags[kLudwigDefeat] == 0 && G.flags[kLudwigDefeated] == 0 && G.flags[kLudwigDefeat + 1] == 1 &&
+                  G.flags[kLudwigBegun] == 0);
             CHECK(G.travels.size() == 2 && G.travels[1].lamp == kLudwigLamp);
+            CHECK(run_until([] { return count_logged("arrived: Ludwig") == 2; }, kFadeFrames + kDarkFrames + 10));
+            CHECK(g_chrs[kLudwigBeast].hp() == 2400 && G.flags[kLudwigDefeat] == 0);  // alive at the load
         }
     }
     CHECK(count_logged("practice: Ludwig, the Holy Blade put at phase 2 (HP under 0.50): 3400800 2400 -> 1188/2400, 3400801 2400 -> 1188/2400") == 2);
@@ -656,9 +675,12 @@ void practice_twice(const char* so, const fs::path& dir) {
     CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 1 in 0:20, attempt 1\n") != std::string::npos);
     CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 2 in 0:20, attempt 2\n") != std::string::npos);
     CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: 2 wins in 2 attempts, 0 deaths; best 0:20, last 0:20\n") != std::string::npos);
+    // The save's flags exactly: the family, 9471 and the Nightmare's 3400..3403
+    // that the wins set again, as they were.
     CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 &&
-          G.flags[kLudwigDefeat + 2] == 0 && G.flags[kLudwigBegun] == 0);
-    CHECK(logged("boss_rush: 12 flags back as the save had them") && !logged("read back otherwise"));
+          G.flags[kLudwigDefeat + 2] == 0 && G.flags[kLudwigBegun] == 0 && G.flags[kLudwigDefeated] == 0);
+    for (std::uint32_t f = 3400; f <= 3403; ++f) CHECK(G.flags[f] == 0);
+    CHECK(logged("boss_rush: 17 flags back as the save had them") && !logged("read back otherwise"));
     check_never_inside_a_screen();
     CHECK(G.refused.empty() && !message("stopped"));
     finish(l, "practice twice");
@@ -691,7 +713,7 @@ void practice_loop(const char* so, const fs::path& dir) {
     CHECK(walk_in(2));
     CHECK(logged("fight-begun flag 13404802 was on at the arrival; off"));
     for (int i = 0; i < 15 * kFps; ++i) step();
-    G.flags[kLudwigDefeat] = 1;
+    ludwig_killed();
     CHECK(run_until([] { return logged("practice: Ludwig, the Holy Blade defeated in"); }, 10));
     CHECK(message("Again - Ludwig, the Holy Blade (0 wins in 1 attempt, 1 death)"));
     CHECK(message("Ludwig, the Holy Blade defeated - 0:15 (best) - 1 win in 2 attempts, 1 death"));
@@ -699,7 +721,10 @@ void practice_loop(const char* so, const fs::path& dir) {
     CHECK(message("Practice stopped - Ludwig, the Holy Blade: 1 win in 2 attempts, 1 death, best 0:15"));
     CHECK(results_of().find("Practice - Ludwig, the Holy Blade: 1 win in 2 attempts, 1 death; best 0:15, last 0:15; phase 2 after 0:30 "
                             "(best 0:30)\n") != std::string::npos);
-    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 && G.flags[kLudwigBegun] == 0);
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 && G.flags[kLudwigBegun] == 0 &&
+          G.flags[kLudwigDefeated] == 0);
+    for (std::uint32_t f = 3400; f <= 3403; ++f) CHECK(G.flags[f] == 0);
+    CHECK(logged("boss_rush: 17 flags back as the save had them") && !logged("read back otherwise"));
     CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
     CHECK(G.travels.size() == 2 && G.travels[1].lamp == kDream);
     check_never_inside_a_screen();
