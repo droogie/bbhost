@@ -1013,6 +1013,10 @@ int g_test_drop_travel = 0;
 
 void travel_failed(const Boss* b, const std::string& why) {
     g.log("boss_rush: %s to %s's arena (lamp %d, asked %d times); the run stops", why.c_str(), b->name, b->lamp, g_travel_asks);
+    if (g_practice) {  // its summary on file too, the message the same
+        practice_end("stopped", false, "Boss rush stopped: " + why + " to " + b->name + "'s arena");
+        return;
+    }
     give_back();
     g.message("Boss rush stopped: " + why + " to " + b->name + "'s arena", 8.0f);
     g_state = State::Done;
