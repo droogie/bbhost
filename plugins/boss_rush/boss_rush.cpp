@@ -23,10 +23,30 @@
 //   rounds = 0          # only N bosses (0: all)
 //   awake = true        # the fog wall stands as on a return; false: the first time's entrances
 //   refill = true       # blood vials and quicksilver bullets back to the most after a death
+//   practice_boss = "Ludwig, the Holy Blade"   # Practice: one boss, by name (any in kBosses)
+//   practice_repeat = "Loop until stopped"     # or "Once", "N times" (practice_times wins)
+//   practice_times = 3
+//   practice_phase = "2"                       # start its fights at phase 2 or 3 ("1": as the game does)
+//
+// Practice (the menu's "Practice this boss") fights one boss again and
+// again: each fight starts at its fog wall as a rush's round does, a death
+// tries again from there, and a win wakes the boss and starts the next fight
+// - once, until N wins, or until Stop. Its attempts, wins, deaths, best and
+// last clear times (from the fight's start, the boss's own "fight begun"
+// event, to its defeat) and, from phase 1, the time the boss took to reach
+// its phase 2, are on screen after each fight and in results.txt. Started at
+// phase 2 or 3, each fight's boss is put just under that phase's HP threshold
+// as the fight begins - the HP its event script (an HP-ratio condition) or
+// its AI (GetHpRate) changes at - and the game plays its own change: the
+// cutscene, the second character, the arena's change. kFights has each
+// boss's thresholds and characters, from those scripts; a boss without a
+// later phase (or a chalice boss: their phase events are not mapped yet)
+// fights from the latest it has, and the message says so.
 //
 // Play it on a save of its own: bosses give their rewards again, and while a
 // run is under way the save holds woken bosses (restore.txt puts them back if
-// the game is closed mid-run).
+// the game is closed mid-run). Practice puts the save's flags back as a rush
+// does, when it ends or is stopped.
 //
 // The player is moved only in the world: each travel and fog warp waits for
 // the load's screen to go (plugin API 12, loading_screen), and the waits are
@@ -40,6 +60,7 @@
 // the fog walls from the same scripts and the maps' layouts.
 #include "bbhost/sdk.hpp"
 #include "bbhost/engine/sprj/camera.hpp"
+#include "bbhost/engine/sprj/chr_ins.hpp"
 #include "bbhost/engine/sprj/game_data_man.hpp"
 
 #include <algorithm>
@@ -54,10 +75,20 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "boss_rush",
     "Boss rush",
-    "1.1.1",
+    "1.2.0",
     "bbhost",
-    "Fight the game's bosses back to back, timed; deaths retry the round and the save's bosses are restored at the end.",
+    "Fight the game's bosses back to back, timed, or practise one again and again, from its later phases too; deaths retry "
+    "the fight and the save's bosses are restored at the end.",
 };
+
+// The practice list: every boss in kBosses by name, in its order (checked
+// against kBosses below).
+#define BOSS_RUSH_PRACTICE_BOSSES                                                                                              \
+    "Cleric Beast|Father Gascoigne|Blood-starved Beast|Vicar Amelia|The Witch of Hemwick|Darkbeast Paarl|Shadow of Yharnam|"   \
+    "Rom, the Vacuous Spider|The One Reborn|Martyr Logarius|Amygdala|Celestial Emissary|Ebrietas, Daughter of the Cosmos|"     \
+    "Mergo's Wet Nurse|Ludwig, the Holy Blade|Living Failures|Lady Maria of the Astral Clocktower|Laurence, the First Vicar|" \
+    "Orphan of Kos|Undead Giant|Merciless Watchers|Watchdog of the Old Lords|Beast-possessed Soul|Keeper of the Old Lords|"     \
+    "Pthumerian Descendant|Bloodletting Beast|Pthumerian Elder|Abhorrent Beast|Yharnam, Pthumerian Queen"
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, nullptr, "Start it from the in-game plugin menu", "Play it on a save of its own: bosses give their rewards again."},
@@ -76,6 +107,19 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL | BB_OPT_LIVE, "refill", "Refill vials and bullets on death", "Off: what you have left, as the game restocks it from storage.", "true"},
     {BB_OPT_BOOL, "auto_start", "Start by itself", "Begin a run when the world first loads, without the menu.", "false"},
     {BB_OPT_INT | BB_OPT_LIVE, "start_delay", "Seconds before the first round", nullptr, "10", 3, 60},
+    {BB_OPT_HEADING, nullptr, "Practice",
+     "One boss again and again, from its fog wall: a death tries again, a win wakes it for the next fight. Skip starts the "
+     "fight over; Stop ends it. Skip the bosses' first entrances, Refill and the seconds before the first round apply."},
+    {BB_OPT_ACTION, "practice", "Practice this boss", "Begins in a few seconds, from wherever you are."},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "practice_boss", "Boss", "The Old Hunters' and the chalice bosses when the save can reach them.",
+     "Cleric Beast", 0, 0, BOSS_RUSH_PRACTICE_BOSSES},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "practice_repeat", "Repeat", "N times: until that many wins. A death never counts.",
+     "Loop until stopped", 0, 0, "Once|N times|Loop until stopped"},
+    {BB_OPT_INT | BB_OPT_LIVE, "practice_times", "N", "Wins, with Repeat N times.", "3", 1, 99},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "practice_phase", "Start at phase",
+     "2 or 3: as each fight begins the boss is put just under the HP its next phase starts at, and the game plays its own "
+     "change. A boss without that phase starts at the latest it has (the message says so).",
+     "1", 0, 0, "1|2|3"},
     {BB_OPT_END}};
 
 namespace {
@@ -106,7 +150,7 @@ struct Boss {
 // thing at yaw y faces (-sin y, -cos y) - the player as the warp sets it and
 // player_position reads it, and the fog objects, which all 19 face into their
 // arenas. Positions are the MSB's frame, which the warp takes as it is.
-const Boss kBosses[] = {
+constexpr Boss kBosses[] = {
     {"Cleric Beast", 12411700, 2412951, false, 500000, 0, {-154.14f, -27.02f, 35.16f}, -135.0f},
     {"Father Gascoigne", 12411800, 2412951, false, 271000, 0, {-50.18f, -40.82f, 71.02f}, -135.0f},
     {"Blood-starved Beast", 12301800, 2302950, false, 209000, 0, {-87.654f, -126.44f, 13.512f}, 129.825f},
@@ -161,6 +205,111 @@ const Boss kBosses[] = {
     {"Yharnam, Pthumerian Queen", 12901802, 2902950, false, 306000, 0, {34.388f, -28.072f, -204.75f}, 90.0f, 0, {12900536}, {}, 0x1d325a00, 12905516},
 };
 
+constexpr bool same(const char* a, const char* b) {
+    while (*a && *a == *b) ++a, ++b;
+    return *a == *b;
+}
+// The practice list is kBosses' names, in order, '|' between.
+constexpr bool practice_list_is_kbosses(const char* list) {
+    for (const Boss& b : kBosses) {
+        const char* n = b.name;
+        while (*n && *n == *list) ++n, ++list;
+        if (*n || (*list != '|' && *list != '\0')) return false;
+        if (*list == '|') ++list;
+    }
+    return *list == '\0';
+}
+static_assert(practice_list_is_kbosses(BOSS_RUSH_PRACTICE_BOSSES), "the practice list must name kBosses in order");
+
+// A boss's later phases, as its fight's own logic starts them: an HP ratio
+// its event script waits for (condition 4[2], "a character's HP ratio",
+// which then sends its AI a command, 2004[17], or plays the change itself)
+// or its AI compares GetHpRate with (the battle program's Activate), from
+// event/<map>.emevd.dcx and script/<map>.luabnd.dcx (bossprac notes have the
+// events, programs and animations). chars: the fight's characters by entity
+// id - the one the thresholds are on first, then those the fight's start
+// links to it (2004[33]: they take the same damage, the second form a boss
+// changes into) or that share its threshold (the Shadows: all three under
+// it). A practice fight from phase 2 or 3 puts every one of them just under
+// that phase's threshold once the fight has begun, as the damage would have.
+// then: phase 3 is set only once phase 2's change has begun - that event
+// flag on (> 0) or that SpEffect on chars[0] (< 0, negated) - where the
+// game does not order the two itself (0: its own event or AI takes phase 2
+// first whatever the HP).
+struct Fight {
+    const char* boss;     // kBosses' name
+    std::int32_t chars[3];
+    float below[2];       // the HP ratio phase 2 / phase 3 starts under; 0: no such phase
+    float any_below = 0;  // phase 2 also starts when any one of chars is under this (the Shadows)
+    std::int32_t then = 0;
+};
+constexpr Fight kFights[] = {
+    // 12414707: under 0.7 the AI is told 1 (slot 1): its roar (3010).
+    {"Cleric Beast", {2410800}, {0.7f, 0}},
+    // The AI's own axe (Act28, 3028; SpEffect 5401) at 0.67; 12414807 under
+    // 0.34: command 40, the change (Act29, 3030), the beast (2410811) put in
+    // his place.
+    {"Father Gascoigne", {2410810, 2410811}, {0.67f, 0.34f}, 0, -5401},
+    // 12304807 under 0.67 (7010, command 100), 12304808 under 0.33 after it.
+    {"Blood-starved Beast", {2300800}, {0.67f, 0.33f}},
+    // 12404807 under 0.5: command 100 (Act20); her heal from 0.5 (AI).
+    {"Vicar Amelia", {2400800}, {0.5f, 0}},
+    // 12204810 at 0.5: the second witch (2200801) comes in.
+    {"The Witch of Hemwick", {2200800}, {0.5f, 0}},
+    // 12304707 under 0.67 (with its SpEffect 5402 window): command 100 (Act17).
+    {"Darkbeast Paarl", {2300810}, {0.67f, 0}},
+    // 12704812, each Shadow, once all three are at 0.5 or one is at 0.3.
+    {"Shadow of Yharnam", {2700800, 2700801, 2700802}, {0.5f, 0}, 0.3f},
+    // 13204807 at 0.75 (the teleport, 3021, flag 13204811), then at 0.5 (13204812).
+    {"Rom, the Vacuous Spider", {3200800}, {0.75f, 0.5f}},
+    // 12804871 under 0.5: the bell ringers' command 2.
+    {"The One Reborn", {2800803}, {0.5f, 0}},
+    // The AI at 0.7 (Act07, 3010; its number 0 set to 1).
+    {"Martyr Logarius", {2500800}, {0.7f, 0}},
+    // 13304807 under 0.7 (command 100), 13304808 under 0.3 after it (110).
+    {"Amygdala", {3300800}, {0.7f, 0.3f}},
+    // 12424790 under 0.6: command 40, the giant (2420811) put in its place (3025).
+    {"Celestial Emissary", {2420810, 2420811}, {0.6f, 0}},
+    // 12424980 under 0.5: command 100.
+    {"Ebrietas, Daughter of the Cosmos", {2420800}, {0.5f, 0}},
+    // The AI at 0.5: the combos and the counter the darkness comes with.
+    {"Mergo's Wet Nurse", {2600802}, {0.5f, 0}},
+    // 13404824 under 0.5, 13404825: the cutscene (34000030) and the Holy
+    // Blade (3400801); 13404835 under 0.35 on the Holy Blade (7002, command 110).
+    {"Ludwig, the Holy Blade", {3400800, 3400801}, {0.5f, 0.35f}, 0, 13404825},
+    // 13505655 under 0.6, at a spawn cycle's end: the meteors (13504869).
+    {"Living Failures", {3500850}, {0.6f, 0}},
+    // The AI: Act30 at 0.6 (3030, SpEffect 5402), Act23 at 0.3 (3016, 5403).
+    {"Lady Maria of the Astral Clocktower", {3500800}, {0.6f, 0.3f}},
+    // The AI: at 0.8 (3010, 3033), at 0.4 (3036; SpEffect 5402).
+    {"Laurence, the First Vicar", {3400850}, {0.8f, 0.4f}},
+    // 13604820 under 0.5: command 100, the second form (3600801) put in its place (3031).
+    {"Orphan of Kos", {3600800, 3600801}, {0.5f, 0}},
+};
+constexpr bool fights_are_kbosses() {
+    for (const Fight& f : kFights) {
+        bool found = false;
+        for (const Boss& b : kBosses) found = found || (same(f.boss, b.name) && !b.dungeon);
+        if (!found || !f.chars[0] || !(f.below[0] > 0 && f.below[0] < 1) || !(f.below[1] < f.below[0])) return false;
+    }
+    return true;
+}
+static_assert(fights_are_kbosses(), "every kFights row names a story boss of kBosses, phase 3 under phase 2");
+
+const Fight* fight_of(const Boss* b) {
+    for (const Fight& f : kFights) {
+        if (same(f.boss, b->name)) return &f;
+    }
+    return nullptr;
+}
+// The latest phase, up to `wanted`, the game can be started at for this boss.
+int phase_for(const Boss* b, int wanted) {
+    const Fight* f = fight_of(b);
+    if (!f || wanted < 2) return 1;
+    if (wanted >= 3 && f->below[1] > 0) return 3;
+    return 2;
+}
+
 bb::Plugin g;
 
 enum class State { Waiting, Countdown, Warping, Fighting, Retry, Cleared, Done };
@@ -190,6 +339,32 @@ double g_fight_time = 0;  // the world's time since this round's arrival, or its
 bool g_test_watch = false;
 double g_watch_at = 0, g_quiet_at = 0;  // the world's time of the next watch line, the next quiet_arena
 bool g_skip_intro = true;
+
+// Practice: a run of one boss (g_run[0]) whose round starts again after a
+// win, until the Repeat setting is met or Stop.
+bool g_practice = false;
+enum class Repeat { Once, Times, Loop };
+Repeat g_repeat = Repeat::Loop;
+int g_times = 3;        // wins wanted, with Repeat::Times
+int g_phase = 1;        // the phase each fight is started at (phase_for: what the boss has)
+int g_test_stop = 0;    // boss_rush.test_stop = N: a test switch - the practice is stopped, as Stop does, after N wins
+bool g_test_practice = false;  // boss_rush.test_practice = true: a test switch - Start by itself begins a practice
+struct PracticeStats {
+    int attempts = 0, wins = 0;
+    std::int64_t deaths_at_start = 0;
+    double best = -1, last = -1;                    // clear times, s
+    int to_phase2_n = 0;                            // fights from phase 1 that reached phase 2
+    double to_phase2_best = -1, to_phase2_last = -1;  // their times from the fight's start, s
+};
+PracticeStats g_ps;
+// The fight under way, since the round's arrival (or its last death):
+bool g_fight_open = false;  // its attempt counted: the stand at the fog, or the fight begun
+bool g_begun = false;       // the boss's own "fight begun" flag has come on
+double g_fight_t0 = -1;     // real time it began (the begun flag; the fog stand until then)
+int g_phase_set = 1;        // the phase its boss's HP has been put at
+double g_phase_at = 0;      // the world's time of the next try at it
+int g_phase_tries = 0;
+bool g_phase2_seen = false;  // from phase 1: its boss has come under phase 2's threshold
 
 // Time, in seconds, from two clocks read once a frame (clocks()):
 //  - real time: the run's and the rounds' times, loading screens in, and the
@@ -300,6 +475,37 @@ void finish() {
     to_dream();
 }
 
+std::string practice_title(const Boss* b);
+std::string practice_tally();
+// A practice's summary: on screen as it ends, and in results.txt after the
+// lines its wins wrote as they fell.
+std::string practice_summary(const Boss* b) {
+    std::string t = "Practice - " + practice_title(b) + ": " + practice_tally();
+    if (g_ps.wins) t += "; best " + clock_text(g_ps.best) + ", last " + clock_text(g_ps.last);
+    if (g_ps.to_phase2_n)
+        t += "; phase 2 after " + clock_text(g_ps.to_phase2_last) + " (best " + clock_text(g_ps.to_phase2_best) + ")";
+    return t;
+}
+void results_line(const std::string& line) {
+    std::ofstream f(g_dir + "/results.txt", std::ios::app);
+    f << line << '\n';
+}
+// The practice over - its wins, or Stop: the summary, the save's flags back,
+// and (once a fight has been travelled to) home to the Hunter's Dream.
+void practice_end(const char* how, bool home, const std::string& say = "") {
+    const Boss* b = g_run[0];
+    give_back();
+    const std::string sum = practice_summary(b);
+    results_line(sum);
+    g.log("boss_rush: practice %s: %s", how, sum.c_str());
+    const std::string text = std::string("Practice ") + how + " - " + b->name + ": " + practice_tally() +
+                             (g_ps.wins ? ", best " + clock_text(g_ps.best) : "");
+    if (say.empty()) g.message(text, 10.0f);
+    else banner(say, 8.0f);  // shown once the world is up
+    g_state = State::Done;
+    if (home) to_dream();
+}
+
 // A boss fight is a small family of events in its map's script, and an
 // event's flag is its own id, set when it has run: the defeat event (the
 // defeat flag itself) and the ones after it (defeat + 1..9), among them the
@@ -364,6 +570,7 @@ void give_back() {
     }
 }
 
+std::uint32_t begun_flag(const Boss* b);
 bool wake(const Boss* b) {
     int failed = 0;
     if (b->dungeon) {
@@ -377,6 +584,8 @@ bool wake(const Boss* b) {
     } else {
         for (std::uint32_t i = 0; i < 10; ++i) failed += g.api->event_flag_set(b->defeat_flag + i, 0) != 0;
         if (g_skip_intro) failed += g.api->event_flag_set(b->defeat_flag + b->met, 1) != 0;
+        // A practice fight's start is that flag coming on: off for each one.
+        if (g_practice) failed += g.api->event_flag_set(begun_flag(b), 0) != 0;
     }
     for (const std::uint32_t f : b->set_flags) {
         if (f) failed += g.api->event_flag_set(f, 1) != 0;
@@ -534,6 +743,134 @@ void quiet_arena(const Boss* b) {
     if (off) g.log("boss_rush: %d characters switched off around %s's fog wall", off, b->name);
 }
 
+// --- practice ------------------------------------------------------------
+//
+// A boss fight's own "fight begun": the event that switches its AI on and
+// shows its health bar once the player has gone through the fog (defeat +
+// 3002 for each story boss: 13404802 is Ludwig's), whose flag comes on as it
+// ends; a chalice boss's `begun`.
+std::uint32_t begun_flag(const Boss* b) { return b->dungeon ? b->begun : b->defeat_flag + 3002; }
+
+std::string plural(std::int64_t n, const char* one) { return std::to_string(n) + " " + one + (n == 1 ? "" : "s"); }
+std::int64_t practice_deaths() { return g.stat("deaths") - g_ps.deaths_at_start; }
+// "2 wins in 3 attempts, 1 death"
+std::string practice_tally() {
+    return plural(g_ps.wins, "win") + " in " + plural(g_ps.attempts, "attempt") + ", " + plural(practice_deaths(), "death");
+}
+std::string practice_title(const Boss* b) {
+    return std::string(b->name) + (g_phase > 1 ? " from phase " + std::to_string(g_phase) : "");
+}
+
+// The fight from its round's arrival, or a death's respawn: nothing begun.
+void reset_fight() {
+    g_fight_open = g_begun = g_phase2_seen = false;
+    g_fight_t0 = -1;
+    g_phase_set = 1;
+    g_phase_tries = 0;
+}
+// A fight's attempt, counted once: at the stand at the fog, or as it begins.
+void open_attempt(const Boss* b, const char* at) {
+    if (g_fight_open) return;
+    g_fight_open = true;
+    ++g_ps.attempts;
+    g_fight_t0 = g_now;
+    g.log("boss_rush: practice: %s, attempt %d (%s)", b->name, g_ps.attempts, at);
+}
+
+// A character by entity id, with the lookup the event instructions use, and
+// its HP (the data module's, ChrIns +0x3b0 -> +0x20: what the health bar and
+// the scripts' HP-ratio conditions read).
+bb::ChrDataModule* chr_data_of(std::int32_t entity) {
+    auto* ins = reinterpret_cast<bb::ChrIns*>(call_at(kChrByEntity, {static_cast<std::uint64_t>(entity), 0, 0}));
+    return ins ? ins->chr_data() : nullptr;
+}
+float hp_ratio(const bb::ChrDataModule* d) { return static_cast<float>(d->hp) / static_cast<float>(d->max_hp); }
+
+// Every character of the fight a little under `below` of its HP - as the
+// damage would have left it, the ones linked to the first taking the same -
+// and none raised or brought back. False while one is not there yet.
+bool put_under(const Boss* b, const Fight* f, int phase) {
+    const float below = f->below[phase - 2];
+    std::string t;
+    for (const std::int32_t e : f->chars) {
+        if (!e) continue;
+        bb::ChrDataModule* d = chr_data_of(e);
+        if (!d || d->max_hp <= 0) return false;
+        const auto to = static_cast<std::int32_t>(std::floor((below - 0.005f) * static_cast<float>(d->max_hp)));
+        const std::int32_t was = d->hp;
+        if (d->hp > to && to >= 1) d->hp = to;
+        char one[96];
+        std::snprintf(one, sizeof(one), "%s%d %d -> %d/%d", t.empty() ? "" : ", ", e, was, d->hp, d->max_hp);
+        t += one;
+    }
+    g.log("boss_rush: practice: %s put at phase %d (HP under %.2f): %s", b->name, phase, static_cast<double>(below), t.c_str());
+    return true;
+}
+// Phase 2 under way in its HP: every character of the fight under its
+// threshold (or one under any_below), as the game's own conditions test it.
+bool phase2_reached(const Fight* f) {
+    bool all = true, any = false;
+    int n = 0;
+    for (const std::int32_t e : f->chars) {
+        if (!e) continue;
+        const bb::ChrDataModule* d = chr_data_of(e);
+        if (!d || d->max_hp <= 0) {
+            all = false;
+            continue;
+        }
+        ++n;
+        const float r = hp_ratio(d);
+        all = all && r < f->below[0];
+        any = any || (f->any_below > 0 && r < f->any_below);
+    }
+    return n && (all || any);
+}
+// Phase 2's change begun, for a boss whose phase 3 waits for it (Fight::then).
+bool then_met(const Fight* f) {
+    if (f->then > 0) return g.flag(static_cast<std::uint32_t>(f->then));
+    void* ins = reinterpret_cast<void*>(call_at(kChrByEntity, {static_cast<std::uint64_t>(f->chars[0]), 0, 0}));
+    return ins && g.api->sp_effect_has(ins, -f->then) != 0;
+}
+
+// Each frame of a practice fight, in the world: its start, the phase it is
+// put at, and from phase 1 the time to phase 2.
+void practice_watch(const Boss* b) {
+    if (!g_begun && g.flag(begun_flag(b))) {
+        g_begun = true;
+        open_attempt(b, "the fight begun");
+        g_fight_t0 = g_now;  // the fight's own start, not the stand at the fog
+        g_phase_at = g_world_time;
+        g.log("boss_rush: practice: %s's fight has begun (flag %u)", b->name, begun_flag(b));
+    }
+    const Fight* f = fight_of(b);
+    if (!g_begun || !f) return;
+    if (g_phase == 1 && !g_phase2_seen && phase2_reached(f)) {
+        g_phase2_seen = true;
+        const double t = g_now - g_fight_t0;
+        ++g_ps.to_phase2_n;
+        g_ps.to_phase2_last = t;
+        if (g_ps.to_phase2_best < 0 || t < g_ps.to_phase2_best) g_ps.to_phase2_best = t;
+        g.log("boss_rush: practice: %s under phase 2's HP (%.2f) %.1f s into the fight", b->name, static_cast<double>(f->below[0]), t);
+        g.text_at("Phase 2 after " + clock_text(t), 5.0f, 0.03f, 0.84f, 1.0f, BB_TEXT_LEFT);
+    }
+    if (g_phase_set >= g_phase || g_world_time < g_phase_at) return;
+    int next = g_phase_set + 1;
+    if (next == 2 && g_phase == 3 && f->then == 0) next = 3;  // the game takes phase 2 first itself
+    if (next == 3 && g_phase_set == 2 && !then_met(f)) {
+        g_phase_at = g_world_time + 0.25;
+        return;
+    }
+    if (put_under(b, f, next)) {
+        g_phase_set = next;
+        g_phase_at = g_world_time + 0.25;
+    } else if (++g_phase_tries >= 40) {  // ten seconds of the world without its characters
+        g.log("boss_rush: practice: %s's characters were not found; this fight is from phase %d", b->name, g_phase_set);
+        g_phase_set = g_phase;
+    } else {
+        g_phase_at = g_world_time + 0.25;
+    }
+}
+
 // The fog warp, inside the arena's block: asked once the world is up, never
 // while the arrival's loading screen is (on_world_load comes with it still
 // up, and a warp then lands before the world is ready: the streamer can ask
@@ -564,6 +901,7 @@ void check_fog(const Boss* b) {
         reset_camera();
         g.log("boss_rush: at %s's fog wall (%.1f %.1f %.1f)", b->name, at[0], at[1], at[2]);
         quiet_arena(b);
+        if (g_practice) open_attempt(b, "at the fog wall");
         if (g_test_watch) {
             const float t = b->fog_yaw * kPi / 180.0f;
             for (const BbChr& c : g.characters()) {
@@ -653,10 +991,13 @@ void travel_tick(const Boss* b) {
 }
 
 void begin();
+void practice();
+void stop(const char* why);
 void start_round() {
     const Boss* b = g_run[g_round];
     wake(b);
-    g.log("boss_rush: round %zu - %s", g_round + 1, b->name);
+    if (g_practice) g.log("boss_rush: practice: %s, fight %d (%s)", b->name, g_ps.attempts + 1, practice_tally().c_str());
+    else g.log("boss_rush: round %zu - %s", g_round + 1, b->name);
     g_state = State::Warping;
     g_travel_asks = 0;
     g_travel_at = -1;
@@ -668,7 +1009,8 @@ void tick() {
     clocks();
     if (g_auto_pending && g_in_world) {  // Start by itself: once the first load's screen has gone
         g_auto_pending = false;
-        begin();
+        if (g_test_practice) practice();
+        else begin();
     }
     if (g_in_world && !g_banner.empty()) {
         g.message(g_banner, g_banner_s);
@@ -690,12 +1032,14 @@ void tick() {
                 } else {
                     for (std::uint32_t i = 0; i < 10; ++i) g_original[b->defeat_flag + i] = g.flag(b->defeat_flag + i);
                     g_original[b->defeat_flag + 3000] = g.flag(b->defeat_flag + 3000);
+                    if (g_practice) g_original[begun_flag(b)] = g.flag(begun_flag(b));
                 }
                 for (const std::uint32_t f : b->set_flags) {
                     if (f) g_original[f] = g.flag(f);
                 }
             }
             save_restore_file();
+            g_ps.deaths_at_start = g_deaths_at_start;
             start_round();
         }
         break;
@@ -709,6 +1053,7 @@ void tick() {
                 g_quiet_at = g_world_time + 1.0;
                 quiet_arena(b);
             }
+            if (g_practice) practice_watch(b);
         }
         if (g_test_watch && g_in_world && g_world_time >= g_watch_at) {
             g_watch_at = g_world_time + 2.0;
@@ -728,6 +1073,26 @@ void tick() {
         // The defeat flag is the defeat event's own: the event system sets it
         // when the event ends, not through SetEventFlag, so on_event_flag
         // does not see it - it is read here instead.
+        if (g.flag(b->defeat_flag) && g_practice) {
+            // Its time from the fight's start (the stand at the fog until the
+            // fight began), the best and the last, on screen and on file.
+            const double took = g_fight_t0 >= 0 ? g_now - g_fight_t0 : 0.0;
+            if (!g_fight_open) open_attempt(b, "the boss's defeat");
+            ++g_ps.wins;
+            g_ps.last = took;
+            const bool best = g_ps.best < 0 || took < g_ps.best;
+            if (best) g_ps.best = took;
+            g.message(std::string(b->name) + " defeated - " + clock_text(took) + (best ? " (best)" : " (best " + clock_text(g_ps.best) + ")") +
+                          " - " + practice_tally(),
+                      6.0f);
+            results_line("Practice - " + practice_title(b) + ": win " + std::to_string(g_ps.wins) + " in " + clock_text(took) + ", attempt " +
+                         std::to_string(g_ps.attempts));
+            g.log("boss_rush: practice: %s defeated in %s (%.1f s), %s", b->name, clock_text(took).c_str(), took, practice_tally().c_str());
+            reset_fight();
+            g_state = State::Cleared;
+            g_wait = 10.0;  // time to pick up what it dropped
+            break;
+        }
         if (g.flag(b->defeat_flag)) {
             const double took = g_round_start >= 0 ? g_now - g_round_start : 0.0;
             g_round_times.push_back(took);
@@ -802,8 +1167,16 @@ void tick() {
     case State::Cleared:
         if (g_in_world && (g_wait -= g_step) <= 0) {
             g_refused = 0;
-            if (++g_round >= g_run.size()) finish();
-            else start_round();
+            if (g_practice) {
+                // The next fight, until the Repeat setting is met.
+                if (g_test_stop && g_ps.wins >= g_test_stop) stop("stopped");
+                else if (g_repeat == Repeat::Loop || g_ps.wins < (g_repeat == Repeat::Once ? 1 : g_times)) start_round();
+                else practice_end("done", true);
+            } else if (++g_round >= g_run.size()) {
+                finish();
+            } else {
+                start_round();
+            }
         }
         break;
     default:
@@ -842,6 +1215,7 @@ void begin() {
     }
     build_run();
     if (g_run.empty()) return;
+    g_practice = false;
     g_round = 0;
     g_retries = g_refused = 0;
     g_round_times.clear();
@@ -855,11 +1229,64 @@ void begin() {
               6.0f);
 }
 
+// Practice: the boss the settings name, its run of one, the round's
+// countdown as a rush's.
+void practice() {
+    if (g_state != State::Waiting && g_state != State::Done) {
+        g.message("A boss rush or practice is already under way", 3.0f);
+        return;
+    }
+    if (g.stat("hp", -1) < 0) {
+        g.message("Load into the world first", 3.0f);
+        return;
+    }
+    build_run();  // the shared settings (start_delay, awake)
+    const std::string name = g.config("boss_rush.practice_boss", kBosses[0].name);
+    const Boss* b = nullptr;
+    for (const Boss& k : kBosses) {
+        if (name == k.name) b = &k;
+    }
+    if (!b) {
+        g.message("Boss rush: no boss is called " + name, 4.0f);
+        return;
+    }
+    const std::string repeat = g.config("boss_rush.practice_repeat", "Loop until stopped");
+    g_repeat = repeat == "Once" ? Repeat::Once : repeat == "N times" ? Repeat::Times : Repeat::Loop;
+    g_times = std::max(1, static_cast<int>(g.config_number("boss_rush.practice_times", 3)));
+    const int wanted = std::clamp(static_cast<int>(g.config_number("boss_rush.practice_phase", 1)), 1, 3);
+    g_phase = phase_for(b, wanted);
+    g_run.assign(1, b);
+    g_practice = true;
+    g_ps = PracticeStats{};
+    reset_fight();
+    g_round = 0;
+    g_retries = g_refused = 0;
+    g_round_times.clear();
+    g_original.clear();
+    g_to_dream = false;
+    g_state = State::Countdown;
+    g_wait = g_start_delay;
+    // Said once, here: a phase the boss does not have, and what it starts at.
+    std::string note;
+    if (wanted > g_phase) {
+        note = b->dungeon ? " - chalice bosses start at phase 1" : g_phase == 1 ? " - it has no later phase" : " - it has no phase 3";
+    }
+    const std::string goal = g_repeat == Repeat::Once ? "once" : g_repeat == Repeat::Times ? plural(g_times, "win") : "until stopped";
+    g.log("boss_rush: practice: %s from phase %d (asked %d), %s", b->name, g_phase, wanted, goal.c_str());
+    g.message("Practice: " + practice_title(b) + note + ", " + goal + " - the first fight in " + std::to_string(g_start_delay) + " seconds",
+              6.0f);
+}
+
 // Ends a run before its last boss: the save's flags as they were, and back to
 // the Hunter's Dream once a round has begun.
 void stop(const char* why) {
     if (g_state == State::Waiting || g_state == State::Done) return;
     const bool travelled = g_state != State::Countdown;
+    if (g_practice) {
+        g.log("boss_rush: practice %s", why);
+        practice_end(why, travelled);
+        return;
+    }
     give_back();
     g.log("boss_rush: %s at round %zu", why, g_round + 1);
     g.message("Boss rush " + std::string(why), 4.0f);
@@ -869,6 +1296,14 @@ void stop(const char* why) {
 
 void skip() {
     if (g_state != State::Fighting && g_state != State::Warping && g_state != State::Retry) return;
+    if (g_practice) {
+        // This fight over, not won: the next from the fog wall, the boss woken anew.
+        g.log("boss_rush: practice: %s's fight skipped; again from the fog wall", g_run[0]->name);
+        reset_fight();
+        g_state = State::Retry;
+        g_wait = 0;
+        return;
+    }
     g.log("boss_rush: %s skipped", g_run[g_round]->name);
     g_round_times.push_back(0);
     g_state = State::Cleared;
@@ -885,12 +1320,15 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     g_test_watch = g.config_bool("boss_rush.test_watch", false);
     g_test_drop_travel = static_cast<int>(g.config_number("boss_rush.test_drop_travel", 0));
     g_frame_seconds = g.config_number("boss_rush.test_frame_seconds", 0);
+    g_test_stop = static_cast<int>(g.config_number("boss_rush.test_stop", 0));
+    g_test_practice = g.config_bool("boss_rush.test_practice", false);
     g_t0 = std::chrono::steady_clock::now();
     g_auto_start = g.config_bool("boss_rush.auto_start", false);
     build_run();
     g.api->on_action("boss_rush", [](const char* action, void*) {
         const std::string a = action;
         if (a == "start") begin();
+        else if (a == "practice") practice();
         else if (a == "stop") stop("stopped");
         else if (a == "skip") skip();
     }, nullptr);
@@ -917,7 +1355,12 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 // Sent away without dying: the game will not keep the player
                 // in that map (The Old Hunters' maps, on a save without their
                 // way in). Twice, and the round is skipped.
-                if (g.stat("deaths") == g_deaths_at_arrival && ++g_refused >= 2) {
+                if (g.stat("deaths") == g_deaths_at_arrival && ++g_refused >= 2 && g_practice) {
+                    g.log("boss_rush: %s's map sends the player away on this save; the practice ends", b->name);
+                    practice_end("ended", true, "Cannot reach " + std::string(b->name) + " on this save - practice ended");
+                    return;
+                }
+                if (g.stat("deaths") == g_deaths_at_arrival && g_refused >= 2) {
                     g.log("boss_rush: %s's map sends the player away on this save; skipped", b->name);
                     banner("Cannot reach " + std::string(b->name) + " on this save - skipped", 6.0f);
                     g_round_times.push_back(0);
@@ -930,8 +1373,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                     g.log("boss_rush: sent away from %s's map without a death; once more", b->name);
                 } else {
                     g.log("boss_rush: died to %s; back to its arena (retry %d)", b->name, g_retries);
-                    banner("Again - " + std::string(b->name), 4.0f);
+                    banner("Again - " + std::string(b->name) + (g_practice ? " (" + practice_tally() + ")" : ""), 4.0f);
                 }
+                reset_fight();
                 // The travel back, asked once the respawn's screen has gone and
                 // the world has settled (travel_tick): past its fade-in.
                 g_state = State::Retry;
@@ -942,12 +1386,22 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                 g_round_start = -1;
                 g_deaths_at_arrival = g.stat("deaths");
                 log_flags(b, "arrived");
-                banner("Round " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
+                if (!g_practice) banner("Round " + std::to_string(g_round + 1) + "/" + std::to_string(g_run.size()) + " - " + b->name, 5.0f);
+                else banner("Practice - " + practice_title(b) + (g_ps.attempts ? " (" + practice_tally() + ")" : ""), 5.0f);
             } else {
                 // A death in the boss's own map: back at the block's lamp.
                 ++g_retries;
                 log_flags(b, "back after a death");
-                banner("Again - " + std::string(b->name), 4.0f);
+                banner("Again - " + std::string(b->name) + (g_practice ? " (" + practice_tally() + ")" : ""), 4.0f);
+            }
+            if (g_practice) {
+                // A fight anew. Its "fight begun" is the map's own and goes with
+                // each load; one still on is taken off, so its start is seen.
+                reset_fight();
+                if (g.flag(begun_flag(b))) {
+                    g.log("boss_rush: practice: %s's fight-begun flag %u was on at the arrival; off", b->name, begun_flag(b));
+                    g.set_flag(begun_flag(b), false);
+                }
             }
             // A death since the last refill (here, or elsewhere before this
             // round's travel): vials and bullets back to the most.

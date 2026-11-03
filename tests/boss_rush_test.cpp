@@ -11,7 +11,10 @@
 // during a load sends the player home once its screen has gone; only a
 // travel the game never begins - or one bbhost refuses with the player there
 // - stops the run, with a message that says so; on an older host (plugin API
-// 11) the SDK's own loading test does the same.
+// 11) the SDK's own loading test does the same. Practice: one boss twice from
+// phase 2 (its characters put under the threshold once the fight has begun,
+// both wins on file, the save's flags back at the end), and a loop with a
+// death, a win, phase 2's time from phase 1, and a stop.
 //
 //   boss_rush_test <boss_rush.so>
 #include "bbhost_plugin.h"
@@ -88,8 +91,32 @@ struct Game {
     // CSNowLoadingHelper's in-game bytes (+0x50, +0x51).
     std::uint8_t request = 0;
     alignas(8) std::uint8_t helper[0x58] = {};
+    std::string text;  // show_text's last line
 };
 Game G;
+
+// The fight's characters as the game's lookup by entity id gives them: a
+// ChrIns whose module container (+0x3b0) holds the data module (+0x20), its
+// HP at +0xf8 and the most at +0xfc. Full again at each load.
+struct FakeChr {
+    alignas(8) std::uint8_t ins[0x400] = {};
+    alignas(8) std::uint8_t modules[0x208] = {};
+    alignas(8) std::uint8_t data[0x208] = {};
+    std::int32_t& hp() { return *reinterpret_cast<std::int32_t*>(data + 0xf8); }
+    std::int32_t& max_hp() { return *reinterpret_cast<std::int32_t*>(data + 0xfc); }
+    void full(std::int32_t most) {
+        *reinterpret_cast<std::uint8_t**>(ins + 0x3b0) = modules;
+        *reinterpret_cast<std::uint8_t**>(modules + 0x20) = data;
+        max_hp() = most;
+        hp() = most;
+    }
+};
+constexpr std::int32_t kLudwigBeast = 3400800, kLudwigHolyBlade = 3400801;
+constexpr std::uint32_t kLudwigBegun = kLudwigDefeat + 3002;
+std::map<std::int32_t, FakeChr> g_chrs;
+void chrs_full() {
+    for (const std::int32_t e : {kLudwigBeast, kLudwigHolyBlade}) g_chrs[e].full(2400);
+}
 
 Call now_call(std::int32_t lamp = 0, const float* xyz = nullptr) {
     Call c{G.frame, G.loading, G.player, lamp, {}};
@@ -179,8 +206,17 @@ int fake_lamp_warp(std::int32_t rp) {
     G.fade = kFadeFrames;
     return 0;
 }
-int fake_call_guest(std::uint64_t, BbCallRegs* regs) {
+int fake_call_guest(std::uint64_t bn, BbCallRegs* regs) {
     regs->ret = 0;
+    if (bn == 0x17c97a0 && G.player) {  // a character by entity id
+        const auto it = g_chrs.find(static_cast<std::int32_t>(regs->arg[0]));
+        if (it != g_chrs.end()) regs->ret = reinterpret_cast<std::uint64_t>(it->second.ins);
+    }
+    return 0;
+}
+int fake_sp_effect_has(void*, std::int32_t) { return 0; }
+int fake_show_text(const char* text, float, float, float, float, std::uint32_t) {
+    G.text = text;
     return 0;
 }
 int fake_on_world_load(void (*fn)(std::uint32_t, void*), void* user) {
@@ -233,6 +269,7 @@ void step() {
         G.pos[1] = kFog[1];
         G.pos[2] = kFog[2] + 40.0f;
         G.hp = 100;
+        chrs_full();
         G.lit = kLoadFrames;
         if (G.load_fn) G.load_fn(G.block, G.load_user);
     } else if (G.lit > 0 && --G.lit == 0) {
@@ -296,6 +333,8 @@ struct Loaded {
 Loaded start(const char* so, const fs::path& dir, const std::string& name, std::uint32_t api_version,
              std::map<std::string, std::string> config) {
     G = Game{};
+    g_chrs.clear();
+    chrs_full();
     G.dir = (dir / name).string();
     fs::create_directories(G.dir);
     G.config = std::move(config);
@@ -340,7 +379,9 @@ Loaded start(const char* so, const fs::path& dir, const std::string& name, std::
     api.plugin_dir = fake_plugin_dir;
     api.show_message = fake_show_message;
     api.on_action = fake_on_action;
+    api.sp_effect_has = fake_sp_effect_has;
     if (api_version >= 12) api.loading_screen = fake_loading_screen;
+    if (api_version >= 14) api.show_text = fake_show_text;
     CHECK(image && image(&api) == 0);
     CHECK(G.frame_fn && G.load_fn);
     if (!G.frame_fn || !G.load_fn) return l;
@@ -549,6 +590,123 @@ void refused(const char* so, const fs::path& dir) {
     std::printf("refused: %s\n", g_failures == failures ? "ok" : "FAILED");
 }
 
+std::map<std::string, std::string> practice_config(const char* repeat, const char* times, const char* phase) {
+    return {{"boss_rush.start_delay", "1"},         {"boss_rush.practice_boss", "Ludwig, the Holy Blade"},
+            {"boss_rush.practice_repeat", repeat}, {"boss_rush.practice_times", times},
+            {"boss_rush.practice_phase", phase},   {"boss_rush.dlc", "true"}};
+}
+std::string results_of() {
+    std::ifstream results(G.dir + "/results.txt");
+    std::stringstream text;
+    text << results.rdbuf();
+    return text.str();
+}
+// The world up after the title's load, a few seconds, and the menu's
+// "Practice this boss".
+bool practice_from_menu() {
+    if (!run_until([] { return screen_end(0) != 0; }, 10000)) return false;
+    for (int i = 0; i < 5 * kFps; ++i) step();
+    if (!G.action_fn) return false;
+    G.action_fn("practice", G.action_user);
+    return true;
+}
+// The player walks through the fog: once the plugin has stood them at it (the
+// nth time), two seconds, and the fight's own start - its flag on.
+bool walk_in(std::size_t nth) {
+    if (!run_until([&] { return count_logged("at Ludwig, the Holy Blade's fog wall") >= nth; }, kFadeFrames + kDarkFrames + kLoadFrames + 2000))
+        return false;
+    for (int i = 0; i < 2 * kFps; ++i) step();
+    G.flags[kLudwigBegun] = 1;
+    return true;
+}
+
+// Practice Ludwig twice (Repeat N times, N = 2) from phase 2: each fight's
+// characters - the beast and the Holy Blade it changes into, which the fight
+// links - just under half their HP once the fight has begun, once; each win
+// on file; after the second, the summary and home, the save's flags back.
+void practice_twice(const char* so, const fs::path& dir) {
+    const int failures = g_failures;
+    Loaded l = start(so, dir, "practice-twice", BB_PLUGIN_API_VERSION, practice_config("N times", "2", "2"));
+    if (!G.frame_fn) return;
+    CHECK(practice_from_menu());
+    CHECK(message("Practice: Ludwig, the Holy Blade from phase 2, 2 wins - the first fight in 1 seconds"));
+    for (int fight = 1; fight <= 2; ++fight) {
+        CHECK(walk_in(static_cast<std::size_t>(fight)));
+        CHECK(g_chrs[kLudwigBeast].hp() == 2400);  // nothing before the fight's start
+        CHECK(run_until([] { return g_chrs[kLudwigBeast].hp() < 2400; }, 10));
+        CHECK(g_chrs[kLudwigBeast].hp() == 1188 && g_chrs[kLudwigHolyBlade].hp() == 1188);
+        for (int i = 0; i < 20 * kFps; ++i) step();
+        CHECK(g_chrs[kLudwigBeast].hp() == 1188);
+        G.flags[kLudwigDefeat] = 1;
+        CHECK(run_until([&] { return count_logged("practice: Ludwig, the Holy Blade defeated in") == static_cast<std::size_t>(fight); }, 10));
+        if (fight == 1) {
+            // Woken again for the next: its defeat off, "met" on, the fight's start off.
+            CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
+            CHECK(G.flags[kLudwigDefeat] == 0 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigBegun] == 0);
+            CHECK(G.travels.size() == 2 && G.travels[1].lamp == kLudwigLamp);
+        }
+    }
+    CHECK(count_logged("practice: Ludwig, the Holy Blade put at phase 2 (HP under 0.50): 3400800 2400 -> 1188/2400, 3400801 2400 -> 1188/2400") == 2);
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best) - 1 win in 1 attempt, 0 deaths"));
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:20 (best 0:20) - 2 wins in 2 attempts, 0 deaths"));
+    CHECK(run_until([] { return G.travels.size() == 3; }, 20 * kFps));
+    CHECK(G.travels.size() == 3 && G.travels[2].lamp == kDream);
+    CHECK(message("Practice done - Ludwig, the Holy Blade: 2 wins in 2 attempts, 0 deaths, best 0:20"));
+    const std::string r = results_of();
+    CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 1 in 0:20, attempt 1\n") != std::string::npos);
+    CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: win 2 in 0:20, attempt 2\n") != std::string::npos);
+    CHECK(r.find("Practice - Ludwig, the Holy Blade from phase 2: 2 wins in 2 attempts, 0 deaths; best 0:20, last 0:20\n") != std::string::npos);
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 &&
+          G.flags[kLudwigDefeat + 2] == 0 && G.flags[kLudwigBegun] == 0);
+    CHECK(logged("boss_rush: 12 flags back as the save had them") && !logged("read back otherwise"));
+    check_never_inside_a_screen();
+    CHECK(G.refused.empty() && !message("stopped"));
+    finish(l, "practice twice");
+    std::printf("practice twice: %s\n", g_failures == failures ? "ok" : "FAILED");
+}
+
+// Practice Ludwig in a loop from phase 1: phase 2's time (the boss under half
+// 30 s in), a death in the arena (back at the fog, the fight's start seen
+// anew though the pretend game kept its flag), a win, and the stop after it
+// (boss_rush.test_stop = 1): the summary, the save's flags back.
+void practice_loop(const char* so, const fs::path& dir) {
+    const int failures = g_failures;
+    auto config = practice_config("Loop until stopped", "3", "1");
+    config["boss_rush.test_stop"] = "1";
+    Loaded l = start(so, dir, "practice-loop", BB_PLUGIN_API_VERSION, config);
+    if (!G.frame_fn) return;
+    CHECK(practice_from_menu());
+    CHECK(message("Practice: Ludwig, the Holy Blade, until stopped - the first fight in 1 seconds"));
+    CHECK(walk_in(1));
+    for (int i = 0; i < 30 * kFps; ++i) step();
+    CHECK(g_chrs[kLudwigBeast].hp() == 2400 && !logged("put at phase"));  // phase 1: left as it is
+    g_chrs[kLudwigBeast].hp() = g_chrs[kLudwigHolyBlade].hp() = 1100;     // the player's damage
+    CHECK(run_until([] { return logged("under phase 2's HP"); }, 5));
+    CHECK(logged("practice: Ludwig, the Holy Blade under phase 2's HP (0.50) 30.0 s into the fight") && G.text == "Phase 2 after 0:30");
+    for (int i = 0; i < 2 * kFps; ++i) step();
+    G.hp = 0;
+    ++G.deaths;
+    G.dying = 240;
+    CHECK(run_until([] { return logged("back after a death"); }, 1000));
+    CHECK(walk_in(2));
+    CHECK(logged("fight-begun flag 13404802 was on at the arrival; off"));
+    for (int i = 0; i < 15 * kFps; ++i) step();
+    G.flags[kLudwigDefeat] = 1;
+    CHECK(run_until([] { return logged("practice: Ludwig, the Holy Blade defeated in"); }, 10));
+    CHECK(message("Again - Ludwig, the Holy Blade (0 wins in 1 attempt, 1 death)"));
+    CHECK(message("Ludwig, the Holy Blade defeated - 0:15 (best) - 1 win in 2 attempts, 1 death"));
+    CHECK(run_until([] { return message("Practice stopped") != nullptr; }, 15 * kFps));
+    CHECK(message("Practice stopped - Ludwig, the Holy Blade: 1 win in 2 attempts, 1 death, best 0:15"));
+    CHECK(results_of().find("Practice - Ludwig, the Holy Blade: 1 win in 2 attempts, 1 death; best 0:15, last 0:15; phase 2 after 0:30 "
+                            "(best 0:30)\n") != std::string::npos);
+    CHECK(G.flags[kLudwigDefeat] == 1 && G.flags[kLudwigDefeat + 1] == 1 && G.flags[kLudwigDefeat + 5] == 1 && G.flags[kLudwigBegun] == 0);
+    CHECK(run_until([] { return G.travels.size() == 2; }, 20 * kFps));
+    CHECK(G.travels.size() == 2 && G.travels[1].lamp == kDream);
+    check_never_inside_a_screen();
+    finish(l, "practice loop");
+    std::printf("practice loop: %s\n", g_failures == failures ? "ok" : "FAILED");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -565,6 +723,8 @@ int main(int argc, char** argv) {
     stopped_in_a_load(argv[1], dir);
     never_begun(argv[1], dir);
     refused(argv[1], dir);
+    practice_twice(argv[1], dir);
+    practice_loop(argv[1], dir);
     fs::remove_all(dir);
     std::printf("%s\n", g_failures ? "FAILED" : "ok");
     return g_failures ? 1 : 0;
