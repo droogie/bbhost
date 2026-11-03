@@ -17,10 +17,6 @@
 #include <unordered_map>
 #include <vector>
 
-// The pool's switch, on for the test (host/gxvk_lists_leaf.cpp's in the game).
-namespace gxvk_lists {
-int pool_threads() { return 2; }
-}  // namespace gxvk_lists
 
 namespace {
 
@@ -93,7 +89,9 @@ void reader(std::atomic<std::uint64_t>* torn, std::atomic<std::uint64_t>* lost, 
 }  // namespace
 
 int main() {
-    CHECK(cache_rw::g_readers);
+    // The readers on, as gxvk_lists::settle turns them on in the game once the pool will run.
+    cache_rw::g_readers.store(true, std::memory_order_release);
+    CHECK(cache_rw::g_readers.load());
     std::atomic<std::uint64_t> torn{0}, lost{0}, finds{0};
     std::vector<std::thread> readers;
     for (int i = 0; i < 8; ++i) readers.emplace_back(reader, &torn, &lost, &finds);
