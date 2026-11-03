@@ -72,6 +72,11 @@ struct HostConfig {
     // world.skill_issue / BBHOST_SKILL_ISSUE=0|1: the death message reads
     // SKILL ISSUE instead of YOU DIED (engine/menu_assets.h). Off by default.
     bool skill_issue = false;
+    // world.messenger_gifts / BBHOST_MESSENGER_GIFTS=0|1: the game is told the
+    // account has add-ons 0, 1 and 2, the pre-order and edition messenger
+    // gifts, which the Stump Messengers then hand out (hle/system.cpp,
+    // sceAppContentGetAddcontInfoList). Off by default.
+    bool messenger_gifts = false;
     // [keys] from the config, action name -> SDL key name. Empty unless the
     // player has rebound something; window.cpp holds the defaults and the
     // list of action names.
@@ -154,7 +159,8 @@ App0Version config_app0_version(const std::string& app0);
 // System menu's PC Enhancements, the setup window's tab) once it is read. A
 // BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS or
 // BBHOST_SKILL_ISSUE of 0 or 1 still wins over the options file.
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue);
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue,
+                             bool messenger_gifts);
 // The setup window's server, in memory before it is saved: its account calls
 // (net::auth_server_base) go where its dropdown says. Main thread, before
 // the game starts.

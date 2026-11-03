@@ -390,6 +390,19 @@ int main() {
         CHECK(c.eboot == base + "/eboot.bin");  // a path given is kept
     }
 
+    // [world] messenger_gifts: off unless the file says so; the environment
+    // wins.
+    {
+        CHECK(!load("[world]\n").messenger_gifts);
+        CHECK(load("[world]\nmessenger_gifts = true\n").messenger_gifts);
+        CHECK(!load("[world]\nmessenger_gifts = false\n").messenger_gifts);
+        setenv("BBHOST_MESSENGER_GIFTS", "0", 1);
+        CHECK(!load("[world]\nmessenger_gifts = true\n").messenger_gifts);
+        setenv("BBHOST_MESSENGER_GIFTS", "1", 1);
+        CHECK(load("[world]\n").messenger_gifts);
+        unsetenv("BBHOST_MESSENGER_GIFTS");
+    }
+
     // The play log's 5 s from the old example moved to 30 (config_version
     // 5), then four mutants of the move, each of which a check must catch.
     const int pl_fails = playlog_migration();

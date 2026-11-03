@@ -214,6 +214,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         auto it = kv.find("world.skill_issue");
         if (it != kv.end()) c->skill_issue = it->second == "true" || it->second == "1";
     }
+    {
+        auto it = kv.find("world.messenger_gifts");
+        if (it != kv.end()) c->messenger_gifts = it->second == "true" || it->second == "1";
+    }
     // Every [keys] entry, whatever it is called: the action names live in
     // window.cpp beside the defaults, and an unknown one is reported there
     // rather than silently dropped here.
@@ -810,6 +814,10 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         if (std::strcmp(e, "1") == 0) c.skill_issue = true;
         else if (std::strcmp(e, "0") == 0) c.skill_issue = false;
     }
+    if (const char* e = std::getenv("BBHOST_MESSENGER_GIFTS")) {
+        if (std::strcmp(e, "1") == 0) c.messenger_gifts = true;
+        else if (std::strcmp(e, "0") == 0) c.messenger_gifts = false;
+    }
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
@@ -918,7 +926,8 @@ std::string config_eboot_help(const HostConfig& c, const std::string& sha256, co
 
 void config_set_skip_intro(bool on) { g_cfg.skip_intro = on; }
 
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue) {
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue,
+                             bool messenger_gifts) {
     const auto set = [](bool* field, bool on, const char* env) {
         const char* e = std::getenv(env);
         if (e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0)) return;  // the environment's, kept
@@ -928,6 +937,7 @@ void config_set_enhancements(bool change_appearance, bool rebirth, bool five_pla
     set(&g_cfg.rebirth, rebirth, "BBHOST_REBIRTH");
     set(&g_cfg.five_players, five_players, "BBHOST_FIVE_PLAYERS");
     set(&g_cfg.skill_issue, skill_issue, "BBHOST_SKILL_ISSUE");
+    set(&g_cfg.messenger_gifts, messenger_gifts, "BBHOST_MESSENGER_GIFTS");
 }
 
 void config_set_online(const std::string& host, const std::string& scheme, bool verify_tls, bool require_account,

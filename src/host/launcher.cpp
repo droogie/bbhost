@@ -344,7 +344,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::chrono::steady_clock::time_point cache_state_at{};
     bool cache_state_devices = false, compile_was_running = false;
     // The PC enhancements, through the same calls: each is read when the
-    // game starts (main.cpp, config_set_enhancements). The same four the
+    // game starts (main.cpp, config_set_enhancements). The same five the
     // game's System > PC Enhancements and F10 > PC ENHANCEMENTS have.
     struct Enhancement {
         const char* key;
@@ -366,6 +366,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
          false},
         {"skill_issue", "SKILL ISSUE", "The death message says SKILL ISSUE.",
          "When the hunter dies, the screen says SKILL ISSUE instead of YOU DIED, in every language.", false},
+        {"messenger_gifts", "Messenger gifts", "The Stump Messengers offer the pre-order and edition gifts.",
+         "The game counts the pre-order and edition bonuses as yours: the Stump Messengers behind the workshop offer "
+         "the Yharnam Messenger Hat, the Worn Messenger Top Hat and the Messenger Head Bandage.",
+         false},
     };
     for (Enhancement& e : enhancements) e.on = host_opt_get(e.key);
     // The Patches page: every manifest the loader would read

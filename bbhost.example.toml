@@ -208,6 +208,14 @@ five_players = true
 # The one enhancement off by default. BBHOST_SKILL_ISSUE=0 or 1 overrides.
 skill_issue = false
 
+# The pre-order and edition bonuses: the game is told it has the three
+# messenger-gift add-ons, and the Stump Messengers behind the workshop offer
+# them ("Accept Gift from Messengers"): the Yharnam Messenger Hat, the Worn
+# Messenger Top Hat and the Messenger Head Bandage, once per character. Off by
+# default; turned off again, the game takes the hats back at the next start.
+# BBHOST_MESSENGER_GIFTS=0 or 1 overrides.
+messenger_gifts = false
+
 # [plugins]
 # Gameplay plugins (docs/plugins.md): randomizer, boss_rush, mutators - each
 # off unless set true.

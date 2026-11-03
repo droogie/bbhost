@@ -101,6 +101,7 @@ enum SettingId {
     kRebirth,
     kFivePlayers,
     kSkillIssue,
+    kMessengerGifts,
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
@@ -304,6 +305,9 @@ Setting g_set[kSettingCount] = {
     // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
     {"skill_issue", "SKILL ISSUE", {"On", "Off"}, 0, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
      true},
+    // Off unless bbhost.toml's [world] turns it on: the pre-order bonuses.
+    {"messenger_gifts", "Messenger gifts", {"On", "Off"}, 0,
+     "Requires a restart. The Stump Messengers offer the pre-order and edition gifts: three messenger hats.", true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
     // in-game menus' follows the game's resolution (height / 900), the setup
@@ -370,6 +374,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
+    {Row::Option, nullptr, kMessengerGifts},
     {Row::Header, "STARTUP"},
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
@@ -713,6 +718,7 @@ void apply(int id) {
         case kRebirth:
         case kFivePlayers:
         case kSkillIssue:
+        case kMessengerGifts:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
         case kMenuHue:
@@ -851,6 +857,7 @@ void rebuild_settings() {
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
     h.skill_issue = on_of(kSkillIssue);
+    h.messenger_gifts = on_of(kMessengerGifts);
     settings_store().publish(h);
 }
 
@@ -921,6 +928,7 @@ void host_options_load() {
     g_set[kRebirth].index = config().rebirth ? 0 : 1;
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
     g_set[kSkillIssue].index = config().skill_issue ? 0 : 1;
+    g_set[kMessengerGifts].index = config().messenger_gifts ? 0 : 1;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -949,7 +957,8 @@ void host_options_load() {
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
                          static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
-                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
+                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue),
+                         static_cast<int>(kMessengerGifts)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
