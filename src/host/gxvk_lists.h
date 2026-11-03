@@ -70,14 +70,16 @@ inline bool splice_compare() { return pool_mode() == 4 || pool_mode() == 6; }
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): the pool also cuts each list a GX
 // context finished into segments - the draws after a run's first, of one
 // list, into the same targets, with nothing between their tokens the command
-// processor does in order - and records each segment's committed draws into a
-// secondary command buffer on its own thread (render.cpp lists_segment). The
-// command processor checks a segment once at its first token and splices it
-// with one op (host_gpu_splice_segment); a run's first draw is spliced or drawn
-// as splice does. segments-compare: every draw drawn in order, each draw of a
-// segment that would have been spliced compared with its commit. Unset, the
-// switch follows the constant buffers' homes (BBHOST_GXVK_HOMES): segments
-// where they bind by handle, off elsewhere (the reason logged).
+// processor does in order - and builds each segment of committed draws on its
+// own thread (render.cpp lists_segment): replayed inline by the recorder, or
+// with BBHOST_GXVK_SEGMENTS_REPLAY=secondary recorded into a secondary command
+// buffer. The command processor checks a segment once at its first token and
+// splices it with one op (host_gpu_splice_segment); a run's first draw is
+// spliced or drawn as splice does. segments-compare: every draw drawn in order,
+// each draw of a segment that would have been spliced compared with its
+// commit. Unset, the switch follows the constant buffers' homes
+// (BBHOST_GXVK_HOMES): segments where they bind by handle, off elsewhere (the
+// reason logged).
 inline bool segments() { return pool_mode() >= 5; }
 inline bool segments_compare() { return pool_mode() == 6; }
 // The device chosen and the homes decided (gpu.cpp): the mode settled - the

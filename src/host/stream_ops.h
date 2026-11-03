@@ -103,8 +103,8 @@ struct ListDraw {
 struct ExecuteCommands {
     VkCommandBuffer cmd;
 };
-// Stage 4b.2 replayed inline (BBHOST_GXVK_SEGMENTS_REPLAY=inline): a segment's
-// list packets, each chained to the one before, with its dynamic offsets.
+// Stage 4b.2 replayed inline (the default): a segment's list packets, each
+// chained to the one before, with its dynamic offsets.
 struct ListRun {
     std::uint32_t n, pad;
     // + ListRunDraw[n]

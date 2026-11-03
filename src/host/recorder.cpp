@@ -1133,9 +1133,10 @@ void recorder_splice_segment(VkCommandBuffer secondary) {
 }
 
 // The command processor: a segment's list packets replayed here inline, chained
-// (BBHOST_GXVK_SEGMENTS_REPLAY=inline) - `n` of them, packet indices[k] spliced
-// for token ids[k] with dynamic offsets dyn[k]. Each packet is held from the
-// pool until the recorder has replayed it (recorder_list_packet_free).
+// (the default; BBHOST_GXVK_SEGMENTS_REPLAY=secondary executes secondaries
+// instead) - `n` of them, packet indices[k] spliced for token ids[k] with
+// dynamic offsets dyn[k]. Each packet is held from the pool until the recorder
+// has replayed it (recorder_list_packet_free).
 void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t* ids, const std::uint32_t (*dyn)[2], std::uint32_t n) {
     if (g_open) g_open->publish();
     for (std::uint32_t k = 0; k < n; ++k) g_list_spliced[indices[k] % kListPackets].store(ids[k], std::memory_order_release);

@@ -473,15 +473,18 @@ struct Pass {
     bool has_depth = false, has_stencil = false;
 };
 Pass g_pass;
-// Stage 4b.2: the flags a pass begins with - inline and secondary contents
-// both while the segments are on and the device mixes them (VK_KHR_maintenance7;
-// BBHOST_GXVK_SEGMENTS_MIXED=0 acts out a device that does not), else inline.
-// BBHOST_GXVK_SEGMENTS_REPLAY=inline: a segment's packets replayed by the
-// recorder into the command buffer itself (one op, kListRun), not recorded into
-// a secondary on the pool - its passes then hold inline contents only.
+// Stage 4b.2: how a segment is replayed. By default its packets are replayed by
+// the recorder into the command buffer itself (one op, kListRun), and passes
+// hold inline contents only. BBHOST_GXVK_SEGMENTS_REPLAY=secondary records them
+// into a secondary command buffer on the pool instead, which the recorder
+// executes: a pass then begins with inline and secondary contents both where the
+// device mixes them (VK_KHR_maintenance7, asked only then;
+// BBHOST_GXVK_SEGMENTS_MIXED=0 acts out a device that does not), and is ended
+// and begun again around them where it does not. On an RTX 4070 the two did as
+// well as each other within noise, inline with a little less GPU and pool time.
 const bool g_seg_inline = [] {
     const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_REPLAY");
-    return e && std::strcmp(e, "inline") == 0;
+    return !(e && std::strcmp(e, "secondary") == 0);
 }();
 bool segments_mixed() {
     static const bool off = [] {
@@ -26231,7 +26234,7 @@ std::string host_gpu_splice_report(bool window) {
 }
 
 
-// ---- Stage 4b.2 (BBHOST_GXVK_LISTS=segments): segments recorded into secondary command buffers ----
+// ---- Stage 4b.2 (BBHOST_GXVK_LISTS=segments): segments spliced with one op ----
 //
 // (host/gxvk_lists.h.) A list a GX context finished comes to the pool as the
 // draws its context recorded, in order (gxvk_lists_internal.h ListRec). A pool
@@ -26241,15 +26244,17 @@ std::string host_gpu_splice_report(bool window) {
 // run's first draw stays as splice has it (spliced alone where its run is open,
 // else drawn in order: it opens the command processor's run and pass); the
 // draws after it are the segment's members, which the builder claims from the
-// per-draw splice and records into a secondary command buffer of its own - its
-// list packets replayed chained, their params blocks written into the pool's
-// region of the params buffer (so the offsets the secondary binds are final),
-// their constant-buffer copies in the list arena - with the members' notes
-// merged. At the first member's token the command processor checks the stream
-// (the members' tokens follow as recorded), then the segment once as splice
-// checks a draw, and executes the secondary with one op; the members' tokens
-// that follow are given back without a take. A segment whose checks fail gives
-// its members back to the per-draw splice, counted by why.
+// per-draw splice - their params blocks written into the pool's region of the
+// params buffer (so the offsets they bind are final), their constant-buffer
+// copies in the list arena - with the members' notes merged. At the first
+// member's token the command processor checks the stream (the members' tokens
+// follow as recorded), then the segment once as splice checks a draw, and
+// appends one op: by default the recorder replays the members' list packets
+// from it, chained (g_seg_inline); with BBHOST_GXVK_SEGMENTS_REPLAY=secondary
+// the builder has recorded them into a secondary command buffer of its own,
+// which the op executes. The members' tokens that follow are given back
+// without a take. A segment whose checks fail gives its members back to the
+// per-draw splice, counted by why.
 
 namespace {
 
@@ -26766,6 +26771,8 @@ void segment_drop(Segment& sg, bool members_back) {
 }  // namespace
 
 namespace gpu {
+bool segments_secondary() { return gxvk_lists::segments() && !g_seg_inline; }
+
 void lists_segment(std::uint32_t rec) {
     using namespace gxvk_lists::detail;
     ListRec& r = g_recs[rec % kRecs];
@@ -27034,11 +27041,12 @@ std::string host_gpu_segment_report(bool spliced_part) {
     if (spliced_part) return host_gpu_segment_report_spliced();
     const std::uint64_t made = g_sg_made.load(), members = g_sg_members.load(), draws = g_sg_draws.load();
     std::snprintf(buf, sizeof(buf), "segments: %llu lists (%llu draws) cut into %llu segments of %llu members (%.1f each, %.1f%% of the lists' draws), "
-                                    "%.2f us recording a member; by members:",
+                                    "%.2f us building a member, replayed %s; by members:",
                   ld(g_sg_lists), static_cast<unsigned long long>(draws), static_cast<unsigned long long>(made),
                   static_cast<unsigned long long>(members), made ? static_cast<double>(members) / static_cast<double>(made) : 0.0,
                   draws ? 100.0 * static_cast<double>(members) / static_cast<double>(draws) : 0.0,
-                  members ? static_cast<double>(g_sg_record_ns.load()) / 1000.0 / static_cast<double>(members) : 0.0);
+                  members ? static_cast<double>(g_sg_record_ns.load()) / 1000.0 / static_cast<double>(members) : 0.0,
+                  g_seg_inline ? "inline (BBHOST_GXVK_SEGMENTS_REPLAY=secondary: from secondaries)" : "from secondary command buffers");
     out += buf;
     static const char* const kLen[8] = {"1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127", "128+"};
     for (int b = 1; b < 8; ++b) {

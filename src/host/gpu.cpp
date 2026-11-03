@@ -4321,6 +4321,7 @@ bool init_locked() {
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
+    if (g.has_maint7 && !segments_secondary()) g.has_maint7 = false;  // (asked only for stage 4b.2's secondaries)
     if (g.has_maint7) dext.push_back("VK_KHR_maintenance7");
     if (g.has_push_descriptor) dext.push_back("VK_KHR_push_descriptor");
     // VK_EXT_device_fault: on a device loss the driver can tell us the faulting

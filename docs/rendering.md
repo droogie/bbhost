@@ -779,29 +779,41 @@ On lavapipe at Central Yharnam with the homes on, the pool committed 64% of
 the draws and the command processor spliced 55%; the compare found 0 of 52,269
 draws different, and the frames were within the noise of the homes alone.
 
-**Segments recorded on the pool's threads (`BBHOST_GXVK_LISTS=segments`).**
-A list a GX context finishes comes to the pool as the draws its context
-recorded, in order, and a pool thread cuts it into segments: draws one after
-another in the list's command buffer - nothing between their tokens the
-command processor does in order - into the same targets and pass, each
-committed. A segment's first draw is left as the splice has it (it opens the
-command processor's run and pass); the draws after it are recorded into a
-secondary command buffer on the pool's thread - their packets replayed, their
-params blocks in the pool's own region of the params buffer, their constant
-buffers' copies in the list arena - with what each noted for its splice merged.
-At the first of those draws the command processor checks that the stream holds
-the segment's tokens as recorded, checks the segment once as the splice checks
-a draw, and executes the secondary with one op; the tokens of its other draws
-are given back as the walk meets them, without being read. A segment whose
-checks fail goes back to the draws' own splices, counted by why. Passes begin
-with inline and secondary contents both where the device has
-`VK_KHR_maintenance7`; without it a pass is ended and begun again for the other
-kind (`BBHOST_GXVK_SEGMENTS_MIXED=0` acts that out). Unset, the switch follows
-the constant buffers' homes: segments where the homes bind by handle, off
-elsewhere (small video memory, an integrated GPU) with the reason in the log;
-the pool needs 8 hardware threads or more. `BBHOST_GXVK_LISTS=segments-compare`
-draws everything in order and compares each draw of a segment that would have
-been spliced with its commit.
+**Segments (`BBHOST_GXVK_LISTS=segments`).** A list a GX context finishes
+comes to the pool as the draws its context recorded, in order, and a pool
+thread cuts it into segments: draws one after another in the list's command
+buffer - nothing between their tokens the command processor does in order -
+into the same targets and pass, each committed. A segment's first draw is left
+as the splice has it (it opens the command processor's run and pass); for the
+draws after it the pool writes their params blocks into its own region of the
+params buffer and merges what each noted for its splice. At the first of those
+draws the command processor checks that the stream holds the segment's tokens
+as recorded, checks the segment once as the splice checks a draw, and appends
+one op; the tokens of its other draws are given back as the walk meets them,
+without being read. By default the recorder replays the segment's packets
+into the command buffer from that op, chained. With
+`BBHOST_GXVK_SEGMENTS_REPLAY=secondary` the pool records them into a secondary
+command buffer instead - each draw under the caches' readers' lock, once the
+descriptor sets it binds are written - which the recorder executes: passes
+then begin able to hold secondaries where the device has
+`VK_KHR_maintenance7` (asked of the device only then), and are ended and begun
+again around them where it has not, at ~10 us of GPU time each. On an RTX
+4070 the two replays did as well as each other within noise, the inline one
+with a little less GPU time and a quarter of the pool's work a draw. A segment
+whose checks fail goes back to its draws' own splices, counted by why. The
+pool's constant-buffer copies take the last 16 MiB of the command processor's
+ring, which keeps the rest while the pool runs, so on a card with a small
+window of video memory the CPU writes both stay in video memory (in host
+memory the GPU read them across the bus: +11% GPU time on an RTX 4070).
+Unset, the switch follows the constant buffers' homes: segments where the
+homes bind by handle, off elsewhere (small video memory, an integrated GPU)
+with the reason in the log; the pool needs 8 hardware threads or more.
+`BBHOST_GXVK_LISTS=segments-compare` draws everything in order and compares
+each draw of a segment that would have been spliced with its commit. On an RTX
+4070 with the homes on, uncapped, the command processor's time a flip fell
+27-31% at Old Yharnam, the Nightmare of Mensis and Cainhurst's courtyard, at
+0.35-0.5 us a spliced draw, and the frame rate rose 5-11% at Old Yharnam,
+where the command processor had been the limit.
 
 ### GX's objects as Vulkan objects (a design note)
 

@@ -289,8 +289,8 @@ void start() {
     g_look.store(new LookRecord[kLookSlots], std::memory_order_release);
     const int n = pool_threads();
     if (segments()) {
-        host_log("gxvk-lists: stage 4b.2's pool: %d thread%s commit each stored GX-native draw ahead of the command processor and record "
-                 "each list's segments into secondary command buffers, which it splices (BBHOST_GXVK_LISTS=%s)",
+        host_log("gxvk-lists: stage 4b.2's pool: %d thread%s commit each stored GX-native draw ahead of the command processor and build "
+                 "each list's segments, which it splices with one op each (BBHOST_GXVK_LISTS=%s)",
                  n, n == 1 ? "" : "s", segments_compare() ? "segments-compare: drawn in order too, and compared" : "segments");
     } else if (splice()) {
         host_log("gxvk-lists: stage 4b.1b's pool: %d thread%s commit each stored GX-native draw ahead of the command processor, which "

@@ -2222,9 +2222,14 @@ void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists
 // record the command processor's splice reads (render.cpp host_gpu_splice).
 void lists_commit(std::uint64_t id);
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
-// `rec` (host/gxvk_lists_internal.h ListRec) into segments and records each
-// into a secondary command buffer of its own (render.cpp).
+// `rec` (host/gxvk_lists_internal.h ListRec) into segments and builds each -
+// its draws' params blocks and merged notes, and with
+// BBHOST_GXVK_SEGMENTS_REPLAY=secondary a secondary command buffer (render.cpp).
 void lists_segment(std::uint32_t rec);
+// Whether the segments run as secondary command buffers: only then does the
+// device get VK_KHR_maintenance7, for passes that hold them and the command
+// processor's draws both (settled before the device is made).
+bool segments_secondary();
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
