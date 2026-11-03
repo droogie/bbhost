@@ -49,6 +49,7 @@ enum class Op : std::uint16_t {
     kMarker,             // AMD's buffer markers around what follows (gpu_write_markers)
     kPushBuffers,        // vkCmdPushDescriptorSetKHR of storage buffers (a dispatch's)
     kListDraw,           // a draw packet a pool thread committed ahead (stage 4b.1b), replayed here
+    kExecuteCommands,    // vkCmdExecuteCommands of a segment a pool thread recorded (stage 4b.2)
     kCount
 };
 
@@ -95,6 +96,11 @@ struct ListDraw {
     // with nothing recorded in place between: the recorder leaves out the binds
     // that one already made (recorder.cpp replay_packet's `prev`).
     std::uint64_t chained;
+};
+// Stage 4b.2: a segment's secondary command buffer, recorded on a pool thread
+// (render.cpp lists_segment), executed in the pass open here.
+struct ExecuteCommands {
+    VkCommandBuffer cmd;
 };
 struct Barrier {
     VkPipelineStageFlags src, dst;
@@ -217,7 +223,8 @@ struct PushBuffers {
 };
 
 template <class T> constexpr bool kRecordable = std::is_trivially_copyable_v<T> && alignof(T) <= 8;
-static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<ListDraw> && kRecordable<Barrier> &&
+static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<ListDraw> &&
+                  kRecordable<ExecuteCommands> && kRecordable<Barrier> &&
                   kRecordable<Flag> && kRecordable<BeginRendering> && kRecordable<Fill> && kRecordable<CopyBuffer> &&
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&

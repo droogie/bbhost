@@ -2277,7 +2277,7 @@ void note_update(const std::uint64_t* f) {
 // game's: it can submit the full chunk and wait for room in the command
 // processor's backlog, so no lock the command processor takes may be held
 // over it.
-std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNativeMagic, std::uint64_t id = 0) {
+std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNativeMagic, std::uint64_t id = 0, std::uint64_t* at = nullptr) {
     const std::uint64_t cb = ctx + 0x10;
     std::uint64_t cmd = rd64(cb + 0x10), end = rd64(cb + 0x8);
     if (!cmd && !end) {
@@ -2313,6 +2313,7 @@ std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNat
     if (!id) id = next_native_id();
     const std::uint32_t token[4] = {0xC0021000u, magic, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(id >> 32)};
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), token, sizeof(token));
+    if (at) *at = cmd;  // where it lies (stage 4b.2's segments: tokens one after another)
     const std::uint64_t next = cmd + sizeof(token);
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof(next));
     host_lists::note(cb, cmd, 0x10);
@@ -2659,7 +2660,8 @@ bool native_draw_call(GxRec& r) {
     }
     stamp.to(kCostNativeGuest);
     if (g_gnm_sources) note_source(r.ctx + 0x10, rd64(write_ptr), rd64(r.ctx + 0x18), kSourceNative);
-    const std::uint64_t id = write_native_token(r.ctx);
+    std::uint64_t token_va = 0;
+    const std::uint64_t id = write_native_token(r.ctx, kGxNativeMagic, 0, &token_va);
     wp = rd64(write_ptr);
     if (!id) {
         // The method runs its flushes, which write whatever differs from their caches.
@@ -2704,7 +2706,7 @@ bool native_draw_call(GxRec& r) {
         slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
-        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id);  // stage 4b.1a's pool looks ahead at it
+        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va);  // stage 4b.1a's pool looks ahead at it
         prefetch_next_slot();
     } else {
         g_native_overflow.fetch_add(1, std::memory_order_relaxed);
@@ -8437,10 +8439,12 @@ const GpuDrawInputs* hle_gx_native_pin(std::uint64_t id, GxDrawObjects* objects)
 // stored, taken or another token's, or when the user data come from the
 // register file at the take (BBHOST_GX_TOKEN_USER_DATA=register: an answer of
 // the walk's place). Given back with hle_gx_native_unpin(id).
-const GpuDrawInputs* hle_gx_native_pin_copy(std::uint64_t id, GpuDrawInputs& in, GxDrawObjects& objects) {
+const GpuDrawInputs* hle_gx_native_pin_copy(std::uint64_t id, GpuDrawInputs& in, GxDrawObjects& objects, bool* own_records) {
     if (g_token_user_data_register) return nullptr;
     const GpuDrawInputs* stored = hle_gx_native_pin(id, &objects);
     if (!stored) return nullptr;
+    // The records unpacked into this thread's own set: nothing of the slot is read after the copy.
+    if (own_records) *own_records = !objects.records || (g_packed_records == 1) || (g_packed_records == 2 && native_slot(id).draw.packed);
     in = *stored;
     std::memset(in.vs_user, 0, sizeof(in.vs_user));
     std::memset(in.ps_user, 0, sizeof(in.ps_user));
@@ -8450,6 +8454,18 @@ const GpuDrawInputs* hle_gx_native_pin_copy(std::uint64_t id, GpuDrawInputs& in,
 void hle_gx_native_unpin(std::uint64_t id) {
     NativeSlot& slot = native_slot(id);
     slot.state.store(2, std::memory_order_release);
+}
+
+bool hle_gx_native_skip(std::uint64_t id) {
+    // (A segment's member: committed, so no pool thread holds or reads its slot - as the take's plain load.)
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return false;
+    g_native_seen.fetch_add(1, std::memory_order_relaxed);
+    slot.draw.records.reset();  // back to the pool here, as the release does
+    slot.draw.packed.reset();
+    slot.state.store(0, std::memory_order_release);
+    g_native_slot_pending.add(~0ull);
+    return true;
 }
 
 void hle_gx_native_release() {

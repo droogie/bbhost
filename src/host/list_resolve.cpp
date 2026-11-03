@@ -52,14 +52,25 @@ int run_commit_from_env() {
 }
 }  // namespace
 
+namespace {
+// Whether stage 4b's pool may commit draws ahead (BBHOST_GXVK_LISTS=splice*,
+// segments*, or unset with the homes asked for: the segments follow them),
+// read from the environment as g_parts is.
+bool lists_may_splice_from_env() {
+    const char* l = std::getenv("BBHOST_GXVK_LISTS");
+    if (l && *l) return std::strncmp(l, "splice", 6) == 0 || std::strncmp(l, "segments", 8) == 0;
+    const char* h = std::getenv("BBHOST_GXVK_HOMES");
+    return h && h[0] == '1' && !h[1];
+}
+}  // namespace
+
 const int g_batch = [] {
     const char* e = std::getenv("BBHOST_RUN_BATCH");
     // A run's parts take its targets as batching shares them: on with the commit.
     if (!e || !*e) {
         if (run_commit_from_env() >= 2) return 1;
-        // And with stage 4b.1b's splice: a run's later draws find its first's targets.
-        const char* l = std::getenv("BBHOST_GXVK_LISTS");
-        return l && std::strncmp(l, "splice", 6) == 0 ? 1 : 0;
+        // And with stage 4b.1b's splice and 4b.2's segments: a run's later draws find its first's targets.
+        return lists_may_splice_from_env() ? 1 : 0;
     }
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
@@ -78,8 +89,7 @@ const int g_commit = run_commit_from_env();
 // between the two modules' initialisers.)
 const bool g_parts = [] {
     if (run_commit_from_env() >= 2) return true;
-    const char* e = std::getenv("BBHOST_GXVK_LISTS");
-    return e && std::strncmp(e, "splice", 6) == 0;
+    return lists_may_splice_from_env();
 }();
 
 void log_commit_default() {

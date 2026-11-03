@@ -13,6 +13,7 @@
 // the slot, and the next token of that index cannot be stored before the
 // command processor released this one: the slot's state orders every access.
 #include "host/gxvk_lists.h"
+#include "host/gxvk_lists_internal.h"
 
 #include "hle/modules.h"
 #include "host/cache_rw.h"
@@ -83,16 +84,13 @@ struct Shared {
     u64 get() const { return n.load(std::memory_order_relaxed); }
 };
 
-// ---- the feed ----------------------------------------------------------
-struct Feed {
-    std::atomic<u64> seq{0};  // its place plus one once `id` is written
-    std::atomic<u64> id{0};
-};
-constexpr u64 kFeed = 1u << 15;
-Feed* g_feed = nullptr;  // made before the first draw is fed (start)
-std::atomic<u64> g_feed_pos{0};   // the recording threads' next place
-std::atomic<u64> g_feed_next{0};  // the pool's next place
-Shared g_fed, g_feed_lapped, g_feed_skipped;
+// ---- the feed (host/gxvk_lists_internal.h) --------------------------------
+using detail::Feed;
+using detail::g_feed;
+using detail::g_feed_next;
+using detail::g_feed_pos;
+using detail::kFeed;
+Shared g_fed, g_feed_lapped, g_feed_skipped, g_lists_fed;
 
 // ---- the answers -----------------------------------------------------------
 // One record per token slot (the slot ring's size and index).
@@ -178,11 +176,13 @@ void pool_main(int index) {
             if (++idle < 64) {
                 pause();
             } else {
+                // (Stage 4b.2: a list's close is fed from FinishCommandList's leaf, which wakes nobody - a parked
+                // thread looks again within half a millisecond.)
                 std::unique_lock<std::mutex> lk(g_park_mu);
                 g_sleepers.fetch_add(1, std::memory_order_seq_cst);
                 if (g_feed_next.load(std::memory_order_seq_cst) >= g_feed_pos.load(std::memory_order_seq_cst) &&
                     !g_stop.load(std::memory_order_acquire))
-                    g_park_cv.wait_for(lk, std::chrono::milliseconds(2));
+                    g_park_cv.wait_for(lk, segments() ? std::chrono::microseconds(500) : std::chrono::microseconds(2000));
                 g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
                 idle = 0;
             }
@@ -217,8 +217,14 @@ void pool_main(int index) {
             }
         }
         const u64 id = f.id.load(std::memory_order_relaxed);
+        const std::uint32_t kind = f.kind.load(std::memory_order_relaxed);
         if (seq != pos + 1 || f.seq.load(std::memory_order_acquire) != pos + 1) {
             g_feed_lapped.add();
+            continue;
+        }
+        if (kind == detail::kFeedList) {
+            g_lists_fed.add();
+            gpu::lists_segment(static_cast<std::uint32_t>(id));  // stage 4b.2: the list's segments
             continue;
         }
         if (splice()) {
@@ -280,17 +286,20 @@ bool choose_pool_cpus(int n) {
 #endif
 
 void start() {
-    g_feed = new Feed[kFeed];
     g_look.store(new LookRecord[kLookSlots], std::memory_order_release);
     const int n = pool_threads();
-    if (splice()) {
+    if (segments()) {
+        host_log("gxvk-lists: stage 4b.2's pool: %d thread%s commit each stored GX-native draw ahead of the command processor and record "
+                 "each list's segments into secondary command buffers, which it splices (BBHOST_GXVK_LISTS=%s)",
+                 n, n == 1 ? "" : "s", segments_compare() ? "segments-compare: drawn in order too, and compared" : "segments");
+    } else if (splice()) {
         host_log("gxvk-lists: stage 4b.1b's pool: %d thread%s commit each stored GX-native draw ahead of the command processor, which "
                  "splices them (BBHOST_GXVK_LISTS=%s)",
                  n, n == 1 ? "" : "s", splice_compare() ? "splice-compare: drawn in order too, and compared" : "splice");
     } else {
         host_log("gxvk-lists: stage 4b.1a's pool: %d thread%s look ahead of the command processor at each stored GX-native draw "
                  "(BBHOST_GXVK_LISTS=%d%s, 1 draw in %u)",
-                 n, n == 1 ? "" : "s", g_pool_mode, g_pool_mode == 2 ? ": the command processor compares its answers with the pool's" : "",
+                 n, n == 1 ? "" : "s", pool_mode(), pool_mode() == 2 ? ": the command processor compares its answers with the pool's" : "",
                  g_look_every);
     }
 #if !defined(_WIN32)
@@ -381,6 +390,10 @@ void report_line(bool at_exit) {
     }
     if (splice()) {
         host_log("gxvk-lists (%s): stage 4b.1b: %s", what, host_gpu_splice_report(!at_exit).c_str());
+        if (segments()) {
+            host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(false).c_str());
+            host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(true).c_str());
+        }
         return;
     }
     host_log("gxvk-lists (%s): the pool looked at %llu draws, %.2f us a draw (fed %llu; the command processor first %llu; feed lapped "
@@ -390,7 +403,7 @@ void report_line(bool at_exit) {
              static_cast<ull>(d.fed), static_cast<ull>(d.late), static_cast<ull>(d.lapped), static_cast<ull>(d.skipped),
              static_cast<ull>(d.lost), kinds.c_str(), static_cast<ull>(d.writes), static_cast<ull>(d.writes_waited),
              static_cast<ull>(d.reads), static_cast<ull>(d.reads_waited));
-    if (g_pool_mode != 2) return;
+    if (pool_mode() != 2) return;
     std::string cmp;
     u64 different = 0, missed = 0;
     for (int k = 0; k < kLookKinds; ++k) {
@@ -428,6 +441,35 @@ u32 slot_of(u64 key) { return static_cast<u32>((key * 0x9e3779b97f4a7c15ull) >> 
 
 }  // namespace
 
+void settle(bool homes_bind, const char* homes_why) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const int env = pool_mode_from_env();
+        const int n = pool_threads();
+        const unsigned hw = std::thread::hardware_concurrency();
+        int mode = env < 0 ? 0 : env;
+        if (env < 0) {
+            // Unset: stage 4b.2's segments where the homes bind by handle (their spliced share needs them), off elsewhere.
+            if (!n) {
+                host_log("gxvk-lists: segments off - %u hardware threads, the pool needs 8 or more", hw);
+            } else if (!homes_bind) {
+                host_log("gxvk-lists: segments off - %s (BBHOST_GXVK_LISTS=segments: on all the same)", homes_why ? homes_why : "the homes are off");
+            } else {
+                mode = 5;
+                host_log("gxvk-lists: segments on with the constant buffers' homes (BBHOST_GXVK_LISTS=0: off)");
+            }
+        } else if (env > 0 && !n) {
+            host_log("gxvk-lists: BBHOST_GXVK_LISTS asks for the pool, which has no threads here (%u hardware threads): off", hw);
+            mode = 0;
+        } else if (env >= 3 && !homes_bind) {
+            host_log("gxvk-lists: the homes are off (%s): most draws read a copy version and are not committed",
+                     homes_why ? homes_why : "unknown");
+        }
+        if (mode && n) cache_rw::g_readers.store(true, std::memory_order_release);
+        g_pool_mode.store(mode && n ? mode : 0, std::memory_order_release);
+    });
+}
+
 void keep_off_pool_cpus() {
 #if !defined(_WIN32)
     static thread_local bool applied = false;
@@ -437,12 +479,41 @@ void keep_off_pool_cpus() {
 #endif
 }
 
-void draw_stored(std::uint64_t id) {
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    const u64 pos = g_feed_pos.fetch_add(1, std::memory_order_seq_cst);
-    Feed& f = g_feed[pos & (kFeed - 1)];
-    f.id.store(id, std::memory_order_relaxed);
-    f.seq.store(pos + 1, std::memory_order_seq_cst);
+    detail::feed_push(id, detail::kFeedDraw);
+    if (segments() && ctx && ctx != detail::g_immediate.load(std::memory_order_relaxed)) {
+        // Stage 4b.2: into its context's open list record (this thread's while it records the context).
+        if (detail::CtxSlot* s = detail::ctx_slot(ctx)) {
+            std::uint32_t open = s->open.load(std::memory_order_relaxed);
+            if (!open) {
+                for (int tries = 0; tries < 16 && !open; ++tries) {
+                    const u64 at = detail::g_rec_pos.fetch_add(1, std::memory_order_relaxed) % detail::kRecs;
+                    std::uint32_t free_state = detail::kRecFree;
+                    if (detail::g_recs[at].state.compare_exchange_strong(free_state, detail::kRecOpen, std::memory_order_acq_rel)) {
+                        detail::ListRec& r = detail::g_recs[at];
+                        r.n = 0;
+                        r.ctx = ctx;
+                        r.list = 0;
+                        open = static_cast<std::uint32_t>(at) + 1;
+                    }
+                }
+                if (!open) {
+                    detail::g_rec_none.fetch_add(1, std::memory_order_relaxed);
+                    open = detail::kRecs + 1;  // none for this list (FinishCommandList clears it)
+                }
+                s->open.store(open, std::memory_order_relaxed);
+            }
+            if (open <= detail::kRecs) {
+                detail::ListRec& r = detail::g_recs[open - 1];
+                r.id[r.n] = id;
+                r.va[r.n] = token_va;
+                if (++r.n == detail::kRecMost) detail::list_closed(*s, 0);  // full: closed as it is
+            } else {
+                detail::g_rec_none.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (g_sleepers.load(std::memory_order_seq_cst)) {  // a parked pool thread: once a burst, not once a draw
         std::lock_guard<std::mutex> lk(g_park_mu);
         g_park_cv.notify_one();
@@ -535,7 +606,7 @@ void cp_look_end() {
 }
 
 void pool_report(bool at_exit) {
-    if (!g_pool_mode) return;
+    if (!pool_mode()) return;
     if (at_exit) {
         // Stopped and joined first: an exit through std::exit must not race them.
         g_stop.store(true, std::memory_order_release);

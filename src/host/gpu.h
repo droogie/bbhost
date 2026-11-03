@@ -397,6 +397,20 @@ bool host_gpu_splice(std::uint64_t id);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 std::string host_gpu_splice_report(bool window = false);
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): at GX-native draw token `id`,
+// before its slot is taken - the members of a segment ready to splice whose
+// first member it is (null: none), their count and the segment's word; the
+// stream checked to hold the members' tokens one after another as recorded,
+// host_gpu_splice_segment splices it (true: its members are drawn - their
+// tokens after this one are given back without a take,
+// hle_gx_native_skip) or gives them back to the per-draw splice (false);
+// host_gpu_segment_refused when the stream did not hold them. Each member
+// token given back is counted with its time (ns, 0 untimed).
+const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count, std::uint64_t* word);
+bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word);
+void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word);
+void host_gpu_segment_skipped(std::uint64_t ns, bool lost);
+std::string host_gpu_segment_report(bool spliced_part);  // the builder's line (false), the splices' (true)
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();

@@ -779,6 +779,30 @@ On lavapipe at Central Yharnam with the homes on, the pool committed 64% of
 the draws and the command processor spliced 55%; the compare found 0 of 52,269
 draws different, and the frames were within the noise of the homes alone.
 
+**Segments recorded on the pool's threads (`BBHOST_GXVK_LISTS=segments`).**
+A list a GX context finishes comes to the pool as the draws its context
+recorded, in order, and a pool thread cuts it into segments: draws one after
+another in the list's command buffer - nothing between their tokens the
+command processor does in order - into the same targets and pass, each
+committed. A segment's first draw is left as the splice has it (it opens the
+command processor's run and pass); the draws after it are recorded into a
+secondary command buffer on the pool's thread - their packets replayed, their
+params blocks in the pool's own region of the params buffer, their constant
+buffers' copies in the list arena - with what each noted for its splice merged.
+At the first of those draws the command processor checks that the stream holds
+the segment's tokens as recorded, checks the segment once as the splice checks
+a draw, and executes the secondary with one op; the tokens of its other draws
+are given back as the walk meets them, without being read. A segment whose
+checks fail goes back to the draws' own splices, counted by why. Passes begin
+with inline and secondary contents both where the device has
+`VK_KHR_maintenance7`; without it a pass is ended and begun again for the other
+kind (`BBHOST_GXVK_SEGMENTS_MIXED=0` acts that out). Unset, the switch follows
+the constant buffers' homes: segments where the homes bind by handle, off
+elsewhere (small video memory, an integrated GPU) with the reason in the log;
+the pool needs 8 hardware threads or more. `BBHOST_GXVK_LISTS=segments-compare`
+draws everything in order and compares each draw of a segment that would have
+been spliced with its commit.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in

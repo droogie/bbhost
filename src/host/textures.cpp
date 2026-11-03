@@ -3604,7 +3604,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             run_part_stop(kRunStopImages);
             return VK_NULL_HANDLE;
         }
-        t_run_draw->list->note_view(id, flags, found, !e.sf);
+        t_run_draw->list->note_view(id, flags, found, !e.sf, w);
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         dims_ok = e.dims_ok;
@@ -3625,7 +3625,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         if (t_run_draw && t_run_draw->list) {
             // Stage 4b.1b's list mode: its refresh is asked at its splice, in
             // the recording it lands in (texture_view_splice_ok).
-            t_run_draw->list->note_view(id, flags, e.view);
+            t_run_draw->list->note_view(id, flags, e.view, true, w);
         } else if (skip && g_images_mode == 1) {
             if (!part) ++g_images_skips;
         } else {
@@ -3690,7 +3690,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
-        if (cache_rw::g_readers) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
+        if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
@@ -3699,12 +3699,20 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
     return view;
 }
 
+std::atomic<std::uint64_t> g_splice_view_why[kSpliceViewWhys] = {};
+std::atomic<std::uint64_t> g_splice_view_again[2] = {};
 bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view) {
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
-    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags || e.view != view) return false;
+    const auto no = [](int why) {
+        g_splice_view_why[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (e.id != id || e.flags != flags) return no(kSpliceViewGone);
+    if (e.epoch != static_cast<std::uint32_t>(g_view_epoch)) return no(kSpliceViewEpoch);
+    if (e.view != view) return no(kSpliceViewOther);
     const bool elided = !e.sf && copy_elide_live();  // (its image's source bound until a copy is made: in order)
-    if (elided) return false;
-    if (e.sf && e.sf->pending) return false;  // a made-ahead upload to record first
+    if (elided) return no(kSpliceViewElided);
+    if (e.sf && e.sf->pending) return no(kSpliceViewPending);  // a made-ahead upload to record first
     const bool skip = e.fast && e.static_epoch == g_static_epoch &&
                       (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
                       !gx_writes_pending().load(std::memory_order_acquire);
@@ -3723,11 +3731,20 @@ bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView vi
             refresh_surface_locked(*e.sf);
         }
         e.refreshed = stamp;
-        if (e.view != view || e.id != id) return false;  // (remade by its refresh: in order)
+        if (e.view != view || e.id != id) return no(kSpliceViewRemade);  // (remade by its refresh: in order)
     }
     if (e.sf) ahead_defer::met_pending(*e.sf, "its view's entry");
     ++g_id_view_hits;
     return true;
+}
+
+bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView view, const std::uint32_t* w) {
+    if (!w || (!w[0] && !w[1])) return false;  // (no words noted)
+    bool dims_ok = false, arrayed = false;
+    std::uint32_t dim = 0;
+    const VkImageView now = texture_view_by_id(id, w, (flags & 1) != 0, dims_ok, dim, arrayed, (flags & 2) != 0, (flags & 4) != 0, nullptr, nullptr);
+    g_splice_view_again[now == view ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    return now == view;
 }
 
 // Stage 4b.1a's reader path (host/cache_rw.h, under its shared lock): the view
@@ -5942,7 +5959,7 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         IdViewEntry& e = g_id_views[i];
         if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
             e.epoch = 0;
-            if (cache_rw::g_readers) g_id_views_pub[i].epoch = 0;
+            if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[i].epoch = 0;
         }
     }
 }

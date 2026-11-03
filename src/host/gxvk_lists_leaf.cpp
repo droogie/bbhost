@@ -14,20 +14,22 @@
 
 namespace gxvk_lists {
 
-namespace {
 // BBHOST_GXVK_LISTS's pool modes: 1 and 2 (stage 4b.1a's lookups, and their
-// compare), splice (3) and splice-compare (4) (stage 4b.1b's commits); 0 for
-// anything else (off, or the census).
+// compare), splice (3) and splice-compare (4) (stage 4b.1b's commits),
+// segments (5) and segments-compare (6) (stage 4b.2's); -1 unset (the homes
+// decide: settle); 0 for anything else (off, or the census).
 int pool_mode_from_env() {
     const char* e = std::getenv("BBHOST_GXVK_LISTS");
-    if (!e) return 0;
+    if (!e || !*e) return -1;
     if (std::strcmp(e, "splice") == 0) return 3;
     if (std::strcmp(e, "splice-compare") == 0) return 4;
+    if (std::strcmp(e, "segments") == 0) return 5;
+    if (std::strcmp(e, "segments-compare") == 0) return 6;
     return (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
 }
-}  // namespace
 
-// Stage 4b.1a's pool (host/gxvk_lists.h): its threads, 0 when it is off.
+// Stage 4b.1a's pool (host/gxvk_lists.h): its threads, 0 when it is off or
+// cannot run (with the switch unset: whether it may, once settled).
 int pool_threads() {
     static const int n = [] {
         if (!pool_mode_from_env()) return 0;
@@ -45,9 +47,34 @@ const bool g_census = [] {
     const char* e = std::getenv("BBHOST_GXVK_LISTS");
     return e && std::strcmp(e, "census") == 0;
 }();
-const int g_pool_mode = [] { return pool_threads() > 0 ? pool_mode_from_env() : 0; }();
+std::atomic<int> g_pool_mode{0};
 
 namespace detail {
+
+Feed g_feed[kFeed];
+std::atomic<std::uint64_t> g_feed_pos{0};
+std::atomic<std::uint64_t> g_feed_next{0};
+ListRec g_recs[kRecs];
+std::atomic<std::uint64_t> g_rec_pos{0};
+std::atomic<std::uint64_t> g_rec_none{0};
+std::atomic<std::uint64_t> g_immediate{0};
+
+void feed_push(std::uint64_t id, std::uint32_t kind) {
+    const std::uint64_t pos = g_feed_pos.fetch_add(1, std::memory_order_seq_cst);
+    Feed& f = g_feed[pos & (kFeed - 1)];
+    f.id.store(id, std::memory_order_relaxed);
+    f.kind.store(kind, std::memory_order_relaxed);
+    f.seq.store(pos + 1, std::memory_order_seq_cst);
+}
+
+void list_closed(CtxSlot& s, std::uint64_t list) {
+    const std::uint32_t open = s.open.exchange(0, std::memory_order_acq_rel);
+    if (!open || open > kRecs) return;  // none (or none to be had for this list: kRecs + 1)
+    ListRec& r = g_recs[open - 1];
+    r.list = list;
+    r.state.store(kRecClosed, std::memory_order_release);
+    feed_push(open - 1, kFeedList);
+}
 
 CtxSlot g_ctx[kCtxSlots];
 std::atomic<std::uint64_t> g_ctx_full{0};
@@ -78,6 +105,10 @@ CtxSlot* ctx_slot(std::uint64_t ctx) {
 using namespace detail;
 
 void finished(std::uint64_t ctx, std::uint64_t list) {
+    if (segments()) {
+        // Stage 4b.2: the list's draws, in its context's open record, to the pool.
+        if (CtxSlot* s = ctx_slot(ctx)) list_closed(*s, list ? list : 1);
+    }
     if (!g_census) return;
     CtxSlot* s = ctx_slot(ctx);
     if (!s) return;
@@ -115,6 +146,10 @@ void executed(std::uint64_t list, std::uint32_t index, std::uint32_t count) {
     r.index = index;
     r.count = count;
     r.done.store(pos + 1, std::memory_order_release);
+}
+
+void immediate_context(std::uint64_t ctx) {
+    if (g_immediate.load(std::memory_order_relaxed) != ctx) g_immediate.store(ctx, std::memory_order_relaxed);
 }
 
 std::uint32_t draw_recorded(std::uint64_t ctx) {

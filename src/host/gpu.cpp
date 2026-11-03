@@ -29,6 +29,7 @@
 #include "host/twin_filter.h"
 #include "host/cb_capture.h"
 #include "host/gxvk_homes.h"
+#include "host/gxvk_lists.h"
 #include "host/options.h"
 
 #include "gcn/container.h"
@@ -188,9 +189,13 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
         }
     }
     if (log) {
-        // The objects and the scope first: host_log keeps 1 KiB of a line.
+        // The objects and the scope first: host_log keeps 1 KiB of a line - the rest of a long message on lines of its own.
+        const char* msg = data && data->pMessage ? data->pMessage : "?";
         host_log("vk validation: [%s%s%s] %s", objects.c_str(), t_validation_scope ? "; building " : "", t_validation_scope ? t_validation_scope : "",
-                 data && data->pMessage ? data->pMessage : "?");
+                 msg);
+        const std::size_t len = std::strlen(msg), shown = 1000 > objects.size() + 40 ? 1000 - objects.size() - 40 : 0;
+        for (std::size_t at = shown; shown && at < len && at < 8000; at += 900)
+            host_log("vk validation (more): %.900s", msg + at);
     }
     return VK_FALSE;
 }
@@ -3688,7 +3693,7 @@ bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_chec
 struct Candidate {
     VkPhysicalDevice device = VK_NULL_HANDLE;
     std::uint32_t family = 0, queues = 0;
-    bool sparse = false, maint8 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
+    bool sparse = false, maint8 = false, maint7 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
     bool memory_fd = false, dma_buf = false;
     bool address_report = false;  // VK_EXT_device_address_binding_report (BBHOST_VA_TRACE=2)
     int type_rank = 0;
@@ -3724,6 +3729,7 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_host") == 0) host_import = true;
             if (std::strcmp(e.extensionName, "VK_EXT_memory_budget") == 0) memory_budget = true;
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) c.maint8 = true;
+            if (std::strcmp(e.extensionName, "VK_KHR_maintenance7") == 0) c.maint7 = true;
             if (std::strcmp(e.extensionName, "VK_KHR_push_descriptor") == 0) c.push = true;
             if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) c.swapchain = true;
             if (std::strcmp(e.extensionName, "VK_EXT_device_fault") == 0) c.fault = true;
@@ -4007,6 +4013,7 @@ bool init_locked() {
         g.family_queues = c.queues;
         g.has_sparse = c.sparse;
         g.has_maint8 = c.maint8;
+        g.has_maint7 = c.maint7;  // (the feature asked below)
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
         if (c.address_report && g_va_trace >= 2 && g_va_messenger) {
@@ -4052,6 +4059,16 @@ bool init_locked() {
         }
         twins_decide(c.type_rank == 4);
         homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        {
+            // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle).
+            const bool hb = gxvk_homes::made_on() && gxvk_homes::bind_on();
+            const char* why = hb                                                       ? ""
+                              : gxvk_homes::env_mode() != gxvk_homes::Mode::kHandle    ? "the constant buffers' homes are off (BBHOST_GXVK_HOMES=1: on)"
+                              : g.integrated                                          ? "the homes are off on an integrated GPU"
+                              : g.tight                                               ? "the homes are off with tight memory"
+                                                                                      : "the homes are off with small video memory";
+            gxvk_lists::settle(hb, why);
+        }
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -4304,6 +4321,7 @@ bool init_locked() {
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
+    if (g.has_maint7) dext.push_back("VK_KHR_maintenance7");
     if (g.has_push_descriptor) dext.push_back("VK_KHR_push_descriptor");
     // VK_EXT_device_fault: on a device loss the driver can tell us the faulting
     // address and what it was doing, which is the difference between "the GPU
@@ -4371,6 +4389,21 @@ bool init_locked() {
         if (q8.maintenance8) {
             fm8.pNext = f13.pNext;
             f13.pNext = &fm8;
+        }
+    }
+    // Stage 4b.2's segments: a pass holds the command processor's own draws and
+    // the pool's secondary command buffers both (VK_RENDERING_CONTENTS_INLINE_BIT_KHR).
+    VkPhysicalDeviceMaintenance7FeaturesKHR fm7{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR};
+    if (g.has_maint7) {
+        VkPhysicalDeviceMaintenance7FeaturesKHR q7{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        qf.pNext = &q7;
+        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+        g.has_maint7 = q7.maintenance7 == VK_TRUE;
+        if (g.has_maint7) {
+            fm7.maintenance7 = VK_TRUE;
+            fm7.pNext = f13.pNext;
+            f13.pNext = &fm7;
         }
     }
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT feds3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
@@ -4926,9 +4959,12 @@ bool init_locked() {
         }
     }
     g.desc_pool = g.slots[0].pool;
-    // Params ring (host visible), one region per slot.
+    // Params ring (host visible), one region per slot - and with stage 4b.2's
+    // segments a region past them for the pool's secondary command buffers.
+    g.ubo_list_base = kMaxQueued * kStageSlots * static_cast<std::uint32_t>(g.slot_count);
+    g.ubo_list_blocks = gxvk_lists::segments() ? kListParamsBlocks : 0;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = static_cast<VkDeviceSize>(kParamsStride) * kMaxQueued * kStageSlots * g.slot_count;
+    bci.size = static_cast<VkDeviceSize>(kParamsStride) * (g.ubo_list_base + g.ubo_list_blocks);
     bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     vkCreateBuffer(g.device, &bci, nullptr, &g.ubo);
     VkMemoryRequirements req{};
@@ -5031,7 +5067,8 @@ bool init_locked() {
              g.subgroup_stages, (g.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT) ? "vertex " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) ? "tess-eval " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ? "compute" : "", g.host_pointer_align,
-             g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
+             g.has_maint8 ? (g.has_maint7 ? ", maintenance7, maintenance8" : ", maintenance8") : g.has_maint7 ? ", maintenance7" : "",
+             g.present_capable ? ", presentable" : "",
              g.has_tessellation ? ", tessellation" : "");
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the

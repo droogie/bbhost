@@ -79,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw"};
+                                        "push buffers",   "list draw",    "execute commands"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -395,8 +395,16 @@ const int g_recorder_spin = [] {
 // (RecordedState): the pipeline, and with it unchanged its library and dynamic
 // state, the sets with their offsets, the indices and the vertex buffers.
 std::atomic<std::uint64_t> g_list_binds_skipped{0}, g_list_chained{0};
-void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev = nullptr);
-void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev) {
+// Stage 4b.2: a segment's list packets replayed into a pool thread's secondary
+// command buffer - `dyn` and `prev_dyn` the dynamic offsets of this packet and
+// the one before, its params blocks' places in the pool's region (the packets
+// keep their block indices: one that falls back is spliced as before). Nothing
+// in the packet is written: it may be replayed again.
+void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev = nullptr, const std::uint32_t* dyn = nullptr,
+                   const std::uint32_t* prev_dyn = nullptr);
+void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev, const std::uint32_t* dyn, const std::uint32_t* prev_dyn) {
+    const std::uint32_t* const p_dyn = dyn ? dyn : p.dynamic;
+    const std::uint32_t* const q_dyn = prev ? (prev_dyn ? prev_dyn : prev->dynamic) : nullptr;
     if (!p.taken_writes.empty()) {
         vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(p.taken_writes.size()), p.taken_writes.data(), 0, nullptr);
     }
@@ -437,16 +445,18 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev) {
         if (same_pl && prev->library && prev->has_depth_bounds == p.has_depth_bounds && std::memcmp(&prev->lib, &p.lib, sizeof(p.lib)) == 0) ++skipped;
         else record_library_state(cmd, p.lib, p.has_depth_bounds);
     }
-    if (p.bind_sets) {
+    bool bind_sets = p.bind_sets;
+    if (bind_sets) {
+        // (prev's sets as it bound them: one that left its own out had them bound already, the same.)
         if (same_pl && prev->bind_sets && prev->layout == p.layout && prev->bindless == p.bindless && prev->sets[0] == p.sets[0] &&
-            prev->sets[1] == p.sets[1] && prev->dynamic_count == p.dynamic_count && prev->dynamic[0] == p.dynamic[0] &&
-            prev->dynamic[1] == p.dynamic[1] && !p.stage_set_bound && !prev->stage_set_bound) {
+            prev->sets[1] == p.sets[1] && prev->dynamic_count == p.dynamic_count && q_dyn[0] == p_dyn[0] &&
+            q_dyn[1] == p_dyn[1] && !p.stage_set_bound && !prev->stage_set_bound) {
             ++skipped;
-            p.bind_sets = false;  // (the bindless set with them, below)
+            bind_sets = false;  // (the bindless set with them, below)
         }
     }
-    if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
-    if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
+    if (bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p_dyn);
+    if (bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
     if (p.stage_set_bound) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.stage_set_layout, p.stage_set_index, 1, &p.stage_set,
                                 p.stage_set_dynamic_count, p.stage_set_dynamic);
@@ -577,6 +587,11 @@ void replay_block(const Block& b) {
             g_list_replayed[r->index].store(r->id, std::memory_order_release);
             t_list_prev = &g_list_packets[r->index];
             t_list_prev_kept = true;
+            break;
+        }
+        case Op::kExecuteCommands: {
+            const auto* r = reinterpret_cast<const stream::ExecuteCommands*>(p);
+            vkCmdExecuteCommands(cmd, 1, &r->cmd);
             break;
         }
         case Op::kBarrier: {
@@ -1056,6 +1071,50 @@ void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const st
         since = 0;
         publish_block(false);
     }
+}
+
+// ---- Stage 4b.2: segments (render.cpp lists_segment / host_gpu_splice_segment) ----
+
+// Whether list packet `index` holds a draw a segment's secondary can take as it
+// is: nothing a pass or the stream around it must do - no descriptor writes, no
+// pass change, no transfer or copies, no markers - and its draw.
+bool recorder_list_packet_plain(std::uint64_t index) {
+    list_packets_make();
+    const DrawPacket& p = g_list_packets[index % kListPackets];
+    return p.draw && p.taken_writes.empty() && p.writes.empty() && !p.end_pass && !p.begin_pass && !p.pass_barrier && !p.xfer_begin &&
+           !p.xfer_end && !p.ncopies && !p.nregions && !p.marker && p.dynamic_count <= 2;
+}
+
+// The dynamic offsets list packet `index` binds its sets with: its params
+// blocks' indices (0, 1) where it binds them (recorder_splice_list_packet's
+// patch, here into `out` for a secondary's own blocks).
+std::uint32_t recorder_list_packet_dynamic(std::uint64_t index, std::uint32_t (&out)[2]) {
+    const DrawPacket& p = g_list_packets[index % kListPackets];
+    out[0] = p.dynamic[0];
+    out[1] = p.dynamic[1];
+    return p.dynamic_count;
+}
+
+// A pool thread: a segment's list packet `index` replayed into its secondary
+// command buffer `cmd` (begun for the pass) with dynamic offsets `dyn`, chained
+// to the one replayed before it (`prev`, ~0: none, with its offsets). The
+// packets are not written.
+void recorder_record_segment_draw(VkCommandBuffer cmd, std::uint64_t index, const std::uint32_t* dyn, std::uint64_t prev,
+                                  const std::uint32_t* prev_dyn) {
+    list_packets_make();
+    DrawPacket& p = g_list_packets[index % kListPackets];
+    replay_packet(p, cmd, prev == ~0ull ? nullptr : &g_list_packets[prev % kListPackets], dyn, prev_dyn);
+}
+
+// The command processor: a segment's secondary command buffer executed here,
+// in the pass open (its contents allow it: host_gpu_splice_segment). Handed
+// over at once: bb-record executes it while the walk goes on.
+void recorder_splice_segment(VkCommandBuffer secondary) {
+    if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
+    std::uint8_t* at = append_record(Op::kExecuteCommands, sizeof(stream::ExecuteCommands));
+    put_struct<stream::ExecuteCommands>(at)->cmd = secondary;
+    after_op();
+    publish_block(false);
 }
 
 void recorder_drain() {
@@ -1635,6 +1694,14 @@ void DrawCmds::start_list(void* packet) {
 }
 
 DrawCmds* DrawCmds::open() { return g_open; }
+
+std::uint64_t DrawCmds::number() const { return packet_ ? static_cast<const DrawPacket*>(packet_)->number : 0; }
+
+// Stage 4b.2: whether the recorder has replayed draw packet `number` (packets are replayed in their numbers' order).
+bool recorder_packet_replayed(std::uint64_t number) {
+    if (g_mode != kModeThread) return true;  // (replayed as published, on the publishing thread)
+    return g_pk_done.load(std::memory_order_acquire) > number;
+}
 
 bool DrawCmds::holds_commands() const {
     if (!packet_) return false;

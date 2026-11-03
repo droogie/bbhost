@@ -158,7 +158,7 @@ DECOMP_LEAF u64 gx_finish_command_list_impl(u64 ctx, u64 state, u64 list, u64 re
     call1(kCommandBufferFlush, cb);
     const u32 result = game_function<Ret2>(kFinishRecording)(cb, list);
     if (result && !MUTANT(3)) return result;
-    if (gxvk_lists::census()) gxvk_lists::finished(ctx, list);  // stage 4's census (host/gxvk_lists.h)
+    if (gxvk_lists::census() || gxvk_lists::segments()) gxvk_lists::finished(ctx, list);  // stage 4's census, 4b.2's segments (host/gxvk_lists.h)
     game_function<Ctx3>(kSnapshotOutputs)(ctx + 0xb558, list + offsetof(GxCommandList, first_records),
                                            list + offsetof(GxCommandList, last_colour));
     reset_caches(ctx);
@@ -174,6 +174,7 @@ DECOMP_LEAF u64 gx_finish_command_list_impl(u64 ctx, u64 state, u64 list, u64 re
 DECOMP_LEAF u64 gx_context_execute_command_list(u64 ctx, u64 unused, u64 list) {
     const u64 cb = ctx + 0x10;
     if (gxvk_lists::census()) gxvk_lists::executed(list, 0, 1);
+    if (gxvk_lists::segments()) gxvk_lists::immediate_context(ctx);
     clear_pending_byte(ctx);
     call2(kRenameResolveB, ctx + 0xb6f8, cb);
     call2(kRenameResolve, ctx + 0xb3c0, ctx);
@@ -199,6 +200,7 @@ DECOMP_LEAF void gx_context_execute_command_lists(u64 ctx, u64 unused, u64 lists
     const u32 n = static_cast<u32>(count);
     if (!lists || !n) return;
     const u64 cb = ctx + 0x10;
+    if (gxvk_lists::segments()) gxvk_lists::immediate_context(ctx);
     clear_pending_byte(ctx);
     call2(kApplyPendingFlags, ctx + 0xb478, cb);
     call1(kCloseCurrentSegment, cb);

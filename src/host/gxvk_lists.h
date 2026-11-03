@@ -22,6 +22,7 @@
 // commit's parts draw without the walk's notes).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 struct GpuDrawInputs;
@@ -43,10 +44,14 @@ inline bool census() { return g_census; }
 // different (a reader's wrong answer: must stay 0). The pool's threads:
 // BBHOST_GXVK_LIST_THREADS, else 2 on 16 or more hardware threads, 1 on 8-15,
 // none below (the pool off). Read before any of the game's code runs.
-extern const int g_pool_mode;  // 0 off, 1 the pool's lookups, 2 and the compare, 3 splice, 4 splice-compare
-int pool_threads();             // 0 when the pool is off
-inline bool pool() { return g_pool_mode != 0; }
-inline bool compare() { return g_pool_mode == 2; }
+// 0 off, 1 the pool's lookups, 2 and the compare, 3 splice, 4 splice-compare,
+// 5 segments, 6 segments-compare. Settled once the device is chosen (settle):
+// 0 until then.
+extern std::atomic<int> g_pool_mode;
+inline int pool_mode() { return g_pool_mode.load(std::memory_order_relaxed); }
+int pool_threads();             // 0 when the pool is off (or may not run: no switch, fewer than 8 hardware threads)
+inline bool pool() { return pool_mode() != 0; }
+inline bool compare() { return pool_mode() == 2; }
 
 // Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the pool commits each stored
 // GX-native draw ahead of the command processor - through draw_impl in its
@@ -59,8 +64,28 @@ inline bool compare() { return g_pool_mode == 2; }
 // committed, or whose checks fail is drawn in order, counted by why.
 // splice-compare: every draw drawn in order (its packet submitted), each
 // committed one compared with it field by field (RunDigest) and dropped.
-inline bool splice() { return g_pool_mode >= 3; }
-inline bool splice_compare() { return g_pool_mode == 4; }
+inline bool splice() { return pool_mode() >= 3; }
+inline bool splice_compare() { return pool_mode() == 4 || pool_mode() == 6; }
+
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): the pool also cuts each list a GX
+// context finished into segments - the draws after a run's first, of one
+// list, into the same targets, with nothing between their tokens the command
+// processor does in order - and records each segment's committed draws into a
+// secondary command buffer on its own thread (render.cpp lists_segment). The
+// command processor checks a segment once at its first token and splices it
+// with one op (host_gpu_splice_segment); a run's first draw is spliced or drawn
+// as splice does. segments-compare: every draw drawn in order, each draw of a
+// segment that would have been spliced compared with its commit. Unset, the
+// switch follows the constant buffers' homes (BBHOST_GXVK_HOMES): segments
+// where they bind by handle, off elsewhere (the reason logged).
+inline bool segments() { return pool_mode() >= 5; }
+inline bool segments_compare() { return pool_mode() == 6; }
+// The device chosen and the homes decided (gpu.cpp): the mode settled - the
+// switch as given, or with it unset the homes' answer (`homes_bind`: they bind
+// by handle; else `homes_why`, why not) - and the readers' lock turned on when
+// the pool will run.
+void settle(bool homes_bind, const char* homes_why);
+
 
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool
@@ -70,8 +95,10 @@ inline bool splice_compare() { return g_pool_mode == 4; }
 void keep_off_pool_cpus();
 
 // The recording thread stored GX-native draw token `id`'s slot
-// (gx_trace.cpp native_draw_call; a host function, not a leaf).
-void draw_stored(std::uint64_t id);
+// (gx_trace.cpp native_draw_call; a host function, not a leaf): recorded on
+// GX context `ctx`, its token at `token_va` in the context's command buffer
+// (segments: the draw goes into the context's open list record too).
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va);
 
 // The pool's answers, and the command processor's in compare mode: a lookup's
 // kind, its key (the cache's own key, folded to 56 bits) and what it answered
@@ -114,7 +141,7 @@ void cp_look_end();
 extern thread_local constinit bool t_cp_look;
 void cp_note_slow(LookKind kind, std::uint64_t key, std::uint64_t answer);
 inline void cp_note(LookKind kind, std::uint64_t key, std::uint64_t answer) {
-    if (g_pool_mode == 2 && t_cp_look) cp_note_slow(kind, key, answer);
+    if (pool_mode() == 2 && t_cp_look) cp_note_slow(kind, key, answer);
 }
 // The pool's lines (report): every 1,000 flips with tooling from its first
 // thread, and at the exit - its threads stopped and joined first.
@@ -127,6 +154,9 @@ void pool_report(bool at_exit);
 // `count` it was given (ExecuteCommandList(s)).
 void finished(std::uint64_t ctx, std::uint64_t list);
 void executed(std::uint64_t list, std::uint32_t index, std::uint32_t count);
+// Stage 4b.2: `ctx` executes command lists - the immediate context, whose own
+// draws go into no list record (no FinishCommandList ever closes one).
+void immediate_context(std::uint64_t ctx);
 
 // A recording thread wrote a GX-native draw's token on `ctx`
 // (gx_trace.cpp native_draw_call): the list it goes into, 1 for the

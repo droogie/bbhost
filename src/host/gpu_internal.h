@@ -532,6 +532,9 @@ struct Gpu {
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
+    // VK_KHR_maintenance7's feature on: a render pass instance may hold inline
+    // commands and secondary command buffers both (stage 4b.2's segments).
+    bool has_maint7 = false;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
     // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
@@ -571,6 +574,11 @@ struct Gpu {
     VkBuffer ubo = VK_NULL_HANDLE;
     VkDeviceMemory ubo_mem = VK_NULL_HANDLE;
     void* ubo_map = nullptr;
+    // Stage 4b.2's segments: the params blocks past the slots' ring that the
+    // pool's threads write for the secondary command buffers they record (the
+    // same buffer, so the sets' params descriptor is theirs too), as block
+    // indices (kParamsStride each); 0 blocks without the segments.
+    std::uint32_t ubo_list_base = 0, ubo_list_blocks = 0;
     std::uint32_t queued = 0;   // params/descriptor slots used in the current command buffer
     bool recording = false;
     std::uint64_t record_serial = 0;  // bumped whenever g.cmd_ starts recording (render.cpp's state cache)
@@ -1013,6 +1021,10 @@ void profile_begin_locked(const std::string* name);  // timestamp before a draw/
 void profile_end_locked();
 void begin_recording_locked();
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out);
+// A params block into params-ring memory at `dst` as whole 64-byte lines (gpu.cpp).
+void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params);
+// Stage 4b.2: the params blocks of the segments' region (Gpu::ubo_list_blocks).
+constexpr std::uint32_t kListParamsBlocks = 32768;  // 16 MiB
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
@@ -1394,6 +1406,10 @@ struct ListNotes {
     std::uint32_t view_id[kMost] = {};
     std::uint8_t view_flags[kMost] = {};
     VkImageView view[kMost] = {};
+    // Stage 4b.2: each view's T# words, for its splice to resolve it again as the
+    // draw in order would when its entry went stale (the view epoch moves with
+    // every view or image let go anywhere).
+    std::uint32_t view_words[kMost][8] = {};
     std::uint32_t view_target = 0;    // bit k: view k is a render target's (no texture surface): it may be a managed depth view
     std::uint32_t nhomes = 0;
     std::uint32_t home[kMost] = {};   // constant buffers' homes it binds by handle (none with a copy pending)
@@ -1404,10 +1420,22 @@ struct ListNotes {
     std::uint64_t call_flip = 0;     // its GX call's flip (the list arena's copies are shared within one)
     std::uint64_t set_key[2] = {};
     VkDescriptorSet set[2] = {};
+    std::uint64_t set_serial[2] = {};  // stage 4b.2: the cached sets' making (a secondary binds the very set)
+    // Stage 4b.2: its pass's attachments' formats as begin_pass makes the pass
+    // (colour slots up to the last bound, a gap UNDEFINED; depth and stencil),
+    // for a segment's secondary command buffer's inheritance (`formats_ok`:
+    // noted).
+    std::uint32_t ncolor = 0;
+    VkFormat color_fmt[8] = {};
+    VkFormat depth_fmt = VK_FORMAT_UNDEFINED, stencil_fmt = VK_FORMAT_UNDEFINED;
+    bool formats_ok = false;
     bool full = false;  // more to note than fits: not committed
     void clear() {
         params.n = 0;
         pass_key = 0;
+        ncolor = 0;
+        depth_fmt = stencil_fmt = VK_FORMAT_UNDEFINED;
+        formats_ok = false;
         nsampled = nviews = 0;
         view_target = 0;
         set_key[0] = set_key[1] = 0;
@@ -1429,7 +1457,7 @@ struct ListNotes {
         if (nsampled < kMost) sampled[nsampled++] = base;
         else full = true;
     }
-    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v, bool target = true) {
+    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v, bool target = true, const std::uint32_t* w = nullptr) {
         for (std::uint32_t k = 0; k < nviews; ++k) {
             if (view_id[k] == id && view_flags[k] == flags) return;
         }
@@ -1437,6 +1465,12 @@ struct ListNotes {
             if (target) view_target |= 1u << nviews;
             view_id[nviews] = id;
             view[nviews] = v;
+            if (w) {
+                for (int i = 0; i < 8; ++i) view_words[nviews][i] = w[i];
+            } else {
+                view_words[nviews][0] = 0;
+                view_words[nviews][1] = 0;  // (none: no resolution again)
+            }
             view_flags[nviews++] = flags;
         } else {
             full = true;
@@ -2163,6 +2197,15 @@ VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
 // recording already, no made-ahead upload owed - as texture_view_by_id would
 // answer it in order.
 bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view);
+// Stage 4b.2: a view whose entry texture_view_splice_ok found stale resolved again
+// at the splice's place as the draw in order would (texture_view_by_id with its
+// T# words `w`): true when that gives the commit's view.
+bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView view, const std::uint32_t* w);
+// Why texture_view_splice_ok said no: its entry another view's or gone, the view epoch moved since the commit,
+// another view made for it, an elided copy's source, a made-ahead upload to record, remade by its refresh.
+enum SpliceViewWhy : int { kSpliceViewGone, kSpliceViewEpoch, kSpliceViewOther, kSpliceViewElided, kSpliceViewPending, kSpliceViewRemade, kSpliceViewWhys };
+extern std::atomic<std::uint64_t> g_splice_view_why[kSpliceViewWhys];
+extern std::atomic<std::uint64_t> g_splice_view_again[2];  // resolved again: the commit's view, another
 // Stage 4b.1b's list mode: its draws' image stops, by kind (textures.cpp) - a view by its T#'s words, a view by
 // id not made yet, a sampler not made yet.
 extern std::atomic<std::uint64_t> g_list_image_stops[3];
@@ -2175,6 +2218,10 @@ void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists
 // draw committed ahead of the command processor, in its list mode, into the
 // record the command processor's splice reads (render.cpp host_gpu_splice).
 void lists_commit(std::uint64_t id);
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
+// `rec` (host/gxvk_lists_internal.h ListRec) into segments and records each
+// into a secondary command buffer of its own (render.cpp).
+void lists_segment(std::uint32_t rec);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
@@ -2763,6 +2810,7 @@ public:
     DrawCmds(const DrawCmds&) = delete;
     DrawCmds& operator=(const DrawCmds&) = delete;
     bool deferred() const { return packet_ != nullptr; }
+    std::uint64_t number() const;  // its packet's number (0: none)
     void publish();
     void update_sets(const VkWriteDescriptorSet* writes, std::size_t n);
     // The draw's own writes, taken rather than copied: `writes` and `images`
@@ -2844,6 +2892,17 @@ void* recorder_list_packet(std::uint64_t index);
 bool recorder_list_packet_free(std::uint64_t index);
 std::string recorder_list_report();  // chained list packets replayed, and the binds they left out
 void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams);
+// Stage 4b.2 (render.cpp lists_segment, host_gpu_splice_segment): whether a
+// list packet is a plain draw a segment's secondary takes as it is; its
+// dynamic offsets' count and values (its params blocks' indices); a
+// segment's packets replayed into a pool thread's secondary command buffer,
+// chained, with their params blocks' offsets in the pool's region; and the
+// secondary executed at the command processor's place in the stream.
+bool recorder_list_packet_plain(std::uint64_t index);
+bool recorder_packet_replayed(std::uint64_t number);  // the recorder replayed draw packet `number`
+std::uint32_t recorder_list_packet_dynamic(std::uint64_t index, std::uint32_t (&out)[2]);
+void recorder_record_segment_draw(VkCommandBuffer cmd, std::uint64_t index, const std::uint32_t* dyn, std::uint64_t prev, const std::uint32_t* prev_dyn);
+void recorder_splice_segment(VkCommandBuffer secondary);
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it
 // with the pass end before it. Null outside a draw, or when it records in place.

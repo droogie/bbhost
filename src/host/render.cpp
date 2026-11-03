@@ -30,6 +30,7 @@
 #include "host/gxvk.h"
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
+#include "host/gxvk_lists_internal.h"
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
@@ -44,6 +45,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <sys/stat.h>
@@ -387,6 +389,10 @@ struct GfxPipeline {
     // looking it up by key on every draw.
     GfxPipeline* lean_variant = nullptr;
     bool lean_building = false;  // a worker is building its no-fallback variant (queue_lean_variant)
+    // Built (gfx_pipeline, a worker's handed over): stage 4b's pool, which
+    // finds entries the command processor inserted, takes none before
+    // (gfx_lookup; read and written through std::atomic_ref).
+    bool made = false;
     bool building = false;       // a worker is building this pipeline; nothing reads it until handed over
     // Per stage: whether the translation lists the images and samplers
     // paths_for does, so the prefetch takes the words the pipeline key
@@ -456,8 +462,30 @@ struct Pass {
     // Its attachments a draw of it has written so far: bit t colour slot t, bit
     // 8 depth or stencil (the feedback census, note_feedback_loops).
     std::uint32_t written = 0;
+    // Stage 4b.2: what it may hold (VkRenderingInfo::flags: the command
+    // processor's draws, the segments' secondary command buffers, or both with
+    // VK_KHR_maintenance7), and its attachments as begun, so that without
+    // maintenance7 it can be ended and begun again holding the other kind.
+    VkRenderingFlags flags = 0;
+    std::uint32_t ncolor = 0;
+    VkRenderingAttachmentInfo colors[8] = {};
+    VkRenderingAttachmentInfo depth{}, stencil{};
+    bool has_depth = false, has_stencil = false;
 };
 Pass g_pass;
+// Stage 4b.2: the flags a pass begins with - inline and secondary contents
+// both while the segments are on and the device mixes them (VK_KHR_maintenance7;
+// BBHOST_GXVK_SEGMENTS_MIXED=0 acts out a device that does not), else inline.
+bool segments_mixed() {
+    static const bool off = [] {
+        const char* e = std::getenv("BBHOST_GXVK_SEGMENTS_MIXED");
+        return e && e[0] == '0';
+    }();
+    return gxvk_lists::segments() && g.has_maint7 && !off;
+}
+constexpr VkRenderingFlags kPassMixed = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT | VK_RENDERING_CONTENTS_INLINE_BIT_KHR;
+// Passes ended and begun again for the other kind of contents (no maintenance7): [0] for a segment, [1] for a draw.
+std::atomic<std::uint64_t> g_pass_restarts[2] = {};
 const std::string* g_pass_profile_name = nullptr;  // the profile name of the draw beginning the next pass (BBHOST_GPU_PROFILE=3)
 
 // ---- Lazy pass barriers (BBHOST_PASS_BARRIERS=lazy; off by default) ----
@@ -772,8 +800,18 @@ struct CachedSet {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::vector<std::uint64_t> material;  // what the key hashes, compared on a hit
+    // Its making's number: a set dropped, freed and made again with the same
+    // content can come back with the same handle, and a secondary command
+    // buffer recorded with the old one is not valid with the new (stage 4b.2).
+    std::uint64_t serial = 0;
+    // Stage 4b.2: its writes go into the draw packet that made it, applied when
+    // the recorder replays that packet - a secondary binding it before then is
+    // made invalid by the write. The packet's number plus one (0: written in
+    // place already; ~0: not known yet, the packet not started).
+    std::uint64_t written_by = 0;
 };
 std::unordered_map<std::uint64_t, CachedSet> g_cached_sets;                     // under g.mu
+std::uint64_t g_set_serials = 0;                                                // under g.mu
 std::unordered_map<VkImageView, std::vector<std::uint64_t>> g_cached_set_views;  // view -> keys of the sets holding it
 std::vector<VkDescriptorPool> g_set_cache_pools;
 std::uint64_t g_sc_hits = 0, g_sc_misses = 0, g_sc_dropped = 0, g_sc_flushes = 0, g_sc_no_room = 0, g_sc_front_hits = 0;
@@ -855,8 +893,8 @@ VkDescriptorSet set_cache_alloc(VkDescriptorSetLayout layout, VkDescriptorPool& 
     return VK_NULL_HANDLE;
 }
 
-// The cached set with exactly this content, or null.
-VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_t>& material) {
+// The cached set with exactly this content, or null (`serial`: its making's number).
+VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_t>& material, std::uint64_t* serial = nullptr) {
     SetFront& f = g_set_front[key & (kSetFront - 1)];
     const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no front and no count
     if (!list_draw() && f.set && f.key == key && f.set->material == material) {  // (stage 4b.1b's: the map, never the front)
@@ -864,10 +902,12 @@ VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_
             ++g_sc_hits;
             ++g_sc_front_hits;
         }
+        if (serial) *serial = f.set->serial;
         return f.set->set;
     }
     auto it = g_cached_sets.find(key);
     if (it == g_cached_sets.end() || it->second.material != material) return VK_NULL_HANDLE;
+    if (serial) *serial = it->second.serial;
     if (part) return it->second.set;
     ++g_sc_hits;
     if (g_set_front_on) f = SetFront{key, &it->second};
@@ -876,9 +916,11 @@ VkDescriptorSet set_cache_find(std::uint64_t key, const std::vector<std::uint64_
 
 // Stage 4b.1b's splice: the set the cache holds for `key` now (a list-mode
 // draw found its material there when it was committed), or null.
-VkDescriptorSet set_cache_find_key_locked(std::uint64_t key) {
+VkDescriptorSet set_cache_find_key_locked(std::uint64_t key, std::uint64_t* serial = nullptr) {
     const auto it = g_cached_sets.find(key);
-    return it == g_cached_sets.end() ? VK_NULL_HANDLE : it->second.set;
+    if (it == g_cached_sets.end()) return VK_NULL_HANDLE;
+    if (serial) *serial = it->second.serial;
+    return it->second.set;
 }
 
 void set_cache_insert(std::uint64_t key, const std::vector<std::uint64_t>& material, VkDescriptorSet set, VkDescriptorPool pool,
@@ -890,12 +932,32 @@ void set_cache_insert(std::uint64_t key, const std::vector<std::uint64_t>& mater
     c.set = set;
     c.pool = pool;
     c.material = material;
+    c.serial = ++g_set_serials;
+    c.written_by = ~0ull;  // (the draw that made it says by which packet: set_cache_written_by)
     for (VkImageView v : views) {
         if (v) g_cached_set_views[v].push_back(key);
     }
     ++g_sc_misses;
 }
 }  // namespace
+
+// The draw that made the cached sets `keys` (n of them) put their writes into
+// packet `number` (or wrote them in place: `in_place`).
+void set_cache_written_by(const std::uint64_t* keys, int n, std::uint64_t number, bool in_place) {
+    cache_rw::Write cw(cache_rw::kSets);  // stage 4b.2's builders read it
+    for (int k = 0; k < n; ++k) {
+        if (auto it = g_cached_sets.find(keys[k]); it != g_cached_sets.end()) it->second.written_by = in_place ? 0 : number + 1;
+    }
+}
+
+// Stage 4b.2's builder, under the readers' lock: whether the set the cache holds
+// for `key` is `set` of making `serial`, and written (its packet replayed).
+bool set_cache_ready_locked(std::uint64_t key, VkDescriptorSet set, std::uint64_t serial) {
+    const auto it = g_cached_sets.find(key);
+    if (it == g_cached_sets.end() || it->second.set != set || it->second.serial != serial) return false;
+    const std::uint64_t by = it->second.written_by;
+    return !by || (by != ~0ull && recorder_packet_replayed(by - 1));
+}
 
 void set_cache_drop_all_locked() {
     if (!g_cached_sets.empty()) set_cache_flush();
@@ -10353,7 +10415,9 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
 GfxPipeline* gfx_lookup(std::uint64_t key) {
     if (list_draw()) {  // stage 4b.1b: the map under the readers' lock (inserts take it exclusive), no memo
         const auto it = g_gfx.find(key);
-        return it == g_gfx.end() ? nullptr : &it->second;
+        // (An entry being built - inserted, its stages still being taken - is the command processor's: a miss.)
+        if (it == g_gfx.end() || !std::atomic_ref<bool>(it->second.made).load(std::memory_order_acquire)) return nullptr;
+        return &it->second;
     }
     struct Memo {
         std::uint64_t key = 0;
@@ -10394,8 +10458,10 @@ GfxPipeline& gfx_pipeline(const DrawState& s, std::uint64_t key, const std::vect
         cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
         entry = &g_gfx[key];
     }
-    return build_gfx_pipeline(*entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
-                              ps_sampler_modes, cb_no_fallback, vertex_input, create, layout_only);
+    GfxPipeline& built = build_gfx_pipeline(*entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
+                                            ps_sampler_modes, cb_no_fallback, vertex_input, create, layout_only);
+    std::atomic_ref<bool>(entry->made).store(true, std::memory_order_release);  // the pool's readers may take it now
+    return built;
 }
 
 // Two translations of a stage bind the same resources at the same bindings, so
@@ -10621,6 +10687,7 @@ void apply_lean_builds_locked() {
     }
     for (const auto& [base, variant] : done) {
         variant->building = false;
+        std::atomic_ref<bool>(variant->made).store(true, std::memory_order_release);
         if (base == variant) continue;  // a native hull pipeline (queue_native_pipeline): drawn by its own key
         base->lean_variant = variant;
         base->lean_building = false;
@@ -10700,9 +10767,10 @@ void note_depth_first_pass(const RtImage& r, const DrawState& s) {
 // compares a draw, skipped otherwise.
 std::atomic<std::uint64_t> g_feedback_draws[3] = {};
 bool feedback_census_on() {
+    // (On with the validation layer unless BBHOST_FEEDBACK_CENSUS=0: the census makes stage 4b's pool commit nothing.)
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_FEEDBACK_CENSUS");
-        return (e && e[0] == '1') || validation_on();
+        return e && *e ? e[0] == '1' : validation_on();
     }();
     return on;
 }
@@ -11245,7 +11313,11 @@ void end_pass_for_draw_locked() {
 // `hazard`: the draw samples a target written since the last barrier (lazy
 // pass barriers), so the barrier is paid before it, inside a pass or not.
 void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
-    if (g_pass.active && g_pass.key == key && !hazard) return;
+    // (Stage 4b.2 without maintenance7: a pass begun for a segment's secondary command buffers holds no draw of
+    // the command processor's - it ends here and begins again, its attachments loaded.)
+    const bool secondary_only = (g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR);
+    if (g_pass.active && g_pass.key == key && !hazard && !secondary_only) return;
+    if (g_pass.active && g_pass.key == key && !hazard && secondary_only) g_pass_restarts[1].fetch_add(1, std::memory_order_relaxed);
     transfer_flush_locked();
     if (hazard && g_pass.active && g_pass.key == key) g_barriers_mid_pass.fetch_add(1, std::memory_order_relaxed);
     end_pass_for_draw_locked();
@@ -11344,6 +11416,14 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         ri.pDepthAttachment = &depth;
         if (s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM) ri.pStencilAttachment = &stencil;
     }
+    ri.flags = segments_mixed() ? kPassMixed : 0;  // stage 4b.2: the segments' secondary command buffers go into it too
+    g_pass.flags = ri.flags;
+    g_pass.ncolor = std::min<std::uint32_t>(ri.colorAttachmentCount, 8);
+    for (std::uint32_t k = 0; k < g_pass.ncolor; ++k) g_pass.colors[k] = colors[k];
+    g_pass.has_depth = ri.pDepthAttachment != nullptr;
+    g_pass.has_stencil = ri.pStencilAttachment != nullptr;
+    if (g_pass.has_depth) g_pass.depth = depth;
+    if (g_pass.has_stencil) g_pass.stencil = stencil;
     if (g.profile_passes && g_pass_profile_name) {
         // The pass's size and attachments beside its first draw's pipeline:
         // which passes are the render size's, and how many targets they write.
@@ -23071,6 +23151,8 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     static StageSetCache set_cache[2][kSetCacheWays];  // g.mu is held
+    std::uint64_t made_cached[2] = {};  // the cached sets this draw makes (their writes go into its packet)
+    int nmade_cached = 0;
     static int set_cache_next[2] = {0, 0};
     bool stage_reused[2] = {false, false};  // this stage took an earlier draw's set, or one the set cache keeps
     const bool use_set_cache = set_cache_on() && !capture;  // captures describe buffers by their ranges
@@ -23396,11 +23478,13 @@ static bool draw_impl(const GpuDraw& d) {
                 material.push_back(bi.range);
             }
             const std::uint64_t key = fnv1a(material.data(), material.size() * sizeof(std::uint64_t));
-            if (const VkDescriptorSet hit = set_cache_find(key, material)) {
+            std::uint64_t set_serial = 0;
+            if (const VkDescriptorSet hit = set_cache_find(key, material, &set_serial)) {
                 sets[st] = hit;
-                if (run && run->list) {  // stage 4b.1b: still the cache's at its splice
+                if (run && run->list) {  // stage 4b.1b: still the cache's at its splice (4b.2: the very set)
                     run->list->set_key[st] = key;
                     run->list->set[st] = hit;
+                    run->list->set_serial[st] = set_serial;
                 }
                 stage_reused[st] = true;  // a table rebuild takes a set of its own
                 draw_stamp.to(kRenderCostSets);
@@ -23440,6 +23524,7 @@ static bool draw_impl(const GpuDraw& d) {
             if (cached) {
                 static const std::vector<VkImageView> no_views;
                 set_cache_insert(key, material, set, pool, meta.bindless ? no_views : views);
+                made_cached[nmade_cached++] = key;  // (stage 4b.2: by which packet its writes go, below)
                 stage_reused[st] = true;
             }
             continue;
@@ -23642,6 +23727,7 @@ static bool draw_impl(const GpuDraw& d) {
     } else {
         cmds.take_sets(writes, infos, buffer_infos, ubi, 2);
     }
+    if (nmade_cached) set_cache_written_by(made_cached, nmade_cached, cmds.number(), !cmds.deferred());
     draw_stamp.to(kRenderCostUpdate);
 
     // Every constant buffer bound: draw with the variant translated without the
@@ -24093,6 +24179,20 @@ static bool draw_impl(const GpuDraw& d) {
             return false;
         }
         run->list->pass_key = pass_key(s);
+        // Stage 4b.2: the pass's attachments' formats, as begin_pass makes the pass (a segment's inheritance).
+        if (gxvk_lists::segments()) {
+            ListNotes& ln = *run->list;
+            int last = -1;
+            for (int t = 0; t < 8; ++t) {
+                if (s.color[t]) last = t;
+            }
+            ln.ncolor = static_cast<std::uint32_t>(last + 1);
+            ln.formats_ok = true;
+            for (int t = 0; t <= last; ++t) ln.color_fmt[t] = s.color[t] ? s.color[t]->format : VK_FORMAT_UNDEFINED;  // (every target one sample)
+            ln.depth_fmt = s.depth ? s.depth->format : VK_FORMAT_UNDEFINED;
+            ln.stencil_fmt = s.depth && s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM ? s.depth->format
+                                                                                                                             : VK_FORMAT_UNDEFINED;
+        }
     } else if (part) {
         // The run's pass is open - its first draw began it - and a draw into
         // its targets with no hazard begins none (BBHOST_RUN_COMMIT).
@@ -25468,7 +25568,16 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
 
 namespace {
 
-enum ListState : std::uint32_t { kLcFree, kLcCommitting, kLcCommitted, kLcNot };
+// A commit's state, in one word with its token's id (lc_word): the pool's
+// commit (committing, then committed or not), a segment's builder (stage 4b.2:
+// building while it records the draw into a segment's secondary, then
+// segment), and the command processor's per-draw splice (taken). A claim is a
+// compare-and-swap of the whole word, so a record taken again for a newer
+// token is never claimed for an older one.
+enum ListState : std::uint32_t { kLcFree, kLcCommitting, kLcCommitted, kLcNot, kLcBuilding, kLcSegment, kLcTaken };
+inline std::uint64_t lc_word(std::uint64_t id, std::uint32_t st) { return id << 3 | st; }
+inline std::uint32_t lc_state(std::uint64_t w) { return static_cast<std::uint32_t>(w & 7); }
+inline std::uint64_t lc_id(std::uint64_t w) { return w >> 3; }
 // Why a draw was not committed, past RunStop's reasons (RunDraw::stop).
 enum ListWhy : int {
     kLwLate = kRunStops,  // its slot not stored by the time the pool got to it (taken already, or moved on)
@@ -25503,16 +25612,18 @@ enum SpliceWhy : int {
     kSwOcclusion,     // a predicate or a query would take it here
     kSwOther,         // windows given, a run commit or a diagnostic at the walk
     kSwCompare,       // splice-compare: drawn in order by design
+    kSwSegment,       // stage 4b.2: a segment's builder holds it (its segment not spliced here)
     kSpliceWhys
 };
 const char* const kSpliceWhyName[kSpliceWhys] = {"not committed", "not committed yet", "a run's first draw", "a split since its run's first",
                                                  "its run's targets remade or owed work", "other target objects",
                                                  "another pass",  "too old",           "a hazard",           "an owed clear",
                                                  "a view",        "a set",             "a home",             "its copies' segment",
-                                                 "occlusion",     "other",             "compare"};
+                                                 "occlusion",     "other",             "compare",           "held by a segment"};
 
+struct Segment;
 struct ListCommit {
-    std::atomic<std::uint32_t> state{kLcFree};
+    std::atomic<std::uint64_t> word{0};  // lc_word(its token's id, ListState)
     std::uint64_t id = 0;
     std::uint64_t flip = 0;
     int why = -1;
@@ -25526,6 +25637,10 @@ struct ListCommit {
     const std::string* vs_other = nullptr;
     int vs_other_why = 0;
     RunDigest digest;
+    // Stage 4b.2: the segment whose first draw this is, and its word when
+    // ready (written by the builder before the draw's state says segment).
+    Segment* seg = nullptr;
+    std::uint64_t seg_word = 0;
 };
 constexpr std::uint64_t kListCommits = 16384;  // as the token slots: token `id`'s record is id's slot index
 ListCommit* g_list_commits = nullptr;
@@ -25577,6 +25692,18 @@ std::atomic<std::uint64_t> g_sp_spliced{0}, g_sp_why[kSpliceWhys] = {}, g_sp_ns{
 std::atomic<std::uint64_t> g_sp_compared{0}, g_sp_differed{0}, g_sp_field_diff[kCmpFields] = {};
 std::atomic<int> g_sp_diff_logs{0};
 thread_local std::uint64_t t_splice_would = 0;  // splice-compare: the token whose commit passed every check
+// segments-compare (stage 4b.2): the would-be segment's members, compared as they are drawn in order
+// (host_gpu_splice_compare).
+constexpr std::uint32_t kSegWouldMost = 256;
+thread_local std::uint64_t t_seg_would[kSegWouldMost];
+thread_local std::uint32_t t_seg_would_n = 0, t_seg_would_at = 0;
+std::atomic<std::uint64_t> g_sg_compared{0};
+
+// The open run's target names (the command processor's thread), worked out again only when its first draw's
+// inputs change.
+const std::uint32_t* run_names_of(const RunTargets& m);
+// Stage 4b.2 without maintenance7: the open pass begun again to hold the other kind of contents (below).
+void pass_restart_locked(VkRenderingFlags flags);
 
 }  // namespace
 
@@ -25645,6 +25772,18 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
     return false;
 }
 
+const std::uint32_t* run_names_of(const RunTargets& m) {
+    static thread_local TargetInputs names_in{};
+    static thread_local std::uint32_t now[kTargetNames];
+    static thread_local bool names_made = false;
+    if (!names_made || std::memcmp(&names_in, &m.in, sizeof(names_in)) != 0) {
+        names_in = m.in;
+        names_of(m, now);
+        names_made = true;
+    }
+    return now;
+}
+
 // Whether the list-mode commit takes draws in this configuration at all (as
 // host_gpu_run_commit's refusals): read under g.mu.
 bool list_config_ok_locked() {
@@ -25663,12 +25802,15 @@ void lists_commit(std::uint64_t id) {
     ListCommit& c = all[id & (kListCommits - 1)];
     const auto t0 = std::chrono::steady_clock::now();
     g_lc_looked.fetch_add(1, std::memory_order_relaxed);
-    std::uint32_t st = c.state.load(std::memory_order_acquire);
-    if (st == kLcCommitting || !c.state.compare_exchange_strong(st, kLcCommitting, std::memory_order_acq_rel)) {
+    // (A record a segment's builder is recording from is not taken: it reads its packet.)
+    std::uint64_t w = c.word.load(std::memory_order_acquire);
+    if (lc_state(w) == kLcCommitting || lc_state(w) == kLcBuilding ||
+        !c.word.compare_exchange_strong(w, lc_word(id, kLcCommitting), std::memory_order_acq_rel)) {
         g_lc_why[kLwBusy].fetch_add(1, std::memory_order_relaxed);
         return;
     }
     c.id = id;
+    c.seg = nullptr;
     c.why = -1;
     c.flip = hle_video_flip_count();
     bool pinned = false;
@@ -25682,13 +25824,20 @@ void lists_commit(std::uint64_t id) {
         else g_lc_why[why].fetch_add(1, std::memory_order_relaxed);
         g_lc_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
                           std::memory_order_relaxed);
-        c.state.store(why < 0 ? kLcCommitted : kLcNot, std::memory_order_release);
+        c.word.store(lc_word(id, why < 0 ? kLcCommitted : kLcNot), std::memory_order_release);
     };
     if (!recorder_list_packet_free(id)) return finish(kLwBusy);
     static thread_local GpuDrawInputs in;
     static thread_local GxDrawObjects o;
-    if (!hle_gx_native_pin_copy(id, in, o)) return finish(kLwLate);
+    bool own_records = false;
+    if (!hle_gx_native_pin_copy(id, in, o, &own_records)) return finish(kLwLate);
     pinned = true;
+    // (Its records copied for this thread: the slot given back now, so the command processor's take never waits for
+    // the commit - a draw it reaches first is drawn in order.)
+    if (own_records) {
+        hle_gx_native_unpin(id);
+        pinned = false;
+    }
     if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) return finish(kLwKind);
     // The draw as the walk's take of its token gives it (gnm_exec.cpp native_draw).
     static const std::uint32_t no_registers[0x1000] = {};
@@ -25827,10 +25976,15 @@ bool host_gpu_splice(std::uint64_t id) {
         g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const ListCommit& c = all[id & (kListCommits - 1)];
-    const std::uint32_t st = c.state.load(std::memory_order_acquire);
-    if (c.id != id || st == kLcCommitting || st == kLcFree) {
+    ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint64_t cw = c.word.load(std::memory_order_acquire);
+    const std::uint32_t st = lc_state(cw);
+    if (lc_id(cw) != id || st == kLcCommitting || st == kLcFree) {
         g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (st == kLcBuilding || st == kLcSegment) {
+        g_sp_why[kSwSegment].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     if (st != kLcCommitted) {
@@ -25855,16 +26009,7 @@ bool host_gpu_splice(std::uint64_t id) {
     // names, nothing done in order since, no target made, no fill or clear.
     const RunTargets& m = t_run_targets;
     if (!m.valid) return fall(kSwRunFirst);
-    // The run's names, worked out again only when its first draw's inputs change.
-    static thread_local TargetInputs names_in{};
-    static thread_local std::uint32_t now[kTargetNames];
-    static thread_local bool names_made = false;
-    if (!names_made || std::memcmp(&names_in, &m.in, sizeof(names_in)) != 0) {
-        names_in = m.in;
-        names_of(m, now);
-        names_made = true;
-    }
-    if (std::memcmp(now, c.names, sizeof(now)) != 0) return fall(kSwRunFirst);
+    if (std::memcmp(run_names_of(m), c.names, sizeof(c.names)) != 0) return fall(kSwRunFirst);
     // The run open: its first draw's lookups still stand (as batching shares
     // them) - and its targets are the very objects the commit drew with.
     if (m.serial != list_resolve::run_serial()) return fall(kSwChanged);
@@ -25902,7 +26047,9 @@ bool host_gpu_splice(std::uint64_t id) {
     // the recording's uploads, ahead of its draws; a pass a refresh ended is
     // begun again by the draw in order).
     for (std::uint32_t k = 0; k < n.nviews; ++k) {
-        if (!texture_view_splice_ok(n.view_id[k], n.view_flags[k], n.view[k])) return fall(kSwView);
+        if (!texture_view_splice_ok(n.view_id[k], n.view_flags[k], n.view[k]) &&
+            !texture_view_splice_again(n.view_id[k], n.view_flags[k], n.view[k], n.view_words[k]))
+            return fall(kSwView);
     }
     if (!g_pass.active || g_pass.key != c.notes.pass_key) return fall(kSwPass);
     for (int s2 = 0; s2 < 2; ++s2) {
@@ -25920,9 +26067,14 @@ bool host_gpu_splice(std::uint64_t id) {
         t_splice_would = id;
         return fall(kSwCompare);
     }
-    // Spliced: its params into this recording's slots, its packet into the stream.
+    // Spliced: its params into this recording's slots, its packet into the stream. Taken from a segment's builder
+    // (stage 4b.2), which may want it too.
+    if (std::uint64_t want = cw; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
     if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
     begin_recording_locked();
+    // (Stage 4b.2 without maintenance7: a pass begun for segments holds no inline draw - begun again for it.)
+    if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
+        pass_restart_locked(0);
     std::uint32_t offsets[2] = {};
     for (std::uint32_t k = 0; k < n.params.n; ++k) {
         VkDescriptorBufferInfo out{};
@@ -25964,17 +26116,27 @@ bool host_gpu_list_committed(std::uint64_t id) {
     const ListCommit* const all = g_list_commits;
     if (!all) return false;
     const ListCommit& c = all[id & (kListCommits - 1)];
-    return c.state.load(std::memory_order_acquire) == kLcCommitted && c.id == id;
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    const std::uint32_t st = lc_state(w);
+    return lc_id(w) == id && (st == kLcCommitted || st == kLcBuilding || st == kLcSegment || st == kLcTaken);
 }
 
 // splice-compare: after the draw of token `id` drawn in order (its digest in
 // t_run_digest), the pool's commit of it compared with that.
 void host_gpu_splice_compare(std::uint64_t id) {
     ListCommit* const all = g_list_commits;
-    if (!all || t_splice_would != id) return;
-    t_splice_would = 0;
+    if (!all) return;
+    if (t_splice_would == id) {
+        t_splice_would = 0;
+    } else if (t_seg_would_at < t_seg_would_n && t_seg_would[t_seg_would_at] == id) {
+        ++t_seg_would_at;  // segments-compare: a member of the segment that would have been spliced
+        g_sg_compared.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        return;
+    }
     const ListCommit& c = all[id & (kListCommits - 1)];
-    if (c.id != id || c.state.load(std::memory_order_acquire) != kLcCommitted) return;
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    if (lc_id(w) != id || (lc_state(w) != kLcCommitted && lc_state(w) != kLcSegment)) return;
     splice_compare_locked(c);
 }
 
@@ -26045,6 +26207,843 @@ std::string host_gpu_splice_report(bool window) {
         out += buf;
         out += fields + ")";
     }
+    return out;
+}
+
+
+// ---- Stage 4b.2 (BBHOST_GXVK_LISTS=segments): segments recorded into secondary command buffers ----
+//
+// (host/gxvk_lists.h.) A list a GX context finished comes to the pool as the
+// draws its context recorded, in order (gxvk_lists_internal.h ListRec). A pool
+// thread cuts it into segments: a run of draws one after another in the list's
+// command buffer - nothing between their tokens the command processor does in
+// order (list_split_of) - into the same targets and pass, each committed. The
+// run's first draw stays as splice has it (spliced alone where its run is open,
+// else drawn in order: it opens the command processor's run and pass); the
+// draws after it are the segment's members, which the builder claims from the
+// per-draw splice and records into a secondary command buffer of its own - its
+// list packets replayed chained, their params blocks written into the pool's
+// region of the params buffer (so the offsets the secondary binds are final),
+// their constant-buffer copies in the list arena - with the members' notes
+// merged. At the first member's token the command processor checks the stream
+// (the members' tokens follow as recorded), then the segment once as splice
+// checks a draw, and executes the secondary with one op; the members' tokens
+// that follow are given back without a take. A segment whose checks fail gives
+// its members back to the per-draw splice, counted by why.
+
+namespace {
+
+constexpr std::uint32_t kSegMin = 2;  // members a segment takes (a shorter run stays per draw)
+constexpr std::uint32_t kSegMost = gxvk_lists::detail::kRecMost;
+constexpr std::uint32_t kSegRing = 1024;  // a pool thread's segment records
+
+// A segment's state, in one word with its record's generation: free, built
+// (the builder's), ready, taken (the command processor's splice), spliced into
+// recording `serial`, dropped (its checks failed, or never spliced). A record
+// is used again once spliced and that recording has completed, dropped, or
+// ready and too old for any splice.
+enum SegState : std::uint32_t { kSgFree, kSgBuilding, kSgReady, kSgTaken, kSgSpliced, kSgDropped };
+inline std::uint64_t sg_word(std::uint64_t gen, std::uint32_t st) { return gen << 3 | st; }
+inline std::uint32_t sg_state(std::uint64_t w) { return static_cast<std::uint32_t>(w & 7); }
+
+struct Segment {
+    std::atomic<std::uint64_t> word{0};
+    std::uint64_t gen = 0;
+    std::uint32_t count = 0;  // members
+    std::uint64_t ids[kSegMost] = {};
+    std::uint64_t flip = 0;        // its oldest member's commit
+    std::uint64_t ready_flip = 0;  // when it was made ready
+    std::uint32_t names[kTargetNames] = {};
+    RtImage* looked[9] = {};
+    std::uint32_t reached = 0;
+    std::uint64_t pass_key = 0;
+    // The members' notes, merged.
+    std::vector<std::uint64_t> sampled;
+    struct View {
+        std::uint32_t id;
+        std::uint8_t flags;
+        bool target;
+        VkImageView view;
+        std::uint32_t words[8];  // its T# (resolved again at the splice when its entry went stale)
+    };
+    std::vector<View> views;
+    struct Set {
+        std::uint64_t key;
+        VkDescriptorSet set;
+        std::uint64_t serial;
+    };
+    std::vector<Set> sets;
+    std::vector<std::uint32_t> homes;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> cb_segs, pr_segs;  // the list arena's and the params region's segments, laps
+    struct Pipe {
+        GfxPipeline* p;
+        std::uint32_t draws, gx;
+    };
+    std::vector<Pipe> pipes;
+    struct VsOther {
+        const std::string* name;
+        int why;
+        std::uint32_t n;
+    };
+    std::vector<VsOther> vs_other;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    std::uint64_t serial = 0;  // spliced into this recording
+};
+
+// A pool thread's segments and the command pool their secondaries come from.
+struct SegRing {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    Segment segs[kSegRing];
+    std::uint32_t next = 0;
+};
+thread_local SegRing* t_seg_ring = nullptr;
+
+// A set of keys for one segment's merge: slots told current by the merge's stamp.
+struct StampSet {
+    static constexpr std::uint32_t kSlots = 2048;
+    std::uint64_t stamp = 0;
+    std::uint64_t slot_stamp[kSlots] = {};
+    std::uint64_t key[kSlots] = {};
+    std::uint32_t value[kSlots] = {};
+    void clear() { ++stamp; }
+    // The key's slot: true with its value when it was there, else put there (`value` taken).
+    bool find_or_put(std::uint64_t k, std::uint32_t& v) {
+        for (std::uint32_t s = static_cast<std::uint32_t>((k * 0x9e3779b97f4a7c15ull) >> 53) & (kSlots - 1), probe = 0; probe < kSlots;
+             ++probe, s = (s + 1) & (kSlots - 1)) {
+            if (slot_stamp[s] != stamp) {
+                slot_stamp[s] = stamp;
+                key[s] = k;
+                value[s] = v;
+                return false;
+            }
+            if (key[s] == k) {
+                v = value[s];
+                return true;
+            }
+        }
+        return true;  // (full: taken as known - never with a segment's few hundred keys)
+    }
+};
+
+// The pool's region of the params buffer (Gpu::ubo_list_base, ubo_list_blocks):
+// segments of it taken whole by a pool thread, as the list arena's are - taken
+// again only once every segment written into it is too old to splice and every
+// recording one was spliced into has completed. The splice stamps them and
+// refuses one taken again.
+struct ListParamsArena {
+    static constexpr std::uint32_t kSegBlocks = 1024;
+    static constexpr std::uint32_t kSegments = kListParamsBlocks / kSegBlocks;
+    std::mutex mu;
+    std::uint64_t last_flip[kSegments] = {};
+    std::atomic<std::uint64_t> max_serial[kSegments] = {};
+    std::atomic<std::uint64_t> lap[kSegments] = {};
+    std::uint32_t next = 0;
+    std::atomic<std::uint64_t> takes{0}, full{0};
+};
+ListParamsArena g_list_params;
+struct ListParamsCursor {
+    std::uint32_t seg = ~0u;
+    std::uint64_t lap = 0;
+    std::uint32_t next = 0;
+};
+thread_local ListParamsCursor t_list_params;
+// `n` blocks of the region in one piece: their first block's index in the
+// region, the segment and its lap noted in `sg`. False when none is free.
+bool list_params_take(std::uint32_t n, std::uint32_t& first, Segment& sg) {
+    ListParamsArena& a = g_list_params;
+    if (!g.ubo_list_blocks || n > ListParamsArena::kSegBlocks) return false;
+    ListParamsCursor& c = t_list_params;
+    const std::uint64_t flip = hle_video_flip_count();
+    {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (c.seg == ~0u || c.next + n > ListParamsArena::kSegBlocks) {
+            const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
+            std::uint32_t found = ~0u;
+            for (std::uint32_t k = 0; k < ListParamsArena::kSegments; ++k) {
+                const std::uint32_t s = (a.next + k) % ListParamsArena::kSegments;
+                if (s == c.seg) continue;
+                const bool old = !a.last_flip[s] || a.last_flip[s] + kListMaxAge + 2 < flip;
+                if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (a.last_flip[s] ? 0 : 1)) {
+                    found = s;
+                    break;
+                }
+            }
+            if (found == ~0u) {
+                a.full.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            a.next = (found + 1) % ListParamsArena::kSegments;
+            a.max_serial[found].store(0, std::memory_order_relaxed);
+            c.seg = found;
+            c.lap = a.lap[found].fetch_add(1, std::memory_order_acq_rel) + 1;
+            c.next = 0;
+            a.takes.fetch_add(1, std::memory_order_relaxed);
+        }
+        a.last_flip[c.seg] = flip;
+    }
+    first = c.seg * ListParamsArena::kSegBlocks + c.next;
+    c.next += n;
+    bool noted = false;
+    for (const auto& [s, l] : sg.pr_segs) noted |= s == c.seg && l == c.lap;
+    if (!noted) sg.pr_segs.emplace_back(c.seg, c.lap);
+    return true;
+}
+
+// The builder's counts: why a draw of a list record went into no segment, the
+// segments made (by members), the time recording them.
+enum SegNot : int {
+    kSnFirst,      // a run's first draw (by design: spliced or drawn as splice has it)
+    kSnUncommitted,// not committed (or taken, or another token's record by then)
+    kSnPending,    // still being committed when the builder waited no more
+    kSnApart,      // something between its token and the one before (or another chunk)
+    kSnTargets,    // other targets or pass than the draw before
+    kSnPacket,     // its packet holds more than a plain draw (descriptor writes, pass or transfer work)
+    kSnShort,      // its run too short for a segment
+    kSnClaimed,    // the command processor took it first
+    kSnNoRecord,   // no free segment record
+    kSnParams,     // no room in the params region
+    kSnRecording,  // its secondary could not be recorded
+    kSnGone,       // a cached set it binds left the cache since its commit, or it is too old to be spliced
+    kSegNots
+};
+const char* const kSegNotName[kSegNots] = {"a run's first", "not committed", "still committing", "apart",     "other targets",
+                                           "not plain",     "too short",     "taken first",      "no record", "no params room",
+                                           "recording",     "a set gone"};
+// Why a segment was not spliced at its first member's token.
+enum SegFall : int {
+    kSfStream,       // the stream does not hold its tokens one after another as recorded
+    kSfLost,         // its record taken again since (too old)
+    kSfOld,          // committed too long ago
+    kSfRunFirst,     // no run open with its target names
+    kSfChanged,      // something done in order since its run's first draw
+    kSfRunGens,      // a target made or resized, a fill or clear noted since
+    kSfOtherTargets, // its run's targets are not the objects it was committed with
+    kSfPass,         // another pass open
+    kSfHazard,       // it samples an image written since the last barrier
+    kSfClear,        // it samples an image that owes a clear
+    kSfView,         // a view it binds changed or would refresh here
+    kSfSet,          // a cached set it binds is no longer the cache's
+    kSfHome,         // a home it binds has a copy pending
+    kSfArena,        // its copies' or params' segment taken again
+    kSfOcclusion,    // a predicate or a query would take its draws here
+    kSfOther,        // windows given, a run commit, a diagnostic, the configuration
+    kSfCompare,      // segments-compare: drawn in order by design
+    kSegFalls
+};
+const char* const kSegFallName[kSegFalls] = {"stream",  "record lost", "too old",  "a run's first", "a split",   "run generations",
+                                             "other targets", "another pass", "a hazard", "an owed clear", "a view", "a set",
+                                             "a home",  "an arena",     "occlusion", "other",        "compare"};
+
+std::atomic<std::uint64_t> g_sg_lists{0}, g_sg_draws{0}, g_sg_not[kSegNots] = {};
+std::atomic<std::uint64_t> g_sg_made{0}, g_sg_members{0}, g_sg_record_ns{0}, g_sg_by_len[8] = {};
+std::atomic<std::uint64_t> g_sg_spliced{0}, g_sg_spliced_draws{0}, g_sg_splice_ns{0}, g_sg_splice_timed{0}, g_sg_splice_timed_draws{0};
+std::atomic<std::uint64_t> g_sg_fall[kSegFalls] = {}, g_sg_fall_draws{0};
+std::atomic<std::uint64_t> g_sg_skipped{0}, g_sg_skip_ns{0}, g_sg_skip_timed{0}, g_sg_skip_lost{0};
+
+SegRing& seg_ring() {
+    if (!t_seg_ring) {
+        t_seg_ring = new SegRing;
+        VkCommandPoolCreateInfo ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        ci.queueFamilyIndex = g.family;
+        if (vkCreateCommandPool(g.device, &ci, nullptr, &t_seg_ring->pool) != VK_SUCCESS) t_seg_ring->pool = VK_NULL_HANDLE;
+    }
+    return *t_seg_ring;
+}
+
+// A segment record of this pool thread's to build into (its state building, its
+// generation new), with a secondary command buffer; null when none is free.
+Segment* take_segment(SegRing& ring) {
+    if (!ring.pool) return nullptr;
+    const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
+    const std::uint64_t flip = hle_video_flip_count();
+    for (std::uint32_t t = 0; t < kSegRing; ++t) {
+        const std::uint32_t at = (ring.next + t) % kSegRing;
+        Segment& sg = ring.segs[at];
+        std::uint64_t w = sg.word.load(std::memory_order_acquire);
+        const std::uint32_t st = sg_state(w);
+        const bool reuse = st == kSgFree || st == kSgDropped || (st == kSgSpliced && sg.serial < completed) ||
+                           (st == kSgReady && sg.ready_flip + kListMaxAge + 2 < flip);
+        if (!reuse || !sg.word.compare_exchange_strong(w, sg_word(sg.gen + 1, kSgBuilding), std::memory_order_acq_rel)) continue;
+        ++sg.gen;
+        ring.next = (at + 1) % kSegRing;
+        if (!sg.cmd) {
+            VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ai.commandPool = ring.pool;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            ai.commandBufferCount = 1;
+            if (vkAllocateCommandBuffers(g.device, &ai, &sg.cmd) != VK_SUCCESS) {
+                sg.cmd = VK_NULL_HANDLE;
+                sg.word.store(sg_word(sg.gen, kSgFree), std::memory_order_release);
+                return nullptr;
+            }
+        }
+        return &sg;
+    }
+    return nullptr;
+}
+
+// Whether the token after list record `r`'s draw k follows it in its command
+// buffer with nothing between that the command processor does in order.
+bool tokens_follow(const gxvk_lists::detail::ListRec& r, std::uint32_t k) {
+    const std::uint64_t a = r.va[k] + 16, b = r.va[k + 1];
+    if (!r.va[k] || !b) return false;
+    if (a == b) return true;
+    if (b < a || b - a > 1024) return false;  // another chunk, or a long way off
+    const auto* p = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(a));
+    const auto* end = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(b));
+    while (p < end) {
+        const std::uint32_t hdr = p[0];
+        if ((hdr >> 30) != 3) return false;
+        const std::size_t cnt = ((hdr >> 16) & 0x3fff) + 1;
+        if (p + 1 + cnt > end) return false;
+        if (hle_gnm_list_split_of((hdr >> 8) & 0xff, p + 1, cnt) >= 0) return false;
+        p += 1 + cnt;
+    }
+    return p == end;
+}
+
+// The members [m0, m1] of list record `r` (their commits' words `words`) made a
+// segment: claimed, recorded into a secondary, their notes merged, made ready.
+void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* words, std::uint32_t m0, std::uint32_t m1) {
+    ListCommit* const all = g_list_commits;
+    SegRing& ring = seg_ring();
+    Segment* const sgp = take_segment(ring);
+    if (!sgp) {
+        g_sg_not[kSnNoRecord].fetch_add(m1 - m0 + 1, std::memory_order_relaxed);
+        return;
+    }
+    Segment& sg = *sgp;
+    const auto t0 = std::chrono::steady_clock::now();
+    // The members claimed in order: one the command processor took first ends the segment before it.
+    std::uint32_t n = 0;
+    for (std::uint32_t m = m0; m <= m1; ++m) {
+        std::uint64_t want = words[m];
+        if (!all[r.id[m] & (kListCommits - 1)].word.compare_exchange_strong(want, lc_word(r.id[m], kLcBuilding), std::memory_order_acq_rel)) {
+            g_sg_not[kSnClaimed].fetch_add(m1 - m + 1, std::memory_order_relaxed);
+            break;
+        }
+        ++n;
+    }
+    // Members [from, from + count) given back to the per-draw splice.
+    const auto give_back = [&](std::uint32_t from, std::uint32_t count, int why) {
+        for (std::uint32_t m = m0 + from; m < m0 + from + count; ++m) all[r.id[m] & (kListCommits - 1)].word.store(words[m], std::memory_order_release);
+        if (count) g_sg_not[why].fetch_add(count, std::memory_order_relaxed);
+    };
+    const auto drop = [&](int why) {
+        give_back(0, n, why);
+        sg.word.store(sg_word(sg.gen, kSgFree), std::memory_order_release);
+    };
+    if (n < kSegMin) return drop(kSnShort);
+    // The params blocks into the pool's region, each member's offsets at them.
+    static thread_local std::uint32_t dyn[kSegMost][2];
+    std::uint32_t nparams = 0;
+    for (std::uint32_t k = 0; k < n; ++k) nparams += all[r.id[m0 + k] & (kListCommits - 1)].notes.params.n;
+    sg.pr_segs.clear();
+    std::uint32_t first = 0;
+    if (nparams && !list_params_take(nparams, first, sg)) return drop(kSnParams);
+    std::uint32_t at = first;
+    auto* const ubo = static_cast<std::uint8_t*>(g.ubo_map);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        const std::uint64_t index = r.id[m0 + k] & (kListCommits - 1);
+        const ListParams& lp = all[index].notes.params;
+        std::uint32_t d[2];
+        const std::uint32_t nd = recorder_list_packet_dynamic(index, d);
+        for (std::uint32_t i = 0; i < lp.n; ++i) put_params_lines(ubo + static_cast<std::size_t>(g.ubo_list_base + at + i) * kParamsStride, lp.p[i]);
+        for (std::uint32_t i = 0; i < 2; ++i) dyn[k][i] = i < nd && d[i] < lp.n ? (g.ubo_list_base + at + d[i]) * kParamsStride : d[i];
+        at += lp.n;
+    }
+    __builtin_ia32_sfence();  // the blocks leave this core's write-combining buffers before the GPU reads them
+    // The secondary, begun for its pass: the attachments' formats as begin_pass makes it.
+    const ListNotes& hn = all[r.id[m0] & (kListCommits - 1)].notes;
+    VkCommandBufferInheritanceRenderingInfo inh{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+    inh.colorAttachmentCount = hn.ncolor;
+    inh.pColorAttachmentFormats = hn.color_fmt;
+    inh.depthAttachmentFormat = hn.depth_fmt;
+    inh.stencilAttachmentFormat = hn.stencil_fmt;
+    inh.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+    ii.pNext = &inh;
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    bi.pInheritanceInfo = &ii;
+    if (vkBeginCommandBuffer(sg.cmd, &bi) != VK_SUCCESS) return drop(kSnRecording);
+    // Each member recorded under the readers' lock, the cached sets it binds checked first: a set leaves the cache
+    // only with the lock taken exclusive, and is freed only after that, once the recording then current has run. One
+    // that left since its member's commit - or was made again since, even with the same handle - ends the segment
+    // before that member; so does a member too old to be spliced (what it binds may be gone).
+    const std::uint64_t flip = hle_video_flip_count();
+    std::uint32_t recorded = 0;
+    for (; recorded < n; ++recorded) {
+        const std::uint64_t index = r.id[m0 + recorded] & (kListCommits - 1);
+        const ListCommit& c = all[index];
+        cache_rw::Read rd;
+        bool live = c.flip + kListMaxAge >= flip;
+        // (And written: a set the command processor made writes in the packet that made it, applied when the recorder
+        // replays it; bound here before that, the write would make the secondary invalid.)
+        for (int i = 0; i < 2 && live; ++i) {
+            if (c.notes.set[i]) live = set_cache_ready_locked(c.notes.set_key[i], c.notes.set[i], c.notes.set_serial[i]);
+        }
+        if (!live) break;
+        recorder_record_segment_draw(sg.cmd, index, dyn[recorded], recorded ? r.id[m0 + recorded - 1] & (kListCommits - 1) : ~0ull,
+                                     recorded ? dyn[recorded - 1] : nullptr);
+    }
+    if (vkEndCommandBuffer(sg.cmd) != VK_SUCCESS) return drop(kSnRecording);
+    write_combine_fence();  // the commands in memory before another thread submits them
+    if (recorded < kSegMin) return drop(kSnGone);
+    give_back(recorded, n - recorded, kSnGone);
+    n = recorded;
+    // Merged: what each member noted for its splice, and what its join adds.
+    static thread_local StampSet seen;
+    seen.clear();
+    sg.count = n;
+    sg.sampled.clear();
+    sg.views.clear();
+    sg.sets.clear();
+    sg.homes.clear();
+    sg.cb_segs.clear();
+    sg.pipes.clear();
+    sg.vs_other.clear();
+    const ListCommit& head = all[r.id[m0] & (kListCommits - 1)];
+    std::memcpy(sg.names, head.names, sizeof(sg.names));
+    std::memcpy(sg.looked, head.looked, sizeof(sg.looked));
+    sg.reached = head.reached;
+    sg.pass_key = head.notes.pass_key;
+    sg.flip = head.flip;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        const ListCommit& c = all[r.id[m0 + k] & (kListCommits - 1)];
+        const ListNotes& ln = c.notes;
+        sg.ids[k] = r.id[m0 + k];
+        sg.flip = std::min(sg.flip, c.flip);
+        std::uint32_t v = 0;
+        for (std::uint32_t i = 0; i < ln.nsampled; ++i) {
+            if (!seen.find_or_put(ln.sampled[i] ^ (1ull << 63), v)) sg.sampled.push_back(ln.sampled[i]);
+        }
+        for (std::uint32_t i = 0; i < ln.nviews; ++i) {
+            const std::uint64_t key = (2ull << 60) | (static_cast<std::uint64_t>(ln.view_id[i]) << 8) | ln.view_flags[i];
+            if (!seen.find_or_put(key, v)) {
+                Segment::View sv{ln.view_id[i], ln.view_flags[i], ((ln.view_target >> i) & 1) != 0, ln.view[i], {}};
+                std::memcpy(sv.words, ln.view_words[i], sizeof(sv.words));
+                sg.views.push_back(sv);
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (ln.set[i] && !seen.find_or_put((3ull << 60) ^ ln.set_key[i], v)) sg.sets.push_back({ln.set_key[i], ln.set[i], ln.set_serial[i]});
+        }
+        for (std::uint32_t i = 0; i < ln.nhomes; ++i) {
+            if (!seen.find_or_put((4ull << 60) | ln.home[i], v)) sg.homes.push_back(ln.home[i]);
+        }
+        for (std::uint32_t i = 0; i < ln.nsegs; ++i) {
+            bool noted = false;
+            for (const auto& [s2, l2] : sg.cb_segs) noted |= s2 == ln.seg[i] && l2 == ln.seg_lap[i];
+            if (!noted) sg.cb_segs.emplace_back(ln.seg[i], ln.seg_lap[i]);
+        }
+        if (GfxPipeline* const p = static_cast<GfxPipeline*>(c.drew)) {
+            std::uint32_t pat = static_cast<std::uint32_t>(sg.pipes.size());
+            if (seen.find_or_put((5ull << 60) ^ reinterpret_cast<std::uintptr_t>(p), pat)) {
+                ++sg.pipes[pat].draws;
+                if (c.drew_gx) ++sg.pipes[pat].gx;
+            } else {
+                sg.pipes.push_back({p, 1, c.drew_gx ? 1u : 0u});
+            }
+        }
+        if (c.vs_other) {
+            bool found = false;
+            for (Segment::VsOther& o : sg.vs_other) {
+                if (o.name == c.vs_other && o.why == c.vs_other_why) {
+                    ++o.n;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) sg.vs_other.push_back({c.vs_other, c.vs_other_why, 1});
+        }
+    }
+    // Ready: the first member names it, its members held for it.
+    ListCommit& c0 = all[sg.ids[0] & (kListCommits - 1)];
+    const std::uint64_t ready = sg_word(sg.gen, kSgReady);
+    c0.seg = &sg;
+    c0.seg_word = ready;
+    sg.ready_flip = hle_video_flip_count();
+    for (std::uint32_t k = 0; k < n; ++k) {
+        all[sg.ids[k] & (kListCommits - 1)].word.store(lc_word(sg.ids[k], kLcSegment), std::memory_order_release);
+    }
+    sg.word.store(ready, std::memory_order_release);
+    g_sg_made.fetch_add(1, std::memory_order_relaxed);
+    g_sg_members.fetch_add(n, std::memory_order_relaxed);
+    g_sg_by_len[std::min<std::uint32_t>(7, static_cast<std::uint32_t>(std::bit_width(n)) - 1)].fetch_add(1, std::memory_order_relaxed);
+    g_sg_record_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                             std::memory_order_relaxed);
+}
+
+// Without maintenance7: the open pass ended and begun again to hold the other
+// kind of contents (`flags`: secondary command buffers for a segment, or
+// inline for a draw the command processor splices alone) - its attachments
+// loaded, their writes before ordered against those after.
+void pass_restart_locked(VkRenderingFlags flags) {
+    rec().end_rendering(false);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    const VkPipelineStageFlags st =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    rec().pipeline_barrier(st, st, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+    VkRenderingAttachmentInfo colors[8];
+    for (std::uint32_t k = 0; k < g_pass.ncolor; ++k) {
+        colors[k] = g_pass.colors[k];
+        colors[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
+    VkRenderingAttachmentInfo depth = g_pass.depth, stencil = g_pass.stencil;
+    depth.loadOp = stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.flags = flags;
+    ri.renderArea = {{0, 0}, g_pass.extent};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = g_pass.ncolor;
+    ri.pColorAttachments = colors;
+    ri.pDepthAttachment = g_pass.has_depth ? &depth : nullptr;
+    ri.pStencilAttachment = g_pass.has_stencil ? &stencil : nullptr;
+    rec().begin_rendering(ri);
+    g_pass.flags = ri.flags;
+    g_pass_restarts[(flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+}
+
+// A segment that will not be spliced: dropped (its record free to be taken
+// again), its members given back to the per-draw splice - unless compared, in
+// which case they stay the segment's and are compared as they are drawn.
+void segment_drop(Segment& sg, bool members_back) {
+    ListCommit* const all = g_list_commits;
+    if (members_back) {
+        for (std::uint32_t k = 0; k < sg.count; ++k) {
+            std::uint64_t want = lc_word(sg.ids[k], kLcSegment);
+            all[sg.ids[k] & (kListCommits - 1)].word.compare_exchange_strong(want, lc_word(sg.ids[k], kLcCommitted), std::memory_order_acq_rel);
+        }
+    }
+    sg.word.store(sg_word(sg.gen, kSgDropped), std::memory_order_release);
+}
+
+}  // namespace
+
+namespace gpu {
+void lists_segment(std::uint32_t rec) {
+    using namespace gxvk_lists::detail;
+    ListRec& r = g_recs[rec % kRecs];
+    std::uint32_t closed = kRecClosed;
+    if (!r.state.compare_exchange_strong(closed, kRecPool, std::memory_order_acq_rel)) return;
+    ListCommit* const all = list_commits();
+    const std::uint32_t n = std::min(r.n, kRecMost);
+    g_sg_lists.fetch_add(1, std::memory_order_relaxed);
+    g_sg_draws.fetch_add(n, std::memory_order_relaxed);
+    // Each draw's commit, done: one fed before the list may still be under way on the pool's other thread.
+    static thread_local std::uint64_t words[kRecMost];
+    for (std::uint32_t k = 0; k < n; ++k) {
+        ListCommit& c = all[r.id[k] & (kListCommits - 1)];
+        std::uint64_t w = c.word.load(std::memory_order_acquire);
+        for (unsigned spins = 0; lc_state(w) == kLcCommitting && lc_id(w) == r.id[k] && spins < 20000; ++spins) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            w = c.word.load(std::memory_order_acquire);
+        }
+        words[k] = w;
+    }
+    const auto committed = [&](std::uint32_t k) {
+        const ListCommit& c = all[r.id[k] & (kListCommits - 1)];
+        return lc_id(words[k]) == r.id[k] && lc_state(words[k]) == kLcCommitted && c.notes.formats_ok;
+    };
+    const auto same_run = [&](std::uint32_t k, std::uint32_t m) {
+        const ListCommit& a = all[r.id[k] & (kListCommits - 1)];
+        const ListCommit& b = all[r.id[m] & (kListCommits - 1)];
+        return std::memcmp(a.names, b.names, sizeof(a.names)) == 0 && std::memcmp(a.looked, b.looked, sizeof(a.looked)) == 0 &&
+               a.reached == b.reached && a.notes.pass_key == b.notes.pass_key && a.notes.ncolor == b.notes.ncolor &&
+               std::memcmp(a.notes.color_fmt, b.notes.color_fmt, sizeof(VkFormat) * a.notes.ncolor) == 0 && a.notes.depth_fmt == b.notes.depth_fmt &&
+               a.notes.stencil_fmt == b.notes.stencil_fmt;
+    };
+    std::uint32_t k = 0;
+    while (k < n) {
+        if (!committed(k)) {
+            g_sg_not[lc_state(words[k]) == kLcCommitting && lc_id(words[k]) == r.id[k] ? kSnPending : kSnUncommitted].fetch_add(1, std::memory_order_relaxed);
+            ++k;
+            continue;
+        }
+        g_sg_not[kSnFirst].fetch_add(1, std::memory_order_relaxed);
+        // The run from draw k: the members after it while each follows the one before, is committed, plain and the run's.
+        std::uint32_t j = k;
+        while (j + 1 < n) {
+            const std::uint32_t m = j + 1;
+            int why = -1;
+            if (!committed(m)) why = lc_state(words[m]) == kLcCommitting && lc_id(words[m]) == r.id[m] ? kSnPending : kSnUncommitted;
+            else if (!tokens_follow(r, j)) why = kSnApart;
+            else if (!same_run(k, m)) why = kSnTargets;
+            else if (!recorder_list_packet_plain(r.id[m] & (kListCommits - 1)) || all[r.id[m] & (kListCommits - 1)].notes.full) why = kSnPacket;
+            if (why >= 0) break;
+            j = m;
+        }
+        if (j - k >= kSegMin) build_segment(r, words, k + 1, j);
+        else if (j > k) g_sg_not[kSnShort].fetch_add(j - k, std::memory_order_relaxed);
+        // The draw that ended the run starts the next one (or is counted when it cannot).
+        k = j + 1;
+    }
+    r.state.store(kRecFree, std::memory_order_release);
+}
+}  // namespace gpu
+
+// The command processor at GX-native draw token `id`, before its slot is taken:
+// the members of a segment ready to splice whose first member it is (null:
+// none), their count and the segment's word for host_gpu_splice_segment.
+const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count, std::uint64_t* word) {
+    ListCommit* const all = g_list_commits;
+    if (!all) return nullptr;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    if (lc_id(w) != id || lc_state(w) != kLcSegment || !c.seg) return nullptr;
+    const Segment& sg = *c.seg;
+    if (sg.word.load(std::memory_order_acquire) != c.seg_word || sg.ids[0] != id) return nullptr;
+    *count = sg.count;
+    *word = c.seg_word;
+    return sg.ids;
+}
+
+// The stream did not hold the segment at `id` as recorded (gnm_exec.cpp's look
+// ahead): dropped, its members back to the per-draw splice.
+void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word) {
+    ListCommit* const all = g_list_commits;
+    if (!all) return;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    Segment* const sg = c.seg;
+    if (!sg) return;
+    std::uint64_t want = word;
+    if (!sg->word.compare_exchange_strong(want, sg_word(sg->gen, kSgTaken), std::memory_order_acq_rel)) return;
+    g_sg_fall[kSfStream].fetch_add(1, std::memory_order_relaxed);
+    g_sg_fall_draws.fetch_add(sg->count, std::memory_order_relaxed);
+    segment_drop(*sg, !gxvk_lists::segments_compare());
+}
+
+// The command processor at the segment's first member's token `id` (its stream
+// checked): true when the segment was spliced - its members are drawn, and
+// their tokens are given back without a take (gnm_exec.cpp); false when they go
+// on as splice has them, counted by why.
+bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
+    ListCommit* const all = g_list_commits;
+    if (!all) return false;
+    Segment* const sgp = all[id & (kListCommits - 1)].seg;
+    if (!sgp) return false;
+    Segment& sg = *sgp;
+    // Booked into the command processor's draw phase as its draws are (one in kPhaseSample timed).
+    static thread_local std::uint32_t phase_seq = 0;
+    const std::uint32_t weight = ++phase_seq % kPhaseSample == 0 ? kPhaseSample : 0;
+    const bool timed = weight != 0;
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    GpuPhaseTimer timer(kPhaseLock, weight);
+    std::lock_guard<GpuMutex> lock(g.mu);
+    timer.next(kPhaseDraw);
+    {
+        std::uint64_t want = word;
+        if (!sg.word.compare_exchange_strong(want, sg_word(sg.gen, kSgTaken), std::memory_order_acq_rel)) {
+            g_sg_fall[kSfLost].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    const auto fall = [&](SegFall why) {
+        g_sg_fall[why].fetch_add(1, std::memory_order_relaxed);
+        g_sg_fall_draws.fetch_add(sg.count, std::memory_order_relaxed);
+        segment_drop(sg, !gxvk_lists::segments_compare() || why != kSfCompare);
+        return false;
+    };
+    if (!g.ok || !g.recording || !t_draw_windows.empty() || !t_given_windows.empty() || !list_config_ok_locked()) return fall(kSfOther);
+    if (sg.flip + kListMaxAge < hle_video_flip_count()) return fall(kSfOld);
+    // The run open: its first draw drawn (or spliced) with these names, nothing done in order since, its lookups
+    // standing, its targets the very objects the members were committed with.
+    const RunTargets& m = t_run_targets;
+    if (!m.valid) return fall(kSfRunFirst);
+    if (std::memcmp(run_names_of(m), sg.names, sizeof(sg.names)) != 0) return fall(kSfRunFirst);
+    if (m.serial != list_resolve::run_serial()) return fall(kSfChanged);
+    if (g_rt_gen != m.rt_gen || g_pending_htile_gen != m.htile_gen || g_pending_gen != m.pending_gen || (m.depth && m.depth->htile_clear_pending))
+        return fall(kSfRunGens);
+    if (m.out.reached != sg.reached || std::memcmp(m.out.looked, sg.looked, sizeof(sg.looked)) != 0) return fall(kSfOtherTargets);
+    if (!g_pass.active || g_pass.key != sg.pass_key) return fall(kSfPass);
+    // What its members sample: no hazard, no owed clear; their views as in order; their sets, homes, arenas.
+    if (g_lazy_barriers && g_hazards.owed) {
+        for (const std::uint64_t b : sg.sampled) {
+            if (g_hazards.written.count(b)) return fall(kSfHazard);
+        }
+    }
+    if (!g_view_clear_list.empty()) {
+        for (const std::uint64_t base : g_view_clear_list) {
+            const auto it = g_rts.find(base);
+            if (it == g_rts.end()) continue;
+            const RtImage& r = it->second;
+            if (!r.view_clear || r.view_clear_load) continue;
+            const std::uint64_t end = r.base + std::max<std::size_t>(rt_size_bytes(r), 1);
+            for (const std::uint64_t b : sg.sampled) {
+                if (b >= r.base && b < end) return fall(kSfClear);
+            }
+        }
+    }
+    if (!g_managed_views.empty()) {
+        for (const Segment::View& v : sg.views) {
+            if (v.target && g_managed_views.count(v.view)) return fall(kSfView);
+        }
+    }
+    for (const Segment::View& v : sg.views) {
+        // (An entry gone stale - the view epoch moves with every view or image let go anywhere - resolved again here
+        // as the draw in order would.)
+        if (!texture_view_splice_ok(v.id, v.flags, v.view) && !texture_view_splice_again(v.id, v.flags, v.view, v.words)) return fall(kSfView);
+    }
+    if (!g_pass.active || g_pass.key != sg.pass_key) return fall(kSfPass);  // (a refresh may have ended it)
+    for (const Segment::Set& c : sg.sets) {
+        // (The very set recorded: one made again with the same content may have the same handle.)
+        std::uint64_t serial = 0;
+        if (set_cache_find_key_locked(c.key, &serial) != c.set || serial != c.serial) return fall(kSfSet);
+    }
+    for (const std::uint32_t h : sg.homes) {
+        if (!homes_splice_ok(h)) return fall(kSfHome);
+    }
+    for (const auto& [s2, lap] : sg.cb_segs) {
+        if (g_list_arena.lap[s2].load(std::memory_order_acquire) != lap) return fall(kSfArena);
+    }
+    for (const auto& [s2, lap] : sg.pr_segs) {
+        if (g_list_params.lap[s2].load(std::memory_order_acquire) != lap) return fall(kSfArena);
+    }
+    if (!occlusion_draw_plain()) return fall(kSfOcclusion);
+    if (gxvk_lists::segments_compare()) {  // drawn in order, each member compared with its commit (host_gpu_splice_compare)
+        std::memcpy(t_seg_would, sg.ids, sizeof(std::uint64_t) * sg.count);
+        t_seg_would_n = sg.count;
+        t_seg_would_at = 0;
+        return fall(kSfCompare);
+    }
+    begin_recording_locked();
+    // Its pass holds secondary command buffers - begun so with maintenance7; without, ended and begun again so.
+    if (!(g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) pass_restart_locked(VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT);
+    recorder_splice_segment(sg.cmd);
+    for (const auto& [s2, lap] : sg.cb_segs) {
+        std::atomic<std::uint64_t>& ms = g_list_arena.max_serial[s2];
+        std::uint64_t cur = ms.load(std::memory_order_relaxed);
+        while (cur < g.flushes && !ms.compare_exchange_weak(cur, g.flushes, std::memory_order_acq_rel)) {}
+    }
+    for (const auto& [s2, lap] : sg.pr_segs) {
+        std::atomic<std::uint64_t>& ms = g_list_params.max_serial[s2];
+        std::uint64_t cur = ms.load(std::memory_order_relaxed);
+        while (cur < g.flushes && !ms.compare_exchange_weak(cur, g.flushes, std::memory_order_acq_rel)) {}
+    }
+    // What the members' joins add where the draws share it.
+    for (const std::uint64_t b : sg.sampled) g_hazards.sampled.insert(b);
+    for (const Segment::Pipe& p : sg.pipes) {
+        p.p->draws += p.draws;
+        p.p->gx_draws += p.gx;
+        p.p->token_draws += p.draws;
+    }
+    for (const Segment::VsOther& o : sg.vs_other) g_vs_other[*o.name][static_cast<std::size_t>(o.why)] += o.n;
+    occlusion_run_issued(sg.count);
+    static thread_local std::uint64_t written_run = 0;
+    if (m.acquires != written_run) {
+        written_run = m.acquires;
+        run_targets_written_locked();
+    }
+    run_forget_recorded_locked();  // a secondary leaves what the primary had bound undefined
+    sg.serial = g.flushes;
+    sg.word.store(sg_word(sg.gen, kSgSpliced), std::memory_order_release);
+    g_sg_spliced.fetch_add(1, std::memory_order_relaxed);
+    g_sg_spliced_draws.fetch_add(sg.count, std::memory_order_relaxed);
+    if (timed) {
+        g_sg_splice_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                                 std::memory_order_relaxed);
+        g_sg_splice_timed.fetch_add(1, std::memory_order_relaxed);
+        g_sg_splice_timed_draws.fetch_add(sg.count, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+// The walk gave back a spliced segment's member token without its take (`ns`:
+// its time, 0 untimed; `lost`: its slot was not as stored).
+void host_gpu_segment_skipped(std::uint64_t ns, bool lost) {
+    g_sg_skipped.fetch_add(1, std::memory_order_relaxed);
+    if (ns) {
+        g_sg_skip_ns.fetch_add(ns, std::memory_order_relaxed);
+        g_sg_skip_timed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (lost) g_sg_skip_lost.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string host_gpu_segment_report_spliced();
+// The lines (beside host_gpu_splice_report's; each under a log line's 1 KiB):
+// what the builder made of the lists (`spliced` false), and what the command
+// processor spliced, why not, and what the splices cost it (true).
+std::string host_gpu_segment_report(bool spliced_part) {
+    char buf[512];
+    std::string out;
+    const auto ld = [](const std::atomic<std::uint64_t>& a) { return static_cast<unsigned long long>(a.load(std::memory_order_relaxed)); };
+    if (spliced_part) return host_gpu_segment_report_spliced();
+    const std::uint64_t made = g_sg_made.load(), members = g_sg_members.load(), draws = g_sg_draws.load();
+    std::snprintf(buf, sizeof(buf), "segments: %llu lists (%llu draws) cut into %llu segments of %llu members (%.1f each, %.1f%% of the lists' draws), "
+                                    "%.2f us recording a member; by members:",
+                  ld(g_sg_lists), static_cast<unsigned long long>(draws), static_cast<unsigned long long>(made),
+                  static_cast<unsigned long long>(members), made ? static_cast<double>(members) / static_cast<double>(made) : 0.0,
+                  draws ? 100.0 * static_cast<double>(members) / static_cast<double>(draws) : 0.0,
+                  members ? static_cast<double>(g_sg_record_ns.load()) / 1000.0 / static_cast<double>(members) : 0.0);
+    out += buf;
+    static const char* const kLen[8] = {"1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127", "128+"};
+    for (int b = 1; b < 8; ++b) {
+        std::snprintf(buf, sizeof(buf), " %s %llu;", kLen[b], ld(g_sg_by_len[b]));
+        out += buf;
+    }
+    out += " not members:";
+    for (int k = 0; k < kSegNots; ++k) {
+        if (const std::uint64_t v = g_sg_not[k].load()) {
+            std::snprintf(buf, sizeof(buf), " %s %llu;", kSegNotName[k], static_cast<unsigned long long>(v));
+            out += buf;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), " [sums: record ns %llu]", ld(g_sg_record_ns));
+    out += buf;
+    return out;
+}
+
+std::string host_gpu_segment_report_spliced() {
+    char buf[512];
+    std::string out;
+    const auto ld = [](const std::atomic<std::uint64_t>& a) { return static_cast<unsigned long long>(a.load(std::memory_order_relaxed)); };
+    const std::uint64_t spliced = g_sg_spliced.load(), sdraws = g_sg_spliced_draws.load();
+    const std::uint64_t timed = g_sg_splice_timed.load(), timed_draws = g_sg_splice_timed_draws.load(), skip_timed = g_sg_skip_timed.load();
+    const double per_seg = timed ? static_cast<double>(g_sg_splice_ns.load()) / 1000.0 / static_cast<double>(timed) : 0.0;
+    const double per_skip = skip_timed ? static_cast<double>(g_sg_skip_ns.load()) / 1000.0 / static_cast<double>(skip_timed) : 0.0;
+    const double per_draw = timed_draws ? static_cast<double>(g_sg_splice_ns.load()) / 1000.0 / static_cast<double>(timed_draws) : 0.0;
+    std::uint64_t falls = 0;
+    std::string why;
+    for (int k = 0; k < kSegFalls; ++k) {
+        if (const std::uint64_t v = g_sg_fall[k].load()) {
+            falls += v;
+            std::snprintf(buf, sizeof(buf), " %s %llu;", kSegFallName[k], static_cast<unsigned long long>(v));
+            why += buf;
+        }
+    }
+    // The splice's cost a spliced draw: the segments' (sampled) and the member tokens given back after the first
+    // (sampled), over the draws spliced.
+    const double cost = sdraws ? (per_seg * static_cast<double>(spliced) + per_skip * static_cast<double>(g_sg_skipped.load())) / static_cast<double>(sdraws)
+                               : 0.0;
+    std::snprintf(buf, sizeof(buf), "segments spliced %llu (%llu draws), %.2f us a segment (%.3f a member), %.3f us a member token given back: "
+                                    "%.3f us a spliced draw; tokens given back %llu (lost %llu); not spliced %llu segments (%llu draws), by why:",
+                  static_cast<unsigned long long>(spliced), static_cast<unsigned long long>(sdraws), per_seg, per_draw, per_skip, cost,
+                  ld(g_sg_skipped), ld(g_sg_skip_lost), static_cast<unsigned long long>(falls), ld(g_sg_fall_draws));
+    out += buf;
+    out += why;
+    std::snprintf(buf, sizeof(buf), " params region segments taken %llu, none free %llu; passes begun again for a segment %llu, for a draw %llu; "
+                                    "draws in no list record %llu; splices' views refused: gone %llu, epoch %llu, other %llu, elided %llu, pending %llu, "
+                                    "remade %llu; resolved again: the same %llu, another %llu;",
+                  ld(g_list_params.takes), ld(g_list_params.full), ld(g_pass_restarts[0]), ld(g_pass_restarts[1]), ld(gxvk_lists::detail::g_rec_none),
+                  ld(g_splice_view_why[kSpliceViewGone]), ld(g_splice_view_why[kSpliceViewEpoch]), ld(g_splice_view_why[kSpliceViewOther]),
+                  ld(g_splice_view_why[kSpliceViewElided]), ld(g_splice_view_why[kSpliceViewPending]), ld(g_splice_view_why[kSpliceViewRemade]),
+                  ld(g_splice_view_again[0]), ld(g_splice_view_again[1]));
+    out += buf;
+    if (gxvk_lists::segments_compare()) {
+        std::snprintf(buf, sizeof(buf), "; compare: segments' members compared %llu", ld(g_sg_compared));
+        out += buf;
+    }
+    // The sums the averages come from, for a window's difference (scripts read them).
+    std::snprintf(buf, sizeof(buf), " [sums: splice ns %llu timed %llu (%llu draws); give-back ns %llu timed %llu]", ld(g_sg_splice_ns),
+                  ld(g_sg_splice_timed), ld(g_sg_splice_timed_draws), ld(g_sg_skip_ns), ld(g_sg_skip_timed));
+    out += buf;
     return out;
 }
 

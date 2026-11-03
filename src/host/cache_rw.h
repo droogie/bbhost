@@ -27,9 +27,9 @@
 
 namespace cache_rw {
 
-// Whether any reader may run: the pool's switch, read before any of the
-// game's code runs.
-extern const bool g_readers;
+// Whether any reader may run: the pool's switch, settled with the device
+// (gxvk_lists::settle) before any draw is made.
+extern std::atomic<bool> g_readers;
 
 // True on a reader's thread while it holds the lock shared.
 extern thread_local constinit bool t_reader;
@@ -58,7 +58,7 @@ inline std::uint64_t gen(int cache) { return g_gen[cache].load(std::memory_order
 struct Write {
     bool held = false;
     explicit Write(int cache) {
-        if (!g_readers || t_reader) return;
+        if (!g_readers.load(std::memory_order_relaxed) || t_reader) return;
         if (t_write_depth++ == 0) lock_slow();
         g_gen[cache].fetch_add(1, std::memory_order_relaxed);
         held = true;

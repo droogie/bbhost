@@ -1871,6 +1871,85 @@ void note_list_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n) {
     else if (s >= 0) list_resolve::split(static_cast<list_resolve::Split>(s));
 }
 
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): the members of the segment spliced
+// last whose tokens the walk has still to meet (copied at the splice), given
+// back without a take as it meets them.
+thread_local std::uint64_t t_seg_ids[256];
+thread_local std::uint32_t t_seg_left = 0, t_seg_at = 0;
+thread_local std::uint32_t t_seg_skip_seq = 0;
+
+// Whether the packets from p hold the tokens of `ids[0..k)` in that order with
+// nothing between them that the command processor does in order, inside the
+// command buffer the walk is in.
+bool segment_follows(const std::uint32_t* p, const std::uint64_t* ids, std::uint32_t k) {
+    const auto* end = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_cb_hi));
+    std::uint32_t found = 0;
+    for (std::uint32_t packets = 0; found < k && p + 1 < end && packets < 4 * k + 64; ++packets) {
+        const std::uint32_t hdr = p[0];
+        if ((hdr >> 30) != 3) return false;
+        const std::size_t cnt = ((hdr >> 16) & 0x3fff) + 1;
+        if (p + 1 + cnt > end) return false;
+        const std::uint32_t op = (hdr >> 8) & 0xff;
+        const std::uint32_t* body = p + 1;
+        if (op == kNop && cnt >= 3 && body[0] == kGxNativeMagic) {
+            if ((body[1] | (static_cast<std::uint64_t>(body[2]) << 32)) != ids[found]) return false;
+            ++found;
+        } else if (list_split_of(op, body, cnt) >= 0) {
+            return false;
+        }
+        p += 1 + cnt;
+    }
+    return found == k;
+}
+
+// A member token given back: without a take when its slot is as stored, else
+// taken the usual way and released (never drawn again).
+void segment_give_back(std::uint64_t id) {
+    const bool timed = (++t_seg_skip_seq & 15) == 0;
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool ok = hle_gx_native_skip(id);
+    if (!ok && hle_gx_native_token(id, t_regs.sh, t_regs.ctx)) hle_gx_native_release();
+    g_draws.fetch_add(1);
+    host_gpu_segment_skipped(
+        timed ? 16 * static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()) : 0, !ok);
+}
+
+// The walk at GX-native draw token b (its n dwords): true when it is a spliced
+// segment's member - given back - or the first member of a segment spliced
+// here now.
+bool segment_token(const std::uint32_t* b, std::size_t n) {
+    const std::uint64_t id = b[1] | (static_cast<std::uint64_t>(b[2]) << 32);
+    if (t_seg_left) {
+        if (id == t_seg_ids[t_seg_at]) {
+            ++t_seg_at;
+            --t_seg_left;
+            segment_give_back(id);
+            return true;
+        }
+        // (The stream was checked to hold them so: never.)
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8)
+            host_log("gxvk-lists: a spliced segment's member token %llu expected, %llu met (%u left)", static_cast<unsigned long long>(t_seg_ids[t_seg_at]),
+                     static_cast<unsigned long long>(id), t_seg_left);
+        t_seg_left = 0;
+    }
+    if (list_resolve::commit_draws() || list_resolve::committing()) return false;
+    std::uint32_t count = 0;
+    std::uint64_t word = 0;
+    const std::uint64_t* ids = host_gpu_segment_ids(id, &count, &word);
+    if (!ids || count < 2 || count > 256) return false;
+    if (!segment_follows(b + n, ids + 1, count - 1)) {
+        host_gpu_segment_refused(id, word);
+        return false;
+    }
+    std::memcpy(t_seg_ids, ids + 1, sizeof(std::uint64_t) * (count - 1));
+    if (!host_gpu_splice_segment(id, word)) return false;
+    t_seg_left = count - 1;
+    t_seg_at = 0;
+    segment_give_back(id);
+    return true;
+}
+
 // BBHOST_RUN_COMMIT: the draws after a run's first draw token (inputs
 // `first`, the packets after it from p) that belong to its run - the GX-native
 // draw tokens that follow in the command buffer with nothing between them the
@@ -2578,6 +2657,8 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
+                // Stage 4b.2: a spliced segment's member, or the first member of a segment spliced here.
+                if (gxvk_lists::segments() && segment_token(b, n)) break;
                 lookahead_tokens(b + n);
                 const GpuDrawInputs* in = hle_gx_native_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.sh, t_regs.ctx);
                 if (in && list_resolve::census()) {
@@ -2941,6 +3022,12 @@ void execute(const std::uint32_t* cb, std::size_t dwords, int depth) {
 }
 
 }  // namespace
+
+int hle_gnm_list_split_of(std::uint32_t op, const std::uint32_t* body, std::size_t n) {
+    // (Another GX-native draw's token keeps two draws from one segment too: one the pool was not given.)
+    if (op == kNop && n >= 3 && body[0] == kGxNativeMagic) return list_resolve::kSplitPacketDraw;
+    return list_split_of(op, body, n);
+}
 
 namespace {
 
