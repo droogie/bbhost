@@ -233,7 +233,7 @@ bool motion_pipeline_locked() {
 // view of it `velo` of velo_w x velo_h (null: none).
 void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
                    std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
-                   int velo_mode) {
+                   int velo_mode, bool whole) {
     float p[40] = {};
     p[0] = g_cam_now.tan_x;
     p[1] = g_cam_now.tan_y;
@@ -262,7 +262,7 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[36] = static_cast<float>(velo_w);
         p[37] = static_cast<float>(velo_h);
         p[38] = 3.0f;
-        p[39] = velo_previous_due() ? 1.0f : 0.0f;
+        p[39] = whole ? 1.0f : 0.0f;
     } else if (velo) {
         // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
         // (NDC now - NDC then) x scale x 0.5, its y up where uv's is down.
@@ -274,7 +274,7 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[37] = static_cast<float>(velo_h);
         // The game's encoding with the pass given last frame's matrices: the
         // whole motion (mode 4, render.cpp velo_previous_locked).
-        p[38] = static_cast<float>(velo_mode == 1 && velo_previous_due() ? 4 : velo_mode);
+        p[38] = static_cast<float>(velo_mode == 1 && whole ? 4 : velo_mode);
         p[39] = velo_tolerance();
     }
     const VkDescriptorSet set = alloc_set_locked(g_motion_set_layout);
@@ -466,6 +466,16 @@ float check_motion() {
     return gain;
 }
 
+// BBHOST_UPSCALE_CHECK_BOX=<pixels> (with the check): it compares averages over
+// the render pixels that many around instead of single pixels (0: single).
+float check_box() {
+    static const float r = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_CHECK_BOX");
+        return e ? std::clamp(static_cast<float>(std::atof(e)), 0.0f, 8.0f) : 0.0f;
+    }();
+    return r;
+}
+
 // One of the tests' compute passes over g_output: its pipeline, made at the
 // first use from `spv` with the bindings `types` (in order) and 32 bytes of
 // push constants.
@@ -522,8 +532,9 @@ bool test_pass_locked(TestPass& t) {
 
 // The pass `t` over g_output (its last binding), its other bindings the
 // images `views` and the sampler; the push constants the output's size, the
-// render size and `k`.
-void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkImageView> views, float k) {
+// render size and `k`, `k2`, `k3`.
+void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkImageView> views, float k, float k2 = 0.0f,
+                      float k3 = 0.0f) {
     if (!test_pass_locked(t)) return;
     const VkDescriptorSet set = alloc_set_locked(t.set_layout);
     if (!set) return;
@@ -542,7 +553,7 @@ void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkI
         wr[i].pImageInfo = &infos[i];
     }
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(wr.size()), wr.data(), 0, nullptr);
-    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, 0, 0, 0};
+    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, k2, k3, 0};
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t.pipeline);
@@ -550,6 +561,10 @@ void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkI
     vkCmdPushConstants(cb, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     vkCmdDispatch(cb, (g_ow + 7) / 8, (g_oh + 7) / 8, 1);
 }
+
+// Whether the frame the check shows had the velocity pass's last-frame
+// matrices (its top-left corner says: white with, grey without).
+bool g_check_whole = false;
 
 // The reprojection check's last scene: a copy of each frame's at the call point.
 OwnImage g_prev_scene;
@@ -571,7 +586,8 @@ void record_motion_check(VkCommandBuffer cb, RtImage& scene, float gain) {
         g_prev_scene_format = scene.format;
         g_prev_scene_valid = false;
     }
-    if (g_prev_scene_valid) record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain);
+    if (g_prev_scene_valid)
+        record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain, g_check_whole ? 2.0f : 1.0f, check_box());
     barrier(cb, g_prev_scene.image, VK_IMAGE_ASPECT_COLOR_BIT, g_prev_scene_valid ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
@@ -620,6 +636,16 @@ void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageL
     told = true;
 }
 
+// BBHOST_VELO_PREV: 0 the game's matrices always (a test), alt last frame's
+// given every other frame (velo_previous_given), else 1.
+int velo_previous_env() {
+    static const int on = [] {
+        const char* e = std::getenv("BBHOST_VELO_PREV");
+        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "alt") == 0 ? 2 : 1;
+    }();
+    return on;
+}
+
 }  // namespace
 
 bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
@@ -627,14 +653,17 @@ bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
 std::uint64_t upscale_velo_frame() { return g_velo_frame; }
 
 bool velo_previous_due() {
-    static const bool on = [] {
-        const char* e = std::getenv("BBHOST_VELO_PREV");
-        return !(e && e[0] == '0');
-    }();
     // Rebuilt motion vectors, or the game's map while its blur, which would
     // read whole motions, is off (Motion blur, Performance mode).
     const HostSettings& hs = host_settings_ref();
-    return on && upscale_motion_on() && (host_opt_motion_rebuilt_bits() || !hs.motion_blur || hs.performance_mode);
+    return velo_previous_env() != 0 && upscale_motion_on() &&
+           (host_opt_motion_rebuilt_bits() || !hs.motion_blur || hs.performance_mode);
+}
+
+bool velo_previous_given() {
+    // BBHOST_VELO_PREV=alt: kept every frame and given every other one, an
+    // A/B within one run (the reprojection check marks which).
+    return velo_previous_due() && !(velo_previous_env() == 2 && (g_velo_frame & 1));
 }
 
 bool upscale_velo_clear_due(std::uint64_t base, int kind) {
@@ -869,12 +898,16 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         if (velo) ++g_velo_used;
     }
     g_velo_cam_seen = false;
+    // Whether this frame's velocity pass had last frame's matrices (as it was
+    // asked, before the frame count moves on).
+    const bool whole = velo_previous_given();
     // The next frame's map work (upscale_velo_clear_due, upscale_velo_copy_due).
     ++g_velo_frame;
     g_velo_camera_pass = false;
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
         record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
-                      velo_mode);
+                      velo_mode, whole);
+        g_check_whole = whole;
         g_velo_cam[0] = g_velo_cam[1] = 0.0f;
         if (!g_cam_prev_ok) g_reset = true;
         g_cam_prev = g_cam_now;

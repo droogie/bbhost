@@ -11900,8 +11900,9 @@ float velo_matrix_apart(const float* a, const float* b) {
     return d / n;
 }
 
-void velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::TranslateResult& meta, const std::uint32_t* user,
-                          const GxStageRecords* gx) {
+// The base of the constant buffer it changed, or 0.
+std::uint64_t velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::TranslateResult& meta, const std::uint32_t* user,
+                                   const GxStageRecords* gx, bool give) {
     if (pl.velo_mat_cb == -1) {
         // The buffer whose two matrices are equal, as the game writes them.
         for (std::size_t i = 0; i < meta.buffers.size() && i < 16 && pl.velo_mat_cb == -1; ++i) {
@@ -11927,9 +11928,9 @@ void velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::Translat
                          pl.velo_mat_cb >= 0 ? ("in constant buffer " + std::to_string(pl.velo_mat_cb)).c_str() : "not found");
         }
     }
-    if (pl.velo_mat_cb < 0) return;
+    if (pl.velo_mat_cb < 0) return 0;
     const std::uint64_t base = velo_matrix_base(meta, static_cast<std::size_t>(pl.velo_mat_cb), user, gx);
-    if (!base) return;
+    if (!base) return 0;
     VeloPrevious& v = g_velo_previous;
     const std::uint64_t frame = upscale_velo_frame();
     if (frame != v.frame) {
@@ -11951,11 +11952,12 @@ void velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::Translat
     VeloPrevious::Draws& mine = v.now[id];
     mine.m.push_back(cur);
     mine.taken.push_back(false);
+    if (!give) return 0;  // (kept for the next frame: BBHOST_VELO_PREV=alt)
     // Last frame's draw of the mesh nearest this one, not taken yet.
     const auto it = v.last.find(id);
     if (it == v.last.end()) {
         ++v.first;
-        return;
+        return 0;
     }
     VeloPrevious::Draws& was = it->second;
     std::size_t best = was.m.size();
@@ -11970,11 +11972,12 @@ void velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::Translat
     }
     if (best == was.m.size()) {
         ++v.rejected;
-        return;
+        return 0;
     }
     was.taken[best] = true;
     std::memcpy(f + 16, was.m[best].data(), sizeof(float) * 16);
     ++v.matched;
+    return base;
 }
 
 struct TsharpInfo {
@@ -15542,6 +15545,12 @@ using SnapMemo = DrawCtx::CbMemo;  // a draw context keeps its own (BBHOST_DRAW_
 SnapMemo g_snap_memo[1024];
 std::uint64_t g_scratch_lap = 1;
 inline SnapMemo& snap_memo_for(std::uint64_t base) { return g_snap_memo[((base >> 4) ^ (base >> 14)) & 1023]; }
+void cb_snapshot_forget(std::uint64_t base) {
+    if (SnapMemo& m = snap_memo_for(base); m.base == base) m = SnapMemo{};
+    if (draw_ctx()) {
+        if (SnapMemo& m = draw_ctx()->cb_memo_for(base); m.base == base) m = SnapMemo{};
+    }
+}
 // BBHOST_CB_PREFETCH (on unless 0): a constant buffer the draw will copy as it
 // records has its lines asked for as soon as its base is known (below).
 const bool g_cb_prefetch = [] {
@@ -23130,7 +23139,10 @@ static bool draw_impl(const GpuDraw& d) {
                 run_part_stop(kRunStopOrder);
                 return false;
             }
-            velo_previous_locked(pl, d, meta, params.user_sgpr, gx_stage[0]);
+            // A copy of the buffer an earlier draw of the recording made would
+            // be bound again: forgotten, it is copied with the change.
+            if (const std::uint64_t changed = velo_previous_locked(pl, d, meta, params.user_sgpr, gx_stage[0], velo_previous_given()))
+                cb_snapshot_forget(changed);
         }
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,

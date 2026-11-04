@@ -23,7 +23,7 @@ layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
 
 layout(push_constant) uniform Params {
     vec4 size;  // the output's width and height, then the render size
-    vec4 k;     // x: the gain
+    vec4 k;     // x: the gain, y: the corner's mark (0 none)
 };
 
 vec3 texel(ivec2 p) {
@@ -49,17 +49,35 @@ void main() {
     const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
     if (o.x >= int(size.x) || o.y >= int(size.y)) return;
     const ivec2 p = clamp(ivec2((vec2(o) + 0.5) * size.zw / size.xy), ivec2(0), ivec2(size.zw) - 1);
-    const vec2 mv = texelFetch(sampler2D(motion, any_sampler), p, 0).rg;
-    const vec2 at = vec2(p) + 0.5 + mv;
+    // k.z (BBHOST_UPSCALE_CHECK_BOX): the three compared as averages over the
+    // (2 k.z + 1)^2 render pixels around, each fetched by its own motion - the
+    // motion judged past what one pixel shows (a fur's alpha-tested strands
+    // change their pixels as they move, however right the motion is).
+    const int r = clamp(int(k.z + 0.5), 0, 8);
+    vec3 now = vec3(0.0), moved = vec3(0.0), stayed = vec3(0.0);
+    bool inside = true;
+    for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+            const ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(size.zw) - 1);
+            const vec2 at = vec2(q) + 0.5 + texelFetch(sampler2D(motion, any_sampler), q, 0).rg;
+            inside = inside && all(greaterThanEqual(at, vec2(0.0))) && all(lessThanEqual(at, size.zw));
+            now += max(texelFetch(sampler2D(scene, any_sampler), q, 0).rgb, vec3(0.0));
+            moved += max(prev_at(at), vec3(0.0));
+            stayed += max(texel(q), vec3(0.0));
+        }
+    }
     vec3 c = vec3(0.0, 0.0, 1.0);
-    if (all(greaterThanEqual(at, vec2(0.0))) && all(lessThanEqual(at, size.zw))) {
-        const vec3 now = max(texelFetch(sampler2D(scene, any_sampler), p, 0).rgb, vec3(0.0));
-        const float moved = apart(now, max(prev_at(at), vec3(0.0)));
-        const float stayed = apart(now, max(texel(p), vec3(0.0)));
+    if (inside) {
+        const float n = float((2 * r + 1) * (2 * r + 1));
+        const float m = apart(now / n, moved / n);
+        const float s = apart(now / n, stayed / n);
         const float t = 0.6 / max(k.x, 0.01);
         c = vec3(0.0);
-        if (moved > t && moved > 0.7 * stayed) c = vec3(1.0, 0.0, 0.0);
-        else if (stayed > t && moved < 0.5 * stayed) c = vec3(0.0, 1.0, 0.0);
+        if (m > t && m > 0.7 * s) c = vec3(1.0, 0.0, 0.0);
+        else if (s > t && m < 0.5 * s) c = vec3(0.0, 1.0, 0.0);
     }
+    // The frame's state in the top-left corner (k.y: 2 the velocity pass
+    // had last frame's matrices, white; 1 not, grey), for an A/B in one run.
+    if (k.y > 0.5 && o.x < 24 && o.y < 24) c = vec3(k.y > 1.5 ? 1.0 : 0.3);
     imageStore(dst, o, vec4(c, 1.0));
 }

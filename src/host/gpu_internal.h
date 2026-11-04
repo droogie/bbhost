@@ -1781,8 +1781,10 @@ void upscale_pass_reset_locked();
 bool upscale_motion_on();
 // Whether the game's velocity pass is given last frame's matrices (render.cpp
 // velo_previous_locked: rebuilt motion vectors), so a mesh's texel holds its
-// whole motion rather than its bones' alone.
+// whole motion rather than its bones' alone: the matrices kept, and given
+// (velo_previous_given: all of those frames but BBHOST_VELO_PREV=alt's odd ones).
 bool velo_previous_due();
+bool velo_previous_given();
 // The upscaler's frames so far, counted at its call point (after the
 // velocity pass): a frame's velocity draws share one.
 std::uint64_t upscale_velo_frame();
