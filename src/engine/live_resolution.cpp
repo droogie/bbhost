@@ -73,9 +73,13 @@ constexpr std::uint64_t kListenerYebisShutdownCall = 0x269c82a;  // in the graph
 constexpr std::uint64_t kGxFree = 0x15e6b00, kGxFreeRecord = 0x15e69e0;
 constexpr std::uint64_t kSwfPlayerCtor = 0x2358360, kSwfPlayerDtor = 0x2358670, kSwfPlayerVtable = 0x5756a00;
 
-// The largest entries of the Resolution setting, wide and tall: 5120x2160
-// (21:9) and 3840x2160 (16:9) - the display buffers fit both.
-constexpr std::uint32_t kMaxW = 5120, kMaxH = 2160;
+// The largest entries of the Resolution setting, wide and tall: 11520x2160
+// (three 16:9 screens) and 7680x4320 (8K) - the display buffers fit any size
+// up to the largest display's, within these. With no display to go by, the
+// widest and tallest of the entries up to 5120x2160 (21:9), as before the
+// list grew past it.
+constexpr std::uint32_t kMaxW = 11520, kMaxH = 4320;
+constexpr std::uint32_t kNoDisplayW = 5120, kNoDisplayH = 2160;
 
 std::uint64_t g_slide = 0;
 bool g_installed = false;
@@ -1066,7 +1070,13 @@ bool pin_display_read(ElfImage* image, std::uint64_t site, std::uint64_t word, s
 // little to spare: +1 GiB fits, but +2 GiB left no room for
 // GFX_GraphicsPrivateB (it was not made, and its allocations went to the
 // grown heap - nothing gained) and +3 GiB failed at the start. So past 1 GiB
-// the direct memory grows by the same amount (hle_kernel_set_dmem_size). The
+// the direct memory grows by the same amount (hle_kernel_set_dmem_size) - as
+// far as the guest's direct-memory window goes (7936 MiB, the most it holds:
+// 1792 more), so the heap grows by at most 2816 MiB, about 11.5 million
+// pixels. Grown past what the window granted, the heaps after it in the table
+// found no room (GFX_GraphicsPrivateB's 886 MiB the first), and at 7680x2160
+// the whole picture was black. Larger sizes draw their 3D at a render size
+// (engine/render_scale.cpp), and the heap is sized for that instead. The
 // memory is the PC's but pinned for the GPU, so a
 // run is not grown for sizes it will not reach: a run with live changes
 // covers 3440x1440's pixels (+1088 MiB, about v0.2.5's +1 GiB) or its
@@ -1110,9 +1120,16 @@ void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
         return;
     }
     const std::uint64_t dmem_more = more > kFitsInDmemMiB ? more - kFitsInDmemMiB : 0;
-    if (dmem_more && !hle_kernel_set_dmem_size(hle_kernel_dmem_size() + (dmem_more << 20))) {
+    const std::uint64_t dmem_before = hle_kernel_dmem_size();
+    if (dmem_more && !hle_kernel_set_dmem_size(dmem_before + (dmem_more << 20))) {
         more = kFitsInDmemMiB;  // the direct memory exists already: what fits in it
         px = kPx1080 + static_cast<std::uint64_t>((static_cast<double>(more) - 256.0) / 270.0 * 1e6);
+    } else if (const std::uint64_t granted = (hle_kernel_dmem_size() - dmem_before) >> 20; granted < dmem_more) {
+        // The window's end: what it granted, and the heaps after this one keep their room.
+        host_log("resolution: the direct memory grew by %llu MiB of the %llu asked (the guest's window is full); the render-target heap grows by %llu MiB",
+                 (unsigned long long)granted, (unsigned long long)dmem_more, (unsigned long long)(kFitsInDmemMiB + granted));
+        more = kFitsInDmemMiB + granted;
+        px = std::min(px, kPx1080 + static_cast<std::uint64_t>((static_cast<double>(more) - 256.0) / 270.0 * 1e6));
     }
     *sz = kGfxPrivateStock + (more << 20);
     g_live_max_px = given ? ~0ull : px;
@@ -1143,13 +1160,17 @@ bool live_resolution_install(ElfImage* image) {
     // clears of them every frame and +1,088 MiB of heap on a 1080p screen.
     // A larger entry applies at the next start (live_resolution_can).
     // BBHOST_LIVE_MAX=<w>x<h> sets the size, =max the Resolution setting's
-    // largest entries (5120x2160), as before.
-    std::uint32_t max_w = kMaxW, max_h = kMaxH;
-    const char* max_why = "the Resolution setting's largest entries";
+    // largest entries (11520 wide, 4320 tall).
+    std::uint32_t max_w = kNoDisplayW, max_h = kNoDisplayH;
+    const char* max_why = "no display size; up to 5120x2160";
     int desk_w = 0, desk_h = 0;
     if (const char* e = std::getenv("BBHOST_LIVE_MAX"); e && *e) {
         unsigned ew = 0, eh = 0;
-        if (std::strcmp(e, "max") != 0 && std::sscanf(e, "%ux%u", &ew, &eh) == 2 && ew && eh) {
+        if (std::strcmp(e, "max") == 0) {
+            max_w = kMaxW;
+            max_h = kMaxH;
+            max_why = "BBHOST_LIVE_MAX=max: the Resolution setting's largest entries";
+        } else if (std::sscanf(e, "%ux%u", &ew, &eh) == 2 && ew && eh) {
             max_w = std::min<std::uint32_t>(ew, kMaxW);
             max_h = std::min<std::uint32_t>(eh, kMaxH);
             max_why = "BBHOST_LIVE_MAX";
@@ -1196,6 +1217,10 @@ bool live_resolution_install(ElfImage* image) {
     }
     install_water_wave_full();  // at any size, live changes or not (before the heap's size, which counts it)
     grow_gfx_heap(image, !live ? start_px : live_px);
+    if (!g_scale_locked && !std::getenv("BBHOST_GFX_HEAP_MORE_MIB") && start_px > g_live_max_px)
+        host_log("resolution: %dx%d (%.1f million pixels) is more than the render-target heap holds (%.1f million): its targets may not "
+                 "all be made - Upscaling below Native AA draws the 3D at a size that fits",
+                 w, h, static_cast<double>(start_px) / 1e6, static_cast<double>(g_live_max_px) / 1e6);
     if (tight)
         host_log("resolution: live changes up to %.1f million pixels, the GPU's memory is tight (larger sizes apply at the next start)",
                  static_cast<double>(g_live_max_px) / 1e6);

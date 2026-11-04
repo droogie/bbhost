@@ -365,20 +365,32 @@ Setting g_set[kSettingCount] = {
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
-    // and scrolls through more. In order of size within each shape - 16:9,
-    // then 16:10, 4:3, 21:9 and 32:9 - and saved by name, not by place, so a
-    // saved entry survives the order changing (engine/option_menu.cpp's
-    // kResolutions and host/launcher.cpp's labels follow this list). The
-    // other shapes are engine/live_resolution.cpp's. 960x600 and 1024x640 are
-    // the Deck's screen at 75% and 80%: it holds 60 fps there (pixel-bound at
-    // 1280x800, ~45), and the presenter upscales by FSR 1.
-    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
-                                  "1920x1080", "2560x1440", "2880x1620", "3200x1800", "3840x2160",
-                                  "960x600", "1024x640", "1280x800", "1920x1200", "2560x1600",
-                                  "1280x960", "1440x1080", "2560x1080", "3440x1440", "5120x2160",
-                                  "3840x1080", "5120x1440"}, 5,
-     "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
-     "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
+    // and scrolls through more. In order of size within each shape - 16:9
+    // (5K and 8K at its end), 16:10, 4:3, 5:4, 1:1, then the wide ones: 21:9
+    // (64:27, 43:18 and 12:5 screens), 16:5 (two 16:10 screens), 32:9, 18:5,
+    // 4:1 (three 4:3), 24:5 (three 16:10), 5:1, 16:3 (three 16:9) and three
+    // 21:9 screens - and saved by name, not by place, so a saved entry
+    // survives the order changing (engine/option_menu.cpp's kResolutions,
+    // whose game list holds 32 of them, and tools/pc_option_messages.tsv's
+    // texts follow this list). The other shapes are
+    // engine/live_resolution.cpp's: the cameras widened (or the height kept for
+    // a taller one), the HUD at 16:9 in the middle, the plates and the lock-on
+    // where the camera puts them. 960x600 and 1024x640 are the Deck's screen at
+    // 75% and 80%: it holds 60 fps there (pixel-bound at 1280x800, ~45), and
+    // the presenter upscales by FSR 1. The largest want a GPU to match - or
+    // Upscaling below Native AA, which draws the 3D at a fraction of them.
+    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1366x768", "1440x810", "1600x900", "1920x1080", "2560x1440",
+                                  "2880x1620", "3200x1800", "3840x2160", "5120x2880", "7680x4320", "960x600", "1024x640",
+                                  "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600", "2880x1800", "3840x2400",
+                                  "800x600", "1024x768", "1280x960", "1440x1080", "1600x1200", "2048x1536", "1280x1024",
+                                  "1080x1080", "1440x1440", "1920x1920", "2560x1080", "3440x1440", "3840x1600", "5120x2160",
+                                  "6880x2880", "3840x1200", "3840x1080", "5120x1440", "7680x2160", "4320x1200", "3840x960",
+                                  "4800x1200", "5760x1200", "7680x1600", "5400x1080", "3840x720", "4800x900", "5760x1080",
+                                  "7680x1440", "11520x2160", "7680x1080", "10320x1440"}, 6,
+     "What the game renders at. 1920x1080 is what it shipped with; ultrawide, super-ultrawide, multi-screen, 16:10, 4:3 and "
+     "square screens are filled, the HUD kept 16:9 in the middle. The largest sizes can need a restart: the memory for them "
+     "is set aside when the game starts, and past about 11.5 million pixels (5120x2880, 7680x2160 and up) only Upscaling below "
+     "Native AA, which draws the 3D smaller, fits in it. With Upscaling below Native AA, a change applies at the next start.",
      true},
     // The shaders' form on the GPU (host/translation_cache.h): HLSL is the
     // lifted shaders printed as HLSL and compiled by DXC on this machine,

@@ -567,18 +567,79 @@ std::int32_t g_frame_cap = 30;
 // The render resolution, as the index into the setting's own list of names -
 // the row stores an int32 and the host owns what each one means, so the two
 // front ends cannot disagree about the order. The setting's order (host/
-// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 21:9, 32:9 (the
-// pick list scrolls past six). Each entry's text is its size's message, which
-// keeps its id whatever its place.
-const Choice kResolutions[] = {
-    {0, 117038},  {1, 117039},  {2, 117010},  {3, 117040},  {4, 117011},  {5, 117012},   // 640x360 .. 1920x1080
-    {6, 117013},  {7, 117041},  {8, 117014},  {9, 117015},                              // 2560x1440 .. 3840x2160
-    {10, 117036}, {11, 117037}, {12, 117035}, {13, 117042}, {14, 117043},               // 16:10
-    {15, 117044}, {16, 117045},                                                         // 4:3
-    {17, 117030}, {18, 117031}, {19, 117032},                                           // 21:9
-    {20, 117033}, {21, 117034},                                                         // 32:9
+// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 5:4, 1:1, then
+// the wide ones from 21:9 to three 21:9 screens (the pick list scrolls past
+// six). Each entry's text is its size's message, which keeps its id whatever
+// its place. The game's list holds 32 entries (its append, sub_1f1c0c0,
+// panics past them): PC Graphics lists the `listed` ones and the size the
+// setting holds when it is another; F10 and the setup window list them all.
+struct ResolutionChoice {
+    Choice choice;
+    bool listed;  // in PC Graphics' list
 };
-std::int32_t g_resolution = 5;
+constexpr ResolutionChoice kResolutions[] = {
+    {{0, 117038}, true },  // 640x360
+    {{1, 117039}, true },  // 960x540
+    {{2, 117010}, true },  // 1280x720
+    {{3, 117046}, true },  // 1366x768
+    {{4, 117040}, true },  // 1440x810
+    {{5, 117011}, true },  // 1600x900
+    {{6, 117012}, true },  // 1920x1080
+    {{7, 117013}, true },  // 2560x1440
+    {{8, 117041}, true },  // 2880x1620
+    {{9, 117014}, true },  // 3200x1800
+    {{10, 117015}, true },  // 3840x2160
+    {{11, 117047}, false},  // 5120x2880 (5K)
+    {{12, 117048}, false},  // 7680x4320 (8K)
+    {{13, 117036}, true },  // 960x600 (16:10, upscaled)
+    {{14, 117037}, true },  // 1024x640 (16:10, upscaled)
+    {{15, 117035}, true },  // 1280x800 (16:10)
+    {{16, 117049}, false},  // 1440x900 (16:10)
+    {{17, 117050}, true },  // 1680x1050 (16:10)
+    {{18, 117042}, true },  // 1920x1200 (16:10)
+    {{19, 117043}, true },  // 2560x1600 (16:10)
+    {{20, 117051}, false},  // 2880x1800 (16:10)
+    {{21, 117052}, false},  // 3840x2400 (16:10)
+    {{22, 117053}, false},  // 800x600 (4:3)
+    {{23, 117054}, false},  // 1024x768 (4:3)
+    {{24, 117044}, true },  // 1280x960 (4:3)
+    {{25, 117045}, true },  // 1440x1080 (4:3)
+    {{26, 117055}, false},  // 1600x1200 (4:3)
+    {{27, 117056}, false},  // 2048x1536 (4:3)
+    {{28, 117057}, false},  // 1280x1024 (5:4)
+    {{29, 117058}, false},  // 1080x1080 (1:1)
+    {{30, 117059}, false},  // 1440x1440 (1:1)
+    {{31, 117060}, false},  // 1920x1920 (1:1)
+    {{32, 117030}, true },  // 2560x1080 (21:9)
+    {{33, 117031}, true },  // 3440x1440 (21:9)
+    {{34, 117061}, true },  // 3840x1600 (21:9)
+    {{35, 117032}, true },  // 5120x2160 (21:9)
+    {{36, 117062}, false},  // 6880x2880 (21:9)
+    {{37, 117063}, true },  // 3840x1200 (16:5, two 16:10 screens)
+    {{38, 117033}, true },  // 3840x1080 (32:9)
+    {{39, 117034}, true },  // 5120x1440 (32:9)
+    {{40, 117064}, true },  // 7680x2160 (32:9, 8K ultrawide)
+    {{41, 117065}, false},  // 4320x1200 (18:5)
+    {{42, 117066}, false},  // 3840x960 (4:1, three 4:3 screens)
+    {{43, 117067}, false},  // 4800x1200 (4:1, three 4:3 screens)
+    {{44, 117068}, true },  // 5760x1200 (24:5, three 16:10 screens)
+    {{45, 117069}, false},  // 7680x1600 (24:5, three 16:10 screens)
+    {{46, 117070}, false},  // 5400x1080 (5:1)
+    {{47, 117071}, false},  // 3840x720 (16:3, three 16:9 screens)
+    {{48, 117072}, false},  // 4800x900 (16:3, three 16:9 screens)
+    {{49, 117073}, true },  // 5760x1080 (16:3, three 16:9 screens)
+    {{50, 117074}, true },  // 7680x1440 (16:3, three 16:9 screens)
+    {{51, 117075}, false},  // 11520x2160 (16:3, three 16:9 screens)
+    {{52, 117076}, true },  // 7680x1080 (64:9, three 21:9 screens)
+    {{53, 117077}, false},  // 10320x1440 (43:6, three 21:9 screens)
+};
+constexpr int listed_resolutions() {
+    int n = 0;
+    for (const ResolutionChoice& r : kResolutions) n += r.listed ? 1 : 0;
+    return n;
+}
+static_assert(listed_resolutions() <= 31, "the game's list holds 32 entries: the listed ones and the setting's own");
+std::int32_t g_resolution = 6;
 std::int32_t g_last_resolution = -1;
 std::int32_t g_last_frame_cap = -1;
 bool g_seeded = false;
@@ -809,8 +870,11 @@ GUEST_ABI void pc_graphics_handler(void* dialog, void* params) {
     // other section: it is translucent and opens directly under the row that
     // owns it, so anywhere else its entries sit over the rows below and their
     // values read through the panel.
-    add_list_row(dialog, &g_resolution, kGfxResolution, kResolutions,
-                 static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])), host_opt_default_resolution_index());
+    Choice listed[32];
+    int count = 0;
+    for (const ResolutionChoice& r : kResolutions)
+        if (r.listed || r.choice.value == g_resolution) listed[count++] = r.choice;
+    add_list_row(dialog, &g_resolution, kGfxResolution, listed, count, host_opt_default_resolution_index());
     log_rows("PCGraphics", dialog, kGraphicsRows, kGraphicsRows);
 }
 

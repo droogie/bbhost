@@ -1495,7 +1495,9 @@ void resolution_patch(ElfImage* image, bool live) {
         if (live) ui_stage_pin(image);
         return;
     }
-    if (w < 256 || h < 144 || w > 7680 || h > 4320) {
+    // Up to the Resolution setting's widest and tallest entries: three 16:9
+    // 4K screens (11520x2160) and 8K (7680x4320).
+    if (w < 256 || h < 144 || w > 11520 || h > 4320) {
         host_log("graphics: %dx%d is outside the range this will write", w, h);
         return;
     }
