@@ -206,7 +206,8 @@ bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
     d.struct_size = sizeof(d);
     d.method = c.method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR;
     d.quality = c.quality;
-    d.flags = (c.reset ? UB_EVAL_RESET : 0u) | (c.method == 2 && upscaler_fsr3_override() ? UB_EVAL_FSR3 : 0u);
+    d.flags = (c.reset ? UB_EVAL_RESET : 0u) | (c.method == 2 && upscaler_fsr3_override() ? UB_EVAL_FSR3 : 0u) |
+              (c.depth_inverted ? UB_EVAL_DEPTH_INVERTED : 0u);
     d.render_width = c.render_w;
     d.render_height = c.render_h;
     d.output_width = c.output_w;

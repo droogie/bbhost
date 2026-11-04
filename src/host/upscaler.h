@@ -73,6 +73,7 @@ struct UpscaleCall {
     float jitter_x = 0, jitter_y = 0;
     float motion_scale = 1.0f;  // the motion texel times this is render pixels (-1: a test of the wrong sign)
     float frame_ms = 16.7f, near_m = 0.1f, far_m = 10000.0f, fov_y = 1.0f;
+    bool depth_inverted = false;  // depth 1 at the near plane
     std::uint32_t dlss_preset = 0;  // NGX's preset number (10 J, 11 K, 12 L, 13 M); 0 the bridge's own (K)
 };
 bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c);

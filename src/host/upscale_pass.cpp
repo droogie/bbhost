@@ -59,6 +59,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -617,6 +618,45 @@ bool blit_into(VkFormat format) {
 // Frame generation's prepare (host/framegen.h): this frame's depth and motion,
 // the jitter the draws had and the camera's vertical field of view. The frame
 // it is prepared as is the one its HUD-less copy is then of.
+// What the upscalers judge history by, from the camera: the near and far
+// planes the depth stands for (the engine's decode, view distance =
+// 1 / (z raw + w): raw 0 and raw 1's distances, whichever is nearer the near
+// plane - and with it the depth's direction), the vertical field of view, and
+// the time since the last frame. They were left at stand-ins (0.1 m, 10 km,
+// 57 degrees, 16.7 ms), which FSR takes without complaint and judges
+// disocclusion by wrongly - history kept behind a moving character, a ghost.
+struct CameraTerms {
+    float near_m = 0.1f, far_m = 10000.0f, fov_y = 1.0f, frame_ms = 16.7f;
+    bool inverted = false;
+};
+CameraTerms camera_terms() {
+    static std::chrono::steady_clock::time_point last;
+    const auto now = std::chrono::steady_clock::now();
+    CameraTerms t;
+    if (last.time_since_epoch().count())
+        t.frame_ms = std::clamp(std::chrono::duration<float, std::milli>(now - last).count(), 1.0f, 100.0f);
+    last = now;
+    if (g_cam_now.tan_y > 0.0f) t.fov_y = 2.0f * std::atan(g_cam_now.tan_y);
+    // raw r: 1 / (z r + w), z = 1 / r2w, w = -a / r2w.
+    const float z = g_cam_now.r2w != 0.0f ? 1.0f / g_cam_now.r2w : 0.0f, w = -g_cam_now.a * z;
+    const auto dist = [&](float raw) { const float q = z * raw + w; return q > 1e-7f ? 1.0f / q : 1e6f; };
+    const float d0 = dist(0.0f), d1 = dist(1.0f);
+    if (z != 0.0f && std::isfinite(d0) && std::isfinite(d1) && d0 > 0.0f && d1 > 0.0f) {
+        t.inverted = d1 < d0;
+        t.near_m = std::max(std::min(d0, d1), 0.001f);
+        t.far_m = std::min(std::max(d0, d1), 1e6f);
+    }
+    static bool told = false;
+    if (!told && g_cam_now.tan_y > 0.0f) {
+        told = true;
+        host_log("upscaler: camera for the upscalers: near %g m, far %g m, depth %s, vertical field of view %.1f degrees",
+                 static_cast<double>(t.near_m), static_cast<double>(t.far_m), t.inverted ? "inverted (near = 1)" : "near = 0",
+                 static_cast<double>(t.fov_y * 57.29578f));
+    }
+    return t;
+}
+CameraTerms g_terms;  // this frame's (upscale_pass_run_locked)
+
 void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageLayout depth_layout, float jitter_x, float jitter_y,
                               float motion_scale) {
     FramegenInputs fi;
@@ -629,7 +669,10 @@ void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageL
     fi.jitter_x = jitter_x;
     fi.jitter_y = jitter_y;
     fi.motion_scale = motion_scale;
-    if (g_cam_now.tan_y > 0.0f) fi.fov_y = 2.0f * std::atan(g_cam_now.tan_y);
+    fi.fov_y = g_terms.fov_y;
+    fi.near_m = g_terms.near_m;
+    fi.far_m = g_terms.far_m;
+    fi.frame_ms = g_terms.frame_ms;
     g_fg_pending = framegen_prepare(cb, g_fg_frames + 1, fi) ? ++g_fg_frames : 0;
     static bool told = false;
     if (!told) host_log("framegen: first prepare %s", g_fg_pending ? "recorded" : "refused");
@@ -929,6 +972,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_reset = true;
     }
     g_cam_noted = false;
+    g_terms = camera_terms();
     if (motion_only) {
         // No upscaler: frame generation's prepare alone - no jitter (the
         // draws are moved only while an upscaler runs) - and AMD's binds gone
@@ -952,6 +996,11 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.dlss_preset = static_cast<std::uint32_t>(host_settings_ref().dlss_preset);
     c.jitter_x = jitter_x;
     c.jitter_y = jitter_y;
+    c.near_m = g_terms.near_m;
+    c.far_m = g_terms.far_m;
+    c.fov_y = g_terms.fov_y;
+    c.frame_ms = g_terms.frame_ms;
+    c.depth_inverted = g_terms.inverted;
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,
                 g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED};
     const bool ok = upscaler_evaluate(cb, c);
