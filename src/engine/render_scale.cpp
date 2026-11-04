@@ -406,7 +406,19 @@ RenderScale wanted(std::uint32_t output_w, std::uint32_t output_h, bool upscaler
     rs.output_w = output_w;
     rs.output_h = output_h;
     rs.quality = upscaler ? quality : 0;
-    render_scale_size(rs.quality, output_w, output_h, &rs.render_w, &rs.render_h);
+    // The 3D's base: the output, or with an upscaler a Resolution smaller
+    // than it (host_opt_output_size: the output is then the window's), fitted
+    // to the output's shape - then the quality's share of that.
+    std::uint32_t base_w = output_w, base_h = output_h;
+    int res_w = 0, res_h = 0;
+    if (upscaler && host_opt_resolution(&res_w, &res_h) && res_w > 0 && res_h > 0 &&
+        static_cast<std::uint64_t>(res_w) * static_cast<std::uint32_t>(res_h) < static_cast<std::uint64_t>(output_w) * output_h) {
+        const double k = std::min(static_cast<double>(res_w) / output_w, static_cast<double>(res_h) / output_h);
+        base_w = std::max<std::uint32_t>(static_cast<std::uint32_t>(output_w * k) & ~3u, 4);
+        base_h = std::max<std::uint32_t>(static_cast<std::uint32_t>(output_h * k) & ~3u, 4);
+        rs.quality = std::max(rs.quality, 1);  // drawn smaller than the output: the upscaler brings it up
+    }
+    render_scale_size(quality && upscaler ? quality : 0, base_w, base_h, &rs.render_w, &rs.render_h);
     return rs;
 }
 
@@ -435,6 +447,13 @@ void settings_changed(const HostSettings& s) {
         runs = s.upscaler == 1 ? caps.dlss : s.upscaler >= 2 ? caps.fsr : false;
     }
     const int quality = std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality : std::clamp(s.upscale_quality, 0, 3);
+    // The upscaler on or off moves the game's own size too (host_opt_output_size:
+    // the window's with one and a smaller Resolution, the Resolution without).
+    int ow = 0, oh = 0;
+    if (host_opt_output_size(&ow, &oh) && (static_cast<std::uint32_t>(ow) != now.output_w || static_cast<std::uint32_t>(oh) != now.output_h)) {
+        live_resolution_request(static_cast<unsigned>(ow), static_cast<unsigned>(oh));
+        return;
+    }
     const RenderScale want = wanted(now.output_w, now.output_h, runs, quality);
     if (want.render_w != now.render_w || want.render_h != now.render_h) live_resolution_rebuild();
 }
@@ -460,7 +479,7 @@ bool render_scale_plan(RenderScale* out) {
         // Its changes are the live resolution's rebuilds.
         if (const char* e = std::getenv("BBHOST_LIVE_RESOLUTION"); e && e[0] == '0') return rs;
         int w = 1920, h = 1080;
-        if (!host_opt_resolution(&w, &h)) w = 1920, h = 1080;
+        if (!host_opt_output_size(&w, &h)) w = 1920, h = 1080;
         return wanted(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), upscaler_asked(), quality_asked());
     }();
     if (out) *out = plan;

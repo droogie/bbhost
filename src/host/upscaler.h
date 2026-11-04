@@ -85,3 +85,9 @@ void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, 
 // bridge's: log2 of the render size over the output's, less 1), 0 without the
 // bridge.
 float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h);
+// The same two for a render size the qualities do not name (a Resolution
+// under the window's size, engine/render_scale.cpp): the phase count AMD's
+// and NVIDIA's guides give, 8 x (output / render) squared, and log2 of the
+// render size over the output's, less 1.
+void upscaler_jitter_sized(int method, std::uint32_t render_w, std::uint32_t output_w, std::uint32_t frame, float* x, float* y);
+float upscaler_mip_bias_sized(int method, std::uint32_t render_w, std::uint32_t output_w);

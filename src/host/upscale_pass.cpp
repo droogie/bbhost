@@ -39,6 +39,7 @@
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
+#include "host/options.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
 #include "log.h"
@@ -224,7 +225,15 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[20 + 4 * j + 2] = rz;
         p[20 + 4 * j + 3] = -(rx * m[3] + ry * m[7] + rz * m[11]);
     }
-    if (velo) {
+    if (velo && velo_mode == 3) {
+        // Rebuilt: NDC motion as it is, at 8 bits x 2 + 0.5.
+        const bool b8 = host_opt_motion_rebuilt_bits() == 8;
+        p[32] = p[33] = b8 ? 0.5f : 1.0f;
+        p[34] = p[35] = b8 ? 0.5f : 0.0f;
+        p[36] = static_cast<float>(velo->width);
+        p[37] = static_cast<float>(velo->height);
+        p[38] = 3.0f;
+    } else if (velo) {
         // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
         // (NDC now - NDC then) x scale x 0.5, its y up where uv's is down.
         p[32] = g_velo_cam[0] * 2.5f;
@@ -463,7 +472,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
             const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
             return !(e && e[0] == '0');
         }();
-        g_mip_bias = mip_bias_on ? upscaler_mip_bias(method, g_scaled ? static_cast<std::uint32_t>(rs.quality) : 0, g_ow, g_oh) : 0.0f;
+        g_mip_bias = !mip_bias_on ? 0.0f : g_scaled ? upscaler_mip_bias_sized(method, g_w, g_ow) : upscaler_mip_bias(method, 0, g_ow, g_oh);
         host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
                  mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
         if (g_scaled)
@@ -522,12 +531,15 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     // The meshes' own motion from the game's velocity map, its camera pass
     // drawn this frame (BBHOST_UPSCALE_VELO=0: none, the camera's alone;
     // =all: the map's motion everywhere, the camera's pass's too - tests).
+    // Rebuilt motion vectors (the Motion vectors setting): mode 3.
     static const int velo_mode = [] {
         const char* e = std::getenv("BBHOST_UPSCALE_VELO");
-        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "all") == 0 ? 2 : 1;
+        if (e && e[0] == '0') return 0;
+        if (host_opt_motion_rebuilt_bits()) return 3;
+        return !e ? 1 : std::strcmp(e, "all") == 0 ? 2 : 1;
     }();
     RtImage* velo = nullptr;
-    if (velo_mode && g_velo_cam_seen && g_velo_mesh_known && g_cam_prev_ok) {
+    if (velo_mode && g_velo_cam_seen && (g_velo_mesh_known || velo_mode == 3) && g_cam_prev_ok) {
         velo = find_render_target(g_velo_base);
         if (velo && (!velo->image || !velo->view || velo->depth)) velo = nullptr;
         if (velo) {
@@ -544,6 +556,22 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
         record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_mode);
         g_velo_cam[0] = g_velo_cam[1] = 0.0f;
+        // The map is cleared by the game only when it is made: with no camera
+        // pass over it each frame (the camera blur off), what a mesh drew
+        // stays where it was, old motion where the mesh has gone. Read, it is
+        // cleared to no motion - while the game's own blur, which reads it
+        // after this, is off (Motion blur, Performance mode, rebuilt).
+        const HostSettings& hs = host_settings_ref();
+        if (velo && (!hs.motion_blur || hs.performance_mode || velo_mode == 3)) {
+            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue none{};
+            if (velo_mode != 3) none.float32[0] = none.float32[1] = none.float32[2] = 0.5f;  // the encoding's zero
+            const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cb, velo->image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &all);
+            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        }
         if (!g_cam_prev_ok) g_reset = true;
         g_cam_prev = g_cam_now;
         g_cam_prev_ok = true;

@@ -396,10 +396,13 @@ void settings_changed(const HostSettings& hs) {
         g_aa.store(hs.anti_alias);
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
+    // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
-    if (hs.motion_blur != blur_was) {
-        blur_was = hs.motion_blur;
-        motion_blur_apply(hs.motion_blur);
+    // Rebuilt motion vectors hold what the blur cannot read: it goes too.
+    const bool blur = hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits();
+    if (blur != blur_was) {
+        blur_was = blur;
+        motion_blur_apply(blur);
     }
     set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
@@ -1489,7 +1492,9 @@ void ui_stage_pin(ElfImage* image) {
 
 void resolution_patch(ElfImage* image, bool live) {
     int w = 0, h = 0;
-    if (!host_opt_resolution(&w, &h) || (w == 1920 && h == 1080)) {
+    // The game's size: the Resolution, or the window's with an upscaler and a
+    // smaller Resolution (the 3D then drawn at the Resolution, render_scale.cpp).
+    if (!host_opt_output_size(&w, &h) || (w == 1920 && h == 1080)) {
         // What it shipped with: nothing to write - but the words change
         // under a live resolution change, so the stage readers are pinned.
         if (live) ui_stage_pin(image);

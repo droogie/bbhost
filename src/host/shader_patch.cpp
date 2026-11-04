@@ -43,7 +43,12 @@ std::atomic<std::uint32_t> g_mask{0};
 void settings_changed(const HostSettings& hs) {
     std::uint32_t m = 0;
     for (std::size_t i = 0; i < kCount; ++i) {
-        if (!(hs.*(kPatches[i].setting))) m |= 1u << i;
+        // Performance mode takes motion blur off here too: it leaves the
+        // scene's motion blur flag on for the velocity map with an upscaler
+        // (engine/patch_manifest.cpp, performance-mode).
+        const bool off = !(hs.*(kPatches[i].setting)) || (kPatches[i].setting == &HostSettings::motion_blur &&
+                                                          (hs.performance_mode || host_opt_motion_rebuilt_bits()));
+        if (off) m |= 1u << i;
     }
     g_mask.store(m, std::memory_order_release);
 }

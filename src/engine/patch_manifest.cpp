@@ -9,6 +9,7 @@
 #include "engine/render_scale.h"
 #include "gcn/container.h"
 #include "hle/fs.h"
+#include "host/options.h"
 #include "host/ruleset.h"
 #include "host/settings.h"
 #include "log.h"
@@ -246,7 +247,12 @@ Manifest performance_mode_manifest() {
     m.order = 11;
     const std::vector<std::uint8_t> one = {0x01}, zero = {0x00};
     m.sites.push_back(Site{"ssao", 0x026c2548, one, zero, true, {}});
-    m.sites.push_back(Site{"motion-blur", 0x026c2549, one, zero, true, {}});
+    // Motion blur's flag also draws the velocity map, which an upscaler's
+    // motion takes the player's and the enemies' own movement from
+    // (host/upscale_pass.cpp): with one chosen the flag stays and the blur is
+    // taken off the Motion blur setting's way (its shader patched away, the
+    // dilation skipped - host/shader_patch.cpp, engine/graphics_patch.cpp).
+    if (!host_opt_upscaler_chosen()) m.sites.push_back(Site{"motion-blur", 0x026c2549, one, zero, true, {}});
     m.sites.push_back(Site{"anti-aliasing", 0x026c254a, one, zero, true, {}});
     m.sites.push_back(Site{"dynamic-light-shadow", 0x026c2538, one, zero, true, {}});
     m.sites.push_back(Site{"dof", 0x025d7bbc, {0x0f, 0x84, 0xde, 0x00, 0x00, 0x00}, {0xe9, 0xdf, 0x00, 0x00, 0x00, 0x90}, true, {}});
@@ -423,12 +429,17 @@ Manifest velomap_manifest() {
     m.title = "16-bit velocity map";
     m.eboot = kEboot109Sha256;
     m.description = "motion blur's velocity map in 16-bit float, for the upscaler's motion";
-    m.order = 9150;
+    m.order = 9150;  // after HD motion blur: rebuilt motion vectors' size stands
+    // Rebuilt motion vectors (the Motion vectors setting): the map at the
+    // render size, in the bits asked for - the game's codes are DXGI's
+    // (0x1c R8G8B8A8_UNORM, 0x0a R16G16B16A16_FLOAT, 0x02 R32G32B32A32_FLOAT).
+    const int rebuilt = host_opt_motion_rebuilt_bits();
     const char* bits = std::getenv("BBHOST_VELOMAP_8BIT");  // =1: the game's RGBA8 kept (a test)
-    if (!(bits && bits[0] == '1')) m.sites.push_back(Site{"velomap-format", 0x026c3e04, {0x1c}, {0x0a}, true, {}});
+    const std::uint8_t format = rebuilt == 8 ? 0x1c : rebuilt == 32 ? 0x02 : 0x0a;
+    if (format != 0x1c && !(bits && bits[0] == '1')) m.sites.push_back(Site{"velomap-format", 0x026c3e04, {0x1c}, {format}, true, {}});
     const char* e = std::getenv("BBHOST_VELOMAP_RES");
-    if (e && !host_settings().hd_motion_blur) {
-        const std::string r(e);
+    if (rebuilt || (e && !host_settings().hd_motion_blur)) {
+        const std::string r(e && !rebuilt ? e : "full");
         const int shift = r == "full" ? 0 : r == "quarter" ? 2 : 1;
         std::vector<std::uint8_t> bytes = {0xc4, 0xc1, 0x7a, 0x7e, 0x07, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift),
                                            0xc5, 0xf9, 0xd6, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00};
@@ -446,7 +457,7 @@ Manifest velomap_manifest() {
         m.sites.push_back(Site{"depth-quarter-size", 0x0125b1d6,
                                {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
                                {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift + 1), 0xc5, 0xf9, 0xd6, 0x04,
-                                0x24, 0x90, 0x90, 0x90},
+                                0x24, 0x90, 0x90, 0x90, 0x90},
                                true, {}});
     }
     return m;

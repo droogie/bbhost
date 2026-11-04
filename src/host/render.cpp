@@ -23873,8 +23873,10 @@ static bool draw_impl(const GpuDraw& d) {
                 // render size (render scale), 1:1 otherwise.
                 RenderScale rs;
                 const bool scaled = render_scale_on(&rs) && scene->width == rs.render_w && scene->height == rs.render_h;
-                upscaler_jitter(upscaler_method(), scaled ? static_cast<std::uint32_t>(rs.quality) : 0, scaled ? rs.output_w : scene->width,
-                                scaled ? rs.output_h : scene->height, u.frame, &u.jx, &u.jy);
+                if (scaled)
+                    upscaler_jitter_sized(upscaler_method(), rs.render_w, rs.output_w, u.frame, &u.jx, &u.jy);
+                else
+                    upscaler_jitter(upscaler_method(), 0, scene->width, scene->height, u.frame, &u.jx, &u.jy);
                 u.jittered = false;
             }
         }

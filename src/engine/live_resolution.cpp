@@ -1158,7 +1158,7 @@ bool live_resolution_install(ElfImage* image) {
     g_slide = image->mem.slide;
     g_image = image;
     int w = 0, h = 0;
-    if (!host_opt_resolution(&w, &h)) w = 1920, h = 1080;
+    if (!host_opt_output_size(&w, &h)) w = 1920, h = 1080;
     const bool live = [] {
         const char* e = std::getenv("BBHOST_LIVE_RESOLUTION");
         return !(e && e[0] == '0');

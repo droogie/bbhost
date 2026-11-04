@@ -206,6 +206,9 @@ void host_mouse_describe(char* out, std::size_t n);
 // to the mode nearest width x height - the resolution - at the desktop's
 // refresh rate). A width and height of 0 keep the last ones.
 void host_window_set_mode(int mode, int width = 0, int height = 0);
+// The presenter's swapchain made again at its next frame (frame generation
+// switched: AMD's swapchain or its own).
+void host_window_recreate_swapchain();
 #if defined(BBHOST_HAVE_SDL3)
 // A controller press as one of the bindable buttons (host/bindings.h
 // PadInput): a button down, or a trigger pulled past a quarter; -1 otherwise.

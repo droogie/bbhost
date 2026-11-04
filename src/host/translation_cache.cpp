@@ -6,6 +6,7 @@
 #include "translator_fingerprint.h"
 #include "gcn/hlsl.h"
 #include "host/dxc.h"
+#include "host/options.h"
 
 #ifdef BBHOST_HAVE_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
@@ -1264,6 +1265,69 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
     return !out.empty();
 }
 
+// ---- Rebuilt motion vectors (host/options.h host_opt_motion_rebuilt_bits) ----
+// The game's moving meshes draw their motion into motion blur's velocity map
+// with GXFlver_*_Velo pixel shaders, from each vertex where it is (attr0) and
+// where it was a frame ago (attr1), clip space, skinned with this frame's and
+// the last's bones. The blur wants that scaled by its strength, clamped to
+// [0, 1] and packed to 16 bits in the shader. Rebuilt, the same shaders keep
+// their discards and write the exact NDC motion instead - now minus then -
+// alpha 0.5 marking a mesh's texel (the camera's pass writes 1, the clear 0):
+// as it is at 16 and 32 bits, at 8 as x 2 + 0.5 (+-0.25 of the screen, steps
+// of about 2 pixels at 1080p). host/upscale_pass.cpp reads it.
+bool velo_rebuilt(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::vector<std::uint32_t>& out) {
+    const int bits = host_opt_motion_rebuilt_bits();
+    if (!bits) return false;
+    static const char* const kVelo[] = {"749e4f9e", "b25e4fae", "34bc187c", "d79de945"};  // GXFlver_{Col,Col_[A],Emi,Water}_Velo
+    bool velo = false;
+    for (const char* v : kVelo) velo |= hopt.title == v;
+    if (!velo || lift_stage_tag(lifted) != "ps") return false;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> done;
+    const std::uint64_t hash = lift_hash(lifted);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (const auto it = done.find(hash); it != done.end()) {
+            out = it->second;
+            return !out.empty();
+        }
+    }
+    gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
+    std::string why;
+    std::vector<std::uint32_t> spirv;
+    const std::size_t body = h.source.find("void lifted_main()");
+    const std::size_t end = body == std::string::npos ? body : h.source.find("\n    return;\n}\n", body);
+    if (h.profile.empty() || end == std::string::npos) {
+        why = "its HLSL has no lifted_main to end";
+    } else if (!dxc.loaded()) {
+        why = "DXC not found";
+    } else {
+        const char* write = bits == 8 ? "    mrt0 = float4(saturate((attr0.xy / attr0.w - attr1.xy / attr1.w) * 2.0f + 0.5f), 0.0f, 0.5f);\n"
+                                      : "    mrt0 = float4(attr0.xy / attr0.w - attr1.xy / attr1.w, 0.0f, 0.5f);\n";
+        h.source.insert(end + 1, write);
+        h.errors.clear();
+        DxcOptions o;
+        o.optimize = hlsl_level();
+        std::string error;
+        if (!dxc.compile(h, o, spirv, error)) {
+            why = "DXC: " + error.substr(0, 400);
+        } else if (std::string d = gcn::hlsl_interface_diff(lifted, spirv); !d.empty()) {
+            why = "another interface than the lift's: " + d;
+        } else if (std::string v = hlsl_validate(spirv); !v.empty()) {
+            why = "invalid SPIR-V: " + v;
+        }
+        if (!why.empty()) spirv.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        done.emplace(hash, spirv);
+    }
+    host_log("render: rebuilt motion vectors (%d-bit) %s for velocity shader %s%s%s", bits, spirv.empty() ? "refused" : "taken", hopt.title.c_str(),
+             why.empty() ? "" : ": ", why.c_str());
+    out = std::move(spirv);
+    return !out.empty();
+}
+
 void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* to) {
     t_last_deferred = nullptr;
     std::string name = std::move(t_hlsl_name);  // taken by this lift, whatever happens to it
@@ -1281,7 +1345,7 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         hlsl_keep("DXC not found");
         return;
     }
-    if (std::vector<std::uint32_t> own; hlsl_override(l.spirv, hopt, dxc, own)) {
+    if (std::vector<std::uint32_t> own; velo_rebuilt(l.spirv, hopt, dxc, own) || hlsl_override(l.spirv, hopt, dxc, own)) {
         g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
         hlsl_remember_lift(own, lift_key, l.spirv);
         l.spirv = std::move(own);

@@ -617,6 +617,13 @@ bool vk_create_swapchain() {
         framegen_destroy_swapchain(g_vk.device);
         old = VK_NULL_HANDLE;
         sci.oldSwapchain = VK_NULL_HANDLE;
+    } else if (old && framegen_wanted()) {
+        // Frame generation switched on: AMD's swapchain takes no old one, and
+        // the surface holds one at a time - ours goes first, its last present done.
+        vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        vkDestroySwapchainKHR(g_vk.device, old, nullptr);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
     }
     const bool fg = framegen_wanted() &&
                     framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
@@ -1858,6 +1865,12 @@ std::uint64_t host_present_last_ns(std::uint64_t* serial) {
 #else
     *serial = 0;
     return 0;
+#endif
+}
+
+void host_window_recreate_swapchain() {
+#if defined(BBHOST_HAVE_SDL3)
+    g_swap_dirty.store(true);
 #endif
 }
 

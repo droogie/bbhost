@@ -151,8 +151,9 @@ VkQueueInfoFFXAPI queue_info(void* q, std::uint32_t family) {
 }  // namespace
 
 bool framegen_wanted() {
-    static const bool want = host_settings().frame_generation;
-    return want && load();
+    // Live: the presenter asks each time it makes its swapchain, and a change
+    // of the setting makes it again (host/options.cpp).
+    return host_settings().frame_generation && load();
 }
 
 bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkSwapchainCreateInfoKHR& sci, VkQueue game_queue,
@@ -277,11 +278,13 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     static std::uint64_t frames = 0, base = 0, base60 = 0;
     if (g_fns.pOutGetLastPresentCountFFXAPI && (frames + 1) % 60 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
+        if (shown < base60) base60 = 0, base = shown;  // a new swapchain counts from 0
         if (base60 && shown > base60) g_shown_per_frame.store(static_cast<float>(shown - base60) / 60.0f, std::memory_order_relaxed);
         base60 = shown;
     }
     if (g_fns.pOutGetLastPresentCountFFXAPI && ++frames % 600 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
+        if (shown < base) base = 0;
         host_log("framegen: %llu frames shown for the last 600 of the game's", static_cast<unsigned long long>(shown - base));
         base = shown;
     }

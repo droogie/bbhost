@@ -10,6 +10,8 @@
 
 #include "upscaler_bridge.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -171,6 +173,19 @@ float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_
     return ri.mip_bias;
 }
 
+void upscaler_jitter_sized(int method, std::uint32_t render_w, std::uint32_t output_w, std::uint32_t frame, float* x, float* y) {
+    *x = *y = 0.0f;
+    if (!g_ub || !method || !render_w || !output_w) return;
+    const double r = static_cast<double>(output_w) / render_w;
+    const auto phases = static_cast<std::uint32_t>(std::max(8.0, std::ceil(8.0 * r * r)));
+    g_ub->get_jitter(frame % phases, phases, x, y);
+}
+
+float upscaler_mip_bias_sized(int method, std::uint32_t render_w, std::uint32_t output_w) {
+    if (!g_ub || !method || !render_w || !output_w) return 0.0f;
+    return static_cast<float>(std::log2(static_cast<double>(render_w) / output_w) - 1.0);
+}
+
 bool upscaler_fsr3_override() {
     const char* e = std::getenv("BBHOST_UPSCALE");
     if (e && *e) return std::strcmp(e, "fsr3") == 0;
@@ -226,6 +241,8 @@ void upscaler_attach(VkInstance, VkPhysicalDevice, VkDevice, std::uint32_t) {}
 UpscalerCaps upscaler_caps() { return {}; }
 int upscaler_method() { return 0; }
 bool upscaler_fsr3_override() { return false; }
+void upscaler_jitter_sized(int, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
+float upscaler_mip_bias_sized(int, std::uint32_t, std::uint32_t) { return 0.0f; }
 bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
 void upscaler_jitter(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
 float upscaler_mip_bias(int, std::uint32_t, std::uint32_t, std::uint32_t) { return 0.0f; }

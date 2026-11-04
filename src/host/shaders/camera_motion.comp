@@ -18,7 +18,9 @@
 // NDC then) x the mesh scale x 0.5 + 0.5. A texel that differs from what the
 // camera's pass would have written there is a mesh's, and its motion is the
 // pixel's; elsewhere the camera's motion from the depth stays, at full
-// precision.
+// precision. Rebuilt (mode 3, host/translation_cache.cpp velo_rebuilt): a
+// mesh's texel holds its NDC motion itself, now minus then, alpha 0.5 marking
+// it - stored as (v - offset) x scale, at 8 bits (v - 0.5) / 2.
 //
 // Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -36,7 +38,8 @@ layout(push_constant) uniform Params {
     // The velocity map: the camera's pass's scale (x 2.5, its uv delta's),
     // the meshes' (their NDC delta's x 0.5, y as uv: down)
     vec4 velo_k;
-    vec4 velo_size;  // its size, then mode (0: unused, 1: the meshes', 2: all of it), the tolerance
+    vec4 velo_size;  // its size, then mode (0: unused, 1: the meshes', 2: all of it, 3: rebuilt), the tolerance
+    // (rebuilt: velo_k is the decode, scale then offset)
 };
 
 void main() {
@@ -65,7 +68,15 @@ void main() {
             mv = clamp((prev_uv - uv) * size, vec2(-60000.0), vec2(60000.0));
             if (any(isnan(mv))) mv = vec2(0.0);
         }
-        if (velo_size.z > 0.0) {
+        if (velo_size.z > 2.5) {
+            const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
+            const vec4 t = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0);
+            if (abs(t.a - 0.5) < 0.1) {
+                const vec2 d = (t.rg - velo_k.zw) * velo_k.xy;
+                const vec2 own = vec2(-0.5 * d.x, 0.5 * d.y) * size;
+                if (!any(isnan(own)) && !any(isinf(own))) mv = own;
+            }
+        } else if (velo_size.z > 0.0) {
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
             const vec2 v = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0).rg - 0.5;
             // What the camera's pass wrote for this motion: (uv now - uv then) x its scale.

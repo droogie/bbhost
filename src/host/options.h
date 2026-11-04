@@ -61,6 +61,19 @@ bool host_opt_saved(const char* key);
 // The render resolution the player chose, or what BBHOST_RES says. False when
 // neither parses. Read once by the loader - it is a patch on the image.
 bool host_opt_resolution(int* w, int* h);
+// The game's own size - its post chain, the HUD and the menus, and the
+// upscaler's output: the Resolution, or with an upscaler chosen and a
+// Resolution smaller than the window, the window's size (Borderless and
+// Fullscreen: the screen's; Windowed: [video] width x height). The 3D is
+// then drawn at the Resolution (engine/render_scale.cpp) and upscaled, so a
+// low Resolution keeps the UI sharp. False as host_opt_resolution.
+bool host_opt_output_size(int* w, int* h);
+// Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE).
+bool host_opt_upscaler_chosen();
+// The upscaler's rebuilt motion vectors (the Motion vectors setting, read
+// once; BBHOST_MOTION_VECTORS=velomap|8|16|32 for tests): 8, 16 or 32 bits,
+// or 0 for the game's velocity map - and 0 with no upscaler chosen.
+int host_opt_motion_rebuilt_bits();
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
 // The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
