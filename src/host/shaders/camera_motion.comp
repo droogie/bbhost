@@ -15,12 +15,15 @@
 // game's own velocity map (the motion blur's, upscale_pass.cpp): a full-screen
 // pass writes the camera's motion into it, (uv now - uv then) x the camera
 // scale + 0.5, and each moving mesh then writes its own over it, (NDC now -
-// NDC then) x the mesh scale x 0.5 + 0.5. A texel that differs from what the
-// camera's pass would have written there is a mesh's, and its motion is the
-// pixel's; elsewhere the camera's motion from the depth stays, at full
-// precision. Rebuilt (mode 3, host/translation_cache.cpp velo_rebuilt): a
-// mesh's texel holds its NDC motion itself, now minus then, alpha 0.5 marking
-// it - stored as (v - offset) x scale, at 8 bits (v - 0.5) / 2.
+// NDC then) x the mesh scale x 0.5 + 0.5. A mesh's motion is its own alone:
+// the game projects where it was through this frame's camera too (its blur
+// leaves a camera turn to the camera's pass), so a mesh standing still while
+// the camera turns writes none. A texel that differs from what the camera's
+// pass would have written there is a mesh's, and its motion is added to the
+// camera's from the depth there - the surface's whole motion. Rebuilt (mode 3,
+// host/translation_cache.cpp velo_rebuilt): a mesh's texel holds its NDC
+// motion itself, now minus then, alpha 0.5 marking it - stored as
+// (v - offset) x scale, at 8 bits (v - 0.5) / 2 - added the same way.
 //
 // Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -74,7 +77,7 @@ void main() {
             if (abs(t.a - 0.5) < 0.1) {
                 const vec2 d = (t.rg - velo_k.zw) * velo_k.xy;
                 const vec2 own = vec2(-0.5 * d.x, 0.5 * d.y) * size;
-                if (!any(isnan(own)) && !any(isinf(own))) mv = own;
+                if (!any(isnan(own)) && !any(isinf(own))) mv += own;
             }
         } else if (velo_size.z > 0.0) {
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
@@ -83,7 +86,8 @@ void main() {
             const vec2 cam = -mv / size * velo_k.xy;
             if (velo_size.z > 1.5 || any(greaterThan(abs(v - cam), vec2(velo_size.w)))) {
                 const vec2 own = -v / velo_k.zw * size;
-                if (!any(isnan(own)) && !any(isinf(own))) mv = own;
+                // (Mode 2, a test, takes the map's alone: its camera pass's too.)
+                if (!any(isnan(own)) && !any(isinf(own))) mv = velo_size.z > 1.5 ? own : mv + own;
             }
         }
     }

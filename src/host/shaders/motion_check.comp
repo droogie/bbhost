@@ -1,0 +1,65 @@
+#version 450
+// The motion checked (host/upscale_pass.cpp, BBHOST_UPSCALE_CHECK=<gain>, a
+// test - Numity1504's handoff, step 4's reprojection check): in place of the
+// upscaler's picture, whether the motion explains how this frame's scene
+// differs from the last frame's. Each pixel is compared with the last frame
+// fetched where the motion says its surface was, and with the last frame at
+// the same place (no motion): green where the motion takes most of the change
+// away, red where the pixel changed and the motion made it no better - a mesh
+// given the camera's motion is red while it moves - black where nothing
+// changed. Pure colours, so the post chain's exposure cannot hide or invent
+// an error. Blue: the surface came from off the screen. Run with the jitter
+// off (BBHOST_UPSCALE_JITTER=0); the gain sets how big a change counts
+// (0.6 / gain of the brighter value).
+//
+// Compiled offline (tools/build_shaders.sh) into motion_check.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D scene;       // this frame's, render size
+layout(set = 0, binding = 1) uniform texture2D prev_scene;  // the last frame's
+layout(set = 0, binding = 2) uniform texture2D motion;      // R16G16_SFLOAT, render pixels
+layout(set = 0, binding = 3) uniform sampler any_sampler;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 size;  // the output's width and height, then the render size
+    vec4 k;     // x: the gain
+};
+
+vec3 texel(ivec2 p) {
+    return texelFetch(sampler2D(prev_scene, any_sampler), clamp(p, ivec2(0), ivec2(size.zw) - 1), 0).rgb;
+}
+
+// The last frame's scene at `at` (render pixels, centres at +0.5), bilinear.
+vec3 prev_at(vec2 at) {
+    const vec2 q = at - 0.5;
+    const ivec2 i = ivec2(floor(q));
+    const vec2 f = q - vec2(i);
+    return mix(mix(texel(i), texel(i + ivec2(1, 0)), f.x), mix(texel(i + ivec2(0, 1)), texel(i + ivec2(1, 1)), f.x), f.y);
+}
+
+// How far apart two colours are, against the brighter (so a bright lamp does
+// not outweigh a dark coat).
+float apart(vec3 a, vec3 b) {
+    const vec3 d = abs(a - b) / (vec3(0.05) + max(a, b));
+    return max(d.r, max(d.g, d.b));
+}
+
+void main() {
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= int(size.x) || o.y >= int(size.y)) return;
+    const ivec2 p = clamp(ivec2((vec2(o) + 0.5) * size.zw / size.xy), ivec2(0), ivec2(size.zw) - 1);
+    const vec2 mv = texelFetch(sampler2D(motion, any_sampler), p, 0).rg;
+    const vec2 at = vec2(p) + 0.5 + mv;
+    vec3 c = vec3(0.0, 0.0, 1.0);
+    if (all(greaterThanEqual(at, vec2(0.0))) && all(lessThanEqual(at, size.zw))) {
+        const vec3 now = max(texelFetch(sampler2D(scene, any_sampler), p, 0).rgb, vec3(0.0));
+        const float moved = apart(now, max(prev_at(at), vec3(0.0)));
+        const float stayed = apart(now, max(texel(p), vec3(0.0)));
+        const float t = 0.6 / max(k.x, 0.01);
+        c = vec3(0.0);
+        if (moved > t && moved > 0.7 * stayed) c = vec3(1.0, 0.0, 0.0);
+        else if (stayed > t && moved < 0.5 * stayed) c = vec3(0.0, 1.0, 0.0);
+    }
+    imageStore(dst, o, vec4(c, 1.0));
+}

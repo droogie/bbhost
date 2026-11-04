@@ -49,6 +49,7 @@
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
+#include "host/shaders/motion_check.spv.h"
 #include "host/shaders/motion_view.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
@@ -448,33 +449,58 @@ float show_motion() {
     return px;
 }
 
-VkDescriptorSetLayout g_view_set_layout = VK_NULL_HANDLE;
-VkPipelineLayout g_view_layout = VK_NULL_HANDLE;
-VkPipeline g_view_pipeline = VK_NULL_HANDLE;
-bool g_view_tried = false;
+// BBHOST_UPSCALE_CHECK=<gain> (a test): the reprojection check in place of the
+// upscaler's picture (shaders/motion_check.comp) - black where the motion is
+// right - with this frame's scene kept for the next (1: a gain of 4).
+float check_motion() {
+    static const float gain = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_CHECK");
+        if (!e || !*e || e[0] == '0') return 0.0f;
+        const float v = static_cast<float>(std::atof(e));
+        return v > 1.0f ? v : 4.0f;
+    }();
+    return gain;
+}
 
-bool view_pipeline_locked() {
-    if (g_view_tried) return g_view_pipeline != VK_NULL_HANDLE;
-    g_view_tried = true;
-    const VkDescriptorSetLayoutBinding binds[3] = {
-        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-    };
+// One of the tests' compute passes over g_output: its pipeline, made at the
+// first use from `spv` with the bindings `types` (in order) and 32 bytes of
+// push constants.
+struct TestPass {
+    const char* what;
+    const std::uint32_t* spv;
+    std::size_t spv_bytes;
+    std::vector<VkDescriptorType> types;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool tried = false;
+};
+TestPass g_view_pass{"motion view (BBHOST_UPSCALE_SHOW_MOTION)", k_motion_view_spv, sizeof(k_motion_view_spv),
+                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
+TestPass g_check_pass{"reprojection check (BBHOST_UPSCALE_CHECK)", k_motion_check_spv, sizeof(k_motion_check_spv),
+                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                       VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
+
+bool test_pass_locked(TestPass& t) {
+    if (t.tried) return t.pipeline != VK_NULL_HANDLE;
+    t.tried = true;
+    std::vector<VkDescriptorSetLayoutBinding> binds;
+    for (std::size_t i = 0; i < t.types.size(); ++i)
+        binds.push_back({static_cast<std::uint32_t>(i), t.types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 3;
-    sli.pBindings = binds;
-    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_view_set_layout) != VK_SUCCESS) return false;
+    sli.bindingCount = static_cast<std::uint32_t>(binds.size());
+    sli.pBindings = binds.data();
+    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &t.set_layout) != VK_SUCCESS) return false;
     VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
-    pli.pSetLayouts = &g_view_set_layout;
+    pli.pSetLayouts = &t.set_layout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &range;
-    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_view_layout) != VK_SUCCESS) return false;
+    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &t.layout) != VK_SUCCESS) return false;
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = sizeof(k_motion_view_spv);
-    smi.pCode = k_motion_view_spv;
+    smi.codeSize = t.spv_bytes;
+    smi.pCode = t.spv;
     VkShaderModule module = VK_NULL_HANDLE;
     if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -482,44 +508,83 @@ bool view_pipeline_locked() {
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = module;
     ci.stage.pName = "main";
-    ci.layout = g_view_layout;
-    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_view_pipeline) == VK_SUCCESS;
+    ci.layout = t.layout;
+    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &t.pipeline) == VK_SUCCESS;
     vkDestroyShaderModule(g.device, module, nullptr);
-    if (!ok) g_view_pipeline = VK_NULL_HANDLE;
-    host_log("upscaler: the motion view (BBHOST_UPSCALE_SHOW_MOTION) %s", ok ? "ready" : "failed to build");
+    if (!ok) t.pipeline = VK_NULL_HANDLE;
+    host_log("upscaler: the %s %s", t.what, ok ? "ready" : "failed to build");
     return ok;
 }
 
-// The motion as colours into g_output (written: the picture's place).
-void record_motion_view(VkCommandBuffer cb, float px) {
-    if (!view_pipeline_locked()) return;
-    const VkDescriptorSet set = alloc_set_locked(g_view_set_layout);
+// The pass `t` over g_output (its last binding), its other bindings the
+// images `views` and the sampler; the push constants the output's size, the
+// render size and `k`.
+void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkImageView> views, float k) {
+    if (!test_pass_locked(t)) return;
+    const VkDescriptorSet set = alloc_set_locked(t.set_layout);
     if (!set) return;
-    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, g_motion.view, VK_IMAGE_LAYOUT_GENERAL};
-    const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[3] = {};
-    for (int k = 0; k < 3; ++k) {
-        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[k].dstSet = set;
-        wr[k].dstBinding = static_cast<std::uint32_t>(k);
-        wr[k].descriptorCount = 1;
+    std::vector<VkDescriptorImageInfo> infos(t.types.size());
+    std::vector<VkWriteDescriptorSet> wr(t.types.size());
+    auto view = views.begin();
+    for (std::size_t i = 0; i < t.types.size(); ++i) {
+        if (t.types[i] == VK_DESCRIPTOR_TYPE_SAMPLER) infos[i] = {g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        else if (t.types[i] == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) infos[i] = {VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL};
+        else infos[i] = {VK_NULL_HANDLE, view != views.end() ? *view++ : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstSet = set;
+        wr[i].dstBinding = static_cast<std::uint32_t>(i);
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = t.types[i];
+        wr[i].pImageInfo = &infos[i];
     }
-    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    wr[0].pImageInfo = &src_info;
-    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    wr[1].pImageInfo = &sampler_info;
-    wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    wr[2].pImageInfo = &dst_info;
-    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
-    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), px, 0, 0, 0};
+    vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(wr.size()), wr.data(), 0, nullptr);
+    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, 0, 0, 0};
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_view_pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_view_layout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cb, g_view_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     vkCmdDispatch(cb, (g_ow + 7) / 8, (g_oh + 7) / 8, 1);
 }
+
+// The reprojection check's last scene: a copy of each frame's at the call point.
+OwnImage g_prev_scene;
+VkFormat g_prev_scene_format = VK_FORMAT_UNDEFINED;
+bool g_prev_scene_valid = false;
+
+// The check of this frame's motion against the last frame's scene, into
+// g_output; then this frame's scene kept for the next.
+void record_motion_check(VkCommandBuffer cb, RtImage& scene, float gain) {
+    if (g_prev_scene.image && (g_prev_scene_format != scene.format)) {
+        drop(g_prev_scene);
+        g_prev_scene_valid = false;
+    }
+    if (!g_prev_scene.image) {
+        if (!make(g_prev_scene, scene.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, g_w, g_h)) {
+            drop(g_prev_scene);
+            return;
+        }
+        g_prev_scene_format = scene.format;
+        g_prev_scene_valid = false;
+    }
+    if (g_prev_scene_valid) record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain);
+    barrier(cb, g_prev_scene.image, VK_IMAGE_ASPECT_COLOR_BIT, g_prev_scene_valid ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageCopy r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {g_w, g_h, 1};
+    vkCmdCopyImage(cb, scene.image, VK_IMAGE_LAYOUT_GENERAL, g_prev_scene.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier(cb, g_prev_scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+    g_prev_scene_valid = true;
+}
+
+// A test's picture in the upscaler's place (no sharpening over it).
+bool test_view() { return show_motion() > 0.0f || check_motion() > 0.0f; }
 
 // Whether the bridge's RGBA16F picture can be blitted into a scene of `format`.
 bool blit_into(VkFormat format) {
@@ -665,6 +730,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         drop(g_output);
         drop(g_motion);
         drop(g_sharp);
+        drop(g_prev_scene);
+        g_prev_scene_valid = false;
         g_w = scene.width;
         g_h = scene.height;
         g_ow = ow;
@@ -843,11 +910,13 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         prepare_frame_generation(cb, depth, depth_layout, jitter_x, jitter_y, c.motion_scale);
         ::run_forget_recorded_locked();
     }
-    if (const float px = show_motion(); px > 0.0f) record_motion_view(cb, px);  // (a test)
+    // (The tests: the motion, or its check, in the picture's place.)
+    if (const float px = show_motion(); px > 0.0f) record_test_pass(cb, g_view_pass, {g_motion.view}, px);
+    else if (const float gain = check_motion(); gain > 0.0f) record_motion_check(cb, scene, gain);
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     // Sharpness: the sharpened picture goes on in its place.
-    const float sharpness = show_motion() > 0.0f ? 0.0f : sharpness_now();
+    const float sharpness = test_view() ? 0.0f : sharpness_now();
     const OwnImage& picture = sharpness > 0.0f && record_rcas(cb, sharpness) ? g_sharp : g_output;
     if (g_scaled) {
         // The picture stays here for YEBIS's copy, which samples it in the
@@ -946,7 +1015,7 @@ VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t
     if (!g_scaled || !g_output_ready || !g_output.view || scene_w != g_w || scene_h != g_h) return VK_NULL_HANDLE;
     // The image this frame's upscale leaves its picture in: sharpened or not,
     // as the setting is now.
-    return sharpness_now() > 0.0f && show_motion() <= 0.0f && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
+    return sharpness_now() > 0.0f && !test_view() && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
 }
 
 bool upscale_camera_noted() { return g_cam_noted; }
