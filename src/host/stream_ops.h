@@ -48,6 +48,9 @@ enum class Op : std::uint16_t {
     kDispatchIndirect,   // vkCmdDispatchIndirect
     kMarker,             // AMD's buffer markers around what follows (gpu_write_markers)
     kPushBuffers,        // vkCmdPushDescriptorSetKHR of storage buffers (a dispatch's)
+    kListDraw,           // a draw packet a pool thread committed ahead (stage 4b.1b), replayed here
+    kExecuteCommands,    // vkCmdExecuteCommands of a segment a pool thread recorded (stage 4b.2)
+    kListRun,            // a segment's list packets replayed here one after another (stage 4b.2, inline)
     kCount
 };
 
@@ -83,6 +86,32 @@ struct ForeignSubmit {
 };
 struct DrawState {
     std::uint64_t packet;  // the packet's number (recorder.cpp's packet ring)
+};
+// Stage 4b.1b: the list packet at `index` (recorder.cpp's list packets, one a
+// token slot), committed for GX-native draw token `id`. Not a pointer: the
+// packet lives in the recorder's own array until the token's slot comes round
+// again, which the pool waits for the recorder to have replayed it.
+struct ListDraw {
+    std::uint64_t index, id;
+    // The op before it in the stream is the list packet spliced just before it,
+    // with nothing recorded in place between: the recorder leaves out the binds
+    // that one already made (recorder.cpp replay_packet's `prev`).
+    std::uint64_t chained;
+};
+// Stage 4b.2: a segment's secondary command buffer, recorded on a pool thread
+// (render.cpp lists_segment), executed in the pass open here.
+struct ExecuteCommands {
+    VkCommandBuffer cmd;
+};
+// Stage 4b.2 replayed inline (the default): a segment's list packets, each
+// chained to the one before, with its dynamic offsets.
+struct ListRun {
+    std::uint32_t n, pad;
+    // + ListRunDraw[n]
+};
+struct ListRunDraw {
+    std::uint64_t index, id;  // the list packet, and the token it was spliced for
+    std::uint32_t dyn[2];
 };
 struct Barrier {
     VkPipelineStageFlags src, dst;
@@ -205,7 +234,8 @@ struct PushBuffers {
 };
 
 template <class T> constexpr bool kRecordable = std::is_trivially_copyable_v<T> && alignof(T) <= 8;
-static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<Barrier> &&
+static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<ListDraw> &&
+                  kRecordable<ExecuteCommands> && kRecordable<ListRun> && kRecordable<ListRunDraw> && kRecordable<Barrier> &&
                   kRecordable<Flag> && kRecordable<BeginRendering> && kRecordable<Fill> && kRecordable<CopyBuffer> &&
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&

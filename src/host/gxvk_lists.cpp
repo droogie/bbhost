@@ -78,6 +78,9 @@ struct CpList {
     u32 stitch = 0;               // draws whose needs are all work a stitcher can do before their segment, and read no answer
     u32 stitch_mirror = 0;        // ... the buffer shadow's mirror work counted as such too
     u32 cont = 0;                 // the rest of a list a submission's end cut (its first part went before)
+    // Stage 4b.3a(i): draws that read no answer but a twin's, and of them those a stitcher could take - the order-free
+    // shares once twins no longer depend on the order (stage 4b.3c: device-local from creation).
+    u32 order_clean_nt = 0, stitch_nt = 0;
     u64 call_flip = 0, cp_flip = 0;
     u64 tsc_first = 0, tsc_end = 0, tsc_draws = 0;
 };
@@ -112,6 +115,7 @@ struct Agg {
     u64 effect_draws[kEffects] = {}, first_effect_lists[kEffects] = {}, first_effect_draws[kEffects] = {};
     u64 order_draws[kOrderKinds] = {}, order_clean = 0, both_clean = 0, lists_both_clean = 0, lists_both_clean_draws = 0;
     u64 stitch = 0, stitch_mirror = 0, lists_stitch = 0, lists_stitch_draws = 0, lists_stitch_mirror = 0, lists_stitch_mirror_draws = 0;
+    u64 order_clean_nt = 0, stitch_nt = 0;
     u64 inside[kKinds] = {}, between[kKinds] = {};
     u64 list_sizes[kSizes] = {}, list_size_draws[kSizes] = {}, seg_sizes[kSizes] = {}, seg_draws[kSizes] = {};
     u64 tsc_span = 0, tsc_draws = 0;
@@ -294,6 +298,8 @@ void Fold::add(Agg& a, const CpList& l, u64 fin, u64 ex) {
     a.both_clean += l.both_clean;
     a.stitch += l.stitch;
     a.stitch_mirror += l.stitch_mirror;
+    a.order_clean_nt += l.order_clean_nt;
+    a.stitch_nt += l.stitch_nt;
     if (l.stitch == l.draws) {
         ++a.lists_stitch;
         a.lists_stitch_draws += l.draws;
@@ -391,6 +397,9 @@ void Fold::line(const Agg& a, const char* what) {
              "%.1f%% (%.1f%% of draws)",
              what, pct(a.stitch, a.draws), pct(a.lists_stitch, a.lists), pct(a.lists_stitch_draws, a.draws), pct(a.stitch_mirror, a.draws),
              pct(a.lists_stitch_mirror, a.lists), pct(a.lists_stitch_mirror_draws, a.draws));
+    host_log("gxvk lists (%s): with a twin's answer taken as order-free (stage 4b.3c): draws that read an answer of the order %.2f%%, "
+             "draws a stitcher could take %.1f%%",
+             what, 100.0 - pct(a.order_clean_nt, a.draws), pct(a.stitch_nt, a.draws));
     host_log("gxvk lists (%s): vertex slots without a GX handle %.1f%% (draws with one %.1f%%), indexed draws whose index buffer has none "
              "%.2f%% of draws; tessellated %.2f%%, geometry-shader %.2f%%, indirect %.2f%% of draws",
              what, pct(a.vtx_nohandle, a.vtx_slots), pct(a.draws_nohandle, a.draws), pct(a.ib_nohandle, a.draws), pct(a.tess, a.draws),
@@ -546,6 +555,10 @@ void cp_draw_end() {
     if (!e && !o) ++l.both_clean;
     if (!o && (e & ~kStitchable) == 0) ++l.stitch;
     if (!o && (e & ~(kStitchable | kMirrorNeed)) == 0) ++l.stitch_mirror;
+    if (!(o & ~kOrderTwin)) {
+        ++l.order_clean_nt;
+        if ((e & ~kStitchable) == 0) ++l.stitch_nt;
+    }
     t_effects = 0;
     t_order = 0;
 }

@@ -52,10 +52,26 @@ int run_commit_from_env() {
 }
 }  // namespace
 
-const int g_batch = [] {
+namespace {
+// Whether stage 4b's pool may commit draws ahead (BBHOST_GXVK_LISTS=splice*,
+// segments*, or unset with the homes asked for: the segments follow them),
+// read from the environment as g_parts is.
+bool lists_may_splice_from_env() {
+    const char* l = std::getenv("BBHOST_GXVK_LISTS");
+    if (l && *l) return std::strncmp(l, "splice", 6) == 0 || std::strncmp(l, "segments", 8) == 0;
+    const char* h = std::getenv("BBHOST_GXVK_HOMES");
+    return h && h[0] == '1' && !h[1];
+}
+}  // namespace
+
+std::atomic<int> g_batch = [] {
     const char* e = std::getenv("BBHOST_RUN_BATCH");
     // A run's parts take its targets as batching shares them: on with the commit.
-    if (!e || !*e) return run_commit_from_env() >= 2 ? 1 : 0;
+    if (!e || !*e) {
+        if (run_commit_from_env() >= 2) return 1;
+        // And with stage 4b.1b's splice and 4b.2's segments: a run's later draws find its first's targets.
+        return lists_may_splice_from_env() ? 1 : 0;
+    }
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
 }();
@@ -68,6 +84,24 @@ const int g_draw_ctx = [] {
 }();
 
 const int g_commit = run_commit_from_env();
+
+// (Read from the environment, not from g_commit or gxvk_lists: no order
+// between the two modules' initialisers.)
+std::atomic<bool> g_parts = [] {
+    if (run_commit_from_env() >= 2) return true;
+    return lists_may_splice_from_env();
+}();
+
+std::atomic<bool> g_sinks = g_commit != 0 || g_parts.load();  // (after both: this file's order)
+
+void follow_homes() {
+    const char* l = std::getenv("BBHOST_GXVK_LISTS");
+    if (l && *l) return;  // the switch's own answer stands (lists_may_splice_from_env)
+    const char* e = std::getenv("BBHOST_RUN_BATCH");
+    if ((!e || !*e) && g_batch.load(std::memory_order_relaxed) == 0) g_batch.store(1, std::memory_order_relaxed);
+    g_parts.store(true, std::memory_order_relaxed);
+    g_sinks.store(true, std::memory_order_relaxed);
+}
 
 void log_commit_default() {
     static std::once_flag once;
@@ -273,7 +307,7 @@ void log_batch() {
              "shared: something in order since %llu, the GPU mutex taken by another %llu, a target made or resized %llu, an HTILE fill "
              "noted or taken %llu, other targets or state %llu, a draw that does not share %llu; compared %llu, differed %llu; lite drains at a "
              "draw's first vertex record %llu",
-             g_batch == 2 ? "compare" : "on", static_cast<ull>(n(kBatchTargetsShared)), static_cast<ull>(asked),
+             batch_compare() ? "compare" : "on", static_cast<ull>(n(kBatchTargetsShared)), static_cast<ull>(asked),
              pct(n(kBatchTargetsShared), asked), static_cast<ull>(n(kBatchMissSplit)), static_cast<ull>(n(kBatchMissLock)),
              static_cast<ull>(n(kBatchMissRemade)), static_cast<ull>(n(kBatchMissFill)), static_cast<ull>(n(kBatchMissInputs)),
              static_cast<ull>(n(kBatchMissKind)),
@@ -356,10 +390,10 @@ void note_draw(const GpuDrawInputs& in, const GxDrawObjects& o) {
 
 void report(bool at_exit) {
     if (at_exit && g_commit) log_commit();
-    if (at_exit && g_batch) log_batch();
+    if (at_exit && batching()) log_batch();
     if (at_exit && g_draw_ctx) log_ctx();
     if (!g_mode || !host_tooling()) return;
-    if (g_batch && !at_exit) log_batch();
+    if (batching() && !at_exit) log_batch();
     static std::mutex mu;
     static Counts last;
     static u64 last_flip = 0;

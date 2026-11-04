@@ -14,6 +14,7 @@
 // nothing changes.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -30,11 +31,12 @@ extern const int g_mode;
 // of a run takes from the draw before it: its targets' lookups (render.cpp
 // draw_targets); and, on, the lite shadow drains GX's notices once a draw
 // rather than once a vertex record (no answer to check: compare drains as
-// before).
-extern const int g_batch;
-inline bool batching() { return g_batch != 0; }
-inline bool batch_compare() { return g_batch == 2; }
-inline bool batch_shares() { return g_batch == 1; }
+// before). Unset, also on where the homes are on by default (follow_homes).
+extern std::atomic<int> g_batch;
+inline int batch_mode() { return g_batch.load(std::memory_order_relaxed); }
+inline bool batching() { return batch_mode() != 0; }
+inline bool batch_compare() { return batch_mode() == 2; }
+inline bool batch_shares() { return batch_mode() == 1; }
 // BBHOST_DRAW_CONTEXT: 0 off (the default), 1 (`chunks`) the command
 // processor's draws take their rings' space through a context of chunks
 // (gpu_internal.h DrawCtx), and the census below counts what they still take
@@ -75,8 +77,25 @@ void log_commit_default();
 inline bool committing() { return g_commit != 0; }
 inline bool commit_draws() { return g_commit >= 2; }
 inline bool commit_compare() { return g_commit == 3; }
+// Whether draws are committed off the order at all: a run's parts (the
+// commit on or compare) or stage 4b.1b's pool committing draws ahead of the
+// command processor (BBHOST_GXVK_LISTS=splice or splice-compare,
+// host/gxvk_lists.h). The part machinery (render.cpp RunDraw, run_part_stop,
+// the draw contexts, the counters' sinks) reads it; the run commit's own
+// fork and join read commit_draws().
+extern std::atomic<bool> g_parts;
+inline bool parts() { return g_parts.load(std::memory_order_relaxed); }
+// committing() || parts() in one load: whether a counter's bump looks for its
+// thread's sink (gpu_internal.h bump).
+extern std::atomic<bool> g_sinks;
+inline bool sinks() { return g_sinks.load(std::memory_order_relaxed); }
+// The constant buffers' homes on by default (host/gxvk_homes.h homes_decide,
+// with the device, before any draw): with BBHOST_GXVK_LISTS unset the pool's
+// segments follow them, so the batching (unless BBHOST_RUN_BATCH says) and the
+// part machinery go on as BBHOST_GXVK_HOMES=1 turns them on at the start.
+void follow_homes();
 // Whether the command processor tells this module what it walks.
-inline bool on() { return g_mode != 0 || g_batch != 0 || g_commit != 0; }
+inline bool on() { return g_mode != 0 || batch_mode() != 0 || g_commit != 0; }
 // Whether the run census counts.
 inline bool census() { return g_mode != 0; }
 // This command-processor thread's run: moves at every split, so two draws

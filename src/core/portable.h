@@ -43,6 +43,9 @@ void host_thread_set_name(const char* name);
 // Puts the calling thread at the lowest priority there is (idle on Windows,
 // nice 19 on Linux), for good: work that must never take a core the game wants.
 void host_thread_background();
+// The hardware threads this process may run on: its CPU affinity (a taskset,
+// numactl, `start /affinity`, a job object's), else every one the system has.
+unsigned host_cpu_threads();
 // The largest width and height among the desktop's displays, in physical
 // pixels (each display's current mode). False when the platform does not say:
 // a headless run (host_set_headless), or a build without SDL off Windows.

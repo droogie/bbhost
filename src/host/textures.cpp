@@ -2237,6 +2237,12 @@ void textures_drain_gx_writes_locked() {
     if (gx_writes_pending().load(std::memory_order_acquire)) drain_gx_writes_locked();
 }
 void refresh_surface_locked(Surface& sf) {
+    // Stage 4b.1b's list mode: a surface bound other than by its view's id is
+    // refreshed in order (the splice asks only views by id).
+    if (t_run_draw && t_run_draw->list) {
+        run_part_stop(kRunStopRefresh);
+        return;
+    }
     // A made-ahead upload still to be recorded (BBHOST_GXVK_AHEAD_DEFER) is
     // recorded before the image is used, in order: a run part's draw stops
     // there, as at a refresh's own upload (a local stop - only draws that
@@ -3385,6 +3391,11 @@ std::uint64_t view_epoch() { return g_view_epoch; }
 // what it may and may not skip.
 VkImageView texture_view(const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
                          bool shader_arrayed, bool r128) {
+    if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: views by their GX id only (the splice asks those)
+        g_list_image_stops[0].fetch_add(1, std::memory_order_relaxed);
+        run_part_stop(kRunStopImages);
+        return VK_NULL_HANDLE;
+    }
     if (!g_view_memo_mode) {
         const VkImageView v = texture_view_uncached(w, storage, dims_ok, dim, arrayed, shader_arrayed, r128);
         if (img_census::on()) img_census::g_last = g_last_view_surface;
@@ -3578,6 +3589,32 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                                bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    if (t_run_draw && t_run_draw->list) [[unlikely]] {
+        // Stage 4b.1b's list mode, under the readers' lock (out of line: the
+        // pool's draws only): the entry as it was made (its view, dims, surface
+        // and slot are written only with the lock held), its refresh asked at
+        // the splice (texture_view_splice_ok). An entry the view epoch has
+        // moved past since it was refreshed still names its view: the splice
+        // binds the commit only where the entry holds that view at the epoch of
+        // its place (texture_view_splice_ok), and a set that held a view let go
+        // is dropped from the cache first.
+        return [&]() __attribute__((noinline)) {
+            const IdViewPub& pub = g_id_views_pub[id & (kIdViewSlots - 1)];
+            const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
+            if (!found || copy_elide_live()) {
+                g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
+                run_part_stop(kRunStopImages);
+                return VkImageView{VK_NULL_HANDLE};
+            }
+            t_run_draw->list->note_view(id, flags, found, !e.sf, w);
+            if (slot) *slot = e.slot;
+            if (base) *base = e.base;
+            dims_ok = e.dims_ok;
+            dim = e.dim;
+            arrayed = e.arrayed;
+            return found;
+        }();
+    }
     // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image until the copy is made: resolved
     // again (by its T#'s base, which stage 2's entries keep), and not remembered.
     const bool elided = e.id == id && !e.sf && copy_elide_live() && (g_images_mode ? copy_elide_hides(e.base) : copy_elide_hides_tsharp(w));
@@ -3588,7 +3625,11 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                           (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
                           !gx_writes_pending().load(std::memory_order_acquire);
         const bool part = run_part();  // BBHOST_RUN_COMMIT: a run part's draw writes no entry and no count
-        if (skip && g_images_mode == 1) {
+        if (t_run_draw && t_run_draw->list) {
+            // Stage 4b.1b's list mode: its refresh is asked at its splice, in
+            // the recording it lands in (texture_view_splice_ok).
+            t_run_draw->list->note_view(id, flags, e.view, true, w);
+        } else if (skip && g_images_mode == 1) {
             if (!part) ++g_images_skips;
         } else {
             const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
@@ -3652,13 +3693,61 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
-        if (cache_rw::g_readers) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
+        if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
                             reinterpret_cast<std::uint64_t>(view));  // stage 4b.1a's compare
     }
     return view;
+}
+
+std::atomic<std::uint64_t> g_splice_view_why[kSpliceViewWhys] = {};
+std::atomic<std::uint64_t> g_splice_view_again[2] = {};
+bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view) {
+    IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
+    const auto no = [](int why) {
+        g_splice_view_why[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (e.id != id || e.flags != flags) return no(kSpliceViewGone);
+    if (e.epoch != static_cast<std::uint32_t>(g_view_epoch)) return no(kSpliceViewEpoch);
+    if (e.view != view) return no(kSpliceViewOther);
+    const bool elided = !e.sf && copy_elide_live();  // (its image's source bound until a copy is made: in order)
+    if (elided) return no(kSpliceViewElided);
+    if (e.sf && e.sf->pending) return no(kSpliceViewPending);  // a made-ahead upload to record first
+    const bool skip = e.fast && e.static_epoch == g_static_epoch &&
+                      (g_images_mode == 2 || static_cast<std::int32_t>(static_cast<std::uint32_t>(g_coarse_ms) - e.recheck_ms) < 0) &&
+                      !gx_writes_pending().load(std::memory_order_acquire);
+    if (skip && g_images_mode == 1) {
+        ++g_images_skips;
+        return true;
+    }
+    // Its refresh in this recording, made here as texture_view_by_id makes it
+    // in order: the gate's checks, an upload into the recording's uploads
+    // (before its draws), its stamp.
+    const std::uint32_t stamp = static_cast<std::uint32_t>(g.record_serial + 1);
+    if (e.sf && (!g_refresh_once || e.refreshed != stamp)) {
+        if (g_images_mode) {
+            images_refresh(e, skip);
+        } else {
+            refresh_surface_locked(*e.sf);
+        }
+        e.refreshed = stamp;
+        if (e.view != view || e.id != id) return no(kSpliceViewRemade);  // (remade by its refresh: in order)
+    }
+    if (e.sf) ahead_defer::met_pending(*e.sf, "its view's entry");
+    ++g_id_view_hits;
+    return true;
+}
+
+bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView view, const std::uint32_t* w) {
+    if (!w || (!w[0] && !w[1])) return false;  // (no words noted)
+    bool dims_ok = false, arrayed = false;
+    std::uint32_t dim = 0;
+    const VkImageView now = texture_view_by_id(id, w, (flags & 1) != 0, dims_ok, dim, arrayed, (flags & 2) != 0, (flags & 4) != 0, nullptr, nullptr);
+    g_splice_view_again[now == view ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    return now == view;
 }
 
 // Stage 4b.1a's reader path (host/cache_rw.h, under its shared lock): the view
@@ -3672,6 +3761,7 @@ VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
 }
 
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
+    if (t_run_draw && t_run_draw->list) return false;  // stage 4b.1b: key_dim is written without the readers' lock
     const IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
     if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags || e.key_dim == kNoKeyDim) return false;
     dim = e.key_dim & (depth ? 0xffu : 0x7fffffffu);  // a depth compare's has no texel kind (image_dim_of)
@@ -3680,6 +3770,7 @@ bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, st
 }
 
 void texture_key_dims_note(std::uint32_t id, std::uint8_t flags, std::uint32_t dim, bool arrayed) {
+    if (t_run_draw && t_run_draw->list) return;  // (the command processor's to note)
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
     if (e.id == id && e.epoch == static_cast<std::uint32_t>(g_view_epoch) && e.flags == flags) e.key_dim = (dim & 0x7fffffffu) | (arrayed ? 0x80000000u : 0u);
 }
@@ -3860,7 +3951,16 @@ bool sampler_fixes_on() {
     return on;
 }
 
+std::atomic<std::uint64_t> g_list_image_stops[3] = {};  // stage 4b.1b's list mode: by words, a view by id not found, a sampler
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
+    if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: the reader path (made in order)
+        const VkSampler found = sampler_find(s, compare);
+        if (!found) {
+            g_list_image_stops[2].fetch_add(1, std::memory_order_relaxed);
+            run_part_stop(kRunStopImages);
+        }
+        return found;
+    }
     // The last sampler made for these words, in front of the map (samplers
     // are never destroyed).
     struct Memo {
@@ -5862,7 +5962,7 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         IdViewEntry& e = g_id_views[i];
         if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
             e.epoch = 0;
-            if (cache_rw::g_readers) g_id_views_pub[i].epoch = 0;
+            if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[i].epoch = 0;
         }
     }
 }

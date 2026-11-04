@@ -44,8 +44,10 @@
 #include "guest_abi.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
+#include "host/cb_capture.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
+#include "host/gxvk_homes.h"
 #include "log.h"
 
 #if !defined(_WIN32)
@@ -477,6 +479,9 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         // BBHOST_GX_TWINS=1: one the GPU writes gets a device-local twin at its first use.
         host_gpu_gx_buffer_made(e.info.memory, e.info.bytes, e.info.usage, bind, e.info.gen);
     }
+    // Stage 4b.3c (host/gxvk_homes.h): its memory is this resource's now - a home over it (its buffer's end unseen)
+    // ends, before this resource's own home, if it gets one, is made.
+    if (e.info.memory && e.info.bytes) host_gpu_home_covered(e.info.memory, e.info.bytes, gxvk_homes::kEndReplaced);
     // GX on Vulkan (host/gxvk.h): a buffer the host keeps gets its entry and
     // its handle at +0x14; BBHOST_GXVK_CENSUS: the class word and canaries in
     // the holder's spare bytes. Not a 1D texture's, whose holder GX builds
@@ -487,8 +492,13 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
             std::uint32_t misc = 0;
             rd(holder + 0x3a, &cpu);
             rd(holder + 0x3c, &misc);
+            // (The holder's +0x14 as GX left it: a home's handle there is an older buffer's, ended unheard of.)
+            std::uint32_t spare = 0;
+            rd(holder + gxvk::kHolderSpareA, &spare);
             gxvk::buffer_made(holder, e.info.memory, e.info.bytes, e.info.usage, cpu, e.info.bind, misc, initial_data);
             gxvk::census_buffer_made(holder, initial_data);
+            // Stage 4b.3c (host/gxvk_homes.h): a constant buffer's device-local home, its handle at +0x14.
+            host_gpu_home_made(holder, e.info.memory, e.info.bytes, e.info.usage, cpu, e.info.bind, spare);
         } else if (e.info.type == 3 || e.info.type == 4) {
             gxvk::census_texture_made(holder);
         }
@@ -693,6 +703,7 @@ void unregister_holder(std::uint64_t holder) {
         host_gpu_gx_buffer_gone(buffer_memory, buffer_gen);
     }
     if (buffer_memory) gxvk::buffer_gone(holder);
+    if (buffer_memory) host_gpu_home_end(holder, gxvk_homes::kEndGone);
 }
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
@@ -808,6 +819,8 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     if (moved_from && moved_bytes) host_gpu_shadow_gx_write(moved_from, moved_bytes);
     // The CPU writes the buffer in place: gx twins keep no device-local copy of it.
     if (own_memory) host_gpu_gx_buffer_mapped_own(own_memory, own_bytes, own_gen);
+    // ...nor a home (stage 4b.3c): it is copied back there, and the buffer takes today's path from now on.
+    if (own_memory) host_gpu_home_end(holder, gxvk_homes::kEndCpuMapped);
     // A texture mapped (none is, in any run so far): the CPU writes it next,
     // and its image is no longer what its memory holds - the texture cache,
     // which does not watch a GX resource's memory, is told (host textures).
@@ -1609,13 +1622,15 @@ void gx_resources_install(ElfImage* image) {
     }
     // The block pool's hand-outs: for the census, and for GX on Vulkan's arena's
     // release proof (host/gxvk_arena.cpp).
-    if (g_census || gxvk::census() || gxvk::arena_wanted())
+    // (The arena's records are wanted for its in-place bindings or for the
+    // copy-backs from the heap, stage 1d.2a: gxvk::arena_proof_wanted.)
+    if (g_census || gxvk::census() || gxvk::arena_proof_wanted())
         hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-    if (gxvk::census() || gxvk::arena_wanted())
+    if (gxvk::census() || gxvk::arena_proof_wanted())
         hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     // Its top end: the arena's records must hold both ends' hand-outs, or the
     // memory one end reuses reads as the other end's stale record once they meet.
-    if (gxvk::arena_wanted()) {
+    if (gxvk::arena_proof_wanted()) {
         hook(kPoolTopBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 1);
         hook(kPoolTopAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 1);
     }
@@ -1638,7 +1653,7 @@ void gx_resources_install_late(ElfImage* image) {
     // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
     // its init tells the host of it (the entry above); the game's is hooked at
     // its prologue for the census (the arena then has no heap: today's path).
-    if (gxvk::census() || gxvk::arena_wanted() || gxvk::heap_snap_wanted()) {
+    if (gxvk::census() || gxvk::arena_proof_wanted() || gxvk::heap_snap_wanted()) {
         if (decomp_placed("gx_upload_pool_init") == 1) {
             decomp_gx::g_upload_region_entry = hle_wrap_fn(reinterpret_cast<void*>(&upload_region_entry));
         } else if (gxvk::census()) {
@@ -1788,6 +1803,7 @@ void gx_resources_memory_protected(std::uint64_t va, std::size_t len, int prot) 
 
 void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
     gxvk::heap_written(gxvk::kHeapGuardUnmap, va, len);  // GX's upload heap is mapped for the session (stage 1d.1)
+    if (len) host_gpu_home_covered(va, len, gxvk_homes::kEndUnmapped);  // the homes over it end (stage 4b.3c)
     if (!g_gx_res_after_thunk || !len) return;
     std::uint64_t n = 0;
     {
@@ -2118,4 +2134,6 @@ void gx_resources_report() {
     gxvk::buffers_report();
     gxvk::arena_report();
     gxvk::heap_snap_report();
+    gxvk::heap_copy_report();
+    cb_capture::report();
 }

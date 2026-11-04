@@ -13,7 +13,11 @@
 // a trip must hold for the rest of the run, so that every binding of the heap
 // takes the lookups after it. With the switch off nothing may trip or count;
 // with compare the choice is the same and only the binding differs (render.cpp).
-// Then eleven deliberate mistakes, each of which must be caught.
+// Stage 1d.2a's choice for a copy-back's source is checked the same way: its
+// edges, its reasons in their order, generated sources against its rule, and
+// its counts (a source outside the heap counts nothing; one after a 1d.1 trip,
+// with the snapshots off, or refused by the arena keeps today's copy).
+// Then seventeen deliberate mistakes, each of which must be caught.
 // Built with GXVK_HEAPSNAP_TESTING and GXVK_HEAPSNAP_MUTANTS (CMakeLists.txt).
 #include "host/gxvk.h"
 
@@ -51,6 +55,101 @@ int model(const HeapSnapCase& c) {
     if (c.check) return gxvk::kHeapSnapCheck;
     if (!c.ring) return gxvk::kHeapSnapNoRing;
     return gxvk::kHeapSnapFast;
+}
+
+// Stage 1d.2a's rule: outside the heap nothing; then the snapshots off, a trip,
+// past the heap's end, no ring, an earlier version, not in one import.
+int copy_model(const gxvk::HeapCopyCase& c) {
+    if (!c.lo || c.src < c.lo || c.src >= c.hi) return gxvk::kHeapCopyNotHeap;
+    if (!c.snapshots) return gxvk::kHeapCopySnapOff;
+    if (c.tripped) return gxvk::kHeapCopyTripped;
+    if (c.src + c.bytes > c.hi) return gxvk::kHeapCopyPastEnd;
+    if (!c.ring) return gxvk::kHeapCopyNoRing;
+    if (c.earlier) return gxvk::kHeapCopyEarlier;
+    if (!c.located) return gxvk::kHeapCopyNotLocated;
+    return gxvk::kHeapCopyFast;
+}
+
+void expect_copy(const gxvk::HeapCopyCase& c, int want, long step, const char* what) {
+    const int got = gxvk::heap_copy_class(c);
+    if (got != want || got != copy_model(c)) fail(what, step);
+}
+
+// The copy-backs' choice: edges, reasons, generated sources, counts.
+void copies(std::mt19937_64& rng, long& step) {
+    const u64 lo = 0x143400040, hi = lo + (160u << 20);
+    gxvk::HeapCopyCase c;
+    c.lo = lo;
+    c.hi = hi;
+    const auto at = [&](u64 src, u64 bytes) {
+        gxvk::HeapCopyCase k = c;
+        k.src = src;
+        k.bytes = bytes;
+        return k;
+    };
+    expect_copy(at(lo, 256), gxvk::kHeapCopyFast, ++step, "a source at the heap's start: taken as it is");
+    expect_copy(at(lo - 16, 64), gxvk::kHeapCopyNotHeap, ++step, "a source below the heap: not the heap's");
+    expect_copy(at(hi - 64, 64), gxvk::kHeapCopyFast, ++step, "a source ending at the heap's end: taken");
+    expect_copy(at(hi - 64, 65), gxvk::kHeapCopyPastEnd, ++step, "a source a byte past the heap's end: today's copy");
+    expect_copy(at(hi, 16), gxvk::kHeapCopyNotHeap, ++step, "a source at the heap's end: not the heap's");
+    gxvk::HeapCopyCase k = at(lo + 4096, 256);
+    k.snapshots = false;
+    k.tripped = true;
+    expect_copy(k, gxvk::kHeapCopySnapOff, ++step, "the snapshots off come first: today's copy");
+    k = at(lo + 4096, 256);
+    k.tripped = true;
+    k.earlier = true;
+    expect_copy(k, gxvk::kHeapCopyTripped, ++step, "a 1d.1 trip: today's copy");
+    k = at(lo + 4096, 256);
+    k.ring = false;
+    expect_copy(k, gxvk::kHeapCopyNoRing, ++step, "no ring yet: today's copy");
+    k = at(lo + 4096, 256);
+    k.earlier = true;
+    k.located = false;
+    expect_copy(k, gxvk::kHeapCopyEarlier, ++step, "an earlier version over the source: today's copy");
+    k = at(lo + 4096, 256);
+    k.located = false;
+    expect_copy(k, gxvk::kHeapCopyNotLocated, ++step, "not in one import: today's copy");
+    std::uniform_int_distribution<int> coin(0, 9);
+    for (int n = 0; n < 20000; ++n) {
+        gxvk::HeapCopyCase g = c;
+        const int where = coin(rng);
+        g.src = where == 0 ? lo - 1 - rng() % 4096 : where == 1 ? hi + rng() % 4096 : where == 2 ? hi - 1 - rng() % 4096 : lo + rng() % (hi - lo);
+        g.src &= ~u64{3};
+        g.bytes = 4 + (rng() % 16384) * 4;
+        g.snapshots = coin(rng) != 0;
+        g.tripped = coin(rng) == 0;
+        g.ring = coin(rng) != 0;
+        g.earlier = coin(rng) == 0;
+        g.located = coin(rng) != 0;
+        if (gxvk::heap_copy_class(g) != copy_model(g)) {
+            fail("a generated source: the copy-backs' choice is not the rule's", ++step);
+            break;
+        }
+    }
+    // The counts, with the heap known and the snapshots on.
+    gxvk::heap_snap_test_reset(HeapSnap::kOn, lo, hi);
+    gxvk::heap_copy_test_reset(gxvk::HeapCopy::kOn);
+    gxvk::heap_snap_region(lo, hi);
+    if (gxvk::heap_copy_decide(lo + 4096, 256, true, false, true) != gxvk::kHeapCopyFast) fail("a source in the heap not taken", ++step);
+    if (gxvk::heap_copy_decide(lo - 4096, 256, true, false, true) != gxvk::kHeapCopyNotHeap) fail("a source outside the heap taken", ++step);
+    if (gxvk::heap_copy_decide(lo + 8192, 256, true, true, true) != gxvk::kHeapCopyEarlier) fail("an earlier version not counted", ++step);
+    gxvk::heap_copy_held(true, 256);
+    gxvk::heap_copy_held(false, 256);
+    gxvk::heap_copy_bound(true);
+    gxvk::heap_copy_bound(true);
+    gxvk::heap_copy_bound(false);
+    auto k2 = gxvk::heap_copy_test_counts();
+    if (k2.fast != 1 || k2.held != 1 || k2.fell[gxvk::kHeapCopyEarlier] != 1 || k2.fell[gxvk::kHeapCopyNotHeld] != 1)
+        fail("the copy-backs' counts: one taken, one held, one earlier, one the arena refused", ++step);
+    if (k2.bound != 2 || k2.bound_wide != 1) fail("the homes' bindings: two snapshotted from the source, one put in place first", ++step);
+    gxvk::heap_written(gxvk::kHeapGuardGpuWrite, lo + 64, 16);  // a 1d.1 guard trips: copies as today from here on
+    if (gxvk::heap_copy_decide(lo + 4096, 256, true, false, true) != gxvk::kHeapCopyTripped) fail("a source taken after a 1d.1 trip", ++step);
+    gxvk::heap_snap_test_reset(HeapSnap::kOff, lo, hi);  // the snapshots off: a home's bindings would read the heap in place
+    gxvk::heap_snap_region(lo, hi);
+    if (gxvk::heap_copy_decide(lo + 4096, 256, true, false, true) != gxvk::kHeapCopySnapOff) fail("a source taken with the snapshots off", ++step);
+    gxvk::heap_copy_test_reset(gxvk::HeapCopy::kOff);
+    if (gxvk::heap_copy_decide(lo + 4096, 256, true, false, true) != gxvk::kHeapCopyNotHeap) fail("the switch off: a source taken", ++step);
 }
 
 void expect_class(const HeapSnapCase& c, int want, long step, const char* what) {
@@ -208,6 +307,7 @@ long run_all(std::mt19937_64& rng) {
     counted(HeapSnap::kOff, step);
     counted(HeapSnap::kOn, step);
     counted(HeapSnap::kCompare, step);
+    copies(rng, step);
     return step;
 }
 
@@ -220,7 +320,7 @@ int main() {
         std::printf("gxvk_heapsnap_test: %d failures in %ld checks\n", g_failed, steps);
         return 1;
     }
-    std::printf("gxvk_heapsnap_test: %ld checks and 3 x 20000 generated bindings passed\n", steps);
+    std::printf("gxvk_heapsnap_test: %ld checks, 3 x 20000 generated bindings and 20000 generated copy-back sources passed\n", steps);
     // The mistakes: each must fail some check.
     const char* const kMutants[] = {"",
                                     "a range one byte past the heap's end taken",
@@ -233,7 +333,13 @@ int main() {
                                     "a guard tripping before the heap is known",
                                     "CPU-written windows ignored",
                                     "no ring ignored",
-                                    "a guard that counts but does not trip"};
+                                    "a guard that counts but does not trip",
+                                    "a trip ignored by the copy-backs' choice",
+                                    "the heap snapshots off ignored by the copy-backs' choice",
+                                    "an earlier version over the source ignored",
+                                    "no ring ignored by the copy-backs' choice",
+                                    "a source below the heap taken",
+                                    "a source one byte past the heap's end taken"};
     int caught = 0;
     const int mutants = static_cast<int>(sizeof kMutants / sizeof kMutants[0]) - 1;
     g_quiet = true;

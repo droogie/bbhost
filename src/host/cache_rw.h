@@ -27,9 +27,9 @@
 
 namespace cache_rw {
 
-// Whether any reader may run: the pool's switch, read before any of the
-// game's code runs.
-extern const bool g_readers;
+// Whether any reader may run: the pool's switch, settled with the device
+// (gxvk_lists::settle) before any draw is made.
+extern std::atomic<bool> g_readers;
 
 // True on a reader's thread while it holds the lock shared.
 extern thread_local constinit bool t_reader;
@@ -44,18 +44,21 @@ void lock_shared_slow();
 void unlock_shared_slow();
 
 // The caches, as the writes name them (gxvk_lists::LookKind's order).
-enum Cache : int { kPrograms, kFetch, kPaths, kPlans, kViews, kSamplers, kCaches };
+enum Cache : int { kPrograms, kFetch, kPaths, kPlans, kViews, kSamplers, kCaches,
+                   // Stage 4b.1b's list mode reads these too: the render targets (g_rts), the
+                   // pipelines (g_gfx), the descriptor set cache.
+                   kTargets = kCaches, kPipelines, kSets, kKinds };
 
 // Each cache's writes so far (moved under the exclusive lock; a reader reads
 // them under the shared one).
-extern std::atomic<std::uint64_t> g_gen[kCaches];
+extern std::atomic<std::uint64_t> g_gen[kKinds];
 inline std::uint64_t gen(int cache) { return g_gen[cache].load(std::memory_order_relaxed); }
 
 // A writer around a change of `cache` a reader could see.
 struct Write {
     bool held = false;
     explicit Write(int cache) {
-        if (!g_readers || t_reader) return;
+        if (!g_readers.load(std::memory_order_relaxed) || t_reader) return;
         if (t_write_depth++ == 0) lock_slow();
         g_gen[cache].fetch_add(1, std::memory_order_relaxed);
         held = true;

@@ -260,9 +260,11 @@ import thread imported that the draws never read in place - is let go: its
 windows' entries point at the sink at once (no work in flight reads them, and
 the sink is memory every submission sees), it is freed once the work recorded
 with it has run, and a later use imports it again (host/import_retire.h,
-`BBHOST_IMPORT_RETIRE`; on by default with window imports on a graphics card,
-kept on an integrated GPU until one has run it). A retired import - let go, or
-replaced by a merge - is freed on a thread of its own, in the background and
+`BBHOST_IMPORT_RETIRE`; on by default wherever windows are imported, but on
+NVIDIA's driver under Windows, whose import of a window wanted again took
+23-57 ms on the command processor, at the draw that wanted it). A retired
+import - let go, or replaced by a merge - is freed on a thread of its own, in
+the background and
 50 ms apart (`BBHOST_IMPORT_FREE_THREAD=0` frees it on the command processor,
 `BBHOST_IMPORT_FREE_GAP_MS` sets the gap): the driver's free took up to 14 ms
 there. Window imports are on by
@@ -751,6 +753,93 @@ built yet; the reasoning, as measured on the development machine:
   after their GX call. The split, the runs (`BBHOST_LIST_RESOLVE=runs`) and
   the order to build it in are [list-resolve.md](list-resolve.md).
 
+**Draws committed ahead and spliced (`BBHOST_GXVK_LISTS=splice`, off by
+default while it is measured).** A first form of it is built: a pool of host
+threads (`bb-list0`, `bb-list1`) takes each GX-native draw a GX thread has
+stored and commits it ahead of the command processor through the draw path
+itself, in a list mode - a run part's draw (as the run commit's parts make
+them) with its own packet, its params blocks kept as contents, its constant
+buffers' copies in an arena of its own, the targets the command processor last
+looked up for the same target names, and the caches read through their readers'
+paths under a lock their writers take exclusive (`src/host/cache_rw.h`).
+Whatever only the command processor's place in the walk answers - the pass,
+the barriers owed for what the draw samples, owed clears, a texture's refresh in
+the recording it lands in, occlusion queries and predicates, a cached set
+still being the cache's, a home with a copy pending - is noted, not read. At
+the draw's token the command processor checks those notes against the run it
+has open (the run's first draw drawn as before: its targets looked up, its
+pass begun), makes the refreshes as it would, copies the params into the
+recording's slots and appends the packet; any draw not committed, or whose
+checks fail, is drawn as before, counted by why. A draw that reads an answer of
+the walk's order (copy versions, GPU writes, the buffer shadow's mirrors,
+twins) is not committed, so the constant buffers' homes
+(`BBHOST_GXVK_HOMES=1`) are what give it most of its draws.
+`BBHOST_GXVK_LISTS=splice-compare` draws every draw as before and compares
+each draw the splice would have taken with the commit, field by field; the
+pool's threads keep cores of their own (`BBHOST_GXVK_LIST_CPUS=off`: anywhere).
+On lavapipe at Central Yharnam with the homes on, the pool committed 64% of
+the draws and the command processor spliced 55%; the compare found 0 of 52,269
+draws different, and the frames were within the noise of the homes alone.
+
+**Segments (`BBHOST_GXVK_LISTS=segments`).** A list a GX context finishes
+comes to the pool as the draws its context recorded, in order, and a pool
+thread cuts it into segments: draws one after another in the list's command
+buffer - nothing between their tokens the command processor does in order -
+into the same targets and pass, each committed. A segment's first draw is left
+as the splice has it (it opens the command processor's run and pass); for the
+draws after it the pool writes their params blocks into its own region of the
+params buffer and merges what each noted for its splice. At the first of those
+draws the command processor checks that the stream holds the segment's tokens
+as recorded, checks the segment once as the splice checks a draw, and appends
+one op; the tokens of its other draws are given back as the walk meets them,
+without being read. By default the recorder replays the segment's packets
+into the command buffer from that op, chained. With
+`BBHOST_GXVK_SEGMENTS_REPLAY=secondary` the pool records them into a secondary
+command buffer instead - each draw under the caches' readers' lock, once the
+descriptor sets it binds are written - which the recorder executes: passes
+then begin able to hold secondaries where the device has
+`VK_KHR_maintenance7` (asked of the device only then), and are ended and begun
+again around them where it has not, at ~10 us of GPU time each. On an RTX
+4070 the two replays did as well as each other within noise, the inline one
+with a little less GPU time and a quarter of the pool's work a draw. A segment
+whose checks fail goes back to its draws' own splices, counted by why. The
+pool's constant-buffer copies take the last 16 MiB of the command processor's
+ring, which keeps the rest while the pool runs, so on a card with a small
+window of video memory the CPU writes both stay in video memory (in host
+memory the GPU read them across the bus: +11% GPU time on an RTX 4070).
+Unset, the switch follows the constant buffers' homes: segments where the
+homes bind by handle, off elsewhere (small video memory, an integrated GPU)
+with the reason in the log; the pool needs 8 hardware threads or more.
+`BBHOST_GXVK_LISTS=segments-compare` draws everything in order and compares
+each draw of a segment that would have been spliced with its commit. On an RTX
+4070 with the homes on, uncapped, the command processor's time a flip fell
+27-31% at Old Yharnam, the Nightmare of Mensis and Cainhurst's courtyard, at
+0.35-0.5 us a spliced draw, and the frame rate rose 5-11% at Old Yharnam,
+where the command processor had been the limit.
+
+**On by default above 60 fps (`BBHOST_GXVK_HOMES` unset).** The constant
+buffers' homes - and with them the segments, and the run batching
+(`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by default only
+where the frame rate can gain from them: a graphics card with room (the homes'
+own rule below: not an integrated GPU, no small video memory unless
+`BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget, no tight memory), 16 hardware
+threads or more that the process may run on (its CPU affinity, so a
+`taskset` counts), a frame rate above 60 (a fixed rate above 60, or
+Display-Limited on a display above 60 Hz), and the run commit off
+(`BBHOST_RUN_COMMIT`). At 60 and below the frame waits for its limit anyway,
+and the pool's two threads would cost about a core more for nothing, so
+everything there is as it was before them. The pool's splices give way to the
+run commit, which is on by default on Windows, and the homes beside it have
+not been measured there: on Windows they stay off by default, the run commit
+as it was, until a Windows measurement decides (`BBHOST_RUN_COMMIT=0` there
+lets the default decide). The homes are made as
+their buffers are, so the choice is made once, with the device at start: a
+frame rate changed in play applies at the next start, as the frame rate
+itself does (F10 marks it). Off, one line says why (`gxvk homes: off by
+default here (...)`); on, the homes' line says what decided it.
+`BBHOST_GXVK_HOMES=1` or `=0` decides either way, and `BBHOST_GXVK_LISTS` the
+segments alone.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in
@@ -920,6 +1009,76 @@ takes 0.46-0.49 ms a flip less at Old Yharnam, the Nightmare of Mensis and
 Central Yharnam, and Old Yharnam goes from 90.6 to 95.1 fps; at 60 it takes
 up to 0.55 ms a flip less, with the GPU's time, the frames and the frame
 pacing unchanged.
+
+**Copy-backs from the heap with no CPU copy (`BBHOST_GXVK_HEAP_COPY`, off by
+default while it is measured).** GX's map resolves copy each renamed buffer
+back to its own memory, its home - on the console a GPU copy in command
+order. bbhost makes each such copy-back a copy version: the source's bytes
+copied into staging as the command processor reaches it, bound for the home's
+draws until the batch's GPU copy puts them in place, so a draw of the home
+sees what the copy-back will write. Every such source is a renamed copy in
+GX's upload heap, which the game hands out again only after the work that
+read it has completed. With `BBHOST_GXVK_HEAP_COPY=1` the version is the
+source range itself: no staging and no CPU copy. The batch's GPU copy reads
+the heap; a draw that binds the home as a constant buffer takes the source
+through the heap's snapshot above, so no shader reads a renamed constant
+buffer in place (one over the snapshots' 1 MiB puts the copy-backs in place
+first); a vertex or index binding reads the heap. The release order
+is checked every run for these sources as for the arena: each source stamps
+the hand-out it lies in with its submission, and one source in 64 has its
+bytes hashed when it is taken and again when its submission has completed.
+GX can hand a source out again before its copy has run: it retires a
+context's blocks when UpdateSubresource kicks the context's command buffer,
+before the copy-backs that read renames in them are resolved, which on the
+console run right after the retire. So such a hand-out waits for the GPU
+first, as GX's own block reclaim does: what is recorded is submitted and
+run, and the copy has read the source before its new owner writes it.
+Changed bytes, or sixteen such waits within a minute, send every copy-back
+back to a CPU copy for the rest of the run. A source no hand-out
+holds, one an earlier version covers, one while the heap's
+snapshots are off or after their guards tripped, and any with window imports
+take today's copy, counted by reason. `BBHOST_GXVK_HEAP_COPY=compare` copies
+as today, runs the proof over the sources as 1 would, and compares each
+version with its source at its batch.
+
+**Constant buffers in device-local homes made at their creation, bound by
+handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps with 16 hardware
+threads or more, a card with room and the run commit off: "On by default above
+60 fps" above).** A
+constant buffer's own memory is written only by GX's GPU copies: every
+UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
+copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
+each constant buffer of default or dynamic usage gets a home when GX creates
+it - a range of a device-local pool, fixed for the buffer's life - and the
+home's handle in its holder. GX's draw records carry the handle beside the
+constant buffer's record when the record names the buffer's own memory, and
+the command processor binds the home by it: no copy version, no twin, no
+pending GPU write and no snapshot asked about. The copy-backs' bytes are
+copied when GX resolves them, on the GX thread that resolves, into a ring
+the GPU reads (a segment per GX thread, a resolve's copy-backs in one piece,
+a piece written again only once its tokens are walked and the submissions
+that read it have run), and land in the home as GPU copies in stream order,
+put in place together before the next pass starts (or before a dispatch, a
+transfer that touches them, or the submission's end); a draw in the same pass
+after the copy-back binds its capture. A home is filled from its buffer's
+memory at its first use, unless that use is a copy-back over all of it.
+What reads a home without a handle - a dispatch, a copy, a device address -
+finds it by address; a CPU copy of its stale guest bytes is refused; a
+page-table walk that reads it gets it copied back to its memory first, and
+it stays the home. A home ends with its buffer, and a buffer made past the
+pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
+its life. Off on an integrated GPU, and with small video memory unless a
+budget is given (on a 4 GB card the pool's ~80 MiB pushed images into host
+memory). `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+the homes beside it with a CPU mirror of each, and checks each binding of a
+home against its mirror (and each capture against the bytes today's copy
+takes at the token); `=twins` keeps the homes as device-local twins
+(`BBHOST_GX_TWINS=2`), as measured before. With
+`BBHOST_GXVK_COPYBACK_CHECK=1` each dynamic constant buffer's
+UpdateSubresource notes a hash of the bytes the rename gets, and each capture
+is compared with it and its source's block classed: the update's own block, a
+block handed out since on the same thread, or one handed out again to
+another thread before the capture read it.
 
 ## Tools
 
