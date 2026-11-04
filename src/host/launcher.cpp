@@ -429,7 +429,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     LauncherResult result = LauncherResult::Quit;
     bool done = false;
     int page = plugins_tab ? kPagePlugins : kPageGame;
-    bool show_online = false;  // the Game page's server and account settings, under its Online card
     double page_at = 0.0;  // when it was chosen: it fades in
     // BBHOST_SETUP_TEST=play|quit: the window answers itself after a few
     // frames (a test that it opens, draws and hands over). create:NAME makes
@@ -895,7 +894,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(7)), "DISPLAY");
+            // The display, and online beside it: the server and the account, the
+            // way F10 > ACCOUNT has it in the game (no password - this PC linked to
+            // the account signed into on the website with Discord, or an account
+            // held by this PC with a recovery code). The two cards share the
+            // taller one's height.
+            const std::string acct_detail = host_account_detail();
+            const float online_rows = 8.5f + (server == 2 ? 4.0f : 0.0f) + (acct_detail.empty() ? 0.0f : 1.0f) +
+                                      (cfg.profile.empty() ? 0.0f : 1.0f);
+            const float cards_h = card_h(std::max(7.0f, online_rows));
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
                 static const char* const kModes[] = {"Windowed", "Fullscreen"};
@@ -932,22 +940,37 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(7)), "ONLINE");
+            ui::card_begin("##online", ImVec2(0, cards_h), "ONLINE");
             {
-                ui::row_label("Server", 72 * scale);
-                static const char* const kShort[] = {"Live", "Playtest", "Custom"};
+                const float lw = std::min(72 * scale, ImGui::GetContentRegionAvail().x * 0.3f);
+                ui::row_label("Server", lw);
+                static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "Custom"};
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##server", &server, kShort, 3);
-                ui::tooltip_for_item(nullptr, server == 2 ? (f[kHost].str().empty() ? std::string("A server of your own: set it under Manage.")
+                ui::combo("##server", &server, kServerLabels, 3);
+                ui::tooltip_for_item(nullptr, server == 2 ? (f[kHost].str().empty() ? std::string("A server of your own: its host below.")
                                                                                     : f[kHost].str())
                                                           : std::string(kServers[server].host));
+                if (server == 2) {
+                    ui::row_label("Host", lw);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::InputTextWithHint("##host", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
+                    ui::row_label("Scheme", lw);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::InputText("##scheme", scheme, sizeof(scheme));
+                    ui::toggle_row("Check the server's certificate", nullptr, &verify_tls);
+                    ui::toggle_row("Require an account", nullptr, &require_account, "Players sign in (here, or F10 > Account) to play online.");
+                }
+                if (!cfg.profile.empty()) dim_text("This run uses " + cfg.profile_config + ", whose own settings may choose another server.");
                 ImGui::Dummy(ImVec2(0, 4 * scale));
+                // Who is signed in, with Sign out (Cancel while a Discord link
+                // waits for approval) at the right.
+                const bool busy = host_account_busy();
                 const bool in = net::account_logged_in();
                 const float av = std::round(ImGui::GetFrameHeight() * 1.5f);
                 const ImVec2 at = ImGui::GetCursorScreenPos();
                 const float right = at.x + ImGui::GetContentRegionAvail().x;
-                const char* go_label = in ? "Manage" : "Sign in";
-                const float bw = ImGui::CalcTextSize(go_label).x + st.FramePadding.x * 3;
+                const char* out_label = busy ? "Cancel" : "Sign out";
+                const float bw = ImGui::CalcTextSize(out_label).x + st.FramePadding.x * 3;
                 ui::avatar(in ? net::account_name() : std::string(), av);
                 ImGui::SameLine(0, 12 * scale);
                 ImGui::BeginGroup();
@@ -957,17 +980,83 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::PushFont(ui::font_strong(), 0.0f);
                 ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
                 ImGui::PopFont();
+                const std::string outcome = host_account_outcome();
+                const bool plain = outcome.empty() || outcome == host_account_signed_in();
                 ImGui::PushFont(nullptr, 14.0f);
-                ImGui::PushStyleColor(ImGuiCol_Text, in ? ui::kGood : ui::kTextDim);
-                ImGui::TextUnformatted(in ? "Signed in" : "Sign in to play online");
+                ImGui::PushStyleColor(ImGuiCol_Text, in && plain ? ui::kGood : ui::kTextDim);
+                ImGui::TextUnformatted(!plain ? outcome.c_str() : in ? "Signed in" : "Sign in to play online");
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
                 ImGui::PopTextWrapPos();
                 ImGui::EndGroup();
                 ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y + (av - ImGui::GetFrameHeight()) * 0.5f));
-                if (in ? ui::ghost_button(go_label) : ui::primary_button(go_label, ImVec2(bw, 0))) show_online = !show_online;
+                ImGui::BeginDisabled(!busy && !in);
+                if (ui::ghost_button(out_label)) {
+                    apply_server();
+                    host_account_action(4, "", "");
+                }
+                ImGui::EndDisabled();
+                ui::tooltip_for_item(nullptr, busy ? "Stops the Discord link waiting for approval." : "Forgets this PC's token; the game is signed out.");
                 ImGui::SetCursorScreenPos(ImVec2(at.x, at.y + av));
-                ImGui::Dummy(ImVec2(0, 0));
+                ImGui::Dummy(ImVec2(0, 2 * scale));
+                // A code to type on the website, or a recovery code to keep.
+                if (!acct_detail.empty()) {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kIce);
+                    ImGui::PushFont(ui::font_strong(), 0.0f);
+                    ImGui::TextUnformatted(acct_detail.c_str());
+                    ImGui::PopFont();
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    if (ui::icon_button("##copy", ui::Icon::Copy, 0.0f, "Copy the code")) {
+                        // The code alone: the word after "Code" or "code".
+                        std::string code = acct_detail;
+                        for (const char* lead : {"Code ", "Recovery code ", "Website code "}) {
+                            if (acct_detail.rfind(lead, 0) == 0) code = acct_detail.substr(std::strlen(lead));
+                        }
+                        code = code.substr(0, code.find("  "));
+                        SDL_SetClipboardText(code.c_str());
+                    }
+                }
+                const float full = ImGui::GetContentRegionAvail().x;
+                const float half = (full - st.ItemSpacing.x) * 0.5f;
+                ImGui::BeginDisabled(busy);
+                // The way in for most players: lit until someone is signed in.
+                if (in ? ui::ghost_button("Log in with Discord", ImVec2(half, 0)) : ui::primary_button("Log in with Discord", ImVec2(half, 0))) {
+                    apply_server();
+                    host_account_action(0, "", "");
+                }
+                ui::tooltip_for_item(nullptr, "Opens the website: sign in there with Discord and approve the code.");
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!in);
+                if (ui::ghost_button("Website sign-in code", ImVec2(half, 0))) {
+                    apply_server();
+                    host_account_action(3, "", "");
+                }
+                ImGui::EndDisabled();
+                ui::tooltip_for_item(nullptr, "A code to sign in to the website as this account.");
+                // Or an account kept on this PC: a name to create it under, and
+                // its recovery code to bring it back.
+                const float btn = std::max(ImGui::CalcTextSize("Create account").x, ImGui::CalcTextSize("Recover").x) + st.FramePadding.x * 3;
+                const float field = std::max(40 * scale, full - btn - st.ItemSpacing.x);
+                ImGui::SetNextItemWidth(field);
+                ImGui::InputTextWithHint("##acct_name", "Account name", acct_name, sizeof(acct_name));
+                ImGui::SameLine();
+                if (ui::ghost_button("Create account", ImVec2(btn, 0))) {
+                    apply_server();
+                    host_account_action(1, acct_name, "");
+                }
+                ui::tooltip_for_item(nullptr, "An account held by this PC, under that name. Keep the recovery code it shows.");
+                ImGui::SetNextItemWidth(field);
+                ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
+                ImGui::SameLine();
+                if (ui::ghost_button("Recover", ImVec2(btn, 0))) {
+                    apply_server();
+                    host_account_action(2, acct_name, acct_code);
+                    acct_code[0] = 0;
+                }
+                ui::tooltip_for_item(nullptr, "The account of that name, back on this PC with its recovery code.");
+                ImGui::EndDisabled();
             }
             ui::card_end();
 
@@ -996,121 +1085,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     go(kPageShaders);
                 }
                 ui::tooltip_for_item(nullptr, "Builds every shader up front, so the first start does not. Otherwise the game builds them while you play.");
-                ui::card_end();
-            }
-            // The server and the account (was the Online page): under the
-            // Online card's Manage or Sign in.
-            if (show_online) {
-                ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
-            const float w = ImGui::GetContentRegionAvail().x;
-                ui::card_begin("##server", ImVec2(w, 0), "SERVER");
-                {
-                    ui::row_label("Server", label_w);
-                    static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "Custom"};
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    ui::combo("##server", &server, kServerLabels, 3);
-                    if (server == 2) {
-                        ui::row_label("Host", label_w);
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        ImGui::InputTextWithHint("##host", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
-                        ui::row_label("Scheme", label_w);
-                        ImGui::SetNextItemWidth(120 * scale);
-                        ImGui::InputText("##scheme", scheme, sizeof(scheme));
-                        ui::toggle_row("Check the server's certificate", nullptr, &verify_tls);
-                        ui::toggle_row("Require an account", nullptr, &require_account, "Players sign in (here, or F10 > Account) to play online.");
-                    }
-                    if (!cfg.profile.empty()) dim_text("This run uses " + cfg.profile_config + ", whose own settings may choose another server.");
-                }
-                ui::card_end();
-                ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
-                // The private server's account, as F10 > ACCOUNT in the game has
-                // it: no password - this PC linked to the account signed into on
-                // the website with Discord, or an account held by this PC with a
-                // recovery code. The calls go to the server chosen above.
-                ui::card_begin("##account", ImVec2(w, 0), "ACCOUNT");
-                {
-                    const bool busy = host_account_busy();
-                    const bool in = net::account_logged_in();
-                    const float av = std::round(ImGui::GetFrameHeight() * 1.6f);
-                    ui::avatar(in ? net::account_name() : std::string(), av);
-                    ImGui::SameLine(0, 12 * scale);
-                    ImGui::BeginGroup();
-                    ImGui::PushFont(ui::font_strong(), 18.0f);
-                    ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
-                    ImGui::PopFont();
-                    const std::string outcome = host_account_outcome();
-                    dim_text(!outcome.empty() && outcome != host_account_signed_in() ? outcome
-                             : in                                                    ? std::string("Signed in")
-                                                                                     : std::string("Log in with Discord, or keep an account on this PC."),
-                             in && (outcome.empty() || outcome == host_account_signed_in()) ? ui::kGood : ui::kTextDim);
-                    ImGui::EndGroup();
-                    const std::string detail = host_account_detail();
-                    if (!detail.empty()) {
-                        ImGui::Dummy(ImVec2(0, 2 * scale));
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::PushFont(ui::font_strong(), 18.0f);
-                        ImGui::PushStyleColor(ImGuiCol_Text, ui::kIce);
-                        ImGui::TextUnformatted(detail.c_str());
-                        ImGui::PopStyleColor();
-                        ImGui::PopFont();
-                        ImGui::SameLine();
-                        if (ui::icon_button("##copy", ui::Icon::Copy, 0.0f, "Copy the code")) {
-                            // The code alone: the word after "Code" or "code".
-                            std::string code = detail;
-                            for (const char* lead : {"Code ", "Recovery code ", "Website code "}) {
-                                if (detail.rfind(lead, 0) == 0) code = detail.substr(std::strlen(lead));
-                            }
-                            code = code.substr(0, code.find("  "));
-                            SDL_SetClipboardText(code.c_str());
-                        }
-                    }
-                    ImGui::Dummy(ImVec2(0, 4 * scale));
-                    ImGui::BeginDisabled(busy);
-                    // The way in for most players: lit until someone is signed in.
-                    if (in ? ImGui::Button("Log in with Discord") : ui::primary_button("Log in with Discord", ImVec2(0, 0))) {
-                        apply_server();
-                        host_account_action(0, "", "");
-                    }
-                    ImGui::EndDisabled();
-                    ui::tooltip_for_item(nullptr, "Opens the website: sign in there with Discord and approve the code.");
-                    ImGui::Dummy(ImVec2(0, 2 * scale));
-                    ui::caption("OR AN ACCOUNT KEPT ON THIS PC");
-                    const float field_w = std::round(240 * scale);
-                    ImGui::BeginDisabled(busy);
-                    ImGui::SetNextItemWidth(field_w);
-                    ImGui::InputTextWithHint("##acct_name", "Name", acct_name, sizeof(acct_name));
-                    ImGui::SameLine();
-                    if (ImGui::Button("Create account")) {
-                        apply_server();
-                        host_account_action(1, acct_name, "");
-                    }
-                    ui::tooltip_for_item(nullptr, "An account held by this PC, under that name. Keep the recovery code it shows.");
-                    ImGui::SetNextItemWidth(field_w);
-                    ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
-                    ImGui::SameLine();
-                    if (ImGui::Button("Recover")) {
-                        apply_server();
-                        host_account_action(2, acct_name, acct_code);
-                        acct_code[0] = 0;
-                    }
-                    ui::tooltip_for_item(nullptr, "The account of that name, back on this PC with its recovery code.");
-                    ImGui::BeginDisabled(!in);
-                    if (ImGui::Button("Website sign-in code")) {
-                        apply_server();
-                        host_account_action(3, "", "");
-                    }
-                    ImGui::EndDisabled();
-                    ui::tooltip_for_item(nullptr, "A code to sign in to the website as this account.");
-                    ImGui::EndDisabled();
-                    ImGui::SameLine();
-                    // Also stops a Discord link that is waiting for approval.
-                    ImGui::BeginDisabled(!busy && !in);
-                    if (ImGui::Button(busy ? "Cancel" : "Sign out")) {
-                        apply_server();
-                        host_account_action(4, "", "");
-                    }
-                    ImGui::EndDisabled();
-                }
                 ui::card_end();
             }
         } else if (page == kPageGraphics) {
