@@ -991,6 +991,18 @@ bool icon_button(const char* id, Icon icon, float size, const char* tip) {
     return pressed;
 }
 
+float reset_width() { return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x * 0.5f; }
+
+bool reset_button(const char* id, bool at_default) {
+    ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 0.5f);
+    ImGui::BeginDisabled(at_default);
+    const bool pressed = icon_button(id, Icon::Refresh, 0.0f);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+        tooltip(nullptr, at_default ? "The default" : "Back to the default");
+    return pressed && !at_default;
+}
+
 bool ghost_button(const char* label, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 255, 255, 14));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(255, 255, 255, 32));

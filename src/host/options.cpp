@@ -49,6 +49,18 @@ struct Setting;
 bool reads_on(const Setting& s, int index);  // below
 int fps_from_label(const char* label);
 
+// "-180°" to "+180°" a step at a time (`unit` after each number), for a
+// slider of fine steps; the strings live as long as the program.
+std::vector<const char*> signed_steps(int from, int to, const char* unit) {
+    static std::vector<std::string>* store = new std::vector<std::string>();
+    std::vector<const char*> out;
+    store->reserve(store->size() + static_cast<std::size_t>(to - from + 1));
+    const std::size_t first = store->size();
+    for (int v = from; v <= to; ++v) store->push_back((v > 0 ? "+" : "") + std::to_string(v) + unit);
+    for (std::size_t i = first; i < store->size(); ++i) out.push_back((*store)[i].c_str());
+    return out;
+}
+
 // One setting. Everything here is a choice between a few named values: a
 // toggle is a choice of two, which keeps drawing and input to one case.
 struct Setting {
@@ -365,14 +377,10 @@ Setting g_set[kSettingCount] = {
     // are their own blue and violet. Hue turns every colour in them round the
     // colour wheel but the green, amber and red that mean ok, a warning and a
     // problem; vibrance takes colour out (-100%: black and white) or adds it.
-    {"menu_hue", "Menu hue",
-     {"-165°", "-150°", "-135°", "-120°", "-105°", "-90°", "-75°", "-60°", "-45°", "-30°", "-15°", "0°", "+15°", "+30°", "+45°", "+60°", "+75°", "+90°", "+105°", "+120°", "+135°", "+150°", "+165°", "+180°"},
-     11, "Turns the colours of bbhost's own menus (this one, F9 and the setup window) round the colour wheel. 0 degrees "
+    {"menu_hue", "Menu hue", signed_steps(-180, 180, "°"), 180, "Turns the colours of bbhost's own menus (this one, F9 and the setup window) round the colour wheel. 0 degrees "
      "is their own blue and violet.",
      false},
-    {"menu_vibrance", "Menu vibrance",
-     {"-100%", "-90%", "-80%", "-70%", "-60%", "-50%", "-40%", "-30%", "-20%", "-10%", "0%", "+10%", "+20%", "+30%", "+40%", "+50%", "+60%", "+70%", "+80%", "+90%", "+100%"},
-     10, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
+    {"menu_vibrance", "Menu vibrance", signed_steps(-100, 100, "%"), 100, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
 };
 
 const Row g_rows[] = {
@@ -1381,6 +1389,7 @@ void setting_row(int id) {
     ImGui::SameLine();
     ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y));
     int want = cur;
+    bool slider = false;
     if (id == kEffectTiming) {
         // What will run (host_effect_timing_row): one of the three, or a
         // fourth entry for what bbhost.toml or BBHOST_SFX_STEP asks that none
@@ -1407,10 +1416,17 @@ void setting_row(int id) {
             shown += *c;
             if (*c == '%') shown += '%';
         }
-        ImGui::SetNextItemWidth(cw);
+        // Longer than the other controls, with its reset beside it.
+        slider = true;
+        const float sw = std::min(std::round(520 * sc), w * 0.62f);
+        ImGui::SetCursorScreenPos(ImVec2(p.x + w - sw, p.y));
+        ImGui::SetNextItemWidth(sw - ui::reset_width());
         ImGui::SliderInt("##v", &want, 0, n - 1, shown.c_str(), ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
+        if (s.note) ui::tooltip_for_item(s.label, s.note);
+        const int def = g_default_index[static_cast<std::size_t>(id)];
+        if (ui::reset_button("##reset", cur == def)) want = def;
     }
-    if (s.note && id != kShaders) ui::tooltip_for_item(s.label, s.note);
+    if (s.note && id != kShaders && !slider) ui::tooltip_for_item(s.label, s.note);  // a slider's is on the slider, not its reset
     if (want != cur && want >= 0 && want < n) change(id, want);
     ImGui::PopID();
 }

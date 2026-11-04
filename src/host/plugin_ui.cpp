@@ -1,5 +1,6 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/plugin_ui.h"
+#include "host/launcher_ui.h"
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
@@ -77,7 +78,14 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     const std::string label = o.label + (later ? "  (next start)" : "");
     bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
-    const float width = 260 * scale;
+    const float width = 380 * scale;
+    // A number option's reset to its default (BbOption's default text).
+    const auto reset = [&](bool at_default) {
+        if (launcher_ui::reset_button("##reset", at_default)) {
+            plugins_set_option(p.name, o.key, o.def);
+            ui.edits.erase(id);
+        }
+    };
     switch (o.type) {
     case BB_OPT_HEADING:
         ImGui::SeparatorText(o.label.c_str());
@@ -96,6 +104,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, std::to_string(v));
             ui.edits.erase(id);
         }
+        reset(v == std::atoi(o.def.c_str()));
         break;
     }
     case BB_OPT_FLOAT: {
@@ -113,6 +122,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, t);
             ui.edits.erase(id);
         }
+        reset(std::fabs(v - static_cast<float>(std::atof(o.def.c_str()))) < 0.005f);
         break;
     }
     case BB_OPT_CHOICE: {

@@ -1448,30 +1448,35 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                      "usual size (with Windows' display scaling). A window larger than the screen stops at the screen and "
                                      "scrolls. Applies at once; F10 has the same setting.");
             });
-            // Menu hue and Menu vibrance: F10's sliders (a step each, its value shown),
-            // saved at once; a double click puts one back to 0.
+            // Menu hue and Menu vibrance: F10's sliders (a degree and a percent a
+            // step, the value shown), saved at once; the reset beside each, or a
+            // double click, puts it back to 0.
             const auto colour_slider = [&](const char* id, const char* key, int steps, int origin, int step, const char* unit,
                                            const char* title, const char* tip) {
                 int i = std::max(0, host_opt_index(key));
                 const int value = origin + step * i;
                 char shown[24];
                 std::snprintf(shown, sizeof(shown), value > 0 ? "+%d%s" : "%d%s", value, unit);
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ui::reset_width());
                 if (ImGui::SliderInt(id, &i, 0, steps - 1, shown, ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
                     host_opt_set_index(key, i);
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                     host_opt_set_index(key, -origin / step);
                 ui::tooltip_for_item(title, tip);
+                ImGui::PushID(id);
+                if (ui::reset_button("##reset", value == 0)) host_opt_set_index(key, -origin / step);
+                ImGui::PopID();
             };
             ImGui::Dummy(ImVec2(0, 2 * scale));
-            choice_row("Menu hue", "The colours of this window, F9 and F10.", 200 * scale, [&] {
-                colour_slider("##hue", "menu_hue", 24, -165, 15, "°", "Menu hue",
+            choice_row("Menu hue", "The colours of this window, F9 and F10.", 380 * scale, [&] {
+                colour_slider("##hue", "menu_hue", 361, -180, 1, "°", "Menu hue",
                               "Turns the colours of bbhost's own menus - this window and the in-game F9 and F10 menus - round the "
                               "colour wheel: 0 is their own blue and violet. The green, amber and red that mean ok, a warning and a "
                               "problem stay as they are. Double-click for 0; F10 has the same setting.");
             });
             ImGui::Dummy(ImVec2(0, 2 * scale));
-            choice_row("Menu vibrance", "-100% is black and white.", 200 * scale, [&] {
-                colour_slider("##vibrance", "menu_vibrance", 21, -100, 10, "%%", "Menu vibrance",
+            choice_row("Menu vibrance", "-100% is black and white.", 380 * scale, [&] {
+                colour_slider("##vibrance", "menu_vibrance", 201, -100, 1, "%%", "Menu vibrance",
                               "How much colour bbhost's own menus have: -100% is black and white, 0 their own, +100% the most. "
                               "Double-click for 0; F10 has the same setting.");
             });

@@ -115,6 +115,11 @@ std::string fit_left(const std::string& text, float width);
 bool primary_button(const char* label, ImVec2 size, bool enabled = true);
 // A square button holding an icon.
 bool icon_button(const char* id, Icon icon, float size, const char* tip = nullptr);
+// A slider's reset to its default, a frame high, after it on the same line:
+// dimmed and doing nothing while the value is the default already. True when
+// pressed. reset_width() is the room it takes, its gap included.
+bool reset_button(const char* id, bool at_default);
+float reset_width();
 // A quiet button: a faint fill that lights when hovered.
 bool ghost_button(const char* label, ImVec2 size = ImVec2(0, 0));
 // The sidebar's entries: a dot of colour `dot` (0 for none) at the right, or
