@@ -333,6 +333,8 @@ struct ShaderStage {
     }
 };
 struct GfxPipeline {
+    // Once made, changed only by the command processor adopting an optimized relink (apply_relinks_locked), or
+    // creating a deferred fallback under the readers' lock: stage 4b's pool reads it through handle_of().
     VkPipeline pipeline = VK_NULL_HANDLE;
     ShaderStage vs, ps, gs;
     // A tessellated draw's generated vertex and control stages. The
@@ -386,7 +388,8 @@ struct GfxPipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     // The no-fallback variant, once a draw whose constant buffers all bound
     // created it: bind setup and the table rebuild read it here instead of
-    // looking it up by key on every draw.
+    // looking it up by key on every draw. Published once the variant is made
+    // (lean_of()), and so is lean_building's change.
     GfxPipeline* lean_variant = nullptr;
     bool lean_building = false;  // a worker is building its no-fallback variant (queue_lean_variant)
     // Built (gfx_pipeline, a worker's handed over): stage 4b's pool, which
@@ -419,6 +422,7 @@ struct GfxPipeline {
     // The optimized relink, queued at the pipeline's first draw
     // (queue_library_relink): its libraries, and the vertex library's
     // specialization - the elements' formats, the state it was made with.
+    // (The flag's clearing is published: relink_pending_of().)
     bool relink_pending = false;
     VkPipeline relink_libs[4] = {};
     bool relink_formats = false;
@@ -435,7 +439,7 @@ struct GfxPipeline {
     std::uint32_t spec_w3[2][16] = {};
     std::uint32_t spec_stride[2][16] = {};  // and their strides (gcn::kCbStrideSpecId)
     std::uint16_t spec_w3_mask[2] = {};
-    VkPipeline generic = VK_NULL_HANDLE;
+    VkPipeline generic = VK_NULL_HANDLE;  // published before the relink's handle (generic_of())
     // The GPU profile's name (BBHOST_GPU_PROFILE) of the draws bound to it:
     // `name`, "~fallback" for the variant with the page-table paths, "~walks"
     // for one that still walks.
@@ -450,6 +454,23 @@ struct GfxPipeline {
     bool prebuilt = false;
 };
 std::unordered_map<std::uint64_t, GfxPipeline> g_gfx;  // never erased, so references to pipelines stay valid
+
+// What the command processor changes in a pipeline that is made while stage 4b's pool may read it: a list-mode draw
+// takes a pipeline once it is made (gfx_lookup) and reads it without g.mu. The no-fallback variant is published once
+// it is built, after its own fields; whether a worker builds it; an optimized relink's handle once it is adopted, the
+// fast-linked one kept in `generic` first; and the clearing of the relink's flag at its first draw. Each is a single
+// word, stored with release and loaded with acquire here, so a pool draw that finds one reads what came before it
+// whole (the stores: draw_impl and apply_lean_builds_locked, queue_pipeline_build, apply_relinks_locked,
+// queue_library_relink). On x86 each is a plain load or store, as before.
+inline GfxPipeline* lean_of(GfxPipeline& pl) { return std::atomic_ref<GfxPipeline*>(pl.lean_variant).load(std::memory_order_acquire); }
+inline bool lean_building_of(GfxPipeline& pl) { return std::atomic_ref<bool>(pl.lean_building).load(std::memory_order_acquire); }
+inline VkPipeline handle_of(const GfxPipeline& pl) {
+    return std::atomic_ref<VkPipeline>(const_cast<VkPipeline&>(pl.pipeline)).load(std::memory_order_acquire);
+}
+inline VkPipeline generic_of(const GfxPipeline& pl) {
+    return std::atomic_ref<VkPipeline>(const_cast<VkPipeline&>(pl.generic)).load(std::memory_order_acquire);
+}
+inline bool relink_pending_of(GfxPipeline& pl) { return std::atomic_ref<bool>(pl.relink_pending).load(std::memory_order_acquire); }
 std::map<std::uint64_t, std::vector<std::uint32_t>> g_program_cache;  // code va -> words (validated by hash on use)
 
 struct Pass {
@@ -8091,7 +8112,7 @@ const bool g_relink_stride = [] {
 std::atomic<std::uint64_t> g_spec_w3_misses{0}, g_spec_w3_draws{0};
 // Under g.mu: the relink link_gfx_pipeline left pending, with the draw's params.
 void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
-    pl.relink_pending = false;
+    std::atomic_ref<bool>(pl.relink_pending).store(false, std::memory_order_release);  // (relink_pending_of)
     Precompiler& w = precompiler();
     PrecompileJob job;
     job.type = 0;
@@ -8232,8 +8253,11 @@ void apply_relinks_locked() {
             later.emplace_back(pl, pipeline);
             continue;
         }
-        if (pl->spec_w3_mask[0] | pl->spec_w3_mask[1]) pl->generic = pl->pipeline;  // spec_w3_matches
-        pl->pipeline = pipeline;
+        // The fast-linked pipeline kept first, then the relink's handle: stage 4b's pool reads either pair whole
+        // (handle_of, generic_of).
+        if (pl->spec_w3_mask[0] | pl->spec_w3_mask[1])
+            std::atomic_ref<VkPipeline>(pl->generic).store(pl->pipeline, std::memory_order_release);  // spec_w3_matches
+        std::atomic_ref<VkPipeline>(pl->pipeline).store(pipeline, std::memory_order_release);
         vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pipeline), pl->name.c_str());
         w.relinks_adopted.fetch_add(1, std::memory_order_relaxed);
     }
@@ -10669,7 +10693,7 @@ void queue_pipeline_build(GfxPipeline& base, GfxPipeline& variant, const DrawSta
         job->has_vertex_input = true;
         job->vertex_input = *vertex_input;
     }
-    if (&base != &variant) base.lean_building = true;
+    if (&base != &variant) std::atomic_ref<bool>(base.lean_building).store(true, std::memory_order_release);  // (lean_building_of)
     LeanBuilders& w = lean_builders();
     {
         std::lock_guard<std::mutex> lk(w.mu);
@@ -10709,8 +10733,9 @@ void apply_lean_builds_locked() {
         variant->building = false;
         std::atomic_ref<bool>(variant->made).store(true, std::memory_order_release);
         if (base == variant) continue;  // a native hull pipeline (queue_native_pipeline): drawn by its own key
-        base->lean_variant = variant;
-        base->lean_building = false;
+        // Published after the variant is made, for stage 4b's pool (lean_of).
+        std::atomic_ref<GfxPipeline*>(base->lean_variant).store(variant, std::memory_order_release);
+        std::atomic_ref<bool>(base->lean_building).store(false, std::memory_order_release);
     }
 }
 
@@ -22492,7 +22517,8 @@ static bool draw_impl(const GpuDraw& d) {
     draw_stamp.to(kRenderCostPrefetch);
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
-    const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), pl.lean_variant && !pl.lean_variant->failed, d.indirect_va);
+    const GfxPipeline* const capture_lean = lean_of(pl);
+    const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), capture_lean && !capture_lean->failed, d.indirect_va);
     if (capture) capture_settle_locked();
     // Lavapipe only (host/lvp_split.h): after a depth-only pipeline, a draw
     // whose colour slots differ where lavapipe would draw them all with slot
@@ -23118,7 +23144,7 @@ static bool draw_impl(const GpuDraw& d) {
     // (Not a tessellated draw's: its vertex input is the LS's, and the table
     // slot is the LS's own user data, not the domain shader's.)
     if (gx_geometry && d.gx_render && use_vertex_input && !vertex_table && gx_geometry->vtx_ud < 15 && !t_tess) {
-        const GfxPipeline* const lean = pl.lean_variant;
+        const GfxPipeline* const lean = lean_of(pl);
         const std::uint32_t reads = lean && !lean->failed ? lean->table_reads[0] : ~0u;
         if ((reads >> gx_geometry->vtx_ud) & 1) {
             vertex_table = place_vertex_table(*gx_geometry);
@@ -23173,8 +23199,8 @@ static bool draw_impl(const GpuDraw& d) {
     std::uint32_t read_masks[2] = {~0u, ~0u};
     bool user_partial[2] = {false, false};
     if (g_skip_tables && g.cb_lean && gx_records) {
-        const GfxPipeline* lean = pl.lean_variant;
-        if (lean && !lean->failed && lean->pipeline) {
+        const GfxPipeline* lean = lean_of(pl);
+        if (lean && !lean->failed && handle_of(*lean)) {
             table_masks[0] = lean->table_reads[0];
             table_masks[1] = lean->table_reads[1];
             if (g_skip_user_data) {
@@ -23233,7 +23259,7 @@ static bool draw_impl(const GpuDraw& d) {
             // and every binding comes from the records, so none is built. Should
             // the draw end on the fallback variant after all, the table rebuild
             // below builds it all then.
-            const GfxPipeline* lean = pl.lean_variant;
+            const GfxPipeline* lean = lean_of(pl);
             user_skipped[st] = lean && !lean->failed && !lean->user_reads[st] && stage_plan(meta, *gx_stage[st]).all_records;
             if (!part) ++(user_skipped[st] ? g_ud_skipped : g_ud_built);
         }
@@ -23298,9 +23324,10 @@ static bool draw_impl(const GpuDraw& d) {
                 }
             }
         }
-        if (d.gx_token && g_token_user_data_check && pl.lean_variant && !pl.lean_variant->failed) {
+        const GfxPipeline* const check_lean = d.gx_token && g_token_user_data_check ? lean_of(pl) : nullptr;
+        if (check_lean && !check_lean->failed) {
             // The register file's user data belongs to the last packet draw.
-            const std::uint32_t unnamed_reads = pl.lean_variant->table_reads[st] & ~named_user & 0xffff;
+            const std::uint32_t unnamed_reads = check_lean->table_reads[st] & ~named_user & 0xffff;
             std::uint32_t stale = 0;
             for (int k = 0; k < 16; ++k) {
                 if (((unnamed_reads >> k) & 1) && params.user_sgpr[k]) stale |= 1u << k;
@@ -23785,7 +23812,7 @@ static bool draw_impl(const GpuDraw& d) {
     // loads that only fed them. Same bindings, so the sets written above fit.
     GfxPipeline* bind_pl = &pl;
     if (g.cb_lean && any_buffers && all_bound && !pl.tess_native && !pl.gs_native) {  // a native hull or geometry-shader pipeline is its own
-        if (!pl.lean_variant && !pl.lean_building) {
+        if (!lean_of(pl) && !lean_building_of(pl)) {
             if (run_part_stop(kRunStopPipeline)) return false;
             const std::uint64_t lean_key = fnv1a("cb-lean", 7, key);
             // A worker builds the variant only while a created fallback can draw
@@ -23795,12 +23822,14 @@ static bool draw_impl(const GpuDraw& d) {
                 queue_lean_variant(pl, lean_key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
                                    ps_sampler_modes, vertex_plan);
             } else {
-                pl.lean_variant = &gfx_pipeline(s, lean_key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
-                                                vs_sampler_modes, ps_sampler_modes, true, vertex_plan);
+                // Published once it is made, for stage 4b's pool (lean_of).
+                GfxPipeline& lean_made = gfx_pipeline(s, lean_key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
+                                                      vs_sampler_modes, ps_sampler_modes, true, vertex_plan);
+                std::atomic_ref<GfxPipeline*>(pl.lean_variant).store(&lean_made, std::memory_order_release);
             }
         }
-        if (pl.lean_variant) {
-            GfxPipeline& lean = *pl.lean_variant;
+        if (GfxPipeline* const lean_now = lean_of(pl)) {
+            GfxPipeline& lean = *lean_now;
             // The sets fit its layout - or, with a set 4 of its own (a particle
             // LS's constant buffers), its sets 0 and 1 are laid out alike and
             // set 4 was written for it above.
@@ -23811,7 +23840,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // BBHOST_RUN_COMMIT: why a run part's draw binds a pipeline's fallback variant (the census).
     if (part && bind_pl == &pl && g.cb_lean && !pl.tess_native && !pl.gs_native) {
-        const int why = !any_buffers ? 0 : !all_bound ? 1 : !pl.lean_variant ? 2 : 3;
+        const int why = !any_buffers ? 0 : !all_bound ? 1 : !lean_of(pl) ? 2 : 3;
         g_run_fallback[why].fetch_add(1, std::memory_order_relaxed);
     }
     if (skipped_tables[0] | skipped_tables[1]) {
@@ -23898,8 +23927,8 @@ static bool draw_impl(const GpuDraw& d) {
             const gcn::TranslateResult& meta = st == 0 ? pl.vs.meta() : pl.ps.meta();
             if (!meta.buffers.empty()) bound = bound && stage_params[st].cb_valid == (1u << meta.buffers.size()) - 1;
         }
-        GfxPipeline* const lean = pl.lean_variant;
-        if (bound && any_buffers && g.cb_lean && lean && !lean->failed && lean->pipeline && lean->layout == pl.layout) {
+        GfxPipeline* const lean = lean_of(pl);
+        if (bound && any_buffers && g.cb_lean && lean && !lean->failed && handle_of(*lean) && lean->layout == pl.layout) {
             bind_pl = lean;
             g_skip_rebuilds_lean.fetch_add(1, std::memory_order_relaxed);
         }
@@ -24318,40 +24347,46 @@ static bool draw_impl(const GpuDraw& d) {
     // BBHOST_LAYOUT_FROM_LEAN: a draw that reads constant buffers through the
     // page table needs the fallback's own translation. Without constant
     // buffers the two variants translate alike, and its stages serve.
-    if (!bind_pl->pipeline && run_part_stop(kRunStopPipeline)) return false;  // made in order (BBHOST_RUN_COMMIT)
-    if (!bind_pl->pipeline && bind_pl->layout_only && !bind_pl->failed && any_buffers) {
-        const gcn::TranslateResult vs_was = bind_pl->vs.meta(), ps_was = bind_pl->ps.meta();
-        build_gfx_pipeline(*bind_pl, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
-                           ps_sampler_modes, false, vertex_plan, false);
-        {
-            cache_rw::Write cw(cache_rw::kPlans);  // stage 4b.1a's readers see the plans go
-            ++g_binding_plan_gen;  // its translations were replaced in place, and binding plans are keyed by them
-        }
-        g_fallbacks_translated.fetch_add(1, std::memory_order_relaxed);
-        if (!bind_pl->failed && (!same_bindings(vs_was, bind_pl->vs.meta()) || !same_bindings(ps_was, bind_pl->ps.meta()))) {
-            // This draw's sets were written for the other translation's
-            // bindings; the draws after it write them for these.
-            if (g_fallback_binding_mismatch.fetch_add(1, std::memory_order_relaxed) < 8) {
-                host_log("render: pipeline %s: its fallback binds differently from its no-fallback stages; one draw skipped",
-                         bind_pl->name.c_str());
+    if (!handle_of(*bind_pl)) {
+        if (run_part_stop(kRunStopPipeline)) return false;  // made in order (BBHOST_RUN_COMMIT; stage 4b's pool)
+        // The pipeline is made, and stage 4b's pool may be reading it: its stages translated again in place and its
+        // handle created under the readers' lock (host/cache_rw.h), so no pool draw meets either half done.
+        cache_rw::Write pipelines_cw(cache_rw::kPipelines);
+        if (bind_pl->layout_only && !bind_pl->failed && any_buffers) {
+            const gcn::TranslateResult vs_was = bind_pl->vs.meta(), ps_was = bind_pl->ps.meta();
+            build_gfx_pipeline(*bind_pl, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
+                               ps_sampler_modes, false, vertex_plan, false);
+            {
+                cache_rw::Write cw(cache_rw::kPlans);  // stage 4b.1a's readers see the plans go
+                ++g_binding_plan_gen;  // its translations were replaced in place, and binding plans are keyed by them
             }
-            draw_failed(kFailFallbackBinding);
+            g_fallbacks_translated.fetch_add(1, std::memory_order_relaxed);
+            if (!bind_pl->failed && (!same_bindings(vs_was, bind_pl->vs.meta()) || !same_bindings(ps_was, bind_pl->ps.meta()))) {
+                // This draw's sets were written for the other translation's
+                // bindings; the draws after it write them for these.
+                if (g_fallback_binding_mismatch.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    host_log("render: pipeline %s: its fallback binds differently from its no-fallback stages; one draw skipped",
+                             bind_pl->name.c_str());
+                }
+                draw_failed(kFailFallbackBinding);
+                return false;
+            }
+        }
+        // BBHOST_LEAN_FIRST: the fallback pipeline is created by the first draw that binds it.
+        if (bind_pl->failed || !create_gfx_pipeline(*bind_pl, s, vertex_plan, fetch_words.size())) {
+            draw_failed(kFailPipelineCreate);
             return false;
         }
     }
-    // BBHOST_LEAN_FIRST: the fallback pipeline is created by the first draw that binds it.
-    if (!bind_pl->pipeline && (bind_pl->failed || !create_gfx_pipeline(*bind_pl, s, vertex_plan, fetch_words.size()))) {
-        draw_failed(kFailPipelineCreate);
-        return false;
-    }
-    if (bind_pl->relink_pending) {
+    if (relink_pending_of(*bind_pl)) {
         if (run_part_stop(kRunStopPipeline)) return false;
         queue_library_relink(*bind_pl, stage_params);
     }
     // A relink specialized with its first draw's indexed loads' words 3 serves
     // the draws that have the same; the rest take the fast-linked pipeline.
-    VkPipeline bind_vk = bind_pl->pipeline;
-    if (bind_pl->generic) {
+    // (Read as published: the relink's handle, then the fast-linked one kept before it.)
+    VkPipeline bind_vk = handle_of(*bind_pl);
+    if (const VkPipeline generic = generic_of(*bind_pl)) {
         bump(g_spec_w3_draws);
         bool same = true;
         for (int st = 0; st < 2 && same; ++st) {
@@ -24362,7 +24397,7 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         if (!same) {
-            bind_vk = bind_pl->generic;
+            bind_vk = generic;
             bump(g_spec_w3_misses);
         }
     }
