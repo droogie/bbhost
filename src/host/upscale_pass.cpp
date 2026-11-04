@@ -11,9 +11,9 @@
 // in the first case and a blit, which converts, in the second. A B10G11R11
 // scene has no alpha to keep; an RGBA16F one takes the bridge's.
 //
-// Step 2 of Numity1504's DLSS/FSR handoff: the call at the native size (DLAA,
-// FSR native AA), no jitter and no motion yet - the motion image is all
-// zeros.
+// Steps 2 and 3 of Numity1504's DLSS/FSR handoff: the call at the native size
+// (DLAA, FSR native AA), with the frame's jitter (render.cpp: the camera's
+// draws' viewports) and no motion yet - the motion image is all zeros.
 #include "host/gpu_internal.h"
 #include "host/upscaler.h"
 #include "log.h"
@@ -97,7 +97,7 @@ void barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImage
 
 }  // namespace
 
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth) {
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y) {
     const int method = upscaler_method();
     if (!method) return false;
     const bool same_format = scene.format == VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -177,6 +177,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth) {
     c.color = {scene.image, scene.view, scene.format, VK_IMAGE_LAYOUT_GENERAL};
     c.depth = {depth.image, g_depth_view, depth.format, depth_layout};
     c.motion = {g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL};
+    c.jitter_x = jitter_x;
+    c.jitter_y = jitter_y;
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,
                 g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED};
     const bool ok = upscaler_evaluate(cb, c);

@@ -73,3 +73,8 @@ struct UpscaleCall {
     float frame_ms = 16.7f, near_m = 0.1f, far_m = 10000.0f, fov_y = 1.0f;
 };
 bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c);
+// The jitter of frame `frame` for a method and quality at an output size: the
+// bridge's Halton (2, 3) over its phase count, in render pixels, +x moving the
+// picture right and +y down. (0, 0) without the bridge.
+void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
+                     float* y);

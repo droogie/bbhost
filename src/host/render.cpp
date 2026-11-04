@@ -21236,6 +21236,37 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
 
 }  // namespace
 
+// The temporal upscaler's frame (host/upscale_pass.cpp, its call point in
+// draw_impl): the scene and its depth as learned, the scene's write the last
+// upscale followed, and the jitter. Every draw with the G-buffer's depth that
+// is not a rect list - the G-buffer, the transparency, a second coat over
+// them (Cainhurst's snow), each through the camera - is moved by the frame's
+// sub-pixel offset at its viewport (Numity1504's handoff, step 3); rect lists
+// (the lights, the composition: full-screen reads by coordinate), other depths
+// (shadow maps, the velocity pass's half size) and what has none are not. The
+// upscale is handed the offset the frame's draws had, or none when none had
+// it, then the next frame's is taken. Only while the upscaler ran in the last
+// 8 flips: a picture it does not process is never shown moved.
+struct UpscaleFrame {
+    std::uint64_t scene = 0, depth = 0, done_write = 0;
+    std::uint64_t ran_flip = 0;  // the flip of its last run (+1: 0 is never)
+    std::uint32_t frame = 0;     // upscales so far: the jitter's index
+    float jx = 0.0f, jy = 0.0f;  // this frame's offset, render pixels
+    bool jittered = false;       // a draw had it since the last upscale
+};
+UpscaleFrame g_upscale;  // under g.mu
+// BBHOST_UPSCALE_JITTER=0: the upscaler with no jitter (a test of the rest);
+// =neg: the draws moved the other way from what the upscaler is told (a test:
+// the picture should go soft and shimmer).
+float upscale_jitter_sign() {
+    static const float sign = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_JITTER");
+        return !e ? 1.0f : e[0] == '0' ? 0.0f : std::strcmp(e, "neg") == 0 ? -1.0f : 1.0f;
+    }();
+    return sign;
+}
+bool upscale_jitter_on() { return upscale_jitter_sign() != 0.0f; }
+
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
@@ -23710,7 +23741,9 @@ static bool draw_impl(const GpuDraw& d) {
     // with it (the G-buffer's). The first frame that copy is seen in, the
     // upscale runs at that copy.
     if (upscaler_method()) {
-        static std::uint64_t scene_base = 0, depth_base = 0, done_write = 0;
+        UpscaleFrame& u = g_upscale;
+        std::uint64_t& scene_base = u.scene;
+        std::uint64_t& depth_base = u.depth;
         if (pl.name == "0b0acf50+ccbf44a6") {
             for (const StageImages::Image& im : stage_images[1].images) {
                 if (!im.resolved) continue;
@@ -23732,13 +23765,17 @@ static bool draw_impl(const GpuDraw& d) {
             }
             RtImage* scene = reads ? find_render_target(scene_base) : nullptr;
             RtImage* depth = scene ? find_render_target(depth_base) : nullptr;
-            if (scene && depth && depth->depth && scene->last_write != done_write) {
+            if (scene && depth && depth->depth && scene->last_write != u.done_write) {
                 if (part) {
                     run_part_stop(kRunStopOrder);
                     return false;
                 }
-                upscale_pass_run_locked(*scene, *depth);
-                done_write = scene->last_write;
+                const bool ran = upscale_pass_run_locked(*scene, *depth, u.jittered ? u.jx : 0.0f, u.jittered ? u.jy : 0.0f);
+                u.done_write = scene->last_write;
+                if (ran) u.ran_flip = hle_video_flip_count() + 1;
+                ++u.frame;
+                upscaler_jitter(upscaler_method(), 0, scene->width, scene->height, u.frame, &u.jx, &u.jy);
+                u.jittered = false;
             }
         }
     }
@@ -23982,6 +24019,14 @@ static bool draw_impl(const GpuDraw& d) {
     // both ends inside [0, 1].
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f);
     vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
+    // The upscaler's jitter (UpscaleFrame): a camera draw into the G-buffer's
+    // depth, while the upscaler runs.
+    if (g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && upscale_jitter_on() && g_upscale.ran_flip &&
+        hle_video_flip_count() + 1 - g_upscale.ran_flip <= 8 && upscaler_method()) {
+        vp.x += upscale_jitter_sign() * g_upscale.jx;
+        vp.y += upscale_jitter_sign() * g_upscale.jy;
+        g_upscale.jittered = true;
+    }
     if (!rs.viewport_set || std::memcmp(&rs.viewport, &vp, sizeof(vp)) != 0) {
         cmds.viewport(vp);
         rs.viewport = vp;

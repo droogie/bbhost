@@ -1772,7 +1772,7 @@ RtImage* find_render_target(std::uint64_t base);
 RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // The temporal upscaler at its call point (upscale_pass.cpp): the scene upscaled
 // in place, with the G-buffer's depth; false when it did not run.
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth);
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
 void upscale_pass_reset_locked();
 std::uint64_t upscale_pass_calls();
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).

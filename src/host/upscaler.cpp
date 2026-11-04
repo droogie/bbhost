@@ -148,6 +148,18 @@ int upscaler_method() {
     return (asked == 1 && c.dlss) || (asked == 2 && c.fsr) ? asked : 0;
 }
 
+void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
+                     float* y) {
+    *x = *y = 0.0f;
+    if (!g_ub || !method) return;
+    ub_render_info ri{};
+    ri.struct_size = sizeof(ri);
+    if (g_ub->get_render_info(g_ctx, method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR, quality, output_w, output_h, &ri) != UB_OK ||
+        !ri.jitter_phases)
+        return;
+    g_ub->get_jitter(frame % ri.jitter_phases, ri.jitter_phases, x, y);
+}
+
 bool upscaler_fsr3_override() {
     const char* e = std::getenv("BBHOST_UPSCALE");
     return e && std::strcmp(e, "fsr3") == 0;
@@ -201,5 +213,6 @@ UpscalerCaps upscaler_caps() { return {}; }
 int upscaler_method() { return 0; }
 bool upscaler_fsr3_override() { return false; }
 bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
+void upscaler_jitter(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
 
 #endif
