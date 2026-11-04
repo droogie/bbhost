@@ -111,9 +111,7 @@ enum SettingId {
     kSaturation,
     kFog,
     kModelDetail,
-    kPerformancePatch,
     kSsr,
-    kSsrFade,
     kUpscaler,
     kResolution,
     kShaders,
@@ -294,15 +292,6 @@ Setting g_set[kSettingCount] = {
     // visibly simpler up close).
     {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
-    // Kyo's Performance Patch v3 (engine/patch_manifest.cpp performance_manifest),
-    // on: the game's own debug parameters and render sizes set for speed, the
-    // velocity map kept; which were the patch files performance-v3-decals-on
-    // (on by default) and performance-v3-velomap. A bbhost.toml that turned
-    // the former off and not the latter on seeds Off (host_options_load).
-    {"performance_patch", "Performance patch", {"Off", "On"}, 1,
-     "Requires a restart. Kyo's Performance Patch v3: the game's own render and debug settings tuned for frame rate, "
-     "without changing how it looks. Motion blur's velocity map is kept.",
-     true},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
     // game's own half size. Its targets are made as the game starts. The
@@ -310,13 +299,7 @@ Setting g_set[kSettingCount] = {
     // ([patches] screen-space-reflections) seeds it (host_options_load).
     {"ssr", "Screen space reflections", {"Off", "On"}, 0,
      "Requires a restart. Wet streets, water and polished floors reflect what is on screen, at the game's own half "
-     "size. Costs GPU time.",
-     true},
-    // [Ssr] Fade To Viewer: -0.8 in the game fades reflections out as they
-    // turn toward the camera; -10000, as Kyo's shadPS4 list has it, keeps them.
-    {"ssr_fade", "Reflections facing the camera", {"Off", "On"}, 1,
-     "Requires a restart. With screen space reflections on: reflections stay where they face the camera, instead of "
-     "fading out as the game has them (its Fade To Viewer -0.8 becomes -10000).",
+     "size, without fading out where they face the camera. Costs GPU time.",
      true},
     // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
     // picture in place of the game's after the 3D, before the post effects.
@@ -431,7 +414,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
-    {Row::Option, nullptr, kSsrFade},
     {Row::Option, nullptr, kUpscaler},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
@@ -440,7 +422,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
-    {Row::Option, nullptr, kPerformancePatch},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
@@ -930,13 +911,11 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
-    h.performance_patch = on_of(kPerformancePatch);
     h.ssr = on_of(kSsr);
     {
         const int u = index_of(kUpscaler);
         h.upscaler = u == 1 ? 2 : u == 2 ? 1 : 0;  // the menu's FSR, DLSS
     }
-    h.ssr_fade = on_of(kSsrFade);
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
@@ -1013,18 +992,6 @@ void host_options_load() {
     // a bbhost.toml that turned it on keeps them on until the player chooses.
     if (const std::string v = config_value("patches.screen-space-reflections"); !v.empty())
         g_set[kSsr].index = v == "false" || v == "0" ? 0 : 1;
-    {
-        // Performance Patch v3 was two patch files, the Decals On one on by default.
-        auto off = [](const char* name) {
-            const std::string v = config_value(std::string("patches.") + name);
-            return v == "false" || v == "0";
-        };
-        auto on = [](const char* name) {
-            const std::string v = config_value(std::string("patches.") + name);
-            return !v.empty() && v != "false" && v != "0";
-        };
-        if (off("performance-v3-decals-on") && !on("performance-v3-velomap")) g_set[kPerformancePatch].index = 0;
-    }
     // The PC enhancements seed from bbhost.toml's [world] (all on unless it
     // says otherwise); the options file then holds the player's choice, and a
     // BBHOST_* switch still wins over both (config_set_enhancements).

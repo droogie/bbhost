@@ -73,10 +73,8 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "streaming.all_post_processors") return config().all_post_processors;
     if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > STARTUP, read once
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
-    if (option == "graphics.performance_patch") return host_settings().performance_patch;  // F10 > GRAPHICS, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
-    if (option == "graphics.ssr_fade") return host_settings().ssr && host_settings().ssr_fade;
     *known = false;
     return false;
 }
@@ -253,7 +251,9 @@ Manifest performance_mode_manifest() {
     return m;
 }
 
-// performance, Performance patch (graphics.performance_patch, on): Kyo's
+// performance, Performance patch (always on: the renders the rest of bbhost's
+// pipeline - the upscaler among it - is built over; [patches] performance =
+// false in bbhost.toml leaves it out, for a test): Kyo's
 // Performance Patch v3 (Velomap + Camera Blur, Decals On) from his shadPS4
 // list, site for site, which were patches/performance-v3-velomap.toml and,
 // without the velocity map, performance-v3-decals-on.toml - less the camera
@@ -273,7 +273,6 @@ Manifest performance_manifest() {
     m.title = "Performance patch";
     m.eboot = kEboot109Sha256;
     m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's force";
-    m.option = "graphics.performance_patch";
     m.order = 21;
     m.sites = {
 #include "engine/performance_v3_sites.inc"
@@ -311,7 +310,8 @@ Manifest fov_uncap_manifest() {
 // back over a performance patch's fixed sizes - as 32-bit float (0x125b1bf:
 // 0x14 -> 0x28). Two calls and two bytes as shipped (0x26a10c0, 0x26a2829,
 // 0x26c3d7d, 0x26c4fd7) undo the performance patches' changes to what it
-// reads. It loads after every patch file, so its bytes win.
+// reads. It loads after every patch file, so its bytes win. Its Fade To Viewer
+// goes to -10000 with it (the last two sites).
 Manifest ssr_manifest() {
     Manifest m;
     m.name = "ssr";
@@ -343,27 +343,16 @@ Manifest ssr_manifest() {
     site("size-b", 0x026c42b4,
          {0xc7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x41, 0xb9, 0x14, 0x00, 0x00, 0x00, 0x45, 0x89, 0xe0},
          {0x83, 0x24, 0x24, 0x00, 0x31, 0xc9, 0x41, 0xb9, 0x14, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x0a, 0x00, 0x00, 0x00});
+    // [Ssr] Fade To Viewer Param - the scene context's +0x7680, set in its
+    // constructor's movabs - -10000 over the game's -0.8, as the shadPS4 list
+    // has it (the reflections stay where they face the camera), and the debug
+    // menu's slider for it reaching down to it (its minimum loads -10000 at
+    // 0x4c80a34 instead of -1.0) so it shows the value.
+    site("fade-to-viewer", 0x02695a5b, {0xcd, 0xcc, 0x4c, 0xbf}, {0x00, 0x40, 0x1c, 0xc6});
+    site("fade-to-viewer-slider", 0x026b8d65, {0xc5, 0xfa, 0x10, 0x05, 0x1f, 0x0f, 0x67, 0x02}, {0xc5, 0xfa, 0x10, 0x05, 0xc7, 0x7c, 0x5c, 0x02});
     return m;
 }
 
-// ssr-fade-to-viewer, Reflections facing the camera (graphics.ssr_fade, with
-// ssr on): [Ssr] Fade To Viewer Param - the scene context's +0x7680, set in its
-// constructor's movabs - -10000 over the game's -0.8, as the shadPS4 list has
-// it, and the debug menu's slider for it reaching down to it (its minimum
-// loads -10000 at 0x4c80a34 instead of -1.0) so it shows the value.
-Manifest ssr_fade_manifest() {
-    Manifest m;
-    m.name = "ssr-fade-to-viewer";
-    m.title = "Reflections facing the camera";
-    m.eboot = kEboot109Sha256;
-    m.description = "[Ssr] Fade To Viewer -10000 instead of -0.8";
-    m.option = "graphics.ssr_fade";
-    m.order = 9001;
-    m.sites.push_back(Site{"fade-to-viewer", 0x02695a5b, {0xcd, 0xcc, 0x4c, 0xbf}, {0x00, 0x40, 0x1c, 0xc6}, true, {}});
-    m.sites.push_back(Site{"fade-to-viewer-slider", 0x026b8d65, {0xc5, 0xfa, 0x10, 0x05, 0x1f, 0x0f, 0x67, 0x02},
-                           {0xc5, 0xfa, 0x10, 0x05, 0xc7, 0x7c, 0x5c, 0x02}, true, {}});
-    return m;
-}
 
 // skip-intro, Skip company logos (startup.skip_intro): illusion's 1.09 Skip
 // Intro. The three company logos (FromSoftware, Japan Studio, SCE) are
@@ -392,7 +381,6 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(performance_mode_manifest());
     out.push_back(performance_manifest());
     out.push_back(ssr_manifest());
-    out.push_back(ssr_fade_manifest());
     out.push_back(fov_uncap_manifest());
     return out;
 }

@@ -72,17 +72,12 @@ struct HostSettings {
     float ao_strength = 1.0f;   // 1.0 the area's own, 0 none, 2 twice
     int lod_bias = 0;           // the game's model detail bias: -2 finest always, 0 its own, 2 coarsest
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
-    // Screen space reflections (engine/patch_manifest.cpp's ssr and
-    // ssr-fade-to-viewer, read once as the game starts): the reflection pass
-    // on, and its Fade To Viewer at -10000 instead of the game's -0.8.
+    // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
+    // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;
-    // Kyo's Performance Patch v3 (engine/patch_manifest.cpp's performance,
-    // read once as the game starts).
-    bool performance_patch = true;
     // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR - at the
     // full resolution for now (DLAA, FSR native AA). Follows the setting live.
     int upscaler = 0;
-    bool ssr_fade = true;
 
     // Startup (read once by the loader)
     bool skip_logos = false;
