@@ -205,8 +205,8 @@ Setting g_set[kSettingCount] = {
      "and how busy each part is, under the FPS counter (docs/performance.md).", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
-    {"fov", "Field of view", signed_steps(0, 50, "%"), 0,
-     "How wide the camera sees. +0% is the game's own; +50% is about 97 degrees across.", false},
+    {"fov", "Field of view", signed_steps(0, 100, "%"), 0,
+     "How wide the camera sees. +0% is the game's own; +50% is about 97 degrees across, +100% about 118.", false},
     // The same row's camDistTarget and chrOrgOffset_Y: 5 the game's own, 10%
     // a step either way.
     {"camera_distance", "Camera distance", hundred(), 50,

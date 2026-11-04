@@ -660,12 +660,9 @@ void seed(Toggle& t) {
 std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) != t.invert ? 1 : 0; }
 
 // The game's sliders have eleven steps; the settings behind most of them have
-// 101 (0-100) or 51 (Field of view, 0-50%), and a step of the game's is a
-// tenth (a fifth of Field of view) of those - the nearest when it is between.
-int per_step(const char* key) {
-    if (std::strcmp(key, "fov") == 0) return 5;
-    return std::strcmp(key, "shadow_distance") == 0 ? 1 : 10;
-}
+// 101 (0-100, Field of view's +0% to +100% among them), and a step of the
+// game's is a tenth of those - the nearest when it is between.
+int per_step(const char* key) { return std::strcmp(key, "shadow_distance") == 0 ? 1 : 10; }
 void seed(Slider& s) {
     const int i = host_opt_index(s.key), k = per_step(s.key);
     s.value = static_cast<std::uint8_t>(i < 0 ? 0 : std::min(10, (i + k / 2) / k));
