@@ -5,6 +5,7 @@
 #include "core/sha256.h"
 #include "engine/addr.h"
 #include "engine/patch_manifest.h"
+#include "host/controls_page.h"
 #include "host/launcher_ui.h"
 #include "host/options.h"
 #include "net/account.h"
@@ -62,7 +63,7 @@ constexpr int kTextSizes[] = {100, 125, 150, 175, 200, 250, 300, 350, 400};
 const char* const kTextSizeLabels[] = {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"};
 
 // The window's pages, as the sidebar lists them.
-enum Page { kPageGame, kPageGraphics, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageSettings, kPageCount };
+enum Page { kPageGame, kPageGraphics, kPageControls, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageSettings, kPageCount };
 struct PageInfo {
     const char* name;
     const char* slug;  // its picture's name (BBHOST_SETUP_TEST=shot)
@@ -71,6 +72,7 @@ struct PageInfo {
 constexpr PageInfo kPages[kPageCount] = {
     {"Game", "game", launcher_ui::Icon::Game},
     {"Graphics", "graphics", launcher_ui::Icon::Image},
+    {"Controls", "controls", launcher_ui::Icon::Keyboard},
     {"PC Enhancements", "pc-enhancements", launcher_ui::Icon::Enhance},
     {"Patches", "patches", launcher_ui::Icon::Patches},
     {"Shaders", "shaders", launcher_ui::Icon::Shaders},
@@ -215,6 +217,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_log("setup: no window (%s); edit %s instead", SDL_GetError(), config_user_file().c_str());
         return LauncherResult::Quit;
     }
+    // Controllers, for the Controls page's (ImGui's SDL backend opens them):
+    // without it a pad's presses never arrive.
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) host_log("setup: no controllers (%s)", SDL_GetError());
     // The text size, Menu text size (menu_text_size, the same setting as
     // F10's): 100% is the window as it has always been, 1120x720 at Windows'
     // display scaling, and every size in it - the window's own included -
@@ -523,6 +528,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     while (!done) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // The Controls page choosing a binding takes the next press first.
+            if (controls_capture_event(ev)) continue;
             ImGui_ImplSDL3_ProcessEvent(&ev);
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) done = true;
         }
@@ -1082,6 +1089,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             for (int i = 0; i < host_options_page_count(); ++i) {
                 if (std::strcmp(host_options_page_name(i), "Graphics") == 0) host_options_draw_setup_page(i);
             }
+        } else if (page == kPageControls) {
+            // F10's Controls page, the same bindings and file.
+            controls_page_draw();
         } else if (page == kPageEnhancements) {
             ui::card_begin("##enhancements", ImVec2(ImGui::GetContentRegionAvail().x, 0));
             for (std::size_t i = 0; i < std::size(enhancements); ++i) {

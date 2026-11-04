@@ -1454,6 +1454,18 @@ bool script_keys_step() {
     return true;
 }
 
+// The controller's sixteen bindable buttons as SDL names them, in PadInput's
+// order; the triggers are axes (INVALID here).
+SDL_GamepadButton pad_sdl_button(int input) {
+    static constexpr SDL_GamepadButton kButtons[kPadInputs] = {
+        SDL_GAMEPAD_BUTTON_SOUTH,       SDL_GAMEPAD_BUTTON_EAST,        SDL_GAMEPAD_BUTTON_WEST,       SDL_GAMEPAD_BUTTON_NORTH,
+        SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID,
+        SDL_GAMEPAD_BUTTON_LEFT_STICK,  SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_START,       SDL_GAMEPAD_BUTTON_TOUCHPAD,
+        SDL_GAMEPAD_BUTTON_DPAD_UP,     SDL_GAMEPAD_BUTTON_DPAD_DOWN,   SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+    return input >= 0 && input < kPadInputs ? kButtons[input] : SDL_GAMEPAD_BUTTON_INVALID;
+}
+
+
 void update_pad() {
     // Before anything that returns early, so a script keeps its own time.
     const bool scripted = script_keys_step();
@@ -1522,26 +1534,17 @@ void update_pad() {
     bool touch_done = false, back_held = false;
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
-        auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
-            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) {
-                p.buttons |= bit;
-            }
-        };
-        btn(SDL_GAMEPAD_BUTTON_SOUTH, kCross);
-        btn(SDL_GAMEPAD_BUTTON_EAST, kCircle);
-        btn(SDL_GAMEPAD_BUTTON_WEST, kSquare);
-        btn(SDL_GAMEPAD_BUTTON_NORTH, kTriangle);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL1);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR1);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_STICK, kL3);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK, kR3);
-        btn(SDL_GAMEPAD_BUTTON_START, kOptions);
+        // The sixteen buttons, the triggers past a quarter of their travel, each
+        // giving in play the press it is bound to (host/bindings.h host_pad_*):
+        // a rebound one's play press goes to play_buttons, which a menu takes
+        // out again, and its own to menu_buttons, which a menu puts in, so in
+        // a menu every button is itself.
+        bool held[kPadInputs] = {};
+        for (int i = 0; i < kPadInputs; ++i) {
+            const SDL_GamepadButton b = pad_sdl_button(i);
+            held[i] = b != SDL_GAMEPAD_BUTTON_INVALID && static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b);
+        }
         back_held |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_BACK);  // below, after the touchpad's own fingers
-        btn(SDL_GAMEPAD_BUTTON_TOUCHPAD, kTouchPad);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_UP, kUp);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight);
         const auto further = [](std::uint8_t have, std::uint8_t v) {
             return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
@@ -1551,14 +1554,23 @@ void update_pad() {
         p.ry = further(p.ry, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY)));
         const std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
         const std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-        p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
-        p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
-        if (lt > 8000) {
-            p.buttons |= kL2;
+        held[kPadL2] = lt > 8000;
+        held[kPadR2] = rt > 8000;
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (!held[i]) continue;
+            const std::uint32_t play = host_pad_play_bit(i), own = host_pad_input_bit(i);
+            p.buttons |= play;
+            if (play != own) {
+                p.play_buttons |= play;
+                p.menu_buttons |= own;
+            }
+            // A button bound to L2 or R2 pulls that trigger all the way.
+            if (play == kL2 && i != kPadL2) p.l2 = 255;
+            if (play == kR2 && i != kPadR2) p.r2 = 255;
         }
-        if (rt > 8000) {
-            p.buttons |= kR2;
-        }
+        // The triggers' travel, while they are themselves in play.
+        if (host_pad_play_bit(kPadL2) == kL2) p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
+        if (host_pad_play_bit(kPadR2) == kR2) p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
         // The touchpad, for the DualShock 4 and DualSense that have one. SDL
         // reports fingers normalised; the pad reports them in the surface's
         // own pixels, which is the space scePadGetControllerInformation told
@@ -1756,6 +1768,21 @@ void apply_window_mode(int mode) {
     SDL_SetWindowFullscreen(g_window, mode != 0);
 }
 }  // namespace
+#endif
+
+
+#if defined(BBHOST_HAVE_SDL3)
+int host_pad_input_of_event(const SDL_Event& e) {
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (pad_sdl_button(i) == e.gbutton.button) return i;
+        }
+    } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.value > 8000) {
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) return kPadL2;
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) return kPadR2;
+    }
+    return -1;
+}
 #endif
 
 void host_window_set_mode(int mode, int width, int height) {

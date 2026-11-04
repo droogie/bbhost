@@ -41,7 +41,7 @@ ImU32 tint(ImU32 col);
 enum class Icon {
     Game, Online, Enhance, Patches, Shaders, Plugins, Settings,
     Folder, File, Check, Warning, Info, Play, Moon, Search, Copy, User, Download, Refresh, SignIn,
-    Display, Image,
+    Display, Image, Keyboard,
 };
 
 // Once the ImGui context and its renderer backend exist: the fonts (the

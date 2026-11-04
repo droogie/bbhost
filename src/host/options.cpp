@@ -1116,6 +1116,7 @@ void host_options_load() {
     if (f) {
         char line[512];
         bool keys = false;  // in [keys]: bindings, not settings
+        bool pad = false;   // in [pad]: the controller's buttons
         bool account = false;  // in [account]: the name and token
         std::string acct_name, acct_token;
         int file_version = 1;
@@ -1125,6 +1126,7 @@ void host_options_load() {
         while (std::fgets(line, sizeof(line), f)) {
             if (line[0] == '[') {
                 keys = std::strncmp(line, "[keys]", 6) == 0;
+                pad = std::strncmp(line, "[pad]", 5) == 0;
                 account = std::strncmp(line, "[account]", 9) == 0;
                 continue;
             }
@@ -1149,6 +1151,10 @@ void host_options_load() {
             trim(val);
             if (keys) {
                 host_bindings_parse(key.c_str(), val.c_str());
+                continue;
+            }
+            if (pad) {
+                host_pad_parse(key.c_str(), val.c_str());
                 continue;
             }
             if (account) {

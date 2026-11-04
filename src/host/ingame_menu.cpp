@@ -7,6 +7,7 @@
 #include "engine/patch_manifest.h"
 #include "hle/fs.h"
 #include "host/gpu.h"
+#include "host/controls_page.h"
 #include "host/launcher_ui.h"
 #include "host/options.h"
 #include "host/plugin_ui.h"
@@ -539,11 +540,11 @@ void patches_page(PatchMenu& m) {
 
 // ---- The menu ----------------------------------------------------------------
 
-// Its pages: the settings' (host_options_page_*), with the patches and the
-// plugins after PC Enhancements.
+// Its pages: the settings' (host_options_page_*), with the controls after
+// Input and the patches and the plugins after PC Enhancements.
 int g_page = 0;
 double g_page_at = -100.0;
-int g_patches_page = -1, g_plugins_page = -1;  // their places among the pages
+int g_patches_page = -1, g_plugins_page = -1, g_controls_page = -1;  // their places among the pages
 
 const std::vector<Page>& menu_pages() {
     static std::vector<Page> pages;
@@ -567,16 +568,26 @@ const std::vector<Page>& menu_pages() {
             if (std::strcmp(k.name, p.name) == 0) p.icon = k.icon;
         }
         pages.push_back(p);
+        if (std::strcmp(p.name, "Input") == 0) {
+            g_controls_page = static_cast<int>(pages.size());
+            pages.push_back({"Controls", ui::Icon::Keyboard,
+                             "Every action's key, mouse button and controller button, changed by clicking one and pressing the new one."});
+        }
         if (std::strcmp(p.name, "PC Enhancements") == 0) add_mods();
     }
     if (g_patches_page < 0) add_mods();  // no PC Enhancements page: at the end
     return pages;
 }
 
-// The settings page a page of the menu shows (-1: the patches or the plugins).
+// The settings page a page of the menu shows (-1: the controls, the patches or
+// the plugins).
 int options_page_of(int page) {
-    if (page == g_patches_page || page == g_plugins_page) return -1;
-    return page > g_plugins_page ? page - 2 : page;
+    int own = 0;  // the menu's own pages before it
+    for (const int p : {g_controls_page, g_patches_page, g_plugins_page}) {
+        if (p == page) return -1;
+        if (p >= 0 && p < page) ++own;
+    }
+    return page - own;
 }
 
 bool draw_menu() {
@@ -585,6 +596,8 @@ bool draw_menu() {
     return shell("##menu", "MENU", pages.data(), static_cast<int>(pages.size()), &g_page, &g_page_at, g_page != g_plugins_page, [] {
         if (g_page == g_patches_page) {
             patches_page(g_patches);
+        } else if (g_page == g_controls_page) {
+            controls_page_draw();
         } else if (g_page == g_plugins_page) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(14, 12, 34, 190));
             plugin_ui_draw(g_ui, ui::scale(), 0.0f);  // the list and the details fill what is left, each scrolling
@@ -635,7 +648,12 @@ bool ingame_menu_event(const SDL_Event& e, float ratio) {
         }
         return true;
     }
-    if (!ingame_menu_open()) return false;
+    if (!ingame_menu_open()) {
+        controls_menu_closed();
+        return false;
+    }
+    // A binding being chosen on the Controls page takes the next press first.
+    if (controls_capture_event(e)) return true;
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:

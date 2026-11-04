@@ -720,6 +720,15 @@ void draw_icon(ImDrawList* dl, Icon icon, ImVec2 at, float size, ImU32 col) {
         dl->AddCircleFilled(P(0.44f, -0.36f), 0.15f * h, col);
         break;
     }
+    case Icon::Keyboard: {
+        dl->AddRect(P(-0.95f, -0.56f), P(0.95f, 0.56f), col, 0.14f * h, th);
+        for (int row = 0; row < 2; ++row) {
+            for (int k = 0; k < 4; ++k)
+                dl->AddCircleFilled(P(-0.54f + 0.36f * static_cast<float>(k), -0.22f + 0.3f * static_cast<float>(row)), 0.08f * h, col);
+        }
+        dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, th);  // the space bar
+        break;
+    }
     }
 }
 

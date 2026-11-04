@@ -206,6 +206,11 @@ void host_mouse_describe(char* out, std::size_t n);
 // to the mode nearest width x height - the resolution - at the desktop's
 // refresh rate). A width and height of 0 keep the last ones.
 void host_window_set_mode(int mode, int width = 0, int height = 0);
+#if defined(BBHOST_HAVE_SDL3)
+// A controller press as one of the bindable buttons (host/bindings.h
+// PadInput): a button down, or a trigger pulled past a quarter; -1 otherwise.
+int host_pad_input_of_event(const union SDL_Event& e);
+#endif
 void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.
