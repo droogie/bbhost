@@ -114,6 +114,7 @@ enum SettingId {
     kSsr,
     kUpscaler,
     kUpscaleQuality,
+    kDlssPreset,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -314,6 +315,15 @@ Setting g_set[kSettingCount] = {
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
     // Performance 1/2 each way (host/upscaler.h).
+    // DLSS's render preset (NGX's DLSS_Hint_Render_Preset for every quality;
+    // needs upscaler_bridge 1.1.0 and nvngx_dlss 310 or newer): K the
+    // transformer model and NVIDIA's own for DLAA, Quality and Balanced, J
+    // like it with less ghosting and more flicker, L made for Ultra
+    // Performance, M for Performance.
+    {"dlss_preset", "DLSS preset", {"K", "J", "L", "M"}, 0,
+     "Which of DLSS's models runs. K (recommended): the transformer model, the sharpest. J: like K, a little less "
+     "ghosting, a little more flicker. L: made for the lowest render sizes. M: made for Performance. DLSS only.",
+     false},
     {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
      "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full "
      "size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, "
@@ -425,6 +435,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kUpscaler},
     {Row::Option, nullptr, kUpscaleQuality},
+    {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -926,6 +937,8 @@ void rebuild_settings() {
         const int u = index_of(kUpscaler);
         h.upscaler = u == 1 ? 2 : u == 2 ? 3 : u == 3 ? 1 : 0;  // the menu's FSR 4, FSR 3, DLSS
         h.upscale_quality = std::clamp(index_of(kUpscaleQuality), 0, 3);
+        static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
+        h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);

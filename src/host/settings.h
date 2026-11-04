@@ -80,6 +80,8 @@ struct HostSettings {
     // AA), 1 Quality, 2 Balanced, 3 Performance. Follow the settings live.
     int upscaler = 0;
     int upscale_quality = 1;
+    // DLSS's render preset (NGX's number: 11 K, 10 J, 12 L, 13 M).
+    int dlss_preset = 11;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

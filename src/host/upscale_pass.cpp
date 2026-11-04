@@ -18,6 +18,7 @@
 // not yet.
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
+#include "host/settings.h"
 #include "host/upscaler.h"
 #include "log.h"
 
@@ -338,6 +339,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.depth = {depth.image, g_depth_view, depth.format, depth_layout};
     c.motion = {g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL};
     c.motion_scale = motion_mode < 0 ? -1.0f : 1.0f;
+    c.dlss_preset = static_cast<std::uint32_t>(host_settings_ref().dlss_preset);
     c.jitter_x = jitter_x;
     c.jitter_y = jitter_y;
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,

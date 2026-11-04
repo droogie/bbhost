@@ -151,6 +151,9 @@ typedef struct ub_evaluate_desc {
                                              0 counts as 1 */
     float frame_time_ms; /* since the last evaluate */
     float camera_near, camera_far, camera_fov_y; /* metres, metres, radians; FSR needs them */
+    /* Added after 1.0.0 (a struct_size that ends before it reads as 0). DLSS's render preset for every quality: 0 the bridge's own
+       (K), else NGX's preset number - 10 J, 11 K, 12 L, 13 M. A change makes a new context. */
+    uint32_t dlss_preset;
 } ub_evaluate_desc;
 
 /* The table of functions. Every pointer is always set. */

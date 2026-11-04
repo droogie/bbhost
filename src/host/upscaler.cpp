@@ -199,6 +199,7 @@ bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
     d.camera_near = c.near_m;
     d.camera_far = c.far_m;
     d.camera_fov_y = c.fov_y;
+    d.dlss_preset = c.dlss_preset;  // a 1.0.0 bridge (no such field) reads its struct only as far as its own
     if (g_ub->evaluate(g_ctx, cb, &d) == UB_OK) return true;
     g_failed.store(true, std::memory_order_relaxed);
     host_log("upscaler: evaluate failed, the plain picture from now on: %s", g_ub->last_error(g_ctx));
