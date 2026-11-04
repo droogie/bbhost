@@ -85,10 +85,12 @@ void controls_page_draw(bool setup_window) {
     }
     ImGui::Spacing();
 
-    // The bindings' bar: Reset all on the left, and beside it how to choose a
-    // binding - or, while one is being chosen, which and how to back out.
+    // The bindings on a card of their own, as the settings above sit on
+    // theirs: the menus' glass under them, not the painting.
+    ui::card_begin("##bindings", ImVec2(ImGui::GetContentRegionAvail().x, 0.0f), "BINDINGS");
+    // Its bar: Reset all on the left, and beside it how to choose a binding -
+    // or, while one is being chosen, which and how to back out.
     const int key_choosing = host_bind_capturing(), pad_choosing = host_pad_capturing();
-    ui::caption("BINDINGS");
     if (ui::ghost_button("Reset all to defaults", ImVec2(0.0f, 0.0f))) ImGui::OpenPopup("##reset_all");
     ui::tooltip_for_item("Reset all to defaults", "Every key, mouse button and controller button back to its default "
                                                   "(bbhost.toml's [keys] for the keys and the mouse).");
@@ -119,7 +121,10 @@ void controls_page_draw(bool setup_window) {
     ImGui::Spacing();
 
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX | ImGuiTableFlags_SizingFixedFit;
-    if (!ImGui::BeginTable("##controls", 5, flags)) return;
+    if (!ImGui::BeginTable("##controls", 5, flags)) {
+        ui::card_end();
+        return;
+    }
     // The three binding columns share what the action's name and the reset
     // leave, up to 170 each: a narrow menu or a large text size keeps every
     // column, the reset's too, on the page.
@@ -193,6 +198,7 @@ void controls_page_draw(bool setup_window) {
         }
     }
     ImGui::EndTable();
+    ui::card_end();
 }
 
 bool controls_capture_event(const SDL_Event& e) {
