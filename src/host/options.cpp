@@ -369,7 +369,7 @@ Setting g_set[kSettingCount] = {
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "Requires a restart. AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
      "the HUD and the menus are never interpolated. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside "
-     "bbhost.exe. In development: for now its swapchain only, each frame presented as it comes.",
+     "bbhost.exe, and Upscaling (FSR or DLSS) on: the depth and motion it generates from are the upscaler's.",
      true},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
@@ -489,6 +489,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
+    {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     // The preset row (preset_row): for FSR its preset - the Upscaling quality
@@ -497,7 +498,6 @@ const Row g_rows[] = {
     // 3D back to above them, Sharpness over the upscaler's picture below.
     {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kSharpness},
-    {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -1486,6 +1486,48 @@ void change(int id, int index) {
 // show another face (the upscaler's preset row, preset_row).
 // `names`, when given, are what the choices show in place of the setting's
 // own values (n of them; what is saved stays the value).
+// Each choice's own tooltip, for the rows whose choices need saying apart:
+// the upscaler, its presets (FSR's or DLSS's quality - `dlss` - and DLSS's
+// model) and HD motion blur's resolution. nullptr: the row's note only.
+const char* const* value_tips(int id, bool dlss) {
+    static const char* const kUpscalerTips[] = {
+        "The game's own anti-aliasing; the 3D at the Resolution.",
+        "AMD FSR 3: any GPU.",
+        "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
+        "NVIDIA DLSS: RTX cards only.",
+    };
+    static const char* const kFsrTips[] = {
+        "Native AA: the 3D drawn at the full Resolution; FSR only smooths its edges. The sharpest and the slowest.",
+        "Quality: the 3D at two thirds of the Resolution each way, brought back by FSR. Close to native, faster.",
+        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
+        "Performance: the 3D at half the Resolution each way - a quarter of the pixels. The fastest, the softest.",
+    };
+    static const char* const kDlssTips[] = {
+        "DLAA: DLSS at the full Resolution, anti-aliasing only. The sharpest and the slowest.",
+        "Quality: the 3D at two thirds of the Resolution each way, brought back by DLSS. Close to native, faster.",
+        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
+        "Performance: the 3D at half the Resolution each way - a quarter of the pixels. The fastest, the softest.",
+    };
+    static const char* const kPresetTips[] = {
+        "K: the transformer model, the sharpest. Recommended.",
+        "J: like K, with a little less ghosting and a little more flicker.",
+        "L: made for the lowest render sizes (Ultra Performance).",
+        "M: made for Performance.",
+    };
+    static const char* const kHdBlurTips[] = {
+        "Quarter: a quarter of the render size each way. The cheapest, the coarsest blur.",
+        "Half: half the render size each way, the game's own size.",
+        "Full: the render size itself. The cleanest blur, the dearest.",
+    };
+    switch (id) {
+        case kUpscaler: return kUpscalerTips;
+        case kUpscaleQuality: return dlss ? kDlssTips : kFsrTips;
+        case kDlssPreset: return kPresetTips;
+        case kHdMotionBlurRes: return kHdBlurTips;
+        default: return nullptr;
+    }
+}
+
 void setting_row(int id, const char* label = nullptr, const char* note = nullptr, const char* const* names = nullptr) {
     const Setting& s = g_set[id];
     if (!label) label = s.label;
@@ -1539,7 +1581,8 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
     } else if (n <= 4) {
-        ui::segmented("##v", &want, names ? names : s.values.data(), n, cw, id == kShaders ? kHostShaderModeTips : nullptr,
+        const char* const* tips = id == kShaders ? kHostShaderModeTips : value_tips(id, names != nullptr);
+        ui::segmented("##v", &want, names ? names : s.values.data(), n, cw, tips,
                       id == kShaders ? "Applies at the next start." : nullptr);
     } else {
         // A scale: the slider shows the step's own name (+10%, x1.4, 5).

@@ -1775,6 +1775,15 @@ RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // in place, with the G-buffer's depth; false when it did not run.
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
 void upscale_pass_reset_locked();
+// Frame generation's HUD-less picture (host/framegen.h): whether this frame
+// was prepared and its copy is still to make, and the copy of the display
+// buffer `display` as it is now, before the HUD's first draw into it.
+bool upscale_pass_hudless_due_locked();
+void upscale_pass_hudless_locked(RtImage& display);
+// The copy made this frame, and handing it over with the display buffer the
+// HUD's target then goes to (the frame's prepare done with).
+bool upscale_pass_hudless_copied_locked();
+void upscale_pass_hudless_bind_locked(std::uint64_t display_va);
 // Under render scale: the upscaler's picture, at the output size, for YEBIS's
 // copy to sample in place of a scene of scene_w x scene_h; null when there is
 // none (no upscale of that size has run, or the picture went back into the

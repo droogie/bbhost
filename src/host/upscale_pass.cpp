@@ -30,6 +30,7 @@
 // sharpens any more, so FSR 1's RCAS runs over the picture into an image of
 // its own (shaders/upscale_rcas.comp), which goes on in its place - before the
 // post chain and the HUD, which it never touches.
+#include "host/framegen.h"
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
@@ -57,6 +58,14 @@ struct OwnImage {
 
 OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F, the output size) and the motion (R16G16_SFLOAT, the scene's)
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
+// Frame generation (host/framegen.h): the frames prepared so far - each
+// frame's number - and the one this frame was prepared as (0: not), which its
+// HUD-less copy is then of.
+std::uint64_t g_fg_frames = 0, g_fg_pending = 0;
+// This frame's HUD-less copy, made, waiting for the display buffer it goes to.
+VkImage g_fg_copy = VK_NULL_HANDLE;
+VkFormat g_fg_copy_format = VK_FORMAT_UNDEFINED;
+std::uint32_t g_fg_copy_w = 0, g_fg_copy_h = 0;
 std::uint32_t g_w = 0, g_h = 0;     // the render size: the scene's, the motion's
 std::uint32_t g_ow = 0, g_oh = 0;   // the output size: the picture's
 bool g_scaled = false;              // the picture is larger than the scene: YEBIS's copy reads it (render scale)
@@ -497,6 +506,25 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (!ok) return false;
     g_output.initialised = true;
     g_reset = false;
+    // Frame generation's prepare: this frame's depth and motion, the jitter
+    // the draws had and the camera's vertical field of view.
+    if (framegen_active()) {
+        FramegenInputs fi;
+        fi.depth = depth.image;
+        fi.depth_format = depth.format;
+        fi.depth_layout = depth_layout;
+        fi.motion = g_motion.image;
+        fi.render_w = g_w;
+        fi.render_h = g_h;
+        fi.jitter_x = jitter_x;
+        fi.jitter_y = jitter_y;
+        fi.motion_scale = c.motion_scale;
+        if (g_cam_now.tan_y > 0.0f) fi.fov_y = 2.0f * std::atan(g_cam_now.tan_y);
+        g_fg_pending = framegen_prepare(cb, g_fg_frames + 1, fi) ? ++g_fg_frames : 0;
+        static bool told = false;
+        if (!told) host_log("framegen: first prepare %s", g_fg_pending ? "recorded" : "refused");
+        told = true;
+    }
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     // Sharpness: the sharpened picture goes on in its place.
@@ -531,6 +559,62 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         host_log("upscaler: first upscale of the scene 0x%llx (depth 0x%llx)", static_cast<unsigned long long>(scene.base),
                  static_cast<unsigned long long>(depth.base));
     return true;
+}
+
+bool upscale_pass_hudless_due_locked() { return g_fg_pending != 0; }
+
+void upscale_pass_hudless_locked(RtImage& display) {  // `display`: the HUD's target
+    if (!g_fg_pending) return;
+    // Four of ours in turn: the presenter may still be blitting the last
+    // frames' while this one is copied.
+    struct Copy {
+        OwnImage o;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        std::uint32_t w = 0, h = 0;
+    };
+    static Copy copies[4];
+    static unsigned next = 0;
+    Copy& k = copies[next++ % 4];
+    if (k.o.image && (k.format != display.format || k.w != display.width || k.h != display.height)) drop(k.o);
+    if (!k.o.image) {
+        if (!make(k.o, display.format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  display.width, display.height)) {
+            g_fg_pending = 0;
+            return;
+        }
+        k.format = display.format;
+        k.w = display.width;
+        k.h = display.height;
+    }
+    begin_recording_locked();
+    if (display.view_clear) view_clear_apply_locked(display);
+    render_end_pass_locked();
+    VkCommandBuffer cb = g_cmd();
+    barrier(cb, display.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(cb, k.o.image, VK_IMAGE_ASPECT_COLOR_BIT, k.o.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {display.width, display.height, 1};
+    vkCmdCopyImage(cb, display.image, VK_IMAGE_LAYOUT_GENERAL, k.o.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier(cb, display.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, k.o.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    k.o.initialised = true;
+    g_fg_copy = k.o.image;
+    g_fg_copy_format = display.format;
+    g_fg_copy_w = display.width;
+    g_fg_copy_h = display.height;
+}
+
+bool upscale_pass_hudless_copied_locked() { return g_fg_copy != VK_NULL_HANDLE; }
+
+void upscale_pass_hudless_bind_locked(std::uint64_t display_va) {
+    if (g_fg_pending && g_fg_copy) framegen_note_hudless(display_va, g_fg_pending, g_fg_copy, g_fg_copy_format, g_fg_copy_w, g_fg_copy_h);
+    g_fg_pending = 0;  // once a frame
+    g_fg_copy = VK_NULL_HANDLE;
 }
 
 // A frame it could not run in starts the next one's history over.

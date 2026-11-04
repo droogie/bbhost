@@ -23829,6 +23829,45 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // Frame generation's HUD-less picture (host/framegen.h). The HUD is not
+    // drawn into the display buffer: a rect pass copies a target of the same
+    // size into it (89cda9e4+38d65b32, with a table), and the HUD is drawn
+    // into that target first. So the target is learned from that pass, copied
+    // before its first triangle-list draw (the HUD's) once the post chain's
+    // last passes have written it, and the copy handed over with the display
+    // buffer the pass then writes.
+    if (upscale_pass_hudless_due_locked() && s.color[0]) {
+        static std::uint64_t hud_target = 0;
+        static bool target_written = false;
+        const std::uint64_t dst = s.color[0]->base;
+        if (hle_video_is_display_buffer(dst)) {
+            if (s.rect) {
+                for (const StageImages::Image& im : stage_images[1].images) {
+                    if (!im.resolved) continue;
+                    const RtImage* t = find_render_target(image_base(im));
+                    if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
+                        if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
+                        hud_target = t->base;
+                        break;
+                    }
+                }
+                upscale_pass_hudless_bind_locked(dst);
+            }
+            target_written = false;
+        } else if (dst == hud_target) {
+            // The post chain's last passes write it as strips (prim 6) or
+            // rects; the HUD's first draw is a triangle list (prim 4).
+            if (s.prim != 4) {
+                target_written = true;
+            } else if (target_written && !upscale_pass_hudless_copied_locked()) {
+                if (part) {
+                    run_part_stop(kRunStopOrder);
+                    return false;
+                }
+                upscale_pass_hudless_locked(*s.color[0]);
+            }
+        }
+    }
     if (part) {
         // The run's pass is open - its first draw began it - and a draw into
         // its targets with no hazard begins none (BBHOST_RUN_COMMIT).

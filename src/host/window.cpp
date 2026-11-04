@@ -1100,6 +1100,9 @@ bool vk_present() {
                 // The menus (F9, F10) over everything else (host/ingame_menu.h).
                 const bool menu = ingame_menu_record_in_pass(g_vk.cmd, g_vk.extent);
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
+                if (have && framegen_active())
+                    framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src.x),
+                                   static_cast<std::int32_t>(src.y), src.w, src.h);
                 recorded = true;
                 wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 ++g_pstats.one_pass;
@@ -1153,6 +1156,9 @@ bool vk_present() {
             ++g_pstats.clears;
         } else {
             ++g_pstats.blits;
+            if (framegen_active())
+                framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src_x),
+                               static_cast<std::int32_t>(src_y), src_w, src_h);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
         // box and the options screen later. Drawing needs

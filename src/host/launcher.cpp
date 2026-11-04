@@ -928,6 +928,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
+                // Frame generation: the same setting as the Graphics page's,
+                // changed and saved at once.
+                {
+                    bool fg = host_opt_get("frame_generation");
+                    if (ui::toggle_row("Frame generation", nullptr, &fg,
+                                       "Requires a restart. AMD FidelityFX frame generation: a frame made between each two of "
+                                       "the game's, from the 3D alone - the HUD and the menus are never interpolated. Needs "
+                                       "Upscaling (FSR or DLSS) on."))
+                        host_opt_set("frame_generation", fg);
+                }
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");
                 ui::toggle_row("Performance mode", nullptr, &performance_mode,

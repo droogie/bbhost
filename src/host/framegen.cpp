@@ -8,8 +8,11 @@
 #include "ffx_framegeneration.h"
 #include "vk/ffx_api_framegeneration_vk.h"
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -27,7 +30,32 @@ ffxContext g_swap_ctx = nullptr;  // AMD's swapchain
 ffxContext g_fg_ctx = nullptr;    // frame generation
 ffxQueryDescSwapchainReplacementFunctionsVK g_fns{};
 VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
-std::uint64_t g_frame_id = 0;
+VkDevice g_device = VK_NULL_HANDLE;
+VkPhysicalDevice g_phys = VK_NULL_HANDLE;
+VkFormat g_sc_format = VK_FORMAT_UNDEFINED;
+VkExtent2D g_sc_extent{};
+
+// The game's side: each display buffer's last HUD-less copy and the frame it
+// is of (the game draws into at most three in turn).
+struct Hudless {
+    std::uint64_t display_va = 0, id = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t w = 0, h = 0;
+};
+std::mutex g_hudless_mu;
+// AMD's frame generation context is used from two threads - the prepare on
+// the renderer's, the configure on the presenter's - where AMD's sample uses
+// it from one: one at a time.
+std::mutex g_ctx_mu;
+Hudless g_hudless[4];  // under g_hudless_mu
+
+// The presenter's side: the HUD-less picture at the swapchain's size, and the
+// flip being presented with whether everything for it is there.
+VkImage g_sc_hudless = VK_NULL_HANDLE;
+VkDeviceMemory g_sc_hudless_mem = VK_NULL_HANDLE;
+std::uint64_t g_present_id = 0;
+bool g_present_ready = false;
 
 // AMD's loader beside the exe, once; it finds the frame generation DLL itself.
 bool load() {
@@ -61,6 +89,53 @@ bool load() {
 #endif
     }();
     return ok;
+}
+
+// The swapchain-sized HUD-less image, device-local, made with the swapchain.
+bool make_sc_hudless() {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = g_sc_format;
+    ici.extent = {g_sc_extent.width, g_sc_extent.height, 1};
+    ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vkCreateImage(g_device, &ici, nullptr, &g_sc_hudless) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_sc_hudless, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    std::uint32_t type = ~0u;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount && type == ~0u; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (type == ~0u || vkAllocateMemory(g_device, &mai, nullptr, &g_sc_hudless_mem) != VK_SUCCESS ||
+        vkBindImageMemory(g_device, g_sc_hudless, g_sc_hudless_mem, 0) != VK_SUCCESS) {
+        vkDestroyImage(g_device, g_sc_hudless, nullptr);
+        g_sc_hudless = VK_NULL_HANDLE;
+        if (g_sc_hudless_mem) vkFreeMemory(g_device, g_sc_hudless_mem, nullptr);
+        g_sc_hudless_mem = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+FfxApiResource resource(VkImage image, VkFormat format, std::uint32_t w, std::uint32_t h, VkImageUsageFlags usage, std::uint32_t state) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {w, h, 1};
+    ici.mipLevels = ici.arrayLayers = 1;
+    ici.usage = usage;
+    return ffxApiGetResourceVK(image, ffxApiGetImageResourceDescriptionVK(image, ici, 0), state);
+}
+
+ffxReturnCode_t dispatch_generation(ffxDispatchDescFrameGeneration* params, void* ctx) {
+    return g_dispatch(static_cast<ffxContext*>(ctx), &params->header);
 }
 
 VkQueueInfoFFXAPI queue_info(void* q, std::uint32_t family) {
@@ -124,10 +199,19 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
         g_fg_ctx = nullptr;
     }
     g_swapchain = made;
-    g_frame_id = 0;
+    g_device = device;
+    g_phys = phys;
+    g_sc_format = sci.imageFormat;
+    g_sc_extent = sci.imageExtent;
+    if (g_fg_ctx && !make_sc_hudless()) host_log("framegen: no image for the HUD-less picture; frames are presented as they are");
     *out = made;
+#if defined(_WIN32)
+    for (const wchar_t* m : {L"amd_fidelityfx_framegeneration_vk.dll", L"amd_fidelityfx_loader_vk.dll", L"amdvlk64.dll", L"amdxc64.dll",
+                             L"vulkan-1.dll", L"upscaler_bridge.dll", L"amd_fidelityfx_upscaler_vk.dll"})
+        if (HMODULE h = GetModuleHandleW(m)) host_log("framegen: module %ls at %p", m, static_cast<void*>(h));
+#endif
     host_log("framegen: AMD's swapchain %ux%u in place (queues 2-4 of family %u)%s", sci.imageExtent.width, sci.imageExtent.height,
-             family, g_fg_ctx ? ", frame generation context made - generation off in this step" : "");
+             family, g_fg_ctx ? ", frame generation on for flips the upscaler ran in" : "");
     return true;
 }
 
@@ -144,15 +228,165 @@ VkResult framegen_acquire(VkDevice device, VkSwapchainKHR swapchain, std::uint64
 
 VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     if (g_fg_ctx) {
-        // Generation off for now: AMD's swapchain shows each frame as it is.
+        // Generated only for a flip with its prepare and its HUD-less picture:
+        // AMD takes the UI out of the frame against that picture and puts it
+        // over every frame it shows.
+        const bool on = g_present_ready;
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = g_swapchain;
-        cfg.frameGenerationEnabled = false;
-        cfg.frameID = g_frame_id++;
-        g_configure(&g_fg_ctx, &cfg.header);
+        cfg.frameGenerationEnabled = on;
+        cfg.allowAsyncWorkloads = false;  // the generation on the present queue, not async compute, for now
+        cfg.frameGenerationCallback = dispatch_generation;
+        cfg.frameGenerationCallbackUserContext = &g_fg_ctx;
+        if (on)
+            cfg.HUDLessColor = resource(g_sc_hudless, g_sc_format, g_sc_extent.width, g_sc_extent.height,
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_COMMON);
+        cfg.generationRect = {0, 0, static_cast<std::int32_t>(g_sc_extent.width), static_cast<std::int32_t>(g_sc_extent.height)};
+        cfg.frameID = g_present_id;
+        static std::atomic<int> told{0};
+        ffxReturnCode_t rc;
+        {
+            std::lock_guard<std::mutex> lk(g_ctx_mu);
+            rc = g_configure(&g_fg_ctx, &cfg.header);
+        }
+        if (rc != FFX_API_RETURN_OK) {
+            if (told.fetch_add(1) < 4) host_log("framegen: configuring frame %llu failed", static_cast<unsigned long long>(g_present_id));
+        } else if (on) {
+            static bool first = true;
+            if (first) host_log("framegen: generating, first at frame %llu", static_cast<unsigned long long>(g_present_id));
+            first = false;
+        }
     }
-    return g_fns.pOutQueuePresentKHR(queue, info);
+    // The generation runs inside the present (its callback, on this thread):
+    // not while the renderer's prepare is in the context.
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> lk(g_ctx_mu);
+        r = g_fns.pOutQueuePresentKHR(queue, info);
+    }
+    // What reaches the screen, real and generated, against the game's frames.
+    static std::uint64_t frames = 0, base = 0;
+    if (g_fns.pOutGetLastPresentCountFFXAPI && ++frames % 600 == 0) {
+        const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
+        host_log("framegen: %llu frames shown for the last 600 of the game's", static_cast<unsigned long long>(shown - base));
+        base = shown;
+    }
+    return r;
+}
+
+bool framegen_prepare(VkCommandBuffer cb, std::uint64_t id, const FramegenInputs& in) {
+    if (!g_fg_ctx || !in.depth || !in.motion) return false;
+    // AMD's backend reads an image in the layout its state names: depth goes
+    // to GENERAL for it (COMMON) and back.
+    const bool move = in.depth_layout != VK_IMAGE_LAYOUT_GENERAL;
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = in.depth;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (in.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT || in.depth_format == VK_FORMAT_D24_UNORM_S8_UINT)
+        b.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (move) {
+        b.oldLayout = in.depth_layout;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+    ffxDispatchDescFrameGenerationPrepareV2 p{};
+    p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+    p.frameID = id;
+    p.commandList = cb;
+    p.renderSize = {in.render_w, in.render_h};
+    p.jitterOffset = {in.jitter_x, in.jitter_y};
+    p.motionVectorScale = {in.motion_scale, in.motion_scale};  // render pixels already
+    p.frameTimeDelta = in.frame_ms;
+    p.cameraNear = in.near_m;
+    p.cameraFar = in.far_m;
+    p.cameraFovAngleVertical = in.fov_y;
+    p.viewSpaceToMetersFactor = 1.0f;
+    p.depth = resource(in.depth, in.depth_format, in.render_w, in.render_h, VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_COMMON);
+    p.motionVectors = resource(in.motion, VK_FORMAT_R16G16_SFLOAT, in.render_w, in.render_h,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, FFX_API_RESOURCE_STATE_COMMON);
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lk(g_ctx_mu);
+        ok = g_dispatch(&g_fg_ctx, &p.header) == FFX_API_RETURN_OK;
+    }
+    if (move) {
+        std::swap(b.oldLayout, b.newLayout);
+        b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+    static std::atomic<int> told{0};
+    if (!ok && told.fetch_add(1) < 4) host_log("framegen: the prepare for frame %llu failed", static_cast<unsigned long long>(id));
+    return ok;
+}
+
+void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage image, VkFormat format, std::uint32_t w,
+                           std::uint32_t h) {
+    std::lock_guard<std::mutex> lk(g_hudless_mu);
+    Hudless* slot = &g_hudless[0];
+    for (Hudless& s : g_hudless) {
+        if (s.display_va == display_va) { slot = &s; break; }
+        if (s.id < slot->id) slot = &s;  // else the oldest
+    }
+    *slot = Hudless{display_va, id, image, format, w, h};
+    static bool told = false;
+    if (!told) host_log("framegen: first HUD-less copy, frame %llu, display buffer 0x%llx %ux%u", static_cast<unsigned long long>(id),
+                        static_cast<unsigned long long>(display_va), w, h);
+    told = true;
+}
+
+void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D dst, VkExtent2D dst_size, std::int32_t src_x,
+                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h) {
+    g_present_ready = false;
+    if (!g_fg_ctx || !g_sc_hudless) return;
+    Hudless h;
+    {
+        std::lock_guard<std::mutex> lk(g_hudless_mu);
+        for (const Hudless& s : g_hudless) {
+            if (s.display_va == display_va) h = s;
+        }
+    }
+    // A frame seen before (the same buffer shown again) is not one to generate after.
+    if (!h.image || h.id <= g_present_id) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 3)
+            host_log("framegen: no HUD-less copy to present display buffer 0x%llx with (%s)", static_cast<unsigned long long>(display_va),
+                     h.image ? "shown before" : "none for it");
+        return;
+    }
+    g_present_id = h.id;
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_sc_hudless;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    // Black around the picture, as the frame's own edges are.
+    const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+    vkCmdClearColorImage(cmd, g_sc_hudless, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &b.subresourceRange);
+    b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkImageBlit r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.srcOffsets[0] = {src_x, src_y, 0};
+    r.srcOffsets[1] = {src_x + static_cast<std::int32_t>(src_w), src_y + static_cast<std::int32_t>(src_h), 1};
+    r.dstOffsets[0] = {dst.x, dst.y, 0};
+    r.dstOffsets[1] = {dst.x + static_cast<std::int32_t>(dst_size.width), dst.y + static_cast<std::int32_t>(dst_size.height), 1};
+    const bool same = src_w == dst_size.width && src_h == dst_size.height;
+    vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, VK_IMAGE_LAYOUT_GENERAL, 1, &r,
+                   same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    g_present_ready = true;
 }
 
 void framegen_destroy_swapchain(VkDevice device) {
@@ -164,5 +398,9 @@ void framegen_destroy_swapchain(VkDevice device) {
     // After the contexts, as AMD's replacement asks.
     g_fns.pOutDestroySwapchainFFXAPI(device, g_swapchain, nullptr, nullptr);
     g_swapchain = VK_NULL_HANDLE;
+    if (g_sc_hudless) vkDestroyImage(device, g_sc_hudless, nullptr);
+    if (g_sc_hudless_mem) vkFreeMemory(device, g_sc_hudless_mem, nullptr);
+    g_sc_hudless = VK_NULL_HANDLE;
+    g_sc_hudless_mem = VK_NULL_HANDLE;
     host_log("framegen: AMD's swapchain gone");
 }

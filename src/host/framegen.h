@@ -12,9 +12,13 @@
 // device's three spare queues (host/gpu.h fg_queues) or the setting, the
 // presenter keeps a swapchain of its own and nothing here runs.
 //
-// Built in steps (build/HANDOFF-upscaler.md): this one puts AMD's swapchain
-// in place with generation off - every frame presented as it comes - so the
-// swapchain and its pacing are proven before a frame is generated.
+// Each flip it generates for needs three things, all of that flip: AMD's
+// prepare (the 3D's depth, the motion the upscaler made and the camera),
+// recorded in the game's command buffer after the upscale; the HUD-less
+// picture, the display buffer copied before the HUD's first draw; and that
+// picture brought to the swapchain's size as the presenter brings the frame.
+// A flip missing one - no upscaler, no HUD-less copy, a flip skipped - is
+// presented as it is.
 
 #include <vulkan/vulkan.h>
 
@@ -41,3 +45,29 @@ VkResult framegen_acquire(VkDevice device, VkSwapchainKHR swapchain, std::uint64
 VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info);
 // The contexts and AMD's swapchain gone; the presenter makes a swapchain anew.
 void framegen_destroy_swapchain(VkDevice device);
+
+// The game's side, under the renderer's lock: AMD's prepare for `flip`,
+// recorded into `cb` after the upscale. Depth and motion at the render size;
+// motion in render pixels, the way the upscaler takes it.
+struct FramegenInputs {
+    VkImage depth = VK_NULL_HANDLE;
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkImageLayout depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+    VkImage motion = VK_NULL_HANDLE;  // R16G16_SFLOAT, GENERAL
+    std::uint32_t render_w = 0, render_h = 0;
+    float jitter_x = 0.0f, jitter_y = 0.0f, motion_scale = 1.0f;
+    float frame_ms = 16.7f, near_m = 0.1f, far_m = 10000.0f, fov_y = 1.0f;
+};
+// Frames are numbered by the game's side, one a frame prepared: `id`. False:
+// not prepared (no generation for this frame).
+bool framegen_prepare(VkCommandBuffer cb, std::uint64_t id, const FramegenInputs& in);
+// The HUD-less picture of frame `id` (GENERAL, the display buffer's size and
+// format), copied from the display buffer at `display_va`, which the
+// presenter finds again by that buffer when it presents it.
+void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage image, VkFormat format, std::uint32_t w,
+                           std::uint32_t h);
+// The presenter's side, in its command buffer after the frame's blit: the
+// HUD-less picture of the frame in `display_va` brought to the swapchain's
+// size over the same rectangles, for AMD to take the UI out of the frame with.
+void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D dst, VkExtent2D dst_size, std::int32_t src_x,
+                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h);
