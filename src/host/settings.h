@@ -92,6 +92,9 @@ struct HostSettings {
     // Sharpness: RCAS over the upscaler's picture (host/upscale_pass.cpp),
     // 0 none to 1 the most (AMD's scale). Followed live.
     float sharpness = 0.0f;
+    // Frame generation (host/framegen.h): AMD's frame generation swapchain,
+    // read once as the presenter makes its swapchain.
+    bool frame_generation = false;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

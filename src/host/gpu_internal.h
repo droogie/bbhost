@@ -414,6 +414,7 @@ struct Gpu {
     std::uint32_t family = 0;
     VkQueue queue = VK_NULL_HANDLE;
     VkQueue present_queue = VK_NULL_HANDLE;  // the family's second queue, the presenter's own; null with one
+    VkQueue fg_queues[3] = {};  // queues 2-4 for frame generation's present, image acquire and async work; null under five
     std::uint32_t family_queues = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
     // The command buffer being recorded and its fence/pool: aliases of

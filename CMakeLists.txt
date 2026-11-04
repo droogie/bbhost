@@ -162,6 +162,7 @@ add_executable(bbhost
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/controls_page.cpp
+  src/host/framegen.cpp
   src/host/options.cpp
   src/host/updater.cpp
   src/host/update_verify.cpp
@@ -207,7 +208,7 @@ add_executable(bbhost
   src/host/label_landing.cpp
 )
 
-target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen third_party/upscaler_bridge)
+target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen third_party/upscaler_bridge third_party/fidelityfx)
 # The port's menu strings, built in (engine/menu_assets.cpp makes the message
 # bundle from them at start): tools/pc_option_messages.tsv as a string literal.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/pc_option_messages.tsv)

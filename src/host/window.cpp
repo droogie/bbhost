@@ -10,6 +10,7 @@
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "host/framegen.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
@@ -300,6 +301,7 @@ struct Presenter {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;          // the renderer's: under host_gpu_lock
     VkQueue present_queue = VK_NULL_HANDLE;  // this thread's own, when the device has one
+    void* fg_queues[3] = {};                 // frame generation's three (host/gpu.h), null without them
     std::uint32_t family = 0;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -608,7 +610,18 @@ bool vk_create_swapchain() {
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
     // shadPS4 on the Radeon 8060S (ReShade's log there, 2026-10-07).
     [[maybe_unused]] const std::string modules_before = host_graphics_modules();
-    if (vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
+    // Frame generation: AMD's swapchain in place of ours (host/framegen.h),
+    // made afresh each time - the one before it gone first - and presenting on
+    // this thread's queue, the one vkQueuePresentKHR is called on below.
+    if (framegen_active()) {
+        framegen_destroy_swapchain(g_vk.device);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+    }
+    const bool fg = framegen_wanted() &&
+                    framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
+                                              g_vk.family, g_vk.fg_queues, &g_vk.swapchain);
+    if (!fg && vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
         host_log("vulkan: swapchain creation failed");
         return false;
     }
@@ -657,9 +670,10 @@ bool vk_create_swapchain() {
     g_swap_w.store(g_vk.extent.width, std::memory_order_relaxed);
     g_swap_h.store(g_vk.extent.height, std::memory_order_relaxed);
     std::uint32_t n = 0;
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, nullptr);
+    const auto get_images = framegen_active() ? framegen_get_images : vkGetSwapchainImagesKHR;
+    get_images(g_vk.device, g_vk.swapchain, &n, nullptr);
     g_vk.images.resize(n);
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
+    get_images(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
     for (VkImageView v : g_vk.views) {
         if (v) vkDestroyImageView(g_vk.device, v, nullptr);
     }
@@ -707,6 +721,7 @@ bool vk_start() {
     g_vk.device = static_cast<VkDevice>(h.device);
     g_vk.queue = static_cast<VkQueue>(h.queue);
     g_vk.present_queue = static_cast<VkQueue>(h.present_queue);
+    for (int i = 0; i < 3; ++i) g_vk.fg_queues[i] = h.fg_queues[i];
     g_vk.family = h.family;
     g_vk.latest_ready = h.fifo_latest_ready;
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
@@ -906,7 +921,10 @@ bool vk_present() {
     present_step("acquiring an image");
     // The image is ours once the acquire's fence signals (or, the old way, once
     // the GPU has waited on its semaphore: BBHOST_PRESENT_ACQUIRE_FENCE=0).
-    const bool by_fence = g_acquire_fence && g_vk.acquire_fence;
+    // AMD's frame generation swapchain is acquired as its sample does, with a
+    // semaphore.
+    const bool by_fence = g_acquire_fence && g_vk.acquire_fence && !framegen_active();
+    const auto acquire = framegen_active() ? framegen_acquire : vkAcquireNextImageKHR;
     const VkSemaphore acquire_sem = by_fence ? VK_NULL_HANDLE : g_vk.acquire_sem;
     const VkFence acquire_fence = by_fence ? g_vk.acquire_fence : VK_NULL_HANDLE;
     if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
@@ -917,7 +935,7 @@ bool vk_present() {
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -943,7 +961,8 @@ bool vk_present() {
             return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
-        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
+        r = (framegen_active() ? framegen_acquire : vkAcquireNextImageKHR)(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem,
+                                                                               acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
@@ -1279,7 +1298,7 @@ bool vk_present() {
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    const VkResult pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();

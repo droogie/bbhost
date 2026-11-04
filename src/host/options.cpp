@@ -118,6 +118,7 @@ enum SettingId {
     kUpscaleQuality,
     kDlssPreset,
     kSharpness,
+    kFrameGeneration,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -328,7 +329,7 @@ Setting g_set[kSettingCount] = {
     // picture in place of the game's after the 3D, before the post effects.
     // Off by default; the order of the values is the settings object's
     // (0 off, then DLSS, FSR) turned round for the menu (Off, FSR, DLSS).
-    {"upscaler", "Upscaling", {"Off", "FSR 4", "FSR 3", "DLSS"}, 0,
+    {"upscaler", "Upscaling", {"Off", "FSR 3", "FSR 4", "DLSS"}, 0,
      "FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 (any GPU) or DLSS (NVIDIA RTX) in place of the game's "
      "own anti-aliasing. Needs upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; "
      "without them it stays off. FSR 4 runs as FSR 3 where it cannot run. Changes at once; with Upscaling quality below "
@@ -362,6 +363,14 @@ Setting g_set[kSettingCount] = {
      "Sharpens the upscaled 3D (FSR or DLSS) before the post effects and the HUD, which it never touches. 0% leaves the "
      "upscaler's picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
      false},
+    // AMD's frame generation (host/framegen.h): its swapchain in the
+    // presenter's place; a frame it makes from the 3D between two of the
+    // game's, the HUD and the menus put back over each.
+    {"frame_generation", "Frame generation", {"Off", "On"}, 0,
+     "Requires a restart. AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
+     "the HUD and the menus are never interpolated. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside "
+     "bbhost.exe. In development: for now its swapchain only, each frame presented as it comes.",
+     true},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -488,6 +497,7 @@ const Row g_rows[] = {
     // 3D back to above them, Sharpness over the upscaler's picture below.
     {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kSharpness},
+    {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -1004,11 +1014,12 @@ void rebuild_settings() {
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
     {
         const int u = index_of(kUpscaler);
-        h.upscaler = u == 1 ? 2 : u == 2 ? 3 : u == 3 ? 1 : 0;  // the menu's FSR 4, FSR 3, DLSS
+        h.upscaler = u == 1 ? 3 : u == 2 ? 2 : u == 3 ? 1 : 0;  // the menu's FSR 3, FSR 4, DLSS
         h.upscale_quality = std::clamp(index_of(kUpscaleQuality), 0, 3);
         static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
         h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
         h.sharpness = static_cast<float>(std::clamp(index_of(kSharpness), 0, 100)) / 100.0f;
+        h.frame_generation = on_of(kFrameGeneration);
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
@@ -1326,6 +1337,8 @@ void host_options_load() {
             g_set[id].index = e[0] == '0' ? 1 : 0;  // these are {"On","Off"}
         }
     }
+    // BBHOST_FRAMEGEN=1 or 0: Frame generation on or off over the file.
+    if (const char* e = std::getenv("BBHOST_FRAMEGEN"); e && e[0]) g_set[kFrameGeneration].index = e[0] == '0' ? 0 : 1;
     if (const char* e = std::getenv("BBHOST_MOUSE_CAMERA"); e && e[0]) {
         g_set[kMouseCamera].index = e[0] == '0' ? 0 : 1;
     }
@@ -1677,7 +1690,7 @@ const char* host_options_page_blurb(int page) {
 // off, DLSS's model, greyed. The render size is drawn at as the game starts
 // (engine/render_scale.cpp), so it applies at the next start.
 void preset_row() {
-    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 4, FSR 3, DLSS
+    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
     // DLSS at the full size is DLAA: its first choice says so.
     static const char* const kDlssQualityNames[4] = {"DLAA", "Quality", "Balanced", "Performance"};
     const auto quality_note = [](const char* who) {

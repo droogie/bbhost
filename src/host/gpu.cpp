@@ -4289,15 +4289,21 @@ bool init_locked() {
     // queue under its lock - as shadPS4 and vkcube make their devices. An A/B
     // for what Windows' per-process GPU counters see of a program that
     // presents from a queue of its own; it costs the command processor the present's blocking.
-    const float prio[2] = {1.0f, 1.0f};
+    // Frame generation (host/framegen.h) takes three more of the family's
+    // queues when it has five: AMD's frame generation swapchain presents,
+    // acquires and runs its async work on queues of its own (2, 3, 4).
+    const float prio[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g.family;
     const char* one_queue = std::getenv("BBHOST_VK_QUEUES");
     if (one_queue && one_queue[0] == '1') g.family_queues = 1;
-    qci.queueCount = g.family_queues >= 2 ? 2 : 1;
+    qci.queueCount = g.family_queues >= 5 ? 5 : g.family_queues >= 2 ? 2 : 1;
     qci.pQueuePriorities = prio;
     host_log("gpu: queue family %u (%u queues): %u queue%s, priority 1.0%s", g.family, usable[static_cast<std::size_t>(chosen)].queues,
-             qci.queueCount, qci.queueCount == 2 ? "s - the second the presenter's" : ", the presents on it too",
+             qci.queueCount,
+             qci.queueCount == 5   ? "s - the second the presenter's, three for frame generation"
+             : qci.queueCount == 2 ? "s - the second the presenter's"
+                                   : ", the presents on it too",
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
@@ -4756,6 +4762,9 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (g.family_queues >= 5) {
+        for (std::uint32_t i = 0; i < 3; ++i) vkGetDeviceQueue(g.device, g.family, 2 + i, &g.fg_queues[i]);
+    }
     if (f12.timelineSemaphore) {
         VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -9528,6 +9537,7 @@ GpuHandles host_gpu_handles() {
     h.device = g.device;
     h.queue = g.queue;
     h.present_queue = g.present_queue;
+    for (int i = 0; i < 3; ++i) h.fg_queues[i] = g.fg_queues[i];
     h.family = g.family;
     h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
     return h;

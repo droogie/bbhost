@@ -743,6 +743,7 @@ struct GpuHandles {
     void* device = nullptr;          // VkDevice
     void* queue = nullptr;           // VkQueue
     void* present_queue = nullptr;   // VkQueue for presents only (the same family), or null
+    void* fg_queues[3] = {};         // VkQueues for frame generation: present, image acquire, async compute; null when the family has fewer than five
     std::uint32_t family = 0;
     bool fifo_latest_ready = false;  // the device may present in VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
 };
