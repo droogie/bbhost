@@ -85,15 +85,18 @@ int main() {
         if (!on.count(name)) std::printf("  %s is on the list and not on by default\n", name.c_str());
     }
     CHECK(on == kOnByDefault);
-    CHECK(seen.count("screen-space-reflections") == 1);
-    CHECK(on.count("screen-space-reflections") == 0);
+    // Screen Space Reflections is a setting now (engine/patch_manifest.cpp's
+    // ssr): no file of its own.
+    CHECK(seen.count("screen-space-reflections") == 0);
+    CHECK(seen.count("rgba8f-color-space") == 1);
+    CHECK(on.count("rgba8f-color-space") == 0);
 
-    // The guard catches a dropped line: Screen Space Reflections' own file
+    // The guard catches a dropped line: rgba8f color space's own file
     // without its `enabled = false` reads as on.
     const fs::path dir = fs::temp_directory_path() / ("patch_defaults_test." + std::to_string(::getpid()));
     fs::create_directories(dir);
     {
-        std::ifstream in(fs::path(BB_PATCHES_DIR) / "screen-space-reflections.toml");
+        std::ifstream in(fs::path(BB_PATCHES_DIR) / "rgba8f-color-space.toml");
         std::stringstream all;
         all << in.rdbuf();
         std::string text = all.str(), kept;
@@ -111,7 +114,7 @@ int main() {
         patch_file::Manifest m;
         std::string err;
         CHECK(patch_file::parse((dir / "without-enabled.toml").string(), &m, &err));
-        CHECK(m.name == "screen-space-reflections" && m.enabled);
+        CHECK(m.name == "rgba8f-color-space" && m.enabled);
     }
 
     // What a player starts from turns nothing on.

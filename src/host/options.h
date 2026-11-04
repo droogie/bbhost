@@ -36,6 +36,12 @@ int host_options_page_count();
 const char* host_options_page_name(int page);
 const char* host_options_page_blurb(int page);
 void host_options_draw_page(int page);
+// The same page in the setup window (host/launcher.cpp), before the game:
+// every setting applies as the game starts, so none says "next start", and
+// Resolution and Shaders - the setup window's own rows on its Game and Shaders
+// pages - are left out. Its changes are the setup window's to apply
+// (host_options_frame) and to save.
+void host_options_draw_setup_page(int page);
 // Runs `fn` on the window's thread at its next pump: the menus' changes to
 // settings and to bbhost.toml, which can touch the window or write files.
 void host_options_post(std::function<void()> fn);

@@ -93,6 +93,8 @@ enum SettingId {
     kSaturation,
     kFog,
     kModelDetail,
+    kSsr,
+    kSsrFade,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -271,6 +273,21 @@ Setting g_set[kSettingCount] = {
     // visibly simpler up close).
     {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
+    // The game's screen space reflections, off as it shipped
+    // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
+    // game's own half size. Its targets are made as the game starts. The
+    // first time, a bbhost.toml that turned the old patch file on
+    // ([patches] screen-space-reflections) seeds it (host_options_load).
+    {"ssr", "Screen space reflections", {"Off", "On"}, 0,
+     "Requires a restart. Wet streets, water and polished floors reflect what is on screen, at the game's own half "
+     "size. Costs GPU time.",
+     true},
+    // [Ssr] Fade To Viewer: -0.8 in the game fades reflections out as they
+    // turn toward the camera; -10000, as Kyo's shadPS4 list has it, keeps them.
+    {"ssr_fade", "Reflections facing the camera", {"Off", "On"}, 1,
+     "Requires a restart. With screen space reflections on: reflections stay where they face the camera, instead of "
+     "fading out as the game has them (its Fade To Viewer -0.8 becomes -10000).",
+     true},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -385,6 +402,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kSsr},
+    {Row::Option, nullptr, kSsrFade},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
@@ -874,6 +893,8 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
+    h.ssr = on_of(kSsr);
+    h.ssr_fade = on_of(kSsrFade);
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
@@ -946,6 +967,10 @@ void host_options_load() {
     // changed, and the environment switches still win over both.
     host_bindings_load_defaults();
     g_set[kSkipLogos].index = config().skip_intro ? 1 : 0;
+    // Screen space reflections were a patch file until they became a setting:
+    // a bbhost.toml that turned it on keeps them on until the player chooses.
+    if (const std::string v = config_value("patches.screen-space-reflections"); !v.empty())
+        g_set[kSsr].index = v == "false" || v == "0" ? 0 : 1;
     // The PC enhancements seed from bbhost.toml's [world] (all on unless it
     // says otherwise); the options file then holds the player's choice, and a
     // BBHOST_* switch still wins over both (config_set_enhancements).
@@ -1269,6 +1294,9 @@ const std::vector<OptionsPage>& pages() {
     return list;
 }
 
+// Drawing for the setup window (host_options_draw_setup_page), not the game.
+bool g_setup_page = false;
+
 // A setting as the menu shows it: what it set and the pump has not applied
 // yet, else the setting. The presenter's own (g_pending is never the pump's).
 int shown_index(int id) {
@@ -1293,7 +1321,7 @@ void setting_row(int id) {
     const float sc = ui::scale();
     const int n = static_cast<int>(s.values.size());
     const int cur = std::clamp(shown_index(id), 0, n - 1);
-    const bool restart = s.restart && !(id == kResolution && res_live(cur));
+    const bool restart = s.restart && !g_setup_page && !(id == kResolution && res_live(cur));
     ImGui::PushID(id);
     int on_i = -1, off_i = -1;
     for (int v = 0; v < n; ++v) {
@@ -1485,6 +1513,7 @@ void host_options_draw_page(int page) {
     bool first = true;
     for (int r = pg.first; r < pg.end; ++r) {
         if (g_rows[r].kind != Row::Option) continue;
+        if (g_setup_page && (g_rows[r].setting == kResolution || g_rows[r].setting == kShaders)) continue;
         if (!first) row_rule();
         first = false;
         setting_row(g_rows[r].setting);
@@ -1493,8 +1522,15 @@ void host_options_draw_page(int page) {
     ui::card_end();
 }
 
+void host_options_draw_setup_page(int page) {
+    g_setup_page = true;
+    host_options_draw_page(page);
+    g_setup_page = false;
+}
+
 #else  // a build without a window: no menu
 
+void host_options_draw_setup_page(int) {}
 int host_options_page_count() { return 0; }
 const char* host_options_page_name(int) { return ""; }
 const char* host_options_page_blurb(int) { return ""; }

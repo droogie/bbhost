@@ -179,6 +179,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         auto it = kv.find("startup.setup_animations");
         if (it != kv.end()) c->setup_animations = it->second == "true" || it->second == "1";
     }
+    {
+        auto it = kv.find("startup.setup_keep_open");
+        if (it != kv.end()) c->setup_keep_open = it->second == "true" || it->second == "1";
+    }
     num("startup.setup_text_size", &c->setup_text_size);
     {
         auto it = kv.find("debug.tooling");
@@ -606,6 +610,8 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
             c.headless = true;
         } else if (a == "--setup") {
             c.setup_requested = true;
+        } else if (a == "--no-setup") {
+            c.setup_skip = true;
         } else if (a.rfind("--", 0) == 0) {
             *error = "unknown flag " + a;
             return false;

@@ -72,6 +72,11 @@ struct HostSettings {
     float ao_strength = 1.0f;   // 1.0 the area's own, 0 none, 2 twice
     int lod_bias = 0;           // the game's model detail bias: -2 finest always, 0 its own, 2 coarsest
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
+    // Screen space reflections (engine/patch_manifest.cpp's ssr and
+    // ssr-fade-to-viewer, read once as the game starts): the reflection pass
+    // on, and its Fade To Viewer at -10000 instead of the game's -0.8.
+    bool ssr = false;
+    bool ssr_fade = true;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

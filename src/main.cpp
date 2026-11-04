@@ -1017,7 +1017,7 @@ int main(int argc, char** argv) {
         // seen yet (or plugins.show_settings): it opens on the Plugins tab.
         const std::string help = config_setup_help(cfg);
         const bool plugins_tab = !cfg.headless && help.empty() && !cfg.setup_requested && plugin_ui_wants_attention();
-        if (!compile_session && !cfg.headless && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
+        if (!compile_session && !cfg.headless && !cfg.setup_skip && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
             std::string reason = help.substr(0, help.find('\n'));
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;

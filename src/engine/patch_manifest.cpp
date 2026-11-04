@@ -73,6 +73,8 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "streaming.all_post_processors") return config().all_post_processors;
     if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > STARTUP, read once
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
+    if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
+    if (option == "graphics.ssr_fade") return host_settings().ssr && host_settings().ssr_fade;
     *known = false;
     return false;
 }
@@ -249,6 +251,71 @@ Manifest performance_mode_manifest() {
     return m;
 }
 
+// ssr, Screen space reflections (graphics.ssr): Kyo's 1.09 patch from his
+// shadPS4 list ("Enable Screen Space Reflections (READ NOTE)"), site for site,
+// which was patches/screen-space-reflections.toml. The scene context's
+// reflection pass on (its targets made and the pass run), its ray march's step
+// scale 0.0 over the 1.0 at 0x12a8cfd (the list's: dearer, 7.8 ms a frame at
+// 1080p on the Radeon 8060S against 6.1), its two targets at the game's half
+// size in format 10 instead of r12d's, and the depth renders it reads at the
+// game's own half and quarter sizes - four sites that write the game's code
+// back over a performance patch's fixed sizes - as 32-bit float (0x125b1bf:
+// 0x14 -> 0x28). Two calls and two bytes as shipped (0x26a10c0, 0x26a2829,
+// 0x26c3d7d, 0x26c4fd7) undo the performance patches' changes to what it
+// reads. It loads after every patch file, so its bytes win.
+Manifest ssr_manifest() {
+    Manifest m;
+    m.name = "ssr";
+    m.title = "Screen space reflections";
+    m.eboot = kEboot109Sha256;
+    m.description = "the reflection pass on, the depth renders it reads at the game's own sizes";
+    m.option = "graphics.ssr";
+    m.order = 9000;
+    auto site = [&](const char* id, std::uint64_t at, std::vector<std::uint8_t> expect, std::vector<std::uint8_t> bytes) {
+        m.sites.push_back(Site{id, at, std::move(expect), std::move(bytes), true, {}});
+    };
+    site("enable-a", 0x026c4fd7, {0x01}, {0x01});
+    site("enable-b", 0x026c4fd3, {0x77}, {0x74});        // ja -> je
+    site("enable-c", 0x026c3d2f, {0x74, 0x53}, {0x90, 0x90});  // je 0x26c3d84 -> nops
+    site("enable-d", 0x026c3d7d, {0x01}, {0x01});
+    const std::vector<std::uint8_t> half_w = {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24},
+                                    half_h = {0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04},
+                                    quarter_w = {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24},
+                                    quarter_h = {0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04};
+    site("depth-half-width", 0x0125b1a3, half_w, half_w);
+    site("depth-half-height", 0x0125b1aa, half_h, half_h);
+    site("depth-quarter-width", 0x0125b1d6, quarter_w, quarter_w);
+    site("depth-quarter-height", 0x0125b1de, quarter_h, quarter_h);
+    site("depth-format", 0x0125b1bf, {0x14}, {0x28});
+    site("step-scale", 0x012a8cfd, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x00});
+    site("call-a", 0x026a10c0, {0xe8, 0xbb, 0xe0, 0xfe, 0xff}, {0xe8, 0xbb, 0xe0, 0xfe, 0xff});
+    site("call-b", 0x026a2829, {0xe8, 0x52, 0xc9, 0xfe, 0xff}, {0xe8, 0x52, 0xc9, 0xfe, 0xff});
+    site("size-a", 0x026c429a, {0x44, 0x89, 0xe1}, {0x6a, 0x0a, 0x59});  // mov ecx, r12d -> push 10; pop rcx
+    site("size-b", 0x026c42b4,
+         {0xc7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x41, 0xb9, 0x14, 0x00, 0x00, 0x00, 0x45, 0x89, 0xe0},
+         {0x83, 0x24, 0x24, 0x00, 0x31, 0xc9, 0x41, 0xb9, 0x14, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x0a, 0x00, 0x00, 0x00});
+    return m;
+}
+
+// ssr-fade-to-viewer, Reflections facing the camera (graphics.ssr_fade, with
+// ssr on): [Ssr] Fade To Viewer Param - the scene context's +0x7680, set in its
+// constructor's movabs - -10000 over the game's -0.8, as the shadPS4 list has
+// it, and the debug menu's slider for it reaching down to it (its minimum
+// loads -10000 at 0x4c80a34 instead of -1.0) so it shows the value.
+Manifest ssr_fade_manifest() {
+    Manifest m;
+    m.name = "ssr-fade-to-viewer";
+    m.title = "Reflections facing the camera";
+    m.eboot = kEboot109Sha256;
+    m.description = "[Ssr] Fade To Viewer -10000 instead of -0.8";
+    m.option = "graphics.ssr_fade";
+    m.order = 9001;
+    m.sites.push_back(Site{"fade-to-viewer", 0x02695a5b, {0xcd, 0xcc, 0x4c, 0xbf}, {0x00, 0x40, 0x1c, 0xc6}, true, {}});
+    m.sites.push_back(Site{"fade-to-viewer-slider", 0x026b8d65, {0xc5, 0xfa, 0x10, 0x05, 0x1f, 0x0f, 0x67, 0x02},
+                           {0xc5, 0xfa, 0x10, 0x05, 0xc7, 0x7c, 0x5c, 0x02}, true, {}});
+    return m;
+}
+
 // skip-intro, Skip company logos (startup.skip_intro): illusion's 1.09 Skip
 // Intro. The three company logos (FromSoftware, Japan Studio, SCE) are
 // entries the startup flow plays by name; emptying the first two UTF-16
@@ -274,8 +341,16 @@ std::vector<Manifest> built_in_manifests() {
     std::vector<Manifest> out;
     out.push_back(std::move(m));
     out.push_back(performance_mode_manifest());
+    out.push_back(ssr_manifest());
+    out.push_back(ssr_fade_manifest());
     return out;
 }
+
+// Patch files a setting replaced: the Screen Space Reflections patches (the
+// game's half size and the quarter-size variant) are the Graphics page's
+// Screen space reflections now. A package unpacked over an older one still
+// has them in its patches folder; they are passed over, not applied twice.
+bool retired_file(const std::string& file) { return file.rfind("screen-space-reflections", 0) == 0; }
 
 // By file name, a later directory's file replacing an earlier one's.
 std::map<std::string, std::string> manifest_files(const std::vector<std::string>& dirs) {
@@ -284,6 +359,7 @@ std::map<std::string, std::string> manifest_files(const std::vector<std::string>
         std::vector<std::string> names;
         if (!host_list_dir(dir.c_str(), &names)) continue;
         for (const std::string& n : names) {
+            if (retired_file(n)) continue;
             if (n.size() > 5 && n.compare(n.size() - 5, 5, ".toml") == 0) files[n] = dir + "/" + n;
         }
     }

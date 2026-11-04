@@ -28,6 +28,12 @@
 // setup window starts its child with.
 bool shader_compile_take_flag(int& argc, char** argv);
 void shader_compile_set_args(int argc, char** argv);
+// This executable started again with the arguments it was started with,
+// `flag` first: the compile's child (--compile-shaders), the game the setup
+// window starts while it stays open (--no-setup), the setup window again
+// (--setup), its output piped to this one when `pipe_stdio`. The SDL_Process,
+// or null with `error` set.
+void* host_start_again(const char* flag, bool pipe_stdio, std::string& error);
 // The child's run, once the game's folders are known; its exit code.
 int shader_compile_session();
 

@@ -89,6 +89,12 @@ struct HostConfig {
     // painting and its motes, the moon's breathing, the Play button's pulse
     // and shine, the page fade, the eased highlights. Off, it stands still.
     bool setup_animations = true;
+    // startup.setup_keep_open: Play starts the game as a process of its own
+    // and the setup window waits minimized, coming back when the game ends.
+    bool setup_keep_open = false;
+    // --no-setup: never the setup window, whatever startup.setup_window says
+    // (the game the setup window starts when it stays open).
+    bool setup_skip = false;
     // startup.setup_text_size: Menu text size's default in percent (100-400;
     // 0 none), for the setup window, F9 and F10 alike; the options file
     // (menu_text_size, host/options.cpp) holds the player's choice.

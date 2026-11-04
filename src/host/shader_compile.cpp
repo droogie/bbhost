@@ -81,8 +81,8 @@ void shader_compile_set_args(int argc, char** argv) {
     g_args.clear();
     if (argc > 0 && argv[0]) g_exe_name = fs::path(argv[0]).filename().string();
     for (int i = 1; i < argc; ++i) {
-        // The setup window's own switch would open it again in the child.
-        if (std::strcmp(argv[i], "--setup") == 0) continue;
+        // The setup window's own switches: the child says for itself.
+        if (std::strcmp(argv[i], "--setup") == 0 || std::strcmp(argv[i], "--no-setup") == 0) continue;
         g_args.emplace_back(argv[i]);
     }
 }
@@ -257,6 +257,26 @@ ShaderCacheState shader_cache_state(const std::string& data, const std::vector<s
     return s;
 }
 
+void* host_start_again(const char* flag, bool pipe_stdio, std::string& error) {
+    // This executable again, by its own path.
+    std::string name = g_exe_name;
+#if defined(_WIN32)
+    if (name.empty()) name = "bbhost.exe";
+    if (name.size() < 4 || name.compare(name.size() - 4, 4, ".exe") != 0) name += ".exe";
+#else
+    if (name.empty()) name = "bbhost";
+#endif
+    const std::string exe = config_exe_dir() + "/" + name;
+    std::vector<std::string> args{exe, flag};
+    args.insert(args.end(), g_args.begin(), g_args.end());
+    std::vector<const char*> argv;
+    for (const std::string& a : args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+    SDL_Process* p = SDL_CreateProcess(argv.data(), pipe_stdio);
+    if (!p) error = "could not start " + exe + ": " + SDL_GetError();
+    return p;
+}
+
 ShaderCompileJob::~ShaderCompileJob() {
     cancel();
     if (thread_.joinable()) thread_.join();  // the child writes what it has done first
@@ -270,27 +290,12 @@ bool ShaderCompileJob::start(std::string& error) {
         SDL_DestroyProcess(static_cast<SDL_Process*>(proc_));
         proc_ = nullptr;
     }
-    // This executable again, by its own path.
-    std::string name = g_exe_name;
-#if defined(_WIN32)
-    if (name.empty()) name = "bbhost.exe";
-    if (name.size() < 4 || name.compare(name.size() - 4, 4, ".exe") != 0) name += ".exe";
-#else
-    if (name.empty()) name = "bbhost";
-#endif
-    const std::string exe = config_exe_dir() + "/" + name;
-    std::vector<std::string> args{exe, "--compile-shaders"};
-    args.insert(args.end(), g_args.begin(), g_args.end());
-    std::vector<const char*> argv;
-    for (const std::string& a : args) argv.push_back(a.c_str());
-    argv.push_back(nullptr);
-    SDL_Process* p = SDL_CreateProcess(argv.data(), true);
+    auto* p = static_cast<SDL_Process*>(host_start_again("--compile-shaders", true, error));
     if (!p) {
-        error = SDL_GetError();
         std::lock_guard<std::mutex> lk(mu_);
         v_ = View{};
         v_.failed_to_run = true;
-        v_.error = "could not start " + exe + ": " + error;
+        v_.error = error;
         return false;
     }
     proc_ = p;
@@ -300,7 +305,7 @@ bool ShaderCompileJob::start(std::string& error) {
         v_.running = true;
         v_.phase = "starting";
     }
-    host_log("setup: compile-shaders started (%s)", exe.c_str());
+    host_log("setup: compile-shaders started");
     thread_ = std::thread([this] { reader(); });
     return true;
 }
