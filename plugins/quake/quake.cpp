@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.16",
+    "0.3.17",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -1281,7 +1281,15 @@ void guns_apply() {
             auto* b = g.param<bb::params::Bullet>(id);
             if (!b) continue;
             g_saved_bullets.emplace_back(id, *b);
+            // The look only: the hit stays the Piercing Rifle's own (420, 430:
+            // its attack rating and bloodtinge scaling, as every gun's), not the
+            // star's flat arcane, which no stat raises.
+            const std::int32_t atk = b->atkId_Bullet;
+            const std::uint8_t attribute = b->atkAttribute, sp = b->spAttribute;
             *b = *src;
+            b->atkId_Bullet = atk;
+            b->atkAttribute = attribute;
+            b->spAttribute = sp;
             b->homingAngle = 0;
             b->gravityInRange = b->gravityOutRange = 0.0f;
             b->launchConditionType = 0;
@@ -1293,6 +1301,20 @@ void guns_apply() {
             ++bullets;
         }
     }
+    // Its burst (A Call Beyond's 382, the plasma climb's blast) hits for
+    // nothing: its flat arcane is the star's too.
+    if (auto* b = g.param<bb::params::Bullet>(static_cast<std::uint32_t>(kPlasmaLooks[s.plasma].burst))) {
+        g_saved_bullets.emplace_back(kPlasmaLooks[s.plasma].burst, *b);
+        b->atkId_Bullet = -1;
+        ++bullets;
+    }
+    // The cannons fire each other's shell, but each hits as its own shot: the
+    // Church Cannon's shell is 170% of its gun's attack (620, burst 621), the
+    // Cannon's 100% (600, 601). Left with the shell, the rocket was the Church
+    // Cannon's 480 at 100% - the weakest of the two pairings.
+    constexpr std::pair<std::uint32_t, std::int32_t> kShellAtks[] = {{700, 620}, {701, 621}, {720, 600}, {722, 601}};
+    for (const auto& [id, atk] : kShellAtks)
+        if (auto* b = g.param<bb::params::Bullet>(id)) b->atkId_Bullet = atk;  // saved with kBulletRules
     for (const std::uint32_t id : kHitscan) {
         auto* b = g.param<bb::params::Bullet>(id);
         if (!b) continue;
@@ -1399,7 +1421,8 @@ constexpr QuakeWeapon kWeapons[] = {
     {"Shotgun", "Hunter Blunderbuss", 6000000, 100600800, 600, 1000.0, 0.0f},  // the pellets' fan is the bullet's
     // Each gun's model and damage with the other's shot: the Cannon fires the
     // Church Cannon's shell (720, flown as the grenade) and the Church Cannon
-    // the Cannon's (700, the rocket).
+    // the Cannon's (700, the rocket); guns_apply gives each shell its own gun's
+    // attack row.
     {"Grenade Launcher", "Cannon", 15000000, 103500800, 720, 800.0, 0.0f},
     {"Rocket Launcher", "Church Cannon", 35000000, 101500800, 700, 800.0, 0.0f},
     {"Plasma Gun", "Piercing Rifle", 36000000, 103600800, 540, 100.0, 0.0f},
