@@ -332,21 +332,18 @@ Setting g_set[kSettingCount] = {
     {"upscaler", "Upscaling", {"Off", "FSR 3", "FSR 4", "DLSS"}, 0,
      "FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 (any GPU) or DLSS (NVIDIA RTX) in place of the game's "
      "own anti-aliasing. Needs upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; "
-     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run. Changes at once; with Upscaling quality below "
-     "Native AA, the smaller render size it draws the 3D at comes and goes at the next start.",
+     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run. Changes at once.",
      false},
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
-    // Performance 1/2 each way (engine/render_scale.cpp). The scene contexts
-    // are made at it as the game starts, so it applies at the next start - as
-    // does Upscaling turned on or off with a quality above Native AA, which
-    // decides whether the 3D is drawn smaller at all.
+    // Performance 1/2 each way (engine/render_scale.cpp). A change rebuilds
+    // the scene contexts at the new size (live resolution's rebuild), as
+    // Upscaling turned on or off does.
     {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
-     "Requires a restart. How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA "
-     "draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - "
-     "faster, softer. The menus, the HUD and the post effects stay at the Resolution. Below Native AA, a different Resolution "
-     "also applies at the next start.",
-     true},
+     "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full size "
+     "(anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, softer. "
+     "The menus, the HUD and the post effects stay at the Resolution. Changes at once.",
+     false},
     // DLSS's render preset (NGX's DLSS_Hint_Render_Preset for every quality;
     // needs upscaler_bridge 1.1.0 and nvngx_dlss 310 or newer): K the
     // transformer model and NVIDIA's own for DLAA, Quality and Balanced, J
@@ -399,7 +396,7 @@ Setting g_set[kSettingCount] = {
      "What the game renders at. 1920x1080 is what it shipped with; ultrawide, super-ultrawide, multi-screen, 16:10, 4:3 and "
      "square screens are filled, the HUD kept 16:9 in the middle. The largest sizes can need a restart: the memory for them "
      "is set aside when the game starts, and past about 11.5 million pixels (5120x2880, 7680x2160 and up) only Upscaling below "
-     "Native AA, which draws the 3D smaller, fits in it. With Upscaling below Native AA, a change applies at the next start.",
+     "Native AA, which draws the 3D smaller, fits in it.",
      true},
     // The shaders' form on the GPU (host/translation_cache.h): HLSL is the
     // lifted shaders printed as HLSL and compiled by DXC on this machine,
@@ -1687,8 +1684,8 @@ const char* host_options_page_blurb(int page) {
 // for FSR 4 and FSR 3 the render size against the Resolution (Native AA,
 // Quality, Balanced, Performance - Upscaling quality, upscale_quality), for
 // DLSS that render size and then DLSS's model (K, J, L, M); with Upscaling
-// off, DLSS's model, greyed. The render size is drawn at as the game starts
-// (engine/render_scale.cpp), so it applies at the next start.
+// off, DLSS's model, greyed. A change of the render size rebuilds the scene at
+// once (engine/render_scale.cpp).
 void preset_row() {
     const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
     // DLSS at the full size is DLAA: its first choice says so.
@@ -1698,11 +1695,10 @@ void preset_row() {
         const bool dlss = who[0] == 'D';
         std::string& n = notes[dlss ? 1 : 0];
         if (n.empty())
-            n = std::string("Requires a restart. How much smaller than the Resolution the 3D is drawn before ") + who + " brings it back: " +
+            n = std::string("How much smaller than the Resolution the 3D is drawn before ") + who + " brings it back: " +
                 (dlss ? "DLAA" : "Native AA") +
                 " draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half "
-                "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution. Below " +
-                (dlss ? "DLAA" : "Native AA") + ", a different Resolution also applies at the next start.";
+                "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution. Changes at once.";
         return n.c_str();
     };
     if (u == 1 || u == 2) {

@@ -40,6 +40,9 @@ int live_resolution_take_answer();
 // Back to the size shown before the last change that asked to be kept, for
 // a "go back" whose old entry waits for the next start.
 void live_resolution_go_back();
+// A rebuild at the current size, at the next quiet point: the scene contexts
+// made again at the render size the settings now ask for (engine/render_scale.h).
+void live_resolution_rebuild();
 
 // The render size now, and a counter that moves each time a change has been
 // applied (0 before any).

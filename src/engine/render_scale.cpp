@@ -3,7 +3,11 @@
 #include "core/elf.h"
 #include "core/memory.h"
 #include "engine/addr.h"
+#include "core/thunk.h"
+#include "engine/graphics_patch.h"
+#include "engine/live_resolution.h"
 #include "engine/patch_manifest.h"
+#include "hle/modules.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
@@ -14,7 +18,15 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <mutex>
 #include <string>
+#include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 // Addresses are Binary Ninja's (0x400000 base).
 //
@@ -38,17 +50,21 @@
 //     sub_26f9330, sub_26f9940). Each read becomes the render size; the
 //     resize slot's two tests that would take the broadcast's size instead
 //     always go to the entry's (now pinned) read;
-//   - the colour target a context is given. Initialize (sub_26c39f0) keeps
-//     the target its description names - the manager's names the output
-//     entry's DefRenderTarget, the display buffer - only when it shares a
-//     side with the context's size, and otherwise makes one of its own at
-//     that size. Kept always (0x26c3af3), the display buffer stays the
-//     scene's back buffer: YEBIS makes its whole chain at its back buffer's
-//     size, so it stays at the output size, and its copy of the scene
-//     (0b0acf50+ccbf44a6) is where the picture goes from the render size to
-//     the output's. That is why the display buffers must be exactly the
-//     output size here (engine/live_resolution.cpp), as they are on the
-//     console. The depth is still the context's own at the render size;
+//   - the colour target the graphics manager's scene is given. Initialize
+//     (sub_26c39f0) keeps the target its description names - DefRenderTarget,
+//     the display buffer - only when it matches the context's size, and
+//     otherwise makes one of its own at that size; YEBIS makes its whole
+//     chain at that back buffer's size. Kyo's patch keeps the display buffer
+//     at any size (its display buffers are the output size). bbhost's are the
+//     largest a live change can reach, so when they are not the output size
+//     the scene is given an output-sized colour target of ours (made as the
+//     target sets make theirs: a 0x80-byte object, vtable 0x57b6940,
+//     sub_25a32f0), handed in at its two builds (calls at 0x2697b75 and
+//     0x269c812), and Initialize's colour test (0x26c3af0) keeps the one
+//     target this file names at any size - every other the game's way. Its
+//     copy into the display buffer is the flip pass's, as for any picture of
+//     a size other than the display buffers'. The depth is the context's own
+//     at the render size;
 //   - the flip pass's full-screen viewport (sub_25d5f80, 0x25d818d): the
 //     manager's size (+0x1e0, the render size now) becomes the output entry's;
 //   - one YEBIS-side pass into the scene's main target set (sub_1258d30,
@@ -125,8 +141,6 @@ std::vector<PinSite> pin_sites() {
         s.value[1] = kRenderH;
         v.push_back(s);
     }
-    // Initialize keeps the colour target its description names at any size.
-    v.push_back({"keep-colour", 0x26c3af3, {0x74, 0x36}, {0xeb, 0x36}});
     // The flip pass's viewport: the output entry's size (entry 0) for the
     // manager's (+0x1e0/+0x1e4), the same 45 bytes rearranged (the vmovss's
     // displacement moved with it; mov esi/edx, 0 as xor).
@@ -176,8 +190,15 @@ bool upscaler_asked() {
 }
 
 ElfImage* g_image = nullptr;
-RenderScale g_now;                    // the sizes in the code (the plan's, or the output's after a fallback)
-std::atomic<bool> g_scaled{false};    // the 3D is at the render size (render_scale_on)
+std::uint64_t guest(std::uint64_t bn) { return g_image->mem.slide + (bn - kPreferredGuestSlide); }
+void* guest_fn_ptr(std::uint64_t bn) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(guest(bn))); }
+template <typename T>
+T& at_(std::uint64_t a) { return *reinterpret_cast<T*>(static_cast<std::uintptr_t>(a)); }
+
+std::mutex g_mu;                    // g_now
+RenderScale g_now;                  // the sizes in the code now
+std::atomic<bool> g_scaled{false};  // the 3D is at the render size (render_scale_on)
+std::atomic<bool> g_ready{false};   // render_scale_gx_init ran
 
 bool write_values(const RenderScale& rs) {
     if (!g_image) return false;
@@ -193,6 +214,229 @@ bool write_values(const RenderScale& rs) {
         }
     }
     return true;
+}
+
+
+// ---- The scene's own back buffer ---------------------------------------------------
+
+constexpr std::uint64_t kGxDeviceSlot = 0x59406c8, kGxAllocatorSlot = 0x5940680;
+constexpr std::uint64_t kColourTargetVtable = 0x57b6940, kColourTargetDefaults = 0x4d21f50, kColourTargetInit = 0x25a32f0;
+constexpr std::uint64_t kInitialize = 0x26c39f0, kBuildInitializeCall = 0x2697b75;
+constexpr std::uint64_t kReinitialize = 0x26c58e0, kListenerReinitializeCall = 0x269c812;
+constexpr std::uint64_t kColourTest = 0x26c3af0;  // cmp eax, [r15]; je/jne (5 bytes)
+constexpr std::uint64_t kColourKeep = 0x26c3b2b;  // where the test goes to keep the target
+
+std::uint64_t* g_keep = nullptr;  // in the stub's page: the colour target Initialize keeps at any size (0 none)
+std::uint64_t g_back = 0;         // ours, when the scene has one
+std::uint32_t g_back_w = 0, g_back_h = 0;
+struct OldBack {
+    std::uint64_t obj, flip;
+};
+std::vector<OldBack> g_old_back;  // main thread
+
+void* vslot(std::uint64_t obj, int off) {
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(obj) + off)));
+}
+
+void release_ref(std::uint64_t obj) {
+    std::int32_t& refs = at_<std::int32_t>(obj + 8);
+    if (refs-- <= 1) hle_call_guest6(vslot(obj, 0), static_cast<std::int64_t>(obj), 0, 0, 0, 0, 0);  // slot 0: delete
+}
+
+// A colour target of w x h in DefRenderTarget's format, made as a target set
+// makes its own (sub_2666420): our reference held.
+std::uint64_t make_back_buffer(std::uint32_t w, std::uint32_t h) {
+    const std::uint64_t dev = at_<std::uint64_t>(guest(kGxDeviceSlot));
+    const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
+    const std::uint64_t def_rt = out ? at_<std::uint64_t>(out + 0x68) : 0;
+    const std::uint64_t alloc = at_<std::uint64_t>(guest(kGxAllocatorSlot));
+    if (!def_rt || !alloc) return 0;
+    const auto format = static_cast<std::uint32_t>(hle_call_guest6(vslot(def_rt, 0x38), static_cast<std::int64_t>(def_rt), 0, 0, 0, 0, 0));
+    const auto obj = static_cast<std::uint64_t>(hle_call_guest6(vslot(alloc, 0x58), static_cast<std::int64_t>(alloc), 0x80, 0x10, 0, 0, 0));
+    if (!obj) return 0;
+    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(obj)), 0, 0x80);
+    at_<std::uint64_t>(obj) = guest(kColourTargetVtable);
+    at_<float>(obj + 0x10) = 1.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(obj + 0x20)), guest_ptr(g_image->mem, guest(kColourTargetDefaults)), 16);
+    at_<std::uint64_t>(obj + 0x68) = ~0ull;
+    at_<std::uint32_t>(obj + 0x70) = ~0u;
+    alignas(16) std::uint32_t samples[2] = {1, 0};
+    GuestCallRegs r{};
+    r.fn = guest_fn_ptr(kColourTargetInit);
+    r.ints[0] = obj;
+    r.ints[1] = w;
+    r.ints[2] = h;
+    r.ints[3] = format;
+    r.ints[4] = 1;  // mips
+    r.ints[5] = reinterpret_cast<std::uintptr_t>(samples);
+    r.stack[0] = 0;  // flags
+    hle_call_guest_regs(&r);
+    if (!(r.ret & 0xff)) {
+        release_ref(obj);  // no reference taken yet: deleted
+        host_log("render scale: no %ux%u colour target could be made for the scene", w, h);
+        return 0;
+    }
+    at_<std::int32_t>(obj + 8) += 1;
+    host_log("render scale: the scene's back buffer is a %ux%u target of its own (format %u): the display buffers are another size", w, h,
+             format);
+    return obj;
+}
+
+// The scene's back buffer for the render and output sizes: none at the full
+// size (the game's own test), DefRenderTarget when the display buffers are
+// the output size, else ours (made, or kept from before). Main thread, with
+// nothing recording.
+void choose_back_buffer(const RenderScale& rs, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip) {
+    const bool scaled = rs.render_w != rs.output_w || rs.render_h != rs.output_h;
+    const bool ours = scaled && (display_w != rs.output_w || display_h != rs.output_h);
+    if (g_back && (!ours || g_back_w != rs.output_w || g_back_h != rs.output_h)) {
+        g_old_back.push_back({g_back, flip});  // the scene lets go of it in its rebuild
+        g_back = 0;
+    }
+    if (ours && !g_back) {
+        g_back = make_back_buffer(rs.output_w, rs.output_h);
+        g_back_w = rs.output_w;
+        g_back_h = rs.output_h;
+    }
+    if (!g_keep) return;
+    if (!scaled) {
+        *g_keep = 0;
+    } else if (g_back) {
+        *g_keep = g_back;
+    } else {
+        const std::uint64_t dev = at_<std::uint64_t>(guest(kGxDeviceSlot));
+        *g_keep = dev ? at_<std::uint64_t>(at_<std::uint64_t>(dev + 0x90) + 0x68) : 0;  // DefRenderTarget
+    }
+}
+
+// The manager's scene's build and rebuild: our back buffer for its colour.
+void build_with_back_buffer(std::uint64_t fn, const std::uint64_t* saved) {
+    const std::uint64_t desc = saved[4];  // rsi
+    if (g_back && desc) at_<std::uint64_t>(desc + 0x20) = g_back;
+    hle_call_guest6(guest_fn_ptr(fn), static_cast<std::int64_t>(saved[5]), static_cast<std::int64_t>(saved[4]), static_cast<std::int64_t>(saved[3]),
+                    static_cast<std::int64_t>(saved[2]), static_cast<std::int64_t>(saved[1]), static_cast<std::int64_t>(saved[0]));
+}
+GUEST_ABI std::int64_t build_call_hook(std::uint64_t, const std::uint64_t* saved) {
+    build_with_back_buffer(kInitialize, saved);
+    return 1;
+}
+GUEST_ABI std::int64_t rebuild_call_hook(std::uint64_t, const std::uint64_t* saved) {
+    build_with_back_buffer(kReinitialize, saved);
+    return 1;
+}
+
+// A page within a rel32 of `at`.
+void* page_near(std::uint64_t at) {
+#if defined(_WIN32)
+    const std::uint64_t reach = 0x7ff00000ull, base = at & ~0xffffull;
+    for (std::uint64_t a = base - 0x10000; a > 0x10000 && base - a < reach; a -= 0x10000)
+        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+    for (std::uint64_t a = base + 0x10000; a - base < reach; a += 0x10000)
+        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+    return nullptr;
+#else
+    void* p = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    const std::int64_t d = static_cast<std::int64_t>(reinterpret_cast<std::uint64_t>(p)) - static_cast<std::int64_t>(at);
+    if (d < INT32_MIN + 0x1000ll || d > INT32_MAX - 0x1000ll) {
+        munmap(p, 0x1000);
+        return nullptr;
+    }
+    return p;
+#endif
+}
+
+bool rel32(std::uint64_t from_end, std::uint64_t to, std::uint8_t* out) {
+    const std::int64_t d = static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from_end);
+    if (d < INT32_MIN || d > INT32_MAX) return false;
+    const auto v = static_cast<std::int32_t>(d);
+    std::memcpy(out, &v, 4);
+    return true;
+}
+
+// Initialize's colour test (cmp eax, [r15]: the target's width against the
+// context's, then the game's je to keep it or live resolution's both-sides
+// jne to make one) through a stub that first keeps the one target g_keep
+// names, at any size.
+bool install_keep_stub() {
+    const std::uint64_t at = guest(kColourTest);
+    auto* p = static_cast<std::uint8_t*>(guest_ptr(g_image->mem, at));
+    if (p[0] != 0x41 || p[1] != 0x3b || p[2] != 0x07 || (p[3] != 0x74 && p[3] != 0x75)) {
+        host_log("render scale: Initialize's colour test is not as expected; the scene's back buffer stays the game's choice");
+        return false;
+    }
+    const std::uint64_t branch_to = at + 5 + static_cast<std::int8_t>(p[4]);
+    const std::uint8_t jcc = p[3] == 0x74 ? 0x84 : 0x85;
+    auto* page = static_cast<std::uint8_t*>(page_near(at));
+    if (!page) return false;
+    const auto base = reinterpret_cast<std::uint64_t>(page);
+    const std::uint64_t code_at = base + 64;  // the slot at +0
+    std::uint8_t code[40];
+    std::size_t n = 0;
+    const auto emit = [&](std::initializer_list<std::uint8_t> b) {
+        for (std::uint8_t x : b) code[n++] = x;
+    };
+    bool ok = true;
+    emit({0x4c, 0x3b, 0x35, 0, 0, 0, 0});  // cmp r14, [rip+keep]
+    ok &= rel32(code_at + n, base, code + n - 4);
+    emit({0x0f, 0x84, 0, 0, 0, 0});  // je keep
+    ok &= rel32(code_at + n, guest(kColourKeep), code + n - 4);
+    emit({0x41, 0x3b, 0x07});        // cmp eax, [r15]
+    emit({0x0f, jcc, 0, 0, 0, 0});   // the test's own branch
+    ok &= rel32(code_at + n, branch_to, code + n - 4);
+    emit({0xe9, 0, 0, 0, 0});        // on to the height's test
+    ok &= rel32(code_at + n, at + 5, code + n - 4);
+    std::uint8_t jmp[5] = {0xe9, 0, 0, 0, 0};
+    ok &= rel32(at + 5, code_at, jmp + 1);
+    if (!ok) return false;
+    g_keep = reinterpret_cast<std::uint64_t*>(page);
+    *g_keep = 0;
+    std::memcpy(page + 64, code, n);
+    const std::uint64_t lo = at & ~0xfffull, hi = (at + 5 + 0xfff) & ~0xfffull;
+    if (!guest_protect_rwx(&g_image->mem, lo, hi - lo)) return false;
+    std::memcpy(p, jmp, 5);
+    guest_protect_rx(&g_image->mem, lo, hi - lo);
+    return true;
+}
+
+// What the settings ask for at an output size: the quality's render size
+// with an upscaler that runs here, the full size without.
+RenderScale wanted(std::uint32_t output_w, std::uint32_t output_h, bool upscaler, int quality) {
+    RenderScale rs;
+    rs.output_w = output_w;
+    rs.output_h = output_h;
+    rs.quality = upscaler ? quality : 0;
+    render_scale_size(rs.quality, output_w, output_h, &rs.render_w, &rs.render_h);
+    return rs;
+}
+
+void publish(const RenderScale& rs) {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_now = rs;
+    }
+    g_scaled.store(rs.render_w != rs.output_w || rs.render_h != rs.output_h, std::memory_order_release);
+}
+
+// Settings: a change of the upscaler or its quality asks for a rebuild at the
+// same Resolution (engine/live_resolution.cpp), whose quiet point retargets.
+void settings_changed(const HostSettings& s) {
+    if (!g_ready.load(std::memory_order_acquire)) return;
+    RenderScale now;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        now = g_now;
+    }
+    bool runs = false;
+    if (std::getenv("BBHOST_UPSCALE")) {
+        runs = upscaler_method() != 0;
+    } else {
+        const UpscalerCaps caps = upscaler_caps();
+        runs = s.upscaler == 1 ? caps.dlss : s.upscaler >= 2 ? caps.fsr : false;
+    }
+    const int quality = std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality : std::clamp(s.upscale_quality, 0, 3);
+    const RenderScale want = wanted(now.output_w, now.output_h, runs, quality);
+    if (want.render_w != now.render_w || want.render_h != now.render_h) live_resolution_rebuild();
 }
 
 }  // namespace
@@ -213,21 +457,14 @@ bool render_scale_plan(RenderScale* out) {
     static const RenderScale plan = [] {
         RenderScale rs;
         if (const char* e = std::getenv("BBHOST_RENDER_SCALE"); e && e[0] == '0') return rs;
-        // The display buffers are made at the output size by the live
-        // resolution's GX init hook, which also checks that an upscaler runs.
+        // Its changes are the live resolution's rebuilds.
         if (const char* e = std::getenv("BBHOST_LIVE_RESOLUTION"); e && e[0] == '0') return rs;
-        const int q = quality_asked();
-        if (!q || !upscaler_asked()) return rs;
         int w = 1920, h = 1080;
         if (!host_opt_resolution(&w, &h)) w = 1920, h = 1080;
-        rs.output_w = static_cast<std::uint32_t>(w);
-        rs.output_h = static_cast<std::uint32_t>(h);
-        rs.quality = q;
-        render_scale_size(q, rs.output_w, rs.output_h, &rs.render_w, &rs.render_h);
-        return rs;
+        return wanted(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), upscaler_asked(), quality_asked());
     }();
     if (out) *out = plan;
-    return plan.quality > 0;
+    return plan.output_w != 0;
 }
 
 std::vector<patch_file::Site> render_scale_sites(const RenderScale& rs) {
@@ -249,29 +486,63 @@ bool render_scale_applied() {
     return owner && std::strcmp(owner, "render-scale") == 0;
 }
 
-void render_scale_gx_init(ElfImage* image) {
-    RenderScale rs;
-    if (!render_scale_plan(&rs) || !render_scale_applied()) return;
+void render_scale_install(ElfImage* image) {
+    if (!render_scale_applied()) return;
     g_image = image;
-    g_now = rs;
-    if (!upscaler_method()) {
-        // No upscaler runs here: the plain picture at the full size, not a
-        // stretch of the render size.
-        RenderScale full = rs;
-        full.render_w = rs.output_w;
-        full.render_h = rs.output_h;
-        if (write_values(full)) g_now = full;
-        host_log("render scale: no upscaler runs here (%s); the 3D is drawn at the full %ux%u", upscaler_caps().loaded ? "its method is not available" : "no bridge",
-                 rs.output_w, rs.output_h);
-        return;
+    const bool keep = install_keep_stub();
+    const bool hooks =
+        engine_call_site_hook(image, guest(kBuildInitializeCall), guest(kInitialize), reinterpret_cast<void*>(&build_call_hook)) &&
+        engine_call_site_hook(image, guest(kListenerReinitializeCall), guest(kReinitialize), reinterpret_cast<void*>(&rebuild_call_hook));
+    if (!keep || !hooks) host_log("render scale: the scene's back-buffer hooks did not all go in; with display buffers of another size it misdraws");
+    host_settings_listen(&settings_changed);
+}
+
+void render_scale_gx_init(std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip) {
+    if (!g_image) return;
+    RenderScale plan;
+    render_scale_plan(&plan);
+    render_scale_retarget(plan.output_w, plan.output_h, display_w, display_h, flip, nullptr, nullptr);
+    g_ready.store(true, std::memory_order_release);
+}
+
+bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip,
+                           RenderScale* before, RenderScale* after) {
+    if (!g_image) return false;
+    RenderScale was;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        was = g_now;
     }
-    g_scaled.store(true);
-    host_log("render scale: the 3D is drawn at %ux%u and upscaled to %ux%u (Upscaling quality %d); YEBIS, the HUD and the menus at %ux%u",
-             rs.render_w, rs.render_h, rs.output_w, rs.output_h, rs.quality, rs.output_w, rs.output_h);
+    const bool runs = upscaler_method() != 0;
+    const RenderScale rs = wanted(output_w, output_h, runs, quality_asked());
+    if (!was.output_w) was = rs;
+    write_values(rs);
+    choose_back_buffer(rs, display_w, display_h, flip);
+    publish(rs);
+    if (before) *before = was;
+    if (after) *after = rs;
+    const bool scaled = rs.render_w != rs.output_w || rs.render_h != rs.output_h;
+    host_log("render scale: the 3D at %ux%u for %ux%u (%s)", rs.render_w, rs.render_h, output_w, output_h,
+             !runs ? "no upscaler running: the full size" : scaled ? "upscaled" : "Native AA");
+    return true;
+}
+
+void render_scale_flip(std::uint64_t flip) {
+    std::size_t kept = 0;
+    for (const OldBack& o : g_old_back) {
+        if (flip >= o.flip + 3)
+            release_ref(o.obj);
+        else
+            g_old_back[kept++] = o;
+    }
+    g_old_back.resize(kept);
 }
 
 bool render_scale_on(RenderScale* out) {
     if (!g_scaled.load(std::memory_order_acquire)) return false;
-    if (out) *out = g_now;
+    if (out) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        *out = g_now;
+    }
     return true;
 }
