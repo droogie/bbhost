@@ -242,9 +242,9 @@ Setting g_set[kSettingCount] = {
     // angle a count at each step (engine/mouse_camera.h), 5 its default.
     {"mouse_sens", "Mouse sensitivity", hundred(), 50,
      "How far a given mouse movement turns the camera.", false},
-    {"mouse_invert_x", "Mouse X-axis", {"Off", "On"}, 0,
+    {"mouse_invert_x", "Reverse mouse X-axis", {"Off", "On"}, 0,
      "Reverses the mouse's horizontal camera movement.", false},
-    {"mouse_invert_y", "Mouse Y-axis", {"Off", "On"}, 0,
+    {"mouse_invert_y", "Reverse mouse Y-axis", {"Off", "On"}, 0,
      "Reverses the mouse's vertical camera movement.", false},
     // Off by default: with the mouse the camera stays where it is put, as
     // the community's "Disable Camera Auto Rotation" patch has it - but only

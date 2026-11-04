@@ -8,8 +8,10 @@
 
 union SDL_Event;
 
-// Draws the page into the menu's content area (host/ingame_menu.cpp).
-void controls_page_draw();
+// Draws the page: the Input settings' rows (the mouse, the pointer, the
+// prompts), then the bindings - in F10 (host/ingame_menu.cpp) or the setup
+// window (`setup_window`, whose rows hand their changes to its pump).
+void controls_page_draw(bool setup_window);
 // While the page is choosing a binding, the event pump gives it every event
 // first: the next key, mouse button, wheel notch or controller button is the
 // choice and reaches nothing else. True when it took the event.

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace ui = launcher_ui;
 
@@ -69,11 +70,19 @@ void save_if_changed() {
 
 }  // namespace
 
-void controls_page_draw() {
+void controls_page_draw(bool setup_window) {
     if (!g_saved_serial) g_saved_serial = host_bindings_serial();
     const float sc = ui::scale();
     if (g_page_capture && host_bind_capturing() < 0 && host_pad_capturing() < 0) g_page_capture = false;
     save_if_changed();
+
+    // The settings' Input page's rows first.
+    for (int i = 0; i < host_options_page_count(); ++i) {
+        if (std::strcmp(host_options_page_name(i), "Input") != 0) continue;
+        if (setup_window) host_options_draw_setup_page(i);
+        else host_options_draw_page(i);
+    }
+    ImGui::Spacing();
 
     ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 150.0f * sc);
     ImGui::TextDisabled("Click a key, mouse or controller box and press the new one; Escape keeps the old. A right-click "

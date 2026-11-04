@@ -540,11 +540,13 @@ void patches_page(PatchMenu& m) {
 
 // ---- The menu ----------------------------------------------------------------
 
-// Its pages: the settings' (host_options_page_*), with the controls after
-// Input and the patches and the plugins after PC Enhancements.
+// Its pages: the settings' (host_options_page_*) - Input's rows on the
+// Controls page, over the bindings - with the patches and the plugins after
+// PC Enhancements.
 int g_page = 0;
 double g_page_at = -100.0;
 int g_patches_page = -1, g_plugins_page = -1, g_controls_page = -1;  // their places among the pages
+std::vector<int> g_options_of;  // each page's settings page, -1 for the menu's own
 
 const std::vector<Page>& menu_pages() {
     static std::vector<Page> pages;
@@ -555,24 +557,29 @@ const std::vector<Page>& menu_pages() {
     } kIcons[] = {{"Display", ui::Icon::Display},   {"Input", ui::Icon::Game},       {"Graphics", ui::Icon::Image},
                   {"PC Enhancements", ui::Icon::Enhance}, {"Startup", ui::Icon::Play}, {"Account", ui::Icon::User},
                   {"Updates", ui::Icon::Download}};
+    auto own = [&](int* at, const Page& p) {
+        *at = static_cast<int>(pages.size());
+        pages.push_back(p);
+        g_options_of.push_back(-1);
+    };
     auto add_mods = [&] {
-        g_patches_page = static_cast<int>(pages.size());
-        pages.push_back({"Patches", ui::Icon::Patches,
-                         "Changes to the game's code. Most turn on or off at once; the rest when the game starts again."});
-        g_plugins_page = static_cast<int>(pages.size());
-        pages.push_back({"Plugins", ui::Icon::Plugins, "Each plugin's settings and actions. Those marked change at once; the rest at the next start."});
+        own(&g_patches_page, {"Patches", ui::Icon::Patches,
+                              "Changes to the game's code. Most turn on or off at once; the rest when the game starts again."});
+        own(&g_plugins_page, {"Plugins", ui::Icon::Plugins, "Each plugin's settings and actions. Those marked change at once; the rest at the next start."});
     };
     for (int i = 0; i < host_options_page_count(); ++i) {
         Page p{host_options_page_name(i), ui::Icon::Settings, host_options_page_blurb(i)};
+        if (std::strcmp(p.name, "Input") == 0) {
+            // The mouse and the prompts with the bindings: one page for input.
+            own(&g_controls_page, {"Controls", ui::Icon::Keyboard,
+                                   "The mouse and the prompts, and every action's key, mouse button and controller button."});
+            continue;
+        }
         for (const auto& k : kIcons) {
             if (std::strcmp(k.name, p.name) == 0) p.icon = k.icon;
         }
         pages.push_back(p);
-        if (std::strcmp(p.name, "Input") == 0) {
-            g_controls_page = static_cast<int>(pages.size());
-            pages.push_back({"Controls", ui::Icon::Keyboard,
-                             "Every action's key, mouse button and controller button, changed by clicking one and pressing the new one."});
-        }
+        g_options_of.push_back(i);
         if (std::strcmp(p.name, "PC Enhancements") == 0) add_mods();
     }
     if (g_patches_page < 0) add_mods();  // no PC Enhancements page: at the end
@@ -582,12 +589,7 @@ const std::vector<Page>& menu_pages() {
 // The settings page a page of the menu shows (-1: the controls, the patches or
 // the plugins).
 int options_page_of(int page) {
-    int own = 0;  // the menu's own pages before it
-    for (const int p : {g_controls_page, g_patches_page, g_plugins_page}) {
-        if (p == page) return -1;
-        if (p >= 0 && p < page) ++own;
-    }
-    return page - own;
+    return page >= 0 && page < static_cast<int>(g_options_of.size()) ? g_options_of[static_cast<std::size_t>(page)] : -1;
 }
 
 bool draw_menu() {
@@ -597,7 +599,7 @@ bool draw_menu() {
         if (g_page == g_patches_page) {
             patches_page(g_patches);
         } else if (g_page == g_controls_page) {
-            controls_page_draw();
+            controls_page_draw(false);
         } else if (g_page == g_plugins_page) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(14, 12, 34, 190));
             plugin_ui_draw(g_ui, ui::scale(), 0.0f);  // the list and the details fill what is left, each scrolling

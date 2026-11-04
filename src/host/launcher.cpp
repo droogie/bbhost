@@ -1090,8 +1090,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 if (std::strcmp(host_options_page_name(i), "Graphics") == 0) host_options_draw_setup_page(i);
             }
         } else if (page == kPageControls) {
-            // F10's Controls page, the same bindings and file.
-            controls_page_draw();
+            // F10's Controls page: the mouse and the prompts, then the
+            // bindings - the same settings and file.
+            controls_page_draw(true);
         } else if (page == kPageEnhancements) {
             ui::card_begin("##enhancements", ImVec2(ImGui::GetContentRegionAvail().x, 0));
             for (std::size_t i = 0; i < std::size(enhancements); ++i) {
