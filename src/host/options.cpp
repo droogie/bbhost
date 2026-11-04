@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -51,15 +52,20 @@ int fps_from_label(const char* label);
 
 // "-180°" to "+180°" a step at a time (`unit` after each number), for a
 // slider of fine steps; the strings live as long as the program.
-std::vector<const char*> signed_steps(int from, int to, const char* unit) {
-    static std::vector<std::string>* store = new std::vector<std::string>();
+std::vector<const char*> signed_steps(int from, int to, const char* unit, bool sign = true) {
+    // A deque: its strings never move as more are added, so the pointers
+    // handed out stay good (a vector's growth moved short strings' bytes).
+    static std::deque<std::string>* store = new std::deque<std::string>();
     std::vector<const char*> out;
-    store->reserve(store->size() + static_cast<std::size_t>(to - from + 1));
-    const std::size_t first = store->size();
-    for (int v = from; v <= to; ++v) store->push_back((v > 0 ? "+" : "") + std::to_string(v) + unit);
-    for (std::size_t i = first; i < store->size(); ++i) out.push_back((*store)[i].c_str());
+    for (int v = from; v <= to; ++v) {
+        store->push_back((sign && v > 0 ? "+" : "") + std::to_string(v) + unit);
+        out.push_back(store->back().c_str());
+    }
     return out;
 }
+
+// The steps of a 0-100 slider ("0" to "100").
+std::vector<const char*> hundred() { return signed_steps(0, 100, "", false); }
 
 // One setting. Everything here is a choice between a few named values: a
 // toggle is a choice of two, which keeps drawing and input to one case.
@@ -199,14 +205,14 @@ Setting g_set[kSettingCount] = {
      "and how busy each part is, under the FPS counter (docs/performance.md).", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
-    {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
+    {"fov", "Field of view", signed_steps(0, 50, "%"), 0,
      "How wide the camera sees. +0% is the game's own; +50% is about 97 degrees across.", false},
     // The same row's camDistTarget and chrOrgOffset_Y: 5 the game's own, 10%
     // a step either way.
-    {"camera_distance", "Camera distance", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How far behind the character the camera sits. 5 is the game's own.", false},
-    {"camera_height", "Camera height", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How high above the character the camera looks. 5 is the game's own.", false},
+    {"camera_distance", "Camera distance", hundred(), 50,
+     "How far behind the character the camera sits. 50 is the game's own.", false},
+    {"camera_height", "Camera height", hundred(), 50,
+     "How high above the character the camera looks. 50 is the game's own.", false},
     // The follow camera above 30 fps (engine/frame_rate.cpp camera_original):
     // the game's own values, the same camera at every frame rate, whatever is
     // saved here - the menus no longer offer it, and only
@@ -227,7 +233,7 @@ Setting g_set[kSettingCount] = {
     // 0..10, the range of the game's own Camera Sensitivity slider, which is
     // the widget the PC Controls screen draws it with, and DS3's: the same
     // angle a count at each step (engine/mouse_camera.h), 5 its default.
-    {"mouse_sens", "Mouse sensitivity", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
+    {"mouse_sens", "Mouse sensitivity", hundred(), 50,
      "How far a given mouse movement turns the camera.", false},
     {"mouse_invert_x", "Mouse X-axis", {"Off", "On"}, 0,
      "Reverses the mouse's horizontal camera movement.", false},
@@ -263,8 +269,8 @@ Setting g_set[kSettingCount] = {
     // Two of the area's draw parameters (param/drawparam), scaled or cleared
     // as the game hands them to YEBIS each frame - engine/graphics_patch.cpp.
     // 10 is the area's own glare; 0 is none.
-    {"bloom", "Bloom", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
-     "The glow around bright light. 10 is the game's own; lower dims it.", false},
+    {"bloom", "Bloom", hundred(), 100,
+     "The glow around bright light. 100 is the game's own; lower dims it.", false},
     {"vignette", "Vignette", {"On", "Off"}, 0,
      "The darkened frame edges some areas use.", false},
     // The area's shadow cascades, stretched past the first split: 1 + 0.2 a
@@ -274,13 +280,13 @@ Setting g_set[kSettingCount] = {
      "How far the sun and moon cast shadows. Farther spreads each shadow map wider.", false},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
-    {"ao_strength", "AO strength", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "How dark ambient occlusion makes corners and contact. 5 is the game's own.", false},
-    {"saturation", "Saturation", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
-     "Colour. 5 is the game's own; 0 is black and white.", false},
+    {"ao_strength", "AO strength", hundred(), 50,
+     "How dark ambient occlusion makes corners and contact. 50 is the game's own.", false},
+    {"saturation", "Saturation", hundred(), 50,
+     "Colour. 50 is the game's own; 0 is black and white.", false},
     // The fog table's opacities (engine/graphics_patch.cpp): 10 the area's own.
-    {"fog", "Fog", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 10,
-     "How thick distance and height fog are. 10 is the game's own; 0 clears it.", false},
+    {"fog", "Fog", hundred(), 100,
+     "How thick distance and height fog are. 100 is the game's own; 0 clears it.", false},
     // The game's level-of-detail bias (engine/graphics_patch.cpp): Full keeps
     // every model at its finest mesh, Low and Lowest move each to a coarser
     // one sooner. Lowest is the community "model LOD 2" (-8% GPU, models
@@ -799,7 +805,7 @@ void apply(int id) {
 // version stays. 4: the camera zoom actions (zoom_in, zoom_out, zoom_reset on
 // the wheel and the middle button); an older file's Transform on the middle
 // button, its default until then, gives it to Camera Zoom Reset.
-constexpr int kOptionsVersion = 5;
+constexpr int kOptionsVersion = 6;
 
 void save() {
     if (!g_dirty) {
@@ -875,9 +881,9 @@ void rebuild_settings() {
             h.res_height = static_cast<int>(hh);
         }
     }
-    // Distance and height: 5 is the game's own, 10% a step either way. Field
-    // of view: 0 is the game's own, 5% wider a step (BBHOST_FOV overrides).
-    const auto around = [](int id) { return 0.5f + 0.1f * static_cast<float>(index_of(id)); };
+    // Distance and height: 50 is the game's own, 1% a step either way. Field
+    // of view: 0 is the game's own, 1% wider a step (BBHOST_FOV overrides).
+    const auto around = [](int id) { return 0.5f + 0.01f * static_cast<float>(index_of(id)); };
     h.camera_distance_scale = around(kCameraDistance);
     h.camera_height_scale = around(kCameraHeight);
     h.camera_original = index_of(kCameraTuning) == 1;
@@ -885,13 +891,13 @@ void rebuild_settings() {
         const char* e = std::getenv("BBHOST_FOV");
         const float env = e && *e ? std::strtof(e, nullptr) : 0.0f;
         const int fov = index_of(kFov);
-        h.fov_scale = env > 0.0f ? env : fov <= 0 ? 1.0f : 1.0f + 0.05f * static_cast<float>(fov);
+        h.fov_scale = env > 0.0f ? env : fov <= 0 ? 1.0f : 1.0f + 0.01f * static_cast<float>(fov);
     }
     h.mouse_menu = on_of(kMouseMenu);
     h.mouse_camera = on_of(kMouseCamera);
-    // DS3's mouse sensitivity (engine/mouse_camera.h): the same 0..10 and the
-    // same default, and the same angle a count at each step.
-    h.mouse_sens = index_of(kMouseSens) < 0 || index_of(kMouseSens) > 10 ? 5 : index_of(kMouseSens);
+    // DS3's mouse sensitivity (engine/mouse_camera.h): its 0..10 and its
+    // default, a tenth a step (0-100).
+    h.mouse_sens = index_of(kMouseSens) < 0 ? 5.0f : static_cast<float>(index_of(kMouseSens)) / 10.0f;
     h.mouse_invert_x = on_of(kMouseInvertX);
     h.mouse_invert_y = on_of(kMouseInvertY);
     h.mouse_auto_rotation = on_of(kMouseAutoRotation);
@@ -903,10 +909,10 @@ void rebuild_settings() {
     h.depth_of_field = on_of(kDepthOfField);
     h.chromatic_aberration = on_of(kChromaticAberration);
     h.vignette = on_of(kVignette);
-    h.bloom = static_cast<float>(index_of(kBloom)) / 10.0f;
-    h.saturation = static_cast<float>(index_of(kSaturation)) / 5.0f;  // 5 the area's own
-    h.fog = static_cast<float>(index_of(kFog)) / 10.0f;
-    h.ao_strength = static_cast<float>(index_of(kAoStrength)) / 5.0f;
+    h.bloom = static_cast<float>(index_of(kBloom)) / 100.0f;
+    h.saturation = static_cast<float>(index_of(kSaturation)) / 50.0f;  // 50 the area's own
+    h.fog = static_cast<float>(index_of(kFog)) / 100.0f;
+    h.ao_strength = static_cast<float>(index_of(kAoStrength)) / 50.0f;
     h.shadow_scale = 1.0f + 0.2f * static_cast<float>(index_of(kShadowDistance));
     {
         static constexpr int kBias[] = {-2, 0, 1, 2};
@@ -1138,6 +1144,14 @@ void host_options_load() {
         // (before any save below writes version 3).
         // Before version 4 there were no camera zoom actions: the middle
         // button they take was Transform's (host/bindings.h).
+        // Before version 6 the 0-10 sliders were eleven steps: a saved value is
+        // the same place on today's 0-100 (Field of view's percents read as
+        // they are).
+        if (file_version < 6) {
+            for (const int id : {kBloom, kSaturation, kFog, kAoStrength, kCameraDistance, kCameraHeight, kMouseSens}) {
+                if (g_saved[static_cast<std::size_t>(id)]) g_set[id].index = std::min(g_set[id].index, 10) * 10;
+            }
+        }
         if (file_version < 4) {
             host_bindings_migrate_zoom();
             g_dirty = true;
@@ -1218,7 +1232,7 @@ void host_options_load() {
     }
     if (const char* e = std::getenv("BBHOST_MOUSE_SENS"); e && e[0]) {
         const int v = std::atoi(e);
-        g_set[kMouseSens].index = v < 0 ? 0 : v > 10 ? 10 : v;
+        g_set[kMouseSens].index = (v < 0 ? 0 : v > 10 ? 10 : v) * 10;  // BBHOST_MOUSE_SENS stays 0..10
     }
     if (const char* e = std::getenv("BBHOST_MOUSE_CURSOR"); e && e[0]) {
         g_set[kDrawCursor].index = e[0] == '0' ? 1 : 0;

@@ -320,7 +320,6 @@ wants one keeps its file in their own patches folder.
 | `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
 | `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |
 | `deflate-level.toml` | **Deflate level 1**: The game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s) (off by default) |
-| `fov-uncap.toml` | **Uncapped field of view**: The field of view is no longer capped at 48 degrees (off by default) |
 | `glow-blur.toml` | **Glow: force on + Blur**: Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo) (off by default) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather

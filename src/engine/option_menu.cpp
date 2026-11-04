@@ -659,20 +659,27 @@ void seed(Toggle& t) {
 // What the row's Defaults restores: the setting as it ships.
 std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) != t.invert ? 1 : 0; }
 
+// The game's sliders have eleven steps; the settings behind most of them have
+// 101 (0-100) or 51 (Field of view, 0-50%), and a step of the game's is a
+// tenth (a fifth of Field of view) of those - the nearest when it is between.
+int per_step(const char* key) {
+    if (std::strcmp(key, "fov") == 0) return 5;
+    return std::strcmp(key, "shadow_distance") == 0 ? 1 : 10;
+}
 void seed(Slider& s) {
-    const int i = host_opt_index(s.key);
-    s.value = static_cast<std::uint8_t>(i < 0 ? 0 : i);
+    const int i = host_opt_index(s.key), k = per_step(s.key);
+    s.value = static_cast<std::uint8_t>(i < 0 ? 0 : std::min(10, (i + k / 2) / k));
     s.last = s.value;
 }
 std::uint8_t default_of(const Slider& s) {
-    const int i = host_opt_default_index(s.key);
-    return static_cast<std::uint8_t>(i < 0 ? 0 : i);
+    const int i = host_opt_default_index(s.key), k = per_step(s.key);
+    return static_cast<std::uint8_t>(i < 0 ? 0 : std::min(10, (i + k / 2) / k));
 }
-// A slider moved: its step is the setting's index.
+// A slider moved: its step, in the setting's steps.
 void push(Slider& s) {
     if (s.value == s.last) return;
     s.last = s.value;
-    host_opt_set_index(s.key, s.value);
+    host_opt_set_index(s.key, s.value * per_step(s.key));
     host_log("pc-options: %s %u from the System menu", s.key, s.value);
 }
 void push(Toggle& t) {
@@ -685,7 +692,7 @@ void push(Toggle& t) {
 void seed_controls() {
     seed(g_ctl_camera);
     const int sens = host_opt_index("mouse_sens");
-    g_ctl_sens = static_cast<std::uint8_t>(sens < 0 ? 5 : sens);
+    g_ctl_sens = static_cast<std::uint8_t>(sens < 0 ? 5 : std::min(10, (sens + 5) / 10));
     g_ctl_sens_last = g_ctl_sens;
     for (int i = 0; i < 2; ++i) {
         g_ctl_axis[i] = host_opt_get(kAxisKeys[i]) ? 0 : 1;
@@ -836,7 +843,7 @@ GUEST_ABI void pc_controls_handler(void* dialog, void* params) {
     seed_controls();
     add_toggle_row(dialog, &g_ctl_camera.value, g_ctl_camera.id, default_of(g_ctl_camera));
     const int sens = host_opt_default_index("mouse_sens");
-    add_slider_row(dialog, &g_ctl_sens, kCtlSensitivity, static_cast<std::uint8_t>(sens < 0 ? 5 : sens));
+    add_slider_row(dialog, &g_ctl_sens, kCtlSensitivity, static_cast<std::uint8_t>(sens < 0 ? 5 : std::min(10, (sens + 5) / 10)));
     for (int i = 0; i < 2; ++i) {
         // The game's list: 1 is Normal, 0 Reversed, and the setting is "invert".
         add_axis_row(dialog, &g_ctl_axis[i], kAxisIds[i], host_opt_default_get(kAxisKeys[i]) ? 0 : 1);
@@ -1883,7 +1890,7 @@ void option_menu_poll() {
     }
     if (g_ctl_sens != g_ctl_sens_last) {
         g_ctl_sens_last = g_ctl_sens;
-        host_opt_set_index("mouse_sens", g_ctl_sens);
+        host_opt_set_index("mouse_sens", g_ctl_sens * 10);
         host_log("pc-options: mouse sensitivity %u from the System menu", g_ctl_sens);
     }
     for (int i = 0; i < 2; ++i) {

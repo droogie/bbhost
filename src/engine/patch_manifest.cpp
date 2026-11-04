@@ -75,6 +75,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
     if (option == "graphics.performance_patch") return host_settings().performance_patch;  // F10 > GRAPHICS, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
+    if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
     if (option == "graphics.ssr_fade") return host_settings().ssr && host_settings().ssr_fade;
     *known = false;
     return false;
@@ -280,6 +281,25 @@ Manifest performance_manifest() {
     return m;
 }
 
+// fov-uncap, Uncapped field of view (camera.fov_wide: Field of view above
+// +0%): the camera's field of view is clamped to 38-48 degrees where the
+// option table's value is applied (0x183af4e, `cmovbe rax, rsi`), so a wider
+// one stopped at 48 - the game's 43 at +12%. The clamp comes out while the
+// setting is above +0% and goes back at +0%, live (engine/camera.cpp
+// settings_changed), so the game's own camera keeps it. Was
+// patches/fov-uncap.toml, off unless turned on.
+Manifest fov_uncap_manifest() {
+    Manifest m;
+    m.name = "fov-uncap";
+    m.title = "Uncapped field of view";
+    m.eboot = kEboot109Sha256;
+    m.description = "the field of view is no longer capped at 48 degrees";
+    m.option = "camera.fov_wide";
+    m.order = 1040;
+    m.sites.push_back(Site{"clamp", 0x0183af4e, {0x48, 0x0f, 0x46, 0xc6}, {0x48, 0x89, 0xf0, 0x90}, true, {}});
+    return m;
+}
+
 // ssr, Screen space reflections (graphics.ssr): Kyo's 1.09 patch from his
 // shadPS4 list ("Enable Screen Space Reflections (READ NOTE)"), site for site,
 // which was patches/screen-space-reflections.toml. The scene context's
@@ -373,16 +393,17 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(performance_manifest());
     out.push_back(ssr_manifest());
     out.push_back(ssr_fade_manifest());
+    out.push_back(fov_uncap_manifest());
     return out;
 }
 
 // Patch files a setting replaced: the Screen Space Reflections patches (the
-// game's half size and the quarter-size variant) and Performance Patch v3's
-// variants are the Graphics page's Screen space reflections and Performance
-// patch now. A package unpacked over an older one still has them in its
+// game's half size and the quarter-size variant), Performance Patch v3's
+// variants and the uncapped field of view are the Graphics page's Screen
+// space reflections and Performance patch and the Field of view setting now. A package unpacked over an older one still has them in its
 // patches folder; they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
-    return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0;
+    return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.
