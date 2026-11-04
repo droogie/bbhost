@@ -121,7 +121,51 @@ GUEST_ABI int hle_appcontent_param_int(int id, int* value) {
     host_log("sceAppContentAppParamGetInt %d -> %d", id, v);
     return 0;
 }
-GUEST_ABI int hle_appcontent_addcont(void*, int, int*) { return 0; }
+// sceAppContentGetAddcontInfoList(serviceLabel, list, listNum, hitNum): the
+// add-ons the account has, as a console's list reports them. A record is
+// 0x18 bytes: the label (16 characters, NUL, three bytes of padding) and the
+// download status. Bloodborne's CSDlcBackingData (include/bbhost/engine/cs/
+// dlc.hpp) calls it twice, a null list for the count and then the records,
+// and files each add-on under the label's last two decimal digits, which it
+// publishes as event flags 6900 + index; the status is not read. The game's
+// add-ons: 00, 01 and 02 are the pre-order and edition messenger gifts (the
+// Stump Messengers behind the Hunter's Dream workshop hand out goods 4900,
+// 4901 and 4902 for the flags, m21 event 12105064, and common event 3500
+// takes a gift back when its flag goes off); 03 is The Old Hunters, which
+// the old-hunters patch grants through the package edition (event flag 6899)
+// with or without a record here. The Messenger gifts enhancement
+// (world.messenger_gifts) owns the three; off, the list is empty, as a
+// console with no add-ons answers.
+struct SceAppContentAddcontInfo {
+    char label[17];
+    char padding[3];
+    std::uint32_t status;
+};
+static_assert(sizeof(SceAppContentAddcontInfo) == 0x18, "SceAppContentAddcontInfo");
+constexpr std::uint32_t SCE_APP_CONTENT_ADDCONT_DOWNLOAD_STATUS_INSTALLED = 4;
+constexpr int SCE_APP_CONTENT_ERROR_PARAMETER = static_cast<int>(0x80D90002);
+constexpr std::uint32_t kMessengerGiftAddons = 3;  // add-ons 00, 01 and 02
+
+GUEST_ABI int hle_appcontent_addcont(std::uint32_t, SceAppContentAddcontInfo* list, std::uint32_t list_num,
+                                     std::uint32_t* hit_num) {
+    if (!hit_num) return SCE_APP_CONTENT_ERROR_PARAMETER;
+    const std::uint32_t owned = config().messenger_gifts ? kMessengerGiftAddons : 0;
+    std::uint32_t n = 0;
+    if (list) {
+        for (; n < owned && n < list_num; ++n) {
+            SceAppContentAddcontInfo& info = list[n];
+            std::memset(&info, 0, sizeof info);
+            std::snprintf(info.label, sizeof info.label, "BBHOSTADDON%02u", static_cast<unsigned>(n));
+            info.status = SCE_APP_CONTENT_ADDCONT_DOWNLOAD_STATUS_INSTALLED;
+        }
+    } else {
+        n = owned;
+    }
+    *hit_num = n;
+    static std::once_flag once;
+    std::call_once(once, [&] { host_log("sceAppContentGetAddcontInfoList: %u add-on(s)", static_cast<unsigned>(owned)); });
+    return 0;
+}
 
 // A console delivers a LOGIN event for the initial user after
 // initialisation; games tie the pad's "decide" button to that user.
