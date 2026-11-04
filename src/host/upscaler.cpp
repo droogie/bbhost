@@ -190,6 +190,7 @@ bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
     d.output = img(c.output);
     d.jitter_x = c.jitter_x;
     d.jitter_y = c.jitter_y;
+    d.motion_scale_x = d.motion_scale_y = c.motion_scale;
     d.frame_time_ms = c.frame_ms;
     d.camera_near = c.near_m;
     d.camera_far = c.far_m;

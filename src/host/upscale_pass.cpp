@@ -11,15 +11,20 @@
 // in the first case and a blit, which converts, in the second. A B10G11R11
 // scene has no alpha to keep; an RGBA16F one takes the bridge's.
 //
-// Steps 2 and 3 of Numity1504's DLSS/FSR handoff: the call at the native size
+// Steps 2 to 4 of Numity1504's DLSS/FSR handoff: the call at the native size
 // (DLAA, FSR native AA), with the frame's jitter (render.cpp: the camera's
-// draws' viewports) and no motion yet - the motion image is all zeros.
+// draws' viewports) and the camera's motion (shaders/camera_motion.comp, from
+// the depth and the two frames' view blocks) - the characters' own motion
+// not yet.
 #include "host/gpu_internal.h"
+#include "host/shaders/camera_motion.spv.h"
 #include "host/upscaler.h"
 #include "log.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstring>
 
 void run_forget_recorded_locked();  // render.cpp: the command buffer's cached graphics state forgotten
 
@@ -38,7 +43,147 @@ std::uint32_t g_w = 0, g_h = 0;     // their size
 VkImage g_depth_for = VK_NULL_HANDLE;  // the depth image g_depth_view is of
 VkImageView g_depth_view = VK_NULL_HANDLE;
 bool g_reset = true;                // the next call has no history
-std::atomic<std::uint64_t> g_calls{0}, g_skipped{0};
+std::atomic<std::uint64_t> g_calls{0}, g_skipped{0}, g_no_camera{0};
+
+void barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to, VkAccessFlags src,
+             VkAccessFlags dst) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    b.srcAccessMask = src;
+    b.dstAccessMask = dst;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// The camera as the motion pass wants it (camera_motion.comp's Params), this
+// frame's and the last's.
+struct Camera {
+    float tan_x = 0, tan_y = 0, a = 0, r2w = 0;
+    float rows[12] = {};  // view to world: rotation | eye
+};
+Camera g_cam_now, g_cam_prev;
+bool g_cam_noted = false;  // this frame's taken (render.cpp, the first camera draw)
+bool g_cam_prev_ok = false;
+
+// The engine's per-view block (864 bytes, the G-buffer's vertex stage), in
+// floats: 36-51 the inverse projection (its first row's x the tangent of half
+// the horizontal field of view, its second's y the vertical, the third
+// (0,0,0,1), the fourth the depth terms), 180-195 the camera, view to world
+// (the last row (0,0,0,1), each row's w the eye). Numity1504's appendix A.
+bool camera_of(const float* f, Camera* c) {
+    for (int i = 0; i < 216; ++i) {
+        if (!std::isfinite(f[i])) return false;
+    }
+    const float tx = f[36], ty = f[41];
+    if (!(tx > 0.1f && tx < 10.0f && ty > 0.1f && ty < 10.0f)) return false;
+    if (f[44] != 0.0f || f[45] != 0.0f || f[46] != 0.0f || f[47] != 1.0f) return false;
+    if (f[192] != 0.0f || f[193] != 0.0f || f[194] != 0.0f || f[195] != 1.0f) return false;
+    const float z = f[50], w = f[51];
+    if (!(std::fabs(z) > 1e-6f) || std::fabs(f[48]) > 1e-4f || std::fabs(f[49]) > 1e-4f) return false;
+    c->tan_x = tx;
+    c->tan_y = ty;
+    c->a = -w / z;
+    c->r2w = 1.0f / z;
+    std::memcpy(c->rows, f + 180, sizeof(c->rows));
+    return true;
+}
+
+VkDescriptorSetLayout g_motion_set_layout = VK_NULL_HANDLE;
+VkPipelineLayout g_motion_layout = VK_NULL_HANDLE;
+VkPipeline g_motion_pipeline = VK_NULL_HANDLE;
+bool g_motion_tried = false;
+
+bool motion_pipeline_locked() {
+    if (g_motion_tried) return g_motion_pipeline != VK_NULL_HANDLE;
+    g_motion_tried = true;
+    const VkDescriptorSetLayoutBinding binds[3] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 3;
+    sli.pBindings = binds;
+    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_motion_set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_motion_set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_motion_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_camera_motion_spv);
+    smi.pCode = k_camera_motion_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = g_motion_layout;
+    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_motion_pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok) g_motion_pipeline = VK_NULL_HANDLE;
+    host_log("upscaler: the camera's motion pass %s", ok ? "ready" : "failed to build; no motion");
+    return ok;
+}
+
+// The motion image written from the depth and the two cameras (the last one
+// absent: all zeros).
+void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
+                   std::uint32_t w, std::uint32_t h, bool prev_ok) {
+    float p[32] = {};
+    p[0] = g_cam_now.tan_x;
+    p[1] = g_cam_now.tan_y;
+    p[2] = g_cam_now.a;
+    p[3] = g_cam_now.r2w;
+    std::memcpy(p + 4, g_cam_now.rows, sizeof(g_cam_now.rows));
+    p[16] = prev_ok ? g_cam_prev.tan_x : 0.0f;
+    p[17] = g_cam_prev.tan_y;
+    p[18] = static_cast<float>(w);
+    p[19] = static_cast<float>(h);
+    // World to the last view: the rotation transposed, its eye taken out.
+    const float* m = g_cam_prev.rows;
+    for (int j = 0; j < 3; ++j) {
+        const float rx = m[0 * 4 + j], ry = m[1 * 4 + j], rz = m[2 * 4 + j];
+        p[20 + 4 * j + 0] = rx;
+        p[20 + 4 * j + 1] = ry;
+        p[20 + 4 * j + 2] = rz;
+        p[20 + 4 * j + 3] = -(rx * m[3] + ry * m[7] + rz * m[11]);
+    }
+    const VkDescriptorSet set = alloc_set_locked(g_motion_set_layout);
+    if (!set) return;
+    const VkDescriptorImageInfo depth_info{VK_NULL_HANDLE, depth_view, depth_layout};
+    const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    const VkDescriptorImageInfo motion_info{VK_NULL_HANDLE, motion_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[3] = {};
+    for (int k = 0; k < 3; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = static_cast<std::uint32_t>(k);
+        wr[k].descriptorCount = 1;
+    }
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[0].pImageInfo = &depth_info;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    wr[1].pImageInfo = &sampler_info;
+    wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[2].pImageInfo = &motion_info;
+    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_motion_pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_motion_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, g_motion_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+    vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+}
 
 void drop(OwnImage& o) {
     if (o.view) defer_destroy_private_view(o.view);
@@ -82,18 +227,6 @@ bool blit_into(VkFormat format) {
     return (src.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
 }
 
-void barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to, VkAccessFlags src,
-             VkAccessFlags dst) {
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.oldLayout = from;
-    b.newLayout = to;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = {aspect, 0, 1, 0, 1};
-    b.srcAccessMask = src;
-    b.dstAccessMask = dst;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-}
 
 }  // namespace
 
@@ -121,7 +254,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_reset = true;
         if (!make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_w, g_h) ||
-            !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, g_w, g_h)) {
+            !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                  g_w, g_h)) {
             host_log("upscaler: no images of %ux%u for it; not upscaled", g_w, g_h);
             drop(g_output);
             drop(g_motion);
@@ -168,6 +302,32 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
                 VK_ACCESS_SHADER_READ_BIT);
         g_motion.initialised = true;
     }
+    // The camera's motion, from this frame's view block and the last's; with no
+    // block this frame, none (and no history: the motion would be wrong).
+    // BBHOST_UPSCALE_MOTION=0: none (a test); =neg: the upscaler told the
+    // motion the other way (a test: moving, the picture should smear).
+    static const int motion_mode = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_MOTION");
+        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "neg") == 0 ? -1 : 1;
+    }();
+    if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
+        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok);
+        if (!g_cam_prev_ok) g_reset = true;
+        g_cam_prev = g_cam_now;
+        g_cam_prev_ok = true;
+    } else {
+        g_no_camera.fetch_add(1, std::memory_order_relaxed);
+        barrier(cb, g_motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, g_motion.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        barrier(cb, g_motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT);
+        g_cam_prev_ok = false;
+        g_reset = true;
+    }
+    g_cam_noted = false;
     UpscaleCall c;
     c.method = method;
     c.quality = 0;
@@ -177,6 +337,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.color = {scene.image, scene.view, scene.format, VK_IMAGE_LAYOUT_GENERAL};
     c.depth = {depth.image, g_depth_view, depth.format, depth_layout};
     c.motion = {g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL};
+    c.motion_scale = motion_mode < 0 ? -1.0f : 1.0f;
     c.jitter_x = jitter_x;
     c.jitter_y = jitter_y;
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -213,6 +374,22 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
 
 // A frame it could not run in starts the next one's history over.
 void upscale_pass_reset_locked() { g_reset = true; }
+
+bool upscale_camera_noted() { return g_cam_noted; }
+
+bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
+    if (g_cam_noted || !base || bytes < 864) return g_cam_noted;
+    Camera c;
+    if (!camera_of(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base)), &c)) return false;
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) == 0)
+        host_log("upscaler: the camera's view block at 0x%llx (tangents %.3f %.3f, eye %.1f %.1f %.1f)", static_cast<unsigned long long>(base),
+                 static_cast<double>(c.tan_x), static_cast<double>(c.tan_y), static_cast<double>(c.rows[3]), static_cast<double>(c.rows[7]),
+                 static_cast<double>(c.rows[11]));
+    g_cam_now = c;
+    g_cam_noted = true;
+    return true;
+}
 
 std::uint64_t upscale_pass_calls() { return g_calls.load(std::memory_order_relaxed); }
 

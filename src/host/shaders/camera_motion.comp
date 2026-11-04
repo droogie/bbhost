@@ -1,0 +1,56 @@
+#version 460
+// The temporal upscaler's motion from the camera (host/upscale_pass.cpp):
+// for each render pixel, where the surface in it was a frame ago minus where
+// it is, in render pixels, x right and y down - from the G-buffer's depth and
+// the two frames' cameras (Numity1504's handoff, step 4). Pixel centres, so
+// no jitter enters it. A pixel with no distance (the sky, an infinite far
+// plane) moves with the camera's turn alone. A point behind the last camera,
+// or no last camera, is no motion.
+//
+// The game's view has x right, y up and z forward. The camera is given as its
+// view-to-world rows (rotation | eye) for this frame and world-to-view rows
+// (the rotation transposed | its eye taken out) for the last.
+//
+// Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_plane;
+layout(set = 0, binding = 1) uniform sampler any_sampler;
+layout(set = 0, binding = 2) uniform writeonly image2D motion;  // R16G16_SFLOAT, written without a format
+
+layout(push_constant) uniform Params {
+    vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
+    vec4 now_r0, now_r1, now_r2;     // view to world
+    vec4 prev_proj;  // the last camera's tangents (x <= 0: none), then the render size
+    vec4 prev_r0, prev_r1, prev_r2;  // world to the last camera's view
+};
+
+void main() {
+    const vec2 size = prev_proj.zw;
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(size.x) || xy.y >= int(size.y)) return;
+    vec2 mv = vec2(0.0);
+    if (prev_proj.x > 0.0) {
+        const vec2 uv = (vec2(xy) + 0.5) / size;
+        const vec2 ndc = uv * 2.0 - 1.0;
+        const vec3 dir = vec3(ndc.x * now_proj.x, -ndc.y * now_proj.y, 1.0);
+        const float raw = texelFetch(sampler2D(depth_plane, any_sampler), xy, 0).r;
+        const float d = now_proj.w / (raw - now_proj.z);
+        vec3 gp;
+        if (d > 0.0 && d < 100000.0) {
+            const vec4 g = vec4(dir * d, 1.0);
+            const vec4 w = vec4(dot(now_r0, g), dot(now_r1, g), dot(now_r2, g), 1.0);
+            gp = vec3(dot(prev_r0, w), dot(prev_r1, w), dot(prev_r2, w));
+        } else {
+            // The sky: the direction turned, no translation.
+            const vec3 w = vec3(dot(now_r0.xyz, dir), dot(now_r1.xyz, dir), dot(now_r2.xyz, dir));
+            gp = vec3(dot(prev_r0.xyz, w), dot(prev_r1.xyz, w), dot(prev_r2.xyz, w));
+        }
+        if (gp.z > 0.0001) {
+            const vec2 prev_uv = vec2((gp.x / (prev_proj.x * gp.z) + 1.0) * 0.5, (-gp.y / (prev_proj.y * gp.z) + 1.0) * 0.5);
+            mv = clamp((prev_uv - uv) * size, vec2(-60000.0), vec2(60000.0));
+            if (any(isnan(mv))) mv = vec2(0.0);
+        }
+    }
+    imageStore(motion, xy, vec4(mv, 0.0, 0.0));
+}

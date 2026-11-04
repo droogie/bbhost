@@ -22880,9 +22880,18 @@ static bool draw_impl(const GpuDraw& d) {
         }
         std::uint64_t gate_bases[16] = {};
         const bool gate = st == 0 && pl.gs_as_vs && pl.gs_gate.vertices && meta.buffers.size() <= 16;
+        // The upscaler's camera (upscale_pass.cpp): a camera draw's vertex
+        // stage, once a frame, its constant buffers looked at for the view block.
+        const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
+                            meta.buffers.size() <= 16 && !upscale_camera_noted() && upscaler_method();
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
-                              gate ? gate_bases : nullptr);
+                              gate || camera ? gate_bases : nullptr);
+        if (camera) {
+            for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
+                if (upscale_camera_note_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4)) break;
+            }
+        }
         if (digest) t_ring_cb_stage = -1;
         if (gate) particle_vertices = particle_gate_vertices_locked(pl, meta, gate_bases);
         if (!meta.buffers.empty()) {

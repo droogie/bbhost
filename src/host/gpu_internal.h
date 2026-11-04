@@ -1774,6 +1774,11 @@ RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // in place, with the G-buffer's depth; false when it did not run.
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
 void upscale_pass_reset_locked();
+// The camera's view block for the upscaler's motion (upscale_pass.cpp): a
+// constant buffer of a camera draw's vertex stage at `base`, `bytes` long;
+// true when it is the engine's per-view block (taken once a frame).
+bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
+bool upscale_camera_noted();
 std::uint64_t upscale_pass_calls();
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
 // copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is
