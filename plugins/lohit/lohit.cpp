@@ -6,7 +6,8 @@
 //   pass = "3e/25"      # the scene pass it is drawn ahead of: category/sub-category (BBHOST_SCENE_CATEGORIES=1)
 //   whole_map = true    # every loaded part's lo-hit, not only the part stood on and its neighbours
 //   show_hi_hit = false # the hi-hit (what characters and objects collide with) in place of the lo-hit
-//   edges = false       # the triangles' edges the game draws over the faces (a second draw of each)
+//   wall_r = 46  wall_g = 20  wall_b = 108    # the walls' colour, as it comes out on the screen (0-255)
+//   floor_r = 32 floor_g = 56 floor_b = 128   # the floors'
 //   occluder_pass = "3e/04"  # where its depth-only play goes, for occlusion (ahead of the scene's objects)
 //
 // What it draws. The world's hit manager (WorldHitMan) has a debug draw of
@@ -46,11 +47,12 @@
 // 0x4d00840 / 0x4d00850, read by its draw sub_1c06490 alone), come out as
 // they are (46, 0, 76). In the scene they go through the tone-mapping with
 // the rest and came out 2.7x brighter (124, 11, 163), so the plugin writes
-// colours there that come out as the late ones do (kEarlyColour; [lohit]
-// early_colour = "r,g,b,r,g,b" replaces them). The colours are the
-// launcher's, dark: the walls its deep violet (46, 20, 108), the floors its
-// blue at half (32, 56, 128), in place of the game's purple and brown, at
-// alpha 1 (the game's 0.5 drew the same: its faces are opaque already).
+// colours there that come out as the late ones do. The colours are options,
+// as they come out on the screen (0-255): by default the launcher's, dark -
+// the walls its deep violet (46, 20, 108), the floors its blue at half (32,
+// 56, 128) - in place of the game's purple and brown, at alpha 1 (the game's
+// 0.5 drew the same: its faces are opaque already). A changed colour builds
+// the meshes again (their shade is in their vertices).
 //
 // Hi-hit. Each part also holds its hi-hit (+0x110, loaded at +0x100 = 6),
 // drawn by sub_1c06380 into the same list for the flag bit 0x20, in its own
@@ -95,7 +97,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.4.1",
+    "0.4.2",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -108,9 +110,13 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "show_hi_hit", "Hi-hit",
      "The hi-hit - what characters and objects collide with, in its full detail - in place of the lo-hit.", "false"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "edges", "Triangle edges",
-     "The edges the game draws over the faces: a second draw of every triangle, which costs more of the GPU than the faces.",
-     "false"},
+    {BB_OPT_HEADING, "colours", "Colours", "As they come out on the screen, 0-255. Lo-hit and hi-hit alike.", nullptr},
+    {BB_OPT_INT | BB_OPT_LIVE, "wall_r", "Walls: red", nullptr, "46", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "wall_g", "Walls: green", nullptr, "20", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "wall_b", "Walls: blue", nullptr, "108", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "floor_r", "Floors: red", nullptr, "32", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "floor_g", "Floors: green", nullptr, "56", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "floor_b", "Floors: blue", nullptr, "128", 0, 255},
     {0}};
 
 namespace {
@@ -290,6 +296,7 @@ struct Batch {
 struct Mesh {
     std::uint8_t key[kMeshKey];
     bool built = false;
+    std::uint32_t gen = 0;  // g_mesh_gen it was built for
     std::vector<Batch> batches;  // without a buffer of its own
     std::uint64_t buffer = 0;    // the GX buffer's holder
     std::uint32_t tris = 0;
@@ -306,7 +313,7 @@ thread_local Mesh* t_capture = nullptr;
 thread_local bool t_mesh_ours = false;  // a mesh drawn by us (built or played)
 thread_local std::uint64_t t_bind = 0;  // our whole-mesh play: the buffer sub_2590be0 binds
 thread_local int t_pass = 0;            // sub_2590be0's calls in one sub_13673c0: 0 the faces, 1 the edges
-std::atomic<bool> g_edges{false};       // the second draw, the triangles' edges
+std::atomic<std::uint32_t> g_mesh_gen{0};  // bumped when the colours change: every mesh built again
 std::atomic<std::uint64_t> g_built{0}, g_played{0}, g_tris_played{0}, g_draws{0};
 
 std::uint32_t seconds_now() {
@@ -398,11 +405,11 @@ int on_batch_draw(BbHookCtx* ctx, void*) {
 }
 
 // sub_2590be0's entry, in a mesh drawn by us: the edges' draw (sub_13673c0's
-// second) left out unless `edges`; in a whole-mesh play, its steps with the
+// second, costing the GPU more than the faces) left out; in a whole-mesh play, its steps with the
 // mesh's buffer bound where the ring's copy would be (0x2590c6f-0x2590cfa).
 int on_draw_up(BbHookCtx* ctx, void*) {
     if (!t_mesh_ours) return 0;
-    if ((t_pass++ & 1) && !g_edges.load(std::memory_order_relaxed)) return 1;
+    if (t_pass++ & 1) return 1;
     const std::uint64_t buffer = t_bind;
     if (!buffer) return 0;
     const std::uint32_t topology = static_cast<std::uint32_t>(ctx->arg[1]), count = static_cast<std::uint32_t>(ctx->arg[2]);
@@ -439,7 +446,7 @@ int on_mesh_draw(BbHookCtx* ctx, void*) {
         Mesh& slot = g_meshes[mesh];
         slot.used = now;
         ++slot.busy;
-        if (slot.built && std::memcmp(slot.key, key, kMeshKey) == 0) {
+        if (slot.built && slot.gen == g_mesh_gen.load(std::memory_order_relaxed) && std::memcmp(slot.key, key, kMeshKey) == 0) {
             m = &slot;
         } else {
             std::memcpy(slot.key, key, kMeshKey);
@@ -471,6 +478,7 @@ int on_mesh_draw(BbHookCtx* ctx, void*) {
             tris += b.tris;
             same = same && std::memcmp(b.xf, slot.batches.front().xf, sizeof b.xf) == 0;
         }
+        slot.gen = g_mesh_gen.load(std::memory_order_relaxed);
         for (Batch& b : slot.batches) shade_batch(b);
         if (g_buffers_on && same && tris) {
             if (const std::uint64_t buffer = make_buffer(slot.batches, tris)) {
@@ -701,42 +709,64 @@ constexpr float kGameColour[8] = {0.18f, 0.0f, 0.3f, 0.5f, 0.18f, 0.15f, 0.0f, 0
 constexpr std::uint64_t kHiColours = 0x4d00820;  // the hi-hit's, read by sub_1c06380 alone
 constexpr float kHiGameColour[8] = {0.045f, 0.0f, 0.3f, 0.5f, 0.045f, 0.15f, 0.0f, 0.5f};
 constexpr float kAlpha = 1.0f;  // opaque (the game's 0.5): nothing seen through it, an occluder
-// The launcher's deep violet and its blue at half (launcher_ui.cpp kRamp): walls, then floors.
-constexpr float kLateColour[8] = {0.180f, 0.078f, 0.424f, kAlpha, 0.125f, 0.220f, 0.502f, kAlpha};
-// Measured at Central Yharnam's lamp: the scene's curve there is about 1.88 x^1.3
-// (linear light) before the display's gamma, so (0.0405, 0, 0.0817) comes out
-// at 44-46, 3, 76 as the late play's (0.18, 0, 0.3) does at 46, 0, 76. Black
-// keeps a lift of 3-4. Brighter colours come out brighter than that curve
-// says: the launcher's, measured at the same place and corrected once.
-float kEarlyColour[8] = {0.0258f, 0.0033f, 0.0778f, kAlpha, 0.0126f, 0.0287f, 0.1657f, kAlpha};
+// The colours for the scene (the early play): the launcher's were measured
+// at Central Yharnam's lamp and corrected once (kEarlyColour); any other
+// comes out near 0.72 x its linear value (a fit to those six channels: the
+// scene's tone-mapping, between the play and the screen).
+constexpr float kEarlyColour[8] = {0.0258f, 0.0033f, 0.0778f, kAlpha, 0.0126f, 0.0287f, 0.1657f, kAlpha};
+constexpr int kDefaultRgb[6] = {46, 20, 108, 32, 56, 128};
+int g_rgb[6] = {46, 20, 108, 32, 56, 128};  // walls r g b, floors r g b (0-255, on the screen)
+float g_colours[8];                         // what is written: walls, floors
+bool g_colours_written = false;
 
-void read_early_colour(const char* v) {
-    if (!v || !*v) return;
-    float c[6];
-    int n = 0;
-    const char* at = v;
-    while (n < 6 && *at) {
-        char* end = nullptr;
-        c[n] = std::strtof(at, &end);
-        if (end == at) break;
-        ++n;
-        at = *end == ',' ? end + 1 : end;
-    }
-    if (n != 6) {
-        api->log("lohit: early_colour '%s' is not six numbers; kept", v);
-        return;
-    }
-    const float out[8] = {c[0], c[1], c[2], kAlpha, c[3], c[4], c[5], kAlpha};
-    std::memcpy(kEarlyColour, out, sizeof out);
+float srgb_linear(int v) {
+    const float c = static_cast<float>(v) / 255.0f;
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
+void make_colours() {
+    for (int k = 0; k < 6; ++k) {
+        const int i = k < 3 ? k : k + 1;
+        if (!g_early) g_colours[i] = static_cast<float>(g_rgb[k]) / 255.0f;
+        else if (g_rgb[k] == kDefaultRgb[k]) g_colours[i] = kEarlyColour[i];
+        else g_colours[i] = 0.72f * srgb_linear(g_rgb[k]);
+    }
+    g_colours[3] = g_colours[7] = kAlpha;
+}
+
+// The lo-hit's and the hi-hit's colours (read on the main thread, where
+// sub_1c06490 and sub_1c06380 record them): the first time patched over the
+// game's, after that written; the meshes built again.
 void write_colours() {
-    const float* ours = g_early ? kEarlyColour : kLateColour;
-    g_shade_colours = ours;
-    const int r = api->patch(kColours, kGameColour, ours, sizeof kGameColour);
-    if (r != 0) api->log("lohit: 0x4d00840 is not the lo-hit's colours (%d); kept as they are", r);
-    if (api->patch(kHiColours, kHiGameColour, ours, sizeof kHiGameColour) != 0)
-        api->log("lohit: 0x4d00820 is not the hi-hit's colours; kept as they are");
+    make_colours();
+    g_shade_colours = g_colours;
+    if (!g_colours_written) {
+        const int r = api->patch(kColours, kGameColour, g_colours, sizeof kGameColour);
+        if (r != 0) api->log("lohit: 0x4d00840 is not the lo-hit's colours (%d); kept as they are", r);
+        if (api->patch(kHiColours, kHiGameColour, g_colours, sizeof kHiGameColour) != 0)
+            api->log("lohit: 0x4d00820 is not the hi-hit's colours; kept as they are");
+        g_colours_written = r == 0;
+        return;
+    }
+    if (api->write(kColours, g_colours, sizeof g_colours) != 0 || api->write(kHiColours, g_colours, sizeof g_colours) != 0)
+        api->log("lohit: the colours could not be written");
+    g_mesh_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+int rgb_index(const char* key) {
+    static const char* const kKeys[6] = {"wall_r", "wall_g", "wall_b", "floor_r", "floor_g", "floor_b"};
+    for (int k = 0; k < 6; ++k)
+        if (std::strcmp(key, kKeys[k]) == 0) return k;
+    return -1;
+}
+
+bool read_rgb(int k, const char* v) {
+    if (!v || !*v) return false;
+    const int n = static_cast<int>(std::strtod(v, nullptr));
+    const int c = n < 0 ? 0 : n > 255 ? 255 : n;
+    if (c == g_rgb[k]) return false;
+    g_rgb[k] = c;
+    return true;
 }
 
 // "3e/05" (category/sub-category, hex) -> 0xf85; -1 when it is not one.
@@ -770,7 +800,9 @@ void on_option(const char* key, const char* value, void*) {
     if (std::strcmp(key, "pass") == 0) set_pass(value);
     else if (std::strcmp(key, "whole_map") == 0) g_whole_map.store(truthy(value), std::memory_order_relaxed);
     else if (std::strcmp(key, "show_hi_hit") == 0) show_hi(truthy(value));
-    else if (std::strcmp(key, "edges") == 0) g_edges.store(truthy(value), std::memory_order_relaxed);
+    else if (const int k = rgb_index(key); k >= 0) {
+        if (read_rgb(k, value)) write_colours();
+    }
     else if (std::strcmp(key, "occluder_pass") == 0 && g_can_occlude) {
         const int p = parse_pass(value);
         if (p >= 0) g_occluder_pass = p;
@@ -817,7 +849,11 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     const int shown = apply(kLoHit);
     if (const char* d = std::getenv("LOHIT_DIAG")) g_diag = std::atoi(d);
     g_whole_map.store(option_on("lohit.whole_map", true), std::memory_order_relaxed);
-    g_edges.store(option_on("lohit.edges", false), std::memory_order_relaxed);
+    {
+        static const char* const kKeys[6] = {"lohit.wall_r", "lohit.wall_g", "lohit.wall_b",
+                                             "lohit.floor_r", "lohit.floor_g", "lohit.floor_b"};
+        for (int k = 0; k < 6; ++k) read_rgb(k, host->config(kKeys[k]));
+    }
     // push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x48
     static const std::uint8_t hit_draw_entry[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                                     0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48};
@@ -856,7 +892,6 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     }
     if (host->hook2(kHitDraw, hit_draw_entry, sizeof hit_draw_entry, &on_hit_draw, nullptr) != 0)
         host->log("lohit: 0x1c8a150 is not WorldHitMan's debug draw; the connected parts are not drawn");
-    if (g_early) read_early_colour(host->config("lohit.early_colour"));
     write_colours();
     if (option_on("lohit.show_hi_hit", false)) show_hi(true);
     if (g_early) {
@@ -871,10 +906,11 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         }
     }
     host->log("lohit: the lo-hit shown in place of the map (%d of 2 sites), %s (ahead of the scene's %02x/%02x), %s%s; "
-              "meshes %s, edges %s",
+              "meshes %s, colours %d,%d,%d / %d,%d,%d",
               shown, g_early ? "under the effects" : "over everything", g_pass >> 6, g_pass & 0x3f,
               g_whole_map.load() ? "the whole map" : "the part stood on and its neighbours", g_hi.load() ? " (the hi-hit)" : "",
-              !g_cache_on ? "built every frame" : g_buffers_on ? "built once into buffers" : "built once", g_edges.load() ? "on" : "off");
+              !g_cache_on ? "built every frame" : g_buffers_on ? "built once into buffers" : "built once", g_rgb[0], g_rgb[1],
+              g_rgb[2], g_rgb[3], g_rgb[4], g_rgb[5]);
     host->log("lohit: occlusion %s", !g_can_occlude ? "not available (needs plugin API 17 and the early play)"
                                      : g_occlusion.load() ? "on: its depth ahead of the scene's objects" : "off");
     return 0;
