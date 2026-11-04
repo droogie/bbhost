@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 16
+#define BB_PLUGIN_API_VERSION 17
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -470,8 +470,9 @@ typedef struct BbHostApi {
      * thread state, on a worker: call only the game's draw code (BB_GUEST_ABI
      * pointers from guest_addr) and nothing of the host's but log. Not called
      * on a frame whose scene has nothing at or after the pass. One pass for
-     * all plugins - a later call replaces it; -1 takes it away. 0 on success;
-     * 1 for another eboot. */
+     * each fn and user (version 17, up to four in all; one for all plugins
+     * before) - a later call with the same fn and user replaces it; -1 takes
+     * it away. 0 on success; 1 for another eboot. */
     int (*on_scene_category)(int32_t pass, void (*fn)(uint64_t cc, void* user), void* user);
 
     /* Version 16. */
@@ -485,7 +486,11 @@ typedef struct BbHostApi {
      * there; pulled toward the viewer a little, its depth written). A shader
      * that shades from the triangle's slope on screen draws its lines dark:
      * white lines are drawn as black ones over white faces, then the faces
-     * again subtracting. No plugin uses it today. */
+     * again subtracting. Version 17: BB_DRAW_DEPTH_ONLY - no colour written,
+     * the depth tested and written; BB_DRAW_DEPTH_EQUAL - the depth tested
+     * less-or-equal and not written, pulled toward the viewer a little: a draw
+     * made depth-only early in the scene (an occluder for the game's
+     * occlusion queries) and again later lands on its own depth. */
     void (*draw_style)(int style);
 } BbHostApi;
 
@@ -493,6 +498,8 @@ typedef struct BbHostApi {
 #define BB_DRAW_LINES 1
 #define BB_DRAW_BLACK 2
 #define BB_DRAW_SUBTRACT 4
+#define BB_DRAW_DEPTH_ONLY 8   /* version 17: no colour written, the depth tested and written */
+#define BB_DRAW_DEPTH_EQUAL 16 /* version 17: the depth tested less-or-equal, not written, pulled toward the viewer a little */
 
 #define BB_TEXT_LEFT 0u
 #define BB_TEXT_CENTRE 1u

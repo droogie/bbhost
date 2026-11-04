@@ -76,8 +76,13 @@ std::uint32_t gx_raster_id(std::uint64_t object);
 // over the faces they outline, and the depth not written; kGxDrawBlack - the
 // blend state's copy that writes zero to every target; kGxDrawSubtract - the
 // blend state's copy that writes the draw's colour less the target's, once a
-// pixel (pulled toward the viewer a little, tested less-than, depth written).
-constexpr int kGxDrawLines = 1, kGxDrawBlack = 2, kGxDrawSubtract = 4;
+// pixel (pulled toward the viewer a little, tested less-than, depth written);
+// kGxDrawDepthOnly (API 17) - the blend state's copy that writes no colour,
+// the depth tested and written; kGxDrawDepthEqual (API 17) - the depth
+// tested less-or-equal and not written, pulled toward the viewer a little, so
+// a draw lands on the depth an earlier depth-only draw of it wrote.
+constexpr int kGxDrawLines = 1, kGxDrawBlack = 2, kGxDrawSubtract = 4, kGxDrawDepthOnly = 8, kGxDrawDepthEqual = 16;
+constexpr int kGxDrawAll = kGxDrawLines | kGxDrawBlack | kGxDrawSubtract | kGxDrawDepthOnly | kGxDrawDepthEqual;
 void gx_draw_style(int style);
 // The description behind an id; null for 0 or an unknown id. Stable for the run.
 const GxBlendDesc* gx_blend_desc(std::uint32_t id);

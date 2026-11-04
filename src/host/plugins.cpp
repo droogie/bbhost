@@ -1138,7 +1138,7 @@ int api_key_bound(std::uint16_t scancode) {
     return 0;
 }
 
-void api_draw_style(int style) { gx_draw_style(style & (kGxDrawLines | kGxDrawBlack | kGxDrawSubtract)); }
+void api_draw_style(int style) { gx_draw_style(style & kGxDrawAll); }
 
 int api_on_scene_category(std::int32_t pass, void (*fn)(std::uint64_t, void*), void* user) {
     if (!g_image || !api_eboot_is_109()) return 1;

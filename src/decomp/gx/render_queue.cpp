@@ -849,9 +849,15 @@ DECOMP_LEAF void learn_chunk(u64 q, u64 range, u64 dt) {
 // is appended first, so it plays just before the chunk. A chunk whose item
 // before it is already at or after the pass is not the first and gets none;
 // a frame without that pass gets the segment ahead of the next one.
-std::atomic<int> g_insert_pass{-1};
-std::atomic<void (*)(u64, void*)> g_insert_fn{nullptr};
-std::atomic<void*> g_insert_user{nullptr};
+// One slot per plugin function and user (plugin API 17; one in all before).
+struct InsertSlot {
+    std::atomic<int> pass{-1};
+    std::atomic<void (*)(u64, void*)> fn{nullptr};
+    std::atomic<void*> user{nullptr};
+};
+constexpr int kInsertSlots = 4;
+InsertSlot g_insert[kInsertSlots];
+std::mutex g_insert_mu;  // registrations alone; the chunk jobs read the atomics
 
 // BBHOST_SCENE_CATEGORIES=1: each queue's items by pass, logged every 300
 // flips - which passes a frame's queues hold (what to name above). The chunk
@@ -918,12 +924,11 @@ void log_categories(u32 flips) {
                  kCategoryQueues);
 }
 
-DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
-    const u64 q = load<u64>(functor + 0x10);
-    if (g_log_categories) count_categories(q, range);
-    const int want = g_insert_pass.load(std::memory_order_acquire);
-    const auto fn = g_insert_fn.load(std::memory_order_acquire);
+DECOMP_LEAF void scene_insert_one(u64 functor, u64 range, u32 worker, const InsertSlot& slot) {
+    const int want = slot.pass.load(std::memory_order_acquire);
+    const auto fn = slot.fn.load(std::memory_order_acquire);
     if (want < 0 || !fn) return;
+    const u64 q = load<u64>(functor + 0x10);
     const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
     const u32 end = count > last ? last : count;
     if (first >= end) return;
@@ -952,12 +957,17 @@ DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
     store<u32>(ctx + kCtxCategory, (key >> 22) & 0x3f);
     store<u32>(ctx + kCtxSub, (key >> 16) & 0x3f);
     store<u32>(ctx + kCtxLow, key & 0xffff);
-    fn(cc, g_insert_user.load(std::memory_order_acquire));
+    fn(cc, slot.user.load(std::memory_order_acquire));
     game_function<OneFn>(kEndRecord)(cc);
     game_function<QueueFn>(kQueueContext)(gx, cc, (key & 0xffff0000u) | (first & 0xffffu));
     const u64 owner = game_function<OneFn>(kOwnerOf)(ctx);
     method<OneFn>(ctx, 0)(ctx);
     method<TwoFn>(owner, 0x70)(owner, ctx);
+}
+
+DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
+    if (g_log_categories) count_categories(load<u64>(functor + 0x10), range);
+    for (const InsertSlot& slot : g_insert) scene_insert_one(functor, range, worker, slot);
 }
 
 DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
@@ -1591,10 +1601,25 @@ void render_queue_flip(std::uint32_t flips, float limit_fps) {
 
 void render_queue_scene_insert(int pass, void (*fn)(std::uint64_t cc, void* user), void* user) {
     const bool on = pass >= 0 && pass < 0x1000 && fn;
-    g_insert_pass.store(-1, std::memory_order_release);
-    g_insert_fn.store(on ? fn : nullptr, std::memory_order_release);
-    g_insert_user.store(on ? user : nullptr, std::memory_order_release);
-    if (on) g_insert_pass.store(pass, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_insert_mu);
+    // Its own slot (the same function and user), else a free one.
+    InsertSlot* slot = nullptr;
+    for (InsertSlot& s : g_insert)
+        if (s.fn.load(std::memory_order_relaxed) == fn && s.user.load(std::memory_order_relaxed) == user) slot = &s;
+    if (!slot && on)
+        for (InsertSlot& s : g_insert)
+            if (!s.fn.load(std::memory_order_relaxed)) {
+                slot = &s;
+                break;
+            }
+    if (!slot) {
+        if (on) host_log("decomp: no room for another plugin segment in the scene (%d slots)", kInsertSlots);
+        return;
+    }
+    slot->pass.store(-1, std::memory_order_release);
+    slot->fn.store(on ? fn : nullptr, std::memory_order_release);
+    slot->user.store(on ? user : nullptr, std::memory_order_release);
+    if (on) slot->pass.store(pass, std::memory_order_release);
     if (on)
         host_log("decomp: a plugin's segment in the scene ahead of its first chunk at or after %02x/%02x", pass >> 6, pass & 0x3f);
     else
