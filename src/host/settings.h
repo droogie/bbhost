@@ -75,6 +75,13 @@ struct HostSettings {
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;
+    // HD motion blur (engine/patch_manifest.cpp's hd-motion-blur, read once as
+    // the game starts): motion blur's velocity map and the depth it blurs
+    // with at a share of the render size - 0 a quarter, 1 half (the game's
+    // own), 2 full - in place of the performance patch's 640x360, and the
+    // camera blur on.
+    bool hd_motion_blur = false;
+    int hd_motion_blur_res = 2;
     // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR (4 where
     // it can run), 3 FSR 3; and its quality, 0 native AA (DLAA, FSR native
     // AA), 1 Quality, 2 Balanced, 3 Performance. Follow the settings live.

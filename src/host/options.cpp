@@ -112,6 +112,8 @@ enum SettingId {
     kFog,
     kModelDetail,
     kSsr,
+    kHdMotionBlur,
+    kHdMotionBlurRes,
     kUpscaler,
     kUpscaleQuality,
     kDlssPreset,
@@ -161,8 +163,12 @@ struct Row {
 };
 
 Setting g_set[kSettingCount] = {
-    {"window_mode", "Window mode", {"Windowed", "Fullscreen"}, 0,
-     "Fullscreen is borderless: the desktop resolution, no mode switch.", false},
+    // Borderless was this setting's Fullscreen until 2026-11-04 (an older
+    // file's Fullscreen reads as Borderless: host_options_load).
+    {"window_mode", "Window mode", {"Windowed", "Borderless", "Fullscreen"}, 0,
+     "Borderless fills the screen at the desktop's resolution and switches away at once. Fullscreen takes the display "
+     "over at the mode nearest the Resolution, which can change the screen's resolution.",
+     false},
     {"vsync", "V-Sync", {"On", "Off"}, 0,
      "Off presents as soon as a frame is ready, and can tear.", false},
     // The game's own pace (engine/frame_rate.h), the same eleven the game's
@@ -261,6 +267,20 @@ Setting g_set[kSettingCount] = {
     // (host/shader_patch.h).
     {"motion_blur", "Motion blur", {"On", "Off"}, 0,
      "The blur on fast camera and character movement.", false},
+    // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
+    // hd_motion_blur_manifest): their buffers at a share of the render size
+    // rather than at one fixed size each. The targets are made as the game
+    // starts. A bbhost.toml that turned one of the old files on seeds it
+    // (host_options_load).
+    {"hd_motion_blur", "HD motion blur", {"Off", "On"}, 0,
+     "Requires a restart. Motion blur's velocity map and the depth it blurs with at the HD motion blur resolution "
+     "below instead of a fixed 640x360, with the camera's own blur on: cleaner, steadier blur. Costs GPU time and "
+     "video memory, more the larger. Shows only with Motion blur on.",
+     true},
+    {"hd_motion_blur_res", "HD motion blur resolution", {"Quarter", "Half", "Full"}, 2,
+     "Requires a restart. HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
+     "size) or Full. It follows the render resolution, Resolution and upscaling both.",
+     true},
     {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
      "The game's own AA pass.", false},
     {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
@@ -429,6 +449,8 @@ const Row g_rows[] = {
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
+    {Row::Option, nullptr, kHdMotionBlur},
+    {Row::Option, nullptr, kHdMotionBlurRes},
     {Row::Option, nullptr, kAntiAlias},
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
@@ -753,12 +775,26 @@ std::string options_path() {
     return path;
 }
 
+// The resolution as width and height: BBHOST_RES's when it is set (it wins
+// here too, or applying the settings at the start undid it), else the
+// setting's.
+bool resolution_of(unsigned* w, unsigned* h) {
+    const char* forced = std::getenv("BBHOST_RES");
+    return (forced && forced[0] && std::sscanf(forced, "%ux%u", w, h) == 2) ||
+           std::sscanf(g_set[kResolution].values[static_cast<std::size_t>(g_set[kResolution].index)], "%ux%u", w, h) == 2;
+}
+
 // Applied every time one changes, and once at load, so there is one path to
 // the live state instead of a copy in each caller.
 void apply(int id) {
     const Setting& s = g_set[id];
     switch (id) {
-        case kWindowMode: host_window_set_fullscreen(s.index == 1); break;
+        case kWindowMode: {
+            unsigned w = 0, h = 0;
+            resolution_of(&w, &h);
+            host_window_set_mode(s.index, static_cast<int>(w), static_cast<int>(h));
+            break;
+        }
         case kVsync: host_window_set_vsync(s.index == 0); break;
         case kFrameCap:
             hle_video_set_fps_cap(fps_from_label(s.values[static_cast<std::size_t>(s.index)]));
@@ -780,12 +816,12 @@ void apply(int id) {
         case kResolution: {
             unsigned w = 0, h = 0;
             // A change the player made asks to be kept (g_res_prev set by
-            // set_index); going back, and the start, ask nothing. BBHOST_RES
-            // wins here too, or applying the settings at the start undid it.
-            const char* forced = std::getenv("BBHOST_RES");
-            if ((forced && forced[0] && std::sscanf(forced, "%ux%u", &w, &h) == 2) ||
-                std::sscanf(s.values[static_cast<std::size_t>(s.index)], "%ux%u", &w, &h) == 2)
+            // set_index); going back, and the start, ask nothing.
+            if (resolution_of(&w, &h)) {
                 live_resolution_request(w, h, g_res_prev >= 0 && !g_res_reverting);
+                // Fullscreen's display mode follows the resolution.
+                if (g_set[kWindowMode].index == 2) host_window_set_mode(2, static_cast<int>(w), static_cast<int>(h));
+            }
             break;
         }
         case kSkipLogos:
@@ -818,8 +854,10 @@ void apply(int id) {
 // every older build ran, so a file without it reads as before and the
 // version stays. 4: the camera zoom actions (zoom_in, zoom_out, zoom_reset on
 // the wheel and the middle button); an older file's Transform on the middle
-// button, its default until then, gives it to Camera Zoom Reset.
-constexpr int kOptionsVersion = 6;
+// button, its default until then, gives it to Camera Zoom Reset. 7: Window
+// mode's Borderless and an exclusive Fullscreen; an older file's Fullscreen
+// was the borderless one.
+constexpr int kOptionsVersion = 7;
 
 void save() {
     if (!g_dirty) {
@@ -873,7 +911,7 @@ int index_of(int id) { return g_set[id].index; }
 
 void rebuild_settings() {
     HostSettings h;
-    h.fullscreen = index_of(kWindowMode) == 1;
+    h.fullscreen = index_of(kWindowMode) != 0;  // Borderless or Fullscreen
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.frame_clock = on_of(kFrameClock);
@@ -934,6 +972,8 @@ void rebuild_settings() {
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
     h.ssr = on_of(kSsr);
+    h.hd_motion_blur = on_of(kHdMotionBlur);
+    h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
     {
         const int u = index_of(kUpscaler);
         h.upscaler = u == 1 ? 2 : u == 2 ? 3 : u == 3 ? 1 : 0;  // the menu's FSR 4, FSR 3, DLSS
@@ -1017,6 +1057,15 @@ void host_options_load() {
     // a bbhost.toml that turned it on keeps them on until the player chooses.
     if (const std::string v = config_value("patches.screen-space-reflections"); !v.empty())
         g_set[kSsr].index = v == "false" || v == "0" ? 0 : 1;
+    // So were the HD Motion Blur patches, each at one size: the one a
+    // bbhost.toml turned on becomes HD motion blur at the share nearest it
+    // (360p a quarter of 1440p, 1080p and up the full size).
+    for (const auto& [file, res] : {std::pair{"360p", 0}, std::pair{"1080p", 2}, std::pair{"1440p", 2}, std::pair{"4k", 2}}) {
+        const std::string v = config_value(std::string("patches.hd-motion-blur-") + file);
+        if (v.empty() || v == "false" || v == "0") continue;
+        g_set[kHdMotionBlur].index = 1;
+        g_set[kHdMotionBlurRes].index = res;
+    }
     // The PC enhancements seed from bbhost.toml's [world] (all on unless it
     // says otherwise); the options file then holds the player's choice, and a
     // BBHOST_* switch still wins over both (config_set_enhancements).
@@ -1072,6 +1121,7 @@ void host_options_load() {
         int file_version = 1;
         bool old_hunters_off = false;  // v0.2.9's PC enhancement, turned off
         std::string frame_cap_val;
+        std::string window_mode_val;  // its label as saved (Fullscreen was Borderless before version 7)
         while (std::fgets(line, sizeof(line), f)) {
             if (line[0] == '[') {
                 keys = std::strncmp(line, "[keys]", 6) == 0;
@@ -1116,6 +1166,7 @@ void host_options_load() {
             }
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
+            if (key == "window_mode") window_mode_val = val;
             // Display-Limited was called Uncapped until 2026-10-28.
             if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
             // Effect timing's names before it had three choices; a saved Smooth,
@@ -1158,6 +1209,12 @@ void host_options_load() {
             for (const int id : {kBloom, kSaturation, kFog, kAoStrength, kCameraDistance, kCameraHeight, kMouseSens}) {
                 if (g_saved[static_cast<std::size_t>(id)]) g_set[id].index = std::min(g_set[id].index, 10) * 10;
             }
+        }
+        // Before version 7 Window mode's Fullscreen was borderless: it is
+        // Borderless now, and Fullscreen the exclusive mode.
+        if (file_version < 7 && window_mode_val == "Fullscreen") {
+            g_set[kWindowMode].index = 1;
+            g_dirty = true;
         }
         if (file_version < 4) {
             host_bindings_migrate_zoom();
@@ -1754,6 +1811,10 @@ void host_opt_set(const char* key, bool on) {
         // game's menu saved it off. Two values that are not On/Off
         // (Windowed/Fullscreen) read the second as on.
         const Setting& s = g_set[id];
+        // A setting with no On (Window mode) is on at any value past its
+        // first: on keeps Fullscreen as it is, and turns Windowed Borderless.
+        const bool has_on = std::any_of(s.values.begin(), s.values.end(), [](const char* v) { return std::strcmp(v, "On") == 0; });
+        if (on && !has_on && s.index != 0) return;
         int want = on ? 1 : 0;
         for (std::size_t v = 0; v < s.values.size(); ++v) {
             if (std::strcmp(s.values[v], on ? "On" : "Off") == 0) {

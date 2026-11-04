@@ -201,7 +201,11 @@ void host_mouse_describe(char* out, std::size_t n);
 // are safe before the window exists: they record the wish and the presenter
 // picks it up when it comes up. V-Sync off rebuilds the swapchain on the next
 // present with whichever no-wait mode the surface supports.
-void host_window_set_fullscreen(bool on);
+// Window mode: 0 windowed, 1 borderless (fullscreen at the desktop's own
+// resolution, no mode switch), 2 fullscreen (exclusive: the display switched
+// to the mode nearest width x height - the resolution - at the desktop's
+// refresh rate). A width and height of 0 keep the last ones.
+void host_window_set_mode(int mode, int width = 0, int height = 0);
 void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.

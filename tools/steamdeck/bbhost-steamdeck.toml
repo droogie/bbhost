@@ -15,7 +15,7 @@ height = 800
 # What the game renders at: the screen's own size. At 16:10 the world fills
 # the screen and the HUD and menus stay 16:9 in the middle.
 resolution = "1280x800"
-window_mode = "Fullscreen"
+window_mode = "Borderless"
 # The game's own pace. With the Deck's screen at 40 Hz (Steam's performance
 # menu), 40 is worth a try.
 fps_cap = 30

@@ -74,6 +74,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > STARTUP, read once
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
+    if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
     *known = false;
     return false;
@@ -353,6 +354,108 @@ Manifest ssr_manifest() {
     return m;
 }
 
+// hd-motion-blur, HD motion blur (graphics.hd_motion_blur): Kyo's HD Motion
+// Blur patches (360p, 1080p, 1440p, 4K - patches/hd-motion-blur-*.toml until
+// now), each of which set motion blur's buffers to one fixed size, made a
+// share of the render size instead (HD motion blur resolution: a quarter,
+// half - the game's own - or full). The three are where the game halves or
+// quarters the scene's size for them: the velocity map (0x26c3de4, the
+// scene context's target at +0xce0: `mov eax, [r15]; shr eax, 1` and the
+// same for the height) and the half- and quarter-size depth renders it blurs
+// with (0x125b1a3, 0x125b1d6), which the performance patch fixes at 640x360
+// and 320x180 and Screen space reflections gives back the game's halves and
+// quarters. Each becomes one 64-bit load of the {width, height} pair, a
+// shift of both halves and one store - fewer bytes than the game's, xmm0 free
+// there (a call that clobbers it follows, and nothing between reads it) -
+// with the velocity map and the half depth at the chosen share and the
+// quarter depth at half of it, as the patches had them (1080p: 1920x1080 and
+// 960x540). A share of the scene's own size follows any render size,
+// Resolution's and the upscaler's smaller one alike. The camera blur's switch
+// (the scene context's +0x2a10, "Camera Blur (for Test)" in the debug menu,
+// 0x26c265d) comes on with it, as in the patches. After Screen space
+// reflections (order 9000), as the patches came after it in the list, so its
+// sizes are the ones that stand.
+Manifest hd_motion_blur_manifest() {
+    Manifest m;
+    m.name = "hd-motion-blur";
+    m.title = "HD motion blur";
+    m.eboot = kEboot109Sha256;
+    m.description = "motion blur's velocity map and depth at a share of the render size, the camera blur on";
+    m.option = "graphics.hd_motion_blur";
+    m.order = 9100;
+    // How far each is shifted down: the velocity map and the half depth by
+    // 2, 1 or 0 (a quarter, half, full), the quarter depth one more.
+    const std::uint8_t shift = static_cast<std::uint8_t>(2 - std::clamp(host_settings().hd_motion_blur_res, 0, 2));
+    auto site = [&](const char* id, std::uint64_t at, std::vector<std::uint8_t> expect, std::vector<std::uint8_t> bytes) {
+        bytes.resize(expect.size(), 0x90);
+        m.sites.push_back(Site{id, at, std::move(expect), std::move(bytes), true, {}});
+    };
+    // vmovq xmm0, [r15]; vpsrld xmm0, xmm0, n; vmovq [rsp+0x200], xmm0
+    site("velomap-size", 0x026c3de4,
+         {0x41, 0x8b, 0x07, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00, 0x41,
+          0x8b, 0x47, 0x04, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x04, 0x02, 0x00, 0x00},
+         {0xc4, 0xc1, 0x7a, 0x7e, 0x07, 0xc5, 0xf9, 0x72, 0xd0, shift, 0xc5, 0xf9, 0xd6, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00});
+    // vmovq xmm0, [rbx]; vpsrld xmm0, xmm0, n; vmovq [rsp], xmm0
+    site("depth-half-size", 0x0125b1a3,
+         {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04},
+         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, shift, 0xc5, 0xf9, 0xd6, 0x04, 0x24});
+    site("depth-quarter-size", 0x0125b1d6,
+         {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
+         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift + 1), 0xc5, 0xf9, 0xd6, 0x04, 0x24});
+    site("camera-blur", 0x026c265d, {0x00}, {0x01});  // mov byte [rbx+0x2a10], 0 -> 1
+    return m;
+}
+
+// all-languages, Every text language (always on): the game's text languages
+// are CSLocalize's, and which of them a disc offers is its region's - the
+// region the game makes of param.sfo's USER_DEFINED_PARAM_1 (the US disc's
+// Americas: English (US), French, Spanish (Latin America), Portuguese
+// (Brazil); a European disc's 14 European languages; Japan's Japanese
+// alone). A static initializer (0x23b9680) builds a 32-byte entry per region
+// at 0x59994e0: the list System > Language shows (+0, its count +8), what a
+// language - the player's pick, or the system language's while there is
+// none - becomes there (+0x10, 21 entries; Europe's turns Japanese into
+// English (UK)) and the language past the end of that (+0x18). The sixth,
+// region 5's (the build's own: a USER_DEFINED_PARAM_1 of 0), lists all 21
+// and keeps each as it is. Its list, its count and its mapping now stand for
+// every region's, each region's last-resort language left as it was.
+//
+// The region itself is untouched: it also picks the title id the game goes
+// online as, its server address (region 5 has none) and whether Circle
+// decides - which is why the community's Unlock Game Region patch, which made
+// the game region 5, took online play with it. That patch file is retired
+// (retired_file). A save with no pick of its own follows the system language,
+// which the region's console answers (hle/system.cpp), so a European disc
+// still starts in English (UK).
+Manifest all_languages_manifest() {
+    Manifest m;
+    m.name = "all-languages";
+    m.title = "Every text language";
+    m.eboot = kEboot109Sha256;
+    m.description = "System > Language lists all 21 of the game's text languages, whatever the disc's region";
+    m.order = 12;
+    auto site = [&](const char* id, std::uint64_t at, std::vector<std::uint8_t> expect, std::vector<std::uint8_t> bytes) {
+        m.sites.push_back(Site{id, at, std::move(expect), std::move(bytes), true, {}});
+    };
+    // Per region: the list's lea (rip+disp32 to 0x4b368f0, region 5's), the
+    // count's mov (21) and the mapping's lea (0x4b36950, region 5's).
+    site("japan-list", 0x023b96b3, {0xf1, 0xcf, 0x77, 0x02}, {0x39, 0xd2, 0x77, 0x02});
+    site("japan-count", 0x023b96c4, {0x01, 0x00, 0x00, 0x00}, {0x15, 0x00, 0x00, 0x00});
+    site("japan-remap", 0x023b96cb, {0xe1, 0xcf, 0x77, 0x02}, {0x81, 0xd2, 0x77, 0x02});
+    site("americas-list", 0x023b96e3, {0x29, 0xd0, 0x77, 0x02}, {0x09, 0xd2, 0x77, 0x02});
+    site("americas-count", 0x023b96f4, {0x04, 0x00, 0x00, 0x00}, {0x15, 0x00, 0x00, 0x00});
+    site("americas-remap", 0x023b96fb, {0x21, 0xd0, 0x77, 0x02}, {0x51, 0xd2, 0x77, 0x02});
+    site("europe-list", 0x023b9713, {0x69, 0xd0, 0x77, 0x02}, {0xd9, 0xd1, 0x77, 0x02});
+    site("europe-count", 0x023b9724, {0x0e, 0x00, 0x00, 0x00}, {0x15, 0x00, 0x00, 0x00});
+    site("europe-remap", 0x023b972b, {0x91, 0xd0, 0x77, 0x02}, {0x21, 0xd2, 0x77, 0x02});
+    site("asia-list", 0x023b9743, {0xd9, 0xd0, 0x77, 0x02}, {0xa9, 0xd1, 0x77, 0x02});
+    site("asia-count", 0x023b9754, {0x04, 0x00, 0x00, 0x00}, {0x15, 0x00, 0x00, 0x00});
+    site("asia-remap", 0x023b975b, {0xd1, 0xd0, 0x77, 0x02}, {0xf1, 0xd1, 0x77, 0x02});
+    site("region4-list", 0x023b9773, {0x0d, 0xd1, 0x77, 0x02}, {0x79, 0xd1, 0x77, 0x02});
+    site("region4-count", 0x023b9784, {0x01, 0x00, 0x00, 0x00}, {0x15, 0x00, 0x00, 0x00});
+    site("region4-remap", 0x023b978b, {0x01, 0xd1, 0x77, 0x02}, {0xc1, 0xd1, 0x77, 0x02});
+    return m;
+}
 
 // skip-intro, Skip company logos (startup.skip_intro): illusion's 1.09 Skip
 // Intro. The three company logos (FromSoftware, Japan Studio, SCE) are
@@ -382,16 +485,22 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(performance_manifest());
     out.push_back(ssr_manifest());
     out.push_back(fov_uncap_manifest());
+    out.push_back(all_languages_manifest());
+    out.push_back(hd_motion_blur_manifest());
     return out;
 }
 
-// Patch files a setting replaced: the Screen Space Reflections patches (the
-// game's half size and the quarter-size variant), Performance Patch v3's
+// Patch files bbhost does itself now: the Screen Space Reflections patches
+// (the game's half size and the quarter-size variant), Performance Patch v3's
 // variants and the uncapped field of view are the Graphics page's Screen
-// space reflections and Performance patch and the Field of view setting now. A package unpacked over an older one still has them in its
-// patches folder; they are passed over, not applied twice.
+// space reflections, the built-in performance patch and the Field of view
+// setting, the HD Motion Blur patches are HD motion blur, and Unlock Game
+// Region is all-languages without its online cost. A
+// package unpacked over an older one still has them in its patches folder;
+// they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
-    return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml";
+    return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
+           file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.

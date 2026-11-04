@@ -298,7 +298,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
-    bool fullscreen = host_opt_index("window_mode") == 1;
+    int window_mode = std::max(0, host_opt_index("window_mode"));  // Windowed, Borderless, Fullscreen
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
     bool debug_camera = host_opt_get("debug_camera");
@@ -493,7 +493,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         for (PatchRow& r : patch_rows) r.was = r.on;
         quick_reentry_was = quick_reentry;
         all_post_processors_was = all_post_processors;
-        host_opt_set_index("window_mode", fullscreen ? 1 : 0);
+        host_opt_set_index("window_mode", window_mode);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
@@ -897,9 +897,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
-                static const char* const kModes[] = {"Windowed", "Fullscreen"};
-                int mode = fullscreen ? 1 : 0;
-                if (ui::segmented("##mode", &mode, kModes, 2, ImGui::GetContentRegionAvail().x)) fullscreen = mode == 1;
+                static const char* const kModes[] = {"Windowed", "Borderless", "Fullscreen"};
+                ui::segmented("##mode", &window_mode, kModes, 3, ImGui::GetContentRegionAvail().x);
+                ui::tooltip_for_item("Window mode", "Borderless fills the screen at the desktop's resolution and switches away "
+                                                    "at once. Fullscreen takes the display over at the mode nearest the "
+                                                    "Resolution, which can change the screen's resolution.");
                 ui::row_label("Frame rate", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ui::combo("##cap", &cap_choice, kCapLabels, kCapCount, kCapTips);

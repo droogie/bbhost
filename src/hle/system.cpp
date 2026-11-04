@@ -166,15 +166,35 @@ GUEST_ABI int hle_user_event(std::int32_t* ev) {
     return static_cast<int>(0x80960005);  // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
 
+// The system language a console of the disc's region answers, as far as the
+// game's text goes. A save that has no language picked in System > Language
+// follows the system language, and since every region now keeps every
+// language as it is (engine/patch_manifest.cpp all-languages) the answer is
+// the text: English (UK) on a European or Asian disc, Japanese on a Japanese
+// one, English (US) on an American one - what each region's own mapping made
+// of English (US) before.
+int region_system_lang() {
+    // The game's region (sub_23b9190): USER_DEFINED_PARAM_1 modulo ten
+    // through its table at 0x4b36690, 0 past 5.
+    static constexpr int kRegion[] = {5, 0, 1, 2, 3, 4};
+    const int m = sfo_user_param(1) % 10;
+    const int region = m >= 0 && m <= 5 ? kRegion[m] : 0;
+    // Japan, Americas, Europe, Asia, region 4 (Europe's English alone), the
+    // build's own.
+    static constexpr int kLang[] = {0, 1, 18, 18, 18, 1};
+    return kLang[region];
+}
+
 GUEST_ABI int hle_sysparam_int(int id, int* value) {
     int v = 0;
     if (id == 1) {
-        // SCE_SYSTEM_SERVICE_PARAM_ID_LANG: English (US); BBHOST_SYSTEM_LANG=N
-        // another (2 French, 4 German, 18 English UK, ...) - for testing
-        // the other languages' message bundles.
+        // SCE_SYSTEM_SERVICE_PARAM_ID_LANG: the disc's region's
+        // (region_system_lang); BBHOST_SYSTEM_LANG=N another (1 English US,
+        // 2 French, 4 German, 18 English UK, ...) - for testing the other
+        // languages' message bundles.
         static const int lang = [] {
             const char* e = std::getenv("BBHOST_SYSTEM_LANG");
-            return e && *e ? std::atoi(e) : 1;
+            return e && *e ? std::atoi(e) : region_system_lang();
         }();
         v = lang;
     } else if (id == 1000) {

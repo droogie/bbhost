@@ -100,7 +100,10 @@ std::atomic<bool> g_ime_test_reopen{true};
 // The options screen's two display settings (host/options.h). Both can be set
 // before the presenter exists, so they are wishes the swapchain reads, not
 // calls into it.
-std::atomic<bool> g_want_fullscreen{false};
+// Window mode (host_window_set_mode): 0 windowed, 1 borderless, 2 fullscreen,
+// and the size Fullscreen's display mode is to be nearest.
+std::atomic<int> g_want_mode{0};
+std::atomic<int> g_mode_w{0}, g_mode_h{0};
 std::atomic<bool> g_want_vsync{true};
 // When the presenting thread last finished a present, and how many it has
 // finished: with V-Sync on that instant is a display vblank, which is the
@@ -638,7 +641,7 @@ bool vk_create_swapchain() {
         const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
         host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
                  chosen.c_str(), have.c_str(),
-                 g_want_fullscreen.load() ? "fullscreen" : "windowed",
+                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
                                                                : "another format",
@@ -1726,17 +1729,51 @@ bool host_test_keys_play(const char* path) {
 }
 
 
-void host_window_set_fullscreen(bool on) {
 #if defined(BBHOST_HAVE_SDL3)
-    if (g_want_fullscreen.exchange(on) == on) {
+namespace {
+// Borderless is SDL's fullscreen with no display mode of its own: the desktop's,
+// unchanged. Fullscreen is exclusive: the display set to the mode nearest the
+// resolution, at the desktop's refresh rate - or the desktop's own mode when
+// the display has none that large (a resolution above the display's, drawn
+// and scaled down).
+void apply_window_mode(int mode) {
+    if (mode == 2) {
+        const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+        const SDL_DisplayMode* desk = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+        SDL_DisplayMode m{};
+        const int w = g_mode_w.load(), h = g_mode_h.load();
+        if (desk && w > 0 && h > 0 && SDL_GetClosestFullscreenDisplayMode(d, w, h, desk->refresh_rate, false, &m)) {
+            SDL_SetWindowFullscreenMode(g_window, &m);
+            host_log("window: fullscreen, %dx%d at %.2f Hz", m.w, m.h, m.refresh_rate);
+        } else {
+            SDL_SetWindowFullscreenMode(g_window, desk);
+            host_log("window: fullscreen at the desktop's mode (none is %dx%d or larger)", w, h);
+        }
+    } else {
+        SDL_SetWindowFullscreenMode(g_window, nullptr);
+        host_log("window: %s", mode == 1 ? "borderless" : "windowed");
+    }
+    SDL_SetWindowFullscreen(g_window, mode != 0);
+}
+}  // namespace
+#endif
+
+void host_window_set_mode(int mode, int width, int height) {
+#if defined(BBHOST_HAVE_SDL3)
+    // Both sizes stored either way: a new resolution moves Fullscreen's mode.
+    bool resized = false;
+    if (width > 0 && height > 0) {
+        resized = g_mode_w.exchange(width) != width;
+        resized = (g_mode_h.exchange(height) != height) || resized;
+    }
+    if (g_want_mode.exchange(mode) == mode && !(mode == 2 && resized)) {
         return;
     }
-    if (g_window) {
-        SDL_SetWindowFullscreen(g_window, on);
-        host_log("window: %s", on ? "fullscreen" : "windowed");
-    }
+    if (g_window) apply_window_mode(mode);
 #else
-    (void)on;
+    (void)mode;
+    (void)width;
+    (void)height;
 #endif
 }
 
@@ -1854,12 +1891,13 @@ bool window_start_impl(int width, int height, const char* title) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
-    // The options are read before the window exists, so a saved Fullscreen
-    // is only a wish until here (host_window_set_fullscreen).
-    const bool fullscreen = g_want_fullscreen.load();
+    // The options are read before the window exists, so a saved Borderless
+    // or Fullscreen is only a wish until here (host_window_set_mode). Both
+    // start as the desktop's fullscreen; Fullscreen then takes its own mode.
+    const int mode = g_want_mode.load();
     g_window = SDL_CreateWindow(title, width, height,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
-    if (g_window && fullscreen) host_log("window: fullscreen");
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (mode != 0 ? SDL_WINDOW_FULLSCREEN : 0));
+    if (g_window && mode != 0) apply_window_mode(mode);
     if (!g_window) {
         host_log("SDL_CreateWindow failed: %s", SDL_GetError());
         SDL_Quit();
