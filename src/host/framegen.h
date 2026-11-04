@@ -43,6 +43,9 @@ VkResult framegen_acquire(VkDevice device, VkSwapchainKHR swapchain, std::uint64
 // The frame's settings first (frameID counting each presented game frame by
 // one), then AMD's present.
 VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info);
+// Frames shown for each of the game's, measured over the last 60 presents:
+// about 2 while generating, 1 otherwise (the FPS counter's factor).
+float framegen_shown_per_frame();
 // The contexts and AMD's swapchain gone; the presenter makes a swapchain anew.
 void framegen_destroy_swapchain(VkDevice device);
 

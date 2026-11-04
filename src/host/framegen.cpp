@@ -1,6 +1,7 @@
 #include "host/framegen.h"
 
 #include "core/config.h"
+#include "engine/loading.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -49,6 +50,7 @@ std::mutex g_hudless_mu;
 // the renderer's, the configure on the presenter's - where AMD's sample uses
 // it from one: one at a time.
 std::mutex g_ctx_mu;
+std::atomic<float> g_shown_per_frame{1.0f};
 Hudless g_hudless[4];  // under g_hudless_mu
 
 // The presenter's side: the HUD-less picture at the swapchain's size, and the
@@ -218,6 +220,8 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
 
 bool framegen_active() { return g_swap_ctx != nullptr; }
 
+float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }
+
 VkResult framegen_get_images(VkDevice device, VkSwapchainKHR swapchain, std::uint32_t* count, VkImage* images) {
     return g_fns.pOutGetSwapchainImagesKHR(device, swapchain, count, images);
 }
@@ -232,7 +236,9 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         // Generated only for a flip with its prepare and its HUD-less picture:
         // AMD takes the UI out of the frame against that picture and puts it
         // over every frame it shows.
-        const bool on = g_present_ready;
+        // Not while a loading screen is up: its frames run uncapped to load
+        // faster, and there is nothing to smooth.
+        const bool on = g_present_ready && !loading_screen_up();
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = g_swapchain;
@@ -266,8 +272,14 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         std::lock_guard<std::mutex> lk(g_ctx_mu);
         r = g_fns.pOutQueuePresentKHR(queue, info);
     }
-    // What reaches the screen, real and generated, against the game's frames.
-    static std::uint64_t frames = 0, base = 0;
+    // What reaches the screen, real and generated, against the game's frames:
+    // the FPS counter's factor every 60, the log's line every 600.
+    static std::uint64_t frames = 0, base = 0, base60 = 0;
+    if (g_fns.pOutGetLastPresentCountFFXAPI && (frames + 1) % 60 == 0) {
+        const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
+        if (base60 && shown > base60) g_shown_per_frame.store(static_cast<float>(shown - base60) / 60.0f, std::memory_order_relaxed);
+        base60 = shown;
+    }
     if (g_fns.pOutGetLastPresentCountFFXAPI && ++frames % 600 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
         host_log("framegen: %llu frames shown for the last 600 of the game's", static_cast<unsigned long long>(shown - base));

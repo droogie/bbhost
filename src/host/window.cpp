@@ -2290,6 +2290,9 @@ bool host_window_pump() {
             const std::uint64_t last = g_fps_last_ns.load(std::memory_order_relaxed);
             double fps = g_fps_avg.load(std::memory_order_relaxed);
             if (last && now > last + 500'000'000) fps = std::min(fps, 1e9 / static_cast<double>(now - last));
+            // With frame generation, what is on screen: the game's frames and
+            // the ones generated between them.
+            if (framegen_active()) fps *= framegen_shown_per_frame();
             shown = last ? static_cast<int>(fps + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
