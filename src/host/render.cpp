@@ -8,6 +8,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/loading.h"
+#include "engine/render_scale.h"
 #include "host/clip_control.h"
 #include "host/copy_census.h"
 #include "host/full_write.h"
@@ -22025,6 +22026,41 @@ static bool draw_impl(const GpuDraw& d) {
     // Phase 2 B1: an exact point copy left undrawn, a pending copy in its place (in order only).
     if (!part && g_elide_draws && copy_elide_point_copy_locked(s, d, pl, use_vertex_input ? &vertex_input : nullptr, stage_images)) return true;
     draw_stamp.to(kRenderCostPrefetch);
+    // Render scale (engine/render_scale.cpp): the scene is the render size and
+    // YEBIS's copy of it - the post chain's first pass, at the output size -
+    // samples the upscaler's picture in its place (host/upscale_pass.cpp).
+    // Its T# stays the scene's, so the call point below still finds the copy
+    // reading the scene and runs the upscale before it. Without a picture (the
+    // first frame, the upscaler off) the copy stretches the scene itself.
+    if (g_upscale.scene && pl.name == "0b0acf50+ccbf44a6" && upscaler_method()) {
+        for (StageImages::Image& im : stage_images[1].images) {
+            if (!im.resolved || image_base(im) != g_upscale.scene) continue;
+            if (const RtImage* scene = find_render_target(g_upscale.scene)) {
+                if (const VkImageView picture = upscale_pass_output_view_locked(scene->width, scene->height)) {
+                    im.view = picture;
+                    im.slot = 0;
+                }
+            }
+            break;
+        }
+    }
+    // The upscaler's mip bias: the camera's draws - the G-buffer, the
+    // transparency, each with the G-buffer's depth and not a rect list, as the
+    // jitter takes them (UpscaleFrame) - sample their textures as at the
+    // output size. Shadows (another depth) and the post chain (rect lists)
+    // keep their own.
+    if (g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && g_upscale.ran_flip &&
+        hle_video_flip_count() + 1 - g_upscale.ran_flip <= 8) {
+        if (const float bias = upscale_pass_mip_bias_locked(); bias != 0.0f) {
+            for (StageImages& st : stage_images) {
+                for (VkSampler& smp : st.samplers) {
+                    const VkSampler biased = sampler_with_lod_bias(smp, bias);
+                    if (!biased) return false;  // a run part's draw: made in order
+                    smp = biased;
+                }
+            }
+        }
+    }
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), pl.lean_variant && !pl.lean_variant->failed, d.indirect_va);
@@ -23783,7 +23819,12 @@ static bool draw_impl(const GpuDraw& d) {
                 u.done_write = scene->last_write;
                 if (ran) u.ran_flip = hle_video_flip_count() + 1;
                 ++u.frame;
-                upscaler_jitter(upscaler_method(), 0, scene->width, scene->height, u.frame, &u.jx, &u.jy);
+                // The jitter's phases follow the ratio of the output to the
+                // render size (render scale), 1:1 otherwise.
+                RenderScale rs;
+                const bool scaled = render_scale_on(&rs) && scene->width == rs.render_w && scene->height == rs.render_h;
+                upscaler_jitter(upscaler_method(), scaled ? static_cast<std::uint32_t>(rs.quality) : 0, scaled ? rs.output_w : scene->width,
+                                scaled ? rs.output_h : scene->height, u.frame, &u.jx, &u.jy);
                 u.jittered = false;
             }
         }

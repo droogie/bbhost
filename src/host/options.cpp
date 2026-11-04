@@ -330,16 +330,21 @@ Setting g_set[kSettingCount] = {
     {"upscaler", "Upscaling", {"Off", "FSR 4", "FSR 3", "DLSS"}, 0,
      "FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 (any GPU) or DLSS (NVIDIA RTX) in place of the game's "
      "own anti-aliasing. Needs upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; "
-     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run.",
+     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run. Changes at once; with Upscaling quality below "
+     "Native AA, the smaller render size it draws the 3D at comes and goes at the next start.",
      false},
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
-    // Performance 1/2 each way (host/upscaler.h).
+    // Performance 1/2 each way (engine/render_scale.cpp). The scene contexts
+    // are made at it as the game starts, so it applies at the next start - as
+    // does Upscaling turned on or off with a quality above Native AA, which
+    // decides whether the 3D is drawn smaller at all.
     {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
-     "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full "
-     "size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, "
-     "softer. The menus, the HUD and the post effects stay at the Resolution.",
-     false},
+     "Requires a restart. How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA "
+     "draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - "
+     "faster, softer. The menus, the HUD and the post effects stay at the Resolution. Below Native AA, a different Resolution "
+     "also applies at the next start.",
+     true},
     // DLSS's render preset (NGX's DLSS_Hint_Render_Preset for every quality;
     // needs upscaler_bridge 1.1.0 and nvngx_dlss 310 or newer): K the
     // transformer model and NVIDIA's own for DLAA, Quality and Balanced, J
@@ -1641,17 +1646,30 @@ const char* host_options_page_blurb(int page) {
 }
 
 // The upscaler's preset row, which shows what the chosen upscaler takes:
-// DLSS's model (K, J, L, M), or for FSR 4 and FSR 3 the render size against
-// the Resolution (Native AA, Quality, Balanced, Performance - Upscaling
-// quality, upscale_quality); with Upscaling off, DLSS's, greyed.
+// for FSR 4 and FSR 3 the render size against the Resolution (Native AA,
+// Quality, Balanced, Performance - Upscaling quality, upscale_quality), for
+// DLSS that render size and then DLSS's model (K, J, L, M); with Upscaling
+// off, DLSS's model, greyed. The render size is drawn at as the game starts
+// (engine/render_scale.cpp), so it applies at the next start.
 void preset_row() {
     const int u = shown_index(kUpscaler);  // the menu's Off, FSR 4, FSR 3, DLSS
+    const auto quality_note = [](const char* who) {
+        static std::string notes[2];
+        std::string& n = notes[who[0] == 'D' ? 1 : 0];
+        if (n.empty())
+            n = std::string("Requires a restart. How much smaller than the Resolution the 3D is drawn before ") + who +
+                " brings it back: Native AA draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about "
+                "59%, Performance at half each way - faster, softer. The menus, the HUD and the post effects stay at the "
+                "Resolution. Below Native AA, a different Resolution also applies at the next start.";
+        return n.c_str();
+    };
     if (u == 1 || u == 2) {
-        setting_row(kUpscaleQuality, "FSR preset",
-                    "How much smaller than the Resolution the 3D is drawn before FSR brings it back: Native AA draws it "
-                    "full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half "
-                    "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution.");
+        setting_row(kUpscaleQuality, "FSR preset", quality_note("FSR"));
         return;
+    }
+    if (u == 3) {
+        setting_row(kUpscaleQuality, "DLSS quality", quality_note("DLSS"));
+        row_rule();
     }
     ImGui::BeginDisabled(u == 0);
     setting_row(kDlssPreset);

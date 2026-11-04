@@ -1774,6 +1774,15 @@ RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // in place, with the G-buffer's depth; false when it did not run.
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
 void upscale_pass_reset_locked();
+// Under render scale: the upscaler's picture, at the output size, for YEBIS's
+// copy to sample in place of a scene of scene_w x scene_h; null when there is
+// none (no upscale of that size has run, or the picture went back into the
+// scene).
+VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t scene_h);
+// The texture LOD bias for the camera's draws while the upscaler runs (the
+// bridge's for its method, quality and output size); 0 otherwise, or with
+// BBHOST_UPSCALE_MIP_BIAS=0.
+float upscale_pass_mip_bias_locked();
 // The camera's view block for the upscaler's motion (upscale_pass.cpp): a
 // constant buffer of a camera draw's vertex stage at `base`, `bytes` long;
 // true when it is the engine's per-view block (taken once a frame).
@@ -2081,6 +2090,11 @@ VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
 // not made yet.
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
+// `base` with `bias` added to its LOD bias (the upscaler's mip bias for the
+// 3D's materials), made once and kept; `base` itself for a bias of 0 or a
+// sampler not made here. Null in a run part's draw that stopped for it to be
+// made in order (BBHOST_RUN_COMMIT).
+VkSampler sampler_with_lod_bias(VkSampler base, float bias);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
 // cache_rw::Read, into `out` (stage 4b.1a's pool).

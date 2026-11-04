@@ -163,6 +163,14 @@ void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, 
     g_ub->get_jitter(frame % ri.jitter_phases, ri.jitter_phases, x, y);
 }
 
+float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h) {
+    if (!g_ub || !method) return 0.0f;
+    ub_render_info ri{};
+    ri.struct_size = sizeof(ri);
+    if (g_ub->get_render_info(g_ctx, method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR, quality, output_w, output_h, &ri) != UB_OK) return 0.0f;
+    return ri.mip_bias;
+}
+
 bool upscaler_fsr3_override() {
     const char* e = std::getenv("BBHOST_UPSCALE");
     if (e && *e) return std::strcmp(e, "fsr3") == 0;
@@ -220,5 +228,6 @@ int upscaler_method() { return 0; }
 bool upscaler_fsr3_override() { return false; }
 bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
 void upscaler_jitter(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
+float upscaler_mip_bias(int, std::uint32_t, std::uint32_t, std::uint32_t) { return 0.0f; }
 
 #endif

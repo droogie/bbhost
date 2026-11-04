@@ -4095,6 +4095,30 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     return out;
 }
 
+VkSampler sampler_with_lod_bias(VkSampler base, float bias) {
+    if (!base || bias == 0.0f) return base;
+    // By the sampler and the bias in 1/256ths (the S#'s own steps). Read by a
+    // run part's draw, written in order (under g.mu).
+    static std::map<std::pair<VkSampler, std::int32_t>, VkSampler> biased;
+    const auto key = std::make_pair(base, static_cast<std::int32_t>(bias * 256.0f + (bias < 0.0f ? -0.5f : 0.5f)));
+    if (const auto it = biased.find(key); it != biased.end()) return it->second;
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+    const auto rec = g_sampler_records.find(base);
+    VkSampler out = base;
+    // Only a sampler with mipmaps: the bias picks among them, and a lookup
+    // table or a screen-space target has none to pick.
+    if (rec != g_sampler_records.end() && rec->second.maxLod > 0.25f) {
+        VkSamplerCreateInfo sci = rec->second;
+        sci.mipLodBias = std::clamp(sci.mipLodBias + bias, -g.max_lod_bias, g.max_lod_bias);
+        if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+            g_sampler_records[out] = sci;
+        else
+            out = base;
+    }
+    biased[key] = out;
+    return out;
+}
+
 // Stage 4b.1a's reader path (under cache_rw's shared lock): the sampler made
 // for these words, null when it is not made yet.
 VkSampler sampler_find(const std::uint32_t* s, bool compare) {

@@ -9,6 +9,7 @@
 #include "engine/graphics_patch.h"
 #include "engine/gx_resources.h"
 #include "engine/option_menu.h"
+#include "engine/render_scale.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/options.h"
@@ -642,10 +643,12 @@ constexpr BothSidesSite kBothSidesSites[] = {
 };
 
 bool g_both_sides = false;  // install_scene_both_sides() went in
+bool g_scale_locked = false;  // render scale: the display buffers are the output size, changes wait for the next start
 
 // Where the graphics manager's scene renders its picture at w x h, by the test
 // Initialize makes (the patched one or the game's), for the log.
 const char* scene_target_path(std::uint32_t w, std::uint32_t h) {
+    if (render_scale_applied()) return "at the render size, the display buffers its back buffer (render scale)";
     const bool wide = g_display[0] == w, tall = g_display[1] == h;
     return (g_both_sides ? wide && tall : wide || tall) ? "straight into the display buffers" : "into a target of its own";
 }
@@ -1001,6 +1004,9 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
 // chosen one.
 GUEST_ABI std::int64_t gx_init_call_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::int64_t ok = hle_call_guest6(guest_fn(kGxInit), static_cast<std::int64_t>(saved[5]), 0, 0, 0, 0, 0);
+    // The init made the GPU device and with it the upscaler; the graphics
+    // manager is built after it: its size, or the full one with no upscaler.
+    render_scale_gx_init(g_image);
     std::uint64_t dev = 0, gm = 0;
     device_ready(&dev, &gm);
     const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
@@ -1167,7 +1173,27 @@ bool live_resolution_install(ElfImage* image) {
         max_w = std::min<std::uint32_t>(max_w, 1920);
         max_h = std::min<std::uint32_t>(max_h, 1080);
     }
-    const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
+    // Render scale (engine/render_scale.cpp): the scene keeps the display
+    // buffer for its back buffer whatever its own size, and YEBIS makes its
+    // whole chain at that buffer's size - so the buffers are exactly the
+    // output size, as the console makes them, and another Resolution applies
+    // when the game next starts.
+    g_scale_locked = render_scale_applied();
+    if (g_scale_locked) {
+        max_w = static_cast<std::uint32_t>(w);
+        max_h = static_cast<std::uint32_t>(h);
+        max_why = "render scale: the output size; another Resolution applies at the next start";
+    }
+    std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
+    if (RenderScale rs; g_scale_locked && render_scale_plan(&rs)) {
+        // The scene contexts at the render size, and a share for what stays
+        // the output size (the display buffers, DefDepthStencil, YEBIS's
+        // chain): 7680x2160 with its 3D at 3840x1080 ran in +1792 MiB, where
+        // its own 16.6 million pixels asked for more than the window holds.
+        live_px = static_cast<std::uint64_t>(rs.render_w) * rs.render_h + start_px / 4;
+        host_log("resolution: the render-target heap sized for the render size %ux%u and a quarter of %ux%u (render scale)", rs.render_w,
+                 rs.render_h, w, h);
+    }
     install_water_wave_full();  // at any size, live changes or not (before the heap's size, which counts it)
     grow_gfx_heap(image, !live ? start_px : live_px);
     if (tight)
@@ -1213,7 +1239,13 @@ bool live_resolution_install(ElfImage* image) {
     }
     if (!install_display_rect_stubs())
         host_log("resolution: the render-target viewport code is not as expected; debug draws keep the display buffers' size");
-    g_both_sides = install_scene_both_sides();
+    // Under render scale the colour target's test is the render scale's (it
+    // keeps the display buffer at any size); the depth's keeps the game's
+    // either-side test, which no render size smaller each way passes.
+    if (g_scale_locked)
+        host_log("resolution: render scale - the scene keeps the display buffers for its colour at any size, its depth its own");
+    else
+        g_both_sides = install_scene_both_sides();
     if (!engine_prologue_hook(image, guest(kGxFree), free_pro, sizeof(free_pro), reinterpret_cast<void*>(&gx_free_hook)) ||
         !engine_prologue_hook(image, guest(kGxFreeRecord), free_rec_pro, sizeof(free_rec_pro), reinterpret_cast<void*>(&gx_free_record_hook)) ||
         !engine_prologue_hook(image, guest(kSwfPlayerCtor), swf_ctor_pro, sizeof(swf_ctor_pro), reinterpret_cast<void*>(&swf_player_ctor_hook)) ||
@@ -1283,12 +1315,15 @@ bool live_resolution_available() {
 }
 
 bool live_resolution_can(unsigned w, unsigned h) {
+    if (g_scale_locked && (w != g_display[0] || h != g_display[1])) return false;
     return g_installed && w && h && w <= g_display[0] && h <= g_display[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
 }
 
 bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
     if (!live_resolution_can(w, h)) {
-        if (g_installed && static_cast<std::uint64_t>(w) * h > g_live_max_px)
+        if (g_scale_locked)
+            host_log("resolution: %ux%u applies when the game next starts: under render scale the display buffers are the output size", w, h);
+        else if (g_installed && static_cast<std::uint64_t>(w) * h > g_live_max_px)
             host_log("resolution: %ux%u needs more render-target memory than this run was given at its start; it applies when the game next starts", w, h);
         return false;
     }

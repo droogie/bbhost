@@ -16,6 +16,16 @@
 // draws' viewports) and the camera's motion (shaders/camera_motion.comp, from
 // the depth and the two frames' view blocks) - the characters' own motion
 // not yet.
+//
+// Under render scale (engine/render_scale.cpp: an Upscaling quality above
+// Native AA) the scene, its depth and the motion are the render size and the
+// picture is the output size, which no longer fits back into the scene: it
+// stays in the upscaler's own image, and YEBIS's copy of the scene - the
+// post chain's first pass, at the output size - samples it in the scene's
+// place (render.cpp, upscale_pass_output_view_locked). Every other reader of
+// the scene (the reflections' downsample) reads it at the render size, as
+// the passes that draw it do.
+#include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
 #include "host/settings.h"
@@ -39,8 +49,12 @@ struct OwnImage {
     bool initialised = false;
 };
 
-OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F) and the motion (R16G16_SFLOAT), the scene's size
-std::uint32_t g_w = 0, g_h = 0;     // their size
+OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F, the output size) and the motion (R16G16_SFLOAT, the scene's)
+std::uint32_t g_w = 0, g_h = 0;     // the render size: the scene's, the motion's
+std::uint32_t g_ow = 0, g_oh = 0;   // the output size: the picture's
+bool g_scaled = false;              // the picture is larger than the scene: YEBIS's copy reads it (render scale)
+bool g_output_ready = false;        // a picture of this size was written
+float g_mip_bias = 0.0f;            // the camera's draws' texture LOD bias for this method, quality and size (upscale_pass_mip_bias_locked)
 VkImage g_depth_for = VK_NULL_HANDLE;  // the depth image g_depth_view is of
 VkImageView g_depth_view = VK_NULL_HANDLE;
 bool g_reset = true;                // the next call has no history
@@ -234,37 +248,64 @@ bool blit_into(VkFormat format) {
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y) {
     const int method = upscaler_method();
     if (!method) return false;
+    // The output size: render scale's when the scene is its render size,
+    // else the scene's own (DLAA, FSR native AA).
+    RenderScale rs;
+    const bool scaled = render_scale_on(&rs) && scene.width == rs.render_w && scene.height == rs.render_h &&
+                        (rs.output_w != rs.render_w || rs.output_h != rs.render_h);
+    // A picture that goes back into the scene: by a copy, or a blit into
+    // another format. One that stays here (render scale) needs neither.
     const bool same_format = scene.format == VK_FORMAT_R16G16B16A16_SFLOAT;
     static VkFormat checked = VK_FORMAT_UNDEFINED;
     static bool can_blit = false;
-    if (!same_format && checked != scene.format) {
+    if (!scaled && !same_format && checked != scene.format) {
         checked = scene.format;
         can_blit = blit_into(scene.format);
         host_log("upscaler: the scene is format %d: %s", static_cast<int>(scene.format),
                  can_blit ? "the upscaled picture goes back by a blit" : "this device cannot blit into it; not upscaled");
     }
-    if (!same_format && !can_blit) {
+    if (!scaled && !same_format && !can_blit) {
         g_skipped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (scene.width != g_w || scene.height != g_h) {
+    const std::uint32_t ow = scaled ? rs.output_w : scene.width, oh = scaled ? rs.output_h : scene.height;
+    if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh) {
         drop(g_output);
         drop(g_motion);
         g_w = scene.width;
         g_h = scene.height;
+        g_ow = ow;
+        g_oh = oh;
+        g_scaled = scaled;
+        g_output_ready = false;
         g_reset = true;
         if (!make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
-                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_w, g_h) ||
+                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_ow, g_oh) ||
             !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   g_w, g_h)) {
-            host_log("upscaler: no images of %ux%u for it; not upscaled", g_w, g_h);
+            host_log("upscaler: no images of %ux%u and %ux%u for it; not upscaled", g_ow, g_oh, g_w, g_h);
             drop(g_output);
             drop(g_motion);
-            g_w = g_h = 0;
+            g_w = g_h = g_ow = g_oh = 0;
+            g_scaled = false;
             return false;
         }
-        host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d", method == 1 ? "DLAA" : "FSR native AA",
-                 g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
+        // The materials' textures sampled as at the output size: the
+        // bridge's mip bias (BBHOST_UPSCALE_MIP_BIAS=0: none, a test).
+        static const bool mip_bias_on = [] {
+            const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
+            return !(e && e[0] == '0');
+        }();
+        g_mip_bias = mip_bias_on ? upscaler_mip_bias(method, g_scaled ? static_cast<std::uint32_t>(rs.quality) : 0, g_ow, g_oh) : 0.0f;
+        host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
+                 mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
+        if (g_scaled)
+            host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
+                     method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
+                     static_cast<int>(depth.format));
+        else
+            host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d", method == 1 ? "DLAA" : "FSR native AA",
+                     g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
     }
     if (depth.image != g_depth_for) {
         if (g_depth_view) defer_destroy_private_view(g_depth_view);
@@ -331,10 +372,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     g_cam_noted = false;
     UpscaleCall c;
     c.method = method;
-    c.quality = 0;
+    c.quality = g_scaled ? static_cast<std::uint32_t>(rs.quality) : 0;
     c.reset = g_reset;
-    c.render_w = c.output_w = g_w;
-    c.render_h = c.output_h = g_h;
+    c.render_w = g_w;
+    c.render_h = g_h;
+    c.output_w = g_ow;
+    c.output_h = g_oh;
     c.color = {scene.image, scene.view, scene.format, VK_IMAGE_LAYOUT_GENERAL};
     c.depth = {depth.image, g_depth_view, depth.format, depth_layout};
     c.motion = {g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL};
@@ -350,9 +393,18 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (!ok) return false;
     g_output.initialised = true;
     g_reset = false;
-    // Its picture into the scene.
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT);
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    if (g_scaled) {
+        // The picture stays here for YEBIS's copy, which samples it in the
+        // scene's place.
+        g_output_ready = true;
+        if (g_calls.fetch_add(1, std::memory_order_relaxed) == 0)
+            host_log("upscaler: first upscale of the scene 0x%llx (depth 0x%llx), %ux%u to %ux%u", static_cast<unsigned long long>(scene.base),
+                     static_cast<unsigned long long>(depth.base), g_w, g_h, g_ow, g_oh);
+        return true;
+    }
+    // Its picture into the scene.
     barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT);
     if (same_format) {
@@ -376,6 +428,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
 
 // A frame it could not run in starts the next one's history over.
 void upscale_pass_reset_locked() { g_reset = true; }
+
+float upscale_pass_mip_bias_locked() { return g_w && upscaler_method() ? g_mip_bias : 0.0f; }
+
+VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t scene_h) {
+    return g_scaled && g_output_ready && g_output.view && scene_w == g_w && scene_h == g_h ? g_output.view : VK_NULL_HANDLE;
+}
 
 bool upscale_camera_noted() { return g_cam_noted; }
 

@@ -6,6 +6,7 @@
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/render_scale.h"
 #include "gcn/container.h"
 #include "hle/fs.h"
 #include "host/ruleset.h"
@@ -76,6 +77,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
+    if (option == "graphics.render_scale") return render_scale_plan(nullptr);  // Upscaling and its quality, read once
     *known = false;
     return false;
 }
@@ -457,6 +459,32 @@ Manifest all_languages_manifest() {
     return m;
 }
 
+// render-scale, the 3D at the Upscaling quality's render size
+// (graphics.render_scale: an upscaler and a quality above Native AA at the
+// start): the decoupled half of Kyo's "Decoupled Render Res" patches, its
+// sizes written from the Resolution and the quality as the game starts -
+// engine/render_scale.cpp says which sites and why. Not live: the contexts
+// are made at the size their code gives when the game builds them.
+Manifest render_scale_manifest() {
+    Manifest m;
+    m.name = "render-scale";
+    m.title = "Render scale";
+    m.eboot = kEboot109Sha256;
+    m.option = "graphics.render_scale";
+    m.order = 9200;  // after hd-motion-blur (9100), whose sites are the velocity map's and the blur depth's: none of these
+    m.live = false;
+    RenderScale rs;
+    if (render_scale_plan(&rs)) {
+        m.description = "the 3D drawn at " + std::to_string(rs.render_w) + "x" + std::to_string(rs.render_h) + " and upscaled to " +
+                        std::to_string(rs.output_w) + "x" + std::to_string(rs.output_h);
+        m.sites = render_scale_sites(rs);
+    } else {
+        m.description = "the 3D drawn smaller than the Resolution and upscaled";
+        m.sites = render_scale_sites(RenderScale{1920, 1080, 1920, 1080, 0});  // the bytes it would write, for the expectations
+    }
+    return m;
+}
+
 // skip-intro, Skip company logos (startup.skip_intro): illusion's 1.09 Skip
 // Intro. The three company logos (FromSoftware, Japan Studio, SCE) are
 // entries the startup flow plays by name; emptying the first two UTF-16
@@ -484,6 +512,7 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(performance_mode_manifest());
     out.push_back(performance_manifest());
     out.push_back(ssr_manifest());
+    out.push_back(render_scale_manifest());
     out.push_back(fov_uncap_manifest());
     out.push_back(all_languages_manifest());
     out.push_back(hd_motion_blur_manifest());
