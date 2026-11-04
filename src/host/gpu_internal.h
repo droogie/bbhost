@@ -1779,6 +1779,13 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
 void upscale_pass_reset_locked();
 // Whether the frame's motion is taken: an upscaler running, or frame generation.
 bool upscale_motion_on();
+// Whether the game's velocity pass is given last frame's matrices (render.cpp
+// velo_previous_locked: rebuilt motion vectors), so a mesh's texel holds its
+// whole motion rather than its bones' alone.
+bool velo_previous_due();
+// The upscaler's frames so far, counted at its call point (after the
+// velocity pass): a frame's velocity draws share one.
+std::uint64_t upscale_velo_frame();
 // Frame generation's HUD-less picture (host/framegen.h): whether this frame
 // was prepared and its copy is still to make, and the copy of the display
 // buffer `display` as it is now, before the HUD's first draw into it.

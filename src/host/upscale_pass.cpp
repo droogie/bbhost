@@ -254,13 +254,15 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[20 + 4 * j + 3] = -(rx * m[3] + ry * m[7] + rz * m[11]);
     }
     if (velo && velo_mode == 3) {
-        // Rebuilt: NDC motion as it is, at 8 bits x 2 + 0.5.
+        // Rebuilt: NDC motion as it is, at 8 bits x 2 + 0.5; whole when the
+        // pass had last frame's matrices (render.cpp velo_previous_locked).
         const bool b8 = host_opt_motion_rebuilt_bits() == 8;
         p[32] = p[33] = b8 ? 0.5f : 1.0f;
         p[34] = p[35] = b8 ? 0.5f : 0.0f;
         p[36] = static_cast<float>(velo_w);
         p[37] = static_cast<float>(velo_h);
         p[38] = 3.0f;
+        p[39] = velo_previous_due() ? 1.0f : 0.0f;
     } else if (velo) {
         // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
         // (NDC now - NDC then) x scale x 0.5, its y up where uv's is down.
@@ -270,7 +272,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[35] = -g_velo_mesh[1] * velo_y_sign();
         p[36] = static_cast<float>(velo_w);
         p[37] = static_cast<float>(velo_h);
-        p[38] = static_cast<float>(velo_mode);
+        // The game's encoding with the pass given last frame's matrices: the
+        // whole motion (mode 4, render.cpp velo_previous_locked).
+        p[38] = static_cast<float>(velo_mode == 1 && velo_previous_due() ? 4 : velo_mode);
         p[39] = velo_tolerance();
     }
     const VkDescriptorSet set = alloc_set_locked(g_motion_set_layout);
@@ -619,6 +623,19 @@ void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageL
 }  // namespace
 
 bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
+
+std::uint64_t upscale_velo_frame() { return g_velo_frame; }
+
+bool velo_previous_due() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_VELO_PREV");
+        return !(e && e[0] == '0');
+    }();
+    // Rebuilt motion vectors, or the game's map while its blur, which would
+    // read whole motions, is off (Motion blur, Performance mode).
+    const HostSettings& hs = host_settings_ref();
+    return on && upscale_motion_on() && (host_opt_motion_rebuilt_bits() || !hs.motion_blur || hs.performance_mode);
+}
 
 bool upscale_velo_clear_due(std::uint64_t base, int kind) {
     return kind == 2 && base && g_velo_cleared != g_velo_frame && !g_velo_camera_pass;

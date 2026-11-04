@@ -317,6 +317,11 @@ struct GfxPipeline {
     // map: the upscaler takes its copy first).
     std::uint8_t velo = 0, velo_cb = 0, velo_dw = 0;
     bool velo_known = false;  // classified (velo_classify)
+    // A mesh velocity pass's vertex stage: the constant buffer holding its two
+    // matrices (velo_previous_locked); -1 not found yet (velo_mat_tries so
+    // far), -2 none.
+    std::int8_t velo_mat_cb = -1;
+    std::uint8_t velo_mat_tries = 0;
     // A tessellated draw's generated vertex and control stages. The
     // domain shader stays in `vs` - it binds what a vertex stage binds, so
     // every descriptor, prefetch and user-data path is the one already there -
@@ -11836,6 +11841,142 @@ bool resolve_via_plan(const GxBindingPlan* p, const gcn::ResourcePath& path, con
     return ok;
 }
 
+// Rebuilt motion vectors: the previous matrices of the game's velocity pass.
+// Each GXFlver_*_Velo vertex shader makes its two clip positions from one
+// constant buffer - this frame's matrix in dwords 0-15 with this frame's
+// bones, the "previous" one in 16-31 with last frame's - and the game writes
+// this frame's matrix in both, so the motion its pass draws is the bones'
+// alone: none of the camera's turn and none of the character's own walk (its
+// blur leaves those to the camera's pass). Here the previous one is made what
+// the same mesh's draw had as its current one a frame ago, in the game's
+// constants before the draw takes its copy of them, and the shader draws each
+// vertex's whole motion - camera, walk, bones, the cloth's bones. The mesh is
+// the draw's pipeline, index buffer and index count; of several draws of one
+// (a fence's posts, two enemies of a kind) each takes last frame's nearest
+// (velo_matrix_apart), and one with none near keeps the game's - the bones'
+// motion alone, for that frame. The constant buffer is the one
+// whose two matrices are equal (the 2nd for most of the shaders, the 6th for
+// the cloth's, the 5th for one), found at the pipeline's first draws.
+// With the game's blur on (it reads the map) and its encoding, the game's
+// matrices stay. BBHOST_VELO_PREV=0: the game's always (a test;
+// upscale_pass.cpp velo_previous_due).
+struct VeloPrevious {
+    std::uint64_t frame = ~0ull;  // the upscaler's frame `now` is of (upscale_velo_frame)
+    // Each mesh's draws' current matrices this frame and last, and which of
+    // last frame's this frame's draws took.
+    struct Draws {
+        std::vector<std::array<float, 16>> m;
+        std::vector<bool> taken;
+    };
+    std::unordered_map<std::uint64_t, Draws> now, last;
+    std::uint64_t matched = 0, first = 0, rejected = 0, reported = 0;
+};
+VeloPrevious g_velo_previous;  // under g.mu (the draws that use it run in order)
+
+// The constant buffer `i` of a draw's stage at its base (0: none), resolved
+// as resolve_stage_buffers resolves it.
+std::uint64_t velo_matrix_base(const gcn::TranslateResult& meta, std::size_t i, const std::uint32_t* user, const GxStageRecords* gx) {
+    const gcn::BufferBinding& b = meta.buffers[i];
+    if (b.written || b.max_dw < 32) return 0;
+    const GxStagePlan* plan = gx && g_binding_plans ? &stage_plan(meta, *gx) : nullptr;
+    std::uint32_t w[4] = {};
+    const bool resolved = b.pointer ? resolve_resource_impl(b.path, user, 2, w)
+                                    : resolve_via_plan(plan ? &plan->buffers[i] : nullptr, b.path, user, gx, b.indexed || b.ranged ? 4 : 2, w);
+    if (!resolved) return 0;
+    const std::uint64_t hi = b.pointer ? w[1] : (w[1] & 0xff);
+    const std::uint64_t base = static_cast<std::uint64_t>(w[0]) | (hi << 32);
+    return base && !(base & 3) && hle_kernel_va_mapped(base, 128) ? base : 0;
+}
+
+// How far apart two of a mesh's matrices are, against their size: a draw's
+// own a frame apart differ by the frame's motion, two copies of a mesh (a
+// fence's posts, two enemies of a kind) by where each stands.
+float velo_matrix_apart(const float* a, const float* b) {
+    float d = 0.0f, n = 1.0f;
+    for (int k = 0; k < 16; ++k) {
+        d += std::fabs(a[k] - b[k]);
+        n += std::fabs(a[k]);
+    }
+    return d / n;
+}
+
+void velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn::TranslateResult& meta, const std::uint32_t* user,
+                          const GxStageRecords* gx) {
+    if (pl.velo_mat_cb == -1) {
+        // The buffer whose two matrices are equal, as the game writes them.
+        for (std::size_t i = 0; i < meta.buffers.size() && i < 16 && pl.velo_mat_cb == -1; ++i) {
+            const std::uint64_t base = velo_matrix_base(meta, i, user, gx);
+            if (!base) continue;
+            const auto* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
+            // (Equal as numbers: the game's two copies differ in a zero's sign.)
+            bool any = false, finite = true, equal = true;
+            for (int k = 0; k < 16; ++k) {
+                any |= f[k] != 0.0f;
+                finite &= std::isfinite(f[k]) && std::isfinite(f[k + 16]);
+                equal &= std::fabs(f[k] - f[k + 16]) <= 1e-5f * std::max(1.0f, std::fabs(f[k]));
+            }
+            if (any && finite && equal) pl.velo_mat_cb = static_cast<std::int8_t>(i);
+        }
+        // (A buffer an earlier draw of the frame shares and already gave
+        // last frame's matrix no longer shows them equal: tried again.)
+        if (pl.velo_mat_cb == -1 && ++pl.velo_mat_tries >= 32) pl.velo_mat_cb = -2;
+        if (pl.velo_mat_cb != -1) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24)
+                host_log("upscaler: velocity pass %s: its matrices %s", pl.name.c_str(),
+                         pl.velo_mat_cb >= 0 ? ("in constant buffer " + std::to_string(pl.velo_mat_cb)).c_str() : "not found");
+        }
+    }
+    if (pl.velo_mat_cb < 0) return;
+    const std::uint64_t base = velo_matrix_base(meta, static_cast<std::size_t>(pl.velo_mat_cb), user, gx);
+    if (!base) return;
+    VeloPrevious& v = g_velo_previous;
+    const std::uint64_t frame = upscale_velo_frame();
+    if (frame != v.frame) {
+        v.last.swap(v.now);
+        v.now.clear();
+        v.frame = frame;
+        if (v.matched + v.first + v.rejected - v.reported >= 50000) {
+            host_log("upscaler: velocity draws given last frame's matrix: %llu, first seen: %llu, no near one: %llu",
+                     static_cast<unsigned long long>(v.matched), static_cast<unsigned long long>(v.first),
+                     static_cast<unsigned long long>(v.rejected));
+            v.reported = v.matched + v.first + v.rejected;
+        }
+    }
+    const std::uint64_t mesh[3] = {fnv1a(pl.name.data(), pl.name.size()), d.index_va, d.index_count};
+    const std::uint64_t id = fnv1a(mesh, sizeof(mesh));
+    auto* f = reinterpret_cast<float*>(static_cast<std::uintptr_t>(base));
+    std::array<float, 16> cur;
+    std::memcpy(cur.data(), f, sizeof(float) * 16);
+    VeloPrevious::Draws& mine = v.now[id];
+    mine.m.push_back(cur);
+    mine.taken.push_back(false);
+    // Last frame's draw of the mesh nearest this one, not taken yet.
+    const auto it = v.last.find(id);
+    if (it == v.last.end()) {
+        ++v.first;
+        return;
+    }
+    VeloPrevious::Draws& was = it->second;
+    std::size_t best = was.m.size();
+    float best_apart = 0.5f;  // past it, not the same: a jump, or another copy
+    for (std::size_t k = 0; k < was.m.size(); ++k) {
+        if (was.taken[k]) continue;
+        const float a = velo_matrix_apart(cur.data(), was.m[k].data());
+        if (a < best_apart) {
+            best_apart = a;
+            best = k;
+        }
+    }
+    if (best == was.m.size()) {
+        ++v.rejected;
+        return;
+    }
+    was.taken[best] = true;
+    std::memcpy(f + 16, was.m[best].data(), sizeof(float) * 16);
+    ++v.matched;
+}
+
 struct TsharpInfo {
     std::uint64_t base;
     std::uint32_t dfmt, nfmt, width, height, depth, pitch, type, tiling, base_level, last_level, dst_sel;
@@ -22982,6 +23123,15 @@ static bool draw_impl(const GpuDraw& d) {
         if (st == 1 && !pl.velo_known) velo_classify(pl);
         const bool velo = st == 1 && pl.velo && pl.velo != 4 && s.color[0] && pl.velo_cb < meta.buffers.size() &&
                           meta.buffers.size() <= 16 && upscale_motion_on();
+        // A mesh velocity draw's previous matrix made last frame's (velo_previous_locked),
+        // in the game's constants before this stage takes its copy of them.
+        if (st == 0 && pl.velo == 2 && velo_previous_due()) {
+            if (part) {
+                run_part_stop(kRunStopOrder);
+                return false;
+            }
+            velo_previous_locked(pl, d, meta, params.user_sgpr, gx_stage[0]);
+        }
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate || camera || velo ? gate_bases : nullptr);

@@ -23,7 +23,9 @@
 // camera's from the depth there - the surface's whole motion. Rebuilt (mode 3,
 // host/translation_cache.cpp velo_rebuilt): a mesh's texel holds its NDC
 // motion itself, now minus then, alpha 0.5 marking it - stored as
-// (v - offset) x scale, at 8 bits (v - 0.5) / 2 - added the same way.
+// (v - offset) x scale, at 8 bits (v - 0.5) / 2 - and with the pass given last
+// frame's matrices (host/render.cpp velo_previous_locked, velo_size.w) it is
+// the whole motion, camera and walk included; without, added the same way.
 //
 // Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -71,23 +73,34 @@ void main() {
             mv = clamp((prev_uv - uv) * size, vec2(-60000.0), vec2(60000.0));
             if (any(isnan(mv))) mv = vec2(0.0);
         }
-        if (velo_size.z > 2.5) {
+        // The map's mode (velo_size.z): 1 the game's encoding, the bones' motion
+        // alone (added to the camera's); 4 the same encoding with the pass
+        // given last frame's matrices (render.cpp velo_previous_locked): the
+        // whole motion; 2 the map everywhere (a test); 3 rebuilt.
+        const int mode = int(velo_size.z + 0.5);
+        if (mode == 3) {
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
             const vec4 t = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0);
             if (abs(t.a - 0.5) < 0.1) {
                 const vec2 d = (t.rg - velo_k.zw) * velo_k.xy;
                 const vec2 own = vec2(-0.5 * d.x, 0.5 * d.y) * size;
-                if (!any(isnan(own)) && !any(isinf(own))) mv += own;
+                // Whole (velo_size.w: the pass given last frame's matrices),
+                // else the bones' alone, added to the camera's. Over a screen
+                // a frame: not motion.
+                if (!any(isnan(own)) && !any(isinf(own)) && all(lessThan(abs(own), size))) mv = velo_size.w > 0.5 ? own : mv + own;
             }
-        } else if (velo_size.z > 0.0) {
+        } else if (mode > 0) {
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
-            const vec2 v = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0).rg - 0.5;
+            const vec2 raw = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0).rg;
+            const vec2 v = raw - 0.5;
             // What the camera's pass wrote for this motion: (uv now - uv then) x its scale.
             const vec2 cam = -mv / size * velo_k.xy;
-            if (velo_size.z > 1.5 || any(greaterThan(abs(v - cam), vec2(velo_size.w)))) {
+            if (mode == 2 || any(greaterThan(abs(v - cam), vec2(velo_size.w)))) {
                 const vec2 own = -v / velo_k.zw * size;
-                // (Mode 2, a test, takes the map's alone: its camera pass's too.)
-                if (!any(isnan(own)) && !any(isinf(own))) mv = velo_size.z > 1.5 ? own : mv + own;
+                // The encoding is clamped to 0..1: a whole motion past it is
+                // not held, and the camera's alone stands there.
+                const bool clamped = any(lessThan(raw, vec2(0.0005))) || any(greaterThan(raw, vec2(0.9995)));
+                if (!any(isnan(own)) && !any(isinf(own)) && !(mode == 4 && clamped)) mv = mode == 1 ? mv + own : own;
             }
         }
     }
