@@ -1436,6 +1436,25 @@ std::uint8_t axis_to_u8(std::int16_t v) {
     return static_cast<std::uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
 }
 
+// A stick's two axes through its deadzones (Controls: host/settings.h
+// stick_inner, stick_outer), radially, so a diagonal keeps its direction:
+// inside `inner` of the full travel at rest, from `outer` out all the way,
+// the travel between spread over the whole range. 0 and 1 leave it as it is.
+void stick_deadzone(std::int16_t ax, std::int16_t ay, float inner, float outer, std::uint8_t* x, std::uint8_t* y) {
+    if (inner <= 0.0f && outer >= 1.0f) {
+        *x = axis_to_u8(ax);
+        *y = axis_to_u8(ay);
+        return;
+    }
+    const float fx = std::max(static_cast<float>(ax) / 32767.0f, -1.0f), fy = std::max(static_cast<float>(ay) / 32767.0f, -1.0f);
+    const float m = std::min(std::sqrt(fx * fx + fy * fy), 1.0f);
+    float k = 0.0f;
+    if (m > inner) k = std::min((m - inner) / std::max(outer - inner, 0.01f), 1.0f) / m;
+    const auto back = [](float f) { return static_cast<std::int16_t>(std::clamp(f, -1.0f, 1.0f) * 32767.0f); };
+    *x = axis_to_u8(back(fx * k));
+    *y = axis_to_u8(back(fy * k));
+}
+
 // A test harness's keys (the request "keys FILE", BBHOST_TEST_REQUESTS in
 // hle/video.cpp): FILE's lines "<ms> +<key>" and "<ms> -<key>" in SDL's key
 // names, played from the request on and read at this thread's pump (every
@@ -1580,10 +1599,16 @@ void update_pad() {
         const auto further = [](std::uint8_t have, std::uint8_t v) {
             return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
-        p.lx = further(p.lx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX)));
-        p.ly = further(p.ly, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY)));
-        p.rx = further(p.rx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX)));
-        p.ry = further(p.ry, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY)));
+        const HostSettings& hs = host_settings_ref();
+        std::uint8_t lx = 0, ly = 0, rx = 0, ry = 0;
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY),
+                       hs.stick_inner[0], hs.stick_outer[0], &lx, &ly);
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY),
+                       hs.stick_inner[1], hs.stick_outer[1], &rx, &ry);
+        p.lx = further(p.lx, lx);
+        p.ly = further(p.ly, ly);
+        p.rx = further(p.rx, rx);
+        p.ry = further(p.ry, ry);
         const std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
         const std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
         held[kPadL2] = lt > 8000;

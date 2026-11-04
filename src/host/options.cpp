@@ -103,6 +103,10 @@ enum SettingId {
     kMouseAutoRotation,
     kDrawCursor,
     kButtonPrompts,
+    kLeftStickInner,
+    kLeftStickOuter,
+    kRightStickInner,
+    kRightStickOuter,
     kSsao,
     kMotionBlur,
     kAntiAlias,
@@ -266,6 +270,23 @@ Setting g_set[kSettingCount] = {
     // (engine/key_prompts.h). Auto follows the device last used (host_input_device).
     {"button_prompts", "Button prompts", {"Auto", "Keyboard", "Controller"}, 0,
      "What the game's own prompts show. Auto follows the device you last used, keys or controller.", false},
+    // The controller's sticks (host/window.cpp stick_deadzone): radial, from
+    // the centre - inside the inner deadzone the stick reads as at rest, from
+    // the outer one out as pushed all the way, and between them the travel is
+    // spread over the whole range. 0% and 100%, the defaults, leave the stick
+    // as it comes (the game keeps its own small deadzone).
+    {"left_stick_inner", "Left stick inner deadzone", signed_steps(0, 50, "%", false), 0,
+     "How far the left stick must move from the centre before the game sees it. Raise it if your character creeps "
+     "with the stick let go. 0% passes everything.", false},
+    {"left_stick_outer", "Left stick outer deadzone", signed_steps(50, 100, "%", false), 50,
+     "How far out the left stick counts as pushed all the way. Lower it if a worn stick never reaches a full run. "
+     "100% is the stick's own edge.", false},
+    {"right_stick_inner", "Right stick inner deadzone", signed_steps(0, 50, "%", false), 0,
+     "How far the right stick must move from the centre before the camera turns. Raise it if the camera drifts "
+     "with the stick let go. 0% passes everything.", false},
+    {"right_stick_outer", "Right stick outer deadzone", signed_steps(50, 100, "%", false), 50,
+     "How far out the right stick counts as pushed all the way: lower turns the camera at full speed sooner. "
+     "100% is the stick's own edge.", false},
     // The post-processing switches. They follow their settings live
     // (engine/graphics_patch.cpp, host/shader_patch.h).
     {"ssao", "Ambient occlusion", {"On", "Off"}, 0,
@@ -498,6 +519,10 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMouseAutoRotation},
     {Row::Option, nullptr, kDrawCursor},
     {Row::Option, nullptr, kButtonPrompts},
+    {Row::Option, nullptr, kLeftStickInner},
+    {Row::Option, nullptr, kLeftStickOuter},
+    {Row::Option, nullptr, kRightStickInner},
+    {Row::Option, nullptr, kRightStickOuter},
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
@@ -933,6 +958,10 @@ void apply(int id) {
         case kMouseAutoRotation:
         case kDrawCursor:
         case kButtonPrompts:
+        case kLeftStickInner:
+        case kLeftStickOuter:
+        case kRightStickInner:
+        case kRightStickOuter:
             break;  // the settings object carries them (host/settings.h)
         case kSsao:
         case kMotionBlur:
@@ -1089,6 +1118,10 @@ void rebuild_settings() {
     h.mouse_auto_rotation = on_of(kMouseAutoRotation);
     h.draw_cursor = on_of(kDrawCursor);
     h.button_prompts = index_of(kButtonPrompts) < 0 ? 0 : index_of(kButtonPrompts);
+    h.stick_inner[0] = static_cast<float>(std::max(index_of(kLeftStickInner), 0)) / 100.0f;
+    h.stick_outer[0] = static_cast<float>(50 + std::max(index_of(kLeftStickOuter), 0)) / 100.0f;
+    h.stick_inner[1] = static_cast<float>(std::max(index_of(kRightStickInner), 0)) / 100.0f;
+    h.stick_outer[1] = static_cast<float>(50 + std::max(index_of(kRightStickOuter), 0)) / 100.0f;
     h.ssao = on_of(kSsao);
     h.motion_blur = on_of(kMotionBlur);
     h.anti_alias = on_of(kAntiAlias);
