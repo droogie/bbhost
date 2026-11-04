@@ -46,9 +46,10 @@ struct UpscalerCaps {
 };
 UpscalerCaps upscaler_caps();
 
-// The method asked for by BBHOST_UPSCALE (until the Graphics page has its
-// setting): 0 none, 1 DLSS ("dlss"), 2 FSR ("fsr"; "fsr3" for the newest 3.x
-// where FSR 4 could run) - and only one the bridge says can run here.
+// The method asked for: Graphics > Upscaling (host/settings.h upscaler), or
+// BBHOST_UPSCALE over it - 0 none, 1 DLSS ("dlss"), 2 FSR ("fsr"; "fsr3" for
+// the newest 3.x where FSR 4 could run) - and only one the bridge says can
+// run here.
 int upscaler_method();
 bool upscaler_fsr3_override();
 

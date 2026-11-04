@@ -2,6 +2,7 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
+#include "host/settings.h"
 #include "log.h"
 
 #if defined(_WIN32)
@@ -137,12 +138,13 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 }  // namespace
 
 int upscaler_method() {
-    static const int asked = [] {
+    static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
-        if (!e || !*e) return 0;
+        if (!e || !*e) return -1;
         const std::string v = e;
         return v == "dlss" ? 1 : v == "fsr" || v == "fsr3" ? 2 : 0;
     }();
+    const int asked = env >= 0 ? env : host_settings_ref().upscaler;
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
     const UpscalerCaps c = upscaler_caps();
     return (asked == 1 && c.dlss) || (asked == 2 && c.fsr) ? asked : 0;

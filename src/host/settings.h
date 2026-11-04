@@ -79,6 +79,9 @@ struct HostSettings {
     // Kyo's Performance Patch v3 (engine/patch_manifest.cpp's performance,
     // read once as the game starts).
     bool performance_patch = true;
+    // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR - at the
+    // full resolution for now (DLAA, FSR native AA). Follows the setting live.
+    int upscaler = 0;
     bool ssr_fade = true;
 
     // Startup (read once by the loader)

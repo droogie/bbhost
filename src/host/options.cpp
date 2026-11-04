@@ -114,6 +114,7 @@ enum SettingId {
     kPerformancePatch,
     kSsr,
     kSsrFade,
+    kUpscaler,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -317,6 +318,15 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. With screen space reflections on: reflections stay where they face the camera, instead of "
      "fading out as the game has them (its Fade To Viewer -0.8 becomes -10000).",
      true},
+    // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
+    // picture in place of the game's after the 3D, before the post effects.
+    // Off by default; the order of the values is the settings object's
+    // (0 off, then DLSS, FSR) turned round for the menu (Off, FSR, DLSS).
+    {"upscaler", "Upscaling", {"Off", "FSR", "DLSS"}, 0,
+     "FSR 3/4 (any GPU) or DLSS (NVIDIA RTX) anti-aliasing at the full resolution, in place of the game's own. Needs "
+     "upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them it stays off. "
+     "Lower render sizes (Quality, Performance) come later.",
+     false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -422,6 +432,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kSsrFade},
+    {Row::Option, nullptr, kUpscaler},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -921,6 +932,10 @@ void rebuild_settings() {
     }
     h.performance_patch = on_of(kPerformancePatch);
     h.ssr = on_of(kSsr);
+    {
+        const int u = index_of(kUpscaler);
+        h.upscaler = u == 1 ? 2 : u == 2 ? 1 : 0;  // the menu's FSR, DLSS
+    }
     h.ssr_fade = on_of(kSsrFade);
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
