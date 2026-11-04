@@ -199,7 +199,7 @@ Setting g_set[kSettingCount] = {
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
-     "The game's frames per second, in the top right corner.", false},
+     "The game's frames per second, in the top right corner; with frame generation, the frames shown in brackets after it.", false},
     // What bbhost holds of video memory and of the memory Windows counts as
     // shared GPU memory (host/window.cpp, host_gpu_memory_glance).
     {"memory_counter", "Memory counter", {"Off", "On"}, 0,

@@ -2277,7 +2277,7 @@ bool host_window_pump() {
     const bool fps_on = host_settings_ref().fps_counter;
     g_fps_on.store(fps_on, std::memory_order_relaxed);
     if (fps_on) {
-        static int shown = 0;
+        static int shown = 0, shown_total = 0;  // the game's frames; with frame generation's, 0 without it
         static std::uint64_t shown_at = 0;
         // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
         // the last three refreshes, about a second. Task Manager's GPU column
@@ -2290,10 +2290,10 @@ bool host_window_pump() {
             const std::uint64_t last = g_fps_last_ns.load(std::memory_order_relaxed);
             double fps = g_fps_avg.load(std::memory_order_relaxed);
             if (last && now > last + 500'000'000) fps = std::min(fps, 1e9 / static_cast<double>(now - last));
-            // With frame generation, what is on screen: the game's frames and
-            // the ones generated between them.
-            if (framegen_active()) fps *= framegen_shown_per_frame();
             shown = last ? static_cast<int>(fps + 0.5) : 0;
+            // With frame generation, beside it in brackets what is on screen:
+            // the game's frames and the ones generated between them.
+            shown_total = last && framegen_active() ? static_cast<int>(fps * framegen_shown_per_frame() + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
             if (b.on && busy_was[0].on) {
@@ -2319,11 +2319,16 @@ bool host_window_pump() {
             std::lock_guard<std::mutex> ml(g_mouse_mu);
             dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
         }
-        char text[48];
-        if (gpu_pct >= 0) {
-            std::snprintf(text, sizeof(text), "%d FPS  GPU %d%%", shown, gpu_pct);
+        char rate[24], text[48];
+        if (shown_total > 0) {
+            std::snprintf(rate, sizeof(rate), "%d (%d) FPS", shown, shown_total);
         } else {
-            std::snprintf(text, sizeof(text), "%d FPS", shown);
+            std::snprintf(rate, sizeof(rate), "%d FPS", shown);
+        }
+        if (gpu_pct >= 0) {
+            std::snprintf(text, sizeof(text), "%s  GPU %d%%", rate, gpu_pct);
+        } else {
+            std::snprintf(text, sizeof(text), "%s", rate);
         }
         const float scale = 0.8f, w = host_overlay_text_width(scale, text);
         const float x = dw - w - 20.0f, y = 14.0f;
