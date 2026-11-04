@@ -76,7 +76,9 @@
 // now (the setup window's main page, F10 > STARTUP).
 #include "bbhost_plugin.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -127,6 +129,8 @@ using PlayFn = BB_GUEST_ABI void (*)(std::uint64_t list, void* params);
 using CameraFn = BB_GUEST_ABI void (*)(void* params, std::uint64_t camera);
 
 bool g_early = true;  // drawn in the scene; false when the draw lists' play cannot be hooked
+bool g_cache_on = true;    // LOHIT_CACHE=0: the game's own build every frame
+bool g_buffers_on = true;  // LOHIT_BUFFERS=0: the copies played to sub_13673c0 a batch at a time
 int g_pass = 0xfa5;   // 3e/25: the effects (their items leave it with GROUP MASK Sfx off)
 std::uint64_t g_rendman_slot = 0, g_gx_slot = 0;
 PlayFn g_play = nullptr;
@@ -197,7 +201,9 @@ void play_early(std::uint64_t cc, void*) {
 
 // Ahead of the scene's objects: the list's depth alone, for the occlusion tests.
 void play_depth(std::uint64_t cc, void*) {
-    if (!g_occlusion.load(std::memory_order_relaxed)) return;
+    // The coloured play lands on this depth only when both draw the same
+    // vertices: the meshes' buffers (built every frame, it comes out black).
+    if (!g_occlusion.load(std::memory_order_relaxed) || !g_cache_on || !g_buffers_on) return;
     const std::uint64_t list = first_list();
     if (!list || !cc) return;
     Params p;
@@ -236,6 +242,16 @@ int on_play(BbHookCtx* ctx, void*) {
 // CreateBuffer, 0x2565c10), and on the frames after hands sub_13673c0 the
 // whole mesh at once, with sub_2590be0's two draws binding that buffer where
 // they would have copied: two draws a mesh, nothing built or copied.
+//
+// Its shade. The drawer blends each triangle between the two colours by
+// |normal . the camera's forward| (sub_13dd010, the drawer's view rows at
+// +0xa0..+0xc8): faces toward the camera the first colour, faces edge-on the
+// second, recomputed as the camera turns. Built once, a mesh would keep the
+// shade of the frame it was built in, each mesh another frame's. So the
+// plugin shades the copies itself, from the world: a wall the first colour
+// (violet), a floor the second (blue), walls a little darker the more they
+// face across kShadeLight, so their corners still show. Triangles whose
+// colour is not between the two (another material's) keep it.
 
 constexpr std::uint64_t kMeshDraw = 0x13dc900;   // (renderer, mesh)
 constexpr std::uint64_t kBatchDraw = 0x13673c0;  // (renderer, vertices, triangles, drawer +0x30)
@@ -264,8 +280,6 @@ ShapesFn g_shapes_make = nullptr;
 ShapesDrawFn g_shapes_draw = nullptr;
 DrawFn g_immediate_draw = nullptr;
 CreateFn g_create_buffer = nullptr;
-bool g_cache_on = true;    // LOHIT_CACHE=0: the game's own build every frame
-bool g_buffers_on = true;  // LOHIT_BUFFERS=0: the copies played to sub_13673c0 a batch at a time
 
 template <class T> void put(std::uint64_t a, T v) {
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), &v, sizeof v);
@@ -329,6 +343,46 @@ std::uint64_t make_buffer(const std::vector<Batch>& batches, std::uint32_t tris)
     std::uint64_t holder = 0;
     if (g_create_buffer(device, &holder, desc, init, 0, 0, 0) != 0) return 0;
     return holder;
+}
+
+const float* g_shade_colours = nullptr;  // the two colours written for the game (write_colours)
+
+struct V3 {
+    float x, y, z;
+};
+V3 sub3(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+
+// The batch's triangles shaded from the world (see above): vertex = position
+// (vec4) at 0, colour (vec4) at 0x10.
+void shade_batch(Batch& b) {
+    const float* c = g_shade_colours;
+    if (!c) return;
+    const float d[3] = {c[0] - c[4], c[1] - c[5], c[2] - c[6]};
+    const float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if (dd <= 0.0f) return;
+    constexpr float kLx = 0.6f, kLz = 0.8f;  // kShadeLight: across the map, level
+    for (std::uint32_t t = 0; t < b.tris; ++t) {
+        std::uint8_t* tri = b.verts.data() + std::size_t(t) * 3 * kVertex;
+        float col[4];
+        std::memcpy(col, tri + 0x10, sizeof col);
+        // On the line between the two colours: where (0 the second, 1 the first).
+        const float r[3] = {col[0] - c[4], col[1] - c[5], col[2] - c[6]};
+        const float along = (r[0] * d[0] + r[1] * d[1] + r[2] * d[2]) / dd;
+        const float off[3] = {r[0] - along * d[0], r[1] - along * d[1], r[2] - along * d[2]};
+        if (along < -0.01f || along > 1.01f || off[0] * off[0] + off[1] * off[1] + off[2] * off[2] > 1e-6f * (dd + 1e-6f)) continue;
+        V3 p[3];
+        for (int k = 0; k < 3; ++k) std::memcpy(&p[k], tri + k * kVertex, sizeof(V3));
+        const V3 e1 = sub3(p[1], p[0]), e2 = sub3(p[2], p[0]);
+        V3 n = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        const float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len <= 0.0f) continue;
+        n = {n.x / len, n.y / len, n.z / len};
+        const float wall = std::sqrt(std::max(0.0f, 1.0f - n.y * n.y));  // 1 upright, 0 level
+        const float across = wall > 1e-4f ? std::fabs(n.x * kLx + n.z * kLz) / wall : 0.0f;
+        const float k = wall * (1.0f - 0.3f * across);
+        const float out[4] = {c[4] + k * d[0], c[5] + k * d[1], c[6] + k * d[2], col[3]};
+        for (int v = 0; v < 3; ++v) std::memcpy(tri + v * kVertex + 0x10, out, sizeof out);
+    }
 }
 
 int on_batch_draw(BbHookCtx* ctx, void*) {
@@ -420,6 +474,7 @@ int on_mesh_draw(BbHookCtx* ctx, void*) {
             tris += b.tris;
             same = same && std::memcmp(b.xf, slot.batches.front().xf, sizeof b.xf) == 0;
         }
+        for (Batch& b : slot.batches) shade_batch(b);
         if (g_buffers_on && same && tris) {
             if (const std::uint64_t buffer = make_buffer(slot.batches, tris)) {
                 std::lock_guard<std::mutex> lock(g_mesh_mu);
@@ -680,6 +735,7 @@ void read_early_colour(const char* v) {
 
 void write_colours() {
     const float* ours = g_early ? kEarlyColour : kLateColour;
+    g_shade_colours = ours;
     const int r = api->patch(kColours, kGameColour, ours, sizeof kGameColour);
     if (r != 0) api->log("lohit: 0x4d00840 is not the lo-hit's colours (%d); kept as they are", r);
     if (api->patch(kHiColours, kHiGameColour, ours, sizeof kHiGameColour) != 0)
