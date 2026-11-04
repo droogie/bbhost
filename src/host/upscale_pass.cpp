@@ -666,6 +666,10 @@ bool velo_previous_given() {
     return velo_previous_due() && !(velo_previous_env() == 2 && (g_velo_frame & 1));
 }
 
+bool velo_cloth_given() {
+    return velo_previous_env() != 0 && upscale_motion_on() && !(velo_previous_env() == 2 && (g_velo_frame & 1));
+}
+
 bool upscale_velo_clear_due(std::uint64_t base, int kind) {
     return kind == 2 && base && g_velo_cleared != g_velo_frame && !g_velo_camera_pass;
 }

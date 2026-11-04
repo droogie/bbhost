@@ -3690,6 +3690,7 @@ struct VertexInputPlan {
     VkBuffer buffer[16] = {};
     VkDeviceSize offset[16] = {};
     std::uint64_t va[16] = {};  // guest address of each binding's first byte (draw captures copy from there)
+    std::uint64_t bytes[16] = {};  // and from there to its last record's furthest element's end
     std::uint64_t hash = 0;     // pipeline identity: elements, bindings and attributes
     std::uint8_t served[16] = {};  // by element (its location): VertexServed
 };
@@ -11980,6 +11981,91 @@ std::uint64_t velo_previous_locked(GfxPipeline& pl, const GpuDraw& d, const gcn:
     return base;
 }
 
+// The cloth's velocity draws (translation_cache.cpp velo_cloth_prev): the
+// game rewrites a cloth mesh's vertex records every frame - its simulation's
+// positions - so its velocity shader read this frame's positions for where
+// the vertex was too, and the cloth had no motion of its own. Its lift reads
+// inputs 0 and 1 again at locations 14 and 15 for that, bound here to the
+// records a frame ago: a copy kept from the mesh's draw then (by the shader,
+// index buffer and count, and its place among the mesh's draws), copied into
+// the snapshot ring. Without one, or with the upscaler's motion off (the
+// game's own picture then), to this frame's records.
+struct VeloCloth {
+    std::uint64_t frame = ~0ull;  // upscale_velo_frame of `now`
+    struct Records {
+        std::uint64_t va = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+    std::unordered_map<std::uint64_t, std::vector<Records>> now, last;
+    std::uint64_t given = 0, first = 0, reported = 0;
+};
+VeloCloth g_velo_cloth;  // under g.mu
+
+// `motion`: the upscaler's motion on (the records kept, in order).
+void velo_cloth_twin_locked(VertexInputPlan& p, const std::string& vs_name, const GpuDraw& d, bool motion) {
+    if (!velo_cloth_vs(vs_name) || p.bindings.size() >= 16) return;
+    VkVertexInputAttributeDescription at[2] = {};
+    bool found[2] = {};
+    for (const VkVertexInputAttributeDescription& a : p.attributes) {
+        if (a.location < 2) {
+            at[a.location] = a;
+            found[a.location] = true;
+        }
+    }
+    if (!found[0]) return;
+    const std::uint32_t b = at[0].binding;
+    VkBuffer buffer = p.buffer[b];
+    VkDeviceSize offset = p.offset[b];
+    const std::uint64_t va = p.va[b], bytes = p.bytes[b];
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8)
+        host_log("upscaler: cloth velocity draw %s: binding %u at 0x%llx, %llu bytes, stride %u", vs_name.c_str(), b,
+                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes), p.bindings[b].stride);
+    if (motion && va && bytes && bytes <= (1u << 20) && (!found[1] || at[1].binding == b) && hle_kernel_va_mapped(va, bytes)) {
+        VeloCloth& v = g_velo_cloth;
+        const std::uint64_t frame = upscale_velo_frame();
+        if (frame != v.frame) {
+            v.last.swap(v.now);
+            v.now.clear();
+            v.frame = frame;
+            if (v.given + v.first - v.reported >= 20000) {
+                host_log("upscaler: cloth velocity draws given their records of a frame ago: %llu, without: %llu",
+                         static_cast<unsigned long long>(v.given), static_cast<unsigned long long>(v.first));
+                v.reported = v.given + v.first;
+            }
+        }
+        const std::uint64_t mesh[3] = {fnv1a(vs_name.data(), vs_name.size()), d.index_va, d.index_count};
+        const std::uint64_t id = fnv1a(mesh, sizeof(mesh));
+        std::vector<VeloCloth::Records>& mine = v.now[id];
+        // Its place among the mesh's draws this frame (one recorded again keeps it).
+        std::size_t k = 0;
+        while (k < mine.size() && mine[k].va != va) ++k;
+        if (k == mine.size() && k < 8) {
+            const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va));
+            mine.push_back({va, std::vector<std::uint8_t>(src, src + bytes)});
+        }
+        const auto then = v.last.find(id);
+        Located loc;
+        if (velo_cloth_given() && then != v.last.end() && k < then->second.size() && then->second[k].bytes.size() == bytes &&
+            shadow_copy_bytes_locked(then->second[k].bytes.data(), bytes, loc)) {
+            buffer = loc.buffer;
+            offset = loc.offset;
+            ++v.given;
+        } else {
+            ++v.first;
+        }
+    }
+    const std::uint32_t twin = static_cast<std::uint32_t>(p.bindings.size());
+    p.bindings.push_back({twin, p.bindings[b].stride, VK_VERTEX_INPUT_RATE_VERTEX});
+    p.buffer[twin] = buffer;
+    p.offset[twin] = offset;
+    p.va[twin] = 0;  // (no guest range: a capture reads its binding's)
+    p.bytes[twin] = 0;
+    for (std::uint32_t k = 0; k < 2; ++k)
+        if (found[k]) p.attributes.push_back({14 + k, at[k].binding == b ? twin : at[k].binding, at[k].format, at[k].offset});
+    p.hash = vertex_plan_hash(p);
+}
+
 struct TsharpInfo {
     std::uint64_t base;
     std::uint32_t dfmt, nfmt, width, height, depth, pitch, type, tiling, base_level, last_level, dst_sel;
@@ -16794,6 +16880,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         VkFormat format;
         std::uint64_t va;
     } placed[16];
+    std::uint64_t ends[16] = {};  // each element's last byte's end, in guest memory
     p.elements.clear();
     // GX on Vulkan (host/gxvk.h): an element of a record in a GX buffer the
     // host keeps is bound from the buffer's device-local copy by the handle
@@ -16871,6 +16958,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
+        if (std::int64_t last = 0; draw_last_vertex(last) && last >= 0)
+            ends[e] = va + std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
+        else
+            ends[e] = va + need;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
         int handle_result = -1;            // stage 1b's for the record (the import census)
         if (handles) {
@@ -17225,6 +17316,11 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             const VkDeviceSize rel = pl[e].offset - q.offset[binding_of[e]];
             if (rel > 2047) return false;
             q.attributes.push_back({static_cast<std::uint32_t>(e), binding_of[e], pl[e].format, static_cast<std::uint32_t>(rel)});
+        }
+        for (std::uint32_t k = 0; k < q.bindings.size(); ++k) q.bytes[k] = 0;
+        for (std::size_t e = 0; e < n; ++e) {
+            const std::uint32_t k = binding_of[e];
+            if (ends[e] > q.va[k]) q.bytes[k] = std::max<std::uint64_t>(q.bytes[k], ends[e] - q.va[k]);
         }
         return true;
     };
@@ -21936,6 +22032,15 @@ static bool draw_impl(const GpuDraw& d) {
     if (use_vertex_input && g_vertex_pack && !(t_tess && t_tess->native) && g_vertex_format_params && use_pipeline_library() &&
         gcn::vertex_formats_from_params_supported(vertex_input.elements))
         pack_vertex_input(vertex_input);
+    if (use_vertex_input && velo_cloth_vs(vs_name)) {
+        // Its records kept and matched across frames in order (BBHOST_RUN_COMMIT).
+        const bool motion = upscale_motion_on();
+        if (part && motion) {
+            run_part_stop(kRunStopOrder);
+            return false;
+        }
+        velo_cloth_twin_locked(vertex_input, vs_name, d, motion);
+    }
     const std::vector<std::uint32_t>& fetch_words = fetch ? fetch->words : no_words;
     draw_stamp.to(kRenderCostPrograms);
     const std::uint64_t ps_hash = ps_cp ? ps_cp->hash : 0;

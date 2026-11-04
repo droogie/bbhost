@@ -1466,6 +1466,10 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
 // GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// `bytes` of host memory at `src` copied into the same ring now, for the draw
+// recording (a ring in host memory read in place); `loc` becomes the copy.
+// False, `loc` unchanged, past 1 MiB or with no room.
+bool shadow_copy_bytes_locked(const void* src, std::uint64_t bytes, Located& loc);
 // Whether shadow_snapshot_locked may copy any of [va, va+bytes) - a page of it
 // the game rewrites, or a range this cannot tell cheaply - before the caller
 // works out how much of it a draw reads.
@@ -1785,6 +1789,11 @@ bool upscale_motion_on();
 // (velo_previous_given: all of those frames but BBHOST_VELO_PREV=alt's odd ones).
 bool velo_previous_due();
 bool velo_previous_given();
+// Whether a cloth's velocity draw is given its records of a frame ago
+// (render.cpp velo_cloth_twin_locked): the upscaler's motion on, whatever
+// reads the map (the game's blur too), but BBHOST_VELO_PREV=0 and =alt's odd
+// frames.
+bool velo_cloth_given();
 // The upscaler's frames so far, counted at its call point (after the
 // velocity pass): a frame's velocity draws share one.
 std::uint64_t upscale_velo_frame();

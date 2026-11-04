@@ -2419,11 +2419,9 @@ bool snap_ring_take_locked(VkDeviceSize bytes, VkDeviceSize& at_out) {
     at_out = at;
     return true;
 }
-bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    // A ring in host memory stages each copy into device memory (below):
-    // in order, for a run part's draw (BBHOST_RUN_COMMIT).
-    if (!g_snap.device_local && run_part_stop(kRunStopBuffers)) return false;
-    VkDeviceSize at = 0;
+// The ring's next `bytes` for the draw recording now: from its draw
+// context's chunk (BBHOST_DRAW_CONTEXT), else the ring's own.
+bool snap_take_locked(std::uint64_t bytes, VkDeviceSize& at) {
     if (DrawCtx* const c = draw_ctx()) {
         // BBHOST_DRAW_CONTEXT: from the context's chunk of the ring, taken
         // as a copy of the chunk's size would be (refused the same way).
@@ -2439,9 +2437,17 @@ bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         }
         c->snap_next = at + bytes;
         list_resolve::count(list_resolve::kCtxSnapBytes, bytes);
-    } else if (!snap_ring_take_locked(bytes, at)) {
-        return false;
+        return true;
     }
+    return snap_ring_take_locked(bytes, at);
+}
+
+bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    // A ring in host memory stages each copy into device memory (below):
+    // in order, for a run part's draw (BBHOST_RUN_COMMIT).
+    if (!g_snap.device_local && run_part_stop(kRunStopBuffers)) return false;
+    VkDeviceSize at = 0;
+    if (!snap_take_locked(bytes, at)) return false;
     std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
     bump(g_snapshots);
     bump(g_snapshot_bytes, bytes);  // not a locked add: it would wait for the copy to drain
@@ -2457,6 +2463,22 @@ bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 std::atomic<std::uint64_t> g_fallback[import_fallback::kChoices], g_fallback_bytes{0};
 std::atomic<std::uint64_t> g_fallback_mirror_why[kLocWhys];  // why the mirrors did not serve a range in no import
 }  // namespace
+
+bool shadow_copy_bytes_locked(const void* src, std::uint64_t bytes, Located& loc) {
+    if (!bytes || bytes > kSnapMaxBytes) return false;
+    if (!g_snap.buffer && !g_snap.failed && run_part_stop(kRunStopRing)) return false;  // the ring made in order (BBHOST_RUN_COMMIT)
+    if (g_snap.failed || (!g_snap.buffer && !snap_ring_make())) {
+        g_snap.failed = true;
+        return false;
+    }
+    VkDeviceSize at = 0;
+    if (!snap_take_locked(bytes, at)) return false;
+    std::memcpy(g_snap.map + at, src, bytes);
+    loc.buffer = g_snap.buffer;
+    loc.offset = at;
+    loc.avail = bytes;
+    return true;
+}
 
 int shadow_import_fallback_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t read_bytes, Located& out) {
     static const bool on = [] {

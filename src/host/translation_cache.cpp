@@ -34,6 +34,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gpu {
@@ -1330,10 +1331,191 @@ bool velo_rebuilt(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptio
     return !out.empty();
 }
 
+// ---- The cloth's last positions (host/render.cpp velo_cloth_twin_locked) ----
+// The game rewrites a cloth mesh's vertex records every frame - its
+// simulation's positions - and its velocity vertex shader makes both of its
+// clip positions from them: where the vertex is (param 0) and, with last
+// frame's bones, where it was (param 1). So the cloth's own swing was in
+// neither. Here the shader reads its inputs 0 and 1 a second time, at
+// locations 14 and 15, and param 1 is made from those: each value that
+// depends on the inputs and reaches param 1 is computed again from the twins,
+// next to the original. render.cpp binds the twins to last frame's copy of
+// the records. The lift's own SPIR-V stays (no HLSL compile), so the rewrite
+// meets the lifter's form: SSA values, one load an input, whole stores.
+bool velo_cloth_prev(std::vector<std::uint32_t>& spirv, const std::string& name) {
+    if (!velo_cloth_vs(name) || spirv.size() < 5 || lift_stage_tag(spirv) != "vs") return false;
+    const std::vector<std::uint32_t>& w = spirv;
+    struct Ins {
+        std::size_t at;
+        std::uint32_t op, n;
+    };
+    std::vector<Ins> ins;
+    for (std::size_t i = 5; i < w.size();) {
+        const std::uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || i + n > w.size()) return false;
+        ins.push_back({i, op, n});
+        i += n;
+    }
+    // The inputs at locations 0 and 1, param 1 (its location 1), their types.
+    std::unordered_map<std::uint32_t, std::uint32_t> location, var_class, var_type;
+    for (const Ins& x : ins) {
+        if (x.op == 71 && x.n == 4 && w[x.at + 2] == 30) location[w[x.at + 1]] = w[x.at + 3];  // OpDecorate Location
+        if (x.op == 59 && x.n >= 4) {                                                       // OpVariable
+            var_type[w[x.at + 2]] = w[x.at + 1];
+            var_class[w[x.at + 2]] = w[x.at + 3];
+        }
+    }
+    std::uint32_t in_var[2] = {}, out_prev = 0;
+    for (const auto& [id, loc] : location) {
+        const auto c = var_class.find(id);
+        if (c == var_class.end()) continue;
+        if (c->second == 1 && loc < 2) in_var[loc] = id;  // Input
+        if (c->second == 3 && loc == 1) out_prev = id;    // Output
+    }
+    if (!in_var[0] || !out_prev) return false;
+    // The body's values: each one's operands that are ids (an opcode's literal
+    // words left out), for the ops the lifter writes; another op stops it.
+    const auto value_op = [](std::uint32_t op) {
+        switch (op) {
+            case 12: case 61: case 65: case 66: case 77: case 78: case 79: case 80: case 81: case 82: case 83:
+            case 109: case 110: case 111: case 112: case 113: case 114: case 115: case 116: case 124: case 126: case 127:
+            case 128: case 129: case 130: case 131: case 132: case 133: case 134: case 135: case 136: case 137: case 138:
+            case 139: case 140: case 141: case 142: case 143: case 144: case 145: case 146: case 147: case 148: case 149:
+            case 150: case 151: case 152: case 154: case 155: case 156: case 157: case 164: case 165: case 166: case 167:
+            case 168: case 169: case 170: case 171: case 172: case 173: case 174: case 175: case 176: case 177: case 178:
+            case 179: case 180: case 181: case 182: case 183: case 184: case 185: case 186: case 187: case 188: case 189:
+            case 190: case 191: case 194: case 195: case 196: case 197: case 198: case 199: case 200: case 201: case 202:
+            case 203: case 204: case 205: case 245:
+                return true;
+            default:
+                return false;
+        }
+    };
+    // Its id operands' word range [first, end) (OpExtInst: the set and the
+    // operands, not the instruction's number - handled by `is_id` below).
+    const auto id_words = [&](const Ins& x, std::size_t& first, std::size_t& end) {
+        first = 3;
+        end = x.n;
+        if (x.op == 81) end = 4;                    // OpCompositeExtract: indices
+        if (x.op == 82 || x.op == 79) end = 5;      // OpCompositeInsert, OpVectorShuffle
+        if (x.op == 61) end = 4;                    // OpLoad: a memory access mask
+    };
+    const auto is_id = [](const Ins& x, std::size_t k) { return !(x.op == 12 && k == 4); };  // OpExtInst's number
+    std::size_t body = ins.size(), body_end = ins.size();
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        if (ins[i].op == 54 && body == ins.size()) body = i;  // OpFunction
+        if (ins[i].op == 56) body_end = i;                    // OpFunctionEnd
+    }
+    if (body == ins.size() || body_end == ins.size() || body_end < body) return false;
+    std::unordered_map<std::uint32_t, std::size_t> def;
+    std::vector<std::uint32_t> stores;  // param 1's values
+    for (std::size_t i = body + 1; i < body_end; ++i) {
+        const Ins& x = ins[i];
+        if (value_op(x.op)) {
+            if (x.n < 3) return false;
+            def[w[x.at + 2]] = i;
+        } else if (x.op == 62) {  // OpStore
+            if (x.n < 3) return false;
+            if (w[x.at + 1] == out_prev) stores.push_back(w[x.at + 2]);
+        } else if (x.op != 248 && x.op != 249 && x.op != 250 && x.op != 247 && x.op != 253 && x.op != 8 && x.op != 317 && x.op != 0) {
+            return false;  // (labels, branches, merges, return, line info)
+        }
+    }
+    if (stores.empty()) return false;
+    // What depends on the inputs (to a fixed point: a phi takes values from below).
+    std::unordered_set<std::uint32_t> tainted;
+    std::uint32_t loads[2] = {};
+    for (const auto& [id, i] : def) {
+        const Ins& x = ins[i];
+        for (int k = 0; k < 2; ++k)
+            if (x.op == 61 && in_var[k] && w[x.at + 3] == in_var[k]) {
+                if (loads[k]) return false;  // (one load an input)
+                loads[k] = id;
+                tainted.insert(id);
+            }
+    }
+    for (bool more = true; more;) {
+        more = false;
+        for (std::size_t i = body + 1; i < body_end; ++i) {
+            const Ins& x = ins[i];
+            if (!value_op(x.op) || tainted.count(w[x.at + 2])) continue;
+            std::size_t first = 0, end = 0;
+            id_words(x, first, end);
+            for (std::size_t k = first; k < end; ++k) {
+                if (is_id(x, k) && tainted.count(w[x.at + k])) {
+                    tainted.insert(w[x.at + 2]);
+                    more = true;
+                    break;
+                }
+            }
+        }
+    }
+    // What param 1's values come from, of that: the values to compute again.
+    std::unordered_set<std::uint32_t> again;
+    std::vector<std::uint32_t> todo(stores);
+    while (!todo.empty()) {
+        const std::uint32_t id = todo.back();
+        todo.pop_back();
+        const auto d = def.find(id);
+        if (d == def.end() || !tainted.count(id) || !again.insert(id).second) continue;
+        const Ins& x = ins[d->second];
+        std::size_t first = 0, end = 0;
+        id_words(x, first, end);
+        for (std::size_t k = first; k < end; ++k)
+            if (is_id(x, k)) todo.push_back(w[x.at + k]);
+    }
+    if (again.empty()) return false;
+    std::uint32_t bound = w[3];
+    std::unordered_map<std::uint32_t, std::uint32_t> twin;  // value -> its twin
+    for (const std::uint32_t id : again) twin[id] = bound++;
+    std::uint32_t twin_var[2] = {};
+    for (int k = 0; k < 2; ++k)
+        if (loads[k] && again.count(loads[k])) twin_var[k] = bound++;
+    std::vector<std::uint32_t> out(w.begin(), w.begin() + 5);
+    out[3] = bound;
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        const Ins& x = ins[i];
+        const std::size_t at = out.size();
+        out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
+        if (x.op == 15) {  // OpEntryPoint: the twins in its interface
+            for (const std::uint32_t v : twin_var)
+                if (v) out.push_back(v);
+            out[at] = static_cast<std::uint32_t>(out.size() - at) << 16 | 15;
+        } else if (x.op == 71 && x.n == 4 && w[x.at + 2] == 30) {
+            for (int k = 0; k < 2; ++k)
+                if (twin_var[k] && w[x.at + 1] == in_var[k]) out.insert(out.end(), {4u << 16 | 71, twin_var[k], 30u, 14u + k});
+        } else if (x.op == 59 && x.n >= 4) {
+            for (int k = 0; k < 2; ++k)
+                if (twin_var[k] && w[x.at + 2] == in_var[k]) out.insert(out.end(), {4u << 16 | 59, var_type[in_var[k]], twin_var[k], 1u});
+        } else if (x.op == 62 && i > body && i < body_end && w[x.at + 1] == out_prev) {
+            if (const auto t = twin.find(w[x.at + 2]); t != twin.end()) out[at + 2] = t->second;
+        } else if (i > body && i < body_end && value_op(x.op) && again.count(w[x.at + 2])) {
+            // The twin, next to the value: its operands' twins, an input's load
+            // from the input's twin.
+            const std::size_t t = out.size();
+            out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
+            out[t + 2] = twin[w[x.at + 2]];
+            std::size_t first = 0, end = 0;
+            id_words(x, first, end);
+            for (std::size_t k = first; k < end; ++k) {
+                if (!is_id(x, k)) continue;
+                if (const auto o = twin.find(w[x.at + k]); o != twin.end()) out[t + k] = o->second;
+            }
+            for (int k = 0; k < 2; ++k)
+                if (x.op == 61 && w[x.at + 2] == loads[k]) out[t + 3] = twin_var[k];
+        }
+    }
+    host_log("render: cloth velocity shader %s takes last frame's positions (%zu values computed again)", name.c_str(), again.size());
+    spirv = std::move(out);
+    return true;
+}
+
 void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* to) {
     t_last_deferred = nullptr;
     std::string name = std::move(t_hlsl_name);  // taken by this lift, whatever happens to it
     t_hlsl_name.clear();
+    // A cloth's velocity shader keeps its lift, rewritten (no HLSL compile).
+    if (l.ok() && velo_cloth_prev(l.spirv, name)) return;
     if (!hlsl_on() || !l.ok()) return;
     gcn::HlslOptions hopt;
     hopt.title = std::move(name);
@@ -1416,6 +1598,14 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
     l.spirv = std::move(spirv);
 }
 }  // namespace
+
+bool velo_cloth_vs(const std::string& name) {
+    // GXFlver's cloth _Velo vertex shaders (their matrices in constant buffer 6).
+    static const char* const kCloth[] = {"8bc6ea32", "2b6c1d92", "6242b6f6", "40c7002a", "be79c622"};
+    for (const char* c : kCloth)
+        if (name == c) return true;
+    return false;
+}
 
 void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons) {
     taken = g_hlsl.taken.load();
