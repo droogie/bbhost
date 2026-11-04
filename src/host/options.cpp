@@ -1713,10 +1713,16 @@ void preset_row() {
         setting_row(kUpscaleQuality, "DLSS quality", quality_note("DLSS"), kDlssQualityNames);
         row_rule();
     }
-    ImGui::BeginDisabled(u == 0);
     setting_row(kDlssPreset);
-    ImGui::EndDisabled();
-    if (u == 0) ui::tooltip_for_item(g_set[kDlssPreset].label, "Choose an upscaler under Upscaling first.");
+}
+
+// Rows that only mean something under another setting, left out while it is
+// off: the upscaler's preset row with Upscaling off, HD motion blur's
+// resolution with HD motion blur off.
+bool row_hidden(int id) {
+    if (id == kDlssPreset) return shown_index(kUpscaler) == 0;
+    if (id == kHdMotionBlurRes) return !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
+    return false;
 }
 
 void host_options_draw_page(int page) {
@@ -1729,6 +1735,7 @@ void host_options_draw_page(int page) {
     for (int r = pg.first; r < pg.end; ++r) {
         if (g_rows[r].kind != Row::Option) continue;
         if (g_setup_page && g_rows[r].setting == kShaders) continue;
+        if (row_hidden(g_rows[r].setting)) continue;
         if (!first) row_rule();
         first = false;
         if (g_rows[r].setting == kDlssPreset) preset_row();
