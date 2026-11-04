@@ -1767,6 +1767,9 @@ std::string image_reuse_report_locked();
 // The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
 std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// The colour or depth target of lowest base in (after, below), or null (g_rts
+// only: textures.cpp's mip chains of targets).
+RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
 // copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is
 // the command processor's, under g.mu.

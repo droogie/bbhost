@@ -13293,6 +13293,11 @@ RtImage* find_render_target(std::uint64_t base) {
     return st == g_snapshots.end() ? nullptr : &st->second;
 }
 
+RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below) {
+    auto it = g_rts.upper_bound(after);
+    return it != g_rts.end() && it->first < below ? &it->second : nullptr;
+}
+
 // What a copy's destination is to the host: the image samplers would read
 // there, or the GX texture the game made there, or nothing but memory.
 std::string copy_destination_describe_locked(std::uint64_t dst_base) {

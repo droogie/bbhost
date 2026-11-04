@@ -1960,7 +1960,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
 std::atomic<std::uint64_t> g_rt_unlisted_reads{0};
 
 VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uint32_t first_layer, std::uint32_t layer_count,
-                               bool arrayed) {
+                               bool arrayed, std::uint32_t level_count = 1) {
     if (r.view_clear) view_clear_apply_locked(r, kVcwTexture);  // about to be sampled: a clear owed to it goes first (render.cpp lazy clears)
     first_layer = std::min(first_layer, r.layers - 1);
     layer_count = std::max(1u, std::min(layer_count, r.layers - first_layer));
@@ -1989,8 +1989,8 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
         }
     }
     const std::uint64_t key = (tsharp[3] & 0xfff) | (static_cast<std::uint64_t>(first_layer) << 12) |
-                              (static_cast<std::uint64_t>(layer_count) << 24) | (arrayed ? 1ull << 40 : 0) |
-                              (static_cast<std::uint64_t>(format) << 41);
+                              (static_cast<std::uint64_t>(layer_count) << 24) | (static_cast<std::uint64_t>(level_count - 1) << 36) |
+                              (arrayed ? 1ull << 40 : 0) | (static_cast<std::uint64_t>(format) << 41);
     auto& views = g_rt_views[r.base];
     if (auto it = views.find(key); it != views.end()) return it->second;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -2009,8 +2009,8 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
         return swizzle(v);
     };
     vci.components = {sel(tsharp[3] & 7), sel((tsharp[3] >> 3) & 7), sel((tsharp[3] >> 6) & 7), sel((tsharp[3] >> 9) & 7)};
-    vci.subresourceRange = {static_cast<VkImageAspectFlags>(r.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1,
-                            first_layer, layer_count};
+    vci.subresourceRange = {static_cast<VkImageAspectFlags>(r.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0,
+                            level_count, first_layer, layer_count};
     if (r.depth) vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
     VkImageViewUsageCreateInfo narrowed{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     if (!r.depth) narrow_sampled_view_usage(vci, narrowed);
@@ -2022,7 +2022,7 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = r.format;
     ici.extent = {r.width, r.height, 1};
-    ici.mipLevels = 1;
+    ici.mipLevels = level_count;
     ici.arrayLayers = r.layers;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2847,6 +2847,138 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
     return render_target_view(la.img, w, 0, 1, false);
 }
 
+// A T# of several levels over a render target whose smaller levels the game
+// drew as targets of their own, each at its level's address: the reflections'
+// blur pyramid (0x16b3b0000 960x540, then 480x270 at +0x800000, 240x135 at
+// +0xa00000, ... down to 1x1), which the scene's composite samples by the
+// surface's roughness. Bound as the 960x540 target alone (one level), every
+// roughness read the sharp ray march, and rough floors sparkled with the
+// reflected embers where the console shows a soft glow. The levels are found
+// above the target in memory, each exactly half the last (rounded down, not
+// below 1), and copied into the levels of one image at every bind; the view
+// spans as many as were found. BBHOST_RT_MIP_CHAIN=0: the target's one level.
+struct RtMipChain {
+    RtImage img;                   // not in g_rts; img.base is a key of its own for g_rt_views
+    std::vector<VkImage> sources;  // the targets it was made from, level by level
+};
+std::map<std::tuple<std::uint64_t, std::uint32_t, int>, RtMipChain> g_rt_mip_chains;
+std::atomic<std::uint64_t> g_rt_mip_chain_copies{0};
+
+VkImageView rt_mip_chain_view(RtImage& rt, const std::uint32_t* w, std::uint32_t levels) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_RT_MIP_CHAIN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || levels < 2 || rt.depth || rt.layers != 1) return VK_NULL_HANDLE;
+    // The levels drawn as targets: each above the last, within four times the
+    // top level's bytes of it (the pyramid's allocation, tiling's padding too).
+    std::vector<RtImage*> found{&rt};
+    const std::uint64_t limit = rt.base + 4ull * rt.width * rt.height * std::max<std::uint32_t>(format_bytes_per_pixel(rt.format), 1);
+    for (std::uint32_t l = 1; l < levels; ++l) {
+        const std::uint32_t lw = std::max(1u, rt.width >> l), lh = std::max(1u, rt.height >> l);
+        RtImage* next = nullptr;
+        for (std::uint64_t at = found.back()->base; (next = next_render_target_locked(at, limit));) {
+            if (next->width == lw && next->height == lh) break;
+            at = next->base;
+        }
+        if (!next || next->depth || next->layers != 1 || next->format != rt.format || !next->initialised) break;
+        found.push_back(next);
+    }
+    if (found.size() < 2) return VK_NULL_HANDLE;
+    const std::uint32_t n = static_cast<std::uint32_t>(found.size());
+    const auto key = std::make_tuple(rt.base, n, static_cast<int>(rt.format));
+    auto it = g_rt_mip_chains.find(key);
+    if (it != g_rt_mip_chains.end()) {
+        bool same = it->second.sources.size() == n;
+        for (std::uint32_t l = 0; same && l < n; ++l) same = it->second.sources[l] == found[l]->image;
+        if (!same) {
+            invalidate_rt_views(it->second.img.base);
+            defer_destroy_image(it->second.img.image, it->second.img.memory);
+            g_rt_mip_chains.erase(it);
+            it = g_rt_mip_chains.end();
+        }
+    }
+    if (it == g_rt_mip_chains.end()) {
+        RtMipChain nc;
+        for (RtImage* f : found) nc.sources.push_back(f->image);
+        nc.img.base = (rt.base ^ (0x7ull << 60)) + (static_cast<std::uint64_t>(n) << 44);
+        nc.img.format = rt.format;
+        nc.img.width = rt.width;
+        nc.img.height = rt.height;
+        nc.img.layers = 1;
+        nc.img.depth = false;
+        nc.img.mutable_format = rt.mutable_format;
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.flags = rt.mutable_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = rt.format;
+        ici.extent = {rt.width, rt.height, 1};
+        ici.mipLevels = n;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(g.device, &ici, nullptr, &nc.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(g.device, nc.img.image, &req);
+        if (!image_memory_alloc(req, nc.img.memory, true)) {
+            vkDestroyImage(g.device, nc.img.image, nullptr);
+            return VK_NULL_HANDLE;
+        }
+        vkBindImageMemory(g.device, nc.img.image, nc.img.memory.memory, nc.img.memory.offset);
+        it = g_rt_mip_chains.emplace(key, nc).first;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 16) {
+            host_log("texture: T# of %u levels over render target 0x%llx %ux%u format %d samples %u levels drawn as targets (copied at every bind)",
+                     levels, static_cast<unsigned long long>(rt.base), rt.width, rt.height, static_cast<int>(rt.format), n);
+        }
+    }
+    RtMipChain& mc = it->second;
+    for (RtImage* f : found) {
+        if (f->view_clear) view_clear_apply_locked(*f, kVcwTexture);
+    }
+    begin_recording_locked();
+    render_end_pass_locked();
+    std::vector<VkImageMemoryBarrier> pre;
+    for (RtImage* f : found) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = f->image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        pre.push_back(b);
+    }
+    VkImageMemoryBarrier dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    dst.oldLayout = mc.img.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    dst.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dst.srcQueueFamilyIndex = dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dst.image = mc.img.image;
+    dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, n, 0, 1};
+    dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre.push_back(dst);
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                         static_cast<std::uint32_t>(pre.size()), pre.data());
+    mc.img.initialised = true;
+    for (std::uint32_t l = 0; l < n; ++l) {
+        VkImageCopy r{};
+        r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+        r.extent = {std::max(1u, rt.width >> l), std::max(1u, rt.height >> l), 1};
+        vkCmdCopyImage(g_cmd(), found[l]->image, VK_IMAGE_LAYOUT_GENERAL, mc.img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    }
+    dst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dst.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dst.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &dst);
+    g_rt_mip_chain_copies.fetch_add(1, std::memory_order_relaxed);
+    g_last_view_no_memo = true;
+    return render_target_view(mc.img, w, 0, 1, false, n);
+}
+
 // Whether the target `rt` at `addr` is generation `gen`'s image: 0 already
 // (or no generation to go by), 1 taken now, -1 another resource's. Taken when
 // something drew into it after that resource was made - a draw that names no
@@ -2951,6 +3083,9 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
             }
         }
         if (VkImageView v = rt_region_view(*rt, w, width, height)) return v;
+        if (base_level == 0 && last_level > 0 && width == rt->width && height == rt->height) {
+            if (VkImageView v = rt_mip_chain_view(*rt, w, last_level + 1)) return v;
+        }
         if (width > rt->width || height > rt->height) {
             // Memory a target was drawn into and the game has since given to a
             // texture of the T#'s size (the registry's live resource there):
