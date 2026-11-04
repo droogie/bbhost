@@ -434,7 +434,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kUpscaler},
-    {Row::Option, nullptr, kUpscaleQuality},
+    // Upscaling quality (kUpscaleQuality) has no row until the render size it
+    // asks for exists (the decoupled render size: build/HANDOFF-upscaler.md).
     {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
