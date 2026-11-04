@@ -23851,7 +23851,7 @@ static bool draw_impl(const GpuDraw& d) {
                         break;
                     }
                 }
-                upscale_pass_hudless_bind_locked(dst);
+                upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
             target_written = false;
         } else if (dst == hud_target) {

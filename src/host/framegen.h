@@ -64,8 +64,11 @@ bool framegen_prepare(VkCommandBuffer cb, std::uint64_t id, const FramegenInputs
 // The HUD-less picture of frame `id` (GENERAL, the display buffer's size and
 // format), copied from the display buffer at `display_va`, which the
 // presenter finds again by that buffer when it presents it.
+// `display_w` x `display_h` is the display buffer's size, which the copy -
+// the HUD's target, the output size - covers whole (render scale's back
+// buffer can be smaller than the display buffers).
 void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage image, VkFormat format, std::uint32_t w,
-                           std::uint32_t h);
+                           std::uint32_t h, std::uint32_t display_w, std::uint32_t display_h);
 // The presenter's side, in its command buffer after the frame's blit: the
 // HUD-less picture of the frame in `display_va` brought to the swapchain's
 // size over the same rectangles, for AMD to take the UI out of the frame with.

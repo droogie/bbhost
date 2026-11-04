@@ -611,8 +611,9 @@ void upscale_pass_hudless_locked(RtImage& display) {  // `display`: the HUD's ta
 
 bool upscale_pass_hudless_copied_locked() { return g_fg_copy != VK_NULL_HANDLE; }
 
-void upscale_pass_hudless_bind_locked(std::uint64_t display_va) {
-    if (g_fg_pending && g_fg_copy) framegen_note_hudless(display_va, g_fg_pending, g_fg_copy, g_fg_copy_format, g_fg_copy_w, g_fg_copy_h);
+void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t display_w, std::uint32_t display_h) {
+    if (g_fg_pending && g_fg_copy)
+        framegen_note_hudless(display_va, g_fg_pending, g_fg_copy, g_fg_copy_format, g_fg_copy_w, g_fg_copy_h, display_w, display_h);
     g_fg_pending = 0;  // once a frame
     g_fg_copy = VK_NULL_HANDLE;
 }

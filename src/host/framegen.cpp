@@ -42,6 +42,7 @@ struct Hudless {
     VkImage image = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::uint32_t w = 0, h = 0;
+    std::uint32_t display_w = 0, display_h = 0;
 };
 std::mutex g_hudless_mu;
 // AMD's frame generation context is used from two threads - the prepare on
@@ -325,14 +326,14 @@ bool framegen_prepare(VkCommandBuffer cb, std::uint64_t id, const FramegenInputs
 }
 
 void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage image, VkFormat format, std::uint32_t w,
-                           std::uint32_t h) {
+                           std::uint32_t h, std::uint32_t display_w, std::uint32_t display_h) {
     std::lock_guard<std::mutex> lk(g_hudless_mu);
     Hudless* slot = &g_hudless[0];
     for (Hudless& s : g_hudless) {
         if (s.display_va == display_va) { slot = &s; break; }
         if (s.id < slot->id) slot = &s;  // else the oldest
     }
-    *slot = Hudless{display_va, id, image, format, w, h};
+    *slot = Hudless{display_va, id, image, format, w, h, display_w ? display_w : w, display_h ? display_h : h};
     static bool told = false;
     if (!told) host_log("framegen: first HUD-less copy, frame %llu, display buffer 0x%llx %ux%u", static_cast<unsigned long long>(id),
                         static_cast<unsigned long long>(display_va), w, h);
@@ -374,13 +375,18 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    // The rectangles are the display buffer's; the copy is the HUD's target,
+    // which the display pass stretches over the whole display buffer.
+    const double kx = static_cast<double>(h.w) / h.display_w, ky = static_cast<double>(h.h) / h.display_h;
     VkImageBlit r{};
     r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    r.srcOffsets[0] = {src_x, src_y, 0};
-    r.srcOffsets[1] = {src_x + static_cast<std::int32_t>(src_w), src_y + static_cast<std::int32_t>(src_h), 1};
+    r.srcOffsets[0] = {static_cast<std::int32_t>(src_x * kx), static_cast<std::int32_t>(src_y * ky), 0};
+    r.srcOffsets[1] = {static_cast<std::int32_t>((src_x + static_cast<std::int32_t>(src_w)) * kx),
+                       static_cast<std::int32_t>((src_y + static_cast<std::int32_t>(src_h)) * ky), 1};
     r.dstOffsets[0] = {dst.x, dst.y, 0};
     r.dstOffsets[1] = {dst.x + static_cast<std::int32_t>(dst_size.width), dst.y + static_cast<std::int32_t>(dst_size.height), 1};
-    const bool same = src_w == dst_size.width && src_h == dst_size.height;
+    const bool same = r.srcOffsets[1].x - r.srcOffsets[0].x == static_cast<std::int32_t>(dst_size.width) &&
+                      r.srcOffsets[1].y - r.srcOffsets[0].y == static_cast<std::int32_t>(dst_size.height);
     vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, VK_IMAGE_LAYOUT_GENERAL, 1, &r,
                    same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
