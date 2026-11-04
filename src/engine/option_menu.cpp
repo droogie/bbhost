@@ -924,7 +924,7 @@ int g_keys_page = 0;  // kept across opens, as DS3 keeps its tab
 constexpr int kKeysRows = 1 + kBindPerPage;
 std::uint8_t g_keys_value[kKeysRows];
 char16_t g_keys_label[kKeysRows][48];
-char16_t g_keys_help[kKeysRows][160];
+char16_t g_keys_help[kKeysRows][224];
 char16_t g_keys_text[kKeysRows][64];
 struct KeysScreen {
     std::uint8_t* dialog = nullptr;
@@ -1014,8 +1014,12 @@ void keys_fill(int page) {
         }
         const BindingInfo& b = host_binding_info(keys_action(r));
         to_utf16(g_keys_label[r], b.label);
-        char help[160];
-        std::snprintf(help, sizeof(help), "%s Enter or click to rebind, Delete to clear.", b.help);
+        // Triangle is a menu's Initialize; on the keyboard, whatever Menu
+        // Toggle Status is bound to (R unless moved).
+        const char* init = host_key_name(host_binding_key(kBindMenuStatus));
+        char help[224];
+        std::snprintf(help, sizeof(help), "%s Enter or click to rebind (Escape cancels), Delete to clear, Triangle%s%s%s to reset.",
+                      b.help, init ? " (" : "", init ? init : "", init ? ")" : "");
         to_utf16(g_keys_help[r], help);
         keys_fill_value(r);
     }
@@ -1098,6 +1102,14 @@ void keys_update(int row, bool focused) {
             // Right, or Circle / a click, is the next page; Left the previous.
             keys_fill(g_keys.page + ((edge & 0x80u) ? -1 : 1));
             rows_changed = values_changed = true;
+        } else if (keys_row_bound(row) && (edge & 0x1000u)) {
+            // Triangle (a menu's Initialize): this action back to its default
+            // key and mouse button. Every row again: a key it took back
+            // changes the row that had it.
+            host_binding_reset(keys_action(row));
+            for (int r = 1; r < kKeysRows; ++r) keys_fill_value(r);
+            values_changed = true;
+            g_keys_save.store(true, std::memory_order_relaxed);
         } else if (keys_row_bound(row) && host_bind_take_clear_key()) {
             host_binding_clear(keys_action(row));
             keys_fill_value(row);

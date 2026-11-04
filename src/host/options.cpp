@@ -456,9 +456,11 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kUpscaler},
-    // Upscaling quality (kUpscaleQuality) has no row until the render size it
-    // asks for exists (the decoupled render size: build/HANDOFF-upscaler.md).
+    // The preset row (preset_row): DLSS preset, or for FSR its preset - the
+    // Upscaling quality setting, which has no row of its own - greyed with
+    // Upscaling off. Then the Resolution the upscaler brings the 3D back to.
     {Row::Option, nullptr, kDlssPreset},
+    {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -466,7 +468,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
-    {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
@@ -1440,8 +1441,12 @@ void change(int id, int index) {
 // scale's steps; the note in the bubble. A setting read only as the game
 // starts says so under its label (the resolution only when it cannot change
 // now).
-void setting_row(int id) {
+// `label` and `note`, when given, stand for the setting's own: one row can
+// show another face (the upscaler's preset row, preset_row).
+void setting_row(int id, const char* label = nullptr, const char* note = nullptr) {
     const Setting& s = g_set[id];
+    if (!label) label = s.label;
+    if (!note) note = s.note;
     const float sc = ui::scale();
     const int n = static_cast<int>(s.values.size());
     const int cur = std::clamp(shown_index(id), 0, n - 1);
@@ -1454,7 +1459,7 @@ void setting_row(int id) {
     }
     if (n == 2 && on_i >= 0 && off_i >= 0) {
         bool v = cur == on_i;
-        if (ui::toggle_row(s.label, restart ? "Applies at the next start" : nullptr, &v, s.note)) change(id, v ? on_i : off_i);
+        if (ui::toggle_row(label, restart ? "Applies at the next start" : nullptr, &v, note)) change(id, v ? on_i : off_i);
         ImGui::PopID();
         return;
     }
@@ -1463,13 +1468,13 @@ void setting_row(int id) {
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(s.label);
+    ImGui::TextUnformatted(label);
     if (restart) {
         ImGui::SameLine();
         ui::pill("next start", ui::kWarn, ui::alpha(ui::kWarn, 38));
     }
     ImGui::EndGroup();
-    if (s.note) ui::tooltip_for_item(s.label, s.note);
+    if (note) ui::tooltip_for_item(label, note);
     ImGui::SameLine();
     ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y));
     int want = cur;
@@ -1506,11 +1511,11 @@ void setting_row(int id) {
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - sw, p.y));
         ImGui::SetNextItemWidth(sw - ui::reset_width());
         ImGui::SliderInt("##v", &want, 0, n - 1, shown.c_str(), ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
-        if (s.note) ui::tooltip_for_item(s.label, s.note);
+        if (note) ui::tooltip_for_item(label, note);
         const int def = g_default_index[static_cast<std::size_t>(id)];
         if (ui::reset_button("##reset", cur == def)) want = def;
     }
-    if (s.note && id != kShaders && !slider) ui::tooltip_for_item(s.label, s.note);  // a slider's is on the slider, not its reset
+    if (note && id != kShaders && !slider) ui::tooltip_for_item(label, note);  // a slider's is on the slider, not its reset
     if (want != cur && want >= 0 && want < n) change(id, want);
     ImGui::PopID();
 }
@@ -1635,6 +1640,25 @@ const char* host_options_page_blurb(int page) {
     return page >= 0 && page < host_options_page_count() ? pages()[static_cast<std::size_t>(page)].blurb : "";
 }
 
+// The upscaler's preset row, which shows what the chosen upscaler takes:
+// DLSS's model (K, J, L, M), or for FSR 4 and FSR 3 the render size against
+// the Resolution (Native AA, Quality, Balanced, Performance - Upscaling
+// quality, upscale_quality); with Upscaling off, DLSS's, greyed.
+void preset_row() {
+    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 4, FSR 3, DLSS
+    if (u == 1 || u == 2) {
+        setting_row(kUpscaleQuality, "FSR preset",
+                    "How much smaller than the Resolution the 3D is drawn before FSR brings it back: Native AA draws it "
+                    "full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half "
+                    "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution.");
+        return;
+    }
+    ImGui::BeginDisabled(u == 0);
+    setting_row(kDlssPreset);
+    ImGui::EndDisabled();
+    if (u == 0) ui::tooltip_for_item(g_set[kDlssPreset].label, "Choose an upscaler under Upscaling first.");
+}
+
 void host_options_draw_page(int page) {
     if (page < 0 || page >= host_options_page_count()) return;
     const OptionsPage& pg = pages()[static_cast<std::size_t>(page)];
@@ -1647,7 +1671,8 @@ void host_options_draw_page(int page) {
         if (g_setup_page && g_rows[r].setting == kShaders) continue;
         if (!first) row_rule();
         first = false;
-        setting_row(g_rows[r].setting);
+        if (g_rows[r].setting == kDlssPreset) preset_row();
+        else setting_row(g_rows[r].setting);
         ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
     }
     ui::card_end();

@@ -53,7 +53,8 @@ bool cell(const char* id, const char* text, bool choosing, float w, bool enabled
     ImGui::PushID(id);
     if (!enabled) ImGui::BeginDisabled();
     if (choosing) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    const bool clicked = ImGui::Button(choosing ? "Press..." : text, ImVec2(w, 0.0f));
+    const bool clicked = ImGui::Button(choosing ? (std::strcmp(id, "##pad") == 0 ? "Press a button" : "Press a key") : text,
+                                       ImVec2(w, 0.0f));
     if (choosing) ImGui::PopStyleColor();
     if (!enabled) ImGui::EndDisabled();
     ImGui::PopID();
@@ -84,36 +85,52 @@ void controls_page_draw(bool setup_window) {
     }
     ImGui::Spacing();
 
-    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 150.0f * sc);
-    ImGui::TextDisabled("Click a key, mouse or controller box and press the new one; Escape keeps the old. A right-click "
-                        "clears a key or a mouse button. The controller's buttons move in play only: in menus each "
-                        "button is itself, so Confirm and Back stay where they were.");
-    ImGui::PopTextWrapPos();
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 140.0f * sc + ImGui::GetCursorPosX());
-    if (ui::ghost_button("Reset all", ImVec2(140.0f * sc, 0.0f))) ImGui::OpenPopup("##reset_all");
-    ui::tooltip_for_item("Reset all", "Every key, mouse button and controller button back to its default (bbhost.toml's [keys] for "
-                                      "the keys and mouse).");
+    // The bindings' bar: Reset all on the left, and beside it how to choose a
+    // binding - or, while one is being chosen, which and how to back out.
+    const int key_choosing = host_bind_capturing(), pad_choosing = host_pad_capturing();
+    ui::caption("BINDINGS");
+    if (ui::ghost_button("Reset all to defaults", ImVec2(0.0f, 0.0f))) ImGui::OpenPopup("##reset_all");
+    ui::tooltip_for_item("Reset all to defaults", "Every key, mouse button and controller button back to its default "
+                                                  "(bbhost.toml's [keys] for the keys and the mouse).");
     if (ImGui::BeginPopup("##reset_all")) {
-        ImGui::TextUnformatted("Put every binding back?");
-        if (ui::primary_button("Reset", ImVec2(110.0f * sc, 0.0f))) {
+        ImGui::TextUnformatted("Put every binding back to its default?");
+        if (ui::primary_button("Reset all", ImVec2(130.0f * sc, 0.0f))) {
             host_bindings_reset_all();
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ui::ghost_button("Cancel", ImVec2(110.0f * sc, 0.0f))) ImGui::CloseCurrentPopup();
+        if (ui::ghost_button("Cancel", ImVec2(130.0f * sc, 0.0f))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+    ImGui::SameLine(0.0f, 14.0f * sc);
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(0.0f);
+    if (key_choosing >= 0) {
+        ImGui::Text("%s: press the new key or mouse button. Escape cancels.", host_binding_info(key_choosing).label);
+    } else if (pad_choosing >= 0) {
+        ImGui::Text("%s: press the new controller button. Escape cancels.", host_binding_info(pad_choosing).label);
+    } else {
+        ImGui::TextDisabled("Click a box, then press the new key, mouse button or controller button; Escape cancels. "
+                            "Right-click clears a key or a mouse button, and the arrow at the end of a line puts that "
+                            "action back to its default. The controller's buttons move in play only: in menus each is "
+                            "itself, so Confirm and Back stay where they were.");
+    }
+    ImGui::PopTextWrapPos();
     ImGui::Spacing();
 
-    const int key_choosing = host_bind_capturing(), pad_choosing = host_pad_capturing();
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX | ImGuiTableFlags_SizingFixedFit;
     if (!ImGui::BeginTable("##controls", 5, flags)) return;
-    const float cw = 170.0f * sc;
+    // The three binding columns share what the action's name and the reset
+    // leave, up to 170 each: a narrow menu or a large text size keeps every
+    // column, the reset's too, on the page.
+    const float reset_w = std::max(ui::reset_width(), ImGui::CalcTextSize("Reset").x);
+    const float spare = ImGui::GetContentRegionAvail().x - 150.0f * sc - reset_w - ImGui::GetStyle().CellPadding.x * 10.0f;
+    const float cw = std::clamp(spare / 3.0f, 72.0f * sc, 170.0f * sc);
     ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("Keyboard", ImGuiTableColumnFlags_WidthFixed, cw);
     ImGui::TableSetupColumn("Mouse", ImGuiTableColumnFlags_WidthFixed, cw);
     ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthFixed, cw);
-    ImGui::TableSetupColumn("##reset", ImGuiTableColumnFlags_WidthFixed, ui::reset_width());
+    ImGui::TableSetupColumn("Reset", ImGuiTableColumnFlags_WidthFixed, reset_w);
     ImGui::TableHeadersRow();
     for (const Section& sec : kSections) {
         ImGui::TableNextRow();
@@ -165,7 +182,13 @@ void controls_page_draw(bool setup_window) {
             }
 
             ImGui::TableSetColumnIndex(4);
-            if (ui::reset_button("##reset", host_binding_at_default(a))) host_binding_reset(a);
+            const bool at_default = host_binding_at_default(a);
+            ImGui::BeginDisabled(at_default);
+            if (ui::icon_button("##reset", ui::Icon::Refresh, 0.0f)) host_binding_reset(a);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+                ui::tooltip(info.label, at_default ? "Its default key, mouse button and controller button."
+                                                   : "Back to its default key, mouse button and controller button.");
             ImGui::PopID();
         }
     }
