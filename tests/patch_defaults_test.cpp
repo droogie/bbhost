@@ -38,7 +38,6 @@ const std::map<std::string, std::string> kOnByDefault = {
     {"easier-run-range", ""},
     {"ingame-post-processors", "streaming.all_post_processors"},
     {"old-hunters", ""},
-    {"performance-v3-decals-on", ""},
     {"quick-reentry", "loading.quick_reentry"},
 };
 

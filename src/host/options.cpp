@@ -93,6 +93,7 @@ enum SettingId {
     kSaturation,
     kFog,
     kModelDetail,
+    kPerformancePatch,
     kSsr,
     kSsrFade,
     kResolution,
@@ -273,6 +274,15 @@ Setting g_set[kSettingCount] = {
     // visibly simpler up close).
     {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
+    // Kyo's Performance Patch v3 (engine/patch_manifest.cpp performance_manifest),
+    // on: the game's own debug parameters and render sizes set for speed, the
+    // velocity map kept; which were the patch files performance-v3-decals-on
+    // (on by default) and performance-v3-velomap. A bbhost.toml that turned
+    // the former off and not the latter on seeds Off (host_options_load).
+    {"performance_patch", "Performance patch", {"Off", "On"}, 1,
+     "Requires a restart. Kyo's Performance Patch v3: the game's own render and debug settings tuned for frame rate, "
+     "without changing how it looks. Motion blur's velocity map is kept.",
+     true},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
     // game's own half size. Its targets are made as the game starts. The
@@ -402,6 +412,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kPerformancePatch},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kSsrFade},
     {Row::Option, nullptr, kResolution},
@@ -893,6 +904,7 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
+    h.performance_patch = on_of(kPerformancePatch);
     h.ssr = on_of(kSsr);
     h.ssr_fade = on_of(kSsrFade);
     h.skip_logos = on_of(kSkipLogos);
@@ -971,6 +983,18 @@ void host_options_load() {
     // a bbhost.toml that turned it on keeps them on until the player chooses.
     if (const std::string v = config_value("patches.screen-space-reflections"); !v.empty())
         g_set[kSsr].index = v == "false" || v == "0" ? 0 : 1;
+    {
+        // Performance Patch v3 was two patch files, the Decals On one on by default.
+        auto off = [](const char* name) {
+            const std::string v = config_value(std::string("patches.") + name);
+            return v == "false" || v == "0";
+        };
+        auto on = [](const char* name) {
+            const std::string v = config_value(std::string("patches.") + name);
+            return !v.empty() && v != "false" && v != "0";
+        };
+        if (off("performance-v3-decals-on") && !on("performance-v3-velomap")) g_set[kPerformancePatch].index = 0;
+    }
     // The PC enhancements seed from bbhost.toml's [world] (all on unless it
     // says otherwise); the options file then holds the player's choice, and a
     // BBHOST_* switch still wins over both (config_set_enhancements).

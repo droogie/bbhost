@@ -294,8 +294,6 @@ wants one keeps its file in their own patches folder.
 
 | File | Patch |
 |---|---|
-| `performance-v3-decals-on.toml` | **Performance Patch (Perf Increase)**: Modifies some of the game's debug parameters for better performance without affecting visuals (Kyo). (on by default; one of performance v3; at the next start) |
-| `performance-v3-velomap.toml` | **Performance Patch v3 (Velomap + Camera Blur)**: Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo) (off by default; one of performance v3; at the next start) |
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
 | `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
 | `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |

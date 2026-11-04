@@ -73,6 +73,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "streaming.all_post_processors") return config().all_post_processors;
     if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > STARTUP, read once
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
+    if (option == "graphics.performance_patch") return host_settings().performance_patch;  // F10 > GRAPHICS, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "graphics.ssr_fade") return host_settings().ssr && host_settings().ssr_fade;
     *known = false;
@@ -251,6 +252,34 @@ Manifest performance_mode_manifest() {
     return m;
 }
 
+// performance, Performance patch (graphics.performance_patch, on): Kyo's
+// Performance Patch v3 (Velomap + Camera Blur, Decals On) from his shadPS4
+// list, site for site, which were patches/performance-v3-velomap.toml and,
+// without the velocity map, performance-v3-decals-on.toml - less the camera
+// blur's force (0x26c265d 00 -> 01): the Motion blur setting decides it. The
+// velocity map stays, at 640x360 (0x26c3de4/0x26c3df0), with motion blur's
+// half and quarter depth at 640x360 and 320x180 (0x125b1a3/0x125b1d6, which
+// Screen space reflections puts back at the game's sizes when it is on). A
+// 2026-10-03 review of it, entry by entry, found parts emulator-specific,
+// parts that leave SSAO, depth of field and distortion reading stale buffers
+// (the skipped depth and scene copies), and parts it judged harmful (the file
+// cache's access-time skips, a condition wait made a `ret`, a cave calling
+// with a misaligned stack, the assert and DL_PANIC suppression). It is kept
+// byte for byte as players have run it, until each part is done natively.
+Manifest performance_manifest() {
+    Manifest m;
+    m.name = "performance";
+    m.title = "Performance patch";
+    m.eboot = kEboot109Sha256;
+    m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's force";
+    m.option = "graphics.performance_patch";
+    m.order = 21;
+    m.sites = {
+#include "engine/performance_v3_sites.inc"
+    };
+    return m;
+}
+
 // ssr, Screen space reflections (graphics.ssr): Kyo's 1.09 patch from his
 // shadPS4 list ("Enable Screen Space Reflections (READ NOTE)"), site for site,
 // which was patches/screen-space-reflections.toml. The scene context's
@@ -341,16 +370,20 @@ std::vector<Manifest> built_in_manifests() {
     std::vector<Manifest> out;
     out.push_back(std::move(m));
     out.push_back(performance_mode_manifest());
+    out.push_back(performance_manifest());
     out.push_back(ssr_manifest());
     out.push_back(ssr_fade_manifest());
     return out;
 }
 
 // Patch files a setting replaced: the Screen Space Reflections patches (the
-// game's half size and the quarter-size variant) are the Graphics page's
-// Screen space reflections now. A package unpacked over an older one still
-// has them in its patches folder; they are passed over, not applied twice.
-bool retired_file(const std::string& file) { return file.rfind("screen-space-reflections", 0) == 0; }
+// game's half size and the quarter-size variant) and Performance Patch v3's
+// variants are the Graphics page's Screen space reflections and Performance
+// patch now. A package unpacked over an older one still has them in its
+// patches folder; they are passed over, not applied twice.
+bool retired_file(const std::string& file) {
+    return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0;
+}
 
 // By file name, a later directory's file replacing an earlier one's.
 std::map<std::string, std::string> manifest_files(const std::vector<std::string>& dirs) {

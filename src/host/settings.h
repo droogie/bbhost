@@ -76,6 +76,9 @@ struct HostSettings {
     // ssr-fade-to-viewer, read once as the game starts): the reflection pass
     // on, and its Fade To Viewer at -10000 instead of the game's -0.8.
     bool ssr = false;
+    // Kyo's Performance Patch v3 (engine/patch_manifest.cpp's performance,
+    // read once as the game starts).
+    bool performance_patch = true;
     bool ssr_fade = true;
 
     // Startup (read once by the loader)
