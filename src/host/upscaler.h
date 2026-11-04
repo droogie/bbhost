@@ -1,0 +1,47 @@
+#pragma once
+// The temporal upscalers - NVIDIA DLSS and AMD FSR 3 / 4 - through Numity1504's
+// upscaler_bridge.dll (third_party/upscaler_bridge: its C API, MIT), loaded at
+// run time when it sits beside bbhost.exe, so bbhost needs no vendor SDK to
+// build. The bridge holds the calls into NVIDIA's and AMD's code; the files
+// those come in (nvngx_dlss.dll, amd_fidelityfx_loader_vk.dll,
+// amd_fidelityfx_upscaler_vk.dll) sit beside it, and a missing one only turns
+// its method off. Windows only; elsewhere every call is a no-op and nothing is
+// available.
+//
+// The order (host/gpu.cpp init_locked, for the real instance and device only -
+// never the throwaway probe instances): upscaler_open before Vulkan, then
+// upscaler_prepare_instance / upscaler_instance_done around vkCreateInstance,
+// upscaler_prepare_device / upscaler_device_done around vkCreateDevice, then
+// upscaler_attach. A failed create with the bridge's copy is made again with
+// the host's own (the bridge's rule): the method that needed it is then off.
+//
+// BBHOST_UPSCALER=0: the bridge is not loaded at all.
+
+#include <vulkan/vulkan.h>
+
+#include <cstdint>
+#include <string>
+
+// Loads the bridge and opens its context; false (and nothing else happens)
+// without it.
+bool upscaler_open();
+// What to give vkCreateInstance: `in` itself, or the bridge's copy with what
+// NGX needs. upscaler_instance_done with the result; a failure with a copy is
+// made again with `in` by the caller (upscaler_instance_retry says whether).
+const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in);
+void upscaler_instance_done(VkResult r);
+bool upscaler_instance_retry(const VkInstanceCreateInfo* in, const VkInstanceCreateInfo* used);
+// The same for vkCreateDevice: the host's feature structures in `in`'s chain
+// may be changed for the call, and are put back by upscaler_device_done.
+const VkDeviceCreateInfo* upscaler_prepare_device(VkInstance instance, VkPhysicalDevice phys, const VkDeviceCreateInfo* in);
+void upscaler_device_done(VkResult r);
+// After the device: the vendors' runtimes started, and what can run logged.
+void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t frames_in_flight);
+
+// What can run here, as the bridge says (attach first).
+struct UpscalerCaps {
+    bool loaded = false;  // the bridge is in and attached
+    bool dlss = false, fsr = false, fsr4 = false;
+    std::string dlss_version, fsr_versions, dlss_reason, fsr_reason;
+};
+UpscalerCaps upscaler_caps();

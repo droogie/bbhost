@@ -28,6 +28,7 @@
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
 #include "host/options.h"
+#include "host/upscaler.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -3952,7 +3953,14 @@ bool init_locked() {
     ici.ppEnabledExtensionNames = iext.data();
     ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
     ici.ppEnabledLayerNames = layers.data();
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) {
+    // The upscaler bridge (host/upscaler.h) adds what DLSS needs to the
+    // instance and the device; without it, or when that fails, ours as asked.
+    upscaler_open();
+    const VkInstanceCreateInfo* ici_use = upscaler_prepare_instance(&ici);
+    VkResult ir = vkCreateInstance(ici_use, nullptr, &g.instance);
+    upscaler_instance_done(ir);
+    if (ir != VK_SUCCESS && upscaler_instance_retry(&ici, ici_use)) ir = vkCreateInstance(&ici, nullptr, &g.instance);
+    if (ir != VK_SUCCESS) {
         host_log("gpu: no Vulkan 1.3 instance%s", g_validate ? " (validation layer requested)" : "");
         return false;
     }
@@ -4679,7 +4687,12 @@ bool init_locked() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<std::uint32_t>(dext.size());
     dci.ppEnabledExtensionNames = dext.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) == VK_SUCCESS && g.has_push_descriptor) {
+    const VkDeviceCreateInfo* dci_use = upscaler_prepare_device(g.instance, g.phys, &dci);
+    VkResult dr = vkCreateDevice(g.phys, dci_use, nullptr, &g.device);
+    upscaler_device_done(dr);
+    if (dr != VK_SUCCESS && dci_use != &dci) dr = vkCreateDevice(g.phys, &dci, nullptr, &g.device);
+    if (dr == VK_SUCCESS) upscaler_attach(g.instance, g.phys, g.device, kSlots + 2);
+    if (dr == VK_SUCCESS && g.has_push_descriptor) {
         g.cmd_push_descriptor_set =
             reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
         if (!g.cmd_push_descriptor_set) g.has_push_descriptor = false;

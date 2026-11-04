@@ -1,0 +1,5 @@
+upscaler_bridge.h from Numity1504's upscaler_bridge 1.0.0 (BBsuite), MIT (LICENSE.txt):
+the C API of upscaler_bridge.dll, which bbhost loads at run time when it sits
+beside bbhost.exe (src/host/upscaler.cpp). The dll and the vendor files it
+calls (nvngx_dlss.dll, amd_fidelityfx_loader_vk.dll,
+amd_fidelityfx_upscaler_vk.dll) are not in this repository.
