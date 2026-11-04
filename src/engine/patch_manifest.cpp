@@ -494,13 +494,14 @@ std::vector<Manifest> built_in_manifests() {
 // (the game's half size and the quarter-size variant), Performance Patch v3's
 // variants and the uncapped field of view are the Graphics page's Screen
 // space reflections, the built-in performance patch and the Field of view
-// setting, the HD Motion Blur patches are HD motion blur, and Unlock Game
-// Region is all-languages without its online cost. A
+// setting, the HD Motion Blur patches are HD motion blur, Unlock Game Region
+// is all-languages without its online cost, and the Intel Black Tonemap Fix's
+// six bytes are the performance patch's own (always on). A
 // package unpacked over an older one still has them in its patches folder;
 // they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
     return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
-           file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml";
+           file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.

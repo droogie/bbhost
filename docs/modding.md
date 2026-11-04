@@ -288,8 +288,9 @@ Increased Graphics Heap Sizes (bbhost grows that heap for the render size),
 Faster loading screens (bbhost runs loading screens unpaced), Skip Intro
 (Skip company logos, built into bbhost) and Unlock Game Region (System >
 Language lists all 21 text languages on every disc, built into bbhost
-without changing the region, so online play keeps working) - and the ones a
-release does not
+without changing the region, so online play keeps working), and the Intel
+Black Tonemap Fix (its bytes are the built-in performance patch's, always on)
+- and the ones a release does not
 carry: the debug patches (camera, dash, menu, Enemy Control), the rally and
 weapon-size changes, and the emulator workarounds and extras (FMOD Crash Fix,
 the Intel SFX workaround, Disable HTTP Requests, Disable Facegen, Enable TAA,
@@ -303,7 +304,6 @@ wants one keeps its file in their own patches folder.
 | `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
-| `intel-tonemap-fix.toml` | **Intel Black Tonemap Fix**: Fixes the black tonemap colours, most noticeable in the DLC's areas, when using an Intel CPU. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
 | `lower-object-physics.toml` | **Lower object/corpse physics**: Corpses resist being moved by the player or anything else. (off by default; one of object physics) |
 | `disable-camera-auto-rotation.toml` | **Disable Camera Auto Rotation via Movement**: The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work. (off by default; at the next start) |

@@ -267,20 +267,6 @@ Setting g_set[kSettingCount] = {
     // (host/shader_patch.h).
     {"motion_blur", "Motion blur", {"On", "Off"}, 0,
      "The blur on fast camera and character movement.", false},
-    // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
-    // hd_motion_blur_manifest): their buffers at a share of the render size
-    // rather than at one fixed size each. The targets are made as the game
-    // starts. A bbhost.toml that turned one of the old files on seeds it
-    // (host_options_load).
-    {"hd_motion_blur", "HD motion blur", {"Off", "On"}, 0,
-     "Requires a restart. Motion blur's velocity map and the depth it blurs with at the HD motion blur resolution "
-     "below instead of a fixed 640x360, with the camera's own blur on: cleaner, steadier blur. Costs GPU time and "
-     "video memory, more the larger. Shows only with Motion blur on.",
-     true},
-    {"hd_motion_blur_res", "HD motion blur resolution", {"Quarter", "Half", "Full"}, 2,
-     "Requires a restart. HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
-     "size) or Full. It follows the render resolution, Resolution and upscaling both.",
-     true},
     {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
      "The game's own AA pass.", false},
     {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
@@ -323,6 +309,20 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Wet streets, water and polished floors reflect what is on screen, at the game's own half "
      "size, without fading out where they face the camera. Costs GPU time.",
      true},
+    // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
+    // hd_motion_blur_manifest): their buffers at a share of the render size
+    // rather than at one fixed size each. The targets are made as the game
+    // starts. A bbhost.toml that turned one of the old files on seeds it
+    // (host_options_load).
+    {"hd_motion_blur", "HD motion blur", {"Off", "On"}, 0,
+     "Requires a restart. Motion blur's velocity map and the depth it blurs with at the HD motion blur resolution "
+     "below instead of a fixed 640x360, with the camera's own blur on: cleaner, steadier blur. Costs GPU time and "
+     "video memory, more the larger. Shows only with Motion blur on.",
+     true},
+    {"hd_motion_blur_res", "HD motion blur resolution", {"Quarter", "Half", "Full"}, 2,
+     "Requires a restart. HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
+     "size) or Full. It follows the render resolution, Resolution and upscaling both.",
+     true},
     // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
     // picture in place of the game's after the 3D, before the post effects.
     // Off by default; the order of the values is the settings object's
@@ -335,6 +335,11 @@ Setting g_set[kSettingCount] = {
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
     // Performance 1/2 each way (host/upscaler.h).
+    {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
+     "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full "
+     "size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, "
+     "softer. The menus, the HUD and the post effects stay at the Resolution.",
+     false},
     // DLSS's render preset (NGX's DLSS_Hint_Render_Preset for every quality;
     // needs upscaler_bridge 1.1.0 and nvngx_dlss 310 or newer): K the
     // transformer model and NVIDIA's own for DLAA, Quality and Balanced, J
@@ -343,11 +348,6 @@ Setting g_set[kSettingCount] = {
     {"dlss_preset", "DLSS preset", {"K", "J", "L", "M"}, 0,
      "Which of DLSS's models runs. K (recommended): the transformer model, the sharpest. J: like K, a little less "
      "ghosting, a little more flicker. L: made for the lowest render sizes. M: made for Performance. DLSS only.",
-     false},
-    {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
-     "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full "
-     "size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, "
-     "softer. The menus, the HUD and the post effects stay at the Resolution.",
      false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
