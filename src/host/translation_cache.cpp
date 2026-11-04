@@ -1284,7 +1284,9 @@ bool velo_rebuilt(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptio
     if (!velo || lift_stage_tag(lifted) != "ps") return false;
     static std::mutex mu;
     static std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> done;
-    const std::uint64_t hash = lift_hash(lifted);
+    // Each bit depth its own module: the setting changes while the game runs,
+    // and render.cpp keys the velocity shaders' pipelines by it.
+    const std::uint64_t hash = lift_hash(lifted) ^ (0x9e3779b97f4a7c15ull * static_cast<std::uint64_t>(bits));
     {
         std::lock_guard<std::mutex> lk(mu);
         if (const auto it = done.find(hash); it != done.end()) {

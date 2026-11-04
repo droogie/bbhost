@@ -49,6 +49,10 @@ std::string graphics_glare_report();
 // hook): its constructor turns both on, so it is given the settings at its
 // next view, even where an earlier context stood at the same address.
 void graphics_scene_context_made(std::uint64_t ctx);
+// Screen space reflections' patch put in while the game runs (host/options.cpp):
+// its Fade To Viewer into the live graphics manager, as its constructor would
+// have taken it from the patched code.
+void graphics_ssr_live_in();
 
 // A hook at a guest function's entry (core/thunk.h's prologue stub): `host`
 // runs with the argument registers first. `prologue` is the `n` (>= 14) bytes

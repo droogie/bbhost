@@ -65,6 +65,7 @@ std::mutex g_live_mu;
 std::vector<Loaded> g_loaded;         // under g_live_mu
 GuestMemory* g_mem = nullptr;         // under g_live_mu
 std::set<std::string> g_deferred_to;  // under g_live_mu
+std::set<std::string> g_built_in;     // bbhost's own that no file replaced (under g_live_mu)
 
 
 // The config switches a manifest may name.
@@ -247,12 +248,13 @@ Manifest performance_mode_manifest() {
     m.order = 11;
     const std::vector<std::uint8_t> one = {0x01}, zero = {0x00};
     m.sites.push_back(Site{"ssao", 0x026c2548, one, zero, true, {}});
-    // Motion blur's flag also draws the velocity map, which an upscaler's
-    // motion takes the player's and the enemies' own movement from
-    // (host/upscale_pass.cpp): with one chosen the flag stays and the blur is
-    // taken off the Motion blur setting's way (its shader patched away, the
-    // dilation skipped - host/shader_patch.cpp, engine/graphics_patch.cpp).
-    if (!host_opt_upscaler_chosen()) m.sites.push_back(Site{"motion-blur", 0x026c2549, one, zero, true, {}});
+    // Motion blur's flag also draws the velocity map, which an upscaler's or
+    // frame generation's motion takes the player's and the enemies' own
+    // movement from (host/upscale_pass.cpp): with either the flag stays and
+    // the blur is taken off the Motion blur setting's way (its shader patched
+    // away, the dilation skipped - host/shader_patch.cpp,
+    // engine/graphics_patch.cpp, which also follows a later change of either).
+    if (!host_opt_motion_wanted()) m.sites.push_back(Site{"motion-blur", 0x026c2549, one, zero, true, {}});
     m.sites.push_back(Site{"anti-aliasing", 0x026c254a, one, zero, true, {}});
     m.sites.push_back(Site{"dynamic-light-shadow", 0x026c2538, one, zero, true, {}});
     m.sites.push_back(Site{"dof", 0x025d7bbc, {0x0f, 0x84, 0xde, 0x00, 0x00, 0x00}, {0xe9, 0xdf, 0x00, 0x00, 0x00, 0x90}, true, {}});
@@ -345,7 +347,9 @@ Manifest ssr_manifest() {
     site("depth-quarter-width", 0x0125b1d6, quarter_w, quarter_w);
     site("depth-quarter-height", 0x0125b1de, quarter_h, quarter_h);
     site("depth-format", 0x0125b1bf, {0x14}, {0x28});
-    site("step-scale", 0x012a8cfd, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x00});
+    // BBHOST_SSR_STEP=game: the game's own 1.0 kept (a test against the list's).
+    if (const char* e = std::getenv("BBHOST_SSR_STEP"); !(e && std::strcmp(e, "game") == 0))
+        site("step-scale", 0x012a8cfd, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x00});
     site("call-a", 0x026a10c0, {0xe8, 0xbb, 0xe0, 0xfe, 0xff}, {0xe8, 0xbb, 0xe0, 0xfe, 0xff});
     site("call-b", 0x026a2829, {0xe8, 0x52, 0xc9, 0xfe, 0xff}, {0xe8, 0x52, 0xc9, 0xfe, 0xff});
     site("size-a", 0x026c429a, {0x44, 0x89, 0xe1}, {0x6a, 0x0a, 0x59});  // mov ecx, r12d -> push 10; pop rcx
@@ -709,7 +713,10 @@ void patch_manifests_apply(ElfImage* image) {
     }
     for (Manifest& b : built_in_manifests()) {
         if (b.eboot != image->sha256) continue;
-        if (std::none_of(read.begin(), read.end(), [&](const Manifest& m) { return m.name == b.name; })) read.push_back(std::move(b));
+        if (std::none_of(read.begin(), read.end(), [&](const Manifest& m) { return m.name == b.name; })) {
+            g_built_in.insert(b.name);
+            read.push_back(std::move(b));
+        }
     }
     // Which are on, first: a site may step aside for another patch (yields).
     std::vector<Manifest> chosen;
@@ -1056,6 +1063,49 @@ bool patch_manifest_set_live(const std::string& name, bool on, std::string* why)
     if (!l) w = "it was not read for this eboot at the start";
     const bool ok = l && (on ? put_in_locked(*l, &w) : take_out_locked(*l, &w));
     if (!ok) host_log("patch: %s: %s at the next start - %s", name.c_str(), on ? "on" : "off", w.c_str());
+    if (why) *why = w;
+    return ok;
+}
+
+bool patch_manifest_refresh_live(const std::string& name, bool on, bool* changed, std::string* why) {
+    if (changed) *changed = false;
+    // Made again from the settings now, outside the lock (the settings take their own).
+    Manifest fresh;
+    bool found = false;
+    for (Manifest& b : built_in_manifests()) {
+        if (b.name != name) continue;
+        fresh = std::move(b);
+        found = true;
+    }
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    Loaded* l = find_locked(name);
+    std::string w;
+    if (!l) w = "it was not read for this eboot at the start";
+    else if (!found || !g_built_in.count(name)) w = "a patch file of that name stands in for bbhost's own";
+    else if (!g_mem) w = "the game's code is not loaded";
+    bool ok = w.empty();
+    if (ok) {
+        // The game's bytes under its old sites and its new ones, before and after.
+        std::vector<std::pair<std::uint64_t, std::size_t>> spans;
+        for (const Site& s : l->m.sites) spans.emplace_back(s.address, s.bytes.size());
+        for (const Site& s : fresh.sites) spans.emplace_back(s.address, s.bytes.size());
+        const auto bytes_now = [&] {
+            std::vector<std::uint8_t> v;
+            for (const auto& [at, n] : spans) {
+                const auto* p = static_cast<const std::uint8_t*>(guest_ptr(*g_mem, g_mem->slide + (at - kPreferredGuestSlide)));
+                v.insert(v.end(), p, p + n);
+            }
+            return v;
+        };
+        const std::vector<std::uint8_t> before = bytes_now();
+        if (l->applied) ok = take_out_locked(*l, &w);
+        if (ok) {
+            l->m.sites = std::move(fresh.sites);
+            if (on) ok = put_in_locked(*l, &w);
+        }
+        if (changed) *changed = bytes_now() != before;
+    }
+    if (!ok) host_log("patch: %s: made again %s at the next start - %s", name.c_str(), on ? "on" : "off", w.c_str());
     if (why) *why = w;
     return ok;
 }

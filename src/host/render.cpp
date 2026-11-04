@@ -13,6 +13,7 @@
 #include "host/copy_census.h"
 #include "host/full_write.h"
 #include "host/gpu_internal.h"
+#include "host/options.h"
 #include "host/upscaler.h"
 #include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
@@ -312,7 +313,8 @@ struct GfxPipeline {
     // velocity is written with is that shader's constant `velo_dw` (and the
     // next) of constant buffer `velo_cb`. 0: none, 1: the camera's full-screen
     // pass, 2: a mesh's own, 3: the camera's pass with the camera still (no
-    // motion written, no scale).
+    // motion written, no scale), 4: the motion blur's dilation (it reads the
+    // map: the upscaler takes its copy first).
     std::uint8_t velo = 0, velo_cb = 0, velo_dw = 0;
     bool velo_known = false;  // classified (velo_classify)
     // A tessellated draw's generated vertex and control stages. The
@@ -6536,8 +6538,23 @@ void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
     }
 }
 
+// The velocity shaders rebuilt motion vectors rewrite (host/translation_cache.cpp
+// velo_rebuilt): their pipelines and lifted stages are keyed by the Motion
+// vectors setting as it is now (8, 16, 32; 0, the game's own, adds nothing),
+// so a change while the game runs builds them again and a change back finds
+// the earlier ones.
+std::uint32_t velo_variant(const std::string& ps_name) {
+    static const char* const kVelo[] = {"749e4f9e", "b25e4fae", "34bc187c", "d79de945"};  // GXFlver_{Col,Col_[A],Emi,Water}_Velo
+    for (const char* v : kVelo) {
+        if (ps_name == v) return static_cast<std::uint32_t>(host_opt_motion_rebuilt_bits());
+    }
+    return 0;
+}
+
 // A velocity map pass's pipeline (GfxPipeline::velo), by its pixel shader:
-// the velocity map's writers (MotionBlurWriteCMBVelocity, GXFlver_*_Velo).
+// the velocity map's writers (MotionBlurWriteCMBVelocity, GXFlver_*_Velo) and
+// the motion blur's dilation (MotionBlurDilateVelocity), which reads the map
+// and writes its spread back into it.
 void velo_classify(GfxPipeline& pl) {
     pl.velo_known = true;
     static const struct {
@@ -6550,6 +6567,7 @@ void velo_classify(GfxPipeline& pl) {
         {"b25e4fae", 2, 2, 0},   // GXFlver_Col_Velo_[A]
         {"34bc187c", 2, 0, 0},   // GXFlver_Emi_Velo
         {"d79de945", 2, 2, 28},  // GXFlver_Water_Velo
+        {"abf92450", 4, 0, 0},   // MotionBlurDilateVelocity: the map spread, into the work target and back
     };
     const std::size_t plus = pl.name.find('+');
     if (plus == std::string::npos) return;
@@ -6631,7 +6649,9 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         const PsStageInputs ps_in{&ps_words, s.ps_rsrc1, s.ps_rsrc2, s.ps_input_ena, ps_flat_mask, early_fragment_tests, stage_lean,
                                   &ps_dims, &ps_sampler_modes, &ps_input_map, clip_discard};
         const bool ps_lift = stage_lean && decomp_selects(ps_name);
-        const std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
+        std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
+        // Its lift rewritten for rebuilt motion vectors: one per setting (velo_variant).
+        if (const std::uint32_t v = ps_lift ? velo_variant(ps_name) : 0) ps_key = fnv1a(&v, sizeof(v), ps_key);
         pl.ps_key = ps_key;
         const bool ps_cacheable = g_stage_cache_on;
         const std::shared_ptr<const CachedStage> ps_hit = ps_cacheable ? cached_stage(ps_key) : nullptr;
@@ -21917,6 +21937,9 @@ static bool draw_impl(const GpuDraw& d) {
         for (const auto& d2 : ps_dims) shape.push_back(d2.first | (d2.second ? 0x80000000u : 0u));
         key = fnv1a(shape.data(), shape.size() * sizeof(std::uint32_t), key);
     }
+    // A velocity shader rebuilt motion vectors rewrite: a pipeline per
+    // Motion vectors setting (velo_variant).
+    if (const std::uint32_t v = velo_variant(ps_name)) key = fnv1a(&v, sizeof(v), key);
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
     // BBHOST_LEAN_FIRST: translate and lay out the fallback pipeline, but create
@@ -22954,11 +22977,11 @@ static bool draw_impl(const GpuDraw& d) {
         // The upscaler's camera (upscale_pass.cpp): a camera draw's vertex
         // stage, once a frame, its constant buffers looked at for the view block.
         const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
-                            meta.buffers.size() <= 16 && !upscale_camera_noted() && upscaler_method();
+                            meta.buffers.size() <= 16 && !upscale_camera_noted() && upscale_motion_on();
         // A pass of the game's velocity map: its scale's constant buffer.
         if (st == 1 && !pl.velo_known) velo_classify(pl);
-        const bool velo = st == 1 && pl.velo && s.color[0] && pl.velo_cb < meta.buffers.size() && meta.buffers.size() <= 16 &&
-                          upscaler_method();
+        const bool velo = st == 1 && pl.velo && pl.velo != 4 && s.color[0] && pl.velo_cb < meta.buffers.size() &&
+                          meta.buffers.size() <= 16 && upscale_motion_on();
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate || camera || velo ? gate_bases : nullptr);
@@ -23828,14 +23851,73 @@ static bool draw_impl(const GpuDraw& d) {
         depth_layouts_for_images_locked(stage_images, 2, s.depth);
         if (part && run->stop >= 0) return false;
     }
+    // BBHOST_PASS_WATCH=<name>[,<name>...]: of each 120 flips, how many drew a
+    // pipeline whose name holds each - a pass the game runs only some frames.
+    {
+        static const std::vector<std::string> watch = [] {
+            std::vector<std::string> v;
+            const char* e = std::getenv("BBHOST_PASS_WATCH");
+            for (std::string w = e ? e : ""; !w.empty();) {
+                const std::size_t c = w.find(',');
+                if (c) v.push_back(w.substr(0, c));
+                w = c == std::string::npos ? std::string() : w.substr(c + 1);
+            }
+            return v;
+        }();
+        if (!watch.empty()) {
+            static std::vector<std::uint64_t> seen_at(watch.size(), ~0ull);
+            static std::vector<int> flips(watch.size(), 0);
+            static std::uint64_t from = ~0ull;
+            const std::uint64_t flip = hle_video_flip_count();
+            if (from == ~0ull) from = flip;
+            if (flip >= from + 120) {
+                std::string line;
+                for (std::size_t i = 0; i < watch.size(); ++i) {
+                    line += " " + watch[i] + "=" + std::to_string(flips[i]);
+                    flips[i] = 0;
+                }
+                host_log("pass watch: flips %llu-%llu:%s", static_cast<unsigned long long>(from), static_cast<unsigned long long>(flip - 1),
+                         line.c_str());
+                from = flip;
+            }
+            for (std::size_t i = 0; i < watch.size(); ++i) {
+                if (seen_at[i] != flip && pl.name.find(watch[i]) != std::string::npos) {
+                    seen_at[i] = flip;
+                    ++flips[i];
+                }
+            }
+        }
+    }
     // The temporal upscaler's call point (host/upscale_pass.cpp): before the
     // first draw that samples the scene after its last write - the lit scene
     // and its transparency done, nothing of the post chain begun. The scene is
     // the image YEBIS's copy into its own (0b0acf50+ccbf44a6, the post chain's
     // first pass) samples, learned from that draw; its depth is the one drawn
     // with it (the G-buffer's). The first frame that copy is seen in, the
-    // upscale runs at that copy.
-    if (upscaler_method()) {
+    // upscale runs at that copy. Frame generation without an upscaler takes
+    // the motion there too (upscale_pass_run_locked).
+    if (upscale_motion_on()) {
+        // The velocity map, before the frame's first pass of it draws (its
+        // clear, when no camera pass covers it) and before the motion blur's
+        // dilation spreads it (the copy the motion reads) - once a frame each.
+        if (pl.velo && pl.velo != 4 && s.color[0] && !s.color[0]->depth && upscale_velo_clear_due(s.color[0]->base, pl.velo)) {
+            if (part) {
+                run_part_stop(kRunStopOrder);
+                return false;
+            }
+            upscale_velo_clear_locked(*s.color[0]);
+        } else if (pl.velo == 4) {
+            for (const StageImages::Image& im : stage_images[1].images) {
+                RtImage* velo = im.resolved && upscale_velo_copy_due(image_base(im)) ? find_render_target(image_base(im)) : nullptr;
+                if (!velo || velo->depth) continue;
+                if (part) {
+                    run_part_stop(kRunStopOrder);
+                    return false;
+                }
+                upscale_velo_copy_locked(*velo);
+                break;
+            }
+        }
         UpscaleFrame& u = g_upscale;
         std::uint64_t& scene_base = u.scene;
         std::uint64_t& depth_base = u.depth;

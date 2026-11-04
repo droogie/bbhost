@@ -91,8 +91,26 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<bool> g_ssao{true}, g_aa{true};
-// Bumped when the SSAO or AA setting changes: each renderer is given the
-// values once a generation (render_view_hook). 0: never changed - the game's.
+// Motion blur's flag (+0x2969) - what draws the velocity map, which an
+// upscaler's or frame generation's motion reads (host/upscale_pass.cpp) - on
+// for a renderer that can blur unless Performance mode takes it and nothing
+// needs the map; and the camera blur's switch (+0x2a10), which HD motion blur
+// turns on (engine/patch_manifest.cpp). Both as the start's manifests made
+// them until a setting changes.
+std::atomic<bool> g_velocity{true}, g_camera_blur{false};
+constexpr std::size_t kVelocityFlag = 0x2969, kCameraBlur = 0x2a10;
+// The resource setup makes the velocity map under either bit (`test ax, 0x420`
+// at 0x26c3d8f); the scene's main renderer has 0x400 alone.
+constexpr std::uint64_t kBlurCapability = 0x420;
+// Screen space reflections' switch (+0x2974): the patched resource setup sets
+// it as it makes the reflections' targets (engine/patch_manifest.cpp ssr), and
+// the scene renderer runs the pass each frame it is on. With the setting off
+// it is cleared every view - the targets stay until the next start.
+constexpr std::size_t kSsrFlag = 0x2974;
+std::atomic<bool> g_ssr_off{false};
+// Bumped when the SSAO, AA, motion or HD motion blur settings change: each
+// renderer is given the values once a generation (render_view_hook). 0: never
+// changed - the game's.
 std::atomic<std::uint32_t> g_flags_gen{0};
 // The renderers given them, and the generation each was given (render_view_hook,
 // the render thread alone).
@@ -373,6 +391,24 @@ void motion_blur_apply(bool on) {
     host_log("graphics: motion blur %s (its velocity pass %s)", on ? "on" : "off", on ? "runs" : "skipped at the graphics manager's switch");
 }
 
+// [Ssr] Fade To Viewer Param, the graphics manager's +0x7680: what the ssr
+// manifest writes into the manager's constructor (-10000 over -0.8), written
+// into the live manager when the manifest goes in while the game runs.
+constexpr std::size_t kSsrFadeToViewer = 0x7680;
+}  // namespace
+
+void graphics_ssr_live_in() {
+    std::uint64_t gm = 0;
+    if (g_velocity_slide)
+        std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManagerOfBlur - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    const float fade = -10000.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(gm + kSsrFadeToViewer)), &fade, sizeof(fade));
+    host_log("graphics: screen space reflections' fade to viewer %g in the graphics manager", static_cast<double>(fade));
+}
+
+namespace {
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -389,13 +425,23 @@ void settings_changed(const HostSettings& hs) {
     // first view when the file asks for other than the game's own
     // (render_view_hook); never while they are the game's.
     static bool ssao_was = true, aa_was = true;
-    if (hs.ssao != ssao_was || hs.anti_alias != aa_was) {
+    // The velocity map and the camera blur as the start's manifests left them
+    // (performance-mode, hd-motion-blur), followed once one of these changes.
+    static const bool velocity_start = host_opt_motion_wanted() || !hs.performance_mode, camera_blur_start = hs.hd_motion_blur;
+    static bool velocity_was = velocity_start, camera_blur_was = camera_blur_start;
+    const bool velocity = host_opt_motion_wanted() || !hs.performance_mode;
+    if (hs.ssao != ssao_was || hs.anti_alias != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
         ssao_was = hs.ssao;
         aa_was = hs.anti_alias;
+        velocity_was = velocity;
+        camera_blur_was = hs.hd_motion_blur;
         g_ssao.store(hs.ssao);
         g_aa.store(hs.anti_alias);
+        g_velocity.store(velocity);
+        g_camera_blur.store(hs.hd_motion_blur);
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
+    g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
     // Rebuilt motion vectors hold what the blur cannot read: it goes too.
@@ -1191,6 +1237,9 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         g_made_any.store(false, std::memory_order_relaxed);
     }
     auto* r = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[0]));
+    // Screen space reflections off: every view, as a rebuild of the targets
+    // (a Resolution change) sets the switch again.
+    if (r && g_ssr_off.load(std::memory_order_relaxed)) r[kSsrFlag] = 0;
     if (r && gen) {
         GivenRenderer* g = nullptr;
         for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
@@ -1202,13 +1251,18 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
             std::memcpy(&caps, r + kCapabilities, sizeof(caps));
             const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
             const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
+            const std::uint8_t velocity = g_velocity.load(std::memory_order_relaxed) && (caps & kBlurCapability);
+            const std::uint8_t camera_blur = g_camera_blur.load(std::memory_order_relaxed) && (caps & kBlurCapability);
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {
-                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u", static_cast<void*>(r),
-                         static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa);
+                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u, velocity map %u -> %u, camera blur %u -> %u",
+                         static_cast<void*>(r), static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa, r[kVelocityFlag],
+                         velocity, r[kCameraBlur], camera_blur);
             }
             r[kSsaoFlag] = ssao;
             r[kAaFlag] = aa;
+            r[kVelocityFlag] = velocity;
+            r[kCameraBlur] = camera_blur;
         }
     }
     return 0;  // and the view renders as it would

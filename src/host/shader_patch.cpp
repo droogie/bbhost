@@ -25,6 +25,12 @@ const Patch kPatches[] = {
     // The else side writes the centre sample through untouched, so an
     // always-false compare (v_cmp_f_f32, opcode 0) leaves every pixel as it was.
     {"e0305cef", &HostSettings::motion_blur, "motion blur", {0x7c061420, 0xbea0246a}, {0x7c001420, 0xbea0246a}},
+    // Its other build, which the camera blur (HD motion blur's) draws with -
+    // twice a frame at the output size, after a pass that packs the velocity
+    // map (7ea47480+d3c8bb21) - the same three instructions. Without it the
+    // Motion blur setting left this blur on, and rebuilt motion vectors' map
+    // (raw NDC motion, which it reads as 0.5 off centre) smeared every mesh.
+    {"157a299c", &HostSettings::motion_blur, "motion blur (camera blur)", {0x7c061420, 0xbea0246a}, {0x7c001420, 0xbea0246a}},
     // YEBIS depth of field's composite (d3ca03f3+111fce32):
     //   v_mad_f32 v0, v5, s0, v0 clamp       ; t = clamp(scene.a * k + b)
     //   rgb = scene + t * (blurred - scene)

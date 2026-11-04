@@ -215,7 +215,7 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
         if (HMODULE h = GetModuleHandleW(m)) host_log("framegen: module %ls at %p", m, static_cast<void*>(h));
 #endif
     host_log("framegen: AMD's swapchain %ux%u in place (queues 2-4 of family %u)%s", sci.imageExtent.width, sci.imageExtent.height,
-             family, g_fg_ctx ? ", frame generation on for flips the upscaler ran in" : "");
+             family, g_fg_ctx ? ", frame generation on for the flips whose motion was prepared" : "");
     return true;
 }
 

@@ -70,9 +70,13 @@ bool host_opt_resolution(int* w, int* h);
 bool host_opt_output_size(int* w, int* h);
 // Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE).
 bool host_opt_upscaler_chosen();
-// The upscaler's rebuilt motion vectors (the Motion vectors setting, read
-// once; BBHOST_MOTION_VECTORS=velomap|8|16|32 for tests): 8, 16 or 32 bits,
-// or 0 for the game's velocity map - and 0 with no upscaler chosen.
+// Whether anything takes the frame's motion: an upscaler chosen, or frame
+// generation on (which runs without one).
+bool host_opt_motion_wanted();
+// The rebuilt motion vectors (the Motion vectors setting, as it is now - it
+// changes live; BBHOST_MOTION_VECTORS=velomap|8|16|32 for tests): 8, 16 or
+// 32 bits, or 0 for the game's velocity map - and 0 while nothing takes the
+// motion (host_opt_motion_wanted).
 int host_opt_motion_rebuilt_bits();
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);

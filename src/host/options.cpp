@@ -5,9 +5,11 @@
 
 #include "host/bindings.h"
 #include "host/overlay.h"
+#include "host/upscaler.h"
 #include "host/window.h"
 #include "core/config.h"
 #include "core/portable.h"
+#include "engine/graphics_patch.h"
 #include "engine/live_resolution.h"
 #include "engine/patch_manifest.h"
 #include "hle/modules.h"
@@ -307,13 +309,15 @@ Setting g_set[kSettingCount] = {
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
-    // game's own half size. Its targets are made as the game starts. The
-    // first time, a bbhost.toml that turned the old patch file on
-    // ([patches] screen-space-reflections) seeds it (host_options_load).
+    // game's own half size. On while the game runs puts the patch in and
+    // makes the scene's targets again; off clears the pass's switch each view
+    // (engine/graphics_patch.cpp). The first time, a bbhost.toml that turned
+    // the old patch file on ([patches] screen-space-reflections) seeds it
+    // (host_options_load).
     {"ssr", "Screen space reflections", {"Off", "On"}, 0,
-     "Requires a restart. Wet streets, water and polished floors reflect what is on screen, at the game's own half "
-     "size, without fading out where they face the camera. Costs GPU time.",
-     true},
+     "Wet streets, water and polished floors reflect what is on screen, at half the 3D's resolution, without fading "
+     "out where they face the camera. Costs GPU time. Changes at once.",
+     false},
     // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
     // hd_motion_blur_manifest): their buffers at a share of the render size
     // rather than at one fixed size each. The targets are made as the game
@@ -322,12 +326,12 @@ Setting g_set[kSettingCount] = {
     {"hd_motion_blur", "HD motion blur", {"Off", "On"}, 0,
      "Motion blur's velocity map and the depth it blurs with at the HD motion blur resolution "
      "below instead of a fixed 640x360, with the camera's own blur on: cleaner, steadier blur. Costs GPU time and "
-     "video memory, more the larger. Shows only with Motion blur on. Changes at once (with Rebuilt motion vectors, at the next start).",
+     "video memory, more the larger. Shows only with Motion blur on. Changes at once.",
      false},
     {"hd_motion_blur_res", "HD motion blur resolution", {"Quarter", "Half", "Full"}, 2,
-     "Requires a restart. HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
-     "size) or Full. It follows the render resolution, Resolution and upscaling both.",
-     true},
+     "HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
+     "size) or Full. It follows the render resolution, Resolution and upscaling both. Changes at once.",
+     false},
     // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
     // picture in place of the game's after the 3D, before the post effects.
     // Off by default; the order of the values is the settings object's
@@ -365,11 +369,13 @@ Setting g_set[kSettingCount] = {
      false},
     // AMD's frame generation (host/framegen.h): its swapchain in the
     // presenter's place; a frame it makes from the 3D between two of the
-    // game's, the HUD and the menus put back over each.
+    // game's, the HUD and the menus put back over each. With Upscaling off (or
+    // one this GPU cannot run) it takes the same depth and motion at the full
+    // size (host/upscale_pass.cpp).
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
-     "the HUD and the menus are never interpolated. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside "
-     "bbhost.exe, and Upscaling (FSR or DLSS) on: the depth and motion it generates from are the upscaler's. Changes at once.",
+     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. Needs "
+     "AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the
@@ -377,12 +383,12 @@ Setting g_set[kSettingCount] = {
     // exact screen motion at the render size (host/translation_cache.cpp) in
     // 8-, 16- or 32-bit, for comparing accuracy and cost.
     {"motion_vectors", "Motion vectors", {"Velomap", "Rebuilt 8-bit", "Rebuilt 16-bit", "Rebuilt 32-bit"}, 2,
-     "Requires a restart. Where the upscaler and frame generation take the motion of the player, enemies and other moving "
+     "Where the upscaler and frame generation take the motion of the player, enemies and other moving "
      "things from (the camera's own comes from the depth). Velomap: the game's motion blur velocity map, scaled and clamped "
-     "for blurring. Rebuilt: the same skinned meshes' motion written exactly, at the render resolution, in 8, 16 or 32 bits "
-     "per channel - more bits are more accurate and cost more memory and bandwidth. Rebuilt turns the game's own motion "
-     "blur off (it reads the map).",
-     true},
+     "for blurring, read before the blur spreads it. Rebuilt: the same skinned meshes' motion written exactly, at the render "
+     "resolution, in 8, 16 or 32 bits per channel - more bits are more accurate and cost more memory and bandwidth. Rebuilt "
+     "turns the game's own motion blur off (it reads the map). Changes at once.",
+     false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -848,6 +854,29 @@ bool output_of(unsigned* w, unsigned* h) {
     return true;
 }
 
+// The scene's targets as the settings now want them, while the game runs:
+// Screen space reflections' patch in once it is on (off clears its pass's
+// switch each view, engine/graphics_patch.cpp, and the patch stays until the
+// next start), HD motion blur's sizes and the velocity map's format and size
+// made again from the settings (engine/patch_manifest.cpp) - and the targets
+// made again at the same size when the game's code changed for them, or when
+// reflections were turned on (`ssr_on`: the patched setup sets their switch).
+void targets_follow_settings(const char* what, bool ssr_on) {
+    const HostSettings hs = host_settings();
+    bool rebuild = false, changed = false;
+    std::string why;
+    if (ssr_on && hs.ssr) {
+        if (!patch_manifest_live_state("ssr").applied) {
+            if (patch_manifest_set_live("ssr", true, &why)) graphics_ssr_live_in();
+        }
+        rebuild = true;
+    }
+    if (patch_manifest_refresh_live("hd-motion-blur", hs.hd_motion_blur, &changed, &why)) rebuild |= changed;
+    if (patch_manifest_refresh_live("velomap-16f", true, &changed, &why)) rebuild |= changed;
+    if (rebuild && live_resolution_available()) live_resolution_rebuild();
+    host_log("graphics: %s changed: %s", what, rebuild ? "the scene's targets made again" : "no target changes");
+}
+
 // Applied every time one changes, and once at load, so there is one path to
 // the live state instead of a copy in each caller.
 void apply(int id) {
@@ -862,30 +891,35 @@ void apply(int id) {
         case kVsync: host_window_set_vsync(s.index == 0); break;
         case kFrameGeneration: {
             // AMD's swapchain made or dropped at the presenter's next frame
-            // (host/framegen.h reads the setting as it makes the swapchain).
+            // (host/framegen.h reads the setting as it makes the swapchain);
+            // the velocity map follows whether anything takes the motion.
             static int was = -1;
-            if (was >= 0 && was != s.index && live_resolution_available()) host_window_recreate_swapchain();
+            if (was >= 0 && was != s.index && live_resolution_available()) {
+                host_window_recreate_swapchain();
+                targets_follow_settings(s.label, false);
+            }
             was = s.index;
             break;
         }
-        case kHdMotionBlur: {
-            // Its code in or out now, and the scene's targets made again at the
-            // sizes it gives (engine/patch_manifest.cpp hd_motion_blur_manifest).
-            // Under rebuilt motion vectors, whose sizes are the same sites, at
-            // the next start.
-            static int was = -1;
-            // (Only once the game runs: the start's own applies come before the
-            // manifests go in, which put it in themselves.)
-            if (was >= 0 && was != s.index && live_resolution_available() && host_opt_motion_rebuilt_bits()) {
-                host_log("graphics: HD motion blur %s at the next start (Rebuilt motion vectors keep the map's sizes; the game's blur is off with them)",
-                         s.index == 1 ? "on" : "off");
-            } else if (was >= 0 && was != s.index && live_resolution_available()) {
-                std::string why;
-                const bool ok = patch_manifest_set_live("hd-motion-blur", s.index == 1, &why);
-                if (ok && live_resolution_available()) live_resolution_rebuild();
-                host_log("graphics: HD motion blur %s %s", s.index == 1 ? "on" : "off", ok ? "now (the scene's targets made again)" : "at the next start");
+        case kUpscaler:
+        case kSsr:
+        case kHdMotionBlur:
+        case kHdMotionBlurRes:
+        case kMotionVectors: {
+            // The patches that make the scene's targets - Screen space
+            // reflections, HD motion blur's sizes, the velocity map's format
+            // and size - made again from the settings and the targets with
+            // them (targets_follow_settings). Only once the game runs: the
+            // start's own applies come before the manifests go in, which take
+            // the settings themselves.
+            static int was[kSettingCount];
+            static bool seeded = false;
+            if (!seeded) {
+                std::fill(std::begin(was), std::end(was), -1);
+                seeded = true;
             }
-            was = s.index;
+            if (was[id] >= 0 && was[id] != s.index && live_resolution_available()) targets_follow_settings(s.label, id == kSsr && s.index == 1);
+            was[id] = s.index;
             break;
         }
         case kFrameCap:
@@ -1821,11 +1855,37 @@ void preset_row() {
     setting_row(kDlssPreset);
 }
 
+// The Upscaling row's note: its own, or - the choice one this GPU or the
+// files beside bbhost.exe cannot run - why, and that the game's own
+// anti-aliasing runs in its place (frame generation still does).
+const char* upscaler_note() {
+    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
+    // (The setup window comes before the bridge loads: nothing known yet.)
+    if (u == 0 || g_setup_page) return g_set[kUpscaler].note;
+    const UpscalerCaps caps = upscaler_caps();
+    static std::string note;
+    const bool dlss = u == 3;
+    if (!caps.loaded) {
+        note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
+               "game's own anti-aliasing runs instead; Frame generation works without it.";
+    } else if (dlss ? !caps.dlss : !caps.fsr) {
+        const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
+        note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
+               ": the game's own anti-aliasing runs instead. Frame generation works without it." +
+               (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
+    } else {
+        return g_set[kUpscaler].note;
+    }
+    return note.c_str();
+}
+
 // Rows that only mean something under another setting, left out while it is
-// off: the upscaler's preset and motion vector rows with Upscaling off, HD motion blur's
-// resolution with HD motion blur off.
+// off: the upscaler's preset with Upscaling off, the motion vectors with
+// Upscaling and Frame generation both off, HD motion blur's resolution with
+// HD motion blur off.
 bool row_hidden(int id) {
-    if (id == kDlssPreset || id == kMotionVectors) return shown_index(kUpscaler) == 0;
+    if (id == kDlssPreset) return shown_index(kUpscaler) == 0;
+    if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
     if (id == kHdMotionBlurRes) return !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
     return false;
 }
@@ -1844,6 +1904,7 @@ void host_options_draw_page(int page) {
         if (!first) row_rule();
         first = false;
         if (g_rows[r].setting == kDlssPreset) preset_row();
+        else if (g_rows[r].setting == kUpscaler) setting_row(kUpscaler, nullptr, upscaler_note());
         else setting_row(g_rows[r].setting);
         ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
     }
@@ -1976,22 +2037,28 @@ bool host_opt_resolution(int* w, int* h) {
 }
 
 bool host_opt_upscaler_chosen() {
-    if (const char* e = std::getenv("BBHOST_UPSCALE"); e && *e)
-        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0;
-    return host_settings().upscaler != 0;
+    // BBHOST_UPSCALE, read once: -1 unset, else whether it names an upscaler.
+    static const int env = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE");
+        if (!e || !*e) return -1;
+        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 ? 1 : 0;
+    }();
+    return env >= 0 ? env != 0 : host_settings_ref().upscaler != 0;
 }
 
+bool host_opt_motion_wanted() { return host_opt_upscaler_chosen() || host_settings_ref().frame_generation; }
+
 int host_opt_motion_rebuilt_bits() {
-    static const int bits = [] {
-        if (!host_opt_upscaler_chosen()) return 0;
-        if (const char* e = std::getenv("BBHOST_MOTION_VECTORS"); e && *e) {
-            const int b = std::atoi(e);
-            return b == 8 || b == 16 || b == 32 ? b : 0;
-        }
-        static constexpr int kBits[] = {0, 8, 16, 32};
-        return kBits[std::clamp(host_settings().motion_vectors, 0, 3)];
+    if (!host_opt_motion_wanted()) return 0;
+    static const int env = [] {
+        const char* e = std::getenv("BBHOST_MOTION_VECTORS");
+        if (!e || !*e) return -1;
+        const int b = std::atoi(e);
+        return b == 8 || b == 16 || b == 32 ? b : 0;
     }();
-    return bits;
+    if (env >= 0) return env;
+    static constexpr int kBits[] = {0, 8, 16, 32};
+    return kBits[std::clamp(host_settings_ref().motion_vectors, 0, 3)];
 }
 
 bool host_opt_output_size(int* w, int* h) {

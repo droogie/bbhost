@@ -1772,9 +1772,13 @@ RtImage* find_render_target(std::uint64_t base);
 // only: textures.cpp's mip chains of targets).
 RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // The temporal upscaler at its call point (upscale_pass.cpp): the scene upscaled
-// in place, with the G-buffer's depth; false when it did not run.
+// in place, with the G-buffer's depth; false when it did not run. With frame
+// generation and no upscaler running, the motion and frame generation's
+// prepare alone (false: nothing upscaled, the draws not moved).
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
 void upscale_pass_reset_locked();
+// Whether the frame's motion is taken: an upscaler running, or frame generation.
+bool upscale_motion_on();
 // Frame generation's HUD-less picture (host/framegen.h): whether this frame
 // was prepared and its copy is still to make, and the copy of the display
 // buffer `display` as it is now, before the HUD's first draw into it.
@@ -1803,6 +1807,19 @@ bool upscale_camera_noted();
 // full-screen pass, 2: a mesh's own, 3: the camera's pass with the camera
 // still), the scale its velocity is written with.
 void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky);
+// Before a draw of a velocity pass (render.cpp) into the map at `base`, `kind`
+// as above: whether the map is to be cleared first - the frame's first mesh
+// pass with no camera pass before it (nothing else clears it: the game does
+// only when it is made, and what a mesh drew stayed) - and the clear. Only
+// reads, the first (a run part may ask).
+bool upscale_velo_clear_due(std::uint64_t base, int kind);
+void upscale_velo_clear_locked(RtImage& velo);
+// Before the motion blur's dilation reads the image at `base`: whether it is
+// the map, not copied yet this frame, and the copy of it as its passes drew
+// it, which the motion then reads - the dilation writes its spread back into
+// the map, the moving meshes' motion over what is around them.
+bool upscale_velo_copy_due(std::uint64_t base);
+void upscale_velo_copy_locked(RtImage& velo);
 std::uint64_t upscale_pass_calls();
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
 // copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is

@@ -121,3 +121,10 @@ PatchLiveState patch_manifest_live_state(const std::string& name);
 // bytes that are no longer what it expects, live = false): the switch, which
 // the caller saves, then applies at the next start.
 bool patch_manifest_set_live(const std::string& name, bool on, std::string* why);
+// One of bbhost's own manifests made again from the settings now - its sites
+// follow them (HD motion blur's sizes, the velocity map's format and size) -
+// and put in (on) or left out, as patch_manifest_set_live does with the sites
+// as they are now. *changed: whether any of the game's bytes changed (the
+// scene's targets want making again: live_resolution_rebuild). False, and
+// why, when it cannot change now or a patch file of its name replaced it.
+bool patch_manifest_refresh_live(const std::string& name, bool on, bool* changed, std::string* why);

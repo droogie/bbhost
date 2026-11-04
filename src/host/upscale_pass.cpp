@@ -19,7 +19,18 @@
 // scales from the draws that write it, render.cpp upscale_velo_note_locked),
 // where a mesh moved of itself. Without it the player, standing still on the
 // screen as the camera orbits, had the background's motion and smeared.
-// BBHOST_UPSCALE_VELO=0: the camera's motion alone (a test).
+// BBHOST_UPSCALE_VELO=0: the camera's motion alone (a test). The map is read
+// as its passes drew it: with the game's blur on, its dilation reads the map
+// and writes it back spread - each moving mesh's motion over what is around
+// it, which ghosted the background beside anything moving - so it is copied
+// before the dilation's first draw (upscale_velo_copy_locked). With no camera
+// pass over it (the camera blur off) it is cleared before the meshes' passes
+// (upscale_velo_clear_locked): the game clears it only when it is made.
+//
+// Frame generation (host/framegen.h) takes the same depth and motion. With no
+// upscaler running - Upscaling off, or one this GPU cannot run (DLSS on AMD) -
+// the call point makes the motion at the scene's size and prepares frame
+// generation alone, the scene left as it is and the draws not moved.
 //
 // Under render scale (engine/render_scale.cpp: an Upscaling quality above
 // Native AA) the scene, its depth and the motion are the render size and the
@@ -38,6 +49,7 @@
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
+#include "host/shaders/motion_view.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -113,6 +125,20 @@ std::uint64_t g_velo_base = 0;
 float g_velo_cam[2] = {}, g_velo_mesh[2] = {};
 bool g_velo_cam_seen = false, g_velo_mesh_known = false;
 std::uint64_t g_velo_used = 0;  // frames it was read in
+// The frame's work on the map before the call point (render.cpp, before the
+// draws that need it): the frames so far (counted at the call point), the one
+// the map was cleared in, whether a camera pass covered it this frame, and
+// its copy taken before the motion blur's dilation and the frame it is of.
+std::uint64_t g_velo_frame = 1, g_velo_cleared = 0, g_velo_copied = 0;
+bool g_velo_camera_pass = false;
+struct VeloCopy {
+    VkImage image = VK_NULL_HANDLE;
+    ImageMemory memory;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t w = 0, h = 0;
+};
+VeloCopy g_velo_copy;
 
 // The engine's per-view block (864 bytes, the G-buffer's vertex stage), in
 // floats: 36-51 the inverse projection (its first row's x the tangent of half
@@ -202,10 +228,11 @@ bool motion_pipeline_locked() {
 }
 
 // The motion image written from the depth and the two cameras (the last one
-// absent: all zeros), and the meshes' own from the game's velocity map `velo`
-// (null: none).
+// absent: all zeros), and the meshes' own from the game's velocity map, a
+// view of it `velo` of velo_w x velo_h (null: none).
 void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
-                   std::uint32_t w, std::uint32_t h, bool prev_ok, const RtImage* velo, int velo_mode) {
+                   std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
+                   int velo_mode) {
     float p[40] = {};
     p[0] = g_cam_now.tan_x;
     p[1] = g_cam_now.tan_y;
@@ -230,8 +257,8 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         const bool b8 = host_opt_motion_rebuilt_bits() == 8;
         p[32] = p[33] = b8 ? 0.5f : 1.0f;
         p[34] = p[35] = b8 ? 0.5f : 0.0f;
-        p[36] = static_cast<float>(velo->width);
-        p[37] = static_cast<float>(velo->height);
+        p[36] = static_cast<float>(velo_w);
+        p[37] = static_cast<float>(velo_h);
         p[38] = 3.0f;
     } else if (velo) {
         // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
@@ -240,8 +267,8 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[33] = g_velo_cam[1] * 2.5f;
         p[34] = g_velo_mesh[0];
         p[35] = -g_velo_mesh[1] * velo_y_sign();
-        p[36] = static_cast<float>(velo->width);
-        p[37] = static_cast<float>(velo->height);
+        p[36] = static_cast<float>(velo_w);
+        p[37] = static_cast<float>(velo_h);
         p[38] = static_cast<float>(velo_mode);
         p[39] = velo_tolerance();
     }
@@ -251,8 +278,7 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     const VkDescriptorImageInfo motion_info{VK_NULL_HANDLE, motion_view, VK_IMAGE_LAYOUT_GENERAL};
     // No map: the depth stands in, unread.
-    const VkDescriptorImageInfo velo_info{VK_NULL_HANDLE, velo ? velo->view : depth_view,
-                                          velo ? VK_IMAGE_LAYOUT_GENERAL : depth_layout};
+    const VkDescriptorImageInfo velo_info{VK_NULL_HANDLE, velo ? velo : depth_view, velo ? VK_IMAGE_LAYOUT_GENERAL : depth_layout};
     VkWriteDescriptorSet wr[4] = {};
     for (int k = 0; k < 4; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -409,6 +435,92 @@ bool record_rcas(VkCommandBuffer cb, float sharpness) {
 // Sharpness as the settings have it now, 0..1 (0: none).
 float sharpness_now() { return std::clamp(host_settings_ref().sharpness, 0.0f, 1.0f); }
 
+// BBHOST_UPSCALE_SHOW_MOTION=<pixels> (a test): the motion as colours in place
+// of the upscaler's picture (shaders/motion_view.comp), a full step of colour
+// for that many render pixels of motion (1: 8).
+float show_motion() {
+    static const float px = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_SHOW_MOTION");
+        if (!e || !*e || e[0] == '0') return 0.0f;
+        const float v = static_cast<float>(std::atof(e));
+        return v > 1.0f ? v : 8.0f;
+    }();
+    return px;
+}
+
+VkDescriptorSetLayout g_view_set_layout = VK_NULL_HANDLE;
+VkPipelineLayout g_view_layout = VK_NULL_HANDLE;
+VkPipeline g_view_pipeline = VK_NULL_HANDLE;
+bool g_view_tried = false;
+
+bool view_pipeline_locked() {
+    if (g_view_tried) return g_view_pipeline != VK_NULL_HANDLE;
+    g_view_tried = true;
+    const VkDescriptorSetLayoutBinding binds[3] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 3;
+    sli.pBindings = binds;
+    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_view_set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_view_set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_view_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_motion_view_spv);
+    smi.pCode = k_motion_view_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = g_view_layout;
+    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_view_pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok) g_view_pipeline = VK_NULL_HANDLE;
+    host_log("upscaler: the motion view (BBHOST_UPSCALE_SHOW_MOTION) %s", ok ? "ready" : "failed to build");
+    return ok;
+}
+
+// The motion as colours into g_output (written: the picture's place).
+void record_motion_view(VkCommandBuffer cb, float px) {
+    if (!view_pipeline_locked()) return;
+    const VkDescriptorSet set = alloc_set_locked(g_view_set_layout);
+    if (!set) return;
+    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, g_motion.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[3] = {};
+    for (int k = 0; k < 3; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = static_cast<std::uint32_t>(k);
+        wr[k].descriptorCount = 1;
+    }
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[0].pImageInfo = &src_info;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    wr[1].pImageInfo = &sampler_info;
+    wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[2].pImageInfo = &dst_info;
+    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), px, 0, 0, 0};
+    barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_view_pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_view_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, g_view_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cb, (g_ow + 7) / 8, (g_oh + 7) / 8, 1);
+}
+
 // Whether the bridge's RGBA16F picture can be blitted into a scene of `format`.
 bool blit_into(VkFormat format) {
     VkFormatProperties src{}, dst{};
@@ -417,34 +529,139 @@ bool blit_into(VkFormat format) {
     return (src.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
 }
 
+// Frame generation's prepare (host/framegen.h): this frame's depth and motion,
+// the jitter the draws had and the camera's vertical field of view. The frame
+// it is prepared as is the one its HUD-less copy is then of.
+void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageLayout depth_layout, float jitter_x, float jitter_y,
+                              float motion_scale) {
+    FramegenInputs fi;
+    fi.depth = depth.image;
+    fi.depth_format = depth.format;
+    fi.depth_layout = depth_layout;
+    fi.motion = g_motion.image;
+    fi.render_w = g_w;
+    fi.render_h = g_h;
+    fi.jitter_x = jitter_x;
+    fi.jitter_y = jitter_y;
+    fi.motion_scale = motion_scale;
+    if (g_cam_now.tan_y > 0.0f) fi.fov_y = 2.0f * std::atan(g_cam_now.tan_y);
+    g_fg_pending = framegen_prepare(cb, g_fg_frames + 1, fi) ? ++g_fg_frames : 0;
+    static bool told = false;
+    if (!told) host_log("framegen: first prepare %s", g_fg_pending ? "recorded" : "refused");
+    told = true;
+}
 
 }  // namespace
 
+bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
+
+bool upscale_velo_clear_due(std::uint64_t base, int kind) {
+    return kind == 2 && base && g_velo_cleared != g_velo_frame && !g_velo_camera_pass;
+}
+
+void upscale_velo_clear_locked(RtImage& velo) {
+    g_velo_cleared = g_velo_frame;
+    if (!velo.image) return;
+    begin_recording_locked();
+    if (velo.view_clear) view_clear_apply_locked(velo);
+    render_end_pass_locked();
+    if (velo.managed_layout) rt_set_layout_locked(velo, VK_IMAGE_LAYOUT_GENERAL);
+    VkCommandBuffer cb = g_cmd();
+    barrier(cb, velo.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    // No motion: rebuilt's texels 0 with no mark (alpha 0), the game's
+    // encoding's zero, 0.5, as its still camera's pass writes it.
+    VkClearColorValue none{};
+    if (!host_opt_motion_rebuilt_bits()) {
+        none.float32[0] = none.float32[1] = 0.5f;
+        none.float32[3] = 1.0f;
+    }
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, velo.image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &all);
+    barrier(cb, velo.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+    static bool told = false;
+    if (!told)
+        host_log("upscaler: the velocity map 0x%llx cleared before its passes (no camera pass covers it)",
+                 static_cast<unsigned long long>(velo.base));
+    told = true;
+}
+
+bool upscale_velo_copy_due(std::uint64_t base) { return base && base == g_velo_base && g_velo_copied != g_velo_frame; }
+
+void upscale_velo_copy_locked(RtImage& velo) {
+    g_velo_copied = g_velo_frame;
+    VeloCopy& k = g_velo_copy;
+    if (!velo.image) return;
+    if (k.image && (k.format != velo.format || k.w != velo.width || k.h != velo.height)) {
+        defer_destroy_private_view(k.view);
+        defer_destroy_image(k.image, k.memory);
+        k = VeloCopy{};
+    }
+    if (!k.image) {
+        OwnImage o;
+        if (!make(o, velo.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, velo.width, velo.height)) {
+            drop(o);
+            g_velo_copied = 0;
+            return;
+        }
+        k.image = o.image;
+        k.memory = o.memory;
+        k.view = o.view;
+        k.format = velo.format;
+        k.w = velo.width;
+        k.h = velo.height;
+        host_log("upscaler: the velocity map 0x%llx (%ux%u format %d) copied before the motion blur's dilation spreads it",
+                 static_cast<unsigned long long>(velo.base), velo.width, velo.height, static_cast<int>(velo.format));
+    }
+    begin_recording_locked();
+    if (velo.view_clear) view_clear_apply_locked(velo);
+    render_end_pass_locked();
+    if (velo.managed_layout) rt_set_layout_locked(velo, VK_IMAGE_LAYOUT_GENERAL);
+    VkCommandBuffer cb = g_cmd();
+    barrier(cb, velo.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(cb, k.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {velo.width, velo.height, 1};
+    vkCmdCopyImage(cb, velo.image, VK_IMAGE_LAYOUT_GENERAL, k.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier(cb, velo.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, k.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+}
+
 bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y) {
     const int method = upscaler_method();
-    if (!method) return false;
+    // Frame generation with no upscaler running (Upscaling off, or one this
+    // GPU cannot run): the motion and its prepare at the scene's size, and the
+    // scene left as the game drew it.
+    const bool motion_only = !method && framegen_active();
+    if (!method && !motion_only) return false;
     // The output size: render scale's when the scene is its render size,
     // else the scene's own (DLAA, FSR native AA).
     RenderScale rs;
-    const bool scaled = render_scale_on(&rs) && scene.width == rs.render_w && scene.height == rs.render_h &&
+    const bool scaled = method && render_scale_on(&rs) && scene.width == rs.render_w && scene.height == rs.render_h &&
                         (rs.output_w != rs.render_w || rs.output_h != rs.render_h);
     // A picture that goes back into the scene: by a copy, or a blit into
     // another format. One that stays here (render scale) needs neither.
     const bool same_format = scene.format == VK_FORMAT_R16G16B16A16_SFLOAT;
     static VkFormat checked = VK_FORMAT_UNDEFINED;
     static bool can_blit = false;
-    if (!scaled && !same_format && checked != scene.format) {
+    if (method && !scaled && !same_format && checked != scene.format) {
         checked = scene.format;
         can_blit = blit_into(scene.format);
         host_log("upscaler: the scene is format %d: %s", static_cast<int>(scene.format),
                  can_blit ? "the upscaled picture goes back by a blit" : "this device cannot blit into it; not upscaled");
     }
-    if (!scaled && !same_format && !can_blit) {
+    if (method && !scaled && !same_format && !can_blit) {
         g_skipped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     const std::uint32_t ow = scaled ? rs.output_w : scene.width, oh = scaled ? rs.output_h : scene.height;
-    if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh) {
+    if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image) {
         drop(g_output);
         drop(g_motion);
         drop(g_sharp);
@@ -455,8 +672,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_scaled = scaled;
         g_output_ready = false;
         g_reset = true;
-        if (!make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
-                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_ow, g_oh) ||
+        // The upscaler's picture only with an upscaler.
+        if ((!motion_only && !make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_ow, g_oh)) ||
             !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   g_w, g_h)) {
             host_log("upscaler: no images of %ux%u and %ux%u for it; not upscaled", g_ow, g_oh, g_w, g_h);
@@ -466,22 +684,29 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
             g_scaled = false;
             return false;
         }
+        if (motion_only)
+            host_log("framegen: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d", g_w, g_h,
+                     static_cast<int>(scene.format), static_cast<int>(depth.format));
         // The materials' textures sampled as at the output size: the
         // bridge's mip bias (BBHOST_UPSCALE_MIP_BIAS=0: none, a test).
         static const bool mip_bias_on = [] {
             const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
             return !(e && e[0] == '0');
         }();
-        g_mip_bias = !mip_bias_on ? 0.0f : g_scaled ? upscaler_mip_bias_sized(method, g_w, g_ow) : upscaler_mip_bias(method, 0, g_ow, g_oh);
-        host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
-                 mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
-        if (g_scaled)
-            host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
-                     method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
-                     static_cast<int>(depth.format));
-        else
-            host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d", method == 1 ? "DLAA" : "FSR native AA",
-                     g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
+        g_mip_bias = !mip_bias_on || motion_only ? 0.0f
+                     : g_scaled               ? upscaler_mip_bias_sized(method, g_w, g_ow)
+                                              : upscaler_mip_bias(method, 0, g_ow, g_oh);
+        if (!motion_only) {
+            host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
+                     mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
+            if (g_scaled)
+                host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
+                         method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
+                         static_cast<int>(depth.format));
+            else
+                host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d",
+                         method == 1 ? "DLAA" : "FSR native AA", g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
+        }
     }
     if (depth.image != g_depth_for) {
         if (g_depth_view) defer_destroy_private_view(g_depth_view);
@@ -528,50 +753,45 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         const char* e = std::getenv("BBHOST_UPSCALE_MOTION");
         return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "neg") == 0 ? -1 : 1;
     }();
-    // The meshes' own motion from the game's velocity map, its camera pass
-    // drawn this frame (BBHOST_UPSCALE_VELO=0: none, the camera's alone;
-    // =all: the map's motion everywhere, the camera's pass's too - tests).
-    // Rebuilt motion vectors (the Motion vectors setting): mode 3.
-    static const int velo_mode = [] {
+    // The meshes' own motion from the game's velocity map, its passes drawn
+    // this frame (BBHOST_UPSCALE_VELO=0: none, the camera's alone; =all: the
+    // map's motion everywhere, the camera's pass's too - tests). Rebuilt
+    // motion vectors (the Motion vectors setting, as it is now): mode 3. The
+    // map as its passes drew it: the copy taken before the motion blur's
+    // dilation spread it, else the map itself.
+    static const int velo_env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE_VELO");
-        if (e && e[0] == '0') return 0;
-        if (host_opt_motion_rebuilt_bits()) return 3;
-        return !e ? 1 : std::strcmp(e, "all") == 0 ? 2 : 1;
+        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "all") == 0 ? 2 : 1;
     }();
-    RtImage* velo = nullptr;
+    const int velo_mode = !velo_env ? 0 : host_opt_motion_rebuilt_bits() ? 3 : velo_env;
+    VkImageView velo = VK_NULL_HANDLE;
+    std::uint32_t velo_w = 0, velo_h = 0;
     if (velo_mode && g_velo_cam_seen && (g_velo_mesh_known || velo_mode == 3) && g_cam_prev_ok) {
-        velo = find_render_target(g_velo_base);
-        if (velo && (!velo->image || !velo->view || velo->depth)) velo = nullptr;
-        if (velo) {
-            if (velo->view_clear) view_clear_apply_locked(*velo);
+        if (g_velo_copied == g_velo_frame && g_velo_copy.view) {
+            velo = g_velo_copy.view;
+            velo_w = g_velo_copy.w;
+            velo_h = g_velo_copy.h;
+        } else if (RtImage* map = find_render_target(g_velo_base); map && map->image && map->view && !map->depth) {
+            if (map->view_clear) view_clear_apply_locked(*map);
             render_end_pass_locked();
-            if (velo->managed_layout) rt_set_layout_locked(*velo, VK_IMAGE_LAYOUT_GENERAL);
-            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            if (map->managed_layout) rt_set_layout_locked(*map, VK_IMAGE_LAYOUT_GENERAL);
+            barrier(cb, map->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_SHADER_READ_BIT);
-            ++g_velo_used;
+            velo = map->view;
+            velo_w = map->width;
+            velo_h = map->height;
         }
+        if (velo) ++g_velo_used;
     }
     g_velo_cam_seen = false;
+    // The next frame's map work (upscale_velo_clear_due, upscale_velo_copy_due).
+    ++g_velo_frame;
+    g_velo_camera_pass = false;
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
-        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_mode);
+        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
+                      velo_mode);
         g_velo_cam[0] = g_velo_cam[1] = 0.0f;
-        // The map is cleared by the game only when it is made: with no camera
-        // pass over it each frame (the camera blur off), what a mesh drew
-        // stays where it was, old motion where the mesh has gone. Read, it is
-        // cleared to no motion - while the game's own blur, which reads it
-        // after this, is off (Motion blur, Performance mode, rebuilt).
-        const HostSettings& hs = host_settings_ref();
-        if (velo && (!hs.motion_blur || hs.performance_mode || velo_mode == 3)) {
-            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT);
-            VkClearColorValue none{};
-            if (velo_mode != 3) none.float32[0] = none.float32[1] = none.float32[2] = 0.5f;  // the encoding's zero
-            const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(cb, velo->image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &all);
-            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
-        }
         if (!g_cam_prev_ok) g_reset = true;
         g_cam_prev = g_cam_now;
         g_cam_prev_ok = true;
@@ -588,6 +808,14 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_reset = true;
     }
     g_cam_noted = false;
+    if (motion_only) {
+        // No upscaler: frame generation's prepare alone - no jitter (the
+        // draws are moved only while an upscaler runs) - and AMD's binds gone
+        // from cb, as the bridge's are below.
+        prepare_frame_generation(cb, depth, depth_layout, 0.0f, 0.0f, motion_mode < 0 ? -1.0f : 1.0f);
+        ::run_forget_recorded_locked();
+        return false;
+    }
     UpscaleCall c;
     c.method = method;
     c.quality = g_scaled ? static_cast<std::uint32_t>(rs.quality) : 0;
@@ -611,29 +839,15 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (!ok) return false;
     g_output.initialised = true;
     g_reset = false;
-    // Frame generation's prepare: this frame's depth and motion, the jitter
-    // the draws had and the camera's vertical field of view.
     if (framegen_active()) {
-        FramegenInputs fi;
-        fi.depth = depth.image;
-        fi.depth_format = depth.format;
-        fi.depth_layout = depth_layout;
-        fi.motion = g_motion.image;
-        fi.render_w = g_w;
-        fi.render_h = g_h;
-        fi.jitter_x = jitter_x;
-        fi.jitter_y = jitter_y;
-        fi.motion_scale = c.motion_scale;
-        if (g_cam_now.tan_y > 0.0f) fi.fov_y = 2.0f * std::atan(g_cam_now.tan_y);
-        g_fg_pending = framegen_prepare(cb, g_fg_frames + 1, fi) ? ++g_fg_frames : 0;
-        static bool told = false;
-        if (!told) host_log("framegen: first prepare %s", g_fg_pending ? "recorded" : "refused");
-        told = true;
+        prepare_frame_generation(cb, depth, depth_layout, jitter_x, jitter_y, c.motion_scale);
+        ::run_forget_recorded_locked();
     }
+    if (const float px = show_motion(); px > 0.0f) record_motion_view(cb, px);  // (a test)
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     // Sharpness: the sharpened picture goes on in its place.
-    const float sharpness = sharpness_now();
+    const float sharpness = show_motion() > 0.0f ? 0.0f : sharpness_now();
     const OwnImage& picture = sharpness > 0.0f && record_rcas(cb, sharpness) ? g_sharp : g_output;
     if (g_scaled) {
         // The picture stays here for YEBIS's copy, which samples it in the
@@ -732,7 +946,7 @@ VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t
     if (!g_scaled || !g_output_ready || !g_output.view || scene_w != g_w || scene_h != g_h) return VK_NULL_HANDLE;
     // The image this frame's upscale leaves its picture in: sharpened or not,
     // as the setting is now.
-    return sharpness_now() > 0.0f && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
+    return sharpness_now() > 0.0f && show_motion() <= 0.0f && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
 }
 
 bool upscale_camera_noted() { return g_cam_noted; }
@@ -748,10 +962,11 @@ void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) 
         g_velo_cam[0] = kx;
         g_velo_cam[1] = ky;
         g_velo_cam_seen = true;
+        g_velo_camera_pass = true;  // it covers the map: no clear before the meshes'
     } else {
         // With the camera's blur off (the Performance patch) there is no
-        // camera pass: the map is cleared to no motion and the meshes alone
-        // draw into it.
+        // camera pass: the map is cleared to no motion before the meshes'
+        // passes (upscale_velo_clear_locked) and they alone draw into it.
         g_velo_base = base;
         g_velo_mesh[0] = kx;
         g_velo_mesh[1] = ky;
