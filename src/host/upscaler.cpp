@@ -144,7 +144,8 @@ int upscaler_method() {
         const std::string v = e;
         return v == "dlss" ? 1 : v == "fsr" || v == "fsr3" ? 2 : 0;
     }();
-    const int asked = env >= 0 ? env : host_settings_ref().upscaler;
+    const int setting = host_settings_ref().upscaler;
+    const int asked = env >= 0 ? env : setting == 3 ? 2 : setting;
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
     const UpscalerCaps c = upscaler_caps();
     return (asked == 1 && c.dlss) || (asked == 2 && c.fsr) ? asked : 0;
@@ -164,7 +165,8 @@ void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, 
 
 bool upscaler_fsr3_override() {
     const char* e = std::getenv("BBHOST_UPSCALE");
-    return e && std::strcmp(e, "fsr3") == 0;
+    if (e && *e) return std::strcmp(e, "fsr3") == 0;
+    return host_settings_ref().upscaler == 3;
 }
 
 bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {

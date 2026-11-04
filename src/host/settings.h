@@ -75,9 +75,11 @@ struct HostSettings {
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;
-    // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR - at the
-    // full resolution for now (DLAA, FSR native AA). Follows the setting live.
+    // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR (4 where
+    // it can run), 3 FSR 3; and its quality, 0 native AA (DLAA, FSR native
+    // AA), 1 Quality, 2 Balanced, 3 Performance. Follow the settings live.
     int upscaler = 0;
+    int upscale_quality = 1;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

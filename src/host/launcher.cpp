@@ -311,14 +311,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // will run (host_effect_timing_row); a pick, one of the three, is the
     // player's own from Save or Play on.
     int effect_timing = -1;  // the pick, -1 none
-    int resolution = host_opt_resolution_index();
-    // In the setting's order (host/options.cpp): by size within each shape.
-    static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
-                                               "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
-                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
-                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
-                                               "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
-                                               "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
     // The game's frame rate (engine/frame_rate.h): 0 is Display-Limited, the display's refresh rate.
     static const int kCaps[] = {30, 60, 90, 120, 150, 180, 240, 360, 480, 960, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
@@ -510,7 +502,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (effect_timing >= 0) host_opt_choose_effect_timing(effect_timing);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
-        host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
         saved_note = "Saved";
@@ -928,10 +919,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
-                ui::row_label("Resolution", row_lw);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
-                ui::tooltip_for_item("Render resolution", "The size the game draws at. F10 in the game has every other setting.");
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");
                 ui::toggle_row("Performance mode", nullptr, &performance_mode,

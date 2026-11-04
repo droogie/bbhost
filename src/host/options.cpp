@@ -113,6 +113,7 @@ enum SettingId {
     kModelDetail,
     kSsr,
     kUpscaler,
+    kUpscaleQuality,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -305,10 +306,18 @@ Setting g_set[kSettingCount] = {
     // picture in place of the game's after the 3D, before the post effects.
     // Off by default; the order of the values is the settings object's
     // (0 off, then DLSS, FSR) turned round for the menu (Off, FSR, DLSS).
-    {"upscaler", "Upscaling", {"Off", "FSR", "DLSS"}, 0,
-     "FSR 3/4 (any GPU) or DLSS (NVIDIA RTX) anti-aliasing at the full resolution, in place of the game's own. Needs "
-     "upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them it stays off. "
-     "Lower render sizes (Quality, Performance) come later.",
+    {"upscaler", "Upscaling", {"Off", "FSR 4", "FSR 3", "DLSS"}, 0,
+     "FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 (any GPU) or DLSS (NVIDIA RTX) in place of the game's "
+     "own anti-aliasing. Needs upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; "
+     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run.",
+     false},
+    // The upscaler's render size against the output (Resolution): Native AA
+    // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
+    // Performance 1/2 each way (host/upscaler.h).
+    {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
+     "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full "
+     "size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, "
+     "softer. The menus, the HUD and the post effects stay at the Resolution.",
      false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
@@ -415,6 +424,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kUpscaler},
+    {Row::Option, nullptr, kUpscaleQuality},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -914,7 +924,8 @@ void rebuild_settings() {
     h.ssr = on_of(kSsr);
     {
         const int u = index_of(kUpscaler);
-        h.upscaler = u == 1 ? 2 : u == 2 ? 1 : 0;  // the menu's FSR, DLSS
+        h.upscaler = u == 1 ? 2 : u == 2 ? 3 : u == 3 ? 1 : 0;  // the menu's FSR 4, FSR 3, DLSS
+        h.upscale_quality = std::clamp(index_of(kUpscaleQuality), 0, 3);
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
@@ -1556,7 +1567,7 @@ void host_options_draw_page(int page) {
     bool first = true;
     for (int r = pg.first; r < pg.end; ++r) {
         if (g_rows[r].kind != Row::Option) continue;
-        if (g_setup_page && (g_rows[r].setting == kResolution || g_rows[r].setting == kShaders)) continue;
+        if (g_setup_page && g_rows[r].setting == kShaders) continue;
         if (!first) row_rule();
         first = false;
         setting_row(g_rows[r].setting);
@@ -1566,6 +1577,9 @@ void host_options_draw_page(int page) {
 }
 
 void host_options_draw_setup_page(int page) {
+    // Resolution is the Graphics tab's here too (the upscaler's output size
+    // and the render size follow it); only the shader form stays the Shaders
+    // page's.
     g_setup_page = true;
     host_options_draw_page(page);
     g_setup_page = false;
