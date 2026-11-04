@@ -13,6 +13,7 @@ void decomp_chalice_ritual_add();      // chalice/ritual.cpp: a chalice ritual's
 void decomp_follow_camera_add();       // camera/follow_camera.cpp: ChrExFollowCam::Update
 void decomp_gx_flush_wait_add();       // gx/flush_wait.cpp: the render path's flush wait
 void decomp_gx_block_reclaim_add();    // gx/block_reclaim.cpp: the resource tables' block reclaim
+void decomp_gx_rename_wait_add();      // gx/rename_wait.cpp: GX's discard rename, with a wait when it finds no room
 void decomp_gx_drain_token_add();      // gx/drain_token.cpp: the pipeline drain as a barrier token
 void decomp_gx_query_token_add();      // gx/query_token.cpp: an occlusion query's packets as one token
 void decomp_gx_dead_packets_add();     // gx/dead_packets.cpp: the Gnm packet writers nothing reads
@@ -56,6 +57,7 @@ void decomp_add_areas() {
     decomp_follow_camera_add();
     decomp_gx_flush_wait_add();
     decomp_gx_block_reclaim_add();
+    decomp_gx_rename_wait_add();
     decomp_gx_drain_token_add();
     decomp_gx_query_token_add();
     decomp_gx_dead_packets_add();

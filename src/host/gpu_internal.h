@@ -11,6 +11,8 @@
 #include "host/gpu.h"
 #include "host/copy_elide.h"
 #include "host/list_resolve.h"
+#include "host/cache_rw.h"
+#include "host/gxvk_lists.h"
 #include "host/stream_ops.h"
 
 #include <vulkan/vulkan.h>
@@ -206,6 +208,13 @@ struct DmemChunk {
     // window is not asked of the driver again for a while (import_backoff_ms),
     // its draws read through the page table and the sink meanwhile.
     std::uint64_t failed_ms[kImportWindows] = {};
+    // Idle windows let go (BBHOST_IMPORT_RETIRE, gpu.cpp): when each window
+    // was last used - a binding, a copy, a device address, a walk, its import's
+    // making (steady ms, the command processor's clock at its last
+    // submission; stored by run parts too) - and when it was let go (0: not
+    // since it was last imported), for the windows imported again.
+    std::atomic<std::uint64_t> used_ms[kImportWindows] = {};
+    std::uint64_t retired_ms[kImportWindows] = {};
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
@@ -1082,6 +1091,17 @@ struct ImportSite {
     ImportSite(const ImportSite&) = delete;
     ImportSite& operator=(const ImportSite&) = delete;
 };
+// The census by window's (gpu.cpp, BBHOST_IMPORT_CENSUS=1): why the binding
+// whose locate() is under way did not go by its GX buffer's handle - stage 1b's
+// result for it (gxvk::Fallback), -1 for none asked - set for the call's length.
+extern thread_local constinit int t_import_fall;
+struct ImportFall {
+    int prev;
+    explicit ImportFall(int fall) : prev(t_import_fall) { t_import_fall = fall; }
+    ~ImportFall() { t_import_fall = prev; }
+    ImportFall(const ImportFall&) = delete;
+    ImportFall& operator=(const ImportFall&) = delete;
+};
 // BBHOST_IMPORT_AUDIT=1 (gpu.cpp): counts the GPU side's resolutions per guest
 // mapping - kind 0 locate, 1 a device address, 2 a vertex/index mirror source.
 extern const bool g_import_audit;
@@ -1361,6 +1381,7 @@ enum RunStop : int {
 // draw committed in order: notes `why` among its effects (what a part would
 // have stopped at) and goes on. Outside both: false.
 inline bool run_part_stop(int why) {
+    if (gxvk_lists::census()) gxvk_lists::t_effects |= 1u << why;  // stage 4's census: what the draw needed in order
     if (!list_resolve::commit_draws()) return false;  // (no thread-local read with it off)
     RunDraw* const r = t_run_draw;
     if (!r) return false;
@@ -2041,6 +2062,16 @@ void textures_census_report();
 // registry saw made names it (its resource's generation known), and whether target_image's slot memo answered.
 void textures_census_target(int depth, bool gx_view, bool memo_hit);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
+// Stage 4b.1a's reader paths (host/cache_rw.h, under its shared lock; a pool
+// thread's): what the view entry for `id` (texture_view_flags' `flags`) and the
+// sampler cache hold, without a refresh, a count or anything made; null when
+// not made yet.
+VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
+VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
+// render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
+// translations, stage plans, views, samplers) through the reader paths, under
+// cache_rw::Read, into `out` (stage 4b.1a's pool).
+void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists::LookSink& out);
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within

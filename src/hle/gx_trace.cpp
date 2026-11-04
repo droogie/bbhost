@@ -28,6 +28,7 @@
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
+#include "host/gxvk_lists.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "log.h"
@@ -53,6 +54,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2325,10 +2327,30 @@ std::unordered_map<std::uint64_t, NativeDraw> g_native_draws;  // under g_native
 // processor builds the draw from it in place and frees it (0). A slot still in
 // use sends the call to g_native_draws instead, so no draw is lost.
 struct NativeSlot {
-    std::atomic<int> state{0};  // 0 free, 1 being written, 2 ready
+    // 0 free, 1 being written, 2 ready; with stage 4b.1a's pool on
+    // (BBHOST_GXVK_LISTS=1/2) also 3, a pool thread reading it (it gives it
+    // back as 2 a few microseconds on), and 4, taken by the command processor
+    // (the pool reads it no more).
+    std::atomic<int> state{0};
     std::uint64_t id = 0;
     alignas(64) NativeDraw draw;  // the inputs start a line of their own
 };
+// A slot a pool thread is reading (3): the command processor waits for it to
+// be given back (counted), as briefly as one draw's lookups.
+std::atomic<std::uint64_t> g_native_pinned_waits{0};
+int native_unpinned(std::atomic<int>& state) {
+    int s = state.load(std::memory_order_acquire);
+    if (s != 3) return s;
+    g_native_pinned_waits.fetch_add(1, std::memory_order_relaxed);
+    for (unsigned spins = 0; (s = state.load(std::memory_order_acquire)) == 3; ++spins) {
+        if (spins < 256) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    return s;
+}
 static_assert(std::is_trivially_copyable_v<GpuDrawInputs> && std::is_trivially_copyable_v<GxDrawObjects>);
 
 // The GX objects behind a draw, from its record: what the command processor's
@@ -2625,6 +2647,7 @@ bool native_draw_call(GxRec& r) {
     int free_state = 0;
     GxDrawObjects objects;
     build_objects(r, objects);
+    if (gxvk_lists::census()) objects.list_seq = gxvk_lists::draw_recorded(r.ctx);
     // BBHOST_GX_PACKED_RECORDS: the records packed into a pooled set, after
     // everything on this thread that reads them; =1 hands the command
     // processor only those (this thread's own set goes back to being its own),
@@ -2658,6 +2681,7 @@ bool native_draw_call(GxRec& r) {
         slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
+        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id);  // stage 4b.1a's pool looks ahead at it
         prefetch_next_slot();
     } else {
         g_native_overflow.fetch_add(1, std::memory_order_relaxed);
@@ -7657,7 +7681,15 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
         NativeSlot* slot = &native_slot(id);
         NativeDraw overflow;
         NativeDraw* draw = nullptr;
-        if (slot->state.load(std::memory_order_acquire) == 2 && slot->id == id) {
+        // With stage 4b.1a's pool on, the slot is taken (4) once a pool thread
+        // reading it has given it back: the pool reads it no more.
+        int expect = gxvk_lists::pool() ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
+        if (expect == 2 && gxvk_lists::pool() && slot->id == id) {
+            while (expect == 2 && !slot->state.compare_exchange_weak(expect, 4, std::memory_order_acquire, std::memory_order_acquire)) {
+                if (expect == 3) expect = native_unpinned(slot->state);
+            }
+        }
+        if ((expect == 2 || expect == 4) && slot->id == id) {
             draw = &slot->draw;
         } else {
             slot = nullptr;
@@ -7914,6 +7946,10 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                      static_cast<ull>(g_native_ineligible.load()), static_cast<ull>(g_native_late.load()),
                      static_cast<ull>(g_native_unmatched.load()), static_cast<ull>(g_native_failed.load()),
                      static_cast<ull>(g_native_overflow.load()));
+            if (gxvk_lists::pool()) {
+                host_log("gx-native: slots the command processor waited for while stage 4b.1a's pool read them: %llu",
+                         static_cast<ull>(g_native_pinned_waits.load()));
+            }
             if (g_packed_records) {
                 const std::uint64_t n = g_packed_draws.load();
                 std::string differ;
@@ -8263,16 +8299,23 @@ void hle_gx_native_prefetch(std::uint64_t id, bool next) {
     }
 }
 
+// Stored: ready (2), or taken by the command processor (4, the pool on); a
+// slot a pool thread reads (3) is waited for.
+bool native_stored(NativeSlot& slot, std::uint64_t id) {
+    const int s = gxvk_lists::pool() ? native_unpinned(slot.state) : slot.state.load(std::memory_order_acquire);
+    return (s == 2 || s == 4) && slot.id == id;
+}
+
 const GpuDrawInputs* hle_gx_native_peek(std::uint64_t id, const GxDrawObjects** objects) {
     NativeSlot& slot = native_slot(id);
-    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return nullptr;
+    if (!native_stored(slot, id)) return nullptr;
     if (objects) *objects = &slot.draw.objects;
     return &slot.draw.in;
 }
 
 bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs& in, GxDrawObjects& objects) {
     NativeSlot& slot = native_slot(id);
-    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return false;
+    if (!native_stored(slot, id)) return false;
     const NativeDraw& draw = slot.draw;
     in = draw.in;
     objects = draw.objects;
@@ -8292,6 +8335,36 @@ bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs
         std::memset(in.ps_user, 0, sizeof(in.ps_user));
     }
     return true;
+}
+
+// Stage 4b.1a's pool (host/gxvk_lists_pool.cpp): token `id`'s slot held for
+// reading (2 -> 3) while it is ready and still that token's - its inputs, its
+// objects (`objects`, records set: unpacked into the calling thread's own set
+// when packed, as the command processor's take does) - until
+// hle_gx_native_unpin. Null when it is not stored, taken or another token's.
+const GpuDrawInputs* hle_gx_native_pin(std::uint64_t id, GxDrawObjects* objects) {
+    NativeSlot& slot = native_slot(id);
+    int expect = 2;
+    if (!slot.state.compare_exchange_strong(expect, 3, std::memory_order_acquire, std::memory_order_relaxed)) return nullptr;
+    if (slot.id != id) {
+        slot.state.store(2, std::memory_order_release);
+        return nullptr;
+    }
+    const NativeDraw& draw = slot.draw;
+    *objects = draw.objects;
+    if (g_packed_records == 1 && draw.records) {
+        objects->records = unpack_records(draw.records.get());
+    } else if (g_packed_records == 2 && draw.records && draw.packed) {
+        objects->records = unpack_records(draw.packed.get());
+    } else {
+        objects->records = draw.records.get();
+    }
+    return &draw.in;
+}
+
+void hle_gx_native_unpin(std::uint64_t id) {
+    NativeSlot& slot = native_slot(id);
+    slot.state.store(2, std::memory_order_release);
 }
 
 void hle_gx_native_release() {

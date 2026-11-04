@@ -226,6 +226,8 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
             e.vk_offset = 0;
             e.block = -1;
             e.placed_serial = 0;
+            e.room_refused = false;
+            e.room_retry_flip = 0;
             e.hash = 0;
             e.binds = 0;
             e.watch_slot = static_cast<std::int8_t>(slot);
@@ -289,6 +291,21 @@ void memory_released(std::uint64_t va, std::uint64_t bytes) {
     if (!buffers_on() || !bytes) return;
     std::lock_guard<std::mutex> lk(g_mu);
     retire_overlapping_locked(va, bytes, kRetireUnmap);
+}
+
+bool kept_at(std::uint64_t va, std::uint64_t bytes) {
+    if (!buffers_on() || !bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_by_memory.empty()) return false;
+    auto it = g_by_memory.upper_bound(va);
+    if (it != g_by_memory.begin()) --it;
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) {
+        const BufferEntry* e = entry_at(it->second);
+        if (!e || it->first + e->bytes <= va) continue;
+        const std::uint32_t st = entry_state(e->word.load(std::memory_order_acquire));
+        if (st == kEntryMade || st == kEntryPlaced) return true;
+    }
+    return false;
 }
 
 void buffers_report() {

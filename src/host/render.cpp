@@ -2525,9 +2525,26 @@ CachedProgram* program_at(std::uint64_t va) {
     if (shader_patch_touches(cp.name)) cp.patch_mask = mask;
     cp.hash = fnv1a(cp.words.data(), cp.words.size() * 4);
     std::memcpy(cp.head, p, 64);
-    CachedProgram* made = &(g_programs[va] = cp);
+    CachedProgram* made = nullptr;
+    {
+        cache_rw::Write cw(cache_rw::kPrograms);  // stage 4b.1a's readers see it whole (host/cache_rw.h)
+        made = &(g_programs[va] = cp);
+    }
     m = {va, made};
     return made;
+}
+
+// Stage 4b.1a's reader path (host/cache_rw.h, under its shared lock): the
+// program at `va` as the map holds it - no memo read or written, nothing made;
+// null when it is not made yet (or the code there is not what it was made of).
+const CachedProgram* program_find(std::uint64_t va) {
+    if (!hle_kernel_va_mapped(va, 64)) return nullptr;
+    const auto it = g_programs.find(va);
+    if (it == g_programs.end()) return nullptr;
+    const CachedProgram& cp = it->second;
+    if (std::memcmp(cp.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 64) != 0) return nullptr;
+    if (cp.patch_mask >= 0 && cp.patch_mask != shader_patch_mask()) return nullptr;
+    return &cp;
 }
 
 // The fetch shader ends with s_setpc_b64.
@@ -2538,8 +2555,9 @@ struct FetchProgram {
     std::vector<std::uint32_t> words;
     std::uint64_t hash = 0;
 };
+std::unordered_map<std::uint64_t, FetchProgram> g_fetch_programs;  // under g.mu; changed under cache_rw's lock
 const FetchProgram* fetch_program_at(std::uint64_t va) {
-    static std::unordered_map<std::uint64_t, FetchProgram> cache;
+    std::unordered_map<std::uint64_t, FetchProgram>& cache = g_fetch_programs;
     if (!hle_kernel_va_mapped(va, 4)) return nullptr;
     auto cached = cache.find(va);
     if (cached != cache.end() && hle_kernel_va_mapped(va, cached->second.words.size() * 4) &&
@@ -2558,6 +2576,7 @@ const FetchProgram* fetch_program_at(std::uint64_t va) {
     gcn::Inst in;
     for (std::size_t i = 0; i < limit && gcn::decode_one(p, limit, i, in); i += in.size) {
         if (in.enc == gcn::Enc::SOP1 && in.op == 32) {  // s_setpc_b64
+            cache_rw::Write cw(cache_rw::kFetch);  // stage 4b.1a's readers see it whole
             FetchProgram& fp = cache[va];
             fp.words.assign(p, p + i + in.size);
             fp.hash = fnv1a(fp.words.data(), fp.words.size() * 4);
@@ -2566,6 +2585,20 @@ const FetchProgram* fetch_program_at(std::uint64_t va) {
         if (in.enc == gcn::Enc::SOPP && in.op == 1) break;  // s_endpgm
     }
     return nullptr;
+}
+
+// Stage 4b.1a's reader path (under cache_rw's shared lock): the fetch shader at
+// `va` as the cache holds it, null when it is not made yet or the words there
+// changed (the command processor makes it again in order).
+const FetchProgram* fetch_find(std::uint64_t va) {
+    if (!hle_kernel_va_mapped(va, 4)) return nullptr;
+    const auto it = g_fetch_programs.find(va);
+    if (it == g_fetch_programs.end()) return nullptr;
+    const FetchProgram& fp = it->second;
+    if (!hle_kernel_va_mapped(va, fp.words.size() * 4) ||
+        std::memcmp(fp.words.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), fp.words.size() * 4) != 0)
+        return nullptr;
+    return &fp;
 }
 
 // A binding the plan reads from a shader-resource view's record
@@ -2622,7 +2655,14 @@ ProgramById g_program_by_id[kById];  // under g.mu, direct-mapped by id
 FetchById g_fetch_by_id[kById];
 std::uint64_t g_by_id_hits = 0, g_by_id_misses = 0, g_by_id_disagree = 0, g_by_id_none = 0, g_by_id_unseen = 0;  // under g.mu
 
+CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va);
+// Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the command processor's answer noted for the pool's.
 CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
+    CachedProgram* const cp = program_for_impl(id, va);
+    gxvk_lists::cp_note(gxvk_lists::kLookProgram, va, cp ? cp->hash : 0);
+    return cp;
+}
+CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va) {
     if (!id || !g_program_ids) return program_at(va);
     ProgramById& e = g_program_by_id[id & (kById - 1)];
     CachedProgram* cp = nullptr;
@@ -2644,7 +2684,13 @@ CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
     return cp;
 }
 
+FetchById* fetch_for_impl(std::uint32_t id, std::uint64_t va, const FetchProgram*& out);
 FetchById* fetch_for(std::uint32_t id, std::uint64_t va, const FetchProgram*& out) {
+    FetchById* const e = fetch_for_impl(id, va, out);
+    gxvk_lists::cp_note(gxvk_lists::kLookFetch, va, out ? out->hash : 0);  // stage 4b.1a's compare
+    return e;
+}
+FetchById* fetch_for_impl(std::uint32_t id, std::uint64_t va, const FetchProgram*& out) {
     if (!id || !g_program_ids) {
         out = fetch_program_at(va);
         return nullptr;
@@ -3180,8 +3226,25 @@ void offer_paths(const std::vector<std::uint32_t>& words, const gcn::TranslateRe
     g_paths_ready.emplace(hash, std::move(kept));
 }
 
+const gcn::TranslateResult& paths_for_impl(std::uint64_t hash, const std::vector<std::uint32_t>& words, gcn::Stage stage,
+                                           std::uint32_t rsrc1, std::uint32_t rsrc2);
 const gcn::TranslateResult& paths_for(std::uint64_t hash, const std::vector<std::uint32_t>& words, gcn::Stage stage,
                                       std::uint32_t rsrc1, std::uint32_t rsrc2) {
+    const gcn::TranslateResult& paths = paths_for_impl(hash, words, stage, rsrc1, rsrc2);
+    gxvk_lists::cp_note(gxvk_lists::kLookPaths, hash, reinterpret_cast<std::uintptr_t>(&paths));  // stage 4b.1a's compare
+    return paths;
+}
+
+// Stage 4b.1a's reader path (under cache_rw's shared lock): a program's paths
+// as the cache holds them, null when not translated yet (never taken from the
+// ones made ahead, never translated here).
+const gcn::TranslateResult* paths_find(std::uint64_t hash) {
+    const auto it = g_paths_cache.find(hash);
+    return it == g_paths_cache.end() ? nullptr : &it->second;
+}
+
+const gcn::TranslateResult& paths_for_impl(std::uint64_t hash, const std::vector<std::uint32_t>& words, gcn::Stage stage,
+                                           std::uint32_t rsrc1, std::uint32_t rsrc2) {
     struct Memo {
         std::uint64_t hash = 0;
         const gcn::TranslateResult* paths = nullptr;
@@ -3202,6 +3265,7 @@ const gcn::TranslateResult& paths_for(std::uint64_t hash, const std::vector<std:
         std::lock_guard<std::mutex> lk(g_paths_ready_mu);
         if (auto rd = g_paths_ready.find(hash); rd != g_paths_ready.end()) {
             g_paths_taken.fetch_add(1, std::memory_order_relaxed);
+            cache_rw::Write cw(cache_rw::kPaths);  // stage 4b.1a's readers see it whole
             gcn::TranslateResult& taken = g_paths_cache[hash] = std::move(rd->second);
             g_paths_ready.erase(rd);
             return taken;
@@ -3214,7 +3278,9 @@ const gcn::TranslateResult& paths_for(std::uint64_t hash, const std::vector<std:
     o.stage = stage;
     o.rsrc1 = rsrc1;
     o.rsrc2 = rsrc2;
-    return g_paths_cache[hash] = translate_cached(prog, o, TranslationUse::kPaths);
+    gcn::TranslateResult made = translate_cached(prog, o, TranslationUse::kPaths);
+    cache_rw::Write cw(cache_rw::kPaths);  // stage 4b.1a's readers see it whole
+    return g_paths_cache[hash] = std::move(made);
 }
 
 namespace {
@@ -11603,7 +11669,34 @@ bool resolve_planned(const GxBindingPlan& p, const gcn::ResourcePath& path, cons
 // The plan for a translation's bindings over a stage's descriptors, built at
 // its first draw. A hash collision only rebuilds: the entry checks what it
 // was built from.
+// The open-addressed table's key for a translation's plan over a stage's descriptors.
+std::uint64_t stage_plan_key(const gcn::TranslateResult& meta, const GxStageRecords& st) {
+    const std::uintptr_t m = reinterpret_cast<std::uintptr_t>(&meta);
+    return ((st.desc_fp ^ (m * 0x9e3779b97f4a7c15ull)) + st.ndesc) | 1;
+}
+
+// Stage 4b.1a's reader path (under cache_rw's shared lock): the plan the table
+// holds for `meta` over these descriptors - not the front, which is the
+// command processor's memo - null when it is not made yet.
+const GxStagePlan* stage_plan_find(const gcn::TranslateResult& meta, const GxStageRecords& st) {
+    const std::uint64_t key = stage_plan_key(meta, st);
+    std::size_t i = static_cast<std::size_t>(key >> 20) & (kPlanSlots - 1);
+    for (int probe = 0; probe < 8; ++probe, i = (i + 1) & (kPlanSlots - 1)) {
+        const PlanSlot& s = g_plan_slots[i];
+        const GxStagePlan* p = s.plan;
+        if (s.key == key && p && p->meta == &meta && p->desc_fp == st.desc_fp && p->ndesc == st.ndesc && p->gen == g_binding_plan_gen)
+            return p;
+    }
+    return nullptr;
+}
+
+const GxStagePlan& stage_plan_impl(const gcn::TranslateResult& meta, const GxStageRecords& st);
 const GxStagePlan& stage_plan(const gcn::TranslateResult& meta, const GxStageRecords& st) {
+    const GxStagePlan& plan = stage_plan_impl(meta, st);
+    gxvk_lists::cp_note(gxvk_lists::kLookPlan, stage_plan_key(meta, st), reinterpret_cast<std::uintptr_t>(&plan));  // stage 4b.1a's compare
+    return plan;
+}
+const GxStagePlan& stage_plan_impl(const gcn::TranslateResult& meta, const GxStageRecords& st) {
     const auto fits = [&](const GxStagePlan* p) {
         return p && p->meta == &meta && p->desc_fp == st.desc_fp && p->ndesc == st.ndesc && p->gen == g_binding_plan_gen;
     };
@@ -11660,6 +11753,7 @@ const GxStagePlan& stage_plan(const gcn::TranslateResult& meta, const GxStageRec
             free_slot = &g_plan_slots[static_cast<std::size_t>(key >> 20) & (kPlanSlots - 1)];
             ++g_plans_evicted;
         }
+        cache_rw::Write cw(cache_rw::kPlans);  // stage 4b.1a's readers see the slot whole
         free_slot->key = key;
         free_slot->plan = plan;
     }
@@ -14514,6 +14608,68 @@ void prefetch_stage_images(const gcn::TranslateResult& meta, const std::uint32_t
     }
 }
 
+// Stage 4b.1a's pool (host/gxvk_lists.h): a stored GX-native draw's lookups
+// as the command processor's draw will make them, through the reader paths -
+// its programs, fetch shader, translations, the key stages' plans, and the
+// views and samplers its records bind through them - with the keys the
+// command processor's answers are noted by. The caller holds cache_rw::Read.
+// A tessellated draw, or one that binds a geometry shader, takes other paths
+// on the command processor and is left out; so are bindings that fall back
+// to user data (the register file at the token, which the pool has not got).
+void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists::LookSink& out) {
+    using namespace gxvk_lists;
+    if (in.tess || in.gs) return;
+    const std::uint64_t vs_va = (static_cast<std::uint64_t>(in.vs_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(in.vs_pgm[0]) << 8);
+    const std::uint64_t ps_va = (static_cast<std::uint64_t>(in.ps_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(in.ps_pgm[0]) << 8);
+    const CachedProgram* vs = program_find(vs_va);
+    out.add(kLookProgram, vs_va, vs ? vs->hash : 0);
+    const CachedProgram* ps = ps_va ? program_find(ps_va) : nullptr;
+    if (ps_va) out.add(kLookProgram, ps_va, ps ? ps->hash : 0);
+    if (o.geometry && o.fetch_va) {
+        const FetchProgram* f = fetch_find(o.fetch_va);
+        out.add(kLookFetch, o.fetch_va, f ? f->hash : 0);
+    }
+    const CachedProgram* const programs[2] = {vs, ps};
+    const GxDrawRecords* rec = o.records;
+    for (int k = 0; k < 2; ++k) {
+        if (!programs[k]) continue;
+        const gcn::TranslateResult* paths = paths_find(programs[k]->hash);
+        out.add(kLookPaths, programs[k]->hash, reinterpret_cast<std::uintptr_t>(paths));
+        if (!paths || !rec || !g_binding_plans) continue;
+        const GxStageRecords& st = rec->stage[k];
+        const GxStagePlan* plan = stage_plan_find(*paths, st);
+        out.add(kLookPlan, stage_plan_key(*paths, st), reinterpret_cast<std::uintptr_t>(plan));
+        if (!plan) continue;
+        if (g_view_by_id) {
+            for (std::size_t i = 0; i < paths->images.size() && i < plan->images.size(); ++i) {
+                const GxBindingPlan& bp = plan->images[i];
+                if (bp.source != GxBindingPlan::kTex || !((st.obj_tex_set >> bp.slot) & 1)) continue;
+                const gcn::ImageBinding& b = paths->images[i];
+                const std::uint32_t id = st.obj_tex_id[bp.slot];
+                if (!id) continue;
+                const std::uint8_t flags = texture_view_flags(b.storage, b.da, b.r128);
+                out.add(kLookView, id | static_cast<std::uint64_t>(flags) << 32, reinterpret_cast<std::uint64_t>(texture_view_find(id, flags)));
+            }
+        }
+        for (std::size_t i = 0; i < paths->samplers.size() && i < plan->samplers.size(); ++i) {
+            const GxBindingPlan& bp = plan->samplers[i];
+            const std::uint8_t* r = nullptr;
+            if (bp.source == GxBindingPlan::kSmp && ((st.obj_smp_set >> bp.slot) & 1)) {
+                r = st.obj_smp + static_cast<std::size_t>(bp.slot) * 32;
+            } else if (bp.source == GxBindingPlan::kSmpCache && (((st.obj_smp_set | st.obj_smp_default) >> bp.slot) & 1)) {
+                r = st.obj_smp + static_cast<std::size_t>(bp.slot) * 32;
+            }
+            if (!r) continue;
+            std::uint32_t w[4] = {};
+            copy_record_dwords(w, r, 4);
+            const bool compare = paths->samplers[i].compare;
+            std::uint64_t key = fnv1a(w, 16);
+            key = fnv1a(&compare, 1, key);
+            out.add(kLookSampler, key, reinterpret_cast<std::uint64_t>(sampler_find(w, compare)));
+        }
+    }
+}
+
 // The view each image binding of a stage gets: its texture's, or a dummy of
 // the shape the shader declares; null for none at all (left unwritten).
 void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre, const char* pipeline_name,
@@ -15362,6 +15518,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         } else if (!in_heap && outcome == kUnmapped && !known) {
             version = copy_version_lookup_locked(base, bytes, &loc);
             if (check && version != kCopyVersionNone) gxvk::heap_snap_disagree(gxvk::kHeapDiffCopyVersion, base, bytes);
+            if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
         }
         if (version == kCopyVersionStraddles) {
             if (run_part_stop(kRunStopOrder)) return;
@@ -15378,7 +15535,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // land on the range is asked once, for both.)
         int pending_known = known ? 0 : -1;  // (the heap's answer: none)
         const auto gpu_pending = [&]() {
-            if (pending_known < 0) pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+            if (pending_known < 0) {
+                pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+                if (pending_known) gxvk_lists::note_order(gxvk_lists::kOrderCbGpuWrite);
+            }
             return pending_known == 1;
         };
         if (check) {  // =compare: today's lookups, against the heap's answers
@@ -16500,12 +16660,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
+        int handle_result = -1;            // stage 1b's for the record (the import census)
         if (handles) {
             const std::uint64_t holder = o.vtx_obj[fe.slot];
             const std::uint32_t h = o.vtx_handle[fe.slot];
             const int r = !holder ? gxvk::kFallNoObject
                           : !h    ? gxvk::kFallNoHandle
                                   : gxvk_resolve_locked(gxvk::kUseVertex, h, holder, va, need, by_handle[e]);
+            handle_result = r;
             if (run_part_stopped()) return false;  // its copy placed in order (BBHOST_RUN_COMMIT)
             if (slot_result[fe.slot] < 0 || slot_result[fe.slot] == gxvk::kFalls) slot_result[fe.slot] = static_cast<std::int8_t>(r);
             handle_el[e] = r == gxvk::kFalls;
@@ -16546,6 +16708,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             }
         }
         const int version = heap_record ? kCopyVersionNone : copy_version_lookup_locked(va, need, &loc);
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderVertexVersion);
         if (version == kCopyVersionStraddles) {
             if (run_part_stop(kRunStopOrder)) return false;
             copy_versions_put_in_place_locked(kCvStraddle);
@@ -16613,6 +16776,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         placed_need = std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
                     }
                 }
+                const ImportFall fall(handle_result);
                 loc = locate(va, placed_need);
             }
         }
@@ -23609,7 +23773,10 @@ static bool draw_impl(const GpuDraw& d) {
         const gcn::TranslateResult vs_was = bind_pl->vs.meta(), ps_was = bind_pl->ps.meta();
         build_gfx_pipeline(*bind_pl, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes,
                            ps_sampler_modes, false, vertex_plan, false);
-        ++g_binding_plan_gen;  // its translations were replaced in place, and binding plans are keyed by them
+        {
+            cache_rw::Write cw(cache_rw::kPlans);  // stage 4b.1a's readers see the plans go
+            ++g_binding_plan_gen;  // its translations were replaced in place, and binding plans are keyed by them
+        }
         g_fallbacks_translated.fetch_add(1, std::memory_order_relaxed);
         if (!bind_pl->failed && (!same_bindings(vs_was, bind_pl->vs.meta()) || !same_bindings(ps_was, bind_pl->ps.meta()))) {
             // This draw's sets were written for the other translation's
@@ -23834,6 +24001,7 @@ static bool draw_impl(const GpuDraw& d) {
         // BBHOST_GXVK_BUFFERS=2 takes today's path and checks the handle's.
         bool by_handle = false;
         std::uint32_t index_handle = 0;
+        int index_result = -1;  // stage 1b's for the indices (the import census)
         if (gxvk::buffers_on()) {
             const GxDrawObjects* go = d.gx_objects;
             Located hl;
@@ -23843,6 +24011,7 @@ static bool draw_impl(const GpuDraw& d) {
                                             : gxvk_resolve_locked(gxvk::kUseIndex, go->ib_handle, go->ib_obj, d.index_va, index_bytes, hl);
             if (run_part_stopped()) return false;  // its copy placed in order (BBHOST_RUN_COMMIT)
             gxvk_count_locked(gxvk::kUseIndex, r);
+            index_result = r;
             if (r == gxvk::kFalls) {
                 index_handle = go->ib_handle;
                 if (gxvk_buffers_bind_mode()) {
@@ -23852,6 +24021,7 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderIndexVersion);
         if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
         // index_why: whether a mirror serves them, for the race census.
@@ -23864,6 +24034,7 @@ static bool draw_impl(const GpuDraw& d) {
                 // same answer for the import's binding, not asked again.
                 const std::uint8_t probe_why = probe ? shadow_locate_why() : kLocNotAsked;
                 const ImportSite site("an index buffer");
+                const ImportFall fall(index_result);
                 loc = locate(d.index_va, index_bytes);
                 if (!d.indirect_va) {
                     if (probe_why == kLocInPlace && loc.buffer) {
@@ -23986,6 +24157,7 @@ static bool draw_impl(const GpuDraw& d) {
         if (g_import_audit) audit_range(d.indirect_va, args_bytes, kUseIndex);
         Located loc;
         const int version = copy_version_lookup_locked(d.indirect_va, args_bytes, &loc);  // a straddle ended the pass above
+        if (version != kCopyVersionNone) gxvk_lists::note_order(gxvk_lists::kOrderIndexVersion);
         if (version != kCopyVersionInside) {
             const ImportSite site("a draw's indirect arguments");
             loc = locate(d.indirect_va, args_bytes);

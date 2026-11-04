@@ -188,6 +188,9 @@ void memory_released(std::uint64_t va, std::uint64_t bytes);
 // The exit report's lines for the table (gx_resources_report calls it; the
 // command processor's side reports with the GPU's).
 void buffers_report();
+// The import census's (gpu.cpp, BBHOST_IMPORT_CENSUS=1): whether a kept buffer's live entry holds any of
+// [va, va + bytes) - a binding of it that reached guest memory took today's path where its handle's was there.
+bool kept_at(std::uint64_t va, std::uint64_t bytes);
 
 // --- Stage 1c: GX's upload heap bound in place (host/gxvk_arena.cpp) ---
 //
@@ -235,6 +238,9 @@ enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending,
 void arena_note(ArenaNote what, std::uint64_t bytes);
 // The exit report (gx_resources_report calls it).
 void arena_report();
+// GX's upload heap's bounds once its pool is made, whatever BBHOST_GXVK_ARENA says (the import census's owners:
+// gpu.cpp); false before.
+bool upload_heap(std::uint64_t* lo, std::uint64_t* hi);
 // --- Stage 1d.1: the heap's constant buffers snapshotted with no lookups (host/gxvk_heapsnap.cpp) ---
 //
 // A constant buffer the game writes on the CPU is copied as its draw records

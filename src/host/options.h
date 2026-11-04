@@ -48,8 +48,9 @@ void host_options_frame(float display_w, float display_h);
 // typed fields; the calls below are the front ends' way in, by name.
 // Read one by the same name host_opt_set() takes. Unknown names read false.
 bool host_opt_get(const char* key);
-// Whether the options file held a value for it when it was read; false, the
-// setting is its default (the table's, or what bbhost.toml sets for it).
+// Whether the setting is the player's own: the options file held a value for
+// it when it was read, or it was set since. False, it is its default (the
+// table's, or what bbhost.toml sets for it).
 bool host_opt_saved(const char* key);
 // The render resolution the player chose, or what BBHOST_RES says. False when
 // neither parses. Read once by the loader - it is a patch on the image.
@@ -103,6 +104,26 @@ std::uint64_t host_opt_serial();
 // What the Shaders setting's HLSL and Lifted mean, in a player's words: the
 // setup window's bubbles and F10's.
 extern const char* const kHostShaderModeTips[2];
+// The Effect timing setting's choices (Smooth, Original (30), 60 a second, Your
+// frame rate), what the row says and what each choice means, for the setup
+// window's row and F10's.
+extern const char* const kHostEffectTimingLabels[4];
+extern const char* const kHostEffectTimingNote;
+extern const char* const kHostEffectTimingTips[4];
+// The Effect timing row as the setup window and F10 show it: the choice that
+// will run (`index`, 0 to 3), or 4 when none of the four is it - bbhost.toml's
+// [video] effect_steps or BBHOST_SFX_STEP asking for a number of steps or for
+// frame - with `custom` that fifth entry ("Custom: 5 (bbhost.toml)") and `tip`
+// its bubble.
+struct HostEffectTimingRow {
+    int index = 0;
+    std::string custom, tip;
+};
+HostEffectTimingRow host_effect_timing_row();
+// Effect timing picked in a menu (0 to 3): the setting, and the player's own
+// from then on even when it already held that choice (the row showed what
+// bbhost.toml asks for), written to the options file at once.
+void host_opt_choose_effect_timing(int index);
 
 // What each setting ships with - the table's own values, whatever the files
 // say - for the game's Defaults row (engine/option_menu.cpp). Read the way

@@ -1,22 +1,19 @@
 # Enable Screen Space Reflections: Kyo's 1.09 patch from his shadPS4 list
-# (Bloodborne.xml, "Enable Screen Space Reflections (native res)"), with the
-# reflection's step scale left as the game has it: the list's version also
-# writes 0.0 over the 1.0 at 0x12a8cfd, which made the half-size ray march take
-# 7.8 ms a frame at 1080p on the Radeon 8060S against the game's 6.1.
+# (Bloodborne.xml, "Enable Screen Space Reflections (READ NOTE)"), every site
+# as the list has it, the reflection's step scale included (0.0 over the 1.0
+# at 0x12a8cfd). The 0.0 costs ray-march time: it made the half-size ray march
+# take 7.8 ms a frame at 1080p on the Radeon 8060S against the game's 6.1.
 # Its [Ssr] Fade To Viewer Param of -10000 (the game's -0.8, at 0x2695a5b,
 # and the debug menu's slider minimum at 0x26b8d65) is kept, as Kyo asked.
 # Off until turned on (the setup window's Patches tab, or
 # screen-space-reflections = true under [patches] in bbhost.toml).
 #
-# It turns the scene context's reflection pass on at the render size. The game
-# makes the reflection's two targets at half the render size and the depth
-# renders it reads at half and a quarter, so the reflection traced at 0.5 and
-# blurred from 0.25; here its targets are the render size (each `shr esi, 1;
-# shr edx, 1` a 4-byte nop) and the depth renders full and half size (the
-# halving dropped, the quarter a halving): it traces at 1.0 and blurs from 0.5,
-# as Kyo had it. The depth renders are derived from the render size (four sites
-# written over any patch's fixed size), as 32-bit float depth (0x125b1bf:
-# format 0x14 -> 0x28), and its own targets fed. Its two
+# It turns the scene context's reflection pass on, its ray march's step scale
+# 0, and puts the depth renders it reads back at the game's default
+# resolutions: the half- and quarter-size depth renders derived from the
+# render size again (four sites that write the game's own code over any
+# patch's fixed size), as 32-bit float depth (0x125b1bf: format 0x14 -> 0x28),
+# and its own targets sized and fed. Its two
 # sites that rewrite calls already as shipped (0x26a10c0, 0x26a2829) and two
 # that rewrite a byte as shipped (0x26c3d7d, 0x26c4fd7) are kept as the list
 # has them: they undo the performance patches' changes to what it reads.
@@ -28,7 +25,7 @@
 name = "screen-space-reflections"
 title = "Enable Screen Space Reflections"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
-description = "Screen space reflections on, at the render's full size, with the depth they read at full and half size (the game's are half and a quarter): sharper reflections, more GPU time. It loads last, so other patches' render changes give way to it."
+description = "Screen space reflections on, with the depth renders back at the game's default resolutions. It loads last, so other patches' render changes give way to it."
 enabled = false
 order = 9000
 live = false
@@ -55,35 +52,41 @@ address = "0x026c3d7d"
 expect = "01"
 bytes = "01"
 
-# the game's width / 2 -> width (shr eax, 1 -> xchg ax, ax)
-[site.depth-full-width]
+# the game's own: width / 2
+[site.depth-half-width]
 address = "0x0125b1a3"
 expect = "8b 03 d1 e8 89 04 24"
-bytes = "8b 03 66 90 89 04 24"
+bytes = "8b 03 d1 e8 89 04 24"
 
-# the game's height / 2 -> height
-[site.depth-full-height]
+# height / 2
+[site.depth-half-height]
 address = "0x0125b1aa"
 expect = "8b 43 04 d1 e8 89 44 24 04"
-bytes = "8b 43 04 66 90 89 44 24 04"
+bytes = "8b 43 04 d1 e8 89 44 24 04"
 
-# the game's width / 4 -> width / 2 (shr eax, 2 -> shr eax, 1; nop)
-[site.depth-half-width]
+# width / 4
+[site.depth-quarter-width]
 address = "0x0125b1d6"
 expect = "8b 03 c1 e8 02 89 04 24"
-bytes = "8b 03 d1 e8 90 89 04 24"
+bytes = "8b 03 c1 e8 02 89 04 24"
 
-# the game's height / 4 -> height / 2
-[site.depth-half-height]
+# height / 4
+[site.depth-quarter-height]
 address = "0x0125b1de"
 expect = "8b 43 04 c1 e8 02 89 44 24 04"
-bytes = "8b 43 04 d1 e8 90 89 44 24 04"
+bytes = "8b 43 04 c1 e8 02 89 44 24 04"
 
 # the depth render's format 0x14 -> 0x28 (D32_FLOAT)
 [site.depth-format]
 address = "0x0125b1bf"
 expect = "14"
 bytes = "28"
+
+# the reflection's step scale: the high half of a movabs, 1.0 -> 0.0
+[site.step-scale]
+address = "0x012a8cfd"
+expect = "00 00 80 3f"
+bytes = "00 00 00 00"
 
 # call 0x268f180, as shipped
 [site.call-a]
@@ -96,19 +99,6 @@ bytes = "e8 bb e0 fe ff"
 address = "0x026a2829"
 expect = "e8 52 c9 fe ff"
 bytes = "e8 52 c9 fe ff"
-
-# the reflection's first target (0x26c429d's call) at the render size: its
-# shr esi, 1; shr edx, 1 -> nop dword [rax]
-[site.target-a-full]
-address = "0x026c428d"
-expect = "d1 ee d1 ea"
-bytes = "0f 1f 40 00"
-
-# the second (0x26c42c6's call) at the render size
-[site.target-b-full]
-address = "0x026c42b0"
-expect = "d1 ee d1 ea"
-bytes = "0f 1f 40 00"
 
 # mov ecx, r12d -> push 10; pop rcx
 [site.size-a]

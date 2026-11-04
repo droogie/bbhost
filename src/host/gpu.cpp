@@ -13,10 +13,12 @@
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
+#include "host/gxvk_table.h"
 #include "host/import_mode.h"
 #include "host/import_prefetch.h"
 #include "host/memory_policy.h"
 #include "host/host_lists.h"
+#include "host/import_retire.h"
 #include "host/import_table.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
@@ -69,6 +71,7 @@ namespace gpu {
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 thread_local constinit const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
+thread_local constinit int t_import_fall = -1;                  // gpu_internal.h: the census by window
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -509,6 +512,7 @@ void free_import(Chunk& c) {
     c = Chunk{};
 }
 
+
 // [ptr, ptr + size) of the mirror into c as one host-pointer import.
 VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -770,6 +774,34 @@ VKAPI_ATTR VkBool32 VKAPI_CALL va_binding_callback(VkDebugUtilsMessageSeverityFl
     return VK_FALSE;
 }
 
+// Idle window imports let go (host/import_retire.h; the memory policy decides
+// it, host/memory_policy.h, BBHOST_IMPORT_RETIRE winning): 1 lets go of a
+// window import none of whose windows anything has used for
+// BBHOST_IMPORT_RETIRE_S seconds (60), at most BBHOST_IMPORT_RETIRE_MB (128)
+// MiB a second, so the frees - each an unpinning in the driver, at a slot's
+// retirement on the command processor - spread over the seconds after an
+// area's change; 2 counts what 1 would let go and the windows it would have
+// imported again, and lets go of nothing; 0 keeps every window imported once
+// made. 0 until the policy is decided: a window used before has no stamp, which
+// the first check gives it.
+const import_retire::Switch g_retire =
+    import_retire::parse(nullptr, std::getenv("BBHOST_IMPORT_RETIRE_S"), std::getenv("BBHOST_IMPORT_RETIRE_MB"));
+std::atomic<int> g_retire_mode{0};
+// The command processor's clock at its last submission (steady ms): what a use
+// stamps on its windows, without a clock read of its own.
+std::atomic<std::uint64_t> g_import_now_ms{0};
+// Bumped at every import let go: the import thread's view of what is imported
+// (prefetch_thread's `known`) starts again.
+std::atomic<std::uint64_t> g_import_retire_gen{0};
+// Under g.mu: checks made, imports let go (and their MiB); windows used again
+// after it - imported again (their MiB, the driver's time of the paths that
+// asked, the longest), each by the path that asked; with 2, what 1 would have
+// let go and imported again.
+std::uint64_t g_retire_checks = 0, g_retire_n = 0, g_retire_bytes = 0, g_retire_skipped = 0;
+std::uint64_t g_again_n = 0, g_again_bytes = 0, g_again_us = 0, g_again_max_us = 0, g_again_prefetch = 0;
+std::uint64_t g_would_n = 0, g_would_bytes = 0, g_would_again_n = 0, g_would_again_bytes = 0, g_would_idle_most = 0;
+std::uint64_t g_would_ms[gcn::kDmemChunks][kImportWindows] = {};  // =2: when the window would have been let go (0: not)
+
 // BBHOST_IMPORT_TABLE_DEFER (on unless 0): a window import that replaces
 // older ones (a merge) takes over their windows' page-table entries only once
 // every submission made before it has run (host/import_table.h); =0 points them
@@ -862,17 +894,23 @@ struct SiteUse {
     const char* site = nullptr;
     std::uint64_t n = 0, bytes = 0;
 };
-SiteUse g_site_uses[64];  // under g.mu
+constexpr int kSiteSlots = 64;
+SiteUse g_site_uses[kSiteSlots];  // under g.mu
+// The slot of a path (its name's pointer: ImportSite's literal), -1 once every slot is taken.
+int site_slot_locked(const char* site) {
+    for (int k = 0; k < kSiteSlots; ++k) {
+        SiteUse& u = g_site_uses[k];
+        if (!u.site) u.site = site;
+        if (u.site == site) return k;
+    }
+    return -1;
+}
 void note_site_use_locked(std::uint64_t bytes) {
     if (!g_census) return;
-    const char* const site = t_import_site ? t_import_site : "other";
-    for (SiteUse& u : g_site_uses) {
-        if (!u.site) u.site = site;
-        if (u.site != site) continue;
-        ++u.n;
-        u.bytes += bytes;
-        return;
-    }
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    if (k < 0) return;
+    ++g_site_uses[k].n;
+    g_site_uses[k].bytes += bytes;
 }
 // The GX buffers GPU copies wrote (copy tokens' destinations, copy versions'):
 // by generation, with their usage, bind flags and size - candidates for a
@@ -903,6 +941,116 @@ std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImpo
 // else wants it waits too), the mapping thread's for a whole span.
 std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
+// Retired imports freed once their slot's work has run (the driver's time of each - an import's pages unpinned - on the
+// thread that frees them), and the command processor's part of it: the free itself without the free thread, the hand-over
+// with it.
+std::atomic<std::uint64_t> g_import_freed{0}, g_import_freed_bytes{0}, g_import_free_us{0}, g_import_free_max_us{0};
+std::atomic<std::uint64_t> g_import_free_cp_us{0}, g_import_free_cp_max_us{0};
+
+// ---- Retired window imports freed off the command processor (BBHOST_IMPORT_FREE_THREAD, on unless 0) ----
+// A window import a merge replaced, or one let go while idle, is freed once
+// every submission that could name it has run - its slot's retirement - and
+// the free itself is the driver unpinning its pages: on an RTX 4070 up to 14 ms
+// for one, 95-181 ms over a 3.5-minute tour, on the command processor under the
+// renderer's lock. The slot's retirement now hands each to a thread of its own
+// (bb-import-free) that frees it: the order stays - nothing is handed over
+// before that retirement - and Vulkan lets memory and buffers be freed on any
+// thread, as the import thread already does with a raced import. =0 frees
+// them at the retirement, on the command processor, as before.
+const bool g_free_thread_on = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_THREAD");
+    return !(e && e[0] == '0');
+}();
+// The thread runs in the background (host_thread_background) and waits
+// BBHOST_IMPORT_FREE_GAP_MS (50) after each free before the next: freed back
+// to back beside the game, the frees took ~1.7 times as long and the main
+// loop's work at Laurence's staircase rose 0.23 ms (uncapped -2.5%, an RTX
+// 4070 as a 4 GB card) - spread out and yielding, they are meant to meet
+// nothing. A burst of retired imports (a merge's, an area's) is freed over a
+// second or two instead.
+const std::uint32_t g_free_gap_ms = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_GAP_MS");
+    return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 50u;
+}();
+// BBHOST_IMPORT_FREE_LOG=1: each free logged with its flip and wall clock, so a
+// harness can line frees up with the frame intervals.
+const bool g_free_log = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_LOG");
+    return e && e[0] == '1';
+}();
+struct DeadImport {
+    Chunk chunk;
+    int slot = 0;
+    std::uint64_t serial = 0;
+};
+std::mutex g_free_mu;
+std::condition_variable g_free_cv;
+std::deque<DeadImport> g_free_q;  // under g_free_mu
+bool g_free_started = false;      // under g_free_mu
+std::atomic<std::uint64_t> g_free_queue_most{0};
+
+// One import freed, timed (va trace, counts); `cp`: on the command processor.
+void free_dead_import_now(Chunk& c, int slot, std::uint64_t serial, bool cp) {
+    va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(slot), serial);
+    const std::uint64_t size = c.size;
+    const auto t0 = std::chrono::steady_clock::now();
+    free_import(c);
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (g_free_log) {
+        const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        host_log("gpu: import freed: %llu MiB in %.2f ms at flip %llu %.3f, %s", static_cast<unsigned long long>(size >> 20), us / 1e3,
+                 static_cast<unsigned long long>(hle_video_flip_count()), wall, cp ? "on the command processor" : "on bb-import-free");
+    }
+    g_import_freed.fetch_add(1, std::memory_order_relaxed);
+    g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_import_free_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_max_us.load(std::memory_order_relaxed)) g_import_free_max_us.store(us, std::memory_order_relaxed);
+    if (cp) {
+        g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+        if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+    }
+}
+
+void import_free_thread() {
+    host_thread_set_name("bb-import-free");
+    host_thread_background();
+    for (;;) {
+        DeadImport d;
+        {
+            std::unique_lock<std::mutex> lk(g_free_mu);
+            g_free_cv.wait(lk, [] { return !g_free_q.empty(); });
+            d = std::move(g_free_q.front());
+            g_free_q.pop_front();
+        }
+        free_dead_import_now(d.chunk, d.slot, d.serial, false);
+        if (g_free_gap_ms) std::this_thread::sleep_for(std::chrono::milliseconds(g_free_gap_ms));
+    }
+}
+
+// At a slot's retirement (every submission that could name it has run): the
+// import freed on the free thread, or here (BBHOST_IMPORT_FREE_THREAD=0).
+void free_dead_import(Chunk& c, int slot, std::uint64_t serial) {
+    if (!g_free_thread_on) {
+        free_dead_import_now(c, slot, serial, true);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_free_mu);
+        g_free_q.push_back(DeadImport{std::move(c), slot, serial});
+        c = Chunk{};
+        const std::uint64_t n = g_free_q.size();
+        if (n > g_free_queue_most.load(std::memory_order_relaxed)) g_free_queue_most.store(n, std::memory_order_relaxed);
+        if (!g_free_started) {
+            g_free_started = true;
+            std::thread(import_free_thread).detach();
+        }
+    }
+    g_free_cv.notify_one();
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+}
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
 // An import can fail on a player's machine as well as from a full card: the
@@ -1087,6 +1235,19 @@ bool set_page_locked(std::uint64_t va, std::uint64_t dev) {
 }
 
 // The guest pages over [lo, hi) of chunk `index` - every mapping of them -
+// point at the sink (an idle window let go, BBHOST_IMPORT_RETIRE).
+void map_sink_pages_locked(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+    const std::uint64_t page = 1ull << gcn::kPageShift;
+    const std::uint64_t base = static_cast<std::uint64_t>(index) * kChunkBytes;
+    for (const GuestMapInfo& mi : g.maps) {
+        if (!mi.dmem || !(mi.prot & 1) || mi.len == 0 || (mi.va & (page - 1)) || (mi.len & (page - 1))) continue;
+        const std::uint64_t a = std::max(static_cast<std::uint64_t>(mi.phys), base + lo);
+        const std::uint64_t b = std::min(static_cast<std::uint64_t>(mi.phys) + mi.len, base + hi);
+        for (std::uint64_t phys = a & ~(page - 1); phys < b; phys += page) set_page_locked(mi.va + (phys - static_cast<std::uint64_t>(mi.phys)), g.sink.address);
+    }
+}
+
+// The guest pages over [lo, hi) of chunk `index` - every mapping of them -
 // point into import `c`.
 void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t lo, std::uint64_t hi) {
     const std::uint64_t page = 1ull << gcn::kPageShift;
@@ -1259,12 +1420,25 @@ void count_lagging_tables_locked() {
 // job cannot see yet (amdgpu maps a new buffer for the submissions after it) -
 // they keep it until publish_import_tables_locked finds the queue has. The
 // imports neither view names any more retire (host/import_table.h).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who);  // the census by window, below
 void install_import_locked(std::uint32_t index, Chunk* c) {
     DmemChunk& d = g.dmem[index];
     const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
     if (end <= c->lo) return;
     const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
     const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    if (g_census) window_made_locked(index, a, b, t_import_who);
+    if (g_retire_mode.load(std::memory_order_relaxed)) {
+        const std::uint64_t now = g_import_now_ms.load(std::memory_order_relaxed);
+        for (std::uint32_t w = a; w <= b; ++w) {
+            d.used_ms[w].store(now, std::memory_order_relaxed);
+            if (d.retired_ms[w]) {  // let go before: imported again (dmem_import counts the paths that asked; here the import thread's)
+                if (t_import_who == kIwPrefetch) ++g_again_prefetch;
+                d.retired_ms[w] = 0;
+            }
+            g_would_ms[index][w] = 0;
+        }
+    }
     c->made_serial = g.flushes;  // the recording open now goes to the queue after it was made
     c->made_ns = host_clock_monotonic_ns();
     bool replaces = false;
@@ -1358,6 +1532,118 @@ void publish_import_tables_locked() {
         g_table_published += done.written;
     }
     count_lagging_tables_locked();
+}
+
+std::int64_t steady_ms();  // below, beside the image heap
+
+// The windows [a, b] of chunk `index` that import `c` holds (in the chunk).
+bool import_windows_of(const Chunk& c, std::uint32_t& a, std::uint32_t& b) {
+    const std::uint64_t end = std::min(c.lo + c.size, kChunkBytes);
+    if (end <= c.lo) return false;
+    a = static_cast<std::uint32_t>(c.lo >> kImportWindowShift);
+    b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    return true;
+}
+
+// Idle import `c` of chunk `index` let go (BBHOST_IMPORT_RETIRE=1): its
+// windows' entries at the sink, the windows naming nothing, the import into the
+// current slot's dead imports - freed once the work recorded with it has run.
+void let_go_idle_import_locked(std::uint32_t index, Chunk* c, std::uint64_t now) {
+    DmemChunk& d = g.dmem[index];
+    std::uint32_t a = 0, b = 0;
+    if (!import_windows_of(*c, a, b)) return;
+    const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+    for (std::uint32_t w = a; w <= b; ++w) {
+        const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+        const std::uint64_t hi = std::min(end, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+        if (d.table[w] == c && hi > lo) map_sink_pages_locked(index, lo, hi);
+        d.table[w] = nullptr;
+        d.window[w] = nullptr;
+        d.retired_ms[w] = now;
+    }
+    ++g_retire_n;
+    g_retire_bytes += c->size;
+    if (g_va_trace) {
+        char det[96];
+        std::snprintf(det, sizeof(det), "chunk %u +0x%llx windows %u-%u: idle, let go", index, static_cast<unsigned long long>(c->lo), a, b);
+        va_note("import let go", c->address, c->size, index, c->lo, det);
+    }
+    retire_import_locked(index, c);  // nothing names it now
+    g_import_retire_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+// After every submission (submit_locked) - no recording and no run open, and
+// the dead imports go to the slot the next recording fills: the clock the
+// uses stamp, and once a second the window imports none of whose windows was
+// used for BBHOST_IMPORT_RETIRE_S let go (=1) or counted (=2). One a merge's
+// page-table view still moves over, or a copy version names, waits for a later
+// check.
+void retire_idle_imports_locked() {
+    if (!g_retire_mode.load(std::memory_order_relaxed) || imports_whole()) return;
+    const std::uint64_t now = static_cast<std::uint64_t>(std::max<std::int64_t>(steady_ms(), 1));
+    g_import_now_ms.store(now, std::memory_order_relaxed);
+    static std::uint64_t last = 0;
+    if (now - last < 1000) return;
+    last = now;
+    ++g_retire_checks;
+    std::uint64_t idle_now = 0, let_go = 0;
+    std::vector<Chunk*> idle;
+    for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+        DmemChunk& d = g.dmem[k];
+        idle.clear();
+        for (const auto& up : d.imports) {
+            Chunk* c = up.get();
+            std::uint32_t a = 0, b = 0;
+            if (!import_windows_of(*c, a, b)) continue;
+            if (!import_retire::idle(d.window, d.table, d.used_ms, a, b, c, now, g_retire.after_ms)) continue;
+            if (copy_versions_name_buffer_locked(c->buffer)) {
+                ++g_retire_skipped;
+                continue;
+            }
+            idle.push_back(c);
+        }
+        for (Chunk* c : idle) {
+            idle_now += c->size;
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
+                if (!import_retire::fits(let_go, g_retire.per_check)) continue;  // the next check's
+                let_go += c->size;
+                let_go_idle_import_locked(k, c, now);
+                continue;
+            }
+            // =2: counted once until a window of it is used again.
+            std::uint32_t a = 0, b = 0;
+            import_windows_of(*c, a, b);
+            bool fresh = false;
+            for (std::uint32_t w = a; w <= b; ++w) {
+                if (g_would_ms[k][w]) continue;
+                g_would_ms[k][w] = now;
+                fresh = true;
+            }
+            if (fresh) {
+                ++g_would_n;
+                g_would_bytes += c->size;
+            }
+        }
+    }
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) count_lagging_tables_locked();
+    g_would_idle_most = std::max(g_would_idle_most, idle_now);
+}
+
+// A use of [in, in + bytes) of chunk `index`, with BBHOST_IMPORT_RETIRE on:
+// its windows' stamp, and with =2 a window it would have let go imported again.
+void note_windows_used(DmemChunk& d, std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+    const std::uint64_t now = g_import_now_ms.load(std::memory_order_relaxed);
+    const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+    const std::uint32_t w1 = static_cast<std::uint32_t>((std::min(in + std::max<std::uint64_t>(bytes, 1), kChunkBytes) - 1) >> kImportWindowShift);
+    for (std::uint32_t w = w0; w <= w1; ++w) {
+        if (d.used_ms[w].load(std::memory_order_relaxed) != now) d.used_ms[w].store(now, std::memory_order_relaxed);
+        // (=2's count on the command processor alone: a run part's use counts at its commit's.)
+        if (g_retire_mode.load(std::memory_order_relaxed) == 2 && g_would_ms[index][w] && !t_bump_sink) {
+            g_would_ms[index][w] = 0;
+            ++g_would_again_n;
+            g_would_again_bytes += 1ull << kImportWindowShift;
+        }
+    }
 }
 }  // namespace
 
@@ -1453,6 +1739,328 @@ std::string import_idle_report_locked() {
     return buf;
 }
 
+// ---- The census by window (BBHOST_IMPORT_CENSUS=1; off, nothing is counted) ----
+// Every use of direct memory an import answers or is made for (dmem_import),
+// by the 16 MiB window it falls in: the path that asked (t_import_site), what
+// lies at the address it asked for - its owner: GX's upload heap, a GX buffer
+// kept by handle (stage 1b; such a binding took today's path), another GX
+// buffer by kind, a GX texture, the middleware (BBHOST_RESOURCE_CENSUS=1),
+// nothing of GX's - and when. At a report, every window imported: those that
+// serve GX-owned memory alone and those a handle covers - what stage 6 may stop
+// importing - and those a minute (or 3,600 flips) without a use - what retiring
+// idle windows would give back - in bytes, with what lies in them. With whole
+// spans the same uses say which windows window imports would need.
+namespace {
+enum WinOwner : int {
+    kWoHeap,         // GX's upload heap (renamed copies, Map renames, the ring allocator's)
+    kWoKept,         // a GX buffer kept by handle (stage 1b)
+    kWoDynamic,      // a dynamic GX buffer, in its own memory
+    kWoGpuWritten,   // a GX buffer the GPU writes (unordered access, stream output)
+    kWoConstant,     // a GX constant buffer, in its own memory
+    kWoBuffer,       // another GX buffer (default without data, staging)
+    kWoTexture,      // a GX texture
+    kWoYebis,        // YEBIS's device's (BBHOST_RESOURCE_CENSUS=1)
+    kWoScaleform,    // a Scaleform texture's plane (BBHOST_RESOURCE_CENSUS=1)
+    kWoNone,         // no GX object
+    kWoUnnamed,      // the path named no address (the buffer shadow's mirror pages)
+    kWinOwners
+};
+const char* const kWinOwnerName[kWinOwners] = {"GX's upload heap", "a GX buffer kept by handle", "a dynamic GX buffer",
+                                               "a GX buffer the GPU writes", "a GX constant buffer", "another GX buffer", "a GX texture",
+                                               "YEBIS", "Scaleform", "no GX object", "no address named"};
+constexpr std::uint32_t kWoGx = (1u << kWoHeap) | (1u << kWoKept) | (1u << kWoDynamic) | (1u << kWoGpuWritten) | (1u << kWoConstant) |
+                                (1u << kWoBuffer) | (1u << kWoTexture);
+struct WindowUses {
+    std::uint64_t sites = 0;   // bit k: the path in g_site_uses[k] used it
+    std::uint32_t owners = 0;  // bit per WinOwner met at its uses
+    std::uint64_t uses = 0, bytes = 0;
+    std::uint64_t first_ms = 0, last_ms = 0, last_flip = 0;
+    int maker = -1;  // the ImportWho of the first import that covered it (window imports)
+};
+WindowUses g_wuse[gcn::kDmemChunks][kImportWindows];                                    // under g.mu
+std::uint64_t g_wuse_n[kSiteSlots][kWinOwners], g_wuse_bytes[kSiteSlots][kWinOwners];  // by path and owner, under g.mu
+// The uses of GX buffers' memory (a GX buffer kept by handle, another GX buffer) by why the binding took today's path
+// (stage 1b's result, t_import_fall; the last: none asked), under g.mu.
+constexpr int kWinFalls = 12;
+const char* const kWinFallName[kWinFalls] = {"no GX object", "not kept", "a stale handle", "taken back since the call", "retired by a write",
+                                             "past the buffer's end", "no memory for the copy", "its bytes out of reach", "indirect indices",
+                                             "shared with another buffer", "the copies' budget", "none asked, or compared"};
+static_assert(gxvk::kFalls == kWinFalls - 1, "a name for each of stage 1b's results");
+std::uint64_t g_wuse_fall_n[2][kWinFalls], g_wuse_fall_bytes[2][kWinFalls];
+
+int win_owner_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!va) return kWoUnnamed;
+    if (!bytes) bytes = 1;
+    std::uint64_t lo = 0, hi = 0;
+    if (gxvk::upload_heap(&lo, &hi) && va < hi && va + bytes > lo) return kWoHeap;
+    GxResourceInfo info;
+    if (gx_resource_overlapping(va, bytes, &info) && info.alive) {
+        if (info.type != 1) return kWoTexture;
+        if (gxvk::kept_at(va, bytes)) return kWoKept;
+        if (info.usage == 2) return kWoDynamic;
+        if (info.bind & 0x90) return kWoGpuWritten;
+        if (info.bind & 0x4) return kWoConstant;
+        return kWoBuffer;
+    }
+    const int mw = gx_middleware_at(va, bytes);
+    return mw == 1 ? kWoYebis : mw == 2 ? kWoScaleform : kWoNone;
+}
+
+// A use of [in, in + bytes) of chunk `index` (the caller asks g_census).
+void window_use_locked(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+    if (index >= gcn::kDmemChunks || in >= kChunkBytes) return;
+    if (!bytes) bytes = 1;
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    const int own = win_owner_locked(t_import_va, bytes);
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+    const std::uint32_t w1 = static_cast<std::uint32_t>((std::min(in + bytes, kChunkBytes) - 1) >> kImportWindowShift);
+    for (std::uint32_t w = w0; w <= w1; ++w) {
+        WindowUses& u = g_wuse[index][w];
+        if (k >= 0) u.sites |= 1ull << k;
+        u.owners |= 1u << own;
+        ++u.uses;
+        if (w == w0) u.bytes += bytes;
+        if (!u.first_ms) u.first_ms = now;
+        u.last_ms = now;
+        u.last_flip = flip;
+    }
+    if (k >= 0) {
+        ++g_wuse_n[k][own];
+        g_wuse_bytes[k][own] += bytes;
+    }
+    if (own == kWoKept || own == kWoBuffer) {
+        const int f = t_import_fall >= 0 && t_import_fall < kWinFalls - 1 ? t_import_fall : kWinFalls - 1;
+        ++g_wuse_fall_n[own == kWoKept ? 0 : 1][f];
+        g_wuse_fall_bytes[own == kWoKept ? 0 : 1][f] += bytes;
+    }
+}
+// Windows [a, b] of chunk `index` covered by an import `who` made (window imports).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who) {
+    if (index >= gcn::kDmemChunks) return;
+    for (std::uint32_t w = a; w <= b && w < kImportWindows; ++w) {
+        if (g_wuse[index][w].maker < 0) g_wuse[index][w].maker = who;
+    }
+}
+}  // namespace
+
+// The census's lines: a summary at every video memory report; at exit also the
+// uses by path and owner, and every window imported.
+std::string import_window_census_report_locked(bool at_exit) {
+    if (!g_census) return {};
+    using ull = unsigned long long;
+    const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    // The windows' classes by what their uses met.
+    enum Cls : int { kClGx, kClHandle, kClMixed, kClNotGx, kClUnnamed, kClNever, kClasses };
+    static const char* const kClName[kClasses] = {"GX-owned alone", "a handle's alone", "GX's and others'", "nothing of GX's",
+                                                  "no address named", "never used"};
+    std::uint64_t n[kClasses] = {}, bytes[kClasses] = {}, idle[kClasses] = {}, idle_f[kClasses] = {};
+    std::uint64_t lies[kGxBytesKinds] = {}, lies_heap = 0, lies_none = 0, windows = 0, wbytes = 0, live = 0;
+    std::uint64_t cls_lies[kClasses][kGxBytesKinds + 2] = {};  // + the heap, + nothing of GX's
+    std::size_t nlive = 0;
+    std::uint64_t heap_lo = 0, heap_hi = 0;
+    const bool have_heap = gxvk::upload_heap(&heap_lo, &heap_hi);
+    static const char* const whos[] = {"a binding", "a device address", "a walk", "the prefetch", "a whole span"};
+    std::string detail;
+    char b[2048];
+    for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+        const DmemChunk& d = g.dmem[k];
+        for (const auto& c : d.imports) live += c->size;
+        nlive += d.imports.size();
+        for (std::uint32_t w = 0; w < kImportWindows; ++w) {
+            const Chunk* c = d.window[w];
+            if (!c) continue;
+            const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+            const std::uint64_t hi = std::min({c->lo + c->size, static_cast<std::uint64_t>(w + 1) << kImportWindowShift, kChunkBytes});
+            if (hi <= lo) continue;
+            const WindowUses& u = g_wuse[k][w];
+            const std::uint32_t gx = u.owners & kWoGx, other = u.owners & ~kWoGx;
+            const int cls = !u.uses ? kClNever
+                            : !other ? (gx == (1u << kWoKept) ? kClHandle : kClGx)
+                            : !gx    ? (other == (1u << kWoUnnamed) ? kClUnnamed : kClNotGx)
+                                     : kClMixed;
+            ++windows;
+            wbytes += hi - lo;
+            ++n[cls];
+            bytes[cls] += hi - lo;
+            if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) idle[cls] += hi - lo;
+            if (!u.last_ms || flip - u.last_flip >= 3600) idle_f[cls] += hi - lo;
+            // What lies there: the live resources over its pages, by the first
+            // mapping of each (a page mapped twice counted once).
+            std::uint64_t here[kGxBytesKinds] = {}, here_heap = 0;
+            const std::uint64_t plo = static_cast<std::uint64_t>(k) * kChunkBytes + lo, phi = static_cast<std::uint64_t>(k) * kChunkBytes + hi;
+            struct Piece {
+                std::uint64_t lo, hi, va;  // physical [lo, hi), mapped at va
+            };
+            std::vector<Piece> pieces;
+            for (const GuestMapInfo& mi : g.maps) {
+                if (!mi.dmem || mi.phys < 0) continue;
+                const std::uint64_t mlo = static_cast<std::uint64_t>(mi.phys), mhi = mlo + mi.len;
+                if (mhi <= plo || mlo >= phi) continue;
+                pieces.push_back({std::max(mlo, plo), std::min(mhi, phi), mi.va + (std::max(mlo, plo) - mlo)});
+            }
+            std::sort(pieces.begin(), pieces.end(), [](const Piece& x, const Piece& y) { return x.lo < y.lo; });
+            std::uint64_t covered = plo;
+            for (const Piece& pc : pieces) {
+                const std::uint64_t a = std::max(pc.lo, covered);
+                if (pc.hi <= a) continue;
+                const std::uint64_t va = pc.va + (a - pc.lo), len = pc.hi - a;
+                gx_resources_bytes_by_kind(va, len, here);
+                if (have_heap && va < heap_hi && va + len > heap_lo) here_heap += std::min(va + len, heap_hi) - std::max(va, heap_lo);
+                covered = pc.hi;
+            }
+            std::uint64_t gx_here = here_heap;
+            for (int q = 0; q < kGxBytesKinds; ++q) {
+                lies[q] += here[q];
+                cls_lies[cls][q] += here[q];
+                gx_here += here[q];
+            }
+            lies_heap += here_heap;
+            cls_lies[cls][kGxBytesKinds] += here_heap;
+            const std::uint64_t none_here = hi - lo > gx_here ? hi - lo - gx_here : 0;
+            lies_none += none_here;
+            cls_lies[cls][kGxBytesKinds + 1] += none_here;
+            if (!at_exit) continue;
+            std::string owners, paths;
+            for (int o = 0; o < kWinOwners; ++o) {
+                if (u.owners & (1u << o)) owners += std::string(owners.empty() ? "" : ", ") + kWinOwnerName[o];
+            }
+            for (int s = 0; s < kSiteSlots; ++s) {
+                if ((u.sites >> s) & 1) paths += std::string(paths.empty() ? "" : "; ") + (g_site_uses[s].site ? g_site_uses[s].site : "?");
+            }
+            const int mk = u.maker >= 0 && u.maker < kImportWhos ? u.maker : imports_whole() ? kIwSpan : -1;
+            std::snprintf(b, sizeof(b),
+                          "\n[bbhost]     window %u.%02u (%llu MiB, %s; made by %s): %llu uses (%llu MiB asked), the last %.0f s and %llu "
+                          "flips ago; owners: %s; paths: %s; lies there (MiB): kept-able %llu, dynamic %llu, GPU-written %llu, constant %llu, "
+                          "other buffers %llu, textures %llu, the upload heap %llu",
+                          k, w, mib(hi - lo), kClName[cls], mk >= 0 ? whos[mk] : "?", static_cast<ull>(u.uses), mib(u.bytes),
+                          u.last_ms ? static_cast<double>(now - u.last_ms) / 1e3 : -1.0, static_cast<ull>(u.last_ms ? flip - u.last_flip : 0),
+                          owners.empty() ? "none" : owners.c_str(), paths.empty() ? "none" : paths.substr(0, 400).c_str(), mib(here[0]),
+                          mib(here[1]), mib(here[2]), mib(here[3]), mib(here[4]), mib(here[5]), mib(here_heap));
+            detail += b;
+        }
+    }
+    std::uint64_t flex = 0;
+    for (const auto& kv : g.anon_imports) flex += kv.second.size;
+    std::uint64_t idle_all = 0, idle_f_all = 0;
+    for (int q = 0; q < kClasses; ++q) {
+        idle_all += idle[q];
+        idle_f_all += idle_f[q];
+    }
+    std::snprintf(b, sizeof(b),
+                  "import census by window (BBHOST_IMPORT_CENSUS=1, %s): %llu windows imported now, %llu MiB (live imports %llu MiB in %zu, "
+                  "flexible %llu MiB) - by what their uses met: GX-owned alone %llu (%llu MiB), a handle's alone %llu (%llu), GX's and others' "
+                  "%llu (%llu), nothing of GX's %llu (%llu), no address named %llu (%llu), never used %llu (%llu); idle 60 s or more %llu MiB "
+                  "(GX-owned alone %llu, a handle's %llu, GX's and others' %llu, nothing of GX's %llu, no address %llu, never used %llu), "
+                  "3,600 flips or more %llu MiB\n[bbhost]   import census by window: what lies in the windows imported now (MiB): GX buffers 1b "
+                  "keeps %llu, dynamic %llu, the GPU writes %llu, constant %llu, other %llu, textures %llu, GX's upload heap %llu, nothing of "
+                  "GX's %llu",
+                  imports_whole() ? "whole spans: the windows window imports would need" : "window imports", static_cast<ull>(windows),
+                  mib(wbytes), mib(live), nlive, mib(flex), static_cast<ull>(n[kClGx]), mib(bytes[kClGx]), static_cast<ull>(n[kClHandle]),
+                  mib(bytes[kClHandle]), static_cast<ull>(n[kClMixed]), mib(bytes[kClMixed]), static_cast<ull>(n[kClNotGx]), mib(bytes[kClNotGx]),
+                  static_cast<ull>(n[kClUnnamed]), mib(bytes[kClUnnamed]), static_cast<ull>(n[kClNever]), mib(bytes[kClNever]), mib(idle_all),
+                  mib(idle[kClGx]), mib(idle[kClHandle]), mib(idle[kClMixed]), mib(idle[kClNotGx]), mib(idle[kClUnnamed]), mib(idle[kClNever]),
+                  mib(idle_f_all), mib(lies[0]), mib(lies[1]), mib(lies[2]), mib(lies[3]), mib(lies[4]), mib(lies[5]), mib(lies_heap),
+                  mib(lies_none));
+    std::string out = b;
+    // By import: the live imports idle as a whole (every window of theirs a
+    // minute without a use) - what letting go of whole imports gives back -
+    // and the idle windows inside imports a window of which is still used -
+    // what only splitting an import would.
+    {
+        std::uint64_t whole_n = 0, whole_bytes = 0, held_windows = 0, held_bytes = 0, hot_n = 0;
+        for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+            const DmemChunk& d = g.dmem[k];
+            for (const auto& c : d.imports) {
+                const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+                if (end <= c->lo) continue;
+                const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
+                const std::uint32_t z = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+                std::uint64_t idle_w = 0, idle_wb = 0;
+                bool hot = false;
+                for (std::uint32_t w = a; w <= z; ++w) {
+                    const WindowUses& u = g_wuse[k][w];
+                    const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                    const std::uint64_t hi = std::min(end, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                    if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) {
+                        ++idle_w;
+                        idle_wb += hi - lo;
+                    } else {
+                        hot = true;
+                    }
+                }
+                if (!hot) {
+                    ++whole_n;
+                    whole_bytes += c->size;
+                } else {
+                    ++hot_n;
+                    held_windows += idle_w;
+                    held_bytes += idle_wb;
+                }
+            }
+        }
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]   import census by window, by import: idle as a whole (every window a minute without a use) %llu imports "
+                      "(%llu MiB); in the %llu imports a window of which was used within the minute, idle windows %llu (%llu MiB)",
+                      static_cast<ull>(whole_n), mib(whole_bytes), static_cast<ull>(hot_n), static_cast<ull>(held_windows), mib(held_bytes));
+        out += b;
+    }
+    if (!at_exit) return out;
+    // What lies in each class's windows.
+    for (int q = 0; q < kClasses; ++q) {
+        if (!n[q]) continue;
+        const std::uint64_t* l = cls_lies[q];
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]     the %s windows' %llu MiB hold (MiB): GX buffers 1b keeps %llu, dynamic %llu, the GPU writes %llu, constant "
+                      "%llu, other %llu, textures %llu, GX's upload heap %llu, nothing of GX's %llu",
+                      kClName[q], mib(bytes[q]), mib(l[0]), mib(l[1]), mib(l[2]), mib(l[3]), mib(l[4]), mib(l[5]), mib(l[kGxBytesKinds]),
+                      mib(l[kGxBytesKinds + 1]));
+        out += b;
+    }
+    // The uses by path and owner, the most used path first.
+    std::vector<int> order;
+    for (int s = 0; s < kSiteSlots; ++s) {
+        if (g_site_uses[s].site) order.push_back(s);
+    }
+    std::sort(order.begin(), order.end(), [](int x, int y) {
+        std::uint64_t a = 0, c = 0;
+        for (int o = 0; o < kWinOwners; ++o) a += g_wuse_n[x][o], c += g_wuse_n[y][o];
+        return a > c;
+    });
+    out += "\n[bbhost]     uses an import answered or was made for, by path and what lies at the address:";
+    for (const int s : order) {
+        std::string line;
+        std::uint64_t total = 0;
+        for (int o = 0; o < kWinOwners; ++o) {
+            if (!g_wuse_n[s][o]) continue;
+            total += g_wuse_n[s][o];
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinOwnerName[o], static_cast<ull>(g_wuse_n[s][o]),
+                          mib(g_wuse_bytes[s][o]));
+            line += b;
+        }
+        if (!total) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]       %s: %llu - %s", g_site_uses[s].site, static_cast<ull>(total), line.c_str());
+        out += b;
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        std::string line;
+        for (int f = 0; f < kWinFalls; ++f) {
+            if (!g_wuse_fall_n[kind][f]) continue;
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinFallName[f], static_cast<ull>(g_wuse_fall_n[kind][f]),
+                          mib(g_wuse_fall_bytes[kind][f]));
+            line += b;
+        }
+        if (line.empty()) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]     uses of %s by why the binding took today's path (stage 1b): ", kind ? "another GX buffer" : "a GX buffer kept by handle");
+        out += b;
+        out += line;
+    }
+    out += "\n[bbhost]     the windows imported now, one by one:";
+    out += detail;
+    return out;
+}
+
 // A window whose import failed less than kImportBackoffMs ago is not asked of
 // the driver again (counted); and a failure's time, over its windows.
 bool import_backing_off(const DmemChunk& d, std::uint32_t w0, std::uint32_t w1) {
@@ -1479,7 +2087,10 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
         // windows do not cover lies outside every GPU-visible mapping.
         if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
         const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
-        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
+            if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
+            return c;
+        }
         if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
         if (run_part_stop(kRunStopIndex)) return nullptr;  // imported in order (BBHOST_RUN_COMMIT)
         const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
@@ -1503,6 +2114,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
             }
             d.window[w] = c;
         }
+        if (g_census) window_use_locked(index, in, bytes);
         return c;
     }
     // Windows (BBHOST_IMPORT_WINDOWS=1): the whole windows the range touches,
@@ -1518,6 +2130,8 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
     if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
         idle_note_use_locked(*c);
+        if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
+        if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
         return c;
     }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
@@ -1540,15 +2154,31 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     const std::uint32_t wa = static_cast<std::uint32_t>(lo >> kImportWindowShift);
     const std::uint32_t wb = static_cast<std::uint32_t>((std::min(hi, kChunkBytes) - 1) >> kImportWindowShift);
     if (import_backing_off(d, wa, wb)) return nullptr;
+    // A window let go while idle (BBHOST_IMPORT_RETIRE=1), wanted again: the
+    // driver's time of this import is the path's wait for it.
+    bool again = false;
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
+        for (std::uint32_t w = wa; w <= wb; ++w) again |= d.retired_ms[w] != 0;
+    }
+    const auto t_again = again ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Chunk* c = import_span(index, lo, hi);
     if (!c) {
         import_failed_at(d, wa, wb);
         return nullptr;
     }
+    if (again) {
+        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_again).count());
+        ++g_again_n;
+        g_again_bytes += c->size;
+        g_again_us += us;
+        g_again_max_us = std::max(g_again_max_us, us);
+    }
     note_import_asker_locked(c->size);
     install_import_locked(index, c);
     if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
     idle_note_use_locked(*c);
+    if (g_census) window_use_locked(index, in, bytes);
+    if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
     return c;
 }
 
@@ -1651,6 +2281,7 @@ void prefetch_thread() {
         std::uint64_t lo, hi;
     };
     std::vector<Run> runs;
+    std::uint64_t retire_gen = 0;
     for (;;) {
         PrefetchJob job;
         {
@@ -1658,6 +2289,12 @@ void prefetch_thread() {
             g_pf_cv.wait(lk, [] { return !g_pf_jobs.empty(); });
             job = g_pf_jobs.front();
             g_pf_jobs.pop_front();
+        }
+        // A window let go while idle (BBHOST_IMPORT_RETIRE) is imported no more:
+        // what this thread saw imported is looked at again.
+        if (const std::uint64_t gen = g_import_retire_gen.load(std::memory_order_relaxed); gen != retire_gen) {
+            retire_gen = gen;
+            std::fill(std::begin(known), std::end(known), 0);
         }
         if (const std::uint64_t gen = hle_kernel_maps_generation(); gen != maps_gen) {
             maps_gen = gen;
@@ -2946,7 +3583,10 @@ Located locate(std::uint64_t va, std::uint64_t bytes) {
     // A GX buffer the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1).
     if (twins_on()) {
         Located t;
-        if (twin_locate_locked(va, bytes, t)) return t;
+        if (twin_locate_locked(va, bytes, t)) {
+            gxvk_lists::note_order(gxvk_lists::kOrderTwin);  // stage 4's census (host/gxvk_lists.h)
+            return t;
+        }
     }
     return locate_guest(va, bytes);
 }
@@ -6777,10 +7417,7 @@ void retire_slot_locked(int k) {
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
-    for (Chunk& c : sl.dead_imports) {  // window imports a merged one replaced
-        va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(k), sl.serial);
-        free_import(c);
-    }
+    for (Chunk& c : sl.dead_imports) free_dead_import(c, k, sl.serial);  // window imports replaced by a merge or let go while idle
     sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
         va_note("buffer freed", b.address, b.size, static_cast<std::uint64_t>(k), sl.serial);
@@ -7849,6 +8486,8 @@ std::string video_memory_report_locked(bool at_exit) {
     }
     // The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1).
     if (const std::string idle = import_idle_report_locked(); !idle.empty()) out += "\n[bbhost]   " + idle;
+    // The census by window (BBHOST_IMPORT_CENSUS=1).
+    if (const std::string wc = import_window_census_report_locked(at_exit); !wc.empty()) out += "\n[bbhost]   " + wc;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
     out += buf;
@@ -8587,6 +9226,7 @@ void submit_locked() {
     g.desc_pool = g.slots[g.slot].pool;
     g_submit_ending = false;
     publish_import_tables_locked();  // window imports the queue sees now take over their windows' entries
+    retire_idle_imports_locked();    // idle window imports let go (BBHOST_IMPORT_RETIRE)
     stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
 }
 
@@ -8784,8 +9424,10 @@ const memory_policy::Policy& host_gpu_memory_policy() {
         sw.small = std::getenv("BBHOST_SMALL_VRAM");
         const std::int64_t free = g_start_free.load();
         const bool nvidia = g_vendor.load() == 0x10de;
+        sw.retire = std::getenv("BBHOST_IMPORT_RETIRE");
         const memory_policy::Policy p = memory_policy::decide(d, kWindowsHost, free > 0 ? static_cast<std::uint64_t>(free) : 0, nvidia, sw);
         host_log("gpu: memory: %s", memory_policy::describe(p, sw).c_str());
+        g_retire_mode.store(p.retire, std::memory_order_relaxed);
         return p;
     }();
     g_policy_known.store(true, std::memory_order_release);
@@ -12315,6 +12957,31 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        if (g_retire_mode.load(std::memory_order_relaxed) && !imports_whole()) {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1)
+                host_log("gpu: idle window imports let go (BBHOST_IMPORT_RETIRE=1, after %.0f s without a use): %llu (%llu MiB) in %llu checks, "
+                         "%llu put off while a copy version named them; windows wanted again and imported again by the paths that asked %llu "
+                         "(%llu MiB) in %.1f ms of the driver's time, the longest %.1f ms; by the import thread %llu",
+                         g_retire.after_ms / 1e3, static_cast<ull>(g_retire_n), static_cast<ull>(g_retire_bytes >> 20),
+                         static_cast<ull>(g_retire_checks), static_cast<ull>(g_retire_skipped), static_cast<ull>(g_again_n),
+                         static_cast<ull>(g_again_bytes >> 20), g_again_us / 1e3, g_again_max_us / 1e3, static_cast<ull>(g_again_prefetch));
+            else
+                host_log("gpu: idle window imports counted (BBHOST_IMPORT_RETIRE=2, after %.0f s without a use; none let go): would have let go "
+                         "%llu (%llu MiB) in %llu checks, at most %llu MiB idle at once, %llu put off while a copy version named them; would have "
+                         "imported again %llu windows (%llu MiB)",
+                         g_retire.after_ms / 1e3, static_cast<ull>(g_would_n), static_cast<ull>(g_would_bytes >> 20),
+                         static_cast<ull>(g_retire_checks), static_cast<ull>(g_would_idle_most >> 20), static_cast<ull>(g_retire_skipped),
+                         static_cast<ull>(g_would_again_n), static_cast<ull>(g_would_again_bytes >> 20));
+        }
+        if (const std::uint64_t freed = g_import_freed.load())
+            host_log("gpu: window imports freed once their work had run (replaced by a merge, or let go while idle): %llu (%llu MiB) in %.1f ms of the "
+                     "driver's time %s, the longest %.1f ms; the command processor's part %.1f ms, the longest %.3f ms%s",
+                     static_cast<ull>(freed), mib(g_import_freed_bytes), g_import_free_us.load() / 1e3,
+                     g_free_thread_on ? ("on their own thread (bb-import-free, in the background, " + std::to_string(g_free_gap_ms) + " ms apart)").c_str()
+                                      : "on the command processor (BBHOST_IMPORT_FREE_THREAD=0)",
+                     g_import_free_max_us.load() / 1e3, g_import_free_cp_us.load() / 1e3, g_import_free_cp_max_us.load() / 1e3,
+                     g_free_thread_on ? (", handing them over; at most " + std::to_string(g_free_queue_most.load()) + " waiting").c_str() : "");
         if (!imports_whole()) {
             std::lock_guard<GpuMutex> lock(g.mu);
             host_log("gpu: the page table's view of the window imports (host/import_table.h, BBHOST_IMPORT_TABLE_DEFER%s): windows whose "

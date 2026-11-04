@@ -73,6 +73,7 @@ constexpr std::uint64_t kHashMax = 4096;  // a longer range's first bytes
 constexpr std::uint64_t kPageShift = 16;
 
 std::atomic<std::uint64_t> g_lo{0}, g_hi{0}, g_pool{0};
+std::atomic<std::uint64_t> g_heap_lo{0}, g_heap_hi{0};  // the first heap's bounds, whatever the mode (upload_heap)
 
 // The heap's hand-outs: their ranges, the newest submission (+1) that bound
 // each, and a generation that changes when one is handed out over. Indexed
@@ -242,6 +243,10 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
     // The pool's bounds as its init sets them: 16-byte aligned.
     const std::uint64_t pad = (0u - static_cast<std::uint32_t>(region)) & 0xfu;
     const std::uint64_t lo = region + pad, hi = lo + ((bytes - pad) & ~std::uint64_t{0xf});
+    if (!g_heap_lo.load(std::memory_order_relaxed)) {
+        g_heap_hi.store(hi, std::memory_order_relaxed);
+        g_heap_lo.store(lo, std::memory_order_release);
+    }
     heap_snap_region(lo, hi);  // stage 1d.1's snapshots with the lookups' answers known (host/gxvk_heapsnap.cpp), when on
     if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
     {
@@ -261,6 +266,14 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
         host_log("gxvk arena: GX's upload heap is 0x%llx, %llu MiB: its bindings %s, under the release proof (BBHOST_GXVK_ARENA=0: today's path)",
                  static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
                  g_mode == Arena::kCompare ? "checked as they would be bound in place, and bound as today" : "in place");
+}
+
+bool upload_heap(std::uint64_t* lo, std::uint64_t* hi) {
+    const std::uint64_t l = g_heap_lo.load(std::memory_order_acquire);
+    if (!l) return false;
+    *lo = l;
+    *hi = g_heap_hi.load(std::memory_order_relaxed);
+    return true;
 }
 
 bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {

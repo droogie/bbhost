@@ -98,6 +98,23 @@ int main() {
         double c = 0.0;
         CHECK(bits(next(c, 1.0 / 60, 60).seconds) == 0x3c888889u);  // 1/60
     }
+    // Effect steps smooth or a number: whole 1/120 s every frame at 120, every
+    // third at 360, four at 30; 45 a second at 30 fps never more than two.
+    CHECK(pattern(1.0 / 120, 120, 6) == "111111");
+    CHECK(pattern(1.0 / 360, 120, 6) == "001001");
+    CHECK(pattern(1.0 / 30, 120, 3) == "444");
+    CHECK(sfx_schedule::most(45) == 2);
+    // Below 30 (a test): whole 1/5 s every sixth frame at 30, every twelfth at 60.
+    CHECK(pattern(1.0 / 30, 5, 12) == "000001000001");
+    CHECK(pattern(1.0 / 60, 5, 12) == "000000000001");
+    {
+        double c = 0.0;
+        CHECK(bits(next(c, 1.0 / 30, 5).seconds) == 0u);
+        c = 1.0 / 5 - 1.0 / 30;
+        CHECK(bits(next(c, 1.0 / 30, 5).seconds) == bits(0.2f));
+    }
+    CHECK(sfx_schedule::most(1) == 1);
+    CHECK(sfx_schedule::most(960) == 32);
     // 144: a whole 1/30 s every 4.8 frames - 30 a second, never two in a row.
     {
         const std::string p = pattern(1.0 / 144, 30, 144 * 10);
@@ -131,6 +148,11 @@ int main() {
     for (const double fps : {30.0, 45.0, 60.0, 90.0, 120.0, 144.0, 165.0, 240.0, 1000.0}) {
         steady(1.0 / fps, 30, 200000);
         steady(1.0 / fps, 60, 200000);
+        steady(1.0 / fps, 45, 200000);
+        steady(1.0 / fps, 120, 200000);
+        steady(1.0 / fps, 360, 200000);
+        steady(1.0 / fps, 5, 200000);
+        steady(1.0 / fps, 1, 200000);
     }
     // BBHOST_SFX_SIM_FPS's float frame time (1/N as a double of a float).
     steady(static_cast<float>(1.0 / 60), 30, 200000);

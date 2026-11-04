@@ -3350,7 +3350,10 @@ EpochSite g_epoch_sites[16];
 const bool g_epoch_sites_on = [] { const char* e = std::getenv("BBHOST_EPOCH_SITES"); return e && e[0] == '1'; }();
 }
 __attribute__((noinline)) void bump_view_epoch() {
-    ++g_view_epoch;
+    {
+        cache_rw::Write cw(cache_rw::kViews);  // stage 4b.1a's readers see the entries go
+        ++g_view_epoch;
+    }
     if (!g_epoch_sites_on) return;
     void* site = __builtin_return_address(0);
     for (EpochSite& e : g_epoch_sites) {
@@ -3502,6 +3505,16 @@ struct alignas(64) IdViewEntry {
 static_assert(sizeof(IdViewEntry) == 64, "an entry is one line");
 constexpr std::size_t kIdViewSlots = 8192;
 IdViewEntry g_id_views[kIdViewSlots];
+// Stage 4b.1a's readers' copy of each entry's key and view (texture_view_find), written with the entry under
+// cache_rw's lock and nowhere else: the command processor writes an entry's own line at every refresh (refreshed,
+// fast, static_epoch, recheck_ms, key_dim), and a reader on that line took it from the command processor's cache
+// each time.
+struct IdViewPub {
+    std::uint32_t id = 0, epoch = 0;
+    VkImageView view = VK_NULL_HANDLE;
+    std::uint8_t flags = 0;
+};
+IdViewPub g_id_views_pub[kIdViewSlots];
 std::uint64_t g_id_view_hits = 0, g_id_view_misses = 0;
 // Stage 2's counts (under g.mu): bindings that skipped the refresh; refreshes run, by why the skip did not apply;
 // compare mode's refreshes the skip would have left out (and of them the hash backstop's catches, which a skip only
@@ -3606,6 +3619,8 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         dims_ok = e.dims_ok;
         dim = e.dim;
         arrayed = e.arrayed;
+        gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
+                            reinterpret_cast<std::uint64_t>(e.view));  // stage 4b.1a's compare
         return e.view;
     }
     if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order (BBHOST_RUN_COMMIT)
@@ -3620,6 +3635,7 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
     // not streamed in yet has to be tried again (and a region copy is made
     // again at every bind).
     if (view != VK_NULL_HANDLE && !g_last_view_no_memo) {
+        cache_rw::Write cw(cache_rw::kViews);  // stage 4b.1a's readers see the entry whole
         e = IdViewEntry{};
         e.id = id;
         e.flags = flags;
@@ -3636,10 +3652,23 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
+        if (cache_rw::g_readers) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
+        gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
+                            reinterpret_cast<std::uint64_t>(view));  // stage 4b.1a's compare
     }
     return view;
+}
+
+// Stage 4b.1a's reader path (host/cache_rw.h, under its shared lock): the view
+// the entry for `id` holds while it stands - no refresh asked, nothing counted
+// or made; null when it is not made yet (the command processor makes it, and
+// refreshes its surface, in order).
+VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
+    const IdViewPub& e = g_id_views_pub[id & (kIdViewSlots - 1)];
+    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags) return VK_NULL_HANDLE;
+    return e.view;
 }
 
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
@@ -3841,11 +3870,19 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     };
     static Memo memo[64];  // under g.mu
     Memo& m = memo[(s[0] ^ (s[1] * 31u) ^ (s[2] * 17u) ^ (s[3] * 7u) ^ (compare ? 1u : 0u)) & 63];
-    if (m.sampler && m.compare == compare && std::memcmp(m.w, s, 16) == 0) return m.sampler;
+    if (m.sampler && m.compare == compare && std::memcmp(m.w, s, 16) == 0) {
+        if (gxvk_lists::compare() && gxvk_lists::t_cp_look) {  // stage 4b.1a's compare: the answer by its key
+            std::uint64_t key = fnv1a(s, 16);
+            key = fnv1a(&compare, 1, key);
+            gxvk_lists::cp_note(gxvk_lists::kLookSampler, key, reinterpret_cast<std::uint64_t>(m.sampler));
+        }
+        return m.sampler;
+    }
     std::uint64_t key = fnv1a(s, 16);
     key = fnv1a(&compare, 1, key);
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) {
+        gxvk_lists::cp_note(gxvk_lists::kLookSampler, key, reinterpret_cast<std::uint64_t>(it->second));  // stage 4b.1a's compare
         if (run_part()) return it->second;  // a run part's draw writes no memo (BBHOST_RUN_COMMIT)
         std::memcpy(m.w, s, 16);
         m.compare = compare;
@@ -3914,9 +3951,22 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
         sci.compareEnable = VK_FALSE;
         vkCreateSampler(g.device, &sci, nullptr, &out);
     }
-    g_samplers[key] = out;
+    {
+        cache_rw::Write cw(cache_rw::kSamplers);  // stage 4b.1a's readers see it whole
+        g_samplers[key] = out;
+    }
     if (out) g_sampler_records[out] = sci;
+    gxvk_lists::cp_note(gxvk_lists::kLookSampler, key, reinterpret_cast<std::uint64_t>(out));  // stage 4b.1a's compare
     return out;
+}
+
+// Stage 4b.1a's reader path (under cache_rw's shared lock): the sampler made
+// for these words, null when it is not made yet.
+VkSampler sampler_find(const std::uint32_t* s, bool compare) {
+    std::uint64_t key = fnv1a(s, 16);
+    key = fnv1a(&compare, 1, key);
+    const auto it = g_samplers.find(key);
+    return it == g_samplers.end() ? VK_NULL_HANDLE : it->second;
 }
 
 // After a storage-image dispatch the VkImage is the source of truth. Tiling
@@ -5807,8 +5857,13 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         const std::uint64_t vbase = static_cast<std::uint64_t>(e.w[0]) | (static_cast<std::uint64_t>(e.w[1] & 0xff) << 32);
         if (at(base) || at(vbase)) e.epoch = 0;
     }
-    for (IdViewEntry& e : g_id_views) {
-        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) e.epoch = 0;
+    cache_rw::Write cw(cache_rw::kViews);  // stage 4b.1a's readers see the entries go
+    for (std::size_t i = 0; i < kIdViewSlots; ++i) {
+        IdViewEntry& e = g_id_views[i];
+        if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
+            e.epoch = 0;
+            if (cache_rw::g_readers) g_id_views_pub[i].epoch = 0;
+        }
     }
 }
 

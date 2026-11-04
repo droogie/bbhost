@@ -103,6 +103,7 @@ add_executable(bbhost
   src/host/gs_emit_gate.cpp
   src/engine/guest.cpp
   src/engine/patch_manifest.cpp
+  src/engine/patch_manifest_file.cpp
   src/engine/gx_resources.cpp
   src/engine/gx_state.cpp
   src/engine/params.cpp
@@ -186,6 +187,10 @@ add_executable(bbhost
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
   src/host/list_resolve.cpp
+  src/host/gxvk_lists.cpp
+  src/host/gxvk_lists_leaf.cpp
+  src/host/gxvk_lists_pool.cpp
+  src/host/cache_rw.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -439,6 +444,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/camera/follow_camera.cpp
   src/decomp/gx/flush_wait.cpp
   src/decomp/gx/block_reclaim.cpp
+  src/decomp/gx/rename_wait.cpp
   src/decomp/gx/drain_token.cpp
   src/decomp/gx/query_token.cpp
   src/decomp/gx/dead_packets.cpp
@@ -476,6 +482,8 @@ target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 # The host lists record from decomp leaves, on the game's threads with the game's FS.
 set_source_files_properties(src/host/host_lists.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+# Stage 4's census records from decomp leaves too (host/gxvk_lists.h).
+set_source_files_properties(src/host/gxvk_lists_leaf.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The follow camera's step is the game's own AVX, intrinsic for intrinsic
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
@@ -645,11 +653,23 @@ if(UNIX)
   target_compile_definitions(ruleset_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(ruleset_test bbhost_version)
   add_test(NAME ruleset_test COMMAND ruleset_test)
+  # The shipped manifests read as the game reads them: the ones on by default
+  # are exactly the expected list (Screen Space Reflections stays off).
+  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/sfo.cpp)
+  target_include_directories(patch_defaults_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_compile_definitions(patch_defaults_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
+  add_dependencies(patch_defaults_test bbhost_version)
+  add_test(NAME patch_defaults_test COMMAND patch_defaults_test)
   # The rings in video memory the CPU writes only within the heap's budget.
   add_executable(ring_budget_test tests/ring_budget_test.cpp)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
   # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  # Stage 4b.1a's lock: readers on eight threads beside one writer (host/cache_rw.h).
+  add_executable(cache_rw_test tests/cache_rw_test.cpp src/host/cache_rw.cpp)
+  target_include_directories(cache_rw_test PRIVATE src)
+  target_link_libraries(cache_rw_test PRIVATE Threads::Threads)
+  add_test(NAME cache_rw_test COMMAND cache_rw_test)
   # The bottleneck meter's verdict (host/bottleneck.h).
   add_executable(bottleneck_test tests/bottleneck_test.cpp)
   target_include_directories(bottleneck_test PRIVATE src)
@@ -714,6 +734,10 @@ if(UNIX)
   add_executable(import_table_test tests/import_table_test.cpp)
   target_include_directories(import_table_test PRIVATE src)
   add_test(NAME import_table_test COMMAND import_table_test)
+  # Window imports let go while idle: the switch, which imports a check finds idle, the check's cap.
+  add_executable(import_retire_test tests/import_retire_test.cpp)
+  target_include_directories(import_retire_test PRIVATE src)
+  add_test(NAME import_retire_test COMMAND import_retire_test)
   # The image heap's placement in its blocks and its compaction's policy: the block chosen, the room kept, the pace, the stop.
   add_executable(heap_compact_test tests/heap_compact_test.cpp)
   target_include_directories(heap_compact_test PRIVATE src)
@@ -799,7 +823,7 @@ if(UNIX)
   bbhost_decomp_test(gx_dma SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_constant_engine SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_draw SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
-  bbhost_decomp_test(gx_command_list)
+  bbhost_decomp_test(gx_command_list SOURCES src/host/gxvk_lists_leaf.cpp)
   bbhost_decomp_test(gx_present)
   bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_upload_heap)

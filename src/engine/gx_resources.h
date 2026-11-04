@@ -110,6 +110,12 @@ void gx_resources_memory_protected(std::uint64_t va, std::size_t len, int prot);
 // The T# GX built for the live 2D texture whose memory begins at `memory`,
 // base filled in; false when the registry has none.
 bool gx_resource_tsharp(std::uint64_t memory, std::uint32_t out[8]);
+// The bytes of [va, va + bytes) that live resources hold, by kind, added to `out` (the import census, gpu.cpp,
+// BBHOST_IMPORT_CENSUS=1): [0] vertex or index buffers stage 1b can keep (immutable, or default made with data; no
+// constant, unordered-access or stream-output bind), [1] dynamic buffers, [2] buffers the GPU writes (unordered access,
+// stream output), [3] constant buffers, [4] other buffers, [5] textures.
+constexpr int kGxBytesKinds = 6;
+void gx_resources_bytes_by_kind(std::uint64_t va, std::uint64_t bytes, std::uint64_t out[kGxBytesKinds]);
 // The exit report.
 void gx_resources_report();
 

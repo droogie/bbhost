@@ -3,9 +3,10 @@
 // The effects' step above 30 fps (engine/frame_rate.cpp), as a pure function
 // the frame-rate code and tests/sfx_schedule_test.cpp share: each frame's time
 // (the step the game takes, at most 1/30 s; 1/N under BBHOST_SFX_SIM_FPS) is
-// added to a carry and taken out in whole steps of 1/rate s, rate 30 or 60.
+// added to a carry and taken out in whole steps of 1/rate s, rate 1 or more.
 // A frame takes at most the one 1/30 s the game steps a frame below 30 fps -
-// one whole step at 30, two at 60 - and the rest stays in the carry. A frame
+// one whole step at 30, two at 60, four at 120 - and the rest stays in the
+// carry. A frame
 // that takes none is one bbhost put between whole steps: the game runs its
 // effect update with a step of 0 there.
 //
@@ -27,10 +28,11 @@ struct Frame {
     float into = 0.f;     // the carry after the frame, at least +0
 };
 
-// The whole steps a frame takes at most: one 1/30 s.
-constexpr int most(int rate) { return rate >= 60 ? 2 : 1; }
+// The whole steps a frame takes at most: one 1/30 s (rounded up, so a rate
+// that is not a multiple of 30 never leaves its carry growing).
+constexpr int most(int rate) { return rate <= 30 ? 1 : (rate + 29) / 30; }
 
-// `rate` is 30 or 60. A frame time above 1/30 s counts as 1/30 s (the game's
+// `rate` is 1 or more. A frame time above 1/30 s counts as 1/30 s (the game's
 // own step there) and one that is not above 0 (or NaN) as none, so the carry
 // stays under a step and a thirtieth.
 inline Frame next(double& carry, double frame_seconds, int rate) {

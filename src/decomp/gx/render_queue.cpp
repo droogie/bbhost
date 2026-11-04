@@ -32,13 +32,26 @@
 //     ones an item longer), the entry's chunks either its own count (+8) or
 //     ceil(items / its divisor (+0x10)) up to its cap (+0xc);
 //   - with the queue's task-stealing byte (+0x634, the scene's Enable Task
-//     Stealing) one chunk, its grain (+8) items / chunks, at least 10 - a
-//     grain no job reads in this build: the job runner (sub_25b7be0) runs
-//     the whole chunk.
+//     Stealing) one chunk all the same, its size field (+8) a grain: items /
+//     chunks, at least 10 (all of them under 10).
 // The range's last run is always one chunk, whatever its entry allows, and
 // so is everything left once the table (63 chunks at +0x30, 0x18 bytes each:
 // first, last, size, the entry's +0x18, its rank (+0x1c), its byte at +0x20)
 // would pass 62. Ours does the same; the census says which runs met which.
+//
+// Task stealing. The parallel-for gives each job its chunk's range and a grain,
+// the chunk's size field or its span if less, and GX's job system cuts a job
+// holding two grains or more as it goes (the job's vtable 0x575fbf0): a pop
+// takes a grain off the job's front and leaves the rest at the deque's front
+// (slot 1, sub_25b7c90), a steal from a deque holding the job alone takes its
+// upper half (slot 2, sub_25b7d40), and each piece is a chunk job of its own,
+// its segment keyed by its own first item. So a task-stealing run is cut at
+// run time into pieces of a grain, its last one to two grains. The execute
+// takes the byte from the graphics manager's +0x78bd (its sixth argument,
+// 0x26b0e1c), which the game's constructor clears and the Performance Patch
+// (Perf Increase), on by default, sets (0x2695d04): with it every run the
+// table cuts is one such job - 3e/04, 98 to 190 items, at a grain of 10 to 15
+// - and the cut's two entries act through the grain they give.
 //
 // The cut (BBHOST_RQ_SPLIT; unset, on while the frame rate's limit is above
 // 60, at 90, 120 or uncapped but for V-Sync on a 60 Hz display, and off at 60
@@ -94,12 +107,33 @@
 // cheapest keep the ranks that put them on the main thread. Both learn the
 // costs in the chunk job.
 //
+// The pieces late (BBHOST_RQ_GUIDED; unset 3.4, 0 the game's, K.M). With the
+// main thread taking jobs to the end (job_barrier.cpp), what holds GX's
+// barrier is the last piece in flight: a 3e/04 piece of 14 to 20 items, 1.2
+// to 1.8 ms, in 51-99% of the frames, started half a millisecond before the
+// main thread found nothing more, with four or five workers still busy (the
+// census on an RTX 4070, uncapped). A finer grain throughout halves that wait
+// and costs as much in pieces, some 25 us each (a grain of 5: the queue's
+// phase -0.24 to +0.12 ms at six places). So ours keeps the game's pieces
+// early and cuts finer late: the parallel-for gives a task-stealing job our
+// vtable over the game's (the game's grain kept in it), whose pop takes
+// max(M, min(the grain, ceil(n / K))) items - the game's grain while the job
+// holds K grains, then a K-th of what is left, down to M - and whose steal
+// halves the job while it holds 2 M, the game's own splits doing the cutting
+// with those grains; a stolen half takes our vtable and the grain, and a job
+// gets the pool's vtable back before the game's run returns it to its pool.
+// Every piece is a chunk job as before, keyed by its first item. Only where
+// our parallel-for runs: above 60 with the cut, or BBHOST_RQ_PUSH=1. On the
+// RTX 4070 at 1080p, a b b a against BBHOST_RQ_GUIDED=0: uncapped +3.9% at the
+// Nightmare of Mensis, +1.7% at Central Yharnam, +2.1% at the Hunter's Dream,
+// the barrier's spin 0.17-0.49 ms a frame shorter; at 120 +2.6% at Mensis.
+//
 // Where ours has nothing to add, the game's own functions run, through their
 // trampolines: every partition but a parallel-for's while the costs are wanted
 // (the cut on, BBHOST_RQ_PUSH=1 or BBHOST_RQ_RANKS=1), every chunk job but the
 // census's - the game's job, timed while the costs are wanted - and the
 // parallel-for while it cannot push. With the cut off, at 60 and below, the
-// three are the game's own.
+// three are the game's own, and so are the jobs' splits.
 //
 // The census (BBHOST_RQ_CENSUS=1; the segment note is placed only with it):
 // per parallel-for, its runs and the chunks they became; per chunk job,
@@ -166,6 +200,10 @@ constexpr u64 kWake = 0x25b8670;          // (GX's jobs, 0, limit): wakes the pa
 constexpr u64 kBarrier = 0x25b8710;       // GX's job barrier
 constexpr u64 kFunctorVtable = 0x56ea060; // the parallel-for's job functor (relocated; slot 2 the chunk job)
 constexpr u64 kTaskSort = 0x5522754;      // the scene's Enable Task Sort (1)
+// GX's range job: vtable 0x575fbf0 (relocated) of its run, the pop's split,
+// the steal's split and a spread; its range at +0x10 (first, last, grain).
+constexpr u64 kJobVtable = 0x575fbf0;
+constexpr u64 kJobRun = 0x25b7be0, kJobSplitPop = 0x25b7c90, kJobSplitSteal = 0x25b7d40;  // slot 3, 0x25b7e10, the spread
 
 // The queue.
 constexpr u64 kItems = 0x8, kCount = 0x10, kChunks = 0x30, kChunkCount = 0x630, kStealing = 0x634;
@@ -198,6 +236,8 @@ using PushFn = GUEST_ABI u64 (*)(u64 jobs, u64 job, u32 participant);
 using WakeFn = GUEST_ABI u64 (*)(u64 jobs, u32 zero, u32 limit);
 using ChunkJobFn = GUEST_ABI u64 (*)(u64 functor, u64 range, u32 participant);
 using ParallelForFn = GUEST_ABI u64 (*)(u64 queue, u64 ctx, u32 first, u32 last, u32 limit);
+using JobRunFn = GUEST_ABI u64 (*)(u64 job, u32 participant);
+using SplitFn = GUEST_ABI u64 (*)(u64 job, u64 out);
 
 template <class F>
 inline F method(u64 object, u64 offset) {
@@ -292,6 +332,12 @@ Push g_push_mode = Push::WithCut;  // the parallel-for as ours, longest first
 u32 g_split_every = 0;    // BBHOST_RQ_SPLIT_EVERY=N: the cut on N flips, off N
 bool g_ranks = false;     // BBHOST_RQ_RANKS=1: ranks by cost
 bool g_push_placed = false;  // the parallel-for placed: the push could be on
+// The task-stealing jobs cut finer late (BBHOST_RQ_GUIDED): a pop takes the
+// game's grain while a job holds K of them, then a K-th of what is left, down
+// to M items (the file's head). 0: the game's grains.
+constexpr u32 kGuidedK = 3, kGuidedLeast = 4;
+u32 g_guided_k = kGuidedK, g_guided_least = kGuidedLeast;
+u64 g_rq_job_vt[4];  // those jobs' vtable: ours over the game's slots 0-2, the game's slot 3
 // The cut now (render_queue_flip: Auto by the frame rate's limit, each flip;
 // On and Off once, at placement); the costs' learning with it.
 std::atomic<bool> g_cut_on{false};
@@ -977,6 +1023,50 @@ DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
     return ret;
 }
 
+// ---- The task-stealing jobs cut finer late (BBHOST_RQ_GUIDED) ----
+//
+// The parallel-for gives such a job our vtable and keeps the game's grain G
+// in it: its pop's split takes max(M, min(G, ceil(n / K))) items off the
+// front - the game's grain while the job holds K grains or more, then a K-th
+// of what is left, down to M (the game's split with that grain) - its steal's
+// split halves it while it holds 2 M or more (the game's split with grain M),
+// the half keeping G and our vtable, and its run puts the pool's vtable back
+// before the game's run returns the job to its pool.
+std::atomic<u64> g_guided_pops{0}, g_guided_steals{0};
+
+DECOMP_LEAF u64 rq_job_run(u64 job, u32 participant) {
+    if (!MUTANT(21)) store<u64>(job, game_address(kJobVtable));
+    return game_function<JobRunFn>(kJobRun)(job, participant);
+}
+
+DECOMP_LEAF u64 rq_job_split_pop(u64 job, u64 out) {
+    const u32 f = load<u32>(job + 0x10), l = load<u32>(job + 0x14), grain = load<u32>(job + 0x18);
+    const u32 n = l > f ? l - f : 0;
+    u32 take = MUTANT(18) ? n / g_guided_k : (n + g_guided_k - 1) / g_guided_k;
+    if (take > grain && !MUTANT(23)) take = grain;
+    if (take < g_guided_least) take = g_guided_least;
+    store<u32>(job + 0x18, take);
+    const u64 r = game_function<SplitFn>(kJobSplitPop)(job, out);
+    if (!MUTANT(19)) store<u32>(job + 0x18, grain);
+    if (r & 0xff) g_guided_pops.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
+DECOMP_LEAF u64 rq_job_split_steal(u64 job, u64 out) {
+    const u32 grain = load<u32>(job + 0x18);
+    store<u32>(job + 0x18, g_guided_least);
+    const u64 r = game_function<SplitFn>(kJobSplitSteal)(job, out);
+    store<u32>(job + 0x18, grain);
+    if (r & 0xff) {
+        if (const u64 half = load<u64>(out); half && !MUTANT(20)) {
+            store<u64>(half, host_address(g_rq_job_vt));
+            store<u32>(half + 0x18, grain);
+        }
+        g_guided_steals.fetch_add(1, std::memory_order_relaxed);
+    }
+    return r;
+}
+
 // ---- The parallel-for (sub_12c7810), for BBHOST_RQ_PUSH ----
 
 // The chunks [b, e) of a queue's table in place, the dearest first (their
@@ -1024,6 +1114,12 @@ DECOMP_LEAF u32 render_queue_parallel_for(u64 q, u64 ctx, u32 first, u32 last, u
     // forced, and no cut to follow.
     if (g_push_mode != Push::On && !(g_push_mode == Push::WithCut && g_cut_on.load(std::memory_order_relaxed)))
         return static_cast<u32>(reinterpret_cast<ParallelForFn>(g_game_parallel_for)(q, ctx, first, last, limit));
+    if (g_guided_k && !g_rq_job_vt[0]) {
+        g_rq_job_vt[3] = load<u64>(game_address(kJobVtable) + 0x18);
+        g_rq_job_vt[2] = host_address(reinterpret_cast<void*>(&rq_job_split_steal));
+        g_rq_job_vt[1] = host_address(reinterpret_cast<void*>(&rq_job_split_pop));
+        g_rq_job_vt[0] = host_address(reinterpret_cast<void*>(&rq_job_run));
+    }
     g_in_parallel_for = true;
     g_pf_cut = false;
     const u32 n = method<PartitionFn>(q, 0x18)(q, first, last, limit);
@@ -1060,7 +1156,9 @@ DECOMP_LEAF u32 render_queue_parallel_for(u64 q, u64 ctx, u32 first, u32 last, u
         range.last = load<u32>(c + 4);
         const s32 span = static_cast<s32>(range.last - range.first), size = load<s32>(c + 8);
         range.grain = static_cast<u32>(span > size ? size : span);
+        const bool guided = g_guided_k && size < span && !MUTANT(22);
         const u64 job = game_function<JobForFn>(kJobFor)(host_address(&functor), host_address(&range), worker);
+        if (guided && job) store<u64>(job, host_address(g_rq_job_vt));
         game_function<PushFn>(kPushJob)(jobs, job, worker);
     }
     game_function<VoidFn>(kAfterPush)();
@@ -1445,6 +1543,11 @@ void render_queue_report() {
                  decomp_comparing() ? (std::string("; compared: ") + std::to_string(g_cut_refined.load()) +
                                        " pieces past the game's chunks, each refining them").c_str()
                                     : "");
+    if (g_push_placed && g_guided_k)
+        host_log("decomp: the render queue's task-stealing jobs cut finer late (a pop the game's grain while a job holds %u of them, "
+                 "then 1/%u of what is left, down to %u items; BBHOST_RQ_GUIDED): %llu pops cut, %llu steals halved",
+                 g_guided_k, g_guided_k, g_guided_least, static_cast<unsigned long long>(g_guided_pops.load()),
+                 static_cast<unsigned long long>(g_guided_steals.load()));
     if (g_ranks) host_log("decomp: the render queue's ranks by cost: %llu parallel-fors", static_cast<unsigned long long>(g_ranked.load()));
     if (g_push_placed)
         host_log("decomp: the render queue pushed longest first: %llu parallel-fors", static_cast<unsigned long long>(g_pushed.load()));
@@ -1514,6 +1617,17 @@ void decomp_gx_render_queue_add() {
     g_cut_on.store(g_split_mode == Split::On, std::memory_order_relaxed);
     if (const char* e = std::getenv("BBHOST_RQ_SPLIT_EVERY"); e && std::atoi(e) > 0) g_split_every = static_cast<u32>(std::atoi(e));
     g_ranks = on("BBHOST_RQ_RANKS", false);
+    if (const char* e = std::getenv("BBHOST_RQ_GUIDED"); e && *e) {
+        unsigned k = 0, m = 0;
+        if (e[0] == '0' && e[1] == 0) {
+            g_guided_k = 0;
+        } else if (std::sscanf(e, "%u.%u", &k, &m) == 2 && k >= 2 && m >= 1) {
+            g_guided_k = k;
+            g_guided_least = m;
+        } else {
+            host_log("decomp: BBHOST_RQ_GUIDED=%s is not 0 or K.M (K 2 or more, M 1 or more); the default, %u.%u", e, kGuidedK, kGuidedLeast);
+        }
+    }
     g_log_categories = on("BBHOST_SCENE_CATEGORIES", false);
     // What could be on in this run: Auto follows the frame rate's limit, which V-Sync moves while uncapped.
     const bool may_cut = g_split_mode != Split::Off;

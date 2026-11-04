@@ -254,7 +254,19 @@ the newer one has run: a shader walking the table reads whatever address an
 entry holds as it runs, and AMD's Linux driver maps a new buffer's addresses
 for the submissions made after it, not for the ones already queued
 (host/import_table.h; `BBHOST_IMPORT_TABLE_DEFER=0` switches them at once, as
-before). It is on by default on an integrated GPU under Windows,
+before). An import none of whose windows anything has used for a minute - an
+area's meshes and copy-backs once the game has gone elsewhere, a buffer the
+import thread imported that the draws never read in place - is let go: its
+windows' entries point at the sink at once (no work in flight reads them, and
+the sink is memory every submission sees), it is freed once the work recorded
+with it has run, and a later use imports it again (host/import_retire.h,
+`BBHOST_IMPORT_RETIRE`; on by default with window imports on a graphics card,
+kept on an integrated GPU until one has run it). A retired import - let go, or
+replaced by a merge - is freed on a thread of its own, in the background and
+50 ms apart (`BBHOST_IMPORT_FREE_THREAD=0` frees it on the command processor,
+`BBHOST_IMPORT_FREE_GAP_MS` sets the gap): the driver's free took up to 14 ms
+there. Window imports are on by
+default on an integrated GPU under Windows,
 where whole spans kept about 1.5 GB more of the game's memory resident for the
 GPU, and on a graphics card with small video memory (under 7.5 GiB free at
 the start), whose whole spans pin 4-5 GiB of system memory beside a 4-6 GB
@@ -788,7 +800,10 @@ reserve kept for render targets and device buffers; short of room a buffer
 keeps today's path - never a copy in host memory on a discrete GPU, where
 one placed during a dip stayed for the session and every draw of it read
 across the bus (on an integrated GPU, whose host memory is the same RAM,
-host-visible memory is taken). `BBHOST_GXVK_BUFFERS=2` keeps today's path
+host-visible memory is taken) - until a draw half a second or more after the
+refusal finds room for its copy (`BBHOST_GXVK_ROOM_RETRY=0`: for the rest of
+the session, as before, when a 4 GB card read 109 such buffers' 9.9 M vertex
+records from guest memory over a 3.5-minute tour). `BBHOST_GXVK_BUFFERS=2` keeps today's path
 and checks the handles
 beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -

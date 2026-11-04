@@ -247,6 +247,13 @@ const GpuDrawInputs* hle_gx_native_peek(std::uint64_t id, const struct GxDrawObj
 // the token) - without taking it. False when the slot is not stored or not
 // this token's.
 bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs& in, struct GxDrawObjects& objects);
+// Stage 4b.1a's pool (host/gxvk_lists.h): a draw token's slot held for reading
+// on a pool thread while it is stored and not taken - its inputs, and its
+// objects copied into `objects` with their records (unpacked into the calling
+// thread's own set when packed) - until hle_gx_native_unpin(id); the command
+// processor's take waits for it. Null (nothing held) otherwise.
+const GpuDrawInputs* hle_gx_native_pin(std::uint64_t id, struct GxDrawObjects* objects);
+void hle_gx_native_unpin(std::uint64_t id);
 // BBHOST_GX_NATIVE_COPIES: a GX buffer-copy pass's copy token, a type-3 NOP
 // with payload {kGxCopyMagic, id low, id high}; runs the call's copies.
 constexpr std::uint32_t kGxCopyMagic = 0x50434242u;  // "BBCP"

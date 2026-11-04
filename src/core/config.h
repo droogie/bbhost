@@ -195,10 +195,34 @@ std::string config_user_dir();
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
-// The effects' steps above 30 fps as asked for: BBHOST_SFX_STEP, else [video]
-// effect_steps, else "smooth" (the default). The frame rate code reads 30,
-// smooth, 60 and frame (engine/frame_rate.cpp).
-std::string config_effect_steps();
+// The effects' timing above 30 fps when nothing asks for another: Smooth, the
+// Effect timing setting's default (F10's DISPLAY, the setup window's Game
+// page). One constant: the options file holds the setting only once a player
+// chose it (host/options.cpp), so a new default here reaches everyone else.
+inline constexpr char kEffectTimingDefault[] = "smooth";
+// The effects' timing above 30 fps, decided once as the game starts
+// (engine/frame_rate.cpp): BBHOST_SFX_STEP, else `setting` - the Effect timing
+// setting's "smooth", "30", "auto" or "fps" - once the player has chosen one
+// (`chosen`), else [video] effect_steps, else kEffectTimingDefault. What each
+// value means at `fps` frames a second:
+//   smooth  whole 1/30 s steps for what the effects count in updates (a
+//           flicker's picks, a wobble's re-rolls, a node's state edges) and
+//           each frame's own time for what moves, in the effects the step gate
+//           has converted (decomp/sfx/step_gate.cpp; the rest as 30);
+//   30      whole 1/30 s steps;
+//   auto    30 at 30, 60 above;
+//   fps     whole steps of 1/fps s;
+//   1..960  that many whole steps a second (60 among them);
+//   frame   each frame's own time (steps 0).
+// A value that is none of these runs the default, readable false.
+struct EffectTiming {
+    std::string value;      // what was asked for, as written
+    const char* from = "";  // what decided, for the start log
+    int steps = 30;         // whole steps a second; 0 for frame
+    bool smooth = false;    // the step gate's smooth steps
+    bool readable = true;
+};
+EffectTiming config_effect_timing(int fps, const char* setting, bool chosen);
 // The effects' emission clock as asked for: BBHOST_SFX_EMISSION, else [video]
 // effect_emission, else "60" (the default): "60" for emission events at 60 a
 // second at every frame rate, "30" for the game's one an update

@@ -1164,10 +1164,49 @@ std::string config_value(const std::string& key) {
     return it == g_values.end() ? std::string() : unquote(it->second);
 }
 
-std::string config_effect_steps() {
-    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) return e;
-    const std::string v = config_value("video.effect_steps");
-    return v.empty() ? "smooth" : v;
+namespace {
+// One value of the effects' timing at `fps` (config_effect_timing): its steps
+// and smooth, or false for none.
+bool effect_timing_of(const std::string& v, int fps, EffectTiming* t) {
+    t->smooth = v == "smooth";
+    if (t->smooth) {
+        t->steps = 30;
+        return true;
+    }
+    if (v == "auto") t->steps = fps > 30 ? 60 : 30;
+    else if (v == "fps") t->steps = fps;
+    else if (v == "frame") t->steps = 0;
+    else {
+        char* end = nullptr;
+        const long n = std::strtol(v.c_str(), &end, 10);
+        if (end == v.c_str() || *end != '\0' || n < 1 || n > 960) return false;
+        t->steps = static_cast<int>(n);
+    }
+    return true;
+}
+}  // namespace
+
+EffectTiming config_effect_timing(int fps, const char* setting, bool chosen) {
+    EffectTiming t;
+    const std::string file = config_value("video.effect_steps");
+    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) {
+        t.value = e;
+        t.from = "BBHOST_SFX_STEP";
+    } else if (chosen && setting && *setting) {
+        t.value = setting;
+        t.from = "the Effect timing setting";
+    } else if (!file.empty()) {
+        t.value = file;
+        t.from = "bbhost.toml's [video] effect_steps";
+    } else {
+        t.value = kEffectTimingDefault;
+        t.from = "the default";
+    }
+    if (!effect_timing_of(t.value, fps, &t)) {
+        t.readable = false;
+        effect_timing_of(kEffectTimingDefault, fps, &t);
+    }
+    return t;
 }
 
 bool config_frame_clock(bool setting, bool saved, const char** from) {

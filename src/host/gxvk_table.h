@@ -43,6 +43,10 @@ struct BufferEntry {
     std::atomic<std::uint32_t> last_flip{0};
     std::uint64_t hash = 0;           // compare mode: the buffer's bytes when copied
     std::uint32_t binds = 0;          // compare mode: bindings so far, for the sampled checks
+    // The command processor's: its copy found no room (BBHOST_GXVK_ROOM_RETRY) and is not placed since; no placement is
+    // tried for it before flip room_retry_flip.
+    bool room_refused = false;
+    std::uint32_t room_retry_flip = 0;
 };
 
 constexpr std::uint32_t kIndexBits = 20;
