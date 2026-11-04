@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
+#include <string>
 
 namespace {
 
@@ -130,6 +132,62 @@ UpscalerCaps upscaler_caps() {
     return g_caps;
 }
 
+namespace {
+std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture from then on
+}  // namespace
+
+int upscaler_method() {
+    static const int asked = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE");
+        if (!e || !*e) return 0;
+        const std::string v = e;
+        return v == "dlss" ? 1 : v == "fsr" || v == "fsr3" ? 2 : 0;
+    }();
+    if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
+    const UpscalerCaps c = upscaler_caps();
+    return (asked == 1 && c.dlss) || (asked == 2 && c.fsr) ? asked : 0;
+}
+
+bool upscaler_fsr3_override() {
+    const char* e = std::getenv("BBHOST_UPSCALE");
+    return e && std::strcmp(e, "fsr3") == 0;
+}
+
+bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
+    if (!g_ub || !g_attached || g_failed.load(std::memory_order_relaxed)) return false;
+    auto img = [](const UpscaleImage& i) {
+        ub_image u{};
+        u.image = i.image;
+        u.view = i.view;
+        u.format = i.format;
+        u.layout = i.layout;
+        return u;
+    };
+    ub_evaluate_desc d{};
+    d.struct_size = sizeof(d);
+    d.method = c.method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR;
+    d.quality = c.quality;
+    d.flags = (c.reset ? UB_EVAL_RESET : 0u) | (c.method == 2 && upscaler_fsr3_override() ? UB_EVAL_FSR3 : 0u);
+    d.render_width = c.render_w;
+    d.render_height = c.render_h;
+    d.output_width = c.output_w;
+    d.output_height = c.output_h;
+    d.color = img(c.color);
+    d.depth = img(c.depth);
+    d.motion = img(c.motion);
+    d.output = img(c.output);
+    d.jitter_x = c.jitter_x;
+    d.jitter_y = c.jitter_y;
+    d.frame_time_ms = c.frame_ms;
+    d.camera_near = c.near_m;
+    d.camera_far = c.far_m;
+    d.camera_fov_y = c.fov_y;
+    if (g_ub->evaluate(g_ctx, cb, &d) == UB_OK) return true;
+    g_failed.store(true, std::memory_order_relaxed);
+    host_log("upscaler: evaluate failed, the plain picture from now on: %s", g_ub->last_error(g_ctx));
+    return false;
+}
+
 #else  // no bridge outside Windows
 
 bool upscaler_open() { return false; }
@@ -140,5 +198,8 @@ const VkDeviceCreateInfo* upscaler_prepare_device(VkInstance, VkPhysicalDevice, 
 void upscaler_device_done(VkResult) {}
 void upscaler_attach(VkInstance, VkPhysicalDevice, VkDevice, std::uint32_t) {}
 UpscalerCaps upscaler_caps() { return {}; }
+int upscaler_method() { return 0; }
+bool upscaler_fsr3_override() { return false; }
+bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
 
 #endif

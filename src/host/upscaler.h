@@ -45,3 +45,31 @@ struct UpscalerCaps {
     std::string dlss_version, fsr_versions, dlss_reason, fsr_reason;
 };
 UpscalerCaps upscaler_caps();
+
+// The method asked for by BBHOST_UPSCALE (until the Graphics page has its
+// setting): 0 none, 1 DLSS ("dlss"), 2 FSR ("fsr"; "fsr3" for the newest 3.x
+// where FSR 4 could run) - and only one the bridge says can run here.
+int upscaler_method();
+bool upscaler_fsr3_override();
+
+// One upscale, recorded into `cb` outside a render pass (host/upscale_pass.cpp
+// at the call point). Each image's layout is the one it is in when `cb`
+// reaches the call, and it is left there. False: nothing was written to
+// `output` (the method is turned off after its first error; the plain picture
+// stands).
+struct UpscaleImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+};
+struct UpscaleCall {
+    int method = 0;
+    std::uint32_t quality = 0;  // 0 native (DLAA / FSR native AA)
+    bool reset = false;
+    std::uint32_t render_w = 0, render_h = 0, output_w = 0, output_h = 0;
+    UpscaleImage color, depth, motion, output;
+    float jitter_x = 0, jitter_y = 0;
+    float frame_ms = 16.7f, near_m = 0.1f, far_m = 10000.0f, fov_y = 1.0f;
+};
+bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c);

@@ -12,6 +12,7 @@
 #include "host/copy_census.h"
 #include "host/full_write.h"
 #include "host/gpu_internal.h"
+#include "host/upscaler.h"
 #include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
 #include "host/import_fallback.h"
@@ -23700,6 +23701,46 @@ static bool draw_impl(const GpuDraw& d) {
     if (g.depth_layouts) {
         depth_layouts_for_images_locked(stage_images, 2, s.depth);
         if (part && run->stop >= 0) return false;
+    }
+    // The temporal upscaler's call point (host/upscale_pass.cpp): before the
+    // first draw that samples the scene after its last write - the lit scene
+    // and its transparency done, nothing of the post chain begun. The scene is
+    // the image YEBIS's copy into its own (0b0acf50+ccbf44a6, the post chain's
+    // first pass) samples, learned from that draw; its depth is the one drawn
+    // with it (the G-buffer's). The first frame that copy is seen in, the
+    // upscale runs at that copy.
+    if (upscaler_method()) {
+        static std::uint64_t scene_base = 0, depth_base = 0, done_write = 0;
+        if (pl.name == "0b0acf50+ccbf44a6") {
+            for (const StageImages::Image& im : stage_images[1].images) {
+                if (!im.resolved) continue;
+                const std::uint64_t b = image_base(im);
+                if (b != scene_base) {
+                    host_log("upscaler: the scene is 0x%llx (YEBIS's copy samples it)", static_cast<unsigned long long>(b));
+                    scene_base = b;
+                    depth_base = 0;
+                }
+                break;
+            }
+        }
+        const bool writes_scene = scene_base && s.color[0] && s.color[0]->base == scene_base;
+        if (writes_scene && s.depth) depth_base = s.depth->base;
+        if (scene_base && depth_base && !writes_scene) {
+            bool reads = false;
+            for (int st = 0; st < 2 && !reads; ++st) {
+                for (const StageImages::Image& im : stage_images[st].images) reads |= im.resolved && image_base(im) == scene_base;
+            }
+            RtImage* scene = reads ? find_render_target(scene_base) : nullptr;
+            RtImage* depth = scene ? find_render_target(depth_base) : nullptr;
+            if (scene && depth && depth->depth && scene->last_write != done_write) {
+                if (part) {
+                    run_part_stop(kRunStopOrder);
+                    return false;
+                }
+                upscale_pass_run_locked(*scene, *depth);
+                done_write = scene->last_write;
+            }
+        }
     }
     if (part) {
         // The run's pass is open - its first draw began it - and a draw into
