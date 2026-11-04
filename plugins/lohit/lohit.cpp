@@ -7,8 +7,7 @@
 //   whole_map = true    # every loaded part's lo-hit, not only the part stood on and its neighbours
 //   show_hi_hit = false # the hi-hit (what characters and objects collide with) in place of the lo-hit
 //   edges = false       # the triangles' edges the game draws over the faces (a second draw of each)
-//   occlusion = true    # its depth early in the scene too, so the game's occlusion tests see the walls
-//   occluder_pass = "3e/04"  # where that depth-only play goes (ahead of the scene's objects)
+//   occluder_pass = "3e/04"  # where its depth-only play goes, for occlusion (ahead of the scene's objects)
 //
 // What it draws. The world's hit manager (WorldHitMan) has a debug draw of
 // the parts the player last stood on (its two slots at +0x2de8/+0x2df0): each
@@ -66,7 +65,8 @@
 // drawn the next frame predicated on it. With the map's geometry left out,
 // nothing is in the depth buffer when the objects draw (3e/04 on), so nothing
 // behind a wall is culled, and the lo-hit drawn at 3e/25 is too late to be an
-// occluder. With `occlusion` (plugin API 17) the list is played a second time
+// occluder. So (plugin API 17; always, LOHIT_OCCLUSION=0 for a test without
+// it) the list is played a second time
 // ahead of `occluder_pass` with no colour written (BB_DRAW_DEPTH_ONLY), and
 // the coloured play at `pass` tests less-or-equal against that depth
 // (BB_DRAW_DEPTH_EQUAL). Drawn with its colour that early, it goes into the
@@ -95,7 +95,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.4.0",
+    "0.4.1",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -108,9 +108,6 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "show_hi_hit", "Hi-hit",
      "The hi-hit - what characters and objects collide with, in its full detail - in place of the lo-hit.", "false"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "occlusion", "Occlusion",
-     "The lo-hit's depth early in the scene as well, so the game's occlusion culling skips what is behind its walls.",
-     "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "edges", "Triangle edges",
      "The edges the game draws over the faces: a second draw of every triangle, which costs more of the GPU than the faces.",
      "false"},
@@ -774,7 +771,6 @@ void on_option(const char* key, const char* value, void*) {
     else if (std::strcmp(key, "whole_map") == 0) g_whole_map.store(truthy(value), std::memory_order_relaxed);
     else if (std::strcmp(key, "show_hi_hit") == 0) show_hi(truthy(value));
     else if (std::strcmp(key, "edges") == 0) g_edges.store(truthy(value), std::memory_order_relaxed);
-    else if (std::strcmp(key, "occlusion") == 0) g_occlusion.store(truthy(value), std::memory_order_relaxed);
     else if (std::strcmp(key, "occluder_pass") == 0 && g_can_occlude) {
         const int p = parse_pass(value);
         if (p >= 0) g_occluder_pass = p;
@@ -867,7 +863,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         const char* c = host->config("lohit.pass");
         set_pass(c && *c ? c : "3e/25");
         g_can_occlude = host->version >= 17 && host->size >= offsetof(BbHostApi, draw_style) + sizeof(void*);
-        g_occlusion.store(option_on("lohit.occlusion", true), std::memory_order_relaxed);
+        if (const char* o = std::getenv("LOHIT_OCCLUSION")) g_occlusion.store(o[0] != '0', std::memory_order_relaxed);
         if (g_can_occlude) {
             const int op = parse_pass(host->config("lohit.occluder_pass"));
             if (op >= 0) g_occluder_pass = op;
