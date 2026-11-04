@@ -5,7 +5,9 @@
 // answer the command processor asks of it (meets, holding, straddles, and the
 // filter's "no") checked against a plain list of the live ranges. The filter
 // may say "maybe" where nothing is; it may never say "no" where a home is.
-// The handle's packing is checked too (host/gxvk_homes.h).
+// The handle's packing is checked too (host/gxvk_homes.h), and the default's
+// rule (default_off: on only with a card with room, 16 hardware threads or more
+// and a frame rate above 60).
 #include "host/gxvk_homes.h"
 #include "host/gxvk_homes_index.h"
 
@@ -55,6 +57,23 @@ int main() {
         }
     }
     check(!gxvk_homes::is_handle(0xa0000123u) && !gxvk_homes::is_handle(0), "another tag is no handle", 0, 0);
+    // The default (BBHOST_GXVK_HOMES unset): on only with a card with room, 16 hardware threads or more and a frame rate
+    // above 60 - Display-Limited at 144 Hz or uncapped (960) on, 60 and 30 off, 15 threads off - each reason its own bit.
+    {
+        using namespace gxvk_homes;
+        check(default_off(false, false, false, 16, 61, false) == 0 && default_off(false, false, false, 80, 960, false) == 0 &&
+                  default_off(false, false, false, 32, 144, false) == 0,
+              "on with room, 16+ threads, above 60", 0, 0);
+        check(default_off(false, false, false, 80, 60, false) == kDefaultOffRate && default_off(false, false, false, 80, 30, false) == kDefaultOffRate,
+              "off at 60 and below", 0, 60);
+        check(default_off(false, false, false, 15, 960, false) == kDefaultOffThreads && default_off(false, false, false, 8, 960, false) == kDefaultOffThreads,
+              "off below 16 threads", 15, 960);
+        check(default_off(true, false, false, 80, 960, false) == kDefaultOffIntegrated && default_off(false, true, false, 80, 960, false) == kDefaultOffTight &&
+                  default_off(false, false, true, 80, 960, false) == kDefaultOffSmall,
+              "off on an integrated GPU, with tight or small video memory", 0, 0);
+        check(default_off(false, false, true, 8, 60, false) == (kDefaultOffSmall | kDefaultOffThreads | kDefaultOffRate), "every reason said", 8, 60);
+        check(default_off(false, false, false, 80, 960, true) == kDefaultOffRunCommit, "off with the run commit on", 80, 960);
+    }
 
     std::mt19937_64 rng(4321);
     HomeIndex ix;

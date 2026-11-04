@@ -53,9 +53,9 @@
 // forbids it for these usages) copies the home back and retires it - the
 // buffer then takes today's path.
 //
-// BBHOST_GXVK_HOMES: unset or 0 today's path (the default until its gate
-// passes); 1 homes by handle (with the captures; the GPU particles' twins stay
-// as they are); compare: today's path is bound, and the homes are kept as 1
+// BBHOST_GXVK_HOMES: unset, the default below; 0 today's path; 1 homes by
+// handle (with the captures; the GPU particles' twins stay as they are);
+// compare: today's path is bound, and the homes are kept as 1
 // keeps them - made, filled, written by the copy-backs on the GPU, with a CPU
 // mirror of what each holds - and each binding today's path makes of a home is
 // checked against its mirror, a sample of homes read back from the GPU after
@@ -74,9 +74,42 @@
 
 namespace gxvk_homes {
 
-enum class Mode : int { kOff = 0, kHandle = 1, kCompare = 2, kTwins = 3 };
-// BBHOST_GXVK_HOMES as given (the device's decision aside).
+enum class Mode : int { kOff = 0, kHandle = 1, kCompare = 2, kTwins = 3, kAuto = 4 };
+// BBHOST_GXVK_HOMES as given (the device's decision aside): kAuto when unset.
 Mode env_mode();
+
+// The default (BBHOST_GXVK_HOMES unset), decided once with the device
+// (homes_decide): the homes - and with them the draw segments stage 4b.2's pool
+// prepares on its own threads (host/gxvk_lists.h settle), the run batching and
+// the copy-back captures, as 1 turns them on - only where the frame rate can
+// gain from them: a graphics card with room (the device rule above: no
+// integrated GPU, no small video memory unless a budget is given, no tight
+// memory), 16 hardware threads or more for the process, and a frame rate above
+// 60 (a fixed rate above 60, or Display-Limited on a display above 60 Hz). On
+// an RTX 4070 uncapped they took the command processor's time a flip down
+// 27-31% and the frame rate up 6.5% where the command processor limited; at
+// 60 and below, where the frame waits for its limit anyway, the pool's threads
+// cost about a core more for nothing. Nor with the run commit on
+// (BBHOST_RUN_COMMIT, on by default on Windows): the pool's splices give way to
+// it, so its threads would commit ahead for nothing, and the homes beside the
+// run commit have not been measured. The homes are made as their buffers are,
+// so the choice holds for the run: a frame rate changed in play applies at the
+// next start. The reasons it is off, as bits (none: on).
+enum DefaultOff : unsigned {
+    kDefaultOffIntegrated = 1u << 0,  // an integrated GPU (its video memory is the system's)
+    kDefaultOffTight = 1u << 1,       // tight memory (all heaps under 12 GiB)
+    kDefaultOffSmall = 1u << 2,       // small video memory, no BBHOST_GXVK_HOMES_BUDGET_MB
+    kDefaultOffThreads = 1u << 3,     // fewer than kDefaultThreads hardware threads (host_cpu_threads)
+    kDefaultOffRate = 1u << 4,        // a frame rate of kDefaultAboveFps or less (frame_rate_game_fps)
+    kDefaultOffRunCommit = 1u << 5,   // the run commit on (list_resolve::committing())
+};
+constexpr unsigned kDefaultThreads = 16;
+constexpr int kDefaultAboveFps = 60;
+constexpr unsigned default_off(bool integrated, bool tight, bool small_vram_unbudgeted, unsigned threads, int fps, bool run_commit) {
+    return (integrated ? kDefaultOffIntegrated : 0u) | (tight ? kDefaultOffTight : 0u) | (small_vram_unbudgeted ? kDefaultOffSmall : 0u) |
+           (threads < kDefaultThreads ? kDefaultOffThreads : 0u) | (fps <= kDefaultAboveFps ? kDefaultOffRate : 0u) |
+           (run_commit ? kDefaultOffRunCommit : 0u);
+}
 
 // The handle in a holder's +0x14: the tag, the entry's generation (8 bits) and
 // its index (20 bits). Stage 1b's handles have tag 0xa.

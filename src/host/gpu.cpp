@@ -4060,13 +4060,18 @@ bool init_locked() {
         twins_decide(c.type_rank == 4);
         homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
         {
-            // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle).
+            // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
+            // the homes' own line said why (null: no second line).
             const bool hb = gxvk_homes::made_on() && gxvk_homes::bind_on();
-            const char* why = hb                                                       ? ""
-                              : gxvk_homes::env_mode() != gxvk_homes::Mode::kHandle    ? "the constant buffers' homes are off (BBHOST_GXVK_HOMES=1: on)"
-                              : g.integrated                                          ? "the homes are off on an integrated GPU"
-                              : g.tight                                               ? "the homes are off with tight memory"
-                                                                                      : "the homes are off with small video memory";
+            const gxvk_homes::Mode hm = gxvk_homes::env_mode();
+            const char* why = hb                                  ? ""
+                              : hm == gxvk_homes::Mode::kAuto    ? nullptr
+                              : hm == gxvk_homes::Mode::kOff     ? "the constant buffers' homes are off (BBHOST_GXVK_HOMES=0)"
+                              : hm == gxvk_homes::Mode::kCompare ? "the constant buffers' homes are compared, not bound (BBHOST_GXVK_HOMES=compare)"
+                              : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
+                              : g.integrated                     ? "the homes are off on an integrated GPU"
+                              : g.tight                          ? "the homes are off with tight memory"
+                                                                 : "the homes are off with small video memory";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)
@@ -13323,7 +13328,7 @@ std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::ui
         }
     }
     const bool live = g_capture_ring.buffer && cb_capture::piece_live(piece);
-    const bool compare = cb_capture::g_mode == cb_capture::Mode::kCompare;
+    const bool compare = cb_capture::mode() == cb_capture::Mode::kCompare;
     std::size_t i = 0;
     for (; i < n; ++i) {
         if (!bytes[i]) continue;

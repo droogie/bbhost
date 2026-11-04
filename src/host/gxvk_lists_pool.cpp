@@ -453,7 +453,8 @@ void settle(bool homes_bind, const char* homes_why) {
             if (!n) {
                 host_log("gxvk-lists: segments off - %u hardware threads, the pool needs 8 or more", hw);
             } else if (!homes_bind) {
-                host_log("gxvk-lists: segments off - %s (BBHOST_GXVK_LISTS=segments: on all the same)", homes_why ? homes_why : "the homes are off");
+                // (No why: the homes are off by their default, whose line said why and names both switches.)
+                if (homes_why) host_log("gxvk-lists: segments off - %s (BBHOST_GXVK_LISTS=segments: on all the same)", homes_why);
             } else {
                 mode = 5;
                 host_log("gxvk-lists: segments on with the constant buffers' homes (BBHOST_GXVK_LISTS=0: off)");
@@ -463,7 +464,7 @@ void settle(bool homes_bind, const char* homes_why) {
             mode = 0;
         } else if (env >= 3 && !homes_bind) {
             host_log("gxvk-lists: the homes are off (%s): most draws read a copy version and are not committed",
-                     homes_why ? homes_why : "unknown");
+                     homes_why ? homes_why : "by their default here, as their line says");
         }
         if (mode && n) cache_rw::g_readers.store(true, std::memory_order_release);
         g_pool_mode.store(mode && n ? mode : 0, std::memory_order_release);

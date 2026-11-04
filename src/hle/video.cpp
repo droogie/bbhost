@@ -1187,7 +1187,9 @@ void hle_video_set_fps_cap(int fps) {
     // next run.
     if (const int pace = g_game_pace.load(); pace >= 0) {
         if (fps != pace) {
-            host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped)", fps, pace);
+            host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped), and with it the default "
+                     "for the draw work prepared on the pool's threads, decided at start (host/gxvk_homes.h)",
+                     fps, pace);
         }
         return;
     }

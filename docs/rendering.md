@@ -817,6 +817,29 @@ each draw of a segment that would have been spliced with its commit. On an RTX
 0.35-0.5 us a spliced draw, and the frame rate rose 5-11% at Old Yharnam,
 where the command processor had been the limit.
 
+**On by default above 60 fps (`BBHOST_GXVK_HOMES` unset).** The constant
+buffers' homes - and with them the segments, and the run batching
+(`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by default only
+where the frame rate can gain from them: a graphics card with room (the homes'
+own rule below: not an integrated GPU, no small video memory unless
+`BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget, no tight memory), 16 hardware
+threads or more that the process may run on (its CPU affinity, so a
+`taskset` counts), a frame rate above 60 (a fixed rate above 60, or
+Display-Limited on a display above 60 Hz), and the run commit off
+(`BBHOST_RUN_COMMIT`). At 60 and below the frame waits for its limit anyway,
+and the pool's two threads would cost about a core more for nothing, so
+everything there is as it was before them. The pool's splices give way to the
+run commit, which is on by default on Windows, and the homes beside it have
+not been measured there: on Windows they stay off by default, the run commit
+as it was, until a Windows measurement decides (`BBHOST_RUN_COMMIT=0` there
+lets the default decide). The homes are made as
+their buffers are, so the choice is made once, with the device at start: a
+frame rate changed in play applies at the next start, as the frame rate
+itself does (F10 marks it). Off, one line says why (`gxvk homes: off by
+default here (...)`); on, the homes' line says what decided it.
+`BBHOST_GXVK_HOMES=1` or `=0` decides either way, and `BBHOST_GXVK_LISTS` the
+segments alone.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in
@@ -1019,7 +1042,9 @@ as today, runs the proof over the sources as 1 would, and compares each
 version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
-handle (`BBHOST_GXVK_HOMES`, off by default while it is measured).** A
+handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps with 16 hardware
+threads or more, a card with room and the run commit off: "On by default above
+60 fps" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
 copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`

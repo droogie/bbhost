@@ -13,9 +13,12 @@
 #include "host/gxvk_homes.h"
 #include "host/gxvk_homes_index.h"
 
+#include "core/portable.h"
+#include "engine/frame_rate.h"
 #include "hle/modules.h"
 #include "host/cb_capture.h"
 #include "host/gpu_internal.h"
+#include "host/list_resolve.h"
 #include "host/memory_policy.h"
 #include "log.h"
 
@@ -355,7 +358,50 @@ void sync_one_locked(Home& e) {
 // ---- GX's threads ----
 
 void homes_decide(bool integrated, bool small_vram, bool tight) {
-    const Mode m = env_mode();
+    Mode m = env_mode();
+    const char* budget_env = std::getenv("BBHOST_GXVK_HOMES_BUDGET_MB");
+    // The default (BBHOST_GXVK_HOMES unset, host/gxvk_homes.h default_off): on as 1 turns them on, or off with its
+    // reasons in one line. The frame rate was chosen as the game's code was patched, before the device.
+    char by_default[256] = "";
+    if (m == Mode::kAuto) {
+        const unsigned threads = host_cpu_threads();
+        const int fps = frame_rate_game_fps();
+        const unsigned off =
+            default_off(integrated, tight, small_vram && !(budget_env && *budget_env), threads, fps, list_resolve::committing());
+        if (off) {
+            std::string why;
+            char b[64];
+            const auto add = [&why](const char* w) {
+                if (!why.empty()) why += ", ";
+                why += w;
+            };
+            if (off & kDefaultOffIntegrated) add("an integrated GPU");
+            if (off & kDefaultOffTight) add("tight memory");
+            if (off & kDefaultOffSmall) add("small video memory");
+            if (off & kDefaultOffThreads) {
+                std::snprintf(b, sizeof(b), "%u hardware threads", threads);
+                add(b);
+            }
+            if (off & kDefaultOffRate) {
+                std::snprintf(b, sizeof(b), "%d fps", fps);
+                add(b);
+            }
+            if (off & kDefaultOffRunCommit) add("the run commit on, which the pool's segments give way to (BBHOST_RUN_COMMIT=0: the default decides)");
+            host_log("gxvk homes: off by default here (%s) - the constant buffers' homes, and with them the draw segments prepared on "
+                     "the pool's threads, are on by default only with a graphics card with room, %u or more hardware threads, a "
+                     "frame rate above %d and the run commit off; at %d and below the pool would take about a core more for nothing. "
+                     "Decided at start: a frame rate changed in play applies at the next start. BBHOST_GXVK_HOMES=1 turns them on",
+                     why.c_str(), kDefaultThreads, kDefaultAboveFps, kDefaultAboveFps);
+            return;
+        }
+        std::snprintf(by_default, sizeof(by_default),
+                      "on by default: a graphics card with room, %u hardware threads, %d fps, the run commit off; decided at start, a "
+                      "frame rate changed in play applies at the next start; BBHOST_GXVK_HOMES=0: off",
+                      threads, fps);
+        m = Mode::kHandle;
+        cb_capture::set_on();          // the copy-backs captured at the resolve, as 1 has them
+        list_resolve::follow_homes();  // and the run batching and the part machinery the segments need
+    }
     if (m != Mode::kHandle && m != Mode::kCompare) return;
     if (integrated || tight) {
         host_log("gxvk homes: off on this GPU (%s: its video memory is the system's) - BBHOST_GXVK_HOMES takes today's path",
@@ -366,7 +412,6 @@ void homes_decide(bool integrated, bool small_vram, bool tight) {
     // 80 MiB left the GX copies' pool under the mirrors' cushion, the mirrors grew and images went to host memory: OY's
     // GPU time 4.7 -> 11.1 ms a flip, 99 -> 80 fps. A budget under the ~60 MiB a world's constant buffers take would
     // leave most of them on today's path anyway.
-    const char* budget_env = std::getenv("BBHOST_GXVK_HOMES_BUDGET_MB");
     if (small_vram && !(budget_env && *budget_env)) {
         host_log("gxvk homes: off with small video memory (their pool would take the room the images and the mirrors need) - "
                  "BBHOST_GXVK_HOMES takes today's path; BBHOST_GXVK_HOMES_BUDGET_MB=N turns them on with that budget");
@@ -380,10 +425,10 @@ void homes_decide(bool integrated, bool small_vram, bool tight) {
     }
     g_bind.store(m == Mode::kHandle, std::memory_order_relaxed);
     g_made.store(true, std::memory_order_release);
-    host_log("gxvk homes: GX's constant buffers in device-local homes made at their creation, %s (BBHOST_GXVK_HOMES=%s); the pool's budget "
-             "%llu MiB%s",
-             m == Mode::kHandle ? "bound by handle" : "kept beside today's path and checked against it", m == Mode::kHandle ? "1" : "compare",
-             static_cast<ull>(mib), small_vram ? " (small video memory)" : "");
+    host_log("gxvk homes: GX's constant buffers in device-local homes made at their creation, %s (%s); the pool's budget %llu MiB%s",
+             m == Mode::kHandle ? "bound by handle" : "kept beside today's path and checked against it",
+             by_default[0] ? by_default : m == Mode::kHandle ? "BBHOST_GXVK_HOMES=1" : "BBHOST_GXVK_HOMES=compare", static_cast<ull>(mib),
+             small_vram ? " (small video memory)" : "");
 }
 
 }  // namespace gpu
@@ -401,7 +446,8 @@ void host_gpu_home_made(std::uint64_t holder, std::uint64_t memory, std::uint32_
         put(0);
     }
     if (!gxvk_homes::made_on()) {
-        if (gxvk_homes::env_mode() == gxvk_homes::Mode::kHandle || gxvk_homes::env_mode() == gxvk_homes::Mode::kCompare)
+        const gxvk_homes::Mode m = gxvk_homes::env_mode();
+        if (m == gxvk_homes::Mode::kHandle || m == gxvk_homes::Mode::kCompare || m == gxvk_homes::Mode::kAuto)
             g_no_home[gxvk_homes::kNoHomeNoDevice].fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -558,7 +604,7 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
     std::uint32_t index = 0;
     Home* e = index_meets(va, bytes, &index);
     if (!e || va < e->memory || va + bytes > e->memory + e->bytes) return false;
-    if (env_mode() != Mode::kHandle) return false;  // compare: today's path is bound
+    if (!bind_on()) return false;  // compare: today's path is bound
     if (!e->filled && (run_part_stop(kRunStopRefresh) || !fill_locked(*e))) return false;
     if (e->pending) bump(g_addr_pending);  // (a copy into it pending: the callers that bind ask the copies first - counted)
     if (out) *out = {e->buffer, e->offset + (va - e->memory), class_bytes(e->cls) - (va - e->memory)};
@@ -882,7 +928,7 @@ void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_
 }
 
 std::string homes_report() {
-    const Mode m = env_mode();
+    const Mode m = env_mode() == Mode::kAuto && made_on() ? Mode::kHandle : env_mode();
     if (m != Mode::kHandle && m != Mode::kCompare) return {};
     static const char* const kNoName[kNoHomes] = {"not a constant buffer of default or dynamic usage", "bound as something else too", "CPU access", "size",
                                                   "the pool at its budget", "no device memory", "the table full", "before the device"};
@@ -929,7 +975,9 @@ std::string homes_report() {
                   "today's path: %s; filled from their memory %llu, a whole copy-back first "
                   "%llu; copies in %llu (%llu staged, %llu refused, %llu taking a pending one's place) in %llu batches (%llu copies, %llu "
                   "overwritten); copied back to their memory %llu (walks %llu, edges %llu, CPU maps %llu)",
-                  m == Mode::kHandle ? "bound by handle (BBHOST_GXVK_HOMES=1)" : "compared beside today's path (BBHOST_GXVK_HOMES=compare)",
+                  m == Mode::kCompare                  ? "compared beside today's path (BBHOST_GXVK_HOMES=compare)"
+                  : env_mode() == Mode::kAuto ? "bound by handle (on by default)"
+                                                       : "bound by handle (BBHOST_GXVK_HOMES=1)",
                   static_cast<ull>(g_made_n.load()), static_cast<ull>(g_made_bytes.load() >> 10), nh.empty() ? "none" : nh.c_str(), live,
                   static_cast<ull>(blocks), static_cast<ull>((blocks * kBlockBytes) >> 20), static_cast<ull>(held >> 10),
                   static_cast<ull>(peak >> 10), en.empty() ? "none" : en.c_str(), static_cast<ull>(g_taken_back.load()),

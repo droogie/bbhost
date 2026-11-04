@@ -22,13 +22,19 @@
 namespace cb_capture {
 
 // (1 and twins capture and put the captures in place; compare captures beside today's path: host/gxvk_homes.h.)
-const Mode g_mode = [] {
+std::atomic<Mode> g_mode = [] {
     const char* e = std::getenv("BBHOST_GXVK_HOMES");
     if (!e || !*e) return Mode::kOff;
     if (std::strcmp(e, "compare") == 0) return Mode::kCompare;
     if (std::strcmp(e, "twins") == 0) return Mode::kOn;
     return e[0] == '1' ? Mode::kOn : Mode::kOff;
 }();
+std::atomic<bool> g_by_default{false};
+
+void set_on() {
+    g_by_default.store(true, std::memory_order_relaxed);
+    g_mode.store(Mode::kOn, std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -97,7 +103,7 @@ bool reusable(Piece& p, u64 flip) {
 // ---- BBHOST_GXVK_COPYBACK_CHECK: what UpdateSubresource wrote into each rename ----
 const bool g_check = [] {
     const char* e = std::getenv("BBHOST_GXVK_COPYBACK_CHECK");
-    return g_mode != Mode::kOff && e && e[0] == '1';
+    return mode() != Mode::kOff && e && e[0] == '1';  // (with BBHOST_GXVK_HOMES given: read before any default)
 }();
 struct Update {
     u64 hash = 0, seq = 0;
@@ -302,7 +308,7 @@ void compared(bool same, std::uint64_t dst, std::uint64_t src, std::uint64_t byt
 }
 
 void report() {
-    if (g_mode == Mode::kOff) return;
+    if (mode() == Mode::kOff) return;
     const u64 batches = g_batches.load(), copies = g_copies.load();
     std::string skips, uses;
     for (int i = 0; i < kSkips; ++i) {
@@ -318,12 +324,13 @@ void report() {
     host_log("gxvk homes (BBHOST_GXVK_HOMES=%s): copy-backs captured at the GX resolve: %llu in %llu batches, %.1f MiB, %.0f cycles a batch "
              "on the GX threads (%u segments of %llu MiB); %llu laps of a piece, %llu taken back from tokens never walked, %llu releases of a "
              "lap taken back; not captured: %s",
-             g_mode == Mode::kCompare ? "compare" : "1", static_cast<ull>(copies), static_cast<ull>(batches),
+             mode() == Mode::kCompare ? "compare" : g_by_default.load(std::memory_order_relaxed) ? "unset, on by default" : "1",
+             static_cast<ull>(copies), static_cast<ull>(batches),
              static_cast<double>(g_bytes.load()) / (1 << 20), batches ? static_cast<double>(g_cycles.load()) / static_cast<double>(batches) : 0.0,
              std::min<u32>(g_segments.load(), kSegments), static_cast<ull>(kSegmentBytes >> 20), static_cast<ull>(g_laps.load()),
              static_cast<ull>(g_reclaimed.load()), static_cast<ull>(g_stale_releases.load()), skips.c_str());
     host_log("gxvk homes: at the command processor: %s", uses.c_str());
-    if (g_mode == Mode::kCompare)
+    if (mode() == Mode::kCompare)
         host_log("gxvk homes compare: captures against the bytes today's path copied at the token: %llu the same, %llu different",
                  static_cast<ull>(g_cmp_same.load()), static_cast<ull>(g_cmp_diff.load()));
     if (g_check) {
@@ -363,7 +370,7 @@ std::atomic<bool> g_made{false}, g_bind{false};
 Mode env_mode() {
     static const Mode m = [] {
         const char* e = std::getenv("BBHOST_GXVK_HOMES");
-        if (!e || !*e) return Mode::kOff;
+        if (!e || !*e) return Mode::kAuto;  // the default (host/gxvk_homes.h default_off)
         if (std::strcmp(e, "compare") == 0) return Mode::kCompare;
         if (std::strcmp(e, "twins") == 0) return Mode::kTwins;
         return e[0] == '1' ? Mode::kHandle : Mode::kOff;

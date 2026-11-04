@@ -78,14 +78,14 @@ inline bool splice_compare() { return pool_mode() == 4 || pool_mode() == 6; }
 // spliced or drawn as splice does. segments-compare: every draw drawn in order,
 // each draw of a segment that would have been spliced compared with its
 // commit. Unset, the switch follows the constant buffers' homes
-// (BBHOST_GXVK_HOMES): segments where they bind by handle, off elsewhere (the
-// reason logged).
+// (BBHOST_GXVK_HOMES, and their default: host/gxvk_homes.h default_off):
+// segments where they bind by handle, off elsewhere (the reason logged).
 inline bool segments() { return pool_mode() >= 5; }
 inline bool segments_compare() { return pool_mode() == 6; }
 // The device chosen and the homes decided (gpu.cpp): the mode settled - the
 // switch as given, or with it unset the homes' answer (`homes_bind`: they bind
-// by handle; else `homes_why`, why not) - and the readers' lock turned on when
-// the pool will run.
+// by handle; else `homes_why`, why not, or null when the homes' default line
+// said so already) - and the readers' lock turned on when the pool will run.
 void settle(bool homes_bind, const char* homes_why);
 
 

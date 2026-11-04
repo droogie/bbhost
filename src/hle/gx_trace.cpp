@@ -2084,8 +2084,9 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                 cbs[i].own = rd64(cbs[i].key + 8);
             }
         }
-        // Stage 4b.3c: a record that names the buffer's own memory names its home, whose handle the holder carries.
-        static const bool homes = gxvk_homes::env_mode() == gxvk_homes::Mode::kHandle || gxvk_homes::env_mode() == gxvk_homes::Mode::kCompare;
+        // Stage 4b.3c: a record that names the buffer's own memory names its home, whose handle the holder carries
+        // (homes made: BBHOST_GXVK_HOMES=1 or compare, or on by default, once the device is chosen).
+        const bool homes = gxvk_homes::made_on();
         for (int i = 0; i < ncb; ++i) {
             const std::uint64_t addr = cbs[i].addr;
             const std::uint32_t rec[4] = {static_cast<std::uint32_t>(addr),
@@ -2094,7 +2095,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
             std::memcpy(s.obj_cb + cbs[i].j * 16, rec, sizeof(rec));
             s.obj_cb_set |= 1u << cbs[i].j;
             std::uint32_t home = 0;
-            if (homes && addr && addr == cbs[i].own && gxvk_homes::made_on()) {
+            if (homes && addr && addr == cbs[i].own) {
                 home = rd32(cbs[i].key - 0x18 + gxvk::kHolderSpareA);
                 if (!gxvk_homes::is_handle(home)) home = 0;
             }
@@ -7295,7 +7296,7 @@ void hle_gx_copy_token(std::uint64_t id) {
         if (!c.bytes ||
             (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes)
                                 : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen,
-                                                      cb_capture::g_mode == cb_capture::Mode::kOn ? c.cap : cb_capture::kNone, c.piece)))
+                                                      cb_capture::mode() == cb_capture::Mode::kOn ? c.cap : cb_capture::kNone, c.piece)))
             continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),

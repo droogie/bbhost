@@ -25,7 +25,9 @@
 // place as GPU copies (gpu.cpp: a home kept as a device-local twin takes the
 // copy in stream order, any other copy-back a copy version whose bytes are the
 // capture); =compare captures, keeps today's path, and compares each capture
-// with the bytes today's path copies at the token. 0 (the default): nothing.
+// with the bytes today's path copies at the token. 0: nothing. Unset, nothing
+// until the homes are on by default (host/gxvk_homes.h: set_on, with the
+// device, before any draw); a copy-back resolved before then goes as today.
 //
 // BBHOST_GXVK_COPYBACK_CHECK=1 with it: each dynamic constant buffer's
 // UpdateSubresource notes a hash of the bytes the rename gets and the upload
@@ -35,13 +37,17 @@
 // Hosted code only (the GX hooks and the renderer), never a decomp leaf.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 namespace cb_capture {
 
 enum class Mode : int { kOff, kOn, kCompare };
-extern const Mode g_mode;  // BBHOST_GXVK_HOMES, read at start
-inline bool on() { return g_mode != Mode::kOff; }
+extern std::atomic<Mode> g_mode;  // BBHOST_GXVK_HOMES, read at start (or set_on)
+inline Mode mode() { return g_mode.load(std::memory_order_relaxed); }
+inline bool on() { return mode() != Mode::kOff; }
+// The homes on by default (BBHOST_GXVK_HOMES unset): captures as =1's.
+void set_on();
 
 constexpr std::uint32_t kSegments = 16;                 // GX threads with a segment
 constexpr std::uint64_t kSegmentBytes = 4ull << 20;     // each
