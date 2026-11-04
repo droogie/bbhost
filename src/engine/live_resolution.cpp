@@ -647,12 +647,12 @@ constexpr BothSidesSite kBothSidesSites[] = {
 };
 
 bool g_both_sides = false;  // install_scene_both_sides() went in
-bool g_scale_locked = false;  // render scale: the display buffers are the output size, changes wait for the next start
+std::atomic<bool> g_rebuild{false};  // live_resolution_rebuild: a change at the same size
 
 // Where the graphics manager's scene renders its picture at w x h, by the test
 // Initialize makes (the patched one or the game's), for the log.
 const char* scene_target_path(std::uint32_t w, std::uint32_t h) {
-    if (render_scale_applied()) return "at the render size, the display buffers its back buffer (render scale)";
+    if (RenderScale rs; render_scale_on(&rs)) return "at the render size, upscaled to the output size (render scale)";
     const bool wide = g_display[0] == w, tall = g_display[1] == h;
     return (g_both_sides ? wide && tall : wide || tall) ? "straight into the display buffers" : "into a target of its own";
 }
@@ -796,7 +796,10 @@ bool remake_default_depth(std::uint64_t out, std::uint32_t w, std::uint32_t h) {
 // GX init's aspect fit inside the display buffer), which the scene contexts
 // rebuild from, DefDepthStencil and the rectangle binding the display buffers
 // sets; then the game's broadcast and the contexts it does not reach.
-int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::uint32_t oh, std::uint32_t w, std::uint32_t h) {
+// Under render scale the scene contexts are the render size: rs_before and
+// rs_after give the unregistered ones' sizes (render_scale_retarget).
+int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::uint32_t oh, std::uint32_t w, std::uint32_t h,
+                   const RenderScale* rs_before = nullptr, const RenderScale* rs_after = nullptr) {
     const std::uint64_t out = at_<std::uint64_t>(dev + 0x90);
     at_<std::uint32_t>(out + 0x80) = w;
     at_<std::uint32_t>(out + 0x84) = h;
@@ -808,6 +811,8 @@ int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::u
     if (!remake_default_depth(out, w, h)) host_log("resolution: DefDepthStencil was not made at %ux%u; the scene keeps a depth of its own", w, h);
     const std::vector<std::uint64_t> before = live_scene_ctxs();
     hle_call_guest6(guest_fn(kResizeBroadcast), static_cast<std::int64_t>(dev), w, h, 0, 0, 0);
+    if (rs_before && rs_after)
+        return resize_scene_ctxs(dev, gm, before, rs_before->render_w, rs_before->render_h, rs_after->render_w, rs_after->render_h);
     return resize_scene_ctxs(dev, gm, before, ow, oh, w, h);
 }
 
@@ -832,13 +837,21 @@ bool resize(std::uint32_t w, std::uint32_t h) {
     const std::uint32_t was_w = at_<std::uint32_t>(out + 0x80), was_h = at_<std::uint32_t>(out + 0x84);
     g_dead_frees.store(0);
     const std::uint64_t failed = gx_resources_create_failures();
-    int ctxs = broadcast_size(dev, gm, was_w, was_h, w, h);
+    RenderScale rs_was, rs_now;
+    const bool scaled = render_scale_retarget(w, h, g_display[0], g_display[1], hle_video_flip_count(), &rs_was, &rs_now);
+    int ctxs = scaled ? broadcast_size(dev, gm, was_w, was_h, w, h, &rs_was, &rs_now) : broadcast_size(dev, gm, was_w, was_h, w, h);
     bool fitted = true;
     const std::uint64_t unfit = unfit_scene_ctx();
     if (unfit || gx_resources_create_failures() != failed) {
         host_log("resolution: %ux%u did not fit the render-target heap (%llu resources not made%s); back to %ux%u", w, h,
                  (unsigned long long)(gx_resources_create_failures() - failed), unfit ? ", a scene context's pass among them" : "", was_w, was_h);
-        ctxs += broadcast_size(dev, gm, w, h, was_w, was_h);
+        if (scaled) {
+            RenderScale rs_back;
+            render_scale_retarget(was_w, was_h, g_display[0], g_display[1], hle_video_flip_count(), nullptr, &rs_back);
+            ctxs += broadcast_size(dev, gm, w, h, was_w, was_h, &rs_now, &rs_back);
+        } else {
+            ctxs += broadcast_size(dev, gm, w, h, was_w, was_h);
+        }
         w = was_w;
         h = was_h;
         fitted = false;
@@ -972,10 +985,11 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
     const std::uint64_t req = settled ? g_request.exchange(0) : 0;
     hle_call_guest6(guest_fn(kFrameEnd), static_cast<std::int64_t>(dev), 0, 0, 0, 0, 0);
     if (!g_old_depth.empty()) release_old_depth(f0);
+    render_scale_flip(f0);
     confirm_tick();
     if (!req) return 1;  // the frame end ran; back to the caller
     const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
-    if (req == g_current.load()) {
+    if (req == g_current.load() && !g_rebuild.exchange(false)) {
         g_request_confirm.store(false);
         return 1;
     }
@@ -1010,7 +1024,7 @@ GUEST_ABI std::int64_t gx_init_call_hook(std::uint64_t, const std::uint64_t* sav
     const std::int64_t ok = hle_call_guest6(guest_fn(kGxInit), static_cast<std::int64_t>(saved[5]), 0, 0, 0, 0, 0);
     // The init made the GPU device and with it the upscaler; the graphics
     // manager is built after it: its size, or the full one with no upscaler.
-    render_scale_gx_init(g_image);
+    render_scale_gx_init(g_display[0], g_display[1], hle_video_flip_count());
     std::uint64_t dev = 0, gm = 0;
     device_ready(&dev, &gm);
     const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
@@ -1194,30 +1208,10 @@ bool live_resolution_install(ElfImage* image) {
         max_w = std::min<std::uint32_t>(max_w, 1920);
         max_h = std::min<std::uint32_t>(max_h, 1080);
     }
-    // Render scale (engine/render_scale.cpp): the scene keeps the display
-    // buffer for its back buffer whatever its own size, and YEBIS makes its
-    // whole chain at that buffer's size - so the buffers are exactly the
-    // output size, as the console makes them, and another Resolution applies
-    // when the game next starts.
-    g_scale_locked = render_scale_applied();
-    if (g_scale_locked) {
-        max_w = static_cast<std::uint32_t>(w);
-        max_h = static_cast<std::uint32_t>(h);
-        max_why = "render scale: the output size; another Resolution applies at the next start";
-    }
-    std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
-    if (RenderScale rs; g_scale_locked && render_scale_plan(&rs)) {
-        // The scene contexts at the render size, and a share for what stays
-        // the output size (the display buffers, DefDepthStencil, YEBIS's
-        // chain): 7680x2160 with its 3D at 3840x1080 ran in +1792 MiB, where
-        // its own 16.6 million pixels asked for more than the window holds.
-        live_px = static_cast<std::uint64_t>(rs.render_w) * rs.render_h + start_px / 4;
-        host_log("resolution: the render-target heap sized for the render size %ux%u and a quarter of %ux%u (render scale)", rs.render_w,
-                 rs.render_h, w, h);
-    }
+    const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
     install_water_wave_full();  // at any size, live changes or not (before the heap's size, which counts it)
     grow_gfx_heap(image, !live ? start_px : live_px);
-    if (!g_scale_locked && !std::getenv("BBHOST_GFX_HEAP_MORE_MIB") && start_px > g_live_max_px)
+    if (!std::getenv("BBHOST_GFX_HEAP_MORE_MIB") && start_px > g_live_max_px)
         host_log("resolution: %dx%d (%.1f million pixels) is more than the render-target heap holds (%.1f million): its targets may not "
                  "all be made - Upscaling below Native AA draws the 3D at a size that fits",
                  w, h, static_cast<double>(start_px) / 1e6, static_cast<double>(g_live_max_px) / 1e6);
@@ -1264,13 +1258,9 @@ bool live_resolution_install(ElfImage* image) {
     }
     if (!install_display_rect_stubs())
         host_log("resolution: the render-target viewport code is not as expected; debug draws keep the display buffers' size");
-    // Under render scale the colour target's test is the render scale's (it
-    // keeps the display buffer at any size); the depth's keeps the game's
-    // either-side test, which no render size smaller each way passes.
-    if (g_scale_locked)
-        host_log("resolution: render scale - the scene keeps the display buffers for its colour at any size, its depth its own");
-    else
-        g_both_sides = install_scene_both_sides();
+    g_both_sides = install_scene_both_sides();
+    // Render scale's back buffer goes through the colour test edited above.
+    render_scale_install(image);
     if (!engine_prologue_hook(image, guest(kGxFree), free_pro, sizeof(free_pro), reinterpret_cast<void*>(&gx_free_hook)) ||
         !engine_prologue_hook(image, guest(kGxFreeRecord), free_rec_pro, sizeof(free_rec_pro), reinterpret_cast<void*>(&gx_free_record_hook)) ||
         !engine_prologue_hook(image, guest(kSwfPlayerCtor), swf_ctor_pro, sizeof(swf_ctor_pro), reinterpret_cast<void*>(&swf_player_ctor_hook)) ||
@@ -1340,15 +1330,12 @@ bool live_resolution_available() {
 }
 
 bool live_resolution_can(unsigned w, unsigned h) {
-    if (g_scale_locked && (w != g_display[0] || h != g_display[1])) return false;
     return g_installed && w && h && w <= g_display[0] && h <= g_display[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
 }
 
 bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
     if (!live_resolution_can(w, h)) {
-        if (g_scale_locked)
-            host_log("resolution: %ux%u applies when the game next starts: under render scale the display buffers are the output size", w, h);
-        else if (g_installed && static_cast<std::uint64_t>(w) * h > g_live_max_px)
+        if (g_installed && static_cast<std::uint64_t>(w) * h > g_live_max_px)
             host_log("resolution: %ux%u needs more render-target memory than this run was given at its start; it applies when the game next starts", w, h);
         return false;
     }
@@ -1359,6 +1346,13 @@ bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
 }
 
 int live_resolution_take_answer() { return g_answer.exchange(0); }
+
+void live_resolution_rebuild() {
+    if (!g_installed) return;
+    g_rebuild.store(true);
+    g_request_not_before.store(0);
+    g_request.store(g_current.load());
+}
 
 void live_resolution_go_back() {
     const std::uint64_t b = g_before_asked.exchange(0);

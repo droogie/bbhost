@@ -460,11 +460,13 @@ Manifest all_languages_manifest() {
 }
 
 // render-scale, the 3D at the Upscaling quality's render size
-// (graphics.render_scale: an upscaler and a quality above Native AA at the
-// start): the decoupled half of Kyo's "Decoupled Render Res" patches, its
-// sizes written from the Resolution and the quality as the game starts -
-// engine/render_scale.cpp says which sites and why. Not live: the contexts
-// are made at the size their code gives when the game builds them.
+// (graphics.render_scale: on whenever live resolution is - BBHOST_RENDER_SCALE=0
+// leaves it out): the decoupled half of Kyo's "Decoupled Render Res" patches,
+// the scene contexts' size reads made immediates that engine/render_scale.cpp
+// writes - at the start from the Resolution and the quality, the full size
+// with no upscaler, and again before each live rebuild. engine/render_scale.cpp
+// says which sites and why. Not live as a manifest: its sizes change by the
+// rebuild, its sites stay.
 Manifest render_scale_manifest() {
     Manifest m;
     m.name = "render-scale";
@@ -474,14 +476,10 @@ Manifest render_scale_manifest() {
     m.order = 9200;  // after hd-motion-blur (9100), whose sites are the velocity map's and the blur depth's: none of these
     m.live = false;
     RenderScale rs;
-    if (render_scale_plan(&rs)) {
-        m.description = "the 3D drawn at " + std::to_string(rs.render_w) + "x" + std::to_string(rs.render_h) + " and upscaled to " +
-                        std::to_string(rs.output_w) + "x" + std::to_string(rs.output_h);
-        m.sites = render_scale_sites(rs);
-    } else {
-        m.description = "the 3D drawn smaller than the Resolution and upscaled";
-        m.sites = render_scale_sites(RenderScale{1920, 1080, 1920, 1080, 0});  // the bytes it would write, for the expectations
-    }
+    if (!render_scale_plan(&rs)) rs = RenderScale{1920, 1080, 1920, 1080, 0};  // the bytes it would write, for the expectations
+    m.description = "the scene contexts at the Upscaling quality's render size (at the start " + std::to_string(rs.render_w) + "x" +
+                    std::to_string(rs.render_h) + " for " + std::to_string(rs.output_w) + "x" + std::to_string(rs.output_h) + ")";
+    m.sites = render_scale_sites(rs);
     return m;
 }
 

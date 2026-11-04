@@ -11,6 +11,7 @@
 #include "host/bindings.h"
 #include "engine/world_chr.h"
 #include "host/gpu.h"
+#include "host/options.h"
 #include "core/config.h"
 #include "host/window.h"
 
@@ -387,6 +388,10 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             const bool ok = world_lamp_warp_queue(std::atoi(arg.c_str()));
             host_log("test: lamp travel to return point %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count),
                      ok ? "" : ": not queued (BBHOST_TEST_WARP=1, in the world)");
+        } else if (verb == "opt" && !arg.empty() && !arg2.empty()) {
+            // A setting changed as the menus change it (host/options.h): its entry by index.
+            host_opt_set_index(arg.c_str(), std::atoi(arg2.c_str()));
+            host_log("test: option %s set to entry %s at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);
