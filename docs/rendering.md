@@ -260,9 +260,11 @@ import thread imported that the draws never read in place - is let go: its
 windows' entries point at the sink at once (no work in flight reads them, and
 the sink is memory every submission sees), it is freed once the work recorded
 with it has run, and a later use imports it again (host/import_retire.h,
-`BBHOST_IMPORT_RETIRE`; on by default with window imports on a graphics card,
-kept on an integrated GPU until one has run it). A retired import - let go, or
-replaced by a merge - is freed on a thread of its own, in the background and
+`BBHOST_IMPORT_RETIRE`; on by default wherever windows are imported, but on
+NVIDIA's driver under Windows, whose import of a window wanted again took
+23-57 ms on the command processor, at the draw that wanted it). A retired
+import - let go, or replaced by a merge - is freed on a thread of its own, in
+the background and
 50 ms apart (`BBHOST_IMPORT_FREE_THREAD=0` frees it on the command processor,
 `BBHOST_IMPORT_FREE_GAP_MS` sets the gap): the driver's free took up to 14 ms
 there. Window imports are on by
