@@ -306,9 +306,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
     bool frame_clock = host_opt_get("frame_clock");
-    // Effect timing (Smooth by default): F10's DISPLAY row, read as the game
+    // Effect timing (60 fps by default): F10's DISPLAY row, read as the game
     // starts (engine/frame_rate.cpp; BBHOST_SFX_STEP wins). The row shows what
-    // will run (host_effect_timing_row); a pick, one of the four, is the
+    // will run (host_effect_timing_row); a pick, one of the three, is the
     // player's own from Save or Play on.
     int effect_timing = -1;  // the pick, -1 none
     int resolution = host_opt_resolution_index();
@@ -921,12 +921,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 {
                     const HostEffectTimingRow et = host_effect_timing_row();
-                    const char* labels[5] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
-                                             kHostEffectTimingLabels[3], et.custom.c_str()};
-                    const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
-                                           kHostEffectTimingTips[3], et.tip.c_str()};
+                    const char* labels[4] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
+                                             et.custom.c_str()};
+                    const char* tips[4] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2], et.tip.c_str()};
                     int shown = effect_timing >= 0 ? effect_timing : et.index;
-                    if (ui::combo("##effects", &shown, labels, et.index == 4 ? 5 : 4, tips) && shown < 4) effect_timing = shown;
+                    if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
                 ui::row_label("Resolution", row_lw);

@@ -69,12 +69,12 @@ height = 1080
 fps_cap = 30
 # The default of F10's Effect timing (the setup window's Game page has the
 # same row): how the effects - fire, blood, magic, the lamps' and candles'
-# flicker - keep time above 30 fps. smooth (the default): whole 1/30 s steps,
-# 30 a second as at 30, for what they count in updates (the flicker among
-# it), with what they move by time moved by each frame's own time in the
-# effects converted for it. 30: whole 1/30 s steps alone. Both step the wind
-# on grass and trees in whole 1/30 s too. auto: whole 1/60 s at every frame
-# rate above 30. fps: a whole step every frame (1/120 s at 120). A number
+# flicker - keep time above 30 fps. 30 (30 fps): whole 1/30 s steps, the wind
+# on grass and trees too. auto (60 fps, the default): whole 1/60 s at every
+# frame rate above 30. fps (Frame rate-dependent): a whole step every frame
+# (1/120 s at 120). smooth: whole 1/30 s steps for what they count in updates
+# (the flicker among it), with what they move by time moved by each frame's
+# own time in the effects converted for it - most still look like 30. A number
 # from 1 to 960 ("120") steps them that many times a second at any frame
 # rate - below 30 to test them in coarse steps ("5": a 1/5 s step five times
 # a second). frame: by each frame's time. Wherever there are fewer steps than
@@ -82,7 +82,7 @@ fps_cap = 30
 # in F10 or the setup window wins over this (the row shows a number or frame
 # from here as Custom), and BBHOST_SFX_STEP over both.
 # Requires a restart.
-# effect_steps = "smooth"
+# effect_steps = "auto"
 # The effects' emission clock: 60 (the default) makes their particles and
 # children as the game's effects do at 60 updates a second, at every frame
 # rate (30 included); 30 keeps the game's one emission an update, 30 a second

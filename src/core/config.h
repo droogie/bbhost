@@ -201,14 +201,14 @@ std::string config_user_dir();
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
-// The effects' timing above 30 fps when nothing asks for another: Smooth, the
-// Effect timing setting's default (F10's DISPLAY, the setup window's Game
+// The effects' timing above 30 fps when nothing asks for another: 60 fps
+// (auto: 30 at 30, 60 above), the Effect timing setting's default (F10's DISPLAY, the setup window's Game
 // page). One constant: the options file holds the setting only once a player
 // chose it (host/options.cpp), so a new default here reaches everyone else.
-inline constexpr char kEffectTimingDefault[] = "smooth";
+inline constexpr char kEffectTimingDefault[] = "auto";
 // The effects' timing above 30 fps, decided once as the game starts
 // (engine/frame_rate.cpp): BBHOST_SFX_STEP, else `setting` - the Effect timing
-// setting's "smooth", "30", "auto" or "fps" - once the player has chosen one
+// setting's "30", "auto" or "fps" - once the player has chosen one
 // (`chosen`), else [video] effect_steps, else kEffectTimingDefault. What each
 // value means at `fps` frames a second:
 //   smooth  whole 1/30 s steps for what the effects count in updates (a

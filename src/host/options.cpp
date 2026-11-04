@@ -113,11 +113,13 @@ enum SettingId {
 };
 
 // Effect timing's choices as the frame rate reads them (core/config.h's
-// config_effect_timing), in the setting's order: Smooth, Original (30), 60 a
-// second (auto: 60 above 30) and Your frame rate.
-constexpr const char* kEffectTimingValues[] = {"smooth", "30", "auto", "fps"};
+// config_effect_timing), in the setting's order: 30 fps, 60 fps (auto: 60
+// above 30) and Frame rate-dependent. Smooth, a fourth until 2026-11-04, is
+// still read from bbhost.toml or BBHOST_SFX_STEP (the row's Custom entry).
+constexpr int kEffectTimingCount = 3;
+constexpr const char* kEffectTimingValues[kEffectTimingCount] = {"30", "auto", "fps"};
 constexpr int effect_timing_index(std::string_view v) {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kEffectTimingCount; ++i) {
         if (v == kEffectTimingValues[i]) return i;
     }
     return -1;
@@ -163,10 +165,9 @@ Setting g_set[kSettingCount] = {
      true},
     // How the effects keep time above 30 fps (engine/frame_rate.cpp), read
     // once as the game starts: BBHOST_SFX_STEP, else this once chosen, else
-    // bbhost.toml's [video] effect_steps, else kEffectTimingDefault, Smooth
+    // bbhost.toml's [video] effect_steps, else kEffectTimingDefault, 60 fps
     // (config_effect_timing). Written to the file only once chosen (save).
-    {"effect_timing", "Effect timing",
-     {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2], kHostEffectTimingLabels[3]},
+    {"effect_timing", "Effect timing", {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2]},
      effect_timing_index(kEffectTimingDefault), kHostEffectTimingNote, true},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
@@ -848,7 +849,7 @@ void rebuild_settings() {
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.frame_clock = on_of(kFrameClock);
-    h.effect_timing = kEffectTimingValues[std::clamp(index_of(kEffectTiming), 0, 3)];
+    h.effect_timing = kEffectTimingValues[std::clamp(index_of(kEffectTiming), 0, kEffectTimingCount - 1)];
     h.fps_counter = on_of(kFpsCounter);
     h.memory_counter = on_of(kMemoryCounter);
     h.perf_overlay = on_of(kPerfOverlay);
@@ -1096,6 +1097,13 @@ void host_options_load() {
             if (key == "frame_cap") frame_cap_val = val;
             // Display-Limited was called Uncapped until 2026-10-28.
             if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
+            // Effect timing's names before it had three choices; a saved Smooth,
+            // no longer one, reads as not chosen (the default, 60 fps).
+            if (key == "effect_timing") {
+                if (val == "Original (30)") val = kHostEffectTimingLabels[0];
+                else if (val == "60 a second") val = kHostEffectTimingLabels[1];
+                else if (val == "Your frame rate") val = kHostEffectTimingLabels[2];
+            }
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
@@ -1374,19 +1382,18 @@ void setting_row(int id) {
     ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y));
     int want = cur;
     if (id == kEffectTiming) {
-        // What will run (host_effect_timing_row): one of the four, or a fifth
-        // entry for what bbhost.toml or BBHOST_SFX_STEP asks that none of them
-        // is. A pick is one of the four, the player's own even when the
-        // setting held it already (set_index).
+        // What will run (host_effect_timing_row): one of the three, or a
+        // fourth entry for what bbhost.toml or BBHOST_SFX_STEP asks that none
+        // of them is. A pick is one of the three, the player's own even when
+        // the setting held it already (set_index).
         const HostEffectTimingRow et = host_effect_timing_row();
-        const char* labels[5] = {s.values[0], s.values[1], s.values[2], s.values[3], et.custom.c_str()};
-        const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
-                               kHostEffectTimingTips[3], et.tip.c_str()};
+        const char* labels[4] = {s.values[0], s.values[1], s.values[2], et.custom.c_str()};
+        const char* tips[4] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2], et.tip.c_str()};
         const int shown = g_pending[static_cast<std::size_t>(id)] >= 0 ? cur : et.index;
         int pick = shown;
         ImGui::SetNextItemWidth(cw);
-        ui::combo("##v", &pick, labels, et.index == 4 ? 5 : 4, tips);
-        if (pick != shown && pick < 4) change(id, pick);
+        ui::combo("##v", &pick, labels, et.index == kEffectTimingCount ? 4 : 3, tips);
+        if (pick != shown && pick < kEffectTimingCount) change(id, pick);
     } else if (id == kFrameCap || id == kResolution) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
@@ -1570,15 +1577,14 @@ const char* const kHostShaderModeTips[2] = {
     "HLSL gives you trouble. The picture is the same either way.",
 };
 
-const char* const kHostEffectTimingLabels[4] = {"Smooth", "Original (30)", "60 a second", "Your frame rate"};
+const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "Requires a restart. How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps.";
-const char* const kHostEffectTimingTips[4] = {
-    "Effects move at your frame rate, while the flicker and the other parts the game counts keep its own 30 a second.",
+const char* const kHostEffectTimingTips[3] = {
     "Effects step 30 times a second, as the game at 30 fps, whatever your frame rate: above 30 fps their motion is less "
     "smooth.",
-    "Effects step 60 times a second. The flicker and the other counted parts speed up with them, to twice the game's "
-    "own pace.",
+    "The default. Effects step 60 times a second at any frame rate above 30. The flicker and the other counted parts "
+    "speed up with them, to twice the game's own pace.",
     "Effects step once a frame. The flicker and the other counted parts speed up with them: twice the game's own pace "
     "at 60 fps, four times at 120.",
 };
@@ -1639,22 +1645,24 @@ bool host_opt_saved(const char* key) {
 
 HostEffectTimingRow host_effect_timing_row() {
     HostEffectTimingRow r;
-    const int chosen = std::clamp(g_set[kEffectTiming].index, 0, 3);
+    const int chosen = std::clamp(g_set[kEffectTiming].index, 0, kEffectTimingCount - 1);
     const EffectTiming t = config_effect_timing(60, kEffectTimingValues[chosen], g_saved[kEffectTiming]);
     const std::string v = t.readable ? t.value : std::string(kEffectTimingDefault);  // one it cannot read runs the default
     r.index = effect_timing_index(v == "60" ? "auto" : v);
     if (r.index >= 0) return r;
     const bool env = std::strcmp(t.from, "BBHOST_SFX_STEP") == 0;
-    r.index = 4;
+    r.index = kEffectTimingCount;
     r.custom = "Custom: " + v + (env ? " (BBHOST_SFX_STEP)" : " (bbhost.toml)");
-    r.tip = (v == "frame" ? std::string("Effects move by each frame's own time") : "Effects step " + v + " times a second") +
+    r.tip = (v == "frame"    ? std::string("Effects move by each frame's own time")
+             : v == "smooth" ? std::string("Effects move at your frame rate while what the game counts keeps 30 a second (the old Smooth)")
+                             : "Effects step " + v + " times a second") +
             (env ? ", as BBHOST_SFX_STEP asks: it wins over this setting while it is set."
                  : ", as effect_steps in bbhost.toml asks. Choosing one of the others replaces it.");
     return r;
 }
 
 void host_opt_choose_effect_timing(int index) {
-    if (index < 0 || index > 3) return;
+    if (index < 0 || index >= kEffectTimingCount) return;
     set_index(kEffectTiming, index, false);  // the player's own (g_saved) and written, even when it held it already
     save();
 }

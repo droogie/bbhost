@@ -509,31 +509,32 @@ counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
 before). How the effects keep time is the Effect timing setting (F10's
 DISPLAY page, or the same row on the setup window's Game page; it applies
 when the game starts):
-- Smooth, the default, keeps 30's whole steps for what the effects count and
-  moves what they move by time - a particle's path, a motion's turn, the GPU
-  particles' clock, a ribbon's head (its points still inserted once a whole
-  step), the wind sources' gusts - by each frame's own time, in the effects
-  whose every part has been converted for it; the rest run as at 30.
-- Original (30) runs them all on whole 1/30 s steps alone, the cadence the
-  game has at 30: above 30 fps what moves moves less smoothly than with
-  Smooth.
-- 60 a second steps them in whole 1/60 s at every rate above 30 (every frame
-  at 60, every other at 120, every third at 180), so what they count - the
-  flicker, a wobble's turns, a node's states - runs twice as fast as the
-  game's own.
-- Your frame rate steps them once a frame (1/120 s at 120, 1/144 s at 144),
-  with no frames between: what they count runs twice as fast at 60, four
-  times at 120.
+- 30 fps runs them all on whole 1/30 s steps, the cadence the game has at
+  30: above 30 fps they move less smoothly than the rest of the picture.
+- 60 fps, the default, steps them in whole 1/60 s at every rate above 30
+  (every frame at 60, every other at 120, every third at 180), so what they
+  count - the flicker, a wobble's turns, a node's states - runs twice as fast
+  as the game's own.
+- Frame rate-dependent steps them once a frame (1/120 s at 120, 1/144 s at
+  144), with no frames between: what they count runs twice as fast at 60,
+  four times at 120.
+
+Smooth, a fourth choice until 2026-11-04, kept 30's whole steps for what the
+effects count and moved what they move by each frame's own time - but only in
+the effects whose every part had been converted for it, so most effects still
+looked like 30 at 60 fps. It is still read from bbhost.toml or
+`BBHOST_SFX_STEP` (`smooth`, shown as Custom); a saved Smooth choice reads as
+not chosen, the default.
 
 `[video] effect_steps` in bbhost.toml is the setting's default, with the same
-choices as `smooth`, `30`, `auto` and `fps`, and two more: a number of steps
+choices as `30`, `auto` and `fps`, and three more: `smooth`, a number of steps
 a second (`"120"` or `120`, 1 to 960 - below 30 to test them in coarse
 steps, `5` a 1/5 s step five times a second; `60` is auto above 30), and
 `frame`, which steps them by the frame's time. It decides until a choice is
 made in F10 or the setup window: bbhost-options.toml holds Effect timing only
 once it has been chosen, so the file's value stays in force, and a later
 default reaches whoever never chose. The row shows what will run: a value
-none of its four is, from bbhost.toml or `BBHOST_SFX_STEP`, as a fifth entry
+none of its three is, from bbhost.toml or `BBHOST_SFX_STEP`, as a fourth entry
 (Custom: 5 (bbhost.toml)). With smooth and 30 the wind's grass and
 trees step in whole 1/30 s too (every other value leaves the wind on the
 frame's time). A value the frame rate code cannot read runs the default.
