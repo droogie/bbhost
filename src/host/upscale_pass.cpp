@@ -25,9 +25,15 @@
 // place (render.cpp, upscale_pass_output_view_locked). Every other reader of
 // the scene (the reflections' downsample) reads it at the render size, as
 // the passes that draw it do.
+//
+// Sharpness (Graphics > Sharpness, above 0%): neither the bridge nor DLSS
+// sharpens any more, so FSR 1's RCAS runs over the picture into an image of
+// its own (shaders/upscale_rcas.comp), which goes on in its place - before the
+// post chain and the HUD, which it never touches.
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
+#include "host/shaders/upscale_rcas.spv.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
 #include "log.h"
@@ -50,6 +56,7 @@ struct OwnImage {
 };
 
 OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F, the output size) and the motion (R16G16_SFLOAT, the scene's)
+OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 std::uint32_t g_w = 0, g_h = 0;     // the render size: the scene's, the motion's
 std::uint32_t g_ow = 0, g_oh = 0;   // the output size: the picture's
 bool g_scaled = false;              // the picture is larger than the scene: YEBIS's copy reads it (render scale)
@@ -234,6 +241,102 @@ bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w
     return vkCreateImageView(g.device, &vci, nullptr, &o.view) == VK_SUCCESS;
 }
 
+// Sharpness: RCAS of g_output into g_sharp.
+VkDescriptorSetLayout g_rcas_set_layout = VK_NULL_HANDLE;
+VkPipelineLayout g_rcas_layout = VK_NULL_HANDLE;
+VkPipeline g_rcas_pipeline = VK_NULL_HANDLE;
+bool g_rcas_tried = false;
+
+bool rcas_pipeline_locked() {
+    if (g_rcas_tried) return g_rcas_pipeline != VK_NULL_HANDLE;
+    g_rcas_tried = true;
+    const VkDescriptorSetLayoutBinding binds[3] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 3;
+    sli.pBindings = binds;
+    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_rcas_set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_rcas_set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_rcas_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_upscale_rcas_spv);
+    smi.pCode = k_upscale_rcas_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = g_rcas_layout;
+    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_rcas_pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok) g_rcas_pipeline = VK_NULL_HANDLE;
+    host_log("upscaler: the sharpening pass (RCAS) %s", ok ? "ready" : "failed to build; no sharpening");
+    return ok;
+}
+
+// The picture sharpened by `sharpness` (0..1, AMD's scale: 1 the most) into
+// g_sharp; false when it could not be (the picture stands as it is).
+// g_output has been written and made readable.
+bool record_rcas(VkCommandBuffer cb, float sharpness) {
+    if (!rcas_pipeline_locked()) return false;
+    if (!g_sharp.image &&
+        !make(g_sharp, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+              g_ow, g_oh)) {
+        drop(g_sharp);
+        return false;
+    }
+    const VkDescriptorSet set = alloc_set_locked(g_rcas_set_layout);
+    if (!set) return false;
+    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, g_sharp.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[3] = {};
+    for (int k = 0; k < 3; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = static_cast<std::uint32_t>(k);
+        wr[k].descriptorCount = 1;
+    }
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[0].pImageInfo = &src_info;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    wr[1].pImageInfo = &sampler_info;
+    wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[2].pImageInfo = &dst_info;
+    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    // FsrRcasCon: the strength in stops below the most - AMD's FSR 2 maps its
+    // 0..1 sharpness to 2..0 stops.
+    const float stops = 2.0f * (1.0f - std::clamp(sharpness, 0.0f, 1.0f));
+    const float scale = std::exp2(-stops);
+    std::uint32_t pc[8] = {};
+    std::memcpy(&pc[0], &scale, 4);
+    pc[4] = g_ow;
+    pc[5] = g_oh;
+    barrier(cb, g_sharp.image, VK_IMAGE_ASPECT_COLOR_BIT, g_sharp.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    g_sharp.initialised = true;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rcas_pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rcas_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, g_rcas_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cb, (g_ow + 15) / 16, (g_oh + 15) / 16, 1);
+    barrier(cb, g_sharp.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    return true;
+}
+
+// Sharpness as the settings have it now, 0..1 (0: none).
+float sharpness_now() { return std::clamp(host_settings_ref().sharpness, 0.0f, 1.0f); }
+
 // Whether the bridge's RGBA16F picture can be blitted into a scene of `format`.
 bool blit_into(VkFormat format) {
     VkFormatProperties src{}, dst{};
@@ -272,6 +375,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh) {
         drop(g_output);
         drop(g_motion);
+        drop(g_sharp);
         g_w = scene.width;
         g_h = scene.height;
         g_ow = ow;
@@ -395,6 +499,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     g_reset = false;
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    // Sharpness: the sharpened picture goes on in its place.
+    const float sharpness = sharpness_now();
+    const OwnImage& picture = sharpness > 0.0f && record_rcas(cb, sharpness) ? g_sharp : g_output;
     if (g_scaled) {
         // The picture stays here for YEBIS's copy, which samples it in the
         // scene's place.
@@ -411,12 +518,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         VkImageCopy r{};
         r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.extent = {g_w, g_h, 1};
-        vkCmdCopyImage(cb, g_output.image, VK_IMAGE_LAYOUT_GENERAL, scene.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        vkCmdCopyImage(cb, picture.image, VK_IMAGE_LAYOUT_GENERAL, scene.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {
         VkImageBlit r{};
         r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.srcOffsets[1] = r.dstOffsets[1] = {static_cast<std::int32_t>(g_w), static_cast<std::int32_t>(g_h), 1};
-        vkCmdBlitImage(cb, g_output.image, VK_IMAGE_LAYOUT_GENERAL, scene.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r, VK_FILTER_NEAREST);
+        vkCmdBlitImage(cb, picture.image, VK_IMAGE_LAYOUT_GENERAL, scene.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r, VK_FILTER_NEAREST);
     }
     barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
@@ -432,7 +539,10 @@ void upscale_pass_reset_locked() { g_reset = true; }
 float upscale_pass_mip_bias_locked() { return g_w && upscaler_method() ? g_mip_bias : 0.0f; }
 
 VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t scene_h) {
-    return g_scaled && g_output_ready && g_output.view && scene_w == g_w && scene_h == g_h ? g_output.view : VK_NULL_HANDLE;
+    if (!g_scaled || !g_output_ready || !g_output.view || scene_w != g_w || scene_h != g_h) return VK_NULL_HANDLE;
+    // The image this frame's upscale leaves its picture in: sharpened or not,
+    // as the setting is now.
+    return sharpness_now() > 0.0f && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
 }
 
 bool upscale_camera_noted() { return g_cam_noted; }

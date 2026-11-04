@@ -117,6 +117,7 @@ enum SettingId {
     kUpscaler,
     kUpscaleQuality,
     kDlssPreset,
+    kSharpness,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -354,6 +355,13 @@ Setting g_set[kSettingCount] = {
      "Which of DLSS's models runs. K (recommended): the transformer model, the sharpest. J: like K, a little less "
      "ghosting, a little more flicker. L: made for the lowest render sizes. M: made for Performance. DLSS only.",
      false},
+    // RCAS over the upscaler's picture (host/upscale_pass.cpp): FSR 3 and 4
+    // through the bridge and DLSS do no sharpening of their own. 0% none, the
+    // default (the picture as the upscaler leaves it); 100% AMD's most.
+    {"sharpness", "Sharpness", signed_steps(0, 100, "%", false), 0,
+     "Sharpens the upscaled 3D (FSR or DLSS) before the post effects and the HUD, which it never touches. 0% leaves the "
+     "upscaler's picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
+     false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -460,12 +468,14 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kDepthOfField},
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kSsr},
-    {Row::Option, nullptr, kUpscaler},
-    // The preset row (preset_row): DLSS preset, or for FSR its preset - the
-    // Upscaling quality setting, which has no row of its own - greyed with
-    // Upscaling off. Then the Resolution the upscaler brings the 3D back to.
-    {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kResolution},
+    {Row::Option, nullptr, kUpscaler},
+    // The preset row (preset_row): for FSR its preset - the Upscaling quality
+    // setting, which has no row of its own - for DLSS that quality and DLSS's
+    // preset, greyed with Upscaling off. The Resolution the upscaler brings the
+    // 3D back to above them, Sharpness over the upscaler's picture below.
+    {Row::Option, nullptr, kDlssPreset},
+    {Row::Option, nullptr, kSharpness},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kShadowDistance},
@@ -986,6 +996,7 @@ void rebuild_settings() {
         h.upscale_quality = std::clamp(index_of(kUpscaleQuality), 0, 3);
         static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
         h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
+        h.sharpness = static_cast<float>(std::clamp(index_of(kSharpness), 0, 100)) / 100.0f;
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);

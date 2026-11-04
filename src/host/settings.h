@@ -89,6 +89,9 @@ struct HostSettings {
     int upscale_quality = 1;
     // DLSS's render preset (NGX's number: 11 K, 10 J, 12 L, 13 M).
     int dlss_preset = 11;
+    // Sharpness: RCAS over the upscaler's picture (host/upscale_pass.cpp),
+    // 0 none to 1 the most (AMD's scale). Followed live.
+    float sharpness = 0.0f;
 
     // Startup (read once by the loader)
     bool skip_logos = false;
