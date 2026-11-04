@@ -1471,7 +1471,9 @@ void change(int id, int index) {
 // now).
 // `label` and `note`, when given, stand for the setting's own: one row can
 // show another face (the upscaler's preset row, preset_row).
-void setting_row(int id, const char* label = nullptr, const char* note = nullptr) {
+// `names`, when given, are what the choices show in place of the setting's
+// own values (n of them; what is saved stays the value).
+void setting_row(int id, const char* label = nullptr, const char* note = nullptr, const char* const* names = nullptr) {
     const Setting& s = g_set[id];
     if (!label) label = s.label;
     if (!note) note = s.note;
@@ -1524,7 +1526,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
     } else if (n <= 4) {
-        ui::segmented("##v", &want, s.values.data(), n, cw, id == kShaders ? kHostShaderModeTips : nullptr,
+        ui::segmented("##v", &want, names ? names : s.values.data(), n, cw, id == kShaders ? kHostShaderModeTips : nullptr,
                       id == kShaders ? "Applies at the next start." : nullptr);
     } else {
         // A scale: the slider shows the step's own name (+10%, x1.4, 5).
@@ -1676,14 +1678,18 @@ const char* host_options_page_blurb(int page) {
 // (engine/render_scale.cpp), so it applies at the next start.
 void preset_row() {
     const int u = shown_index(kUpscaler);  // the menu's Off, FSR 4, FSR 3, DLSS
+    // DLSS at the full size is DLAA: its first choice says so.
+    static const char* const kDlssQualityNames[4] = {"DLAA", "Quality", "Balanced", "Performance"};
     const auto quality_note = [](const char* who) {
         static std::string notes[2];
-        std::string& n = notes[who[0] == 'D' ? 1 : 0];
+        const bool dlss = who[0] == 'D';
+        std::string& n = notes[dlss ? 1 : 0];
         if (n.empty())
-            n = std::string("Requires a restart. How much smaller than the Resolution the 3D is drawn before ") + who +
-                " brings it back: Native AA draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about "
-                "59%, Performance at half each way - faster, softer. The menus, the HUD and the post effects stay at the "
-                "Resolution. Below Native AA, a different Resolution also applies at the next start.";
+            n = std::string("Requires a restart. How much smaller than the Resolution the 3D is drawn before ") + who + " brings it back: " +
+                (dlss ? "DLAA" : "Native AA") +
+                " draws it full size (anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half "
+                "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution. Below " +
+                (dlss ? "DLAA" : "Native AA") + ", a different Resolution also applies at the next start.";
         return n.c_str();
     };
     if (u == 1 || u == 2) {
@@ -1691,7 +1697,7 @@ void preset_row() {
         return;
     }
     if (u == 3) {
-        setting_row(kUpscaleQuality, "DLSS quality", quality_note("DLSS"));
+        setting_row(kUpscaleQuality, "DLSS quality", quality_note("DLSS"), kDlssQualityNames);
         row_rule();
     }
     ImGui::BeginDisabled(u == 0);
