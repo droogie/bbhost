@@ -22439,11 +22439,13 @@ static bool draw_impl(const GpuDraw& d) {
     static thread_local StageImages stage_images[2];
     {
         GpuPhaseTimer t(kPhasePrefetch, phase_weight);
-        if (!pl.paths_checked) {
+        // (Checked once, by the command processor, its answers published before the flag: a pool thread's list-mode
+        // draw that finds it unchecked stops, one that finds it checked reads the answers.)
+        if (!std::atomic_ref<bool>(pl.paths_checked).load(std::memory_order_acquire)) {
             if (run_part_stop(kRunStopPipeline)) return false;
-            pl.paths_checked = true;
             pl.paths_match[0] = key_stage_matches(pl.vs.meta(), vs_paths);
             pl.paths_match[1] = ps_paths ? key_stage_matches(pl.ps.meta(), *ps_paths) : pl.ps.meta().images.empty() && pl.ps.meta().samplers.empty();
+            std::atomic_ref<bool>(pl.paths_checked).store(true, std::memory_order_release);
         }
         for (int st = 0; st < 2; ++st) bump(pl.paths_match[st] ? g_prefetch_key_words : g_prefetch_resolved);
         t_resolve_site = kSitePrefetch;
