@@ -1798,6 +1798,11 @@ float upscale_pass_mip_bias_locked();
 // true when it is the engine's per-view block (taken once a frame).
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
 bool upscale_camera_noted();
+// The game's velocity map (the motion blur's) for the upscaler's motion: a
+// pass of it drawn into the target at `base` (`kind` 1: the camera's
+// full-screen pass, 2: a mesh's own, 3: the camera's pass with the camera
+// still), the scale its velocity is written with.
+void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky);
 std::uint64_t upscale_pass_calls();
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
 // copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is

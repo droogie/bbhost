@@ -14,8 +14,12 @@
 // Steps 2 to 4 of Numity1504's DLSS/FSR handoff: the call at the native size
 // (DLAA, FSR native AA), with the frame's jitter (render.cpp: the camera's
 // draws' viewports) and the camera's motion (shaders/camera_motion.comp, from
-// the depth and the two frames' view blocks) - the characters' own motion
-// not yet.
+// the depth and the two frames' view blocks) - and the characters' own
+// motion, the meshes' from the game's velocity map (the motion blur's: its
+// scales from the draws that write it, render.cpp upscale_velo_note_locked),
+// where a mesh moved of itself. Without it the player, standing still on the
+// screen as the camera orbits, had the background's motion and smeared.
+// BBHOST_UPSCALE_VELO=0: the camera's motion alone (a test).
 //
 // Under render scale (engine/render_scale.cpp: an Upscaling quality above
 // Native AA) the scene, its depth and the motion are the render size and the
@@ -99,6 +103,16 @@ Camera g_cam_now, g_cam_prev;
 bool g_cam_noted = false;  // this frame's taken (render.cpp, the first camera draw)
 bool g_cam_prev_ok = false;
 
+// The game's velocity map (the motion blur's): its target, and the scales its
+// two kinds of pass write their motion with (render.cpp, the draws' constant
+// buffers) - the camera's this frame (0: its pass not drawn, or drawn still:
+// the map's background is no motion), the meshes' as last seen. Seen: a pass
+// of it drawn this frame.
+std::uint64_t g_velo_base = 0;
+float g_velo_cam[2] = {}, g_velo_mesh[2] = {};
+bool g_velo_cam_seen = false, g_velo_mesh_known = false;
+std::uint64_t g_velo_used = 0;  // frames it was read in
+
 // The engine's per-view block (864 bytes, the G-buffer's vertex stage), in
 // floats: 36-51 the inverse projection (its first row's x the tangent of half
 // the horizontal field of view, its second's y the vertical, the third
@@ -122,6 +136,27 @@ bool camera_of(const float* f, Camera* c) {
     return true;
 }
 
+// The meshes' y against uv's (BBHOST_UPSCALE_VELO_Y=1: the same way, a test;
+// the default: NDC's up against uv's down).
+float velo_y_sign() {
+    static const float s = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_VELO_Y");
+        return e && e[0] == '1' ? -1.0f : 1.0f;
+    }();
+    return s;
+}
+
+// How far a texel may be from the camera's pass's value and still be the
+// camera's: a step and a half of its 8 bits (BBHOST_UPSCALE_VELO_TOL, in steps).
+float velo_tolerance() {
+    static const float t = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_VELO_TOL");
+        const float steps = e ? static_cast<float>(std::atof(e)) : 1.5f;
+        return (steps > 0.0f ? steps : 1.5f) / 255.0f;
+    }();
+    return t;
+}
+
 VkDescriptorSetLayout g_motion_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_motion_layout = VK_NULL_HANDLE;
 VkPipeline g_motion_pipeline = VK_NULL_HANDLE;
@@ -130,16 +165,17 @@ bool g_motion_tried = false;
 bool motion_pipeline_locked() {
     if (g_motion_tried) return g_motion_pipeline != VK_NULL_HANDLE;
     g_motion_tried = true;
-    const VkDescriptorSetLayoutBinding binds[3] = {
+    const VkDescriptorSetLayoutBinding binds[4] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 3;
+    sli.bindingCount = 4;
     sli.pBindings = binds;
     if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_motion_set_layout) != VK_SUCCESS) return false;
-    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 160};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &g_motion_set_layout;
@@ -165,10 +201,11 @@ bool motion_pipeline_locked() {
 }
 
 // The motion image written from the depth and the two cameras (the last one
-// absent: all zeros).
+// absent: all zeros), and the meshes' own from the game's velocity map `velo`
+// (null: none).
 void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
-                   std::uint32_t w, std::uint32_t h, bool prev_ok) {
-    float p[32] = {};
+                   std::uint32_t w, std::uint32_t h, bool prev_ok, const RtImage* velo, int velo_mode) {
+    float p[40] = {};
     p[0] = g_cam_now.tan_x;
     p[1] = g_cam_now.tan_y;
     p[2] = g_cam_now.a;
@@ -187,13 +224,28 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[20 + 4 * j + 2] = rz;
         p[20 + 4 * j + 3] = -(rx * m[3] + ry * m[7] + rz * m[11]);
     }
+    if (velo) {
+        // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
+        // (NDC now - NDC then) x scale x 0.5, its y up where uv's is down.
+        p[32] = g_velo_cam[0] * 2.5f;
+        p[33] = g_velo_cam[1] * 2.5f;
+        p[34] = g_velo_mesh[0];
+        p[35] = -g_velo_mesh[1] * velo_y_sign();
+        p[36] = static_cast<float>(velo->width);
+        p[37] = static_cast<float>(velo->height);
+        p[38] = static_cast<float>(velo_mode);
+        p[39] = velo_tolerance();
+    }
     const VkDescriptorSet set = alloc_set_locked(g_motion_set_layout);
     if (!set) return;
     const VkDescriptorImageInfo depth_info{VK_NULL_HANDLE, depth_view, depth_layout};
     const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     const VkDescriptorImageInfo motion_info{VK_NULL_HANDLE, motion_view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[3] = {};
-    for (int k = 0; k < 3; ++k) {
+    // No map: the depth stands in, unread.
+    const VkDescriptorImageInfo velo_info{VK_NULL_HANDLE, velo ? velo->view : depth_view,
+                                          velo ? VK_IMAGE_LAYOUT_GENERAL : depth_layout};
+    VkWriteDescriptorSet wr[4] = {};
+    for (int k = 0; k < 4; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = static_cast<std::uint32_t>(k);
@@ -205,7 +257,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     wr[1].pImageInfo = &sampler_info;
     wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[2].pImageInfo = &motion_info;
-    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    wr[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[3].pImageInfo = &velo_info;
+    vkUpdateDescriptorSets(g.device, 4, wr, 0, nullptr);
     barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_SHADER_WRITE_BIT);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_motion_pipeline);
@@ -465,8 +519,31 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         const char* e = std::getenv("BBHOST_UPSCALE_MOTION");
         return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "neg") == 0 ? -1 : 1;
     }();
+    // The meshes' own motion from the game's velocity map, its camera pass
+    // drawn this frame (BBHOST_UPSCALE_VELO=0: none, the camera's alone;
+    // =all: the map's motion everywhere, the camera's pass's too - tests).
+    static const int velo_mode = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_VELO");
+        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "all") == 0 ? 2 : 1;
+    }();
+    RtImage* velo = nullptr;
+    if (velo_mode && g_velo_cam_seen && g_velo_mesh_known && g_cam_prev_ok) {
+        velo = find_render_target(g_velo_base);
+        if (velo && (!velo->image || !velo->view || velo->depth)) velo = nullptr;
+        if (velo) {
+            if (velo->view_clear) view_clear_apply_locked(*velo);
+            render_end_pass_locked();
+            if (velo->managed_layout) rt_set_layout_locked(*velo, VK_IMAGE_LAYOUT_GENERAL);
+            barrier(cb, velo->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT);
+            ++g_velo_used;
+        }
+    }
+    g_velo_cam_seen = false;
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
-        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok);
+        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_mode);
+        g_velo_cam[0] = g_velo_cam[1] = 0.0f;
         if (!g_cam_prev_ok) g_reset = true;
         g_cam_prev = g_cam_now;
         g_cam_prev_ok = true;
@@ -631,6 +708,37 @@ VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t
 }
 
 bool upscale_camera_noted() { return g_cam_noted; }
+
+void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) {
+    if (kind != 3 && (!std::isfinite(kx) || !std::isfinite(ky) || kx == 0.0f || ky == 0.0f)) return;
+    if (kind == 3) kind = 1;  // the camera's pass, still: a scale of 0 (it wrote no motion)
+    static int logs = 0;
+    const bool changed = kind == 1 ? (kx != g_velo_cam[0] || ky != g_velo_cam[1] || base != g_velo_base)
+                                   : (kx != g_velo_mesh[0] || ky != g_velo_mesh[1]);
+    if (kind == 1) {
+        g_velo_base = base;
+        g_velo_cam[0] = kx;
+        g_velo_cam[1] = ky;
+        g_velo_cam_seen = true;
+    } else {
+        // With the camera's blur off (the Performance patch) there is no
+        // camera pass: the map is cleared to no motion and the meshes alone
+        // draw into it.
+        g_velo_base = base;
+        g_velo_mesh[0] = kx;
+        g_velo_mesh[1] = ky;
+        g_velo_mesh_known = true;
+        g_velo_cam_seen = true;
+    }
+    if (changed && logs < 8) {
+        ++logs;
+        const RtImage* rt = find_render_target(base);
+        host_log("upscaler: velocity map 0x%llx (%ux%u format %d): the %s pass's scale %g %g (read in %llu frames so far)",
+                 static_cast<unsigned long long>(base), rt ? rt->width : 0, rt ? rt->height : 0, rt ? static_cast<int>(rt->format) : 0,
+                 kind == 1 ? "camera" : "meshes'", static_cast<double>(kx), static_cast<double>(ky),
+                 static_cast<unsigned long long>(g_velo_used));
+    }
+}
 
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
     if (g_cam_noted || !base || bytes < 864) return g_cam_noted;

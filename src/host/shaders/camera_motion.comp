@@ -11,18 +11,32 @@
 // view-to-world rows (rotation | eye) for this frame and world-to-view rows
 // (the rotation transposed | its eye taken out) for the last.
 //
+// What moves of itself - the player, enemies, their weapons - comes from the
+// game's own velocity map (the motion blur's, upscale_pass.cpp): a full-screen
+// pass writes the camera's motion into it, (uv now - uv then) x the camera
+// scale + 0.5, and each moving mesh then writes its own over it, (NDC now -
+// NDC then) x the mesh scale x 0.5 + 0.5. A texel that differs from what the
+// camera's pass would have written there is a mesh's, and its motion is the
+// pixel's; elsewhere the camera's motion from the depth stays, at full
+// precision.
+//
 // Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform texture2D depth_plane;
 layout(set = 0, binding = 1) uniform sampler any_sampler;
 layout(set = 0, binding = 2) uniform writeonly image2D motion;  // R16G16_SFLOAT, written without a format
+layout(set = 0, binding = 3) uniform texture2D velo_map;           // the game's velocity map (velo_size.z == 0: none)
 
 layout(push_constant) uniform Params {
     vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
     vec4 now_r0, now_r1, now_r2;     // view to world
     vec4 prev_proj;  // the last camera's tangents (x <= 0: none), then the render size
     vec4 prev_r0, prev_r1, prev_r2;  // world to the last camera's view
+    // The velocity map: the camera's pass's scale (x 2.5, its uv delta's),
+    // the meshes' (their NDC delta's x 0.5, y as uv: down)
+    vec4 velo_k;
+    vec4 velo_size;  // its size, then mode (0: unused, 1: the meshes', 2: all of it), the tolerance
 };
 
 void main() {
@@ -50,6 +64,16 @@ void main() {
             const vec2 prev_uv = vec2((gp.x / (prev_proj.x * gp.z) + 1.0) * 0.5, (-gp.y / (prev_proj.y * gp.z) + 1.0) * 0.5);
             mv = clamp((prev_uv - uv) * size, vec2(-60000.0), vec2(60000.0));
             if (any(isnan(mv))) mv = vec2(0.0);
+        }
+        if (velo_size.z > 0.0) {
+            const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
+            const vec2 v = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0).rg - 0.5;
+            // What the camera's pass wrote for this motion: (uv now - uv then) x its scale.
+            const vec2 cam = -mv / size * velo_k.xy;
+            if (velo_size.z > 1.5 || any(greaterThan(abs(v - cam), vec2(velo_size.w)))) {
+                const vec2 own = -v / velo_k.zw * size;
+                if (!any(isnan(own)) && !any(isinf(own))) mv = own;
+            }
         }
     }
     imageStore(motion, xy, vec4(mv, 0.0, 0.0));

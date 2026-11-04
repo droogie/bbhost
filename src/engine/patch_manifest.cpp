@@ -408,6 +408,50 @@ Manifest hd_motion_blur_manifest() {
     return m;
 }
 
+// velomap-16f, the motion blur's velocity map as 16-bit float (always on):
+// the scene context's two velocity targets (+0xce0, +0xd38) are made in the
+// game's format 0x1c, RGBA8, and the meshes write their motion into it at a
+// step of about a pixel at 1080p - coarse for the upscaler, which takes the
+// meshes' own motion from it (host/upscale_pass.cpp). Format 0x0a, the lit
+// scene's RGBA16F, keeps it exact; the game's blur reads it the same. One
+// byte, the immediate of `mov dword [rsp+0x208], 0x1c` (0x26c3dfd).
+// BBHOST_VELOMAP_RES=full|half|quarter (a test, HD motion blur off): the map
+// at that share of the render size, without HD motion blur's camera blur.
+Manifest velomap_manifest() {
+    Manifest m;
+    m.name = "velomap-16f";
+    m.title = "16-bit velocity map";
+    m.eboot = kEboot109Sha256;
+    m.description = "motion blur's velocity map in 16-bit float, for the upscaler's motion";
+    m.order = 9150;
+    const char* bits = std::getenv("BBHOST_VELOMAP_8BIT");  // =1: the game's RGBA8 kept (a test)
+    if (!(bits && bits[0] == '1')) m.sites.push_back(Site{"velomap-format", 0x026c3e04, {0x1c}, {0x0a}, true, {}});
+    const char* e = std::getenv("BBHOST_VELOMAP_RES");
+    if (e && !host_settings().hd_motion_blur) {
+        const std::string r(e);
+        const int shift = r == "full" ? 0 : r == "quarter" ? 2 : 1;
+        std::vector<std::uint8_t> bytes = {0xc4, 0xc1, 0x7a, 0x7e, 0x07, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift),
+                                           0xc5, 0xf9, 0xd6, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00};
+        bytes.resize(25, 0x90);
+        m.sites.push_back(Site{"velomap-size", 0x026c3de4,
+                               {0x41, 0x8b, 0x07, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00, 0x41,
+                                0x8b, 0x47, 0x04, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x04, 0x02, 0x00, 0x00},
+                               std::move(bytes), true, {}});
+        // The depth it is drawn against, at the same share (as HD motion blur).
+        m.sites.push_back(Site{"depth-half-size", 0x0125b1a3,
+                               {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04},
+                               {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift), 0xc5, 0xf9, 0xd6, 0x04,
+                                0x24, 0x90, 0x90},
+                               true, {}});
+        m.sites.push_back(Site{"depth-quarter-size", 0x0125b1d6,
+                               {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
+                               {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift + 1), 0xc5, 0xf9, 0xd6, 0x04,
+                                0x24, 0x90, 0x90, 0x90},
+                               true, {}});
+    }
+    return m;
+}
+
 // all-languages, Every text language (always on): the game's text languages
 // are CSLocalize's, and which of them a disc offers is its region's - the
 // region the game makes of param.sfo's USER_DEFINED_PARAM_1 (the US disc's
@@ -514,6 +558,7 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(fov_uncap_manifest());
     out.push_back(all_languages_manifest());
     out.push_back(hd_motion_blur_manifest());
+    out.push_back(velomap_manifest());
     return out;
 }
 

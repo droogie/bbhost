@@ -307,6 +307,14 @@ struct ShaderStage {
 struct GfxPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     ShaderStage vs, ps, gs;
+    // A pass of the game's velocity map (the motion blur's) by its pixel
+    // shader, for the upscaler's motion (upscale_pass.cpp): the scale its
+    // velocity is written with is that shader's constant `velo_dw` (and the
+    // next) of constant buffer `velo_cb`. 0: none, 1: the camera's full-screen
+    // pass, 2: a mesh's own, 3: the camera's pass with the camera still (no
+    // motion written, no scale).
+    std::uint8_t velo = 0, velo_cb = 0, velo_dw = 0;
+    bool velo_known = false;  // classified (velo_classify)
     // A tessellated draw's generated vertex and control stages. The
     // domain shader stays in `vs` - it binds what a vertex stage binds, so
     // every descriptor, prefetch and user-data path is the one already there -
@@ -6525,6 +6533,33 @@ void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
         for (const std::uint32_t l : outs) vs_outs += (vs_outs.empty() ? "" : ",") + std::to_string(l);
         host_log("render: pipeline %s: pixel-shader inputs no vertex output writes:%s; the vertex stage writes {%s}", pl.name.c_str(),
                  missing.c_str(), vs_outs.c_str());
+    }
+}
+
+// A velocity map pass's pipeline (GfxPipeline::velo), by its pixel shader:
+// the velocity map's writers (MotionBlurWriteCMBVelocity, GXFlver_*_Velo).
+void velo_classify(GfxPipeline& pl) {
+    pl.velo_known = true;
+    static const struct {
+        const char* ps;
+        std::uint8_t kind, cb, dw;
+    } kVelo[] = {
+        {"52b0abfd", 1, 1, 32},  // MotionBlurWriteCMBVelocity: the camera's, uv delta x 2.5
+        {"dfff41ca", 3, 0, 0},   // MotionBlurWriteCMBVelocityNoMove: the camera still, no motion
+        {"749e4f9e", 2, 2, 0},   // GXFlver_Col_Velo
+        {"b25e4fae", 2, 2, 0},   // GXFlver_Col_Velo_[A]
+        {"34bc187c", 2, 0, 0},   // GXFlver_Emi_Velo
+        {"d79de945", 2, 2, 28},  // GXFlver_Water_Velo
+    };
+    const std::size_t plus = pl.name.find('+');
+    if (plus == std::string::npos) return;
+    const std::string ps = pl.name.substr(plus + 1);
+    for (const auto& v : kVelo) {
+        if (ps == v.ps) {
+            pl.velo = v.kind;
+            pl.velo_cb = v.cb;
+            pl.velo_dw = v.dw;
+        }
     }
 }
 
@@ -22920,12 +22955,27 @@ static bool draw_impl(const GpuDraw& d) {
         // stage, once a frame, its constant buffers looked at for the view block.
         const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
                             meta.buffers.size() <= 16 && !upscale_camera_noted() && upscaler_method();
+        // A pass of the game's velocity map: its scale's constant buffer.
+        if (st == 1 && !pl.velo_known) velo_classify(pl);
+        const bool velo = st == 1 && pl.velo && s.color[0] && pl.velo_cb < meta.buffers.size() && meta.buffers.size() <= 16 &&
+                          upscaler_method();
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
-                              gate || camera ? gate_bases : nullptr);
+                              gate || camera || velo ? gate_bases : nullptr);
         if (camera) {
             for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
                 if (upscale_camera_note_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4)) break;
+            }
+        }
+        // The velocity map's scales, for the upscaler's motion (upscale_pass.cpp).
+        if (velo && pl.velo == 3) {
+            upscale_velo_note_locked(3, s.color[0]->base, 0.0f, 0.0f);
+        } else if (velo) {
+            const std::uint64_t at = gate_bases[pl.velo_cb] + 4ull * pl.velo_dw;
+            if (gate_bases[pl.velo_cb] && hle_kernel_va_mapped(at, 8)) {
+                float k[2];
+                std::memcpy(k, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), sizeof(k));
+                upscale_velo_note_locked(pl.velo, s.color[0]->base, k[0], k[1]);
             }
         }
         if (digest) t_ring_cb_stage = -1;
