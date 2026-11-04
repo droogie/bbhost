@@ -92,6 +92,8 @@ const bool g_parts = [] {
     return lists_may_splice_from_env();
 }();
 
+const bool g_sinks = g_commit != 0 || g_parts;  // (after both: this file's order)
+
 void log_commit_default() {
     static std::once_flag once;
     std::call_once(once, [] {

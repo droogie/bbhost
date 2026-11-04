@@ -2791,10 +2791,12 @@ std::uint64_t g_by_id_hits = 0, g_by_id_misses = 0, g_by_id_disagree = 0, g_by_i
 CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va);
 // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the command processor's answer noted for the pool's.
 CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
-    if (list_draw()) {  // stage 4b.1b: by address, through the reader path
-        const CachedProgram* const found = program_find(va);
-        if (!found) run_part_stop(kRunStopProgram);
-        return const_cast<CachedProgram*>(found);
+    if (list_draw()) [[unlikely]] {  // stage 4b.1b: by address, through the reader path (out of line)
+        return [va]() __attribute__((noinline)) {
+            const CachedProgram* const found = program_find(va);
+            if (!found) run_part_stop(kRunStopProgram);
+            return const_cast<CachedProgram*>(found);
+        }();
     }
     CachedProgram* const cp = program_for_impl(id, va);
     gxvk_lists::cp_note(gxvk_lists::kLookProgram, va, cp ? cp->hash : 0);
@@ -15797,39 +15799,45 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // handle is bound in its home - no copy version, twin, GPU write still to land or snapshot asked about: the
         // GPU's queue order puts each copy-back there before the draws after it. A new home's fill (before-work in this
         // recording's uploads) and a copy into it still pending in this pass (the draw binds that copy's source) are all
-        // it meets. =compare binds today's path, and checks what it binds against the home's mirror below.
+        // it meets. =compare binds today's path, and checks what it binds against the home's mirror below. (The
+        // records' handles are read only while the homes are made, and the binding is made out of line: with the homes
+        // off - the default - this loop reads and runs what it did before them.)
         std::uint32_t home_handle = 0;
-        if (gx && plan && base && !b.pointer && i < plan->buffers.size() && plan->buffers[i].source == GxBindingPlan::kCb &&
-            ((gx->obj_cb_set >> plan->buffers[i].slot) & 1))
+        if (gxvk_homes::made_on() && gx && plan && base && !b.pointer && i < plan->buffers.size() &&
+            plan->buffers[i].source == GxBindingPlan::kCb && ((gx->obj_cb_set >> plan->buffers[i].slot) & 1))
             home_handle = gx->cb_home[plan->buffers[i].slot];
         if (home_handle && gxvk_homes::bind_on() && !b.written && bytes && !(base & 3) && shape && !t_snapshot_cbs &&
             (list_draw() || !glitch_watching_draw())) {  // (a list-mode draw: the glitch hunt is off - lists_commit's refusals)
-            Located hl;
-            const int r = homes_bind_locked(home_handle, base, bytes, hl);
-            // Its block bound whole, the home's place the bias: one descriptor for every home in the block, as the
-            // snapshots bind their ring (each at its own offset, every draw would want a set of its own).
-            if (r == kHomeBound && !exact && bytes <= hl.avail && g.ssbo_max_range >= gxvk_homes::kBlockBytes && !(hl.offset & 3) &&
-                hl.offset + bytes <= gxvk_homes::kBlockBytes) {
-                info = {hl.buffer, 0, gxvk_homes::kBlockBytes};
-                params.cb_valid |= 1u << i;
-                params.cb_bias_dw[i] = static_cast<std::uint32_t>(hl.offset / 4);
-                if (!run_part()) ++outcomes[kBound];
-                infos.push_back(info);
-                continue;
-            }
-            if (r == kHomeBound || r == kHomePending) {
-                if (r == kHomePending) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
-                const VkDeviceSize start = exact ? hl.offset : hl.offset & ~(g.ssbo_align - 1);
-                const VkDeviceSize bias = hl.offset - start;
-                if (bytes <= hl.avail && bias + bytes <= g.ssbo_max_range && !(exact && (start & (g.ssbo_align - 1)))) {
-                    info = {hl.buffer, start, bias + bytes};
+            const bool bound = [&]() __attribute__((noinline)) {
+                Located hl;
+                const int r = homes_bind_locked(home_handle, base, bytes, hl);
+                // Its block bound whole, the home's place the bias: one descriptor for every home in the block, as the
+                // snapshots bind their ring (each at its own offset, every draw would want a set of its own).
+                if (r == kHomeBound && !exact && bytes <= hl.avail && g.ssbo_max_range >= gxvk_homes::kBlockBytes && !(hl.offset & 3) &&
+                    hl.offset + bytes <= gxvk_homes::kBlockBytes) {
+                    info = {hl.buffer, 0, gxvk_homes::kBlockBytes};
                     params.cb_valid |= 1u << i;
-                    params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
+                    params.cb_bias_dw[i] = static_cast<std::uint32_t>(hl.offset / 4);
                     if (!run_part()) ++outcomes[kBound];
                     infos.push_back(info);
-                    continue;
+                    return true;
                 }
-            }
+                if (r == kHomeBound || r == kHomePending) {
+                    if (r == kHomePending) gxvk_lists::note_order(gxvk_lists::kOrderCbVersion);
+                    const VkDeviceSize start = exact ? hl.offset : hl.offset & ~(g.ssbo_align - 1);
+                    const VkDeviceSize bias = hl.offset - start;
+                    if (bytes <= hl.avail && bias + bytes <= g.ssbo_max_range && !(exact && (start & (g.ssbo_align - 1)))) {
+                        info = {hl.buffer, start, bias + bytes};
+                        params.cb_valid |= 1u << i;
+                        params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
+                        if (!run_part()) ++outcomes[kBound];
+                        infos.push_back(info);
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            if (bound) continue;
         }
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
@@ -15893,19 +15901,21 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // in place first and binds the home as any other. (=compare counts
             // what 1 would do, and binds today's version.)
             if (version == kCopyVersionInside && heap_src) {
-                const bool snap = bytes <= (1u << 20);
-                gxvk::heap_copy_bound(snap);
-                if (gxvk::heap_copy_mode() == gxvk::HeapCopy::kOn) {
-                    if (snap) {
-                        copy_from = heap_src;
-                        from_heap = known = true;
-                        check = false;
-                    } else {
-                        copy_versions_put_in_place_locked(kCvHeapWide);
+                [&]() __attribute__((noinline)) {  // (out of line: off by default)
+                    const bool snap = bytes <= (1u << 20);
+                    gxvk::heap_copy_bound(snap);
+                    if (gxvk::heap_copy_mode() == gxvk::HeapCopy::kOn) {
+                        if (snap) {
+                            copy_from = heap_src;
+                            from_heap = known = true;
+                            check = false;
+                        } else {
+                            copy_versions_put_in_place_locked(kCvHeapWide);
+                        }
+                        version = kCopyVersionNone;
+                        loc = Located{};
                     }
-                    version = kCopyVersionNone;
-                    loc = Located{};
-                }
+                }();
             }
         }
         if (version == kCopyVersionStraddles) {
@@ -16183,52 +16193,56 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     }
                 }
                 if (list && scratch.map && outcome != kBound) {
-                    // Stage 4b.1b's list mode: into the list arena (list_cb_take),
-                    // bound as the ring is.
-                    if (!snapshot && !known) {
-                        run_part_stop(kRunStopBuffers);
-                        return;
-                    }
-                    VkDeviceSize copy_bytes = bytes;
-                    if (g_wc_whole_lines) {
-                        const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
-                        if (((copy_from + bytes - 1) >> 12) == ((copy_from + lines - 1) >> 12)) copy_bytes = lines;
-                    }
-                    VkDeviceSize at = 0;
-                    // A buffer copied again for a draw of the same frame (its GX
-                    // call's flip) binds its first copy, as the command processor's
-                    // memo shares one within a recording: a renamed copy's bytes are
-                    // final at its call, and its block is not handed out again
-                    // before the GPU has run the frame that reads it.
-                    struct ArenaMemo {
-                        std::uint64_t base = 0, bytes = 0, flip = 0, lap = 0;
-                        std::uint32_t seg = 0;
-                        VkDeviceSize at = 0;
-                    };
-                    static thread_local ArenaMemo memo_tab[512];
-                    ListNotes& ln = *t_run_draw->list;
-                    ArenaMemo& am = memo_tab[((copy_from >> 4) ^ (copy_from >> 13)) & 511];
-                    if (am.base == copy_from && am.bytes >= copy_bytes && am.flip == ln.call_flip &&
-                        g_list_arena.lap[am.seg].load(std::memory_order_acquire) == am.lap && list_cb_keep(am.seg, am.lap, ln)) {
-                        at = am.at;
-                        g_list_arena.shared.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        if (!list_cb_take(copy_bytes, at, ln)) {
-                            run_part_stop(kRunStopRing);
-                            return;
+                    // Stage 4b.1b's list mode (out of line: the pool's draws only): into the
+                    // list arena (list_cb_take), bound as the ring is; false: the draw stops.
+                    const bool bound = [&]() __attribute__((noinline)) {
+                        if (!snapshot && !known) {
+                            run_part_stop(kRunStopBuffers);
+                            return false;
                         }
-                        std::memcpy(static_cast<std::uint8_t*>(g_list_arena.ring->map) + g_list_arena.base + at,
-                                    reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
-                        am = ArenaMemo{copy_from, copy_bytes, ln.call_flip, t_list_cb.lap, t_list_cb.seg, at};
-                    }
-                    const bool whole = whole_ring;
-                    const VkDeviceSize in_ring = g_list_arena.base + at;  // (the arena lies in the ring's buffer)
-                    info = whole ? VkDescriptorBufferInfo{g_list_arena.ring->buffer, 0, kScratch}
-                                 : VkDescriptorBufferInfo{g_list_arena.ring->buffer, in_ring, bytes};
-                    params.cb_valid |= 1u << i;
-                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(in_ring / 4) : 0;
-                    if (whole && run_digest_on()) run_digest_ring_cb(i, in_ring, base, bytes);
-                    outcome = kBound;
+                        VkDeviceSize copy_bytes = bytes;
+                        if (g_wc_whole_lines) {
+                            const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
+                            if (((copy_from + bytes - 1) >> 12) == ((copy_from + lines - 1) >> 12)) copy_bytes = lines;
+                        }
+                        VkDeviceSize at = 0;
+                        // A buffer copied again for a draw of the same frame (its GX
+                        // call's flip) binds its first copy, as the command processor's
+                        // memo shares one within a recording: a renamed copy's bytes are
+                        // final at its call, and its block is not handed out again
+                        // before the GPU has run the frame that reads it.
+                        struct ArenaMemo {
+                            std::uint64_t base = 0, bytes = 0, flip = 0, lap = 0;
+                            std::uint32_t seg = 0;
+                            VkDeviceSize at = 0;
+                        };
+                        static thread_local ArenaMemo memo_tab[512];
+                        ListNotes& ln = *t_run_draw->list;
+                        ArenaMemo& am = memo_tab[((copy_from >> 4) ^ (copy_from >> 13)) & 511];
+                        if (am.base == copy_from && am.bytes >= copy_bytes && am.flip == ln.call_flip &&
+                            g_list_arena.lap[am.seg].load(std::memory_order_acquire) == am.lap && list_cb_keep(am.seg, am.lap, ln)) {
+                            at = am.at;
+                            g_list_arena.shared.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            if (!list_cb_take(copy_bytes, at, ln)) {
+                                run_part_stop(kRunStopRing);
+                                return false;
+                            }
+                            std::memcpy(static_cast<std::uint8_t*>(g_list_arena.ring->map) + g_list_arena.base + at,
+                                        reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
+                            am = ArenaMemo{copy_from, copy_bytes, ln.call_flip, t_list_cb.lap, t_list_cb.seg, at};
+                        }
+                        const bool whole = whole_ring;
+                        const VkDeviceSize in_ring = g_list_arena.base + at;  // (the arena lies in the ring's buffer)
+                        info = whole ? VkDescriptorBufferInfo{g_list_arena.ring->buffer, 0, kScratch}
+                                     : VkDescriptorBufferInfo{g_list_arena.ring->buffer, in_ring, bytes};
+                        params.cb_valid |= 1u << i;
+                        params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(in_ring / 4) : 0;
+                        if (whole && run_digest_on()) run_digest_ring_cb(i, in_ring, base, bytes);
+                        outcome = kBound;
+                        return true;
+                    }();
+                    if (!bound) return;
                 } else if (scratch.map && outcome != kBound) {
                     // The ring is write-combined memory: a copy whose last line
                     // is partly written leaves that line in a write-combining
@@ -22074,12 +22088,14 @@ static bool draw_impl(const GpuDraw& d) {
     bool no_gx_attempt = false;     // a draw without GX geometry asked its fetch shader's table (BBHOST_VERTEX_INPUT_NO_GX)
     if (gx_geometry_compare) compare_gx_geometry(d, *gx_geometry);
     {
-        if (vs_cp->fetch_sgpr == -2) {
+        // (Set once, by the command processor; a pool thread's list-mode draw that finds it unset stops.)
+        int fs = std::atomic_ref<int>(vs_cp->fetch_sgpr).load(std::memory_order_acquire);
+        if (fs == -2) {
             if (run_part_stop(kRunStopProgram)) return false;
             const gcn::Program vs_prog = gcn::decode(vs_words.data(), vs_words.size());
-            vs_cp->fetch_sgpr = fetch_user_sgpr(vs_prog);
+            fs = fetch_user_sgpr(vs_prog);
+            std::atomic_ref<int>(vs_cp->fetch_sgpr).store(fs, std::memory_order_release);
         }
-        const int fs = vs_cp->fetch_sgpr;
         if (fs >= 0 && fs + 1 < 16) {
             const std::uint64_t user_fetch =
                 static_cast<std::uint64_t>(s.vs_user[fs]) | (static_cast<std::uint64_t>(s.vs_user[fs + 1]) << 32);

@@ -13037,8 +13037,11 @@ bool copy_versions_name_buffer_locked(VkBuffer buffer) {
 
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src) {
     if (heap_src) *heap_src = 0;
-    // A copy into a home still to land in this pass (stage 4b.3c): no version is made over a home.
-    if (const int h = homes_pending_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;
+    // A copy into a home still to land in this pass (stage 4b.3c): no version is made over a home. (Asked only while
+    // the homes bind: with them off this lookup is what it was before them.)
+    if (gxvk_homes::bind_on()) {
+        if (const int h = homes_pending_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;
+    }
     // A twin home's copy pending in this pass (stage 4b.3a(i)) is newer than any version over it: versions are made only
     // for homes that are not live twins, and a twin made since takes no version's copy.
     if (const int h = home_copy_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;

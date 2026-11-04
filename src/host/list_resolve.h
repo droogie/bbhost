@@ -83,6 +83,10 @@ inline bool commit_compare() { return g_commit == 3; }
 // fork and join read commit_draws().
 extern const bool g_parts;
 inline bool parts() { return g_parts; }
+// committing() || parts() in one load: whether a counter's bump looks for its
+// thread's sink (gpu_internal.h bump).
+extern const bool g_sinks;
+inline bool sinks() { return g_sinks; }
 // Whether the command processor tells this module what it walks.
 inline bool on() { return g_mode != 0 || g_batch != 0 || g_commit != 0; }
 // Whether the run census counts.

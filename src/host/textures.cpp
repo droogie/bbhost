@@ -3589,28 +3589,31 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
                                bool shader_arrayed, bool r128, std::uint32_t* slot, std::uint64_t* base) {
     const std::uint8_t flags = static_cast<std::uint8_t>((storage ? 1 : 0) | (shader_arrayed ? 2 : 0) | (r128 ? 4 : 0));
     IdViewEntry& e = g_id_views[id & (kIdViewSlots - 1)];
-    if (t_run_draw && t_run_draw->list) {
-        // Stage 4b.1b's list mode, under the readers' lock: the entry as it was
-        // made (its view, dims, surface and slot are written only with the lock
-        // held), its refresh asked at the splice (texture_view_splice_ok).
-        // An entry the view epoch has moved past since it was refreshed still
-        // names its view: the splice binds the commit only where the entry
-        // holds that view at the epoch of its place (texture_view_splice_ok),
-        // and a set that held a view let go is dropped from the cache first.
-        const IdViewPub& pub = g_id_views_pub[id & (kIdViewSlots - 1)];
-        const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
-        if (!found || copy_elide_live()) {
-            g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
-            run_part_stop(kRunStopImages);
-            return VK_NULL_HANDLE;
-        }
-        t_run_draw->list->note_view(id, flags, found, !e.sf, w);
-        if (slot) *slot = e.slot;
-        if (base) *base = e.base;
-        dims_ok = e.dims_ok;
-        dim = e.dim;
-        arrayed = e.arrayed;
-        return found;
+    if (t_run_draw && t_run_draw->list) [[unlikely]] {
+        // Stage 4b.1b's list mode, under the readers' lock (out of line: the
+        // pool's draws only): the entry as it was made (its view, dims, surface
+        // and slot are written only with the lock held), its refresh asked at
+        // the splice (texture_view_splice_ok). An entry the view epoch has
+        // moved past since it was refreshed still names its view: the splice
+        // binds the commit only where the entry holds that view at the epoch of
+        // its place (texture_view_splice_ok), and a set that held a view let go
+        // is dropped from the cache first.
+        return [&]() __attribute__((noinline)) {
+            const IdViewPub& pub = g_id_views_pub[id & (kIdViewSlots - 1)];
+            const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
+            if (!found || copy_elide_live()) {
+                g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
+                run_part_stop(kRunStopImages);
+                return VkImageView{VK_NULL_HANDLE};
+            }
+            t_run_draw->list->note_view(id, flags, found, !e.sf, w);
+            if (slot) *slot = e.slot;
+            if (base) *base = e.base;
+            dims_ok = e.dims_ok;
+            dim = e.dim;
+            arrayed = e.arrayed;
+            return found;
+        }();
     }
     // A target a copy left unmade into (BBHOST_COPY_ELIDE) binds its source's image until the copy is made: resolved
     // again (by its T#'s base, which stage 2's entries keep), and not remembered.

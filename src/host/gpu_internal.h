@@ -117,7 +117,7 @@ extern thread_local constinit BumpSink* t_bump_sink;
 // only with BBHOST_RUN_COMMIT on: a thread-local read is several loads where
 // the bump is one add, and the draw path bumps at a hundred places.
 inline void bump(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) {
-    if (list_resolve::committing() || list_resolve::parts()) [[unlikely]] {
+    if (list_resolve::sinks()) [[unlikely]] {
         if (BumpSink* s = t_bump_sink) {
             s->add(&c, n);
             return;
