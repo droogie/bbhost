@@ -92,7 +92,7 @@ int main() {
     const auto rows = read_messages();
     CHECK(rows.count(117009) && rows.at(117009).text == "HLSL Shaders" && rows.at(117009).help.find("restart") != std::string::npos);
     CHECK(rows.count(116008) && rows.at(116008).text == "Texture Quality");
-    CHECK(rows.count(116042) && rows.count(116043) && rows.count(116044) && rows.at(116044).text == "High");
+    CHECK(rows.count(116045) && rows.count(116042) && rows.count(116043) && rows.count(116044) && rows.at(116044).text == "High");
     int languages = 0;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(test_app0_file("dvdroot_ps4/msg"), ec)) {

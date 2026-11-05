@@ -336,10 +336,10 @@ Setting g_set[kSettingCount] = {
     // The textures' size in video memory (host/textures.cpp quality_drop):
     // each texture's top mip levels left out of its image, its own smaller
     // levels in their place - High none (1.0x), Medium one (0.5x), Low two
-    // (0.25x). Live: a texture is made again at its next use.
-    {"texture_quality", "Texture quality", {"Low", "Medium", "High"}, 2,
+    // (0.25x), Lowest three (0.125x: mip levels halve, so no 0.10x). Live: a texture is made again at its next use.
+    {"texture_quality", "Texture quality", {"Lowest", "Low", "Medium", "High"}, 3,
      "The size of the game's textures in video memory. High is the game's own. Medium halves each texture's width and height "
-     "(a quarter of the memory), Low quarters them (a sixteenth), with the textures' own smaller mip levels in their place: less video memory and "
+     "(a quarter of the memory), Low quarters them (a sixteenth), Lowest takes them to an eighth, with the textures' own smaller mip levels in their place: less video memory and "
      "bandwidth, for graphics cards short of either, and a softer picture. No texture goes below 256 on its longer side, and "
      "the smaller ones stay as they are. Changes at once: each texture is made again the next time it is drawn.",
      false},
@@ -1172,7 +1172,7 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
-    h.texture_quality = 2 - std::clamp(index_of(kTextureQuality), 0, 2);  // the levels left out: High none, Low two
+    h.texture_quality = 3 - std::clamp(index_of(kTextureQuality), 0, 3);  // the levels left out: High none, Lowest three
     h.ssr = on_of(kSsr);
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
@@ -1694,6 +1694,7 @@ const char* const* value_tips(int id, bool dlss) {
         "Full: the render size itself. The cleanest blur, the dearest.",
     };
     static const char* const kTextureTips[] = {
+        "Lowest: textures at an eighth of their width and height (0.125x), a sixty-fourth of the video memory - a 1024x2048 texture is 128x256.",
         "Low: textures at a quarter of their width and height (0.25x), a sixteenth of the video memory - a 1024x2048 texture is 256x512.",
         "Medium: textures at half their width and height (0.5x), a quarter of the video memory - a 1024x2048 texture is 512x1024.",
         "High: every texture at the size the game made it (1.0x).",

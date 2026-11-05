@@ -42,7 +42,7 @@ struct HostConfig {
     std::string resolution;    // video.resolution: the Resolution setting's default entry ("1280x800"); F10's file has the last word
     std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed", "Borderless" or "Fullscreen")
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
-    std::string texture_quality;  // video.texture_quality: the Texture quality setting's default ("Low", "Medium", "High")
+    std::string texture_quality;  // video.texture_quality: the Texture quality setting's default ("Lowest", "Low", "Medium", "High")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,

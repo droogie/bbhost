@@ -252,7 +252,7 @@ constexpr std::uint32_t kGfxShaders = 117009;
 constexpr std::uint32_t kFxBloom = 120000, kFxVignette = 120001, kFxSaturation = 120002;
 constexpr std::uint32_t kRowFrameCap = 116005;
 // Texture Quality (the Texture quality setting: Low, Medium, High; live), a
-// pick list of its three entries 116042..116044.
+// pick list of its four entries 116045, 116042..116044.
 constexpr std::uint32_t kRowTextureQuality = 116008;
 // The section title, StaticText_116020 in the generated movie.
 constexpr std::uint32_t kSectionTitleId = 116020;
@@ -510,8 +510,8 @@ Toggle g_toggles[] = {
 constexpr int kToggleCount = static_cast<int>(sizeof(g_toggles) / sizeof(g_toggles[0]));
 // Texture Quality: the setting's entry (host/options.cpp texture_quality), its
 // list between the toggles and the frame rate's.
-const Choice kTextureQualities[] = {{0, 116042}, {1, 116043}, {2, 116044}};
-std::int32_t g_texture_quality = 2, g_texture_quality_last = 2;
+const Choice kTextureQualities[] = {{0, 116045}, {1, 116042}, {2, 116043}, {3, 116044}};
+std::int32_t g_texture_quality = 3, g_texture_quality_last = 3;
 
 // A 0..10 slider row's byte, and what was pushed.
 struct Slider {

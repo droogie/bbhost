@@ -3030,7 +3030,7 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
 // how many of a texture's top levels its image leaves out, its own smaller
 // levels - already in its memory - in their place: 0 at High (1.0x), 1 at
 // Medium (0.5x: a 1024x2048 texture is 512x1024, a quarter of the video
-// memory), 2 at Low (0.25x).
+// memory), 2 at Low (0.25x), 3 at Lowest (0.125x).
 // Only block-compressed 2D textures and arrays with the levels to spare, made
 // as nothing the GPU draws or stores into (a GX resource bound as a target,
 // depth or UAV never is; nor a T# bound for stores, or one in g_full_size),
@@ -3040,7 +3040,7 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
 // level, and stays as it is. Nor cubes: the reflection probes are read at a
 // level the surface's roughness picks, and one without its first level would
 // make every reflection a level blurrier.
-// BBHOST_TEXTURE_QUALITY=1.0|0.5|0.25 wins over the setting.
+// BBHOST_TEXTURE_QUALITY=1.0|0.5|0.25|0.125 wins over the setting.
 namespace {
 constexpr std::uint32_t kQualityFloor = 256;
 std::uint32_t g_quality_drop = 0;  // the setting's, under g.mu (textures_follow_quality_locked)
@@ -3051,9 +3051,9 @@ std::uint32_t quality_wanted() {
         const char* e = std::getenv("BBHOST_TEXTURE_QUALITY");
         if (!e || !*e) return -1;
         const double scale = std::strtod(e, nullptr);
-        return scale <= 0.25 ? 2 : scale <= 0.5 ? 1 : 0;
+        return scale <= 0.125 ? 3 : scale <= 0.25 ? 2 : scale <= 0.5 ? 1 : 0;
     }();
-    return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().texture_quality, 0, 2));
+    return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().texture_quality, 0, 3));
 }
 
 // The resources (by memory, with their generation) whose texture is made at
@@ -3102,7 +3102,7 @@ bool g_quality_started = false;
 void textures_follow_quality_locked() {
     const std::uint32_t want = quality_wanted();
     if (g_quality_started && want == g_quality_drop) return;
-    static const char* const kName[] = {"High (1.0x)", "Medium (0.5x)", "Low (0.25x)"};
+    static const char* const kName[] = {"High (1.0x)", "Medium (0.5x)", "Low (0.25x)", "Lowest (0.125x)"};
     const std::uint32_t was = g_quality_drop;
     g_quality_drop = want;
     if (!g_quality_started) {
@@ -6736,7 +6736,7 @@ void textures_report() {
         }
         host_log("texture: texture quality %s: textures made reduced %llu, leaving out %llu MiB of levels; made at full size again (written by the "
                  "GPU, or the setting raised) %llu; reduced now %llu, leaving out %llu MiB; full size for good %zu",
-                 g_quality_drop == 2 ? "Low (0.25x)" : g_quality_drop == 1 ? "Medium (0.5x)" : "High (1.0x)", static_cast<unsigned long long>(g_quality_surfaces),
+                 g_quality_drop == 3 ? "Lowest (0.125x)" : g_quality_drop == 2 ? "Low (0.25x)" : g_quality_drop == 1 ? "Medium (0.5x)" : "High (1.0x)", static_cast<unsigned long long>(g_quality_surfaces),
                  static_cast<unsigned long long>(g_quality_saved >> 20), static_cast<unsigned long long>(g_quality_full),
                  static_cast<unsigned long long>(now_reduced), static_cast<unsigned long long>(now_saved >> 20), g_full_size.size());
     }
