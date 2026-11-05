@@ -2874,9 +2874,24 @@ CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va);
 // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the command processor's answer noted for the pool's.
 CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
     if (list_draw()) [[unlikely]] {  // stage 4b.1b: by address, through the reader path (out of line)
-        return [va]() __attribute__((noinline)) {
+        return [id, va]() __attribute__((noinline)) {
+            // A pool thread's own answers by the program object's id, as the command processor's by-id entries
+            // (a GX program object's code stays at its address while it lives): good while no program was made or
+            // updated since (the cache's writes, under the readers' lock this commit holds shared).
+            struct PoolById {
+                std::uint32_t id = 0;
+                std::uint64_t va = 0, gen = 0;
+                const CachedProgram* cp = nullptr;
+            };
+            static thread_local PoolById by_id[kById];
+            const std::uint64_t gen = cache_rw::gen(cache_rw::kPrograms);
+            PoolById* const e = id && g_program_ids == 1 ? &by_id[id & (kById - 1)] : nullptr;
+            if (e && e->id == id && e->va == va && e->gen == gen && e->cp &&
+                (e->cp->patch_mask < 0 || e->cp->patch_mask == shader_patch_mask()))
+                return const_cast<CachedProgram*>(e->cp);
             const CachedProgram* const found = program_find(va);
             if (!found) run_part_stop(kRunStopProgram);
+            else if (e) *e = {id, va, gen, found};
             return const_cast<CachedProgram*>(found);
         }();
     }
@@ -16708,7 +16723,9 @@ struct ListCbArena {
     VkDeviceSize base = 0;      // where the arena begins in it
     std::atomic<bool> made{false};
     std::mutex mu;                                        // the pool threads' segment takes
-    std::uint64_t last_flip[kSegments] = {};              // its last commit's flip (under mu)
+    // Its last commit's flip: stored by the thread that copies into it (once a flip, no lock), read under mu by a
+    // take looking for a segment old enough to take again.
+    std::atomic<std::uint64_t> last_flip[kSegments] = {};
     std::atomic<std::uint64_t> max_serial[kSegments] = {};  // the newest recording a commit of it was spliced into
     std::atomic<std::uint64_t> lap[kSegments] = {};         // its takes so far
     std::uint32_t next = 0;                               // where the next take looks first (under mu)
@@ -16719,18 +16736,24 @@ struct ListCbCursor {  // a pool thread's segment
     std::uint32_t seg = ~0u;
     std::uint64_t lap = 0;
     VkDeviceSize next = 0;
+    std::uint64_t flip = 0;  // the flip it last stored as its segment's
 };
 thread_local ListCbCursor t_list_cb;
+// Segment `seg` used at `flip` by this thread: its last flip stored when it moved (a take sees a segment in use as
+// recent, and leaves it).
+inline void list_cb_used(std::uint32_t seg, std::uint64_t flip) {
+    std::atomic<std::uint64_t>& f = g_list_arena.last_flip[seg];
+    if (f.load(std::memory_order_relaxed) != flip) f.store(flip, std::memory_order_relaxed);
+}
 // A copy an earlier commit of this thread made in segment `seg` (lap `lap`)
 // bound again: the segment kept from being taken again meanwhile and noted for
-// the splice. False when it was taken again since.
+// the splice. False when it was taken again since. (No lock: the copy is of
+// this flip's call, so its segment was used within the flip and no take finds
+// it old.)
 bool list_cb_keep(std::uint32_t seg, std::uint64_t lap, ListNotes& notes) {
     ListCbArena& a = g_list_arena;
-    {
-        std::lock_guard<std::mutex> lk(a.mu);
-        if (a.lap[seg].load(std::memory_order_relaxed) != lap) return false;
-        a.last_flip[seg] = hle_video_flip_count();
-    }
+    if (a.lap[seg].load(std::memory_order_acquire) != lap) return false;
+    list_cb_used(seg, hle_video_flip_count());
     for (std::uint32_t k = 0; k < notes.nsegs; ++k) {
         if (notes.seg[k] == seg && notes.seg_lap[k] == lap) return true;
     }
@@ -16752,15 +16775,18 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
     ListCbCursor& c = t_list_cb;
     const std::uint64_t flip = hle_video_flip_count();
     VkDeviceSize off = (c.next + 255) & ~VkDeviceSize{255};
-    if (c.seg == ~0u || off + bytes > ListCbArena::kSegment) {
+    // (A segment of this thread's taken again by another meanwhile - this thread left it unused long enough to look
+    // old - is this thread's no more: a new one.)
+    if (c.seg == ~0u || off + bytes > ListCbArena::kSegment || a.lap[c.seg].load(std::memory_order_acquire) != c.lap) {
         std::lock_guard<std::mutex> lk(a.mu);
         const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
         std::uint32_t found = ~0u;
         for (std::uint32_t k = 0; k < ListCbArena::kSegments; ++k) {
             const std::uint32_t s = (a.next + k) % ListCbArena::kSegments;
             if (s == c.seg) continue;
-            const bool old = !a.last_flip[s] || a.last_flip[s] + kListMaxAge + 2 < flip;
-            if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (a.last_flip[s] ? 0 : 1)) {
+            const std::uint64_t last = a.last_flip[s].load(std::memory_order_relaxed);
+            const bool old = !last || last + kListMaxAge + 2 < flip;
+            if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (last ? 0 : 1)) {
                 found = s;
                 break;
             }
@@ -16770,15 +16796,16 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
             return false;
         }
         a.next = (found + 1) % ListCbArena::kSegments;
-        a.last_flip[found] = flip;
+        a.last_flip[found].store(flip, std::memory_order_relaxed);
         a.max_serial[found].store(0, std::memory_order_relaxed);
         c.seg = found;
         c.lap = a.lap[found].fetch_add(1, std::memory_order_acq_rel) + 1;
+        c.flip = flip;
         a.takes.fetch_add(1, std::memory_order_relaxed);
         off = 0;
-    } else {
-        std::lock_guard<std::mutex> lk(a.mu);
-        a.last_flip[c.seg] = flip;
+    } else if (c.flip != flip) {
+        c.flip = flip;
+        list_cb_used(c.seg, flip);
     }
     c.next = off + bytes;
     at = static_cast<VkDeviceSize>(c.seg) * ListCbArena::kSegment + off;
@@ -17334,7 +17361,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         if (am.base == copy_from && am.bytes >= copy_bytes && am.flip == ln.call_flip &&
                             g_list_arena.lap[am.seg].load(std::memory_order_acquire) == am.lap && list_cb_keep(am.seg, am.lap, ln)) {
                             at = am.at;
-                            g_list_arena.shared.fetch_add(1, std::memory_order_relaxed);
+                            bump(g_list_arena.shared);  // (into the commit's sink: one locked add per draw no more)
                         } else {
                             if (!list_cb_take(copy_bytes, at, ln)) {
                                 run_part_stop(kRunStopRing);
@@ -22683,11 +22710,14 @@ thread_local std::uint32_t t_list_names[kTargetNames];
 void run_targets_part(const GpuDrawInputs& in, DrawState& s) {
     const bool list = t_run_draw && t_run_draw->list;
     const RunTargets& m = list ? *t_list_targets : *g_run_shared_targets;
-    std::uint32_t now[kTargetNames];
-    target_names(in, now);
-    if (std::memcmp(now, list ? t_list_names : g_run_first_names, sizeof(now)) != 0) {
-        run_part_stop(kRunStopTargets);
-        return;
+    // (A list-mode draw's names are those its commit looked its targets up by, from these very inputs.)
+    if (!list) {
+        std::uint32_t now[kTargetNames];
+        target_names(in, now);
+        if (std::memcmp(now, g_run_first_names, sizeof(now)) != 0) {
+            run_part_stop(kRunStopTargets);
+            return;
+        }
     }
     const DrawScissor target_rect = draw_scissor(in, false);
     DrawScissor draw_rect = target_rect;
@@ -23152,7 +23182,8 @@ void publish_run_targets_locked(const RunTargets& m);  // stage 4b.1b (below)
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
-    g.draw_calls.fetch_add(1, std::memory_order_relaxed);
+    if (list_draw()) bump(g.draw_calls);  // (a pool thread's: into its commit's sink, not a locked add on the command processor's line)
+    else g.draw_calls.fetch_add(1, std::memory_order_relaxed);
     // BBHOST_PASS_BREAK=<n>: end the render pass before every n-th draw, the
     // way a tessellated draw's compute pass has to. A check on whether that
     // churn is what washes a frame out.
@@ -28010,20 +28041,23 @@ void publish_run_targets_locked(const RunTargets& m) {
 namespace {
 
 bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, std::uint64_t& erase_gen, std::uint64_t& flip) {
-    PubTargets& p = g_pub_targets[pub_slot(n)];
     // The thread's last copy, when it is this slot's publication still (the
-    // draws of a run commit one after another): not copied again. `out` is the
-    // caller's own (lists_commit's thread-local).
+    // draws of a run commit one after another): not copied again - told by its
+    // names before the slot's hash is worked out. `out` is the caller's own
+    // (lists_commit's thread-local).
     static thread_local const PubTargets* last = nullptr;
     static thread_local std::uint64_t last_seq = 0, last_erase = 0, last_flip = 0;
     static thread_local const RunTargets* last_out = nullptr;
-    if (last == &p && last_out == &out && p.seq.load(std::memory_order_acquire) == last_seq && std::memcmp(p.names, n, sizeof(n)) == 0) {
-        if (p.seq.load(std::memory_order_acquire) == last_seq) {
+    static thread_local std::uint32_t last_names[kTargetNames] = {};
+    if (last && last_out == &out && std::memcmp(last_names, n, sizeof(n)) == 0 && last->seq.load(std::memory_order_acquire) == last_seq &&
+        std::memcmp(last->names, n, sizeof(n)) == 0) {
+        if (last->seq.load(std::memory_order_acquire) == last_seq) {
             erase_gen = last_erase;
             flip = last_flip;
             return true;
         }
     }
+    PubTargets& p = g_pub_targets[pub_slot(n)];
     t_find_why = kTwBusy;
     for (int tries = 0; tries < 4; ++tries) {
         const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
@@ -28046,6 +28080,7 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
                 last_erase = erase_gen;
                 last_flip = flip;
                 last_out = &out;
+                std::memcpy(last_names, n, sizeof(last_names));
             } else {
                 t_find_why = kTwOther;
             }
@@ -28079,20 +28114,46 @@ bool list_config_ok_locked() {
 
 }  // namespace
 
+namespace {
+// A pool thread's statistics - those its commits' draws bump (bump: into the sink) and the commits' own counts - added to
+// the totals every 64 commits (each a locked add on a line the other pool thread or the command processor writes too).
+thread_local BumpSink t_commit_sink;
+struct CommitCounts {
+    std::uint64_t looked = 0, committed = 0, ns = 0, why[kListWhys] = {};
+    std::uint32_t n = 0;
+};
+thread_local CommitCounts t_commit_counts;
+void commit_counts_flush() {
+    CommitCounts& k = t_commit_counts;
+    t_commit_sink.merge_atomic();
+    if (k.looked) g_lc_looked.fetch_add(k.looked, std::memory_order_relaxed);
+    if (k.committed) g_lc_committed.fetch_add(k.committed, std::memory_order_relaxed);
+    if (k.ns) g_lc_ns.fetch_add(k.ns, std::memory_order_relaxed);
+    for (int w = 0; w < kListWhys; ++w) {
+        if (k.why[w]) g_lc_why[w].fetch_add(k.why[w], std::memory_order_relaxed);
+    }
+    k = CommitCounts{};
+}
+}  // namespace
+
 namespace gpu {
-// A pool thread ending (gxvk_lists_pool.cpp): what its commits timed, added.
-void lists_thread_end() { commit_times_flush(t_commit_times); }
+// A pool thread ending (gxvk_lists_pool.cpp): what its commits counted, added.
+void lists_thread_end() {
+    commit_counts_flush();
+    commit_times_flush(t_commit_times);
+}
 
 void lists_commit(std::uint64_t id) {
     ListCommit* const all = list_commits();
     ListCommit& c = all[id & (kListCommits - 1)];
     const auto t0 = std::chrono::steady_clock::now();
-    g_lc_looked.fetch_add(1, std::memory_order_relaxed);
+    CommitCounts& counts = t_commit_counts;
+    ++counts.looked;
     // (A record a segment's builder is recording from is not taken: it reads its packet.)
     std::uint64_t w = c.word.load(std::memory_order_acquire);
     if (lc_state(w) == kLcCommitting || lc_state(w) == kLcBuilding ||
         !c.word.compare_exchange_strong(w, lc_word(id, kLcCommitting), std::memory_order_acq_rel)) {
-        g_lc_why[kLwBusy].fetch_add(1, std::memory_order_relaxed);
+        ++counts.why[kLwBusy];
         return;
     }
     c.id = id;
@@ -28117,10 +28178,10 @@ void lists_commit(std::uint64_t id) {
         if (pinned) hle_gx_native_unpin(id);
         pinned = false;
         c.why = why;
-        if (why < 0) g_lc_committed.fetch_add(1, std::memory_order_relaxed);
-        else g_lc_why[why].fetch_add(1, std::memory_order_relaxed);
-        g_lc_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
-                          std::memory_order_relaxed);
+        if (why < 0) ++counts.committed;
+        else ++counts.why[why];
+        counts.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (++counts.n >= 64 || t_commit_sink.nused >= BumpSink::kSlots / 2) commit_counts_flush();
         if (timed) {
             lap(kCpEnd);
             CommitTimes& t = t_commit_times;
@@ -28201,11 +28262,24 @@ void lists_commit(std::uint64_t id) {
     c.notes.clear();
     c.notes.packet_index = id & (kListCommits - 1);
     c.notes.call_flip = o.call_flip;
-    RunDraw r;
+    // The thread's own, its fields set for each draw - all but the run commit's compare digest (2 KiB), which a
+    // list-mode draw never writes or reads: one constructed for each draw spent ~0.25 us zeroing it.
+    static thread_local RunDraw r;
+    r.params_next = r.params_end = 0;
+    r.packet = r.record = 0;
     r.part = true;
+    r.started = false;
+    r.stop = -1;
+    r.part_index = 0;
+    r.effects = 0;
+    r.fresh_packet = false;
+    r.drew = nullptr;
+    r.drew_gx = false;
+    r.vs_other = nullptr;
+    r.vs_other_why = 0;
     r.list = &c.notes;
     t_part_recorded = RecordedState{};  // its packet binds everything it draws with
-    static thread_local BumpSink sink;
+    BumpSink& sink = t_commit_sink;
     t_bump_sink = &sink;
     t_list_targets = &targets;
     std::memcpy(t_list_names, c.names, sizeof(c.names));
@@ -28215,8 +28289,9 @@ void lists_commit(std::uint64_t id) {
     t_run_draw = nullptr;
     t_list_targets = nullptr;
     t_bump_sink = nullptr;
+    // The statistics its draws bumped go to the counters with the commits' own (finish: every 64 commits - a locked add
+    // a counter at every commit took ~0.25 us of it - and when the thread ends, lists_thread_end); under g.mu at once.
     if (locked) sink.merge();
-    else sink.merge_atomic();
     if (run_digest_on()) c.digest = t_run_digest;
     __builtin_ia32_sfence();  // its copies into write-combined memory leave this core first
     if (r.stop >= 0) return finish(r.stop);

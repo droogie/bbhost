@@ -219,7 +219,7 @@ void pool_main(int index) {
     host_thread_set_class(HostThreadClass::GpuFeed, name);
     if (g_times) hw_open();
     pool_main_loop(index);
-    if (g_times && splice()) gpu::lists_thread_end();  // its times added (the exit's lines come after the join)
+    if (splice()) gpu::lists_thread_end();  // its statistics merged (the exit's lines come after the join)
 }
 void pool_main_loop(int index) {
     unsigned idle = 0;
@@ -291,6 +291,11 @@ void pool_main_loop(int index) {
             continue;
         }
         if (splice()) {
+            // The slot two entries on - the other pool thread most likely takes the next - asked for while this draw
+            // is committed: a GX thread's core wrote its lines, and the copy that starts a commit waited for them.
+            const Feed& ahead = g_feed[(pos + 2) & (kFeed - 1)];
+            if (ahead.seq.load(std::memory_order_relaxed) == pos + 3 && ahead.kind.load(std::memory_order_relaxed) == detail::kFeedDraw)
+                hle_gx_native_prefetch(ahead.id.load(std::memory_order_relaxed), false);
             gpu::lists_commit(id);  // stage 4b.1b
         } else {
             look(id);

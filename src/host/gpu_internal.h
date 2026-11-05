@@ -2353,7 +2353,7 @@ void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists
 // draw committed ahead of the command processor, in its list mode, into the
 // record the command processor's splice reads (render.cpp host_gpu_splice).
 void lists_commit(std::uint64_t id);
-void lists_thread_end();  // a pool thread ending: its commits' times added to the totals (BBHOST_GXVK_LISTS_TIMES)
+void lists_thread_end();  // a pool thread ending: its commits' statistics and times added to the totals
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
 // `rec` (host/gxvk_lists_internal.h ListRec) into segments and builds each -
 // its draws' params blocks and merged notes, and with
