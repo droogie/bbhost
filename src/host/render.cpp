@@ -3603,6 +3603,19 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
         const GxDepthStencilDesc& ds = *s.gx_depth;
         f.cull_mode = no_cull ? 0u : r.cull == 1 ? VK_CULL_MODE_FRONT_BIT : r.cull == 2 ? VK_CULL_MODE_BACK_BIT : 0u;
         f.front_face = r.front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+        // A OnePass cube shadow's triangle GS (onepass_faces): drawn with no
+        // culling. With the game's culling its faces came out empty, the
+        // winding turned either way; with none each face holds what the
+        // six-pass draws put there (Kyo's clinic: coverage within 2%, mean
+        // |dM1| under 0.01 - the nearest surface wins the depth test either
+        // way). BBHOST_ONEPASS_CULL=keep: the game's culling (a test).
+        if (s.gs && s.prim != 1 && s.color[0] && s.color[0]->layers == 6) {
+            static const bool keep = [] {
+                const char* e = std::getenv("BBHOST_ONEPASS_CULL");
+                return e && std::strcmp(e, "keep") == 0;
+            }();
+            if (!keep) f.cull_mode = 0;
+        }
         f.polygon_mode = r.fill ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         f.depth_clamp = !r.depth_clip;
         f.depth_test = ds.depth_enable && s.depth && !no_depth;
@@ -13645,8 +13658,16 @@ void cross_vendor_report() {
              static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off", gcn::image_store_bounds() ? "on" : "off");
 }
 
+// OnePass cube shadows' draws given their six faces (onepass_faces_locked),
+// and those whose light block was not found (drawn with none: nothing).
+std::atomic<std::uint64_t> g_onepass_faced{0}, g_onepass_unfaced{0};
+
 void render_report() {
     cross_vendor_report();
+    if (const std::uint64_t n = g_onepass_faced.load() + g_onepass_unfaced.load())
+        host_log("render: OnePass cube shadows: %llu caster draws given their six faces, %llu without a light block found (of %llu)",
+                 static_cast<unsigned long long>(g_onepass_faced.load()), static_cast<unsigned long long>(g_onepass_unfaced.load()),
+                 static_cast<unsigned long long>(n));
     if (list_resolve::commit_compare()) ::run_compare_log();
     host_log("%s", gx_state_report().c_str());
     cb_proof::report();
@@ -22433,6 +22454,116 @@ float upscale_jitter_sign() {
 }
 bool upscale_jitter_on() { return upscale_jitter_sign() != 0.0f; }
 
+// OnePass cube shadows (the debug menu's "OnePass CubeShadow", the graphics
+// manager's +0x78b3, which BBHOST_ONEPASS=1 holds on): each caster is drawn
+// once, its GS (7c49f753's and the like) putting each triangle in the six
+// faces with the faces' view-projections it reads from constant buffer slot 0
+// - s[4:7], s_buffer_load_dwordx16 at 0x10 * face dwords, rows of four, clip
+// = M x (xyz, 1) of the ES's skinned world place - a buffer the retail game
+// never makes: with the flag set, the light's setup (0x2645320, its +0x190
+// test) makes one camera where the six-pass path makes six, and the GS stage
+// has no constant buffer at the call (shadPS4 crashes there; here the GS
+// multiplied by zeros and drew nothing). The six are made here from that one
+// camera's block, which the casters' pixel shader is given: 864 bytes, the
+// light's place at dwords 183/187/191 and its camera-relative view-projection
+// at 200-215 - a 90-degree square view along the cube's face 0, the near
+// plane in row 2. The six-pass path's faces are the standard D3D cube's about
+// that camera's axes (right e_r, up e_u, forward e_f: +X = e_f, +Y = e_u,
+// +Z = -e_r), each made absolute (x T(-L)) for world places: measured against
+// the six-pass draws' own blocks in Kyo's clinic (BBHOST_CUBE_MATS, four
+// lamps, every face) to within 1e-4.
+
+// A pixel shader's light block: a V# of 864 bytes in its user data, or in the
+// table its s[2:3] points at, whose view-projection is a 90-degree square view.
+// Its V#'s words in `vsharp`; the block's address, or 0.
+static std::uint64_t onepass_light_block(const std::uint32_t* u, std::uint32_t vsharp[4]) {
+    const auto block = [&](const std::uint32_t* w) -> std::uint64_t {
+        if ((w[3] & 0xfff) != 0xfac || !w[2] || std::uint64_t{w[2]} * std::max<std::uint32_t>(1, (w[1] >> 16) & 0x3fff) != 216 * 4) return 0;
+        const std::uint64_t base = static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32);
+        if (!base || (base & 3) || !hle_kernel_va_mapped(base, 216 * 4)) return 0;
+        const float* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
+        const auto unit = [&](int row) {
+            const float* r = f + 200 + 4 * row;
+            return std::fabs(r[0] * r[0] + r[1] * r[1] + r[2] * r[2] - 1.0f) < 2e-3f;
+        };
+        if (!unit(0) || !unit(1) || !unit(3)) return 0;
+        std::memcpy(vsharp, w, 4 * sizeof(std::uint32_t));
+        return base;
+    };
+    for (int k = 0; k + 3 < 16; ++k) {
+        if (const std::uint64_t b = block(u + k)) return b;
+    }
+    const std::uint64_t table = static_cast<std::uint64_t>(u[2]) | (static_cast<std::uint64_t>(u[3] & 0xffff) << 32);
+    if (table && !(table & 3) && hle_kernel_va_mapped(table, 8 * 16)) {
+        const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(table));
+        for (int e = 0; e < 8; ++e) {
+            if (const std::uint64_t b = block(w + 4 * e)) return b;
+        }
+    }
+    return 0;
+}
+
+// The six faces' view-projections from a light block, rows of four.
+static void onepass_faces(const float* f, float out[6][16]) {
+    const float L[3] = {f[183], f[187], f[191]};
+    const float* r0 = f + 200;
+    const float* r1 = f + 204;
+    const float* r2 = f + 208;
+    const float* r3 = f + 212;
+    const float p00 = std::sqrt(r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2]);
+    const float p11 = std::sqrt(r1[0] * r1[0] + r1[1] * r1[1] + r1[2] * r1[2]);
+    const float axes[3][3] = {{r0[0] / p00, r0[1] / p00, r0[2] / p00}, {r1[0] / p11, r1[1] / p11, r1[2] / p11}, {r3[0], r3[1], r3[2]}};
+    const float za = r2[0] * r3[0] + r2[1] * r3[1] + r2[2] * r3[2];  // z = za * w + zb
+    // Each face's right, up and forward as a signed axis (1 e_r, 2 e_u, 3 e_f).
+    static constexpr int kFace[6][3] = {{1, 2, 3}, {-1, 2, -3}, {3, 1, 2}, {3, -1, -2}, {3, 2, -1}, {-3, 2, 1}};
+    for (int face = 0; face < 6; ++face) {
+        float v[3][3];
+        for (int k = 0; k < 3; ++k) {
+            const int a = kFace[face][k];
+            const float sign = a < 0 ? -1.0f : 1.0f;
+            for (int c = 0; c < 3; ++c) v[k][c] = sign * axes[std::abs(a) - 1][c];
+        }
+        const auto at = [&](const float* d) { return -(d[0] * L[0] + d[1] * L[1] + d[2] * L[2]); };
+        float* m = out[face];
+        for (int c = 0; c < 3; ++c) {
+            m[c] = p00 * v[0][c];
+            m[4 + c] = p11 * v[1][c];
+            m[8 + c] = za * v[2][c];
+            m[12 + c] = v[2][c];
+        }
+        m[3] = p00 * at(v[0]) + r0[3];
+        m[7] = p11 * at(v[1]) + r1[3];
+        m[11] = za * at(v[2]) + r2[3];
+        m[15] = at(v[2]) + r3[3];
+    }
+    // BBHOST_ONEPASS_MAP=<units> (a test): face 0 a map from above of the
+    // places the ES gives, that many units around the light (x right, z down).
+    static const float map = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_MAP");
+        return e ? static_cast<float>(std::atof(e)) : 0.0f;
+    }();
+    if (map < 0.0f) {  // =-1: with BBHOST_GS_DEBUG=1, face f's w the ES's component f / 2 (negated on odd faces)
+        for (int face = 0; face < 6; ++face) {
+            float* m = out[face];
+            for (int k = 0; k < 16; ++k) m[k] = 0.0f;
+            m[11] = 0.5f;
+            // faces: x, the constant 1 (the pixel shader's scale), y, z, 2, -1
+            static constexpr float kRow3[6][4] = {{1, 0, 0, 0}, {0, 0, 0, 1}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 2}, {0, 0, 0, -1}};
+            for (int c = 0; c < 4; ++c) m[12 + c] = kRow3[face][c];
+        }
+    }
+    if (map > 0.0f) {
+        float* m = out[0];
+        for (int k = 0; k < 16; ++k) m[k] = 0.0f;
+        m[0] = 1.0f / map;
+        m[3] = -L[0] / map;
+        m[6] = 1.0f / map;
+        m[7] = -L[2] / map;
+        m[11] = 0.5f;
+        m[15] = 1.0f;
+    }
+}
+
 void publish_run_targets_locked(const RunTargets& m);  // stage 4b.1b (below)
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
@@ -24271,7 +24402,110 @@ static bool draw_impl(const GpuDraw& d) {
                 }
             }
         }
-        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
+        // OnePass cube shadows (onepass_faces, above): a GS drawing into a
+        // cube's six faces that reads a V# from the s[4:7] the game left empty
+        // takes the six faces' view-projections, made from its pixel shader's
+        // light block and placed in the host ring.
+        // Its buffers are then resolved from the user data: GX's binding plan
+        // would take slot 0 from the records, where it is empty.
+        bool onepass_given = false;
+        if (st == 0 && s.gs && s.color[0] && s.color[0]->layers == 6 && !user_skipped[st] &&
+            !(params.user_sgpr[4] | params.user_sgpr[5] | params.user_sgpr[6] | params.user_sgpr[7])) {
+            bool reads = false;
+            for (const gcn::BufferBinding& b : meta.buffers) reads |= b.path.user_sgpr == 4 && b.path.loads.empty() && !b.pointer;
+            if (reads) {
+                std::uint32_t pu[16];
+                std::memcpy(pu, s.ps_user, sizeof(pu));
+                if (gx_stage[1]) {
+                    static thread_local GxUserData pn;
+                    if (build_gx_user_data(*gx_stage[1], pn, ~0u) == kUserBuilt) {
+                        for (int k = 0; k < 16; ++k) {
+                            if ((pn.set >> k) & 1) pu[k] = pn.user[k];
+                        }
+                    }
+                }
+                std::uint32_t lv[4] = {};
+                const std::uint64_t block = onepass_light_block(pu, lv);
+                float faces[6][16];
+                std::uint64_t va = 0;
+                if (block) {
+                    onepass_faces(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(block)), faces);
+                    va = gx_ring_place(reinterpret_cast<const std::uint8_t*>(faces), sizeof(faces), 256);
+                }
+                if (va) {
+                    params.user_sgpr[4] = static_cast<std::uint32_t>(va);
+                    params.user_sgpr[5] = static_cast<std::uint32_t>((va >> 32) & 0xff) | (16u << 16);  // records of 16 bytes
+                    params.user_sgpr[6] = sizeof(faces) / 16;
+                    params.user_sgpr[7] = lv[3];  // the block's selects and format
+                    onepass_given = true;
+                    g_onepass_faced.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_onepass_unfaced.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        // BBHOST_CUBE_MATS=<flip> (a test): from that flip, for two flips, the
+        // draws into a cube's faces: each stage's user data, and behind each V#
+        // in it or in a table it points at, the floats a cube caster's view
+        // block holds (dwords 180-191: the camera's place, 200-215: its
+        // camera-relative view-projection) or a short buffer's first 16.
+        static const std::uint64_t cube_mats = [] {
+            const char* e = std::getenv("BBHOST_CUBE_MATS");
+            return e ? std::strtoull(e, nullptr, 10) : 0ull;
+        }();
+        if (cube_mats && st < 2 && s.color[0] && s.color[0]->layers == 6) {
+            const std::uint64_t flip = hle_video_flip_count();
+            static std::atomic<int> logs{0};
+            if (flip >= cube_mats && flip < cube_mats + 2 && logs.fetch_add(1, std::memory_order_relaxed) < 900) {
+                char cl[6000];
+                int cn = std::snprintf(cl, sizeof(cl), "cube mats: flip %llu %s%s st %d into 0x%llx layer %u n %u:", static_cast<unsigned long long>(flip),
+                                       pl.name.c_str(), s.gs ? " (GS)" : "", st, static_cast<unsigned long long>(s.color[0]->base), s.color_layer[0],
+                                       d.index_count);
+                const std::uint32_t* u = params.user_sgpr;
+                const auto vsharp = [&](const std::uint32_t* w, const char* tag, int k) {
+                    if ((w[3] & 0xfff) != 0xfac || !w[2]) return;
+                    if (w[2] * std::max<std::uint32_t>(1, (w[1] >> 16) & 0x3fff) != 216 * 4) return;  // view blocks only
+                    const std::uint64_t base = static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32);
+                    const std::uint32_t bytes = w[2] * std::max<std::uint32_t>(1, (w[1] >> 16) & 0x3fff);
+                    if (!base || cn > static_cast<int>(sizeof(cl)) - 400) return;
+                    const bool view = bytes >= 216 * 4 && hle_kernel_va_mapped(base, 216 * 4);
+                    if (!view && !hle_kernel_va_mapped(base, 64)) return;
+                    const float* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
+                    cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " | %s%d %llx %uB:", tag, k,
+                                        static_cast<unsigned long long>(base), bytes);
+                    if (view) {
+                        for (int x = 180; x < 192; ++x) cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " %.7g", static_cast<double>(f[x]));
+                        cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " /");
+                        for (int x = 200; x < 216; ++x) cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " %.7g", static_cast<double>(f[x]));
+                    } else {
+                        for (int x = 0; x < 16; ++x) cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " %.7g", static_cast<double>(f[x]));
+                    }
+                };
+                for (int k = 0; k + 3 < 16; ++k) {
+                    if ((u[k + 3] & 0xfff) == 0xfac && u[k + 2]) {
+                        vsharp(u + k, "s", k);
+                        k += 3;
+                    }
+                }
+                for (int k = 0; k + 1 < 16; k += 2) {  // a table's first eight V#s
+                    const std::uint64_t t = static_cast<std::uint64_t>(u[k]) | (static_cast<std::uint64_t>(u[k + 1] & 0xffff) << 32);
+                    if (t < 0x100000000ull || (t & 3) || !hle_kernel_va_mapped(t, 8 * 16)) continue;
+                    const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t));
+                    for (int e = 0; e < 8; ++e) {
+                        char tag[16];
+                        std::snprintf(tag, sizeof tag, "t%d.", k);
+                        vsharp(w + 4 * e, tag, e);
+                    }
+                }
+                if (st == 0 && s.gs) {
+                    cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " | ES user:");
+                    for (int k = 0; k < 16 && cn < static_cast<int>(sizeof(cl)) - 16; ++k)
+                        cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " %08x", in.vs_user[k]);
+                }
+                host_log("%s", cl);
+            }
+        }
+        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, onepass_given ? nullptr : gx_stage[st], cb_exact_bindings(), nullptr,
                               gate || camera || velo ? gate_bases : nullptr);
         if (camera) {
             for (std::size_t i = 0; i < meta.buffers.size() && !camera_draw; ++i)

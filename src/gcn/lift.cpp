@@ -4912,11 +4912,21 @@ private:
     };
     std::map<Id, RingWord> ring_words;
     std::size_t ring_descriptors = 0;
+    // An ES that reads its mesh through a fetch shader has the fetch's address
+    // in s[0:1] (s_swappc writes its return there) and the table in a later
+    // user-data pair: the OnePass cube shadows' ESs load the ESGS write ring
+    // through s[4:5]. An ES's table is any user-data pair still holding its
+    // value (with vertex input only: a particle ES's table stays s[0:1]); a
+    // GS's is s[0:1].
     bool ring_descriptor_load(const Inst& in) {
-        if (in.op != 2 || !in.imm_flag || in.src0 != 0) return false;  // s_load_dwordx4 s[n:n+3], s[0:1], imm
+        if (in.op != 2 || !in.imm_flag) return false;  // s_load_dwordx4 s[n:n+3], s[base:base+1], imm
+        if (gs_es() && !opt.vertex_input.empty() ? (in.src0 % 2 || in.src0 >= 16) : in.src0 != 0) return false;
         const std::uint8_t ring = gs_es() ? (in.imm == 8 ? kRingEsgsWrite : 0) : (in.imm == 12 ? kRingEsgsRead : in.imm == 16 ? kRingGsvsWrite : 0);
         if (!ring) return false;
-        if (peek(0, in).id != initial_value(0).id || peek(1, in).id != initial_value(1).id) {
+        const int base = in.src0;
+        if (gs_es() && base != 0 && (peek(base, in).id != initial_value(base).id || peek(base + 1, in).id != initial_value(base + 1).id))
+            return false;  // not the user data's table
+        if (peek(base, in).id != initial_value(base).id || peek(base + 1, in).id != initial_value(base + 1).id) {
             reject("a ring's V# loaded through s[0:1] after the program wrote them (not the user data's table)");
             return true;
         }
