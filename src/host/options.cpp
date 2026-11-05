@@ -116,6 +116,7 @@ enum SettingId {
     kBloom,
     kVignette,
     kShadowDistance,
+    kDynamicShadows,
     kAoStrength,
     kSaturation,
     kFog,
@@ -319,6 +320,13 @@ Setting g_set[kSettingCount] = {
     {"shadow_distance", "Shadow distance",
      {"x1.0", "x1.2", "x1.4", "x1.6", "x1.8", "x2.0", "x2.2", "x2.4", "x2.6", "x2.8", "x3.0"}, 0,
      "How far the sun and moon cast shadows. Farther spreads each shadow map wider.", false},
+    // The dynamic lights' shadows (the scene context's +0x296e, which its
+    // constructor sets): off clears it each view (engine/graphics_patch.cpp).
+    // Was Kyo's patches/disable-dynamic-light-shadow.toml: a bbhost.toml that
+    // turned it on seeds Off (host_options_load).
+    {"dynamic_shadows", "Dynamic light shadows", {"Off", "On"}, 1,
+     "Shadows cast by lamps, torches, fire and other lights that move or flicker. Off is faster. Changes at once.",
+     false},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
     {"ao_strength", "AO strength", hundred(), 50,
@@ -579,6 +587,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSharpness},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kShadowDistance},
+    {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kAoStrength},
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
@@ -1183,6 +1192,7 @@ void rebuild_settings() {
     h.fog = static_cast<float>(index_of(kFog)) / 100.0f;
     h.ao_strength = static_cast<float>(index_of(kAoStrength)) / 50.0f;
     h.shadow_scale = 1.0f + 0.2f * static_cast<float>(index_of(kShadowDistance));
+    h.dynamic_shadows = on_of(kDynamicShadows);
     {
         static constexpr int kBias[] = {-2, 0, 1, 2};
         const int i = index_of(kModelDetail);
@@ -1279,6 +1289,9 @@ void host_options_load() {
     // a bbhost.toml that turned it on keeps them on until the player chooses.
     if (const std::string v = config_value("patches.screen-space-reflections"); !v.empty())
         g_set[kSsr].index = v == "false" || v == "0" ? 0 : 1;
+    // So was Disable Dynamic Light Shadows.
+    if (const std::string v = config_value("patches.disable-dynamic-light-shadow"); !v.empty())
+        g_set[kDynamicShadows].index = v == "false" || v == "0" ? 1 : 0;
     // So were the HD Motion Blur patches, each at one size: the one a
     // bbhost.toml turned on becomes HD motion blur at the share nearest it
     // (360p a quarter of 1440p, 1080p and up the full size).

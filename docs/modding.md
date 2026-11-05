@@ -301,7 +301,6 @@ wants one keeps its file in their own patches folder.
 |---|---|
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
 | `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
-| `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |

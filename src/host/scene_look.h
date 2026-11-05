@@ -22,7 +22,8 @@ void scene_look_set_nearest(bool on);
 bool scene_look_nearest();
 
 // The 3D at a size of its own, nearest up to the window's (scene_scale):
-// `lines` high, 0 the Resolution.
+// `lines` high, 0 the Resolution. Not while an upscaler is chosen and there
+// (upscaler_method): FSR or DLSS then brings the 3D up from its own size.
 void scene_look_set_scale(bool nearest, std::uint32_t lines);
 bool scene_look_scale(std::uint32_t* lines = nullptr);
 

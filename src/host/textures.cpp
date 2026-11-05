@@ -3035,9 +3035,9 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
 // By the folder the texture was loaded from (engine/texture_origin.h): the
 // areas' (map/) and the armour's and weapons' (parts/) every 2D texture and
 // array with the levels to spare, whatever its format and size; the effects'
-// (sfx/) the same by SFX texture quality; the menus' and the colour grading
-// tables never; the rest (chr/, obj/, decals, what no file names) only
-// block-compressed and never below kQualityFloor texels on the longer side -
+// (sfx/) the same by SFX texture quality; the menus', the colour grading
+// tables and the areas' baked lighting and shadows (gi_env: *_gi_*) never;
+// the rest (chr/, obj/, decals, what no file names) only block-compressed and never below kQualityFloor texels on the longer side -
 // what a shader reads texel by texel there (lookup tables, atlases) is
 // uncompressed or a single level. None made as something the GPU draws or
 // stores into (a GX resource bound as a target, depth or UAV; a T# bound for
@@ -3094,7 +3094,8 @@ std::uint32_t quality_drop(std::uint64_t base, std::uint32_t block, std::uint32_
             floor = 1;
             break;
         case kOriginMenu:
-        case kOriginGrading: return 0;
+        case kOriginGrading:
+        case kOriginLighting: return 0;
         default:
             if (block != 4) return 0;
             break;

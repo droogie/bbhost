@@ -13,6 +13,7 @@ enum GxTextureOrigin : std::uint8_t {
     kOriginSfx,          // sfx/: the effects' textures
     kOriginMenu,         // menu/ and MENU_*: the menus and the HUD, never scaled
     kOriginGrading,      // the areas' colour grading tables (mNN_cgrading.tpf), never scaled
+    kOriginLighting,     // the areas' baked lighting and shadows (gi_env_mNN: *_gi_*), never scaled
     kOriginOther,        // the rest: chr/, obj/, other/ (decals), ...
     kOriginCount
 };

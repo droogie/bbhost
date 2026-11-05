@@ -270,7 +270,9 @@ Manifest performance_mode_manifest() {
 // Performance Patch v3 (Velomap + Camera Blur, Decals On) from his shadPS4
 // list, site for site, which were patches/performance-v3-velomap.toml and,
 // without the velocity map, performance-v3-decals-on.toml - less the camera
-// blur's force (0x26c265d 00 -> 01): the Motion blur setting decides it. The
+// blur's force (0x26c265d 00 -> 01): the Motion blur setting decides it - and
+// its model level bias's (0x216fc09, the mesh draw's read of it made -2,
+// Full): the Model detail setting decides it (graphics_patch.cpp). The
 // velocity map stays, at 640x360 (0x26c3de4/0x26c3df0), with motion blur's
 // half and quarter depth at 640x360 and 320x180 (0x125b1a3/0x125b1d6, which
 // Screen space reflections puts back at the game's sizes when it is on). A
@@ -285,7 +287,7 @@ Manifest performance_manifest() {
     m.name = "performance";
     m.title = "Performance patch";
     m.eboot = kEboot109Sha256;
-    m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's force";
+    m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's and model detail's forces";
     m.order = 21;
     m.sites = {
 #include "engine/performance_v3_sites.inc"
@@ -399,23 +401,27 @@ Manifest hd_motion_blur_manifest() {
     m.order = 9100;
     // How far each is shifted down: the velocity map and the half depth by
     // 2, 1 or 0 (a quarter, half, full), the quarter depth one more.
-    const std::uint8_t shift = static_cast<std::uint8_t>(2 - std::clamp(host_settings().hd_motion_blur_res, 0, 2));
+    // While a plugin's look draws the 3D small, a share of it near half the
+    // window's height (render_scale_blur_shift): a negative shift is one left.
+    const int shift = render_scale_blur_shift(2 - std::clamp(host_settings().hd_motion_blur_res, 0, 2));
+    const auto op = [](int k) { return static_cast<std::uint8_t>(k < 0 ? 0xf0 : 0xd0); };  // vpslld / vpsrld xmm0, xmm0, n
+    const auto by = [](int k) { return static_cast<std::uint8_t>(k < 0 ? -k : k); };
     auto site = [&](const char* id, std::uint64_t at, std::vector<std::uint8_t> expect, std::vector<std::uint8_t> bytes) {
         bytes.resize(expect.size(), 0x90);
         m.sites.push_back(Site{id, at, std::move(expect), std::move(bytes), true, {}});
     };
-    // vmovq xmm0, [r15]; vpsrld xmm0, xmm0, n; vmovq [rsp+0x200], xmm0
+    // vmovq xmm0, [r15]; vpsrld (vpslld) xmm0, xmm0, n; vmovq [rsp+0x200], xmm0
     site("velomap-size", 0x026c3de4,
          {0x41, 0x8b, 0x07, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00, 0x41,
           0x8b, 0x47, 0x04, 0xd1, 0xe8, 0x89, 0x84, 0x24, 0x04, 0x02, 0x00, 0x00},
-         {0xc4, 0xc1, 0x7a, 0x7e, 0x07, 0xc5, 0xf9, 0x72, 0xd0, shift, 0xc5, 0xf9, 0xd6, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00});
+         {0xc4, 0xc1, 0x7a, 0x7e, 0x07, 0xc5, 0xf9, 0x72, op(shift), by(shift), 0xc5, 0xf9, 0xd6, 0x84, 0x24, 0x00, 0x02, 0x00, 0x00});
     // vmovq xmm0, [rbx]; vpsrld xmm0, xmm0, n; vmovq [rsp], xmm0
     site("depth-half-size", 0x0125b1a3,
          {0x8b, 0x03, 0xd1, 0xe8, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xd1, 0xe8, 0x89, 0x44, 0x24, 0x04},
-         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, shift, 0xc5, 0xf9, 0xd6, 0x04, 0x24});
+         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, op(shift), by(shift), 0xc5, 0xf9, 0xd6, 0x04, 0x24});
     site("depth-quarter-size", 0x0125b1d6,
          {0x8b, 0x03, 0xc1, 0xe8, 0x02, 0x89, 0x04, 0x24, 0x8b, 0x43, 0x04, 0xc1, 0xe8, 0x02, 0x89, 0x44, 0x24, 0x04},
-         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, 0xd0, static_cast<std::uint8_t>(shift + 1), 0xc5, 0xf9, 0xd6, 0x04, 0x24});
+         {0xc5, 0xfa, 0x7e, 0x03, 0xc5, 0xf9, 0x72, op(shift + 1), by(shift + 1), 0xc5, 0xf9, 0xd6, 0x04, 0x24});
     site("camera-blur", 0x026c265d, {0x00}, {0x01});  // mov byte [rbx+0x2a10], 0 -> 1
     return m;
 }
@@ -610,13 +616,15 @@ std::vector<Manifest> built_in_manifests() {
 // variants and the uncapped field of view are the Graphics page's Screen
 // space reflections, the built-in performance patch and the Field of view
 // setting, the HD Motion Blur patches are HD motion blur, Unlock Game Region
-// is all-languages without its online cost, and the Intel Black Tonemap Fix's
-// six bytes are the performance patch's own (always on). A
+// is all-languages without its online cost, the Intel Black Tonemap Fix's
+// six bytes are the performance patch's own (always on), and Disable Dynamic
+// Light Shadows is the Dynamic light shadows setting. A
 // package unpacked over an older one still has them in its patches folder;
 // they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
     return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
-           file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml";
+           file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml" ||
+           file == "disable-dynamic-light-shadow.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.

@@ -3,7 +3,6 @@
 #include "bbhost_version.h"
 #include "core/config.h"
 #include "host/settings.h"
-#include "host/scene_look.h"
 #include "log.h"
 
 #if defined(_WIN32)
@@ -141,9 +140,7 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 }  // namespace
 
 int upscaler_method() {
-    // A plugin's 3D at a size of its own is brought up nearest (host/scene_look.h):
-    // no upscale, jitter, mip bias or sharpening.
-    if (scene_look_scale()) return 0;
+    // Chosen, it wins over a plugin's 3D at a size of its own (host/scene_look.h).
     static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
         if (!e || !*e) return -1;

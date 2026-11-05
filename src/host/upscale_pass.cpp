@@ -1173,6 +1173,13 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     RenderScale rs;
     const bool scaled = method && render_scale_on(&rs) && scene.width == rs.render_w && scene.height == rs.render_h &&
                         (rs.output_w != rs.render_w || rs.output_h != rs.render_h);
+    // A smaller 3D with no quality is a plugin's look the upscaler has just
+    // taken over (host/scene_look.h): its frames until the rebuild to the
+    // quality's size are left as drawn - the bridge refuses them.
+    if (scaled && !rs.quality) {
+        g_skipped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     // A picture that goes back into the scene: by a copy, or a blit into
     // another format. One that stays here (render scale) needs neither.
     const bool same_format = scene.format == VK_FORMAT_R16G16B16A16_SFLOAT;

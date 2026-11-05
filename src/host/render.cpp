@@ -9,6 +9,7 @@
 #include "engine/gx_state.h"
 #include "engine/loading.h"
 #include "engine/render_scale.h"
+#include "engine/texture_origin.h"
 #include "host/clip_control.h"
 #include "host/copy_census.h"
 #include "host/full_write.h"
@@ -22232,10 +22233,12 @@ bool grading_table(const std::uint32_t* t) {
 // vertex stage's drive its animation, and stay smooth):
 //   - the 3D's textures nearest (scene_look_nearest): a camera draw's
 //     samplers, for the textures they sample - a block-compressed one always
-//     a texture, else any image that is not a render target. A target of
-//     another size than the draw's (the SSAO, a shadow mask, a blur's half)
-//     keeps the sampler's filter; one of the draw's own size, read texel for
-//     texel, is the same either way;
+//     a texture, else any image that is not in a render target's memory. A
+//     target of another size than the draw's (the SSAO, a shadow mask, a
+//     blur's half) or a slice or level inside one (the shadow maps) keeps the
+//     sampler's filter, as do the area's baked lighting and shadows (the
+//     gi_env textures, engine/texture_origin.h); a target of the draw's own
+//     size, read texel for texel, is the same either way;
 //   - the colour grading's table (grading_table) nearest in its pass
 //     (scene_look_grading_nearest: the PS1 Look's 8-bit colour); without it
 //     smooth, as the game samples it;
@@ -22264,11 +22267,15 @@ bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
             if (copy && image_base(im) == g_upscale.scene) nearest = true;
             if (camera) {
                 const std::uint32_t dfmt = (im.w[1] >> 20) & 0x3f;
-                const RtImage* rt = dfmt >= 35 && dfmt <= 41 ? nullptr : find_render_target(image_base(im));
-                if (!rt) {
+                const std::uint64_t base = image_base(im);
+                const RtImage* rt = dfmt >= 35 && dfmt <= 41 ? nullptr : find_render_target(base);
+                GxResourceInfo r;
+                if (!rt && gx_resource_at(base, 1, &r) && r.origin == kOriginLighting) {
+                    keep = true;  // the area's baked lighting and shadows (gi_env), smooth
+                } else if (!rt && (dfmt >= 35 && dfmt <= 41 || !rt_overlapping_locked(base, 1))) {
                     nearest = true;
-                } else if (!s.color[0] || rt->width != s.color[0]->width || rt->height != s.color[0]->height) {
-                    keep = true;
+                } else if (!rt || !s.color[0] || rt->width != s.color[0]->width || rt->height != s.color[0]->height) {
+                    keep = true;  // a slice or level of a target (a shadow map's), or a target of another size
                 }
             }
         }

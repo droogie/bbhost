@@ -1,6 +1,8 @@
 // The 3D's look a plugin asks for (host/scene_look.h).
 #include "host/scene_look.h"
 
+#include "host/upscaler.h"
+
 #include <atomic>
 #include <cmath>
 
@@ -46,7 +48,8 @@ void scene_look_set_scale(bool nearest, std::uint32_t lines) {
     if (was != nearest || was_lines != (nearest ? lines : 0)) targets_changed();
 }
 bool scene_look_scale(std::uint32_t* lines) {
-    const bool on = g_scale.load(std::memory_order_acquire);
+    // An upscaler chosen and there takes the 3D's size, the plugin's yields.
+    const bool on = g_scale.load(std::memory_order_acquire) && !upscaler_method();
     if (lines) *lines = on ? g_scale_lines.load(std::memory_order_acquire) : 0;
     return on;
 }

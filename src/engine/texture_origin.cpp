@@ -11,7 +11,8 @@
 // back from the TPF and finding the TPF among its files; a TPF of its own is
 // placed by its first texture's name: a map tpfbhd names each of the areas'
 // textures, the menus' begin MENU_, the colour grading tables are mNN_..._
-// CGrading. A TPF's textures are made one after another, so the last few
+// CGrading. A texture's own name (its entry in the TPF) then says whether it
+// is baked lighting or a grading table, whatever pack holds it. A TPF's textures are made one after another, so the last few
 // TPFs found are kept and the next texture is looked for in them first.
 #include "engine/texture_origin.h"
 
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -118,6 +120,44 @@ std::string tpf_name(std::uint64_t t) {
         i = k;
     }
     return {};
+}
+
+// The name of the TPF at `t`'s texture whose texels start at `texels`, or "":
+// the PS4's entries (0x24 bytes each after the 0x10 header) hold the data's
+// offset from the TPF at +0 and the name's at +0x18.
+std::string tpf_entry_name(std::uint64_t t, std::uint64_t texels) {
+    std::uint8_t h[0x10];
+    if (!read(t, h, sizeof(h)) || h[12] != 4 || texels <= t || texels - t > 0xffffffffull) return {};
+    std::uint32_t count = 0;
+    std::memcpy(&count, h + 8, 4);
+    if (!count || count > 8192) return {};
+    std::vector<std::uint8_t> e(static_cast<std::size_t>(count) * 0x24);
+    if (!read(t + 0x10, e.data(), e.size())) return {};
+    const std::uint32_t at = static_cast<std::uint32_t>(texels - t);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uint32_t off = 0, name = 0;
+        std::memcpy(&off, e.data() + i * 0x24, 4);
+        std::memcpy(&name, e.data() + i * 0x24 + 0x18, 4);
+        if (off == at) return name ? wide_at(t + name, 128) : std::string{};
+    }
+    return {};
+}
+
+// What a texture's own name says over its pack's origin: baked lighting
+// (the gi_env packs' *_gi_*, their atlases and their _l lower levels) and
+// grading tables are never scaled, wherever they lie.
+// BBHOST_TEXTURE_ORIGIN_LOG=1 logs each texture's name and origin.
+GxTextureOrigin by_own_name(const std::string& name, GxTextureOrigin pack) {
+    const std::string n = lower(name);
+    GxTextureOrigin o = pack;
+    if (n.find("cgrading") != std::string::npos) o = kOriginGrading;
+    else if (n.find("_gi_") != std::string::npos || n.rfind("gi_", 0) == 0 || n.find("lightmap") != std::string::npos) o = kOriginLighting;
+    static const bool log = [] {
+        const char* e = std::getenv("BBHOST_TEXTURE_ORIGIN_LOG");
+        return e && *e == '1';
+    }();
+    if (log) host_log("texture-origin: %s -> %s", name.empty() ? "(no name)" : name.c_str(), texture_origin_name(o));
+    return o;
 }
 
 // A BND4's file table: its headers (from +0x40, fileHeaderSize each, the
@@ -266,7 +306,7 @@ GxTextureOrigin texture_origin_of(std::uint64_t texels) {
     if (!texels) return kOriginUnknown;
     g_textures.fetch_add(1, std::memory_order_relaxed);
     for (const Known& k : t_known) {
-        if (texels >= k.lo && texels < k.hi) return k.origin;
+        if (texels >= k.lo && texels < k.hi) return by_own_name(tpf_entry_name(k.lo, texels), k.origin);
     }
     const auto t0 = std::chrono::steady_clock::now();
     struct Timed {
@@ -299,7 +339,7 @@ GxTextureOrigin texture_origin_of(std::uint64_t texels) {
     g_phase_us[2].fetch_add(us_from(tp));
     t_known[t_next++ & 3] = Known{t, end, origin};
     g_packs.fetch_add(1, std::memory_order_relaxed);
-    return origin;
+    return by_own_name(tpf_entry_name(t, texels), origin);
 }
 
 void texture_origin_prepare() {
@@ -315,6 +355,6 @@ void texture_origin_stats(std::uint64_t* textures, std::uint64_t* packs, std::ui
 }
 
 const char* texture_origin_name(std::uint8_t origin) {
-    static const char* const kNames[kOriginCount] = {"unknown", "map", "parts", "sfx", "menu", "grading", "other"};
+    static const char* const kNames[kOriginCount] = {"unknown", "map", "parts", "sfx", "menu", "grading", "lighting", "other"};
     return origin < kOriginCount ? kNames[origin] : "?";
 }

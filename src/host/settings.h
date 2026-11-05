@@ -83,6 +83,7 @@ struct HostSettings {
     int texture_quality = 0;
     int sfx_texture_quality = 0;  // the same for the effects' textures (sfx/)
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
+    bool dynamic_shadows = true;  // the dynamic lights' shadows (graphics_patch.cpp, +0x296e)
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;

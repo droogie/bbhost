@@ -109,6 +109,13 @@ constexpr std::uint64_t kBlurCapability = 0x420;
 // it is cleared every view - the targets stay until the next start.
 constexpr std::size_t kSsrFlag = 0x2974;
 std::atomic<bool> g_ssr_off{false};
+// The dynamic lights' shadows (+0x296e, the constructor's first flag; Kyo's
+// Disable Dynamic Light Shadows patch zeroed its immediate): with Dynamic
+// light shadows off cleared every view, on given back to the renderers it
+// was cleared on (the render thread alone).
+constexpr std::size_t kDynamicShadowFlag = 0x296e;
+std::atomic<bool> g_dyn_shadows_off{false};
+std::uint8_t* g_dyn_cleared[16] = {};
 // Bumped when the SSAO, AA, motion or HD motion blur settings change: each
 // renderer is given the values once a generation (render_view_hook). 0: never
 // changed - the game's.
@@ -447,6 +454,7 @@ void settings_changed(const HostSettings& hs) {
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
     g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
+    g_dyn_shadows_off.store(!hs.dynamic_shadows, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
     // Rebuilt motion vectors hold what the blur cannot read: it goes too.
@@ -1245,6 +1253,18 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     // Screen space reflections off: every view, as a rebuild of the targets
     // (a Resolution change) sets the switch again.
     if (r && g_ssr_off.load(std::memory_order_relaxed)) r[kSsrFlag] = 0;
+    if (r) {
+        const bool off = g_dyn_shadows_off.load(std::memory_order_relaxed);
+        std::uint8_t** slot = nullptr;
+        for (std::uint8_t*& c : g_dyn_cleared) slot = c == r ? &c : !slot && !c ? &c : slot;
+        if (off) {
+            r[kDynamicShadowFlag] = 0;
+            if (slot && !*slot) *slot = r;
+        } else if (slot && *slot == r) {
+            r[kDynamicShadowFlag] = 1;
+            *slot = nullptr;
+        }
+    }
     // The velocity map, while an upscaler or frame generation takes motion
     // from it: on every view, whatever turned it off in between - the debug
     // menu's sgScene motion blur switch is the same byte. The upscaler learns

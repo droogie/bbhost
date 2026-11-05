@@ -60,3 +60,10 @@ void render_scale_flip(std::uint64_t flip);
 // The 3D is drawn at a render size smaller than the output now: the sizes in
 // *out when given.
 bool render_scale_on(RenderScale* out = nullptr);
+
+// HD motion blur's share of the 3D for its velocity map and depth (`shift`
+// right: 2 a quarter, 1 half, 0 full) while a plugin's look draws the 3D
+// smaller than the window (host/scene_look.h): the share of a power of two
+// nearest half the window's height when the asked one is below that -
+// negative a shift left, a map larger than the 3D. `shift` itself otherwise.
+int render_scale_blur_shift(int shift);

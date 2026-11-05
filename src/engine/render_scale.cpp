@@ -461,7 +461,7 @@ void settings_changed(const HostSettings& s) {
     }
     bool runs = false;
     if (scene_look_scale()) {
-        runs = false;  // a plugin's 3D size: no upscaler (host/upscaler.cpp)
+        runs = false;  // a plugin's 3D size: no upscaler chosen and there (host/scene_look.cpp)
     } else if (std::getenv("BBHOST_UPSCALE")) {
         runs = upscaler_method() != 0;
     } else {
@@ -571,6 +571,19 @@ void render_scale_gx_init(std::uint32_t display_w, std::uint32_t display_h, std:
     scene_look_on_targets_change(&look_changed);
 }
 
+int render_scale_blur_shift(int shift) {
+    RenderScale rs;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        rs = g_now;
+    }
+    if (!rs.output_w) render_scale_plan(&rs);
+    if (!scene_look_scale() || !rs.render_h || rs.render_h >= rs.output_h) return shift;
+    const std::uint32_t floor_h = rs.output_h / 2;
+    if ((rs.render_h >> shift) >= floor_h) return shift;
+    return std::min(shift, static_cast<int>(std::lround(std::log2(static_cast<double>(rs.render_h) / floor_h))));
+}
+
 bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip,
                            RenderScale* before, RenderScale* after) {
     if (!g_image) return false;
@@ -585,6 +598,18 @@ bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::
     write_values(rs);
     choose_back_buffer(rs, display_w, display_h, flip);
     publish(rs);
+    // HD motion blur's sizes follow the plugin's look's 3D (render_scale_blur_shift):
+    // its bytes made again before the targets are.
+    static int blur_shift = 99;
+    const int hd = std::clamp(host_settings_ref().hd_motion_blur_res, 0, 2);
+    if (const int k = render_scale_blur_shift(2 - hd); host_settings_ref().hd_motion_blur && k != blur_shift) {
+        if (blur_shift != 99 || k != 2 - hd) {
+            bool changed = false;
+            std::string why;
+            patch_manifest_refresh_live("hd-motion-blur", true, &changed, &why);
+        }
+        blur_shift = k;
+    }
     if (before) *before = was;
     if (after) *after = rs;
     const bool scaled = rs.render_w != rs.output_w || rs.render_h != rs.output_h;
