@@ -12428,7 +12428,11 @@ void velo_cloth_twin_locked(VertexInputPlan& p, const std::string& vs_name, cons
     const std::uint32_t b = at[0].binding;
     VkBuffer buffer = p.buffer[b];
     VkDeviceSize offset = p.offset[b];
-    const std::uint64_t va = p.va[b], bytes = p.bytes[b];
+    const std::uint64_t va = p.va[b];
+    std::uint64_t bytes = p.bytes[b];
+    // Up to the draw's last vertex's record (plan_vertex_input leaves the binding's whole extent).
+    if (std::int64_t last = 0; bytes && draw_last_vertex(last) && last >= 0)
+        bytes = std::min<std::uint64_t>(bytes, (static_cast<std::uint64_t>(last) + 1) * p.bindings[b].stride);
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 8)
         host_log("upscaler: cloth velocity draw %s: binding %u at 0x%llx, %llu bytes, stride %u", vs_name.c_str(), b,
@@ -17635,10 +17639,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
-        if (std::int64_t last = 0; draw_last_vertex(last) && last >= 0)
-            ends[e] = va + std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
-        else
-            ends[e] = va + need;
+        // Its records' whole extent: the cloth's twin (velo_cloth_twin_locked,
+        // its only reader) cuts it at the draw's last vertex itself. Worked
+        // out here for every draw, the highest index's read (draw_last_vertex)
+        // went through each draw's whole index buffer - 0.84 -> 3.96 us a draw
+        // in the command processor's "programs and vertex input", the burning
+        // Hunter's Dream command-processor bound at ~110 fps against 0.2.25's
+        // ~140 GPU-bound.
+        ends[e] = va + need;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
         int handle_result = -1;            // stage 1b's for the record (the import census)
         if (handles) {
