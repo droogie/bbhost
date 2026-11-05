@@ -26266,6 +26266,10 @@ void splice_compare_locked(const ListCommit& c) {
 
 }  // namespace
 
+namespace {
+bool segment_release_member(std::uint64_t id);  // (stage 4b.2, below)
+}  // namespace
+
 // The command processor at GX-native draw token `id` (gnm_exec.cpp), its slot
 // taken: true when the pool's commit of its draw was spliced into the stream -
 // the draw is done; false when it is to be drawn in order (counted by why).
@@ -26284,11 +26288,13 @@ bool host_gpu_splice(std::uint64_t id) {
         g_sp_why[lc_id(cw) != id && gxvk_lists::resting() ? kSwRested : kSwPending].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (st == kLcBuilding || st == kLcSegment) {
+    std::uint64_t cw_now = cw;
+    if (st == kLcSegment && segment_release_member(id)) cw_now = c.word.load(std::memory_order_acquire);  // (its segment given up)
+    if (lc_id(cw_now) != id || lc_state(cw_now) == kLcBuilding || lc_state(cw_now) == kLcSegment) {
         g_sp_why[kSwSegment].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (st != kLcCommitted) {
+    if (lc_state(cw_now) != kLcCommitted) {
         g_sp_why[kSwNotCommitted].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -26379,7 +26385,7 @@ bool host_gpu_splice(std::uint64_t id) {
     }
     // Spliced: its params into this recording's slots, its packet into the stream. Taken from a segment's builder
     // (stage 4b.2), which may want it too.
-    if (std::uint64_t want = cw; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
+    if (std::uint64_t want = cw_now; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
     if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
     begin_recording_locked();
     // (Stage 4b.2 without maintenance7: a pass begun for segments holds no inline draw - begun again for it.)
@@ -26907,11 +26913,13 @@ enum SegFall : int {
     kSfOther,        // windows given, a run commit, a diagnostic, the configuration
     kSfCompare,      // segments-compare: drawn in order by design
     kSfOff,          // BBHOST_GXVK_SEGMENTS_SPLICE=0
+    kSfPassed,       // ready only once the walk had passed its first member: given back at a later one, spliced per draw
     kSegFalls
 };
 const char* const kSegFallName[kSegFalls] = {"stream",  "record lost", "too old",  "a run's first", "a split",   "run generations",
                                              "other targets", "another pass", "a hazard", "an owed clear", "a view", "a set",
-                                             "a home",  "an arena",     "occlusion", "other",        "compare",  "off"};
+                                             "a home",  "an arena",     "occlusion", "other",        "compare",  "off",
+                                             "met past its first"};
 
 std::atomic<std::uint64_t> g_sg_lists{0}, g_sg_draws{0}, g_sg_not[kSegNots] = {};
 std::atomic<std::uint64_t> g_sg_made{0}, g_sg_members{0}, g_sg_record_ns{0}, g_sg_by_len[8] = {};
@@ -27145,11 +27153,14 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
             if (!found) sg.vs_other.push_back({c.vs_other, c.vs_other_why, 1});
         }
     }
-    // Ready: the first member names it, its members held for it.
-    ListCommit& c0 = all[sg.ids[0] & (kListCommits - 1)];
+    // Ready: its members name it (the first, for the splice at its token; the others, for a splice that meets them
+    // past it), its members held for it.
     const std::uint64_t ready = sg_word(sg.gen, kSgReady);
-    c0.seg = &sg;
-    c0.seg_word = ready;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        ListCommit& cm = all[sg.ids[k] & (kListCommits - 1)];
+        cm.seg = &sg;
+        cm.seg_word = ready;
+    }
     sg.ready_flip = hle_video_flip_count();
     for (std::uint32_t k = 0; k < n; ++k) {
         all[sg.ids[k] & (kListCommits - 1)].word.store(lc_word(sg.ids[k], kLcSegment), std::memory_order_release);
@@ -27207,6 +27218,25 @@ void segment_drop(Segment& sg, bool members_back) {
         }
     }
     sg.word.store(sg_word(sg.gen, kSgDropped), std::memory_order_release);
+}
+
+// The command processor at token `id`, a member of a ready segment it did not
+// splice at its first token (made ready after the walk passed it, or passed
+// over at it): the segment given up, its members back to their own splices -
+// this one's first - rather than all of them drawn in order. False when the
+// segment is not ready (being built, or taken).
+bool segment_release_member(std::uint64_t id) {
+    ListCommit* const all = g_list_commits;
+    if (!all) return false;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    Segment* const sg = c.seg;
+    if (!sg) return false;
+    std::uint64_t want = c.seg_word;
+    if (sg_state(want) != kSgReady || !sg->word.compare_exchange_strong(want, sg_word(sg->gen, kSgTaken), std::memory_order_acq_rel)) return false;
+    g_sg_fall[kSfPassed].fetch_add(1, std::memory_order_relaxed);
+    g_sg_fall_draws.fetch_add(sg->count, std::memory_order_relaxed);
+    segment_drop(*sg, true);
+    return true;
 }
 
 }  // namespace
