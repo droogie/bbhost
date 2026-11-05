@@ -121,6 +121,7 @@ enum SettingId {
     kFog,
     kModelDetail,
     kTextureQuality,
+    kSfxTextureQuality,
     kSsr,
     kHdMotionBlur,
     kHdMotionBlurRes,
@@ -336,12 +337,21 @@ Setting g_set[kSettingCount] = {
     // The textures' size in video memory (host/textures.cpp quality_drop):
     // each texture's top mip levels left out of its image, its own smaller
     // levels in their place - High none (1.0x), Medium one (0.5x), Low two
-    // (0.25x), Lowest three (0.125x: mip levels halve, so no 0.10x). Live: a texture is made again at its next use.
+    // (0.25x), Lowest three (0.125x: mip levels halve, so no 0.10x). Live: a
+    // texture is made again at its next use.
     {"texture_quality", "Texture quality", {"Lowest", "Low", "Medium", "High"}, 3,
      "The size of the game's textures in video memory. High is the game's own. Medium halves each texture's width and height "
-     "(a quarter of the memory), Low quarters them (a sixteenth), Lowest takes them to an eighth, with the textures' own smaller mip levels in their place: less video memory and "
-     "bandwidth, for graphics cards short of either, and a softer picture. No texture goes below 256 on its longer side, and "
-     "the smaller ones stay as they are. Changes at once: each texture is made again the next time it is drawn.",
+     "(a quarter of the memory), Low quarters them (a sixteenth), Lowest takes them to an eighth, with the textures' own "
+     "smaller mip levels in their place: less video memory and bandwidth, for graphics cards short of either, and a softer "
+     "picture. Every texture of the areas and of the armour and weapons is scaled; the rest stay at least 256 on their longer "
+     "side. The menus and the colour grading never change, and the effects follow SFX texture quality. Changes at once: "
+     "each texture is made again the next time it is drawn.",
+     false},
+    // The same for the effects' textures (sfx/: fire, blood, magic, smoke),
+    // apart from the rest (host/textures.cpp quality_drop).
+    {"sfx_texture_quality", "SFX texture quality", {"Lowest", "Low", "Medium", "High"}, 3,
+     "The size of the effects' textures - fire, blood, magic, smoke - in video memory, apart from Texture quality: High is the "
+     "game's own, Medium half each way, Low a quarter, Lowest an eighth. Changes at once.",
      false},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
@@ -360,13 +370,17 @@ Setting g_set[kSettingCount] = {
     // starts. A bbhost.toml that turned one of the old files on seeds it
     // (host_options_load).
     {"hd_motion_blur", "HD motion blur", {"Off", "On"}, 0,
-     "Motion blur's velocity map and the depth it blurs with at the HD motion blur resolution "
+     "Motion blur's velocity map and the depth it blurs with at the HD motion blur quality "
      "below instead of a fixed 640x360, with the camera's own blur on: cleaner, steadier blur. Costs GPU time and "
      "video memory, more the larger. Shows only with Motion blur on. Changes at once.",
      false},
-    {"hd_motion_blur_res", "HD motion blur resolution", {"Quarter", "Half", "Full"}, 2,
-     "HD motion blur's velocity map against the render resolution: Quarter, Half (the game's own "
-     "size) or Full. It follows the render resolution, Resolution and upscaling both. Changes at once.",
+    // Its entries were Quarter, Half and Full until 2026-11-05 (an options
+    // file's read as Low, Medium and High: host_options_load); greyed while HD
+    // motion blur is off (host_options_draw_page).
+    {"hd_motion_blur_res", "HD motion blur quality", {"Low", "Medium", "High"}, 2,
+     "HD motion blur's velocity map against the render resolution: Low a quarter of it each way, Medium half (the game's "
+     "own size), High all of it. It follows the render resolution, Resolution and upscaling both. Needs HD motion blur on. "
+     "Changes at once.",
      false},
     // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
     // picture in place of the game's after the 3D, before the post effects.
@@ -544,6 +558,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRightStickOuter},
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kTextureQuality},
+    {Row::Option, nullptr, kSfxTextureQuality},
     {Row::Option, nullptr, kSsao},
     {Row::Option, nullptr, kMotionBlur},
     {Row::Option, nullptr, kHdMotionBlur},
@@ -988,7 +1003,8 @@ void apply(int id) {
         case kLeftStickOuter:
         case kRightStickInner:
         case kRightStickOuter:
-        case kTextureQuality:  // the textures follow it at the next submission (host/textures.cpp)
+        case kTextureQuality:  // the textures follow them at the next submission (host/textures.cpp)
+        case kSfxTextureQuality:
             break;  // the settings object carries them (host/settings.h)
         case kSsao:
         case kMotionBlur:
@@ -1173,6 +1189,7 @@ void rebuild_settings() {
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
     h.texture_quality = 3 - std::clamp(index_of(kTextureQuality), 0, 3);  // the levels left out: High none, Lowest three
+    h.sfx_texture_quality = 3 - std::clamp(index_of(kSfxTextureQuality), 0, 3);
     h.ssr = on_of(kSsr);
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
@@ -1385,6 +1402,8 @@ void host_options_load() {
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
             if (key == "window_mode") window_mode_val = val;
+            // HD motion blur quality's were Quarter, Half and Full until 2026-11-05.
+            if (key == "hd_motion_blur_res") val = val == "Quarter" ? "Low" : val == "Half" ? "Medium" : val == "Full" ? "High" : val;
             // Texture quality's entries were 1.0x, 0.5x and 0.25x until 2026-11-05.
             if (key == "texture_quality") val = val == "1.0x" ? "High" : val == "0.5x" ? "Medium" : val == "0.25x" ? "Low" : val;
             // Display-Limited was called Uncapped until 2026-10-28.
@@ -1689,9 +1708,9 @@ const char* const* value_tips(int id, bool dlss) {
         "M: made for Performance.",
     };
     static const char* const kHdBlurTips[] = {
-        "Quarter: a quarter of the render size each way. The cheapest, the coarsest blur.",
-        "Half: half the render size each way, the game's own size.",
-        "Full: the render size itself. The cleanest blur, the dearest.",
+        "Low: a quarter of the render size each way. The cheapest, the coarsest blur.",
+        "Medium: half the render size each way, the game's own size.",
+        "High: the render size itself. The cleanest blur, the dearest.",
     };
     static const char* const kTextureTips[] = {
         "Lowest: textures at an eighth of their width and height (0.125x), a sixty-fourth of the video memory - a 1024x2048 texture is 128x256.",
@@ -1704,7 +1723,8 @@ const char* const* value_tips(int id, bool dlss) {
         case kUpscaleQuality: return dlss ? kDlssTips : kFsrTips;
         case kDlssPreset: return kPresetTips;
         case kHdMotionBlurRes: return kHdBlurTips;
-        case kTextureQuality: return kTextureTips;
+        case kTextureQuality:
+        case kSfxTextureQuality: return kTextureTips;
         default: return nullptr;
     }
 }
@@ -1965,13 +1985,17 @@ const char* upscaler_note() {
 
 // Rows that only mean something under another setting, left out while it is
 // off: the upscaler's preset with Upscaling off, the motion vectors with
-// Upscaling and Frame generation both off, HD motion blur's resolution with
-// HD motion blur off.
+// Upscaling and Frame generation both off. (HD motion blur quality is greyed
+// with HD motion blur off instead: row_greyed.)
 bool row_hidden(int id) {
     if (id == kDlssPreset) return shown_index(kUpscaler) == 0;
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
-    if (id == kHdMotionBlurRes) return !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
     return false;
+}
+
+// Rows shown but not to be changed while the setting they need is off.
+bool row_greyed(int id) {
+    return id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
 }
 
 void host_options_draw_page(int page) {
@@ -1987,9 +2011,12 @@ void host_options_draw_page(int page) {
         if (row_hidden(g_rows[r].setting)) continue;
         if (!first) row_rule();
         first = false;
+        const bool greyed = row_greyed(g_rows[r].setting);
+        if (greyed) ImGui::BeginDisabled();
         if (g_rows[r].setting == kDlssPreset) preset_row();
         else if (g_rows[r].setting == kUpscaler) setting_row(kUpscaler, nullptr, upscaler_note());
         else setting_row(g_rows[r].setting);
+        if (greyed) ImGui::EndDisabled();
         ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
     }
     ui::card_end();

@@ -14,6 +14,7 @@
 #include "core/image_file.h"
 #include "core/portable.h"
 #include "engine/gx_resources.h"
+#include "engine/texture_origin.h"
 #include "host/gxvk.h"
 
 #include "core/write_watch.h"
@@ -2524,7 +2525,7 @@ void refresh_surface_locked(Surface& sf) {
 std::atomic<std::uint64_t> g_surface_carries{0};
 
 bool carry_surface_locked(Surface& dst, const Surface& src) {
-    if (!src.gpu_written || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
+    if (!src.gpu_written || src.drop || dst.drop || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
         dst.thick || dst.levels.empty() || src.levels.empty() || dst.info.arrayLayers > src.info.arrayLayers) {
         return false;
     }
@@ -2773,7 +2774,7 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
     const Surface* owner = nullptr;
     std::uint32_t level = 0;
     auto consider = [&](const Surface& o) {
-        if (owner || !o.gpu_written || o.failed || !o.image || o.thick || o.block != 1 || o.esize != esize || o.type == 10 ||
+        if (owner || !o.gpu_written || o.drop || o.failed || !o.image || o.thick || o.block != 1 || o.esize != esize || o.type == 10 ||
             o.base >= base || o.base + o.total_src <= base) {
             return;
         }
@@ -3031,29 +3032,39 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
 // levels - already in its memory - in their place: 0 at High (1.0x), 1 at
 // Medium (0.5x: a 1024x2048 texture is 512x1024, a quarter of the video
 // memory), 2 at Low (0.25x), 3 at Lowest (0.125x).
-// Only block-compressed 2D textures and arrays with the levels to spare, made
-// as nothing the GPU draws or stores into (a GX resource bound as a target,
-// depth or UAV never is; nor a T# bound for stores, or one in g_full_size),
-// and never below kQualityFloor texels on the longer side: the small ones are
-// a sliver of the memory. What a shader reads texel by texel - lookup tables,
-// the font and the menus' atlases, the targets - is uncompressed or a single
-// level, and stays as it is. Nor cubes: the reflection probes are read at a
+// By the folder the texture was loaded from (engine/texture_origin.h): the
+// areas' (map/) and the armour's and weapons' (parts/) every 2D texture and
+// array with the levels to spare, whatever its format and size; the effects'
+// (sfx/) the same by SFX texture quality; the menus' and the colour grading
+// tables never; the rest (chr/, obj/, decals, what no file names) only
+// block-compressed and never below kQualityFloor texels on the longer side -
+// what a shader reads texel by texel there (lookup tables, atlases) is
+// uncompressed or a single level. None made as something the GPU draws or
+// stores into (a GX resource bound as a target, depth or UAV; a T# bound for
+// stores; one in g_full_size). Nor cubes: the reflection probes are read at a
 // level the surface's roughness picks, and one without its first level would
 // make every reflection a level blurrier.
-// BBHOST_TEXTURE_QUALITY=1.0|0.5|0.25|0.125 wins over the setting.
+// BBHOST_TEXTURE_QUALITY=1.0|0.5|0.25|0.125 wins over the setting, and
+// BBHOST_SFX_TEXTURE_QUALITY over SFX texture quality.
 namespace {
 constexpr std::uint32_t kQualityFloor = 256;
 std::uint32_t g_quality_drop = 0;  // the setting's, under g.mu (textures_follow_quality_locked)
+std::uint32_t g_sfx_quality_drop = 0;  // SFX texture quality's
 std::uint64_t g_quality_surfaces = 0, g_quality_saved = 0, g_quality_full = 0;  // made reduced, the untiled bytes they left out; made full size again
 
+int quality_forced(const char* name) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return -1;
+    const double scale = std::strtod(e, nullptr);
+    return scale <= 0.125 ? 3 : scale <= 0.25 ? 2 : scale <= 0.5 ? 1 : 0;
+}
 std::uint32_t quality_wanted() {
-    static const int forced = [] {
-        const char* e = std::getenv("BBHOST_TEXTURE_QUALITY");
-        if (!e || !*e) return -1;
-        const double scale = std::strtod(e, nullptr);
-        return scale <= 0.125 ? 3 : scale <= 0.25 ? 2 : scale <= 0.5 ? 1 : 0;
-    }();
+    static const int forced = quality_forced("BBHOST_TEXTURE_QUALITY");
     return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().texture_quality, 0, 3));
+}
+std::uint32_t sfx_quality_wanted() {
+    static const int forced = quality_forced("BBHOST_SFX_TEXTURE_QUALITY");
+    return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().sfx_texture_quality, 0, 3));
 }
 
 // The resources (by memory, with their generation) whose texture is made at
@@ -3070,12 +3081,26 @@ std::uint64_t resource_gen_at(std::uint64_t base) {
 
 std::uint32_t quality_drop(std::uint64_t base, std::uint32_t block, std::uint32_t type, std::uint32_t tiling, std::uint32_t width,
                            std::uint32_t height, std::uint32_t nlevels, bool storage) {
-    if (!g_quality_drop || storage || block != 4 || tiling == 19 || (type != 9 && type != 13)) return 0;
-    const std::uint32_t d = texture_quality::levels_dropped(g_quality_drop, width, height, nlevels, kQualityFloor);
-    if (!d) return 0;
+    if ((!g_quality_drop && !g_sfx_quality_drop) || storage || tiling == 19 || (type != 9 && type != 13) || nlevels < 2) return 0;
     GxResourceInfo r;
     const bool registered = gx_resource_at(base, 1, &r);
     if (registered && (r.bind & 0xe0) != 0) return 0;
+    std::uint32_t want = g_quality_drop, floor = kQualityFloor;
+    switch (registered ? r.origin : kOriginUnknown) {
+        case kOriginMap:
+        case kOriginParts: floor = 1; break;
+        case kOriginSfx:
+            want = g_sfx_quality_drop;
+            floor = 1;
+            break;
+        case kOriginMenu:
+        case kOriginGrading: return 0;
+        default:
+            if (block != 4) return 0;
+            break;
+    }
+    const std::uint32_t d = texture_quality::levels_dropped(want, width, height, nlevels, floor);
+    if (!d) return 0;
     if (const auto f = g_full_size.find(base); f != g_full_size.end() && f->second == (registered ? r.gen : 0)) return 0;
     return d;
 }
@@ -3083,7 +3108,7 @@ std::uint32_t quality_drop(std::uint64_t base, std::uint32_t block, std::uint32_
 // The texture at `base` made at full size from here on (g_full_size): its
 // next lookup makes it again so if its image is a reduced one.
 void texture_full_size_locked(std::uint64_t base) {
-    if (!g_quality_drop) {
+    if (!g_quality_drop && !g_sfx_quality_drop) {
         // Nothing is made reduced now; one made before the setting changed
         // goes at its next lookup anyway.
         auto it = g_surfaces.find(base);
@@ -3100,14 +3125,15 @@ void texture_full_size_locked(std::uint64_t base) {
 // keeps its image.
 bool g_quality_started = false;
 void textures_follow_quality_locked() {
-    const std::uint32_t want = quality_wanted();
-    if (g_quality_started && want == g_quality_drop) return;
+    const std::uint32_t want = quality_wanted(), sfx = sfx_quality_wanted();
+    if (g_quality_started && want == g_quality_drop && sfx == g_sfx_quality_drop) return;
     static const char* const kName[] = {"High (1.0x)", "Medium (0.5x)", "Low (0.25x)", "Lowest (0.125x)"};
-    const std::uint32_t was = g_quality_drop;
+    const std::uint32_t was = g_quality_drop, sfx_was = g_sfx_quality_drop;
     g_quality_drop = want;
+    g_sfx_quality_drop = sfx;
     if (!g_quality_started) {
         g_quality_started = true;
-        if (want) host_log("texture: texture quality %s", kName[want]);
+        if (want || sfx) host_log("texture: texture quality %s, SFX %s", kName[want], kName[sfx]);
         return;
     }
     std::uint64_t n = 0, freed = 0;
@@ -3126,7 +3152,8 @@ void textures_follow_quality_locked() {
         note_surface_erased(sf);
         it = g_surfaces.erase(it);
     }
-    host_log("texture: texture quality %s (was %s): %llu textures let go (%llu MiB), each made again at its next use", kName[want], kName[was],
+    host_log("texture: texture quality %s (was %s), SFX %s (was %s): %llu textures let go (%llu MiB), each made again at its next use", kName[want],
+             kName[was], kName[sfx], kName[sfx_was],
              static_cast<unsigned long long>(n), static_cast<unsigned long long>(freed >> 20));
     bump_view_epoch();
 }
@@ -4791,7 +4818,7 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end()) return false;
     const Surface& sf = it->second;
-    if (!sf.gpu_written || sf.failed || !sf.image || sf.block != 1 || sf.esize != bytes_per_pixel || sf.width != width ||
+    if (!sf.gpu_written || sf.drop || sf.failed || !sf.image || sf.block != 1 || sf.esize != bytes_per_pixel || sf.width != width ||
         sf.height != height || sf.type == 10 || sf.thick) {
         return false;
     }
@@ -6729,7 +6756,12 @@ void textures_report() {
              static_cast<unsigned long long>(g_region_out_of_range.load()));
     {
         std::uint64_t now_reduced = 0, now_saved = 0;
+        std::uint64_t by_origin[kOriginCount][2] = {};  // surfaces of each origin, and of them reduced
         for (const auto& [base, sf] : g_surfaces) {
+            GxResourceInfo r;
+            const std::uint8_t o = gx_resource_at(base, 1, &r) && r.origin < kOriginCount ? r.origin : 0;
+            ++by_origin[o][0];
+            if (sf.drop) ++by_origin[o][1];
             if (!sf.drop) continue;
             ++now_reduced;
             for (std::uint32_t l = 0; l < sf.drop; ++l) now_saved += sf.levels[l].dst_slice_bytes * sf.slices;
@@ -6739,6 +6771,17 @@ void textures_report() {
                  g_quality_drop == 3 ? "Lowest (0.125x)" : g_quality_drop == 2 ? "Low (0.25x)" : g_quality_drop == 1 ? "Medium (0.5x)" : "High (1.0x)", static_cast<unsigned long long>(g_quality_surfaces),
                  static_cast<unsigned long long>(g_quality_saved >> 20), static_cast<unsigned long long>(g_quality_full),
                  static_cast<unsigned long long>(now_reduced), static_cast<unsigned long long>(now_saved >> 20), g_full_size.size());
+        std::string by;
+        for (int o = 0; o < kOriginCount; ++o) {
+            char b[64];
+            std::snprintf(b, sizeof(b), " %s %llu (%llu reduced)", texture_origin_name(static_cast<std::uint8_t>(o)),
+                          static_cast<unsigned long long>(by_origin[o][0]), static_cast<unsigned long long>(by_origin[o][1]));
+            by += b;
+        }
+        std::uint64_t placed = 0, packs = 0, us = 0;
+        texture_origin_stats(&placed, &packs, &us);
+        host_log("texture: textures by the folder they came from:%s; %llu placed (%llu TPFs looked up, %.1f ms in all)", by.c_str(),
+                 static_cast<unsigned long long>(placed), static_cast<unsigned long long>(packs), us / 1000.0);
     }
     host_log("texture: copy-image tokens' sides by their resources: their own target %llu, their own surface %llu, a dead resource's target "
              "taken (made over it without data) %llu, another resource's target not used %llu, no generation %llu; binds of a view whose "

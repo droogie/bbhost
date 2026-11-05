@@ -371,7 +371,7 @@ Manifest ssr_manifest() {
 // hd-motion-blur, HD motion blur (graphics.hd_motion_blur): Kyo's HD Motion
 // Blur patches (360p, 1080p, 1440p, 4K - patches/hd-motion-blur-*.toml until
 // now), each of which set motion blur's buffers to one fixed size, made a
-// share of the render size instead (HD motion blur resolution: a quarter,
+// share of the render size instead (HD motion blur quality: a quarter,
 // half - the game's own - or full). The three are where the game halves or
 // quarters the scene's size for them: the velocity map (0x26c3de4, the
 // scene context's target at +0xce0: `mov eax, [r15]; shr eax, 1` and the

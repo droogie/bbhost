@@ -81,6 +81,7 @@ struct HostSettings {
     // half each way (Medium, 0.5x), 2 a quarter (Low, 0.25x), 3 an eighth
     // (Lowest, 0.125x). Followed live.
     int texture_quality = 0;
+    int sfx_texture_quality = 0;  // the same for the effects' textures (sfx/)
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.

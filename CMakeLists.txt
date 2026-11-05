@@ -106,6 +106,7 @@ add_executable(bbhost
   src/engine/patch_manifest.cpp
   src/engine/patch_manifest_file.cpp
   src/engine/gx_resources.cpp
+  src/engine/texture_origin.cpp
   src/engine/gx_state.cpp
   src/engine/params.cpp
   src/engine/paramdef.cpp
