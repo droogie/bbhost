@@ -26,6 +26,10 @@ ub_context* g_ctx = nullptr;
 bool g_attached = false;
 std::mutex g_caps_mu;
 UpscalerCaps g_caps;  // under g_caps_mu
+// Its two methods' availability, read at every draw (upscaler_method) without
+// the lock or a copy of the caps' four strings: the copy's allocations and the
+// lock's contention between the run parts were ~4% of the command processor.
+std::atomic<bool> g_caps_dlss{false}, g_caps_fsr{false};
 
 void UB_CALL bridge_log(void*, int32_t level, const char* line) {
     host_log("upscaler: %s%s", level == UB_LOG_ERROR ? "error: " : level == UB_LOG_WARNING ? "warning: " : "", line);
@@ -128,6 +132,8 @@ void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device
              c.fsr || !caps.fsr_reason[0] ? "" : (std::string(" (") + caps.fsr_reason + ")").c_str());
     std::lock_guard<std::mutex> lk(g_caps_mu);
     g_caps = c;
+    g_caps_dlss.store(c.dlss, std::memory_order_relaxed);
+    g_caps_fsr.store(c.fsr, std::memory_order_relaxed);
 }
 
 UpscalerCaps upscaler_caps() {
@@ -150,8 +156,7 @@ int upscaler_method() {
     const int setting = host_settings_ref().upscaler;
     const int asked = env >= 0 ? env : setting == 3 ? 2 : setting;
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
-    const UpscalerCaps c = upscaler_caps();
-    return (asked == 1 && c.dlss) || (asked == 2 && c.fsr) ? asked : 0;
+    return (asked == 1 && g_caps_dlss.load(std::memory_order_relaxed)) || (asked == 2 && g_caps_fsr.load(std::memory_order_relaxed)) ? asked : 0;
 }
 
 void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
