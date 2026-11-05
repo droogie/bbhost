@@ -450,6 +450,7 @@ struct GfxPipeline {
     std::uint32_t relink_vertex_formats[16] = {};
     VkPolygonMode relink_polygon = VK_POLYGON_MODE_FILL;
     bool relink_clamp = false;
+    bool relink_gl_clip = false;
     bool relink_discard = false;
     // Made with rasterizer discard dynamic (GfxFixedState::rasterizer_discard):
     // a draw sets it on after binding the pipeline.
@@ -3184,7 +3185,7 @@ struct ClipCensus {
     std::atomic<std::uint64_t> clip_disable{0}, near_off{0}, far_off{0}, clamp_changed{0}, gl_space{0}, ucp{0}, kill{0}, gx_kill{0};
     std::atomic<bool> names_full{false};
     std::mutex mu;
-    std::set<std::string> clamp_names, kill_names;  // under mu
+    std::set<std::string> clamp_names, kill_names, gl_names;  // under mu
 } g_clip_census;
 void clip_control_census(const DrawState& s, const std::string& name) {
     const std::uint32_t c = s.clip_cntl;
@@ -3192,7 +3193,8 @@ void clip_control_census(const DrawState& s, const std::string& name) {
         if (g_clip_census.names_full.load(std::memory_order_relaxed)) return;
         std::lock_guard<std::mutex> lk(g_clip_census.mu);
         if (names.size() < 12) names.insert(name);
-        if (g_clip_census.clamp_names.size() >= 12 && g_clip_census.kill_names.size() >= 12) g_clip_census.names_full = true;
+        if (g_clip_census.clamp_names.size() >= 12 && g_clip_census.kill_names.size() >= 12 && g_clip_census.gl_names.size() >= 12)
+            g_clip_census.names_full = true;
     };
     if (s.gx_raster && s.gx_depth) {
         if (c & kDxRasterizationKill) {
@@ -3205,7 +3207,10 @@ void clip_control_census(const DrawState& s, const std::string& name) {
     if (c & kClipDisable) g_clip_census.clip_disable.fetch_add(1, std::memory_order_relaxed);
     if (c & kZclipNearDisable) g_clip_census.near_off.fetch_add(1, std::memory_order_relaxed);
     if (c & kZclipFarDisable) g_clip_census.far_off.fetch_add(1, std::memory_order_relaxed);
-    if (!(c & kDxClipSpaceDef)) g_clip_census.gl_space.fetch_add(1, std::memory_order_relaxed);
+    if (!(c & kDxClipSpaceDef)) {
+        g_clip_census.gl_space.fetch_add(1, std::memory_order_relaxed);
+        note(g_clip_census.gl_names);
+    }
     if (c & 0x3fu) g_clip_census.ucp.fetch_add(1, std::memory_order_relaxed);
     if (c & kDxRasterizationKill) {
         g_clip_census.kill.fetch_add(1, std::memory_order_relaxed);
@@ -3220,19 +3225,21 @@ std::string clip_control_report() {
     const ClipCensus& c = g_clip_census;
     const auto n = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load()); };
     if (!n(c.clip_disable) && !n(c.near_off) && !n(c.far_off) && !n(c.gl_space) && !n(c.ucp) && !n(c.kill) && !n(c.gx_kill)) return {};
-    std::string clamp, kill;
+    std::string clamp, kill, gl;
     {
         std::lock_guard<std::mutex> lk(g_clip_census.mu);
         for (const std::string& name : g_clip_census.clamp_names) clamp += " " + name;
         for (const std::string& name : g_clip_census.kill_names) kill += " " + name;
+        for (const std::string& name : g_clip_census.gl_names) gl += " " + name;
     }
-    char buf[640];
+    char buf[1024];
     std::snprintf(buf, sizeof(buf),
                   "clip control (PA_CL_CLIP_CNTL; BBHOST_CLIP_CONTROL %s): register-path draws with CLIP_DISABLE %llu, ZCLIP_NEAR_DISABLE %llu, "
-                  "ZCLIP_FAR_DISABLE %llu, DX_RASTERIZATION_KILL %llu, GL clip space %llu, user clip planes %llu (the last two not read); depth clamp "
-                  "changed by the z bits %llu; GX-described draws with DX_RASTERIZATION_KILL %llu. Clamp changed for:%s; killed:%s",
-                  g_clip_control ? "on" : "off", n(c.clip_disable), n(c.near_off), n(c.far_off), n(c.kill), n(c.gl_space), n(c.ucp),
-                  n(c.clamp_changed), n(c.gx_kill), clamp.empty() ? " none" : clamp.c_str(), kill.empty() ? " none" : kill.c_str());
+                  "ZCLIP_FAR_DISABLE %llu, DX_RASTERIZATION_KILL %llu, GL clip space %llu (%s), user clip planes %llu (not read); depth clamp "
+                  "changed by the z bits %llu; GX-described draws with DX_RASTERIZATION_KILL %llu. Clamp changed for:%s; killed:%s; GL clip space:%s",
+                  g_clip_control ? "on" : "off", n(c.clip_disable), n(c.near_off), n(c.far_off), n(c.kill), n(c.gl_space),
+                  g.has_depth_clip_control ? "clipped at -w" : "clipped at 0, as D3D's", n(c.ucp), n(c.clamp_changed), n(c.gx_kill),
+                  clamp.empty() ? " none" : clamp.c_str(), kill.empty() ? " none" : kill.c_str(), gl.empty() ? " none" : gl.c_str());
     return buf;
 }
 
@@ -3569,6 +3576,19 @@ bool format_blends(VkFormat format) {
     return blends;
 }
 
+// A register-path draw in GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF
+// clear): the hardware clips z at -w, the near end of a projection made for
+// [-1, 1]. Clipped at 0 as D3D's clip space is - Vulkan's - the near part of
+// the depth range was lost: the point lights' cube shadows (their casters
+// draw in GL's clip space) had nothing nearer the light than about a quarter
+// of its range, and a hunter beside a lamp cast his legs' shadows and not his
+// body's (Kyo: "look how skinny those legs are"). With
+// VK_EXT_depth_clip_control the pipeline takes [-1, 1] (gl_clip_space) and
+// the draw its viewport's depth range from both ends (draw_impl).
+bool gl_clip_space_draw(const DrawState& s) {
+    return g.has_depth_clip_control && !(s.gx_raster && s.gx_depth) && !(s.clip_cntl & kDxClipSpaceDef);
+}
+
 void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     f.topology = s.topo;
     const ClipControlState clip = clip_control_state(s.clip_cntl, g_clip_control);
@@ -3614,6 +3634,7 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     // PA_CL_CLIP_CNTL: z not clipped (CLIP_DISABLE, ZCLIP_NEAR_DISABLE or
     // ZCLIP_FAR_DISABLE) is depth clamp (host/clip_control.h).
     f.depth_clamp = clip.depth_clamp;
+    f.gl_clip_space = gl_clip_space_draw(s);
     const std::uint32_t dc = s.depth_control;
     f.depth_test = (dc & 2) && s.depth && !no_depth;
     f.depth_write = (dc & 4) && s.depth;
@@ -5498,6 +5519,10 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
     h.clip_discard = pl.clip_discard;
     h.raster_discard = f.rasterizer_discard ? 1u : 0u;
     std::uint64_t k = fnv1a(&h, sizeof(h), 0x9b9e7ac0ffee0001ull);
+    if (f.gl_clip_space) {  // (mixed in only when set: every other pipeline's key as before)
+        const std::uint32_t one = 1;
+        k = fnv1a(&one, sizeof(one), k ^ 0x61c1000000000000ull);
+    }
     k = fnv1a(f.blends.data(), f.blends.size() * sizeof(VkPipelineColorBlendAttachmentState), k);
     k = fnv1a(f.color_formats.data(), f.color_formats.size() * sizeof(VkFormat), k);
     const VkFormat ds[2] = {f.depth_format, f.stencil_format};
@@ -5785,6 +5810,7 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
     std::copy(pre->relink_vertex_formats, pre->relink_vertex_formats + 16, pl.relink_vertex_formats);
     pl.relink_polygon = pre->relink_polygon;
     pl.relink_clamp = pre->relink_clamp;
+    pl.relink_gl_clip = pre->relink_gl_clip;
     pl.relink_discard = pre->relink_discard;
     pl.raster_discard = pre->raster_discard;
     pl.relink_pending = pre->relink_pending;
@@ -7754,7 +7780,7 @@ struct TessLibraryStages {
 // are made as before.
 VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPolygonMode polygon_mode, bool draw_clamp, VkPipelineLayout layout,
                               const VkDescriptorSetLayout set_layouts[2], const TessLibraryStages* tess = nullptr,
-                              const std::uint32_t* vertex_formats = nullptr, bool keep = true, bool discard = false) {
+                              const std::uint32_t* vertex_formats = nullptr, bool keep = true, bool discard = false, bool gl_clip = false) {
     const bool depth_clamp = draw_clamp && !g.dynamic_depth_clamp;  // else the draw sets it (DrawLibraryState)
     if (!vertex_formats && keep) {
         const std::uint64_t vs_hash = fnv1a(vs.meta().spirv.data(), vs.meta().spirv.size() * 4);
@@ -7788,6 +7814,10 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         const std::uint32_t d = 1;
         key = fnv1a(&d, sizeof(d), key ^ 0xd15c000000000000ull);
     }
+    if (gl_clip) {  // GL's clip space (GfxFixedState::gl_clip_space)
+        const std::uint32_t c = 1;
+        key = fnv1a(&c, sizeof(c), key ^ 0x61c1000000000000ull);
+    }
     return pipeline_library(kLibPreRaster, key, "pre-rasterization", vs.meta().spirv.size(), [&] {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         const auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -7819,6 +7849,9 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount = 1;
         vp.scissorCount = 1;
+        VkPipelineViewportDepthClipControlCreateInfoEXT vdcc{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+        vdcc.negativeOneToOne = VK_TRUE;
+        if (gl_clip) vp.pNext = &vdcc;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = polygon_mode;
         rs.lineWidth = 1.0f;
@@ -8036,6 +8069,7 @@ struct PrecompileJob {
     std::uint32_t vertex_formats[16] = {};
     VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
     bool depth_clamp = false;
+    bool gl_clip = false;
     bool raster_discard = false;
     // And its indexed loads' words 3 and strides as its first draw had them
     // (by stage).
@@ -8347,6 +8381,7 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
     std::copy(pl.relink_vertex_formats, pl.relink_vertex_formats + 16, job.vertex_formats);
     job.polygon_mode = pl.relink_polygon;
     job.depth_clamp = pl.relink_clamp;
+    job.gl_clip = pl.relink_gl_clip;
     job.raster_discard = pl.relink_discard;
     if (g_relink_w3 && !pl.tess_hw && pl.lean) {
         for (int st = 0; st < 2; ++st) {
@@ -8406,7 +8441,7 @@ VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
         std::copy(job.w3[0], job.w3[0] + 16, words + 16);
         std::copy(job.stride[0], job.stride[0] + 16, words + 32);
         if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words, true,
-                                                     job.raster_discard)) {
+                                                     job.raster_discard, job.gl_clip)) {
             libraries[1] = pr;
             if (job.specialize_formats) w.relinks_specialized.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -8585,6 +8620,7 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
         std::copy(pl->relink_vertex_formats, pl->relink_vertex_formats + 16, job.vertex_formats);
         job.polygon_mode = pl->relink_polygon;
         job.depth_clamp = pl->relink_clamp;
+        job.gl_clip = pl->relink_gl_clip;
         job.raster_discard = pl->relink_discard;
         std::memcpy(job.w3, r.spec_w3, sizeof(job.w3));
         std::memcpy(job.stride, r.spec_stride, sizeof(job.stride));
@@ -10304,7 +10340,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         tess.control_points = pl.tess_control_points;
     }
     const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr,
-                                             nullptr, true, f.rasterizer_discard);
+                                             nullptr, true, f.rasterizer_discard, f.gl_clip_space);
 
     const VkPipeline fs = fragment_library(pl.ps.meta(), pl.ps.module, pl.set_layouts[1], pl.layout);
 
@@ -10350,6 +10386,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         }
         pl.relink_polygon = f.polygon_mode;
         pl.relink_clamp = f.depth_clamp;
+        pl.relink_gl_clip = f.gl_clip_space;
         pl.relink_discard = f.rasterizer_discard;
         pl.relink_pending = true;
     }
@@ -10541,6 +10578,9 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1;
     vp.scissorCount = 1;
+    VkPipelineViewportDepthClipControlCreateInfoEXT vdcc{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+    vdcc.negativeOneToOne = VK_TRUE;
+    if (f.gl_clip_space) vp.pNext = &vdcc;  // GL's clip space (gl_clip_space_draw)
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = f.polygon_mode;
     rs.cullMode = f.cull_mode;
@@ -25564,6 +25604,9 @@ static bool draw_impl(const GpuDraw& d) {
         vp.height = 2.0f * s.vport[2];
         vp.minDepth = s.vport[5];
         vp.maxDepth = s.vport[5] + s.vport[4];
+        // GL's clip space (gl_clip_space_draw): z from -1 maps to ZOFFSET - ZSCALE,
+        // the pipeline's [-1, 1] spanning the range from both ends.
+        if (gl_clip_space_draw(s)) vp.minDepth = s.vport[5] - s.vport[4];
     } else {
         vp.x = 0;
         vp.y = 0;
@@ -25593,6 +25636,26 @@ static bool draw_impl(const GpuDraw& d) {
     // The G-buffer's viewport, the jitter in it: the characters' capture
     // draws their motion through it (upscale_pass.cpp).
     if (camera_draw && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect) upscale_capture_viewport_locked(vp);
+    // BBHOST_CUBE_TRACE=1 (a test): the draws into a cube's faces (a 6-layer
+    // colour target) - their clip control, path, depth clamp and z mapping.
+    static const bool cube_trace = [] {
+        const char* e = std::getenv("BBHOST_CUBE_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (cube_trace && s.color[0] && s.color[0]->layers == 6 && s.depth) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 80) {
+            GfxFixedState t;
+            fixed_raster_depth(s, t);
+            host_log("cube trace: %s into 0x%llx layer %u: clip_cntl %08x (%s), gx raster %s depth_clip %d, depth clamp %d, gl %d, zscale %g "
+                     "zoffset %g -> depth %g..%g, depth target 0x%llx dctl %08x, vte %08x",
+                     pl.name.c_str(), static_cast<unsigned long long>(s.color[0]->base), s.color_layer[0], s.clip_cntl,
+                     (s.clip_cntl & kDxClipSpaceDef) ? "D3D z" : "GL z", s.gx_raster ? "yes" : "no", s.gx_raster ? s.gx_raster->depth_clip : -1,
+                     t.depth_clamp ? 1 : 0, t.gl_clip_space ? 1 : 0, static_cast<double>(s.vport[4]), static_cast<double>(s.vport[5]),
+                     static_cast<double>(vp.minDepth), static_cast<double>(vp.maxDepth),
+                     static_cast<unsigned long long>(s.depth ? s.depth->base : 0), s.depth_control, s.vte_cntl);
+        }
+    }
     if (!rs.viewport_set || std::memcmp(&rs.viewport, &vp, sizeof(vp)) != 0) {
         cmds.viewport(vp);
         rs.viewport = vp;

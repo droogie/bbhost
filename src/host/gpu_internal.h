@@ -554,6 +554,10 @@ struct Gpu {
     // turns it off): pre-rasterization libraries leave it to the draw.
     bool dynamic_depth_clamp = false;
     PFN_vkCmdSetDepthClampEnableEXT cmd_set_depth_clamp_enable = nullptr;
+    // VK_EXT_depth_clip_control (BBHOST_GL_CLIP_SPACE=0 turns it off): a draw
+    // in GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear) clips z
+    // at -w as the PS4 does, not at 0 (GfxFixedState::gl_clip_space).
+    bool has_depth_clip_control = false;
     // Graphics constant buffers, pushed per draw into set 2 (cb_push_on()):
     // the vertex stage's at bindings 112-127, the pixel stage's at 128-143.
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
@@ -1732,6 +1736,10 @@ struct GfxFixedState {
     // PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL (host/clip_control.h): the pipeline
     // takes rasterizer discard as a dynamic state and the draw sets it.
     bool rasterizer_discard = false;
+    // PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear (host/clip_control.h): GL's clip
+    // space, z from -w to w - the pipeline's viewport takes [-1, 1]
+    // (VK_EXT_depth_clip_control) and the draw its depth range from both ends.
+    bool gl_clip_space = false;
     bool depth_test = false, depth_write = false, depth_bounds_test = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
     VkStencilOpState front{}, back{};

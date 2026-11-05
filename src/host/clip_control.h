@@ -31,7 +31,7 @@
 namespace gpu {
 
 constexpr std::uint32_t kClipDisable = 1u << 16;
-constexpr std::uint32_t kDxClipSpaceDef = 1u << 19;  // D3D's clip space (z from 0 to w); clear is GL's - only counted (render.cpp)
+constexpr std::uint32_t kDxClipSpaceDef = 1u << 19;  // D3D's clip space (z from 0 to w); clear is GL's (z from -w to w: render.cpp gl_clip_space_draw)
 constexpr std::uint32_t kDxRasterizationKill = 1u << 22;
 constexpr std::uint32_t kZclipNearDisable = 1u << 26;
 constexpr std::uint32_t kZclipFarDisable = 1u << 27;

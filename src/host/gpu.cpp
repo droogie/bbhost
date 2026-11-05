@@ -4262,6 +4262,20 @@ bool init_locked() {
             const char* e = std::getenv("BBHOST_DYNAMIC_DEPTH_CLAMP");
             g.dynamic_depth_clamp = q3.extendedDynamicState3DepthClampEnable && !(e && e[0] == '0');
         }
+        // GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear: z clipped at
+        // -w, not 0 - the point lights' cube shadows' casters): VK_EXT_depth_clip_control's
+        // [-1, 1]. Without it those draws lost everything in the near part of
+        // the light's range (render.cpp gl_clip_space_draw).
+        if (has("VK_EXT_depth_clip_control")) {
+            VkPhysicalDeviceDepthClipControlFeaturesEXT qc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &qc;
+            vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+            const char* e = std::getenv("BBHOST_GL_CLIP_SPACE");
+            g.has_depth_clip_control = qc.depthClipControl && !(e && e[0] == '0');
+        }
+        host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
+                                                                      : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4362,6 +4376,7 @@ bool init_locked() {
         dext.push_back("VK_EXT_graphics_pipeline_library");
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
+    if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -4431,6 +4446,12 @@ bool init_locked() {
     if (g.dynamic_depth_clamp) {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
+    }
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    fdcc.depthClipControl = VK_TRUE;
+    if (g.has_depth_clip_control) {
+        fdcc.pNext = f13.pNext;
+        f13.pNext = &fdcc;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
