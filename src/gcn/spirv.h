@@ -90,7 +90,7 @@ enum Decoration : std::uint32_t {
 };
 
 enum BuiltIn : std::uint32_t {
-    BiPosition = 0, BiFragCoord = 15, BiFrontFacing = 17, BiSampleId = 18, BiSampleMask = 20, BiFragDepth = 22,
+    BiPosition = 0, BiLayer = 9, BiFragCoord = 15, BiFrontFacing = 17, BiSampleId = 18, BiSampleMask = 20, BiFragDepth = 22,
     BiWorkgroupId = 26, BiLocalInvocationId = 27, BiLocalInvocationIndex = 29, BiSubgroupSize = 36,
     BiSubgroupLocalInvocationId = 41, BiVertexIndex = 42, BiInstanceIndex = 43, BiHelperInvocation = 23,
     // Tessellation

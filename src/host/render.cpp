@@ -393,6 +393,7 @@ struct GfxPipeline {
     // no geometry stage. BBHOST_GX_PARTICLES=gs, a debug switch, draws with
     // the geometry stage above instead.
     bool gs_as_vs = false;
+    bool gs_es_input = false;  // its ES takes Vulkan vertex input (a triangle GS's: the OnePass cube shadows')
     VkShaderModule gs_vs_module = VK_NULL_HANDLE;
     std::uint32_t gs_vertices = 0;  // a particle's vertices: one strip of them (gs_strip), or quads
     bool gs_strip = false;
@@ -2647,8 +2648,21 @@ void ensure_initialised(RtImage& r) {
 }
 
 // The attachment view of one layer of a layered target (one cube face); layer 0
-// is the target's own view.
-VkImageView attachment_view(RtImage& r, std::uint32_t layer) {
+// is the target's own view. With `count` above 1, a 2D-array view of layers
+// [layer, layer + count) (a layered pass: the GS picks each primitive's).
+VkImageView attachment_view(RtImage& r, std::uint32_t layer, std::uint32_t count = 1) {
+    if (count > 1 && layer + count <= r.layers) {
+        const std::uint32_t key = layer | (count << 16);
+        if (auto it = r.layer_views.find(key); it != r.layer_views.end()) return it->second;
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = r.image;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        vci.format = r.format;
+        vci.subresourceRange = {aspect_of(r), 0, 1, layer, count};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        return r.layer_views[key] = view;
+    }
     if (layer == 0 || layer >= r.layers) return r.view;
     if (auto it = r.layer_views.find(layer); it != r.layer_views.end()) return it->second;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -3109,6 +3123,14 @@ struct DrawState {
     std::uint32_t color_layer[8] = {};  // CB_COLOR*_VIEW SLICE_START: the layer drawn into
     RtImage* depth = nullptr;
     std::uint32_t depth_layer = 0;  // DB_DEPTH_VIEW SLICE_START
+    // DB_DEPTH_VIEW SLICE_MAX - SLICE_START + 1: more than one where a draw
+    // writes several layers at once, its GS naming each primitive's (the
+    // OnePass cube shadows: the six faces in one draw); drawn as a layered pass.
+    std::uint32_t depth_layers = 1;
+    // The pass's layers: above 1 for a triangle GS's draw that writes Layer
+    // (the OnePass cube shadows) into targets that all span that many slices
+    // from the ones it names - every attachment as a 2D-array view of them.
+    std::uint32_t pass_layers = 1;
     std::uint32_t depth_control = 0, stencil_control = 0, stencil_ref = 0, stencil_ref_bf = 0;
     float depth_bounds_min = 0.0f, depth_bounds_max = 1.0f;  // DB_DEPTH_BOUNDS_MIN/MAX (dynamic)
     std::uint32_t blend[8] = {};
@@ -5983,6 +6005,13 @@ bool gs_lift_for(const DrawState& s, gcn::GsLift& gl, std::string& why) {
     gl.max_vertices = s.gs_max_vertices;
     gl.vertex_dwords = s.gs_vertex_dwords;
     gl.out_prim = s.gs_out_prim;
+    // The GS's input primitive: the draw's (VGT_PRIMITIVE_TYPE) - a point
+    // (the particles') or a triangle (the OnePass cube shadows').
+    gl.in_vertices = s.prim == 1 ? 1 : s.prim == 4 || s.prim == 5 || s.prim == 6 ? 3 : 0;
+    if (!gl.in_vertices) {
+        why = "its draw's primitive type " + std::to_string(s.prim) + " (points and triangles are lifted)";
+        return false;
+    }
     const gcn::Program cp = gcn::decode(copy->words.data(), copy->words.size());
     std::string w;
     if (!gcn::parse_gs_copy(cp, gl.max_vertices, gl.copy, w)) {
@@ -6018,7 +6047,7 @@ VkDescriptorSetLayout gs_es_set_layout(const gcn::TranslateResult& es) {
 
 // A geometry-shader pipeline's ES: lifted as the vertex stage with its own
 // params and buffers in set 4, or the pipeline is not built (`why`).
-bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
+bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::string& why) {
     const CachedProgram* es = gs_program(s, 0);
     if (!es) {
         why = "its ES is not a known program";
@@ -6043,6 +6072,9 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
     o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
     o.cb_binding_base = kTessNativeLsBuffers;
     o.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
+    // A triangle GS's ES reads its mesh through its fetch shader: the draw's
+    // elements as Vulkan vertex input, as a vertex shader's.
+    if (vertex_input && s.prim != 1) o.vertex_input = vertex_input->elements;
     const gcn::TranslateResult ref = translate_cached(prog, o);
     if (!ref.ok()) {
         why = "ES " + es->name + ": " + ref.errors[0];
@@ -6075,6 +6107,7 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
         return false;
     }
     pl.gs_native = true;
+    pl.gs_es_input = !o.vertex_input.empty();
     return true;
 }
 
@@ -6885,6 +6918,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     pl.tess_native = false;
     pl.gs_native = false;
     pl.gs_as_vs = false;
+    pl.gs_es_input = false;
     pl.gs_vs_module = VK_NULL_HANDLE;
     pl.tess_set_layout = VK_NULL_HANDLE;
     pl.tess_ls.lifted = false;
@@ -7272,10 +7306,12 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         pl.vs_key = fnv1a(s.snap_cells, sizeof(s.snap_cells), vs_key ^ kSnapSalt);
     if (gs_lift) {
         std::string why;
-        if (!build_gs_es_stage(pl, s, why)) return fail("geometry-shader pipeline: " + why);
+        if (!build_gs_es_stage(pl, s, vertex_input, why)) return fail("geometry-shader pipeline: " + why);
         // The ES and the GS as one vertex stage, or the pipeline is not built
         // (BBHOST_GX_PARTICLES=gs, a debug switch: with the geometry stage).
-        if (particle_path() == ParticlePath::kVs && !build_gs_vertex_stage(pl, why)) return fail("geometry-shader pipeline as a vertex stage: " + why);
+        // A triangle GS (the OnePass cube shadows') keeps its geometry stage.
+        if (particle_path() == ParticlePath::kVs && s.prim == 1 && !build_gs_vertex_stage(pl, why))
+            return fail("geometry-shader pipeline as a vertex stage: " + why);
         if (pl.gs_as_vs && pl.gs_strip && particle_gate_on()) {
             const gcn::Program gp = gcn::decode(vs_words.data(), vs_words.size());
             const GsEmitGate gate = gs_emit_gate(gp, (s.vs_rsrc2 >> 1) & 0x1f);
@@ -10464,7 +10500,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     const bool ps_sized = !linked && pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    if (vertex_input && !pl.gs_native) {  // Vulkan vertex input (a geometry-shader pipeline's ES reads its buffers itself)
+    if (vertex_input && (!pl.gs_native || pl.gs_es_input)) {  // Vulkan vertex input (a particle GS's ES reads its buffers itself)
         vi.vertexBindingDescriptionCount = static_cast<std::uint32_t>(vertex_input->bindings.size());
         vi.pVertexBindingDescriptions = vertex_input->bindings.data();
         vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(vertex_input->attributes.size());
@@ -10955,7 +10991,7 @@ void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vec
 bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<std::uint32_t>& vs_words, const std::vector<std::uint32_t>& ps_words,
                        const std::string& vs_name, const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
                        const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
-                       const std::vector<bool>& ps_modes) {
+                       const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
     const CachedProgram* es = program_at(s.es_va);
     const CachedProgram* copy = program_at(s.gs_copy_va);
     if (!es || !copy) return false;
@@ -10964,8 +11000,8 @@ bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<
         cache_rw::Write cw(cache_rw::kPipelines);  // stage 4b.1b's readers find it whole
         return g_gfx[key];
     }();
-    queue_pipeline_build(entry, entry, s, vs_words, no_fetch, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, nullptr, nullptr, nullptr,
-                         es, copy);
+    queue_pipeline_build(entry, entry, s, vs_words, no_fetch, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input, nullptr,
+                         nullptr, es, copy);
     return true;
 }
 
@@ -11587,7 +11623,8 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         ensure_initialised(*s.color[t]);
         s.color[t]->fill_last = false;  // drawn into: a fill is no longer its last write
         VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        a.imageView = attachment_view(*s.color[t], s.color_layer[t]);
+        a.imageView = attachment_view(*s.color[t], s.color_layer[t], s.pass_layers);
+        if (!a.imageView) a.imageView = attachment_view(*s.color[t], s.color_layer[t]);
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -11621,7 +11658,8 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         } else {
             ensure_initialised(*s.depth);
         }
-        depth.imageView = attachment_view(*s.depth, s.depth_layer);
+        depth.imageView = attachment_view(*s.depth, s.depth_layer, s.pass_layers);
+        if (!depth.imageView) depth.imageView = attachment_view(*s.depth, s.depth_layer);
         depth.imageLayout = s.depth->managed_layout ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -11646,7 +11684,15 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent};
-    ri.layerCount = 1;
+    // A layered pass (DrawState::pass_layers): the GS's Layer picks each
+    // primitive's slice.
+    ri.layerCount = s.pass_layers;
+    if (s.pass_layers > 1) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 4)
+            host_log("render: a layered pass of %u layers (%zu colour targets%s, %ux%u)", s.pass_layers, colors.size(), s.depth ? " and depth" : "",
+                     extent.width, extent.height);
+    }
     ri.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
     ri.pColorAttachments = colors.data();
     if (s.depth) {
@@ -11688,7 +11734,8 @@ std::uint64_t pass_key(const DrawState& s) {
         const std::uint64_t b = s.color[t] ? s.color[t]->base ^ (static_cast<std::uint64_t>(s.color_layer[t]) << 48) : 0;
         h = fnv1a(&b, 8, h);
     }
-    const std::uint64_t d = s.depth ? s.depth->base ^ (static_cast<std::uint64_t>(s.depth_layer) << 48) : 0;
+    const std::uint64_t d =
+        (s.depth ? s.depth->base ^ (static_cast<std::uint64_t>(s.depth_layer) << 48) : 0) ^ (static_cast<std::uint64_t>(s.pass_layers) << 40);
     return fnv1a(&d, 8, h);
 }
 
@@ -21648,6 +21695,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
                 out.reached |= 1u << 8;
                 textures_census_target(1, in.depth_gen != 0, g_target_memo_hit);
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
+                s.depth_layers = layers - s.depth_layer;
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;
                     if (logged.size() < 24 && logged.insert(dbase).second) {
@@ -21736,7 +21784,7 @@ struct RunTargets {
     RtImage* color[8] = {};
     std::uint32_t color_mask[8] = {}, color_layer[8] = {};
     RtImage* depth = nullptr;
-    std::uint32_t depth_layer = 0;
+    std::uint32_t depth_layer = 0, depth_layers = 1;
 };
 thread_local RunTargets t_run_targets;
 
@@ -22054,7 +22102,10 @@ void run_targets_part(const GpuDrawInputs& in, DrawState& s) {
     s.depth_clear = in.depth_clear;
     s.stencil_clear = in.stencil_clear;
     s.depth = (m.out.reached >> 8) & 1 ? m.out.looked[8] : nullptr;
-    if (s.depth) s.depth_layer = std::min(in.depth_view & 0x7ff, ((in.depth_view >> 13) & 0x7ff));
+    if (s.depth) {
+        s.depth_layer = std::min(in.depth_view & 0x7ff, ((in.depth_view >> 13) & 0x7ff));
+        s.depth_layers = ((in.depth_view >> 13) & 0x7ff) + 1 - s.depth_layer;
+    }
     drop_small_targets(s);
 }
 
@@ -22128,6 +22179,7 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
         s.stencil_clear = in.stencil_clear;
         s.depth = m.depth;
         s.depth_layer = m.depth_layer;
+        s.depth_layers = m.depth_layers;
         m.acquires = mu_taken;
         return;
     }
@@ -22180,6 +22232,7 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
     std::memcpy(m.color_layer, s.color_layer, sizeof(m.color_layer));
     m.depth = s.depth;
     m.depth_layer = s.depth_layer;
+    m.depth_layers = s.depth_layers;
 }
 
 }  // namespace
@@ -22748,6 +22801,23 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // A triangle GS's ES (the OnePass cube shadows'): its input layout's fetch
+    // shader - GX's geometry is the ES's - as vertex input, which its lift
+    // takes in place of the fetch (build_gs_es_stage). The GS in the VS slot
+    // calls none.
+    if (s.gs && s.prim != 1 && !use_vertex_input && gx_geometry && d.gx_render && g_vertex_input && gx_geometry->fetch_va) {
+        if (const FetchProgram* ef = fetch_program_at(gx_geometry->fetch_va)) {
+            t_vertex_span = DrawVertexSpan{};
+            t_vertex_span.known = !d.indirect_va;
+            t_vertex_span.index_va = d.index_va;
+            t_vertex_span.count = d.index_count;
+            t_vertex_span.index_type = d.index_type;
+            t_vertex_span.base = in.base_vertex;
+            use_vertex_input = plan_vertex_input(ef->words, ef->hash, *gx_geometry, vertex_input);
+            fetch_hash = ef->hash;
+        }
+        if (!use_vertex_input) return gs_refuse("no vertex input for its ES");
+    }
     // The host tessellator's LS as the vertex stage: its elements as vertex
     // input, which its lift takes in place of the fetch shader (the domain
     // shader in the vertex slot calls none). The pipeline's key holds the plan.
@@ -22968,10 +23038,26 @@ static bool draw_impl(const GpuDraw& d) {
     // A geometry-shader pipeline is its own no-fallback variant, lifted: built by
     // a worker (queue_gs_pipeline), the draw not drawn until it is.
     const bool gs_native = s.gs;
+    s.pass_layers = 1;
+    if (gs_native && s.prim != 1) {
+        // The layers every target spans from the one it names; layered when
+        // all agree on more than one.
+        std::uint32_t n = 0;
+        bool same = true;
+        const auto span = [&](const RtImage* r, std::uint32_t first) {
+            if (!r) return;
+            const std::uint32_t k = r->layers > first ? r->layers - first : 1;
+            same = same && (!n || n == k);
+            n = k;
+        };
+        for (int t = 0; t < 8; ++t) span(s.color[t], s.color_layer[t]);
+        span(s.depth, s.depth_layer);
+        if (same && n > 1) s.pass_layers = n;
+    }
     if (gs_native) {
         GfxPipeline* const built = gfx_lookup(key);
         if (!built && g_async_pipelines && !g_dump_spirv && !g_token_user_data_check) {
-            if (!queue_gs_pipeline(key, s, vs_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes))
+            if (!queue_gs_pipeline(key, s, vs_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes, vertex_plan))
                 return gs_refuse("its ES or copy shader is not a known program");
             return gs_refuse("its pipeline is being built");
         }
@@ -23134,24 +23220,6 @@ static bool draw_impl(const GpuDraw& d) {
     // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
     // the colour grading's tables as its rule says, the 3D brought up nearest.
     if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
-    // A cube T#'s faces sampled as a 2D array: their samplers clamped to each
-    // face (sampler_cube_clamped).
-    {
-        StageImages& si = stage_images[1];
-        const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
-        for (std::size_t k = 0; k < si.samplers.size() && k < pairs.size(); ++k) {
-            if (!si.samplers[k]) continue;
-            bool cube = false;
-            for (std::uint32_t b = pairs[k]; b && !cube; b &= b - 1) {
-                const std::size_t i = static_cast<std::size_t>(__builtin_ctz(b));
-                cube = i < si.images.size() && si.images[i].resolved && (si.images[i].w[3] >> 28) == 11;
-            }
-            if (!cube) continue;
-            const VkSampler c = sampler_cube_clamped(si.samplers[k]);
-            if (!c) return false;  // a run part's draw: made in order
-            si.samplers[k] = c;
-        }
-    }
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const GfxPipeline* const capture_lean = lean_of(pl);

@@ -215,7 +215,7 @@ LiftResult lift_hull_shader(const Program& program, const TranslateOptions& opti
 // for their other bindings (the particles' buffers, the GS's constants);
 // ring V#s and the vertex offset are never data (as_u and as_f refuse them).
 struct GsCopyOut {
-    std::uint8_t target = 12;  // 12 the position, 32 + n param n
+    std::uint8_t target = 12;  // 12 the position, 13 the misc vector (its z the render target index: Layer), 32 + n param n
     std::uint8_t comp = 0;     // 0-3
     bool constant = false;     // `value` the component's bits; otherwise GSVS dword `value` of the vertex
     std::uint32_t value = 0;
@@ -225,6 +225,7 @@ struct GsLift {
     std::uint32_t max_vertices = 0;  // the GS's most vertices a primitive (VGT_GS_MAX_VERT_OUT, word 13)
     std::uint32_t vertex_dwords = 0;  // a GSVS vertex's dwords (the stream's export size, word 9)
     std::uint32_t out_prim = 2;      // VGT_GS_OUT_PRIM_TYPE (word 7): 1 line strip, 2 triangle strip
+    std::uint32_t in_vertices = 1;   // the draw's primitive's vertices, the GS's input: 1 a point, 3 a triangle
     std::vector<GsCopyOut> copy;     // from parse_gs_copy: every component it exports, in export order
 };
 // The copy shader's exports as GsCopyOut: buffer_load_dword through the GSVS

@@ -601,12 +601,22 @@ private:
             if (opt.gs_role == TranslateOptions::GsRole::None) reject("a GsLift without a geometry-shader role");
             if (opt.stage != Stage::Vertex || opt.tess_role != TranslateOptions::TessRole::None)
                 reject("the ES and the GS lift with a vertex stage's options and no tessellation role");
-            if (!opt.vertex_input.empty()) reject("the ES and the GS are lifted without vertex input");
-            if (opt.vs_out_cntl) reject("PA_CL_VS_OUT_CNTL is set for the ES or the GS (their copy shader's is what draws)");
+            // The ES may take vertex input (its fetch shader's elements: the
+            // OnePass cube shadows' meshes); the GS reads the ring alone.
+            if (!opt.vertex_input.empty() && !gs_es()) reject("the GS is lifted without vertex input");
+            // PA_CL_VS_OUT_CNTL is the copy shader's (what draws): the misc
+            // vector with the render target index (VS_OUT_MISC_VEC_ENA, bit 21;
+            // USE_VTX_RENDER_TARGET_INDX, bit 18 - the OnePass cube shadows'
+            // face; their copy shaders' 0x1240000) is taken, as Layer; anything
+            // else it enables is not.
+            constexpr std::uint32_t kGsCntlTaken = (1u << 18) | (1u << 21) | (1u << 24);  // + VS_OUT_MISC_SIDE_BUS_ENA
+            if (opt.vs_out_cntl & ~kGsCntlTaken)
+                reject("PA_CL_VS_OUT_CNTL " + std::to_string(opt.vs_out_cntl) + " enables more than the misc vector's render target index for the ES or the GS");
             if (!gs->es_dwords || gs->es_dwords > kEsgsDwords) {
                 reject("an ES ring vertex of " + std::to_string(gs->es_dwords) + " dwords (1-" + std::to_string(kEsgsDwords) +
                        ": the geometry stage's inputs a vertex)");
             }
+            if (gs->in_vertices != 1 && gs->in_vertices != 3) reject("a GS input of " + std::to_string(gs->in_vertices) + " vertices (a point or a triangle)");
             if (gs_geom()) {
                 if (!gs->max_vertices || gs->max_vertices > 256) reject("a GS of " + std::to_string(gs->max_vertices) + " vertices (1-256)");
                 if (gs->out_prim != 1 && gs->out_prim != 2) {
@@ -617,7 +627,9 @@ private:
                     reject("a GSVS vertex of " + std::to_string(gs->vertex_dwords) + " dwords (1-" + std::to_string(kGsvsDwords) + ")");
                 }
                 for (const GsCopyOut& c : gs->copy) {
-                    if (c.comp > 3 || (c.target != 12 && (c.target < 32 || c.target >= 64)) || (!c.constant && c.value >= gs->vertex_dwords)) {
+                    const bool layer = c.target == 13 && (opt.vs_out_cntl & (1u << 21)) && (opt.vs_out_cntl & (1u << 18));
+                    if (c.comp > 3 || (c.target != 12 && !layer && (c.target < 32 || c.target >= 64)) ||
+                        (!c.constant && c.value >= gs->vertex_dwords)) {
                         reject("a copy-shader export the lift does not take (target " + std::to_string(c.target) + ", component " +
                                std::to_string(c.comp) + ")");
                         break;
@@ -1092,17 +1104,18 @@ private:
             return flt(extract(t_f32, m.load(t_v3f, in_tess_coord), static_cast<std::uint32_t>(key - 256)));
         }
         if (key >= 256 && gs_geom()) {
-            // As GCN fills a GS's VGPRs for a point: v0 the ES vertex's offset
-            // in the ESGS ring (ring_offset), v2 the primitive's id, v7 the
-            // instance (VGT_GS_INSTANCE_CNT 0: one); v1 and v3-v6 are the
-            // offsets of vertices a point does not have.
-            if (key == 256) return ring_offset();
+            // As GCN fills a GS's VGPRs: v0, v1 and v3 the input vertices'
+            // offsets in the ESGS ring (ring_offset: a point has v0 alone, a
+            // triangle all three), v2 the primitive's id, v7 the instance
+            // (VGT_GS_INSTANCE_CNT 0: one); v4-v6 are adjacency's.
+            if (key == 256) return ring_offset(0);
+            if (gs->in_vertices == 3 && (key == 257 || key == 259)) return ring_offset(key == 257 ? 1 : 2);
             if (key == 258) {
                 if (!in_primitive_id) in_primitive_id = builtin(p_in_u32, spv::BiPrimitiveId);
                 return word(m.load(t_u32, in_primitive_id));
             }
-            if (key == 257 || (key >= 259 && key <= 262)) {  // offsets of vertices a point does not have: never data, nothing to address
-                Val v = ring_offset();
+            if (key == 257 || (key >= 259 && key <= 262)) {  // offsets of vertices the primitive does not have: never data, nothing to address
+                Val v = ring_offset(kNoRingVertex);
                 v.sym = false;
                 return v;
             }
@@ -1493,6 +1506,28 @@ private:
             interface.push_back(out_pos);
         }
         return out_pos;
+    }
+    // A GS's render target index (its copy shader's misc vector, pos1's z: the
+    // OnePass cube shadows' face): Layer, from the dword's bits.
+    Id out_layer_var = 0;
+    Id out_layer() {
+        if (!out_layer_var) {
+            out_layer_var = m.global_variable(m.type_pointer(spv::ScOutput, t_i32), spv::ScOutput);
+            m.decorate(out_layer_var, spv::DecBuiltIn, {static_cast<std::uint32_t>(spv::BiLayer)});
+            interface.push_back(out_layer_var);
+        }
+        return out_layer_var;
+    }
+    // A copy-shader export's stores at an emit: the position, the params, and
+    // of the misc vector the render target index alone (the point size, edge
+    // flag and viewport index its other components carry are not drawn here).
+    void gs_store_export(std::uint8_t target, const std::array<Id, 4>& comps) {
+        if (target == 13) {
+            m.store(out_layer(), m.emit(spv::OpBitcast, t_i32, {comps[2]}));
+            return;
+        }
+        const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+        for (const Id var : target == 12 ? std::vector<Id>{out_position()} : param_outputs(target - 32)) m.store(var, v4);
     }
     Id out_param(int n) {
         if (auto it = out_params.find(n); it != out_params.end()) return it->second;
@@ -4283,10 +4318,18 @@ private:
         const int coord_va = va;
         std::vector<Id> coords;
         for (int k = 0; k < ncoord; ++k) coords.push_back(as_f(vgpr(va++)));
-        if (b.cube) {  // the translator's cube conversion (translate.cpp mimg)
+        if (b.cube) {  // the translator's cube conversion and face clamp (translate.cpp mimg)
             coords[0] = fsub(coords[0], cf(1.0f));
             coords[1] = fsub(coords[1], cf(1.0f));
             coords[2] = ext(spv::GlslFma, {ext(spv::GlslFloor, {fdiv(coords[2], cf(8.0f))}), cf(-2.0f), coords[2]});
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySizeLod, t_v3i, {image, m.emit(spv::OpBitcast, t_i32, {cu(0)})});
+            Id texels = cf(0.5f);
+            if (has_l) texels = fmul(cf(0.5f), ext(spv::GlslExp2, {ext(spv::GlslCeil, {ext(spv::GlslFMax, {as_f(vgpr(va)), cf(0.0f)})})}));
+            for (std::uint32_t k = 0; k < 2; ++k) {
+                const Id half = ext(spv::GlslFMin, {fdiv(texels, m.emit(spv::OpConvertSToF, t_f32, {extract(t_i32, size, k)})), cf(0.5f)});
+                coords[k] = ext(spv::GlslFClamp, {coords[k], half, fsub(cf(1.0f), half)});
+            }
         }
         if (unnormalized && !b.cube) {
             m.capability(spv::CapImageQuery);
@@ -4783,14 +4826,19 @@ private:
     // The ES vertex's offset in the ESGS ring (the GS's v0), which the lift
     // knows only as its own vertex's: an OpUndef it never computes with (as_u
     // and as_f refuse it), in its affine form (Val::sym) one unit an offset.
+    // Each with the input vertex it addresses (GsLift::in_vertices; kNoRingVertex
+    // one the primitive does not have).
+    static constexpr std::uint32_t kNoRingVertex = ~0u;
     std::set<Id> ring_offsets;
-    Val ring_offset() {
+    std::map<Id, std::uint32_t> ring_vertex;
+    Val ring_offset(std::uint32_t vertex) {
         Id undef;
         {
             EntryScope entry(m);
             undef = m.emit(spv::OpUndef, t_u32, {});
         }
         ring_offsets.insert(undef);
+        ring_vertex[undef] = vertex;
         Val v = word(undef);
         v.sym = true;
         v.sym_base = 0;
@@ -4824,10 +4872,21 @@ private:
             !sym_eval(ops, [&](const std::vector<std::uint32_t>& x, std::uint32_t& r) {
                 return int_op(in, x[0], x.size() > 1 ? x[1] : 0, x.size() > 2 ? x[2] : 0, r);
             }, base, coef)) {
-            reject(std::string(mnemonic(in) ? mnemonic(in) : "an instruction") + " computes with the ES vertex's ring offset other than as an address the lift follows");
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "an instruction") + " computes with the ES vertex's ring offset other than as an address the lift follows (enc " +
+                   std::to_string(static_cast<int>(in.enc)) + " op " + std::to_string(in.op) + " src0 " + std::to_string(in.src0) + " src1 " +
+                   std::to_string(in.src1) + (carry ? " carry" : "") + ")");
             return true;
         }
-        Val v = ring_offset();
+        std::uint32_t vertex = kNoRingVertex;
+        for (const Val& o : ops) {
+            if (o.constant || !ring_offsets.count(o.id)) continue;
+            if (vertex != kNoRingVertex && ring_vertex[o.id] != vertex) {
+                reject("an instruction computes with two input vertices' ring offsets");
+                return true;
+            }
+            vertex = ring_vertex[o.id];
+        }
+        Val v = ring_offset(vertex);
         v.sym_base = base;
         v.sym_coef = coef;
         write_v(in.dst, v);
@@ -4945,24 +5004,26 @@ private:
             return;
         }
         const Val a = peek(static_cast<std::uint16_t>(256 + in.vaddr), in);
-        if (a.constant || !ring_offsets.count(a.id) || !sym_holds(a, current_exec()) || a.sym_base != 0 || a.sym_coef != 4) {
-            reject("an ESGS ring load at an address other than its vertex's own (v0 << 2)");
+        if (a.constant || !ring_offsets.count(a.id) || !sym_holds(a, current_exec()) || a.sym_base != 0 || a.sym_coef != 4 ||
+            ring_vertex[a.id] >= gs->in_vertices) {
+            reject("an ESGS ring load at an address other than an input vertex's own (v0, v1 or v3 << 2)");
             return;
         }
+        const std::uint32_t vi = ring_vertex[a.id];
         if (at % 256 || at / 256 >= gs->es_dwords) {
             reject("an ESGS ring load at byte " + std::to_string(at) + ": not a dword of the ES's " + std::to_string(gs->es_dwords));
             return;
         }
         const std::uint32_t k = at / 256;
-        Id& v = es_gs_loads[k];
+        Id& v = es_gs_loads[vi * 1024 + k];
         if (!v) {
             EntryScope entry(m);
-            v = m.load(t_u32, m.access_chain(m.type_pointer(spv::ScInput, t_u32), es_gs, {cu(0), cu(k / 4), cu(k % 4)}));
+            v = m.load(t_u32, m.access_chain(m.type_pointer(spv::ScInput, t_u32), es_gs, {cu(vi), cu(k / 4), cu(k % 4)}));
         }
         inst_uniform = false;  // per primitive
         write_v(in.vdata, word(v));
         ++gs_ring_loads;
-        note += " es_gs[0][" + std::to_string(k) + "]";
+        note += " es_gs[" + std::to_string(vi) + "][" + std::to_string(k) + "]";
     }
     // GS: buffer_store_dword at soffset + offset 4 * (max_vertices * d + v):
     // dword d of the vertex in slot v, kept with the EXEC it was made under
@@ -5080,13 +5141,14 @@ private:
             }
             it->second[c.comp] = as_f(store->value);
         }
-        std::vector<std::pair<std::vector<Id>, std::array<Id, 4>>> stores;  // the outputs' variables, made before the branch
-        for (const auto& [t, comps] : outs) stores.push_back({t == 12 ? std::vector<Id>{out_position()} : param_outputs(t - 32), comps});
+        // The outputs' variables, made before the branch.
+        for (const auto& [t, comps] : outs) {
+            if (t == 13) out_layer();
+            else if (t == 12) out_position();
+            else param_outputs(t - 32);
+        }
         where_exec(e, [&] {
-            for (const auto& [vars, comps] : stores) {
-                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
-                for (const Id var : vars) m.store(var, v4);
-            }
+            for (const auto& [t, comps] : outs) gs_store_export(t, comps);
             m.emit_void(spv::OpEmitVertex, {});
         });
         gs_emits.push_back({e, slot});
@@ -5153,9 +5215,13 @@ private:
     void gs_emit_array(const Val& e) {
         const Id count = as_u(reg.at(kKeyGsCount));
         std::map<std::uint8_t, std::array<Id, 4>> outs;
-        std::vector<std::pair<std::vector<Id>, std::uint8_t>> vars;
+        std::vector<std::uint8_t> targets;
         for (const GsCopyOut& c : gs->copy) {
-            if (outs.try_emplace(c.target).second) vars.push_back({c.target == 12 ? std::vector<Id>{out_position()} : param_outputs(c.target - 32), c.target});
+            if (!outs.try_emplace(c.target).second) continue;
+            targets.push_back(c.target);
+            if (c.target == 13) out_layer();
+            else if (c.target == 12) out_position();
+            else param_outputs(c.target - 32);
         }
         const Id p_fn_u32 = m.type_pointer(spv::ScFunction, t_u32);
         const Id fits = m.emit(spv::OpULessThan, t_bool, {count, cu(gs->max_vertices)});
@@ -5169,11 +5235,7 @@ private:
                 const Id element = ibin(spv::OpIAdd, cu(c.value * gs->max_vertices), count);
                 outs[c.target][c.comp] = m.emit(spv::OpBitcast, t_f32, {m.load(t_u32, m.access_chain(p_fn_u32, gsvs_array, {element}))});
             }
-            for (const auto& [vs, t] : vars) {
-                const std::array<Id, 4>& comps = outs[t];
-                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
-                for (const Id var : vs) m.store(var, v4);
-            }
+            for (const std::uint8_t t : targets) gs_store_export(t, outs[t]);
             m.emit_void(spv::OpEmitVertex, {});
         });
         // The counter steps where the invocation emits.
@@ -8208,12 +8270,12 @@ private:
         }
 
         if (gs) {
-            // GsLift: the ring vertex, the ES's output and the GS's input (one vertex: a point).
+            // GsLift: the ring vertex, the ES's output and the GS's input (a point's one vertex, a triangle's three).
             const Id t_slots = m.type_array(t_v4u, cu((gs->es_dwords + 3) / 4));
             if (gs_es()) {
                 es_gs = m.global_variable(m.type_pointer(spv::ScOutput, t_slots), spv::ScOutput);
             } else {
-                es_gs = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_slots, cu(1))), spv::ScInput);
+                es_gs = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_slots, cu(gs->in_vertices))), spv::ScInput);
             }
             m.decorate(es_gs, spv::DecLocation, {0});
             m.name(es_gs, "es_gs");
@@ -8397,7 +8459,7 @@ private:
             return;
         }
         if (gs_geom()) {
-            // The geometry stage: a point in, the copy shader's strip out.
+            // The geometry stage: a point or a triangle in, the copy shader's strip out.
             if (gs_emits.empty()) {
                 cur = prog.insts.back().offset;
                 reject("the GS emits no vertex");
@@ -8405,7 +8467,7 @@ private:
             }
             m.capability(spv::CapGeometry);
             m.entry_point(spv::EmGeometry, fn_main, "main", interface);
-            m.execution_mode(fn_main, spv::ExInputPoints);
+            m.execution_mode(fn_main, gs->in_vertices == 3 ? spv::ExTriangles : spv::ExInputPoints);
             m.execution_mode(fn_main, spv::ExInvocations, {1});
             m.execution_mode(fn_main, gs->out_prim == 1 ? spv::ExOutputLineStrip : spv::ExOutputTriangleStrip);
             m.execution_mode(fn_main, spv::ExOutputVertices, {gs->max_vertices});
@@ -8864,7 +8926,8 @@ bool parse_gs_copy(const Program& copy, std::uint32_t max_vertices, std::vector<
         }
         case Enc::EXP: {
             if (!end_at) return fail(&in, "an export before the stream test");
-            if (in.tgt != 12 && (in.tgt < 32 || in.tgt >= 64)) return fail(&in, "an export of target " + std::to_string(in.tgt) + " (pos0 and params are lifted)");
+            if (in.tgt != 12 && in.tgt != 13 && (in.tgt < 32 || in.tgt >= 64))
+                return fail(&in, "an export of target " + std::to_string(in.tgt) + " (pos0, the misc vector and params are lifted)");
             if (in.compr) return fail(&in, "a compressed export");
             for (std::uint8_t c = 0; c < 4; ++c) {
                 if (!exported.insert({in.tgt, c}).second) return fail(&in, "a component exported twice");

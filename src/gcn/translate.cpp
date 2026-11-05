@@ -3643,6 +3643,24 @@ struct Translator {
             coords[0] = fsub(coords[0], cf(1.0f));
             coords[1] = fsub(coords[1], cf(1.0f));
             coords[2] = fma_(m.ext_inst(t_f32, spv::GlslFloor, {fdiv(coords[2], cf(8.0f))}), cf(-2.0f), coords[2]);
+            // Each face its own 2D layer: filtering cannot cross into the next
+            // face as the GPU's cube sampling does, and the game's samplers
+            // repeat - its far edge read at every face's edge (the point
+            // lights' cube shadows' seams). Held half a texel inside the face,
+            // as a clamp to its edge - in the shader, not the sampler, which
+            // serves the draw's other textures too (a tiled dither's repeat). At
+            // an explicit LOD the margin is that level's (the reflection
+            // probes' rough levels), 2^ceil(lod) of level 0's texels.
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySizeLod, t_v3i, {image, i(c_zero_u)});
+            Id texels = cf(0.5f);
+            if (has_l)  // the LOD is the VGPR after the coordinates
+                texels = fmul(cf(0.5f), m.ext_inst(t_f32, spv::GlslExp2,
+                                                   {m.ext_inst(t_f32, spv::GlslCeil, {m.ext_inst(t_f32, spv::GlslFMax, {f(ld(vgpr_var(va))), cf(0.0f)})})}));
+            for (std::uint32_t k = 0; k < 2; ++k) {
+                const Id half = m.ext_inst(t_f32, spv::GlslFMin, {fdiv(texels, i2f(ui(extract(t_i32, size, k)))), cf(0.5f)});
+                coords[k] = m.ext_inst(t_f32, spv::GlslFClamp, {coords[k], half, fsub(cf(1.0f), half)});
+            }
         }
         // UNORM means UNnormalized: a set bit requests texel coordinates.
         // Normalized coordinates may legitimately be negative or exceed one;

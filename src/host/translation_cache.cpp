@@ -1743,7 +1743,7 @@ gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, con
     h.u32(static_cast<std::uint32_t>(use));
     hash_program(h, prog);
     hash_options(h, o);
-    for (const std::uint32_t v : {gs.es_dwords, gs.max_vertices, gs.vertex_dwords, gs.out_prim}) h.u32(v);
+    for (const std::uint32_t v : {gs.es_dwords, gs.max_vertices, gs.vertex_dwords, gs.out_prim, gs.in_vertices}) h.u32(v);
     h.u32(static_cast<std::uint32_t>(gs.copy.size()));
     for (const gcn::GsCopyOut& c : gs.copy) {
         h.u32(static_cast<std::uint32_t>(c.target) | static_cast<std::uint32_t>(c.comp) << 8 | (c.constant ? 1u << 16 : 0u));
