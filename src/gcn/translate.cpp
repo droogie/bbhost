@@ -3658,8 +3658,14 @@ struct Translator {
                 texels = fmul(cf(0.5f), m.ext_inst(t_f32, spv::GlslExp2,
                                                    {m.ext_inst(t_f32, spv::GlslCeil, {m.ext_inst(t_f32, spv::GlslFMax, {f(ld(vgpr_var(va))), cf(0.0f)})})}));
             for (std::uint32_t k = 0; k < 2; ++k) {
+                // First where the game's repeat puts it (a cube sample's
+                // coordinates are not always in [1, 2]: the shadows' interiors
+                // read past it), [0, 1] kept as it is - then held inside.
+                const Id in01 = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpFOrdGreaterThanEqual, t_bool, {coords[k], cf(0.0f)}),
+                                                                   m.emit(spv::OpFOrdLessThanEqual, t_bool, {coords[k], cf(1.0f)})});
+                const Id wrapped = m.emit(spv::OpSelect, t_f32, {in01, coords[k], m.ext_inst(t_f32, spv::GlslFract, {coords[k]})});
                 const Id half = m.ext_inst(t_f32, spv::GlslFMin, {fdiv(texels, i2f(ui(extract(t_i32, size, k)))), cf(0.5f)});
-                coords[k] = m.ext_inst(t_f32, spv::GlslFClamp, {coords[k], half, fsub(cf(1.0f), half)});
+                coords[k] = m.ext_inst(t_f32, spv::GlslFClamp, {wrapped, half, fsub(cf(1.0f), half)});
             }
         }
         // UNORM means UNnormalized: a set bit requests texel coordinates.

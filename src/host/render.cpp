@@ -22843,7 +22843,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (part && run->stop >= 0) return false;  // its programs or vertex input stopped it (BBHOST_RUN_COMMIT)
     // Elements a vertex shader reading its formats from its params can take
     // packed (build_gfx_pipeline decides vs_formats_from_params the same way).
-    if (use_vertex_input && g_vertex_pack && !(t_tess && t_tess->native) && g_vertex_format_params && use_pipeline_library() &&
+    if (use_vertex_input && g_vertex_pack && !(t_tess && t_tess->native) && !s.gs && g_vertex_format_params && use_pipeline_library() &&
         gcn::vertex_formats_from_params_supported(vertex_input.elements))
         pack_vertex_input(vertex_input);
     if (use_vertex_input && velo_cloth_vs(vs_name)) {
@@ -29198,6 +29198,49 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                 }
             }
         }
+    }
+    // BBHOST_DUMP_RT_LAYERS=0xbase[,..] (a test): every layer of those render
+    // targets, raw, to build/rtl-<base>-<layer>.bin (a cube's six faces).
+    static const std::vector<std::uint64_t> layer_bases = [] {
+        std::vector<std::uint64_t> v;
+        const char* e = std::getenv("BBHOST_DUMP_RT_LAYERS");
+        while (e && *e) {
+            char* end = nullptr;
+            const unsigned long long b = std::strtoull(e, &end, 0);
+            if (end == e) break;
+            v.push_back(b);
+            e = *end == ',' ? end + 1 : end;
+        }
+        return v;
+    }();
+    for (std::uint64_t b : layer_bases) {
+        auto rt = g_rts.find(b);
+        if (rt == g_rts.end() || rt->second.depth) continue;
+        RtImage& r = rt->second;
+        const std::size_t bpp = rt_bytes_per_pixel(r), one = static_cast<std::size_t>(r.width) * r.height * bpp;
+        DevBuffer staging;
+        MemOwner own_mem("diagnostic readbacks");
+        if (!create_dev_buffer(staging, one * r.layers, true)) continue;
+        begin_recording_locked();
+        render_end_pass_locked();
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, r.layers};
+        region.imageExtent = {r.width, r.height, 1};
+        vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
+        flush_locked();
+        for (std::uint32_t l = 0; l < r.layers; ++l) {
+            char q[96];
+            std::snprintf(q, sizeof(q), "build/rtl-%llx-%u.bin", static_cast<unsigned long long>(b), l);
+            host_mkdir("build");
+            if (FILE* f = std::fopen(q, "wb")) {
+                std::fwrite(static_cast<const std::uint8_t*>(staging.map) + one * l, 1, one, f);
+                std::fclose(f);
+            }
+        }
+        host_log("render: %u layers of 0x%llx (%ux%u, format %d) dumped raw", r.layers, static_cast<unsigned long long>(b), r.width, r.height,
+                 static_cast<int>(r.format));
+        vkDestroyBuffer(g.device, staging.buffer, nullptr);
+        vkFreeMemory(g.device, staging.memory, nullptr);
     }
     auto it = g_rts.find(display_va);
     if (it == g_rts.end() || !it->second.initialised) {

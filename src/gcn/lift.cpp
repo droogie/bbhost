@@ -1523,7 +1523,12 @@ private:
     // flag and viewport index its other components carry are not drawn here).
     void gs_store_export(std::uint8_t target, const std::array<Id, 4>& comps) {
         if (target == 13) {
-            m.store(out_layer(), m.emit(spv::OpBitcast, t_i32, {comps[2]}));
+            // The index as an integer's bits; a value past any layer count read
+            // as a float's (a GS that stores 3.0 for face 3).
+            const Id bits = m.emit(spv::OpBitcast, t_u32, {comps[2]});
+            const Id small = m.emit(spv::OpULessThan, t_bool, {bits, cu(2048)});
+            const Id as_float = m.emit(spv::OpConvertFToU, t_u32, {ext(spv::GlslFMax, {comps[2], cf(0.0f)})});
+            m.store(out_layer(), m.emit(spv::OpBitcast, t_i32, {m.emit(spv::OpSelect, t_u32, {small, bits, as_float})}));
             return;
         }
         const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
@@ -4327,8 +4332,11 @@ private:
             Id texels = cf(0.5f);
             if (has_l) texels = fmul(cf(0.5f), ext(spv::GlslExp2, {ext(spv::GlslCeil, {ext(spv::GlslFMax, {as_f(vgpr(va)), cf(0.0f)})})}));
             for (std::uint32_t k = 0; k < 2; ++k) {
+                const Id in01 = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpFOrdGreaterThanEqual, t_bool, {coords[k], cf(0.0f)}),
+                                                                   m.emit(spv::OpFOrdLessThanEqual, t_bool, {coords[k], cf(1.0f)})});
+                const Id wrapped = m.emit(spv::OpSelect, t_f32, {in01, coords[k], ext(spv::GlslFract, {coords[k]})});
                 const Id half = ext(spv::GlslFMin, {fdiv(texels, m.emit(spv::OpConvertSToF, t_f32, {extract(t_i32, size, k)})), cf(0.5f)});
-                coords[k] = ext(spv::GlslFClamp, {coords[k], half, fsub(cf(1.0f), half)});
+                coords[k] = ext(spv::GlslFClamp, {wrapped, half, fsub(cf(1.0f), half)});
             }
         }
         if (unnormalized && !b.cube) {
