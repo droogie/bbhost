@@ -1961,13 +1961,14 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
 // The characters' capture (upscale_pass.cpp): a skinned G-buffer draw's
 // capture address for its vertex shader (StageParams::lds_address), 0 for
-// none - taken in the draws' order, never from a run part's draw; the
-// G-buffer's jittered viewport; whether the capture runs.
-std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index_va, const void* indices, std::uint32_t count, bool i32,
-                                          std::int32_t base_vertex);
+// none - from any thread, a run part's draw included: `order` is its place in
+// the stream (its packet's number), which the frame's draws are matched in;
+// the G-buffer's jittered viewport; whether the capture runs.
+std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t order, std::uint64_t index_va, const void* indices, std::uint32_t count,
+                                          bool i32, std::int32_t base_vertex);
 void upscale_capture_viewport_locked(const VkViewport& vp);
 bool upscale_capture_on();
-void upscale_capture_part_stop();  // a run part's draw handed back to be captured in order (counted)
+void upscale_capture_part_draw();  // a run part's draw captured (counted)
 void upscale_capture_note_moving(std::uint64_t index_va);  // a velocity-pass mesh's index buffer
 bool upscale_capture_moving(std::uint64_t index_va);
 bool upscale_camera_noted();
@@ -2994,6 +2995,9 @@ private:
 // to the stream in its order at the join; and the appended ops handed over.
 bool recorder_threaded();
 std::uint64_t recorder_reserve_packets(std::uint32_t n);
+// The number the command processor's next packet takes (an in-order draw's,
+// before its packet starts): with a run's reserved numbers, the stream's order.
+std::uint64_t recorder_next_packet();
 void recorder_append_packet(std::uint64_t number);
 void recorder_publish_appended();
 // Stage 4b.1b (gxvk_lists.h splice): the list packet of token slot `index`,

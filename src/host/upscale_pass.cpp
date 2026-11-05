@@ -420,13 +420,15 @@ bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w
 // map alone).
 constexpr std::uint32_t kCapSlots = 3;
 constexpr std::uint32_t kCapVertices = 1u << 20;  // a slot's corners (16 bytes each)
-constexpr std::uint32_t kCapCorners = 1u << 21;   // a frame's triangle corners drawn (8 bytes each)
+constexpr std::uint32_t kCapIndexCap = 1u << 23;  // the meshes' indices kept for the motion pass (4 bytes each)
 struct CapIndices {
     std::uint32_t vmin = 0, verts = 0;
     std::vector<std::uint32_t> local;  // each index less vmin
+    std::uint32_t first = ~0u;         // its copy's place in the capture's index buffer (~0u: none)
 };
 struct CapDraw {
-    std::uint64_t key = 0;
+    std::uint64_t key = 0;     // the draw's own until record_capture, then with its n-th of the frame
+    std::uint64_t order = 0;   // its place in the stream (its packet's number)
     std::uint32_t offset = 0;  // in the slot, in corners
     const CapIndices* idx = nullptr;
 };
@@ -435,15 +437,22 @@ struct CapState {
     VkBuffer buf = VK_NULL_HANDLE;  // kCapSlots x kCapVertices vec4s
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkDeviceAddress addr = 0;
-    VkBuffer corners[kCapSlots] = {};
-    VkDeviceMemory corners_mem[kCapSlots] = {};
-    std::uint8_t* corners_map[kCapSlots] = {};
+    // Each mesh's indices, copied once: the motion pass draws a mesh with them
+    // and its two places pushed - a frame's corners were written out one by
+    // one, ~250k pairs a frame on the command processor.
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    VkDeviceMemory ibuf_mem = VK_NULL_HANDLE;
+    std::uint8_t* ibuf_map = nullptr;
+    std::uint32_t ibuf_used = 0;  // under g_cap_mu
     std::uint32_t slot = 0, used = 0;
-    std::vector<CapDraw> now, last;
+    std::vector<CapDraw> now, last;  // now: under g_cap_mu (run parts add to it)
     std::uint32_t last_slot = 0;
     bool last_ok = false;
-    std::unordered_map<std::uint64_t, std::uint32_t> keys;  // this frame's: how many of each so far
-    std::unordered_map<std::uint64_t, std::unique_ptr<CapIndices>> indices;
+    std::unordered_map<std::uint64_t, std::uint32_t> keys;  // record_capture's: how many of each key so far
+    std::unordered_map<std::uint64_t, std::unique_ptr<CapIndices>> indices;  // under g_cap_mu
+    // Replaced while this or the last frame's draws may still name them,
+    // with the frame they were replaced in (freed two frames on).
+    std::vector<std::pair<std::uint64_t, std::unique_ptr<CapIndices>>> retired;
     VkViewport vp{};
     bool vp_set = false;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
@@ -451,10 +460,17 @@ struct CapState {
     VkPipeline pipeline = VK_NULL_HANDLE;
     OwnImage map, zbuf;
     std::uint32_t map_w = 0, map_h = 0;
-    std::uint64_t frames = 0, draws = 0, matched = 0, corner_total = 0, full = 0;
-    std::atomic<std::uint64_t> part_stops{0};  // draws a run part handed back to be captured in order (render.cpp)
+    std::uint64_t frames = 0, draws = 0, matched = 0, corner_total = 0, full = 0, renewed = 0;
+    std::atomic<std::uint64_t> part_draws{0};  // draws captured from a run part (render.cpp)
 };
 CapState g_cap;
+// A run part's draw (BBHOST_RUN_COMMIT) takes its place in the capture on a
+// worker of its own, beside the other parts: the places and the frame's list
+// are taken under this lock, and the frame's draws are put in the stream's
+// order (CapDraw::order) before the n-th of a key is counted (record_capture).
+// Unlocked, two parts tore the count of each key - a null read at the next
+// look-up (the crash with an upscaler at 4K) - and handed two draws one place.
+std::mutex g_cap_mu;
 
 bool capture_env() {
     static const bool on = [] {
@@ -502,26 +518,25 @@ bool capture_ready_locked() {
     g_cap.buf = cap_buffer(VkDeviceSize{kCapSlots} * kCapVertices * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                            g_cap.mem, &g_cap.addr, nullptr);
     bool ok = g_cap.buf != VK_NULL_HANDLE;
-    for (std::uint32_t k = 0; ok && k < kCapSlots; ++k) {
-        g_cap.corners[k] = cap_buffer(VkDeviceSize{kCapCorners} * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, g_cap.corners_mem[k], nullptr,
-                                      &g_cap.corners_map[k]);
-        ok = g_cap.corners[k] != VK_NULL_HANDLE;
+    if (ok) {
+        g_cap.ibuf = cap_buffer(VkDeviceSize{kCapIndexCap} * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, g_cap.ibuf_mem, nullptr, &g_cap.ibuf_map);
+        ok = g_cap.ibuf != VK_NULL_HANDLE;
     }
     if (ok) {
-        const VkDescriptorSetLayoutBinding binds[2] = {
-            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
-        };
+        const VkDescriptorSetLayoutBinding bind{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        sli.bindingCount = 2;
-        sli.pBindings = binds;
+        sli.bindingCount = 1;
+        sli.pBindings = &bind;
         ok = vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_cap.set_layout) == VK_SUCCESS;
     }
     if (ok) {
+        const VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 8};
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1;
         pli.pSetLayouts = &g_cap.set_layout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
         ok = vkCreatePipelineLayout(g.device, &pli, nullptr, &g_cap.layout) == VK_SUCCESS;
     }
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
@@ -591,8 +606,8 @@ bool capture_ready_locked() {
     if (vs) vkDestroyShaderModule(g.device, vs, nullptr);
     if (fs) vkDestroyShaderModule(g.device, fs, nullptr);
     g_cap.ok = ok;
-    host_log("upscaler: the characters' capture %s (%u corners a frame in each of %u slots; BBHOST_CHAR_CAPTURE=0 turns it off)",
-             ok ? "ready" : "failed to set up; the velocity map alone", kCapVertices, kCapSlots);
+    host_log("upscaler: the characters' capture %s (%u corners a frame in each of %u slots, %u indices kept; BBHOST_CHAR_CAPTURE=0 turns it off)",
+             ok ? "ready" : "failed to set up; the velocity map alone", kCapVertices, kCapSlots, kCapIndexCap);
     return ok;
 }
 
@@ -612,28 +627,33 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
         g_cap.map_w = w;
         g_cap.map_h = h;
     }
-    // The matched corners.
+    // This frame's draws in the stream's order, each key's n-th counted in it
+    // (the n-th draw of a key stands for the last frame's n-th).
+    std::lock_guard<std::mutex> cap_lk(g_cap_mu);
+    std::stable_sort(g_cap.now.begin(), g_cap.now.end(), [](const CapDraw& a, const CapDraw& b) { return a.order < b.order; });
+    for (CapDraw& c : g_cap.now) {
+        const std::uint32_t nth = g_cap.keys[c.key]++;
+        c.key = fnv1a(&nth, sizeof(nth), c.key);
+    }
+    // The matched draws: each mesh's indices (its copy in the index buffer)
+    // with its places this frame and last.
+    struct Matched {
+        std::uint32_t first, count, bases[2];
+    };
+    static std::vector<Matched> matched;
+    matched.clear();
     std::uint32_t n = 0;
     if (g_cap.ok && g_cap.last_ok && g_cap.vp_set) {
         std::unordered_map<std::uint64_t, const CapDraw*> last;
         last.reserve(g_cap.last.size());
         for (const CapDraw& l : g_cap.last) last.emplace(l.key, &l);
-        auto* out = reinterpret_cast<std::uint32_t*>(g_cap.corners_map[g_cap.slot]);
         const std::uint32_t now_base = g_cap.slot * kCapVertices, last_base = g_cap.last_slot * kCapVertices;
         for (const CapDraw& c : g_cap.now) {
             const auto it = last.find(c.key);
-            if (it == last.end() || it->second->idx != c.idx) continue;
+            if (it == last.end() || it->second->idx != c.idx || c.idx->first == ~0u) continue;
             const std::uint32_t k = static_cast<std::uint32_t>(c.idx->local.size());
-            if (n + k > kCapCorners) {
-                ++g_cap.full;
-                break;
-            }
-            const std::uint32_t a = now_base + c.offset, b = last_base + it->second->offset;
-            for (const std::uint32_t v : c.idx->local) {
-                out[2 * n] = a + v;
-                out[2 * n + 1] = b + v;
-                ++n;
-            }
+            matched.push_back({c.idx->first, k, {now_base + c.offset, last_base + it->second->offset}});
+            n += k;
             ++g_cap.matched;
         }
     }
@@ -641,11 +661,11 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
     g_cap.draws += g_cap.now.size();
     if (++g_cap.frames % 600 == 0) {
         host_log("upscaler: the characters' capture over 600 frames: %llu draws a frame, %llu matched, %llu corners drawn, %llu frames full, "
-                 "%llu draws from run parts taken again in order",
+                 "%llu draws from run parts, %llu meshes' indices read again (changed under their buffer)",
                  static_cast<unsigned long long>(g_cap.draws / 600), static_cast<unsigned long long>(g_cap.matched / 600),
                  static_cast<unsigned long long>(g_cap.corner_total / 600), static_cast<unsigned long long>(g_cap.full),
-                 static_cast<unsigned long long>(g_cap.part_stops.exchange(0)));
-        g_cap.draws = g_cap.matched = g_cap.corner_total = g_cap.full = 0;
+                 static_cast<unsigned long long>(g_cap.part_draws.exchange(0)), static_cast<unsigned long long>(g_cap.renewed));
+        g_cap.draws = g_cap.matched = g_cap.corner_total = g_cap.full = g_cap.renewed = 0;
     }
     render_end_pass_locked();
     // This frame's corners, written by the game's vertex shaders.
@@ -690,22 +710,24 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
     if (n) {
         const VkDescriptorSet set = alloc_set_locked(g_cap.set_layout);
         if (set) {
-            const VkDescriptorBufferInfo bi[2] = {{g_cap.buf, 0, VK_WHOLE_SIZE}, {g_cap.corners[g_cap.slot], 0, VkDeviceSize{n} * 8}};
-            VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-            for (int k = 0; k < 2; ++k) {
-                wr[k].dstSet = set;
-                wr[k].dstBinding = static_cast<std::uint32_t>(k);
-                wr[k].descriptorCount = 1;
-                wr[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                wr[k].pBufferInfo = &bi[k];
-            }
-            vkUpdateDescriptorSets(g.device, 2, wr, 0, nullptr);
+            const VkDescriptorBufferInfo bi{g_cap.buf, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr.dstSet = set;
+            wr.dstBinding = 0;
+            wr.descriptorCount = 1;
+            wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr.pBufferInfo = &bi;
+            vkUpdateDescriptorSets(g.device, 1, &wr, 0, nullptr);
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cap.pipeline);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cap.layout, 0, 1, &set, 0, nullptr);
+            vkCmdBindIndexBuffer(cb, g_cap.ibuf, 0, VK_INDEX_TYPE_UINT32);
             vkCmdSetViewport(cb, 0, 1, &g_cap.vp);
             const VkRect2D sc{{0, 0}, {w, h}};
             vkCmdSetScissor(cb, 0, 1, &sc);
-            vkCmdDraw(cb, n, 1, 0, 0);
+            for (const Matched& m : matched) {
+                vkCmdPushConstants(cb, g_cap.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(m.bases), m.bases);
+                vkCmdDrawIndexed(cb, m.count, 1, m.first, 0, 0);
+            }
         }
     }
     vkCmdEndRendering(cb);
@@ -723,6 +745,20 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
         g_cap.slot = (g_cap.slot + 1) % kCapSlots;
         g_cap.used = 0;
         g_cap.keys.clear();
+        // Entries replaced two frames ago are named by no list now.
+        std::erase_if(g_cap.retired, [](const auto& r) { return r.first + 2 <= g_cap.frames; });
+        // The index buffer nearly full (areas' meshes since the start): every
+        // entry retired - the lists still name them for two frames - and the
+        // meshes read and copied again as they are drawn.
+        if (g_cap.ibuf_used > kCapIndexCap - kCapIndexCap / 8) {
+            for (auto& [k, e] : g_cap.indices) {
+                if (e) g_cap.retired.emplace_back(g_cap.frames, std::move(e));
+            }
+            g_cap.indices.clear();
+            g_cap.ibuf_used = 0;
+            host_log("upscaler: the characters' capture's index buffer emptied (%u indices kept) - meshes copied again as they are drawn",
+                     kCapIndexCap);
+        }
     }
     g_cap.vp_set = false;
 }
@@ -1714,17 +1750,36 @@ std::uint64_t upscale_pass_calls() { return g_calls.load(std::memory_order_relax
 // first vertex's (an index plus the base vertex is the vertex shader's vertex
 // index), or 0 for none. The indices, read once for each buffer and range,
 // give the vertices it uses and its triangles.
-std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index_va, const void* indices, std::uint32_t count, bool i32,
-                                          std::int32_t base_vertex) {
+std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t order, std::uint64_t index_va, const void* indices, std::uint32_t count,
+                                          bool i32, std::int32_t base_vertex) {
     if (!capture_env() || !g_cap.ok || !indices || count < 3 || count > (1u << 22)) return 0;
     const std::uint64_t ikey = fnv1a(&count, sizeof(count), index_va ^ (i32 ? 0x32ull : 0x16ull));
+    const auto index_at = [&](std::uint32_t k) {
+        return i32 ? static_cast<const std::uint32_t*>(indices)[k] : static_cast<std::uint32_t>(static_cast<const std::uint16_t*>(indices)[k]);
+    };
+    std::lock_guard<std::mutex> lk(g_cap_mu);
     std::unique_ptr<CapIndices>& slot = g_cap.indices[ikey];
+    // Read once for its buffer and count - and again when eight of them no
+    // longer read as kept (another mesh's indices streamed into the same
+    // place): its vertex shader would store past the corners given it.
+    if (slot && slot->verts) {
+        const std::uint32_t used = static_cast<std::uint32_t>(slot->local.size());
+        bool same = used == count - count % 3;
+        for (std::uint32_t s = 0; same && s < 8; ++s) {
+            const std::uint32_t k = static_cast<std::uint32_t>(static_cast<std::uint64_t>(used - 1) * s / 7);
+            same = index_at(k) - slot->vmin == slot->local[k];
+        }
+        if (!same) {
+            g_cap.retired.emplace_back(g_cap.frames, std::move(slot));
+            ++g_cap.renewed;
+        }
+    }
     if (!slot) {
         slot = std::make_unique<CapIndices>();
         std::uint32_t lo = UINT32_MAX, hi = 0;
         std::vector<std::uint32_t> v(count);
         for (std::uint32_t k = 0; k < count; ++k) {
-            v[k] = i32 ? static_cast<const std::uint32_t*>(indices)[k] : static_cast<const std::uint16_t*>(indices)[k];
+            v[k] = index_at(k);
             lo = std::min(lo, v[k]);
             hi = std::max(hi, v[k]);
         }
@@ -1734,14 +1789,21 @@ std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index
             slot->vmin = lo;
             slot->verts = hi - lo + 1;
             slot->local = std::move(v);
+            // Its copy for the motion pass, once (the buffer full: the meshes
+            // made from here on go uncaptured until it is emptied, below).
+            const auto k = static_cast<std::uint32_t>(slot->local.size());
+            if (g_cap.ibuf_used + k <= kCapIndexCap) {
+                std::memcpy(g_cap.ibuf_map + std::size_t{g_cap.ibuf_used} * 4, slot->local.data(), std::size_t{k} * 4);
+                slot->first = g_cap.ibuf_used;
+                g_cap.ibuf_used += k;
+            }
         }
     }
     const CapIndices* idx = slot.get();
     if (!idx->verts || g_cap.used + idx->verts > kCapVertices) return 0;
-    // The n-th draw of a key this frame stands for the n-th of the last.
-    const std::uint32_t nth = g_cap.keys[key]++;
     CapDraw c;
-    c.key = fnv1a(&nth, sizeof(nth), key);
+    c.key = key;  // its n-th of the frame added in the stream's order (record_capture)
+    c.order = order;
     c.offset = g_cap.used;
     c.idx = idx;
     g_cap.now.push_back(c);
@@ -1752,7 +1814,7 @@ std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index
 
 // The G-buffer's viewport as a camera draw had it, the jitter included.
 void upscale_capture_viewport_locked(const VkViewport& vp) {
-    std::lock_guard<std::mutex> lk(g_note_mu);
+    std::lock_guard<std::mutex> lk(g_cap_mu);
     g_cap.vp = vp;
     g_cap.vp.minDepth = 0.0f;
     g_cap.vp.maxDepth = 1.0f;
@@ -1760,7 +1822,7 @@ void upscale_capture_viewport_locked(const VkViewport& vp) {
 }
 
 bool upscale_capture_on() { return capture_env() && g_cap.ok; }
-void upscale_capture_part_stop() { g_cap.part_stops.fetch_add(1, std::memory_order_relaxed); }
+void upscale_capture_part_draw() { g_cap.part_draws.fetch_add(1, std::memory_order_relaxed); }
 
 // The meshes the game moves: each index buffer its velocity pass ever drew a
 // mesh from (render.cpp), remembered - the G-buffer draws of the same buffer
