@@ -85,9 +85,9 @@ struct HostSettings {
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
     bool dynamic_shadows = true;  // the dynamic lights' shadows (graphics_patch.cpp, +0x296e)
     // Shadow resolution (engine/patch_manifest.cpp's shadow-resolution, read once as
-    // the game starts): 0 Low, the game's sizes; 1 Medium (the sun 4096, spot
-    // 2048, cube faces 1024); 2 High (all 4096).
-    int shadow_resolution = 0;
+    // the game starts): 0 Lowest, 1 Low, 2 Default (the game's sizes), 3 High,
+    // 4 Ultra, 5 Giga; Performance mode's sizes over them.
+    int shadow_resolution = 2;
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;
