@@ -1533,6 +1533,19 @@ inline bool run_part() {
     const RunDraw* const r = t_run_draw;
     return r && r->part;
 }
+// The 'buffers' stops by where they are met (BBHOST_GXVK_LISTS_TIMES counts a
+// list-mode draw's first by its site): a constant buffer neither a home, in
+// GX's upload heap nor a known heap snapshot; one realigned or not snapshotted
+// for the list arena; one read through the page table; a vertex record in no
+// import; a twin candidate's range; the vertex copies' ring in host memory.
+enum BuffersStop : int { kBsCbLookups, kBsCbArena, kBsCbPageTable, kBsVertexNoImport, kBsTwin, kBsSnapRing, kBuffersStops };
+extern thread_local constinit int t_buffers_stop;
+inline bool run_part_stop_buffers(int site) {
+    if (list_resolve::parts()) {
+        if (const RunDraw* const r = t_run_draw; r && r->part && r->stop < 0) t_buffers_stop = site;
+    }
+    return run_part_stop(kRunStopBuffers);
+}
 // A run part's draw that has stopped (its first stop kept).
 inline bool run_part_stopped() {
     if (!list_resolve::parts()) return false;
@@ -2212,6 +2225,7 @@ extern std::atomic<std::uint64_t> g_splice_view_again[2];  // resolved again: th
 // Stage 4b.1b's list mode: its draws' image stops, by kind (textures.cpp) - a view by its T#'s words, a view by
 // id not made yet, a sampler not made yet.
 extern std::atomic<std::uint64_t> g_list_image_stops[3];
+extern std::atomic<std::uint64_t> g_list_view_stop_why[4];  // (BBHOST_GXVK_LISTS_TIMES: the views by id not found, by why)
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
@@ -2221,6 +2235,7 @@ void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists
 // draw committed ahead of the command processor, in its list mode, into the
 // record the command processor's splice reads (render.cpp host_gpu_splice).
 void lists_commit(std::uint64_t id);
+void lists_thread_end();  // a pool thread ending: its commits' times added to the totals (BBHOST_GXVK_LISTS_TIMES)
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
 // `rec` (host/gxvk_lists_internal.h ListRec) into segments and builds each -
 // its draws' params blocks and merged notes, and with

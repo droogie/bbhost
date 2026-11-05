@@ -5,6 +5,7 @@
 // come straight from the imported guest memory.
 #include "core/image_file.h"
 #include "core/portable.h"
+#include "core/host_clock.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/loading.h"
@@ -15741,6 +15742,25 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
     return true;
 }
 
+// BBHOST_GXVK_LISTS_TIMES: a list-mode draw's constant buffer that stopped it for its lookups ('a constant
+// buffer's lookups'), by why it took no home: no GX records, no binding plan, a pointer pair, a binding that is no
+// constant-buffer record, no buffer object in its slot, a record naming no home (a renamed copy outside GX's upload
+// heap), a home not taken (stored to, empty, unaligned, a byte table, Scaleform's snapshots), a home not bound. The
+// first few logged.
+enum CbLookupsWhy : int { kClNoRecords, kClNoPlan, kClPointer, kClNotRecord, kClNoObject, kClNoHome, kClNotTaken, kClNotBound, kCbLookupsWhys };
+const char* const kCbLookupsWhyName[kCbLookupsWhys] = {"no records", "no binding plan", "a pointer", "not a buffer record", "no buffer in the slot",
+                                                       "no home (a renamed copy outside the heap)", "a home not taken", "a home not bound"};
+std::atomic<std::uint64_t> g_cb_lookups_why[kCbLookupsWhys] = {};
+std::atomic<int> g_cb_lookups_said{0};
+__attribute__((noinline)) void note_cb_lookups(int why, std::uint64_t base, VkDeviceSize bytes, int source, int slot, int plan_why) {
+    g_cb_lookups_why[why].fetch_add(1, std::memory_order_relaxed);
+    if (g_cb_lookups_said.fetch_add(1, std::memory_order_relaxed) < 12)
+        host_log("gxvk-lists: times: a constant buffer's lookups stopped a commit: %s - 0x%llx, %llu bytes; plan source %d slot %d why %d; "
+                 "pipeline %s",
+                 kCbLookupsWhyName[why], static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), source, slot, plan_why,
+                 t_draw_pipeline ? t_draw_pipeline : "?");
+}
+
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
                            std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
                            std::uint32_t* records = nullptr, std::uint64_t* bases = nullptr) {
@@ -15908,7 +15928,21 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // Stage 4b.1b's list mode: a range neither a home nor GX's upload heap
         // holds is answered by the copy versions, the GPU writes and the twins
         // as they stand at its splice's place, not this one's: in order.
-        if (t_run_draw && t_run_draw->list && !in_heap && outcome == kUnmapped && !known && base && run_part_stop(kRunStopBuffers)) return;
+        if (t_run_draw && t_run_draw->list && !in_heap && outcome == kUnmapped && !known && base) {
+            if (gxvk_lists::times() && t_run_draw->stop < 0) {  // (BBHOST_GXVK_LISTS_TIMES: why it took no home)
+                const GxBindingPlan* const bp = plan && i < plan->buffers.size() ? &plan->buffers[i] : nullptr;
+                const int why = !gx                                           ? kClNoRecords
+                                : !plan                                       ? kClNoPlan
+                                : b.pointer                                   ? kClPointer
+                                : !bp || bp->source != GxBindingPlan::kCb     ? kClNotRecord
+                                : !((gx->obj_cb_set >> bp->slot) & 1)         ? kClNoObject
+                                : !home_handle                                ? kClNoHome
+                                : !gxvk_homes::bind_on() || b.written || !bytes || (base & 3) || !shape || t_snapshot_cbs ? kClNotTaken
+                                                                              : kClNotBound;
+                note_cb_lookups(why, base, bytes, bp ? bp->source : -1, bp ? bp->slot : -1, bp ? bp->why : -1);
+            }
+            if (run_part_stop_buffers(kBsCbLookups)) return;
+        }
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
@@ -16222,7 +16256,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // list arena (list_cb_take), bound as the ring is; false: the draw stops.
                     const bool bound = [&]() __attribute__((noinline)) {
                         if (!snapshot && !known) {
-                            run_part_stop(kRunStopBuffers);
+                            run_part_stop_buffers(kBsCbArena);
                             return false;
                         }
                         VkDeviceSize copy_bytes = bytes;
@@ -16425,7 +16459,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (b.written && !twin_holds_live_locked(base, bytes)) shadow_written_locked(base, bytes, true);
             }
         }
-        if (outcome != kBound && base && run_part_stop(kRunStopBuffers)) return;  // its windows imported in order
+        if (outcome != kBound && base && run_part_stop_buffers(kBsCbPageTable)) return;  // its windows imported in order
         if (outcome != kBound) {
             // The shader walks the page table over the V#'s range: its windows
             // imported, and any copy-back still in its copy put in place first.
@@ -17305,7 +17339,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 fb = had->whole;
                 how = had->snapped ? import_fallback::kCopy : import_fallback::kMirror;
             } else if (rec_bytes >= fe.offset + bytes) {
-                if (run_part_stop(kRunStopBuffers)) return false;  // a record in no import: copied in order
+                if (run_part_stop_buffers(kBsVertexNoImport)) return false;  // a record in no import: copied in order
                 how = shadow_import_fallback_locked(rec_va, rec_bytes, draw_read_bytes(w, stride, rec_bytes), fb);
             }
             if (how == import_fallback::kMirror && fb.avail > fe.offset) {
@@ -25726,8 +25760,56 @@ struct ListCommit {
     // ready (written by the builder before the draw's state says segment).
     Segment* seg = nullptr;
     std::uint64_t seg_word = 0;
+    // BBHOST_GXVK_LISTS_TIMES: when the commit began and ended (rdtsc).
+    std::atomic<std::uint64_t> t0{0}, t1{0};
 };
 constexpr std::uint64_t kListCommits = 16384;  // as the token slots: token `id`'s record is id's slot index
+static_assert(kListCommits == gxvk_lists::detail::kTimeSlots, "a draw's times are kept by its commit's index");
+
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the commit's time by
+// part, kept per pool thread and added to the totals every 128 commits.
+enum CommitPart : int { kCpBegin, kCpPin, kCpKind, kCpLock, kCpDraw, kCpEnd, kCommitParts };
+const char* const kCommitPartName[kCommitParts] = {"begin", "pin", "kind and targets", "lock and config", "draw", "end"};
+// And the refusals' finer reasons: a kind refused by what made it so (tessellated, a geometry shader, indirect, other
+// stages, no count, no geometry), a draw with no published targets by why (none published under its names' slot,
+// another run's names there, the slot being written).
+enum KindWhy : int { kKwTess, kKwGs, kKwIndirect, kKwStages, kKwCount, kKwGeometry, kKindWhys };
+const char* const kKindWhyName[kKindWhys] = {"tessellated", "a geometry shader", "indirect", "other stages", "no count", "no geometry"};
+enum TargetsWhy : int { kTwNone, kTwOther, kTwBusy, kTargetsWhys };
+const char* const kTargetsWhyName[kTargetsWhys] = {"none published", "another run's names", "being written"};
+thread_local int t_find_why = kTwNone;  // find_run_targets' why, when it finds none
+struct CommitTimes {
+    std::uint64_t part[kCommitParts] = {};
+    std::uint64_t ok = 0, ok_ticks = 0, refused = 0, refused_ticks = 0, n = 0;
+    std::uint64_t kind_why[kKindWhys] = {}, targets_why[kTargetsWhys] = {}, buffers_why[kBuffersStops] = {};
+};
+thread_local CommitTimes t_commit_times;
+std::atomic<std::uint64_t> g_commit_part[kCommitParts] = {}, g_commit_ok{0}, g_commit_ok_ticks{0}, g_commit_refused{0},
+    g_commit_refused_ticks{0}, g_kind_why[kKindWhys] = {}, g_targets_why[kTargetsWhys] = {}, g_buffers_why[kBuffersStops] = {};
+const char* const kBuffersStopName[kBuffersStops] = {"a constant buffer's lookups", "a constant buffer for the arena", "a page-table read",
+                                                     "a vertex record in no import", "a twin candidate", "the vertex copies' ring in host memory"};
+// The per-draw splice's finer in-order reasons (the command processor's, with the times): a run's first draw with no
+// run open at all / another run open; a split since its run's first by the split's kind (list_resolve::Split).
+struct SpliceCensus {
+    std::atomic<std::uint64_t> first[2] = {};
+    std::atomic<std::uint64_t> split[list_resolve::kSplits + 1] = {};
+};
+SpliceCensus g_splice_census;
+const char* const kSplitName[list_resolve::kSplits + 1] = {"targets", "wait",  "label",      "copy",     "dispatch",  "query",      "other draw",
+                                                           "cp write", "predication", "constant engine", "call", "packet draw", "submission", "none"};
+// A count only the command processor adds to.
+void arr_bump(std::atomic<std::uint64_t>& a) { a.store(a.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+void commit_times_flush(CommitTimes& t) {
+    for (int k = 0; k < kBuffersStops; ++k) g_buffers_why[k].fetch_add(t.buffers_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kKindWhys; ++k) g_kind_why[k].fetch_add(t.kind_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kTargetsWhys; ++k) g_targets_why[k].fetch_add(t.targets_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kCommitParts; ++k) g_commit_part[k].fetch_add(t.part[k], std::memory_order_relaxed);
+    g_commit_ok.fetch_add(t.ok, std::memory_order_relaxed);
+    g_commit_ok_ticks.fetch_add(t.ok_ticks, std::memory_order_relaxed);
+    g_commit_refused.fetch_add(t.refused, std::memory_order_relaxed);
+    g_commit_refused_ticks.fetch_add(t.refused_ticks, std::memory_order_relaxed);
+    t = CommitTimes{};
+}
 ListCommit* g_list_commits = nullptr;
 std::once_flag g_list_commits_made;
 ListCommit* list_commits() {
@@ -25833,9 +25915,14 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
             return true;
         }
     }
+    t_find_why = kTwBusy;
     for (int tries = 0; tries < 4; ++tries) {
         const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
-        if (!s0 || (s0 & 1)) continue;
+        if (!s0) {
+            t_find_why = kTwNone;
+            return false;
+        }
+        if (s0 & 1) continue;
         const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
         if (same) {
             out = p.m;
@@ -25850,6 +25937,8 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
                 last_erase = erase_gen;
                 last_flip = flip;
                 last_out = &out;
+            } else {
+                t_find_why = kTwOther;
             }
             return same;
         }
@@ -25882,6 +25971,9 @@ bool list_config_ok_locked() {
 }  // namespace
 
 namespace gpu {
+// A pool thread ending (gxvk_lists_pool.cpp): what its commits timed, added.
+void lists_thread_end() { commit_times_flush(t_commit_times); }
+
 void lists_commit(std::uint64_t id) {
     ListCommit* const all = list_commits();
     ListCommit& c = all[id & (kListCommits - 1)];
@@ -25898,6 +25990,17 @@ void lists_commit(std::uint64_t id) {
     c.seg = nullptr;
     c.why = -1;
     c.flip = hle_video_flip_count();
+    // BBHOST_GXVK_LISTS_TIMES: the commit's parts, timed.
+    const bool timed = gxvk_lists::times();
+    const std::uint64_t tsc0 = timed ? __builtin_ia32_rdtsc() : 0;
+    std::uint64_t mark = tsc0;
+    const auto lap = [&](int part) {
+        if (!timed) return;
+        const std::uint64_t now = __builtin_ia32_rdtsc();
+        t_commit_times.part[part] += now - mark;
+        mark = now;
+    };
+    if (timed) c.t0.store(tsc0, std::memory_order_relaxed);
     bool pinned = false;
     const auto finish = [&](int why) {
         // The slot given back first: a committed record says the pool reads
@@ -25909,13 +26012,24 @@ void lists_commit(std::uint64_t id) {
         else g_lc_why[why].fetch_add(1, std::memory_order_relaxed);
         g_lc_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
                           std::memory_order_relaxed);
+        if (timed) {
+            lap(kCpEnd);
+            CommitTimes& t = t_commit_times;
+            if (why == kRunStopBuffers && t_buffers_stop >= 0 && t_buffers_stop < kBuffersStops) ++t.buffers_why[t_buffers_stop];
+            (why < 0 ? t.ok : t.refused) += 1;
+            (why < 0 ? t.ok_ticks : t.refused_ticks) += mark - tsc0;
+            c.t1.store(mark, std::memory_order_relaxed);
+            if (++t.n == 128) commit_times_flush(t);
+        }
         c.word.store(lc_word(id, why < 0 ? kLcCommitted : kLcNot), std::memory_order_release);
     };
     if (!recorder_list_packet_free(id)) return finish(kLwBusy);
     static thread_local GpuDrawInputs in;
     static thread_local GxDrawObjects o;
     bool own_records = false;
+    lap(kCpBegin);
     if (!hle_gx_native_pin_copy(id, in, o, &own_records)) return finish(kLwLate);
+    lap(kCpPin);
     pinned = true;
     // (Its records copied for this thread: the slot given back now, so the command processor's take never waits for
     // the commit - a draw it reaches first is drawn in order.)
@@ -25923,7 +26037,13 @@ void lists_commit(std::uint64_t id) {
         hle_gx_native_unpin(id);
         pinned = false;
     }
-    if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) return finish(kLwKind);
+    if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) {
+        if (timed) {
+            ++t_commit_times.kind_why[in.tess ? kKwTess : in.gs ? kKwGs : o.indirect_va ? kKwIndirect : (in.stages & 0x7) ? kKwStages
+                                      : !o.count ? kKwCount : kKwGeometry];
+        }
+        return finish(kLwKind);
+    }
     // The draw as the walk's take of its token gives it (gnm_exec.cpp native_draw).
     static const std::uint32_t no_registers[0x1000] = {};
     GpuDraw d;
@@ -25943,13 +26063,17 @@ void lists_commit(std::uint64_t id) {
     target_names(in, c.names);
     static thread_local RunTargets targets;
     std::uint64_t erase_gen = 0, pub_flip = 0;
-    if (!find_run_targets(c.names, targets, erase_gen, pub_flip)) return finish(kLwTargets);
+    if (!find_run_targets(c.names, targets, erase_gen, pub_flip)) {
+        if (timed) ++t_commit_times.targets_why[t_find_why];
+        return finish(kLwTargets);
+    }
     // Its targets stay allocated while it may use them - let go, they lie in
     // the graveyard (rt_bury_locked) - if the publication is recent enough.
     if (pub_flip + kRtPubAge < c.flip) return finish(kLwRemade);
     c.erase_gen = erase_gen;
     std::memcpy(c.looked, targets.out.looked, sizeof(c.looked));
     c.reached = targets.out.reached;
+    lap(kCpKind);
     // Beside the command processor: the caches and maps it reads under the
     // readers' lock (host/cache_rw.h), which every change they could see takes
     // exclusive - a target let go, a pipeline, set, program or view made.
@@ -25962,6 +26086,7 @@ void lists_commit(std::uint64_t id) {
     if (locked) lock.lock();
     cache_rw::Read rd;
     if (!list_config_ok_locked()) return finish(kLwConfig);
+    lap(kCpLock);
     // (A target let go since it was published is still allocated - the graveyard - with its format and size as
     // published; the splice binds the commit only to a run whose targets are these very objects.)
     c.notes.clear();
@@ -25977,6 +26102,7 @@ void lists_commit(std::uint64_t id) {
     std::memcpy(t_list_names, c.names, sizeof(c.names));
     t_run_draw = &r;
     const bool ok = draw_impl(d);
+    lap(kCpDraw);
     t_run_draw = nullptr;
     t_list_targets = nullptr;
     t_bump_sink = nullptr;
@@ -26084,11 +26210,20 @@ bool host_gpu_splice(std::uint64_t id) {
     // The run open on this thread: its first draw drawn in order with these
     // names, nothing done in order since, no target made, no fill or clear.
     const RunTargets& m = t_run_targets;
-    if (!m.valid) return fall(kSwRunFirst);
-    if (std::memcmp(run_names_of(m), c.names, sizeof(c.names)) != 0) return fall(kSwRunFirst);
+    if (!m.valid) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.first[0]);
+        return fall(kSwRunFirst);
+    }
+    if (std::memcmp(run_names_of(m), c.names, sizeof(c.names)) != 0) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.first[1]);
+        return fall(kSwRunFirst);
+    }
     // The run open: its first draw's lookups still stand (as batching shares
     // them) - and its targets are the very objects the commit drew with.
-    if (m.serial != list_resolve::run_serial()) return fall(kSwChanged);
+    if (m.serial != list_resolve::run_serial()) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.split[std::min(list_resolve::last_split(), static_cast<int>(list_resolve::kSplits))]);
+        return fall(kSwChanged);
+    }
     if (g_rt_gen != m.rt_gen || g_pending_htile_gen != m.htile_gen || g_pending_gen != m.pending_gen ||
         (m.depth && m.depth->htile_clear_pending))
         return fall(kSwRunGens);
@@ -26195,6 +26330,160 @@ bool host_gpu_list_committed(std::uint64_t id) {
     const std::uint64_t w = c.word.load(std::memory_order_acquire);
     const std::uint32_t st = lc_state(w);
     return lc_id(w) == id && (st == kLcCommitted || st == kLcBuilding || st == kLcSegment || st == kLcTaken);
+}
+
+// BBHOST_GXVK_LISTS_TIMES: the command processor's arrival at GX-native draw
+// token `id` (gnm_exec.cpp, before anything takes it), by where the pool was:
+// its feed's entry not taken yet (with how far behind the pool's next entry
+// it lay), committing, done (committed or refused), held or built into a
+// segment, taken (a spliced segment's member) - each with the time since the
+// draw was stored; and for a done commit the time since it ended, for a draw
+// whose list had closed the time since then. All the command processor's
+// (one writer): plain loads and stores. Ticks are rdtsc's, turned into
+// microseconds at the first 100 ms (then fixed).
+namespace {
+enum Arrival : int { kArQueued, kArCommitting, kArCommitted, kArRefused, kArBuilding, kArSegment, kArTaken, kArOther, kArrivals };
+const char* const kArrivalName[kArrivals] = {"queued", "committing", "committed", "refused", "building", "segment", "taken", "other"};
+constexpr int kLeadBuckets = 12;  // < 25, 50, 100, 200, 500 us, 1, 2, 3, 5, 10, 20 ms, more
+constexpr double kLeadEdge[kLeadBuckets - 1] = {25, 50, 100, 200, 500, 1000, 2000, 3000, 5000, 10000, 20000};
+constexpr int kBehindBuckets = 6;  // feed entries behind: < 16, 64, 256, 1024, 4096, more
+struct ArrivalCounts {
+    std::atomic<std::uint64_t> n[kArrivals] = {};
+    std::atomic<std::uint64_t> lead[kArrivals][kLeadBuckets] = {};
+    std::atomic<std::uint64_t> behind[kBehindBuckets] = {};
+    std::atomic<std::uint64_t> slack[kLeadBuckets] = {};      // committed: since its commit ended
+    std::atomic<std::uint64_t> list_lead[kLeadBuckets] = {};  // since its list closed
+    std::atomic<std::uint64_t> list_open = 0, no_time = 0;
+};
+ArrivalCounts g_arr;
+std::atomic<double> g_tsc_per_us{0.0};
+std::atomic<std::uint64_t> g_seg_wait_ticks{0};  // a list's segment builder waiting for its draws' commits (lists_segment)
+int lead_bucket(std::uint64_t ticks, double per_us) {
+    const double us = static_cast<double>(ticks) / per_us;
+    int b = 0;
+    while (b < kLeadBuckets - 1 && us >= kLeadEdge[b]) ++b;
+    return b;
+}
+}  // namespace
+
+void host_gpu_lists_arrival(std::uint64_t id) {
+    const std::uint64_t now = __builtin_ia32_rdtsc();
+    double per_us = g_tsc_per_us.load(std::memory_order_relaxed);
+    if (per_us == 0.0) {
+        static std::uint64_t tsc0 = 0, ns0 = 0;
+        const std::uint64_t ns = host_clock_monotonic_ns();
+        if (!tsc0) {
+            tsc0 = now;
+            ns0 = ns;
+            return;
+        }
+        if (ns - ns0 < 100'000'000) return;
+        per_us = static_cast<double>(now - tsc0) * 1000.0 / static_cast<double>(ns - ns0);
+        g_tsc_per_us.store(per_us, std::memory_order_relaxed);
+    }
+    const gxvk_lists::detail::DrawTime& t = gxvk_lists::detail::g_draw_times[id & (gxvk_lists::detail::kTimeSlots - 1)];
+    const ListCommit* const all = g_list_commits;
+    if (!all || t.id.load(std::memory_order_relaxed) != id) {
+        arr_bump(g_arr.no_time);
+        return;
+    }
+    const std::uint64_t stored = t.stored.load(std::memory_order_relaxed);
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    int a = kArOther;
+    if (lc_id(w) != id) {
+        a = kArQueued;
+        const std::uint64_t pos = t.feed.load(std::memory_order_relaxed);
+        const std::uint64_t next = gxvk_lists::detail::g_feed_next.load(std::memory_order_relaxed);
+        const std::uint64_t behind = pos >= next ? pos - next : 0;
+        int b = 0;
+        for (std::uint64_t edge = 16; b < kBehindBuckets - 1 && behind >= edge; edge *= 4) ++b;
+        arr_bump(g_arr.behind[b]);
+    } else {
+        switch (lc_state(w)) {
+        case kLcCommitting: a = kArCommitting; break;
+        case kLcCommitted: a = kArCommitted; break;
+        case kLcNot: a = kArRefused; break;
+        case kLcBuilding: a = kArBuilding; break;
+        case kLcSegment: a = kArSegment; break;
+        case kLcTaken: a = kArTaken; break;
+        default: break;
+        }
+        if (a == kArCommitted || a == kArSegment) {
+            const std::uint64_t t1 = c.t1.load(std::memory_order_relaxed);
+            if (t1 && t1 <= now) arr_bump(g_arr.slack[lead_bucket(now - t1, per_us)]);
+        }
+    }
+    arr_bump(g_arr.n[a]);
+    if (stored && stored <= now) arr_bump(g_arr.lead[a][lead_bucket(now - stored, per_us)]);
+    const std::uint64_t closed = t.closed.load(std::memory_order_relaxed);
+    if (closed >= stored && closed <= now) arr_bump(g_arr.list_lead[lead_bucket(now - closed, per_us)]);
+    else arr_bump(g_arr.list_open);
+}
+
+// The line (cumulative, the pool's report): the arrivals by class with their
+// leads, the queued draws' places behind, the committed ones' slack, the
+// lists' leads, then the commit's parts and the pool's parking and waits.
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks) {
+    const double per_us = g_tsc_per_us.load(std::memory_order_relaxed);
+    const auto hist = [](const std::atomic<std::uint64_t>* h, int n) {
+        std::string out;
+        for (int k = 0; k < n; ++k) out += (k ? "/" : "") + std::to_string(h[k].load(std::memory_order_relaxed));
+        return out;
+    };
+    std::string out = "times (rdtsc " + std::to_string(per_us) + " a us; leads < 25/50/100/200/500 us, 1/2/3/5/10/20 ms, more): arrivals";
+    for (int a = 0; a < kArrivals; ++a) {
+        out += " " + std::string(kArrivalName[a]) + " " + std::to_string(g_arr.n[a].load(std::memory_order_relaxed)) + " [" +
+               hist(g_arr.lead[a], kLeadBuckets) + "];";
+    }
+    out += " no time " + std::to_string(g_arr.no_time.load(std::memory_order_relaxed));
+    if (part == 0) return out;  // (each part under a log line's 1 KiB)
+    if (part == 3) {
+        out = "times (4): a constant buffer's lookups, by why it took no home:";
+        for (int k = 0; k < kCbLookupsWhys; ++k)
+            out += " " + std::string(kCbLookupsWhyName[k]) + " " + std::to_string(g_cb_lookups_why[k].load(std::memory_order_relaxed)) + ";";
+        return out;
+    }
+    if (part == 2) {
+        out = "times (3): refused kinds:";
+        for (int k = 0; k < kKindWhys; ++k) out += " " + std::string(kKindWhyName[k]) + " " + std::to_string(g_kind_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " no targets:";
+        for (int k = 0; k < kTargetsWhys; ++k)
+            out += " " + std::string(kTargetsWhyName[k]) + " " + std::to_string(g_targets_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " buffers stops:";
+        for (int k = 0; k < kBuffersStops; ++k)
+            out += " " + std::string(kBuffersStopName[k]) + " " + std::to_string(g_buffers_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " views by id not found: none in the slot " + std::to_string(g_list_view_stop_why[0].load(std::memory_order_relaxed)) +
+               "; another view " + std::to_string(g_list_view_stop_why[1].load(std::memory_order_relaxed)) + "; other flags " +
+               std::to_string(g_list_view_stop_why[2].load(std::memory_order_relaxed)) + "; elision " +
+               std::to_string(g_list_view_stop_why[3].load(std::memory_order_relaxed)) + ";";
+        out += " | in order, a run's first: no run open " + std::to_string(g_splice_census.first[0].load(std::memory_order_relaxed)) +
+               "; another run open " + std::to_string(g_splice_census.first[1].load(std::memory_order_relaxed)) + "; split since, by kind:";
+        for (int k = 0; k <= list_resolve::kSplits; ++k) {
+            const std::uint64_t v = g_splice_census.split[k].load(std::memory_order_relaxed);
+            if (v) out += " " + std::string(kSplitName[k]) + " " + std::to_string(v) + ";";
+        }
+        return out;
+    }
+    out = "times (2):";
+    out += " queued behind (< 16/64/256/1024/4096, more) [" + hist(g_arr.behind, kBehindBuckets) + "]";
+    out += "; committed slack [" + hist(g_arr.slack, kLeadBuckets) + "]";
+    out += "; list lead [" + hist(g_arr.list_lead, kLeadBuckets) + "], list open " + std::to_string(g_arr.list_open.load(std::memory_order_relaxed));
+    char buf[160];
+    const auto us = [&](std::uint64_t ticks) { return per_us > 0.0 ? static_cast<double>(ticks) / per_us : 0.0; };
+    const std::uint64_t ok = g_commit_ok.load(std::memory_order_relaxed), refused = g_commit_refused.load(std::memory_order_relaxed);
+    std::snprintf(buf, sizeof(buf), " | commits %llu ok (%.0f us in all), %llu refused (%.0f us); parts (us in all):", static_cast<unsigned long long>(ok),
+                  us(g_commit_ok_ticks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refused),
+                  us(g_commit_refused_ticks.load(std::memory_order_relaxed)));
+    out += buf;
+    for (int k = 0; k < kCommitParts; ++k) {
+        std::snprintf(buf, sizeof(buf), " %s %.0f;", kCommitPartName[k], us(g_commit_part[k].load(std::memory_order_relaxed)));
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf), " parked %.0f us in all (%llu parks); segment waits %.0f us", us(parked_ticks), static_cast<unsigned long long>(parks),
+                  us(g_seg_wait_ticks.load(std::memory_order_relaxed)));
+    out += buf;
+    return out;
 }
 
 // splice-compare: after the draw of token `id` drawn in order (its digest in
@@ -26840,11 +27129,15 @@ void lists_segment(std::uint32_t rec) {
     for (std::uint32_t k = 0; k < n; ++k) {
         ListCommit& c = all[r.id[k] & (kListCommits - 1)];
         std::uint64_t w = c.word.load(std::memory_order_acquire);
-        for (unsigned spins = 0; lc_state(w) == kLcCommitting && lc_id(w) == r.id[k] && spins < 20000; ++spins) {
+        if (lc_state(w) == kLcCommitting && lc_id(w) == r.id[k]) {
+            const std::uint64_t w0 = gxvk_lists::times() ? __builtin_ia32_rdtsc() : 0;
+            for (unsigned spins = 0; lc_state(w) == kLcCommitting && lc_id(w) == r.id[k] && spins < 20000; ++spins) {
 #if defined(__x86_64__)
-            __builtin_ia32_pause();
+                __builtin_ia32_pause();
 #endif
-            w = c.word.load(std::memory_order_acquire);
+                w = c.word.load(std::memory_order_acquire);
+            }
+            if (w0) g_seg_wait_ticks.fetch_add(__builtin_ia32_rdtsc() - w0, std::memory_order_relaxed);
         }
         words[k] = w;
     }

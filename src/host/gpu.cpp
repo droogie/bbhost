@@ -11488,7 +11488,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     }
     if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;
     // A candidate's twin made, let go or dropped, a pass ended: in order.
-    if (run_part_stop(kRunStopBuffers)) return false;
+    if (run_part_stop_buffers(kBsTwin)) return false;
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;

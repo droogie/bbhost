@@ -2265,6 +2265,7 @@ thread_local constinit DrawCtx* t_draw_ctx = nullptr;
 thread_local constinit BumpSink* t_bump_sink = nullptr;  // BBHOST_RUN_COMMIT: a run worker's counters
 thread_local constinit RunDraw* t_run_draw = nullptr;    // BBHOST_RUN_COMMIT: a forked run's draw
 thread_local constinit RunDigest t_run_digest;           // BBHOST_RUN_COMMIT=compare: the drawing thread's last draw's
+thread_local constinit int t_buffers_stop = 0;            // (BBHOST_GXVK_LISTS_TIMES: the first 'buffers' stop's site)
 HostLock g_part_ring_mu;                       // BBHOST_RUN_COMMIT: the parts' chunk takes from the copy rings
 
 namespace {
@@ -2422,7 +2423,7 @@ bool snap_ring_take_locked(VkDeviceSize bytes, VkDeviceSize& at_out) {
 bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // A ring in host memory stages each copy into device memory (below):
     // in order, for a run part's draw (BBHOST_RUN_COMMIT).
-    if (!g_snap.device_local && run_part_stop(kRunStopBuffers)) return false;
+    if (!g_snap.device_local && run_part_stop_buffers(kBsSnapRing)) return false;
     VkDeviceSize at = 0;
     if (DrawCtx* const c = draw_ctx()) {
         // BBHOST_DRAW_CONTEXT: from the context's chunk of the ring, taken

@@ -349,7 +349,11 @@ void count(Count k, std::uint64_t n) {
     g_batch_n[k].store(g_batch_n[k].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
 
+thread_local constinit int t_last_split = kSplits;
+int last_split() { return t_last_split; }
+
 void split(Split why) {
+    t_last_split = why;
     ++t_serial;
     t_run_left = 0;
     t_run_hold = 0;

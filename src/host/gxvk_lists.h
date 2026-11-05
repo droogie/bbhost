@@ -89,6 +89,15 @@ inline bool segments_compare() { return pool_mode() == 6; }
 void settle(bool homes_bind, const char* homes_why);
 
 
+// BBHOST_GXVK_LISTS_TIMES=1 (a diagnostic, in the pool's lines): when each
+// stored draw was stored, when its list closed and when the pool's commit of
+// it began and ended, against the command processor's arrival at its token -
+// by where the pool was then (its feed's entry not taken yet, and how far
+// behind; committing; done) - and the commit's time by part, the pool's time
+// parked and waiting. Read before any of the game's code runs.
+extern const bool g_times;
+inline bool times() { return g_times; }
+
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool
 // thread, both of a core's hardware threads kept for it; off): the command

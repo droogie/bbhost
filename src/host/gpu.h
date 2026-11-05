@@ -397,6 +397,11 @@ bool host_gpu_splice(std::uint64_t id);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 std::string host_gpu_splice_report(bool window = false);
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the command processor
+// arrives at GX-native draw token `id`, before anything takes it; the line,
+// in three parts, with the pool's time parked (rdtsc ticks) and its parks.
+void host_gpu_lists_arrival(std::uint64_t id);
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks);  // part 0, 1, 2
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): at GX-native draw token `id`,
 // before its slot is taken - the members of a segment ready to splice whose
 // first member it is (null: none), their count and the segment's word; the

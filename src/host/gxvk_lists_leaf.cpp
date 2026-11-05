@@ -47,6 +47,10 @@ const bool g_census = [] {
     const char* e = std::getenv("BBHOST_GXVK_LISTS");
     return e && std::strcmp(e, "census") == 0;
 }();
+const bool g_times = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS_TIMES");
+    return e && e[0] == '1';
+}();
 std::atomic<int> g_pool_mode{0};
 
 namespace detail {
@@ -59,12 +63,15 @@ std::atomic<std::uint64_t> g_rec_pos{0};
 std::atomic<std::uint64_t> g_rec_none{0};
 std::atomic<std::uint64_t> g_immediate{0};
 
-void feed_push(std::uint64_t id, std::uint32_t kind) {
+DrawTime g_draw_times[kTimeSlots];
+
+std::uint64_t feed_push(std::uint64_t id, std::uint32_t kind) {
     const std::uint64_t pos = g_feed_pos.fetch_add(1, std::memory_order_seq_cst);
     Feed& f = g_feed[pos & (kFeed - 1)];
     f.id.store(id, std::memory_order_relaxed);
     f.kind.store(kind, std::memory_order_relaxed);
     f.seq.store(pos + 1, std::memory_order_seq_cst);
+    return pos;
 }
 
 void list_closed(CtxSlot& s, std::uint64_t list) {
@@ -72,6 +79,11 @@ void list_closed(CtxSlot& s, std::uint64_t list) {
     if (!open || open > kRecs) return;  // none (or none to be had for this list: kRecs + 1)
     ListRec& r = g_recs[open - 1];
     r.list = list;
+    if (g_times) {
+        const std::uint64_t now = __rdtsc();
+        const std::uint32_t n = r.n < kRecMost ? r.n : kRecMost;
+        for (std::uint32_t k = 0; k < n; ++k) g_draw_times[r.id[k] & (kTimeSlots - 1)].closed.store(now, std::memory_order_relaxed);
+    }
     r.state.store(kRecClosed, std::memory_order_release);
     feed_push(open - 1, kFeedList);
 }

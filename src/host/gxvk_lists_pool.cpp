@@ -23,6 +23,7 @@
 #include "core/host_clock.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -40,7 +41,10 @@
 #endif
 #if !defined(_WIN32)
 #include <fstream>
+#include <linux/perf_event.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace gxvk_lists {
@@ -91,6 +95,54 @@ using detail::g_feed_next;
 using detail::g_feed_pos;
 using detail::kFeed;
 Shared g_fed, g_feed_lapped, g_feed_skipped, g_lists_fed;
+Shared g_parked_ticks, g_parks;  // BBHOST_GXVK_LISTS_TIMES: the threads' time parked (rdtsc ticks)
+
+// BBHOST_GXVK_LISTS_TIMES on Linux: each pool thread's own hardware counters (user space only) - cycles, instructions,
+// last-level cache misses and its task clock - read for the lines, so a commit's cost can be told clock-, cache- or
+// contention-bound. None where perf_event_open refuses (counted).
+#if !defined(_WIN32)
+constexpr int kHwCounters = 4;  // cycles, instructions, LLC misses, task clock (ns)
+constexpr int kHwThreads = 8;
+int g_hw_fd[kHwThreads][kHwCounters];
+std::atomic<int> g_hw_threads{0};
+std::atomic<int> g_hw_refused{0};
+void hw_open() {
+    const int t = g_hw_threads.fetch_add(1, std::memory_order_relaxed);
+    if (t >= kHwThreads) return;
+    const std::pair<std::uint32_t, std::uint64_t> what[kHwCounters] = {{PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+                                                                      {PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+                                                                      {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+                                                                      {PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK}};
+    for (int k = 0; k < kHwCounters; ++k) {
+        perf_event_attr a{};
+        a.size = sizeof(a);
+        a.type = what[k].first;
+        a.config = what[k].second;
+        a.exclude_kernel = 1;
+        a.exclude_hv = 1;
+        g_hw_fd[t][k] = static_cast<int>(syscall(SYS_perf_event_open, &a, 0, -1, -1, 0));
+        if (g_hw_fd[t][k] < 0) g_hw_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+std::string hw_line() {
+    const int n = std::min(g_hw_threads.load(std::memory_order_relaxed), kHwThreads);
+    u64 sum[kHwCounters] = {};
+    for (int t = 0; t < n; ++t) {
+        for (int k = 0; k < kHwCounters; ++k) {
+            u64 v = 0;
+            if (g_hw_fd[t][k] >= 0 && read(g_hw_fd[t][k], &v, sizeof(v)) == sizeof(v)) sum[k] += v;
+        }
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), " | hardware (%d threads, %d refused): cycles %llu, instructions %llu, llc misses %llu, task clock ns %llu", n,
+                  g_hw_refused.load(std::memory_order_relaxed), static_cast<ull>(sum[0]), static_cast<ull>(sum[1]), static_cast<ull>(sum[2]),
+                  static_cast<ull>(sum[3]));
+    return buf;
+}
+#else
+void hw_open() {}
+std::string hw_line() { return std::string(); }
+#endif
 
 // ---- the answers -----------------------------------------------------------
 // One record per token slot (the slot ring's size and index).
@@ -159,11 +211,17 @@ void look(u64 id) {
     g_look_ns.add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
 }
 
+void pool_main_loop(int index);
 void pool_main(int index) {
     char name[16];
     std::snprintf(name, sizeof(name), "bb-list%d", index);
     host_thread_set_name(name);
     host_thread_set_class(HostThreadClass::GpuFeed, name);
+    if (g_times) hw_open();
+    pool_main_loop(index);
+    if (g_times && splice()) gpu::lists_thread_end();  // its times added (the exit's lines come after the join)
+}
+void pool_main_loop(int index) {
     unsigned idle = 0;
     while (!g_stop.load(std::memory_order_acquire)) {
         u64 pos = g_feed_next.load(std::memory_order_relaxed);
@@ -178,6 +236,7 @@ void pool_main(int index) {
             } else {
                 // (Stage 4b.2: a list's close is fed from FinishCommandList's leaf, which wakes nobody - a parked
                 // thread looks again within half a millisecond.)
+                const std::uint64_t p0 = g_times ? __builtin_ia32_rdtsc() : 0;
                 std::unique_lock<std::mutex> lk(g_park_mu);
                 g_sleepers.fetch_add(1, std::memory_order_seq_cst);
                 if (g_feed_next.load(std::memory_order_seq_cst) >= g_feed_pos.load(std::memory_order_seq_cst) &&
@@ -185,6 +244,10 @@ void pool_main(int index) {
                     g_park_cv.wait_for(lk, segments() ? std::chrono::microseconds(500) : std::chrono::microseconds(2000));
                 g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
                 idle = 0;
+                if (p0) {
+                    g_parked_ticks.add(__builtin_ia32_rdtsc() - p0);
+                    g_parks.add();
+                }
             }
             if (index == 0 && host_tooling()) {
                 const u64 flip = hle_video_flip_count();
@@ -394,6 +457,11 @@ void report_line(bool at_exit) {
             host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(false).c_str());
             host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(true).c_str());
         }
+        if (g_times) {
+            for (int part = 0; part < 4; ++part)
+                host_log("gxvk-lists (%s): %s%s", what, host_gpu_lists_times_report(part, g_parked_ticks.get(), g_parks.get()).c_str(),
+                         part == 1 ? hw_line().c_str() : "");
+        }
         return;
     }
     host_log("gxvk-lists (%s): the pool looked at %llu draws, %.2f us a draw (fed %llu; the command processor first %llu; feed lapped "
@@ -482,7 +550,14 @@ void keep_off_pool_cpus() {
 
 void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    detail::feed_push(id, detail::kFeedDraw);
+    if (g_times) {
+        detail::DrawTime& t = detail::g_draw_times[id & (detail::kTimeSlots - 1)];
+        t.id.store(id, std::memory_order_relaxed);
+        t.stored.store(__builtin_ia32_rdtsc(), std::memory_order_relaxed);
+        t.feed.store(detail::feed_push(id, detail::kFeedDraw), std::memory_order_relaxed);
+    } else {
+        detail::feed_push(id, detail::kFeedDraw);
+    }
     if (segments() && ctx && ctx != detail::g_immediate.load(std::memory_order_relaxed)) {
         // Stage 4b.2: into its context's open list record (this thread's while it records the context).
         if (detail::CtxSlot* s = detail::ctx_slot(ctx)) {

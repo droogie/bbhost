@@ -2681,6 +2681,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
+                if (gxvk_lists::times() && gxvk_lists::splice()) host_gpu_lists_arrival(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                 // Stage 4b.2: a spliced segment's member, or the first member of a segment spliced here.
                 if (gxvk_lists::segments() && segment_token(b, n)) break;
                 lookahead_tokens(b + n);
