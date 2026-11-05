@@ -22223,7 +22223,7 @@ bool grading_table(const std::uint32_t* t) {
 //     keeps the sampler's filter; one of the draw's own size, read texel for
 //     texel, is the same either way;
 //   - the colour grading's table (grading_table) nearest in its pass
-//     (scene_look_grading_nearest: the PS1 Look's 8-bit colour); without it
+//     (scene_look_grading_nearest: the Bloodborne PS1's 8-bit colour); without it
 //     smooth, as the game samples it;
 //   - with the 3D at the plugin's own size (scene_look_scale), YEBIS's copy
 //     of the scene (the post chain's first pass, at the output size) samples
@@ -22915,7 +22915,7 @@ static bool draw_impl(const GpuDraw& d) {
     // A velocity shader rebuilt motion vectors rewrite: a pipeline per
     // Motion vectors setting (velo_variant).
     if (const std::uint32_t v = velo_variant(ps_name)) key = fnv1a(&v, sizeof(v), key);
-    // A plugin's vertex snap (host/scene_look.h, the PS1 Look's): a camera
+    // A plugin's vertex snap (host/scene_look.h, the Bloodborne PS1's): a camera
     // draw takes a pipeline whose last stage before the rasterizer snaps to
     // the grid (build_gfx_pipeline), one per grid - the 3D's size and the
     // grid's lines decide it.

@@ -403,7 +403,7 @@ bool install_keep_stub() {
 
 // What the settings ask for at an output size: the quality's render size
 // with an upscaler that runs here, the full size without. A plugin's 3D at a
-// size of its own (host/scene_look.h, the PS1 Look's) has no upscaler: the
+// size of its own (host/scene_look.h, the Bloodborne PS1's) has no upscaler: the
 // Resolution fitted to the output's shape as an upscaler's would be, or the
 // plugin's height and as wide as the output's shape gives, each way a
 // multiple of 4 - YEBIS's copy brings it up nearest (render.cpp).
