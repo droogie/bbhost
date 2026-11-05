@@ -3923,6 +3923,10 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
             if (!found || copy_elide_live()) {
                 g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
+                // (BBHOST_GXVK_LISTS_TIMES: why - no view published in its slot, another view's there, its own with other
+                // flags, or none made yet with the copies being elided.)
+                if (gxvk_lists::times())
+                    g_list_view_stop_why[!pub.id ? 0 : pub.id != id ? 1 : pub.flags != flags || !pub.view ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
                 run_part_stop(kRunStopImages);
                 return VkImageView{VK_NULL_HANDLE};
             }
@@ -4272,6 +4276,7 @@ bool sampler_fixes_on() {
 }
 
 std::atomic<std::uint64_t> g_list_image_stops[3] = {};  // stage 4b.1b's list mode: by words, a view by id not found, a sampler
+std::atomic<std::uint64_t> g_list_view_stop_why[4] = {};  // and the views by id not found: none, another view, other flags, elision
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: the reader path (made in order)
         const VkSampler found = sampler_find(s, compare);

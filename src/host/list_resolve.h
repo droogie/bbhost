@@ -157,6 +157,9 @@ enum Split : int {
 // The command processor met `why` (any packet it acts on that is not a
 // GX-native draw token).
 void split(Split why);
+// The command processor's last split's kind (kSplits before any): what stage
+// 4b's splice census (BBHOST_GXVK_LISTS_TIMES) counts a split run by.
+int last_split();
 // A GX pipeline drain's barrier token (no split).
 void note_barrier();
 // A GX-native draw token's draw, with its inputs and objects.
