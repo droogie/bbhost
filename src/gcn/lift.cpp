@@ -5149,6 +5149,12 @@ private:
             }
             it->second[c.comp] = as_f(store->value);
         }
+        // BBHOST_GS_DEBUG=1 (a test, with BBHOST_TRANSLATION_CACHE=0): each
+        // vertex a corner of a triangle over the whole target, by its slot.
+        if (const char* dbg = std::getenv("BBHOST_GS_DEBUG"); dbg && dbg[0] == '1' && outs.count(12)) {
+            static const float kCorner[3][2] = {{-1.0f, -1.0f}, {3.0f, -1.0f}, {-1.0f, 3.0f}};
+            outs[12] = {cf(kCorner[slot % 3][0]), cf(kCorner[slot % 3][1]), cf(0.5f), cf(1.0f)};
+        }
         // The outputs' variables, made before the branch.
         for (const auto& [t, comps] : outs) {
             if (t == 13) out_layer();

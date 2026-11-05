@@ -2721,7 +2721,9 @@ CachedProgram* program_at(std::uint64_t va) {
     // BBHOST_DUMP_PROGRAM=<name>[,<name>..] (a test): those programs' code to build/prog-<name>.bin.
     if (const char* e = std::getenv("BBHOST_DUMP_PROGRAM"); e && std::strstr(e, cp.name.c_str())) {
         host_mkdir("build");
-        if (FILE* f = std::fopen(("build/prog-" + cp.name + ".bin").c_str(), "wb")) {
+        char at[24];
+        std::snprintf(at, sizeof at, "-%llx", static_cast<unsigned long long>(va));
+        if (FILE* f = std::fopen(("build/prog-" + cp.name + at + ".bin").c_str(), "wb")) {
             std::fwrite(cp.words.data(), 4, cp.words.size(), f);
             std::fclose(f);
         }
@@ -11695,6 +11697,13 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     // A layered pass (DrawState::pass_layers): the GS's Layer picks each
     // primitive's slice.
     ri.layerCount = s.pass_layers;
+    if (s.pass_layers > 1 && std::getenv("BBHOST_LAYER_TRACE")) {
+        static std::atomic<int> tl{0};
+        if (tl.fetch_add(1) < 40)
+            host_log("layer-trace: layered pass %u layers, colour 0x%llx layer %u loadOp %d, flip %llu", s.pass_layers,
+                     s.color[0] ? static_cast<unsigned long long>(s.color[0]->base) : 0ull, s.color_layer[0], colors.empty() ? -1 : static_cast<int>(colors[0].loadOp),
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     if (s.pass_layers > 1) {
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 4)
@@ -18686,6 +18695,12 @@ namespace gpu {
 // leaves the barrier after it to the caller (a flush makes one for all).
 void view_clear_apply_barrier_locked(RtImage& r, bool barrier, int why) {
     if (!r.view_clear) return;
+    if (std::getenv("BBHOST_LAYER_TRACE") && r.layers > 1 && !r.depth) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 40)
+            host_log("layer-trace: owed clear of 0x%llx applied (why %d), slices %u+%u, flip %llu", static_cast<unsigned long long>(r.base), why,
+                     r.view_clear_first, r.view_clear_count, static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     r.view_clear = r.view_clear_load = false;
     ++g_vc_transfer;
     why = why >= 0 && why < kVcwCount ? why : kVcwOther;
