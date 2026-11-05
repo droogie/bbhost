@@ -268,6 +268,7 @@ bb_plugin(boss_rush plugins/boss_rush/boss_rush.cpp)
 bb_plugin(mutators plugins/mutators/mutators.cpp)
 bb_plugin(quake plugins/quake/quake.cpp)
 bb_plugin(lohit plugins/lohit/lohit.cpp)
+bb_plugin(ps1 plugins/ps1/ps1.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -571,6 +572,14 @@ if(UNIX)
   target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(boss_rush_test bb_plugin_boss_rush)
   add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
+  # The PS1 Look plugin on a pretend host (plugins/ps1): the look it asks the
+  # host for at the start and as its options change, and none on an older host.
+  add_executable(ps1_plugin_test tests/ps1_plugin_test.cpp)
+  target_include_directories(ps1_plugin_test PRIVATE include)
+  target_compile_features(ps1_plugin_test PRIVATE cxx_std_17)
+  target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(ps1_plugin_test bb_plugin_ps1)
+  add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
@@ -1093,7 +1102,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke
