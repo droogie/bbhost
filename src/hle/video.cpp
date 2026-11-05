@@ -12,6 +12,7 @@
 #include "engine/world_chr.h"
 #include "host/gpu.h"
 #include "host/options.h"
+#include "host/plugins.h"
 #include "core/config.h"
 #include "host/window.h"
 
@@ -316,6 +317,13 @@ void test_requests_read(const std::string& dir) {
             {
                 std::ifstream f(p);
                 f >> r.verb >> r.arg >> r.arg2;
+                // A plugin option's value may hold spaces ("240 lines"): the rest of the line.
+                if (r.verb == "plugin") {
+                    std::string rest;
+                    std::getline(f, rest);
+                    while (!rest.empty() && (rest.back() == '\r' || rest.back() == '\n' || rest.back() == ' ')) rest.pop_back();
+                    r.arg2 += rest;
+                }
             }
             fs::remove(p, ec);
             std::lock_guard<std::mutex> lk(g_test_req_mu);
@@ -392,6 +400,11 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             // A setting changed as the menus change it (host/options.h): its entry by index.
             host_opt_set_index(arg.c_str(), std::atoi(arg2.c_str()));
             host_log("test: option %s set to entry %s at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
+        } else if (verb == "plugin" && arg.find('.') != std::string::npos && !arg2.empty()) {
+            // A plugin's option changed as its menu changes it (host/plugins.h): <name>.<key> <value>.
+            const std::size_t dot = arg.find('.');
+            plugins_set_option(arg.substr(0, dot), arg.substr(dot + 1), arg2);
+            host_log("test: plugin option %s set to \"%s\" at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);

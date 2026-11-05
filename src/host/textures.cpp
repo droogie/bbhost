@@ -4376,6 +4376,51 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias) {
     return out;
 }
 
+VkSampler sampler_nearest(VkSampler base) {
+    if (!base) return base;
+    // The answer for this thread's last few, in front of the map (samplers
+    // are never destroyed, so an entry never goes stale).
+    struct Memo {
+        VkSampler base = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    };
+    static thread_local Memo memo[64];
+    Memo& m = memo[(reinterpret_cast<std::uintptr_t>(base) >> 4) & 63];
+    if (m.base == base) return m.out;
+    // Read by a run part's draw and by stage 4b.1b's list mode (under
+    // cache_rw's shared lock), written in order.
+    static std::map<VkSampler, VkSampler> made;
+    VkSampler out = base;
+    if (const auto it = made.find(base); it != made.end()) {
+        out = it->second;
+    } else {
+        if (t_run_draw && t_run_draw->list) g_list_image_stops[2].fetch_add(1, std::memory_order_relaxed);
+        if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+        const auto rec = g_sampler_records.find(base);
+        // A depth comparison (the shadows' PCF) keeps its filter: nearest
+        // would take the hardware's four-sample blend away.
+        if (rec != g_sampler_records.end() && !rec->second.compareEnable) {
+            const VkSamplerCreateInfo& was = rec->second;
+            if (was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST || was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST ||
+                was.anisotropyEnable) {
+                VkSamplerCreateInfo sci = was;
+                sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+                sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sci.anisotropyEnable = VK_FALSE;
+                sci.maxAnisotropy = 1.0f;
+                if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+                    g_sampler_records[out] = sci;
+                else
+                    out = base;
+            }
+        }
+        cache_rw::Write cw(cache_rw::kSamplers);  // stage 4b.1b's readers see it whole
+        made[base] = out;
+    }
+    m.base = base;
+    m.out = out;
+    return out;
+}
+
 // Stage 4b.1a's reader path (under cache_rw's shared lock): the sampler made
 // for these words, null when it is not made yet.
 VkSampler sampler_find(const std::uint32_t* s, bool compare) {

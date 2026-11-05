@@ -66,10 +66,19 @@ bool host_opt_resolution(int* w, int* h);
 // Resolution smaller than the window, the window's size (Borderless and
 // Fullscreen: the screen's; Windowed: [video] width x height). The 3D is
 // then drawn at the Resolution (engine/render_scale.cpp) and upscaled, so a
-// low Resolution keeps the UI sharp. False as host_opt_resolution.
+// low Resolution keeps the UI sharp. A plugin's 3D at a size of its own
+// (plugin API 18 scene_scale, host/scene_look.h: the PS1 Look's) is the same
+// with no upscaler, the 3D brought up nearest - and with a height of its own
+// the game is the window's size whatever the Resolution. False as
+// host_opt_resolution.
 bool host_opt_output_size(int* w, int* h);
-// Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE).
+// Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE) - none while a
+// plugin draws the 3D at a size of its own (host/scene_look.h scene_look_scale).
 bool host_opt_upscaler_chosen();
+// The settings published again as they are, so their listeners follow what
+// they read beside them (host/scene_look.h: a plugin's look changed). The
+// options' own thread: from elsewhere, through host_options_post.
+void host_opt_republish();
 // Whether anything takes the frame's motion: an upscaler chosen, or frame
 // generation on (which runs without one).
 bool host_opt_motion_wanted();

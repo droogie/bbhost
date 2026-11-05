@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 18 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -208,6 +208,28 @@ gives the Binary Ninja address.
   target's, once a pixel), `BB_DRAW_DEPTH_ONLY` (v17: no colour, the depth
   written), `BB_DRAW_DEPTH_EQUAL` (v17: tested less-or-equal against the depth
   an earlier depth-only draw of the same geometry wrote), or-ed.
+- The 3D's look (v18): how the camera's draws - the world, its characters, the
+  sky and the effects, the draws with the scene's depth that are not
+  full-screen rect lists - are drawn; the shadow maps, the post-processing and
+  the HUD and menus keep the game's own. `scene_snap(lines)` moves each vertex,
+  as its stage writes it, to the nearest corner of a grid of the screen `lines`
+  cells high (as many across as the 3D's shape gives; `BB_SNAP_PIXELS` the
+  3D's own pixels; 0 off) - the PS1's wobble. `scene_filter(BB_FILTER_NEAREST)`
+  samples their textures nearest (the nearest mip, no anisotropy; depth
+  comparisons keep theirs). `scene_scale(BB_SCALE_NEAREST, lines)` draws the
+  game, its HUD and menus at the window's size and the 3D at the Resolution, or
+  `lines` high, brought up to the window texel for texel with no upscaler.
+  `scene_colour_bits(8)` makes the scene's colour targets RGBA8, as the rgba8f
+  patch does. `grading_filter(BB_FILTER_NEAREST)` samples the colour grading's
+  table nearest - the area's `CGrading` textures (`map/mXX/mXX_cgrading.tpf`)
+  are copied each frame into a 16x16x16 table that the grading pass samples -
+  so the grading steps from entry to entry, 16 shades a channel.
+  `scene_scale` and `scene_colour_bits` decide the scene's targets: call them
+  from `bb_plugin_init` for the start, or once the game runs from the main
+  thread (`on_frame`, `on_option`), which makes the targets again at the next
+  quiet point; the others work from any thread. With `scene_scale` on, the
+  game and its HUD are always the window's size and the 3D at most that. The
+  PS1 Look plugin is all of these.
 - `plugin_dir(name)` (v8): a data folder of the plugin's own.
 - `game_file(path, ...)` (v9): a game file by its `/app0` path, decompressed.
 - `overlay_file(name, path, data, size)` (v9): a file the game reads instead
@@ -287,8 +309,11 @@ setup window can download the latest signed plugins from the newest release.
 | `mutators` | Switchable rules: gravity, game speed, bullet time at low HP, one-hit deaths, blood drain, enemy HP, echo rate, random effects. |
 | `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. |
 | `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): every part loaded (Whole map, the default), or the part you stand on and the parts connected to it, one step out; Hi-hit shows the detailed collision characters and objects use instead. Each mesh is built once into a vertex buffer of its own and drawn with two draws a frame, where the game's debug draw rebuilt every triangle each frame and copied it twice (the triangles' edges the game drew over the faces, a second draw costing the GPU more than the faces, are left out). Its depth (plugin API 17) is drawn ahead of the scene's objects too, so the game's occlusion culling skips what is behind its walls, as the map's own geometry would. It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, by default in the launcher's deep violet (walls) and dark blue (floors); the Colours sliders set both (0-255, as they come out on the screen) for the lo-hit and the hi-hit. Pair it with Performance mode (the setup window's main page) for the post-effects off. |
+| `ps1` | Off until turned on. The 3D drawn as the first PlayStation drew it, the HUD and the menus left sharp at the window's size: its vertices snapped to a grid of the screen as it moves (Vertex snap: 240 lines, the PS1's own screen, by default; 480, 360 or 120 lines, the 3D's own pixels, or off), its textures unfiltered (no bilinear, trilinear or anisotropic filtering), its colour targets 8 bits a channel (8-bit colour, as the rgba8f patch makes them; the colour grading then steps between its table's entries too, where it is smooth without it), and the 3D at the Resolution - or 480, 360 or 240 lines high - brought up to the window pixel for pixel, with no smoothing. Upscaling and the anti-aliasing stand aside while it is on. Each option changes in the game (F9). |
 | `debug_menu` | Restores the developers' debug menu (`` ` `` opens it), in English or the developers' Japanese, and makes the debug font it draws with from the public-domain X11 fonts k14 and 7x14, so nothing has to be downloaded. Cheating against other players with it gets an account banned; trying it out online with friends is fine. |
 
 The gameplay plugins - all five - announce themselves in the session's
 ruleset, so the server keeps their players' messages, bloodstains and
-statistics apart from those of players without them.
+statistics apart from those of players without them. Lo-Hit and PS1 Look
+change only the picture: they are not in the rules, and their players meet
+everyone.

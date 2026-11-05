@@ -1,0 +1,257 @@
+// plugins/ps1 on a host of our own: no game, no GPU. The plugin is loaded as
+// the host loads plugins, started with a config, and its options changed as
+// the in-game menu changes them; every plugin API 18 call it makes is
+// recorded. Checked: the defaults ask for the whole look at bb_plugin_init -
+// the 3D at the Resolution brought up nearest, 8-bit colour with the colour
+// grading nearest, unfiltered textures, a 240-line snap - before the
+// image phase (the render size and the targets' formats are decided between
+// the two); each option says what it should, at the start and live; on a host
+// older than API 18 it refuses before calling anything; on another eboot it
+// takes the look back as it unloads; its options table is
+// whole (unique keys, defaults among their choices).
+//
+//   ps1_plugin_test <ps1.so>
+#include "bbhost_plugin.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+static int g_failures = 0;
+#define CHECK(cond)                                                                        \
+    do {                                                                                   \
+        if (!(cond)) {                                                                     \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);  \
+            ++g_failures;                                                                  \
+        }                                                                                  \
+    } while (0)
+
+namespace {
+
+struct Host {
+    std::map<std::string, std::string> config;
+    std::vector<std::string> calls;  // "snap 240", "filter 1", "scale 1 0", "colour 8", "grading 1"
+    std::vector<std::string> log;
+    void (*option_fn)(const char*, const char*, void*) = nullptr;
+    void* option_user = nullptr;
+    bool is_109 = true;
+} H;
+
+void fake_log(const char* fmt, ...) {
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    H.log.push_back(b);
+}
+const char* fake_config(const char* key) {
+    static std::string v;
+    const auto it = H.config.find(key);
+    v = it == H.config.end() ? "" : it->second;
+    return v.c_str();
+}
+int fake_eboot_is_109() { return H.is_109 ? 1 : 0; }
+int fake_on_option(const char* name, void (*fn)(const char*, const char*, void*), void* user) {
+    CHECK(std::strcmp(name, "ps1") == 0);
+    H.option_fn = fn;
+    H.option_user = user;
+    return 0;
+}
+void fake_scene_snap(std::uint32_t lines) { H.calls.push_back("snap " + std::to_string(lines)); }
+void fake_scene_filter(int filter) { H.calls.push_back("filter " + std::to_string(filter)); }
+void fake_scene_scale(int scale, std::uint32_t lines) { H.calls.push_back("scale " + std::to_string(scale) + " " + std::to_string(lines)); }
+void fake_scene_colour_bits(int bits) { H.calls.push_back("colour " + std::to_string(bits)); }
+void fake_grading_filter(int filter) { H.calls.push_back("grading " + std::to_string(filter)); }
+
+struct Plugin {
+#if defined(_WIN32)
+    HMODULE handle = nullptr;
+    void* sym(const char* name) { return reinterpret_cast<void*>(GetProcAddress(handle, name)); }
+#else
+    void* handle = nullptr;
+    void* sym(const char* name) { return dlsym(handle, name); }
+#endif
+    int (*init)(const BbHostApi*) = nullptr;
+    int (*image)(const BbHostApi*) = nullptr;
+    const BbOption* options = nullptr;
+    const BbPluginInfo* info = nullptr;
+};
+
+Plugin load(const char* path) {
+    Plugin p;
+#if defined(_WIN32)
+    p.handle = LoadLibraryA(path);
+#else
+    p.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!p.handle) return p;
+    p.init = reinterpret_cast<int (*)(const BbHostApi*)>(p.sym("bb_plugin_init"));
+    p.image = reinterpret_cast<int (*)(const BbHostApi*)>(p.sym("bb_plugin_image"));
+    p.options = static_cast<const BbOption*>(p.sym("bb_plugin_options"));
+    p.info = static_cast<const BbPluginInfo*>(p.sym("bb_plugin_info"));
+    return p;
+}
+
+BbHostApi make_api(std::uint32_t version) {
+    BbHostApi api;
+    std::memset(&api, 0, sizeof api);
+    api.version = version;
+    api.size = version >= 18 ? sizeof api : static_cast<std::uint32_t>(offsetof(BbHostApi, scene_snap));
+    api.log = fake_log;
+    api.config = fake_config;
+    api.eboot_is_109 = fake_eboot_is_109;
+    api.on_option = fake_on_option;
+    if (version >= 18) {
+        api.scene_snap = fake_scene_snap;
+        api.scene_filter = fake_scene_filter;
+        api.scene_scale = fake_scene_scale;
+        api.scene_colour_bits = fake_scene_colour_bits;
+        api.grading_filter = fake_grading_filter;
+    }
+    return api;
+}
+
+bool has(const std::vector<std::string>& calls, const std::string& c) {
+    for (const std::string& x : calls)
+        if (x == c) return true;
+    return false;
+}
+
+void dump(const char* what) {
+    std::fprintf(stderr, "--- %s: calls\n", what);
+    for (const std::string& c : H.calls) std::fprintf(stderr, "  %s\n", c.c_str());
+    for (const std::string& l : H.log) std::fprintf(stderr, "  log: %s\n", l.c_str());
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: ps1_plugin_test <ps1 plugin>\n");
+        return 2;
+    }
+    Plugin p = load(argv[1]);
+    CHECK(p.handle && p.init && p.image && p.options && p.info);
+    if (!p.handle || !p.init || !p.image || !p.options || !p.info) return 1;
+
+    // What it says about itself: opt-in, not a gameplay plugin (the picture alone).
+    CHECK(std::strcmp(p.info->name, "ps1") == 0);
+    CHECK((p.info->flags & BB_PLUGIN_OPT_IN) != 0);
+    CHECK((p.info->flags & BB_PLUGIN_GAMEPLAY) == 0);
+
+    // Its options: unique keys; the toggles on; each choice's default among its choices.
+    {
+        std::set<std::string> keys;
+        std::map<std::string, std::string> defaults;
+        for (const BbOption* o = p.options; o->type != BB_OPT_END; ++o) {
+            CHECK(o->key && *o->key);
+            CHECK(keys.insert(o->key).second);
+            const std::uint32_t type = o->type & 0xff;
+            if (type == BB_OPT_CHOICE) {
+                CHECK(o->choices && o->def);
+                const std::string list = std::string("|") + o->choices + "|";
+                CHECK(list.find(std::string("|") + o->def + "|") != std::string::npos);
+            }
+            if (o->def) defaults[o->key] = o->def;
+        }
+        CHECK(defaults["unfiltered"] == "true");
+        CHECK(defaults["colour_8bit"] == "true");
+        CHECK(defaults["snap"] == "240 lines");
+        CHECK(defaults["resolution"] == "Resolution");
+    }
+
+    // An older host: refused before any call.
+    {
+        H = Host{};
+        BbHostApi api = make_api(17);
+        CHECK(p.init(&api) != 0);
+        CHECK(H.calls.empty());
+    }
+
+    // The defaults: the whole look asked for at init, nothing more at image.
+    {
+        H = Host{};
+        BbHostApi api = make_api(BB_PLUGIN_API_VERSION);
+        CHECK(p.init(&api) == 0);
+        CHECK(has(H.calls, "scale 1 0"));
+        CHECK(has(H.calls, "colour 8"));
+        CHECK(has(H.calls, "grading 1"));
+        CHECK(has(H.calls, "filter 1"));
+        CHECK(has(H.calls, "snap 240"));
+        const std::size_t at_init = H.calls.size();
+        CHECK(p.image(&api) == 0);
+        CHECK(H.calls.size() == at_init);
+        CHECK(H.option_fn != nullptr);
+        if (g_failures) dump("defaults");
+
+        // Live changes, as the menus make them.
+        if (H.option_fn) {
+            H.calls.clear();
+            H.option_fn("snap", "3D pixels", H.option_user);
+            CHECK(has(H.calls, "snap " + std::to_string(BB_SNAP_PIXELS)));
+            H.option_fn("snap", "Off", H.option_user);
+            CHECK(has(H.calls, "snap 0"));
+            H.option_fn("unfiltered", "false", H.option_user);
+            CHECK(has(H.calls, "filter 0"));
+            H.option_fn("colour_8bit", "false", H.option_user);
+            CHECK(has(H.calls, "colour 0"));
+            CHECK(has(H.calls, "grading 0"));  // the grading smooth again
+            H.option_fn("resolution", "240 lines", H.option_user);
+            CHECK(has(H.calls, "scale 1 240"));
+            H.option_fn("resolution", "Resolution", H.option_user);
+            CHECK(has(H.calls, "scale 1 0"));
+            if (g_failures) dump("live");
+        }
+    }
+
+    // A config of its own at the start.
+    {
+        H = Host{};
+        H.config = {{"ps1.snap", "Off"}, {"ps1.unfiltered", "false"}, {"ps1.colour_8bit", "false"}, {"ps1.resolution", "360 lines"}};
+        BbHostApi api = make_api(BB_PLUGIN_API_VERSION);
+        CHECK(p.init(&api) == 0);
+        CHECK(has(H.calls, "snap 0"));
+        CHECK(has(H.calls, "filter 0"));
+        CHECK(has(H.calls, "colour 0"));
+        CHECK(has(H.calls, "grading 0"));
+        CHECK(has(H.calls, "scale 1 360"));
+        if (g_failures) dump("config");
+    }
+
+    // Another eboot: off at the image phase.
+    {
+        H = Host{};
+        H.is_109 = false;
+        BbHostApi api = make_api(BB_PLUGIN_API_VERSION);
+        CHECK(p.init(&api) == 0);
+        H.calls.clear();
+        CHECK(p.image(&api) != 0);
+        // Unloaded, nothing could change the look: it is taken back.
+        CHECK(has(H.calls, "snap 0"));
+        CHECK(has(H.calls, "filter 0"));
+        CHECK(has(H.calls, "colour 0"));
+        CHECK(has(H.calls, "grading 0"));
+        CHECK(has(H.calls, "scale 0 0"));
+        if (g_failures) dump("other eboot");
+    }
+
+    if (g_failures) {
+        std::fprintf(stderr, "%d check(s) failed\n", g_failures);
+        return 1;
+    }
+    std::printf("ps1 plugin: all checks passed\n");
+    return 0;
+}

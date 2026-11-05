@@ -14,7 +14,9 @@
 #include "host/full_write.h"
 #include "host/gpu_internal.h"
 #include "host/options.h"
+#include "host/scene_look.h"
 #include "host/upscaler.h"
+#include "host/vertex_snap.h"
 #include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
 #include "host/import_fallback.h"
@@ -464,6 +466,14 @@ struct GfxPipeline {
     // The stage cache's keys of its vertex and pixel stages (build_gfx_pipeline),
     // which the pipeline manifest knows a pipeline by.
     std::uint64_t vs_key = 0, ps_key = 0;
+    // A plugin's vertex snap (DrawState::snap_cells): the grid its last stage
+    // before the rasterizer snaps to, 0 none.
+    float snap_cells[2] = {};
+    // Per pixel-stage sampler, the images (bit i: ps.meta().images[i], the
+    // first 32) its instructions sample with it - from the translation's
+    // image_at and sampler_at, made once with the pipeline (pair_samplers);
+    // empty when not made.
+    std::vector<std::uint32_t> ps_sampler_images;
     // The pipeline manifest's record of what built it (its inputs, copied at
     // the build; kept in the manifest once the pipeline is created), and
     // whether its Vulkan pipeline was the one the manifest built at the start.
@@ -3116,6 +3126,10 @@ struct DrawState {
     const GxRasterDesc* gx_raster = nullptr;
     std::uint32_t gx_ids[3] = {};
     std::uint64_t program_fp = 0;  // GpuDrawInputs::program_fp: stands for vte_cntl and the PS/VS fields below it
+    // A plugin's vertex snap (host/scene_look.h): a camera draw's grid, its
+    // cells across and down (0: none). After program_fp, so pipeline_key
+    // leaves it out: draw_impl salts the key with it.
+    float snap_cells[2] = {};
 };
 
 // BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
@@ -5370,6 +5384,9 @@ const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
 // programs, if it has any, can be read where it is built (a worker reads only
 // the copies it was given).
 bool recipe_recordable(const DrawState& s) {
+    // A plugin's snapped camera draw (DrawState::snap_cells): the lists keep no
+    // grid, so a start would build it unsnapped - left to its draws.
+    if (s.snap_cells[0] > 0.0f) return false;
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
@@ -6060,6 +6077,71 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, std::string& why) {
     return true;
 }
 
+// ---- A plugin's vertex snap (host/vertex_snap.h, host/scene_look.h) ----
+// A camera draw's last stage before the rasterizer, snapped: a twin of the
+// stage under a key of its own (the stage's key salted with the grid), its
+// module the stage's words through vertex_snap. A twin of DXC's module keeps
+// the module it was made from, by the twin's words, so a pipeline the driver
+// refuses finds the lift through it and snaps that (hlsl_lift_stage).
+struct SnapOrigin {
+    std::vector<std::uint32_t> words;
+    float cells[2] = {};
+};
+std::mutex g_snap_origin_mu;
+std::unordered_map<std::uint64_t, SnapOrigin> g_snap_origin;  // by the twin's words
+std::atomic<std::uint64_t> g_snap_twins{0}, g_snap_refused{0};
+constexpr std::uint64_t kSnapSalt = 0x5a4a9c11ull;
+
+void snap_refused(const std::string& name, const std::string& why) {
+    g_snap_refused.fetch_add(1, std::memory_order_relaxed);
+    static std::mutex mu;
+    static std::set<std::string> logged;
+    std::lock_guard<std::mutex> lk(mu);
+    if (logged.size() < 64 && logged.insert(name).second)
+        host_log("render: vertex snap: %s drawn unsnapped - %s", name.c_str(), why.empty() ? "its module" : why.c_str());
+}
+
+// `st` (its module made, under `key`) as its snapped twin; false and `st` as
+// it was when the rewrite refuses it.
+bool snap_stage(ShaderStage& st, std::uint64_t key, const float cells[2], const std::string& name, bool cacheable) {
+    const std::uint64_t snap_key = fnv1a(cells, 2 * sizeof(float), key ^ kSnapSalt);
+    if (const std::shared_ptr<const CachedStage> have = cacheable ? cached_stage(snap_key) : nullptr) {
+        st.take(have);
+        st.module = have->module;
+        return true;
+    }
+    gcn::TranslateResult twin = st.meta();
+    std::string why;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (!vertex_snap(twin.spirv, cells[0], cells[1], &why) || !make_module(twin.spirv, module)) {
+        snap_refused(name, why);
+        return false;
+    }
+    if (std::vector<std::uint32_t> lift; st.lifted && hlsl_lift_of(st.meta().spirv, lift)) {
+        std::lock_guard<std::mutex> lk(g_snap_origin_mu);
+        g_snap_origin[fnv1a(twin.spirv.data(), twin.spirv.size() * 4)] = SnapOrigin{st.meta().spirv, {cells[0], cells[1]}};
+    }
+    const bool lifted = st.lifted;
+    if (cacheable) cache_stage(snap_key, twin, module, lifted);
+    st.fresh() = std::move(twin);
+    st.lifted = lifted;
+    st.module = module;
+    g_snap_twins.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Per pixel-stage sampler, the images its instructions sample with it
+// (GfxPipeline::ps_sampler_images): one sampler serves every image its S#
+// path names.
+void pair_samplers(GfxPipeline& pl) {
+    const gcn::TranslateResult& m = pl.ps.meta();
+    pl.ps_sampler_images.assign(m.samplers.size(), 0);
+    for (const auto& [at, k] : m.sampler_at) {
+        const auto i = m.image_at.find(at);
+        if (i != m.image_at.end() && i->second < 32 && k < pl.ps_sampler_images.size()) pl.ps_sampler_images[k] |= 1u << i->second;
+    }
+}
+
 // ---- GPU particles as one vertex stage (BBHOST_GX_PARTICLES, gcn/gs_vertex.h) ----
 // A lift's own words: the stage's module may be DXC's (BBHOST_HLSL).
 std::vector<std::uint32_t> lift_words_of(const ShaderStage& st) {
@@ -6072,10 +6154,19 @@ std::vector<std::uint32_t> lift_words_of(const ShaderStage& st) {
 // splice refuses them.
 bool build_gs_vertex_stage(GfxPipeline& pl, std::string& why) {
     const std::vector<std::uint32_t> es = lift_words_of(pl.gs_es), gs = lift_words_of(pl.vs);
-    const gcn::GsVertexStage st = gcn::gs_vertex_stage(es, gs);
+    gcn::GsVertexStage st = gcn::gs_vertex_stage(es, gs);
     if (!st.ok()) {
         why = st.why;
         return false;
+    }
+    // A camera draw's vertex snap: the spliced stage is the one before the
+    // rasterizer (the GS's own emits stay as the splice reads them).
+    if (pl.snap_cells[0] > 0.0f) {
+        std::string snap_why;
+        if (vertex_snap(st.spirv, pl.snap_cells[0], pl.snap_cells[1], &snap_why))
+            g_snap_twins.fetch_add(1, std::memory_order_relaxed);
+        else
+            snap_refused(pl.name + "-gs-vs", snap_why);
     }
     dump_spirv(pl.name + "-gs-vs", st.spirv);
     if (!make_module(st.spirv, pl.gs_vs_module)) {
@@ -7170,6 +7261,14 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
         if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module, pl.vs.lifted);
     }
+    // A camera draw's vertex snap (snap_stage): this stage - a vertex stage,
+    // or a tessellated draw's evaluation stage - or a geometry-shader draw's
+    // ES and GS spliced into one (build_gs_vertex_stage). Its own content key:
+    // no pipeline the manifest made unsnapped crosses over.
+    pl.snap_cells[0] = s.snap_cells[0];
+    pl.snap_cells[1] = s.snap_cells[1];
+    if (s.snap_cells[0] > 0.0f && (gs_lift || snap_stage(pl.vs, vs_key, s.snap_cells, vs_name, vs_cacheable)))
+        pl.vs_key = fnv1a(s.snap_cells, sizeof(s.snap_cells), vs_key ^ kSnapSalt);
     if (gs_lift) {
         std::string why;
         if (!build_gs_es_stage(pl, s, why)) return fail("geometry-shader pipeline: " + why);
@@ -7388,6 +7487,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     } else if (pl.tess_set_layout) {
         return fail("a tessellation pipeline with a set 4 needs per-stage set layouts (BBHOST_SET_LAYOUTS=0)");
     }
+    pair_samplers(pl);
     note_unwritten_ps_inputs(pl, s);
     note_oob_slots(pl);
     if (create && !create_gfx_pipeline(pl, s, vertex_input, fetch_words.size())) pl.failed = true;
@@ -10093,6 +10193,10 @@ void precompile_report() {
                  g_manifest.compile_us.load() / 1e6, static_cast<unsigned long long>(g_manifest.failed.load()),
                  static_cast<unsigned long long>(g_manifest.hits.load()), static_cast<unsigned long long>(g_manifest.recorded.load()));
     }
+    if (g_snap_twins.load() || g_snap_refused.load()) {
+        host_log("render: vertex snap (a plugin's look): %llu stages snapped, %llu drawn unsnapped (the rewrite refused them)",
+                 static_cast<unsigned long long>(g_snap_twins.load()), static_cast<unsigned long long>(g_snap_refused.load()));
+    }
     std::string names;
     for (const std::string& n : w.not_ready) names += n;
     std::string reasons;
@@ -10225,7 +10329,17 @@ std::shared_ptr<const CachedStage> hlsl_lift_stage(const gcn::TranslateResult& m
         if (!make) return nullptr;
     }
     std::vector<std::uint32_t> lift;
-    if (!hlsl_lift_of(meta.spirv, lift)) return nullptr;
+    if (!hlsl_lift_of(meta.spirv, lift)) {
+        // A vertex snap's twin of DXC's module (snap_stage): its lift, snapped the same way.
+        SnapOrigin o;
+        {
+            std::lock_guard<std::mutex> lk(g_snap_origin_mu);
+            const auto it = g_snap_origin.find(key);
+            if (it == g_snap_origin.end()) return nullptr;
+            o = it->second;
+        }
+        if (!hlsl_lift_of(o.words, lift) || !vertex_snap(lift, o.cells[0], o.cells[1])) return nullptr;
+    }
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;  // DXC's module declares the lift's bindings and interface: the same translation
     entry->meta.spirv = std::move(lift);
@@ -22083,11 +22197,96 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
 struct UpscaleFrame {
     std::uint64_t scene = 0, depth = 0, done_write = 0;
     std::uint64_t ran_flip = 0;  // the flip of its last run (+1: 0 is never)
+    std::uint64_t seen_flip = 0;  // the flip the scene was last drawn with its depth in (+1: 0 is never)
     std::uint32_t frame = 0;     // upscales so far: the jitter's index
     float jx = 0.0f, jy = 0.0f;  // this frame's offset, render pixels
     bool jittered = false;       // a draw had it since the last upscale
 };
 UpscaleFrame g_upscale;  // under g.mu
+// A plugin's look (host/scene_look.h) takes the camera's draws as the
+// upscaler's jitter and mip bias do: those drawn with the scene's depth (the
+// G-buffer's, learned below at YEBIS's copy) that are not rect lists - the
+// world, its characters, sky and effects, the lights' volumes - and not the
+// shadow maps (another depth), the post chain (rect lists) or the HUD and
+// menus (no depth). With the depth not seen for 8 flips (a rebuild of the
+// targets, a loading screen) none is.
+bool look_camera_draw(const DrawState& s) {
+    const UpscaleFrame& u = g_upscale;
+    return u.depth && s.depth && s.depth->base == u.depth && !s.rect && u.seen_flip && hle_video_flip_count() + 1 - u.seen_flip <= 8;
+}
+
+// The colour grading's table: each frame the game copies the area's grading
+// texture its draw parameters pick (map/mXX/mXX_cgrading.tpf's 16x256 RGBA8
+// CGrading ones, a 16x16x16 table each) - or blends two - into one 16x16x16
+// R32G32B32A32_FLOAT 3D texture (LutCopy2DTo3DCs / LutBlend2DTo3DCs, which load
+// them with no sampler), made once in the post-effect setup (0x25d38f8), and
+// the grading pass (ScreenSpaceQuadShader + ColorGrading.ppo, 0b0acf50+ed4c7668)
+// samples it. Known by its T#: 3D, 16x16x16, 32_32_32_32 float - nothing else
+// the game draws has that shape.
+bool grading_table(const std::uint32_t* t) {
+    return (t[3] >> 28) == 10 && (t[2] & 0x3fff) == 15 && ((t[2] >> 14) & 0x3fff) == 15 && (t[4] & 0x1fff) == 15 &&
+           ((t[1] >> 20) & 0x3f) == 14 && ((t[1] >> 26) & 0xf) == 7;
+}
+
+// A plugin's look's samplers (host/scene_look.h), the pixel stage's (the
+// vertex stage's drive its animation, and stay smooth):
+//   - the 3D's textures nearest (scene_look_nearest): a camera draw's
+//     samplers, for the textures they sample - a block-compressed one always
+//     a texture, else any image that is not a render target. A target of
+//     another size than the draw's (the SSAO, a shadow mask, a blur's half)
+//     keeps the sampler's filter; one of the draw's own size, read texel for
+//     texel, is the same either way;
+//   - the colour grading's table (grading_table) nearest in its pass
+//     (scene_look_grading_nearest: the PS1 Look's 8-bit colour); without it
+//     smooth, as the game samples it;
+//   - with the 3D at the plugin's own size (scene_look_scale), YEBIS's copy
+//     of the scene (the post chain's first pass, at the output size) samples
+//     it nearest: the 3D brought up texel for texel.
+// The pairs are the pipeline's (pair_samplers); a sampler whose images are
+// not known is taken as a texture's in a camera draw. Depth comparisons keep
+// theirs (sampler_nearest). False in a run part's draw that stopped for a
+// sampler to be made in order.
+bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
+    const bool camera = scene_look_nearest() && look_camera_draw(s);
+    const bool copy = scene_look_scale() && g_upscale.scene && pl.name == "0b0acf50+ccbf44a6";
+    const bool grading = scene_look_grading_nearest();
+    if (!camera && !copy && !grading) return true;
+    const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
+    for (std::size_t k = 0; k < si.samplers.size(); ++k) {
+        if (!si.samplers[k]) continue;  // unresolved: the dummy is bound
+        const std::uint32_t images = k < pairs.size() ? pairs[k] : 0;
+        bool nearest = false, keep = false, table = false;
+        for (std::uint32_t b = images; b; b &= b - 1) {
+            const std::size_t i = static_cast<std::size_t>(__builtin_ctz(b));
+            if (i >= si.images.size() || !si.images[i].resolved) continue;
+            const StageImages::Image& im = si.images[i];
+            if (grading && grading_table(im.w)) table = true;
+            if (copy && image_base(im) == g_upscale.scene) nearest = true;
+            if (camera) {
+                const std::uint32_t dfmt = (im.w[1] >> 20) & 0x3f;
+                const RtImage* rt = dfmt >= 35 && dfmt <= 41 ? nullptr : find_render_target(image_base(im));
+                if (!rt) {
+                    nearest = true;
+                } else if (!s.color[0] || rt->width != s.color[0]->width || rt->height != s.color[0]->height) {
+                    keep = true;
+                }
+            }
+        }
+        if (!images && camera) nearest = true;
+        if (keep) nearest = false;
+        if (table) nearest = true;
+        if (!nearest) continue;
+        const VkSampler n = sampler_nearest(si.samplers[k]);
+        if (!n) return false;  // a run part's draw: made in order
+        si.samplers[k] = n;
+        static std::atomic<bool> told_table{false}, told_copy{false};
+        if (table && !told_table.exchange(true))
+            host_log("render: the colour grading's table sampled nearest (pipeline %s), for a plugin's look", pl.name.c_str());
+        if (copy && !told_copy.exchange(true) && s.color[0])
+            host_log("render: YEBIS's copy brings the 3D up nearest, to %ux%u, for a plugin's look", s.color[0]->width, s.color[0]->height);
+    }
+    return true;
+}
 // BBHOST_UPSCALE_JITTER=0: the upscaler with no jitter (a test of the rest);
 // =neg: the draws moved the other way from what the upscaler is told (a test:
 // the picture should go soft and shimmer).
@@ -22730,6 +22929,13 @@ static bool draw_impl(const GpuDraw& d) {
     // A velocity shader rebuilt motion vectors rewrite: a pipeline per
     // Motion vectors setting (velo_variant).
     if (const std::uint32_t v = velo_variant(ps_name)) key = fnv1a(&v, sizeof(v), key);
+    // A plugin's vertex snap (host/scene_look.h, the PS1 Look's): a camera
+    // draw takes a pipeline whose last stage before the rasterizer snaps to
+    // the grid (build_gfx_pipeline), one per grid - the 3D's size and the
+    // grid's lines decide it.
+    s.snap_cells[0] = s.snap_cells[1] = 0.0f;
+    if (scene_look_snap() && look_camera_draw(s) && scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]))
+        key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
     // BBHOST_LEAN_FIRST: translate and lay out the fallback pipeline, but create
@@ -22915,6 +23121,9 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
+    // the colour grading's tables as its rule says, the 3D brought up nearest.
+    if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const GfxPipeline* const capture_lean = lean_of(pl);
@@ -24788,7 +24997,10 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         const bool writes_scene = scene_base && s.color[0] && s.color[0]->base == scene_base;
-        if (writes_scene && s.depth) depth_base = s.depth->base;
+        if (writes_scene && s.depth) {
+            depth_base = s.depth->base;
+            u.seen_flip = hle_video_flip_count() + 1;
+        }
         if (scene_base && depth_base && !writes_scene) {
             bool reads = false;
             for (int st = 0; st < 2 && !reads; ++st) {
@@ -24815,6 +25027,27 @@ static bool draw_impl(const GpuDraw& d) {
                     upscaler_jitter(upscaler_method(), 0, scene->width, scene->height, u.frame, &u.jx, &u.jy);
                 u.jittered = false;
             }
+        }
+    }
+    // A plugin's look with no upscaler or frame generation (host/scene_look.h):
+    // the scene and its depth learned the same way, for look_camera_draw.
+    else if (scene_look_camera()) {
+        UpscaleFrame& u = g_upscale;
+        if (pl.name == "0b0acf50+ccbf44a6") {
+            for (const StageImages::Image& im : stage_images[1].images) {
+                if (!im.resolved) continue;
+                const std::uint64_t b = image_base(im);
+                if (b != u.scene) {
+                    host_log("render: the scene is 0x%llx (YEBIS's copy samples it), for a plugin's look", static_cast<unsigned long long>(b));
+                    u.scene = b;
+                    u.depth = 0;
+                }
+                break;
+            }
+        }
+        if (u.scene && s.color[0] && s.color[0]->base == u.scene && s.depth) {
+            u.depth = s.depth->base;
+            u.seen_flip = hle_video_flip_count() + 1;
         }
     }
     // Frame generation's HUD-less picture (host/framegen.h). The HUD is not

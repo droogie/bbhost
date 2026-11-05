@@ -11,6 +11,7 @@
 #include "hle/fs.h"
 #include "host/options.h"
 #include "host/ruleset.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -80,6 +81,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
     if (option == "graphics.render_scale") return render_scale_plan(nullptr);  // Upscaling and its quality, read once
+    if (option == "plugin.scene_rgba8") return scene_look_colour_8bit();  // a plugin's scene_colour_bits (the PS1 Look's), then live
     *known = false;
     return false;
 }
@@ -467,6 +469,31 @@ Manifest velomap_manifest() {
     return m;
 }
 
+// scene-rgba8, the scene's colour targets in 8 bits a channel (plugin API 18
+// scene_colour_bits: the PS1 Look's 8-bit colour): Kyo's "rgba8f color space
+// (Perf Increase)" patch, site for site (patches/rgba8f-color-space.toml). The
+// scene context's Initialize (sub_26c39f0) makes its colour targets in the
+// formats these bytes name - the game's 0x0a, RGBA16F, which the Performance
+// patch makes 0x1a (R11G11B10F) and, at 0x26c4b6f, 0x18 (R10G10B10A2) - and
+// here they are all 0x1c, RGBA8; the 0x1c at 0x26c4984, which the Performance
+// patch makes 0x1a, goes back to it. Two sites the Performance patch writes the
+// same way already (the flag at 0x26c1084, the jne at 0x26c4ac6). After every
+// built-in that touches the scene's targets, so its bytes stand; live: the
+// targets are made again with it (engine/render_scale.cpp).
+Manifest scene_rgba8_manifest() {
+    Manifest m;
+    m.name = "scene-rgba8";
+    m.title = "8-bit scene colour";
+    m.eboot = kEboot109Sha256;
+    m.description = "the scene's colour targets in RGBA8, as the rgba8f patch makes them";
+    m.option = "plugin.scene_rgba8";
+    m.order = 9300;
+    m.sites = {
+#include "engine/scene_rgba8_sites.inc"
+    };
+    return m;
+}
+
 // all-languages, Every text language (always on): the game's text languages
 // are CSLocalize's, and which of them a disc offers is its region's - the
 // region the game makes of param.sfo's USER_DEFINED_PARAM_1 (the US disc's
@@ -574,6 +601,7 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(all_languages_manifest());
     out.push_back(hd_motion_blur_manifest());
     out.push_back(velomap_manifest());
+    out.push_back(scene_rgba8_manifest());
     return out;
 }
 

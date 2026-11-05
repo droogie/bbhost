@@ -15,6 +15,7 @@
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/window.h"
 #include "log.h"
@@ -430,13 +431,17 @@ void settings_changed(const HostSettings& hs) {
     static const bool velocity_start = host_opt_motion_wanted() || !hs.performance_mode, camera_blur_start = hs.hd_motion_blur;
     static bool velocity_was = velocity_start, camera_blur_was = camera_blur_start;
     const bool velocity = host_opt_motion_wanted() || !hs.performance_mode;
-    if (hs.ssao != ssao_was || hs.anti_alias != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
+    // A plugin's 3D brought up nearest (host/scene_look.h, the PS1 Look's):
+    // the AA (FXAA, after YEBIS's copy at the output size) would smooth its
+    // pixels again, so it is off while it is.
+    const bool aa = hs.anti_alias && !scene_look_scale();
+    if (hs.ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
         ssao_was = hs.ssao;
-        aa_was = hs.anti_alias;
+        aa_was = aa;
         velocity_was = velocity;
         camera_blur_was = hs.hd_motion_blur;
         g_ssao.store(hs.ssao);
-        g_aa.store(hs.anti_alias);
+        g_aa.store(aa);
         g_velocity.store(velocity);
         g_camera_blur.store(hs.hd_motion_blur);
         g_flags_gen.fetch_add(1, std::memory_order_release);

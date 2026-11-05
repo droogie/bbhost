@@ -2304,6 +2304,11 @@ VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
 // sampler not made here. Null in a run part's draw that stopped for it to be
 // made in order (BBHOST_RUN_COMMIT).
 VkSampler sampler_with_lod_bias(VkSampler base, float bias);
+// `base` sampling the nearest texel of the nearest mip with no anisotropy (a
+// plugin's look, host/scene_look.h), made once and kept; `base` itself for a
+// depth comparison, one already nearest or one not made here. Null in a run
+// part's draw that stopped for it to be made in order.
+VkSampler sampler_nearest(VkSampler base);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
 // cache_rw::Read, into `out` (stage 4b.1a's pool).

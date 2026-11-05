@@ -5,6 +5,7 @@
 
 #include "host/bindings.h"
 #include "host/overlay.h"
+#include "host/scene_look.h"
 #include "host/upscaler.h"
 #include "host/window.h"
 #include "core/config.h"
@@ -917,6 +918,8 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     host_log("graphics: %s changed: %s", what, rebuild ? "the scene's targets made again" : "no target changes");
 }
 
+void res_keep();
+
 // Applied every time one changes, and once at load, so there is one path to
 // the live state instead of a copy in each caller.
 void apply(int id) {
@@ -926,6 +929,11 @@ void apply(int id) {
             unsigned w = 0, h = 0;
             output_of(&w, &h);
             host_window_set_mode(s.index, static_cast<int>(w), static_cast<int>(h));
+            // With the game at the window's size (an upscaler and a smaller
+            // Resolution, a plugin's 3D size) that size is another mode's now.
+            unsigned cw = 0, ch = 0;
+            live_resolution_current(&cw, &ch);
+            if (live_resolution_available() && w && h && cw && ch && (cw != w || ch != h)) live_resolution_request(w, h, false);
             break;
         }
         case kVsync: host_window_set_vsync(s.index == 0); break;
@@ -994,7 +1002,14 @@ void apply(int id) {
                 unsigned cw = 0, ch = 0;
                 live_resolution_current(&cw, &ch);
                 if (cw == w && ch == h) {
-                    if (id == kResolution && live_resolution_available()) live_resolution_rebuild();
+                    // The game's size unchanged: only the 3D's moves, nothing
+                    // to confirm, and the entry is kept as it is (a change
+                    // waiting on the dialog that never comes went on saving
+                    // the old one).
+                    if (id == kResolution && live_resolution_available()) {
+                        live_resolution_rebuild();
+                        res_keep();
+                    }
                 }
                 else
                     live_resolution_request(w, h, g_res_prev >= 0 && !g_res_reverting);
@@ -2017,6 +2032,8 @@ const char* const kHostEffectTimingTips[3] = {
 
 HostSettings host_settings() { return settings_store().now(); }
 const HostSettings& host_settings_ref() { return settings_store().now(); }
+void host_opt_republish() { rebuild_settings(); }
+
 void host_settings_listen(HostSettingsListener fn) {
     if (!settings_store().listen(fn)) host_log("options: no room for another settings listener; one consumer will not follow changes");
 }
@@ -2102,6 +2119,7 @@ bool host_opt_resolution(int* w, int* h) {
 }
 
 bool host_opt_upscaler_chosen() {
+    if (scene_look_scale()) return false;  // a plugin's 3D at a size of its own, brought up nearest
     // BBHOST_UPSCALE, read once: -1 unset, else whether it names an upscaler.
     static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
@@ -2134,7 +2152,8 @@ bool host_opt_output_size(int* w, int* h) {
 
 namespace {
 void output_for(int* w, int* h) {
-    if (!host_opt_upscaler_chosen()) return;
+    const bool look = scene_look_scale();
+    if (!host_opt_upscaler_chosen() && !look) return;
     int ww = 0, wh = 0;
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
@@ -2143,8 +2162,11 @@ void output_for(int* w, int* h) {
         return;
     }
     if (ww <= 0 || wh <= 0) return;
-    // A Resolution as large as the window, or larger, is the size itself.
-    if (static_cast<long long>(*w) * *h >= static_cast<long long>(ww) * wh) return;
+    // A Resolution as large as the window, or larger, is the size itself -
+    // unless a plugin's look draws the 3D at a size of its own: the game and
+    // its HUD are then always the window's (a larger Resolution would be
+    // filtered down to it), the 3D at most that (render_scale.cpp wanted).
+    if (!look && static_cast<long long>(*w) * *h >= static_cast<long long>(ww) * wh) return;
     *w = ww;
     *h = wh;
 }

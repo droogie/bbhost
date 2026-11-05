@@ -31,6 +31,7 @@
 #include "hle/modules.h"
 #include "host/bindings.h"
 #include "host/ruleset.h"
+#include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
 #include "log.h"
@@ -1146,6 +1147,18 @@ int api_on_scene_category(std::int32_t pass, void (*fn)(std::uint64_t, void*), v
     return 0;
 }
 
+// Version 18: the 3D's look (host/scene_look.h).
+void api_scene_snap(std::uint32_t lines) {
+    scene_look_set_snap(lines);
+    if (!lines) host_log("plugin: the 3D's vertices as they are");
+    else if (lines == kSnapPixels) host_log("plugin: the 3D's vertices snapped to its pixels");
+    else host_log("plugin: the 3D's vertices snapped to a grid %u lines high", lines);
+}
+void api_scene_filter(int filter) { scene_look_set_nearest(filter == BB_FILTER_NEAREST); }
+void api_scene_scale(int scale, std::uint32_t lines) { scene_look_set_scale(scale == BB_SCALE_NEAREST, lines); }
+void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
+void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1163,6 +1176,7 @@ const BbHostApi g_api = {
     &api_show_text,
     &api_on_scene_category,
     &api_draw_style,
+    &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
 };
 
 std::string read_file(const std::string& path) {

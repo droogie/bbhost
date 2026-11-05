@@ -9,8 +9,10 @@
 #include "engine/patch_manifest.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
+#include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
@@ -400,11 +402,29 @@ bool install_keep_stub() {
 }
 
 // What the settings ask for at an output size: the quality's render size
-// with an upscaler that runs here, the full size without.
+// with an upscaler that runs here, the full size without. A plugin's 3D at a
+// size of its own (host/scene_look.h, the PS1 Look's) has no upscaler: the
+// Resolution fitted to the output's shape as an upscaler's would be, or the
+// plugin's height and as wide as the output's shape gives, each way a
+// multiple of 4 - YEBIS's copy brings it up nearest (render.cpp).
 RenderScale wanted(std::uint32_t output_w, std::uint32_t output_h, bool upscaler, int quality) {
     RenderScale rs;
     rs.output_w = output_w;
     rs.output_h = output_h;
+    if (std::uint32_t lines = 0; scene_look_scale(&lines)) {
+        rs.quality = 0;
+        double k = 1.0;
+        int res_w = 0, res_h = 0;
+        if (lines) {
+            k = std::min(1.0, static_cast<double>(lines) / output_h);
+        } else if (host_opt_resolution(&res_w, &res_h) && res_w > 0 && res_h > 0 &&
+                   static_cast<std::uint64_t>(res_w) * static_cast<std::uint32_t>(res_h) < static_cast<std::uint64_t>(output_w) * output_h) {
+            k = std::min(static_cast<double>(res_w) / output_w, static_cast<double>(res_h) / output_h);
+        }
+        rs.render_w = k < 1.0 ? std::max<std::uint32_t>(static_cast<std::uint32_t>(output_w * k + 0.5) & ~3u, 4) : output_w;
+        rs.render_h = k < 1.0 ? std::max<std::uint32_t>(static_cast<std::uint32_t>(output_h * k + 0.5) & ~3u, 4) : output_h;
+        return rs;
+    }
     rs.quality = upscaler ? quality : 0;
     // The 3D's base: the output, or with an upscaler a Resolution smaller
     // than it (host_opt_output_size: the output is then the window's), fitted
@@ -440,7 +460,9 @@ void settings_changed(const HostSettings& s) {
         now = g_now;
     }
     bool runs = false;
-    if (std::getenv("BBHOST_UPSCALE")) {
+    if (scene_look_scale()) {
+        runs = false;  // a plugin's 3D size: no upscaler (host/upscaler.cpp)
+    } else if (std::getenv("BBHOST_UPSCALE")) {
         runs = upscaler_method() != 0;
     } else {
         const UpscalerCaps caps = upscaler_caps();
@@ -456,6 +478,30 @@ void settings_changed(const HostSettings& s) {
     }
     const RenderScale want = wanted(now.output_w, now.output_h, runs, quality);
     if (want.render_w != now.render_w || want.render_h != now.render_h) live_resolution_rebuild();
+}
+
+// A plugin's look changed what the scene's targets are (host/scene_look.h),
+// once the game runs (main thread, its on_option): its 8-bit colour patch in
+// or out (engine/patch_manifest.cpp scene-rgba8) - Initialize reads those
+// bytes at each build, Reinitialize calls it whole - then the settings told
+// again on the options' thread: settings_changed above asks for the 3D's new size, and
+// engine/graphics_patch.cpp turns its AA off or back. The targets are made
+// again when the bytes moved (the rgba8f patch file on as well moves none).
+void look_changed() {
+    const bool rgba8 = scene_look_colour_8bit();
+    bool formats = false;
+    std::string why;
+    patch_manifest_refresh_live("scene-rgba8", rgba8, &formats, &why);
+    // The settings are the options' thread's (the window's pump): published
+    // there. With no window (headless) nothing else writes them, and nothing
+    // pumps: published here.
+    if (host_window_active())
+        host_options_post([] { host_opt_republish(); });
+    else
+        host_opt_republish();
+    if (formats && live_resolution_available()) live_resolution_rebuild();
+    host_log("render scale: a plugin's look changed: the 3D's colour %s%s%s", rgba8 ? "8-bit" : "as the game makes it",
+             formats ? ", its targets made again" : why.empty() ? "" : " at the next start - ", formats ? "" : why.c_str());
 }
 
 }  // namespace
@@ -522,6 +568,7 @@ void render_scale_gx_init(std::uint32_t display_w, std::uint32_t display_h, std:
     render_scale_plan(&plan);
     render_scale_retarget(plan.output_w, plan.output_h, display_w, display_h, flip, nullptr, nullptr);
     g_ready.store(true, std::memory_order_release);
+    scene_look_on_targets_change(&look_changed);
 }
 
 bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip,
@@ -542,7 +589,10 @@ bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::
     if (after) *after = rs;
     const bool scaled = rs.render_w != rs.output_w || rs.render_h != rs.output_h;
     host_log("render scale: the 3D at %ux%u for %ux%u (%s)", rs.render_w, rs.render_h, output_w, output_h,
-             !runs ? "no upscaler running: the full size" : scaled ? "upscaled" : "Native AA");
+             scene_look_scale() ? (scaled ? "a plugin's look: brought up nearest" : "a plugin's look: the full size")
+             : !runs            ? "no upscaler running: the full size"
+             : scaled           ? "upscaled"
+                                : "Native AA");
     return true;
 }
 
