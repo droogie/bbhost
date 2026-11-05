@@ -2718,6 +2718,14 @@ CachedProgram* program_at(std::uint64_t va) {
     CachedProgram cp;
     const std::uint32_t mask = shader_patch_mask();
     if (!extract_program(va, cp.words, cp.name)) return nullptr;
+    // BBHOST_DUMP_PROGRAM=<name>[,<name>..] (a test): those programs' code to build/prog-<name>.bin.
+    if (const char* e = std::getenv("BBHOST_DUMP_PROGRAM"); e && std::strstr(e, cp.name.c_str())) {
+        host_mkdir("build");
+        if (FILE* f = std::fopen(("build/prog-" + cp.name + ".bin").c_str(), "wb")) {
+            std::fwrite(cp.words.data(), 4, cp.words.size(), f);
+            std::fclose(f);
+        }
+    }
     if (shader_patch_touches(cp.name)) cp.patch_mask = mask;
     cp.hash = fnv1a(cp.words.data(), cp.words.size() * 4);
     std::memcpy(cp.head, p, 64);
