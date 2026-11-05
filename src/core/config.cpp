@@ -165,6 +165,7 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("video.resolution", &c->resolution);
     str("video.window_mode", &c->window_mode);
     str("video.model_detail", &c->model_detail);
+    str("video.texture_quality", &c->texture_quality);
     str("video.shaders", &c->shaders);
     num("video.vblank_hz", &c->vblank_hz);
     {

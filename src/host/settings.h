@@ -76,6 +76,10 @@ struct HostSettings {
     float fog = 1.0f;           // 1.0 the area's own opacities, 0 clear
     float ao_strength = 1.0f;   // 1.0 the area's own, 0 none, 2 twice
     int lod_bias = 0;           // the game's model detail bias: -2 finest always, 0 its own, 2 coarsest
+    // Texture quality (host/textures.cpp quality_drop): the top levels of each
+    // texture's mip chain its image leaves out - 0 full size (1.0x), 1 half
+    // each way (0.5x), 2 a quarter (0.25x). Followed live.
+    int texture_quality = 0;
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.

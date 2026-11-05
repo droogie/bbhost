@@ -119,6 +119,7 @@ enum SettingId {
     kSaturation,
     kFog,
     kModelDetail,
+    kTextureQuality,
     kSsr,
     kHdMotionBlur,
     kHdMotionBlurRes,
@@ -331,6 +332,15 @@ Setting g_set[kSettingCount] = {
     // visibly simpler up close).
     {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
+    // The textures' size in video memory (host/textures.cpp quality_drop):
+    // each texture's top mip levels left out of its image, its own smaller
+    // levels in their place. Live: a texture is made again at its next use.
+    {"texture_quality", "Texture quality", {"1.0x", "0.5x", "0.25x"}, 0,
+     "The size of the game's textures in video memory. 0.5x halves each texture's width and height (a quarter of the memory), "
+     "0.25x quarters them (a sixteenth), with the textures' own smaller mip levels in their place: less video memory and "
+     "bandwidth, for graphics cards short of either, and a softer picture. No texture goes below 256 on its longer side, and "
+     "the smaller ones stay as they are. Changes at once: each texture is made again the next time it is drawn.",
+     false},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
     // game's own half size. On while the game runs puts the patch in and
@@ -552,6 +562,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
@@ -965,6 +976,7 @@ void apply(int id) {
         case kLeftStickOuter:
         case kRightStickInner:
         case kRightStickOuter:
+        case kTextureQuality:  // the textures follow it at the next submission (host/textures.cpp)
             break;  // the settings object carries them (host/settings.h)
         case kSsao:
         case kMotionBlur:
@@ -1141,6 +1153,7 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
+    h.texture_quality = std::clamp(index_of(kTextureQuality), 0, 2);
     h.ssr = on_of(kSsr);
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
@@ -1269,7 +1282,8 @@ void host_options_load() {
         if (const int i = effect_timing_index(v == "60" ? "auto" : v); i >= 0) g_set[kEffectTiming].index = i;
     }
     // A package's own (video.resolution, video.window_mode: the Steam Deck
-    // kit's 1280x800, fullscreen; video.model_detail), by the entry's name.
+    // kit's 1280x800, fullscreen; video.model_detail, video.texture_quality),
+    // by the entry's name.
     const auto seed = [](int id, const std::string& value) {
         for (std::size_t k = 0; !value.empty() && k < g_set[id].values.size(); ++k)
             if (value == g_set[id].values[k]) g_set[id].index = static_cast<int>(k);
@@ -1277,12 +1291,14 @@ void host_options_load() {
     seed(kResolution, config().resolution);
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
+    seed(kTextureQuality, config().texture_quality);
     seed(kShaders, config().shaders);
     if (config().setup_text_size > 0) seed(kMenuTextSize, std::to_string(config().setup_text_size) + "%");
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
                          static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
-                         static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
-                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
+                         static_cast<int>(kModelDetail), static_cast<int>(kTextureQuality), static_cast<int>(kShaders),
+                         static_cast<int>(kChangeAppearance), static_cast<int>(kRebirth), static_cast<int>(kFivePlayers),
+                         static_cast<int>(kSkillIssue)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
@@ -1652,11 +1668,17 @@ const char* const* value_tips(int id, bool dlss) {
         "Half: half the render size each way, the game's own size.",
         "Full: the render size itself. The cleanest blur, the dearest.",
     };
+    static const char* const kTextureTips[] = {
+        "1.0x: every texture at the size the game made it.",
+        "0.5x: textures at half their width and height, a quarter of the video memory - a 1024x2048 texture is 512x1024.",
+        "0.25x: textures at a quarter of their width and height, a sixteenth of the video memory - a 1024x2048 texture is 256x512.",
+    };
     switch (id) {
         case kUpscaler: return kUpscalerTips;
         case kUpscaleQuality: return dlss ? kDlssTips : kFsrTips;
         case kDlssPreset: return kPresetTips;
         case kHdMotionBlurRes: return kHdBlurTips;
+        case kTextureQuality: return kTextureTips;
         default: return nullptr;
     }
 }

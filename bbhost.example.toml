@@ -95,12 +95,13 @@ fps_cap = 30
 # its chosen frame rate. What F10 or the setup window saves wins over it, and
 # BBHOST_FRAME_CLOCK=1 or 0 over both. Requires a restart.
 # frame_clock = false
-# The defaults of four F10 settings, by an entry's name; what F10 or the
+# The defaults of five F10 settings, by an entry's name; what F10 or the
 # game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
 # "1280x800" and "Borderless").
 # resolution = "1920x1080"
 # window_mode = "Windowed"  # Windowed, Borderless, Fullscreen (exclusive)
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
+# texture_quality = "1.0x"  # 1.0x, 0.5x, 0.25x: the textures' width and height in video memory
 # shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out

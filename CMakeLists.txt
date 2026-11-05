@@ -737,6 +737,10 @@ if(UNIX)
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
   add_test(NAME copy_runs_test COMMAND copy_runs_test)
+  # Texture quality: the levels a reduced texture's image leaves out, and its views' levels.
+  add_executable(texture_quality_test tests/texture_quality_test.cpp)
+  target_include_directories(texture_quality_test PRIVATE src)
+  add_test(NAME texture_quality_test COMMAND texture_quality_test)
   # The buffer shadow's choices for pages an integrated GPU reads in place.
   add_executable(shadow_place_test tests/shadow_place_test.cpp)
   target_include_directories(shadow_place_test PRIVATE src)
