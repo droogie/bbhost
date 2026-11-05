@@ -3524,8 +3524,42 @@ struct IdViewPub {
     std::uint32_t id = 0, epoch = 0;
     VkImageView view = VK_NULL_HANDLE;
     std::uint8_t flags = 0;
+    // What a pool's draw takes of the entry as it was made (the entry itself may hold another id by then).
+    bool target = false;  // no texture surface (a render target's view)
+    bool dims_ok = false, arrayed = false;
+    std::uint32_t dim = 0, slot = 0;
+    std::uint64_t base = 0;
+    std::uint64_t made = 0;  // its publication's number (the older way is published over)
 };
-IdViewPub g_id_views_pub[kIdViewSlots];
+// Two ways an entry's slot: the command processor's entries are direct-mapped
+// by id, and two views whose ids share a slot took turns in it - each time the
+// other was published, a pool's draw of the first found another view there
+// and was refused ('images'). Written under the readers' lock, exclusive.
+constexpr std::size_t kIdViewWays = 2;
+IdViewPub g_id_views_pub[kIdViewSlots][kIdViewWays];
+std::uint64_t g_id_views_pub_made = 0;  // (the command processor's)
+// The way of slot `i` that holds `id`'s publication, or null.
+inline const IdViewPub* id_view_pub(std::uint32_t id) {
+    const IdViewPub* const ways = g_id_views_pub[id & (kIdViewSlots - 1)];
+    for (std::size_t k = 0; k < kIdViewWays; ++k) {
+        if (ways[k].id == id) return &ways[k];
+    }
+    return nullptr;
+}
+// The command processor publishes entry `e` (its id's slot): into the way that holds its id, else the older.
+void id_view_publish(const IdViewPub& e) {
+    IdViewPub* const ways = g_id_views_pub[e.id & (kIdViewSlots - 1)];
+    IdViewPub* to = &ways[0];
+    for (std::size_t k = 0; k < kIdViewWays; ++k) {
+        if (ways[k].id == e.id) {
+            to = &ways[k];
+            break;
+        }
+        if (ways[k].made < to->made) to = &ways[k];
+    }
+    *to = e;
+    to->made = ++g_id_views_pub_made;
+}
 std::uint64_t g_id_view_hits = 0, g_id_view_misses = 0;
 // Stage 2's counts (under g.mu): bindings that skipped the refresh; refreshes run, by why the skip did not apply;
 // compare mode's refreshes the skip would have left out (and of them the hash backstop's catches, which a skip only
@@ -3599,23 +3633,26 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         // its place (texture_view_splice_ok), and a set that held a view let go
         // is dropped from the cache first.
         return [&]() __attribute__((noinline)) {
-            const IdViewPub& pub = g_id_views_pub[id & (kIdViewSlots - 1)];
-            const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
+            const IdViewPub* const pub = id_view_pub(id);
+            const VkImageView found = pub && pub->flags == flags ? pub->view : VK_NULL_HANDLE;
             if (!found || copy_elide_live()) {
                 g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
-                // (BBHOST_GXVK_LISTS_TIMES: why - no view published in its slot, another view's there, its own with other
-                // flags, or none made yet with the copies being elided.)
-                if (gxvk_lists::times())
-                    g_list_view_stop_why[!pub.id ? 0 : pub.id != id ? 1 : pub.flags != flags || !pub.view ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+                // (BBHOST_GXVK_LISTS_TIMES: why - none published in its slot, other views' there, its own with other
+                // flags, or the copies being elided.)
+                if (gxvk_lists::times()) {
+                    const IdViewPub* const ways = g_id_views_pub[id & (kIdViewSlots - 1)];
+                    const int why = pub ? (found ? 3 : 2) : ways[0].id || ways[1].id ? 1 : 0;
+                    g_list_view_stop_why[why].fetch_add(1, std::memory_order_relaxed);
+                }
                 run_part_stop(kRunStopImages);
                 return VkImageView{VK_NULL_HANDLE};
             }
-            t_run_draw->list->note_view(id, flags, found, !e.sf, w);
-            if (slot) *slot = e.slot;
-            if (base) *base = e.base;
-            dims_ok = e.dims_ok;
-            dim = e.dim;
-            arrayed = e.arrayed;
+            t_run_draw->list->note_view(id, flags, found, pub->target, w);
+            if (slot) *slot = pub->slot;
+            if (base) *base = pub->base;
+            dims_ok = pub->dims_ok;
+            dim = pub->dim;
+            arrayed = pub->arrayed;
             return found;
         }();
     }
@@ -3697,7 +3734,20 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
-        if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
+        if (cache_rw::g_readers.load(std::memory_order_relaxed)) {
+            IdViewPub pub;
+            pub.id = e.id;
+            pub.epoch = e.epoch;
+            pub.view = e.view;
+            pub.flags = e.flags;
+            pub.target = !e.sf;
+            pub.dims_ok = e.dims_ok;
+            pub.arrayed = e.arrayed;
+            pub.dim = e.dim;
+            pub.slot = e.slot;
+            pub.base = e.base;
+            id_view_publish(pub);
+        }
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
@@ -3759,9 +3809,9 @@ bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView
 // or made; null when it is not made yet (the command processor makes it, and
 // refreshes its surface, in order).
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
-    const IdViewPub& e = g_id_views_pub[id & (kIdViewSlots - 1)];
-    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags) return VK_NULL_HANDLE;
-    return e.view;
+    const IdViewPub* const e = id_view_pub(id);
+    if (!e || e->epoch != static_cast<std::uint32_t>(g_view_epoch) || e->flags != flags) return VK_NULL_HANDLE;
+    return e->view;
 }
 
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
@@ -5967,7 +6017,11 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         IdViewEntry& e = g_id_views[i];
         if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
             e.epoch = 0;
-            if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[i].epoch = 0;
+            if (cache_rw::g_readers.load(std::memory_order_relaxed)) {
+                for (IdViewPub& w : g_id_views_pub[i]) {
+                    if (w.id == e.id) w.epoch = 0;
+                }
+            }
         }
     }
 }

@@ -25862,11 +25862,14 @@ struct PubTargets {
     std::uint64_t erase_gen = 0;  // g_rt_erase_gen when published
     std::uint64_t flip = 0;       // and the flip (a publication older than kRtPubAge flips is not taken)
 };
-constexpr std::uint32_t kPubTargets = 2048;  // (direct-mapped: ~80 runs a flip)
-PubTargets g_pub_targets[kPubTargets];
+// Two ways a set, by the names' hash (~80 runs a flip): direct-mapped, a run
+// whose names shared a slot with another's lost its publication whenever the
+// other published, and its draws were refused ('targets').
+constexpr std::uint32_t kPubSets = 2048, kPubWays = 2;
+PubTargets g_pub_targets[kPubSets * kPubWays];
 std::atomic<std::uint64_t> g_pub_writes{0};
-std::uint32_t pub_slot(const std::uint32_t* names) {
-    return static_cast<std::uint32_t>(fnv1a(names, sizeof(std::uint32_t) * kTargetNames)) & (kPubTargets - 1);
+std::uint32_t pub_set(const std::uint32_t* names) {
+    return (static_cast<std::uint32_t>(fnv1a(names, sizeof(std::uint32_t) * kTargetNames)) & (kPubSets - 1)) * kPubWays;
 }
 void names_of(const RunTargets& m, std::uint32_t (&n)[kTargetNames]) {
     GpuDrawInputs f{};
@@ -25914,7 +25917,22 @@ void publish_run_targets_locked(const RunTargets& m) {
     if (!m.valid) return;
     std::uint32_t n[kTargetNames];
     names_of(m, n);
-    PubTargets& p = g_pub_targets[pub_slot(n)];
+    // The way that holds these names, else the one published longer ago (an empty one first). (The command
+    // processor alone writes the slots: their names and flips are read here without the seqlock.)
+    PubTargets* const set = &g_pub_targets[pub_set(n)];
+    PubTargets* way = nullptr;
+    for (std::uint32_t k = 0; k < kPubWays && !way; ++k) {
+        if (set[k].seq.load(std::memory_order_relaxed) && std::memcmp(set[k].names, n, sizeof(n)) == 0) way = &set[k];
+    }
+    if (!way) {
+        way = &set[0];
+        for (std::uint32_t k = 1; k < kPubWays; ++k) {
+            const bool empty = !set[k].seq.load(std::memory_order_relaxed);
+            if (empty || (way->seq.load(std::memory_order_relaxed) && set[k].flip < way->flip)) way = &set[k];
+            if (empty) break;
+        }
+    }
+    PubTargets& p = *way;
     const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
     if (p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= hle_video_flip_count() &&
         std::memcmp(p.names, n, sizeof(n)) == 0 &&
@@ -25950,23 +25968,26 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
             return true;
         }
     }
-    PubTargets& p = g_pub_targets[pub_slot(n)];
-    t_find_why = kTwBusy;
-    for (int tries = 0; tries < 4; ++tries) {
-        const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
-        if (!s0) {
-            t_find_why = kTwNone;
-            return false;
-        }
-        if (s0 & 1) continue;
-        const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
-        if (same) {
-            out = p.m;
-            erase_gen = p.erase_gen;
-            flip = p.flip;
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (p.seq.load(std::memory_order_relaxed) == s0) {
+    // Each way of the names' set, its publication read under its seqlock: one that holds these names.
+    PubTargets* const set = &g_pub_targets[pub_set(n)];
+    int why = kTwNone;  // (none published in the set, another run's names there, or a way being written throughout)
+    for (std::uint32_t k = 0; k < kPubWays; ++k) {
+        PubTargets& p = set[k];
+        for (int tries = 0; tries < 4; ++tries) {
+            const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
+            if (!s0) break;
+            if (s0 & 1) {
+                if (tries == 3 && why == kTwNone) why = kTwBusy;
+                continue;
+            }
+            const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
+            if (same) {
+                out = p.m;
+                erase_gen = p.erase_gen;
+                flip = p.flip;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (p.seq.load(std::memory_order_relaxed) != s0) continue;
             if (same) {
                 last = &p;
                 last_seq = s0;
@@ -25974,12 +25995,13 @@ bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, s
                 last_flip = flip;
                 last_out = &out;
                 std::memcpy(last_names, n, sizeof(last_names));
-            } else {
-                t_find_why = kTwOther;
+                return true;
             }
-            return same;
+            why = kTwOther;
+            break;
         }
     }
+    t_find_why = why;
     return false;
 }
 
