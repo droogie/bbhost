@@ -9,6 +9,7 @@
 #include "engine/graphics_patch.h"
 #include "engine/gx_resources.h"
 #include "engine/option_menu.h"
+#include "engine/patch_manifest.h"
 #include "engine/render_scale.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
@@ -1112,16 +1113,27 @@ std::uint64_t gfx_heap_more_mib(std::uint64_t px) {
     return std::max(mib, kFitsInDmemMiB);
 }
 
+// The Shadow resolution setting's shadow maps (engine/patch_manifest.cpp
+// shadow_resolution_manifest) are made from this heap as the game starts, the
+// stock heap's room short of them at High (~1.7 GiB): their cost comes on top
+// of the render size's, and what a live change may reach is worked out from
+// the render size's share alone.
 void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
     constexpr std::uint64_t kGfxPrivate = 0x4b36d40 + 1 * 0x80 + 3 * 8;
     constexpr std::uint64_t kGfxPrivateStock = 0x8ef00000ull;
     const char* e = std::getenv("BBHOST_GFX_HEAP_MORE_MIB");
     const bool given = e && *e;
-    std::uint64_t more = given ? std::strtoull(e, nullptr, 10) : gfx_heap_more_mib(px);
+    const std::uint64_t shadows = given ? 0 : shadow_resolution_heap_mib();
+    std::uint64_t more = given ? std::strtoull(e, nullptr, 10) : gfx_heap_more_mib(px) + shadows;
     if (!more) {
         if (!given) g_live_max_px = px;
         return;
     }
+    // The most pixels the heap's growth past the shadows' holds.
+    const auto px_for = [&](std::uint64_t mib) {
+        const double r = static_cast<double>(mib) - static_cast<double>(shadows) - 256.0;
+        return kPx1080 + static_cast<std::uint64_t>(std::max(0.0, r) / 270.0 * 1e6);
+    };
     auto* sz = static_cast<std::uint64_t*>(guest_ptr(image->mem, guest(kGfxPrivate)));
     if (*sz != kGfxPrivateStock) {
         host_log("resolution: refused, GFX_GraphicsPrivate's size is 0x%llx, not 0x%llx", (unsigned long long)*sz,
@@ -1137,19 +1149,24 @@ void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
     const std::uint64_t dmem_before = hle_kernel_dmem_size();
     if (dmem_more && !hle_kernel_set_dmem_size(dmem_before + (dmem_more << 20))) {
         more = kFitsInDmemMiB;  // the direct memory exists already: what fits in it
-        px = kPx1080 + static_cast<std::uint64_t>((static_cast<double>(more) - 256.0) / 270.0 * 1e6);
+        px = px_for(more);
     } else if (const std::uint64_t granted = (hle_kernel_dmem_size() - dmem_before) >> 20; granted < dmem_more) {
         // The window's end: what it granted, and the heaps after this one keep their room.
         host_log("resolution: the direct memory grew by %llu MiB of the %llu asked (the guest's window is full); the render-target heap grows by %llu MiB",
                  (unsigned long long)granted, (unsigned long long)dmem_more, (unsigned long long)(kFitsInDmemMiB + granted));
         more = kFitsInDmemMiB + granted;
-        px = std::min(px, kPx1080 + static_cast<std::uint64_t>((static_cast<double>(more) - 256.0) / 270.0 * 1e6));
+        px = std::min(px, px_for(more));
     }
+    if (more < shadows)
+        host_log("resolution: the heap grew by %llu MiB, short of the %llu MiB Shadow resolution's maps take: areas' "
+                 "meshes and textures may not all be made - a lower Shadow resolution fits",
+                 (unsigned long long)more, (unsigned long long)shadows);
     *sz = kGfxPrivateStock + (more << 20);
     g_live_max_px = given ? ~0ull : px;
-    host_log("resolution: GFX_GraphicsPrivate %llu -> %llu MiB, direct memory %llu MiB - live changes up to %.1f million pixels",
-             (unsigned long long)(kGfxPrivateStock >> 20), (unsigned long long)(*sz >> 20), (unsigned long long)(hle_kernel_dmem_size() >> 20),
-             given ? 99.9 : static_cast<double>(px) / 1e6);
+    host_log("resolution: GFX_GraphicsPrivate %llu -> %llu MiB (%llu MiB of it Shadow resolution's), direct memory %llu MiB - live "
+             "changes up to %.1f million pixels",
+             (unsigned long long)(kGfxPrivateStock >> 20), (unsigned long long)(*sz >> 20), (unsigned long long)shadows,
+             (unsigned long long)(hle_kernel_dmem_size() >> 20), given ? 99.9 : static_cast<double>(px) / 1e6);
 }
 
 }  // namespace

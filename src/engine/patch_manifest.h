@@ -102,6 +102,10 @@ const char* patch_manifest_owner(std::uint64_t address, std::size_t n);
 std::vector<std::string> patch_manifests_gameplay();
 // Whether patch_manifests_apply has run: the list above is final after it.
 bool patch_manifests_done();
+// What the Shadow resolution setting's larger shadow maps take from the
+// render-target heap, in MiB (a multiple of 64), when its built-in patch was
+// applied; 0 when not (engine/live_resolution.cpp grows the heap by it).
+std::uint64_t shadow_resolution_heap_mib();
 
 // A manifest while the game runs, for the patch menu (host/ingame_menu.cpp).
 struct PatchLiveState {

@@ -688,9 +688,9 @@ constexpr int kCameraRows = 4;
 // as one (host_set_deck_profile), and the model detail as a pick list, which
 // no other section has. The pick list last, as everywhere.
 const Choice kDeckRates[2] = {{0, 123030}, {1, 123031}};
-const Choice kModelDetails[] = {{0, 123040}, {1, 123041}, {2, 123042}, {3, 123043}};
+const Choice kModelDetails[] = {{0, 123043}, {1, 123042}, {2, 123041}, {3, 123040}};  // Lowest, Low, Normal, Full
 std::uint8_t g_deck_rate = 0, g_deck_rate_last = 0xff;
-std::int32_t g_deck_model = 1, g_deck_model_last = -1;
+std::int32_t g_deck_model = 2, g_deck_model_last = -1;
 std::uint8_t* g_deck_dialog = nullptr;  // the section while it may be open (menu thread)
 std::uint64_t g_deck_vtable = 0;
 std::atomic<bool> g_deck_redraw{false};  // the model detail row shows a value the frame rate set
@@ -714,7 +714,7 @@ void seed_camera_tuning() {
 void seed_deck() {
     g_deck_rate = g_deck_rate_last = static_cast<std::uint8_t>(host_deck_profile());
     const int m = host_opt_index("model_detail");
-    g_deck_model = g_deck_model_last = m < 0 ? 1 : m;
+    g_deck_model = g_deck_model_last = m < 0 ? 2 : m;
 }
 
 // Every row opens showing what the setting is now - the F10 screen may have
@@ -963,7 +963,7 @@ GUEST_ABI void pc_deck_handler(void* dialog, void* params) {
     add_pair_row(dialog, &g_deck_rate, kDeckFrameRate, kDeckRates, static_cast<std::uint8_t>(host_deck_default_profile()));
     const int model_default = host_opt_default_index("model_detail");
     add_list_row(dialog, &g_deck_model, kDeckModelDetail, kModelDetails, static_cast<int>(sizeof(kModelDetails) / sizeof(kModelDetails[0])),
-                 model_default < 0 ? 1 : model_default);
+                 model_default < 0 ? 2 : model_default);
     log_rows("PCDeck", dialog, kDeckRows, kDeckRows);
 }
 
@@ -1969,7 +1969,7 @@ void option_menu_poll() {
         host_log("pc-options: model detail %d from the System menu", g_deck_model);
     } else if (deck_rate) {
         const int m = host_opt_index("model_detail");
-        g_deck_model = g_deck_model_last = m < 0 ? 1 : m;
+        g_deck_model = g_deck_model_last = m < 0 ? 2 : m;
         g_deck_redraw.store(true);
     }
     if (g_frame_cap != g_last_frame_cap) {
