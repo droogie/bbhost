@@ -106,7 +106,7 @@ struct HostSettings {
     bool frame_generation = false;
     // The upscaler's motion for what moves of itself (host/upscale_pass.cpp):
     // 0 the game's velocity map, 1-3 rebuilt at 8, 16 or 32 bits. Read once.
-    int motion_vectors = 2;
+    int motion_vectors = 0;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

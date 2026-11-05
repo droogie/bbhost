@@ -418,7 +418,11 @@ Setting g_set[kSettingCount] = {
     // same meshes' motion rebuilt - the game's velocity shaders writing their
     // exact screen motion at the render size (host/translation_cache.cpp) in
     // 8-, 16- or 32-bit, for comparing accuracy and cost.
-    {"motion_vectors", "Motion vectors", {"Velomap", "Rebuilt 8-bit", "Rebuilt 16-bit", "Rebuilt 32-bit"}, 2,
+    // No longer shown (2026-11-05): the characters' motion comes from their own
+    // vertex shaders (upscale_pass.cpp's capture), the rest from the depth
+    // and the game's velocity map, so the map is always the game's own;
+    // BBHOST_MOTION_VECTORS=8|16|32 still rebuilds it (a test).
+    {"motion_vectors", "Motion vectors", {"Velomap", "Rebuilt 8-bit", "Rebuilt 16-bit", "Rebuilt 32-bit"}, 0,
      "Where the upscaler and frame generation take the motion of the player, enemies and other moving "
      "things from (the camera's own comes from the depth). Velomap: the game's motion blur velocity map, scaled and clamped "
      "for blurring, read before the blur spreads it. Rebuilt: the same skinned meshes' motion written exactly, at the render "
@@ -550,7 +554,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kFrameGeneration},
-    {Row::Option, nullptr, kMotionVectors},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     // The preset row (preset_row): for FSR its preset - the Upscaling quality
@@ -2139,9 +2142,7 @@ int host_opt_motion_rebuilt_bits() {
         const int b = std::atoi(e);
         return b == 8 || b == 16 || b == 32 ? b : 0;
     }();
-    if (env >= 0) return env;
-    static constexpr int kBits[] = {0, 8, 16, 32};
-    return kBits[std::clamp(host_settings_ref().motion_vectors, 0, 3)];
+    return env > 0 ? env : 0;  // the game's velocity map unless a test asks (the setting is no longer shown)
 }
 
 bool host_opt_output_size(int* w, int* h) {
