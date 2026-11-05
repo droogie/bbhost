@@ -67,7 +67,7 @@ bool host_opt_resolution(int* w, int* h);
 // Fullscreen: the screen's; Windowed: [video] width x height). The 3D is
 // then drawn at the Resolution (engine/render_scale.cpp) and upscaled, so a
 // low Resolution keeps the UI sharp. A plugin's 3D at a size of its own
-// (plugin API 18 scene_scale, host/scene_look.h: the PS1 Look's) is the same
+// (plugin API 18 scene_scale, host/scene_look.h: the Bloodborne PS1's) is the same
 // with no upscaler, the 3D brought up nearest - and with a height of its own
 // the game is the window's size whatever the Resolution. False as
 // host_opt_resolution.

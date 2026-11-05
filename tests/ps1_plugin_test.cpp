@@ -169,8 +169,8 @@ int main(int argc, char** argv) {
         }
         CHECK(defaults["unfiltered"] == "true");
         CHECK(defaults["colour_8bit"] == "true");
-        CHECK(defaults["snap"] == "240 lines");
-        CHECK(defaults["resolution"] == "Resolution");
+        CHECK(defaults["snap"] == "240p");
+        CHECK(defaults["resolution"] == "Native");
     }
 
     // An older host: refused before any call.
@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
         // Live changes, as the menus make them.
         if (H.option_fn) {
             H.calls.clear();
-            H.option_fn("snap", "3D pixels", H.option_user);
+            H.option_fn("snap", "Native", H.option_user);
             CHECK(has(H.calls, "snap " + std::to_string(BB_SNAP_PIXELS)));
             H.option_fn("snap", "Off", H.option_user);
             CHECK(has(H.calls, "snap 0"));
@@ -209,9 +209,9 @@ int main(int argc, char** argv) {
             H.option_fn("colour_8bit", "false", H.option_user);
             CHECK(has(H.calls, "colour 0"));
             CHECK(has(H.calls, "grading 0"));  // the grading smooth again
-            H.option_fn("resolution", "240 lines", H.option_user);
+            H.option_fn("resolution", "240p", H.option_user);
             CHECK(has(H.calls, "scale 1 240"));
-            H.option_fn("resolution", "Resolution", H.option_user);
+            H.option_fn("resolution", "Native", H.option_user);
             CHECK(has(H.calls, "scale 1 0"));
             if (g_failures) dump("live");
         }
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
     // A config of its own at the start.
     {
         H = Host{};
-        H.config = {{"ps1.snap", "Off"}, {"ps1.unfiltered", "false"}, {"ps1.colour_8bit", "false"}, {"ps1.resolution", "360 lines"}};
+        H.config = {{"ps1.snap", "Off"}, {"ps1.unfiltered", "false"}, {"ps1.colour_8bit", "false"}, {"ps1.resolution", "360p"}};
         BbHostApi api = make_api(BB_PLUGIN_API_VERSION);
         CHECK(p.init(&api) == 0);
         CHECK(has(H.calls, "snap 0"));

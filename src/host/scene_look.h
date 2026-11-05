@@ -2,7 +2,7 @@
 
 // The 3D's look a plugin asks for (plugin API 18, include/bbhost_plugin.h:
 // scene_snap, scene_filter, scene_scale, scene_colour_bits, grading_filter) -
-// the PS1 Look plugin's (plugins/ps1). Only the state: render.cpp snaps the
+// the Bloodborne PS1 plugin's (plugins/ps1). Only the state: render.cpp snaps the
 // camera draws' vertices (gcn/vertex_snap.h) and samples their textures as it
 // says, engine/render_scale.cpp and host/options.cpp size the 3D by it,
 // engine/patch_manifest.cpp's scene-rgba8 makes the colour targets RGBA8.

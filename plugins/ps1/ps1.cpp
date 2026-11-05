@@ -1,4 +1,4 @@
-// PS1 Look: the 3D drawn the way the first PlayStation drew it - its vertices
+// Bloodborne PS1: the 3D drawn the way the first PlayStation drew it - its vertices
 // snapped to the screen's grid, its textures unfiltered, its colour in 8 bits
 // a channel, and the 3D at a Resolution of its own, brought up to the window
 // pixel for pixel. The HUD and the menus stay as they are, at the window's
@@ -7,10 +7,10 @@
 //   [plugins]
 //   ps1 = true
 //   [ps1]
-//   snap = "240 lines"     # the grid the vertices land on: Off, 3D pixels, 480/360/240/120 lines
+//   snap = "240p"          # the grid the vertices land on: Off, Native (the 3D's own pixels), 480p/360p/240p/120p
 //   colour_8bit = true     # the 3D's colour targets RGBA8 (and the colour grading unsmoothed)
 //   unfiltered = true      # the 3D's textures sampled nearest: no bilinear, trilinear or anisotropic filtering
-//   resolution = "Resolution"  # the 3D's size: the Resolution setting, or 480/360/240 lines
+//   resolution = "Native"  # the 3D's size: Native (the Resolution setting, at most the window's), or 480p/360p/240p
 //
 // Everything here is the host's (plugin API 18): this file only says what the
 // options ask for, at the start and again as they change in the game.
@@ -25,8 +25,8 @@
 // place on the screen in whole pixels, so a polygon's corners jumped from
 // pixel to pixel as it moved: the wobble of its 3D. The host moves each camera
 // draw's vertex, as its vertex stage writes it, to the nearest corner of a
-// grid `lines` cells high (as many across as the 3D's shape gives: 240 lines
-// is 427 x 240 at 16:9) - 240 is the PS1's own screen; 3D pixels, the 3D's
+// grid `lines` cells high (as many across as the 3D's shape gives: 240p is
+// 427 x 240 at 16:9, about 570 x 240 at 21:9) - 240 is the PS1's own screen; Native, the 3D's
 // own pixels (no wobble you would see at a high Resolution).
 //
 // Unfiltered textures (scene_filter). The PS1 had no bilinear filtering: each
@@ -56,7 +56,7 @@
 // FXAA, after that copy, would smooth the pixels again). The game and its HUD
 // are always the window's size: a Resolution as large as the window or larger
 // draws the 3D at the window's size too (not above it, filtered down); 480,
-// 360 or 240 lines draw it that high whatever the Resolution, as wide as the
+// 360p or 240p draw it that many lines high whatever the Resolution, as wide as the
 // window's shape gives.
 #include "bbhost_plugin.h"
 
@@ -70,29 +70,30 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION,
     BB_PLUGIN_OPT_IN,
     "ps1",
-    "PS1 Look",
-    "0.1.0",
+    "Bloodborne PS1",
+    "0.2.0",
     "Kyo",
-    "The 3D drawn as the first PlayStation drew it: vertices snapped to the screen's grid, unfiltered textures, 8-bit colour, "
-    "a low resolution brought up pixel for pixel. The HUD and menus stay sharp.",
+    "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
+    "native.",
 };
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "look", "The 3D only", "The HUD and the menus stay as they are, at the window's size.", nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "snap", "Vertex snap",
-     "The grid the 3D's corners land on, as the PS1's landed on its pixels: they jump from cell to cell as they move. 240 lines "
-     "is the PS1's own screen; 3D pixels, the 3D's own.",
-     "240 lines", 0, 0, "Off|3D pixels|480 lines|360 lines|240 lines|120 lines"},
+     "The grid the 3D's corners land on, as the PS1's landed on its pixels: they jump from cell to cell as they move. 240p "
+     "is the PS1's own screen; Native, the 3D's own pixels. The grid follows the screen's shape (240p is 427 cells across at 16:9).",
+     "240p", 0, 0, "Off|Native|480p|360p|240p|120p"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "unfiltered", "Unfiltered textures",
      "The 3D's textures sampled nearest - no bilinear, trilinear or anisotropic filtering - as the PS1 had none.", "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "colour_8bit", "8-bit colour",
      "The 3D's colour in 8 bits a channel, as the rgba8f patch makes it: the lighting bands and clips at white. The colour "
      "grading steps between its entries too, where it is smooth without it.",
      "true"},
-    {BB_OPT_CHOICE | BB_OPT_LIVE, "resolution", "3D resolution",
-     "The 3D's size, brought up to the window pixel for pixel. Resolution: the Resolution setting (one as large as the "
-     "window or larger draws the 3D at the window's size). The others draw it that many lines high, as wide as the window's shape.",
-     "Resolution", 0, 0, "Resolution|480 lines|360 lines|240 lines"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "resolution", "Resolution",
+     "The 3D's resolution, brought up to the window pixel for pixel; the HUD and menus stay at the window's. Native: the "
+     "Resolution setting, at most the window's. 480p, 360p and 240p: that many lines high, as wide as the window's shape gives "
+     "(240p is 424 x 240 at 16:9, about 570 x 240 at 21:9), whatever the window's size.",
+     "Native", 0, 0, "Native|480p|360p|240p"},
     {0}};
 
 namespace {
@@ -107,15 +108,19 @@ const char* option(const char* key, const char* fallback) {
     return v && *v ? v : fallback;
 }
 
-// "240 lines" -> 240; "3D pixels" -> BB_SNAP_PIXELS; "Off" and "Resolution" -> 0.
+// "240p" (or 0.1.0's "240 lines") -> 240; "Off", "Native" (0.1.0's "Resolution") -> 0.
 std::uint32_t lines_of(const char* v) {
-    if (!v) return 0;
-    if (std::strcmp(v, "3D pixels") == 0) return BB_SNAP_PIXELS;
-    const long n = std::strtol(v, nullptr, 10);
+    const long n = v ? std::strtol(v, nullptr, 10) : 0;
     return n > 0 ? static_cast<std::uint32_t>(n) : 0;
 }
 
-void set_snap(const char* v) { api->scene_snap(lines_of(v)); }
+// The snap's grid: Native (0.1.0's "3D pixels") the 3D's own pixels.
+std::uint32_t snap_of(const char* v) {
+    if (v && (std::strcmp(v, "Native") == 0 || std::strcmp(v, "3D pixels") == 0)) return BB_SNAP_PIXELS;
+    return lines_of(v);
+}
+
+void set_snap(const char* v) { api->scene_snap(snap_of(v)); }
 void set_unfiltered(bool on) { api->scene_filter(on ? BB_FILTER_NEAREST : BB_FILTER_AS_IS); }
 void set_colour_8bit(bool on) {
     api->scene_colour_bits(on ? 8 : 0);
@@ -141,10 +146,10 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_init(const BbHostApi* host) {
         host->log("ps1: needs plugin API 18 (the 3D's look); this host has %u", host->version);
         return 1;
     }
-    set_resolution(option("ps1.resolution", "Resolution"));
+    set_resolution(option("ps1.resolution", "Native"));
     set_colour_8bit(truthy(option("ps1.colour_8bit", "true")));
     set_unfiltered(truthy(option("ps1.unfiltered", "true")));
-    set_snap(option("ps1.snap", "240 lines"));
+    set_snap(option("ps1.snap", "240p"));
     return 0;
 }
 
@@ -162,9 +167,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     }
     host->on_option("ps1", &on_option, nullptr);
     // config()'s text lasts until the next call: each value copied first.
-    const std::string snap = option("ps1.snap", "240 lines"), resolution = option("ps1.resolution", "Resolution");
+    const std::string snap = option("ps1.snap", "240p"), resolution = option("ps1.resolution", "Native");
     const bool unfiltered = truthy(option("ps1.unfiltered", "true")), colour_8bit = truthy(option("ps1.colour_8bit", "true"));
-    host->log("ps1: the PS1 look on: vertex snap %s, textures %s, colour %s, the 3D at %s", snap.c_str(),
+    host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, the 3D at %s", snap.c_str(),
               unfiltered ? "unfiltered" : "as the game filters them", colour_8bit ? "8-bit" : "as the game makes it", resolution.c_str());
     return 0;
 }

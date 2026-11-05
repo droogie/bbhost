@@ -81,7 +81,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
     if (option == "graphics.render_scale") return render_scale_plan(nullptr);  // Upscaling and its quality, read once
-    if (option == "plugin.scene_rgba8") return scene_look_colour_8bit();  // a plugin's scene_colour_bits (the PS1 Look's), then live
+    if (option == "plugin.scene_rgba8") return scene_look_colour_8bit();  // a plugin's scene_colour_bits (the Bloodborne PS1's), then live
     *known = false;
     return false;
 }
@@ -476,7 +476,7 @@ Manifest velomap_manifest() {
 }
 
 // scene-rgba8, the scene's colour targets in 8 bits a channel (plugin API 18
-// scene_colour_bits: the PS1 Look's 8-bit colour): Kyo's "rgba8f color space
+// scene_colour_bits: the Bloodborne PS1's 8-bit colour): Kyo's "rgba8f color space
 // (Perf Increase)" patch, site for site (patches/rgba8f-color-space.toml). The
 // scene context's Initialize (sub_26c39f0) makes its colour targets in the
 // formats these bytes name - the game's 0x0a, RGBA16F, which the Performance
