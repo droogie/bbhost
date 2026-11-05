@@ -76,6 +76,17 @@ struct OwnImage {
 };
 
 OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F, the output size) and the motion (R16G16_SFLOAT, the scene's)
+// The depth the upscaler and frame generation read: an R32_SFLOAT copy of the
+// G-buffer's, written by the motion pass. The game's is D32_SFLOAT_S8_UINT,
+// and FSR makes its own view of the image it is handed: of a depth-stencil
+// image that view did not read clean depth (Numity1504's bridge notes, section
+// 5, left it open), so FSR could not tell a moving object's edges from what
+// is behind them - no history thrown away where the object had been, its
+// motion not taken from the nearest surface: the object smeared with its own
+// old frames. BBNextGenSuite hands FSR plain depth. Fresh when the motion
+// pass ran this frame (g_depth_r32_fresh), else the game's own is handed on.
+OwnImage g_depth_r32;
+bool g_depth_r32_fresh = false;
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 // Frame generation (host/framegen.h): the frames prepared so far - each
 // frame's number - and the one this frame was prepared as (0: not), which its
@@ -194,14 +205,15 @@ bool g_motion_tried = false;
 bool motion_pipeline_locked() {
     if (g_motion_tried) return g_motion_pipeline != VK_NULL_HANDLE;
     g_motion_tried = true;
-    const VkDescriptorSetLayoutBinding binds[4] = {
+    const VkDescriptorSetLayoutBinding binds[5] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 4;
+    sli.bindingCount = 5;
     sli.pBindings = binds;
     if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_motion_set_layout) != VK_SUCCESS) return false;
     VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 160};
@@ -232,6 +244,8 @@ bool motion_pipeline_locked() {
 // The motion image written from the depth and the two cameras (the last one
 // absent: all zeros), and the meshes' own from the game's velocity map, a
 // view of it `velo` of velo_w x velo_h (null: none).
+bool velo_seen_test();  // below
+
 void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
                    std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
                    int velo_mode, bool whole) {
@@ -262,7 +276,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[34] = p[35] = b8 ? 0.5f : 0.0f;
         p[36] = static_cast<float>(velo_w);
         p[37] = static_cast<float>(velo_h);
-        p[38] = 3.0f;
+        // (16 and 32 bits: each mesh texel's view distance in blue, tested
+        // against the depth - mode 5.)
+        p[38] = host_opt_motion_rebuilt_bits() >= 16 && velo_seen_test() ? 5.0f : 3.0f;
         p[39] = whole ? 1.0f : 0.0f;
     } else if (velo) {
         // The camera's pass: (uv now - uv then) x scale x 2.5. A mesh's:
@@ -285,8 +301,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     const VkDescriptorImageInfo motion_info{VK_NULL_HANDLE, motion_view, VK_IMAGE_LAYOUT_GENERAL};
     // No map: the depth stands in, unread.
     const VkDescriptorImageInfo velo_info{VK_NULL_HANDLE, velo ? velo : depth_view, velo ? VK_IMAGE_LAYOUT_GENERAL : depth_layout};
-    VkWriteDescriptorSet wr[4] = {};
-    for (int k = 0; k < 4; ++k) {
+    const VkDescriptorImageInfo depth_copy_info{VK_NULL_HANDLE, g_depth_r32.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[5] = {};
+    for (int k = 0; k < 5; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = static_cast<std::uint32_t>(k);
@@ -300,15 +317,22 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     wr[2].pImageInfo = &motion_info;
     wr[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     wr[3].pImageInfo = &velo_info;
-    vkUpdateDescriptorSets(g.device, 4, wr, 0, nullptr);
+    wr[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[4].pImageInfo = &depth_copy_info;
+    vkUpdateDescriptorSets(g.device, 5, wr, 0, nullptr);
     barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_SHADER_WRITE_BIT);
+    barrier(cb, g_depth_r32.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT);  // (every texel written again)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_motion_pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_motion_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cb, g_motion_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, g_depth_r32.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+    g_depth_r32_fresh = true;
 }
 
 void drop(OwnImage& o) {
@@ -535,7 +559,7 @@ bool test_pass_locked(TestPass& t) {
 // images `views` and the sampler; the push constants the output's size, the
 // render size and `k`, `k2`, `k3`.
 void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkImageView> views, float k, float k2 = 0.0f,
-                      float k3 = 0.0f) {
+                      float k3 = 0.0f, float k4 = 0.0f) {
     if (!test_pass_locked(t)) return;
     const VkDescriptorSet set = alloc_set_locked(t.set_layout);
     if (!set) return;
@@ -554,7 +578,7 @@ void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkI
         wr[i].pImageInfo = &infos[i];
     }
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(wr.size()), wr.data(), 0, nullptr);
-    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, k2, k3, 0};
+    const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, k2, k3, k4};
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t.pipeline);
@@ -588,7 +612,8 @@ void record_motion_check(VkCommandBuffer cb, RtImage& scene, float gain) {
         g_prev_scene_valid = false;
     }
     if (g_prev_scene_valid)
-        record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain, g_check_whole ? 2.0f : 1.0f, check_box());
+        record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain, g_check_whole ? 2.0f : 1.0f, check_box(),
+                         std::getenv("BBHOST_UPSCALE_CHECK_OVERLAY") ? 1.0f : 0.0f);
     barrier(cb, g_prev_scene.image, VK_IMAGE_ASPECT_COLOR_BIT, g_prev_scene_valid ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
@@ -660,9 +685,9 @@ CameraTerms g_terms;  // this frame's (upscale_pass_run_locked)
 void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageLayout depth_layout, float jitter_x, float jitter_y,
                               float motion_scale) {
     FramegenInputs fi;
-    fi.depth = depth.image;
-    fi.depth_format = depth.format;
-    fi.depth_layout = depth_layout;
+    fi.depth = g_depth_r32_fresh ? g_depth_r32.image : depth.image;
+    fi.depth_format = g_depth_r32_fresh ? VK_FORMAT_R32_SFLOAT : depth.format;
+    fi.depth_layout = g_depth_r32_fresh ? VK_IMAGE_LAYOUT_GENERAL : depth_layout;
     fi.motion = g_motion.image;
     fi.render_w = g_w;
     fi.render_h = g_h;
@@ -678,6 +703,18 @@ void prepare_frame_generation(VkCommandBuffer cb, const RtImage& depth, VkImageL
     if (!told) host_log("framegen: first prepare %s", g_fg_pending ? "recorded" : "refused");
     told = true;
 }
+
+// BBHOST_VELO_SEEN: 0 a mesh's motion wherever its pass drew (a test), alt
+// the visible-surface test every other frame (the check's corner marks it);
+// else on (camera_motion.comp mode 5).
+int velo_seen_env() {
+    static const int on = [] {
+        const char* e = std::getenv("BBHOST_VELO_SEEN");
+        return !e ? 1 : e[0] == '0' ? 0 : std::strcmp(e, "alt") == 0 ? 2 : 1;
+    }();
+    return on;
+}
+bool velo_seen_test() { return velo_seen_env() == 1 || (velo_seen_env() == 2 && (g_velo_frame & 1) == 0); }
 
 // BBHOST_VELO_PREV: 0 the game's matrices always (a test), alt last frame's
 // given every other frame (velo_previous_given), else 1.
@@ -822,6 +859,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image) {
         drop(g_output);
         drop(g_motion);
+        drop(g_depth_r32);
+        g_depth_r32_fresh = false;
         drop(g_sharp);
         drop(g_prev_scene);
         g_prev_scene_valid = false;
@@ -836,10 +875,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         if ((!motion_only && !make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_ow, g_oh)) ||
             !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                  g_w, g_h)) {
+                  g_w, g_h) ||
+            !make(g_depth_r32, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, g_w, g_h)) {
             host_log("upscaler: no images of %ux%u and %ux%u for it; not upscaled", g_ow, g_oh, g_w, g_h);
             drop(g_output);
             drop(g_motion);
+            drop(g_depth_r32);
             g_w = g_h = g_ow = g_oh = 0;
             g_scaled = false;
             return false;
@@ -951,10 +992,11 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     // The next frame's map work (upscale_velo_clear_due, upscale_velo_copy_due).
     ++g_velo_frame;
     g_velo_camera_pass = false;
+    g_depth_r32_fresh = false;  // (record_motion writes this frame's)
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
         record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
                       velo_mode, whole);
-        g_check_whole = whole;
+        g_check_whole = velo_seen_env() == 2 ? velo_seen_test() : whole;
         g_velo_cam[0] = g_velo_cam[1] = 0.0f;
         if (!g_cam_prev_ok) g_reset = true;
         g_cam_prev = g_cam_now;
@@ -990,7 +1032,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.output_w = g_ow;
     c.output_h = g_oh;
     c.color = {scene.image, scene.view, scene.format, VK_IMAGE_LAYOUT_GENERAL};
-    c.depth = {depth.image, g_depth_view, depth.format, depth_layout};
+    c.depth = g_depth_r32_fresh ? UpscaleImage{g_depth_r32.image, g_depth_r32.view, VK_FORMAT_R32_SFLOAT, VK_IMAGE_LAYOUT_GENERAL}
+                                : UpscaleImage{depth.image, g_depth_view, depth.format, depth_layout};
     c.motion = {g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL};
     c.motion_scale = motion_mode < 0 ? -1.0f : 1.0f;
     c.dlss_preset = static_cast<std::uint32_t>(host_settings_ref().dlss_preset);

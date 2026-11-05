@@ -23,7 +23,7 @@ layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
 
 layout(push_constant) uniform Params {
     vec4 size;  // the output's width and height, then the render size
-    vec4 k;     // x: the gain, y: the corner's mark (0 none)
+    vec4 k;     // x: the gain, y: the corner's mark (0 none), z: the box, w: the overlay
 };
 
 vec3 texel(ivec2 p) {
@@ -75,6 +75,15 @@ void main() {
         c = vec3(0.0);
         if (m > t && m > 0.7 * s) c = vec3(1.0, 0.0, 0.0);
         else if (s > t && m < 0.5 * s) c = vec3(0.0, 1.0, 0.0);
+    }
+    // k.w (BBHOST_UPSCALE_CHECK_OVERLAY): the picture itself, dimmed, with the
+    // motion's size over it in red (8 render pixels full) - where the motion
+    // lies against what moved.
+    if (k.w > 0.5) {
+        const vec3 now = max(texelFetch(sampler2D(scene, any_sampler), p, 0).rgb, vec3(0.0));
+        const vec3 base = now / (vec3(1.0) + now) * 0.7;
+        const vec2 mv = texelFetch(sampler2D(motion, any_sampler), p, 0).rg;
+        c = base + vec3(clamp(length(mv) / 8.0, 0.0, 1.0), 0.0, 0.0);
     }
     // The frame's state in the top-left corner (k.y: 2 the velocity pass
     // had last frame's matrices, white; 1 not, grey), for an A/B in one run.

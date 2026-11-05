@@ -1305,8 +1305,11 @@ bool velo_rebuilt(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptio
     } else if (!dxc.loaded()) {
         why = "DXC not found";
     } else {
+        // (16 and 32 bits: the fragment's view distance, clip w, in blue -
+        // upscale_pass.cpp's motion takes a mesh's motion only where it is
+        // the surface seen.)
         const char* write = bits == 8 ? "    mrt0 = float4(saturate((attr0.xy / attr0.w - attr1.xy / attr1.w) * 2.0f + 0.5f), 0.0f, 0.5f);\n"
-                                      : "    mrt0 = float4(attr0.xy / attr0.w - attr1.xy / attr1.w, 0.0f, 0.5f);\n";
+                                      : "    mrt0 = float4(attr0.xy / attr0.w - attr1.xy / attr1.w, attr0.w, 0.5f);\n";
         h.source.insert(end + 1, write);
         // No discards: an alpha-tested mesh's motion over its cards' whole
         // area, the gaps between a cape's fur strands too - its motion a

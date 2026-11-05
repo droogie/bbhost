@@ -34,6 +34,10 @@ layout(set = 0, binding = 0) uniform texture2D depth_plane;
 layout(set = 0, binding = 1) uniform sampler any_sampler;
 layout(set = 0, binding = 2) uniform writeonly image2D motion;  // R16G16_SFLOAT, written without a format
 layout(set = 0, binding = 3) uniform texture2D velo_map;           // the game's velocity map (velo_size.z == 0: none)
+// The depth as a plain R32F image, for the upscalers and frame generation:
+// the game's is D32_SFLOAT_S8_UINT, and the view FSR makes of a depth-stencil
+// image of its own did not read clean depth (upscale_pass.cpp g_depth_r32).
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D depth_copy;
 
 layout(push_constant) uniform Params {
     vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
@@ -52,11 +56,12 @@ void main() {
     const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
     if (xy.x >= int(size.x) || xy.y >= int(size.y)) return;
     vec2 mv = vec2(0.0);
+    const float raw = texelFetch(sampler2D(depth_plane, any_sampler), xy, 0).r;
+    imageStore(depth_copy, xy, vec4(raw, 0.0, 0.0, 0.0));
     if (prev_proj.x > 0.0) {
         const vec2 uv = (vec2(xy) + 0.5) / size;
         const vec2 ndc = uv * 2.0 - 1.0;
         const vec3 dir = vec3(ndc.x * now_proj.x, -ndc.y * now_proj.y, 1.0);
-        const float raw = texelFetch(sampler2D(depth_plane, any_sampler), xy, 0).r;
         const float d = now_proj.w / (raw - now_proj.z);
         vec3 gp;
         if (d > 0.0 && d < 100000.0) {
@@ -76,12 +81,23 @@ void main() {
         // The map's mode (velo_size.z): 1 the game's encoding, the bones' motion
         // alone (added to the camera's); 4 the same encoding with the pass
         // given last frame's matrices (render.cpp velo_previous_locked): the
-        // whole motion; 2 the map everywhere (a test); 3 rebuilt.
+        // whole motion; 2 the map everywhere (a test); 3 rebuilt; 5 rebuilt
+        // with each mesh fragment's view distance, tested against the depth.
         const int mode = int(velo_size.z + 0.5);
-        if (mode == 3) {
+        if (mode == 3 || mode == 5) {
+            const float seen_d = d;  // the seen surface's view distance (d below is the map's delta)
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
             const vec4 t = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0);
-            if (abs(t.a - 0.5) < 0.1) {
+            // Mode 5: the map's blue holds the mesh fragment's view distance,
+            // and its motion is taken only where that fragment is the surface
+            // seen - within 0.4 % + 1 cm of the depth's, or in front of it by
+            // up to a fur's depth (3 % + 10 cm: strands over the body they lie
+            // on) - BBNextGenSuite's test. Elsewhere the motion of what is seen
+            // stays: the wall through a cape's strands, a fence before a
+            // character, the sky past an edge.
+            const bool seen = mode != 5 || (seen_d > 0.0 && seen_d < 100000.0 && t.b <= seen_d * 1.004 + 0.01 &&
+                                            seen_d - t.b <= seen_d * 0.03 + 0.1);
+            if (abs(t.a - 0.5) < 0.1 && seen) {
                 const vec2 d = (t.rg - velo_k.zw) * velo_k.xy;
                 const vec2 own = vec2(-0.5 * d.x, 0.5 * d.y) * size;
                 // Whole (velo_size.w: the pass given last frame's matrices),
