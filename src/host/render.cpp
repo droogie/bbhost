@@ -22610,6 +22610,44 @@ static bool draw_impl(const GpuDraw& d) {
             draw_targets(d, in, s, targets);
         }
     }
+    // The game's occlusion culling under a smaller 3D (render scale: FSR 3, FSR
+    // 4 and DLSS below Native AA; a plugin's look at its own size): its proxies
+    // - boxes drawn depth-tested with no colour and no depth write, between
+    // ZPASS_DONE dumps (host/occlusion.cpp) - are drawn against
+    // DefDepthStencil at the output size, which the scene no longer draws into
+    // (its depth is its own, at the render size). Tested against that, every
+    // box passed and the game culled nothing (0.0% of the pairs occluded with
+    // FSR 3 Performance at 1080p, 71% with Upscaling off). Such a draw takes
+    // the scene's depth instead, its viewport and scissor scaled to it
+    // (below). BBHOST_OCCLUSION_SCENE_DEPTH=0: the output-size depth, as before.
+    float occ_sx = 1.0f, occ_sy = 1.0f;
+    {
+        static const bool redirect = [] {
+            const char* e = std::getenv("BBHOST_OCCLUSION_SCENE_DEPTH");
+            return !(e && e[0] == '0');
+        }();
+        const UpscaleFrame& u = g_upscale;
+        bool colour = false;
+        for (int t = 0; t < 8 && !colour; ++t) colour = s.color[t] != nullptr;
+        if (redirect && !colour && s.depth && u.depth && s.depth->base != u.depth && (s.depth_control & 0x6) == 0x2 &&
+            u.seen_flip && hle_video_flip_count() + 1 - u.seen_flip <= 8) {
+            RtImage* scene_depth = find_render_target(u.depth);
+            if (scene_depth && scene_depth->depth && scene_depth->format == s.depth->format && scene_depth->width < s.depth->width &&
+                scene_depth->height < s.depth->height && s.depth_layers <= 1) {
+                occ_sx = static_cast<float>(scene_depth->width) / static_cast<float>(s.depth->width);
+                occ_sy = static_cast<float>(scene_depth->height) / static_cast<float>(s.depth->height);
+                static std::atomic<int> logs{0};
+                if (logs.fetch_add(1, std::memory_order_relaxed) < 2)
+                    host_log("render: occlusion culling's proxies drawn against the scene's depth 0x%llx (%ux%u) in place of 0x%llx (%ux%u) "
+                             "(BBHOST_OCCLUSION_SCENE_DEPTH=0: as before)",
+                             static_cast<unsigned long long>(scene_depth->base), scene_depth->width, scene_depth->height,
+                             static_cast<unsigned long long>(s.depth->base), s.depth->width, s.depth->height);
+                s.depth = scene_depth;
+                s.depth_layer = 0;
+                s.depth_layers = 1;
+            }
+        }
+    }
     s.su_sc_mode = in.su_sc_mode;
     s.clip_cntl = in.clip_cntl;
     s.vte_cntl = in.vte_cntl;
@@ -25491,6 +25529,12 @@ static bool draw_impl(const GpuDraw& d) {
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
     }
+    if (occ_sx != 1.0f || occ_sy != 1.0f) {  // an occlusion proxy moved onto the scene's depth (above)
+        vp.x *= occ_sx;
+        vp.width *= occ_sx;
+        vp.y *= occ_sy;
+        vp.height *= occ_sy;
+    }
     // A reversed range (zscale < 0) stays reversed: Vulkan only requires
     // both ends inside [0, 1].
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f);
@@ -25512,6 +25556,12 @@ static bool draw_impl(const GpuDraw& d) {
         rs.viewport_set = true;
     }
     VkRect2D sc = s.scissor;
+    if (occ_sx != 1.0f || occ_sy != 1.0f) {
+        sc.offset.x = static_cast<std::int32_t>(static_cast<float>(sc.offset.x) * occ_sx);
+        sc.offset.y = static_cast<std::int32_t>(static_cast<float>(sc.offset.y) * occ_sy);
+        sc.extent.width = static_cast<std::uint32_t>(std::ceil(static_cast<float>(sc.extent.width) * occ_sx));
+        sc.extent.height = static_cast<std::uint32_t>(std::ceil(static_cast<float>(sc.extent.height) * occ_sy));
+    }
     if (t_elide_mutant_draw == 2 && sc.extent.height > 1) --sc.extent.height;  // BBHOST_COPY_ELIDE_MUTANT=2: a proven draw a row short
     sc.extent.width = std::min<std::uint32_t>(sc.extent.width, pass_ext.width > static_cast<std::uint32_t>(sc.offset.x) ? pass_ext.width - sc.offset.x : 0);
     sc.extent.height = std::min<std::uint32_t>(sc.extent.height, pass_ext.height > static_cast<std::uint32_t>(sc.offset.y) ? pass_ext.height - sc.offset.y : 0);
