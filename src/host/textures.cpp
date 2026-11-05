@@ -4404,6 +4404,45 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias) {
     return out;
 }
 
+// A cube T# is sampled as a 2D array of its faces (translate.cpp mimg), where
+// filtering cannot cross into the next face the way the GPU's cube sampling
+// does: a sampler that wraps or has a border then reads the far edge of the
+// same face at every face's edge - the point lights' cube shadows showed the
+// cube's corners as seams. Clamped to each face's edge, the texels at an edge
+// meet their neighbours' nearly as the cube's would. BBHOST_CUBE_CLAMP=0 off.
+VkSampler sampler_cube_clamped(VkSampler base) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CUBE_CLAMP");
+        return !(e && e[0] == '0');
+    }();
+    if (!base || !on) return base;
+    // Read by a run part's draw, written in order (under g.mu).
+    static std::map<VkSampler, VkSampler> made;
+    if (const auto it = made.find(base); it != made.end()) return it->second;
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+    const auto rec = g_sampler_records.find(base);
+    VkSampler out = base;
+    if (rec != g_sampler_records.end()) {
+        const VkSamplerCreateInfo& was = rec->second;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 12)
+            host_log("texture: a cube's sampler: address %d/%d/%d, filter %d/%d, compare %d (op %d)%s", was.addressModeU, was.addressModeV,
+                     was.addressModeW, was.magFilter, was.minFilter, was.compareEnable, was.compareOp,
+                     was.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && was.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                         ? "" : " - clamped to each face");
+        if (was.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE || was.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE) {
+            VkSamplerCreateInfo sci = was;
+            sci.addressModeU = sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+                g_sampler_records[out] = sci;
+            else
+                out = base;
+        }
+    }
+    made[base] = out;
+    return out;
+}
+
 VkSampler sampler_nearest(VkSampler base) {
     if (!base) return base;
     // The answer for this thread's last few, in front of the map (samplers

@@ -23131,6 +23131,24 @@ static bool draw_impl(const GpuDraw& d) {
     // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
     // the colour grading's tables as its rule says, the 3D brought up nearest.
     if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
+    // A cube T#'s faces sampled as a 2D array: their samplers clamped to each
+    // face (sampler_cube_clamped).
+    {
+        StageImages& si = stage_images[1];
+        const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
+        for (std::size_t k = 0; k < si.samplers.size() && k < pairs.size(); ++k) {
+            if (!si.samplers[k]) continue;
+            bool cube = false;
+            for (std::uint32_t b = pairs[k]; b && !cube; b &= b - 1) {
+                const std::size_t i = static_cast<std::size_t>(__builtin_ctz(b));
+                cube = i < si.images.size() && si.images[i].resolved && (si.images[i].w[3] >> 28) == 11;
+            }
+            if (!cube) continue;
+            const VkSampler c = sampler_cube_clamped(si.samplers[k]);
+            if (!c) return false;  // a run part's draw: made in order
+            si.samplers[k] = c;
+        }
+    }
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const GfxPipeline* const capture_lean = lean_of(pl);
