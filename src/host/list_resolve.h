@@ -26,7 +26,8 @@ namespace list_resolve {
 // BBHOST_LIST_RESOLVE: 0 off, 1 (`runs`) the run census.
 extern const int g_mode;
 // BBHOST_RUN_BATCH: 0 off, 1 on, unset on with the run commit (with
-// BBHOST_RUN_COMMIT on or compare, so by default on Windows), 2 (`compare`) today's work
+// BBHOST_RUN_COMMIT on or compare, so by default on Windows, and kept on
+// where that default gives way to the homes), 2 (`compare`) today's work
 // with every answer a run would have shared checked against it. What a draw
 // of a run takes from the draw before it: its targets' lookups (render.cpp
 // draw_targets); and, on, the lite shadow drains GX's notices once a draw
@@ -58,12 +59,15 @@ void check_chunk(int ring, std::uint64_t recording, std::uint64_t lo, std::uint6
 // to do; 2 (`on`) the run's draws after its first committed in parts by the
 // workers and the command processor (render.cpp run_commit), spliced in their
 // order at the join - the default on Windows since 2026-10-29 (unset, or
-// `on`), and off by default on Linux since 2026-10-31; 3
-// (`compare`) as 2, and each forked run also committed in
+// `on`) but where the constant buffers' homes and the pool's segments are on
+// by their rule (commit_give_way, since 2026-11-04), and off by default on
+// Linux since 2026-10-31; 3 (`compare`) as 2, and each forked run also committed in
 // order as before, the parts' packets compared with those and dropped. The
 // workers spin BBHOST_RUN_COMMIT_SPIN_US (50) after a part before they sleep
 // on the fork's word. On (2, 3) turns BBHOST_RUN_BATCH on unless it is set.
-extern const int g_commit;
+// Read from the environment at the start; the default's give-way changes it
+// once, with the device, before any draw.
+extern std::atomic<int> g_commit;
 // The default's one line in the log, with why, when BBHOST_RUN_COMMIT is
 // unset (gpu.cpp init_locked). Off on Linux: on an RTX 4070 with two Xeon Gold
 // 6230 the commit lost 14-21% of the frame rate where the command processor
@@ -72,11 +76,24 @@ extern const int g_commit;
 // three to wake: 562 us from fork to join a run against 266 with them kept
 // spinning, which won the loss back. On Windows a run took 288-290 us from
 // fork to join on an RTX 3070 Ti Laptop GPU, where the commit gained 2%, and
-// a Radeon 8060S gained 12%.
+// a Radeon 8060S gained 12%. Where it gave way (commit_give_way) the line
+// says so.
 void log_commit_default();
-inline bool committing() { return g_commit != 0; }
-inline bool commit_draws() { return g_commit >= 2; }
-inline bool commit_compare() { return g_commit == 3; }
+inline bool committing() { return g_commit.load(std::memory_order_relaxed) != 0; }
+inline bool commit_draws() { return g_commit.load(std::memory_order_relaxed) >= 2; }
+inline bool commit_compare() { return g_commit.load(std::memory_order_relaxed) == 3; }
+// Whether BBHOST_RUN_COMMIT turns the run commit on (set, and not 0 or off).
+bool commit_by_setting();
+// Whether it is on by the platform's default alone (unset: Windows;
+// BBHOST_TEST_RUN_COMMIT_DEFAULT=on takes Windows' default on any platform,
+// =off Linux's, for a test of the give-way).
+bool commit_by_default();
+// The run commit on by the platform's default alone gives way, at the device's
+// choice before any draw (host/gxvk_homes.h run_commit_gives_way: where the
+// homes and the pool's segments are on by their rule): every draw committed
+// in order but for the pool's splices; log_commit_default says why. Nothing
+// where BBHOST_RUN_COMMIT is set.
+void commit_give_way();
 // Whether draws are committed off the order at all: a run's parts (the
 // commit on or compare) or stage 4b.1b's pool committing draws ahead of the
 // command processor (BBHOST_GXVK_LISTS=splice or splice-compare,
@@ -95,7 +112,7 @@ inline bool sinks() { return g_sinks.load(std::memory_order_relaxed); }
 // part machinery go on as BBHOST_GXVK_HOMES=1 turns them on at the start.
 void follow_homes();
 // Whether the command processor tells this module what it walks.
-inline bool on() { return g_mode != 0 || batch_mode() != 0 || g_commit != 0; }
+inline bool on() { return g_mode != 0 || batch_mode() != 0 || committing(); }
 // Whether the run census counts.
 inline bool census() { return g_mode != 0; }
 // This command-processor thread's run: moves at every split, so two draws

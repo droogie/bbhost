@@ -357,27 +357,38 @@ void sync_one_locked(Home& e) {
 
 // ---- GX's threads ----
 
-void homes_decide(bool integrated, bool small_vram, bool tight) {
+void homes_decide(bool integrated, bool small_vram, bool tight, std::uint64_t free_at_start) {
     Mode m = env_mode();
     const char* budget_env = std::getenv("BBHOST_GXVK_HOMES_BUDGET_MB");
-    // The default (BBHOST_GXVK_HOMES unset, host/gxvk_homes.h default_off): on as 1 turns them on, or off with its
-    // reasons in one line. The frame rate was chosen as the game's code was patched, before the device.
-    char by_default[256] = "";
+    const bool budget_given = budget_env && *budget_env;
+    const ull free_mib = free_at_start >> 20;
+    // Small video memory: the homes from kSmallHomesFreeMiB free at the start, with the pool's budget; under it off
+    // unless a budget is given (below).
+    const bool small_off = small_refused(small_vram, free_mib, budget_given);
+    // The default's rule (host/gxvk_homes.h default_off), asked with BBHOST_GXVK_HOMES=1 too: where it holds, the run
+    // commit on by Windows' default alone gives way to the homes and the pool's segments (run_commit_gives_way), before
+    // any draw. The frame rate was chosen as the game's code was patched, before the device.
+    const unsigned threads = host_cpu_threads();
+    const int fps = frame_rate_game_fps();
+    const unsigned off = default_off(integrated, tight, small_off, threads, fps, list_resolve::commit_by_setting());
+    const bool gave_way = run_commit_gives_way(off, list_resolve::commit_by_default(), m);
+    if (gave_way) list_resolve::commit_give_way();
+    // The default (BBHOST_GXVK_HOMES unset): on as 1 turns them on, or off with its reasons in one line.
+    char by_default[448] = "";
     if (m == Mode::kAuto) {
-        const unsigned threads = host_cpu_threads();
-        const int fps = frame_rate_game_fps();
-        const unsigned off =
-            default_off(integrated, tight, small_vram && !(budget_env && *budget_env), threads, fps, list_resolve::committing());
         if (off) {
             std::string why;
-            char b[64];
+            char b[160];
             const auto add = [&why](const char* w) {
                 if (!why.empty()) why += ", ";
                 why += w;
             };
             if (off & kDefaultOffIntegrated) add("an integrated GPU");
             if (off & kDefaultOffTight) add("tight memory");
-            if (off & kDefaultOffSmall) add("small video memory");
+            if (off & kDefaultOffSmall) {
+                std::snprintf(b, sizeof(b), "small video memory, %llu MiB free at the start", free_mib);
+                add(b);
+            }
             if (off & kDefaultOffThreads) {
                 std::snprintf(b, sizeof(b), "%u hardware threads", threads);
                 add(b);
@@ -386,18 +397,29 @@ void homes_decide(bool integrated, bool small_vram, bool tight) {
                 std::snprintf(b, sizeof(b), "%d fps", fps);
                 add(b);
             }
-            if (off & kDefaultOffRunCommit) add("the run commit on, which the pool's segments give way to (BBHOST_RUN_COMMIT=0: the default decides)");
+            if (off & kDefaultOffRunCommit) add("the run commit on by BBHOST_RUN_COMMIT, which the pool's segments give way to");
             host_log("gxvk homes: off by default here (%s) - the constant buffers' homes, and with them the draw segments prepared on "
-                     "the pool's threads, are on by default only with a graphics card with room, %u or more hardware threads, a "
-                     "frame rate above %d and the run commit off; at %d and below the pool would take about a core more for nothing. "
-                     "Decided at start: a frame rate changed in play applies at the next start. BBHOST_GXVK_HOMES=1 turns them on",
-                     why.c_str(), kDefaultThreads, kDefaultAboveFps, kDefaultAboveFps);
+                     "the pool's threads, are on by default only with a graphics card with room or %llu MiB of video memory free at the "
+                     "start, %u or more hardware threads and a frame rate above %d (where the run commit is on by Windows' default, it "
+                     "gives way to them); at %d and below the pool would take about a core more for nothing. Decided at start: a frame "
+                     "rate changed in play applies at the next start. BBHOST_GXVK_HOMES=1 turns them on",
+                     why.c_str(), kSmallHomesFreeMiB, kDefaultThreads, kDefaultAboveFps, kDefaultAboveFps);
             return;
         }
+        const char* rc = std::getenv("BBHOST_RUN_COMMIT");
+        char card[128];
+        if (small_vram)
+            std::snprintf(card, sizeof(card), "a graphics card with %llu MiB of video memory free at the start (%llu or more)", free_mib,
+                          kSmallHomesFreeMiB);
+        else
+            std::snprintf(card, sizeof(card), "a graphics card with room");
         std::snprintf(by_default, sizeof(by_default),
-                      "on by default: a graphics card with room, %u hardware threads, %d fps, the run commit off; decided at start, a "
-                      "frame rate changed in play applies at the next start; BBHOST_GXVK_HOMES=0: off",
-                      threads, fps);
+                      "on by default: %s, %u hardware threads, %d fps, the run commit %s; decided at start, a frame rate changed in play "
+                      "applies at the next start; BBHOST_GXVK_HOMES=0: off",
+                      card, threads, fps,
+                      gave_way    ? "off (on by Windows' default, it gives way to them; BBHOST_RUN_COMMIT=on keeps it on)"
+                      : rc && *rc ? "off (BBHOST_RUN_COMMIT)"
+                                  : "off");
         m = Mode::kHandle;
         cb_capture::set_on();          // the copy-backs captured at the resolve, as 1 has them
         list_resolve::follow_homes();  // and the run batching and the part machinery the segments need
@@ -408,27 +430,32 @@ void homes_decide(bool integrated, bool small_vram, bool tight) {
                  integrated ? "an integrated GPU" : "tight memory");
         return;
     }
-    // Small video memory: off unless a budget is given. Acting out a 4 GB card (BBHOST_TEST_VRAM_MB=2950) the pool's
-    // 80 MiB left the GX copies' pool under the mirrors' cushion, the mirrors grew and images went to host memory: OY's
-    // GPU time 4.7 -> 11.1 ms a flip, 99 -> 80 fps. A budget under the ~60 MiB a world's constant buffers take would
-    // leave most of them on today's path anyway.
-    if (small_vram && !(budget_env && *budget_env)) {
-        host_log("gxvk homes: off with small video memory (their pool would take the room the images and the mirrors need) - "
-                 "BBHOST_GXVK_HOMES takes today's path; BBHOST_GXVK_HOMES_BUDGET_MB=N turns them on with that budget");
+    // Small video memory under kSmallHomesFreeMiB free: off unless a budget is given. Acting out a 4 GB card
+    // (BBHOST_TEST_VRAM_MB=2950) the pool's 80 MiB left the GX copies' pool under the mirrors' cushion, the mirrors grew
+    // and images went to host memory: OY's GPU time 4.7 -> 11.1 ms a flip, 99 -> 80 fps. A budget under the ~60 MiB a
+    // world's constant buffers take would leave most of them on today's path anyway. An 8 GB card (7,249 MiB free under
+    // Windows) took the 128 MiB budget with its frame rate up and its shared GPU memory unchanged (host/gxvk_homes.h).
+    if (small_off) {
+        host_log("gxvk homes: off with small video memory (%llu MiB free at the start, under %llu: their pool would take the room the "
+                 "images and the mirrors need) - BBHOST_GXVK_HOMES takes today's path; BBHOST_GXVK_HOMES_BUDGET_MB=N turns them on with "
+                 "that budget",
+                 free_mib, kSmallHomesFreeMiB);
         return;
     }
     std::uint64_t mib = 128;
-    if (budget_env && *budget_env) mib = std::strtoull(budget_env, nullptr, 10);
+    if (budget_given) mib = std::strtoull(budget_env, nullptr, 10);
     {
         std::lock_guard<std::mutex> lk(g_mu);
         g_budget = mib << 20;
     }
     g_bind.store(m == Mode::kHandle, std::memory_order_relaxed);
     g_made.store(true, std::memory_order_release);
+    char small[96] = "";
+    if (small_vram) std::snprintf(small, sizeof(small), " (small video memory, %llu MiB free at the start)", free_mib);
     host_log("gxvk homes: GX's constant buffers in device-local homes made at their creation, %s (%s); the pool's budget %llu MiB%s",
              m == Mode::kHandle ? "bound by handle" : "kept beside today's path and checked against it",
              by_default[0] ? by_default : m == Mode::kHandle ? "BBHOST_GXVK_HOMES=1" : "BBHOST_GXVK_HOMES=compare", static_cast<ull>(mib),
-             small_vram ? " (small video memory)" : "");
+             small);
 }
 
 }  // namespace gpu
