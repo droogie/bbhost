@@ -68,8 +68,11 @@ struct Home {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
     VkDeviceAddress address = 0;
+    // Whether its fill is recorded: written by the command processor (under g.mu) with release, read with acquire -
+    // also by stage 4b's pool, whose list-mode binding (homes_bind_locked) runs outside g.mu and leaves a home not
+    // filled yet to the command processor's draw in order.
+    std::atomic<bool> filled{false};
     // The command processor's (under g.mu).
-    bool filled = false;
     bool indexed = false;      // in the index by address
     bool end_queued = false;   // on its way to being taken back
     std::uint32_t pending = 0;  // copies into it still to be put in place
@@ -245,7 +248,7 @@ void sync_one_locked(Home& e);
 // Map handed its own memory to is copied back to it first (the CPU reads or writes it there from now on).
 void end_locked(std::uint32_t index, Home& e, int why) {
     if (e.end_queued) return;  // (twice: its end event after a newer home over its memory ended it)
-    if ((why == kEndCpuMapped || why == kEndEdge) && e.filled) sync_one_locked(e);
+    if ((why == kEndCpuMapped || why == kEndEdge) && e.filled.load(std::memory_order_acquire)) sync_one_locked(e);
     index_erase(index, e);
     e.end_queued = true;
     g_ending.push_back({index, hle_video_flip_count() + kEndFlips});
@@ -262,7 +265,7 @@ void recycle(std::uint32_t index) {
     if (!e) return;
     delete[] e->mirror;
     e->mirror = nullptr;
-    e->filled = false;
+    e->filled.store(false, std::memory_order_relaxed);  // (made again, it is published by its word's release)
     e->pending = 0;
     e->end_queued = false;
     e->indexed = false;
@@ -321,16 +324,16 @@ bool fill_locked(Home& e) {
         if (!e.mirror) e.mirror = new std::uint8_t[e.bytes];
         std::memcpy(e.mirror, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(e.memory)), e.bytes);
     }
-    e.filled = true;
+    e.filled.store(true, std::memory_order_release);
     g_fills.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 // The home ready for a copy of [dst, +bytes) into it: filled first, unless the copy writes the whole of it.
 bool ready_for_copy(Home& e, std::uint64_t dst, std::uint64_t bytes) {
-    if (e.filled) return true;
+    if (e.filled.load(std::memory_order_acquire)) return true;
     if (dst == e.memory && bytes >= e.bytes) {
-        e.filled = true;
+        e.filled.store(true, std::memory_order_release);
         g_fill_skipped.fetch_add(1, std::memory_order_relaxed);
         if (env_mode() == Mode::kCompare && !e.mirror) e.mirror = new std::uint8_t[e.bytes]();
         return true;
@@ -342,7 +345,7 @@ bool ready_for_copy(Home& e, std::uint64_t dst, std::uint64_t bytes) {
 // stream (pending copies into it first): what a reader of guest memory there
 // reads from now on. The home stays the home.
 void sync_one_locked(Home& e) {
-    if (!e.filled) return;  // guest memory holds what the home would
+    if (!e.filled.load(std::memory_order_acquire)) return;  // guest memory holds what the home would
     if (e.pending) {
         render_end_pass_locked();
         homes_flush_locked();
@@ -632,7 +635,7 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
     Home* e = index_meets(va, bytes, &index);
     if (!e || va < e->memory || va + bytes > e->memory + e->bytes) return false;
     if (!bind_on()) return false;  // compare: today's path is bound
-    if (!e->filled && (run_part_stop(kRunStopRefresh) || !fill_locked(*e))) return false;
+    if (!e->filled.load(std::memory_order_acquire) && (run_part_stop(kRunStopRefresh) || !fill_locked(*e))) return false;
     if (e->pending) bump(g_addr_pending);  // (a copy into it pending: the callers that bind ask the copies first - counted)
     if (out) *out = {e->buffer, e->offset + (va - e->memory), class_bytes(e->cls) - (va - e->memory)};
     if (address) *address = e->address + (va - e->memory);
@@ -703,7 +706,7 @@ int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t by
         bump(g_fall[kFallRange]);
         return kHomeFall + static_cast<int>(kFallRange);
     }
-    if (!e->filled) {
+    if (!e->filled.load(std::memory_order_acquire)) {
         if (run_part_stop(kRunStopRefresh)) {  // (stage 4's census notes a fill as before-work a stitcher does)
             bump(g_fall[kFallPart]);
             return kHomeFall + static_cast<int>(kFallPart);
@@ -747,7 +750,8 @@ bool homes_splice_ok(std::uint32_t handle) {
     if (!e) return false;
     const std::uint32_t w = e->word.load(std::memory_order_acquire);
     const std::uint32_t st = state_of(w);
-    return gen_of(w) == gxvk_homes::handle_gen(handle) && (st == kLive || st == kEnded) && e->filled && !e->pending;
+    return gen_of(w) == gxvk_homes::handle_gen(handle) && (st == kLive || st == kEnded) && e->filled.load(std::memory_order_acquire) &&
+           !e->pending;
 }
 
 int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, VkDeviceSize src_off, const void* src_map) {
@@ -932,7 +936,7 @@ void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_
         bump(g_cmp_past);
         bytes = e->memory + e->bytes - base;
     }
-    if (!e->filled) fill_locked(*e);
+    if (!e->filled.load(std::memory_order_acquire)) fill_locked(*e);
     if (!today || !e->mirror) {
         bump(today ? g_cmp_none : g_cmp_gpu);
         return;
