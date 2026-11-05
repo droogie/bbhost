@@ -117,6 +117,7 @@ enum SettingId {
     kVignette,
     kShadowDistance,
     kDynamicShadows,
+    kShadowResolution,
     kAoStrength,
     kSaturation,
     kFog,
@@ -327,6 +328,16 @@ Setting g_set[kSettingCount] = {
     {"dynamic_shadows", "Dynamic light shadows", {"Off", "On"}, 1,
      "Shadows cast by lamps, torches, fire and other lights that move or flicker. Off is faster. Changes at once.",
      false},
+    // The shadow maps' sizes (engine/patch_manifest.cpp
+    // shadow_resolution_manifest): the sun's at 4096 whatever the area's
+    // ShadowParam asks, the dynamic lights' spot maps and cube faces larger
+    // than the game's 512 and 256. Made as the game starts, from a
+    // render-target heap grown by what they take (engine/live_resolution.cpp).
+    {"shadow_resolution", "Shadow resolution", {"Game", "High", "Ultra"}, 0,
+     "Requires a restart. The sharpness of every shadow. Game is the game's own: the sun's 2048 or 4096 as each area asks, "
+     "the lamps' and torches' 512 and 256. High: the sun's 4096, the lights' 2048 and 1024 (about 500 MB more memory). "
+     "Ultra: all 4096 (about 1.8 GB more memory, and as much video memory again): much slower where lights cast shadows.",
+     true},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
     {"ao_strength", "AO strength", hundred(), 50,
@@ -588,6 +599,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kShadowDistance},
     {Row::Option, nullptr, kDynamicShadows},
+    {Row::Option, nullptr, kShadowResolution},
     {Row::Option, nullptr, kAoStrength},
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
@@ -1193,6 +1205,7 @@ void rebuild_settings() {
     h.ao_strength = static_cast<float>(index_of(kAoStrength)) / 50.0f;
     h.shadow_scale = 1.0f + 0.2f * static_cast<float>(index_of(kShadowDistance));
     h.dynamic_shadows = on_of(kDynamicShadows);
+    h.shadow_resolution = std::clamp(index_of(kShadowResolution), 0, 2);
     {
         static constexpr int kBias[] = {-2, 0, 1, 2};
         const int i = index_of(kModelDetail);
