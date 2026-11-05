@@ -1245,6 +1245,15 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     // Screen space reflections off: every view, as a rebuild of the targets
     // (a Resolution change) sets the switch again.
     if (r && g_ssr_off.load(std::memory_order_relaxed)) r[kSsrFlag] = 0;
+    // The velocity map, while an upscaler or frame generation takes motion
+    // from it: on every view, whatever turned it off in between - the debug
+    // menu's sgScene motion blur switch is the same byte. The upscaler learns
+    // which meshes move from its draws (host/upscale_pass.cpp's capture).
+    if (r && host_opt_motion_wanted()) {
+        std::uint64_t caps = 0;
+        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        if ((caps & kBlurCapability) && !r[kVelocityFlag]) r[kVelocityFlag] = 1;
+    }
     if (r && gen) {
         GivenRenderer* g = nullptr;
         for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
