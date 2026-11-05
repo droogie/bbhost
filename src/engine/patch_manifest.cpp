@@ -69,6 +69,8 @@ std::set<std::string> g_deferred_to;  // under g_live_mu
 std::set<std::string> g_built_in;     // bbhost's own that no file replaced (under g_live_mu)
 
 
+bool shadow_resolution_on();  // (the Shadow resolution setting's sizes, or Performance mode's, differ from the game's: below)
+
 // The config switches a manifest may name.
 bool option_on(const std::string& option, bool* known) {
     *known = true;
@@ -79,7 +81,7 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
-    if (option == "graphics.shadow_resolution") return host_settings().shadow_resolution > 0;  // F10 > GRAPHICS, read once
+    if (option == "graphics.shadow_resolution") return shadow_resolution_on();  // F10 > GRAPHICS (and Performance mode), read once
     if (option == "camera.fov_wide") return host_settings().fov_scale > 1.0f;  // then live (engine/camera.cpp)
     if (option == "graphics.render_scale") return render_scale_plan(nullptr);  // Upscaling and its quality, read once
     if (option == "plugin.scene_rgba8") return scene_look_colour_8bit();  // a plugin's scene_colour_bits (the Bloodborne PS1's), then live
@@ -577,54 +579,70 @@ Manifest render_scale_manifest() {
 }
 
 // shadow-resolution, Shadow resolution (graphics.shadow_resolution): the
-// shadow maps larger than the game makes them.
+// shadow maps at the setting's sizes - Lowest, Low, Default (the game's own,
+// no patch), High, Ultra, Giga - or Performance mode's, which takes its place.
 //
 // The sun's cascades: sub_12ac210 sets the shadow object up from the
 // renderer's ShadowParam block, whose +0x90 is "Shadow Map Resolution", an
-// index into 0x4ca9668 (2048, 1024, 2048, 4096; 2048 for anything else). Most
-// areas ask for 3; it is read as 3 at either tier.
+// index into 0x4ca9668 (2048, 1024, 2048, 4096; 2048 for anything else) -
+// most areas ask for 3. The size is written in the table's place: `mov eax,
+// size` and a jump past the lookup to its compare with the object's size, so
+// 512 (no entry of the table's) is a size as any other.
 //
 // The dynamic lights': the light shadow manager (the graphics manager's
 // +0x5878) is made by sub_26440b0 from a block its caller fills at 0x261b0f3:
-// the spot lights' maps 512x512 and the point lights' cube faces 256x256, each
-// in four LODs that halve (2, 4, 6 and 10 spot maps, 2 cubes a LOD), and a
-// size the caller's own block gives (when non-zero) in their place - not taken
-// here. A spot map is a D32 depth target, with an RGBA8 one per LOD that its
-// maps share; a cube is six RGBA8 faces, with a D32 face-size depth per LOD
-// (the game's codes are DXGI's: 0x28, 0x1c). Medium makes them 2048 and 1024,
-// High 4096 and 4096. They come from the render-target heap
-// (GFX_GraphicsPrivate) as the game starts, which the stock heap does not
-// hold - at 4096, the first area's meshes were not made and the game read
-// through the null - so the heap grows by shadow_resolution_heap_mib
-// (engine/live_resolution.cpp). Measured at High (Radeon 8060S, 1080p, an
+// the spot lights' (lamps') maps 512x512 and the point lights' (torches')
+// cube faces 256x256, each in four LODs that halve (2, 4, 6 and 10 spot maps,
+// 2 cubes a LOD), and a size the caller's own block gives (when non-zero) in
+// their place - not taken here. A spot map is a D32 depth target, with an
+// RGBA8 one per LOD that its maps share; a cube is six RGBA8 faces, with a
+// D32 face-size depth per LOD (the game's codes are DXGI's: 0x28, 0x1c).
+// They come from the render-target heap (GFX_GraphicsPrivate) as the game
+// starts, which the stock heap does not hold at the larger sizes - at all
+// 4096, the first area's meshes were not made and the game read through the
+// null - so the heap grows by shadow_resolution_heap_mib
+// (engine/live_resolution.cpp). Measured at all 4096 (Radeon 8060S, 1080p, an
 // indoor room with lamps): the heap's free 1663 MiB less, 69 -> 45 fps.
-namespace {
-constexpr std::uint64_t kShadowCubeSizeSite = 0x0261b116;
-constexpr std::uint32_t kShadowSpot[] = {512, 2048, 4096}, kShadowCube[] = {256, 1024, 4096};
-}  // namespace
+constexpr std::uint64_t kShadowSunSite = 0x012ac231, kShadowSpotSite = 0x0261b0f3, kShadowCubeSizeSite = 0x0261b116;
+struct ShadowSizes {
+    std::uint32_t sun, spot, cube;  // 0: the game's own
+};
+// The setting's entries (host/options.cpp), Default the game's own; then
+// Performance mode's.
+constexpr ShadowSizes kShadowTiers[] = {{512, 128, 64},    {1024, 256, 128},   {0, 0, 0},
+                                        {4096, 1024, 512}, {4096, 2048, 1024}, {4096, 4096, 4096}};
+constexpr ShadowSizes kShadowPerformanceMode = {1024, 256, 128};
+// The sizes this run asks for: Performance mode's over the setting's.
+ShadowSizes shadow_sizes() {
+    if (host_settings().performance_mode) return kShadowPerformanceMode;
+    return kShadowTiers[std::clamp(host_settings().shadow_resolution, 0, 5)];
+}
+bool shadow_resolution_on() { return shadow_sizes().sun != 0; }
 
 Manifest shadow_resolution_manifest() {
-    const int tier = std::clamp(host_settings().shadow_resolution, 0, 2);
+    const ShadowSizes z = shadow_sizes();
     Manifest m;
     m.name = "shadow-resolution";
     m.title = "Shadow resolution";
     m.eboot = kEboot109Sha256;
-    m.description = "the sun's shadow maps at 4096, the lights' spot maps at " + std::to_string(kShadowSpot[tier ? tier : 2]) +
-                    " and cube faces at " + std::to_string(kShadowCube[tier ? tier : 2]);
+    m.description = "the shadow maps: the sun's " + std::to_string(z.sun ? z.sun : 4096) + ", the lamps' " +
+                    std::to_string(z.spot ? z.spot : 512) + ", the torches' cube faces " + std::to_string(z.cube ? z.cube : 256) +
+                    (host_settings().performance_mode ? " (Performance mode)" : "");
     m.option = "graphics.shadow_resolution";
     m.order = 9050;
     m.live = false;
-    auto imm = [](std::uint8_t a, std::uint8_t b, std::uint8_t c, std::uint32_t v) {
-        return std::vector<std::uint8_t>{a, b, c, static_cast<std::uint8_t>(v), static_cast<std::uint8_t>(v >> 8),
-                                         static_cast<std::uint8_t>(v >> 16), static_cast<std::uint8_t>(v >> 24)};
+    auto imm = [](std::vector<std::uint8_t> op, std::uint32_t v) {
+        for (int k = 0; k < 4; ++k) op.push_back(static_cast<std::uint8_t>(v >> (8 * k)));
+        return op;
     };
-    // movsxd rcx, dword [r14+0x90] -> mov ecx, 3
-    m.sites.push_back(Site{"sun-resolution", 0x012ac231, {0x49, 0x63, 0x8e, 0x90, 0x00, 0x00, 0x00},
-                           {0xb9, 0x03, 0x00, 0x00, 0x00, 0x90, 0x90}, true, {}});
+    // movsxd rcx, dword [r14+0x90]; mov eax, 0x800 -> mov eax, size; jmp 0x12ac24d (past the table's lookup)
+    std::vector<std::uint8_t> sun = imm({0xb8}, z.sun);
+    sun.insert(sun.end(), {0xeb, 0x15, 0x90, 0x90, 0x90, 0x90, 0x90});
+    m.sites.push_back(Site{"sun-resolution", kShadowSunSite, {0x49, 0x63, 0x8e, 0x90, 0x00, 0x00, 0x00, 0xb8, 0x00, 0x08, 0x00, 0x00},
+                           std::move(sun), true, {}});
     // mov dword [rbp-0x58], 512 (the spot maps) and [rbp-0x44], 256 (the cube faces)
-    m.sites.push_back(Site{"spot-size", 0x0261b0f3, imm(0xc7, 0x45, 0xa8, 512), imm(0xc7, 0x45, 0xa8, kShadowSpot[tier ? tier : 2]), true, {}});
-    m.sites.push_back(Site{"cube-size", kShadowCubeSizeSite, imm(0xc7, 0x45, 0xbc, 256), imm(0xc7, 0x45, 0xbc, kShadowCube[tier ? tier : 2]),
-                           true, {}});
+    m.sites.push_back(Site{"spot-size", kShadowSpotSite, imm({0xc7, 0x45, 0xa8}, 512), imm({0xc7, 0x45, 0xa8}, z.spot), true, {}});
+    m.sites.push_back(Site{"cube-size", kShadowCubeSizeSite, imm({0xc7, 0x45, 0xbc}, 256), imm({0xc7, 0x45, 0xbc}, z.cube), true, {}});
     // test eax, eax; je -> jmp: the caller's sizes are not taken
     m.sites.push_back(Site{"spot-keep", 0x0261b13f, {0x74, 0x03}, {0xeb, 0x03}, true, {}});
     m.sites.push_back(Site{"cube-keep", 0x0261b149, {0x74, 0x03}, {0xeb, 0x03}, true, {}});
@@ -775,9 +793,10 @@ bool patch_manifests_done() { return g_manifests_done.load(std::memory_order_acq
 std::uint64_t shadow_resolution_heap_mib() {
     {
         std::lock_guard<std::mutex> lk(g_live_mu);
-        if (!g_written.count(kShadowCubeSizeSite + 4)) return 0;  // not applied (off, or refused)
+        const auto it = g_written.lower_bound(kShadowSunSite);
+        if (it == g_written.end() || it->first >= kShadowSunSite + 12) return 0;  // not applied (off, or refused)
     }
-    const int tier = std::clamp(host_settings().shadow_resolution, 1, 2);
+    const ShadowSizes z = shadow_sizes();
     // Each LOD's maps and the one target they share, 4 bytes a texel.
     const auto lods = [](std::uint64_t size, const int* count, int faces) {
         std::uint64_t b = 0;
@@ -785,10 +804,12 @@ std::uint64_t shadow_resolution_heap_mib() {
         return b;
     };
     static constexpr int kSpots[] = {2, 4, 6, 10}, kCubes[] = {2, 2, 2, 2};
-    const std::uint64_t more = lods(kShadowSpot[tier], kSpots, 1) - lods(kShadowSpot[0], kSpots, 1) +
-                               lods(kShadowCube[tier], kCubes, 6) - lods(kShadowCube[0], kCubes, 6);
-    // The sun's five 4096 maps where an area asked for 2048 (D32), and a margin.
-    const std::uint64_t mib = ((more + 5ull * (4096 * 4096 - 2048 * 2048) * 4) >> 20) + 128;
+    const auto over = [](std::uint64_t now, std::uint64_t was) { return now > was ? now - was : 0; };
+    // Only what is larger than the game's: a smaller size leaves the heap as it is.
+    const std::uint64_t more = over(lods(z.spot, kSpots, 1), lods(512, kSpots, 1)) + over(lods(z.cube, kCubes, 6), lods(256, kCubes, 6)) +
+                               5ull * over(4ull * z.sun * z.sun, 4ull * 2048 * 2048);  // the sun's five maps, where an area asked for 2048
+    if (!more) return 0;
+    const std::uint64_t mib = (more >> 20) + 128;  // and a margin
     return (mib + 63) / 64 * 64;
 }
 

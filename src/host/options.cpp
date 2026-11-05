@@ -333,10 +333,11 @@ Setting g_set[kSettingCount] = {
     // ShadowParam asks, the dynamic lights' spot maps and cube faces larger
     // than the game's 512 and 256. Made as the game starts, from a
     // render-target heap grown by what they take (engine/live_resolution.cpp).
-    {"shadow_resolution", "Shadow resolution", {"Low", "Medium", "High"}, 0,
-     "Requires a restart. The sharpness of every shadow. Low is the game's own: the sun's 2048 or 4096 as each area asks, "
-     "the lamps' and torches' 512 and 256. Medium: the sun's 4096, the lights' 2048 and 1024 (about 500 MB more memory). "
-     "High: all 4096 (about 1.8 GB more memory, and as much video memory again): much slower where lights cast shadows.",
+    {"shadow_resolution", "Shadow resolution", {"Lowest", "Low", "Default", "High", "Ultra", "Giga"}, 2,
+     "Requires a restart. The sharpness of every shadow: the sun's, the lamps' and the torches'. Default is the game's own "
+     "(the sun 2048 or 4096 as each area asks, lamps 512, torches 256). Lowest 512, 128, 64; Low 1024, 256, 128; High 4096, "
+     "1024, 512; Ultra 4096, 2048, 1024 (about 500 MB more memory); Giga 4096 everywhere (about 1.8 GB more memory and as "
+     "much video memory again; much slower where lights cast shadows). Performance mode sets 1024, 256, 128.",
      true},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
@@ -578,6 +579,7 @@ const Row g_rows[] = {
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kSfxTextureQuality},
+    {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kHdMotionBlur},
     {Row::Option, nullptr, kHdMotionBlurRes},
     {Row::Option, nullptr, kSsao},
@@ -603,7 +605,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kAoStrength},
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
-    {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
@@ -1205,7 +1206,7 @@ void rebuild_settings() {
     h.ao_strength = static_cast<float>(index_of(kAoStrength)) / 50.0f;
     h.shadow_scale = 1.0f + 0.2f * static_cast<float>(index_of(kShadowDistance));
     h.dynamic_shadows = on_of(kDynamicShadows);
-    h.shadow_resolution = std::clamp(index_of(kShadowResolution), 0, 2);
+    h.shadow_resolution = std::clamp(index_of(kShadowResolution), 0, 5);
     {
         static constexpr int kBias[] = {2, 1, 0, -2};  // Lowest, Low, Normal, Full
         const int i = index_of(kModelDetail);
