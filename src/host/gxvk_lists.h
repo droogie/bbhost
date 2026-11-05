@@ -98,6 +98,25 @@ void settle(bool homes_bind, const char* homes_why);
 extern const bool g_times;
 inline bool times() { return g_times; }
 
+// The pool rests while a frame cap holds: while the main loop's frame limiter
+// waits 15% of the frame time or more (two half-second windows in a row) the
+// pool commits nothing and the command processor draws every GX-native draw in
+// order, as with the pool off - at a cap the command processor's time holds no
+// frame back, and a commit there costs more than the draw it saves (a pool
+// thread parked between the frame's bursts wakes on a cold, slow core) - and
+// the pool works again when the limiter waits under 8% of a window - the cap no
+// longer holds the frame - or the command processor, drawing everything, is
+// busy 85% of it. After a short rest the next one waits longer (5 s, doubling
+// to 160 s). BBHOST_GXVK_LISTS_REST=0: it never rests.
+extern std::atomic<bool> g_resting;
+inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
+// The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long
+// it waited, and the rate it held the frame to (0: none, as on a loading screen).
+void frame_paced(std::uint64_t wait_ns, float cap_fps);
+// The command processor's queue 0 (bb-cp0) spent `ns` on a job (hle/gnm_exec.cpp):
+// its busy share, for the rest's lines.
+void cp_busy(std::uint64_t ns);
+
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool
 // thread, both of a core's hardware threads kept for it; off): the command
