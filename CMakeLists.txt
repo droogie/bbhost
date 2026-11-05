@@ -346,11 +346,13 @@ if(Vulkan_FOUND)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_LIB})
   endif()
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
-  # optimizer; without it every table is built. Not in the Windows build yet,
-  # though its prefix has the optimizer: it has not been run there.
+  # optimizer; without it every table is built - every GX draw's user data in
+  # full, each table's pointer into GX's ring, and the draw pool's list mode
+  # stops at each constant buffer read through one. Windows too: the prefix
+  # (tools/win_deps.sh) builds the optimizer at the Linux builds' tag.
   target_sources(bbhost PRIVATE src/host/shader_liveness.cpp)
   find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt)
-  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB AND NOT WIN32)
+  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()
