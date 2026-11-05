@@ -21,6 +21,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <climits>
 #include <cmath>
@@ -1096,6 +1097,47 @@ const std::uint64_t* g_rend_man = nullptr;
 // Written when the setting changes (or the render manager's settings are
 // made again), not held every frame: the debug menu's LodLvBias changes it in
 // between and keeps it.
+// BBHOST_ONEPASS=1 (a probe): the debug menu's "OnePass CubeShadow" (the
+// graphics manager's +0x78b3, copied each frame into the light shadow
+// manager's +0x190 at 0x26aff57) held on, and the light shadow manager's
+// object and vtable logged once.
+void onepass_probe_tick() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS");
+        return e && e[0] == '1';
+    }();
+    if (!on || !g_velocity_slide) return;
+    // BBHOST_ONEPASS_AT=<s>: on only from that many seconds after the first frame (an A/B in one run).
+    static const double at_s = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_AT");
+        return e ? std::atof(e) : 0.0;
+    }();
+    static const auto t0 = std::chrono::steady_clock::now();
+    if (at_s > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < at_s) return;
+    std::uint64_t gm = 0;
+    std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    auto* g8 = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(gm));
+    g8[0x78b3] = 1;
+    static int logged = 0;
+    std::uint64_t lsm = 0;
+    std::memcpy(&lsm, g8 + 0x5878, 8);
+    if (lsm && logged < 2 && ++logged) {
+        const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(lsm));
+        const std::uint64_t base = g_velocity_slide - kPreferredGuestSlide;
+        std::string words;
+        for (int k = 0; k < 64; ++k) {
+            char b[40];
+            const std::uint64_t v = q[k];
+            const bool code = v > base && v - base < 0x5400000;
+            std::snprintf(b, sizeof b, " %x:%llx%s", k * 8, static_cast<unsigned long long>(code ? v - base : v), code ? "*" : "");
+            words += b;
+        }
+        host_log("graphics: onepass probe: light shadow manager 0x%llx, +0x190 = %u;%s", static_cast<unsigned long long>(lsm),
+                 reinterpret_cast<const std::uint8_t*>(q)[0x190], words.c_str());
+    }
+}
+
 void lod_bias_tick() {
     if (!g_rend_man || !*g_rend_man) return;
     const int want = g_lod_bias.load(std::memory_order_relaxed);
@@ -1216,6 +1258,7 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     camera_tick();
     lod_bias_tick();
+    onepass_probe_tick();
     if (g_task_steal) task_steal_tick();
     if (g_graphics_manager) light_grid_render_size_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
