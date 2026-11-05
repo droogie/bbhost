@@ -9,6 +9,7 @@
 #include "core/config.h"
 #include "engine/patch_manifest_file.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -89,6 +92,22 @@ int main() {
     CHECK(seen.count("screen-space-reflections") == 0);
     CHECK(seen.count("rgba8f-color-space") == 1);
     CHECK(on.count("rgba8f-color-space") == 0);
+
+    // bbhost's own scene-rgba8 (a plugin's 8-bit colour, plugin API 18) is
+    // the rgba8f patch site for site: the same addresses, the eboot's bytes and
+    // the bytes written.
+    {
+        const std::vector<patch_file::Site> own = {
+#include "engine/scene_rgba8_sites.inc"
+        };
+        patch_file::Manifest m;
+        std::string err;
+        CHECK(patch_file::parse((fs::path(BB_PATCHES_DIR) / "rgba8f-color-space.toml").string(), &m, &err));
+        std::map<std::uint64_t, std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> file, ours;
+        for (const patch_file::Site& s : m.sites) file[s.address] = {s.expect, s.bytes};
+        for (const patch_file::Site& s : own) ours[s.address] = {s.expect, s.bytes};
+        CHECK(!ours.empty() && file == ours);
+    }
 
     // The guard catches a dropped line: rgba8f color space's own file
     // without its `enabled = false` reads as on.

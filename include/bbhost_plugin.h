@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 14.
+/* bbhost plugin API, version 18.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 17
+#define BB_PLUGIN_API_VERSION 18
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -492,7 +492,52 @@ typedef struct BbHostApi {
      * made depth-only early in the scene (an occluder for the game's
      * occlusion queries) and again later lands on its own depth. */
     void (*draw_style)(int style);
+
+    /* Version 18: the 3D's look. What the camera's draws - the 3D world, its
+     * characters, its sky and effects: the draws with the scene's depth that
+     * are not full-screen rect lists, as the upscaler's jitter takes them - are
+     * drawn with. The shadow maps, the post-processing and the HUD and menus
+     * keep the game's own. scene_scale and scene_colour_bits decide the scene's
+     * targets: call them from bb_plugin_init for the start, or once the game
+     * runs from the main thread (on_frame, on_option), which makes the targets
+     * again at the next quiet point, as a Resolution change does - from
+     * bb_plugin_image they change nothing until then. The others: any thread,
+     * from the next frame. */
+    /* The 3D's vertices moved, as their stage writes them, to the nearest
+     * corner of a grid of the screen `lines` cells high and as many across as
+     * the 3D's shape gives (240: 427 x 240 at 16:9), as the PS1's landed on
+     * its pixels; BB_SNAP_PIXELS the 3D's own pixels; 0 off. */
+    void (*scene_snap)(uint32_t lines);
+    /* How the 3D samples its textures: BB_FILTER_NEAREST - the nearest texel of
+     * the nearest mip, no anisotropy (depth comparisons keep their own) - or
+     * BB_FILTER_AS_IS. */
+    void (*scene_filter)(int filter);
+    /* The 3D's size against the game's: BB_SCALE_NEAREST draws the game, its
+     * HUD and menus at the window's size and the 3D at the Resolution - or
+     * `lines` high (0: the Resolution) as wide as the window's shape - brought
+     * up to the window texel for texel, with no smoothing: no upscaler and no
+     * anti-aliasing; a Resolution as large as the window or larger draws the
+     * 3D at the window's size.
+     * BB_SCALE_AS_IS gives it back to the Resolution, Upscaling and
+     * anti-aliasing settings. */
+    void (*scene_scale)(int scale, uint32_t lines);
+    /* The scene's colour targets - the lit scene, its light and its
+     * reflections - in 8 bits a channel (RGBA8, as the rgba8f patch makes
+     * them), or (0) in the game's and its patches' formats. */
+    void (*scene_colour_bits)(int bits);
+    /* The colour grading's table - the area's CGrading textures
+     * (map/mXX/mXX_cgrading.tpf: m24_00_CGrading0001 ...), copied each frame
+     * into a 16x16x16 table that the post-processing's grading pass samples -
+     * sampled BB_FILTER_NEAREST, the grading stepping from entry to entry (16
+     * shades a channel), or BB_FILTER_AS_IS, smoothly between them. */
+    void (*grading_filter)(int filter);
 } BbHostApi;
+
+#define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
+#define BB_FILTER_AS_IS 0          /* version 18: scene_filter, grading_filter: the game's filtering */
+#define BB_FILTER_NEAREST 1        /* version 18: the nearest texel of the nearest mip */
+#define BB_SCALE_AS_IS 0           /* version 18: scene_scale: the settings' sizes */
+#define BB_SCALE_NEAREST 1         /* version 18: the 3D at its own size, brought up nearest */
 
 #define BB_DRAW_AS_IS 0
 #define BB_DRAW_LINES 1
