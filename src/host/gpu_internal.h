@@ -1819,6 +1819,11 @@ float upscale_pass_mip_bias_locked();
 // constant buffer of a camera draw's vertex stage at `base`, `bytes` long;
 // true when it is the engine's per-view block (taken once a frame).
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
+// Whether a vertex stage's constant buffer at `base` is the camera's view
+// block - a camera draw, the upscaler's jitter's (Numity1504's handoff, step
+// 3: full-screen passes, which read at 0..1, never) - noting the frame's
+// camera from it as upscale_camera_note_locked does.
+bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
 bool upscale_camera_noted();
 // The game's velocity map (the motion blur's) for the upscaler's motion: a
 // pass of it drawn into the target at `base` (`kind` 1: the camera's

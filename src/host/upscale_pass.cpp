@@ -1169,6 +1169,15 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
     return true;
 }
 
+bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes) {
+    if (!base || bytes < 864) return false;
+    const auto* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
+    if (f[47] != 1.0f || f[195] != 1.0f) return false;  // (cheaply first: most buffers are not one)
+    if (!g_cam_noted) return upscale_camera_note_locked(base, bytes);
+    Camera c;
+    return camera_of(f, &c);
+}
+
 std::uint64_t upscale_pass_calls() { return g_calls.load(std::memory_order_relaxed); }
 
 }  // namespace gpu

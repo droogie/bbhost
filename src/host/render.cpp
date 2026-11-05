@@ -23091,6 +23091,7 @@ static bool draw_impl(const GpuDraw& d) {
 
     int reused_way[2] = {-1, -1};
     std::uint32_t stage_named[2] = {0, 0};  // user-data dwords each stage built from GX
+    bool camera_draw = false;  // its vertex stage reads the camera's view block (the upscaler's jitter)
     for (int st = 0; st < 2; ++st) {
         const gcn::TranslateResult& meta = st == 0 ? pl.vs.meta() : pl.ps.meta();
         const std::size_t stage_writes = writes.size();
@@ -23229,10 +23230,12 @@ static bool draw_impl(const GpuDraw& d) {
         }
         std::uint64_t gate_bases[16] = {};
         const bool gate = st == 0 && pl.gs_as_vs && pl.gs_gate.vertices && meta.buffers.size() <= 16;
-        // The upscaler's camera (upscale_pass.cpp): a camera draw's vertex
-        // stage, once a frame, its constant buffers looked at for the view block.
+        // The upscaler's camera (upscale_pass.cpp): a draw into the G-buffer's
+        // depth whose vertex stage reads the camera's view block is a camera
+        // draw, the one kind the jitter moves - not a full-screen pass, which
+        // reads at 0..1, nor the velocity pass (Numity1504's handoff, step 3).
         const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
-                            meta.buffers.size() <= 16 && !upscale_camera_noted() && upscale_motion_on();
+                            meta.buffers.size() <= 16 && pl.velo != 2 && upscale_motion_on();
         // A pass of the game's velocity map: its scale's constant buffer.
         if (st == 1 && !pl.velo_known) velo_classify(pl);
         const bool velo = st == 1 && pl.velo && pl.velo != 4 && s.color[0] && pl.velo_cb < meta.buffers.size() &&
@@ -23253,9 +23256,8 @@ static bool draw_impl(const GpuDraw& d) {
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate || camera || velo ? gate_bases : nullptr);
         if (camera) {
-            for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
-                if (upscale_camera_note_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4)) break;
-            }
+            for (std::size_t i = 0; i < meta.buffers.size() && !camera_draw; ++i)
+                camera_draw = upscale_camera_block_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4);
         }
         // The velocity map's scales, for the upscaler's motion (upscale_pass.cpp).
         if (velo && pl.velo == 3) {
@@ -24511,7 +24513,7 @@ static bool draw_impl(const GpuDraw& d) {
     vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
     // The upscaler's jitter (UpscaleFrame): a camera draw into the G-buffer's
     // depth, while the upscaler runs.
-    if (g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && upscale_jitter_on() && g_upscale.ran_flip &&
+    if (camera_draw && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && upscale_jitter_on() && g_upscale.ran_flip &&
         hle_video_flip_count() + 1 - g_upscale.ran_flip <= 8 && upscaler_method()) {
         vp.x += upscale_jitter_sign() * g_upscale.jx;
         vp.y += upscale_jitter_sign() * g_upscale.jy;
