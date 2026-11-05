@@ -17,6 +17,7 @@
 #include "host/options.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -250,6 +251,9 @@ constexpr std::uint32_t kGfxShadowDistance = 117006, kGfxAoStrength = 117007, kG
 constexpr std::uint32_t kGfxShaders = 117009;
 constexpr std::uint32_t kFxBloom = 120000, kFxVignette = 120001, kFxSaturation = 120002;
 constexpr std::uint32_t kRowFrameCap = 116005;
+// Texture Quality (the Texture quality setting: Low, Medium, High; live), a
+// pick list of its three entries 116042..116044.
+constexpr std::uint32_t kRowTextureQuality = 116008;
 // The section title, StaticText_116020 in the generated movie.
 constexpr std::uint32_t kSectionTitleId = 116020;
 
@@ -504,6 +508,10 @@ Toggle g_toggles[] = {
     {"fps_counter", 116007, 0, 0xff},
 };
 constexpr int kToggleCount = static_cast<int>(sizeof(g_toggles) / sizeof(g_toggles[0]));
+// Texture Quality: the setting's entry (host/options.cpp texture_quality), its
+// list between the toggles and the frame rate's.
+const Choice kTextureQualities[] = {{0, 116042}, {1, 116043}, {2, 116044}};
+std::int32_t g_texture_quality = 2, g_texture_quality_last = 2;
 
 // A 0..10 slider row's byte, and what was pushed.
 struct Slider {
@@ -774,9 +782,9 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 // adds it as it adds Key Bindings' two, and moves the Defaults label below it.
 constexpr int kGraphicsSlots = 7;
 
-// The port's rows: its toggles plus the frame-cap pick list, and in the
-// graphics section its toggles plus the resolution list.
-constexpr int kRowCount = kToggleCount + 1;
+// The port's rows: its toggles plus the Texture Quality and frame-cap pick
+// lists, and in the graphics section its toggles plus the resolution list.
+constexpr int kRowCount = kToggleCount + 2;
 static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
@@ -831,6 +839,7 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
     for (auto& t : g_toggles) seed(t);
     g_frame_cap = host_opt_frame_cap();
     g_last_frame_cap = g_frame_cap;
+    g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
     // The toggles first and the pick list **last**. The engine's pick list is
     // translucent and opens directly under the row that owns it, so with the
     // list on row 0 its four entries sat over the five rows below and their
@@ -840,6 +849,11 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
     for (auto& t : g_toggles) {
         add_toggle_row(dialog, &t.value, t.id, default_of(t));
     }
+    // Texture Quality's three entries open over the frame rate's row alone,
+    // as Language's do over its one row.
+    add_list_row(dialog, &g_texture_quality, kRowTextureQuality, kTextureQualities,
+                 static_cast<int>(sizeof(kTextureQualities) / sizeof(kTextureQualities[0])),
+                 std::max(0, host_opt_default_index("texture_quality")));
     add_list_row(dialog, &g_frame_cap, kRowFrameCap, kFrameCaps,
                  static_cast<int>(sizeof(kFrameCaps) / sizeof(kFrameCaps[0])), host_opt_default_frame_cap());
     log_rows("PCSetting", dialog, kRowCount, kRowCount);
@@ -1263,6 +1277,7 @@ constexpr std::size_t kPickItems = 0x100;  // a pick-list widget's drop-down lis
 struct DefaultsView {
     std::uint8_t* dialog = nullptr;
     std::uint8_t* pick = nullptr;  // the section's pick-list widget, or none
+    std::uint8_t* pick2 = nullptr;  // a second one above it (PC Settings' Texture Quality), or none
     bool hidden = false;
     char16_t first = 0;  // the caption's first character while it is emptied
 };
@@ -1299,7 +1314,7 @@ void keep_defaults_row(std::uint8_t* dialog, int pick_row) {
 void defaults_view_update(std::uint8_t* comp, bool focused) {
     DefaultsView& v = g_defaults_view;
     if (!v.dialog || !v.pick || !focused) return;
-    if (comp == v.pick + kPickItems && !v.hidden) {
+    if ((comp == v.pick + kPickItems || (v.pick2 && comp == v.pick2 + kPickItems)) && !v.hidden) {
         v.hidden = true;
         v.first = g_defaults_caption[0];
         g_defaults_caption[0] = 0;
@@ -1553,7 +1568,10 @@ void confirm_update() {
 // game's is redirected to get here.
 GUEST_ABI std::int64_t pc_open_section(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_section_handler));
-    return open_named(root, params, kOurSectionName, handler, kToggleCount);  // the frame cap
+    const std::int64_t dialog = open_named(root, params, kOurSectionName, handler, kToggleCount + 1);  // the frame cap
+    // Texture Quality's list opens over the Defaults caption too.
+    if (g_defaults_view.dialog && g_defaults_view.pick) g_defaults_view.pick2 = dialog_widget(g_defaults_view.dialog, kToggleCount);
+    return dialog;
 }
 GUEST_ABI std::int64_t pc_open_graphics(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_graphics_handler));
@@ -1877,6 +1895,7 @@ void option_menu_poll() {
         g_last_resolution = g_resolution;
         g_frame_cap = host_opt_frame_cap();
         g_last_frame_cap = g_frame_cap;
+        g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
         return;
     }
     // A row's byte is written by the game's list update as the player moves
@@ -1905,6 +1924,14 @@ void option_menu_poll() {
         // back - and the row shows it on the next menu update.
         g_resolution = g_last_resolution = host_opt_resolution_index();
         g_resolution_redraw.store(true);
+    }
+    if (g_texture_quality != g_texture_quality_last) {
+        g_texture_quality_last = g_texture_quality;
+        host_opt_set_index("texture_quality", g_texture_quality);
+        host_log("pc-options: texture quality entry %d from the System menu", g_texture_quality);
+    } else if (host_opt_index("texture_quality") != g_texture_quality_last) {
+        // Changed in F10: PC Settings shows it when it opens again (its handler seeds it).
+        g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
     }
     for (auto& t : g_graphics) push(t);
     for (auto& t : g_effects) push(t);
