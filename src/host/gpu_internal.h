@@ -1951,6 +1951,15 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
 // 3: full-screen passes, which read at 0..1, never) - noting the frame's
 // camera from it as upscale_camera_note_locked does.
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
+// The characters' capture (upscale_pass.cpp): a skinned G-buffer draw's
+// capture address for its vertex shader (StageParams::lds_address), 0 for
+// none; the G-buffer's jittered viewport; whether the capture runs.
+std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index_va, const void* indices, std::uint32_t count, bool i32,
+                                          std::int32_t base_vertex);
+void upscale_capture_viewport_locked(const VkViewport& vp);
+bool upscale_capture_on();
+void upscale_capture_note_moving(std::uint64_t index_va);  // a velocity-pass mesh's index buffer
+bool upscale_capture_moving(std::uint64_t index_va);
 bool upscale_camera_noted();
 // The game's velocity map (the motion blur's) for the upscaler's motion: a
 // pass of it drawn into the target at `base` (`kind` 1: the camera's

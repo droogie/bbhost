@@ -38,6 +38,12 @@ layout(set = 0, binding = 3) uniform texture2D velo_map;           // the game's
 // the game's is D32_SFLOAT_S8_UINT, and the view FSR makes of a depth-stencil
 // image of its own did not read clean depth (upscale_pass.cpp g_depth_r32).
 layout(set = 0, binding = 4, r32f) uniform writeonly image2D depth_copy;
+// The captured meshes (upscale_pass.cpp, capture_motion.vert/.frag): NDC now
+// minus NDC then in red and green, the view distance in blue, alpha 0.5 where
+// a skinned mesh was drawn - each mesh's own corners this frame and last, as
+// BBNextGenSuite captures them. Taken before the velocity map where it is the
+// surface seen; alpha 0 elsewhere.
+layout(set = 0, binding = 5) uniform texture2D cap_map;
 
 layout(push_constant) uniform Params {
     vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
@@ -84,7 +90,19 @@ void main() {
         // whole motion; 2 the map everywhere (a test); 3 rebuilt; 5 rebuilt
         // with each mesh fragment's view distance, tested against the depth.
         const int mode = int(velo_size.z + 0.5);
-        if (mode == 3 || mode == 5) {
+        bool captured = false;
+        if (d > 0.0 && d < 100000.0) {
+            const vec4 c = texelFetch(sampler2D(cap_map, any_sampler), xy, 0);
+            if (abs(c.a - 0.5) < 0.1 && c.b <= d * 1.004 + 0.01 && d - c.b <= d * 0.03 + 0.1) {
+                const vec2 own = vec2(-0.5 * c.r, 0.5 * c.g) * size;
+                if (!any(isnan(own)) && !any(isinf(own)) && all(lessThan(abs(own), size))) {
+                    mv = own;
+                    captured = true;
+                }
+            }
+        }
+        if (captured) {
+        } else if (mode == 3 || mode == 5) {
             const float seen_d = d;  // the seen surface's view distance (d below is the map's delta)
             const ivec2 vxy = clamp(ivec2(uv * velo_size.xy), ivec2(0), ivec2(velo_size.xy) - 1);
             const vec4 t = texelFetch(sampler2D(velo_map, any_sampler), vxy, 0);

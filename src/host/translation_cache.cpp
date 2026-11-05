@@ -165,6 +165,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.flag(o.vertex_formats_from_params);
     h.flag(o.force_dispatcher);
     h.flag(o.invariant_position);
+    h.flag(o.capture_position);
     h.u32(o.descriptor_set);
     h.i32(o.cb_descriptor_set);
     h.u32(o.cb_binding_base);

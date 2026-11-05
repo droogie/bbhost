@@ -365,6 +365,13 @@ private:
                ref.oob_slot < kOobSlots;
     }
     Id oob_base64 = 0;  // the counters' device address (StageParams::lds_address), at the entry
+    // TranslateOptions::capture_position: the capture's device address
+    // (StageParams::lds_address), at the entry; 0 when not asked.
+    Id capture_base64 = 0;
+    bool capturing() const {
+        return opt.capture_position && opt.stage == Stage::Vertex && !oob_counting() && opt.tess_role == TranslateOptions::TessRole::None &&
+               opt.gs_role == TranslateOptions::GsRole::None;
+    }
     // Threads in the dispatch's workgroup, and whether GCN's waves of it are
     // all whole (every lane of each 64 runs an invocation).
     std::uint32_t workgroup_threads() const {
@@ -4525,6 +4532,18 @@ private:
                 const Id value = m.emit(spv::OpCompositeConstruct, t_v4f, comps);
                 if (in.tgt == 12) {
                     m.store(out_position(), value);
+                    if (capture_base64) {  // translate.cpp's capture_position
+                        const Id base = capture_base64;
+                        if_then(m.emit(spv::OpINotEqual, t_bool, {base, m.const_u64(0)}), [&] {
+                            if (!in_vertex_index) in_vertex_index = builtin(p_in_u32, spv::BiVertexIndex);
+                            const Id vi = m.emit(spv::OpUConvert, t_u64, {m.load(t_u32, in_vertex_index)});
+                            const Id at = m.emit(spv::OpIAdd, t_u64, {base, m.emit(spv::OpIMul, t_u64, {vi, m.const_u64(16)})});
+                            for (int k = 0; k < 4; ++k) {
+                                const Id p = host_dword(m.emit(spv::OpIAdd, t_u64, {at, m.const_u64(4u * k)}));
+                                m.emit_void(spv::OpStore, {p, m.emit(spv::OpBitcast, t_u32, {comps[k]}), 2u /* Aligned */, 4u});
+                            }
+                        });
+                    }
                 } else {
                     for (const Id var : param_outputs(static_cast<int>(in.tgt) - 32)) m.store(var, value);
                 }
@@ -8200,11 +8219,12 @@ private:
             m.name(es_gs, "es_gs");
             interface.push_back(es_gs);
         }
-        if (compute() || oob_counting()) declare_guest_memory();
+        if (compute() || oob_counting() || capturing()) declare_guest_memory();
         fn_main = m.begin_function(t_void, m.type_function(t_void, {}));
         m.name(fn_main, "main");
         cur_label = m.label();
         if (oob_counting()) oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
+        if (capturing()) capture_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
         if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
         if (gs_geom()) gs_ring_model();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set

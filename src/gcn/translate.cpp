@@ -168,6 +168,9 @@ struct Translator {
     // TranslateOptions::tess_role: LDS is the buffer at StageParams::lds_address.
     bool lds_in_buffer = false;
     Id lds_base64 = 0;
+    // TranslateOptions::capture_position: the capture's device address
+    // (StageParams::lds_address), loaded at the entry; 0 when not asked.
+    Id capture_base64 = 0;
     // gcn::set_oob_count: the counters' device address (StageParams::lds_address),
     // loaded at the entry of a stage that counts; 0 otherwise.
     Id oob_base64 = 0;
@@ -3892,6 +3895,17 @@ struct Translator {
                     pos = m.emit(spv::OpSelect, t_v4f, {bad, vec4f(cf(0.0f), cf(0.0f), cf(0.0f), cf(1.0f)), pos});
                 }
                 m.store(out_position, pos);
+                if (capture_base64) {
+                    const Id base = capture_base64;
+                    if_then(m.emit(spv::OpINotEqual, t_bool, {base, m.const_u64(0)}), [&] {
+                        const Id vi = m.emit(spv::OpUConvert, t_u64, {m.load(t_u32, in_vertex_index)});
+                        const Id at = m.emit(spv::OpIAdd, t_u64, {base, m.emit(spv::OpIMul, t_u64, {vi, m.const_u64(16)})});
+                        for (int k = 0; k < 4; ++k) {
+                            const Id p = host_ptr(m.emit(spv::OpIAdd, t_u64, {at, m.const_u64(4u * k)}));
+                            m.emit_void(spv::OpStore, {p, u(comps[k]), 2u /* Aligned */, 4u});
+                        }
+                    });
+                }
             } else {
                 // PA_CL_VS_OUT_CNTL packs the extra vectors after pos0: the misc
                 // vector (bit 20), then clip/cull distance vectors 0 (bit 22) and 1 (bit 23).
@@ -4337,6 +4351,9 @@ struct Translator {
             }
             res.oob_slot = h % kOobSlots;
         }
+        if (opt.capture_position && opt.stage == Stage::Vertex && in_vertex_index && !oob_base64 && !lds_in_buffer &&
+            opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None)
+            capture_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
         if (lds_in_buffer) {
             lds_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             if (params_head_v4) {

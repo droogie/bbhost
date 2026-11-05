@@ -49,6 +49,8 @@
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
+#include "host/shaders/capture_motion_frag.spv.h"
+#include "host/shaders/capture_motion_vert.spv.h"
 #include "host/shaders/motion_check.spv.h"
 #include "host/shaders/motion_view.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
@@ -58,6 +60,9 @@
 #include "log.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <memory>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -205,15 +210,16 @@ bool g_motion_tried = false;
 bool motion_pipeline_locked() {
     if (g_motion_tried) return g_motion_pipeline != VK_NULL_HANDLE;
     g_motion_tried = true;
-    const VkDescriptorSetLayoutBinding binds[5] = {
+    const VkDescriptorSetLayoutBinding binds[6] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 5;
+    sli.bindingCount = 6;
     sli.pBindings = binds;
     if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_motion_set_layout) != VK_SUCCESS) return false;
     VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 160};
@@ -245,6 +251,7 @@ bool motion_pipeline_locked() {
 // absent: all zeros), and the meshes' own from the game's velocity map, a
 // view of it `velo` of velo_w x velo_h (null: none).
 bool velo_seen_test();  // below
+VkImageView g_cap_map_view = VK_NULL_HANDLE;  // the characters' capture map (record_capture, below)
 
 void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
                    std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
@@ -302,8 +309,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     // No map: the depth stands in, unread.
     const VkDescriptorImageInfo velo_info{VK_NULL_HANDLE, velo ? velo : depth_view, velo ? VK_IMAGE_LAYOUT_GENERAL : depth_layout};
     const VkDescriptorImageInfo depth_copy_info{VK_NULL_HANDLE, g_depth_r32.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[5] = {};
-    for (int k = 0; k < 5; ++k) {
+    const VkDescriptorImageInfo cap_info{VK_NULL_HANDLE, g_cap_map_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr[6] = {};
+    for (int k = 0; k < 6; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = static_cast<std::uint32_t>(k);
@@ -319,7 +327,9 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
     wr[3].pImageInfo = &velo_info;
     wr[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[4].pImageInfo = &depth_copy_info;
-    vkUpdateDescriptorSets(g.device, 5, wr, 0, nullptr);
+    wr[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[5].pImageInfo = &cap_info;
+    vkUpdateDescriptorSets(g.device, 6, wr, 0, nullptr);
     barrier(cb, motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_SHADER_WRITE_BIT);
     barrier(cb, g_depth_r32.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
@@ -341,7 +351,8 @@ void drop(OwnImage& o) {
     o = OwnImage{};
 }
 
-bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w, std::uint32_t h) {
+bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w, std::uint32_t h,
+          VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = format;
@@ -365,8 +376,330 @@ bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w
     vci.image = o.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vci.subresourceRange = {aspect, 0, 1, 0, 1};
     return vkCreateImageView(g.device, &vci, nullptr, &o.view) == VK_SUCCESS;
+}
+
+// The characters' capture: BBNextGenSuite's motion, done natively. Each
+// skinned G-buffer draw (render.cpp: a camera draw into the upscaler's depth
+// whose vertex shader reads a constant buffer by index - a bone palette) is
+// given a place in this frame's slot of the capture buffer, and its translated
+// vertex shader stores every vertex's clip position there
+// (gcn::TranslateOptions::capture_position). At the upscale the frame's draws
+// are matched to the last frame's by key (the vertex shader, the index buffer
+// and its range, the base vertex, the vertex buffers; the n-th of a key with
+// the n-th), and the matched ones' triangles drawn through the G-buffer's
+// jittered viewport with both frames' corners (capture_motion.vert/.frag) into
+// g_cap.map: NDC now - NDC then, the view distance, the nearest fragment. The
+// motion pass takes it before the velocity map where it is the surface seen
+// (camera_motion.comp). So a character's motion is what its own vertex shader
+// put on screen this frame and the last, never a velocity draw the game left
+// out or drew with other matrices. BBHOST_CHAR_CAPTURE=0: not (the velocity
+// map alone).
+constexpr std::uint32_t kCapSlots = 3;
+constexpr std::uint32_t kCapVertices = 1u << 20;  // a slot's corners (16 bytes each)
+constexpr std::uint32_t kCapCorners = 1u << 21;   // a frame's triangle corners drawn (8 bytes each)
+struct CapIndices {
+    std::uint32_t vmin = 0, verts = 0;
+    std::vector<std::uint32_t> local;  // each index less vmin
+};
+struct CapDraw {
+    std::uint64_t key = 0;
+    std::uint32_t offset = 0;  // in the slot, in corners
+    const CapIndices* idx = nullptr;
+};
+struct CapState {
+    bool tried = false, ok = false;
+    VkBuffer buf = VK_NULL_HANDLE;  // kCapSlots x kCapVertices vec4s
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkDeviceAddress addr = 0;
+    VkBuffer corners[kCapSlots] = {};
+    VkDeviceMemory corners_mem[kCapSlots] = {};
+    std::uint8_t* corners_map[kCapSlots] = {};
+    std::uint32_t slot = 0, used = 0;
+    std::vector<CapDraw> now, last;
+    std::uint32_t last_slot = 0;
+    bool last_ok = false;
+    std::unordered_map<std::uint64_t, std::uint32_t> keys;  // this frame's: how many of each so far
+    std::unordered_map<std::uint64_t, std::unique_ptr<CapIndices>> indices;
+    VkViewport vp{};
+    bool vp_set = false;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    OwnImage map, zbuf;
+    std::uint32_t map_w = 0, map_h = 0;
+    std::uint64_t frames = 0, draws = 0, matched = 0, corner_total = 0, full = 0;
+};
+CapState g_cap;
+
+bool capture_env() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CHAR_CAPTURE");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+
+VkBuffer cap_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags want, VkDeviceMemory& memory, VkDeviceAddress* address,
+                    std::uint8_t** map) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = usage | (address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &buffer) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, buffer, &req);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    if (address) mai.pNext = &flags;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, want);
+    void* m = nullptr;
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &memory) != VK_SUCCESS ||
+        vkBindBufferMemory(g.device, buffer, memory, 0) != VK_SUCCESS || (map && vkMapMemory(g.device, memory, 0, VK_WHOLE_SIZE, 0, &m) != VK_SUCCESS)) {
+        if (memory) vkFreeMemory(g.device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+        vkDestroyBuffer(g.device, buffer, nullptr);
+        return VK_NULL_HANDLE;
+    }
+    if (map) *map = static_cast<std::uint8_t*>(m);
+    if (address) {
+        VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bai.buffer = buffer;
+        *address = vkGetBufferDeviceAddress(g.device, &bai);
+    }
+    return buffer;
+}
+
+bool capture_ready_locked() {
+    if (g_cap.tried) return g_cap.ok;
+    g_cap.tried = true;
+    g_cap.buf = cap_buffer(VkDeviceSize{kCapSlots} * kCapVertices * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                           g_cap.mem, &g_cap.addr, nullptr);
+    bool ok = g_cap.buf != VK_NULL_HANDLE;
+    for (std::uint32_t k = 0; ok && k < kCapSlots; ++k) {
+        g_cap.corners[k] = cap_buffer(VkDeviceSize{kCapCorners} * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, g_cap.corners_mem[k], nullptr,
+                                      &g_cap.corners_map[k]);
+        ok = g_cap.corners[k] != VK_NULL_HANDLE;
+    }
+    if (ok) {
+        const VkDescriptorSetLayoutBinding binds[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sli.bindingCount = 2;
+        sli.pBindings = binds;
+        ok = vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_cap.set_layout) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &g_cap.set_layout;
+        ok = vkCreatePipelineLayout(g.device, &pli, nullptr, &g_cap.layout) == VK_SUCCESS;
+    }
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    if (ok) {
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smi.codeSize = sizeof(k_capture_motion_vert_spv);
+        smi.pCode = k_capture_motion_vert_spv;
+        ok = vkCreateShaderModule(g.device, &smi, nullptr, &vs) == VK_SUCCESS;
+        smi.codeSize = sizeof(k_capture_motion_frag_spv);
+        smi.pCode = k_capture_motion_frag_spv;
+        ok = ok && vkCreateShaderModule(g.device, &smi, nullptr, &fs) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = vs;
+        st[0].pName = "main";
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        st[1].module = fs;
+        st[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vps.viewportCount = 1;
+        vps.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp = VK_COMPARE_OP_LESS;  // (the viewport noted at 0..1: nearer is less)
+        VkPipelineColorBlendAttachmentState att{};
+        att.colorWriteMask = 0xf;
+        VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cbs.attachmentCount = 1;
+        cbs.pAttachments = &att;
+        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dys.dynamicStateCount = 2;
+        dys.pDynamicStates = dyn;
+        const VkFormat color = VK_FORMAT_R16G16B16A16_SFLOAT;
+        VkPipelineRenderingCreateInfo pr{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        pr.colorAttachmentCount = 1;
+        pr.pColorAttachmentFormats = &color;
+        pr.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+        VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gp.pNext = &pr;
+        gp.stageCount = 2;
+        gp.pStages = st;
+        gp.pVertexInputState = &vi;
+        gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vps;
+        gp.pRasterizationState = &rs;
+        gp.pMultisampleState = &ms;
+        gp.pDepthStencilState = &ds;
+        gp.pColorBlendState = &cbs;
+        gp.pDynamicState = &dys;
+        gp.layout = g_cap.layout;
+        ok = vkCreateGraphicsPipelines(g.device, g.cache, 1, &gp, nullptr, &g_cap.pipeline) == VK_SUCCESS;
+    }
+    if (vs) vkDestroyShaderModule(g.device, vs, nullptr);
+    if (fs) vkDestroyShaderModule(g.device, fs, nullptr);
+    g_cap.ok = ok;
+    host_log("upscaler: the characters' capture %s (%u corners a frame in each of %u slots; BBHOST_CHAR_CAPTURE=0 turns it off)",
+             ok ? "ready" : "failed to set up; the velocity map alone", kCapVertices, kCapSlots);
+    return ok;
+}
+
+// The capture map at the motion's size, cleared, then this frame's matched
+// draws drawn into it; the frame's draws become the last frame's.
+void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
+    if (g_cap.map_w != w || g_cap.map_h != h || !g_cap.map.image) {
+        drop(g_cap.map);
+        drop(g_cap.zbuf);
+        g_cap.map_w = g_cap.map_h = 0;
+        if (!make(g_cap.map, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, w, h) ||
+            !make(g_cap.zbuf, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, w, h, VK_IMAGE_ASPECT_DEPTH_BIT)) {
+            drop(g_cap.map);
+            drop(g_cap.zbuf);
+            return;
+        }
+        g_cap.map_w = w;
+        g_cap.map_h = h;
+    }
+    // The matched corners.
+    std::uint32_t n = 0;
+    if (g_cap.ok && g_cap.last_ok && g_cap.vp_set) {
+        std::unordered_map<std::uint64_t, const CapDraw*> last;
+        last.reserve(g_cap.last.size());
+        for (const CapDraw& l : g_cap.last) last.emplace(l.key, &l);
+        auto* out = reinterpret_cast<std::uint32_t*>(g_cap.corners_map[g_cap.slot]);
+        const std::uint32_t now_base = g_cap.slot * kCapVertices, last_base = g_cap.last_slot * kCapVertices;
+        for (const CapDraw& c : g_cap.now) {
+            const auto it = last.find(c.key);
+            if (it == last.end() || it->second->idx != c.idx) continue;
+            const std::uint32_t k = static_cast<std::uint32_t>(c.idx->local.size());
+            if (n + k > kCapCorners) {
+                ++g_cap.full;
+                break;
+            }
+            const std::uint32_t a = now_base + c.offset, b = last_base + it->second->offset;
+            for (const std::uint32_t v : c.idx->local) {
+                out[2 * n] = a + v;
+                out[2 * n + 1] = b + v;
+                ++n;
+            }
+            ++g_cap.matched;
+        }
+    }
+    g_cap.corner_total += n;
+    g_cap.draws += g_cap.now.size();
+    if (++g_cap.frames % 600 == 0) {
+        host_log("upscaler: the characters' capture over 600 frames: %llu draws a frame, %llu matched, %llu corners drawn, %llu frames full",
+                 static_cast<unsigned long long>(g_cap.draws / 600), static_cast<unsigned long long>(g_cap.matched / 600),
+                 static_cast<unsigned long long>(g_cap.corner_total / 600), static_cast<unsigned long long>(g_cap.full));
+        g_cap.draws = g_cap.matched = g_cap.corner_total = g_cap.full = 0;
+    }
+    render_end_pass_locked();
+    // This frame's corners, written by the game's vertex shaders.
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkImageMemoryBarrier ib[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+    ib[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    ib[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    ib[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ib[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ib[0].srcQueueFamilyIndex = ib[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib[0].image = g_cap.map.image;
+    ib[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    ib[1] = ib[0];
+    ib[1].srcAccessMask = 0;
+    ib[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    ib[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    ib[1].image = g_cap.zbuf.image;
+    ib[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = g_cap.map.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo za{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    za.imageView = g_cap.zbuf.view;
+    za.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    za.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    za.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    za.clearValue.depthStencil = {1.0f, 0};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {w, h}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    ri.pDepthAttachment = &za;
+    vkCmdBeginRendering(cb, &ri);
+    if (n) {
+        const VkDescriptorSet set = alloc_set_locked(g_cap.set_layout);
+        if (set) {
+            const VkDescriptorBufferInfo bi[2] = {{g_cap.buf, 0, VK_WHOLE_SIZE}, {g_cap.corners[g_cap.slot], 0, VkDeviceSize{n} * 8}};
+            VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            for (int k = 0; k < 2; ++k) {
+                wr[k].dstSet = set;
+                wr[k].dstBinding = static_cast<std::uint32_t>(k);
+                wr[k].descriptorCount = 1;
+                wr[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                wr[k].pBufferInfo = &bi[k];
+            }
+            vkUpdateDescriptorSets(g.device, 2, wr, 0, nullptr);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cap.pipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cap.layout, 0, 1, &set, 0, nullptr);
+            vkCmdSetViewport(cb, 0, 1, &g_cap.vp);
+            const VkRect2D sc{{0, 0}, {w, h}};
+            vkCmdSetScissor(cb, 0, 1, &sc);
+            vkCmdDraw(cb, n, 1, 0, 0);
+        }
+    }
+    vkCmdEndRendering(cb);
+    ib[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    ib[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    ib[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ib[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, ib);
+    // The next frame.
+    if (g_cap.ok) {
+        g_cap.last.swap(g_cap.now);
+        g_cap.now.clear();
+        g_cap.last_slot = g_cap.slot;
+        g_cap.last_ok = true;
+        g_cap.slot = (g_cap.slot + 1) % kCapSlots;
+        g_cap.used = 0;
+        g_cap.keys.clear();
+    }
+    g_cap.vp_set = false;
 }
 
 // Sharpness: RCAS of g_output into g_sharp.
@@ -994,6 +1327,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     g_velo_camera_pass = false;
     g_depth_r32_fresh = false;  // (record_motion writes this frame's)
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
+        if (capture_env()) capture_ready_locked();
+        record_capture(cb, g_w, g_h);
+        g_cap_map_view = g_cap.map.view;
         record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
                       velo_mode, whole);
         g_check_whole = velo_seen_env() == 2 ? velo_seen_test() : whole;
@@ -1222,5 +1558,63 @@ bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes) {
 }
 
 std::uint64_t upscale_pass_calls() { return g_calls.load(std::memory_order_relaxed); }
+
+// A skinned G-buffer draw's place in the characters' capture (g_cap above):
+// the device address its vertex shader stores clip positions at, less its
+// first vertex's (an index plus the base vertex is the vertex shader's vertex
+// index), or 0 for none. The indices, read once for each buffer and range,
+// give the vertices it uses and its triangles.
+std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index_va, const void* indices, std::uint32_t count, bool i32,
+                                          std::int32_t base_vertex) {
+    if (!capture_env() || !g_cap.ok || !indices || count < 3 || count > (1u << 22)) return 0;
+    const std::uint64_t ikey = fnv1a(&count, sizeof(count), index_va ^ (i32 ? 0x32ull : 0x16ull));
+    std::unique_ptr<CapIndices>& slot = g_cap.indices[ikey];
+    if (!slot) {
+        slot = std::make_unique<CapIndices>();
+        std::uint32_t lo = UINT32_MAX, hi = 0;
+        std::vector<std::uint32_t> v(count);
+        for (std::uint32_t k = 0; k < count; ++k) {
+            v[k] = i32 ? static_cast<const std::uint32_t*>(indices)[k] : static_cast<const std::uint16_t*>(indices)[k];
+            lo = std::min(lo, v[k]);
+            hi = std::max(hi, v[k]);
+        }
+        if (hi - lo < kCapVertices) {
+            for (std::uint32_t& x : v) x -= lo;
+            v.resize(count - count % 3);
+            slot->vmin = lo;
+            slot->verts = hi - lo + 1;
+            slot->local = std::move(v);
+        }
+    }
+    const CapIndices* idx = slot.get();
+    if (!idx->verts || g_cap.used + idx->verts > kCapVertices) return 0;
+    // The n-th draw of a key this frame stands for the n-th of the last.
+    const std::uint32_t nth = g_cap.keys[key]++;
+    CapDraw c;
+    c.key = fnv1a(&nth, sizeof(nth), key);
+    c.offset = g_cap.used;
+    c.idx = idx;
+    g_cap.now.push_back(c);
+    g_cap.used += idx->verts;
+    const std::uint64_t first = static_cast<std::uint64_t>(static_cast<std::int64_t>(base_vertex) + idx->vmin);
+    return g_cap.addr + (static_cast<std::uint64_t>(g_cap.slot) * kCapVertices + c.offset) * 16 - first * 16;
+}
+
+// The G-buffer's viewport as a camera draw had it, the jitter included.
+void upscale_capture_viewport_locked(const VkViewport& vp) {
+    g_cap.vp = vp;
+    g_cap.vp.minDepth = 0.0f;
+    g_cap.vp.maxDepth = 1.0f;
+    g_cap.vp_set = true;
+}
+
+bool upscale_capture_on() { return capture_env() && g_cap.ok; }
+
+// The meshes the game moves: each index buffer its velocity pass ever drew a
+// mesh from (render.cpp), remembered - the G-buffer draws of the same buffer
+// are captured every frame, the ones the velocity pass left out included.
+std::unordered_set<std::uint64_t> g_cap_moving;
+void upscale_capture_note_moving(std::uint64_t index_va) { g_cap_moving.insert(index_va); }
+bool upscale_capture_moving(std::uint64_t index_va) { return g_cap_moving.count(index_va) != 0; }
 
 }  // namespace gpu

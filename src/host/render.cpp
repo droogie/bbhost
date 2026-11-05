@@ -4929,6 +4929,8 @@ std::uint64_t vs_stage_key(const VsStageInputs& in) {
         }
     }
     key = fnv1a(&in.no_fallback, 1, key);
+    bool vs_capture_on();
+    if (vs_capture_on() && !in.tess_hw && !in.domain_level) key ^= 0xc4a7f0e5d3b2a191ull;  // TranslateOptions::capture_position
     if (in.domain_level) key = fnv1a(&in.domain_level, 4, key ^ 0x7e55u);
     if (in.tess_hw) {
         key = fnv1a(&in.tess_control_points, 4, key ^ 0x7e56u);
@@ -5764,6 +5766,17 @@ float tess_patch_cull_near() {
     return w;
 }
 
+// The characters' capture (upscale_pass.cpp): every plain vertex shader can
+// store its clip positions, at the address a skinned G-buffer draw is given
+// (0 for every other draw, which stores nothing). BBHOST_CHAR_CAPTURE=0: not.
+bool vs_capture_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CHAR_CAPTURE");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+
 gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::Program* fetch) {
     gcn::TranslateOptions vo;
     vo.stage = gcn::Stage::Vertex;
@@ -5775,6 +5788,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
     vo.vertex_formats_from_params = in.formats_from_params;
     vo.force_dispatcher = in.elements && g_vs_dispatcher;
     vo.invariant_position = g_vs_invariant;
+    vo.capture_position = vs_capture_on() && !in.tess_hw && !in.domain_level;
     vo.link_outputs = true;
     vo.output_links = register_links();
     vo.descriptor_set = 0;
@@ -23773,6 +23787,7 @@ static bool draw_impl(const GpuDraw& d) {
                           meta.buffers.size() <= 16 && upscale_motion_on();
         // A mesh velocity draw's previous matrix made last frame's (velo_previous_locked),
         // in the game's constants before this stage takes its copy of them.
+        if (st == 0 && pl.velo == 2 && d.index_va) upscale_capture_note_moving(d.index_va);
         if (st == 0 && pl.velo == 2 && velo_previous_due()) {
             if (part) {
                 run_part_stop(kRunStopOrder);
@@ -23803,6 +23818,22 @@ static bool draw_impl(const GpuDraw& d) {
         }
         if (digest) t_ring_cb_stage = -1;
         if (gate) particle_vertices = particle_gate_vertices_locked(pl, meta, gate_bases);
+        // The characters' capture (upscale_pass.cpp): a skinned mesh in the
+        // G-buffer - a camera draw whose vertex shader reads a constant
+        // buffer by index, its bone palette - stores its clip positions where
+        // the capture puts them (gcn::TranslateOptions::capture_position).
+        if (st == 0 && camera_draw && !t_tess && d.index_va && !d.indirect_va && d.instance_count <= 1 && upscale_capture_on()) {
+            const bool skinned = upscale_capture_moving(d.index_va);
+            const std::uint64_t bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
+            if (skinned && hle_kernel_va_mapped(d.index_va, bytes)) {
+                const std::uint64_t k[4] = {pl.vs_key, d.index_va, d.index_count, static_cast<std::uint64_t>(static_cast<std::int64_t>(in.base_vertex))};
+                std::uint64_t key = fnv1a(k, sizeof(k));
+                if (const std::uint64_t a = upscale_capture_draw_locked(key, d.index_va,
+                                                                        reinterpret_cast<const void*>(static_cast<std::uintptr_t>(d.index_va)),
+                                                                        d.index_count, d.index_type == 1, in.base_vertex))
+                    params.lds_address = a;
+            }
+        }
         if (!meta.buffers.empty()) {
             any_buffers = true;
             all_bound = all_bound && params.cb_valid == (1u << meta.buffers.size()) - 1;
@@ -25122,6 +25153,9 @@ static bool draw_impl(const GpuDraw& d) {
         vp.y += upscale_jitter_sign() * g_upscale.jy;
         g_upscale.jittered = true;
     }
+    // The G-buffer's viewport, the jitter in it: the characters' capture
+    // draws their motion through it (upscale_pass.cpp).
+    if (camera_draw && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect) upscale_capture_viewport_locked(vp);
     if (!rs.viewport_set || std::memcmp(&rs.viewport, &vp, sizeof(vp)) != 0) {
         cmds.viewport(vp);
         rs.viewport = vp;
