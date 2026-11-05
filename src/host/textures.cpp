@@ -3028,8 +3028,9 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
 
 // Texture quality (Graphics > Texture quality, HostSettings::texture_quality):
 // how many of a texture's top levels its image leaves out, its own smaller
-// levels - already in its memory - in their place: 0 at 1.0x, 1 at 0.5x (a
-// 1024x2048 texture is 512x1024, a quarter of the video memory), 2 at 0.25x.
+// levels - already in its memory - in their place: 0 at High (1.0x), 1 at
+// Medium (0.5x: a 1024x2048 texture is 512x1024, a quarter of the video
+// memory), 2 at Low (0.25x).
 // Only block-compressed 2D textures and arrays with the levels to spare, made
 // as nothing the GPU draws or stores into (a GX resource bound as a target,
 // depth or UAV never is; nor a T# bound for stores, or one in g_full_size),
@@ -3101,7 +3102,7 @@ bool g_quality_started = false;
 void textures_follow_quality_locked() {
     const std::uint32_t want = quality_wanted();
     if (g_quality_started && want == g_quality_drop) return;
-    static const char* const kName[] = {"1.0x", "0.5x", "0.25x"};
+    static const char* const kName[] = {"High (1.0x)", "Medium (0.5x)", "Low (0.25x)"};
     const std::uint32_t was = g_quality_drop;
     g_quality_drop = want;
     if (!g_quality_started) {
@@ -6690,7 +6691,7 @@ void textures_report() {
         }
         host_log("texture: texture quality %s: textures made reduced %llu, leaving out %llu MiB of levels; made at full size again (written by the "
                  "GPU, or the setting raised) %llu; reduced now %llu, leaving out %llu MiB; full size for good %zu",
-                 g_quality_drop == 2 ? "0.25x" : g_quality_drop == 1 ? "0.5x" : "1.0x", static_cast<unsigned long long>(g_quality_surfaces),
+                 g_quality_drop == 2 ? "Low (0.25x)" : g_quality_drop == 1 ? "Medium (0.5x)" : "High (1.0x)", static_cast<unsigned long long>(g_quality_surfaces),
                  static_cast<unsigned long long>(g_quality_saved >> 20), static_cast<unsigned long long>(g_quality_full),
                  static_cast<unsigned long long>(now_reduced), static_cast<unsigned long long>(now_saved >> 20), g_full_size.size());
     }

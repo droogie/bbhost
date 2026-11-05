@@ -334,10 +334,11 @@ Setting g_set[kSettingCount] = {
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
     // The textures' size in video memory (host/textures.cpp quality_drop):
     // each texture's top mip levels left out of its image, its own smaller
-    // levels in their place. Live: a texture is made again at its next use.
-    {"texture_quality", "Texture quality", {"1.0x", "0.5x", "0.25x"}, 0,
-     "The size of the game's textures in video memory. 0.5x halves each texture's width and height (a quarter of the memory), "
-     "0.25x quarters them (a sixteenth), with the textures' own smaller mip levels in their place: less video memory and "
+    // levels in their place - High none (1.0x), Medium one (0.5x), Low two
+    // (0.25x). Live: a texture is made again at its next use.
+    {"texture_quality", "Texture quality", {"Low", "Medium", "High"}, 2,
+     "The size of the game's textures in video memory. High is the game's own. Medium halves each texture's width and height "
+     "(a quarter of the memory), Low quarters them (a sixteenth), with the textures' own smaller mip levels in their place: less video memory and "
      "bandwidth, for graphics cards short of either, and a softer picture. No texture goes below 256 on its longer side, and "
      "the smaller ones stay as they are. Changes at once: each texture is made again the next time it is drawn.",
      false},
@@ -1153,7 +1154,7 @@ void rebuild_settings() {
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
-    h.texture_quality = std::clamp(index_of(kTextureQuality), 0, 2);
+    h.texture_quality = 2 - std::clamp(index_of(kTextureQuality), 0, 2);  // the levels left out: High none, Low two
     h.ssr = on_of(kSsr);
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
@@ -1291,7 +1292,11 @@ void host_options_load() {
     seed(kResolution, config().resolution);
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
-    seed(kTextureQuality, config().texture_quality);
+    {
+        // (1.0x, 0.5x, 0.25x: its entries' names until 2026-11-05.)
+        const std::string& t = config().texture_quality;
+        seed(kTextureQuality, t == "1.0x" ? "High" : t == "0.5x" ? "Medium" : t == "0.25x" ? "Low" : t);
+    }
     seed(kShaders, config().shaders);
     if (config().setup_text_size > 0) seed(kMenuTextSize, std::to_string(config().setup_text_size) + "%");
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
@@ -1362,6 +1367,8 @@ void host_options_load() {
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
             if (key == "window_mode") window_mode_val = val;
+            // Texture quality's entries were 1.0x, 0.5x and 0.25x until 2026-11-05.
+            if (key == "texture_quality") val = val == "1.0x" ? "High" : val == "0.5x" ? "Medium" : val == "0.25x" ? "Low" : val;
             // Display-Limited was called Uncapped until 2026-10-28.
             if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
             // Effect timing's names before it had three choices; a saved Smooth,
@@ -1669,9 +1676,9 @@ const char* const* value_tips(int id, bool dlss) {
         "Full: the render size itself. The cleanest blur, the dearest.",
     };
     static const char* const kTextureTips[] = {
-        "1.0x: every texture at the size the game made it.",
-        "0.5x: textures at half their width and height, a quarter of the video memory - a 1024x2048 texture is 512x1024.",
-        "0.25x: textures at a quarter of their width and height, a sixteenth of the video memory - a 1024x2048 texture is 256x512.",
+        "Low: textures at a quarter of their width and height (0.25x), a sixteenth of the video memory - a 1024x2048 texture is 256x512.",
+        "Medium: textures at half their width and height (0.5x), a quarter of the video memory - a 1024x2048 texture is 512x1024.",
+        "High: every texture at the size the game made it (1.0x).",
     };
     switch (id) {
         case kUpscaler: return kUpscalerTips;

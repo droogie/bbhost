@@ -101,7 +101,7 @@ fps_cap = 30
 # resolution = "1920x1080"
 # window_mode = "Windowed"  # Windowed, Borderless, Fullscreen (exclusive)
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
-# texture_quality = "1.0x"  # 1.0x, 0.5x, 0.25x: the textures' width and height in video memory
+# texture_quality = "High"  # Low (0.25x), Medium (0.5x), High (1.0x): the textures' width and height in video memory
 # shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out

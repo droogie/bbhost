@@ -95,7 +95,7 @@ needs the command processor at 92% of a core.
 
 - `gpu`: lower the resolution, Model detail or the effects in the options;
   on a card short of video memory (the Memory counter near its size), Texture
-  quality 0.5x.
+  quality Medium.
   `BBHOST_GPU_PROFILE=3` times the frame's passes on the GPU (it records
   without the recorder thread, so judge its pass times, not its frame rate).
 - `main`, `gx`, `render`, `cp`, `record`: the CPU. A faster CPU, or one
