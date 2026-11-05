@@ -1,0 +1,58 @@
+#version 450
+// The embers back (host/upscale_pass.cpp, Numity1504's handoff step 8): tiny
+// bright dots that land on a new pixel each frame - embers, sparks, a flame's
+// tip - have no history, and the temporal upscaler smooths most of them away.
+// After it, where the game's own scene has a bright dot the upscaler's picture
+// lost, and the game drew it into its glow, the scene's colour goes back into
+// this frame's picture. The upscaler's history keeps its own: no trail.
+//   c = the upscaler's picture at p, s = the scene at p (its render pixels
+//   bilinear), tm = Rec. 709 luma of x / (1 + max(x)).
+//   tm(s) - tm(c) <= 0.02: c. Else m = the brightest tm in c's 3x3,
+//   n = smoothstep(0.02, 0.12, tm(s) - m), g = tm(glow) at the nearest render
+//   pixel: mix(c, s, n * clamp(g * 10, 0, 1)).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform Constants {
+    uvec4 size;  // x, y: the picture's (output) size; z, w: the scene's (render) size
+};
+
+layout(set = 0, binding = 0) uniform texture2D picture;
+layout(set = 0, binding = 1) uniform texture2D scene;
+layout(set = 0, binding = 2) uniform texture2D glow;
+layout(set = 0, binding = 3) uniform sampler unused;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+
+float tm(vec3 x) {
+    x = clamp(x, vec3(0.0), vec3(65504.0));
+    x /= 1.0 + max(x.r, max(x.g, x.b));
+    return dot(x, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec4 at(texture2D t, ivec2 p, ivec2 lim) { return texelFetch(sampler2D(t, unused), clamp(p, ivec2(0), lim), 0); }
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) return;
+    const ivec2 out_lim = ivec2(size.xy) - 1, in_lim = ivec2(size.zw) - 1;
+    vec4 c = at(picture, p, out_lim);
+    // The scene's four render pixels around p's centre, bilinear.
+    const vec2 q = (vec2(p) + 0.5) * vec2(size.zw) / vec2(size.xy) - 0.5;
+    const ivec2 q0 = ivec2(floor(q));
+    const vec2 f = q - vec2(q0);
+    const vec3 s = mix(mix(at(scene, q0, in_lim).rgb, at(scene, q0 + ivec2(1, 0), in_lim).rgb, f.x),
+                       mix(at(scene, q0 + ivec2(0, 1), in_lim).rgb, at(scene, q0 + ivec2(1, 1), in_lim).rgb, f.x), f.y);
+    const float ts = tm(s);
+    if (ts - tm(c.rgb) > 0.02) {
+        float m = 0.0;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) m = max(m, tm(at(picture, p + ivec2(x, y), out_lim).rgb));
+        const float n = smoothstep(0.02, 0.12, ts - m);
+        if (n > 0.0) {
+            const ivec2 g = clamp(ivec2((vec2(p) + 0.5) * vec2(size.zw) / vec2(size.xy)), ivec2(0), in_lim);
+            const float k = n * clamp(tm(at(glow, g, in_lim).rgb) * 10.0, 0.0, 1.0);
+            c.rgb = mix(c.rgb, max(s, vec3(0.0)), k);
+        }
+    }
+    imageStore(dst, p, c);
+}

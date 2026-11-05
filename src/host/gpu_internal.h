@@ -1906,7 +1906,7 @@ RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
 // in place, with the G-buffer's depth; false when it did not run. With frame
 // generation and no upscaler running, the motion and frame generation's
 // prepare alone (false: nothing upscaled, the draws not moved).
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y);
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow = nullptr);
 void upscale_pass_reset_locked();
 // Whether the frame's motion is taken: an upscaler running, or frame generation.
 bool upscale_motion_on();

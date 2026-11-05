@@ -22197,6 +22197,9 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
 // 8 flips: a picture it does not process is never shown moved.
 struct UpscaleFrame {
     std::uint64_t scene = 0, depth = 0, done_write = 0;
+    // The glow (the embers' test, upscale_pass.cpp): the second target, RGBA16F
+    // at the scene's size, of a draw that writes the scene.
+    std::uint64_t glow = 0;
     std::uint64_t ran_flip = 0;  // the flip of its last run (+1: 0 is never)
     std::uint64_t seen_flip = 0;  // the flip the scene was last drawn with its depth in (+1: 0 is never)
     std::uint32_t frame = 0;     // upscales so far: the jitter's index
@@ -25022,6 +25025,14 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         const bool writes_scene = scene_base && s.color[0] && s.color[0]->base == scene_base;
+        if (writes_scene && s.color[1] && s.color[1]->format == VK_FORMAT_R16G16B16A16_SFLOAT && s.color[1]->width == s.color[0]->width &&
+            s.color[1]->height == s.color[0]->height && s.color[1]->base != u.glow) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 4)
+                host_log("upscaler: the glow is 0x%llx (pipeline %s, the scene's second target)", static_cast<unsigned long long>(s.color[1]->base),
+                         pl.name.c_str());
+            u.glow = s.color[1]->base;
+        }
         if (writes_scene && s.depth) {
             depth_base = s.depth->base;
             u.seen_flip = hle_video_flip_count() + 1;
@@ -25038,7 +25049,8 @@ static bool draw_impl(const GpuDraw& d) {
                     run_part_stop(kRunStopOrder);
                     return false;
                 }
-                const bool ran = upscale_pass_run_locked(*scene, *depth, u.jittered ? u.jx : 0.0f, u.jittered ? u.jy : 0.0f);
+                const bool ran = upscale_pass_run_locked(*scene, *depth, u.jittered ? u.jx : 0.0f, u.jittered ? u.jy : 0.0f,
+                                                         u.glow ? find_render_target(u.glow) : nullptr);
                 u.done_write = scene->last_write;
                 if (ran) u.ran_flip = hle_video_flip_count() + 1;
                 ++u.frame;

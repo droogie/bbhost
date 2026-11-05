@@ -45,6 +45,13 @@
 // sharpens any more, so FSR 1's RCAS runs over the picture into an image of
 // its own (shaders/upscale_rcas.comp), which goes on in its place - before the
 // post chain and the HUD, which it never touches.
+//
+// The embers (Numity1504's handoff step 8, shaders/upscale_embers.comp): after
+// the sharpening, the bright one-frame dots the upscaler lost (embers, sparks)
+// put back from the game's own scene where its glow target shows them, into
+// an image of their own that goes on in the picture's place. The glow is the
+// second target, RGBA16F at the scene's size, of a draw that writes the
+// scene (render.cpp). BBHOST_EMBERS=0 off.
 #include "host/framegen.h"
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
@@ -53,6 +60,7 @@
 #include "host/shaders/capture_motion_vert.spv.h"
 #include "host/shaders/motion_check.spv.h"
 #include "host/shaders/motion_view.spv.h"
+#include "host/shaders/upscale_embers.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -92,6 +100,8 @@ OwnImage g_output, g_motion;        // the bridge's picture (RGBA16F, the output
 // pass ran this frame (g_depth_r32_fresh), else the game's own is handed on.
 OwnImage g_depth_r32;
 bool g_depth_r32_fresh = false;
+OwnImage g_embers;                  // the picture with the embers put back, the output size; made at the first use
+VkImageView g_picture_view = VK_NULL_HANDLE;  // this frame's final picture (render scale: YEBIS's copy samples it)
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 // Frame generation (host/framegen.h): the frames prepared so far - each
 // frame's number - and the one this frame was prepared as (0: not), which its
@@ -795,6 +805,111 @@ bool record_rcas(VkCommandBuffer cb, float sharpness) {
     return true;
 }
 
+// The embers: `picture` (the upscaled picture, readable) with the scene's
+// bright one-frame dots put back where `glow` shows them, into g_embers.
+VkDescriptorSetLayout g_ember_set_layout = VK_NULL_HANDLE;
+VkPipelineLayout g_ember_layout = VK_NULL_HANDLE;
+VkPipeline g_ember_pipeline = VK_NULL_HANDLE;
+
+bool ember_pipeline_locked() {
+    static bool tried = false;
+    if (tried) return g_ember_pipeline != VK_NULL_HANDLE;
+    tried = true;
+    const VkDescriptorSetLayoutBinding binds[5] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 5;
+    sli.pBindings = binds;
+    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_ember_set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_ember_set_layout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_ember_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_upscale_embers_spv);
+    smi.pCode = k_upscale_embers_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = g_ember_layout;
+    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_ember_pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok) g_ember_pipeline = VK_NULL_HANDLE;
+    host_log("upscaler: the embers' pass %s", ok ? "ready" : "failed to build; the embers stay as the upscaler leaves them");
+    return ok;
+}
+
+bool embers_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_EMBERS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+bool record_embers(VkCommandBuffer cb, const OwnImage& picture, const RtImage& scene, const RtImage& glow) {
+    if (!embers_on() || !ember_pipeline_locked() || !scene.view || !glow.view) return false;
+    if (!g_embers.image &&
+        !make(g_embers, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+              g_ow, g_oh)) {
+        drop(g_embers);
+        return false;
+    }
+    const VkDescriptorSet set = alloc_set_locked(g_ember_set_layout);
+    if (!set) return false;
+    const VkDescriptorImageInfo infos[5] = {
+        {VK_NULL_HANDLE, picture.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, scene.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, glow.view, VK_IMAGE_LAYOUT_GENERAL},
+        {g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
+        {VK_NULL_HANDLE, g_embers.view, VK_IMAGE_LAYOUT_GENERAL},
+    };
+    const VkDescriptorType types[5] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                       VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    VkWriteDescriptorSet wr[5] = {};
+    for (int k = 0; k < 5; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = static_cast<std::uint32_t>(k);
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = types[k];
+        wr[k].pImageInfo = &infos[k];
+    }
+    vkUpdateDescriptorSets(g.device, 5, wr, 0, nullptr);
+    const std::uint32_t pc[4] = {g_ow, g_oh, g_w, g_h};
+    // The scene and the glow were drawn into: their writes before the reads.
+    barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, glow.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, g_embers.image, VK_IMAGE_ASPECT_COLOR_BIT, g_embers.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    g_embers.initialised = true;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ember_pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ember_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, g_ember_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cb, (g_ow + 15) / 16, (g_oh + 15) / 16, 1);
+    barrier(cb, g_embers.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        host_log("upscaler: the embers put back from the scene where the glow 0x%llx (%ux%u, format %d) shows them",
+                 static_cast<unsigned long long>(glow.base), glow.width, glow.height, static_cast<int>(glow.format));
+    return true;
+}
+
 // Sharpness as the settings have it now, 0..1 (0: none).
 float sharpness_now() { return std::clamp(host_settings_ref().sharpness, 0.0f, 1.0f); }
 
@@ -1161,7 +1276,7 @@ void upscale_velo_copy_locked(RtImage& velo) {
             VK_ACCESS_SHADER_READ_BIT);
 }
 
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y) {
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow) {
     const int method = upscaler_method();
     // Frame generation with no upscaler running (Upscaling off, or one this
     // GPU cannot run): the motion and its prepare at the scene's size, and the
@@ -1202,6 +1317,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         drop(g_depth_r32);
         g_depth_r32_fresh = false;
         drop(g_sharp);
+        drop(g_embers);
         drop(g_prev_scene);
         g_prev_scene_valid = false;
         g_w = scene.width;
@@ -1406,7 +1522,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     // Sharpness: the sharpened picture goes on in its place.
     const float sharpness = test_view() ? 0.0f : sharpness_now();
-    const OwnImage& picture = sharpness > 0.0f && record_rcas(cb, sharpness) ? g_sharp : g_output;
+    const OwnImage* picture_p = sharpness > 0.0f && record_rcas(cb, sharpness) ? &g_sharp : &g_output;
+    // The embers put back over it (record_embers), not in a test's view.
+    if (glow && !test_view() && glow->width == scene.width && glow->height == scene.height && record_embers(cb, *picture_p, scene, *glow))
+        picture_p = &g_embers;
+    const OwnImage& picture = *picture_p;
+    g_picture_view = picture.view;
     if (g_scaled) {
         // The picture stays here for YEBIS's copy, which samples it in the
         // scene's place.
@@ -1504,7 +1625,7 @@ VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t
     if (!g_scaled || !g_output_ready || !g_output.view || scene_w != g_w || scene_h != g_h) return VK_NULL_HANDLE;
     // The image this frame's upscale leaves its picture in: sharpened or not,
     // as the setting is now.
-    return sharpness_now() > 0.0f && !test_view() && g_sharp.initialised && g_sharp.view ? g_sharp.view : g_output.view;
+    return g_picture_view ? g_picture_view : g_output.view;
 }
 
 bool upscale_camera_noted() { return g_cam_noted; }
