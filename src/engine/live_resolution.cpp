@@ -1115,7 +1115,7 @@ std::uint64_t gfx_heap_more_mib(std::uint64_t px) {
 
 // The Shadow resolution setting's shadow maps (engine/patch_manifest.cpp
 // shadow_resolution_manifest) are made from this heap as the game starts, the
-// stock heap's room short of them at Ultra (~1.7 GiB): their cost comes on top
+// stock heap's room short of them at High (~1.7 GiB): their cost comes on top
 // of the render size's, and what a live change may reach is worked out from
 // the render size's share alone.
 void grow_gfx_heap(ElfImage* image, std::uint64_t px) {

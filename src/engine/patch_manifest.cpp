@@ -591,12 +591,12 @@ Manifest render_scale_manifest() {
 // size the caller's own block gives (when non-zero) in their place - not taken
 // here. A spot map is a D32 depth target, with an RGBA8 one per LOD that its
 // maps share; a cube is six RGBA8 faces, with a D32 face-size depth per LOD
-// (the game's codes are DXGI's: 0x28, 0x1c). High makes them 2048 and 1024,
-// Ultra 4096 and 4096. They come from the render-target heap
+// (the game's codes are DXGI's: 0x28, 0x1c). Medium makes them 2048 and 1024,
+// High 4096 and 4096. They come from the render-target heap
 // (GFX_GraphicsPrivate) as the game starts, which the stock heap does not
 // hold - at 4096, the first area's meshes were not made and the game read
 // through the null - so the heap grows by shadow_resolution_heap_mib
-// (engine/live_resolution.cpp). Measured at Ultra (Radeon 8060S, 1080p, an
+// (engine/live_resolution.cpp). Measured at High (Radeon 8060S, 1080p, an
 // indoor room with lamps): the heap's free 1663 MiB less, 69 -> 45 fps.
 namespace {
 constexpr std::uint64_t kShadowCubeSizeSite = 0x0261b116;

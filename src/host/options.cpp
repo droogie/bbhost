@@ -185,7 +185,7 @@ Setting g_set[kSettingCount] = {
      "Borderless fills the screen at the desktop's resolution and switches away at once. Fullscreen takes the display "
      "over at the mode nearest the Resolution, which can change the screen's resolution.",
      false},
-    {"vsync", "V-Sync", {"On", "Off"}, 0,
+    {"vsync", "V-Sync", {"Off", "On"}, 1,
      "Off presents as soon as a frame is ready, and can tear.", false},
     // The game's own pace (engine/frame_rate.h), the same eleven the game's
     // Frame Rate pick list offers (engine/option_menu.cpp). The key is the old
@@ -254,7 +254,7 @@ Setting g_set[kSettingCount] = {
     // On by default, and it only *disables* the automatic behaviour: the
     // mouse turns the camera whenever a menu is not open, which is what DS3
     // does and what a PC player expects. Off hands the camera back to the pad.
-    {"mouse_camera", "Mouse camera", {"On", "Off"}, 0,
+    {"mouse_camera", "Mouse camera", {"Off", "On"}, 1,
      "The mouse turns the camera outside menus. Off leaves it to the pad.", false},
     // 0..10, the range of the game's own Camera Sensitivity slider, which is
     // the widget the PC Controls screen draws it with, and DS3's: the same
@@ -271,7 +271,7 @@ Setting g_set[kSettingCount] = {
     // game's own camera back (engine/mouse_camera.h).
     {"mouse_auto_rotation", "Mouse auto-rotation", {"Off", "On"}, 0,
      "Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.", false},
-    {"draw_cursor", "Draw the pointer", {"On", "Off"}, 0,
+    {"draw_cursor", "Draw the pointer", {"Off", "On"}, 1,
      "The host draws it; the game has no cursor of its own.", false},
     // The game's key guide and its tutorial notes name a pad button as an
     // image tag; the port rewrites the tag into the key bound to it
@@ -297,24 +297,24 @@ Setting g_set[kSettingCount] = {
      "100% is the stick's own edge.", false},
     // The post-processing switches. They follow their settings live
     // (engine/graphics_patch.cpp, host/shader_patch.h).
-    {"ssao", "Ambient occlusion", {"On", "Off"}, 0,
+    {"ssao", "Ambient occlusion", {"Off", "On"}, 1,
      "Screen-space ambient occlusion. Off is faster.", false},
     // Not a byte patch: the blur shader passes every pixel through
     // (host/shader_patch.h).
-    {"motion_blur", "Motion blur", {"On", "Off"}, 0,
+    {"motion_blur", "Motion blur", {"Off", "On"}, 1,
      "The blur on fast camera and character movement.", false},
-    {"anti_alias", "Anti-aliasing", {"On", "Off"}, 0,
+    {"anti_alias", "Anti-aliasing", {"Off", "On"}, 1,
      "The game's own AA pass.", false},
-    {"depth_of_field", "Depth of field", {"On", "Off"}, 0,
+    {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
-    {"chromatic_aberration", "Chromatic aberration", {"On", "Off"}, 0,
+    {"chromatic_aberration", "Chromatic aberration", {"Off", "On"}, 1,
      "The colour fringing at the edges of the frame.", false},
     // Two of the area's draw parameters (param/drawparam), scaled or cleared
     // as the game hands them to YEBIS each frame - engine/graphics_patch.cpp.
     // 10 is the area's own glare; 0 is none.
     {"bloom", "Bloom", hundred(), 100,
      "The glow around bright light. 100 is the game's own; lower dims it.", false},
-    {"vignette", "Vignette", {"On", "Off"}, 0,
+    {"vignette", "Vignette", {"Off", "On"}, 1,
      "The darkened frame edges some areas use.", false},
     // The area's shadow cascades, stretched past the first split: 1 + 0.2 a
     // step, so the game's slider row (0..10) is the same setting.
@@ -333,10 +333,10 @@ Setting g_set[kSettingCount] = {
     // ShadowParam asks, the dynamic lights' spot maps and cube faces larger
     // than the game's 512 and 256. Made as the game starts, from a
     // render-target heap grown by what they take (engine/live_resolution.cpp).
-    {"shadow_resolution", "Shadow resolution", {"Game", "High", "Ultra"}, 0,
-     "Requires a restart. The sharpness of every shadow. Game is the game's own: the sun's 2048 or 4096 as each area asks, "
-     "the lamps' and torches' 512 and 256. High: the sun's 4096, the lights' 2048 and 1024 (about 500 MB more memory). "
-     "Ultra: all 4096 (about 1.8 GB more memory, and as much video memory again): much slower where lights cast shadows.",
+    {"shadow_resolution", "Shadow resolution", {"Low", "Medium", "High"}, 0,
+     "Requires a restart. The sharpness of every shadow. Low is the game's own: the sun's 2048 or 4096 as each area asks, "
+     "the lamps' and torches' 512 and 256. Medium: the sun's 4096, the lights' 2048 and 1024 (about 500 MB more memory). "
+     "High: all 4096 (about 1.8 GB more memory, and as much video memory again): much slower where lights cast shadows.",
      true},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
@@ -351,7 +351,7 @@ Setting g_set[kSettingCount] = {
     // every model at its finest mesh, Low and Lowest move each to a coarser
     // one sooner. Lowest is the community "model LOD 2" (-8% GPU, models
     // visibly simpler up close).
-    {"model_detail", "Model detail", {"Full", "Normal", "Low", "Lowest"}, 1,
+    {"model_detail", "Model detail", {"Lowest", "Low", "Normal", "Full"}, 2,
      "Normal is the game's own. Low and Lowest swap in simpler models sooner; Full never does.", false},
     // The textures' size in video memory (host/textures.cpp quality_drop):
     // each texture's top mip levels left out of its image, its own smaller
@@ -415,7 +415,7 @@ Setting g_set[kSettingCount] = {
     // Performance 1/2 each way (engine/render_scale.cpp). A change rebuilds
     // the scene contexts at the new size (live resolution's rebuild), as
     // Upscaling turned on or off does.
-    {"upscale_quality", "Upscaling quality", {"Native AA", "Quality", "Balanced", "Performance"}, 1,
+    {"upscale_quality", "Upscaling quality", {"Performance", "Balanced", "Quality", "Native AA"}, 2,
      "How much smaller than the Resolution the 3D is drawn before the upscaler brings it back: Native AA draws it full size "
      "(anti-aliasing only), Quality at two thirds, Balanced at about 59%, Performance at half each way - faster, softer. "
      "The menus, the HUD and the post effects stay at the Resolution. Changes at once.",
@@ -519,14 +519,14 @@ Setting g_set[kSettingCount] = {
     // start (main.cpp hands them to config_set_enhancements), all on unless
     // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
     // shipped. (The Old Hunters, a fourth in v0.2.9, is the patch old-hunters.)
-    {"change_appearance", "Hunter's Dream mirror", {"On", "Off"}, 0,
+    {"change_appearance", "Hunter's Dream mirror", {"Off", "On"}, 1,
      "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
-    {"rebirth", "Rebirth at the Altar", {"On", "Off"}, 0,
+    {"rebirth", "Rebirth at the Altar", {"Off", "On"}, 1,
      "Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.", true},
-    {"five_players", "Five players", {"On", "Off"}, 0,
+    {"five_players", "Five players", {"Off", "On"}, 1,
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
     // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
-    {"skill_issue", "SKILL ISSUE", {"On", "Off"}, 0, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
+    {"skill_issue", "SKILL ISSUE", {"Off", "On"}, 1, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
      true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
@@ -975,7 +975,7 @@ void apply(int id) {
             if (live_resolution_available() && w && h && cw && ch && (cw != w || ch != h)) live_resolution_request(w, h, false);
             break;
         }
-        case kVsync: host_window_set_vsync(s.index == 0); break;
+        case kVsync: host_window_set_vsync(reads_on(s, s.index)); break;
         case kFrameGeneration: {
             // AMD's swapchain made or dropped at the presenter's next frame
             // (host/framegen.h reads the setting as it makes the swapchain);
@@ -1146,7 +1146,7 @@ int index_of(int id) { return g_set[id].index; }
 void rebuild_settings() {
     HostSettings h;
     h.fullscreen = index_of(kWindowMode) != 0;  // Borderless or Fullscreen
-    h.vsync = index_of(kVsync) == 0;
+    h.vsync = on_of(kVsync);
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.frame_clock = on_of(kFrameClock);
     h.effect_timing = kEffectTimingValues[std::clamp(index_of(kEffectTiming), 0, kEffectTimingCount - 1)];
@@ -1207,7 +1207,7 @@ void rebuild_settings() {
     h.dynamic_shadows = on_of(kDynamicShadows);
     h.shadow_resolution = std::clamp(index_of(kShadowResolution), 0, 2);
     {
-        static constexpr int kBias[] = {-2, 0, 1, 2};
+        static constexpr int kBias[] = {2, 1, 0, -2};  // Lowest, Low, Normal, Full
         const int i = index_of(kModelDetail);
         h.lod_bias = i >= 0 && i < 4 ? kBias[i] : 0;
     }
@@ -1219,7 +1219,7 @@ void rebuild_settings() {
     {
         const int u = index_of(kUpscaler);
         h.upscaler = u == 1 ? 3 : u == 2 ? 2 : u == 3 ? 1 : 0;  // the menu's FSR 3, FSR 4, DLSS
-        h.upscale_quality = std::clamp(index_of(kUpscaleQuality), 0, 3);
+        h.upscale_quality = 3 - std::clamp(index_of(kUpscaleQuality), 0, 3);  // the menu runs Performance to Native AA
         static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
         h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
         h.sharpness = static_cast<float>(std::clamp(index_of(kSharpness), 0, 100)) / 100.0f;
@@ -1317,10 +1317,10 @@ void host_options_load() {
     // The PC enhancements seed from bbhost.toml's [world] (all on unless it
     // says otherwise); the options file then holds the player's choice, and a
     // BBHOST_* switch still wins over both (config_set_enhancements).
-    g_set[kChangeAppearance].index = config().change_appearance ? 0 : 1;
-    g_set[kRebirth].index = config().rebirth ? 0 : 1;
-    g_set[kFivePlayers].index = config().five_players ? 0 : 1;
-    g_set[kSkillIssue].index = config().skill_issue ? 0 : 1;
+    g_set[kChangeAppearance].index = config().change_appearance ? 1 : 0;
+    g_set[kRebirth].index = config().rebirth ? 1 : 0;
+    g_set[kFivePlayers].index = config().five_players ? 1 : 0;
+    g_set[kSkillIssue].index = config().skill_issue ? 1 : 0;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -1553,7 +1553,7 @@ void host_options_load() {
                                   {"BBHOST_DEPTH_OF_FIELD", kDepthOfField},
                                   {"BBHOST_CHROMATIC_ABERRATION", kChromaticAberration}}) {
         if (const char* e = std::getenv(env); e && e[0]) {
-            g_set[id].index = e[0] == '0' ? 1 : 0;  // these are {"On","Off"}
+            g_set[id].index = e[0] == '0' ? 0 : 1;  // these are {"Off","On"}
         }
     }
     // BBHOST_FRAMEGEN=1 or 0: Frame generation on or off over the file.
@@ -1566,7 +1566,7 @@ void host_options_load() {
         g_set[kMouseSens].index = (v < 0 ? 0 : v > 10 ? 10 : v) * 10;  // BBHOST_MOUSE_SENS stays 0..10
     }
     if (const char* e = std::getenv("BBHOST_MOUSE_CURSOR"); e && e[0]) {
-        g_set[kDrawCursor].index = e[0] == '0' ? 1 : 0;
+        g_set[kDrawCursor].index = e[0] == '0' ? 0 : 1;
     }
     host_options_apply();
     rebuild_settings();
@@ -1716,16 +1716,16 @@ const char* const* value_tips(int id, bool dlss) {
         "NVIDIA DLSS: RTX cards only.",
     };
     static const char* const kFsrTips[] = {
-        "Native AA: the 3D drawn at the full Resolution; FSR only smooths its edges. The sharpest and the slowest.",
-        "Quality: the 3D at two thirds of the Resolution each way, brought back by FSR. Close to native, faster.",
-        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
         "Performance: the 3D at half the Resolution each way - a quarter of the pixels. The fastest, the softest.",
+        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
+        "Quality: the 3D at two thirds of the Resolution each way, brought back by FSR. Close to native, faster.",
+        "Native AA: the 3D drawn at the full Resolution; FSR only smooths its edges. The sharpest and the slowest.",
     };
     static const char* const kDlssTips[] = {
-        "DLAA: DLSS at the full Resolution, anti-aliasing only. The sharpest and the slowest.",
-        "Quality: the 3D at two thirds of the Resolution each way, brought back by DLSS. Close to native, faster.",
-        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
         "Performance: the 3D at half the Resolution each way - a quarter of the pixels. The fastest, the softest.",
+        "Balanced: the 3D at about 59% of the Resolution each way. Faster again, a little softer.",
+        "Quality: the 3D at two thirds of the Resolution each way, brought back by DLSS. Close to native, faster.",
+        "DLAA: DLSS at the full Resolution, anti-aliasing only. The sharpest and the slowest.",
     };
     static const char* const kPresetTips[] = {
         "K: the transformer model, the sharpest. Recommended.",
@@ -1961,8 +1961,8 @@ const char* host_options_page_blurb(int page) {
 // once (engine/render_scale.cpp).
 void preset_row() {
     const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
-    // DLSS at the full size is DLAA: its first choice says so.
-    static const char* const kDlssQualityNames[4] = {"DLAA", "Quality", "Balanced", "Performance"};
+    // DLSS at the full size is DLAA: its last choice says so.
+    static const char* const kDlssQualityNames[4] = {"Performance", "Balanced", "Quality", "DLAA"};
     const auto quality_note = [](const char* who) {
         static std::string notes[2];
         const bool dlss = who[0] == 'D';
@@ -2368,7 +2368,7 @@ int host_deck_default_profile() { return deck_profile_of(host_opt_default_frame_
 void host_set_deck_profile(int profile) {
     const bool sixty = profile == 1;
     if (const int i = fps_index(sixty ? 60 : 30); i >= 0 && i != g_set[kFrameCap].index) set_index(kFrameCap, i, false);
-    if (const int m = sixty ? 2 : 1; m != g_set[kModelDetail].index) set_index(kModelDetail, m, false);  // Low, Normal
+    if (const int m = sixty ? 1 : 2; m != g_set[kModelDetail].index) set_index(kModelDetail, m, false);  // Low, Normal
     const char* const size = sixty ? "960x600" : "1280x800";
     for (std::size_t v = 0; v < g_set[kResolution].values.size(); ++v) {
         if (std::strcmp(g_set[kResolution].values[v], size) != 0 || static_cast<int>(v) == g_set[kResolution].index) continue;
