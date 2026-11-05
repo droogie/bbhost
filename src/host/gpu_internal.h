@@ -2373,8 +2373,10 @@ void copy_versions_flush_locked();
 void home_copies_flush_locked();
 // Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h): GX's constant buffers' device-local homes, the command
 // processor's side (gxvk_homes_vk.cpp), every one under g.mu.
-// At the device's choice: homes on (1, compare) unless the GPU is integrated or its memory tight; the pool's budget.
-void homes_decide(bool integrated, bool small_vram, bool tight);
+// At the device's choice: homes on (1, compare, or by the default) unless the GPU is integrated, its memory tight or its
+// small video memory under host/gxvk_homes.h kSmallHomesFreeMiB free (`free_at_start`, bytes, the memory policy's); the
+// pool's budget; and the run commit's Windows default given way where the default's rule holds.
+void homes_decide(bool integrated, bool small_vram, bool tight, std::uint64_t free_at_start);
 // A recording begins: the homes GX made and ended since are in the index by address, ended ones taken back once no
 // draw recorded before their end is still to come, their ranges freed once the work that read them has run.
 void homes_begin_recording_locked();

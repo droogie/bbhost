@@ -4058,7 +4058,8 @@ bool init_locked() {
             g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
         }
         twins_decide(c.type_rank == 4);
-        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight,
+                     host_gpu_memory_policy().free_at_start);
         {
             // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
             // the homes' own line said why (null: no second line).
@@ -4071,7 +4072,7 @@ bool init_locked() {
                               : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
                               : g.integrated                     ? "the homes are off on an integrated GPU"
                               : g.tight                          ? "the homes are off with tight memory"
-                                                                 : "the homes are off with small video memory";
+                                                                 : "the homes are off with small video memory, under 6 GiB free";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)

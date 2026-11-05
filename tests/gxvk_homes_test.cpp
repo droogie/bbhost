@@ -6,8 +6,10 @@
 // filter's "no") checked against a plain list of the live ranges. The filter
 // may say "maybe" where nothing is; it may never say "no" where a home is.
 // The handle's packing is checked too (host/gxvk_homes.h), and the default's
-// rule (default_off: on only with a card with room, 16 hardware threads or more
-// and a frame rate above 60).
+// rule (default_off: on only with a card with room or 6 GiB of small video
+// memory free, 16 hardware threads or more and a frame rate above 60;
+// small_refused; run_commit_gives_way: Windows' run commit gives way where
+// the rule holds).
 #include "host/gxvk_homes.h"
 #include "host/gxvk_homes_index.h"
 
@@ -72,7 +74,33 @@ int main() {
                   default_off(false, false, true, 80, 960, false) == kDefaultOffSmall,
               "off on an integrated GPU, with tight or small video memory", 0, 0);
         check(default_off(false, false, true, 8, 60, false) == (kDefaultOffSmall | kDefaultOffThreads | kDefaultOffRate), "every reason said", 8, 60);
-        check(default_off(false, false, false, 80, 960, true) == kDefaultOffRunCommit, "off with the run commit on", 80, 960);
+        check(default_off(false, false, false, 80, 960, true) == kDefaultOffRunCommit, "off with the run commit turned on by its setting", 80, 960);
+        // Small video memory: refused under 6,144 MiB free at the start unless a budget is given; a card with room never.
+        check(small_refused(true, 4000, false) && small_refused(true, 6143, false) && small_refused(true, 0, false),
+              "small video memory under 6,144 MiB free refused", 6143, 0);
+        check(!small_refused(true, 6144, false) && !small_refused(true, 7000, false) && !small_refused(true, 7249, false),
+              "small video memory from 6,144 MiB free taken, with the pool's budget", 6144, 0);
+        check(!small_refused(true, 4000, true) && !small_refused(true, 0, true), "a budget given takes small video memory at any size", 4000, 1);
+        check(!small_refused(false, 4000, false) && !small_refused(false, 0, false), "a card with room is never refused", 4000, 0);
+        check(default_off(false, false, small_refused(true, 7000, false), 16, 960, false) == 0 &&
+                  default_off(false, false, small_refused(true, 4000, false), 16, 960, false) == kDefaultOffSmall,
+              "on with 7,000 MiB free, off with 4,000", 7000, 4000);
+        // Windows' run commit (on by its default alone) gives way where the rule holds and the homes are the default or
+        // asked for; any reason off, a setting of the run commit's own, or BBHOST_GXVK_HOMES=0/compare/twins keeps it.
+        check(run_commit_gives_way(0, true, Mode::kAuto) && run_commit_gives_way(0, true, Mode::kHandle),
+              "the run commit gives way where the rule holds", 0, 1);
+        check(!run_commit_gives_way(0, false, Mode::kAuto) && !run_commit_gives_way(0, false, Mode::kHandle),
+              "nothing to give way without the platform's default (Linux, or BBHOST_RUN_COMMIT set)", 0, 0);
+        for (unsigned bit : {kDefaultOffIntegrated, kDefaultOffTight, kDefaultOffSmall, kDefaultOffThreads, kDefaultOffRate, kDefaultOffRunCommit})
+            check(!run_commit_gives_way(bit, true, Mode::kAuto) && !run_commit_gives_way(bit, true, Mode::kHandle),
+                  "the run commit kept where a reason keeps the homes off", bit, 1);
+        check(!run_commit_gives_way(default_off(false, false, false, 8, 960, false), true, Mode::kAuto) &&
+                  !run_commit_gives_way(default_off(false, false, false, 16, 60, false), true, Mode::kAuto) &&
+                  !run_commit_gives_way(default_off(true, false, false, 16, 960, false), true, Mode::kAuto),
+              "Windows keeps the run commit with 8 threads, at 60 fps, on an integrated GPU", 8, 60);
+        check(!run_commit_gives_way(0, true, Mode::kOff) && !run_commit_gives_way(0, true, Mode::kCompare) &&
+                  !run_commit_gives_way(0, true, Mode::kTwins),
+              "BBHOST_GXVK_HOMES=0, compare and twins keep the run commit", 0, 2);
     }
 
     std::mt19937_64 rng(4321);
