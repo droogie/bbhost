@@ -75,6 +75,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 
 void run_forget_recorded_locked();  // render.cpp: the command buffer's cached graphics state forgotten
 
@@ -141,8 +142,19 @@ struct Camera {
     float rows[12] = {};  // view to world: rotation | eye
 };
 Camera g_cam_now, g_cam_prev;
-bool g_cam_noted = false;  // this frame's taken (render.cpp, the first camera draw)
+std::atomic<bool> g_cam_noted{false};  // this frame's taken (render.cpp, the first camera draw)
 bool g_cam_prev_ok = false;
+
+// What draws note for the upscale - the camera's view block, the G-buffer's
+// viewport, the velocity map's scales, the meshes its velocity pass moves -
+// is noted under this lock: a run part's draw (BBHOST_RUN_COMMIT) records on
+// a worker of its own, beside the other parts. (The characters' capture
+// places are taken in order instead - render.cpp stops a part's draw there:
+// two parts taking them at once tore the capture's count of each key, and
+// the next look-up read through a null - Kyo's friend's crash with an
+// upscaler at 4K, ~10 s after a lamp travel, silent when the heap's own
+// check caught the damage first.)
+std::mutex g_note_mu;
 
 // The game's velocity map (the motion blur's): its target, and the scales its
 // two kinds of pass write their motion with (render.cpp, the draws' constant
@@ -440,6 +452,7 @@ struct CapState {
     OwnImage map, zbuf;
     std::uint32_t map_w = 0, map_h = 0;
     std::uint64_t frames = 0, draws = 0, matched = 0, corner_total = 0, full = 0;
+    std::atomic<std::uint64_t> part_stops{0};  // draws a run part handed back to be captured in order (render.cpp)
 };
 CapState g_cap;
 
@@ -627,9 +640,11 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
     g_cap.corner_total += n;
     g_cap.draws += g_cap.now.size();
     if (++g_cap.frames % 600 == 0) {
-        host_log("upscaler: the characters' capture over 600 frames: %llu draws a frame, %llu matched, %llu corners drawn, %llu frames full",
+        host_log("upscaler: the characters' capture over 600 frames: %llu draws a frame, %llu matched, %llu corners drawn, %llu frames full, "
+                 "%llu draws from run parts taken again in order",
                  static_cast<unsigned long long>(g_cap.draws / 600), static_cast<unsigned long long>(g_cap.matched / 600),
-                 static_cast<unsigned long long>(g_cap.corner_total / 600), static_cast<unsigned long long>(g_cap.full));
+                 static_cast<unsigned long long>(g_cap.corner_total / 600), static_cast<unsigned long long>(g_cap.full),
+                 static_cast<unsigned long long>(g_cap.part_stops.exchange(0)));
         g_cap.draws = g_cap.matched = g_cap.corner_total = g_cap.full = 0;
     }
     render_end_pass_locked();
@@ -1199,11 +1214,16 @@ bool velo_cloth_given() {
 }
 
 bool upscale_velo_clear_due(std::uint64_t base, int kind) {
-    return kind == 2 && base && g_velo_cleared != g_velo_frame && !g_velo_camera_pass;
+    if (kind != 2 || !base) return false;
+    std::lock_guard<std::mutex> lk(g_note_mu);
+    return g_velo_cleared != g_velo_frame && !g_velo_camera_pass;
 }
 
 void upscale_velo_clear_locked(RtImage& velo) {
-    g_velo_cleared = g_velo_frame;
+    {
+        std::lock_guard<std::mutex> lk(g_note_mu);
+        g_velo_cleared = g_velo_frame;
+    }
     if (!velo.image) return;
     begin_recording_locked();
     if (velo.view_clear) view_clear_apply_locked(velo);
@@ -1632,6 +1652,7 @@ bool upscale_camera_noted() { return g_cam_noted; }
 
 void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) {
     if (kind != 3 && (!std::isfinite(kx) || !std::isfinite(ky) || kx == 0.0f || ky == 0.0f)) return;
+    std::lock_guard<std::mutex> lk(g_note_mu);
     if (kind == 3) kind = 1;  // the camera's pass, still: a scale of 0 (it wrote no motion)
     static int logs = 0;
     const bool changed = kind == 1 ? (kx != g_velo_cam[0] || ky != g_velo_cam[1] || base != g_velo_base)
@@ -1663,6 +1684,7 @@ void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) 
 }
 
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
+    std::lock_guard<std::mutex> lk(g_note_mu);
     if (g_cam_noted || !base || bytes < 864) return g_cam_noted;
     Camera c;
     if (!camera_of(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base)), &c)) return false;
@@ -1730,6 +1752,7 @@ std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index
 
 // The G-buffer's viewport as a camera draw had it, the jitter included.
 void upscale_capture_viewport_locked(const VkViewport& vp) {
+    std::lock_guard<std::mutex> lk(g_note_mu);
     g_cap.vp = vp;
     g_cap.vp.minDepth = 0.0f;
     g_cap.vp.maxDepth = 1.0f;
@@ -1737,12 +1760,19 @@ void upscale_capture_viewport_locked(const VkViewport& vp) {
 }
 
 bool upscale_capture_on() { return capture_env() && g_cap.ok; }
+void upscale_capture_part_stop() { g_cap.part_stops.fetch_add(1, std::memory_order_relaxed); }
 
 // The meshes the game moves: each index buffer its velocity pass ever drew a
 // mesh from (render.cpp), remembered - the G-buffer draws of the same buffer
 // are captured every frame, the ones the velocity pass left out included.
-std::unordered_set<std::uint64_t> g_cap_moving;
-void upscale_capture_note_moving(std::uint64_t index_va) { g_cap_moving.insert(index_va); }
-bool upscale_capture_moving(std::uint64_t index_va) { return g_cap_moving.count(index_va) != 0; }
+std::unordered_set<std::uint64_t> g_cap_moving;  // under g_note_mu
+void upscale_capture_note_moving(std::uint64_t index_va) {
+    std::lock_guard<std::mutex> lk(g_note_mu);
+    g_cap_moving.insert(index_va);
+}
+bool upscale_capture_moving(std::uint64_t index_va) {
+    std::lock_guard<std::mutex> lk(g_note_mu);
+    return g_cap_moving.count(index_va) != 0;
+}
 
 }  // namespace gpu

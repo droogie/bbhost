@@ -24200,6 +24200,18 @@ static bool draw_impl(const GpuDraw& d) {
             const bool skinned = upscale_capture_moving(d.index_va);
             const std::uint64_t bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
             if (skinned && hle_kernel_va_mapped(d.index_va, bytes)) {
+                // Its place in the frame's capture is taken in the draws'
+                // order (the n-th draw of a key stands for the last frame's
+                // n-th): a run part's draw goes again in order. Two parts
+                // taking places at once tore the capture's count of each key -
+                // a null read at the next look-up (an upscaler at 4K, ~10 s
+                // after a lamp travel) or the hunter's motion from another
+                // draw's corners, a frame here and there.
+                if (part) {
+                    upscale_capture_part_stop();
+                    run_part_stop(kRunStopOrder);
+                    return false;
+                }
                 const std::uint64_t k[4] = {pl.vs_key, d.index_va, d.index_count, static_cast<std::uint64_t>(static_cast<std::int64_t>(in.base_vertex))};
                 std::uint64_t key = fnv1a(k, sizeof(k));
                 if (const std::uint64_t a = upscale_capture_draw_locked(key, d.index_va,

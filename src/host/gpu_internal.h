@@ -1953,11 +1953,13 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
 // The characters' capture (upscale_pass.cpp): a skinned G-buffer draw's
 // capture address for its vertex shader (StageParams::lds_address), 0 for
-// none; the G-buffer's jittered viewport; whether the capture runs.
+// none - taken in the draws' order, never from a run part's draw; the
+// G-buffer's jittered viewport; whether the capture runs.
 std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t index_va, const void* indices, std::uint32_t count, bool i32,
                                           std::int32_t base_vertex);
 void upscale_capture_viewport_locked(const VkViewport& vp);
 bool upscale_capture_on();
+void upscale_capture_part_stop();  // a run part's draw handed back to be captured in order (counted)
 void upscale_capture_note_moving(std::uint64_t index_va);  // a velocity-pass mesh's index buffer
 bool upscale_capture_moving(std::uint64_t index_va);
 bool upscale_camera_noted();
