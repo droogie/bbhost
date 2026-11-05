@@ -14,6 +14,7 @@
 // command processor released this one: the slot's state orders every access.
 #include "host/gxvk_lists.h"
 #include "host/gxvk_lists_internal.h"
+#include "host/gxvk_rest.h"
 
 #include "hle/modules.h"
 #include "host/cache_rw.h"
@@ -144,6 +145,20 @@ void hw_open() {}
 std::string hw_line() { return std::string(); }
 #endif
 
+// ---- the rest at a frame cap (host/gxvk_lists.h resting) ----
+const bool g_rest_on = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS_REST");
+    return !(e && e[0] == '0');
+}();
+// BBHOST_GXVK_LISTS_REST=cycle:N (a check, as lavapipe never meets a cap): rest N frames, work N frames, whatever the
+// limiter waited - every transition met mid-list, as play meets them.
+const unsigned g_rest_cycle = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS_REST");
+    return e && std::strncmp(e, "cycle:", 6) == 0 ? static_cast<unsigned>(std::max(1L, std::strtol(e + 6, nullptr, 10))) : 0u;
+}();
+std::atomic<u64> g_cp_busy_ns{0};  // bb-cp0's jobs' time (one writer)
+std::atomic<u64> g_rests{0}, g_rested_ns{0};  // the rests begun, and their time (ended ones)
+
 // ---- the answers -----------------------------------------------------------
 // One record per token slot (the slot ring's size and index).
 constexpr u64 kLookSlots = 16384;
@@ -241,7 +256,9 @@ void pool_main_loop(int index) {
                 g_sleepers.fetch_add(1, std::memory_order_seq_cst);
                 if (g_feed_next.load(std::memory_order_seq_cst) >= g_feed_pos.load(std::memory_order_seq_cst) &&
                     !g_stop.load(std::memory_order_acquire))
-                    g_park_cv.wait_for(lk, segments() ? std::chrono::microseconds(500) : std::chrono::microseconds(2000));
+                    g_park_cv.wait_for(lk, resting()   ? std::chrono::microseconds(100000)  // (nothing is fed meanwhile)
+                                           : segments() ? std::chrono::microseconds(500)
+                                                        : std::chrono::microseconds(2000));
                 g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
                 idle = 0;
                 if (p0) {
@@ -467,6 +484,11 @@ void report_line(bool at_exit) {
                 host_log("gxvk-lists (%s): %s%s", what, host_gpu_lists_times_report(part, g_parked_ticks.get(), g_parks.get()).c_str(),
                          part == 1 ? hw_line().c_str() : "");
         }
+        if (g_rest_on && (g_rests.load(std::memory_order_relaxed) || at_exit)) {
+            const u64 rests = g_rests.load(std::memory_order_relaxed);
+            host_log("gxvk-lists (%s): the pool rested %llu times at a frame cap, %.1f s in the ended ones%s", what, static_cast<ull>(rests),
+                     static_cast<double>(g_rested_ns.load(std::memory_order_relaxed)) / 1e9, resting() ? "; resting now" : "");
+        }
         return;
     }
     host_log("gxvk-lists (%s): the pool looked at %llu draws, %.2f us a draw (fed %llu; the command processor first %llu; feed lapped "
@@ -553,8 +575,70 @@ void keep_off_pool_cpus() {
 #endif
 }
 
+std::atomic<bool> g_resting{false};
+
+void cp_busy(std::uint64_t ns) { g_cp_busy_ns.store(g_cp_busy_ns.load(std::memory_order_relaxed) + ns, std::memory_order_relaxed); }
+
+void frame_paced(std::uint64_t wait_ns, float cap_fps) {
+    if (!g_rest_on || !pool_mode()) return;
+    if (g_rest_cycle) {
+        static u64 n = 0;
+        const bool rest = (n++ / g_rest_cycle) & 1;
+        if (rest != resting()) {
+            g_resting.store(rest, std::memory_order_relaxed);
+            if (rest) g_rests.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    // The main thread's alone: windows of half a second (or 120 frames), each decided by host/gxvk_rest.h.
+    static u64 last = 0, win_ns = 0, win_wait = 0, frames = 0, cp_at = 0;
+    static gxvk_rest::State state;
+    static int logs = 0;
+    const u64 now = host_clock_monotonic_ns();
+    if (!last) {
+        last = now;
+        cp_at = g_cp_busy_ns.load(std::memory_order_relaxed);
+        return;
+    }
+    win_ns += now - last;
+    last = now;
+    win_wait += wait_ns;
+    ++frames;
+    if (win_ns < 500'000'000ull && frames < 120) return;
+    gxvk_rest::Window w;
+    w.slack = static_cast<double>(win_wait) / static_cast<double>(win_ns);
+    const u64 cp_now = g_cp_busy_ns.load(std::memory_order_relaxed);
+    w.cp = static_cast<double>(cp_now - cp_at) / static_cast<double>(win_ns);
+    w.cap_fps = cap_fps;
+    const double fps = static_cast<double>(frames) * 1e9 / static_cast<double>(win_ns);
+    cp_at = cp_now;
+    win_ns = win_wait = frames = 0;
+    const u64 rest_at = state.rest_at;
+    switch (gxvk_rest::step(state, w, now)) {
+    case gxvk_rest::kRest:
+        g_resting.store(true, std::memory_order_relaxed);
+        g_rests.fetch_add(1, std::memory_order_relaxed);
+        if (logs++ < 16)
+            host_log("gxvk-lists: the pool rests - the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f), the command "
+                     "processor busy %.0f%%: its draws are drawn in order (BBHOST_GXVK_LISTS_REST=0: never)",
+                     100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp);
+        break;
+    case gxvk_rest::kWake:
+        g_resting.store(false, std::memory_order_relaxed);
+        g_rested_ns.fetch_add(now - rest_at, std::memory_order_relaxed);
+        if (logs++ < 16)
+            host_log("gxvk-lists: the pool works again after %.1f s - the frame waits %.0f%% of its time (%.0f fps, cap %.0f), the command "
+                     "processor busy %.0f%%; the next rest no sooner than %.0f s on",
+                     static_cast<double>(now - rest_at) / 1e9, 100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp,
+                     static_cast<double>(state.backoff_ns) / 1e9);
+        break;
+    case gxvk_rest::kStay: break;
+    }
+}
+
 void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
+    if (resting()) return;  // nothing fed, no list record: the command processor draws it in order (counted there)
     if (g_times) {
         detail::DrawTime& t = detail::g_draw_times[id & (detail::kTimeSlots - 1)];
         t.id.store(id, std::memory_order_relaxed);

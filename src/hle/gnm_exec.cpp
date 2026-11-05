@@ -3238,6 +3238,7 @@ void cp_thread(Queue* q, int id) {
             q->jobs.pop_front();
         }
         ++taken;
+        const std::uint64_t job_t0 = id == 0 && gxvk_lists::pool() ? host_clock_monotonic_ns() : 0;  // (the draw pool's rest: host/gxvk_lists.h)
         if (idle_log && id == 0) {
             const std::uint64_t now = host_clock_monotonic_ns();
             if (now - idle_since >= 10'000'000'000ull) {
@@ -3357,6 +3358,7 @@ void cp_thread(Queue* q, int id) {
         }
         q->cv.notify_all();
         q->drained.notify_all();
+        if (job_t0) gxvk_lists::cp_busy(host_clock_monotonic_ns() - job_t0);
     }
 }
 

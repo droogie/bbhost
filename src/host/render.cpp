@@ -25763,13 +25763,15 @@ enum SpliceWhy : int {
     kSwOther,         // windows given, a run commit or a diagnostic at the walk
     kSwCompare,       // splice-compare: drawn in order by design
     kSwSegment,       // stage 4b.2: a segment's builder holds it (its segment not spliced here)
+    kSwRested,        // stored while the pool rested at a frame cap (gxvk_lists::resting): never fed
     kSpliceWhys
 };
 const char* const kSpliceWhyName[kSpliceWhys] = {"not committed", "not committed yet", "a run's first draw", "a split since its run's first",
                                                  "its run's targets remade or owed work", "other target objects",
                                                  "another pass",  "too old",           "a hazard",           "an owed clear",
                                                  "a view",        "a set",             "a home",             "its copies' segment",
-                                                 "occlusion",     "other",             "compare",           "held by a segment"};
+                                                 "occlusion",     "other",             "compare",           "held by a segment",
+                                                 "the pool resting"};
 
 struct Segment;
 struct ListCommit {
@@ -26257,7 +26259,7 @@ bool host_gpu_splice(std::uint64_t id) {
     const std::uint64_t cw = c.word.load(std::memory_order_acquire);
     const std::uint32_t st = lc_state(cw);
     if (lc_id(cw) != id || st == kLcCommitting || st == kLcFree) {
-        g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
+        g_sp_why[lc_id(cw) != id && gxvk_lists::resting() ? kSwRested : kSwPending].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     if (st == kLcBuilding || st == kLcSegment) {
