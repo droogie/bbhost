@@ -25025,13 +25025,25 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         const bool writes_scene = scene_base && s.color[0] && s.color[0]->base == scene_base;
-        if (writes_scene && s.color[1] && s.color[1]->format == VK_FORMAT_R16G16B16A16_SFLOAT && s.color[1]->width == s.color[0]->width &&
-            s.color[1]->height == s.color[0]->height && s.color[1]->base != u.glow) {
+        // (Its format is the game's own choice: RGBA16F in BBsuite's stream, the
+        // scene's B10G11R11 under the performance patch - any float target of
+        // the scene's size.)
+        if (writes_scene && s.color[1] && s.color[1]->width == s.color[0]->width && s.color[1]->height == s.color[0]->height &&
+            (s.color[1]->format == VK_FORMAT_R16G16B16A16_SFLOAT || s.color[1]->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+             s.color[1]->format == VK_FORMAT_R32G32B32A32_SFLOAT) &&
+            s.color[1]->base != u.glow) {
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 4)
-                host_log("upscaler: the glow is 0x%llx (pipeline %s, the scene's second target)", static_cast<unsigned long long>(s.color[1]->base),
-                         pl.name.c_str());
+                host_log("upscaler: the glow is 0x%llx (pipeline %s, the scene's second target, format %d)",
+                         static_cast<unsigned long long>(s.color[1]->base), pl.name.c_str(), static_cast<int>(s.color[1]->format));
             u.glow = s.color[1]->base;
+        }
+        if (writes_scene && (s.color[1] || s.color[2])) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 6)
+                host_log("upscaler: a draw writes the scene with more targets (pipeline %s): 1 %s fmt %d %ux%u, 2 %s fmt %d", pl.name.c_str(),
+                         s.color[1] ? "yes" : "no", s.color[1] ? static_cast<int>(s.color[1]->format) : 0, s.color[1] ? s.color[1]->width : 0,
+                         s.color[1] ? s.color[1]->height : 0, s.color[2] ? "yes" : "no", s.color[2] ? static_cast<int>(s.color[2]->format) : 0);
         }
         if (writes_scene && s.depth) {
             depth_base = s.depth->base;
