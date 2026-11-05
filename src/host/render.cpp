@@ -4054,6 +4054,18 @@ TableMaskWorkers& table_mask_workers() {
                     }
                     std::uint32_t mask = ~0u, any = ~0u;
                     table_slots_read(*job.meta, mask, &any);
+                    // BBHOST_TABLE_MASK_LOG=1: each answer by its module's hash, for comparing builds and platforms.
+                    static const bool mask_log = [] {
+                        const char* e = std::getenv("BBHOST_TABLE_MASK_LOG");
+                        return e && e[0] == '1';
+                    }();
+                    if (mask_log) {
+                        const std::vector<std::uint32_t>& sv = job.meta->spirv;
+                        host_log("render: table read mask: module %016llx (%zu words, %zu buffers), stage %d: tables 0x%08x, user data 0x%08x; "
+                                 "pipeline %s",
+                                 static_cast<unsigned long long>(fnv1a(sv.data(), sv.size() * 4)), sv.size(), job.meta->buffers.size(),
+                                 job.stage, mask, any, job.pipeline->name.c_str());
+                    }
                     std::lock_guard<std::mutex> lk(w->mu);
                     w->results.push_back({job.pipeline, job.stage, mask, any});
                     g_table_masks_ready.store(true, std::memory_order_relaxed);
