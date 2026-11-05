@@ -1778,7 +1778,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &pick, labels, et.index == kEffectTimingCount ? 4 : 3, tips);
         if (pick != shown && pick < kEffectTimingCount) change(id, pick);
-    } else if (id == kFrameCap || id == kResolution) {
+    } else if (id == kFrameCap || id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
     } else if (n <= 4) {
