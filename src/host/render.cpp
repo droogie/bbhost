@@ -24213,6 +24213,64 @@ static bool draw_impl(const GpuDraw& d) {
                 cb_snapshot_forget(changed);
         }
         if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
+        // BBHOST_ONEPASS_TRACE=1 (a test): a triangle GS's own user data and the
+        // first face's matrix it reads through s[4:7].
+        static const bool gs_trace = [] {
+            const char* e = std::getenv("BBHOST_ONEPASS_TRACE");
+            return e && e[0] == '1';
+        }();
+        if (gs_trace && st == 0 && s.gs && s.prim != 1) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1, std::memory_order_relaxed) < 6) {
+                const std::uint32_t* u = params.user_sgpr;
+                const std::uint64_t base = static_cast<std::uint64_t>(u[4]) | (static_cast<std::uint64_t>(u[5] & 0xfff) << 32);
+                float m[16] = {};
+                const bool mapped = base && hle_kernel_va_mapped(base, sizeof(m));
+                if (mapped) std::memcpy(m, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), sizeof(m));
+                host_log("onepass trace: %s GS user data %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x; "
+                         "s[4:7] base 0x%llx (%s): %g %g %g %g / %g %g %g %g / %g %g %g %g / %g %g %g %g",
+                         pl.name.c_str(), u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
+                         static_cast<unsigned long long>(base), mapped ? "mapped" : "not mapped", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                         m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+                if (mapped && hle_kernel_va_mapped(base, 6 * 64)) {
+                    float f6[6 * 16];
+                    std::memcpy(f6, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), sizeof(f6));
+                    host_log("onepass trace: faces' first rows: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g",
+                             f6[0], f6[1], f6[2], f6[3], f6[16], f6[17], f6[18], f6[19], f6[32], f6[33], f6[34], f6[35], f6[48], f6[49], f6[50],
+                             f6[51], f6[64], f6[65], f6[66], f6[67], f6[80], f6[81], f6[82], f6[83]);
+                }
+                if (gx_stage[0]) {
+                    char line[600];
+                    int len = std::snprintf(line, sizeof(line), "onepass trace: GS records: %u descriptors:", gx_stage[0]->ndesc);
+                    for (std::uint32_t i = 0; i < gx_stage[0]->ndesc && i < 24 && len < static_cast<int>(sizeof(line)) - 16; ++i)
+                        len += std::snprintf(line + len, sizeof(line) - static_cast<std::size_t>(len), " %08x", gx_stage[0]->desc[i]);
+                    GxUserData gu;
+                    const int built = build_gx_user_data(*gx_stage[0], gu, ~0u);
+                    host_log("%s; built %d, set %04x; this draw: named %04x, skipped %d, partial %d, table mask %08x, read mask %08x", line,
+                             built, gu.set, stage_named[0], user_skipped[0] ? 1 : 0, user_partial[0] ? 1 : 0, table_masks[0], read_masks[0]);
+                    // GX's pending state: each D3D stage's constant-buffer slots (+0x598 + 0x4f8 * stage, the CBs [14] at +0x480).
+                    if (d.gx_objects && d.gx_objects->state) {
+                        for (int stg = 0; stg < 6; ++stg) {
+                            const std::uint64_t cbs = d.gx_objects->state + 0x598 + 0x4f8ull * static_cast<std::uint64_t>(stg) + 0x480;
+                            std::uint64_t ptr[14] = {};
+                            if (!hle_kernel_va_mapped(cbs, sizeof(ptr))) continue;
+                            std::memcpy(ptr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cbs)), sizeof(ptr));
+                            char cl[400];
+                            int cn = std::snprintf(cl, sizeof(cl), "onepass trace:   stage %d CB slots:", stg);
+                            for (int k = 0; k < 14; ++k) {
+                                if (!ptr[k]) continue;
+                                std::uint64_t home = 0;
+                                if (hle_kernel_va_mapped(ptr[k] + 0x20, 8)) std::memcpy(&home, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ptr[k] + 0x20)), 8);
+                                cn += std::snprintf(cl + cn, sizeof(cl) - static_cast<std::size_t>(cn), " [%d] obj %llx home %llx", k,
+                                                    static_cast<unsigned long long>(ptr[k]), static_cast<unsigned long long>(home));
+                                if (cn > static_cast<int>(sizeof(cl)) - 48) break;
+                            }
+                            host_log("%s", cl);
+                        }
+                    }
+                }
+            }
+        }
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate || camera || velo ? gate_bases : nullptr);
         if (camera) {
@@ -24628,6 +24686,30 @@ static bool draw_impl(const GpuDraw& d) {
         ep.l1_table = g.l1.address;
         for (int k = 0; k < 16; ++k) ep.user_sgpr[k] = (eu.set >> k) & 1 ? eu.user[k] : in.vs_user[k];
         std::memcpy(s.es_user, ep.user_sgpr, sizeof(s.es_user));
+        // BBHOST_ONEPASS_TRACE=1 (a test): a triangle GS's ES's user data - which
+        // slots its GX records set, which came from the VS slot's registers.
+        static const bool op_trace = [] {
+            const char* e = std::getenv("BBHOST_ONEPASS_TRACE");
+            return e && e[0] == '1';
+        }();
+        if (op_trace && s.prim != 1) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1, std::memory_order_relaxed) < 6) {
+                char line[700];
+                int len = std::snprintf(line, sizeof(line), "onepass trace: %s ES user data (records set %04x):", pl.name.c_str(), eu.set);
+                for (int k = 0; k < 16 && len < static_cast<int>(sizeof(line)) - 24; ++k)
+                    len += std::snprintf(line + len, sizeof(line) - static_cast<std::size_t>(len), " %s%08x", (eu.set >> k) & 1 ? "" : "*",
+                                         ep.user_sgpr[k]);
+                host_log("%s (* = the VS slot's register)", line);
+                if (es_rec) {
+                    char dl[400];
+                    int dn = std::snprintf(dl, sizeof(dl), "onepass trace: ES records: %u descriptors:", es_rec->ndesc);
+                    for (std::uint32_t i = 0; i < es_rec->ndesc && i < 24 && dn < static_cast<int>(sizeof(dl)) - 16; ++i)
+                        dn += std::snprintf(dl + dn, sizeof(dl) - static_cast<std::size_t>(dn), " %08x", es_rec->desc[i]);
+                    host_log("%s", dl);
+                }
+            }
+        }
         const std::size_t es_first = buffer_infos.size();
         resolve_stage_buffers(em, ep.user_sgpr, ep, buffer_infos, nullptr, false, &particle_capacity);
         if (!every_buffer_bound(ep, em)) return gs_refuse("a constant buffer of its ES does not bind");
