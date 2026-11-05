@@ -434,6 +434,9 @@ bool occlusion_draw_entry() {
 
 void occlusion_draw_locked(DrawCall& call) {
     if (!g_on) return;
+    // Stage 4b.1b's list mode: no predicate and no query - its splice is made
+    // only where a draw takes neither (occlusion_draw_plain), as issued there.
+    if (t_run_draw && t_run_draw->list) return;
     switch (g_pred_mode.load(std::memory_order_relaxed)) {
         case kPredGpu:
             call.cond_buffer = g_preds.buffer;

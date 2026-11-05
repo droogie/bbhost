@@ -187,10 +187,13 @@ Setting g_set[kSettingCount] = {
     // Frame cap's, so a file keeps its 30 or 60; a file older than version 3
     // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
     // 60, and reads as 60 (host_options_load).
+    // Read once as the game starts (engine/frame_rate.cpp), and with it the
+    // default for the draw work the pool prepares (host/gxvk_homes.h
+    // default_off): a restart setting.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
-     "30 is the game's own pace; the others run its logic at that rate. Display-Limited caps it at your monitor's refresh "
-     "rate when the game starts (180 on a 180 Hz monitor) and runs it the same way. Applies on the next run.",
-     false},
+     "Requires a restart. 30 is the game's own pace; the others run its logic at that rate. Display-Limited caps it at your "
+     "monitor's refresh rate when the game starts (180 on a 180 Hz monitor) and runs it the same way.",
+     true},
     // The frame clock (engine/frame_clock.h), experimental and off by default:
     // what the frame rate otherwise sets once for the rate chosen at start
     // follows each frame's own length. Read once as the game starts

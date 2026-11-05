@@ -45,6 +45,7 @@
 // to bb-submit (R4).
 
 #include "host/gpu_internal.h"
+#include "host/gxvk_lists.h"
 #include "host/list_resolve.h"
 #include "host/stream_ops.h"
 
@@ -58,6 +59,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -77,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers"};
+                                        "push buffers",   "list draw",    "execute commands", "list run"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -264,6 +266,16 @@ enum Mode : int { kModeOff, kModeInline, kModeThread };
 Block* g_blocks = nullptr;
 Block g_inline_block;  // kModeInline: replayed as it is published
 DrawPacket* g_packets = nullptr;
+// Stage 4b.1b: the packets the pool's threads commit ahead (render.cpp
+// lists_commit), one a token slot (the same index), spliced into the stream
+// as kListDraw ops. The token's id each was last spliced for, and replayed
+// for: a pool thread reuses one only once the recorder has replayed what was
+// spliced (recorder_list_packet_free).
+constexpr std::uint64_t kListPackets = 16384;
+DrawPacket* g_list_packets = nullptr;
+std::atomic<std::uint64_t>* g_list_spliced = nullptr;
+std::atomic<std::uint64_t>* g_list_replayed = nullptr;
+std::once_flag g_list_made;
 // Each counter on a cache line of its own: the producer writes g_published
 // at every draw and the recorder g_done and g_pk_done after every block, and
 // sharing a line with them made every publish a miss across the cores (two
@@ -299,6 +311,7 @@ alignas(64) std::uint64_t g_pk_taken = 0;               // packets taken (under 
 std::uint64_t g_done_seen = 0, g_pk_done_seen = 0;      // the producer's last reads of g_done and g_pk_done
 bool g_block_open = false;                  // the block at g_published is being appended to (under g.mu)
 bool g_inplace_dirty = false;               // recorded in place since the last publish (R3)
+std::uint64_t g_appends = 0, g_inplace_seq = 0;  // ops appended, in-place sections (under g.mu): stage 4b.1b's chained splices
 DrawCmds* g_open = nullptr;  // under g.mu
 bool g_thread_started = false;
 
@@ -375,7 +388,23 @@ const int g_recorder_spin = [] {
     return std::thread::hardware_concurrency() >= 16 ? 20000 : 4000;
 }();
 
-void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
+// Stage 4b.1b: a list packet spliced right after another (`prev`, the op
+// before it, nothing recorded in place between) leaves out what that one bound
+// already - each list packet binds everything, its commit not knowing what the
+// draws before it bound - as the command processor's own packets leave it out
+// (RecordedState): the pipeline, and with it unchanged its library and dynamic
+// state, the sets with their offsets, the indices and the vertex buffers.
+std::atomic<std::uint64_t> g_list_binds_skipped{0}, g_list_chained{0};
+// Stage 4b.2: a segment's list packets replayed into a pool thread's secondary
+// command buffer - `dyn` and `prev_dyn` the dynamic offsets of this packet and
+// the one before, its params blocks' places in the pool's region (the packets
+// keep their block indices: one that falls back is spliced as before). Nothing
+// in the packet is written: it may be replayed again.
+void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev = nullptr, const std::uint32_t* dyn = nullptr,
+                   const std::uint32_t* prev_dyn = nullptr);
+void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev, const std::uint32_t* dyn, const std::uint32_t* prev_dyn) {
+    const std::uint32_t* const p_dyn = dyn ? dyn : p.dynamic;
+    const std::uint32_t* const q_dyn = prev ? (prev_dyn ? prev_dyn : prev->dynamic) : nullptr;
     if (!p.taken_writes.empty()) {
         vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(p.taken_writes.size()), p.taken_writes.data(), 0, nullptr);
     }
@@ -405,11 +434,29 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         p.rendering.pStencilAttachment = p.has_stencil ? &p.stencil_att : nullptr;
         vkCmdBeginRendering(cmd, &p.rendering);
     }
-    if (p.pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-    if (p.pipeline && p.raster_discard) vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
-    if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
-    if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
-    if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
+    // (A packet with a pass change, copies or a transfer is never chained: its own work comes between.)
+    const bool same_pl = prev && p.pipeline && prev->pipeline == p.pipeline && prev->raster_discard == p.raster_discard && !p.end_pass &&
+                         !p.begin_pass && !p.xfer_begin && !p.ncopies && !p.nregions;
+    std::uint32_t skipped = 0;
+    if (p.pipeline && !same_pl) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    else if (p.pipeline) ++skipped;
+    if (p.pipeline && p.raster_discard && !same_pl) vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
+    if (p.library) {
+        if (same_pl && prev->library && prev->has_depth_bounds == p.has_depth_bounds && std::memcmp(&prev->lib, &p.lib, sizeof(p.lib)) == 0) ++skipped;
+        else record_library_state(cmd, p.lib, p.has_depth_bounds);
+    }
+    bool bind_sets = p.bind_sets;
+    if (bind_sets) {
+        // (prev's sets as it bound them: one that left its own out had them bound already, the same.)
+        if (same_pl && prev->bind_sets && prev->layout == p.layout && prev->bindless == p.bindless && prev->sets[0] == p.sets[0] &&
+            prev->sets[1] == p.sets[1] && prev->dynamic_count == p.dynamic_count && q_dyn[0] == p_dyn[0] &&
+            q_dyn[1] == p_dyn[1] && !p.stage_set_bound && !prev->stage_set_bound) {
+            ++skipped;
+            bind_sets = false;  // (the bindless set with them, below)
+        }
+    }
+    if (bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p_dyn);
+    if (bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
     if (p.stage_set_bound) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.stage_set_layout, p.stage_set_index, 1, &p.stage_set,
                                 p.stage_set_dynamic_count, p.stage_set_dynamic);
@@ -425,13 +472,33 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         }
         g.cmd_push_descriptor_set(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 2, p.pushes, writes);
     }
-    if (p.viewport) vkCmdSetViewport(cmd, 0, 1, &p.vp);
-    if (p.scissor) vkCmdSetScissor(cmd, 0, 1, &p.sc);
-    if (p.bounds) vkCmdSetDepthBounds(cmd, p.depth_bounds[0], p.depth_bounds[1]);
-    if (p.stencil) record_stencil_words(cmd, p.stencil_words);
-    if (p.blend) vkCmdSetBlendConstants(cmd, p.blend_const);
-    if (p.index) vkCmdBindIndexBuffer(cmd, p.index_buffer, p.index_offset, p.index_type);
-    if (p.vertex_buffers) vkCmdBindVertexBuffers(cmd, 0, p.vertex_buffers, p.vb, p.vb_offset);
+    const auto same_dyn = [&](bool mine, bool theirs, const void* a, const void* b, std::size_t n) {
+        const bool same = same_pl && mine && theirs && std::memcmp(a, b, n) == 0;
+        if (same) ++skipped;
+        return same;
+    };
+    if (p.viewport && !same_dyn(p.viewport, prev && prev->viewport, &p.vp, prev ? &prev->vp : nullptr, sizeof(p.vp))) vkCmdSetViewport(cmd, 0, 1, &p.vp);
+    if (p.scissor && !same_dyn(p.scissor, prev && prev->scissor, &p.sc, prev ? &prev->sc : nullptr, sizeof(p.sc))) vkCmdSetScissor(cmd, 0, 1, &p.sc);
+    if (p.bounds && !same_dyn(p.bounds, prev && prev->bounds, p.depth_bounds, prev ? prev->depth_bounds : nullptr, sizeof(p.depth_bounds)))
+        vkCmdSetDepthBounds(cmd, p.depth_bounds[0], p.depth_bounds[1]);
+    if (p.stencil && !same_dyn(p.stencil, prev && prev->stencil, p.stencil_words, prev ? prev->stencil_words : nullptr, sizeof(p.stencil_words)))
+        record_stencil_words(cmd, p.stencil_words);
+    if (p.blend && !same_dyn(p.blend, prev && prev->blend, p.blend_const, prev ? prev->blend_const : nullptr, sizeof(p.blend_const)))
+        vkCmdSetBlendConstants(cmd, p.blend_const);
+    // The indices and the vertex buffers are the command buffer's whatever the pipeline.
+    const bool same_ib = prev && p.index && prev->index && prev->index_buffer == p.index_buffer && prev->index_offset == p.index_offset &&
+                         prev->index_type == p.index_type;
+    if (p.index && !same_ib) vkCmdBindIndexBuffer(cmd, p.index_buffer, p.index_offset, p.index_type);
+    else if (p.index) ++skipped;
+    const bool same_vb = prev && p.vertex_buffers && prev->vertex_buffers == p.vertex_buffers &&
+                         std::memcmp(prev->vb, p.vb, sizeof(VkBuffer) * p.vertex_buffers) == 0 &&
+                         std::memcmp(prev->vb_offset, p.vb_offset, sizeof(VkDeviceSize) * p.vertex_buffers) == 0;
+    if (p.vertex_buffers && !same_vb) vkCmdBindVertexBuffers(cmd, 0, p.vertex_buffers, p.vb, p.vb_offset);
+    else if (p.vertex_buffers) ++skipped;
+    if (prev) {
+        g_list_chained.fetch_add(1, std::memory_order_relaxed);
+        if (skipped) g_list_binds_skipped.fetch_add(skipped, std::memory_order_relaxed);
+    }
     if (p.marker) gpu_write_markers(cmd, p.marker_value);
     if (p.draw) record_draw_call(cmd, p.call);
 }
@@ -461,6 +528,10 @@ void push_buffer_writes(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkP
     g.cmd_push_descriptor_set(cmd, bind_point, layout, set, n, writes);
 }
 
+// The list packet the recorder replayed last, while nothing else has been
+// replayed after it (stage 4b.1b's chained splices; the recorder's thread).
+thread_local const DrawPacket* t_list_prev = nullptr;
+thread_local bool t_list_prev_kept = false;
 void replay_block(const Block& b) {
     const VkCommandBuffer cmd = b.cmd;
     std::size_t at = 0;
@@ -468,6 +539,12 @@ void replay_block(const Block& b) {
         const auto* h = reinterpret_cast<const stream::Header*>(&b.words[at]);
         const std::uint8_t* p = reinterpret_cast<const std::uint8_t*>(h + 1);
         g_last_kind.store(static_cast<std::uint32_t>(h->kind), std::memory_order_relaxed);
+        t_list_prev_kept = false;
+        struct ListPrevEnd {
+            ~ListPrevEnd() {
+                if (!t_list_prev_kept) t_list_prev = nullptr;
+            }
+        } list_prev_end;
         switch (h->kind) {
         case Op::kBegin: {
             const auto* r = reinterpret_cast<const stream::Begin*>(p);
@@ -501,6 +578,35 @@ void replay_block(const Block& b) {
             const auto* r = reinterpret_cast<const stream::DrawState*>(p);
             replay_packet(g_packets[r->packet % kPackets], cmd);
             g_pk_done.store(r->packet + 1, std::memory_order_release);
+            break;
+        }
+        case Op::kListDraw: {
+            const auto* r = reinterpret_cast<const stream::ListDraw*>(p);
+            const DrawPacket* const prev = r->chained && t_list_prev ? t_list_prev : nullptr;
+            replay_packet(g_list_packets[r->index], cmd, prev);
+            g_list_replayed[r->index].store(r->id, std::memory_order_release);
+            t_list_prev = &g_list_packets[r->index];
+            t_list_prev_kept = true;
+            break;
+        }
+        case Op::kExecuteCommands: {
+            const auto* r = reinterpret_cast<const stream::ExecuteCommands*>(p);
+            vkCmdExecuteCommands(cmd, 1, &r->cmd);
+            break;
+        }
+        case Op::kListRun: {
+            const auto* r = reinterpret_cast<const stream::ListRun*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            const auto* d = tail<stream::ListRunDraw>(q, r->n);
+            const DrawPacket* prev = nullptr;
+            const std::uint32_t* prev_dyn = nullptr;
+            for (std::uint32_t k = 0; k < r->n; ++k) {
+                DrawPacket& pk = g_list_packets[d[k].index % kListPackets];
+                replay_packet(pk, cmd, prev, d[k].dyn, prev_dyn);
+                g_list_replayed[d[k].index % kListPackets].store(d[k].id, std::memory_order_release);
+                prev = &pk;
+                prev_dyn = d[k].dyn;
+            }
             break;
         }
         case Op::kBarrier: {
@@ -675,6 +781,7 @@ void recorder_thread() {
     const int spin = g_recorder_spin;
     std::uint64_t done = g_done.load(std::memory_order_acquire);
     for (;;) {
+        if (gxvk_lists::splice()) gxvk_lists::keep_off_pool_cpus();  // (once the pool has its cores)
         std::uint64_t published = g_published.load(std::memory_order_acquire);
         if (published == done) {
             // Draws come in bursts a few microseconds apart: spin through
@@ -839,6 +946,7 @@ std::uint8_t* append_record(Op kind, std::size_t payload) {
     b.used += words;
     ++b.ops;
     ++g_counts.ops[static_cast<std::size_t>(kind)];
+    ++g_appends;
     return reinterpret_cast<std::uint8_t*>(h + 1);
 }
 
@@ -872,6 +980,7 @@ VkCommandBuffer in_place(void* site) {
         recorder_drain();
         if (g_mode == kModeThread) g_inplace_dirty = true;
     }
+    ++g_inplace_seq;
     return g.cmd_;
 }
 
@@ -914,6 +1023,137 @@ void recorder_append_packet(std::uint64_t number) {
 }
 
 void recorder_publish_appended() { publish_block(false); }
+
+// ---- Stage 4b.1b: the pool's list packets (render.cpp lists_commit / host_gpu_splice) ----
+
+void list_packets_make() {
+    std::call_once(g_list_made, [] {
+        g_list_packets = new DrawPacket[kListPackets];
+        g_list_spliced = new std::atomic<std::uint64_t>[kListPackets];
+        g_list_replayed = new std::atomic<std::uint64_t>[kListPackets];
+        for (std::uint64_t k = 0; k < kListPackets; ++k) {
+            g_list_spliced[k].store(0, std::memory_order_relaxed);
+            g_list_replayed[k].store(0, std::memory_order_relaxed);
+        }
+    });
+}
+
+std::string recorder_list_report() {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "list packets replayed after another %llu, binds left out %llu",
+                  static_cast<unsigned long long>(g_list_chained.load()), static_cast<unsigned long long>(g_list_binds_skipped.load()));
+    return buf;
+}
+
+void* recorder_list_packet(std::uint64_t index) {
+    list_packets_make();
+    return &g_list_packets[index % kListPackets];
+}
+
+bool recorder_list_packet_free(std::uint64_t index) {
+    list_packets_make();
+    const std::uint64_t k = index % kListPackets;
+    const std::uint64_t spliced = g_list_spliced[k].load(std::memory_order_acquire);
+    return !spliced || g_list_replayed[k].load(std::memory_order_acquire) == spliced;
+}
+
+void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams) {
+    const std::uint64_t k = index % kListPackets;
+    DrawPacket& p = g_list_packets[k];
+    // Its params blocks' offsets: the commit put each block's index in the
+    // set binding's dynamic offsets (gpu.cpp alloc_params_slot_locked).
+    for (std::uint32_t i = 0; i < p.dynamic_count && i < 2; ++i) {
+        if (p.dynamic[i] < nparams) p.dynamic[i] = params_offsets[p.dynamic[i]];
+    }
+    if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
+    g_list_spliced[k].store(id, std::memory_order_release);
+    // Chained: the op before it is the list packet spliced just before, nothing recorded in place since.
+    static std::uint64_t last_appends = ~0ull, last_inplace = ~0ull;  // (under g.mu)
+    const bool chained = g_appends == last_appends && g_inplace_seq == last_inplace;
+    std::uint8_t* at = append_record(Op::kListDraw, sizeof(stream::ListDraw));
+    auto* r = put_struct<stream::ListDraw>(at);
+    r->index = k;
+    r->id = id;
+    r->chained = chained ? 1 : 0;
+    last_appends = g_appends;
+    last_inplace = g_inplace_seq;
+    after_op();
+    // Handed over every eighth splice in a row (an op recorded in order after
+    // them hands them over with its own): one publish - and at most one wake of
+    // a sleeping recorder - for a run of them, not one each.
+    static std::uint32_t since = 0;  // (under g.mu)
+    if (++since >= 8) {
+        since = 0;
+        publish_block(false);
+    }
+}
+
+// ---- Stage 4b.2: segments (render.cpp lists_segment / host_gpu_splice_segment) ----
+
+// Whether list packet `index` holds a draw a segment's secondary can take as it
+// is: nothing a pass or the stream around it must do - no descriptor writes, no
+// pass change, no transfer or copies, no markers - and its draw.
+bool recorder_list_packet_plain(std::uint64_t index) {
+    list_packets_make();
+    const DrawPacket& p = g_list_packets[index % kListPackets];
+    return p.draw && p.taken_writes.empty() && p.writes.empty() && !p.end_pass && !p.begin_pass && !p.pass_barrier && !p.xfer_begin &&
+           !p.xfer_end && !p.ncopies && !p.nregions && !p.marker && p.dynamic_count <= 2;
+}
+
+// The dynamic offsets list packet `index` binds its sets with: its params
+// blocks' indices (0, 1) where it binds them (recorder_splice_list_packet's
+// patch, here into `out` for a secondary's own blocks).
+std::uint32_t recorder_list_packet_dynamic(std::uint64_t index, std::uint32_t (&out)[2]) {
+    const DrawPacket& p = g_list_packets[index % kListPackets];
+    out[0] = p.dynamic[0];
+    out[1] = p.dynamic[1];
+    return p.dynamic_count;
+}
+
+// A pool thread: a segment's list packet `index` replayed into its secondary
+// command buffer `cmd` (begun for the pass) with dynamic offsets `dyn`, chained
+// to the one replayed before it (`prev`, ~0: none, with its offsets). The
+// packets are not written.
+void recorder_record_segment_draw(VkCommandBuffer cmd, std::uint64_t index, const std::uint32_t* dyn, std::uint64_t prev,
+                                  const std::uint32_t* prev_dyn) {
+    list_packets_make();
+    DrawPacket& p = g_list_packets[index % kListPackets];
+    replay_packet(p, cmd, prev == ~0ull ? nullptr : &g_list_packets[prev % kListPackets], dyn, prev_dyn);
+}
+
+// The command processor: a segment's secondary command buffer executed here,
+// in the pass open (its contents allow it: host_gpu_splice_segment). Handed
+// over at once: bb-record executes it while the walk goes on.
+void recorder_splice_segment(VkCommandBuffer secondary) {
+    if (g_open) g_open->publish();  // one left open goes first, as at a draw's start
+    std::uint8_t* at = append_record(Op::kExecuteCommands, sizeof(stream::ExecuteCommands));
+    put_struct<stream::ExecuteCommands>(at)->cmd = secondary;
+    after_op();
+    publish_block(false);
+}
+
+// The command processor: a segment's list packets replayed here inline, chained
+// (the default; BBHOST_GXVK_SEGMENTS_REPLAY=secondary executes secondaries
+// instead) - `n` of them, packet indices[k] spliced for token ids[k] with
+// dynamic offsets dyn[k]. Each packet is held from the pool until the recorder
+// has replayed it (recorder_list_packet_free).
+void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t* ids, const std::uint32_t (*dyn)[2], std::uint32_t n) {
+    if (g_open) g_open->publish();
+    for (std::uint32_t k = 0; k < n; ++k) g_list_spliced[indices[k] % kListPackets].store(ids[k], std::memory_order_release);
+    std::uint8_t* at = append_record(Op::kListRun, round8(sizeof(stream::ListRun)) + round8(n * sizeof(stream::ListRunDraw)));
+    stream::ListRun* r = put_struct<stream::ListRun>(at);
+    r->n = n;
+    r->pad = 0;
+    auto* d = reinterpret_cast<stream::ListRunDraw*>(at);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        d[k].index = indices[k] % kListPackets;
+        d[k].id = ids[k];
+        d[k].dyn[0] = dyn[k][0];
+        d[k].dyn[1] = dyn[k][1];
+    }
+    after_op();
+    publish_block(false);
+}
 
 void recorder_drain() {
     if (g_mode != kModeThread || !g_blocks) return;
@@ -1432,6 +1672,7 @@ std::string host_gpu_recorder_report() {
     std::string r = gpu::recorder_report();
     if (gpu::set_cache_on()) r += "; " + gpu::set_cache_report();
     if (const std::string cv = gpu::copy_versions_report(); !cv.empty()) r += "; " + cv;
+    if (const std::string hc = gpu::home_copies_report(); !hc.empty()) host_log("  %s", hc.c_str());
     if (const std::string pb = gpu::render_barriers_report(); !pb.empty()) r += "; " + pb;
     // A line of its own: the recorder's runs past the log's 1 KiB a line.
     if (const std::string sm = gpu::submit_merge_report(); !sm.empty()) host_log("  %s", sm.c_str());
@@ -1482,7 +1723,23 @@ void DrawCmds::start_reserved(std::uint64_t number, bool part) {
     g_open = this;
 }
 
+void DrawCmds::start_list(void* packet) {
+    if (packet_) return;
+    DrawPacket& p = *static_cast<DrawPacket*>(packet);
+    p.reset();
+    packet_ = &p;
+    part_ = true;  // out of the stream when published: the command processor splices it (recorder_splice_list_packet)
+}
+
 DrawCmds* DrawCmds::open() { return g_open; }
+
+std::uint64_t DrawCmds::number() const { return packet_ ? static_cast<const DrawPacket*>(packet_)->number : 0; }
+
+// Stage 4b.2: whether the recorder has replayed draw packet `number` (packets are replayed in their numbers' order).
+bool recorder_packet_replayed(std::uint64_t number) {
+    if (g_mode != kModeThread) return true;  // (replayed as published, on the publishing thread)
+    return g_pk_done.load(std::memory_order_acquire) > number;
+}
 
 bool DrawCmds::holds_commands() const {
     if (!packet_) return false;

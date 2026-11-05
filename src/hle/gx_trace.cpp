@@ -22,12 +22,14 @@
 #include "decomp/gx/dead_packets.h"
 #include "decomp/gx/dma.h"
 #include "decomp/gx/draw.h"
+#include "host/cb_capture.h"
 #include "host/cb_proof.h"
 #include "host/draw_digest.h"
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "host/gxvk.h"
+#include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
@@ -1660,7 +1662,7 @@ struct PackedHead {
 };
 static_assert(sizeof(PackedHead) == 16);
 static_assert(offsetof(GxStageRecords, desc) == 64, "a stage's first line is what the bits and counts are");
-constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 16 + 0xc0 + 2 * 14 * 8);
+constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 20 + 0xc0 + 2 * 14 * 8);
 static_assert(kPackedMax <= sizeof(GxDrawRecords));
 std::atomic<std::uint64_t> g_packed_draws{0}, g_packed_bytes{0}, g_packed_most{0};
 
@@ -1679,6 +1681,7 @@ std::uint32_t pack_records(const GxDrawRecords& src, int stages, void* dst) {
         for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(&s.obj_tex_id[__builtin_ctzll(m)], 4);
         for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) put(s.obj_smp + __builtin_ctz(m) * 32, 32);
         for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(&s.cb_home[__builtin_ctz(m)], 4);
         if (s.has_ctx_block) put(s.ctx_block, sizeof(s.ctx_block));
         for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) put(&s.cb_proof[__builtin_ctz(m)], 8);
         for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) put(&s.cb_hash[__builtin_ctz(m)], 8);
@@ -1716,6 +1719,7 @@ const GxDrawRecords* unpack_records(const void* packed) {
         for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(&s.obj_tex_id[__builtin_ctzll(m)], 4);
         for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) get(s.obj_smp + __builtin_ctz(m) * 32, 32);
         for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(&s.cb_home[__builtin_ctz(m)], 4);
         if (s.has_ctx_block) get(s.ctx_block, sizeof(s.ctx_block));
         for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) get(&s.cb_proof[__builtin_ctz(m)], 8);
         for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) get(&s.cb_hash[__builtin_ctz(m)], 8);
@@ -1759,6 +1763,7 @@ void compare_unpacked(const GxDrawRecords& made, const GxDrawRecords& got) {
         }
         for (std::uint32_t m = a.obj_cb_set; m; m &= m - 1) {
             if (std::memcmp(a.obj_cb + __builtin_ctz(m) * 16, b.obj_cb + __builtin_ctz(m) * 16, 16) != 0) differ(kPfCb);
+            if (a.cb_home[__builtin_ctz(m)] != b.cb_home[__builtin_ctz(m)]) differ(kPfCb);
         }
         if (a.has_ctx_block && std::memcmp(a.ctx_block, b.ctx_block, sizeof(a.ctx_block)) != 0) differ(kPfCtx);
         for (std::uint32_t m = a.cb_proofed; m; m &= m - 1) {
@@ -2034,6 +2039,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
             std::uint64_t key, table, addr;
             std::uint32_t size;
             std::uint16_t index1;
+            std::uint64_t own = 0;  // the buffer's own memory (+0x20): its home's (stage 4b.3c)
         };
         Cb cbs[14];
         int ncb = 0;
@@ -2051,7 +2057,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
             if (g_gx_cost_enabled) g_dynbuf_table.fetch_add(static_cast<std::uint64_t>(ncb), std::memory_order_relaxed);
             for (int i = 0; i < ncb; ++i) {
                 cbs[i].table = rd64(cbs[i].key + 0x38);
-                cbs[i].addr = rd64(cbs[i].key + 8);  // no entry: the buffer's own address
+                cbs[i].addr = cbs[i].own = rd64(cbs[i].key + 8);  // no entry: the buffer's own address
             }
             for (int i = 0; i < ncb; ++i) {
                 // The buffers' per-context index tables sit in a few heaps too:
@@ -2073,8 +2079,14 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                 if (page && rd64(entry) == cbs[i].key) cbs[i].addr = rd64(entry + 8);
             }
         } else {
-            for (int i = 0; i < ncb; ++i) cbs[i].addr = dynamic_buffer_address(map, cbs[i].key);
+            for (int i = 0; i < ncb; ++i) {
+                cbs[i].addr = dynamic_buffer_address(map, cbs[i].key);
+                cbs[i].own = rd64(cbs[i].key + 8);
+            }
         }
+        // Stage 4b.3c: a record that names the buffer's own memory names its home, whose handle the holder carries
+        // (homes made: BBHOST_GXVK_HOMES=1 or compare, or on by default, once the device is chosen).
+        const bool homes = gxvk_homes::made_on();
         for (int i = 0; i < ncb; ++i) {
             const std::uint64_t addr = cbs[i].addr;
             const std::uint32_t rec[4] = {static_cast<std::uint32_t>(addr),
@@ -2082,6 +2094,12 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                                           0x20077fac & 0xc7ffffff};
             std::memcpy(s.obj_cb + cbs[i].j * 16, rec, sizeof(rec));
             s.obj_cb_set |= 1u << cbs[i].j;
+            std::uint32_t home = 0;
+            if (homes && addr && addr == cbs[i].own) {
+                home = rd32(cbs[i].key - 0x18 + gxvk::kHolderSpareA);
+                if (!gxvk_homes::is_handle(home)) home = 0;
+            }
+            s.cb_home[cbs[i].j] = home;
         }
         // BBHOST_GXVK_CENSUS: each one by what holds its bytes (host/gxvk.h).
         if (gxvk::census()) {
@@ -2211,6 +2229,11 @@ void note_update(const std::uint64_t* f) {
                      hi, static_cast<ull>(data), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
         }
     }
+    // Stage 4b.3a(i)'s check (BBHOST_GXVK_COPYBACK_CHECK with BBHOST_GXVK_HOMES): what the rename gets, for the capture
+    // to compare with - 0x2aadb90 copies the buffer's whole size from `data`, a box or not; the copy-back takes its
+    // whole dwords.
+    if ((flags & 4) && cb_capture::check_on() && data)
+        cb_capture::note_update(f[5] + 0x10, addr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(data)), (size >> 2) * 4ull);
     if (flags & 4) {
         g_updates_dynamic.add();
     } else if (type == 1) {
@@ -2255,7 +2278,7 @@ void note_update(const std::uint64_t* f) {
 // game's: it can submit the full chunk and wait for room in the command
 // processor's backlog, so no lock the command processor takes may be held
 // over it.
-std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNativeMagic, std::uint64_t id = 0) {
+std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNativeMagic, std::uint64_t id = 0, std::uint64_t* at = nullptr) {
     const std::uint64_t cb = ctx + 0x10;
     std::uint64_t cmd = rd64(cb + 0x10), end = rd64(cb + 0x8);
     if (!cmd && !end) {
@@ -2291,6 +2314,7 @@ std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNat
     if (!id) id = next_native_id();
     const std::uint32_t token[4] = {0xC0021000u, magic, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(id >> 32)};
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), token, sizeof(token));
+    if (at) *at = cmd;  // where it lies (stage 4b.2's segments: tokens one after another)
     const std::uint64_t next = cmd + sizeof(token);
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof(next));
     host_lists::note(cb, cmd, 0x10);
@@ -2338,6 +2362,7 @@ struct NativeSlot {
 // A slot a pool thread is reading (3): the command processor waits for it to
 // be given back (counted), as briefly as one draw's lookups.
 std::atomic<std::uint64_t> g_native_pinned_waits{0};
+std::atomic<std::uint64_t> g_native_plain_takes{0};  // stage 4b.1b: committed draws' slots taken without the CAS
 int native_unpinned(std::atomic<int>& state) {
     int s = state.load(std::memory_order_acquire);
     if (s != 3) return s;
@@ -2636,7 +2661,8 @@ bool native_draw_call(GxRec& r) {
     }
     stamp.to(kCostNativeGuest);
     if (g_gnm_sources) note_source(r.ctx + 0x10, rd64(write_ptr), rd64(r.ctx + 0x18), kSourceNative);
-    const std::uint64_t id = write_native_token(r.ctx);
+    std::uint64_t token_va = 0;
+    const std::uint64_t id = write_native_token(r.ctx, kGxNativeMagic, 0, &token_va);
     wp = rd64(write_ptr);
     if (!id) {
         // The method runs its flushes, which write whatever differs from their caches.
@@ -2681,7 +2707,7 @@ bool native_draw_call(GxRec& r) {
         slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
-        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id);  // stage 4b.1a's pool looks ahead at it
+        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va);  // stage 4b.1a's pool looks ahead at it
         prefetch_next_slot();
     } else {
         g_native_overflow.fetch_add(1, std::memory_order_relaxed);
@@ -2842,6 +2868,11 @@ struct GuestCopy {
     // A whole texture copied (CopyResource): the generations of the textures
     // whose memory the copy starts at, 0 for anything else (host_gpu_copy_guest).
     std::uint64_t src_gen = 0, dst_gen = 0;
+    // BBHOST_GXVK_COPYBACK_CHECK: the upload heap's hand-outs so far as the GX thread recorded the copy-back.
+    std::uint64_t seq = 0;
+    // Stage 4b.3a(i) (BBHOST_GXVK_HOMES, host/cb_capture.h): the copy-back's bytes captured at the resolve - its place in
+    // the captures' ring and the piece the batch's captures are in (cb_capture::kNone: not captured).
+    std::uint32_t cap = 0xffffffffu, piece = 0xffffffffu;
 };
 // The live GX texture whose memory starts at `va` and covers `bytes`: its generation, or 0.
 std::uint64_t whole_texture_gen(std::uint64_t va, std::uint64_t bytes) {
@@ -2921,9 +2952,11 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
         const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
         if (!entries || !count) return 0;
         copies.reserve(count);
+        const std::uint64_t seq = gxvk::copyback_check_wanted() ? gxvk::arena_handout_seq() : 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::uint64_t e = entries + 0x18ull * i;
             copies.push_back({rd64(e), rd64(e + 8), (rd32(e + 0x10) >> 2) * 4ull, true});
+            copies.back().seq = seq;
         }
     } else {
         GuestCopy one{f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4};
@@ -2945,6 +2978,26 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
     if (!id) {
         g_copy_unwritten.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    // Stage 4b.3a(i): the copy-backs' bytes taken now, on the GX thread, before GX can take their blocks back.
+    if (kind == kCopyBuffers && cb_capture::on()) {
+        static thread_local std::vector<std::uint64_t> cd, cs, cn;
+        static thread_local std::vector<std::uint32_t> at;
+        const std::size_t n = copies.size();
+        cd.resize(n);
+        cs.resize(n);
+        cn.resize(n);
+        at.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            cd[i] = copies[i].dst;
+            cs[i] = copies[i].src;
+            cn[i] = copies[i].bytes;
+        }
+        const std::uint32_t piece = cb_capture::capture(cb, cd.data(), cs.data(), cn.data(), static_cast<std::uint32_t>(n), at.data(), hle_video_flip_count());
+        for (std::size_t i = 0; i < n; ++i) {
+            copies[i].cap = at[i];
+            copies[i].piece = piece;
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_copies_mu);
@@ -6766,7 +6819,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census && !gxvk::census() &&
-            !gxvk::watch_writes())
+            !gxvk::watch_writes() && !cb_capture::check_on())
             continue;
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
@@ -7210,18 +7263,27 @@ void hle_gx_copy_token(std::uint64_t id) {
     // bytes to leave the write-combining buffers.
     std::uint64_t ranges = 0, bytes = 0;
     static thread_local std::vector<std::uint64_t> run_dst, run_src, run_bytes;
+    static thread_local std::vector<std::uint32_t> run_at;
+    // Stage 4b.3a(i): the batch's captures (one piece for the token), released once the token is walked.
+    const std::uint32_t piece = !copies.empty() ? copies[0].piece : 0xffffffffu;
     for (std::size_t i = 0; i < copies.size();) {
         bool refused = false;
         if (copies[i].back && copies[i].bytes) {
             run_dst.clear();
             run_src.clear();
             run_bytes.clear();
+            run_at.clear();
+            static const bool check = gxvk::copyback_check_wanted();
             for (std::size_t j = i; j < copies.size() && copies[j].back; ++j) {
                 run_dst.push_back(copies[j].dst);
                 run_src.push_back(copies[j].src);
                 run_bytes.push_back(copies[j].bytes);
+                run_at.push_back(copies[j].cap);
+                if (check) gxvk::copyback_check(copies[j].src, copies[j].bytes, copies[j].seq);
             }
-            const std::size_t took = host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
+            const std::size_t took = cb_capture::on() ? host_gpu_copy_backs_captured(run_dst.data(), run_src.data(), run_bytes.data(), run_at.data(),
+                                                                                    piece, run_dst.size())
+                                                      : host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
             for (std::size_t k = 0; k < took; ++k) bytes += copies[i + k].bytes;
             ranges += took;
             i += took;
@@ -7232,13 +7294,16 @@ void hle_gx_copy_token(std::uint64_t id) {
         ++ranges;
         bytes += c.bytes;
         if (!c.bytes ||
-            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen)))
+            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes)
+                                : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen,
+                                                      cb_capture::mode() == cb_capture::Mode::kOn ? c.cap : cb_capture::kNone, c.piece)))
             continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),
                      static_cast<ull>(c.dst), static_cast<ull>(c.bytes));
         }
     }
+    cb_capture::release(piece);
     g_copy_ranges.fetch_add(ranges, std::memory_order_relaxed);
     g_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
     static std::atomic<std::uint64_t> walked{0};
@@ -7684,7 +7749,12 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
         // With stage 4b.1a's pool on, the slot is taken (4) once a pool thread
         // reading it has given it back: the pool reads it no more.
         int expect = gxvk_lists::pool() ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
-        if (expect == 2 && gxvk_lists::pool() && slot->id == id) {
+        // Stage 4b.1b: a draw the pool has committed is read by no pool thread
+        // again (each token is fed once, and its commit is published after the
+        // slot was given back): taken with the load above, no CAS.
+        if (expect == 2 && gxvk_lists::splice() && slot->id == id && host_gpu_list_committed(id)) {
+            g_native_plain_takes.fetch_add(1, std::memory_order_relaxed);
+        } else if (expect == 2 && gxvk_lists::pool() && slot->id == id) {
             while (expect == 2 && !slot->state.compare_exchange_weak(expect, 4, std::memory_order_acquire, std::memory_order_acquire)) {
                 if (expect == 3) expect = native_unpinned(slot->state);
             }
@@ -7947,8 +8017,9 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                      static_cast<ull>(g_native_unmatched.load()), static_cast<ull>(g_native_failed.load()),
                      static_cast<ull>(g_native_overflow.load()));
             if (gxvk_lists::pool()) {
-                host_log("gx-native: slots the command processor waited for while stage 4b.1a's pool read them: %llu",
-                         static_cast<ull>(g_native_pinned_waits.load()));
+                host_log("gx-native: slots the command processor waited for while the pool read them: %llu; taken without a CAS "
+                         "(committed by the pool) %llu",
+                         static_cast<ull>(g_native_pinned_waits.load()), static_cast<ull>(g_native_plain_takes.load()));
             }
             if (g_packed_records) {
                 const std::uint64_t n = g_packed_draws.load();
@@ -8362,9 +8433,40 @@ const GpuDrawInputs* hle_gx_native_pin(std::uint64_t id, GxDrawObjects* objects)
     return &draw.in;
 }
 
+// Stage 4b.1b's pool (render.cpp lists_commit): token `id`'s slot held for
+// reading as hle_gx_native_pin holds it, its inputs copied into `in` with the
+// user data a token draw has at the take (hle_gx_native_copy's), its objects
+// into `objects` (records set as the take sets them). Null when it is not
+// stored, taken or another token's, or when the user data come from the
+// register file at the take (BBHOST_GX_TOKEN_USER_DATA=register: an answer of
+// the walk's place). Given back with hle_gx_native_unpin(id).
+const GpuDrawInputs* hle_gx_native_pin_copy(std::uint64_t id, GpuDrawInputs& in, GxDrawObjects& objects, bool* own_records) {
+    if (g_token_user_data_register) return nullptr;
+    const GpuDrawInputs* stored = hle_gx_native_pin(id, &objects);
+    if (!stored) return nullptr;
+    // The records unpacked into this thread's own set: nothing of the slot is read after the copy.
+    if (own_records) *own_records = !objects.records || (g_packed_records == 1) || (g_packed_records == 2 && native_slot(id).draw.packed);
+    in = *stored;
+    std::memset(in.vs_user, 0, sizeof(in.vs_user));
+    std::memset(in.ps_user, 0, sizeof(in.ps_user));
+    return &in;
+}
+
 void hle_gx_native_unpin(std::uint64_t id) {
     NativeSlot& slot = native_slot(id);
     slot.state.store(2, std::memory_order_release);
+}
+
+bool hle_gx_native_skip(std::uint64_t id) {
+    // (A segment's member: committed, so no pool thread holds or reads its slot - as the take's plain load.)
+    NativeSlot& slot = native_slot(id);
+    if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return false;
+    g_native_seen.fetch_add(1, std::memory_order_relaxed);
+    slot.draw.records.reset();  // back to the pool here, as the release does
+    slot.draw.packed.reset();
+    slot.state.store(0, std::memory_order_release);
+    g_native_slot_pending.add(~0ull);
+    return true;
 }
 
 void hle_gx_native_release() {

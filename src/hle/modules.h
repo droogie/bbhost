@@ -254,6 +254,21 @@ bool hle_gx_native_copy(std::uint64_t id, const std::uint32_t* sh, GpuDrawInputs
 // processor's take waits for it. Null (nothing held) otherwise.
 const GpuDrawInputs* hle_gx_native_pin(std::uint64_t id, struct GxDrawObjects* objects);
 void hle_gx_native_unpin(std::uint64_t id);
+// Stage 4b.2: token `id`'s slot given back without a take - the draw of a
+// spliced segment's member, drawn already. False when the slot was not that
+// token's, stored (the caller takes it the usual way then).
+bool hle_gx_native_skip(std::uint64_t id);
+// The command processor's split of a PM4 packet (gnm_exec.cpp list_split_of:
+// >= 0 when it is something done in order between draws, or another GX-native
+// draw's token), for stage 4b.2's pool, which reads a list's packets between
+// its draws' tokens.
+int hle_gnm_list_split_of(std::uint32_t op, const std::uint32_t* body, std::size_t n);
+// Stage 4b.1b's pool: as hle_gx_native_pin, the inputs copied into `in` with a
+// token draw's user data at the take (gx_trace.cpp); null also when those come
+// from the register file. Given back with hle_gx_native_unpin(id).
+// `own_records`: set when the records are the calling thread's own copy (packed records unpacked) - then nothing of
+// the slot is read after this, and the caller may give it back at once.
+const GpuDrawInputs* hle_gx_native_pin_copy(std::uint64_t id, GpuDrawInputs& in, struct GxDrawObjects& objects, bool* own_records = nullptr);
 // BBHOST_GX_NATIVE_COPIES: a GX buffer-copy pass's copy token, a type-3 NOP
 // with payload {kGxCopyMagic, id low, id high}; runs the call's copies.
 constexpr std::uint32_t kGxCopyMagic = 0x50434242u;  // "BBCP"

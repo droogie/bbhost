@@ -87,6 +87,17 @@ struct BumpSink {
         }
         c->fetch_add(v, std::memory_order_relaxed);
     }
+    // Stage 4b.1b's pool, beside the command processor: the counts added with
+    // locked adds (a statistic the command processor bumps meanwhile may lose
+    // one of them), and the table emptied.
+    void merge_atomic() {
+        for (std::size_t k = 0; k < nused; ++k) {
+            const std::uint16_t i = used[k];
+            key[i]->fetch_add(n[i], std::memory_order_relaxed);
+            key[i] = nullptr;
+        }
+        nused = 0;
+    }
     // At the join, under g.mu: the counts into the counters, and the table emptied.
     void merge() {
         for (std::size_t k = 0; k < nused; ++k) {
@@ -106,7 +117,7 @@ extern thread_local constinit BumpSink* t_bump_sink;
 // only with BBHOST_RUN_COMMIT on: a thread-local read is several loads where
 // the bump is one add, and the draw path bumps at a hundred places.
 inline void bump(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) {
-    if (list_resolve::committing()) [[unlikely]] {
+    if (list_resolve::sinks()) [[unlikely]] {
         if (BumpSink* s = t_bump_sink) {
             s->add(&c, n);
             return;
@@ -522,6 +533,9 @@ struct Gpu {
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
+    // VK_KHR_maintenance7's feature on: a render pass instance may hold inline
+    // commands and secondary command buffers both (stage 4b.2's segments).
+    bool has_maint7 = false;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
     // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
@@ -561,6 +575,11 @@ struct Gpu {
     VkBuffer ubo = VK_NULL_HANDLE;
     VkDeviceMemory ubo_mem = VK_NULL_HANDLE;
     void* ubo_map = nullptr;
+    // Stage 4b.2's segments: the params blocks past the slots' ring that the
+    // pool's threads write for the secondary command buffers they record (the
+    // same buffer, so the sets' params descriptor is theirs too), as block
+    // indices (kParamsStride each); 0 blocks without the segments.
+    std::uint32_t ubo_list_base = 0, ubo_list_blocks = 0;
     std::uint32_t queued = 0;   // params/descriptor slots used in the current command buffer
     bool recording = false;
     std::uint64_t record_serial = 0;  // bumped whenever g.cmd_ starts recording (render.cpp's state cache)
@@ -1003,6 +1022,13 @@ void profile_begin_locked(const std::string* name);  // timestamp before a draw/
 void profile_end_locked();
 void begin_recording_locked();
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out);
+// A params block into params-ring memory at `dst` as whole 64-byte lines (gpu.cpp).
+void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params);
+// Stage 4b.2: the params blocks of the segments' region (Gpu::ubo_list_blocks):
+// 8 MiB, ~13 flips of segments. 16 MiB took the params ring past what an
+// RTX 4070's 246 MiB window of video memory the CPU writes leaves the
+// constant-buffer copies' ring (in host memory then: +11% GPU time a flip).
+constexpr std::uint32_t kListParamsBlocks = 16384;
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
@@ -1184,6 +1210,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
+// Stage 4b.3a(i): the live twin holding [va, +bytes) whole, its place in `out` - none made, none let go.
+bool twin_live_holding_locked(std::uint64_t va, std::uint64_t bytes, Located& out);
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
 void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site);  // logs a few imports over a candidate's kind
 // A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
@@ -1285,7 +1313,7 @@ struct DrawCtx {
 // The context draw_impl allocates through (null outside one, and with the
 // switch off).
 extern thread_local constinit DrawCtx* t_draw_ctx;
-inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::commit_draws() ? t_draw_ctx : nullptr; }
+inline DrawCtx* draw_ctx() { return list_resolve::g_draw_ctx || list_resolve::parts() ? t_draw_ctx : nullptr; }
 // BBHOST_RUN_COMMIT=compare (render.cpp run_commit): what a draw resolved -
 // what it binds and draws - as it would be the same committed in a part or in
 // order: what lives in the rings it copies into (whose places differ) by the
@@ -1353,6 +1381,105 @@ struct RunDraw {
     bool drew_gx = false;
     const std::string* vs_other = nullptr;
     int vs_other_why = 0;
+    // Stage 4b.1b: a draw a pool thread commits ahead of the command
+    // processor (render.cpp lists_commit) - `part` too, with what its list mode
+    // changes: its params blocks kept as contents (alloc_params_slot_locked),
+    // its packet the token slot's list packet, and what only the walk's place
+    // answers (the pass, the hazards, the owed clears, the refreshes) noted
+    // for the splice rather than read. Null outside one.
+    struct ListNotes* list = nullptr;
+};
+// Stage 4b.1b: the params blocks a list-mode draw keeps (alloc_params_slot_locked
+// fills them; the splice copies them into slots of the recording it lands in).
+struct ListParams {
+    std::uint32_t n = 0;
+    gcn::StageParams p[2];
+};
+// Stage 4b.1b: what a list-mode draw notes for its splice - what in order it
+// would have read at its place in the walk: the pass it draws in (its key),
+// the images it samples (the lazy barriers' hazards, the owed clears), the
+// texture views it binds by id (their refresh in the recording it lands in),
+// and the cached sets it binds (still the cache's at the splice).
+struct ListNotes {
+    static constexpr std::uint32_t kMost = 32;
+    ListParams params;
+    std::uint64_t pass_key = 0;
+    std::uint32_t nsampled = 0;
+    std::uint64_t sampled[kMost] = {};
+    std::uint32_t nviews = 0;
+    std::uint32_t view_id[kMost] = {};
+    std::uint8_t view_flags[kMost] = {};
+    VkImageView view[kMost] = {};
+    // Stage 4b.2: each view's T# words, for its splice to resolve it again as the
+    // draw in order would when its entry went stale (the view epoch moves with
+    // every view or image let go anywhere).
+    std::uint32_t view_words[kMost][8] = {};
+    std::uint32_t view_target = 0;    // bit k: view k is a render target's (no texture surface): it may be a managed depth view
+    std::uint32_t nhomes = 0;
+    std::uint32_t home[kMost] = {};   // constant buffers' homes it binds by handle (none with a copy pending)
+    std::uint32_t nsegs = 0;
+    std::uint32_t seg[4] = {};        // the list arena's segments its constant-buffer copies went into
+    std::uint64_t seg_lap[4] = {};
+    std::uint64_t packet_index = 0;  // its token slot's list packet (recorder_list_packet)
+    std::uint64_t call_flip = 0;     // its GX call's flip (the list arena's copies are shared within one)
+    std::uint64_t set_key[2] = {};
+    VkDescriptorSet set[2] = {};
+    std::uint64_t set_serial[2] = {};  // stage 4b.2: the cached sets' making (a secondary binds the very set)
+    // Stage 4b.2: its pass's attachments' formats as begin_pass makes the pass
+    // (colour slots up to the last bound, a gap UNDEFINED; depth and stencil),
+    // for a segment's secondary command buffer's inheritance (`formats_ok`:
+    // noted).
+    std::uint32_t ncolor = 0;
+    VkFormat color_fmt[8] = {};
+    VkFormat depth_fmt = VK_FORMAT_UNDEFINED, stencil_fmt = VK_FORMAT_UNDEFINED;
+    bool formats_ok = false;
+    bool full = false;  // more to note than fits: not committed
+    void clear() {
+        params.n = 0;
+        pass_key = 0;
+        ncolor = 0;
+        depth_fmt = stencil_fmt = VK_FORMAT_UNDEFINED;
+        formats_ok = false;
+        nsampled = nviews = 0;
+        view_target = 0;
+        set_key[0] = set_key[1] = 0;
+        set[0] = set[1] = VK_NULL_HANDLE;
+        nhomes = nsegs = 0;
+        full = false;
+    }
+    void note_home(std::uint32_t handle) {
+        for (std::uint32_t k = 0; k < nhomes; ++k) {
+            if (home[k] == handle) return;
+        }
+        if (nhomes < kMost) home[nhomes++] = handle;
+        else full = true;
+    }
+    void note_sampled(std::uint64_t base) {
+        for (std::uint32_t k = 0; k < nsampled; ++k) {
+            if (sampled[k] == base) return;
+        }
+        if (nsampled < kMost) sampled[nsampled++] = base;
+        else full = true;
+    }
+    void note_view(std::uint32_t id, std::uint8_t flags, VkImageView v, bool target = true, const std::uint32_t* w = nullptr) {
+        for (std::uint32_t k = 0; k < nviews; ++k) {
+            if (view_id[k] == id && view_flags[k] == flags) return;
+        }
+        if (nviews < kMost) {
+            if (target) view_target |= 1u << nviews;
+            view_id[nviews] = id;
+            view[nviews] = v;
+            if (w) {
+                for (int i = 0; i < 8; ++i) view_words[nviews][i] = w[i];
+            } else {
+                view_words[nviews][0] = 0;
+                view_words[nviews][1] = 0;  // (none: no resolution again)
+            }
+            view_flags[nviews++] = flags;
+        } else {
+            full = true;
+        }
+    }
 };
 extern thread_local constinit RunDraw* t_run_draw;
 // The most parts a run is split into: the command processor's and a run
@@ -1383,7 +1510,7 @@ enum RunStop : int {
 // have stopped at) and goes on. Outside both: false.
 inline bool run_part_stop(int why) {
     if (gxvk_lists::census()) gxvk_lists::t_effects |= 1u << why;  // stage 4's census: what the draw needed in order
-    if (!list_resolve::commit_draws()) return false;  // (no thread-local read with it off)
+    if (!list_resolve::parts()) return false;  // (no thread-local read with it off)
     RunDraw* const r = t_run_draw;
     if (!r) return false;
     if (!r->part) {
@@ -1403,13 +1530,13 @@ inline bool run_part_stop(int why) {
 constexpr std::uint32_t kRunLocalStops =
     1u << kRunStopParams | 1u << kRunStopProgram | 1u << kRunStopRefresh | 1u << kRunStopRing | 1u << kRunStopMirror;
 inline bool run_part() {
-    if (!list_resolve::commit_draws()) return false;
+    if (!list_resolve::parts()) return false;
     const RunDraw* const r = t_run_draw;
     return r && r->part;
 }
 // A run part's draw that has stopped (its first stop kept).
 inline bool run_part_stopped() {
-    if (!list_resolve::commit_draws()) return false;
+    if (!list_resolve::parts()) return false;
     const RunDraw* const r = t_run_draw;
     return r && r->part && r->stop >= 0;
 }
@@ -2144,6 +2271,24 @@ VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
 // sampler cache hold, without a refresh, a count or anything made; null when
 // not made yet.
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags);
+// Stage 4b.1b's splice (render.cpp host_gpu_splice, under g.mu): whether view
+// `id` (its flags) still binds `view` and a bind of it here would refresh
+// nothing - the entry unchanged, its surface skipped or refreshed in this
+// recording already, no made-ahead upload owed - as texture_view_by_id would
+// answer it in order.
+bool texture_view_splice_ok(std::uint32_t id, std::uint8_t flags, VkImageView view);
+// Stage 4b.2: a view whose entry texture_view_splice_ok found stale resolved again
+// at the splice's place as the draw in order would (texture_view_by_id with its
+// T# words `w`): true when that gives the commit's view.
+bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView view, const std::uint32_t* w);
+// Why texture_view_splice_ok said no: its entry another view's or gone, the view epoch moved since the commit,
+// another view made for it, an elided copy's source, a made-ahead upload to record, remade by its refresh.
+enum SpliceViewWhy : int { kSpliceViewGone, kSpliceViewEpoch, kSpliceViewOther, kSpliceViewElided, kSpliceViewPending, kSpliceViewRemade, kSpliceViewWhys };
+extern std::atomic<std::uint64_t> g_splice_view_why[kSpliceViewWhys];
+extern std::atomic<std::uint64_t> g_splice_view_again[2];  // resolved again: the commit's view, another
+// Stage 4b.1b's list mode: its draws' image stops, by kind (textures.cpp) - a view by its T#'s words, a view by
+// id not made yet, a sampler not made yet.
+extern std::atomic<std::uint64_t> g_list_image_stops[3];
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
 // `base` with `bias` added to its LOD bias (the upscaler's mip bias for the
 // 3D's materials), made once and kept; `base` itself for a bias of 0 or a
@@ -2154,6 +2299,19 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias);
 // translations, stage plans, views, samplers) through the reader paths, under
 // cache_rw::Read, into `out` (stage 4b.1a's pool).
 void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists::LookSink& out);
+// Stage 4b.1b's pool (host/gxvk_lists.h splice): GX-native draw token `id`'s
+// draw committed ahead of the command processor, in its list mode, into the
+// record the command processor's splice reads (render.cpp host_gpu_splice).
+void lists_commit(std::uint64_t id);
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
+// `rec` (host/gxvk_lists_internal.h ListRec) into segments and builds each -
+// its draws' params blocks and merged notes, and with
+// BBHOST_GXVK_SEGMENTS_REPLAY=secondary a secondary command buffer (render.cpp).
+void lists_segment(std::uint32_t rec);
+// Whether the segments run as secondary command buffers: only then does the
+// device get VK_KHR_maintenance7, for passes that hold them and the command
+// processor's draws both (settled before the device is made).
+bool segments_secondary();
 // BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
 // what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
 // MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
@@ -2267,18 +2425,83 @@ bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // the copies into place wait for the next transfer batch, dispatch or
 // submission - no pass end or barrier at the token. False when this copy must
 // go to the GPU as it stands.
-bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes);
+// `cap` (stage 4b.3a(i), BBHOST_GXVK_HOMES=1): the copy-back's bytes captured at the GX resolve - the version is that
+// range of the captures' ring, no CPU copy.
+struct CopyCapture {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    const void* map = nullptr;
+};
+bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes, const CopyCapture* cap = nullptr);
 // The pending versions' copies into place, recorded once no pass is open.
 void copy_versions_flush_locked();
+// Stage 4b.3a(i) (BBHOST_GXVK_HOMES=1): the twin homes' pending GPU copies from their captures, put in place as a batch of
+// their own - at the next pass's start, before a dispatch, transfer or submission, or a put-in-place (no pass open).
+void home_copies_flush_locked();
+// Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h): GX's constant buffers' device-local homes, the command
+// processor's side (gxvk_homes_vk.cpp), every one under g.mu.
+// At the device's choice: homes on (1, compare) unless the GPU is integrated or its memory tight; the pool's budget.
+void homes_decide(bool integrated, bool small_vram, bool tight);
+// A recording begins: the homes GX made and ended since are in the index by address, ended ones taken back once no
+// draw recorded before their end is still to come, their ranges freed once the work that read them has run.
+void homes_begin_recording_locked();
+// A binding of [base, +bytes) by the handle a GX draw's records carried: kHomeBound (`out` the home, filled first if
+// it is new), kHomePending (`out` the source of a copy into it still to land in this pass), or kHomeFall + why
+// (gxvk_homes::BindFall: today's path).
+enum { kHomeBound = 0, kHomePending = 1, kHomeFall = 16 };
+int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, Located& out);
+// Stage 4b.1b's splice (under g.mu): whether home `handle` still binds as a
+// list-mode draw bound it - live (or ended, within its grace), filled, and no
+// copy into it pending in this pass.
+bool homes_splice_ok(std::uint32_t handle);
+// By address (no handle): [va, +bytes) inside a live home - `out` the home (filled first), `address` its device
+// address. With =compare, false (today's path is bound).
+bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, VkDeviceAddress* address = nullptr);
+// [va, +bytes) meets a live home (its guest bytes stale: no CPU copy of them), or runs across one's edge.
+bool homes_meet_locked(std::uint64_t va, std::uint64_t bytes);
+bool homes_straddle_locked(std::uint64_t va, std::uint64_t bytes);
+// The live homes meeting [va, +bytes) copied back to their memory at this point of the stream (a page-table walk,
+// `why` 0; a range across an edge, 1; a CPU read, 2): they stay the homes.
+void homes_sync_locked(std::uint64_t va, std::uint64_t bytes, int why);
+// ...and ended (gxvk_homes::kEndEdge): a GPU access of guest memory across a home's edge, or a walk's stores over it -
+// the buffer takes today's path from now on.
+void homes_end_meeting_locked(std::uint64_t va, std::uint64_t bytes);
+// A copy of `bytes` into [dst, ...) from (src, src_off) - a capture, or staging (`src_map` its bytes, for =compare's
+// mirrors) - queued into the home holding it, put in place with the twin homes' copies. kHomeCopyNotHome: no home
+// there (the copy as today); kHomeCopyRefused: one across a home's edge (that home copied back and ended; the copy as
+// today).
+enum { kHomeCopyNotHome = 0, kHomeCopyTaken = 1, kHomeCopyRefused = 2 };
+int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, VkDeviceSize src_off, const void* src_map);
+// ...from the CPU bytes at `from` (a copy the captures missed), staged now.
+int homes_copy_in_staged_locked(std::uint64_t dst, std::uint64_t bytes, const void* from);
+// A binding by address against the copies into homes still to land (as copy_version_lookup_locked's answers).
+int homes_pending_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+bool homes_pending_locked();
+// BBHOST_RUN_COMMIT's fork: no event waits to be drained (a run part's draws read the index, and never change it).
+bool homes_settled_locked();
+void homes_flush_locked();
+// A transfer about to read or write [off, +bytes) of `buffer`: pending copies into homes that meet it go first.
+bool homes_before_transfer_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSize bytes);
+// =compare: a binding today's path made of [base, +bytes) of the home `handle` names, its bytes `today` (null: not on
+// the CPU) against the home's mirror.
+void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t bytes, const void* today);
+std::string homes_report();
+// A buffer copy at this point of the stream, in a transfer batch (no pass open after it).
+bool copy_in_stream_locked(VkBuffer src, VkDeviceSize so, VkBuffer dst, VkDeviceSize dso, VkDeviceSize bytes);
+// ...first if one writes [off, +bytes) of `dst`, which a transfer is about to write; whether it did.
+bool home_copies_before_transfer_locked(VkBuffer dst, VkDeviceSize off, VkDeviceSize bytes);
 // A render pass ended: the flush, when they wait for that (BBHOST_COPY_VERSIONS=1).
 void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
-// that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvPutReasons };
+// that walks the page table; a shader's buffer over 1 MiB inside a version
+// that is its source in GX's upload heap (stage 1d.2a: one the snapshots do
+// not take).
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvHeapWide, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
 // Whether a pending version's copy into place writes `buffer` (a window import
-// about to retire: its copies go into place first).
+// about to retire: its copies go into place first) - or, for a version that is
+// its source in GX's upload heap (stage 1d.2a), reads it.
 bool copy_versions_name_buffer_locked(VkBuffer buffer);
 // The same for [lo, hi) of `buffer` (a GX twin's slice about to be let go).
 bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi);
@@ -2287,8 +2510,14 @@ bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
+// `heap_src` (stage 1d.2a): with kCopyVersionInside, the guest address in GX's
+// upload heap the version's bytes for `base` are read from, when the version
+// is that range itself (no CPU copy) - or, with BBHOST_GXVK_HEAP_COPY=compare,
+// would be (its copy is today's) - else 0.
 enum { kCopyVersionNone, kCopyVersionInside, kCopyVersionStraddles };
-int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src = nullptr);
+// The CPU bytes of the newest pending version holding [base, +bytes) whole, else null (stage 4b.3c's compare).
+const void* copy_version_bytes_locked(std::uint64_t base, std::uint64_t bytes);
 // Draw captures take a binding's bytes from the guest memory it imports. A
 // binding resolved to a copy of guest memory taken as the draw records (a
 // YEBIS window's, the aligned scratch) is noted with the guest address its
@@ -2300,6 +2529,7 @@ std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, Vk
 void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::uint8_t* to);
 bool copy_versions_pending_locked();
 std::string copy_versions_report();  // "" when none were made or refused
+std::string home_copies_report();     // stage 4b.3a(i): "" with BBHOST_GXVK_HOMES off
 bool render_pass_open_locked();
 std::string render_barriers_report();  // "" unless BBHOST_PASS_BARRIERS=lazy
 // Clears the sampled textures a fill covers whole, where no render target took
@@ -2664,9 +2894,13 @@ public:
     // stream when published - the command processor appends it in its order
     // at the join (recorder_append_packet) - and never becomes the open draw.
     void start_reserved(std::uint64_t number, bool part);
+    // Stage 4b.1b: a pool thread's list packet (recorder_list_packet), kept
+    // out of the stream when published - the command processor splices it.
+    void start_list(void* packet);
     DrawCmds(const DrawCmds&) = delete;
     DrawCmds& operator=(const DrawCmds&) = delete;
     bool deferred() const { return packet_ != nullptr; }
+    std::uint64_t number() const;  // its packet's number (0: none)
     void publish();
     void update_sets(const VkWriteDescriptorSet* writes, std::size_t n);
     // The draw's own writes, taken rather than copied: `writes` and `images`
@@ -2738,6 +2972,28 @@ bool recorder_threaded();
 std::uint64_t recorder_reserve_packets(std::uint32_t n);
 void recorder_append_packet(std::uint64_t number);
 void recorder_publish_appended();
+// Stage 4b.1b (gxvk_lists.h splice): the list packet of token slot `index`,
+// filled by the pool thread that commits the token's draw; whether the
+// recorder has replayed what was last spliced from it (a pool thread reuses it
+// only then); and its splice into the stream at the command processor's
+// place (under g.mu), its params blocks' offsets patched in first: the commit
+// put block k's index k where the offset goes.
+void* recorder_list_packet(std::uint64_t index);
+bool recorder_list_packet_free(std::uint64_t index);
+std::string recorder_list_report();  // chained list packets replayed, and the binds they left out
+void recorder_splice_list_packet(std::uint64_t index, std::uint64_t id, const std::uint32_t* params_offsets, std::uint32_t nparams);
+// Stage 4b.2 (render.cpp lists_segment, host_gpu_splice_segment): whether a
+// list packet is a plain draw a segment's secondary takes as it is; its
+// dynamic offsets' count and values (its params blocks' indices); a
+// segment's packets replayed into a pool thread's secondary command buffer,
+// chained, with their params blocks' offsets in the pool's region; and the
+// secondary executed at the command processor's place in the stream.
+bool recorder_list_packet_plain(std::uint64_t index);
+bool recorder_packet_replayed(std::uint64_t number);  // the recorder replayed draw packet `number`
+std::uint32_t recorder_list_packet_dynamic(std::uint64_t index, std::uint32_t (&out)[2]);
+void recorder_record_segment_draw(VkCommandBuffer cmd, std::uint64_t index, const std::uint32_t* dyn, std::uint64_t prev, const std::uint32_t* prev_dyn);
+void recorder_splice_segment(VkCommandBuffer secondary);
+void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t* ids, const std::uint32_t (*dyn)[2], std::uint32_t n);
 // The draw draw_impl is resolving, its packet started now if it has none
 // (render.cpp): a region copy made while its images are prefetched goes in it
 // with the pass end before it. Null outside a draw, or when it records in place.

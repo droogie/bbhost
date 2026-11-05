@@ -194,6 +194,7 @@ add_executable(bbhost
   src/host/gxvk_lists_leaf.cpp
   src/host/gxvk_lists_pool.cpp
   src/host/cache_rw.cpp
+  src/host/cb_capture.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -336,7 +337,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
@@ -600,6 +601,19 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
+  # Datagrams between two P2P sockets through hle/net.cpp: the game's split
+  # into whole chunks, others up to the largest UDP carries; whole with
+  # BBHOST_NET_SPLIT_DATAGRAMS=0, the 2 KB limit with
+  # BBHOST_NET_LARGE_DATAGRAMS=0 (tests/net_p2p_test.cpp).
+  add_executable(net_p2p_test tests/net_p2p_test.cpp src/hle/net.cpp src/net/stun.cpp src/core/futex.cpp)
+  target_include_directories(net_p2p_test PRIVATE src)
+  target_link_libraries(net_p2p_test PRIVATE pthread)
+  add_test(NAME net_p2p_test COMMAND net_p2p_test)
+  add_test(NAME net_p2p_whole_test COMMAND net_p2p_test)
+  set_tests_properties(net_p2p_whole_test PROPERTIES ENVIRONMENT BBHOST_NET_SPLIT_DATAGRAMS=0)
+  add_test(NAME net_p2p_small_test COMMAND net_p2p_test)
+  set_tests_properties(net_p2p_small_test PROPERTIES ENVIRONMENT BBHOST_NET_LARGE_DATAGRAMS=0)
+  set_tests_properties(net_p2p_test net_p2p_whole_test net_p2p_small_test PROPERTIES TIMEOUT 60)
   # The event poller's long polls and generations (net/poll_pacing.h).
   add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
   target_include_directories(poll_pacing_test PRIVATE src)
@@ -668,6 +682,16 @@ if(UNIX)
   target_include_directories(ring_budget_test PRIVATE src)
   add_test(NAME ring_budget_test COMMAND ring_budget_test)
   # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  # Stage 4b.3a(i): the copy-back captures and their pieces' laps, without the game (tests/cb_capture_test.cpp).
+  add_executable(cb_capture_test tests/cb_capture_test.cpp)
+  target_include_directories(cb_capture_test PRIVATE src include)
+  target_link_libraries(cb_capture_test PRIVATE Threads::Threads)
+  add_test(NAME cb_capture_test COMMAND cb_capture_test)
+  set_tests_properties(cb_capture_test PROPERTIES ENVIRONMENT "BBHOST_GXVK_HOMES=1")
+  # Stage 4b.3c: the index of live homes by address and its page filter, against a plain list (host/gxvk_homes_index.h).
+  add_executable(gxvk_homes_test tests/gxvk_homes_test.cpp)
+  target_include_directories(gxvk_homes_test PRIVATE src include)
+  add_test(NAME gxvk_homes_test COMMAND gxvk_homes_test)
   # Stage 4b.1a's lock: readers on eight threads beside one writer (host/cache_rw.h).
   add_executable(cache_rw_test tests/cache_rw_test.cpp src/host/cache_rw.cpp)
   target_include_directories(cache_rw_test PRIVATE src)

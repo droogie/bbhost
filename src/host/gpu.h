@@ -274,6 +274,10 @@ struct alignas(64) GxStageRecords {
     std::uint8_t obj_tex[64 * 32];
     std::uint8_t obj_smp[16 * 32];
     std::uint8_t obj_cb[14 * 16];
+    // Stage 4b.3c (host/gxvk_homes.h): per obj_cb record, the handle of the
+    // buffer's device-local home when the record names the home (no rename of
+    // the buffer in the draw's context), else 0 - written with each record.
+    std::uint32_t cb_home[14];
     // The id of the shader-resource view behind each obj_tex
     // record (engine/gx_resources.h; 0 when not registered). A view's T# never
     // changes after it is made, so the id stands for the record.
@@ -384,6 +388,31 @@ bool host_gpu_draw(const GpuDraw& d);
 // because the first draw took no answer a part could share (a tessellated or
 // geometry-shader draw ahead of plain ones): the next draw may start a run.
 int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uint32_t n, std::uint32_t& failed);
+// Stage 4b.1b (BBHOST_GXVK_LISTS=splice, host/gxvk_lists.h): at GX-native
+// draw token `id`, its slot taken - true when the pool's commit of its draw
+// was spliced into the stream (the draw is done), false when it is to be
+// drawn in order. splice-compare: false, and after the draw in order
+// host_gpu_splice_compare(id) compares the commit with it. The lines.
+bool host_gpu_splice(std::uint64_t id);
+bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
+void host_gpu_splice_compare(std::uint64_t id);
+std::string host_gpu_splice_report(bool window = false);
+// Stage 4b.2 (BBHOST_GXVK_LISTS=segments): at GX-native draw token `id`,
+// before its slot is taken - the members of a segment ready to splice whose
+// first member it is (null: none), their count and the segment's word; the
+// stream checked to hold the members' tokens one after another as recorded,
+// host_gpu_splice_segment splices it (true: its members are drawn - their
+// tokens after this one are given back without a take,
+// hle_gx_native_skip) or gives them back to the per-draw splice (false);
+// host_gpu_segment_refused when the stream did not hold them. Each member
+// token given back is counted with its time (ns, 0 untimed).
+const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count, std::uint64_t* word);
+bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word);
+void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word);
+void host_gpu_segment_skipped(std::uint64_t ns, bool lost);
+void host_gpu_segment_follows(bool follows);  // BBHOST_GXVK_SEGMENTS_FLAGS=needed: a ready segment follows this draw
+bool host_gpu_segment_flags_needed();
+std::string host_gpu_segment_report(bool spliced_part);  // the builder's line (false), the splices' (true)
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();
@@ -494,6 +523,16 @@ void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uin
 void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t bytes, std::uint64_t gen);
 // That buffer was destroyed (gx twins drop its device-local copy).
 void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
+// Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h), on the thread that made or ended the buffer: GX made a buffer
+// (its holder, memory, size, usage, CPU access and bind flags as the holder holds them) - a constant buffer of default
+// or dynamic usage gets its device-local home and the home's handle at the holder's +0x14 (0 for any other); the
+// buffer at `holder` ended (`why` gxvk_homes::End: released, replaced, mapped in place by the CPU); [va, +bytes)
+// covered - unmapped, or given to a new resource (`why` kEndUnmapped, kEndReplaced): the homes over it end.
+// `spare`: the holder's +0x14 before anything wrote it this time (a home's handle there is an older buffer's).
+void host_gpu_home_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes, std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind,
+                        std::uint32_t spare);
+void host_gpu_home_end(std::uint64_t holder, int why);
+void host_gpu_home_covered(std::uint64_t va, std::uint64_t bytes, int why);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
@@ -505,7 +544,10 @@ void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
 // resource's image when the host holds one (textures_copy_resource_locked,
 // the render-target path for a target), and the memory copy stays the
 // fallback.
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0);
+// `cap_at`/`cap_piece` (stage 4b.3a(i), BBHOST_GXVK_HOMES=1): a copy-back's capture at the GX resolve, read in place of
+// the source (host/cb_capture.h; 0xffffffff: none).
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0,
+                         std::uint32_t cap_at = 0xffffffffu, std::uint32_t cap_piece = 0xffffffffu);
 // A GX dynamic buffer's renamed bytes copied back to its own address (a copy
 // token's batched copies): inside a render pass, the draws after it read a
 // copy of the bytes taken now and the copy into place waits for the pass's
@@ -518,6 +560,11 @@ bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes)
 // a token's copies: each release waited for the copy just made to leave the
 // write-combining buffers of the staging memory.
 std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n);
+// The same, stage 4b.3a(i) (BBHOST_GXVK_HOMES, host/cb_capture.h): the copy-backs' bytes captured at the GX resolve, at[i]
+// each one's place in the captures' ring (cb_capture::kNone: not captured, today's copy) in `piece`. A home kept as a
+// device-local twin takes a GPU copy from its capture in stream order; any other a copy version of its capture.
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at,
+                                         std::uint32_t piece, std::size_t n);
 // A constant window a YEBIS draw reads, given at its token on the command
 // processor's thread (engine/yebis_bind.cpp): written into guest memory by
 // the CPU, and the next draw binds a copy of it taken as it records, so no

@@ -18,11 +18,18 @@
 // today's path. It must refuse in-place binding to a range that runs past its
 // hand-out; and with every binding sampled (compare) it must find bytes
 // changed under a queued draw, and only those - a range handed out again is
-// rewritten as it should be. Then seven deliberate mistakes, each of which
-// must be caught.
+// rewritten as it should be. The same proof holds copy-backs' sources (stage
+// 1d.2a, arena_hold) with the arena's bindings off: a hold stamps its record
+// as a binding does, one past its hand-out or with no hand-out over it is
+// refused, and a hand-out over a held source whose copy has not run waits for
+// the GPU (the recording under way submitted and everything run) instead of
+// failing the proof - each such hand-out once, the sixteenth within a minute
+// stopping the proof.
+// Then thirteen deliberate mistakes, each of which must be caught.
 // Built with GXVK_ARENA_TESTING and GXVK_ARENA_MUTANTS (CMakeLists.txt), as its arena is.
 #include "host/gxvk.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -38,13 +45,23 @@ std::uint64_t g_completed = 0;  // submissions completed: those numbered below i
 // its slot retires, trail the landing's count, raised before the labels land.
 std::uint64_t g_lag = 0;
 std::uint64_t trailing() { return g_completed > g_lag ? g_completed - g_lag : 0; }
+// The submission being recorded; host_gpu_flush submits it, and every submission runs.
+std::uint64_t g_serial = 0;
+long g_flush_calls = 0;
+void host_gpu_flush() {
+    ++g_flush_calls;
+    g_completed = ++g_serial;
+}
 std::uint64_t host_gpu_completed_submits_seen() { return trailing(); }
 namespace label_landing {
 std::uint64_t landing() { return g_completed; }
 std::uint64_t landed() { return trailing(); }
 }  // namespace label_landing
+// Copy-backs from the heap (stage 1d.2a): its mode, which keeps the records for the holds with the bindings off.
+gxvk::HeapCopy g_copy_mode = gxvk::HeapCopy::kOff;
 namespace gxvk {
 bool census() { return false; }
+HeapCopy heap_copy_mode() { return g_copy_mode; }
 void heap_snap_region(std::uint64_t, std::uint64_t) {}  // stage 1d.1's (tests/gxvk_heapsnap_test.cpp)
 }  // namespace gxvk
 
@@ -94,13 +111,17 @@ struct Result {
     long reuses_early = 0;  // the model's own count: hand-outs' overlaps of a range a running submission bound
     long handouts = 0, bindings = 0, in_place = 0, straddles = 0, bytes_changed = 0;
     long first_model = -1, first_arena = -1;  // the steps of the model's first early reuse and of the arena's first find
+    long handouts_early = 0;                  // hand-outs over at least one range a running submission bound
     bool failed = false;                      // the arena's proof has failed (in place off)
     long in_place_after = 0;                  // bindings bound in place after that
 };
 
 // One run. `early`: the chance a hand-out takes a released range before its
-// release has landed (and so, perhaps, over a binding still running).
-Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t seed) {
+// release has landed (and so, perhaps, over a binding still running). `holds`:
+// the draws' reads are copy-backs' sources held (arena_hold, stage 1d.2a), with
+// the arena's bindings off - the records kept for the holds alone.
+Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t seed, bool holds = false) {
+    g_copy_mode = holds ? gxvk::HeapCopy::kOn : gxvk::HeapCopy::kOff;
     gxvk::arena_test_reset(mode);
     g_completed = 0;
     std::mt19937_64 rng(seed);
@@ -109,7 +130,9 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
     const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
     gxvk::arena_region(kPool, base, kHeapBytes);
     std::map<u64, Out> out;  // by start: every hand-out the pool has not taken back
-    u64 serial = 0;          // the submission being recorded
+    u64& serial = g_serial;  // the submission being recorded (host_gpu_flush moves it on)
+    serial = 0;
+    g_flush_calls = 0;
     Result r;
     const auto free_at = [&](u64 start, u64 end, bool take_early) {
         // Whether [start, end) is free to hand out: nothing out overlaps it but
@@ -137,6 +160,7 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
             if (!found) continue;
             const u64 end = start + bytes;
             // Each range it goes over that a running submission bound: the model's count.
+            bool early_here = false;
             for (auto it = out.begin(); it != out.end();) {
                 Out& o = it->second;
                 if (o.end <= start || o.start >= end) {
@@ -145,10 +169,12 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
                 }
                 if (o.last_bound > g_completed) {
                     ++r.reuses_early;
+                    early_here = true;
                     if (r.first_model < 0) r.first_model = step;
                 }
                 it = out.erase(it);
             }
+            if (early_here) ++r.handouts_early;
             out[start] = {start, end};
             gxvk::arena_handout(kPool, node_for(start, end));
             ++r.handouts;
@@ -170,12 +196,12 @@ Result run(Arena mode, long steps, double early, double rewrite, std::uint64_t s
             if (past) bytes = o.end - at + 16;
             if (at + bytes > base + kHeapBytes) continue;
             if (!r.failed) r.failed = !gxvk::arena_test_counts().in_place;
-            const bool placed = gxvk::arena_bind(at, bytes, serial, gxvk::kUseConstant, false);
+            const bool placed = holds ? gxvk::arena_hold(at, bytes, serial) : gxvk::arena_bind(at, bytes, serial, gxvk::kUseConstant, false);
             ++r.bindings;
             if (r.failed && placed) ++r.in_place_after;
             if (past) {
                 ++r.straddles;
-                if (placed) fail("a binding past its hand-out's end bound in place", step);
+                if (placed) fail(holds ? "a copy-back's source past its hand-out's end held" : "a binding past its hand-out's end bound in place", step);
             } else {
                 o.last_bound = std::max(o.last_bound, serial + 1);
                 if (placed) ++r.in_place;
@@ -280,6 +306,82 @@ int check_all(bool say) {
     }
     if (say) std::printf("  bytes: %ld rewrites under queued draws made, %ld found; none found where ranges were only handed out again\n", rewrites,
                          changed);
+    // Copy-backs' sources held (stage 1d.2a), with the arena's bindings off: the records are kept for the holds, a hold
+    // stamps its record as a binding does, so an early reuse over a held source is found at the hand-out that made it;
+    // a hold past its hand-out is refused, and after the proof failed none is held.
+    long held = 0, hold_made = 0;
+    for (std::uint64_t seed = 51; seed <= 53; ++seed) {
+        const Result r = run(Arena::kOff, 40000, 0.0, 0.0, seed, true);
+        const auto c = gxvk::arena_test_counts();
+        held += static_cast<long>(c.holds);
+        if (c.violations_order || c.violations_bytes) fail("a violation found in a clean run of holds", 0);
+        if (!c.holds || r.in_place != static_cast<long>(c.holds)) fail("holds not counted as held in a clean run", 0);
+        if (c.hold_fell != static_cast<std::uint64_t>(r.straddles)) fail("holds refused other than those past their hand-out", 0);
+    }
+    // Early reuse over held sources: each such hand-out waits once - the recording under way submitted, everything
+    // run - so no violation is found; the sixteenth wait stops the proof (none held after it, no records kept). A
+    // short run with few early hand-outs waits for each and goes on.
+    long waited = 0;
+    for (std::uint64_t seed = 61; seed <= 64; ++seed) {
+        const bool few = seed >= 63;
+        const Result r = run(Arena::kOff, 40000, few ? 0.3 : 1.0, 0.0, seed, true);
+        if (say) std::printf("    holds run %llu: %ld early hand-outs, %llu waits\n", static_cast<unsigned long long>(seed), r.handouts_early,
+                             static_cast<unsigned long long>(gxvk::arena_test_counts().hold_waits));
+        const auto c = gxvk::arena_test_counts();
+        hold_made += r.reuses_early;
+        waited += static_cast<long>(c.hold_waits);
+        if (c.violations_order) fail("an early reuse over a held source failed the proof instead of waiting", r.first_model);
+        if (static_cast<long>(c.hold_waits) != g_flush_calls) fail("a hand-out's wait without the GPU's catching up", 0);
+        const long want = std::min<long>(r.handouts_early, 16);
+        if (static_cast<long>(c.hold_waits) != want) fail("hand-outs over held sources not waiting once each, up to sixteen", r.first_model);
+        if (r.handouts_early >= 16) {
+            if (c.in_place) fail("the proof not stopped after sixteen waits", 0);
+            if (r.in_place_after) fail("a copy-back's source held after the proof stopped", 0);
+            if (c.live) fail("records kept after the proof stopped (holds)", 0);
+        } else if (!c.in_place) {
+            fail("the proof stopped with fewer than sixteen waits", 0);
+        }
+        if (!r.handouts_early) fail("a run made no early hand-out over a held source (the test's own)", 0);
+    }
+    // The limit: one range handed out, a source held in it in the recording under way, the range handed out again
+    // before that has run - twenty times, well within a minute. The first sixteen wait and find nothing; the sixteenth
+    // stops the proof, and after it no hand-out is recorded and no source held.
+    {
+        g_copy_mode = gxvk::HeapCopy::kOn;
+        gxvk::arena_test_reset(Arena::kOff);
+        g_completed = g_serial = 0;
+        g_flush_calls = 0;
+        const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
+        gxvk::arena_region(kPool, base, kHeapBytes);
+        long held_after = 0;
+        for (int i = 0; i < 20; ++i) {
+            const u64 s = base + 65536 * static_cast<u64>(i % 4);
+            gxvk::arena_handout(kPool, node_for(s, s + 4096));
+            const bool on = gxvk::arena_test_counts().in_place;
+            if (gxvk::arena_hold(s + 64, 64, g_serial) && !on) ++held_after;
+            gxvk::arena_handout(kPool, node_for(s, s + 4096));
+        }
+        const auto c = gxvk::arena_test_counts();
+        if (c.violations_order) fail("a hand-out over a held source failed the proof instead of waiting (the limit's run)", 0);
+        if (c.hold_waits != 16) fail("the waits not stopped at sixteen", 0);
+        if (c.in_place || c.live || held_after) fail("the proof not stopped at the sixteenth wait, or a source held after it", 0);
+        g_copy_mode = gxvk::HeapCopy::kOff;
+    }
+    {
+        g_copy_mode = gxvk::HeapCopy::kOn;
+        gxvk::arena_test_reset(Arena::kOff);
+        const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
+        gxvk::arena_region(kPool, base, kHeapBytes);
+        gxvk::arena_handout(kPool, node_for(base + 4096, base + 8192));
+        const bool none = gxvk::arena_hold(base + 64, 32, 0);
+        const bool inside = gxvk::arena_hold(base + 4096 + 64, 64, 0);
+        const auto c = gxvk::arena_test_counts();
+        if (none || !inside || c.holds != 1 || c.hold_fell != 1) fail("a source no hand-out holds held, or one inside a hand-out not", 0);
+        g_copy_mode = gxvk::HeapCopy::kOff;
+    }
+    if (say) std::printf("  copy-backs' sources: %ld held over three clean runs, none refused but past their hand-out; the model handed out "
+                         "over %ld held sources early, and those hand-outs waited for the GPU (%ld waits, sixteen at most a run) with no "
+                         "violation\n", held, hold_made, waited);
     // Bindings outside the heap are not the arena's: nothing bound, nothing counted (an address above the heap once
     // wrapped the bounds test round and counted as a fallback); one running past the heap's end is refused.
     {
@@ -309,9 +411,12 @@ int main() {
     static const char* const kMistake[] = {"", "a binding's stamp one submission short", "a hand-out over part of a record not checked",
                                            "a binding past its hand-out bound in place", "a sample checked after its range was handed out again",
                                            "the heap's bounds test wrapping round above it", "the arena going on with its records after the proof failed",
-                                           "the landing's count taken once the labels are in memory, not before"};
+                                           "the landing's count taken once the labels are in memory, not before",
+                                           "a copy-back's source past its hand-out held", "a copy-back's source held without its stamp",
+                                           "a copy-back's source no hand-out holds held", "a hand-out over a held source not waiting",
+                                           "the count of done submissions not read again after the wait", "the waits not limited"};
     int missed = 0;
-    for (int m = 1; m <= 7; ++m) {
+    for (int m = 1; m <= 13; ++m) {
         g_arena_mutant = m;
         g_quiet = true;
         const int bad = check_all(false);

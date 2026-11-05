@@ -302,10 +302,10 @@ the start, says which of these the GPU is and what decided each part:
 | The GPU | The game's vertex and index buffers | The game's memory | Upload staging | A window unused for a minute |
 |---|---|---|---|---|
 | A graphics card with 7.5 GB or more of video memory free | copies in video memory | imported whole | kept | (no windows) |
-| One with less free | copies in video memory, within a budget | imported a 16 MB window at a time | given back in play (kept on NVIDIA's driver, whose free of each chunk stalls a frame) | let go |
+| One with less free | copies in video memory, within a budget | imported a 16 MB window at a time | given back in play (kept on NVIDIA's driver, whose free of each chunk stalls a frame) | let go (kept on NVIDIA's driver under Windows) |
 | One with under 12 GB in all its memory heaps | read where they are | imported whole | kept | (no windows) |
-| An integrated GPU with 8 GB of video memory or more | copies in video memory | a window at a time under Windows, whole under Linux | given back under Windows | kept |
-| A smaller integrated GPU (a Steam Deck too) | read where they are | a window at a time under Windows, whole under Linux | given back under Windows | kept |
+| An integrated GPU with 8 GB of video memory or more | copies in video memory | a window at a time under Windows, whole under Linux | given back under Windows | let go |
+| A smaller integrated GPU (a Steam Deck too) | read where they are | a window at a time under Windows, whole under Linux | given back under Windows | let go |
 
 `BBHOST_GXVK_BUFFERS`, `BBHOST_GXVK_BUFFERS_BUDGET_MB`,
 `BBHOST_IMPORT_WINDOWS` (or `import_windows` under `[gpu]`),
@@ -313,10 +313,12 @@ the start, says which of these the GPU is and what decided each part:
 each change one part, on any GPU. The Steam Deck kit's toml turns window
 imports on. A window import none of whose windows the GPU has used for a
 minute is let go (its memory unpinned once the work that used it has run)
-and imported again if it is wanted again: `BBHOST_IMPORT_RETIRE=0` keeps
-them all, `=1` lets them go on any GPU that imports by window, `=2` only
-counts in the log what `=1` would have let go; `BBHOST_IMPORT_RETIRE_S=<s>`
-sets the minute.
+and imported again if it is wanted again. On NVIDIA's driver under Windows
+they are all kept: its import of a window wanted again took 23-57 ms, and
+the frame that wanted it waited. `BBHOST_IMPORT_RETIRE=0` keeps them all,
+`=1` lets them go on any GPU that imports by window, `=2` only counts in the
+log what `=1` would have let go; `BBHOST_IMPORT_RETIRE_S=<s>` sets the
+minute.
 
 Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
 says where the video memory goes: `gpu: video memory (MiB)`

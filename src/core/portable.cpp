@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -24,6 +25,7 @@
 #include <timeapi.h>
 #else
 #include <dirent.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -254,6 +256,20 @@ void host_thread_background() {
 #else
     setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
 #endif
+}
+
+unsigned host_cpu_threads() {
+#if defined(_WIN32)
+    // (A process whose threads span processor groups gets no mask: then the system's count.)
+    DWORD_PTR process = 0, system = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process)
+        return static_cast<unsigned>(__builtin_popcountll(static_cast<unsigned long long>(process)));
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0) return static_cast<unsigned>(CPU_COUNT(&set));
+#endif
+    return std::max(1u, std::thread::hardware_concurrency());
 }
 
 void host_thread_set_name(const char* name) {

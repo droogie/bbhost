@@ -14,10 +14,10 @@
 
 namespace cache_rw {
 
-const bool g_readers = gxvk_lists::pool_threads() > 0;
+std::atomic<bool> g_readers{false};
 thread_local constinit bool t_reader = false;
 thread_local constinit int t_write_depth = 0;
-std::atomic<std::uint64_t> g_gen[kCaches] = {};
+std::atomic<std::uint64_t> g_gen[kKinds] = {};
 
 namespace {
 

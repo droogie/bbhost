@@ -18,19 +18,23 @@
 //
 //   the device                                  GX's buffers         imports          upload staging   idle windows
 //   a discrete GPU with room (7.5 GiB+ free)    by handle            whole            kept             (no windows)
-//   one with small video memory                 by handle, budgeted  by window        given back (**)  let go
+//   one with small video memory                 by handle, budgeted  by window        given back (**)  let go (***)
 //   one with tight memory (heaps under 12 GiB)  today's path         whole            kept             (no windows)
-//   an integrated GPU with 8 GiB or more        by handle            by platform (*)  by platform (*)  kept (***)
-//   a smaller integrated GPU (a Steam Deck)     today's path         by platform (*)  by platform (*)  kept (***)
+//   an integrated GPU with 8 GiB or more        by handle            by platform (*)  by platform (*)  let go
+//   a smaller integrated GPU (a Steam Deck)     today's path         by platform (*)  by platform (*)  let go
 //   (*) by window and given back under Windows; whole and kept under Linux,
 //   where the Steam Deck's kit asks for window imports in its own toml.
 //   (**) kept on NVIDIA's driver, whose free of a 64 MiB staging chunk stalls
 //   the frame it falls in.
-//   (***) until an integrated GPU has run it: a window wanted again is
-//   imported again on the command processor, 5-46 ms a 16 MiB window on a
-//   Radeon 680M under Windows against ~4 on an RTX 4070.
-//   Window imports asked for on a discrete GPU (BBHOST_IMPORT_WINDOWS,
-//   gpu.import_windows) let idle windows go too.
+//   (***) kept on NVIDIA's driver under Windows, which imports a window wanted
+//   again in 23-57 ms, and mostly on the command processor, at the draw that
+//   wants it: an area come back to after a minute away arrived with a frame
+//   of 0.24-0.34 s against 0.06 with them kept, and a frame in play took
+//   65 ms. An integrated GPU's driver (AMD's under Windows, RADV) imported
+//   them again on the import thread inside the load, 13 ms the longest, at
+//   the same frame rate, with 0.6-1.45 GB less pinned at a place's end.
+//   Window imports asked for on any GPU (BBHOST_IMPORT_WINDOWS,
+//   gpu.import_windows) let idle windows go too, but NVIDIA's under Windows.
 //
 // Why: a card with room has the video memory for the copies and the PCIe
 // link for whole imports, and its staging is kept: each 64 MiB chunk's
@@ -121,8 +125,10 @@ inline Policy decide(Device d, bool windows_host, std::uint64_t free_at_start, b
     p.windows = import_mode::decide(s.imports_env, s.imports_cfg, integrated, windows_host, small) == import_mode::Mode::kWindows;
     // The staging's return on a small card only where the driver frees a chunk without stalling a frame.
     p.staging_return = apu_memory::staging_return(s.staging_env, s.staging_cfg, integrated, windows_host, small && !nvidia ? 1 : 0);
-    // Idle windows let go wherever windows are imported on a discrete GPU.
-    p.retire = !p.windows ? 0 : import_retire::parse(s.retire, nullptr, nullptr, integrated ? import_retire::kOff : import_retire::kOn).mode;
+    // Idle windows let go wherever windows are imported, but on NVIDIA's driver under Windows, whose import of a
+    // window wanted again stalls the command processor 23-57 ms (the table's note).
+    const int retire_dflt = nvidia && windows_host ? import_retire::kOff : import_retire::kOn;
+    p.retire = !p.windows ? 0 : import_retire::parse(s.retire, nullptr, nullptr, retire_dflt).mode;
     return p;
 }
 
@@ -191,12 +197,15 @@ inline std::string describe(const Policy& p, const Switches& s) {
     out += b;
     // Idle windows (with window imports).
     if (p.windows) {
-        const char* rt = given(s.retire) ? " (BBHOST_IMPORT_RETIRE)" : "";
+        const char* why = given(s.retire) ? " (BBHOST_IMPORT_RETIRE)"
+                          : p.retire == import_retire::kOff && p.nvidia && p.windows_host
+                              ? ", as NVIDIA's driver under Windows takes 23-57 ms to import a window wanted again, on the command processor"
+                              : "";
         std::snprintf(b, sizeof b, "; %s%s",
                       p.retire == import_retire::kOn      ? "a window import a minute without a use let go"
                       : p.retire == import_retire::kCount ? "idle window imports counted, none let go"
                                                           : "every window import kept",
-                      rt[0] ? rt : p.retire == import_retire::kOff ? ", as on every integrated GPU until one has run it" : "");
+                      why);
         out += b;
     }
     out += " - BBHOST_GXVK_BUFFERS, BBHOST_GXVK_BUFFERS_BUDGET_MB, BBHOST_IMPORT_WINDOWS, BBHOST_STAGING_RETURN and BBHOST_IMPORT_RETIRE change a part "
