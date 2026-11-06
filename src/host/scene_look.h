@@ -24,6 +24,13 @@ bool scene_look_snap_cells(std::uint32_t w, std::uint32_t h, float* cells_x, flo
 void scene_look_set_cutaway(float tan_x, float tan_y, float near_z, float radius);
 bool scene_look_cutaway(float* out);
 
+// The cutaway per pixel (plugin API 23, host/pixel_cutaway.h): its numbers
+// but the viewport, which each draw gives; radius 0 off. The getter fills
+// them (when `out` is given) and says whether it is on.
+struct PixelCut;
+void scene_look_set_pixel_cut(const PixelCut& cut);
+bool scene_look_pixel_cut(PixelCut* out);
+
 // The camera draws' textures sampled nearest.
 void scene_look_set_nearest(bool on);
 bool scene_look_nearest();

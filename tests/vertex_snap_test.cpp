@@ -6,6 +6,7 @@
 // snaps before every return or emit, keeps its arithmetic NoContraction, and
 // a refusal leaves the module as it was.
 #include "gcn/spirv.h"
+#include "host/pixel_cutaway.h"
 #include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
 
@@ -260,9 +261,91 @@ void check_cut(const char* what, std::vector<u32> m, int sites, bool snap_first)
     CHECK(again == m);
 }
 
+// A pixel stage with early fragment tests, a function-local variable in its
+// first block and a branch out of it, and no FragCoord: what the cutaway's
+// per-pixel twin must take (host/pixel_cutaway.h).
+std::vector<u32> fragment_with_body(bool frag_coord) {
+    Asm a;
+    const u32 main = a.id(), out_c = a.id(), fc = a.id(), t_void = a.id(), t_fn = a.id(), t_f32 = a.id(), t_v4 = a.id(),
+              p_out = a.id(), p_in = a.id(), p_fn = a.id(), t_bool = a.id(), c1 = a.id(), cv = a.id(), l0 = a.id(), l1 = a.id(),
+              local = a.id(), x = a.id(), cond = a.id(), v = a.id();
+    a.op(spv::OpCapability, {spv::CapShader});
+    a.op(spv::OpMemoryModel, {0, 1});
+    if (frag_coord) a.op_str(spv::OpEntryPoint, {spv::EmFragment, main}, "main", {out_c, fc});
+    else a.op_str(spv::OpEntryPoint, {spv::EmFragment, main}, "main", {out_c});
+    a.op(spv::OpExecutionMode, {main, spv::ExOriginUpperLeft});
+    a.op(spv::OpExecutionMode, {main, 9});  // EarlyFragmentTests
+    a.op(spv::OpDecorate, {out_c, spv::DecLocation, 0});
+    if (frag_coord) a.op(spv::OpDecorate, {fc, spv::DecBuiltIn, 15});
+    a.op(spv::OpTypeVoid, {t_void});
+    a.op(spv::OpTypeFunction, {t_fn, t_void});
+    a.op(spv::OpTypeFloat, {t_f32, 32});
+    a.op(spv::OpTypeVector, {t_v4, t_f32, 4});
+    a.op(spv::OpTypePointer, {p_out, spv::ScOutput, t_v4});
+    a.op(spv::OpTypePointer, {p_in, spv::ScInput, t_v4});
+    a.op(spv::OpTypePointer, {p_fn, 7 /* Function */, t_v4});
+    a.op(spv::OpTypeBool, {t_bool});
+    a.op(spv::OpConstant, {t_f32, c1, 0x3f800000u});
+    a.op(spv::OpConstantComposite, {t_v4, cv, c1, c1, c1, c1});
+    a.op(spv::OpVariable, {p_out, out_c, spv::ScOutput});
+    if (frag_coord) a.op(spv::OpVariable, {p_in, fc, spv::ScInput});
+    a.op(spv::OpFunction, {t_void, main, 0, t_fn});
+    a.op(spv::OpLabel, {l0});
+    a.op(spv::OpVariable, {p_fn, local, 7});
+    a.op(spv::OpStore, {local, cv});
+    a.op(spv::OpLoad, {t_v4, v, local});
+    a.op(spv::OpCompositeExtract, {t_f32, x, v, 0});
+    a.op(spv::OpFOrdGreaterThan, {t_bool, cond, x, c1});
+    a.op(spv::OpSelectionMerge, {l1, 0});
+    a.op(spv::OpBranchConditional, {cond, l1, l1});
+    a.op(spv::OpLabel, {l1});
+    a.op(spv::OpStore, {out_c, v});
+    a.op(spv::OpReturn, {});
+    a.op(spv::OpFunctionEnd, {});
+    return a.done();
+}
+
+void check_pixel_cut(const char* what, std::vector<u32> m) {
+    const PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
+    std::string why, msg;
+    CHECK(valid(m, &msg));
+    const bool ok = pixel_cutaway(m, cut, &why);
+    if (!ok) std::fprintf(stderr, "%s: pixel cutaway refused: %s\n", what, why.c_str());
+    CHECK(ok);
+    if (!ok) return;
+    const bool v = valid(m, &msg);
+    if (!v) std::fprintf(stderr, "%s: invalid after the pixel cutaway: %s\n", what, msg.c_str());
+    CHECK(v);
+    CHECK(count(m, spv::OpKill) == 1);
+    int early = 0;
+    for (std::size_t i = 5; i < m.size(); i += m[i] >> 16)
+        if ((m[i] & 0xffff) == spv::OpExecutionMode && m[i + 2] == 9) ++early;
+    CHECK(early == 0);
+}
+
 }  // namespace
 
 int main() {
+    check_pixel_cut("pixel cutaway: no FragCoord", fragment_with_body(false));
+    check_pixel_cut("pixel cutaway: its own FragCoord", fragment_with_body(true));
+    {
+        const PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
+        const std::vector<u32> only = pixel_cutaway_only(cut);
+        std::string msg;
+        extern std::string g_only_why;
+        if (only.empty()) std::fprintf(stderr, "cutaway alone refused: %s", g_only_why.c_str());
+        CHECK(!only.empty());
+        const bool v = valid(only, &msg);
+        if (!v) std::fprintf(stderr, "cutaway alone: invalid: %s", msg.c_str());
+        CHECK(v);
+    }
+    {
+        std::vector<u32> m = vertex_own_variable();
+        const std::vector<u32> before = m;
+        const PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
+        CHECK(!pixel_cutaway(m, cut));
+        CHECK(m == before);
+    }
     check_cut("cutaway: vertex, own variable", vertex_own_variable(), 1, false);
     check_cut("cutaway: vertex, gl_PerVertex member", vertex_block_member(), 2, false);
     check_cut("cutaway: geometry", geometry_two_emits(), 2, false);

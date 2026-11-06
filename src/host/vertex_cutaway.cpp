@@ -223,12 +223,7 @@ bool vertex_cutaway(std::vector<u32>& spirv, const float cut[4], std::string* wh
         add(globals, mk(spv::OpConstant, {t_f32, id, f32_bits(f)}));
         return id;
     };
-    // BBHOST_CUTAWAY_KEEP=1, a test: the distance written is 1 - nothing clipped.
-    static const bool keep_all = [] {
-        const char* e = std::getenv("BBHOST_CUTAWAY_KEEP");
-        return e && e[0] == '1';
-    }();
-    const u32 c_keep = constant(1.0f), c_w_min = constant(kNearest);
+    const u32 c_w_min = constant(kNearest);
     const u32 c_tx = constant(cut[0]), c_ty = constant(cut[1]), c_near = constant(cut[2]), c_radius = constant(cut[3]);
     add(globals, mk(spv::OpVariable, {t_arr_ptr, clip_var, spv::ScOutput}));
     add(decorations, mk(spv::OpDecorate, {clip_var, spv::DecBuiltIn, kBiClipDistance}));
@@ -268,7 +263,7 @@ bool vertex_cutaway(std::vector<u32>& spirv, const float cut[4], std::string* wh
         add(c, mk(spv::OpFSub, {t_f32, inside, c_w_min, wv}));
         add(c, mk(spv::OpExtInst, {t_f32, d, glsl, spv::GlslFMax, d0, inside}));
         add(c, mk(spv::OpAccessChain, {f_out_ptr, slot, clip_var, c_zero}));
-        add(c, mk(spv::OpStore, {slot, keep_all ? c_keep : d}));
+        add(c, mk(spv::OpStore, {slot, d}));
         return c;
     };
     std::vector<std::vector<u32>> code;

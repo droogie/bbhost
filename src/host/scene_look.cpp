@@ -1,6 +1,7 @@
 // The 3D's look a plugin asks for (host/scene_look.h).
 #include "host/scene_look.h"
 
+#include "host/pixel_cutaway.h"
 #include "host/upscaler.h"
 
 #include <atomic>
@@ -20,6 +21,8 @@ std::atomic<void (*)()> g_targets_change{nullptr};
 std::mutex g_cut_mu;
 float g_cut[4] = {};  // under g_cut_mu
 std::atomic<bool> g_cut_on{false};
+PixelCut g_pixel_cut{};  // under g_cut_mu
+std::atomic<bool> g_pixel_cut_on{false};
 
 void targets_changed() {
     if (void (*fn)() = g_targets_change.load(std::memory_order_acquire)) fn();
@@ -66,6 +69,25 @@ bool scene_look_cutaway(float* out) {
     return true;
 }
 
+void scene_look_set_pixel_cut(const PixelCut& cut) {
+    const bool on = cut.radius > 0.0f && cut.distance > 0.0f;
+    std::lock_guard<std::mutex> lk(g_cut_mu);
+    // Rounded: each new set is a new twin of every camera draw's pixel stage.
+    const auto round_to = [](float v, float step) { return std::round(v / step) * step; };
+    g_pixel_cut = cut;
+    g_pixel_cut.distance = round_to(cut.distance, 0.25f);
+    g_pixel_cut.radius = round_to(cut.radius, 0.25f);
+    g_pixel_cut_on.store(on, std::memory_order_release);
+}
+bool scene_look_pixel_cut(PixelCut* out) {
+    if (!g_pixel_cut_on.load(std::memory_order_acquire)) return false;
+    if (out) {
+        std::lock_guard<std::mutex> lk(g_cut_mu);
+        *out = g_pixel_cut;
+    }
+    return true;
+}
+
 void scene_look_set_nearest(bool on) { g_nearest.store(on, std::memory_order_relaxed); }
 bool scene_look_nearest() { return g_nearest.load(std::memory_order_relaxed); }
 
@@ -90,6 +112,8 @@ bool scene_look_colour_8bit() { return g_colour_8bit.load(std::memory_order_acqu
 void scene_look_set_grading_nearest(bool on) { g_grading_nearest.store(on, std::memory_order_relaxed); }
 bool scene_look_grading_nearest() { return g_grading_nearest.load(std::memory_order_relaxed); }
 
-bool scene_look_camera() { return scene_look_snap() || scene_look_nearest() || scene_look_scale() || scene_look_cutaway(nullptr); }
+bool scene_look_camera() {
+    return scene_look_snap() || scene_look_nearest() || scene_look_scale() || scene_look_cutaway(nullptr) || scene_look_pixel_cut(nullptr);
+}
 
 void scene_look_on_targets_change(void (*fn)()) { g_targets_change.store(fn, std::memory_order_release); }

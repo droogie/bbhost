@@ -17,6 +17,7 @@
 #include "host/options.h"
 #include "host/scene_look.h"
 #include "host/upscaler.h"
+#include "host/pixel_cutaway.h"
 #include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
 #include "host/gs_emit_gate.h"
@@ -475,6 +476,8 @@ struct GfxPipeline {
     // last stage before the rasterizer snaps to, 0 none, then the cutaway's
     // tan_x, tan_y, near and radius (host/vertex_cutaway.h), radius 0 none.
     float snap_cells[6] = {};
+    // The cutaway per pixel (DrawState::pixel_cut): its pixel stage the twin.
+    bool pixel_cut_on = false;
     // Per pixel-stage sampler, the images (bit i: ps.meta().images[i], the
     // first 32) its instructions sample with it - from the translation's
     // image_at and sampler_at, made once with the pipeline (pair_samplers);
@@ -3169,6 +3172,10 @@ struct DrawState {
     // After program_fp, so pipeline_key leaves it out: draw_impl salts the key
     // with it.
     float snap_cells[6] = {};
+    // A plugin's cutaway per pixel (plugin API 23, host/pixel_cutaway.h): its
+    // numbers with this draw's viewport; salted into the key like the snap.
+    bool pixel_cut_on = false;
+    PixelCut pixel_cut{};
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
     // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
     // whole and the rest masked (fixed_state). Salted into the key like the
@@ -5471,7 +5478,7 @@ bool look_twin(const float look[6]);
 bool recipe_recordable(const DrawState& s) {
     // A plugin's snapped camera draw (DrawState::snap_cells): the lists keep no
     // grid, so a start would build it unsnapped - left to its draws.
-    if (look_twin(s.snap_cells)) return false;
+    if (look_twin(s.snap_cells) || s.pixel_cut_on) return false;
     if (s.host_gbuffer) return false;  // likewise its host pixel shader
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
@@ -6201,8 +6208,10 @@ struct SnapOrigin {
 std::mutex g_snap_origin_mu;
 std::unordered_map<std::uint64_t, SnapOrigin> g_snap_origin;  // by the twin's words
 std::atomic<std::uint64_t> g_snap_twins{0}, g_snap_refused{0};
+std::atomic<std::uint64_t> g_pixel_cut_twins{0}, g_pixel_cut_refused{0};  // the cutaway's pixel stages
 constexpr std::uint64_t kSnapSalt = 0x5a4a9c11ull;
 constexpr std::uint64_t kGbufferSalt = 0x6b0ffe12ull;  // DrawState::host_gbuffer
+constexpr std::uint64_t kPixelCutSalt = 0x7c11ac03ull;  // DrawState::pixel_cut
 
 // The map's G-buffer draws mark the stencil, and the lights test it: a
 // pixel left unmarked is not lit. So a plugin's G-buffer draw takes the
@@ -7456,6 +7465,47 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     std::memcpy(pl.snap_cells, s.snap_cells, sizeof(pl.snap_cells));
     if (look_twin(s.snap_cells) && (gs_lift || snap_stage(pl.vs, vs_key, s.snap_cells, vs_name, vs_cacheable)))
         pl.vs_key = fnv1a(s.snap_cells, sizeof(s.snap_cells), vs_key ^ kSnapSalt);
+    // The cutaway per pixel (host/pixel_cutaway.h): the pixel stage's twin, or
+    // a stage of the test alone for a draw with none. The characters and the
+    // objects were left out per draw (draw_impl: the G-buffer's stencil).
+    if (s.pixel_cut_on && !pl.ps.module && !pl.gs_native) {
+        // A camera draw with no pixel stage (the map's depth-only passes): one
+        // of the cutaway alone, so the cut surfaces leave no depth behind.
+        gcn::TranslateResult only{};
+        only.spirv = pixel_cutaway_only(s.pixel_cut);
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (!only.spirv.empty() && make_module(only.spirv, module)) {
+            pl.ps.fresh() = std::move(only);
+            pl.ps.lifted = false;
+            pl.ps.module = module;
+            pl.pixel_cut_on = true;
+            pl.ps_key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), kPixelCutSalt ^ 0x5157u);
+            g_pixel_cut_twins.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (s.pixel_cut_on && pl.ps.module) {
+        {
+            gcn::TranslateResult twin = pl.ps.meta();
+            std::string why;
+            VkShaderModule module = VK_NULL_HANDLE;
+            const PixelCut cut = s.pixel_cut;
+            if (pixel_cutaway(twin.spirv, cut, &why) && make_module(twin.spirv, module)) {
+                const bool lifted = pl.ps.lifted;
+                pl.ps.fresh() = std::move(twin);
+                pl.ps.lifted = lifted;
+                pl.ps.module = module;
+                pl.pixel_cut_on = true;
+                pl.ps_key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), pl.ps_key ^ kPixelCutSalt);
+                g_pixel_cut_twins.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_pixel_cut_refused.fetch_add(1, std::memory_order_relaxed);
+                static std::mutex mu;
+                static std::set<std::string> logged;
+                std::lock_guard<std::mutex> lk(mu);
+                if (logged.size() < 32 && logged.insert(ps_name).second)
+                    host_log("render: cutaway: %s drawn whole - %s", ps_name.c_str(), why.empty() ? "its module" : why.c_str());
+            }
+        }
+    }
     if (gs_lift) {
         std::string why;
         if (!build_gs_es_stage(pl, s, vertex_input, why)) return fail("geometry-shader pipeline: " + why);
@@ -10395,6 +10445,10 @@ void precompile_report() {
     if (g_snap_twins.load() || g_snap_refused.load()) {
         host_log("render: vertex snap (a plugin's look): %llu stages snapped, %llu drawn unsnapped (the rewrite refused them)",
                  static_cast<unsigned long long>(g_snap_twins.load()), static_cast<unsigned long long>(g_snap_refused.load()));
+    }
+    if (g_pixel_cut_twins.load() || g_pixel_cut_refused.load()) {
+        host_log("render: cutaway per pixel (a plugin's): %llu pixel stages cut, %llu drawn whole (the rewrite refused them)",
+                 static_cast<unsigned long long>(g_pixel_cut_twins.load()), static_cast<unsigned long long>(g_pixel_cut_refused.load()));
     }
     std::string names;
     for (const std::string& n : w.not_ready) names += n;
@@ -23417,6 +23471,45 @@ static bool draw_impl(const GpuDraw& d) {
         scene_look_cutaway(&s.snap_cells[2]);
         if (look_twin(s.snap_cells)) key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
     }
+    // The cutaway per pixel: the camera draws' pixel stages, with the draw's
+    // viewport to take each pixel back to view space.
+    s.pixel_cut_on = false;
+    // The G-buffer's stencil marks what a draw is: the map's own pieces 9, the
+    // characters (players, enemies, their parts) and the objects 8 and 12 - a
+    // draw that writes those is never cut. (What moves is no test: the map's
+    // pieces are in the velocity pass's index buffers too.)
+    const std::uint32_t mark = s.stencil_ref & 0xffu;
+    const bool chr_or_obj = (s.depth_control & 1u) && (mark == 8u || mark == 12u);
+    // Only what writes depth: the G-buffer's surfaces and their depth pass -
+    // never a pass drawn over them (the lighting's full-screen passes, the
+    // light volumes), whose pixels are what the cut surfaces leave to see.
+    const bool writes_depth = (s.depth_control & 6u) == 6u;
+    float view_tan[2], view_depth[2];
+    if (scene_look_pixel_cut(nullptr) && look_camera_draw(s) && writes_depth && !chr_or_obj && s.vport[0] != 0.0f &&
+        s.vport[2] != 0.0f && upscale_view_terms(&view_tan[0], &view_tan[1], &view_depth[0], &view_depth[1]) &&
+        scene_look_pixel_cut(&s.pixel_cut)) {
+        // The view's own field of view and depth decode, rounded (to 1/1024 and
+        // 12 bits) so a camera that holds still keeps its twins.
+        const auto bits12 = [](float v) {
+            int e = 0;
+            const float m = std::frexp(v, &e);
+            return std::ldexp(std::round(m * 4096.0f) / 4096.0f, e);
+        };
+        s.pixel_cut.scale_x = s.vport[0];
+        s.pixel_cut.offset_x = s.vport[1];
+        s.pixel_cut.scale_y = s.vport[2];
+        s.pixel_cut.offset_y = s.vport[3];
+        s.pixel_cut.tan_x = std::round(view_tan[0] * 1024.0f) / 1024.0f;
+        s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
+        s.pixel_cut.depth_z = bits12(view_depth[0]);
+        s.pixel_cut.depth_w = bits12(view_depth[1]);
+        s.pixel_cut_on = true;
+        key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), key ^ kPixelCutSalt);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) == 0)
+            host_log("render: cutaway: the view's tangents %.3f %.3f, depth 1 / (%g z + %g)", static_cast<double>(s.pixel_cut.tan_x),
+                     static_cast<double>(s.pixel_cut.tan_y), static_cast<double>(s.pixel_cut.depth_z), static_cast<double>(s.pixel_cut.depth_w));
+    }
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
     // BBHOST_LEAN_FIRST: translate and lay out the fallback pipeline, but create
@@ -24485,8 +24578,13 @@ static bool draw_impl(const GpuDraw& d) {
         // depth whose vertex stage reads the camera's view block is a camera
         // draw, the one kind the jitter moves - not a full-screen pass, which
         // reads at 0..1, nor the velocity pass (Numity1504's handoff, step 3).
+        // The cutaway (pixel_cut) reads the block's tangents and depth decode
+        // too: with no upscaler's motion, from a flip's first camera draw.
+        static std::atomic<std::uint64_t> cut_read_flip{~0ull};
+        const bool motion = upscale_motion_on();
+        const bool cut_read = !motion && scene_look_pixel_cut(nullptr) && cut_read_flip.load(std::memory_order_relaxed) != hle_video_flip_count();
         const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
-                            meta.buffers.size() <= 16 && pl.velo != 2 && upscale_motion_on();
+                            meta.buffers.size() <= 16 && pl.velo != 2 && (motion || cut_read);
         // A pass of the game's velocity map: its scale's constant buffer.
         if (st == 1 && !pl.velo_known) velo_classify(pl);
         const bool velo = st == 1 && pl.velo && pl.velo != 4 && s.color[0] && pl.velo_cb < meta.buffers.size() &&
@@ -24671,6 +24769,8 @@ static bool draw_impl(const GpuDraw& d) {
         if (camera) {
             for (std::size_t i = 0; i < meta.buffers.size() && !camera_draw; ++i)
                 camera_draw = upscale_camera_block_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4);
+            if (cut_read && camera_draw) cut_read_flip.store(hle_video_flip_count(), std::memory_order_relaxed);
+            if (!motion) camera_draw = false;  // read for the cutaway alone
         }
         // The velocity map's scales, for the upscaler's motion (upscale_pass.cpp).
         if (velo && pl.velo == 3) {
@@ -26715,6 +26815,7 @@ static bool draw_impl(const GpuDraw& d) {
         r.count = d.index_count;
         r.inst = d.instance_count;
         r.prim = s.prim;
+        r.cut = pl.pixel_cut_on;
         r.vp[0] = vp.x; r.vp[1] = vp.y; r.vp[2] = vp.width; r.vp[3] = vp.height;
         r.sc[0] = sc.offset.x; r.sc[1] = sc.offset.y; r.sc[2] = static_cast<std::int32_t>(sc.extent.width); r.sc[3] = static_cast<std::int32_t>(sc.extent.height);
         r.rt0 = s.color[0] ? s.color[0]->base : 0;
@@ -29662,7 +29763,7 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                              static_cast<unsigned long long>(i), r.name, r.count, r.inst, r.prim, r.vp[0], r.vp[1], r.vp[2],
                              r.vp[3], static_cast<unsigned long long>(r.rt0), static_cast<unsigned long long>(r.depth), r.blend0,
                              r.depth_ctl, r.mask0, r.indexed ? " idx" : "");
-                std::fprintf(f, "smask=%08x colfmt=%08x ", r.shader_mask, r.col_format);
+                std::fprintf(f, "smask=%08x colfmt=%08x %s", r.shader_mask, r.col_format, r.cut ? "cut " : "");
                 for (int k = 0; k < 7; ++k) {
                     if (r.rt[k]) std::fprintf(f, "rt%d=0x%llx ", k + 1, static_cast<unsigned long long>(r.rt[k]));
                 }

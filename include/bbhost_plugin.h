@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 22
+#define BB_PLUGIN_API_VERSION 23
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -202,6 +202,17 @@ typedef struct BbCamera {
     float aspect;          /* width over height */
     float near_z, far_z;   /* the clip planes' distances */
 } BbCamera;
+
+/* Version 23: view_cutaway2's numbers. */
+typedef struct BbCutaway {
+    float distance;      /* metres from the camera to the point it looks at */
+    float pitch;         /* radians the view looks down below the horizon */
+    float radius;        /* metres about the view's axis at that point (0: off) */
+    float widen;         /* metres wider for each metre nearer the camera */
+    float height;        /* metres above the point looked at where the cut starts */
+    float margin;        /* metres in front of the point looked at where the cut starts */
+    float feather;       /* metres over which it fades in */
+} BbCutaway;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -592,6 +603,20 @@ typedef struct BbHostApi {
      * camera draws' pipelines again (rounded to 1/4 m), so set it as the
      * distance or the field of view change, not every frame. Any thread. */
     void (*view_cutaway)(float tan_x, float tan_y, float near_z, float radius);
+
+    /* Version 23: the cutaway per pixel, faded (BbCutaway). The map's own
+     * camera draws (never the characters, the objects or their parts) leave out, in their pixel
+     * stage, what lies within `radius` of the view's axis - `widen` metres
+     * wider for each metre nearer the camera than the point looked at - more
+     * than `height` metres above that point and more than `margin` in front of
+     * it, fading in over `feather` metres at each of those edges (a dither:
+     * the G-buffer has no blending). The view only turns and moves: `pitch`
+     * (radians below the horizon) and `distance` (to the point looked at, at
+     * the screen's middle) place it; the field of view and the depth come from
+     * the drawn view itself. NULL or radius 0 turns it off. Each new set makes
+     * the camera draws' pipelines again, so set it as the distance changes,
+     * not every frame. Any thread. */
+    void (*view_cutaway2)(const struct BbCutaway* cut);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

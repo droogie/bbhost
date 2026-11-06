@@ -11,7 +11,14 @@
 //   fov = 35.0          # vertical field of view, degrees
 //   height = 1.0        # the point looked at, metres above the hunter's feet
 //   follow = 0.08       # seconds the view takes to catch up with the hunter (0: at once)
-//   omni_roll = true    # 4-way omni quicksteps (Modern Movement's, without its quick item)
+//   flatten = 0         # a narrower view from further back (telephoto), degrees; 0 off
+//   cutaway = true      # roofs and walls between the view and the hunter faded out
+//   cutaway_size = 2.0  # the cone's tip, metres across, just above the hunter
+//   cutaway_spread = 0.6  # metres wider for each metre toward the view
+//
+// Always on with the view: the omni-roll (4-way quicksteps, Modern Movement's
+// without its quick item), the lock-on at 60 m all round with 30 s out of
+// sight, and the sound heard from the hunter rather than the camera.
 //
 // Two cameras. The game keeps its own - ChrFollowCam (the camera manager's
 // +0x60) orbits the hunter; the manager's blend of it and the cameras it owns
@@ -28,12 +35,11 @@
 // debug page's), and LOCK_TGT_MAN's lock-on rules are set by its constructor
 // (0x1c8dc71..) and again by its reset (0x1c8de03..); the debug pages point at
 // the fields both fill. ChrFollowCam (offsets from its debug page, 0x183f000..):
-//   +0x198/+0x19c ChrTransChaseRate(ForNormal), +0x1ac/+0x1b0 TargetChaseRateXZ
-//     (ForNormal), +0x1b8 TargetChaseRateY - 1: the camera keeps up with the
-//     hunter at once. Lagging, it trailed a running hunter and looked back at
-//     them, its yaw drifting from CamRotY and the stick's directions with it.
 //   +0x1bc/+0x1c0 TargetChaseRateMinAng/MaxAng - 0: no dead zone before the
-//     point looked at follows the hunter; +0x170 the pivot's sideways shift - 0.
+//     point looked at follows the hunter (it stayed up to 10 degrees off
+//     CamRotY, and the stick's directions with it); +0x170 the pivot's sideways
+//     shift - 0. The chase rates (+0x198.., the camera trailing the hunter) are
+//     the game's own.
 //   +0x1ec..+0x1f8 RotRange MaxX/MinX and at lock (radians; the page shows
 //     degrees) - 0: it never tilts, so the aim is level.
 //   +0x240 LockRotChaseRate - 0, +0x274/+0x275 UpdateTargetRotXByLock/FrontLock -
@@ -50,6 +56,7 @@
 // over-the-shoulder aim - the view glides to it, and back when it is put away.
 #include "bbhost_plugin.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -87,29 +94,16 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Look-at height", "The point the view centres on, metres above the hunter's feet.",
      "1.0", 0, 2.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
-     "Roofs, ceilings and the near walls between the view and the hunter left out, a round hole about the hunter as "
-     "Diablo cuts its walls. Each zoom step builds the 3D's shaders for it once (a short pause the first time).",
+     "Roofs, ceilings and walls between the view and the hunter faded out: a cone above the hunter, widening toward the "
+     "view. Players, enemies and objects (and what they carry) are never cut. Each zoom step builds the map's shaders "
+     "for it once (a short pause the first time).",
      "true"},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_radius", "Cutaway radius",
-     "Metres about the line from the view to the hunter that are cut away (kept clear of the floor around the hunter).",
-     "3.0", 1, 8},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_margin", "Cutaway margin",
-     "Metres in front of the hunter, toward the view, that are kept: the hunter and what is close around them.", "2.0", 0.5,
-     6},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_size", "Cutaway size", "Metres across the cone's tip, just above the hunter.", "2.0",
+     0.5, 6},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_spread", "Cutaway spread",
+     "How fast the cone widens toward the view: metres wider for each metre nearer it.", "0.6", 0, 1.5},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
      "Seconds the view takes to catch up with the hunter (0: fixed to them).", "0.08", 0, 0.5},
-    {BB_OPT_HEADING, "lock", "Lock-on", "Applies at the next start.", nullptr},
-    {BB_OPT_FLOAT, "lock_range", "Lock-on range", "Metres a target can be locked at and held (the game's 22).", "30.0", 10,
-     60},
-    {BB_OPT_FLOAT, "lock_angle", "Lock-on angle",
-     "Half the cone, in degrees, around where the hunter's camera looks that a target can be locked in (the game's 60 near, 30 "
-     "far); 180 is all round.",
-     "180.0", 30, 180},
-    {BB_OPT_FLOAT, "lock_hidden", "Hidden target timeout",
-     "Seconds a locked target may be out of sight before the lock lets go (the game's 2).", "8.0", 1, 30},
-    {BB_OPT_HEADING, "play", "Gameplay", nullptr, nullptr},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "omni_roll", "Omni-roll",
-     "Quicksteps and rolls in all four directions, as Modern Movement's (without its D-pad quick item).", "true"},
     {0}};
 
 namespace {
@@ -133,9 +127,7 @@ struct Settings {
     bool enabled = true;
     float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f, flatten = 0;
     bool cutaway = true;
-    float cutaway_radius = 3.0f, cutaway_margin = 2.0f;
-    float lock_range = 30.0f, lock_angle = 180.0f, lock_hidden = 8.0f;
-    bool omni_roll = true;
+    float cutaway_size = 2.0f, cutaway_spread = 0.6f;
 } s;
 
 constexpr float kPi = 3.14159265358979f;
@@ -153,6 +145,8 @@ struct Default {
     float want;  // overwritten from the settings for the lock-on's
 };
 enum : int { kLockTimeout = 1, kLockRange, kLockAngle };
+// The lock-on from high above (Kyo): 60 m, all round, 30 s out of sight.
+constexpr float kLockRangeM = 60.0f, kLockAngleDeg = 180.0f, kLockHiddenS = 30.0f;
 struct Tagged {
     Default d;
     int from_setting;  // 0: fixed
@@ -161,16 +155,13 @@ struct Tagged {
 // = 48 b8 imm64 (the first field 2 in, the second 6); mov byte [rbx+off], imm8
 // = c6 83 off32 imm8 (6 in).
 Tagged kDefaults[] = {
-    // ChrFollowCam, both constructors: chase rates, RotRange, lock chase.
-    {{0x183a4b3, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a4bd, 6, 4, 0.1f, 1.0f}, 0},
-    {{0x183a4e5, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a4ef, 6, 4, 0.1f, 1.0f}, 0},
-    {{0x183a503, 6, 4, 0.03f, 1.0f}, 0},      {{0x183a585, 6, 4, 1.22173f, 0.0f}, 0},
+    // ChrFollowCam, both constructors: RotRange, lock chase. Its chase rates
+    // stay the game's own (Kyo: the camera's chase as it was).
+    {{0x183a585, 6, 4, 1.22173f, 0.0f}, 0},
     {{0x183a58f, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a599, 6, 4, 0.872665f, 0.0f}, 0},
     {{0x183a5a3, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a657, 6, 4, 0.1f, 0.0f}, 0},
     {{0x183a6a6, 6, 1, 1, 0}, 0},             {{0x183a6ad, 6, 1, 1, 0}, 0},
-    {{0x183a8b1, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a8bb, 6, 4, 0.1f, 1.0f}, 0},
-    {{0x183a8e3, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a8ed, 6, 4, 0.1f, 1.0f}, 0},
-    {{0x183a901, 6, 4, 0.03f, 1.0f}, 0},      {{0x183a983, 6, 4, 1.22173f, 0.0f}, 0},
+    {{0x183a983, 6, 4, 1.22173f, 0.0f}, 0},
     {{0x183a98d, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a997, 6, 4, 0.698132f, 0.0f}, 0},
     {{0x183a9a1, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183aa55, 6, 4, 0.3f, 0.0f}, 0},
     // TargetChaseRateMinAng/MaxAng (+0x1bc/+0x1c0, 10 and 20 degrees): the
@@ -193,8 +184,14 @@ Tagged kDefaults[] = {
     {{0x1c8de7a, 6, 4, 0.523599f, 0}, kLockAngle},
     {{0x1c8de8b, 6, 4, 22.0f, 0}, kLockRange},
 };
-// The auto-rotation's stores (disable-camera-auto-rotation.toml), 9 bytes each.
-const std::uint64_t kAutoRotation[] = {0x183c6e8, 0x183c984, 0x183dde6, 0x183c870};
+// The auto-rotation's stores (disable-camera-auto-rotation.toml), 9 bytes each,
+// and two more: as the stick (or mouse) starts turning it, the follow camera
+// takes its CamRotX and CamRotY again from where it stands against the point
+// it looks at (0x183cac7..: the angles of +0xd0 - +0x100, stored at 0x183cb56
+// and 0x183cb97). Trailing a moving hunter, that turned it toward the trail -
+// against the hunter's way - on every frame of a turn; without them a turn is
+// the stick's alone.
+const std::uint64_t kAutoRotation[] = {0x183c6e8, 0x183c984, 0x183dde6, 0x183c870, 0x183cb56, 0x183cb97};
 
 // The follow camera's fields read each frame.
 constexpr std::size_t kRotY = 0x144;
@@ -228,8 +225,6 @@ float number(const char* key, float fallback, float lo, float hi) {
 void read_options() {
     const char* e = api->config("iso.enabled");
     s.enabled = !e || !*e || truthy(e);
-    const char* o = api->config("iso.omni_roll");
-    s.omni_roll = !o || !*o || truthy(o);
     s.pitch = number("iso.pitch", 55.0f, 25, 89);
     s.distance = number("iso.distance", 14.0f, 3, 40);
     s.fov = number("iso.fov", 35.0f, 15, 75);
@@ -238,11 +233,8 @@ void read_options() {
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
     const char* cu = api->config("iso.cutaway");
     s.cutaway = !cu || !*cu || truthy(cu);
-    s.cutaway_radius = number("iso.cutaway_radius", 3.0f, 1, 8);
-    s.cutaway_margin = number("iso.cutaway_margin", 2.0f, 0.5f, 6);
-    s.lock_range = number("iso.lock_range", 30.0f, 10, 60);
-    s.lock_angle = number("iso.lock_angle", 180.0f, 30, 180);
-    s.lock_hidden = number("iso.lock_hidden", 8.0f, 1, 30);
+    s.cutaway_size = number("iso.cutaway_size", 2.0f, 0.5f, 6);
+    s.cutaway_spread = number("iso.cutaway_spread", 0.6f, 0, 1.5f);
 }
 
 // The omni-roll: every site on, or the hooks back as the game had them (the
@@ -285,9 +277,9 @@ void camera_defaults() {
     int written = 0, refused = 0;
     for (Tagged& t : kDefaults) {
         Default d = t.d;
-        if (t.from_setting == kLockTimeout) d.want = s.lock_hidden;
-        else if (t.from_setting == kLockRange) d.want = s.lock_range;
-        else if (t.from_setting == kLockAngle) d.want = s.lock_angle * kPi / 180.0f;
+        if (t.from_setting == kLockTimeout) d.want = kLockHiddenS;
+        else if (t.from_setting == kLockRange) d.want = kLockRangeM;
+        else if (t.from_setting == kLockAngle) d.want = kLockAngleDeg * kPi / 180.0f;
         // The instruction checked by its opcode and the value it holds by
         // what the game ships (within a rounding), then the value replaced.
         std::uint8_t insn[10], want[4];
@@ -326,8 +318,8 @@ void camera_defaults() {
     }
     api->log("iso: the game's camera and lock-on set for the view (%d constants and stores written, %d refused); lock-on "
              "%.0f m, %.0f degrees, %.0f s hidden",
-             written, refused, static_cast<double>(s.lock_range), static_cast<double>(s.lock_angle),
-             static_cast<double>(s.lock_hidden));
+             written, refused, static_cast<double>(kLockRangeM), static_cast<double>(kLockAngleDeg),
+             static_cast<double>(kLockHiddenS));
 }
 
 std::uint8_t* follow_cam(BbCamera* c) {
@@ -402,34 +394,67 @@ void normalise(float v[3]) {
         for (int i = 0; i < 3; ++i) v[i] /= l;
 }
 
-// The cutaway (plugin API 22): a cylinder about the view's axis, which runs
-// through the point looked at, from the camera to `margin` short of it. Its
-// radius is kept under where the floor around the hunter would come into it
-// at this angle: a floor point toward the view at h metres lies
-// h sin(p) + height cos(p) from the axis and h cos(p) - height sin(p) along it
-// from the point looked at, so it is reached first at radius
-// (margin sin(p) + height) / cos(p). Sent when its numbers change - each new
-// set builds the camera draws' pipelines again - and off while another
-// camera has the view.
-void cutaway(float fov, float aspect, float dist) {
-    static float sent[4] = {-1, -1, -1, -1};
-    float want[4] = {0, 0, 0, 0};
-    if (s.cutaway && view.away <= 0.0f && aspect > 0) {
-        const float p = s.pitch * kPi / 180.0f;
-        const float floor_reach = (s.cutaway_margin * std::sin(p) + s.height) / std::cos(p);
-        float radius = s.cutaway_radius;
-        if (radius > 0.85f * floor_reach) radius = 0.85f * floor_reach;
-        want[1] = std::tan(fov / 2);
-        want[0] = want[1] * aspect;
-        want[2] = dist - s.cutaway_margin;
-        want[3] = want[2] > 0.5f ? radius : 0.0f;
+// The sound's listener at the hunter. FMOD Ex (in the eboot) hears from
+// where System::set3DListenerAttributes (0x11075e0: this, listener, pos, vel,
+// forward, up) puts it, which the game takes from the drawn camera - 14 m and
+// more up in the air here, so everything was faint. The hook hands FMOD the
+// hunter's head instead of the camera's place; forward and up stay the
+// camera's, so left and right are still the screen's. The place is taken on
+// the game's thread (on_view) and read here on FMOD's: a read that meets a
+// write halfway hears from a frame's movement away, once.
+volatile float g_ear[3] = {0, 0, 0};
+std::atomic<bool> g_ear_on{false};  // while the view is ours
+constexpr float kEarHeight = 1.5f;  // the hunter's head, metres over the feet
+
+int listener_hook(BbHookCtx* c, void*) {
+    if (g_ear_on.load(std::memory_order_acquire) && c->arg[2]) {
+        thread_local float out[4];
+        out[0] = g_ear[0];
+        out[1] = g_ear[1];
+        out[2] = g_ear[2];
+        out[3] = 0;
+        static const bool trace = std::getenv("ISO_LOG") != nullptr;
+        static std::atomic<int> calls{0};
+        if (trace && calls.fetch_add(1, std::memory_order_relaxed) % 300 == 0) {
+            const float* was = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(c->arg[2]));
+            api->log("iso: listener %.2f %.2f %.2f (the game's %.2f %.2f %.2f)", static_cast<double>(out[0]),
+                     static_cast<double>(out[1]), static_cast<double>(out[2]), static_cast<double>(was[0]),
+                     static_cast<double>(was[1]), static_cast<double>(was[2]));
+        }
+        c->arg[2] = reinterpret_cast<std::uint64_t>(out);
     }
-    bool same = true;
-    for (int i = 0; i < 4; ++i) same = same && std::fabs(want[i] - sent[i]) < (i < 2 ? 1.0f / 2048 : 0.125f);
-    if (same) return;
-    std::memcpy(sent, want, sizeof(sent));
-    if (api->version >= 22 && api->size >= offsetof(BbHostApi, view_cutaway) + sizeof(void*))
-        api->view_cutaway(want[0], want[1], want[2], want[3]);
+    return 0;
+}
+
+// The cutaway (plugin API 23): a cone over the hunter, its tip `size` across
+// a little above the point looked at, widening `spread` metres a metre toward
+// the camera, faded at its edges - roofs, ceilings and near walls, never the
+// characters, the objects or their parts (the host tells them by the
+// G-buffer's stencil). Sent when its numbers change - each new set builds the
+// map's pipelines again - and off while another camera has the view.
+constexpr float kCutHeight = 0.6f;   // metres over the point looked at before anything is cut
+constexpr float kCutMargin = 0.5f;   // metres in front of it
+constexpr float kCutFeather = 1.5f;  // metres it fades in over
+void cutaway(float dist) {
+    static BbCutaway sent{};
+    static bool sent_any = false;
+    BbCutaway want{};
+    if (s.cutaway && view.away <= 0.0f && dist > 0) {
+        want.distance = dist;
+        want.pitch = s.pitch * kPi / 180.0f;
+        want.radius = s.cutaway_size / 2;
+        want.widen = s.cutaway_spread;
+        want.height = kCutHeight;
+        want.margin = kCutMargin;
+        want.feather = kCutFeather;
+    }
+    if (sent_any && std::fabs(want.distance - sent.distance) < 0.125f && want.radius == sent.radius && want.widen == sent.widen &&
+        want.pitch == sent.pitch)
+        return;
+    sent = want;
+    sent_any = true;
+    if (api->version >= 23 && api->size >= offsetof(BbHostApi, view_cutaway2) + sizeof(void*))
+        api->view_cutaway2(want.radius > 0 ? &want : nullptr);
 }
 
 // The drawn camera: from above, looking down at the hunter - or, while another
@@ -445,7 +470,8 @@ void on_view(BbCamera* c, void*) {
     const float step = dt / kHandOver;
     if (view.away < view.away_want) view.away = view.away + step < view.away_want ? view.away + step : view.away_want;
     else view.away = view.away - step > view.away_want ? view.away - step : view.away_want;
-    if (view.away > 0.0f) cutaway(0, 0, 0);  // the other camera's view: nothing cut
+    if (view.away > 0.0f) cutaway(0);  // the other camera's view: nothing cut
+    if (view.away > 0.0f) g_ear_on.store(false, std::memory_order_release);  // another camera: its own place
     if (view.away >= 1.0f) {
         view.have_focus = false;  // the hunter may have moved while it was away: no glide back from there
         return;                   // the game's own camera, as copied
@@ -453,6 +479,10 @@ void on_view(BbCamera* c, void*) {
     float feet[3], facing = 0;
     if (api->player_position(feet, &facing) != 0) return;
     const float target[3] = {feet[0], feet[1] + s.height, feet[2]};
+    g_ear[0] = feet[0];
+    g_ear[1] = feet[1] + kEarHeight;
+    g_ear[2] = feet[2];
+    g_ear_on.store(true, std::memory_order_release);
     float moved = 0;
     for (int i = 0; i < 3; ++i) moved += (target[i] - view.focus[i]) * (target[i] - view.focus[i]);
     // A warp or a load: no gliding across the map.
@@ -507,12 +537,11 @@ void on_view(BbCamera* c, void*) {
         c->position[i] = pos[i];
     }
     c->fov_y = fov;
-    cutaway(fov, c->aspect, dist);
+    cutaway(dist);
 }
 
 void on_option(const char* key, const char* value, void*) {
     read_options();
-    if (std::strcmp(key, "omni_roll") == 0) omni_roll(s.omni_roll);
     api->log("iso: %s = %s", key, value ? value : "?");
 }
 
@@ -530,8 +559,12 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     }
     read_options();
     host->on_option("iso", &on_option, nullptr);
-    omni_roll(s.omni_roll);
+    omni_roll(true);  // always: part of the mode (Kyo)
     if (s.enabled) {
+        static const std::uint8_t kListenerPrologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                                           0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+        if (host->hook2(0x11075e0, kListenerPrologue, sizeof(kListenerPrologue), &listener_hook, nullptr) != 0)
+            host->log("iso: FMOD's listener is not where it should be; the sound stays at the camera");
         if (host->on_camera(&on_camera, nullptr) != 0 || host->on_view(&on_view, nullptr) != 0) {
             host->log("iso: the host has no camera hooks; the view is off");
         } else {
@@ -540,6 +573,6 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     }
     host->log("iso: Isometric %s (angle %.0f, distance %.1f m, fov %.0f), omni-roll %s", s.enabled ? "on" : "off",
               static_cast<double>(s.pitch), static_cast<double>(s.distance), static_cast<double>(s.fov),
-              s.omni_roll ? "on" : "off");
+              "on");
     return 0;
 }

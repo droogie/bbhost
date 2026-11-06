@@ -1959,6 +1959,9 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
 // 3: full-screen passes, which read at 0..1, never) - noting the frame's
 // camera from it as upscale_camera_note_locked does.
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
+// The camera's view block as last read: its tangents and depth decode (view
+// distance = 1 / (depth_z raw + depth_w)); false before one was read.
+bool upscale_view_terms(float* tan_x, float* tan_y, float* depth_z, float* depth_w);
 // The characters' capture (upscale_pass.cpp): a skinned G-buffer draw's
 // capture address for its vertex shader (StageParams::lds_address), 0 for
 // none - from any thread, a run part's draw included: `order` is its place in
@@ -2048,6 +2051,7 @@ struct DrawRec {
     std::uint32_t blend0, depth_ctl, mask0;
     std::uint32_t shader_mask, col_format;  // CB_SHADER_MASK, SPI_SHADER_COL_FORMAT
     bool indexed;
+    bool cut = false;  // its pixel stage the cutaway's twin (host/pixel_cutaway.h)
     // What the geometry came from: the index buffer, the vertex bindings
     // (vertex-input draws; 0 for a draw that fetches in its shader), the
     // base vertex, and an indirect draw's arguments.

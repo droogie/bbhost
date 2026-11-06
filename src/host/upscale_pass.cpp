@@ -199,6 +199,10 @@ VeloCopy g_velo_copy;
 // the horizontal field of view, its second's y the vertical, the third
 // (0,0,0,1), the fourth the depth terms), 180-195 the camera, view to world
 // (the last row (0,0,0,1), each row's w the eye). Numity1504's appendix A.
+// The last view block's tangents and depth decode (view distance =
+// 1 / (z raw + w)), for the cutaway (upscale_view_terms).
+std::atomic<float> g_view_tan_x{0}, g_view_tan_y{0}, g_view_z{0}, g_view_w{0};
+
 bool camera_of(const float* f, Camera* c) {
     for (int i = 0; i < 216; ++i) {
         if (!std::isfinite(f[i])) return false;
@@ -213,6 +217,10 @@ bool camera_of(const float* f, Camera* c) {
     c->tan_y = ty;
     c->a = -w / z;
     c->r2w = 1.0f / z;
+    g_view_tan_x.store(tx, std::memory_order_relaxed);
+    g_view_tan_y.store(ty, std::memory_order_relaxed);
+    g_view_z.store(z, std::memory_order_relaxed);
+    g_view_w.store(w, std::memory_order_relaxed);
     std::memcpy(c->rows, f + 180, sizeof(c->rows));
     return true;
 }
@@ -1907,6 +1915,14 @@ bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes) {
     if (!g_cam_noted) return upscale_camera_note_locked(base, bytes);
     Camera c;
     return camera_of(f, &c);
+}
+
+bool upscale_view_terms(float* tan_x, float* tan_y, float* depth_z, float* depth_w) {
+    *tan_x = g_view_tan_x.load(std::memory_order_relaxed);
+    *tan_y = g_view_tan_y.load(std::memory_order_relaxed);
+    *depth_z = g_view_z.load(std::memory_order_relaxed);
+    *depth_w = g_view_w.load(std::memory_order_relaxed);
+    return *tan_x > 0.0f && *tan_y > 0.0f && *depth_z != 0.0f;
 }
 
 std::uint64_t upscale_pass_calls() { return g_calls.load(std::memory_order_relaxed); }

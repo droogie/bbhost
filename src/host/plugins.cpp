@@ -32,6 +32,7 @@
 #include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/ruleset.h"
+#include "host/pixel_cutaway.h"
 #include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
@@ -1219,6 +1220,30 @@ void api_view_cutaway(float tan_x, float tan_y, float near_z, float radius) {
     else if (was) host_log("plugin: no cutaway");
 }
 
+// Version 23: the cutaway per pixel (host/pixel_cutaway.h, host/scene_look.h).
+void api_view_cutaway2(const BbCutaway* c) {
+    PixelCut p{};
+    if (c && c->radius > 0.0f) {
+        p.distance = c->distance;
+        p.sin_pitch = std::sin(c->pitch);
+        p.cos_pitch = std::cos(c->pitch);
+        p.radius = c->radius;
+        p.widen = c->widen;
+        p.height = c->height;
+        p.margin = c->margin;
+        p.feather = c->feather;
+    }
+    const bool was = scene_look_pixel_cut(nullptr);
+    scene_look_set_pixel_cut(p);
+    if (scene_look_pixel_cut(nullptr))
+        host_log("plugin: cutaway per pixel within %.2f m (+%.2f a metre nearer) of the view's axis, %.2f m up and %.2f m in front "
+                 "of the point %.2f m off, faded over %.2f m",
+                 static_cast<double>(p.radius), static_cast<double>(p.widen), static_cast<double>(p.height),
+                 static_cast<double>(p.margin), static_cast<double>(p.distance), static_cast<double>(p.feather));
+    else if (was)
+        host_log("plugin: no cutaway per pixel");
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1249,6 +1274,7 @@ const BbHostApi g_api = {
     &api_on_view,
     &api_audio_crush,
     &api_view_cutaway,
+    &api_view_cutaway2,
 };
 
 std::string read_file(const std::string& path) {

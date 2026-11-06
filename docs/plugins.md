@@ -237,7 +237,20 @@ gives the Binary Ninja address.
   nearer than `near_z` along it - the roof, ceiling or near wall between the
   camera and the character it centres. Camera-relative, so it is set when the
   distance or field of view change, not as the camera moves; each new set
-  makes the camera draws' pipelines again. The Isometric plugin's Cutaway.
+  makes the camera draws' pipelines again.
+- `view_cutaway2(const BbCutaway*)` (v23): the cutaway per pixel, faded. The
+  map's own draws into the G-buffer (never the characters, the objects or
+  their parts: the G-buffer's stencil marks them 8 and 12, the map 9) leave
+  out, in their pixel stage, what lies within `radius` of the view's axis -
+  `widen` metres wider for each metre nearer the camera than the point looked
+  at, a cone opening toward the camera - more than `height` metres above that
+  point and more than `margin` in front of it, faded over `feather` metres at
+  those edges by a screen-door dither (the G-buffer has no blending). `pitch`
+  and `distance` place the point; the field of view and the depth's decode
+  come from the drawn view's own block. Set it as the distance changes, not
+  every frame: each new set makes the map's pipelines again. NULL or radius 0
+  turns it off. The Isometric plugin's Cutaway; it costs a third of a
+  millisecond of GPU time a frame at 1080p.
 - The 3D's look (v18): how the camera's draws - the world, its characters, the
   sky and the effects, the draws with the scene's depth that are not
   full-screen rect lists - are drawn; the shadow maps, the post-processing and
