@@ -1609,20 +1609,18 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
 }
 
 // The cap's real frame interval: the rate's, and while frames are generated
-// at least two of the display's refreshes. The refresh rate is read as
-// generation starts (asking brings SDL's video up and down: not every frame);
-// 0 when no display says it (headless), and then the cap's alone.
+// at least two refreshes of the display the window is on
+// (host_window_refresh_hz: cached for a second, safe off the window's thread -
+// the flip clock asks it too - where host_desktop_refresh_hz brings SDL's video
+// up and down); 0 when no display says it (headless), and then the cap's alone.
 float fg_cap_target() {
-    static float hz = 0.0f;
     static bool was = false;
     const float t = pace_target_of_rate();
     const bool on = t > 0.0f && g_fg_pace.on && fg_generating() && !loading_screen_up();
-    if (on && !was) {
-        hz = host_desktop_refresh_hz();
-        if (hz >= 48.0f && 2.0f / hz > t)
-            host_log("frame rate: frame generation on: real frames at most %.0f a second, half the display's %.0f Hz (the cap %.0f)",
-                     static_cast<double>(hz / 2.0f), static_cast<double>(hz), static_cast<double>(1.0f / t));
-    }
+    const float hz = on ? host_window_refresh_hz() : 0.0f;
+    if (on && !was && hz >= 48.0f && 2.0f / hz > t)
+        host_log("frame rate: frame generation on: real frames at most %.0f a second, half the display's %.0f Hz (the cap %.0f)",
+                 static_cast<double>(hz / 2.0f), static_cast<double>(hz), static_cast<double>(1.0f / t));
     was = on;
     return on && hz >= 48.0f ? std::max(t, 2.0f / hz) : t;
 }
