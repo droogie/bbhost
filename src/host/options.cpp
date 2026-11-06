@@ -126,6 +126,7 @@ enum SettingId {
     kTextureQuality,
     kSfxTextureQuality,
     kSsr,
+    kSsrQuality,
     kHdMotionBlur,
     kHdMotionBlurRes,
     kUpscaler,
@@ -386,8 +387,18 @@ Setting g_set[kSettingCount] = {
     // the old patch file on ([patches] screen-space-reflections) seeds it
     // (host_options_load).
     {"ssr", "Screen space reflections", {"Off", "On"}, 0,
-     "Wet streets, water and polished floors reflect what is on screen, at half the 3D's resolution, without fading "
+     "Wet streets, water and polished floors reflect what is on screen, at the Reflection quality's resolution, without fading "
      "out where they face the camera. Costs GPU time. Changes at once.",
+     false},
+    // The reflection pass's size (engine/patch_manifest.cpp ssr_manifest):
+    // Quarter, the default, a quarter of the render size each way (480x270 at
+    // 1080p: ~1 ms a frame on the Radeon 8060S), Half the game's own (3.9 ms).
+    // Changes at once while reflections are in: the patch made again and the
+    // scene's targets with it (targets_follow_settings). Greyed while Screen
+    // space reflections is off (row_greyed).
+    {"ssr_quality", "Reflection quality", {"Quarter", "Half"}, 0,
+     "The resolution of the reflections. Quarter (recommended) traces a quarter of the render size each way and costs about "
+     "a quarter of Half's GPU time; Half is the game's own, sharper and much slower. Changes at once.",
      false},
     // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
     // hd_motion_blur_manifest): their buffers at a share of the render size
@@ -616,6 +627,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kSsr},
+    {Row::Option, nullptr, kSsrQuality},
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
     {Row::Option, nullptr, kResolution},
@@ -950,9 +962,10 @@ bool output_of(unsigned* w, unsigned* h) {
 }
 
 // The scene's targets as the settings now want them, while the game runs:
-// Screen space reflections' patch in once it is on (off clears its pass's
-// switch each view, engine/graphics_patch.cpp, and the patch stays until the
-// next start), HD motion blur's sizes and the velocity map's format and size
+// Screen space reflections' patch in once it is on, at the Reflection
+// quality's size (off clears its pass's switch each view,
+// engine/graphics_patch.cpp, and the patch stays until the next start; a
+// quality changed while it is in makes it again), HD motion blur's sizes and the velocity map's format and size
 // made again from the settings (engine/patch_manifest.cpp) - and the targets
 // made again at the same size when the game's code changed for them, or when
 // reflections were turned on (`ssr_on`: the patched setup sets their switch).
@@ -960,11 +973,13 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     const HostSettings hs = host_settings();
     bool rebuild = false, changed = false;
     std::string why;
+    const bool ssr_in = patch_manifest_live_state("ssr").applied;
     if (ssr_on && hs.ssr) {
-        if (!patch_manifest_live_state("ssr").applied) {
-            if (patch_manifest_set_live("ssr", true, &why)) graphics_ssr_live_in();
-        }
+        // Made from the settings now, so at the quality chosen since the start.
+        if (!ssr_in && patch_manifest_refresh_live("ssr", true, &changed, &why)) graphics_ssr_live_in();
         rebuild = true;
+    } else if (ssr_in && patch_manifest_refresh_live("ssr", true, &changed, &why)) {
+        rebuild |= changed;
     }
     if (patch_manifest_refresh_live("hd-motion-blur", hs.hd_motion_blur, &changed, &why)) rebuild |= changed;
     if (patch_manifest_refresh_live("velomap-16f", true, &changed, &why)) rebuild |= changed;
@@ -1005,6 +1020,7 @@ void apply(int id) {
         }
         case kUpscaler:
         case kSsr:
+        case kSsrQuality:
         case kHdMotionBlur:
         case kHdMotionBlurRes:
         case kMotionVectors: {
@@ -1257,6 +1273,7 @@ void rebuild_settings() {
     h.texture_quality = 3 - std::clamp(index_of(kTextureQuality), 0, 3);  // the levels left out: High none, Lowest three
     h.sfx_texture_quality = 3 - std::clamp(index_of(kSfxTextureQuality), 0, 3);
     h.ssr = on_of(kSsr);
+    h.ssr_half = index_of(kSsrQuality) == 1;
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
     {
@@ -2070,7 +2087,8 @@ bool row_hidden(int id) {
 
 // Rows shown but not to be changed while the setting they need is off.
 bool row_greyed(int id) {
-    return id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
+    return (id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur))) ||
+           (id == kSsrQuality && !reads_on(g_set[kSsr], shown_index(kSsr)));
 }
 
 void host_options_draw_page(int page) {
