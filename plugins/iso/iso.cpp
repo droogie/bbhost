@@ -63,7 +63,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.2.0",
+    "0.2.1",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -79,6 +79,11 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_FLOAT | BB_OPT_LIVE, "distance", "Distance", "Metres from the hunter; the wheel zooms in and out from it.", "14.0",
      3, 40},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "fov", "Field of view", "The view's vertical field of view, in degrees.", "35.0", 15, 75},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "flatten", "Flatten (telephoto)",
+     "Less perspective: the view narrowed to this field of view (degrees) and moved back to frame the hunter as the Field "
+     "of view at the Distance does - near orthographic. 0: off. The game's fog grows with the distance, so small values "
+     "look hazy.",
+     "0", 0, 15},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Look-at height", "The point the view centres on, metres above the hunter's feet.",
      "1.0", 0, 2.5},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
@@ -116,7 +121,7 @@ constexpr std::uint64_t kCaves = 0x4000000;
 
 struct Settings {
     bool enabled = true;
-    float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f;
+    float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f, flatten = 0;
     float lock_range = 30.0f, lock_angle = 180.0f, lock_hidden = 8.0f;
     bool omni_roll = true;
 } s;
@@ -216,6 +221,7 @@ void read_options() {
     s.pitch = number("iso.pitch", 55.0f, 25, 89);
     s.distance = number("iso.distance", 14.0f, 3, 40);
     s.fov = number("iso.fov", 35.0f, 15, 75);
+    s.flatten = number("iso.flatten", 0, 0, 15);
     s.height = number("iso.height", 1.0f, 0, 2.5f);
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
     s.lock_range = number("iso.lock_range", 30.0f, 10, 60);
@@ -415,7 +421,17 @@ void on_view(BbCamera* c, void*) {
     float fwd[3] = {sy * cp, -sp, cy * cp};
     float up[3] = {sy * sp, cp, cy * sp};
     float fov = s.fov * kPi / 180.0f;
-    const float dist = s.distance * view.zoom;
+    float dist = s.distance * view.zoom;
+    // Flatten: a narrower view from further back, framed the same at the
+    // hunter. The game's limits (its 38-48 degree clamp) are the follow
+    // camera's; the drawn camera takes any field of view. A true orthographic
+    // projection is not possible this way: the deferred passes rebuild
+    // positions from depth as a perspective view does.
+    if (s.flatten > 0 && s.flatten < s.fov) {
+        const float narrow = s.flatten * kPi / 180.0f;
+        dist *= std::tan(fov / 2) / std::tan(narrow / 2);
+        fov = narrow;
+    }
     float pos[3];
     for (int i = 0; i < 3; ++i) pos[i] = view.focus[i] - fwd[i] * dist;
     // Part way to the game's camera: eased, the basis made square again.
