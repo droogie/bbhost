@@ -748,6 +748,10 @@ if(UNIX)
   add_executable(vertex_clamp_test tests/vertex_clamp_test.cpp)
   target_include_directories(vertex_clamp_test PRIVATE src)
   add_test(NAME vertex_clamp_test COMMAND vertex_clamp_test)
+  # The render targets' sizes learned by their geometry, and the rule by the address alone failing (host/rt_extent.h).
+  add_executable(rt_extent_test tests/rt_extent_test.cpp)
+  target_include_directories(rt_extent_test PRIVATE src)
+  add_test(NAME rt_extent_test COMMAND rt_extent_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
   add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
   target_include_directories(gxvk_arena_test PRIVATE src)

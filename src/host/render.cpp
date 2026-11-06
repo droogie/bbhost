@@ -29,6 +29,7 @@
 #include "host/list_resolve.h"
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
+#include "host/rt_extent.h"
 #include "host/shader_bundles.h"
 #include "host/vertex_clamp.h"
 #include "host/shader_patch.h"
@@ -1967,12 +1968,28 @@ bool rt_image_memory(VkImage image, ImageMemory& out) {
 // target sampled as a texture is addressed in normalized coordinates over the
 // image's height: a 1080-row target padded to 1088 makes every v 1080/1088 too
 // small. That is what squashed the movie and left an 8-row band of the clear
-// colour along the bottom of the screen. The scissor carries the real height.
-// Remember it per target so a later pass with a smaller scissor cannot resize
-// the image - rt_image() recreates on a size change, and that costs a flush and
-// a vkDeviceWaitIdle.
-std::unordered_map<std::uint64_t, std::uint32_t> g_rt_real_height;
-std::unordered_map<std::uint64_t, std::uint32_t> g_rt_real_width;
+// colour along the bottom of the screen. The scissor carries the real height
+// (and CB_COLOR_PITCH pads the width the same way). Remember it per target so a
+// later pass with a smaller scissor cannot resize the image - rt_image()
+// recreates on a size change, and that costs a flush and a vkDeviceWaitIdle.
+// Per target is by its geometry: its base, pitch and padded height
+// (host/rt_extent.h). By the base alone, a size YEBIS's cutscenes' glare
+// pyramid left at an address (523 wide at 2560x1440) stayed on the 640-wide
+// glare level it later drew there, which glared to the right of the sky and
+// of bright highlights. BBHOST_RT_LEARN_BY_GEOMETRY=0: by the base alone, as
+// before; =2: by the geometry, with the base alone's answers worked out beside
+// them, and where the two differ counted and the first logged.
+const int g_rt_learn_mode = [] {
+    const char* e = std::getenv("BBHOST_RT_LEARN_BY_GEOMETRY");
+    return e && *e ? std::atoi(e) : 1;
+}();
+rt_extent::Table g_rt_extents{g_rt_learn_mode != 0};  // under g.mu
+rt_extent::Table g_rt_extents_by_base{false};         // under g.mu: =2's comparison
+// Under g.mu: lookups where a scissor the padded size met a smaller size
+// learned for the same geometry, which stays (width, height) - the case the
+// geometry does not tell apart; =2's lookups where the base alone would have
+// answered another size.
+std::uint64_t g_rt_padded_over[2] = {0, 0}, g_rt_learn_differ = 0;
 
 // Fill shaders run before the first draw that creates the image (and again
 // after a size/format recreate). The translated compute writes guest memory
@@ -2035,19 +2052,6 @@ bool take_pending_htile(std::uint64_t key, RtImage& r) {
     return true;
 }
 std::atomic<std::uint64_t> g_fill_pending{0}, g_fill_applied{0};
-
-// True when `v` rounded up to a tiling granularity is exactly `padded`: that is
-// what makes a scissor edge believable as the target's real extent rather than
-// a pass drawing into part of a larger one. Colour pitch pads to 128 or 256
-// pixels (392 -> 512, 960 -> 1024, 1176 -> 1280) and height to 64 rows
-// (1080 -> 1088).
-bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
-    if (!v || v > padded) return false;
-    for (std::uint32_t g : {64u, 128u, 256u}) {
-        if (((v + g - 1) & ~(g - 1)) == padded) return true;
-    }
-    return false;
-}
 
 // Bumped whenever what rt_image() would answer for the same registers can
 // change: a target or snapshot made, dropped or replaced, or an unpadded
@@ -2121,38 +2125,48 @@ std::uint64_t reuse_idle_ms() {
     return ms;
 }
 
-std::uint32_t unpadded(std::unordered_map<std::uint64_t, std::uint32_t>& seen, std::uint64_t base, std::uint32_t padded,
-                       std::uint32_t scissor_edge) {
-    if (auto it = seen.find(base); it != seen.end() && plausible_extent(it->second, padded)) {
-        // A pass cannot draw past its target: a scissor wider or taller than
-        // what was learned says the memory holds another target now (the
-        // cutscenes' glare pyramid leaves its sizes on addresses the game's
-        // reuses at others).
-        if (scissor_edge > it->second && scissor_edge != padded && plausible_extent(scissor_edge, padded)) {
-            ++g_rt_gen;
-            it->second = scissor_edge;
+// The size to make the image of the target at `base` whose registers pad it to
+// `pitch` x `padded_h`, from a draw's scissor edges (0 for a clear), learning
+// from them (host/rt_extent.h). CB_COLOR_PITCH pads the same way
+// CB_COLOR_SLICE does, and a target sampled as a texture is addressed in
+// normalized coordinates over the image's width: a 392-wide target held in a
+// 512-wide image makes every u 392/512 too small. Down a bloom pyramid that
+// compounds, which is why the composited frame was a smear along its left edge.
+rt_extent::Answer learned_extent_locked(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t scissor_right,
+                                        std::uint32_t scissor_bottom, bool depth) {
+    const rt_extent::Answer a = g_rt_extents.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
+    if (a.changed) ++g_rt_gen;
+    if (a.padded_over_w || a.padded_over_h) {
+        // A scissor the padded size over a smaller size learned for the same
+        // geometry: a pass over the whole surface of the smaller target, or a
+        // larger target of that geometry at the address now. Nothing in the
+        // registers tells the two apart, and the size stays; counted, to see
+        // whether play meets it.
+        g_rt_padded_over[0] += a.padded_over_w;
+        g_rt_padded_over[1] += a.padded_over_h;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("render: %s target 0x%llx (pitch %u, %u rows): a scissor of %ux%u, its padded size, met a smaller size learned for "
+                     "its geometry; its image stays %ux%u (flip %llu)",
+                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, a.w,
+                     a.h, static_cast<unsigned long long>(hle_video_flip_count()));
         }
-        return it->second;
     }
-    if (plausible_extent(scissor_edge, padded) && scissor_edge != padded) {
-        ++g_rt_gen;
-        seen[base] = scissor_edge;
-        return scissor_edge;
+    if (g_rt_learn_mode == 2) {
+        const rt_extent::Answer b = g_rt_extents_by_base.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
+        if (b.changed) ++g_rt_gen;  // (so the memo asks both again)
+        if (b.w != a.w || b.h != a.h) {
+            ++g_rt_learn_differ;
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24) {
+                host_log("render: %s target 0x%llx (pitch %u, %u rows, scissor %ux%u): %ux%u by its geometry, %ux%u by its base alone "
+                         "(flip %llu)",
+                         depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom,
+                         a.w, a.h, b.w, b.h, static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
     }
-    return padded;
-}
-
-std::uint32_t unpadded_height(std::uint64_t base, std::uint32_t padded, std::uint32_t scissor_bottom) {
-    return unpadded(g_rt_real_height, base, padded, scissor_bottom);
-}
-
-// CB_COLOR_PITCH pads the same way CB_COLOR_SLICE does, and a target sampled as
-// a texture is addressed in normalized coordinates over the image's width: a
-// 392-wide target held in a 512-wide image makes every u 392/512 too small.
-// Down a bloom pyramid that compounds, which is why the composited frame was a
-// smear along its left edge.
-std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint32_t scissor_right) {
-    return unpadded(g_rt_real_width, base, padded, scissor_right);
+    return a;
 }
 
 void copy_layers_locked(RtImage& from, RtImage& to);
@@ -2544,7 +2558,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
 // rt_image() applies on every use: the pending clears.
 // A GX target's real extent from its view's texture
 // (GpuDrawInputs::color_extent) instead of guessing it from the scissor
-// (unpadded_width/height). BBHOST_GX_VIEW_EXTENTS=0 guesses as before; =2
+// (learned_extent_locked). BBHOST_GX_VIEW_EXTENTS=0 guesses as before; =2
 // guesses, and counts and logs where the guess and the texture disagree.
 const int g_view_extents = [] {
     const char* e = std::getenv("BBHOST_GX_VIEW_EXTENTS");
@@ -2586,11 +2600,13 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     std::uint32_t w = 0, h = 0;
     // No view to take it from (YEBIS's draws, the wrapper's): the live GX
     // texture that begins at the target's memory says its size - the game's
-    // own description of what is there now. The learned sizes below are per
+    // own description of what is there now. The learned sizes below were per
     // address, and an address the game reuses for a target of another size
     // kept the old one: the new-character cutscenes' glare pyramid (392x331
     // at its base) left sizes the game's (314x265) then drew into the corner
     // of, and the glare sampled the stale rest - magenta, until a reload.
+    // They are kept per geometry now (learned_extent_locked); two targets
+    // their registers pad to one size at one address still share them.
     // BBHOST_RT_EXTENT_FROM_GX=0: the learned sizes only.
     static const bool extent_from_gx = [] {
         const char* e = std::getenv("BBHOST_RT_EXTENT_FROM_GX");
@@ -2610,8 +2626,9 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     // The texture's extent stands when it fits the padded one it came padded to.
     const bool use_extent = g_view_extents && extent && ew <= padded_w && eh <= padded_h;
     if (!use_extent || g_view_extents == 2) {
-        w = unpadded_width(base, padded_w, scissor_right);
-        h = unpadded_height(base, padded_h, scissor_bottom);
+        const rt_extent::Answer a = learned_extent_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth);
+        w = a.w;
+        h = a.h;
     }
     if (use_extent && g_view_extents == 2) ++g_extent_checked;
     if (use_extent && g_view_extents == 2 && (w != ew || h != eh)) {
@@ -2627,13 +2644,8 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         // What the scissor would have to teach is known now: draws with no
         // view (the wrapper's, YEBIS's) and the texture cache size this
         // target the same way instead of making it again at another size.
-        std::uint32_t& known_w = g_rt_real_width[base];
-        std::uint32_t& known_h = g_rt_real_height[base];
-        if (known_w != ew || known_h != eh) {
-            known_w = ew;
-            known_h = eh;
-            ++g_rt_gen;
-        }
+        if (g_rt_extents.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
+        if (g_rt_learn_mode == 2 && g_rt_extents_by_base.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
     } else {
         ++g_extent_guessed;
     }
@@ -14225,6 +14237,16 @@ void render_report() {
                  static_cast<unsigned long long>(g_extent_guessed),
                  g_view_extents == 2 ? ("; compared " + std::to_string(g_extent_checked) + ", disagreeing " + std::to_string(g_extent_disagree)).c_str() : "");
     }
+    {
+        std::lock_guard<GpuMutex> lk(g.mu);
+        const std::string differ = g_rt_learn_mode == 2 ? "; by the base alone " + std::to_string(g_rt_extents_by_base.size()) +
+                                                              " targets, another size in " + std::to_string(g_rt_learn_differ) + " lookups"
+                                                        : std::string();
+        host_log("render: target sizes learned from scissors and views: %zu %s; a scissor the padded size over a smaller size learned "
+                 "for its geometry, the size kept, in %llu lookups of a width and %llu of a height%s",
+                 g_rt_extents.size(), g_rt_learn_mode ? "geometries (base, pitch, padded height)" : "targets by the base alone (BBHOST_RT_LEARN_BY_GEOMETRY=0)",
+                 static_cast<unsigned long long>(g_rt_padded_over[0]), static_cast<unsigned long long>(g_rt_padded_over[1]), differ.c_str());
+    }
     if (g_view_by_id) {
         host_log("render: %s%s", texture_view_by_id_report().c_str(),
                  g_view_by_id == 2 ? ("; disagreements with the T# " + std::to_string(g_view_by_id_disagree)).c_str() : "");
@@ -22239,7 +22261,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
                  {static_cast<std::uint32_t>(draw_rect.x1 - draw_rect.x0), static_cast<std::uint32_t>(draw_rect.y1 - draw_rect.y0)}};
 
     // The screen and generic scissors' bottom edge is the target's real
-    // height (see unpadded_height); the CB registers only give the padded
+    // height (see learned_extent_locked); the CB registers only give the padded
     // one. The viewport scissor is per draw, so it does not size targets.
     const int x1 = target_rect.x1, y1 = target_rect.y1;
     const std::uint32_t scissor_bottom = y1 > 0 && y1 < 16384 ? static_cast<std::uint32_t>(y1) : 0u;
