@@ -103,7 +103,7 @@ struct HostSettings {
     bool hd_motion_blur = false;
     int hd_motion_blur_res = 2;
     // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR (4 where
-    // it can run), 3 FSR 3; and its quality, 0 native AA (DLAA, FSR native
+    // it can run), 3 FSR 3, 4 TAA (bbhost's own, at the Resolution's size); and its quality, 0 native AA (DLAA, FSR native
     // AA), 1 Quality, 2 Balanced, 3 Performance. Follow the settings live.
     int upscaler = 0;
     int upscale_quality = 1;

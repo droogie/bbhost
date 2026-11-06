@@ -431,11 +431,15 @@ Setting g_set[kSettingCount] = {
     // The temporal upscaler (host/upscaler.h, Numity1504's bridge): its
     // picture in place of the game's after the 3D, before the post effects.
     // Off by default; the order of the values is the settings object's
-    // (0 off, then DLSS, FSR) turned round for the menu (Off, FSR, DLSS).
-    {"upscaler", "Upscaling", {"Off", "FSR 3", "FSR 4", "DLSS"}, 0,
-     "FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 (any GPU) or DLSS (NVIDIA RTX) in place of the game's "
-     "own anti-aliasing. Needs upscaler_bridge.dll and AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; "
-     "without them it stays off. FSR 4 runs as FSR 3 where it cannot run. Changes at once.",
+    // (0 off, then DLSS, FSR, FSR 3, TAA) turned round for the menu (Off,
+    // TAA, FSR, DLSS). TAA is bbhost's own (host/upscale_pass.cpp): it needs
+    // no bridge and never draws the 3D smaller. One choice of the row, so TAA
+    // and FSR or DLSS are never on together.
+    {"upscaler", "Upscaling", {"Off", "TAA", "FSR 3", "FSR 4", "DLSS"}, 0,
+     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
+     "(any GPU) or DLSS (NVIDIA RTX) in place of the game's own anti-aliasing. FSR and DLSS need upscaler_bridge.dll and "
+     "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
+     "FSR 3 where it cannot run. Changes at once.",
      false},
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
@@ -1370,7 +1374,7 @@ void rebuild_settings() {
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
     {
         const int u = index_of(kUpscaler);
-        h.upscaler = u == 1 ? 3 : u == 2 ? 2 : u == 3 ? 1 : 0;  // the menu's FSR 3, FSR 4, DLSS
+        h.upscaler = u == 1 ? 4 : u == 2 ? 3 : u == 3 ? 2 : u == 4 ? 1 : 0;  // the menu's TAA, FSR 3, FSR 4, DLSS
         h.upscale_quality = 3 - std::clamp(index_of(kUpscaleQuality), 0, 3);  // the menu runs Performance to Native AA
         static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
         h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
@@ -1861,6 +1865,8 @@ void change(int id, int index) {
 const char* const* value_tips(int id, bool dlss) {
     static const char* const kUpscalerTips[] = {
         "The game's own anti-aliasing; the 3D at the Resolution.",
+        "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
+        "Resolution. The fastest of these.",
         "AMD FSR 3: any GPU.",
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
@@ -2238,7 +2244,7 @@ const char* host_options_page_blurb(int page) {
 // off, DLSS's model, greyed. A change of the render size rebuilds the scene at
 // once (engine/render_scale.cpp).
 void preset_row() {
-    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
+    const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
     // DLSS at the full size is DLAA: its last choice says so.
     static const char* const kDlssQualityNames[4] = {"Performance", "Balanced", "Quality", "DLAA"};
     const auto quality_note = [](const char* who) {
@@ -2252,11 +2258,11 @@ void preset_row() {
                 "each way - faster, softer. The menus, the HUD and the post effects stay at the Resolution. Changes at once.";
         return n.c_str();
     };
-    if (u == 1 || u == 2) {
+    if (u == 2 || u == 3) {
         setting_row(kUpscaleQuality, "FSR preset", quality_note("FSR"));
         return;
     }
-    if (u == 3) {
+    if (u == 4) {
         setting_row(kUpscaleQuality, "DLSS quality", quality_note("DLSS"), kDlssQualityNames);
         row_rule();
     }
@@ -2267,12 +2273,13 @@ void preset_row() {
 // files beside bbhost.exe cannot run - why, and that the game's own
 // anti-aliasing runs in its place (frame generation still does).
 const char* upscaler_note() {
-    const int u = shown_index(kUpscaler);  // the menu's Off, FSR 3, FSR 4, DLSS
-    // (The setup window comes before the bridge loads: nothing known yet.)
-    if (u == 0 || g_setup_page) return g_set[kUpscaler].note;
+    const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
+    // (The setup window comes before the bridge loads: nothing known yet. TAA
+    // is bbhost's own: it always runs.)
+    if (u <= 1 || g_setup_page) return g_set[kUpscaler].note;
     const UpscalerCaps caps = upscaler_caps();
     static std::string note;
-    const bool dlss = u == 3;
+    const bool dlss = u == 4;
     if (!caps.loaded) {
         note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
                "game's own anti-aliasing runs instead; Frame generation works without it.";
@@ -2292,7 +2299,7 @@ const char* upscaler_note() {
 // Upscaling and Frame generation both off. (HD motion blur quality is greyed
 // with HD motion blur off instead: row_greyed.)
 bool row_hidden(int id) {
-    if (id == kDlssPreset) return shown_index(kUpscaler) == 0;
+    if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
     return false;
 }
@@ -2472,10 +2479,15 @@ bool host_opt_upscaler_chosen() {
         if (!e || !*e) return -1;
         return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 ? 1 : 0;
     }();
-    return env >= 0 ? env != 0 : host_settings_ref().upscaler != 0;
+    // (TAA, 4, keeps the 3D and the game at the Resolution.)
+    const int u = host_settings_ref().upscaler;
+    return env >= 0 ? env != 0 : u != 0 && u != 4;
 }
 
-bool host_opt_motion_wanted() { return host_opt_upscaler_chosen() || host_settings_ref().frame_generation; }
+// (TAA wants the motion too, though it is no upscaler that sizes the 3D.)
+bool host_opt_motion_wanted() {
+    return host_opt_upscaler_chosen() || upscaler_method() == kUpscaleTaa || host_settings_ref().frame_generation;
+}
 
 int host_opt_motion_rebuilt_bits() {
     if (!host_opt_motion_wanted()) return 0;

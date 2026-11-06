@@ -48,9 +48,13 @@ UpscalerCaps upscaler_caps();
 
 // The method asked for: Graphics > Upscaling (host/settings.h upscaler), or
 // BBHOST_UPSCALE over it - 0 none, 1 DLSS ("dlss"), 2 FSR ("fsr"; "fsr3" for
-// the newest 3.x where FSR 4 could run) - and only one the bridge says can
-// run here.
+// the newest 3.x where FSR 4 could run), 3 TAA ("taa": bbhost's own,
+// host/upscale_pass.cpp, any GPU, no bridge) - and only one that can run here.
 int upscaler_method();
+constexpr int kUpscaleTaa = 3;
+// Whether a method draws the 3D smaller and brings it back (DLSS, FSR); TAA
+// is always the Resolution's own size.
+inline bool upscaler_method_scales(int method) { return method == 1 || method == 2; }
 bool upscaler_fsr3_override();
 
 // One upscale, recorded into `cb` outside a render pass (host/upscale_pass.cpp
@@ -79,7 +83,8 @@ struct UpscaleCall {
 bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c);
 // The jitter of frame `frame` for a method and quality at an output size: the
 // bridge's Halton (2, 3) over its phase count, in render pixels, +x moving the
-// picture right and +y down. (0, 0) without the bridge.
+// picture right and +y down. (0, 0) without the bridge. TAA's: Halton (2, 3)
+// over 8 phases, the same way round, bridge or not.
 void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
                      float* y);
 // The texture LOD bias for the 3D's materials at a method and quality (the

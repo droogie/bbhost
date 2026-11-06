@@ -75,8 +75,9 @@ void scene_look_set_scale(bool nearest, std::uint32_t lines) {
     if (was != nearest || was_lines != (nearest ? lines : 0)) targets_changed();
 }
 bool scene_look_scale(std::uint32_t* lines) {
-    // An upscaler chosen and there takes the 3D's size, the plugin's yields.
-    const bool on = g_scale.load(std::memory_order_acquire) && !upscaler_method();
+    // An upscaler chosen and there takes the 3D's size, the plugin's yields
+    // (TAA does not: it runs at whatever size the 3D is).
+    const bool on = g_scale.load(std::memory_order_acquire) && !upscaler_method_scales(upscaler_method());
     if (lines) *lines = on ? g_scale_lines.load(std::memory_order_acquire) : 0;
     return on;
 }

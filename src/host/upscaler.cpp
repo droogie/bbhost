@@ -5,6 +5,47 @@
 #include "host/settings.h"
 #include "log.h"
 
+#include <cstdlib>
+#include <string>
+
+namespace {
+
+// The method asked for, run here or not: BBHOST_UPSCALE over Graphics >
+// Upscaling (the settings' 0 off, 1 DLSS, 2 FSR, 3 FSR 3, 4 TAA).
+int method_asked() {
+    static const int env = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE");
+        if (!e || !*e) return -1;
+        const std::string v = e;
+        return v == "dlss" ? 1 : v == "fsr" || v == "fsr3" ? 2 : v == "taa" ? kUpscaleTaa : 0;
+    }();
+    if (env >= 0) return env;
+    const int setting = host_settings_ref().upscaler;
+    return setting == 3 ? 2 : setting == 4 ? kUpscaleTaa : setting;
+}
+
+float halton(std::uint32_t i, std::uint32_t base) {
+    float f = 1.0f, r = 0.0f;
+    for (; i; i /= base) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % base);
+    }
+    return r;
+}
+
+// TAA's jitter: Halton (2, 3) over 8 phases, centred, never phase 0 (the
+// centre itself); and its LOD bias, a little sharper than the native size's
+// own - the history's average of 8 jittered frames softens the textures by
+// about that much.
+void taa_jitter(std::uint32_t frame, float* x, float* y) {
+    const std::uint32_t phase = frame % 8 + 1;
+    *x = halton(phase, 2) - 0.5f;
+    *y = halton(phase, 3) - 0.5f;
+}
+constexpr float kTaaMipBias = -0.5f;
+
+}  // namespace
+
 #if defined(_WIN32)
 #include <windows.h>
 
@@ -147,14 +188,9 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 
 int upscaler_method() {
     // Chosen, it wins over a plugin's 3D at a size of its own (host/scene_look.h).
-    static const int env = [] {
-        const char* e = std::getenv("BBHOST_UPSCALE");
-        if (!e || !*e) return -1;
-        const std::string v = e;
-        return v == "dlss" ? 1 : v == "fsr" || v == "fsr3" ? 2 : 0;
-    }();
-    const int setting = host_settings_ref().upscaler;
-    const int asked = env >= 0 ? env : setting == 3 ? 2 : setting;
+    // TAA is bbhost's own: it needs neither the bridge nor its caps.
+    const int asked = method_asked();
+    if (asked == kUpscaleTaa) return kUpscaleTaa;
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
     return (asked == 1 && g_caps_dlss.load(std::memory_order_relaxed)) || (asked == 2 && g_caps_fsr.load(std::memory_order_relaxed)) ? asked : 0;
 }
@@ -162,6 +198,7 @@ int upscaler_method() {
 void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
                      float* y) {
     *x = *y = 0.0f;
+    if (method == kUpscaleTaa) return taa_jitter(frame, x, y);
     if (!g_ub || !method) return;
     ub_render_info ri{};
     ri.struct_size = sizeof(ri);
@@ -172,6 +209,7 @@ void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, 
 }
 
 float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h) {
+    if (method == kUpscaleTaa) return kTaaMipBias;
     if (!g_ub || !method) return 0.0f;
     ub_render_info ri{};
     ri.struct_size = sizeof(ri);
@@ -181,6 +219,7 @@ float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_
 
 void upscaler_jitter_sized(int method, std::uint32_t render_w, std::uint32_t output_w, std::uint32_t frame, float* x, float* y) {
     *x = *y = 0.0f;
+    if (method == kUpscaleTaa) return taa_jitter(frame, x, y);
     if (!g_ub || !method || !render_w || !output_w) return;
     const double r = static_cast<double>(output_w) / render_w;
     const auto phases = static_cast<std::uint32_t>(std::max(8.0, std::ceil(8.0 * r * r)));
@@ -188,6 +227,7 @@ void upscaler_jitter_sized(int method, std::uint32_t render_w, std::uint32_t out
 }
 
 float upscaler_mip_bias_sized(int method, std::uint32_t render_w, std::uint32_t output_w) {
+    if (method == kUpscaleTaa) return kTaaMipBias;
     if (!g_ub || !method || !render_w || !output_w) return 0.0f;
     return static_cast<float>(std::log2(static_cast<double>(render_w) / output_w) - 1.0);
 }
@@ -246,12 +286,18 @@ const VkDeviceCreateInfo* upscaler_prepare_device(VkInstance, VkPhysicalDevice, 
 void upscaler_device_done(VkResult) {}
 void upscaler_attach(VkInstance, VkPhysicalDevice, VkDevice, std::uint32_t) {}
 UpscalerCaps upscaler_caps() { return {}; }
-int upscaler_method() { return 0; }
+int upscaler_method() { return method_asked() == kUpscaleTaa ? kUpscaleTaa : 0; }
 bool upscaler_fsr3_override() { return false; }
-void upscaler_jitter_sized(int, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
-float upscaler_mip_bias_sized(int, std::uint32_t, std::uint32_t) { return 0.0f; }
+void upscaler_jitter_sized(int method, std::uint32_t, std::uint32_t, std::uint32_t frame, float* x, float* y) {
+    *x = *y = 0.0f;
+    if (method == kUpscaleTaa) taa_jitter(frame, x, y);
+}
+float upscaler_mip_bias_sized(int method, std::uint32_t, std::uint32_t) { return method == kUpscaleTaa ? kTaaMipBias : 0.0f; }
 bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
-void upscaler_jitter(int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float* x, float* y) { *x = *y = 0.0f; }
-float upscaler_mip_bias(int, std::uint32_t, std::uint32_t, std::uint32_t) { return 0.0f; }
+void upscaler_jitter(int method, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t frame, float* x, float* y) {
+    *x = *y = 0.0f;
+    if (method == kUpscaleTaa) taa_jitter(frame, x, y);
+}
+float upscaler_mip_bias(int method, std::uint32_t, std::uint32_t, std::uint32_t) { return method == kUpscaleTaa ? kTaaMipBias : 0.0f; }
 
 #endif
