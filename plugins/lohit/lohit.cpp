@@ -9,9 +9,8 @@
 //   wall_r = 46  wall_g = 20  wall_b = 108    # the walls' colour, as it comes out on the screen (0-255)
 //   floor_r = 32 floor_g = 56 floor_b = 128   # the floors'
 //   occluder_pass = "3e/04"  # where its depth-only play goes, for occlusion (ahead of the scene's objects)
-//   lit = false         # lit by the game: drawn into the G-buffer (host API 19), the colours its albedo
-//   ambient = 30        # lit: the light no lamp reaches, in thousandths (the map's comes from its lightmaps)
-//   sun = 0             # unlit: faces away from a fixed high sun darkened, 0-100
+//   ambient = 30        # the light no lamp reaches, in thousandths (the map's comes from its lightmaps)
+//   sun = 0             # older hosts (unlit): faces away from a fixed high sun darkened, 0-100
 //
 // What it draws. The world's hit manager (WorldHitMan) has a debug draw of
 // the parts the player last stood on (its two slots at +0x2de8/+0x2df0): each
@@ -77,7 +76,7 @@
 // (BB_DRAW_DEPTH_EQUAL). Drawn with its colour that early, it goes into the
 // G-buffer and comes out lit, near black.
 //
-// Lit (host API 19, `lit`). Drawn at 3e/25 the lo-hit is flat colour over
+// Lit (host API 19; always, where the host has it). Drawn at 3e/25 the lo-hit is flat colour over
 // the lit scene: the lighting, the fog in it included, has run by then
 // (every pass from 3e/13 to 3e/25 gave the same frame). Lit, the coloured
 // play goes ahead of 3e/0c, where the G-buffer is still bound, styled
@@ -112,7 +111,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.5.1",
+    "0.5.2",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -125,11 +124,8 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "show_hi_hit", "Hi-hit",
      "The hi-hit - what characters and objects collide with, in its full detail - in place of the lo-hit.", "false"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "lit", "Lit by the game",
-     "Lit as the map is - the sun, the lamps and the shadows they cast, the fog - with the colours below as its paint. "
-     "Off: flat colours over the lit scene.", "false"},
     {BB_OPT_INT | BB_OPT_LIVE, "ambient", "Ambient light",
-     "Lit by the game: the light where no lamp or sun reaches (the map's own comes from its lightmaps). 0: black there.", "30",
+     "The light where no lamp or sun reaches (the map's own comes from its lightmaps). 0: black there.", "30",
      0, 100},
     {BB_OPT_HEADING, "colours", "Colours", "As they come out on the screen, 0-255. Lo-hit and hi-hit alike.", nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "wall_r", "Walls: red", nullptr, "46", 0, 255},
@@ -138,8 +134,6 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_INT | BB_OPT_LIVE, "floor_r", "Floors: red", nullptr, "32", 0, 255},
     {BB_OPT_INT | BB_OPT_LIVE, "floor_g", "Floors: green", nullptr, "56", 0, 255},
     {BB_OPT_INT | BB_OPT_LIVE, "floor_b", "Floors: blue", nullptr, "128", 0, 255},
-    {BB_OPT_INT | BB_OPT_LIVE, "sun", "Sun shading",
-     "How much faces turned away from a high sun darken (0: off, 100: down to a quarter).", "0", 0, 100},
     {0}};
 
 namespace {
@@ -916,7 +910,6 @@ void on_option(const char* key, const char* value, void*) {
     else if (const int k = rgb_index(key); k >= 0) {
         if (read_rgb(k, value)) write_colours();
     }
-    else if (std::strcmp(key, "lit") == 0) set_lit(truthy(value));
     else if (std::strcmp(key, "ambient") == 0) set_ambient(value);
     else if (std::strcmp(key, "sun") == 0) {
         if (read_sun(value)) g_mesh_gen.fetch_add(1, std::memory_order_relaxed);
@@ -1029,7 +1022,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         if (g_can_light) {
             const char* a = host->config("lohit.ambient");
             set_ambient(a && *a ? a : "30");
-            set_lit(option_on("lohit.lit", false));
+            set_lit(true);
         }
     }
     host->log("lohit: the lo-hit shown in place of the map (%d of 2 sites), %s (ahead of the scene's %02x/%02x), %s%s; "

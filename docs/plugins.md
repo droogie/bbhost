@@ -221,7 +221,7 @@ gives the Binary Ninja address.
   and their shadows, the fog. For the game's simple coloured draw (the debug
   draw's): rgb the albedo (linear), alpha the face's world normal when
   negative, `-(1 + u + 2048 v)` with u and v its octahedral coordinates in
-  11 bits. The Lo-Hit plugin's "Lit by the game" draws the collision this way.
+  11 bits. Lo-Hit draws the collision this way (always, on a host with it).
 - `gbuffer_ambient(level)` (v19): `BB_DRAW_GBUFFER` draws' indirect light,
   which the map gets from its lightmaps (0.03 by default).
 - `audio_crush(rate_hz, bits, lowpass_hz)` (v21): old-hardware sound. The
