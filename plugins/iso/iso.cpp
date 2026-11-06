@@ -63,7 +63,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.2.1",
+    "0.3.0",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -86,6 +86,16 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "0", 0, 15},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Look-at height", "The point the view centres on, metres above the hunter's feet.",
      "1.0", 0, 2.5},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
+     "Roofs, ceilings and the near walls between the view and the hunter left out, a round hole about the hunter as "
+     "Diablo cuts its walls. Each zoom step builds the 3D's shaders for it once (a short pause the first time).",
+     "true"},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_radius", "Cutaway radius",
+     "Metres about the line from the view to the hunter that are cut away (kept clear of the floor around the hunter).",
+     "3.0", 1, 8},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_margin", "Cutaway margin",
+     "Metres in front of the hunter, toward the view, that are kept: the hunter and what is close around them.", "2.0", 0.5,
+     6},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
      "Seconds the view takes to catch up with the hunter (0: fixed to them).", "0.08", 0, 0.5},
     {BB_OPT_HEADING, "lock", "Lock-on", "Applies at the next start.", nullptr},
@@ -122,6 +132,8 @@ constexpr std::uint64_t kCaves = 0x4000000;
 struct Settings {
     bool enabled = true;
     float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f, flatten = 0;
+    bool cutaway = true;
+    float cutaway_radius = 3.0f, cutaway_margin = 2.0f;
     float lock_range = 30.0f, lock_angle = 180.0f, lock_hidden = 8.0f;
     bool omni_roll = true;
 } s;
@@ -224,6 +236,10 @@ void read_options() {
     s.flatten = number("iso.flatten", 0, 0, 15);
     s.height = number("iso.height", 1.0f, 0, 2.5f);
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
+    const char* cu = api->config("iso.cutaway");
+    s.cutaway = !cu || !*cu || truthy(cu);
+    s.cutaway_radius = number("iso.cutaway_radius", 3.0f, 1, 8);
+    s.cutaway_margin = number("iso.cutaway_margin", 2.0f, 0.5f, 6);
     s.lock_range = number("iso.lock_range", 30.0f, 10, 60);
     s.lock_angle = number("iso.lock_angle", 180.0f, 30, 180);
     s.lock_hidden = number("iso.lock_hidden", 8.0f, 1, 30);
@@ -386,6 +402,36 @@ void normalise(float v[3]) {
         for (int i = 0; i < 3; ++i) v[i] /= l;
 }
 
+// The cutaway (plugin API 22): a cylinder about the view's axis, which runs
+// through the point looked at, from the camera to `margin` short of it. Its
+// radius is kept under where the floor around the hunter would come into it
+// at this angle: a floor point toward the view at h metres lies
+// h sin(p) + height cos(p) from the axis and h cos(p) - height sin(p) along it
+// from the point looked at, so it is reached first at radius
+// (margin sin(p) + height) / cos(p). Sent when its numbers change - each new
+// set builds the camera draws' pipelines again - and off while another
+// camera has the view.
+void cutaway(float fov, float aspect, float dist) {
+    static float sent[4] = {-1, -1, -1, -1};
+    float want[4] = {0, 0, 0, 0};
+    if (s.cutaway && view.away <= 0.0f && aspect > 0) {
+        const float p = s.pitch * kPi / 180.0f;
+        const float floor_reach = (s.cutaway_margin * std::sin(p) + s.height) / std::cos(p);
+        float radius = s.cutaway_radius;
+        if (radius > 0.85f * floor_reach) radius = 0.85f * floor_reach;
+        want[1] = std::tan(fov / 2);
+        want[0] = want[1] * aspect;
+        want[2] = dist - s.cutaway_margin;
+        want[3] = want[2] > 0.5f ? radius : 0.0f;
+    }
+    bool same = true;
+    for (int i = 0; i < 4; ++i) same = same && std::fabs(want[i] - sent[i]) < (i < 2 ? 1.0f / 2048 : 0.125f);
+    if (same) return;
+    std::memcpy(sent, want, sizeof(sent));
+    if (api->version >= 22 && api->size >= offsetof(BbHostApi, view_cutaway) + sizeof(void*))
+        api->view_cutaway(want[0], want[1], want[2], want[3]);
+}
+
 // The drawn camera: from above, looking down at the hunter - or, while another
 // camera has the game (the monocular), on the way to it or that camera itself.
 void on_view(BbCamera* c, void*) {
@@ -399,6 +445,7 @@ void on_view(BbCamera* c, void*) {
     const float step = dt / kHandOver;
     if (view.away < view.away_want) view.away = view.away + step < view.away_want ? view.away + step : view.away_want;
     else view.away = view.away - step > view.away_want ? view.away - step : view.away_want;
+    if (view.away > 0.0f) cutaway(0, 0, 0);  // the other camera's view: nothing cut
     if (view.away >= 1.0f) {
         view.have_focus = false;  // the hunter may have moved while it was away: no glide back from there
         return;                   // the game's own camera, as copied
@@ -460,6 +507,7 @@ void on_view(BbCamera* c, void*) {
         c->position[i] = pos[i];
     }
     c->fov_y = fov;
+    cutaway(fov, c->aspect, dist);
 }
 
 void on_option(const char* key, const char* value, void*) {

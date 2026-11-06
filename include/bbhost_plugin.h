@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 21
+#define BB_PLUGIN_API_VERSION 22
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -563,6 +563,18 @@ typedef struct BbHostApi {
      * 0 is the game's own sound, which costs nothing. Any thread, from the
      * next buffer. */
     void (*audio_crush)(int rate_hz, int bits, float lowpass_hz);
+
+    /* Version 22: a cutaway for a high camera (the Isometric's). The camera's
+     * draws - the world, its characters, the effects, not the shadows - are
+     * clipped where they lie within `radius` of the view's axis and nearer
+     * than `near_z` along it (both in metres, view space): what stands between
+     * the camera and the character at the screen's middle, `near_z` the
+     * character's distance less a margin. `tan_x` and `tan_y` are the tangents
+     * of half the drawn view's field of view across and up (on_view's fov_y
+     * and aspect). radius 0 turns it off. Each new set of numbers makes the
+     * camera draws' pipelines again (rounded to 1/4 m), so set it as the
+     * distance or the field of view change, not every frame. Any thread. */
+    void (*view_cutaway)(float tan_x, float tan_y, float near_z, float radius);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

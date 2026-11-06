@@ -229,6 +229,13 @@ gives the Binary Ninja address.
   boundaries don't click) and truncated to `bits` a sample with no dither; 0
   turns each off, and all three 0 costs nothing. Any thread, from the next
   buffer. The Bloodborne PS1 plugin's Sound.
+- `view_cutaway(tan_x, tan_y, near_z, radius)` (v22): a cutaway for a high
+  camera. The camera's draws are clipped (a clip distance added to their last
+  stage before the rasterizer) within `radius` metres of the view's axis and
+  nearer than `near_z` along it - the roof, ceiling or near wall between the
+  camera and the character it centres. Camera-relative, so it is set when the
+  distance or field of view change, not as the camera moves; each new set
+  makes the camera draws' pipelines again. The Isometric plugin's Cutaway.
 - The 3D's look (v18): how the camera's draws - the world, its characters, the
   sky and the effects, the draws with the scene's depth that are not
   full-screen rect lists - are drawn; the shadow maps, the post-processing and

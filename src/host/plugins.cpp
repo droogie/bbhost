@@ -1203,6 +1203,15 @@ void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
 void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
 void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
 
+// Version 22: the cutaway (host/vertex_cutaway.h, host/scene_look.h).
+void api_view_cutaway(float tan_x, float tan_y, float near_z, float radius) {
+    const bool was = scene_look_cutaway(nullptr);
+    scene_look_set_cutaway(tan_x, tan_y, near_z, radius);
+    const bool on = scene_look_cutaway(nullptr);
+    if (on) host_log("plugin: cutaway within %.2f m of the view's axis nearer than %.2f m", static_cast<double>(radius), static_cast<double>(near_z));
+    else if (was) host_log("plugin: no cutaway");
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1232,6 +1241,7 @@ const BbHostApi g_api = {
     &api_gbuffer_ambient,
     &api_on_view,
     &api_audio_crush,
+    &api_view_cutaway,
 };
 
 std::string read_file(const std::string& path) {
