@@ -188,7 +188,9 @@ int quality_asked() {
 bool upscaler_asked() {
     if (const char* e = std::getenv("BBHOST_UPSCALE"); e && *e)
         return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0;
-    return host_settings_ref().upscaler != 0;
+    // (TAA, 4, keeps the 3D at the Resolution.)
+    const int u = host_settings_ref().upscaler;
+    return u != 0 && u != 4;
 }
 
 ElfImage* g_image = nullptr;
@@ -463,10 +465,10 @@ void settings_changed(const HostSettings& s) {
     if (scene_look_scale()) {
         runs = false;  // a plugin's 3D size: no upscaler chosen and there (host/scene_look.cpp)
     } else if (std::getenv("BBHOST_UPSCALE")) {
-        runs = upscaler_method() != 0;
+        runs = upscaler_method_scales(upscaler_method());
     } else {
         const UpscalerCaps caps = upscaler_caps();
-        runs = s.upscaler == 1 ? caps.dlss : s.upscaler >= 2 ? caps.fsr : false;
+        runs = s.upscaler == 1 ? caps.dlss : s.upscaler == 2 || s.upscaler == 3 ? caps.fsr : false;  // (4, TAA: the Resolution's size)
     }
     const int quality = std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality : std::clamp(s.upscale_quality, 0, 3);
     // The upscaler on or off moves the game's own size too (host_opt_output_size:
@@ -592,7 +594,7 @@ bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::
         std::lock_guard<std::mutex> lk(g_mu);
         was = g_now;
     }
-    const bool runs = upscaler_method() != 0;
+    const bool runs = upscaler_method_scales(upscaler_method());
     const RenderScale rs = wanted(output_w, output_h, runs, quality_asked());
     if (!was.output_w) was = rs;
     write_values(rs);
