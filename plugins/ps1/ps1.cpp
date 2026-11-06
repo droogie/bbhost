@@ -8,7 +8,7 @@
 //   ps1 = true
 //   [ps1]
 //   look_3d = true         # the PS1 look below (false: the game's own picture, the sound alone)
-//   snap = "240p"          # the grid the vertices land on: Off, Native (the 3D's own pixels), 480p/360p/240p/120p
+//   snap = "240p"          # the grid the vertices land on: Off, 480p/360p/240p/120p
 //   colour_8bit = true     # the 3D's colour targets RGBA8 (and the colour grading unsmoothed)
 //   unfiltered = true      # the 3D's textures sampled nearest: no bilinear, trilinear or anisotropic filtering
 //   resolution = "Native"  # the 3D's size: Native (the Resolution setting, at most the window's), or 480p/360p/240p
@@ -35,8 +35,10 @@
 // pixel to pixel as it moved: the wobble of its 3D. The host moves each camera
 // draw's vertex, as its vertex stage writes it, to the nearest corner of a
 // grid `lines` cells high (as many across as the 3D's shape gives: 240p is
-// 427 x 240 at 16:9, about 570 x 240 at 21:9) - 240 is the PS1's own screen; Native, the 3D's
-// own pixels (no wobble you would see at a high Resolution).
+// 427 x 240 at 16:9, about 570 x 240 at 21:9) - 240 is the PS1's own screen.
+// No "Native" (the 3D's own pixels): at a high Resolution its wobble is too
+// small to see, the same as Off; a saved Native (or 0.1.0's "3D pixels")
+// reads as Off.
 //
 // Unfiltered textures (scene_filter). The PS1 had no bilinear filtering: each
 // pixel took its texel whole. The camera draws' samplers become nearest, the
@@ -90,7 +92,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "ps1",
     "Bloodborne PS1",
-    "0.3.2",
+    "0.3.3",
     "Kyo",
     "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
     "native. Optionally the sound of an old console's sound chip. Turns on and off in the game.",
@@ -103,8 +105,8 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "look_3d=true"},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "snap", "Vertex snap",
      "The grid the 3D's corners land on, as the PS1's landed on its pixels: they jump from cell to cell as they move. 240p "
-     "is the PS1's own screen; Native, the 3D's own pixels. The grid follows the screen's shape (240p is 427 cells across at 16:9).",
-     "240p", 0, 0, "Off|Native|480p|360p|240p|120p"},
+     "is the PS1's own screen. The grid follows the screen's shape (240p is 427 cells across at 16:9).",
+     "240p", 0, 0, "Off|480p|360p|240p|120p"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "unfiltered", "Unfiltered textures",
      "The 3D's textures sampled nearest - no bilinear, trilinear or anisotropic filtering - as the PS1 had none.", "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "colour_8bit", "8-bit colour",
@@ -146,11 +148,9 @@ std::uint32_t lines_of(const char* v) {
     return n > 0 ? static_cast<std::uint32_t>(n) : 0;
 }
 
-// The snap's grid: Native (0.1.0's "3D pixels") the 3D's own pixels.
-std::uint32_t snap_of(const char* v) {
-    if (v && (std::strcmp(v, "Native") == 0 || std::strcmp(v, "3D pixels") == 0)) return BB_SNAP_PIXELS;
-    return lines_of(v);
-}
+// The snap's grid: "240p" -> 240; Off, and 0.2.0's Native and 0.1.0's
+// "3D pixels" (the 3D's own pixels, no longer offered) -> 0, off.
+std::uint32_t snap_of(const char* v) { return lines_of(v); }
 
 // The plugin's switch: on a host before API 21 it is loaded only when on; on
 // one after, BB_PLUGIN_LIVE_SWITCH loads it off too, to be turned on in game.
