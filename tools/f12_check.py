@@ -13,7 +13,13 @@ Each check is a pattern that has broken frames before:
              target's top-left region is what the hardware reads (the host
              copies it, BBHOST_RT_REGIONS). Larger T#: the target is too small
              and what the game drew past its edge was clipped - the
-             new-character magenta (588x221 drawn into 588x11).
+             new-character magenta (588x221 drawn into 588x11), the 2560x1440
+             glare drawn to the right of its source (640x360 levels made
+             523x360 wide). Not counted when the memory is a live GX texture
+             of the T#'s size now, which the host samples instead: the
+             capture's "registered:" line says so (a YEBIS texture's memory
+             never is); a capture without those lines is judged by a surface
+             of the T#'s size there.
   lost-clear a target cleared, then re-created by the next draw: the clear
              went to the old image (the metallic huntsman's blood layer).
              Since 2026-09-29 the new image starts with that clear
@@ -73,6 +79,9 @@ def check(path):
         m = re.match(r'\s+surface vkformat \d+ (\d+)x(\d+)', l)
         if m:
             cur['surface'] = (int(m.group(1)), int(m.group(2)))
+        m = re.match(r'\s+registered: (YEBIS|GX) texture (\d+)x(\d+)', l)
+        if m:
+            cur['registered'] = (m.group(1), int(m.group(2)), int(m.group(3)))
         if l.startswith('      '):
             cur['hist'].append(l.strip())
         else:
@@ -91,7 +100,9 @@ def check(path):
         rw, rh, _ = t['rt']
         if (rw, rh) == (t['w'], t['h']):
             continue
-        if (t['w'] > rw or t['h'] > rh) and t.get('surface') == (t['w'], t['h']):
+        reg = t.get('registered')
+        live_texture = reg == ('GX', t['w'], t['h']) if 'registered' in t else t.get('surface') == (t['w'], t['h'])
+        if (t['w'] > rw or t['h'] > rh) and live_texture:
             # Memory an old target was drawn into, now a texture of the T#'s
             # size: the host samples the texture (the exit report's "read as
             # the live texture" binds), so nothing is clipped.
