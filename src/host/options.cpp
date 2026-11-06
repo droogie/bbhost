@@ -1008,7 +1008,64 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     host_log("graphics: %s changed: %s", what, rebuild ? "the scene's targets made again" : "no target changes");
 }
 
+// The primary display's refresh rate, the one frame generation's limit is
+// half of (engine/frame_rate.cpp fg_cap_target reads host_desktop_refresh_hz:
+// the same display). host_desktop_refresh_hz brings SDL's video up and down,
+// which the presenter's thread must not, so on Windows the display's settings
+// are asked directly, at most every 2 s; elsewhere SDL's answer once.
+float refresh_hz_now() {
+#if defined(_WIN32)
+    static std::atomic<float> hz{0.0f};
+    static std::atomic<std::int64_t> asked{0};
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (std::int64_t was = asked.load(); now - was > 2000 && asked.compare_exchange_strong(was, now)) {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        hz.store(EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1
+                     ? static_cast<float>(dm.dmDisplayFrequency)
+                     : 0.0f);
+    }
+    return hz.load();
+#else
+    static const float hz = host_desktop_refresh_hz();
+    return hz;
+#endif
+}
+
+// Frame generation's most real frames a second with it `on`: half the
+// display's refresh rate (90 at 180 Hz; frame generation shows twice that),
+// as the frame rate holds them (engine/frame_rate.cpp). 0 with it off, or no
+// display that says a rate of 48 Hz or more (headless).
+int fg_limit(bool on) {
+    if (!on) return 0;
+    const float hz = refresh_hz_now();
+    return hz >= 48.0f ? std::max(30, static_cast<int>(hz / 2.0f)) : 0;
+}
+
+// Frame rate, Custom limit and its number (indices) brought down to `limit`
+// (fg_limit) when the rate they make is above it: a Custom limit's number to
+// it; a listed rate to the list's entry for it, or - a limit the list does not
+// have (72 at 144 Hz) - Custom limit ticked at it. Display-Limited stays: the
+// frame rate holds it to half the refresh rate itself while frames are
+// generated. False when nothing changed.
+bool frame_rate_fit(int* cap, int* custom, int* custom_fps, int limit) {
+    if (limit <= 0) return false;
+    const int fps = frame_rate_of(*cap, *custom, *custom_fps);
+    if (fps == 0 || fps <= limit) return false;
+    if (!reads_on(g_set[kFrameCapCustom], *custom)) {
+        if (const int i = fps_index(limit); i >= 0) {
+            *cap = i;
+            return true;
+        }
+        *custom = 1;
+    }
+    *custom_fps = std::clamp(limit, 30, 960) - 30;
+    return true;
+}
+
 void res_keep();
+void set_index(int id, int index, bool from_file);
 
 // Applied every time one changes, and once at load, so there is one path to
 // the live state instead of a copy in each caller.
@@ -1036,7 +1093,18 @@ void apply(int id) {
                 host_window_recreate_swapchain();
                 targets_follow_settings(s.label, false);
             }
+            const bool turned_on = was >= 0 && was != s.index && reads_on(s, s.index);
             was = s.index;
+            // Turned on: a frame rate above half the refresh rate comes down
+            // to it (fg_limit; 120 -> 90 at 180 Hz, a Custom limit's 166 -> 90).
+            int cap = g_set[kFrameCap].index, custom = g_set[kFrameCapCustom].index, custom_fps = g_set[kFrameCapCustomFps].index;
+            if (turned_on && frame_rate_fit(&cap, &custom, &custom_fps, fg_limit(true))) {
+                host_log("options: frame generation on: the frame rate %d comes down to %d, half the display's refresh rate",
+                         frame_rate_now(), frame_rate_of(cap, custom, custom_fps));
+                if (custom_fps != g_set[kFrameCapCustomFps].index) set_index(kFrameCapCustomFps, custom_fps, false);
+                if (custom != g_set[kFrameCapCustom].index) set_index(kFrameCapCustom, custom, false);
+                if (cap != g_set[kFrameCap].index) set_index(kFrameCap, cap, false);
+            }
             break;
         }
         case kUpscaler:
@@ -1837,40 +1905,8 @@ const char* const* value_tips(int id, bool dlss) {
     }
 }
 
-// The primary display's refresh rate, the one frame generation's limit is
-// half of (engine/frame_rate.cpp fg_cap_target reads host_desktop_refresh_hz:
-// the same display). host_desktop_refresh_hz brings SDL's video up and down,
-// which the presenter's thread must not, so on Windows the display's settings
-// are asked directly, at most every 2 s; elsewhere SDL's answer once.
-float refresh_hz_now() {
-#if defined(_WIN32)
-    static std::atomic<float> hz{0.0f};
-    static std::atomic<std::int64_t> asked{0};
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (std::int64_t was = asked.load(); now - was > 2000 && asked.compare_exchange_strong(was, now)) {
-        DEVMODEW dm{};
-        dm.dmSize = sizeof(dm);
-        hz.store(EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1
-                     ? static_cast<float>(dm.dmDisplayFrequency)
-                     : 0.0f);
-    }
-    return hz.load();
-#else
-    static const float hz = host_desktop_refresh_hz();
-    return hz;
-#endif
-}
-
-// With frame generation on (as the menu shows it), the most real frames a
-// second: half the display's refresh rate (90 at 180 Hz; frame generation
-// shows twice that), as the frame rate holds them. 0 with frame generation
-// off, or no display that says a rate of 48 Hz or more (headless).
-int fg_real_limit() {
-    if (!reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration))) return 0;
-    const float hz = refresh_hz_now();
-    return hz >= 48.0f ? static_cast<int>(hz / 2.0f) : 0;
-}
+// fg_limit with frame generation as the menu shows it.
+int fg_real_limit() { return fg_limit(reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration))); }
 
 // A warning under a control, in `width` from `x`.
 void warn_line(const std::string& text, float x, float width) {
@@ -1883,11 +1919,11 @@ void warn_line(const std::string& text, float x, float width) {
 }
 
 // Frame rate's warning with frame generation on, for the rate the three
-// make (`fps`, 0 Display-Limited) and the Custom limit's tick: empty when
-// there is nothing to say.
-std::string frame_rate_warning(int fps, bool custom) {
+// make (`fps`, 0 Display-Limited): only above the limit (a file's, or a
+// display changed since). Empty when there is nothing to say.
+std::string frame_rate_warning(int fps) {
     const int limit = fg_real_limit();
-    if (limit <= 0 || !(custom || fps == 0 || fps > limit)) return {};
+    if (limit <= 0 || fps == 0 || fps <= limit) return {};
     const int hz = limit * 2;
     return "Frame generation doubles this: at most half your refresh rate (" + std::to_string(limit) + " at " + std::to_string(hz) +
            " Hz).";
@@ -1897,8 +1933,8 @@ std::string frame_rate_warning(int fps, bool custom) {
 // rate: the game is held to that half while frames are generated.
 std::string frame_generation_warning(int fps) {
     const int limit = fg_real_limit();
-    if (limit <= 0 || !(fps == 0 || fps > limit)) return {};
-    const std::string rate = fps == 0 ? std::string("Display-Limited") : std::to_string(fps) + " fps";
+    if (limit <= 0 || fps == 0 || fps <= limit) return {};
+    const std::string rate = std::to_string(fps) + " fps";
     return "Frame rate " + rate + " is above half your " + std::to_string(limit * 2) + " Hz refresh rate: the game runs at " +
            std::to_string(limit) + ", " + std::to_string(limit * 2) + " shown.";
 }
@@ -1946,14 +1982,21 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
         }
         store->SetInt(key, ImGui::IsItemActive() ? typing : *custom_fps);
     } else {
-        changed |= ui::combo("##cap", cap, items.data(), static_cast<int>(items.size()), tips.data());
+        // With frame generation on, the rates above its limit greyed out (fg_real_limit).
+        const int limit = fg_real_limit();
+        bool above[64] = {};
+        for (std::size_t v = 0; v < items.size() && v < 64; ++v) {
+            const int r = fps_from_label(g_set[kFrameCap].values[v]);
+            above[v] = limit > 0 && r > limit;
+        }
+        changed |= ui::combo("##cap", cap, items.data(), static_cast<int>(items.size()), tips.data(), above);
     }
     ui::tooltip_for_item(g_set[kFrameCap].label, g_set[kFrameCap].note);
     ImGui::SameLine(0, st.ItemSpacing.x);
     changed |= ImGui::Checkbox(kBox, custom);
     ui::tooltip_for_item(kBox, kHostFrameRateCustomNote);
     const int fps = *custom ? *custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(std::clamp(*cap, 0, static_cast<int>(items.size()) - 1))]);
-    if (const std::string warn = frame_rate_warning(fps, *custom); !warn.empty()) warn_line(warn, x0, width);
+    if (const std::string warn = frame_rate_warning(fps); !warn.empty()) warn_line(warn, x0, width);
     ImGui::PopID();
     return changed;
 }
@@ -2522,6 +2565,13 @@ int host_opt_frame_rate() { return frame_rate_now(); }
 bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width) {
     return frame_rate_control(cap_index, custom, custom_fps, width);
 }
+bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps) {
+    int c = *custom ? 1 : 0, f = std::clamp(*custom_fps, 30, 960) - 30;
+    if (!frame_rate_fit(cap_index, &c, &f, fg_limit(host_opt_get("frame_generation")))) return false;
+    *custom = c != 0;
+    *custom_fps = f + 30;
+    return true;
+}
 void host_frame_generation_warning(int cap_index, bool custom, int custom_fps) {
     const int fps = custom ? custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(cap_index)]);
     if (const std::string warn = frame_generation_warning(fps); !warn.empty())
@@ -2529,7 +2579,7 @@ void host_frame_generation_warning(int cap_index, bool custom, int custom_fps) {
 }
 int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps) {
     const int fps = custom ? custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(cap_index)]);
-    return (frame_rate_warning(fps, custom).empty() ? 0 : 1) + (frame_generation_warning(fps).empty() ? 0 : 1);
+    return (frame_rate_warning(fps).empty() ? 0 : 1) + (frame_generation_warning(fps).empty() ? 0 : 1);
 }
 #endif
 

@@ -118,6 +118,11 @@ bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, floa
 // Frame rate (F10's rows draw theirs). The count: how many such lines the two
 // rows show now, for the setup window's card height.
 void host_frame_generation_warning(int cap_index, bool custom, int custom_fps);
+// Frame generation turned on brings a Frame rate above half the refresh rate
+// down to it (the setting's own when it changes; this for the setup window's
+// unsaved values): a Custom limit's number to it, a listed rate to the list's
+// entry for it, or Custom limit at it when the list has none. True when changed.
+bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps);
 int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps);
 
 // Set one by name, from the rows the port adds to the game's own System menu

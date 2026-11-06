@@ -934,6 +934,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                        "the game's, from the 3D alone - the HUD and the menus are never interpolated. Works "
                                        "with any Upscaling choice, Off included."))
                         host_opt_set("frame_generation", fg);
+                    // While on, a Frame rate above half the refresh rate comes down to it (F10: as it turns on).
+                    if (fg) host_frame_rate_fit(&cap_choice, &cap_custom, &cap_custom_fps);
                     host_frame_generation_warning(cap_choice, cap_custom, cap_custom_fps);
                 }
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,

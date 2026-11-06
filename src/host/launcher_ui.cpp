@@ -929,7 +929,7 @@ bool segmented(const char* id, int* v, const char* const* labels, int n, float w
     return changed;
 }
 
-bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips) {
+bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips, const bool* disabled) {
     // The frame's place, before the popup (when open) becomes the window.
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::CalcItemWidth(), h = ImGui::GetFrameHeight();
@@ -938,7 +938,8 @@ bool combo(const char* id, int* v, const char* const* items, int n, const char* 
     if (ImGui::BeginCombo(id, *v >= 0 && *v < n ? items[*v] : "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge)) {
         for (int i = 0; i < n; ++i) {
             const bool chosen = i == *v;
-            if (ImGui::Selectable(items[i], chosen) && !chosen) {
+            const bool off = disabled && disabled[i];
+            if (ImGui::Selectable(items[i], chosen, off ? ImGuiSelectableFlags_Disabled : 0) && !chosen && !off) {
                 *v = i;
                 changed = true;
             }
