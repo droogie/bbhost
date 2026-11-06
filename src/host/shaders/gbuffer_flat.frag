@@ -29,8 +29,11 @@ const float kSpecular = 0.04;  // a plain dielectric
 // The indirect light (target 4) in place of a lightmap: the host writes its
 // level into the module (gbuffer_ambient_words) before making it.
 layout(constant_id = 0) const float kAmbient = 0.04;
-// Target 3's and 5's alpha: per-instance values in the map's shader (a byte
-// and two bits), being found out (BBHOST_GBUFFER_SPEC).
+// Target 3's alpha: the light and fog group / 255 - the instance's byte in
+// the map's shader, which the lighting reads back as an index into the
+// frame's cbLight and cbFog; the game numbers them afresh each frame, so the
+// host writes the one its own G-buffer draws use this frame
+// (render.cpp gbuffer_group_take). Target 5's: a 2-bit per-instance value, 0.
 layout(constant_id = 1) const float kRt3Alpha = 0.0;
 layout(constant_id = 2) const float kRt5Alpha = 0.0;
 
@@ -46,6 +49,12 @@ void main() {
         const uint code = uint(-colour.a - 1.0 + 0.5);
         n = octahedral(vec2(code & 2047u, code >> 11) / 2047.0 * 2.0 - 1.0);
     }
+    // The face's other side seen (the collision is one-sided, and the camera
+    // goes behind it): its normal turned to the viewer, as the map's shaders
+    // turn theirs, else the lights shade it from behind. Lo-Hit's winding
+    // puts the faces it sees from their front on the rasterizer's back (a
+    // floor from above is not front-facing).
+    if (gl_FrontFacing) n = -n;
     rt0 = vec4(n * 0.5 + 0.5, 0.0);
     rt1 = vec4(kGloss, 0.0, 1.0, 0.0);
     rt2 = vec4(colour.rgb, 1.0);

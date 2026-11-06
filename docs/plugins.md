@@ -196,12 +196,13 @@ gives the Binary Ninja address.
   the banner on an older host. The Quake plugin names the weapon it switches to
   this way, small, in the bottom left corner.
 - `on_scene_category(pass, fn, user)` (v15): drawing inside the scene.
-  `fn(cc, user)` runs once a frame on the GX worker that records the first
-  chunk of the scene's render queue at or after `pass` - a sort key's category
-  and sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
+  `fn(cc, user)` runs once a frame on the GX worker that records the scene's
+  render queue's first item at or after `pass` - a sort key's category and
+  sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
   logs those a frame holds) - in a GX command context of its own with that
-  chunk's pass set up, queued just ahead of it: what it records draws into the
-  scene's targets before that pass does. One pass for each `fn` and `user`
+  item's pass set up, queued just ahead of it (the worker's chunk is cut
+  there): what it records draws into the scene's targets after the passes
+  before it and before that pass does. One pass for each `fn` and `user`
   (v17, up to four; v15-16 one for all plugins); -1 takes it away. The Lo-Hit
   plugin plays the game's collision debug draw there, under the effects.
 - `draw_style(style)` (v16): inside an `on_scene_category` fn, the draws the
