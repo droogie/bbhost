@@ -405,6 +405,11 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             const std::size_t dot = arg.find('.');
             plugins_set_option(arg.substr(0, dot), arg.substr(dot + 1), arg2);
             host_log("test: plugin option %s set to \"%s\" at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
+        } else if (verb == "plugin_on" && !arg.empty() && !arg2.empty()) {
+            // A plugin turned on or off as its menu's switch does: <name> <true|false>.
+            plugins_set_enabled(arg, arg2 == "true");
+            host_log("test: plugin %s turned %s at flip %llu", arg.c_str(), arg2 == "true" ? "on" : "off",
+                     static_cast<unsigned long long>(count));
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);

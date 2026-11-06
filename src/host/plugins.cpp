@@ -71,7 +71,14 @@ struct Plugin {
     const BbOption* options = nullptr;  // bb_plugin_options, ended by a zero type
     bool official = false;  // signed with the release key
     bool visitor = false;   // off, but loaded to play other players' worlds (BB_PLUGIN_ADOPTS_RULES)
+    bool dormant = false;   // off, but loaded to be turned on in game (BB_PLUGIN_LIVE_SWITCH); main thread
 };
+
+// A plugin that turns on and off while the game runs (BB_PLUGIN_LIVE_SWITCH):
+// opt-in and not a gameplay plugin, whose rules are the session's.
+bool live_switch(std::uint32_t flags) {
+    return (flags & BB_PLUGIN_LIVE_SWITCH) && (flags & BB_PLUGIN_OPT_IN) && !(flags & BB_PLUGIN_GAMEPLAY);
+}
 std::vector<Plugin> g_plugins;
 ElfImage* g_image = nullptr;
 bool g_early = true;  // register_hle allowed
@@ -1289,6 +1296,7 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         e.description = info->description ? info->description : "";
     }
     if (e.title.empty()) e.title = e.name;
+    std::string group_when;  // the last heading's BB_OPT_WHEN
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
         PluginOptionDesc d;
         d.type = o->type & 0xffu;
@@ -1298,6 +1306,10 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         d.help = o->help ? o->help : "";
         d.def = o->def ? o->def : "";
         d.choices = o->choices ? o->choices : "";
+        if ((o->type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+        // A heading's condition covers the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_when = d.when;
+        else if (d.when.empty()) d.when = group_when;
         d.min = o->min;
         d.max = o->max;
         e.options.push_back(std::move(d));
@@ -1396,6 +1408,9 @@ void plugins_load() {
         // turns it off.
         if (off && (flags & BB_PLUGIN_ADOPTS_RULES) && join_modded_worlds()) {
             p.visitor = true;
+        } else if (off && live_switch(flags)) {
+            // Off, and asks for nothing until the player turns it on in game.
+            p.dormant = true;
         } else if (off) {
             if (sw == 0) host_log("plugin: %s: off (plugins.%s = false)", p.name.c_str(), p.name.c_str());
             else host_log("plugin: %s: off until turned on ([plugins] %s = true)", p.name.c_str(), p.name.c_str());
@@ -1418,7 +1433,10 @@ void plugins_load() {
         if (p.info) {
             host_log("plugin: %s %s loaded%s%s (%s)", p.name.c_str(), p.info->version ? p.info->version : "",
                      official ? ", official" : "",
-                     p.visitor ? ", off: only to play other players' worlds" : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game" : "",
+                     p.visitor   ? ", off: only to play other players' worlds"
+                     : p.dormant ? ", off until turned on in game"
+                     : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game"
+                                                    : "",
                      path.c_str());
         } else {
             host_log("plugin: %s loaded%s (%s)", p.name.c_str(), official ? ", official" : "", path.c_str());
@@ -1484,9 +1502,18 @@ void plugins_frame() {
             }
             continue;
         }
-        const std::string raw = toml_value(r.value);
-        config_value_set(r.name + "." + r.key, raw);
-        config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        if (r.key.empty()) {
+            // A live switch (plugins_set_enabled): the plugin on or off.
+            const bool on = r.value == "true";
+            for (Plugin& p : g_plugins) {
+                if (p.name == r.name) p.dormant = !on;
+            }
+            host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
+        } else {
+            const std::string raw = toml_value(r.value);
+            config_value_set(r.name + "." + r.key, raw);
+            config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        }
         for (const OptionCallback& c : options) {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
@@ -1569,7 +1596,7 @@ std::vector<PluginEntry> plugins_catalog() {
         e.official = p.official;
         e.loaded = true;
         e.visitor = p.visitor;
-        e.enabled = !p.visitor;
+        e.enabled = !p.visitor && !p.dormant;
         out.push_back(std::move(e));
     }
     return out;
@@ -1578,7 +1605,15 @@ std::vector<PluginEntry> plugins_catalog() {
 void plugins_set_enabled(const std::string& name, bool on) {
     config_set_values(config_user_file(), {{"plugins", name, on ? "true" : "false"}});
     config_value_set("plugins." + name, on ? "true" : "false");
+    // In game, a live switch's plugin is told at once (plugins_frame).
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || !p.info || !live_switch(p.info->flags) || p.visitor) continue;
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_menu_requests.push_back({false, name, "", on ? "true" : "false"});
+    }
 }
+
+bool plugins_live_switch(const PluginEntry& p) { return p.loaded && live_switch(p.flags); }
 
 std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o) {
     const std::string v = config_value(p.name + "." + o.key);
@@ -1692,7 +1727,7 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
 
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {
-        if (p.name == name && !p.visitor) return true;
+        if (p.name == name && !p.visitor && !p.dormant) return true;
     }
     return false;
 }
