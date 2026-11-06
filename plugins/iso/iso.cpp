@@ -70,7 +70,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.3.0",
+    "0.4.0",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
