@@ -10,6 +10,7 @@
 #include "host/window.h"
 #include "core/config.h"
 #include "core/portable.h"
+#include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/live_resolution.h"
 #include "engine/patch_manifest.h"
@@ -125,6 +126,7 @@ enum SettingId {
     kTextureQuality,
     kSfxTextureQuality,
     kSsr,
+    kSsrQuality,
     kHdMotionBlur,
     kHdMotionBlurRes,
     kUpscaler,
@@ -192,12 +194,14 @@ Setting g_set[kSettingCount] = {
     // Frame cap's, so a file keeps its 30 or 60; a file older than version 3
     // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
     // 60, and reads as 60 (host_options_load).
-    // Read once as the game starts (engine/frame_rate.cpp), and with it the
+    // Read as the game starts (engine/frame_rate.cpp), and with it the
     // default for the draw work the pool prepares (host/gxvk_homes.h
-    // default_off): a restart setting.
+    // default_off). From one rate above 30 to another it changes while the
+    // game runs (frame_rate_request); 30 on either side needs the next start
+    // - the "next start" pill shows for those alone (setting_row).
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
-     "Requires a restart. 30 is the game's own pace; the others run its logic at that rate. Display-Limited caps it at your "
-     "monitor's refresh rate when the game starts (180 on a 180 Hz monitor) and runs it the same way.",
+     "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
+     "rate (180 on a 180 Hz monitor). Changes at once between the rates above 30; to or from 30 needs a restart.",
      true},
     // The frame clock (engine/frame_clock.h), experimental and off by default:
     // what the frame rate otherwise sets once for the rate chosen at start
@@ -208,11 +212,12 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Timing follows each frame's real length, for PCs that do not hold their chosen frame rate.",
      true},
     // How the effects keep time above 30 fps (engine/frame_rate.cpp), read
-    // once as the game starts: BBHOST_SFX_STEP, else this once chosen, else
-    // bbhost.toml's [video] effect_steps, else kEffectTimingDefault, 60 fps
-    // (config_effect_timing). Written to the file only once chosen (save).
+    // as the game starts and set again when it changes (frame_rate_retime):
+    // BBHOST_SFX_STEP, else this once chosen, else bbhost.toml's [video]
+    // effect_steps, else kEffectTimingDefault, 60 fps (config_effect_timing).
+    // Written to the file only once chosen (save).
     {"effect_timing", "Effect timing", {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2]},
-     effect_timing_index(kEffectTimingDefault), kHostEffectTimingNote, true},
+     effect_timing_index(kEffectTimingDefault), kHostEffectTimingNote, false},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
@@ -337,7 +342,8 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. The sharpness of every shadow: the sun's, the lamps' and the torches'. Default is the game's own "
      "(the sun 2048 or 4096 as each area asks, lamps 512, torches 256). Lowest 512, 128, 64; Low 1024, 256, 128; High 4096, "
      "1024, 512; Ultra 4096, 2048, 1024 (about 500 MB more memory); Giga 4096 everywhere (about 1.8 GB more memory and as "
-     "much video memory again; much slower where lights cast shadows). Performance mode sets 1024, 256, 128.",
+     "much video memory again; much slower where lights cast shadows). Performance mode sets 1024, 256, 128 while this is "
+     "Default; any other size wins over it.",
      true},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
@@ -381,8 +387,18 @@ Setting g_set[kSettingCount] = {
     // the old patch file on ([patches] screen-space-reflections) seeds it
     // (host_options_load).
     {"ssr", "Screen space reflections", {"Off", "On"}, 0,
-     "Wet streets, water and polished floors reflect what is on screen, at half the 3D's resolution, without fading "
+     "Wet streets, water and polished floors reflect what is on screen, at the Reflection quality's resolution, without fading "
      "out where they face the camera. Costs GPU time. Changes at once.",
+     false},
+    // The reflection pass's size (engine/patch_manifest.cpp ssr_manifest):
+    // Quarter, the default, a quarter of the render size each way (480x270 at
+    // 1080p: ~1 ms a frame on the Radeon 8060S), Half the game's own (3.9 ms).
+    // Changes at once while reflections are in: the patch made again and the
+    // scene's targets with it (targets_follow_settings). Greyed while Screen
+    // space reflections is off (row_greyed).
+    {"ssr_quality", "Reflection quality", {"Quarter", "Half"}, 0,
+     "The resolution of the reflections. Quarter (recommended) traces a quarter of the render size each way and costs about "
+     "a quarter of Half's GPU time; Half is the game's own, sharper and much slower. Changes at once.",
      false},
     // Kyo's HD Motion Blur patches as a setting (engine/patch_manifest.cpp
     // hd_motion_blur_manifest): their buffers at a share of the render size
@@ -504,9 +520,13 @@ Setting g_set[kSettingCount] = {
     {"skip_logos", "Skip company logos", {"Off", "On"}, 1,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
     // Kyo's Giga Performance Patch's post-effects (engine/patch_manifest.cpp's
-    // performance-mode), and chromatic aberration through its own setting's mask.
+    // performance-mode): its YEBIS sites put in or taken out while the game
+    // runs (apply), SSAO, anti-aliasing, motion blur, chromatic aberration and
+    // the dynamic lights' shadows through their settings' own switches
+    // (engine/graphics_patch.cpp). Its shadow map sizes (Shadow resolution
+    // Default's place) are made as the game starts.
     {"performance_mode", "Performance mode", {"Off", "On"}, 0,
-     "Requires a restart. Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays.", true},
+     "Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays. Changes at once; with Shadow resolution at Default, its smaller shadow maps take a restart.", false},
     // The old switch for the developers' debug menu, which the Debug Menu
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
@@ -607,6 +627,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kSsr},
+    {Row::Option, nullptr, kSsrQuality},
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
     {Row::Option, nullptr, kResolution},
@@ -941,9 +962,10 @@ bool output_of(unsigned* w, unsigned* h) {
 }
 
 // The scene's targets as the settings now want them, while the game runs:
-// Screen space reflections' patch in once it is on (off clears its pass's
-// switch each view, engine/graphics_patch.cpp, and the patch stays until the
-// next start), HD motion blur's sizes and the velocity map's format and size
+// Screen space reflections' patch in once it is on, at the Reflection
+// quality's size (off clears its pass's switch each view,
+// engine/graphics_patch.cpp, and the patch stays until the next start; a
+// quality changed while it is in makes it again), HD motion blur's sizes and the velocity map's format and size
 // made again from the settings (engine/patch_manifest.cpp) - and the targets
 // made again at the same size when the game's code changed for them, or when
 // reflections were turned on (`ssr_on`: the patched setup sets their switch).
@@ -951,11 +973,13 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     const HostSettings hs = host_settings();
     bool rebuild = false, changed = false;
     std::string why;
+    const bool ssr_in = patch_manifest_live_state("ssr").applied;
     if (ssr_on && hs.ssr) {
-        if (!patch_manifest_live_state("ssr").applied) {
-            if (patch_manifest_set_live("ssr", true, &why)) graphics_ssr_live_in();
-        }
+        // Made from the settings now, so at the quality chosen since the start.
+        if (!ssr_in && patch_manifest_refresh_live("ssr", true, &changed, &why)) graphics_ssr_live_in();
         rebuild = true;
+    } else if (ssr_in && patch_manifest_refresh_live("ssr", true, &changed, &why)) {
+        rebuild |= changed;
     }
     if (patch_manifest_refresh_live("hd-motion-blur", hs.hd_motion_blur, &changed, &why)) rebuild |= changed;
     if (patch_manifest_refresh_live("velomap-16f", true, &changed, &why)) rebuild |= changed;
@@ -996,6 +1020,7 @@ void apply(int id) {
         }
         case kUpscaler:
         case kSsr:
+        case kSsrQuality:
         case kHdMotionBlur:
         case kHdMotionBlurRes:
         case kMotionVectors: {
@@ -1015,8 +1040,17 @@ void apply(int id) {
             was[id] = s.index;
             break;
         }
-        case kFrameCap:
-            hle_video_set_fps_cap(fps_from_label(s.values[static_cast<std::size_t>(s.index)]));
+        case kFrameCap: {
+            // From one converted rate to another at the next frame
+            // (engine/frame_rate.h); otherwise, and before the game starts,
+            // the presentation's cap, which says when it waits for the next
+            // start.
+            const int fps = fps_from_label(s.values[static_cast<std::size_t>(s.index)]);
+            if (!frame_rate_request(fps)) hle_video_set_fps_cap(fps);
+            break;
+        }
+        case kEffectTiming:
+            frame_rate_retime();  // nothing before the game runs, or at 30
             break;
         case kMouseMenu:
         case kMouseCamera:
@@ -1064,8 +1098,27 @@ void apply(int id) {
             }
             break;
         }
+        case kPerformanceMode: {
+            // Its YEBIS sites in or out now (depth of field, bloom; the motion
+            // blur's constructor write for the next scene); the renderers'
+            // switches follow from the settings (engine/graphics_patch.cpp).
+            // No targets made again: off while the game runs gives the same
+            // frame as off from the start (checked 2026-11-05, 1% of pixels
+            // apart), and a rebuild with the larger shadow maps left the GPU
+            // slower until the next start. Only once the game runs: the
+            // start's manifests take the setting.
+            static int was = -1;
+            if (was >= 0 && was != s.index && live_resolution_available()) {
+                bool changed = false;
+                std::string why;
+                const bool ok = patch_manifest_refresh_live("performance-mode", reads_on(s, s.index), &changed, &why);
+                host_log("graphics: Performance mode %s while the game runs%s", reads_on(s, s.index) ? "on" : "off",
+                         ok ? "" : " (its YEBIS passes at the next start)");
+            }
+            was = s.index;
+            break;
+        }
         case kSkipLogos:
-        case kPerformanceMode:
         case kDebugMenu:
         case kDebugCamera:
         case kChangeAppearance:
@@ -1220,6 +1273,7 @@ void rebuild_settings() {
     h.texture_quality = 3 - std::clamp(index_of(kTextureQuality), 0, 3);  // the levels left out: High none, Lowest three
     h.sfx_texture_quality = 3 - std::clamp(index_of(kSfxTextureQuality), 0, 3);
     h.ssr = on_of(kSsr);
+    h.ssr_half = index_of(kSsrQuality) == 1;
     h.hd_motion_blur = on_of(kHdMotionBlur);
     h.hd_motion_blur_res = std::clamp(index_of(kHdMotionBlurRes), 0, 2);
     {
@@ -1766,7 +1820,8 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     const float sc = ui::scale();
     const int n = static_cast<int>(s.values.size());
     const int cur = std::clamp(shown_index(id), 0, n - 1);
-    const bool restart = s.restart && !g_setup_page && !(id == kResolution && res_live(cur));
+    const bool restart = s.restart && !g_setup_page && !(id == kResolution && res_live(cur)) &&
+                         !(id == kFrameCap && frame_rate_live(fps_from_label(s.values[static_cast<std::size_t>(cur)])));
     ImGui::PushID(id);
     int on_i = -1, off_i = -1;
     for (int v = 0; v < n; ++v) {
@@ -2032,7 +2087,8 @@ bool row_hidden(int id) {
 
 // Rows shown but not to be changed while the setting they need is off.
 bool row_greyed(int id) {
-    return id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
+    return (id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur))) ||
+           (id == kSsrQuality && !reads_on(g_set[kSsr], shown_index(kSsr)));
 }
 
 void host_options_draw_page(int page) {
@@ -2093,7 +2149,7 @@ const char* const kHostShaderModeTips[2] = {
 
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
-    "Requires a restart. How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps.";
+    "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";
 const char* const kHostEffectTimingTips[3] = {
     "Effects step 30 times a second, as the game at 30 fps, whatever your frame rate: above 30 fps their motion is less "
     "smooth.",

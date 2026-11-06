@@ -91,6 +91,10 @@ struct HostSettings {
     // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
     // the game starts): the reflection pass on, its Fade To Viewer at -10000.
     bool ssr = false;
+    // Reflection quality: the reflection pass's two targets at half the render
+    // size each way (the game's own) instead of a quarter (the default since
+    // 2026-11-05: ~1 ms a frame at 1080p on the Radeon 8060S against 3.9).
+    bool ssr_half = false;
     // HD motion blur (engine/patch_manifest.cpp's hd-motion-blur, read once as
     // the game starts): motion blur's velocity map and the depth it blurs
     // with at a share of the render size - 0 a quarter, 1 half (the game's

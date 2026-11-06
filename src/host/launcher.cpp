@@ -941,7 +941,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");
                 ui::toggle_row("Performance mode", nullptr, &performance_mode,
-                               "Requires a restart. Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays.");
+                               "Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays. Can be changed in game (F10).");
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
