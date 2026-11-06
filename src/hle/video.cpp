@@ -716,7 +716,8 @@ void flip_waiter() {
 
 void start_vsync() {
     std::call_once(g_vsync_once, [] {
-        // Set, never cleared: the game above 60 or uncapped has set it already
+        // Set here, cleared only by a frame rate of 60 chosen while the game
+        // runs: the game above 60 or uncapped has set it already
         // (hle_video_set_game_pace).
         if (const char* e = std::getenv("BBHOST_UNCAP"); e && e[0] == '1') g_flip_uncapped.store(true);
         if (g_flip_keeper) {
@@ -1192,6 +1193,11 @@ void hle_video_set_game_pace(int fps) {
             host_log("video: flips complete as soon as they are recorded (the game paces itself, uncapped)");
         }
     } else {
+        // 60 (or 30) after a rate above it chosen while the game runs
+        // (engine/frame_rate.h frame_rate_request): flips held to the pace
+        // again, unless BBHOST_UNCAP asks otherwise.
+        const char* e = std::getenv("BBHOST_UNCAP");
+        if (!(e && e[0] == '1')) g_flip_uncapped.store(false);
         g_fps_cap.store(fps);
     }
 }
@@ -1201,8 +1207,9 @@ int hle_video_game_pace() { return g_game_pace.load(std::memory_order_relaxed); 
 void hle_video_set_fps_cap(int fps) {
     // The game's pace is chosen when it starts (engine/frame_rate.h): its
     // steps are converted for that rate, so capping it lower now would slow
-    // the game itself down. A frame rate picked while it runs applies on the
-    // next run.
+    // the game itself down. A converted rate picked while it runs goes to
+    // frame_rate_request instead; what reaches here (30 either side) applies
+    // on the next run.
     if (const int pace = g_game_pace.load(); pace >= 0) {
         if (fps != pace) {
             host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped), and with it the default "

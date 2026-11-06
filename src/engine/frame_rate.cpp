@@ -910,7 +910,7 @@ void count_was(const Counted& c, std::uint8_t* out) {
 
 // The game's pace: 30, or the rate it was converted to (60 to 960; Uncapped's
 // is the display's refresh rate, g_uncapped).
-int g_game_fps = 30;
+std::atomic<int> g_game_fps{30};
 bool g_uncapped = false;
 std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};
@@ -977,6 +977,21 @@ struct Late {
     double shown;  // the start-time value, for the log
 };
 std::vector<Late> g_late;
+// What a frame rate or an effect timing chosen while the game runs rewrites
+// (frame_rate_request, frame_rate_retime), kept by apply_rate: the image, the
+// rated constants and the counts it wrote at the rate's values, whether the
+// cloth's caves may go in later (a start at 60 leaves them out), and the
+// effects' step slot (BN; 0 when SprjSfx::Update's load is not ours to
+// move). Used on the main thread, between frames (frame_manager_hook).
+ElfImage* g_image = nullptr;
+std::vector<const Constant*> g_live_constants;
+std::vector<const Counted*> g_live_counts;
+bool g_cloth_ok = false;
+std::uint64_t g_sfx_bn = 0;
+// A rate asked for (0 Display-Limited) and an effect timing changed, taken at
+// the next frame.
+std::atomic<int> g_rate_asked{-1};
+std::atomic<bool> g_retime_asked{false};
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1610,6 +1625,133 @@ void each_frame(const SprjFlipper* f) {
     }
 }
 
+// The 1.09 image's executable segment ends at 0x54d96dc (its first PT_LOAD);
+// a site past it is in the read-write data segment, and its page goes back
+// to read-write - the frame-time slot (0x575a908) is written every frame.
+constexpr std::uint32_t kCodeEnd = 0x54d96dc;
+
+std::uint64_t rate_va(std::uint32_t bn) { return g_image->mem.slide + (bn - kPreferredGuestSlide); }
+
+// One write into the image at a BN address, its pages opened and closed again.
+void rate_write(std::uint32_t bn, const void* src, std::size_t n) {
+    const std::uint64_t at = rate_va(bn), lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
+    guest_protect_rwx(&g_image->mem, lo, hi - lo);
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), src, n);
+    if (bn < kCodeEnd) guest_protect_rx(&g_image->mem, lo, hi - lo);
+    else guest_protect_rw(&g_image->mem, lo, hi - lo);
+}
+
+// The rel32 of a load whose instruction ends 4 bytes after it, pointed at
+// `to` (a BN address), and where one points now.
+void point_load(std::uint32_t at, std::uint64_t to) {
+    const auto d = static_cast<std::int32_t>(static_cast<std::int64_t>(to) - static_cast<std::int64_t>(at + 4));
+    rate_write(at, &d, 4);
+}
+std::uint64_t load_target(std::uint32_t at) {
+    std::int32_t d;
+    std::memcpy(&d, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rate_va(at))), 4);
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(at) + 4 + d);
+}
+
+EffectTiming effect_timing(int fps);
+
+// The effect timing at `fps` while the game runs (Effect timing or the Frame
+// rate changed): what apply_rate set at the start, set again - the effects'
+// whole steps a second, the gate on the frames between, smooth's steps,
+// SprjSfx::Update's load (our step slot, or the frame-time slot for frame),
+// the wind's three loads (the effects' step with whole 1/30 s steps, else the
+// frame-time slot) and the emission clock's sub-steps. On the main thread
+// between frames, so each_frame sees the new state whole.
+void retime_effects(int fps) {
+    if (!g_sfx_bn) {
+        host_log("frame rate: the effects' step is not ours to move (see the start's lines); effect timing applies at the next start");
+        return;
+    }
+    const EffectTiming timing = effect_timing(fps);
+    const int steps = timing.steps;
+    const bool wind_steps = steps == 30;
+    std::size_t wind_moved = 0;
+    for (const std::uint32_t at : kWindStepDisps) {
+        const std::uint64_t to = load_target(at);
+        if (wind_steps && to == kFrameTimeSlot) {
+            point_load(at, g_sfx_bn);
+            ++wind_moved;
+        } else if (!wind_steps && to == g_sfx_bn) {
+            point_load(at, kFrameTimeSlot);
+            ++wind_moved;
+        }
+    }
+    bool smooth = false;
+    if (steps == 0) {
+        g_sfx_step_va = 0;  // each_frame stops writing it, and the load reads the frame's time
+        point_load(kSfxStepLoad + 4, kFrameTimeSlot);
+        g_sfx_gate = false;
+        decomp_sfx_gate_frame(false);
+        decomp_sfx_step_frame(false);
+    } else {
+        g_sfx_steps_a_second = steps;
+        g_sfx_gate = steps < fps;
+        if (const char* e = std::getenv("BBHOST_SFX_GATE"); e && (e[0] == '0' || e[0] == '1')) g_sfx_gate = e[0] == '1';
+        smooth = timing.smooth && steps == 30;
+        if (smooth) g_sfx_gate = true;
+        g_sfx_carry = 0.0;
+        const std::uint64_t slot = rate_va(static_cast<std::uint32_t>(g_sfx_bn));
+        put<float>(slot, steps == 30 ? kThirtieth : steps == 60 ? kSixtieth : 1.0f / static_cast<float>(steps));
+        g_sfx_step_va = slot;
+        point_load(kSfxStepLoad + 4, g_sfx_bn);
+    }
+    decomp_sfx_smooth(smooth);
+    if (config_effect_emission() != "30") sfx_node::set_emission_clock(steps == 0 ? 0 : steps == 30 ? 2 : 1);
+    const std::string how = steps == 0 ? std::string("the effects step by the frame's time") : "whole 1/" + std::to_string(steps) + " s steps";
+    host_log("frame rate: effect timing %s at %d while the game runs: %s%s, the frames between %s, the wind %s (%zu loads moved)",
+             timing.readable ? timing.value.c_str() : kEffectTimingDefault, fps, how.c_str(), smooth ? ", smooth" : "",
+             g_sfx_gate ? "held" : "counted", wind_steps ? "in whole 1/30 s" : "by the frame's time", wind_moved);
+}
+
+// A converted rate to another while the game runs: the rated constants and
+// the counts apply_rate wrote, at the new rate's values; the cloth's caves
+// put in when the game started at 60 and goes above it; the pace, the
+// flips' and the effects' timing. On the main thread between frames. The
+// code sites are the same at every converted rate, and the every-frame
+// values follow the frame's time already.
+void retarget(int want) {
+    int fps = want;
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_desktop_refresh_hz());
+    g_uncapped = want == 0;
+    if (fps == g_game_fps) return;
+    if (fps != 60 && !g_cloth_applied) {
+        if (!g_cloth_ok) {
+            host_log("frame rate: %s needs the cloth's code rewrites, which were refused at the start; it applies at the next start",
+                     mode_name(want).c_str());
+            return;
+        }
+        for (const Site& site : kClothSites) {
+            const std::vector<std::uint8_t> now = hex_bytes(site.now);
+            rate_write(site.at, now.data(), now.size());
+            ++g_cloth_applied;
+        }
+        g_cloth_va = rate_va(kClothScalars);
+        guest_keep_writable(&g_image->mem, g_cloth_va & ~0xfffull);
+    }
+    const int was = g_game_fps;
+    for (const Constant* c : g_live_constants) {
+        const Rated* r = rated(c->at);
+        const std::uint32_t now = fps != 60 ? float_bits(rated_value(r->kind, bits_float(c->was), fps)) : c->now;
+        rate_write(c->at, &now, 4);
+    }
+    for (const Counted* c : g_live_counts) {
+        std::uint8_t now[8];
+        count_bytes(*c, fps, now);
+        rate_write(c->at, now, c->n);
+    }
+    g_game_fps = fps;
+    hle_video_set_game_pace(fps);
+    retime_effects(fps);
+    host_log("frame rate: %d -> %s%s while the game runs (%zu constants and %zu counts at its values%s)", was, mode_name(fps).c_str(),
+             g_uncapped ? " (Display-Limited)" : "", g_live_constants.size(), g_live_counts.size(),
+             g_cloth_va ? ", the cloth's stiffness scale above 60" : "");
+}
+
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
     sound_wake_frame();  // the frame's work is done: its sound requests go to a pass now (engine/sound_wake.h)
@@ -1625,6 +1767,11 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     loading_tick(hle_video_flip_count());  // the loading screens' lengths and the first in-game frame (engine/loading.h)
     auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
     const bool converted = g_game_fps != 30;
+    // A rate or an effect timing chosen in the menus since the last frame.
+    if (converted && g_source == Source::Ours) {
+        if (const int asked = g_rate_asked.exchange(-1, std::memory_order_acq_rel); asked >= 0) retarget(asked);
+        if (g_retime_asked.exchange(false, std::memory_order_acq_rel)) retime_effects(g_game_fps);
+    }
     if (g_source == Source::Ours) {
         note_main_frame_work(saved[5]);
         RealClock clock;
@@ -1736,6 +1883,7 @@ bool sites_hold(ElfImage* image, const Site (&sites)[N], const char* group) {
 // without the code rewrites if those do not hold theirs; 60 if another rate's
 // do not. Never part of a group.
 int apply_rate(ElfImage* image, int want) {
+    g_image = image;
     const auto va = [&](std::uint32_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
     // A value a patch manifest the player turned on changed (Kyo's Movement +
     // Roll-Dodge and Aerial Vectors write some of these) is the manifest's: left
@@ -1788,11 +1936,12 @@ int apply_rate(ElfImage* image, int want) {
     const bool sixty_ok = sites_on && sites_hold(image, kSixtySites, "the 60 FPS++ list") &&
                           sites_hold(image, kFrameTimeSites, "the frame-time sites");
     int mode = want;
+    // Checked at 60 too: a rate above it chosen while the game runs puts them in (retarget).
+    g_cloth_ok = sixty_ok && sites_hold(image, kClothSites, "the cloth caves") &&
+                 std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kClothScalars))), kClothScalarsWas,
+                             sizeof(kClothScalarsWas)) == 0;
     if (mode != 60) {
-        const bool cloth_ok = sixty_ok && sites_hold(image, kClothSites, "the cloth caves") &&
-                              std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kClothScalars))),
-                                          kClothScalarsWas, sizeof(kClothScalarsWas)) == 0;
-        if (!cloth_ok) {
+        if (!g_cloth_ok) {
             host_log("frame rate: %s needs the 60 FPS++, frame-time and cloth code rewrites, which were refused; the game "
                      "runs at 60",
                      mode_name(mode).c_str());
@@ -1800,17 +1949,7 @@ int apply_rate(ElfImage* image, int want) {
         }
     }
 
-    // The 1.09 image's executable segment ends at 0x54d96dc (its first PT_LOAD);
-    // a site past it is in the read-write data segment, and its page goes back
-    // to read-write - the frame-time slot (0x575a908) is written every frame.
-    constexpr std::uint32_t kCodeEnd = 0x54d96dc;
-    const auto write = [&](std::uint32_t bn, const void* src, std::size_t n) {
-        const std::uint64_t at = va(bn), lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
-        guest_protect_rwx(&image->mem, lo, hi - lo);
-        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), src, n);
-        if (bn < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
-        else guest_protect_rw(&image->mem, lo, hi - lo);
-    };
+    const auto write = rate_write;
     // The Camera tuning: Original leaves Kyo's camera sites and constants out.
     const bool original_camera = camera_original();
     const auto write_sites = [&](const auto& sites) {
@@ -1854,6 +1993,7 @@ int apply_rate(ElfImage* image, int want) {
         }
         if (r && mode != 60 && !r->each_frame) ++rated_fixed;
         write(c.at, &now, 4);
+        if (r) g_live_constants.push_back(&c);
     }
     // The counts handed back (kCountsHandedOver) keep the game's the same way.
     const auto count_handed_back = [&](const CountHandedOver& h) {
@@ -1872,6 +2012,7 @@ int apply_rate(ElfImage* image, int want) {
         std::uint8_t now[8];
         count_bytes(c, fps, now);
         write(c.at, now, c.n);
+        g_live_counts.push_back(&c);
     }
     for (const Bytes& b : kBytes) {
         if (!skipped(b.at)) write(b.at, b.now, b.n);
@@ -1959,6 +2100,9 @@ int apply_rate(ElfImage* image, int want) {
                          "(sub_2713870's loads at 0x%x and 0x%x; BBHOST_WIND_PACE=0 for the frame's step)",
                          kWindStepAt, kWindForceAt);
             }
+            // SprjSfx::Update's load as the 60 FPS++ sites leave it: ours to
+            // point at our step or back, now and while the game runs.
+            if (holds(kSfxStepLoad, kSfxStepLoadSixty)) g_sfx_bn = sfx_bn;
             // The effects' timing, and what decided it (effect_timing).
             const EffectTiming timing = effect_timing(fps);
             const int steps = timing.steps;
@@ -2269,6 +2413,20 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 int frame_rate_game_fps() { return g_game_fps; }
+
+bool frame_rate_live(int fps) {
+    return g_game_fps != 30 && fps != 30 && g_source == Source::Ours && g_image && (fps == 60 || g_cloth_applied || g_cloth_ok);
+}
+
+bool frame_rate_request(int fps) {
+    if (!frame_rate_live(fps)) return false;
+    g_rate_asked.store(fps, std::memory_order_release);
+    return true;
+}
+
+void frame_rate_retime() {
+    if (g_game_fps != 30 && g_source == Source::Ours) g_retime_asked.store(true, std::memory_order_release);
+}
 
 float frame_rate_limit_fps() { return static_cast<float>(g_game_fps); }
 

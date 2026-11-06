@@ -442,20 +442,23 @@ void settings_changed(const HostSettings& hs) {
     // A plugin's 3D brought up nearest (host/scene_look.h, the Bloodborne PS1's):
     // the AA (FXAA, after YEBIS's copy at the output size) would smooth its
     // pixels again, so it is off while it is.
-    const bool aa = hs.anti_alias && !scene_look_scale();
-    if (hs.ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
-        ssao_was = hs.ssao;
+    // Performance mode clears both (its patch's constructor writes until
+    // 2026-11-05), and with it on or off while the game runs they follow.
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode;
+    const bool ssao = hs.ssao && !hs.performance_mode;
+    if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
+        ssao_was = ssao;
         aa_was = aa;
         velocity_was = velocity;
         camera_blur_was = hs.hd_motion_blur;
-        g_ssao.store(hs.ssao);
+        g_ssao.store(ssao);
         g_aa.store(aa);
         g_velocity.store(velocity);
         g_camera_blur.store(hs.hd_motion_blur);
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
     g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
-    g_dyn_shadows_off.store(!hs.dynamic_shadows, std::memory_order_relaxed);
+    g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
     // Rebuilt motion vectors hold what the blur cannot read: it goes too.

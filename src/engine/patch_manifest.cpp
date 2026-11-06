@@ -236,12 +236,19 @@ std::string old_hunters_missing() {
 // Performance Patch's post-effects. The scene's constructor sets its feature
 // flags with one `mov dword [rbx+0x2968], 0x01010101` (SSAO +0x2968, motion
 // blur +0x2969, anti-aliasing +0x296a) and the dynamic lights' shadows at
-// +0x296e (imm at 0x26c2538) - each 0. The directional shadow (+0x296c, the
-// sun's and the moon's: the buildings' shadows) stays. YEBIS's apply (sub_25d5f80) jumps past
-// every depth-of-field pass (0x25d7bbc) and reads GlareShape as 0, no bloom
-// (0x25d72f0). The map's fog is left as the game draws it (the Fog setting
-// still scales it). Chromatic aberration is its own setting's mask
-// (engine/graphics_patch.cpp), cleared while this is on.
+// +0x296e (imm at 0x26c2538); the patch made each 0. Since 2026-11-05 SSAO,
+// anti-aliasing and the dynamic lights' shadows are cleared on each renderer
+// by the settings' own switches over the same bytes instead
+// (engine/graphics_patch.cpp settings_changed), which follow a change while
+// the game runs; the motion blur's stays here (the velocity map's, kept for an
+// upscaler). The directional shadow (+0x296c, the sun's and the moon's: the
+// buildings' shadows) stays. YEBIS's apply (sub_25d5f80) jumps past every
+// depth-of-field pass (0x25d7bbc) and reads GlareShape as 0, no bloom
+// (0x25d72f0) - code read each frame, so put in and taken out while the game
+// runs (host/options.cpp, patch_manifest_refresh_live). The map's fog is left
+// as the game draws it (the Fog setting still scales it). Chromatic
+// aberration is its own setting's mask (engine/graphics_patch.cpp), cleared
+// while this is on.
 Manifest performance_mode_manifest() {
     Manifest m;
     m.name = "performance-mode";
@@ -252,7 +259,6 @@ Manifest performance_mode_manifest() {
     m.option = "startup.performance_mode";
     m.order = 11;
     const std::vector<std::uint8_t> one = {0x01}, zero = {0x00};
-    m.sites.push_back(Site{"ssao", 0x026c2548, one, zero, true, {}});
     // Motion blur's flag also draws the velocity map, which an upscaler's or
     // frame generation's motion takes the player's and the enemies' own
     // movement from (host/upscale_pass.cpp): with either the flag stays and
@@ -260,8 +266,6 @@ Manifest performance_mode_manifest() {
     // away, the dilation skipped - host/shader_patch.cpp,
     // engine/graphics_patch.cpp, which also follows a later change of either).
     if (!host_opt_motion_wanted()) m.sites.push_back(Site{"motion-blur", 0x026c2549, one, zero, true, {}});
-    m.sites.push_back(Site{"anti-aliasing", 0x026c254a, one, zero, true, {}});
-    m.sites.push_back(Site{"dynamic-light-shadow", 0x026c2538, one, zero, true, {}});
     m.sites.push_back(Site{"dof", 0x025d7bbc, {0x0f, 0x84, 0xde, 0x00, 0x00, 0x00}, {0xe9, 0xdf, 0x00, 0x00, 0x00, 0x90}, true, {}});
     m.sites.push_back(Site{"bloom", 0x025d72f0, {0x8b, 0xb3, 0xd8, 0x00, 0x00, 0x00}, {0x31, 0xf6, 0x0f, 0x1f, 0x40, 0x00}, true, {}});
     return m;
@@ -320,9 +324,9 @@ Manifest fov_uncap_manifest() {
 // ssr, Screen space reflections (graphics.ssr): Kyo's 1.09 patch from his
 // shadPS4 list ("Enable Screen Space Reflections (READ NOTE)"), site for site,
 // which was patches/screen-space-reflections.toml. The scene context's
-// reflection pass on (its targets made and the pass run), its ray march's step
-// scale 0.0 over the 1.0 at 0x12a8cfd (the list's: dearer, 7.8 ms a frame at
-// 1080p on the Radeon 8060S against 6.1), its two targets at the game's half
+// reflection pass on (its targets made and the pass run) - its ray march's step
+// scale at 0x12a8cfd left at the game's 1.0 (the list's 0.0 is dearer: 7.8 ms
+// a frame at 1080p on the Radeon 8060S against 4.2; BBHOST_SSR_STEP=list) - its two targets at the game's half
 // size in format 10 instead of r12d's, and the depth renders it reads at the
 // game's own half and quarter sizes - four sites that write the game's code
 // back over a performance patch's fixed sizes - as 32-bit float (0x125b1bf:
@@ -354,8 +358,10 @@ Manifest ssr_manifest() {
     site("depth-quarter-width", 0x0125b1d6, quarter_w, quarter_w);
     site("depth-quarter-height", 0x0125b1de, quarter_h, quarter_h);
     site("depth-format", 0x0125b1bf, {0x14}, {0x28});
-    // BBHOST_SSR_STEP=game: the game's own 1.0 kept (a test against the list's).
-    if (const char* e = std::getenv("BBHOST_SSR_STEP"); !(e && std::strcmp(e, "game") == 0))
+    // The game's own step scale, 1.0, unless BBHOST_SSR_STEP=list asks for
+    // the list's 0.0 (about twice the ray march's cost: the 100 fps and more
+    // Kyo saw SSR take, 2026-11-05).
+    if (const char* e = std::getenv("BBHOST_SSR_STEP"); e && std::strcmp(e, "list") == 0)
         site("step-scale", 0x012a8cfd, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x00});
     site("call-a", 0x026a10c0, {0xe8, 0xbb, 0xe0, 0xfe, 0xff}, {0xe8, 0xbb, 0xe0, 0xfe, 0xff});
     site("call-b", 0x026a2829, {0xe8, 0x52, 0xc9, 0xfe, 0xff}, {0xe8, 0x52, 0xc9, 0xfe, 0xff});
@@ -580,7 +586,7 @@ Manifest render_scale_manifest() {
 
 // shadow-resolution, Shadow resolution (graphics.shadow_resolution): the
 // shadow maps at the setting's sizes - Lowest, Low, Default (the game's own,
-// no patch), High, Ultra, Giga - or Performance mode's, which takes its place.
+// no patch), High, Ultra, Giga - or Performance mode's in Default's place.
 //
 // The sun's cascades: sub_12ac210 sets the shadow object up from the
 // renderer's ShadowParam block, whose +0x90 is "Shadow Map Resolution", an
@@ -612,9 +618,18 @@ struct ShadowSizes {
 constexpr ShadowSizes kShadowTiers[] = {{512, 128, 64},    {1024, 256, 128},   {0, 0, 0},
                                         {4096, 1024, 512}, {4096, 2048, 1024}, {4096, 4096, 4096}};
 constexpr ShadowSizes kShadowPerformanceMode = {1024, 256, 128};
-// The sizes this run asks for: Performance mode's over the setting's.
+// The setting's entry for the game's own sizes.
+constexpr int kShadowDefaultTier = 2;
+// Whether Performance mode's sizes run: only while Shadow resolution is
+// Default - a size the player chose wins (Giga under Performance mode ran at
+// 1024 until 2026-11-05, and looked like no change at all).
+bool shadow_performance_sizes() {
+    return host_settings().performance_mode && host_settings().shadow_resolution == kShadowDefaultTier;
+}
+// The sizes this run asks for: the setting's, or Performance mode's in
+// Default's place.
 ShadowSizes shadow_sizes() {
-    if (host_settings().performance_mode) return kShadowPerformanceMode;
+    if (shadow_performance_sizes()) return kShadowPerformanceMode;
     return kShadowTiers[std::clamp(host_settings().shadow_resolution, 0, 5)];
 }
 bool shadow_resolution_on() { return shadow_sizes().sun != 0; }
@@ -627,7 +642,7 @@ Manifest shadow_resolution_manifest() {
     m.eboot = kEboot109Sha256;
     m.description = "the shadow maps: the sun's " + std::to_string(z.sun ? z.sun : 4096) + ", the lamps' " +
                     std::to_string(z.spot ? z.spot : 512) + ", the torches' cube faces " + std::to_string(z.cube ? z.cube : 256) +
-                    (host_settings().performance_mode ? " (Performance mode)" : "");
+                    (shadow_performance_sizes() ? " (Performance mode)" : "");
     m.option = "graphics.shadow_resolution";
     m.order = 9050;
     m.live = false;
