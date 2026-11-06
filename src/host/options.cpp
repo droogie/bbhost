@@ -2088,9 +2088,10 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     } else if (id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
-    } else if (n <= 4 || id == kShadowResolution) {
-        // Shadow resolution's six sizes as buttons too, as wide as a slider
-        // so their names fit.
+    } else if (n <= 4 || id == kShadowResolution || id == kUpscaler) {
+        // Shadow resolution's six sizes and Upscaling's five (Off, TAA, FSR 3,
+        // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
+        // a slider so their names fit.
         const char* const* tips = id == kShaders ? kHostShaderModeTips : value_tips(id, names != nullptr);
         float bw = cw;
         if (n > 4) {
