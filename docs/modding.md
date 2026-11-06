@@ -292,7 +292,7 @@ without changing the region, so online play keeps working), and the Intel
 Black Tonemap Fix (its bytes are the built-in performance patch's, always on),
 The Old Hunters (built in and always on: the game is the edition that
 includes it) and Modern Movement's hold D-pad Down for the first quick item
-(built in, on; Kyo's movement patches carry their own copy, which it steps
+(built in, on; the NR ports' Controls carry their own copy, which it steps
 aside for)
 - and the ones a release does not
 carry: the debug patches (camera, dash, menu, Enemy Control), the rally and

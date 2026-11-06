@@ -713,15 +713,16 @@ Manifest old_hunters_manifest() {
 
 // dpad-first-item, holding D-pad Down picks the first quick item (on;
 // [patches] dpad-first-item = false leaves it out): Modern Movement's hold,
-// alone (Kyo's modern-movement patch and its Lite, and the NR ports' Controls,
-// each carry the same hold in caves of their own). A tap still cycles. After
-// PadManipulator's update has set the action request's arm bits (0x01927ac8,
-// `mov rax, [rbp-0x188]`, r15 = the request) a jump to the cave
-// (dpad_first_item_cave.inc says what it does): Arm_ChangeItem (11) held
+// alone - Kyo's modern-movement patches leave it to this since 2026-11-06. A
+// tap still cycles. After PadManipulator's update has set the action
+// request's arm bits, one instruction past the hook those patches and the NR
+// ports' Controls share (0x01927ac8), so it runs beside them: at 0x01927acf,
+// `mov rax, [rax+0x88]` (rax = [rbp-0x188], r15 = the request), a jump to the
+// cave (dpad_first_item_cave.inc says what it does): Arm_ChangeItem (11) held
 // 0.5 s - its hold time [r15+0x7c] - selects the first quick item, as the
-// game's own cycle would, once per hold. The hook's site steps aside for the
-// patches that hook the same instruction with the hold in them; its cave, at
-// zeros nothing else writes, stays.
+// game's own cycle would, once per hold. The hook steps aside for the NR
+// ports, which carry the same hold in their Controls cave; its cave, at zeros
+// nothing else writes, stays.
 Manifest dpad_first_item_manifest() {
     Manifest m;
     m.name = "dpad-first-item";
@@ -729,13 +730,13 @@ Manifest dpad_first_item_manifest() {
     m.eboot = kEboot109Sha256;
     m.description = "holding D-pad Down half a second picks the first quick item; a tap still cycles";
     m.order = 14;
-    m.sites.push_back(Site{"cave", 0x054a0000, std::vector<std::uint8_t>(324, 0),
+    m.sites.push_back(Site{"cave", 0x054a0000, std::vector<std::uint8_t>(332, 0),
                            {
 #include "engine/dpad_first_item_cave.inc"
                            },
                            true, {}});
-    m.sites.push_back(Site{"hook", 0x01927ac8, {0x48, 0x8b, 0x85, 0x78, 0xfe, 0xff, 0xff}, {0xe9, 0x33, 0x85, 0xb7, 0x03, 0x90, 0x90}, true,
-                           {"modern-movement", "modern-movement-lite", "nr-port-jump", "nr-port-nojump"}});
+    m.sites.push_back(Site{"hook", 0x01927acf, {0x48, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00}, {0xe9, 0x2c, 0x85, 0xb7, 0x03, 0x90, 0x90}, true,
+                           {"nr-port-jump", "nr-port-nojump"}});
     return m;
 }
 
