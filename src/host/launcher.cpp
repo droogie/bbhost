@@ -321,7 +321,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // bubbles are host_frame_rate_control's, F10's.
     static const int kCaps[] = {30, 60, 90, 120, 150, 180, 240, 360, 480, 960, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
-    // Frame rate's Custom limit: ticked, the game runs at the number typed (30 to 960).
+    // Frame rate's Custom limit: ticked, the game runs at the number typed (10 to 960).
     bool cap_custom = host_opt_frame_cap_custom();
     int cap_custom_fps = host_opt_frame_cap_custom_fps();
     int cap_choice = kCapCount - 1;

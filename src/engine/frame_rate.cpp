@@ -606,8 +606,8 @@ static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacemen
 // SprjFlipper::Update the cave loads ours instead (movss xmm0,[step]; nop8;
 // nop5), written every frame in the image's tail just before the cave runs:
 // the same clamp, times a plugin's time scale (frame_rate_set_time_scale),
-// at most 1/30. Above 30 everything steps by that step, so slow motion
-// scales the step rather than stretching the frames.
+// at most 1/30 (below 30, the rate's own frame). Above 30 everything steps by
+// that step, so slow motion scales the step rather than stretching the frames.
 constexpr std::uint32_t kStepLoad = 0x2418e3d;
 constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
 static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
@@ -832,13 +832,16 @@ constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't'
 // - each run the game's mode 2 with a 1/fps target. Uncapped runs the
 // display's refresh rate the same way (engine/uncapped_limit.h), whatever it
 // is - 144, 165 - and the Custom limit the player's own number, so any rate
-// from 30 to 960 can run.
+// from 10 to 960 can run. Below 30 runs converted the same way: the steps and
+// rated constants follow 1/fps there too, so the game keeps real time.
 
 // A frame rate as the game runs it: 30, a converted rate, or 0 (Uncapped).
-// Any number from 30 to 960 runs as itself (45 runs at 45); above 960 is 960.
+// Any number from 10 to 960 runs as itself (45 runs at 45, 15 at 15); above
+// 960 is 960.
+constexpr int kLowestFps = 10;
 int mode_of(int fps) {
     if (fps <= 0) return 0;
-    return std::clamp(fps, 30, uncapped_limit::kMaxFps);
+    return std::clamp(fps, kLowestFps, uncapped_limit::kMaxFps);
 }
 
 std::string mode_name(int fps) { return fps == 0 ? std::string("Display-Limited") : std::to_string(fps); }
@@ -885,8 +888,11 @@ const Rated* rated(std::uint32_t at) {
 
 // A count's bytes at a frame rate.
 void count_bytes(const Counted& c, int fps, std::uint8_t* out) {
-    const std::uint64_t v = c.kind == Count::Frames ? static_cast<std::uint64_t>(c.was) * static_cast<std::uint64_t>(fps) / 30
-                                                    : static_cast<std::uint64_t>(c.was) * 30 / static_cast<std::uint64_t>(fps);
+    std::uint64_t v = c.kind == Count::Frames ? static_cast<std::uint64_t>(c.was) * static_cast<std::uint64_t>(fps) / 30
+                                              : static_cast<std::uint64_t>(c.was) * 30 / static_cast<std::uint64_t>(fps);
+    // Below 30 a count of frames shrinks: one that was some is kept at one
+    // (a count of 0 frames means "never" or "at once" to the code reading it).
+    if (c.kind == Count::Frames && c.was > 0 && v == 0) v = 1;
     if (c.kind == Count::Digits) {
         char d[16];
         std::snprintf(d, sizeof(d), "%05u", static_cast<unsigned>(std::min<std::uint64_t>(v, 99999)));
@@ -1652,9 +1658,15 @@ const float g_test_step = [] {
 // reader on a worker sees the last frame's value or this one's.
 void each_frame(const SprjFlipper* f) {
     const float scale = g_scale_by_step.load(std::memory_order_relaxed) ? g_time_scale.load(std::memory_order_relaxed) : 1.0f;
-    const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
+    // The longest step: 1/30, or below 30 (a Custom limit of 10 to 29) the
+    // rate's own frame - capped at 1/30 a 10 fps frame advanced the game a
+    // third of its time, slow motion. A frame longer than that (a stall) is
+    // still slow motion, as at every rate.
+    const int game_fps = g_game_fps.load(std::memory_order_relaxed);
+    const float longest = game_fps > 0 && game_fps < 30 ? 1.0f / static_cast<float>(game_fps) : kThirtieth;
+    const auto scaled = [scale, longest](float s) { return scale == 1.0f ? s : std::min(s * scale, longest); };
     const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
-    const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
+    const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), longest));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
         // The frame clock (engine/frame_clock.h): with BBHOST_FRAME_CLOCK=1, or
         // for what counts game time by default (frame_clock::publishing).
@@ -1699,7 +1711,7 @@ void each_frame(const SprjFlipper* f) {
     const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(g_game_fps));
     const float dt = frame_clock::on()  ? std::max(step, kShortestFrame)
                      : g_test_step > 0.0f ? scaled(g_test_step)
-                                          : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+                                          : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), longest));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
@@ -1934,7 +1946,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
 }
 
 // The Frame rate option as the game started with it: 30, a rate of
-// the list or the Custom limit's (30 to 960), or 0 for Uncapped (frame_rate_install makes that the display's
+// the list or the Custom limit's (10 to 960), or 0 for Uncapped (frame_rate_install makes that the display's
 // refresh rate). BBHOST_GAME_FPS=30, 60, ... 960 or 0 (also "uncapped": atoi
 // reads 0) overrides it.
 int wanted_fps() {

@@ -58,6 +58,10 @@ int fps_from_label(const char* label);
 
 // "-180°" to "+180°" a step at a time (`unit` after each number), for a
 // slider of fine steps; the strings live as long as the program.
+// The lowest Custom limit: a rate below the game's own 30 runs converted,
+// as the rates above it do (engine/frame_rate.cpp mode_of), in real time.
+constexpr int kCustomFpsMin = 10;
+
 std::vector<const char*> signed_steps(int from, int to, const char* unit, bool sign = true) {
     // A deque: its strings never move as more are added, so the pointers
     // handed out stay good (a vector's growth moved short strings' bytes).
@@ -207,12 +211,12 @@ Setting g_set[kSettingCount] = {
      true},
     // Frame rate's Custom limit, its tick box and its number, drawn in Frame
     // rate's row (frame_rate_control) and not rows of their own: ticked, the
-    // game runs at the number typed (30 to 960; 45 runs the game at 45, as the
+    // game runs at the number typed (10 to 960; 45 runs the game at 45, as the
     // listed rates run at theirs, and frame generation shows twice that) in
     // place of the list's rate (frame_rate_of). A rate picked from a list (the
     // game's own System menu, the Steam Deck row) unticks it.
     {"frame_cap_custom", "Custom limit", {"Off", "On"}, 0, kHostFrameRateCustomNote, true},
-    {"frame_cap_custom_fps", "Custom frame rate", signed_steps(30, 960, "", false), 60 - 30, kHostFrameRateCustomNote, true},
+    {"frame_cap_custom_fps", "Custom frame rate", signed_steps(kCustomFpsMin, 960, "", false), 60 - kCustomFpsMin, kHostFrameRateCustomNote, true},
     // The frame clock (engine/frame_clock.h), experimental and off by default:
     // what the frame rate otherwise sets once for the rate chosen at start
     // follows each frame's own length. Read once as the game starts
@@ -1060,7 +1064,7 @@ bool frame_rate_fit(int* cap, int* custom, int* custom_fps, int limit) {
         }
         *custom = 1;
     }
-    *custom_fps = std::clamp(limit, 30, 960) - 30;
+    *custom_fps = std::clamp(limit, kCustomFpsMin, 960) - kCustomFpsMin;
     return true;
 }
 
@@ -1974,7 +1978,7 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             // With frame generation on, at most half the refresh rate (fg_real_limit).
             const int limit = fg_real_limit();
-            const int fps = std::clamp(typing, 30, limit > 0 ? std::max(30, limit) : 960);
+            const int fps = std::clamp(typing, kCustomFpsMin, limit > 0 ? std::max(kCustomFpsMin, limit) : 960);
             if (fps != *custom_fps) {
                 *custom_fps = fps;
                 changed = true;
@@ -2069,7 +2073,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         const float fw = std::min(std::round(420 * sc), w * 0.62f);
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - fw, p.y));
         if (frame_rate_control(&pick, &on, &fps, fw)) {
-            if (fps != was_fps) change(kFrameCapCustomFps, fps - 30);
+            if (fps != was_fps) change(kFrameCapCustomFps, fps - kCustomFpsMin);
             if (on != was_on) change(kFrameCapCustom, on ? 1 : 0);
             if (pick != cur) change(id, pick);
         }
@@ -2360,7 +2364,7 @@ const char* const kHostShaderModeTips[2] = {
 };
 
 const char* const kHostFrameRateCustomNote =
-    "Tick to type your own frame rate, 30 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
+    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
     "Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh rate "
     "(90 at 180 Hz). Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs "
     "a restart.";
@@ -2551,7 +2555,7 @@ int host_opt_frame_cap_custom_fps() {
 }
 
 void host_opt_set_frame_cap_custom(bool on, int fps) {
-    const int i = std::clamp(fps, 30, 960) - 30;
+    const int i = std::clamp(fps, kCustomFpsMin, 960) - kCustomFpsMin;
     const int tick = on ? 1 : 0;
     if (i == g_set[kFrameCapCustomFps].index && tick == g_set[kFrameCapCustom].index) return;
     if (i != g_set[kFrameCapCustomFps].index) set_index(kFrameCapCustomFps, i, false);
@@ -2566,10 +2570,10 @@ bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, floa
     return frame_rate_control(cap_index, custom, custom_fps, width);
 }
 bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps) {
-    int c = *custom ? 1 : 0, f = std::clamp(*custom_fps, 30, 960) - 30;
+    int c = *custom ? 1 : 0, f = std::clamp(*custom_fps, kCustomFpsMin, 960) - kCustomFpsMin;
     if (!frame_rate_fit(cap_index, &c, &f, fg_limit(host_opt_get("frame_generation")))) return false;
     *custom = c != 0;
-    *custom_fps = f + 30;
+    *custom_fps = f + kCustomFpsMin;
     return true;
 }
 void host_frame_generation_warning(int cap_index, bool custom, int custom_fps) {
