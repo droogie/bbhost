@@ -299,7 +299,7 @@ if(UNIX)
   target_link_libraries(bbhost PRIVATE pthread dl m)
 elseif(WIN32)
   # hle/net.cpp, net/session.cpp; timeBeginPeriod; WaitOnAddress (core/futex.cpp)
-  target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization)
+  target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization version)
   # The SysV convention our guest-facing functions follow lets a leaf keep
   # data in the 128 bytes below rsp, and on Windows an exception - a
   # write-watch fault in a decomp leaf's write, say - builds its frame right

@@ -27,11 +27,11 @@
 // pass over it (the camera blur off) it is cleared before the meshes' passes
 // (upscale_velo_clear_locked): the game clears it only when it is made.
 //
-// TAA (Graphics > Upscaling: TAA) runs here in the bridge's place: bbhost's
-// own resolve (record_taa, shaders/taa_resolve.comp) of the same jittered
-// scene, motion and depth, always at the scene's size, its picture the next
-// frame's history. Sharpness and the embers follow it as they follow the
-// bridge, and frame generation is prepared after it as after the bridge.
+// TAA (Graphics > Upscaling: TAA) runs here in the bridge's place:
+// Numity1504's TAA (record_taa, shaders/taa_resolve.comp) of the same
+// jittered scene, motion and depth, always at the scene's size, with two
+// histories of its own and the ember mask inside it. Sharpness follows it as
+// it follows the bridge, and frame generation is prepared after it.
 //
 // Frame generation (host/framegen.h) takes the same depth and motion. With no
 // upscaler running - Upscaling off, or one this GPU cannot run (DLSS on AMD) -
@@ -113,7 +113,8 @@ bool g_depth_r32_fresh = false;
 OwnImage g_embers;                  // the picture with the embers put back, the output size; made at the first use
 VkImageView g_picture_view = VK_NULL_HANDLE;  // this frame's final picture (render scale: YEBIS's copy samples it)
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
-OwnImage g_taa_history;             // TAA: last frame's picture (g_output's other half, the two swapped each frame)
+OwnImage g_taa_hist[2];             // TAA's two histories (record_taa): one read, one written, changing places each frame
+int g_taa_read = 0;                 // the one this frame's TAA reads
 int g_last_method = 0;              // the last call's method (another one's history is not this one's)
 // Frame generation (host/framegen.h): the frames prepared so far - each
 // frame's number - and the one this frame was prepared as (0: not), which its
@@ -870,11 +871,15 @@ bool record_rcas(VkCommandBuffer cb, float sharpness) {
     return true;
 }
 
-// TAA (Graphics > Upscaling: TAA, host/upscaler.h kUpscaleTaa): bbhost's own
-// temporal anti-aliasing in the bridge's place, from the same inputs - the
-// jittered scene, the motion, the depth's R32 copy (shaders/taa_resolve.comp).
-// Its picture becomes the next frame's history: g_output and g_taa_history
-// change places every frame, so it is never copied.
+// TAA (Graphics > Upscaling: TAA, host/upscaler.h kUpscaleTaa): Numity1504's
+// TAA (his handoff's step 9, with step 8's ember mask in its TAA form) in the
+// bridge's place, from the same inputs - the jittered scene, the motion, the
+// depth - plus the glow (shaders/taa_resolve.comp). Two histories (RGBA16F,
+// colour as light, alpha the motion's length there), one read and one
+// written, changing places each frame; the picture is g_output, alpha the
+// scene's. No mip bias and no sharpening of its own (Sharpness is the
+// player's), and the separate ember pass is not run after it: its mask is
+// inside, kept out of the history.
 VkDescriptorSetLayout g_taa_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_taa_layout = VK_NULL_HANDLE;
 VkPipeline g_taa_pipeline = VK_NULL_HANDLE;
@@ -890,13 +895,13 @@ bool taa_pipeline_locked() {
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.0f;
     if (vkCreateSampler(g.device, &si, nullptr, &g_taa_sampler) != VK_SUCCESS) return false;
-    VkDescriptorSetLayoutBinding binds[6] = {};
-    for (std::uint32_t k = 0; k < 6; ++k) {
-        binds[k] = {k, k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
-                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutBinding binds[8] = {};
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        binds[k] = {k, k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 || k == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     }
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 6;
+    sli.bindingCount = 8;
     sli.pBindings = binds;
     if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_taa_set_layout) != VK_SUCCESS) return false;
     VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
@@ -924,86 +929,82 @@ bool taa_pipeline_locked() {
     return ok;
 }
 
-// The blend's share of this frame, the least (still) and the most (moving 8
-// render pixels or more): BBHOST_TAA_BLEND=least,most (a test).
-void taa_shares(float* least, float* most) {
-    static const std::pair<float, float> s = [] {
-        std::pair<float, float> v{0.1f, 0.25f};
-        if (const char* e = std::getenv("BBHOST_TAA_BLEND"); e && *e) {
-            float a = 0, b = 0;
-            if (std::sscanf(e, "%f,%f", &a, &b) == 2 && a > 0.0f && a <= 1.0f && b >= a && b <= 1.0f) v = {a, b};
-        }
-        return v;
-    }();
-    *least = s.first;
-    *most = s.second;
-}
-
-// This frame's TAA into g_output (after the swap: last frame's picture is
-// g_taa_history). The scene and the motion are readable; `depth` is the R32
-// copy when fresh, else the game's (the motion is then zero and there is no
-// history: only the current picture's filter).
+// This frame's TAA into g_output and the next frame's history. The scene and
+// the motion are readable; `depth` is the R32 copy when fresh, else the
+// game's (the motion is then zero and there is no history: this frame's 3x3
+// alone). `glow` (null: none this frame, no ember mask) the scene's size.
 bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkImageLayout depth_layout, float jitter_x, float jitter_y,
-                bool reset, bool depth_inverted) {
+                bool reset, const RtImage* glow) {
     if (!taa_pipeline_locked()) return false;
-    if (!g_taa_history.image &&
-        !make(g_taa_history, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-              g_ow, g_oh)) {
-        drop(g_taa_history);
-        return false;
+    for (OwnImage& h : g_taa_hist) {
+        if (!h.image && !make(h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_w, g_h)) {
+            drop(g_taa_hist[0]);
+            drop(g_taa_hist[1]);
+            return false;
+        }
     }
     const VkDescriptorSet set = alloc_set_locked(g_taa_set_layout);
     if (!set) return false;
-    std::swap(g_output, g_taa_history);
-    const bool no_history = reset || !g_taa_history.initialised;
-    // With no history its image is not read, but bound all the same: the
-    // scene stands in for it.
-    const VkDescriptorImageInfo infos[6] = {
+    OwnImage &read = g_taa_hist[g_taa_read], &write = g_taa_hist[g_taa_read ^ 1];
+    const bool no_history = reset || !read.initialised;
+    if (glow) {
+        barrier(cb, glow->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
+    // With no history (or no glow) the image is not read, but bound all the
+    // same: the scene stands in for it.
+    const VkDescriptorImageInfo infos[8] = {
         {VK_NULL_HANDLE, scene.view, VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, no_history ? scene.view : g_taa_history.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, no_history ? scene.view : read.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, g_motion.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, depth, depth_layout},
         {g_taa_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
         {VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, write.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, glow ? glow->view : scene.view, VK_IMAGE_LAYOUT_GENERAL},
     };
-    VkWriteDescriptorSet wr[6] = {};
-    for (int k = 0; k < 6; ++k) {
+    VkWriteDescriptorSet wr[8] = {};
+    for (int k = 0; k < 8; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = static_cast<std::uint32_t>(k);
         wr[k].descriptorCount = 1;
-        wr[k].descriptorType = k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        wr[k].descriptorType =
+            k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 || k == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         wr[k].pImageInfo = &infos[k];
     }
-    vkUpdateDescriptorSets(g.device, 6, wr, 0, nullptr);
-    float least = 0, most = 0;
-    taa_shares(&least, &most);
+    vkUpdateDescriptorSets(g.device, 8, wr, 0, nullptr);
     struct {
         std::uint32_t size[4];
-        float jitter[4];
+        float cam[4];
         float weights[12];
-    } pc{{g_w, g_h, no_history ? 1u : 0u, depth_inverted ? 1u : 0u}, {jitter_x, jitter_y, least, most}, {}};
-    // The 3x3's weights: each sample's surface lies at its centre less the
-    // jitter; a Gaussian of its distance from the pixel's centre, normalised.
-    // 3: a little narrower than Blackman-Harris's usual 2.29, which left the
-    // picture soft (a neighbour's weight 5% against 10%).
+    } pc{{g_w, g_h, no_history ? 1u : 0u, glow ? 1u : 0u}, {jitter_x, jitter_y, g_cam_now.a, g_cam_now.r2w}, {}};
+    // The 3x3's weights: each sample lies at its centre less the jitter (the
+    // picture moved by +j); exp(-2.29 d^2) of its distance from the pixel's
+    // centre, normalised - the same for every pixel, so worked out here.
     float sum = 0.0f;
     for (int k = 0; k < 9; ++k) {
         const float dx = static_cast<float>(k % 3 - 1) - jitter_x, dy = static_cast<float>(k / 3 - 1) - jitter_y;
-        pc.weights[k] = std::exp(-3.0f * (dx * dx + dy * dy));
+        pc.weights[k] = std::exp(-2.29f * (dx * dx + dy * dy));
         sum += pc.weights[k];
     }
-    for (int k = 0; k < 9; ++k) pc.weights[k] /= sum;
+    for (int k = 0; k < 9; ++k) pc.weights[k] /= std::max(sum, 1e-6f);
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, write.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa_pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cb, g_taa_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cb, (g_w + 7) / 8, (g_h + 7) / 8, 1);
+    barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+    write.initialised = true;
+    g_taa_read ^= 1;
     static bool told = false;
     if (!told)
-        host_log("upscaler: TAA at %ux%u (the scene's size), blend %.2f..%.2f of each frame, depth %s", g_w, g_h, static_cast<double>(least),
-                 static_cast<double>(most), depth_inverted ? "inverted" : "near = 0");
+        host_log("upscaler: TAA at %ux%u (the scene's size, Numity1504's step 9), the ember mask %s", g_w, g_h,
+                 glow ? "from the glow" : "off until a glow is found");
     told = true;
     return true;
 }
@@ -1526,7 +1527,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_depth_r32_fresh = false;
         drop(g_sharp);
         drop(g_embers);
-        drop(g_taa_history);
+        drop(g_taa_hist[0]);
+        drop(g_taa_hist[1]);
         drop(g_prev_scene);
         g_prev_scene_valid = false;
         g_w = scene.width;
@@ -1721,7 +1723,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,
                 g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED};
     profile_begin_locked(method == kUpscaleTaa ? &g_prof_taa : &g_prof_bridge);
-    const bool ok = method == kUpscaleTaa ? record_taa(cb, scene, c.depth.view, c.depth.layout, jitter_x, jitter_y, c.reset, c.depth_inverted)
+    const bool ok = method == kUpscaleTaa ? record_taa(cb, scene, c.depth.view, c.depth.layout, jitter_x, jitter_y, c.reset,
+                                                     glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr)
                                           : upscaler_evaluate(cb, c);
     profile_end_locked();
     // The bridge's binds are gone from cb: the next draw binds all of its own.
@@ -1745,7 +1748,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     profile_end_locked();
     // The embers put back over it (record_embers), not in a test's view.
     profile_begin_locked(&g_prof_embers);
-    if (glow && !test_view() && glow->width == scene.width && glow->height == scene.height && record_embers(cb, *picture_p, scene, *glow))
+    // (TAA has its own, in its pass: Numity1504's TAA form, kept out of its history.)
+    if (glow && method != kUpscaleTaa && !test_view() && glow->width == scene.width && glow->height == scene.height &&
+        record_embers(cb, *picture_p, scene, *glow))
         picture_p = &g_embers;
     profile_end_locked();
     const OwnImage& picture = *picture_p;
