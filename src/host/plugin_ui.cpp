@@ -79,6 +79,16 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
     const float width = 380 * scale;
+    // BB_OPT_WHEN: greyed out unless another of the plugin's options holds one of its values.
+    bool greyed = false;
+    if (const std::size_t eq = o.when.find('='); eq != std::string::npos) {
+        const std::string key = o.when.substr(0, eq);
+        const std::vector<std::string> want = split(o.when.substr(eq + 1), '|');
+        for (const PluginOptionDesc& other : p.options) {
+            if (other.key == key) greyed = std::find(want.begin(), want.end(), plugins_option_value(p, other)) == want.end();
+        }
+    }
+    ImGui::BeginDisabled(greyed);
     // A number option's reset to its default (BbOption's default text).
     const auto reset = [&](bool at_default) {
         if (launcher_ui::reset_button("##reset", at_default)) {
@@ -189,6 +199,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     } else if (!o.help.empty() && !helped) {
         help(o.help);
     }
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
@@ -299,7 +310,7 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         if (p.visitor && !p.enabled) {
             ImGui::SameLine();
             ImGui::TextDisabled("off - joins other players' %s worlds when summoned", p.title.c_str());
-        } else if (ui.in_game && p.enabled != p.loaded) {
+        } else if (ui.in_game && p.enabled != p.loaded && !plugins_live_switch(p)) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "starts with the next launch" : "stops at the next launch");
         }

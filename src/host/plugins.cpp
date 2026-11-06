@@ -29,6 +29,7 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/ruleset.h"
 #include "host/scene_look.h"
@@ -70,7 +71,14 @@ struct Plugin {
     const BbOption* options = nullptr;  // bb_plugin_options, ended by a zero type
     bool official = false;  // signed with the release key
     bool visitor = false;   // off, but loaded to play other players' worlds (BB_PLUGIN_ADOPTS_RULES)
+    bool dormant = false;   // off, but loaded to be turned on in game (BB_PLUGIN_LIVE_SWITCH); main thread
 };
+
+// A plugin that turns on and off while the game runs (BB_PLUGIN_LIVE_SWITCH):
+// opt-in and not a gameplay plugin, whose rules are the session's.
+bool live_switch(std::uint32_t flags) {
+    return (flags & BB_PLUGIN_LIVE_SWITCH) && (flags & BB_PLUGIN_OPT_IN) && !(flags & BB_PLUGIN_GAMEPLAY);
+}
 std::vector<Plugin> g_plugins;
 ElfImage* g_image = nullptr;
 bool g_early = true;  // register_hle allowed
@@ -1128,6 +1136,48 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
     return 0;
 }
 
+// The scene's camera, after the copy above: the game state's update keeps it
+// in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
+// (+0x10). At 0x1d3bec5 the copy is done and a scripted camera's replacing it
+// is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - the scripted
+// camera's switch). The stub keeps only the argument registers, so the camera is
+// found again through the slot rather than r15.
+std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
+bool g_view_hooked = false;
+
+GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    const std::uint64_t slot = runtime_of(0x594f880, 8);
+    std::uint64_t holder = 0, scene = 0;
+    if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(holder + 0x10)), &scene, 8) || !scene)
+        return 0;
+    std::vector<CameraCallback> now;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        now = g_view_callbacks;
+    }
+    auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    for (const CameraCallback& c : now) c.fn(cam, c.user);
+    return 0;
+}
+
+int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
+    if (!fn || !g_image || !api_eboot_is_109()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_view_callbacks.push_back({fn, user});
+    }
+    if (g_view_hooked) return 0;
+    g_view_hooked = true;
+    static const std::uint8_t after_copy[14] = {0x49, 0x8b, 0x85, 0x10, 0x01, 0x00, 0x00,
+                                                0x83, 0xb8, 0xc4, 0x00, 0x00, 0x00, 0x00};
+    if (!engine_site_hook(g_image, runtime_of(0x1d3bec5, sizeof after_copy), after_copy, sizeof after_copy,
+                          reinterpret_cast<void*>(&view_hook))) {
+        host_log("plugin: 0x1d3bec5 is not the end of the scene camera's copy; on_view is not called");
+    }
+    return 0;
+}
+
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
     // A plugin's own keys work in play, where a menu's actions press nothing
@@ -1160,6 +1210,23 @@ void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
 void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
 void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
 
+// Version 22: the cutaway (host/vertex_cutaway.h, host/scene_look.h).
+void api_view_cutaway(float tan_x, float tan_y, float near_z, float radius) {
+    const bool was = scene_look_cutaway(nullptr);
+    scene_look_set_cutaway(tan_x, tan_y, near_z, radius);
+    const bool on = scene_look_cutaway(nullptr);
+    if (on) host_log("plugin: cutaway within %.2f m of the view's axis nearer than %.2f m", static_cast<double>(radius), static_cast<double>(near_z));
+    else if (was) host_log("plugin: no cutaway");
+}
+
+// Version 21: old-hardware sound (host/audio_crush.h).
+void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
+    audio_crush_set(rate_hz, bits, lowpass_hz);
+    if (!audio_crush_on()) host_log("plugin: the game's sound as it is");
+    else host_log("plugin: the game's sound held to %d Hz, %d bits, low-passed at %.0f Hz (0: off)", rate_hz, bits,
+                  static_cast<double>(lowpass_hz));
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1179,6 +1246,9 @@ const BbHostApi g_api = {
     &api_draw_style,
     &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
     &api_gbuffer_ambient,
+    &api_on_view,
+    &api_audio_crush,
+    &api_view_cutaway,
 };
 
 std::string read_file(const std::string& path) {
@@ -1226,6 +1296,7 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         e.description = info->description ? info->description : "";
     }
     if (e.title.empty()) e.title = e.name;
+    std::string group_when;  // the last heading's BB_OPT_WHEN
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
         PluginOptionDesc d;
         d.type = o->type & 0xffu;
@@ -1235,6 +1306,10 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         d.help = o->help ? o->help : "";
         d.def = o->def ? o->def : "";
         d.choices = o->choices ? o->choices : "";
+        if ((o->type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+        // A heading's condition covers the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_when = d.when;
+        else if (d.when.empty()) d.when = group_when;
         d.min = o->min;
         d.max = o->max;
         e.options.push_back(std::move(d));
@@ -1333,6 +1408,9 @@ void plugins_load() {
         // turns it off.
         if (off && (flags & BB_PLUGIN_ADOPTS_RULES) && join_modded_worlds()) {
             p.visitor = true;
+        } else if (off && live_switch(flags)) {
+            // Off, and asks for nothing until the player turns it on in game.
+            p.dormant = true;
         } else if (off) {
             if (sw == 0) host_log("plugin: %s: off (plugins.%s = false)", p.name.c_str(), p.name.c_str());
             else host_log("plugin: %s: off until turned on ([plugins] %s = true)", p.name.c_str(), p.name.c_str());
@@ -1355,7 +1433,10 @@ void plugins_load() {
         if (p.info) {
             host_log("plugin: %s %s loaded%s%s (%s)", p.name.c_str(), p.info->version ? p.info->version : "",
                      official ? ", official" : "",
-                     p.visitor ? ", off: only to play other players' worlds" : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game" : "",
+                     p.visitor   ? ", off: only to play other players' worlds"
+                     : p.dormant ? ", off until turned on in game"
+                     : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game"
+                                                    : "",
                      path.c_str());
         } else {
             host_log("plugin: %s loaded%s (%s)", p.name.c_str(), official ? ", official" : "", path.c_str());
@@ -1421,9 +1502,18 @@ void plugins_frame() {
             }
             continue;
         }
-        const std::string raw = toml_value(r.value);
-        config_value_set(r.name + "." + r.key, raw);
-        config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        if (r.key.empty()) {
+            // A live switch (plugins_set_enabled): the plugin on or off.
+            const bool on = r.value == "true";
+            for (Plugin& p : g_plugins) {
+                if (p.name == r.name) p.dormant = !on;
+            }
+            host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
+        } else {
+            const std::string raw = toml_value(r.value);
+            config_value_set(r.name + "." + r.key, raw);
+            config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        }
         for (const OptionCallback& c : options) {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
@@ -1506,7 +1596,7 @@ std::vector<PluginEntry> plugins_catalog() {
         e.official = p.official;
         e.loaded = true;
         e.visitor = p.visitor;
-        e.enabled = !p.visitor;
+        e.enabled = !p.visitor && !p.dormant;
         out.push_back(std::move(e));
     }
     return out;
@@ -1515,7 +1605,15 @@ std::vector<PluginEntry> plugins_catalog() {
 void plugins_set_enabled(const std::string& name, bool on) {
     config_set_values(config_user_file(), {{"plugins", name, on ? "true" : "false"}});
     config_value_set("plugins." + name, on ? "true" : "false");
+    // In game, a live switch's plugin is told at once (plugins_frame).
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || !p.info || !live_switch(p.info->flags) || p.visitor) continue;
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_menu_requests.push_back({false, name, "", on ? "true" : "false"});
+    }
 }
+
+bool plugins_live_switch(const PluginEntry& p) { return p.loaded && live_switch(p.flags); }
 
 std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o) {
     const std::string v = config_value(p.name + "." + o.key);
@@ -1629,7 +1727,7 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
 
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {
-        if (p.name == name && !p.visitor) return true;
+        if (p.name == name && !p.visitor && !p.dormant) return true;
     }
     return false;
 }

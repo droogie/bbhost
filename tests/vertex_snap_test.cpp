@@ -6,6 +6,7 @@
 // snaps before every return or emit, keeps its arithmetic NoContraction, and
 // a refusal leaves the module as it was.
 #include "gcn/spirv.h"
+#include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
 
 #include <spirv-tools/libspirv.hpp>
@@ -234,9 +235,49 @@ void check_refused(const char* what, std::vector<u32> m) {
     std::printf("%s: refused (%s)\n", what, why.c_str());
 }
 
+// The cutaway (host/vertex_cutaway.h): valid, one clip distance written at
+// each site, the variable in the entry point's interface - alone and after a
+// snap, as render.cpp's vertex_look makes a twin.
+void check_cut(const char* what, std::vector<u32> m, int sites, bool snap_first) {
+    const float cut[4] = {0.55f, 0.31f, 12.0f, 3.0f};
+    const std::vector<u32> before = m;
+    std::string why, msg;
+    if (snap_first) CHECK(vertex_snap(m, 426.0f, 240.0f, &why));
+    const int stores = count(m, spv::OpStore);
+    const bool ok = vertex_cutaway(m, cut, &why);
+    if (!ok) std::fprintf(stderr, "%s: cutaway refused: %s\n", what, why.c_str());
+    CHECK(ok);
+    if (!ok) return;
+    const bool v = valid(m, &msg);
+    if (!v) std::fprintf(stderr, "%s: invalid after the cutaway: %s\n", what, msg.c_str());
+    CHECK(v);
+    CHECK(count(m, spv::OpStore) == stores + sites);
+    CHECK(count(m, spv::OpExtInst, spv::GlslFMax) == 2 * sites);
+    CHECK(count(m, spv::OpExtInstImport) == 1);
+    // A second cutaway is refused: the stage writes clip distances now.
+    std::vector<u32> again = m;
+    CHECK(!vertex_cutaway(again, cut, &why));
+    CHECK(again == m);
+}
+
 }  // namespace
 
 int main() {
+    check_cut("cutaway: vertex, own variable", vertex_own_variable(), 1, false);
+    check_cut("cutaway: vertex, gl_PerVertex member", vertex_block_member(), 2, false);
+    check_cut("cutaway: geometry", geometry_two_emits(), 2, false);
+    check_cut("cutaway: vertex, snapped first", vertex_own_variable(), 1, true);
+    check_cut("cutaway: vertex member, snapped first", vertex_block_member(), 2, true);
+    {
+        std::vector<u32> m = fragment();
+        const std::vector<u32> before = m;
+        const float cut[4] = {0.55f, 0.31f, 12.0f, 3.0f};
+        CHECK(!vertex_cutaway(m, cut));
+        CHECK(m == before);
+        const float none[4] = {0.55f, 0.31f, 12.0f, 0.0f};
+        std::vector<u32> v = vertex_own_variable();
+        CHECK(!vertex_cutaway(v, none));
+    }
     check_snapped("vertex, own variable", vertex_own_variable(), 1);
     check_snapped("vertex, gl_PerVertex member", vertex_block_member(), 2);
     check_snapped("geometry", geometry_two_emits(), 2);

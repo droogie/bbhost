@@ -17,6 +17,13 @@ std::uint32_t scene_look_snap();
 // The grid for a 3D of w x h: its cells across and down (false: no snap).
 bool scene_look_snap_cells(std::uint32_t w, std::uint32_t h, float* cells_x, float* cells_y);
 
+// The cutaway (plugin API 22, host/vertex_cutaway.h): the camera draws clipped
+// within `radius` of the view's axis nearer than `near`; radius 0 off. The
+// getter fills tan_x, tan_y, near, radius (when `out` is given) and says
+// whether it is on.
+void scene_look_set_cutaway(float tan_x, float tan_y, float near_z, float radius);
+bool scene_look_cutaway(float* out);
+
 // The camera draws' textures sampled nearest.
 void scene_look_set_nearest(bool on);
 bool scene_look_nearest();

@@ -17,6 +17,7 @@
 #include "host/options.h"
 #include "host/scene_look.h"
 #include "host/upscaler.h"
+#include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
 #include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
@@ -470,9 +471,10 @@ struct GfxPipeline {
     // The stage cache's keys of its vertex and pixel stages (build_gfx_pipeline),
     // which the pipeline manifest knows a pipeline by.
     std::uint64_t vs_key = 0, ps_key = 0;
-    // A plugin's vertex snap (DrawState::snap_cells): the grid its last stage
-    // before the rasterizer snaps to, 0 none.
-    float snap_cells[2] = {};
+    // A plugin's vertex snap and cutaway (DrawState::snap_cells): the grid its
+    // last stage before the rasterizer snaps to, 0 none, then the cutaway's
+    // tan_x, tan_y, near and radius (host/vertex_cutaway.h), radius 0 none.
+    float snap_cells[6] = {};
     // Per pixel-stage sampler, the images (bit i: ps.meta().images[i], the
     // first 32) its instructions sample with it - from the translation's
     // image_at and sampler_at, made once with the pipeline (pair_samplers);
@@ -3162,9 +3164,11 @@ struct DrawState {
     std::uint32_t gx_ids[3] = {};
     std::uint64_t program_fp = 0;  // GpuDrawInputs::program_fp: stands for vte_cntl and the PS/VS fields below it
     // A plugin's vertex snap (host/scene_look.h): a camera draw's grid, its
-    // cells across and down (0: none). After program_fp, so pipeline_key
-    // leaves it out: draw_impl salts the key with it.
-    float snap_cells[2] = {};
+    // cells across and down (0: none), then its cutaway (plugin API 22,
+    // host/vertex_cutaway.h): tan_x, tan_y, near, radius (radius 0: none).
+    // After program_fp, so pipeline_key leaves it out: draw_impl salts the key
+    // with it.
+    float snap_cells[6] = {};
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
     // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
     // whole and the rest masked (fixed_state). Salted into the key like the
@@ -5463,10 +5467,11 @@ const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
 // The pipelines a recipe can describe: every one whose tessellation
 // programs, if it has any, can be read where it is built (a worker reads only
 // the copies it was given).
+bool look_twin(const float look[6]);
 bool recipe_recordable(const DrawState& s) {
     // A plugin's snapped camera draw (DrawState::snap_cells): the lists keep no
     // grid, so a start would build it unsnapped - left to its draws.
-    if (s.snap_cells[0] > 0.0f) return false;
+    if (look_twin(s.snap_cells)) return false;
     if (s.host_gbuffer) return false;  // likewise its host pixel shader
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
@@ -6175,6 +6180,15 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, const VertexInputPla
 }
 
 // ---- A plugin's vertex snap (host/vertex_snap.h, host/scene_look.h) ----
+// and cutaway (host/vertex_cutaway.h): `look` is DrawState::snap_cells - the
+// grid (0: none), then the cutaway (radius 0: none).
+bool look_twin(const float look[6]) { return look[0] > 0.0f || look[5] > 0.0f; }
+// The snap, then the cutaway, as `look` asks; false (`why`) when either refuses.
+bool vertex_look(std::vector<std::uint32_t>& spirv, const float look[6], std::string* why = nullptr) {
+    if (look[0] > 0.0f && !vertex_snap(spirv, look[0], look[1], why)) return false;
+    if (look[5] > 0.0f && !vertex_cutaway(spirv, look + 2, why)) return false;
+    return true;
+}
 // A camera draw's last stage before the rasterizer, snapped: a twin of the
 // stage under a key of its own (the stage's key salted with the grid), its
 // module the stage's words through vertex_snap. A twin of DXC's module keeps
@@ -6182,7 +6196,7 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, const VertexInputPla
 // refuses finds the lift through it and snaps that (hlsl_lift_stage).
 struct SnapOrigin {
     std::vector<std::uint32_t> words;
-    float cells[2] = {};
+    float cells[6] = {};
 };
 std::mutex g_snap_origin_mu;
 std::unordered_map<std::uint64_t, SnapOrigin> g_snap_origin;  // by the twin's words
@@ -6262,8 +6276,8 @@ void snap_refused(const std::string& name, const std::string& why) {
 
 // `st` (its module made, under `key`) as its snapped twin; false and `st` as
 // it was when the rewrite refuses it.
-bool snap_stage(ShaderStage& st, std::uint64_t key, const float cells[2], const std::string& name, bool cacheable) {
-    const std::uint64_t snap_key = fnv1a(cells, 2 * sizeof(float), key ^ kSnapSalt);
+bool snap_stage(ShaderStage& st, std::uint64_t key, const float cells[6], const std::string& name, bool cacheable) {
+    const std::uint64_t snap_key = fnv1a(cells, 6 * sizeof(float), key ^ kSnapSalt);
     if (const std::shared_ptr<const CachedStage> have = cacheable ? cached_stage(snap_key) : nullptr) {
         st.take(have);
         st.module = have->module;
@@ -6272,13 +6286,15 @@ bool snap_stage(ShaderStage& st, std::uint64_t key, const float cells[2], const 
     gcn::TranslateResult twin = st.meta();
     std::string why;
     VkShaderModule module = VK_NULL_HANDLE;
-    if (!vertex_snap(twin.spirv, cells[0], cells[1], &why) || !make_module(twin.spirv, module)) {
+    if (!vertex_look(twin.spirv, cells, &why) || !make_module(twin.spirv, module)) {
         snap_refused(name, why);
         return false;
     }
     if (std::vector<std::uint32_t> lift; st.lifted && hlsl_lift_of(st.meta().spirv, lift)) {
         std::lock_guard<std::mutex> lk(g_snap_origin_mu);
-        g_snap_origin[fnv1a(twin.spirv.data(), twin.spirv.size() * 4)] = SnapOrigin{st.meta().spirv, {cells[0], cells[1]}};
+        SnapOrigin& o = g_snap_origin[fnv1a(twin.spirv.data(), twin.spirv.size() * 4)];
+        o.words = st.meta().spirv;
+        std::memcpy(o.cells, cells, sizeof(o.cells));
     }
     const bool lifted = st.lifted;
     if (cacheable) cache_stage(snap_key, twin, module, lifted);
@@ -6320,9 +6336,9 @@ bool build_gs_vertex_stage(GfxPipeline& pl, std::string& why) {
     }
     // A camera draw's vertex snap: the spliced stage is the one before the
     // rasterizer (the GS's own emits stay as the splice reads them).
-    if (pl.snap_cells[0] > 0.0f) {
+    if (look_twin(pl.snap_cells)) {
         std::string snap_why;
-        if (vertex_snap(st.spirv, pl.snap_cells[0], pl.snap_cells[1], &snap_why))
+        if (vertex_look(st.spirv, pl.snap_cells, &snap_why))
             g_snap_twins.fetch_add(1, std::memory_order_relaxed);
         else
             snap_refused(pl.name + "-gs-vs", snap_why);
@@ -7437,9 +7453,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // or a tessellated draw's evaluation stage - or a geometry-shader draw's
     // ES and GS spliced into one (build_gs_vertex_stage). Its own content key:
     // no pipeline the manifest made unsnapped crosses over.
-    pl.snap_cells[0] = s.snap_cells[0];
-    pl.snap_cells[1] = s.snap_cells[1];
-    if (s.snap_cells[0] > 0.0f && (gs_lift || snap_stage(pl.vs, vs_key, s.snap_cells, vs_name, vs_cacheable)))
+    std::memcpy(pl.snap_cells, s.snap_cells, sizeof(pl.snap_cells));
+    if (look_twin(s.snap_cells) && (gs_lift || snap_stage(pl.vs, vs_key, s.snap_cells, vs_name, vs_cacheable)))
         pl.vs_key = fnv1a(s.snap_cells, sizeof(s.snap_cells), vs_key ^ kSnapSalt);
     if (gs_lift) {
         std::string why;
@@ -10523,7 +10538,7 @@ std::shared_ptr<const CachedStage> hlsl_lift_stage(const gcn::TranslateResult& m
             if (it == g_snap_origin.end()) return nullptr;
             o = it->second;
         }
-        if (!hlsl_lift_of(o.words, lift) || !vertex_snap(lift, o.cells[0], o.cells[1])) return nullptr;
+        if (!hlsl_lift_of(o.words, lift) || !vertex_look(lift, o.cells)) return nullptr;
     }
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;  // DXC's module declares the lift's bindings and interface: the same translation
@@ -23382,7 +23397,7 @@ static bool draw_impl(const GpuDraw& d) {
     // draw takes a pipeline whose last stage before the rasterizer snaps to
     // the grid (build_gfx_pipeline), one per grid - the 3D's size and the
     // grid's lines decide it.
-    s.snap_cells[0] = s.snap_cells[1] = 0.0f;
+    std::fill(std::begin(s.snap_cells), std::end(s.snap_cells), 0.0f);
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): where six targets
     // or more are bound, a pipeline with the host's pixel shader.
     s.host_gbuffer = false;
@@ -23395,8 +23410,13 @@ static bool draw_impl(const GpuDraw& d) {
             key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), key));
         }
     }
-    if (scene_look_snap() && look_camera_draw(s) && scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]))
-        key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
+    // And a plugin's cutaway (host/vertex_cutaway.h, the Isometric's): the same
+    // camera draws, a twin per set of its numbers.
+    if ((scene_look_snap() || scene_look_cutaway(nullptr)) && look_camera_draw(s)) {
+        if (scene_look_snap()) scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]);
+        scene_look_cutaway(&s.snap_cells[2]);
+        if (look_twin(s.snap_cells)) key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
+    }
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
     // BBHOST_LEAN_FIRST: translate and lay out the fallback pipeline, but create

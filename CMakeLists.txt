@@ -170,6 +170,7 @@ add_executable(bbhost
   src/host/update_verify.cpp
   src/host/bindings.cpp
   src/host/audio.cpp
+  src/host/audio_crush.cpp
   src/host/frame_stats.cpp
   src/host/draw_digest.cpp
   src/host/perf_meter.cpp
@@ -270,6 +271,7 @@ bb_plugin(mutators plugins/mutators/mutators.cpp)
 bb_plugin(quake plugins/quake/quake.cpp)
 bb_plugin(lohit plugins/lohit/lohit.cpp)
 bb_plugin(ps1 plugins/ps1/ps1.cpp)
+bb_plugin(iso plugins/iso/iso.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -340,7 +342,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
@@ -951,6 +953,10 @@ if(UNIX)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
   add_test(NAME at9_test COMMAND at9_test)
   set_tests_properties(at9_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Old-hardware sound (host/audio_crush.h, plugin API 21) on hand-made buffers.
+  add_executable(audio_crush_test tests/audio_crush_test.cpp src/host/audio_crush.cpp)
+  target_include_directories(audio_crush_test PRIVATE src)
+  add_test(NAME audio_crush_test COMMAND audio_crush_test)
   # Labels written by the host once their submission has run, a counter for the GPU (tests/label_landing_test.cpp).
   add_executable(label_landing_test tests/label_landing_test.cpp src/core/portable.cpp)
   target_include_directories(label_landing_test PRIVATE src include)
@@ -959,7 +965,7 @@ if(UNIX)
   set_tests_properties(label_landing_test PROPERTIES ENVIRONMENT "BBHOST_LABEL_LANDING=1")
   if(SDL3_FOUND)
     # Audio output lifetimes under concurrent writes, on SDL's dummy driver.
-    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/core/portable.cpp)
+    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/host/audio_crush.cpp src/core/portable.cpp)
     target_include_directories(host_audio_test PRIVATE src)
     target_compile_definitions(host_audio_test PRIVATE BBHOST_HAVE_SDL3=1)
     target_link_libraries(host_audio_test PRIVATE SDL3::SDL3 pthread)
@@ -1065,7 +1071,7 @@ if(UNIX)
     add_test(NAME gcn_gs_lift_test COMMAND gcn_gs_lift_test)
     set_tests_properties(gcn_gs_lift_test PROPERTIES SKIP_RETURN_CODE 77)
     # PS1 vertex snapping (host/vertex_snap.h) on small hand-made vertex and geometry stages, validated.
-    add_executable(vertex_snap_test tests/vertex_snap_test.cpp src/host/vertex_snap.cpp)
+    add_executable(vertex_snap_test tests/vertex_snap_test.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp)
     target_include_directories(vertex_snap_test PRIVATE src)
     target_link_libraries(vertex_snap_test PRIVATE ${SPIRV_TOOLS_LIB})
     add_test(NAME vertex_snap_test COMMAND vertex_snap_test)
@@ -1107,7 +1113,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke
