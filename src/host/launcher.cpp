@@ -897,7 +897,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             const std::string acct_detail = host_account_detail();
             const float online_rows = 8.5f + (server == 2 ? 4.0f : 0.0f) + (acct_detail.empty() ? 0.0f : 1.0f) +
                                       (cfg.profile.empty() ? 0.0f : 1.0f);
-            const float cards_h = card_h(std::max(7.0f, online_rows));
+            // A warning line or two under Frame rate and Frame generation (frame generation's limit).
+            const float cards_h =
+                card_h(std::max(7.0f + 1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
+                                online_rows));
             ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
@@ -931,6 +934,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                        "the game's, from the 3D alone - the HUD and the menus are never interpolated. Needs "
                                        "Upscaling (FSR or DLSS) on."))
                         host_opt_set("frame_generation", fg);
+                    host_frame_generation_warning(cap_choice, cap_custom, cap_custom_fps);
                 }
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");

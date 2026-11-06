@@ -1834,6 +1834,72 @@ const char* const* value_tips(int id, bool dlss) {
     }
 }
 
+// The primary display's refresh rate, the one frame generation's limit is
+// half of (engine/frame_rate.cpp fg_cap_target reads host_desktop_refresh_hz:
+// the same display). host_desktop_refresh_hz brings SDL's video up and down,
+// which the presenter's thread must not, so on Windows the display's settings
+// are asked directly, at most every 2 s; elsewhere SDL's answer once.
+float refresh_hz_now() {
+#if defined(_WIN32)
+    static std::atomic<float> hz{0.0f};
+    static std::atomic<std::int64_t> asked{0};
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (std::int64_t was = asked.load(); now - was > 2000 && asked.compare_exchange_strong(was, now)) {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        hz.store(EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1
+                     ? static_cast<float>(dm.dmDisplayFrequency)
+                     : 0.0f);
+    }
+    return hz.load();
+#else
+    static const float hz = host_desktop_refresh_hz();
+    return hz;
+#endif
+}
+
+// With frame generation on (as the menu shows it), the most real frames a
+// second: half the display's refresh rate (90 at 180 Hz; frame generation
+// shows twice that), as the frame rate holds them. 0 with frame generation
+// off, or no display that says a rate of 48 Hz or more (headless).
+int fg_real_limit() {
+    if (!reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration))) return 0;
+    const float hz = refresh_hz_now();
+    return hz >= 48.0f ? static_cast<int>(hz / 2.0f) : 0;
+}
+
+// A warning under a control, in `width` from `x`.
+void warn_line(const std::string& text, float x, float width) {
+    ImGui::SetCursorScreenPos(ImVec2(x, ImGui::GetCursorScreenPos().y));
+    ImGui::PushTextWrapPos(x + width - ImGui::GetWindowPos().x);  // the window's own x
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::kWarn);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+}
+
+// Frame rate's warning with frame generation on, for the rate the three
+// make (`fps`, 0 Display-Limited) and the Custom limit's tick: empty when
+// there is nothing to say.
+std::string frame_rate_warning(int fps, bool custom) {
+    const int limit = fg_real_limit();
+    if (limit <= 0 || !(custom || fps == 0 || fps > limit)) return {};
+    const int hz = limit * 2;
+    return "Frame generation doubles this: at most half your refresh rate (" + std::to_string(limit) + " at " + std::to_string(hz) +
+           " Hz).";
+}
+
+// Frame generation's warning when the Frame rate is above half the refresh
+// rate: the game is held to that half while frames are generated.
+std::string frame_generation_warning(int fps) {
+    const int limit = fg_real_limit();
+    if (limit <= 0 || !(fps == 0 || fps > limit)) return {};
+    const std::string rate = fps == 0 ? std::string("Display-Limited") : std::to_string(fps) + " fps";
+    return "Frame rate " + rate + " is above half your " + std::to_string(limit * 2) + " Hz refresh rate: the game runs at " +
+           std::to_string(limit) + ", " + std::to_string(limit * 2) + " shown.";
+}
+
 // Frame rate's control, the setup window's and F10's alike, in `width`: the
 // list of rates - or, with Custom limit ticked, a field for the player's own
 // number, taken when the field is left or Enter pressed and held to 30-960 -
@@ -1857,6 +1923,7 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     const float box = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + ImGui::CalcTextSize(kBox).x;
     const float field = std::max(ImGui::GetFrameHeight() * 2.0f, width - box - st.ItemSpacing.x);
     bool changed = false;
+    const float x0 = ImGui::GetCursorScreenPos().x;
     ImGui::PushID("##frame_rate");
     ImGui::SetNextItemWidth(field);
     if (*custom) {
@@ -1866,7 +1933,9 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
         int typing = store->GetInt(key, *custom_fps);
         ImGui::InputInt("##fps", &typing, 0, 0);
         if (ImGui::IsItemDeactivatedAfterEdit()) {
-            const int fps = std::clamp(typing, 30, 960);
+            // With frame generation on, at most half the refresh rate (fg_real_limit).
+            const int limit = fg_real_limit();
+            const int fps = std::clamp(typing, 30, limit > 0 ? std::max(30, limit) : 960);
             if (fps != *custom_fps) {
                 *custom_fps = fps;
                 changed = true;
@@ -1880,6 +1949,8 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     ImGui::SameLine(0, st.ItemSpacing.x);
     changed |= ImGui::Checkbox(kBox, custom);
     ui::tooltip_for_item(kBox, kHostFrameRateCustomNote);
+    const int fps = *custom ? *custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(std::clamp(*cap, 0, static_cast<int>(items.size()) - 1))]);
+    if (const std::string warn = frame_rate_warning(fps, *custom); !warn.empty()) warn_line(warn, x0, width);
     ImGui::PopID();
     return changed;
 }
@@ -1905,6 +1976,11 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     if (n == 2 && on_i >= 0 && off_i >= 0) {
         bool v = cur == on_i;
         if (ui::toggle_row(label, restart ? "Applies at the next start" : nullptr, &v, note)) change(id, v ? on_i : off_i);
+        if (id == kFrameGeneration) {
+            const std::string warn = frame_generation_warning(
+                frame_rate_of(shown_index(kFrameCap), shown_index(kFrameCapCustom), shown_index(kFrameCapCustomFps)));
+            if (!warn.empty()) warn_line(warn, ImGui::GetCursorScreenPos().x, ImGui::GetContentRegionAvail().x);
+        }
         ImGui::PopID();
         return;
     }
@@ -2239,8 +2315,9 @@ const char* const kHostShaderModeTips[2] = {
 
 const char* const kHostFrameRateCustomNote =
     "Tick to type your own frame rate, 30 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
-    "Frame generation on, twice as many frames are shown (45 shows 90). Unticked, Frame rate's list is used. Changes "
-    "at once between rates above 30; to or from 30 needs a restart.";
+    "Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh rate "
+    "(90 at 180 Hz). Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs "
+    "a restart.";
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";
@@ -2441,6 +2518,15 @@ int host_opt_frame_rate() { return frame_rate_now(); }
 #if defined(BBHOST_HAVE_SDL3)
 bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width) {
     return frame_rate_control(cap_index, custom, custom_fps, width);
+}
+void host_frame_generation_warning(int cap_index, bool custom, int custom_fps) {
+    const int fps = custom ? custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(cap_index)]);
+    if (const std::string warn = frame_generation_warning(fps); !warn.empty())
+        warn_line(warn, ImGui::GetCursorScreenPos().x, ImGui::GetContentRegionAvail().x);
+}
+int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps) {
+    const int fps = custom ? custom_fps : fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(cap_index)]);
+    return (frame_rate_warning(fps, custom).empty() ? 0 : 1) + (frame_generation_warning(fps).empty() ? 0 : 1);
 }
 #endif
 

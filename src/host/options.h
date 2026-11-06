@@ -111,6 +111,14 @@ extern const char* const kHostFrameRateCustomNote;
 // Custom limit ticked, a field to type the number into - and the Custom
 // limit tick box after it. True when one of the three changed.
 bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width);
+// With frame generation on the game runs at most half the display's refresh
+// rate (engine/frame_rate.cpp): the Custom limit's number is held to that and
+// Frame rate says so under its control. Frame generation's row says so too
+// when the rate is above it - the setup window's row with its own unsaved
+// Frame rate (F10's rows draw theirs). The count: how many such lines the two
+// rows show now, for the setup window's card height.
+void host_frame_generation_warning(int cap_index, bool custom, int custom_fps);
+int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps);
 
 // Set one by name, from the rows the port adds to the game's own System menu
 // (engine/option_menu.h). The two front ends drive the same settings and the
