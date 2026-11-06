@@ -24679,7 +24679,20 @@ static bool draw_impl(const GpuDraw& d) {
                 // worker took a run part's place first.
                 // (A list-mode draw - stage 4b.1b, BBHOST_GXVK_LISTS=splice - has
                 // no packet number of its own: it goes again in order.)
-                if (t_run_draw && t_run_draw->list) {
+                // A run part's draw goes again in order too (as 2f1995fb had
+                // it): a place taken in a part stays in the frame's list even
+                // when the part stops later and its draws are recorded again
+                // in order - its corners never written, the redone draw a second
+                // of its key - so the hunter's motion came from corners frames
+                // old whenever he moved (2026-11-06: the reprojection check red
+                // over his whole body through an attack with run parts on,
+                // clean with BBHOST_RUN_COMMIT=0 or the capture off; ~1% fps in
+                // order). BBHOST_CAPTURE_PARTS=1: taken in the part (a test).
+                static const bool in_parts = [] {
+                    const char* e = std::getenv("BBHOST_CAPTURE_PARTS");
+                    return e && e[0] == '1';
+                }();
+                if (t_run_draw && (t_run_draw->list || (part && !in_parts))) {
                     run_part_stop(kRunStopOrder);
                     return false;
                 }
