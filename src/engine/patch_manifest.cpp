@@ -684,6 +684,62 @@ Manifest shadow_resolution_manifest() {
 }
 
 
+// old-hunters, The Old Hunters (always on; was patches/old-hunters.toml, Kyo's
+// Bloodborne 1.09 "bb 00900" patch): the locale setup (sub_23b6cf0,
+// CSLocalize) stores the package edition at 0x552894c from sub_23b8ee0, the
+// system property Localize.Pkgedition - the tens digit of the app's
+// USER_DEFINED_PARAM_1, 0 in the dump's base package. That call made
+// `mov eax, 1` makes the game the Old Hunters edition (CUSA03179 in the US),
+// whose package carries the DLC: CSDlc counts The Old Hunters as available
+// when add-on 3 is owned or the edition is 1 (sub_23b5620) and sets event flag
+// 6899 from that on every update, which the DLC's events read. The same index
+// picks the edition's title ID and HTTP User-Agent; the private server accepts
+// both editions' agents and matches them together, and bbhost's saves go by
+// directory name, so the character list is the same either way. Not a
+// setting: [patches] cannot turn it off (patch_manifest_on). It is still left
+// out, saying why, for a game folder without the DLC's own files
+// (old_hunters_missing), whose title would be a flat green picture.
+Manifest old_hunters_manifest() {
+    Manifest m;
+    m.name = "old-hunters";
+    m.title = "The Old Hunters";
+    m.eboot = kEboot109Sha256;
+    m.description = "The Old Hunters is available: the game takes itself for the edition that includes it";
+    m.order = 1000;
+    m.live = false;
+    m.sites.push_back(Site{"pkgedition", 0x023b6d20, {0xe8, 0xbb, 0x21, 0x00, 0x00}, {0xb8, 0x01, 0x00, 0x00, 0x00}, true, {}});
+    return m;
+}
+
+// dpad-first-item, holding D-pad Down picks the first quick item (on;
+// [patches] dpad-first-item = false leaves it out): Modern Movement's hold,
+// alone (Kyo's modern-movement patch and its Lite, and the NR ports' Controls,
+// each carry the same hold in caves of their own). A tap still cycles. After
+// PadManipulator's update has set the action request's arm bits (0x01927ac8,
+// `mov rax, [rbp-0x188]`, r15 = the request) a jump to the cave
+// (dpad_first_item_cave.inc says what it does): Arm_ChangeItem (11) held
+// 0.5 s - its hold time [r15+0x7c] - selects the first quick item, as the
+// game's own cycle would, once per hold. The hook's site steps aside for the
+// patches that hook the same instruction with the hold in them; its cave, at
+// zeros nothing else writes, stays.
+Manifest dpad_first_item_manifest() {
+    Manifest m;
+    m.name = "dpad-first-item";
+    m.title = "Hold Down for the first quick item";
+    m.eboot = kEboot109Sha256;
+    m.description = "holding D-pad Down half a second picks the first quick item; a tap still cycles";
+    m.order = 14;
+    m.sites.push_back(Site{"cave", 0x054a0000, std::vector<std::uint8_t>(324, 0),
+                           {
+#include "engine/dpad_first_item_cave.inc"
+                           },
+                           true, {}});
+    m.sites.push_back(Site{"hook", 0x01927ac8, {0x48, 0x8b, 0x85, 0x78, 0xfe, 0xff, 0xff}, {0xe9, 0x33, 0x85, 0xb7, 0x03, 0x90, 0x90}, true,
+                           {"modern-movement", "modern-movement-lite", "nr-port-jump", "nr-port-nojump"}});
+    return m;
+}
+
+
 // skip-intro, Skip company logos (startup.skip_intro): illusion's 1.09 Skip
 // Intro. The three company logos (FromSoftware, Japan Studio, SCE) are
 // entries the startup flow plays by name; emptying the first two UTF-16
@@ -718,6 +774,8 @@ std::vector<Manifest> built_in_manifests() {
     out.push_back(hd_motion_blur_manifest());
     out.push_back(velomap_manifest());
     out.push_back(scene_rgba8_manifest());
+    out.push_back(old_hunters_manifest());
+    out.push_back(dpad_first_item_manifest());
     return out;
 }
 
@@ -728,13 +786,14 @@ std::vector<Manifest> built_in_manifests() {
 // setting, the HD Motion Blur patches are HD motion blur, Unlock Game Region
 // is all-languages without its online cost, the Intel Black Tonemap Fix's
 // six bytes are the performance patch's own (always on), and Disable Dynamic
-// Light Shadows is the Dynamic light shadows setting. A
+// Light Shadows is the Dynamic light shadows setting, and The Old Hunters is
+// bbhost's own, always on. A
 // package unpacked over an older one still has them in its patches folder;
 // they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
     return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
            file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml" ||
-           file == "disable-dynamic-light-shadow.toml";
+           file == "disable-dynamic-light-shadow.toml" || file == "old-hunters.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.
@@ -760,21 +819,16 @@ bool patch_manifest_option_known(const std::string& option) {
 }
 
 bool patch_manifest_on(const std::string& name, bool enabled) {
+    if (name == "old-hunters") return true;  // part of bbhost, not a setting (old_hunters_manifest)
     const std::string v = config_value("patches." + name);
     if (!v.empty()) return !(v == "false" || v == "0");
     return enabled && !patch_manifest_off(name);
 }
 
 bool patch_manifest_off(const std::string& name) {
+    if (name == "old-hunters") return false;  // always on
     const std::string v = config_value("patches." + name);
     if (!v.empty()) return v == "false" || v == "0";
-    // The Old Hunters was a PC enhancement in v0.2.9, `old_hunters` under
-    // [world]: a bbhost.toml (a package's, a player's) that turned it off there
-    // keeps it off until [patches] says otherwise.
-    if (name == "old-hunters") {
-        const std::string w = config_value("world.old_hunters");
-        return w == "false" || w == "0";
-    }
     return false;
 }
 

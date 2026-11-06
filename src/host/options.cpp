@@ -557,7 +557,7 @@ Setting g_set[kSettingCount] = {
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
     // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
-    // shipped. (The Old Hunters, a fourth in v0.2.9, is the patch old-hunters.)
+    // shipped. (The Old Hunters, a fourth in v0.2.9, is always on: engine/patch_manifest.cpp.)
     {"change_appearance", "Hunter's Dream mirror", {"Off", "On"}, 1,
      "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
     {"rebirth", "Rebirth at the Altar", {"Off", "On"}, 1,
@@ -1535,7 +1535,6 @@ void host_options_load() {
         bool account = false;  // in [account]: the name and token
         std::string acct_name, acct_token;
         int file_version = 1;
-        bool old_hunters_off = false;  // v0.2.9's PC enhancement, turned off
         std::string frame_cap_val;
         std::string window_mode_val;  // its label as saved (Fullscreen was Borderless before version 7)
         while (std::fgets(line, sizeof(line), f)) {
@@ -1581,10 +1580,7 @@ void host_options_load() {
                 file_version = std::atoi(val.c_str());
                 continue;
             }
-            if (key == "old_hunters") {
-                old_hunters_off = val == "Off";
-                continue;
-            }
+            if (key == "old_hunters") continue;  // v0.2.9's PC enhancement: The Old Hunters is always on now
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
             if (key == "window_mode") window_mode_val = val;
@@ -1670,26 +1666,6 @@ void host_options_load() {
             g_dirty = true;
             host_log("options: Mouse in menus read as On - this file predates it defaulting to On");
             save();  // as version 2, so a later Off is the player's and stays
-        }
-        // The Old Hunters was a PC enhancement in v0.2.9 and is the patch
-        // old-hunters since. A player who turned it off keeps it off: the
-        // per-user bbhost.toml's [patches] says so from now on, and the next
-        // save drops the old key (unless [patches] already says something).
-        if (old_hunters_off) {
-            bool carried = !config_value("patches.old-hunters").empty();
-            if (!carried) {
-                const std::string user = config_user_file();
-                carried = config_set_values(user, {{"patches", "old-hunters", "false"}});
-                if (carried) {
-                    config_value_set("patches.old-hunters", "false");
-                    host_log("options: The Old Hunters was off here; it is the patch old-hunters now, off under [patches] in %s",
-                             user.c_str());
-                }
-            }
-            if (carried) {
-                g_dirty = true;
-                save();
-            }
         }
         host_log("options: read %s", path.c_str());
     }
