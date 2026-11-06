@@ -1532,8 +1532,12 @@ float pace_target_of_rate() {
 // and AMD's generation - on the same GPU, after the real frame's work - comes
 // out late by whatever the next frame put ahead of it. Kyo's 960 cap, 80 real
 // (160 shown): latency, stutter and uneven frames.
-// So while frames are generated: Display-Limited holds the real frames to half
-// the display's rate (what is shown is then its rate), and a cap that is not
+// So while frames are generated: the real frames are held to half the
+// display's refresh rate at most, whatever the cap - real and generated
+// together never past the display (Kyo: 960 at 180 Hz is 90 real + 90
+// generated; 40 + 40 is fine where that is all the game manages; at 960 the
+// game reached 99 real, 197 shown on 180 Hz, and the frames past it tore) -
+// Display-Limited among them; and a cap that is not
 // reached is replaced by a held one, 3% under the rate the game manages, so
 // the limiter - not the GPU's queue - starts each frame. The held pace is
 // checked every 32 frames: with the limiter no longer waiting (the frames as
@@ -1609,12 +1613,22 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
 }
 
 // The cap's real frame interval: the rate's, and while frames are generated
-// on Display-Limited twice it, so what is shown, real and generated, is at the
-// display's rate.
+// at least two of the display's refreshes. The refresh rate is read as
+// generation starts (asking brings SDL's video up and down: not every frame);
+// 0 when no display says it (headless), and then the cap's alone.
 float fg_cap_target() {
+    static float hz = 0.0f;
+    static bool was = false;
     const float t = pace_target_of_rate();
-    if (t <= 0.0f || !g_fg_pace.on || !g_uncapped || !fg_generating() || loading_screen_up()) return t;
-    return t * 2.0f;
+    const bool on = t > 0.0f && g_fg_pace.on && fg_generating() && !loading_screen_up();
+    if (on && !was) {
+        hz = host_desktop_refresh_hz();
+        if (hz >= 48.0f && 2.0f / hz > t)
+            host_log("frame rate: frame generation on: real frames at most %.0f a second, half the display's %.0f Hz (the cap %.0f)",
+                     static_cast<double>(hz / 2.0f), static_cast<double>(hz), static_cast<double>(1.0f / t));
+    }
+    was = on;
+    return on && hz >= 48.0f ? std::max(t, 2.0f / hz) : t;
 }
 
 float pace_target() {
