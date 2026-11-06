@@ -1128,6 +1128,48 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
     return 0;
 }
 
+// The scene's camera, after the copy above: the game state's update keeps it
+// in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
+// (+0x10). At 0x1d3bec5 the copy is done and a scripted camera's replacing it
+// is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - the scripted
+// camera's switch). The stub keeps only the argument registers, so the camera is
+// found again through the slot rather than r15.
+std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
+bool g_view_hooked = false;
+
+GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    const std::uint64_t slot = runtime_of(0x594f880, 8);
+    std::uint64_t holder = 0, scene = 0;
+    if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(holder + 0x10)), &scene, 8) || !scene)
+        return 0;
+    std::vector<CameraCallback> now;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        now = g_view_callbacks;
+    }
+    auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    for (const CameraCallback& c : now) c.fn(cam, c.user);
+    return 0;
+}
+
+int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
+    if (!fn || !g_image || !api_eboot_is_109()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_view_callbacks.push_back({fn, user});
+    }
+    if (g_view_hooked) return 0;
+    g_view_hooked = true;
+    static const std::uint8_t after_copy[14] = {0x49, 0x8b, 0x85, 0x10, 0x01, 0x00, 0x00,
+                                                0x83, 0xb8, 0xc4, 0x00, 0x00, 0x00, 0x00};
+    if (!engine_site_hook(g_image, runtime_of(0x1d3bec5, sizeof after_copy), after_copy, sizeof after_copy,
+                          reinterpret_cast<void*>(&view_hook))) {
+        host_log("plugin: 0x1d3bec5 is not the end of the scene camera's copy; on_view is not called");
+    }
+    return 0;
+}
+
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
     // A plugin's own keys work in play, where a menu's actions press nothing
@@ -1179,6 +1221,7 @@ const BbHostApi g_api = {
     &api_draw_style,
     &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
     &api_gbuffer_ambient,
+    &api_on_view,
 };
 
 std::string read_file(const std::string& path) {

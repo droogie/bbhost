@@ -173,6 +173,11 @@ gives the Binary Ninja address.
   clip planes, all writable. The character's update has run by then; its next
   one moves by where this camera looks. The Quake plugin is a first-person
   view this way.
+- `on_view(fn, user)` (v20): each frame after the game has copied that camera
+  into the scene's, before a scripted camera replaces it: what `fn` writes is
+  drawn, while the game's own camera - which the follow camera keeps, the
+  controls move by and the aim reads - stays as `on_camera` left it. The
+  Isometric plugin draws its view this way.
 
 **Settings, UI and files**
 

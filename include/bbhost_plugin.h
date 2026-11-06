@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 19
+#define BB_PLUGIN_API_VERSION 20
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -544,6 +544,16 @@ typedef struct BbHostApi {
      * gives the map, which they have none of - from the next frame (0.03 by
      * default; 0 leaves what no lamp reaches black). */
     void (*gbuffer_ambient)(float level);
+
+    /* Version 20: the camera the scene is drawn from. */
+    /* fn(cam, user) each frame once the game has copied the player's camera
+     * (on_camera's, after its callbacks) into the scene's, before a scripted
+     * camera (a cutscene's) replaces it: what fn writes is what is drawn, while
+     * the game's own camera - the one the follow camera keeps, the controls
+     * move by and the aim reads - stays as on_camera left it. Not called in
+     * the game state on_camera reaches through its second hook (a warp's).
+     * Main thread. 0 on success; 1 for another eboot. */
+    int (*on_view)(void (*fn)(BbCamera* cam, void* user), void* user);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
