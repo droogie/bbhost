@@ -1,0 +1,153 @@
+#version 450
+// TAA (host/upscale_pass.cpp, Graphics > Upscaling: TAA): bbhost's own
+// temporal anti-aliasing at the upscalers' call point, from what they are
+// handed - the scene with this frame's jitter in its camera draws, the motion
+// (shaders/camera_motion.comp: the camera's, the characters' capture over it;
+// render pixels, the last frame's place less this one's) and the depth's R32
+// copy. The scene's size in and out, no bridge.
+//   - The current picture, unjittered: its 3x3 weighted by each sample's
+//     distance from the pixel's centre once the jitter is taken out (a
+//     Gaussian in place of Blackman-Harris; the nine weights are the same for
+//     every pixel, so the host works them out once a frame).
+//   - The motion of the nearest surface in the 3x3 (edges keep the motion of
+//     what is in front), the history read there by Catmull-Rom (5 bilinear
+//     taps through `lin`), so it does not soften frame by frame.
+//   - The history clipped towards the 3x3's mean, inside its mean +- 1.25
+//     standard deviations and its min/max, in YCoCg: what the scene no longer
+//     shows there (a disocclusion, a light that went out) cannot stay.
+//   - Blended at 1/10 of this frame, more as the motion grows (a moving
+//     picture is resampled every frame and would blur), all of it where the
+//     history is off the screen or none (reset).
+// Colour is blended through c / (1 + max(c)), the reversible tone map of
+// RCAS and FSR's history, so a bright highlight cannot outweigh its
+// neighbours. Alpha is the scene's: later passes read the game's.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Constants {
+    uvec4 size;    // x, y: the scene's width and height; z: 1 no history (reset); w: 1 depth inverted (near = 1)
+    vec4 jitter;   // x, y: this frame's jitter in render pixels (+x right, +y down); z: the blend's least share, w: its most
+    vec4 weights[3];  // the 3x3's weights for this jitter, row by row from the top left, summing to 1 (the 10th unused)
+};
+
+layout(set = 0, binding = 0) uniform texture2D scene;
+layout(set = 0, binding = 1) uniform texture2D history;
+layout(set = 0, binding = 2) uniform texture2D motion;
+layout(set = 0, binding = 3) uniform texture2D depth;
+layout(set = 0, binding = 4) uniform sampler lin;  // linear, clamped to the edge
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D dst;
+
+vec3 to_unit(vec3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+vec3 from_unit(vec3 c) { return c / max(1.0 / 32768.0, 1.0 - max(c.r, max(c.g, c.b))); }
+
+vec3 to_ycocg(vec3 c) {
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)), dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+vec3 from_ycocg(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+
+vec3 fetch_unit(ivec2 p, ivec2 lim) {
+    const vec3 c = texelFetch(sampler2D(scene, lin), clamp(p, ivec2(0), lim), 0).rgb;
+    // (Not finite or negative: nothing, so one bad texel cannot spread.)
+    return to_unit(clamp(c, vec3(0.0), vec3(65504.0)));
+}
+
+// The history at uv by Catmull-Rom, 5 bilinear taps (the corners' small
+// weights left out), in the unit tone map.
+vec3 history_at(vec2 uv, vec2 dims) {
+    const vec2 pos = uv * dims;
+    const vec2 c1 = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - c1;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 tc0 = (c1 - 1.0) / dims, tc3 = (c1 + 2.0) / dims, tc12 = (c1 + w2 / w12) / dims;
+    vec4 s = vec4(0.0);
+    vec3 h;
+    float w;
+    w = w12.x * w0.y;  h = textureLod(sampler2D(history, lin), vec2(tc12.x, tc0.y), 0.0).rgb;  s += vec4(to_unit(max(h, 0.0)) * w, w);
+    w = w0.x * w12.y;  h = textureLod(sampler2D(history, lin), vec2(tc0.x, tc12.y), 0.0).rgb;  s += vec4(to_unit(max(h, 0.0)) * w, w);
+    w = w12.x * w12.y; h = textureLod(sampler2D(history, lin), vec2(tc12.x, tc12.y), 0.0).rgb; s += vec4(to_unit(max(h, 0.0)) * w, w);
+    w = w3.x * w12.y;  h = textureLod(sampler2D(history, lin), vec2(tc3.x, tc12.y), 0.0).rgb;  s += vec4(to_unit(max(h, 0.0)) * w, w);
+    w = w12.x * w3.y;  h = textureLod(sampler2D(history, lin), vec2(tc12.x, tc3.y), 0.0).rgb;  s += vec4(to_unit(max(h, 0.0)) * w, w);
+    return clamp(s.rgb / max(s.w, 1e-4), vec3(0.0), vec3(1.0));
+}
+
+// The history moved towards the box's centre until it is inside the box.
+vec3 clip_box(vec3 h, vec3 lo, vec3 hi) {
+    const vec3 centre = 0.5 * (lo + hi), extent = max(0.5 * (hi - lo), vec3(1e-5));
+    const vec3 v = h - centre;
+    const vec3 a = abs(v / extent);
+    const float m = max(a.x, max(a.y, a.z));
+    return m > 1.0 ? centre + v / m : h;
+}
+
+// The group's 8x8 pixels and a texel round them, read once into shared
+// memory: each pixel's 3x3 of colour (in the unit tone map, as YCoCg) and
+// depth comes from there, not from 18 fetches and 9 conversions of its own.
+shared vec3 tile_c[10][10];
+shared float tile_z[10][10];
+
+void main() {
+    const ivec2 dims_i = ivec2(size.xy);
+    const ivec2 lim = dims_i - 1;
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8 - 1;
+    for (uint i = gl_LocalInvocationIndex; i < 100u; i += 64u) {
+        const ivec2 t = ivec2(int(i % 10u), int(i / 10u));
+        const ivec2 q = clamp(origin + t, ivec2(0), lim);
+        tile_c[t.y][t.x] = to_ycocg(fetch_unit(q, lim));
+        tile_z[t.y][t.x] = texelFetch(sampler2D(depth, lin), q, 0).r;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= dims_i.x || p.y >= dims_i.y) return;
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy) + 1;
+    const vec2 dims = vec2(size.xy);
+    const vec4 centre = texelFetch(sampler2D(scene, lin), p, 0);
+    const float alpha = centre.a;
+
+    // The 3x3: the unjittered current, its moments, its box and the nearest
+    // surface.
+    vec3 cur = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
+    const bool inverted = size.w != 0u;
+    float near_z = inverted ? -1.0 : 2.0;
+    ivec2 near_o = ivec2(0);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const vec3 c = tile_c[l.y + y][l.x + x];
+            const int k = (y + 1) * 3 + x + 1;
+            cur += c * weights[k >> 2][k & 3];
+            m1 += c;
+            m2 += c * c;
+            lo = min(lo, c);
+            hi = max(hi, c);
+            const float z = tile_z[l.y + y][l.x + x];
+            if (inverted ? z > near_z : z < near_z) {
+                near_z = z;
+                near_o = ivec2(x, y);
+            }
+        }
+    }
+
+    vec3 result;
+    if (size.z != 0u) {
+        result = cur;
+    } else {
+        const vec2 mv = texelFetch(sampler2D(motion, lin), clamp(p + near_o, ivec2(0), lim), 0).rg;
+        const vec2 prev_uv = (vec2(p) + 0.5 + mv) / dims;
+        if (any(lessThan(prev_uv, vec2(0.0))) || any(greaterThan(prev_uv, vec2(1.0))) || any(isnan(mv)) || any(isinf(mv))) {
+            result = cur;
+        } else {
+            const vec3 mean = m1 / 9.0;
+            const vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+            const vec3 box_lo = max(lo, mean - 1.25 * sigma), box_hi = min(hi, mean + 1.25 * sigma);
+            const vec3 hist = clip_box(to_ycocg(history_at(prev_uv, dims)), box_lo, box_hi);
+            const float share = mix(jitter.z, jitter.w, clamp(length(mv) / 8.0, 0.0, 1.0));
+            result = mix(hist, cur, share);
+        }
+    }
+    vec3 c = from_unit(clamp(from_ycocg(result), vec3(0.0), vec3(1.0 - 1.0 / 32768.0)));
+    if (any(isnan(c)) || any(isinf(c))) c = centre.rgb;
+    imageStore(dst, p, vec4(c, alpha));
+}

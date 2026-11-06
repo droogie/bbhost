@@ -17,6 +17,7 @@
 #include "host/options.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
+#include "host/upscaler.h"
 #include "host/window.h"
 #include "log.h"
 
@@ -444,7 +445,9 @@ void settings_changed(const HostSettings& hs) {
     // pixels again, so it is off while it is.
     // Performance mode clears both (its patch's constructor writes until
     // 2026-11-05), and with it on or off while the game runs they follow.
-    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode;
+    // TAA (Graphics > Upscaling) takes the AA's place: FXAA over its picture
+    // only blurred it again.
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && upscaler_method() != kUpscaleTaa;
     const bool ssao = hs.ssao && !hs.performance_mode;
     if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
         ssao_was = ssao;
