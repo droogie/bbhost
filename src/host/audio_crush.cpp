@@ -38,8 +38,21 @@ void audio_crush_apply(AudioCrushState& s, const void* in, void* out, unsigned f
     const double step = rate > 0 && static_cast<unsigned>(rate) < freq ? static_cast<double>(rate) / freq : 1.0;
     const int max_bits = is_float ? 23 : 15;
     const int keep = bits > 0 && bits <= max_bits ? bits : 0;
-    const float levels = keep ? std::ldexp(1.0f, keep - 1) : 0.0f;          // F32: steps of 1 / levels
-    const std::int32_t mask = keep ? ~((std::int32_t{1} << (16 - std::min(keep, 15))) - 1) : ~0;  // S16
+    const float levels = keep ? std::ldexp(1.0f, keep - 1) : 0.0f;  // steps of 1 / levels
+    // The output filter after a hold: a Butterworth low-pass at 0.45 of the
+    // rate held to (RBJ's biquad), taking out the steps' images - the held
+    // staircase's energy around the rate and its multiples, a screech.
+    const bool post = step < 1.0;
+    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    if (post) {
+        const double w = 6.283185307179586 * 0.45 * rate / freq, c = std::cos(w), al = std::sin(w) / (2.0 * 0.7071067811865476);
+        const double a0 = 1.0 + al;
+        b0 = static_cast<float>((1.0 - c) / 2.0 / a0);
+        b1 = static_cast<float>((1.0 - c) / a0);
+        b2 = b0;
+        a1 = static_cast<float>(-2.0 * c / a0);
+        a2 = static_cast<float>((1.0 - al) / a0);
+    }
 
     const float* fin = static_cast<const float*>(in);
     const std::int16_t* s16in = static_cast<const std::int16_t*>(in);
@@ -57,13 +70,24 @@ void audio_crush_apply(AudioCrushState& s, const void* in, void* out, unsigned f
         }
         s.phase += step;
         for (unsigned c = 0; c < channels; ++c) {
-            const float y = s.hold[c];
+            float y = s.hold[c];
+            // Rounded to the nearest step: what is quieter than half a step is
+            // silence, where truncating it flickered between 0 and a step below
+            // (static, and a DC offset of half a step).
+            if (keep) y = std::nearbyint(std::clamp(y, -1.0f, 1.0f - 1.0f / levels) * levels) / levels;
+            if (post) {
+                float o = b0 * y + b1 * s.x1[c] + b2 * s.x2[c] - a1 * s.y1[c] - a2 * s.y2[c];
+                if (std::fabs(o) < 1e-15f) o = 0.0f;  // a decayed tail is silence, not slow denormals
+                s.x2[c] = s.x1[c];
+                s.x1[c] = y;
+                s.y2[c] = s.y1[c];
+                s.y1[c] = o;
+                y = o;
+            }
             if (is_float) {
-                // Truncated toward minus infinity, as dropping the low bits of an integer does.
-                fout[base + c] = keep ? std::floor(std::clamp(y, -1.0f, 1.0f - 1.0f / levels) * levels) / levels : y;
+                fout[base + c] = y;
             } else {
-                const long v = std::clamp(std::lround(y * 32768.0f), -32768L, 32767L);
-                sout[base + c] = static_cast<std::int16_t>(static_cast<std::int32_t>(v) & mask);
+                sout[base + c] = static_cast<std::int16_t>(std::clamp(std::lround(y * 32768.0f), -32768L, 32767L));
             }
         }
     }

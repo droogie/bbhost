@@ -224,8 +224,11 @@ int main(int argc, char** argv) {
         // Live changes, as the menus make them.
         if (H.option_fn) {
             H.calls.clear();
-            H.option_fn("snap", "Native", H.option_user);
-            CHECK(has(H.calls, "snap " + std::to_string(BB_SNAP_PIXELS)));
+            H.option_fn("snap", "Native", H.option_user);  // 0.2.0's Native, no longer offered: off
+            CHECK(has(H.calls, "snap 0"));
+            CHECK(!has(H.calls, "snap " + std::to_string(BB_SNAP_PIXELS)));
+            H.option_fn("snap", "120p", H.option_user);
+            CHECK(has(H.calls, "snap 120"));
             H.option_fn("snap", "Off", H.option_user);
             CHECK(has(H.calls, "snap 0"));
             H.option_fn("unfiltered", "false", H.option_user);
