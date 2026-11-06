@@ -35,6 +35,8 @@
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "host/frame_stats.h"
+#include "host/framegen.h"
+#include "host/gpu.h"
 #include "host/plugins.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -1515,10 +1517,109 @@ float swing_target(float base) {
 }
 
 // The converted pace's target for this frame; 0 at 30.
-float pace_target() {
+float pace_target_of_rate() {
     if (g_game_fps == 30) return 0.0f;
     if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
     return swing_target(1.0f / static_cast<float>(g_game_fps));
+}
+
+// Frame generation's pace (host/framegen.h). AMD's swapchain shows a
+// generated frame half way between two real ones, timed from how far apart
+// the real ones came; it is even only while they come evenly. Under a cap
+// the machine reaches, the limiter makes them even. Above what it reaches (960,
+// or Display-Limited at 180 Hz with ~80 real frames) nothing waits: the GPU is
+// full, the game's frames queue behind it, each starts when the queue lets it,
+// and AMD's generation - on the same GPU, after the real frame's work - comes
+// out late by whatever the next frame put ahead of it. Kyo's 960 cap, 80 real
+// (160 shown): latency, stutter and uneven frames.
+// So while frames are generated: Display-Limited holds the real frames to half
+// the display's rate (what is shown is then its rate), and a cap that is not
+// reached is replaced by a held one, 3% under the rate the game manages, so
+// the limiter - not the GPU's queue - starts each frame. The held pace is
+// checked every 32 frames: with the limiter no longer waiting (the frames as
+// fast as they go: the scene got heavier, or the pace was tried too fast) it is
+// set again from what they took; every 8th check it tries 2% faster, in case
+// the scene got lighter. The GPU's busy share would say when there is room,
+// but AMD's generation is not in it (host/gpu_busy.cpp counts our command
+// buffers): 84% there was a full GPU in the 2026-11-06 runs. BBHOST_FG_PACE=0:
+// the cap as it is.
+struct FgPace {
+    bool on = true;
+    double headroom = 1.03;  // the held interval over the one the frames manage (BBHOST_FG_PACE_HEADROOM=<percent>)
+    float held_s = 0.0f;  // the held real frame interval, 0 when not holding
+    std::uint32_t n = 0;  // this window's frames
+    double interval_s = 0.0, wait_s = 0.0;
+    std::uint64_t last_ns = 0, window_ns = 0, busy_ns = 0, gpu_on = 0;
+    std::uint32_t windows = 0;
+};
+FgPace g_fg_pace = [] {
+    FgPace p;
+    const char* e = std::getenv("BBHOST_FG_PACE");
+    p.on = !(e && e[0] == '0');
+    if (const char* h = std::getenv("BBHOST_FG_PACE_HEADROOM"); h && *h) p.headroom = 1.0 + std::clamp(std::atof(h), 0.0, 50.0) / 100.0;
+    return p;
+}();
+
+bool fg_generating() { return framegen_shown_per_frame() > 1.5f; }
+
+// The frame just paced: its interval since the last one and the limiter's wait in it.
+void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target_s) {
+    FgPace& p = g_fg_pace;
+    const std::uint64_t was = p.last_ns;
+    p.last_ns = now_ns;
+    if (!p.on || rate_target_s <= 0.0f || !fg_generating() || loading_screen_up()) {
+        if (p.held_s > 0.0f) host_log("frame rate: frame generation's held pace %.1f fps let go", 1.0 / p.held_s);
+        p.held_s = 0.0f;
+        p.n = 0;
+        return;
+    }
+    if (!was || now_ns - was > 200000000ull) return;  // a stall (a load, a hitch) is not a frame to pace by
+    if (p.n == 0) {
+        p.interval_s = p.wait_s = 0.0;
+        p.window_ns = was;
+        const GpuBusy b = host_gpu_busy();
+        p.busy_ns = b.busy_ns;
+        p.gpu_on = b.on;
+    }
+    p.interval_s += static_cast<double>(now_ns - was) * 1e-9;
+    p.wait_s += static_cast<double>(wait_ns) * 1e-9;
+    if (++p.n < 32) return;
+    const double interval = p.interval_s / p.n, wait = p.wait_s / p.n;
+    const GpuBusy b = host_gpu_busy();
+    const bool gpu_known = p.gpu_on && b.on && now_ns > p.window_ns;
+    const double gpu = gpu_known ? static_cast<double>(b.busy_ns - p.busy_ns) / static_cast<double>(now_ns - p.window_ns) : -1.0;
+    p.n = 0;
+    ++p.windows;
+    const float cap = rate_target_s;
+    const float before = p.held_s;
+    if (p.held_s <= 0.0f) {
+        // Not holding: only a cap the frames do not reach is replaced.
+        if (interval > cap * 1.05) p.held_s = static_cast<float>(interval * p.headroom);
+    } else if (wait < interval * 0.02) {
+        p.held_s = static_cast<float>(interval * p.headroom);  // the limiter no longer holds them: as fast as they go, the pace follows
+    } else if (p.windows % 8 == 0) {
+        p.held_s *= 0.98f;  // a little faster now and then: the scene may have got lighter
+    }
+    p.held_s = std::min(p.held_s, kThirtieth);
+    if (p.held_s > 0.0f && p.held_s <= cap * 1.01f) p.held_s = 0.0f;  // the cap is reached again: the cap paces
+    if ((before > 0.0f) != (p.held_s > 0.0f) || (p.windows % 64 == 0 && p.held_s > 0.0f))
+        host_log("frame rate: frame generation's held pace %.1f fps (cap %.1f; real frames %.1f/s, limiter wait %.1f ms, gpu %s)",
+                 p.held_s > 0.0f ? 1.0 / p.held_s : 1.0 / cap, 1.0 / cap, 1.0 / interval, wait * 1e3,
+                 gpu_known ? (std::to_string(static_cast<int>(gpu * 100.0 + 0.5)) + "%").c_str() : "unknown");
+}
+
+// The cap's real frame interval: the rate's, and while frames are generated
+// on Display-Limited twice it, so what is shown, real and generated, is at the
+// display's rate.
+float fg_cap_target() {
+    const float t = pace_target_of_rate();
+    if (t <= 0.0f || !g_fg_pace.on || !g_uncapped || !fg_generating() || loading_screen_up()) return t;
+    return t * 2.0f;
+}
+
+float pace_target() {
+    const float t = fg_cap_target();
+    return t > 0.0f && g_fg_pace.held_s > 0.0f ? std::max(t, g_fg_pace.held_s) : t;
 }
 
 // BBHOST_TEST_STEP_FPS=N (a test switch): every frame's step is exactly 1/N
@@ -1781,8 +1882,10 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         sprj_flipper_update(f, clock, target);
         // The bottleneck meter (host/perf_meter.h): the limiter's wait and the
         // rate it held the frame to (none on a loading screen; the game's own 30).
-        perf_meter_limiter(host_clock_monotonic_ns() - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
+        const std::uint64_t waited_t1 = host_clock_monotonic_ns();
+        perf_meter_limiter(waited_t1 - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
                            g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : g_game_fps == 30 ? 30.0f : 0.0f);
+        fg_pace_note(waited_t1, waited_t1 - wait_t0, g_fast_target ? 0.0f : fg_cap_target());
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         if (converted) each_frame(f);
