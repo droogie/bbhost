@@ -470,8 +470,8 @@ Setting g_set[kSettingCount] = {
     // size (host/upscale_pass.cpp).
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
-     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. Needs "
-     "AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
+     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
+     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the

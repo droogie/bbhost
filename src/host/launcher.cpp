@@ -932,7 +932,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::toggle_row("Frame generation", nullptr, &fg,
                                        "AMD FidelityFX frame generation: a frame made between each two of "
                                        "the game's, from the 3D alone - the HUD and the menus are never interpolated. Works "
-                                       "with any Upscaling choice, Off included."))
+                                       "with any Upscaling choice, Off included. While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped."))
                         host_opt_set("frame_generation", fg);
                     // While on, a Frame rate above half the refresh rate comes down to it (F10: as it turns on).
                     if (fg) host_frame_rate_fit(&cap_choice, &cap_custom, &cap_custom_fps);
