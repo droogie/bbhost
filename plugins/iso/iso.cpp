@@ -70,7 +70,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.4.0",
+    "0.4.1",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -394,34 +394,39 @@ void normalise(float v[3]) {
         for (int i = 0; i < 3; ++i) v[i] /= l;
 }
 
-// The sound's listener at the hunter. FMOD Ex (in the eboot) hears from
-// where System::set3DListenerAttributes (0x11075e0: this, listener, pos, vel,
-// forward, up) puts it, which the game takes from the drawn camera - 14 m and
-// more up in the air here, so everything was faint. The hook hands FMOD the
-// hunter's head instead of the camera's place; forward and up stay the
-// camera's, so left and right are still the screen's. The place is taken on
-// the game's thread (on_view) and read here on FMOD's: a read that meets a
-// write halfway hears from a frame's movement away, once.
+// The sound's listener at the hunter. The game's sound manager keeps its
+// listeners (count at +0x280, 0x70 bytes each from +0xc0: a matrix with the
+// place in its last row, then the velocity) and each frame, in its update
+// (0x2c14280: this, dt), hands every listener's place to FMOD
+// (System::set3DListenerAttributes) and to each of its sound emitters, whose
+// own update decides from it what is in reach and how loud it plays. The game
+// puts the drawn camera there - 14 m and more up in the air here, so the
+// places' sounds were faint or never started. The hook moves the places to
+// the hunter's head as the update starts; forward and up stay the camera's,
+// so left and right are still the screen's. The place is taken on the game's
+// thread (on_view) and read here on the sound's: a read that meets a write
+// halfway hears from a frame's movement away, once.
 volatile float g_ear[3] = {0, 0, 0};
 std::atomic<bool> g_ear_on{false};  // while the view is ours
 constexpr float kEarHeight = 1.5f;  // the hunter's head, metres over the feet
+constexpr std::uint64_t kSoundUpdate = 0x2c14280;
 
-int listener_hook(BbHookCtx* c, void*) {
-    if (g_ear_on.load(std::memory_order_acquire) && c->arg[2]) {
-        thread_local float out[4];
-        out[0] = g_ear[0];
-        out[1] = g_ear[1];
-        out[2] = g_ear[2];
-        out[3] = 0;
-        static const bool trace = std::getenv("ISO_LOG") != nullptr;
-        static std::atomic<int> calls{0};
-        if (trace && calls.fetch_add(1, std::memory_order_relaxed) % 300 == 0) {
-            const float* was = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(c->arg[2]));
-            api->log("iso: listener %.2f %.2f %.2f (the game's %.2f %.2f %.2f)", static_cast<double>(out[0]),
-                     static_cast<double>(out[1]), static_cast<double>(out[2]), static_cast<double>(was[0]),
-                     static_cast<double>(was[1]), static_cast<double>(was[2]));
-        }
-        c->arg[2] = reinterpret_cast<std::uint64_t>(out);
+int sound_update_hook(BbHookCtx* c, void*) {
+    auto* const manager = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(c->arg[0]));
+    if (!g_ear_on.load(std::memory_order_acquire) || !manager) return 0;
+    const std::uint32_t count = *reinterpret_cast<const std::uint32_t*>(manager + 0x280);
+    static const bool trace = std::getenv("ISO_LOG") != nullptr;
+    static std::atomic<int> calls{0};
+    const bool log = trace && calls.fetch_add(1, std::memory_order_relaxed) % 300 == 0;
+    for (std::uint32_t i = 0; i < count && i < 4; ++i) {
+        float* const place = reinterpret_cast<float*>(manager + 0xc0 + i * 0x70 + 0x30);
+        if (log)
+            api->log("iso: listener %u %.2f %.2f %.2f (the game's %.2f %.2f %.2f)", i, static_cast<double>(g_ear[0]),
+                     static_cast<double>(g_ear[1]), static_cast<double>(g_ear[2]), static_cast<double>(place[0]),
+                     static_cast<double>(place[1]), static_cast<double>(place[2]));
+        place[0] = g_ear[0];
+        place[1] = g_ear[1];
+        place[2] = g_ear[2];
     }
     return 0;
 }
@@ -561,10 +566,10 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     host->on_option("iso", &on_option, nullptr);
     omni_roll(true);  // always: part of the mode (Kyo)
     if (s.enabled) {
-        static const std::uint8_t kListenerPrologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
-                                                           0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
-        if (host->hook2(0x11075e0, kListenerPrologue, sizeof(kListenerPrologue), &listener_hook, nullptr) != 0)
-            host->log("iso: FMOD's listener is not where it should be; the sound stays at the camera");
+        static const std::uint8_t kSoundUpdatePrologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                                               0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x68};
+        if (host->hook2(kSoundUpdate, kSoundUpdatePrologue, sizeof(kSoundUpdatePrologue), &sound_update_hook, nullptr) != 0)
+            host->log("iso: the sound manager's update is not where it should be; the sound stays at the camera");
         if (host->on_camera(&on_camera, nullptr) != 0 || host->on_view(&on_view, nullptr) != 0) {
             host->log("iso: the host has no camera hooks; the view is off");
         } else {
