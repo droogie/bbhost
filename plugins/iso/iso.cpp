@@ -70,7 +70,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.4.1",
+    "0.4.2",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -89,8 +89,8 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_FLOAT | BB_OPT_LIVE, "flatten", "Flatten (telephoto)",
      "Less perspective: the view narrowed to this field of view (degrees) and moved back to frame the hunter as the Field "
      "of view at the Distance does - near orthographic. 0: off. The game's fog grows with the distance, so small values "
-     "look hazy.",
-     "0", 0, 15},
+     "look hazy; it does nothing at or above the Field of view.",
+     "0", 0, 60},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Look-at height", "The point the view centres on, metres above the hunter's feet.",
      "1.0", 0, 2.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
@@ -228,7 +228,7 @@ void read_options() {
     s.pitch = number("iso.pitch", 55.0f, 25, 89);
     s.distance = number("iso.distance", 14.0f, 3, 40);
     s.fov = number("iso.fov", 35.0f, 15, 75);
-    s.flatten = number("iso.flatten", 0, 0, 15);
+    s.flatten = number("iso.flatten", 0, 0, 60);
     s.height = number("iso.height", 1.0f, 0, 2.5f);
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
     const char* cu = api->config("iso.cutaway");
