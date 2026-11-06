@@ -70,10 +70,11 @@
 //
 // Old-hardware sound (audio_crush, API 21). Everything the game plays, as its
 // final mix reaches the device: low-passed (the PS1's SPU and its Gaussian
-// interpolation lost the top end), held down to a lower rate and truncated to
-// fewer bits, no dither. PS1: 22050 Hz, 12 bits, low-passed at 10 kHz -
-// muffled, a little grainy. Crunchy: 11025 Hz, 8 bits and no low-pass, so the
-// steps alias - a cheap sampler's. Custom: its own rate and bits, low-passed
+// interpolation lost the top end), held down to a lower rate and rounded to
+// fewer bits, no dither, the host smoothing the held steps as a DAC's output
+// filter did. PS1: 22050 Hz, 12 bits, low-passed at 10 kHz - muffled, a little
+// grainy. Crunchy: 11025 Hz, 8 bits and no low-pass going in, so what is above
+// half the rate folds back down - a cheap sampler's. Custom: its own rate and bits, low-passed
 // just under the rate's Nyquist. Off by default; on a host before API 21 the
 // option does nothing and the look works as before.
 #include "bbhost_plugin.h"
@@ -89,7 +90,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "ps1",
     "Bloodborne PS1",
-    "0.3.1",
+    "0.3.2",
     "Kyo",
     "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
     "native. Optionally the sound of an old console's sound chip. Turns on and off in the game.",
@@ -118,7 +119,7 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "audio", "Sound", "Everything the game plays.", nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "sound", "Old-hardware sound",
      "The game's sound as an old console's sound chip played it. PS1: 22050 Hz, 12 bits, the top end muffled above 10 kHz. "
-     "Crunchy: 11025 Hz and 8 bits, unfiltered, so it crackles. Custom: the rate and bits below.",
+     "Crunchy: 11025 Hz and 8 bits, unfiltered going in, so it aliases like a cheap sampler. Custom: the rate and bits below.",
      "Off", 0, 0, "Off|PS1|Crunchy|Custom"},
     {BB_OPT_FLOAT | BB_OPT_LIVE | BB_OPT_WHEN, "sound_rate", "Custom rate (Hz)",
      "Custom's sample rate: each sample held until the next at this rate, muffled just below half of it.", "22050.0", 2000.0, 48000.0,

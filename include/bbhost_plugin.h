@@ -573,8 +573,10 @@ typedef struct BbHostApi {
     /* Version 21: old-hardware sound. Everything the game plays - its final
      * mix, as it reaches the device - low-passed at `lowpass_hz` (a one-pole
      * filter: the muffled top end of a PS1-era sound chip), held down to
-     * `rate_hz` (sample-and-hold, the steps kept across buffers) and truncated
-     * to `bits` a sample (no dither: the crunch). 0 turns each off; all three
+     * `rate_hz` (sample-and-hold, the steps kept across buffers), rounded to
+     * `bits` a sample (no dither: the crunch; quieter than half a step is
+     * silence) and, after a hold, smoothed at 0.45 of `rate_hz` as a DAC's
+     * output filter smoothed its steps. 0 turns each off; all three
      * 0 is the game's own sound, which costs nothing. Any thread, from the
      * next buffer. */
     void (*audio_crush)(int rate_hz, int bits, float lowpass_hz);
