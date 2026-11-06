@@ -589,6 +589,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kChromaticAberration},
     {Row::Option, nullptr, kVignette},
     {Row::Option, nullptr, kSsr},
+    {Row::Option, nullptr, kDynamicShadows},
+    {Row::Option, nullptr, kShadowResolution},
     {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
@@ -600,8 +602,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSharpness},
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kShadowDistance},
-    {Row::Option, nullptr, kDynamicShadows},
-    {Row::Option, nullptr, kShadowResolution},
     {Row::Option, nullptr, kAoStrength},
     {Row::Option, nullptr, kSaturation},
     {Row::Option, nullptr, kFog},
@@ -1808,9 +1808,16 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     } else if (id == kFrameCap || id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
-    } else if (n <= 4) {
+    } else if (n <= 4 || id == kShadowResolution) {
+        // Shadow resolution's six sizes as buttons too, as wide as a slider
+        // so their names fit.
         const char* const* tips = id == kShaders ? kHostShaderModeTips : value_tips(id, names != nullptr);
-        ui::segmented("##v", &want, names ? names : s.values.data(), n, cw, tips,
+        float bw = cw;
+        if (n > 4) {
+            bw = std::min(std::round(520 * sc), w * 0.62f);
+            ImGui::SetCursorScreenPos(ImVec2(p.x + w - bw, p.y));
+        }
+        ui::segmented("##v", &want, names ? names : s.values.data(), n, bw, tips,
                       id == kShaders ? "Applies at the next start." : nullptr);
     } else {
         // A scale: the slider shows the step's own name (+10%, x1.4, 5).
