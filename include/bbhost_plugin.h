@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 20
+#define BB_PLUGIN_API_VERSION 21
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -554,6 +554,15 @@ typedef struct BbHostApi {
      * the game state on_camera reaches through its second hook (a warp's).
      * Main thread. 0 on success; 1 for another eboot. */
     int (*on_view)(void (*fn)(BbCamera* cam, void* user), void* user);
+
+    /* Version 21: old-hardware sound. Everything the game plays - its final
+     * mix, as it reaches the device - low-passed at `lowpass_hz` (a one-pole
+     * filter: the muffled top end of a PS1-era sound chip), held down to
+     * `rate_hz` (sample-and-hold, the steps kept across buffers) and truncated
+     * to `bits` a sample (no dither: the crunch). 0 turns each off; all three
+     * 0 is the game's own sound, which costs nothing. Any thread, from the
+     * next buffer. */
+    void (*audio_crush)(int rate_hz, int bits, float lowpass_hz);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

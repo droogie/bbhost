@@ -29,6 +29,7 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/ruleset.h"
 #include "host/scene_look.h"
@@ -1202,6 +1203,14 @@ void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
 void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
 void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
 
+// Version 21: old-hardware sound (host/audio_crush.h).
+void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
+    audio_crush_set(rate_hz, bits, lowpass_hz);
+    if (!audio_crush_on()) host_log("plugin: the game's sound as it is");
+    else host_log("plugin: the game's sound held to %d Hz, %d bits, low-passed at %.0f Hz (0: off)", rate_hz, bits,
+                  static_cast<double>(lowpass_hz));
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1222,6 +1231,7 @@ const BbHostApi g_api = {
     &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
     &api_gbuffer_ambient,
     &api_on_view,
+    &api_audio_crush,
 };
 
 std::string read_file(const std::string& path) {
