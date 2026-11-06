@@ -508,8 +508,8 @@ motion's turns and its lag toward what it follows
 Ebrietas's attacks left sparks that never ended - 1/30 s steps at 60, 1/60 s
 steps at 120). The wind's warm-up after a load (the grass and trees settling)
 counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
-before). How the effects keep time is the Effect timing setting (F10's
-DISPLAY page, or the same row on the setup window's Game page; it applies
+before). How the effects keep time is the Effect timing setting (the Game
+page of F10 or of the setup window; it applies
 when the game starts):
 - 30 fps runs them all on whole 1/30 s steps, the cadence the game has at
   30: above 30 fps they move less smoothly than the rest of the picture.

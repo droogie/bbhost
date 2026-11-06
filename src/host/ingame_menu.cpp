@@ -554,9 +554,8 @@ const std::vector<Page>& menu_pages() {
     static const struct {
         const char* name;
         ui::Icon icon;
-    } kIcons[] = {{"Display", ui::Icon::Display},   {"Input", ui::Icon::Game},       {"Graphics", ui::Icon::Image},
-                  {"PC Enhancements", ui::Icon::Enhance}, {"Startup", ui::Icon::Play}, {"Account", ui::Icon::User},
-                  {"Updates", ui::Icon::Download}};
+    } kIcons[] = {{"Game", ui::Icon::Game},       {"Graphics", ui::Icon::Image},     {"PC Enhancements", ui::Icon::Enhance},
+                  {"Settings", ui::Icon::Settings}};
     auto own = [&](int* at, const Page& p) {
         *at = static_cast<int>(pages.size());
         pages.push_back(p);

@@ -77,8 +77,8 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "startup.skip_intro") return config().skip_intro;
     if (option == "loading.quick_reentry") return config().quick_reentry;
     if (option == "streaming.all_post_processors") return config().all_post_processors;
-    if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > STARTUP, read once
-    if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > STARTUP, read once
+    if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > Game, read once
+    if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > Game, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
     if (option == "graphics.shadow_resolution") return shadow_resolution_on();  // F10 > GRAPHICS (and Performance mode), read once

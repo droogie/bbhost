@@ -547,22 +547,40 @@ Setting g_set[kSettingCount] = {
     {"menu_vibrance", "Menu vibrance", signed_steps(-100, 100, "%"), 100, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
 };
 
+// The in-game menu's pages, one a header, in the setup window's order: Game
+// (its Display and Online cards: the window and the frame rate, the start,
+// then what only the game shows, then the account), Graphics, Controls
+// (INPUT, over the bindings), PC Enhancements - the patches and the plugins
+// after it (host/ingame_menu.cpp) - and Settings (the menus, the updates).
 const Row g_rows[] = {
-    {Row::Header, "DISPLAY"},
+    {Row::Header, "GAME"},
     {Row::Option, nullptr, kWindowMode},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kEffectTiming},
+    {Row::Option, nullptr, kFrameGeneration},
+    {Row::Option, nullptr, kSkipLogos},
+    {Row::Option, nullptr, kPerformanceMode},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
-    {Row::Option, nullptr, kMenuTextSize},
-    {Row::Option, nullptr, kMenuHue},
-    {Row::Option, nullptr, kMenuVibrance},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
+    // The private server's account (account_page, after the rows above). No
+    // passwords: link this PC to the account signed into on the website with
+    // Discord, or make one held by this PC with a recovery code. The token is
+    // kept in the options file.
+    {Row::Info, nullptr, -1, 0},
+    {Row::Info, nullptr, -1, 1},
+    {Row::Action, "Link with Discord", -1, 0},
+    {Row::Text, "Name", -1, 0},
+    {Row::Action, "Create account on this PC", -1, 1},
+    {Row::Text, "Recovery code", -1, 1},
+    {Row::Action, "Recover account", -1, 2},
+    {Row::Action, "Website sign-in code", -1, 3},
+    {Row::Action, "Sign out", -1, 4},
     {Row::Header, "INPUT"},
     {Row::Option, nullptr, kMouseMenu},
     {Row::Option, nullptr, kMouseCamera},
@@ -591,7 +609,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsr},
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
-    {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     // The preset row (preset_row): for FSR its preset - the Upscaling quality
@@ -611,23 +628,11 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
-    {Row::Header, "STARTUP"},
-    {Row::Option, nullptr, kSkipLogos},
-    {Row::Option, nullptr, kPerformanceMode},
-    // The private server's account. No passwords: link this PC to
-    // the account signed into on the website with Discord, or make one held
-    // by this PC with a recovery code. The token is kept in the options file.
-    {Row::Header, "ACCOUNT"},
-    {Row::Info, nullptr, -1, 0},
-    {Row::Info, nullptr, -1, 1},
-    {Row::Action, "Link with Discord", -1, 0},
-    {Row::Text, "Name", -1, 0},
-    {Row::Action, "Create account on this PC", -1, 1},
-    {Row::Text, "Recovery code", -1, 1},
-    {Row::Action, "Recover account", -1, 2},
-    {Row::Action, "Website sign-in code", -1, 3},
-    {Row::Action, "Sign out", -1, 4},
-    {Row::Header, "UPDATES"},
+    {Row::Header, "SETTINGS"},
+    {Row::Option, nullptr, kMenuTextSize},
+    {Row::Option, nullptr, kMenuHue},
+    {Row::Option, nullptr, kMenuVibrance},
+    // The updates (updates_page, after the rows above).
     {Row::Info, nullptr, -1, 10},
     {Row::Info, nullptr, -1, 11},
     {Row::Action, "Check for updates", -1, 10},
@@ -1654,13 +1659,11 @@ const std::vector<OptionsPage>& pages() {
             const char* name;
             const char* blurb;
         } kNames[] = {
-            {"DISPLAY", "Display", "The window, the frame rate, and what is shown over the game."},
+            {"GAME", "Game", "The window, the frame rate and the start, what is shown over the game, and the online account."},
             {"INPUT", "Input", "The mouse, the pointer and the button prompts."},
             {"GRAPHICS", "Graphics", "The game's effects and detail. Most change at once."},
             {"PC ENHANCEMENTS", "PC Enhancements", "Additions to the game itself, read as it starts."},
-            {"STARTUP", "Startup", "What happens as the game starts."},
-            {"ACCOUNT", "Account", "The private server's account. No passwords: this PC keeps a token."},
-            {"UPDATES", "Updates", "Newer releases of bbhost."},
+            {"SETTINGS", "Settings", "bbhost's own menus, and newer releases of bbhost."},
         };
         std::vector<OptionsPage> out;
         for (int r = 0; r < kRowCount; ++r) {
@@ -2035,8 +2038,6 @@ bool row_greyed(int id) {
 void host_options_draw_page(int page) {
     if (page < 0 || page >= host_options_page_count()) return;
     const OptionsPage& pg = pages()[static_cast<std::size_t>(page)];
-    if (std::strcmp(pg.header, "ACCOUNT") == 0) return account_page();
-    if (std::strcmp(pg.header, "UPDATES") == 0) return updates_page();
     ui::card_begin("##rows", ImVec2(ImGui::GetContentRegionAvail().x, 0));
     bool first = true;
     for (int r = pg.first; r < pg.end; ++r) {
@@ -2054,6 +2055,13 @@ void host_options_draw_page(int page) {
         ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
     }
     ui::card_end();
+    // The pages that end in a card of their own, as the setup window's do.
+    const bool game = std::strcmp(pg.header, "GAME") == 0, settings = std::strcmp(pg.header, "SETTINGS") == 0;
+    if (game || settings) {
+        ImGui::Dummy(ImVec2(0, 8 * ui::scale()));
+        if (game) account_page();
+        else updates_page();
+    }
 }
 
 void host_options_draw_setup_page(int page) {

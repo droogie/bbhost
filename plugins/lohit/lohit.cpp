@@ -90,7 +90,7 @@
 // where no lamp reaches; the lo-hit has none, so `ambient` stands in.
 //
 // The post-effects (Giga Performance Patch's) are the host's Performance mode
-// now (the setup window's main page, F10 > STARTUP).
+// now (the setup window's main page, F10 > Game).
 #include "bbhost_plugin.h"
 
 #include <algorithm>
