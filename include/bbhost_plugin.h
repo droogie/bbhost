@@ -115,6 +115,13 @@ typedef struct BbChr {
                                      vanilla player can be summoned into a world this plugin made; the
                                      server lets players advertising it (X-BBHost-Adopt) meet across
                                      this plugin's rules */
+#define BB_PLUGIN_LIVE_SWITCH 8u  /* version 21: turned on and off while the game runs. With BB_PLUGIN_OPT_IN it
+                                     is loaded even when off - bb_plugin_init and bb_plugin_image run, and
+                                     config("plugins.<name>") says whether it is on ("true") - and asks for
+                                     nothing until it is; the player's switch then comes to on_option as
+                                     the key "" ("true" or "false"), on the main thread, and the plugin
+                                     applies or takes back what it does. Not for BB_PLUGIN_GAMEPLAY
+                                     plugins (their rules are the session's): the host ignores it there. */
 typedef struct BbPluginInfo {
     uint32_t api_version;    /* BB_PLUGIN_API_VERSION it was built against */
     uint32_t flags;          /* BB_PLUGIN_* */
@@ -148,6 +155,12 @@ typedef struct BbPluginInfo {
 #define BB_OPT_HEADING 7   /* a section title: label (and help) only */
 #define BB_OPT_LIVE 0x100u /* or-ed into type: takes effect at once in game
                               (on_option); without it, at the next start */
+#define BB_OPT_WHEN 0x200u /* version 21, or-ed into the type of any option but a
+                              CHOICE: its `choices` is "key=value" ("key=a|b" for any
+                              of them), and the menus grey the row out unless the
+                              plugin's option `key` holds that value (older hosts
+                              show it as always). On a HEADING it covers the rows
+                              under it, up to the next heading. */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -359,7 +372,9 @@ typedef struct BbHostApi {
     /* Version 9: settings and actions from the plugin menus, and files. */
     /* fn(key, value, user) when the player changes one of the calling
      * plugin's options in the in-game menu (key without the section; value
-     * as text). `name` is the plugin's BbPluginInfo name. Main thread. */
+     * as text). `name` is the plugin's BbPluginInfo name. Main thread.
+     * Version 21: a BB_PLUGIN_LIVE_SWITCH plugin also gets the key "" when
+     * the player turns it on ("true") or off ("false"). */
     int (*on_option)(const char* name, void (*fn)(const char* key, const char* value, void* user), void* user);
     /* fn(action, user) when the player presses one of the plugin's
      * BB_OPT_ACTION buttons in the in-game menu. Main thread. */
