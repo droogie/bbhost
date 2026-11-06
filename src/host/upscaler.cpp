@@ -34,15 +34,14 @@ float halton(std::uint32_t i, std::uint32_t base) {
 }
 
 // TAA's jitter: Halton (2, 3) over 8 phases, centred, never phase 0 (the
-// centre itself); and its LOD bias, a little sharper than the native size's
-// own - the history's average of 8 jittered frames softens the textures by
-// about that much.
+// centre itself); and its LOD bias, none (Numity1504's step 9: the negative
+// bias is for upscaling only).
 void taa_jitter(std::uint32_t frame, float* x, float* y) {
     const std::uint32_t phase = frame % 8 + 1;
     *x = halton(phase, 2) - 0.5f;
     *y = halton(phase, 3) - 0.5f;
 }
-constexpr float kTaaMipBias = -0.5f;
+constexpr float kTaaMipBias = 0.0f;
 
 }  // namespace
 
@@ -55,10 +54,12 @@ constexpr float kTaaMipBias = -0.5f;
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -186,11 +187,49 @@ namespace {
 std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture from then on
 }  // namespace
 
+// BBsuite's layer beside the exe (a vulkan-1.dll whose version resource's
+// ProductName does not start with "Vulkan": not the loader). It runs its own
+// TAA and jitter, so ours stays off with it - the bridge's UB_ERR_BLOCKED for
+// TAA, which has no bridge to ask (Numity1504's step 9, "Only one AA").
+bool bbsuite_layer_present() {
+    static const bool present = [] {
+        wchar_t exe[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        if (!n || n >= MAX_PATH) return false;
+        const std::filesystem::path dll = std::filesystem::path(exe).parent_path() / L"vulkan-1.dll";
+        std::error_code ec;
+        if (!std::filesystem::exists(dll, ec)) return false;
+        DWORD handle = 0;
+        const DWORD size = GetFileVersionInfoSizeW(dll.c_str(), &handle);
+        std::wstring product;
+        if (size) {
+            std::vector<unsigned char> info(size);
+            struct Lang {
+                WORD lang, page;
+            }* langs = nullptr;
+            UINT len = 0;
+            if (GetFileVersionInfoW(dll.c_str(), 0, size, info.data()) &&
+                VerQueryValueW(info.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&langs), &len) && len >= sizeof(Lang)) {
+                wchar_t key[64];
+                swprintf(key, 64, L"\\StringFileInfo\\%04x%04x\\ProductName", langs[0].lang, langs[0].page);
+                wchar_t* name = nullptr;
+                if (VerQueryValueW(info.data(), key, reinterpret_cast<void**>(&name), &len) && name && len) product = name;
+            }
+        }
+        const bool other = product.rfind(L"Vulkan", 0) != 0;
+        host_log("upscaler: a vulkan-1.dll beside bbhost.exe (%ls): %s", product.empty() ? L"no product name" : product.c_str(),
+                 other ? "BBsuite's or another layer - TAA stays off (it runs its own)" : "the Vulkan loader");
+        return other;
+    }();
+    return present;
+}
+
 int upscaler_method() {
     // Chosen, it wins over a plugin's 3D at a size of its own (host/scene_look.h).
-    // TAA is bbhost's own: it needs neither the bridge nor its caps.
+    // TAA is bbhost's own: it needs neither the bridge nor its caps - only no
+    // BBsuite beside it.
     const int asked = method_asked();
-    if (asked == kUpscaleTaa) return kUpscaleTaa;
+    if (asked == kUpscaleTaa) return bbsuite_layer_present() ? 0 : kUpscaleTaa;
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
     return (asked == 1 && g_caps_dlss.load(std::memory_order_relaxed)) || (asked == 2 && g_caps_fsr.load(std::memory_order_relaxed)) ? asked : 0;
 }
