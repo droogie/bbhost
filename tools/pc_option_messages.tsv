@@ -36,7 +36,7 @@
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players, SKILL ISSUE. Each needs a restart.
-110014	PC Upscaling	FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
+110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116002	Mouse in Menus	Move and click to select.
@@ -179,9 +179,9 @@
 14000336	Undo Rebirth	
 125020	PC Upscaling	
 125000	Frame Generation	A frame made between each two of the game's, from the 3D alone. The game then runs at most half your refresh rate.
-125001	Sharpness	Sharpens the upscaled 3D (FSR or DLSS). 0 leaves the upscaler's picture as it is. Needs Upscaling on.
+125001	Sharpness	Sharpens the anti-aliased or upscaled 3D (TAA, FSR or DLSS). 0 leaves the upscaler's picture as it is. Needs Upscaling on.
 125002	Reflection Quality	The reflections' resolution. Quarter is about four times cheaper; Half is the game's own, sharper.
-125003	Upscaling	FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
+125003	Upscaling	TAA (bbhost's own, any GPU), FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
 125004	Upscaling Quality	How much smaller the 3D is drawn: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125030	Quarter	
 125031	Half	
@@ -193,3 +193,4 @@
 125037	Balanced	
 125038	Quality	
 125039	Native AA	
+125040	TAA	

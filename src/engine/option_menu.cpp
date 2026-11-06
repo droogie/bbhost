@@ -725,7 +725,8 @@ Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
 Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
 const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
 std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
-const Choice kUpscalers[] = {{0, 125032}, {1, 125033}, {2, 125034}, {3, 125035}};      // Off, FSR 3, FSR 4, DLSS
+// Off, TAA, FSR 3, FSR 4, DLSS: the option's own order (host/options.cpp), TAA's message after the list's.
+const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034}, {4, 125035}};
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
 std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
 std::int32_t g_up_quality = 2, g_up_quality_last = -1;
