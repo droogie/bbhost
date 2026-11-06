@@ -9,6 +9,7 @@
 #include "ffx_framegeneration.h"
 #include "vk/ffx_api_framegeneration_vk.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -35,6 +36,9 @@ VkDevice g_device = VK_NULL_HANDLE;
 VkPhysicalDevice g_phys = VK_NULL_HANDLE;
 VkFormat g_sc_format = VK_FORMAT_UNDEFINED;
 VkExtent2D g_sc_extent{};
+// The largest render size the frame generation context was made for: the
+// prepare of a larger one is refused (the frame presented as it is).
+VkExtent2D g_max_render{};
 
 // The game's side: each display buffer's last HUD-less copy and the frame it
 // is of (the game draws into at most three in turn).
@@ -196,12 +200,20 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
     fg.header.pNext = &backend.header;
     fg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
     fg.displaySize = {sci.imageExtent.width, sci.imageExtent.height};
-    fg.maxRenderSize = fg.displaySize;
+    // The render size can be above the display's: a Resolution larger than the
+    // window (2560x1440 on a 1080p screen). With the display's size as the
+    // most, AMD read only the top-left 1920x1080 of the 2560x1440 depth and
+    // motion - the rest of the picture (the right and bottom quarter on
+    // screen) generated from nothing, blurred blocks on every generated frame.
+    const HostSettings& hs = host_settings_ref();
+    fg.maxRenderSize = {std::max<std::uint32_t>(sci.imageExtent.width, static_cast<std::uint32_t>(std::max(hs.res_width, 0))),
+                        std::max<std::uint32_t>(sci.imageExtent.height, static_cast<std::uint32_t>(std::max(hs.res_height, 0)))};
     fg.backBufferFormat = ffxApiGetSurfaceFormatVK(sci.imageFormat);
     if (g_create(&g_fg_ctx, &fg.header, nullptr) != FFX_API_RETURN_OK) {
         host_log("framegen: the frame generation context was not made; AMD's swapchain presents every frame as it comes");
         g_fg_ctx = nullptr;
     }
+    g_max_render = {fg.maxRenderSize.width, fg.maxRenderSize.height};
     g_swapchain = made;
     g_device = device;
     g_phys = phys;
@@ -214,8 +226,8 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
                              L"vulkan-1.dll", L"upscaler_bridge.dll", L"amd_fidelityfx_upscaler_vk.dll"})
         if (HMODULE h = GetModuleHandleW(m)) host_log("framegen: module %ls at %p", m, static_cast<void*>(h));
 #endif
-    host_log("framegen: AMD's swapchain %ux%u in place (queues 2-4 of family %u)%s", sci.imageExtent.width, sci.imageExtent.height,
-             family, g_fg_ctx ? ", frame generation on for the flips whose motion was prepared" : "");
+    host_log("framegen: AMD's swapchain %ux%u in place, render sizes up to %ux%u (queues 2-4 of family %u)%s", sci.imageExtent.width,
+             sci.imageExtent.height, g_max_render.width, g_max_render.height, family, g_fg_ctx ? ", frame generation on for the flips whose motion was prepared" : "");
     return true;
 }
 
@@ -244,7 +256,18 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = g_swapchain;
         cfg.frameGenerationEnabled = on;
-        cfg.allowAsyncWorkloads = false;  // the generation on the present queue, not async compute, for now
+        // The generation on AMD's async compute queue (queue 4), beside the
+        // game's next frame. On the present queue it waited behind that frame's
+        // work whenever the GPU was full, and the generated frame came out late:
+        // shown 9.5 / 14.5 ms in turn where 12 / 12 was asked (2026-11-06, 960
+        // cap, ~95 real frames). With it: real and generated frames' screen
+        // time 0.45 -> 0.16 apart (the median pair's |a - b| / (a + b)), display
+        // latency p95 16 -> 10.5 ms. BBHOST_FG_ASYNC=0: on the present queue.
+        static const bool async = [] {
+            const char* e = std::getenv("BBHOST_FG_ASYNC");
+            return !(e && e[0] == '0');
+        }();
+        cfg.allowAsyncWorkloads = async;
         cfg.frameGenerationCallback = dispatch_generation;
         cfg.frameGenerationCallbackUserContext = &g_fg_ctx;
         if (on)
@@ -293,6 +316,15 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
 
 bool framegen_prepare(VkCommandBuffer cb, std::uint64_t id, const FramegenInputs& in) {
     if (!g_fg_ctx || !in.depth || !in.motion) return false;
+    if (in.render_w > g_max_render.width || in.render_h > g_max_render.height) {
+        // A Resolution raised past the context's size since it was made: no
+        // generation until the swapchain is made again.
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 2)
+            host_log("framegen: render size %ux%u is above the %ux%u frame generation was made for: frames presented as they are",
+                     in.render_w, in.render_h, g_max_render.width, g_max_render.height);
+        return false;
+    }
     // AMD's backend reads an image in the layout its state names: depth goes
     // to GENERAL for it (COMMON) and back.
     const bool move = in.depth_layout != VK_IMAGE_LAYOUT_GENERAL;

@@ -931,8 +931,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     bool fg = host_opt_get("frame_generation");
                     if (ui::toggle_row("Frame generation", nullptr, &fg,
                                        "AMD FidelityFX frame generation: a frame made between each two of "
-                                       "the game's, from the 3D alone - the HUD and the menus are never interpolated. Needs "
-                                       "Upscaling (FSR or DLSS) on."))
+                                       "the game's, from the 3D alone - the HUD and the menus are never interpolated. Works "
+                                       "with any Upscaling choice, Off included."))
                         host_opt_set("frame_generation", fg);
                     host_frame_generation_warning(cap_choice, cap_custom, cap_custom_fps);
                 }

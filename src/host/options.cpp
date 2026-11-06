@@ -640,6 +640,9 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kSsrQuality},
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
+    // Frame generation on Graphics too, beside the upscaler (Kyo: on both
+    // pages); the same setting as the Game page's row.
+    {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     // The preset row (preset_row): for FSR its preset - the Upscaling quality
