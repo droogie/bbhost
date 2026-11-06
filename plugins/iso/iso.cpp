@@ -14,34 +14,40 @@
 //   omni_roll = true    # 4-way omni quicksteps (Modern Movement's, without its quick item)
 //
 // Two cameras. The game keeps its own - ChrFollowCam (the camera manager's
-// +0x60) orbits the hunter, and the manager's blend of it (and of the lock-on
-// camera) is what the controls move by and the aim reads. The scene's camera
-// is a copy of that, made each frame and drawn from (plugin API 20's on_view).
-// So the game's camera is kept level, at the yaw the view turns to (on_camera),
-// and only the drawn copy looks down (on_view): the hunter walks where the stick
-// points on the screen and aims straight ahead, not at the floor, and the drawn
-// camera, placed by us at the hunter, is never pushed in by the map.
+// +0x60) orbits the hunter; the manager's blend of it and the cameras it owns
+// (the monocular's aim camera, the lock-on's) is what the controls move by and
+// the aim reads. The scene's camera is a copy of that, made each frame and drawn
+// from (plugin API 20's on_view): only the copy is turned to look down from
+// above, so the aim stays level and the drawn camera, placed by us at the
+// hunter, is never pushed in by the map.
 //
-// ChrFollowCam's fields, from its debug page (0x183f000.., the labels' own
-// offsets) and its update (sub_183ac60):
-//   +0x140 CamRotX (pitch, rad: positive looks down; RotRange MaxX 70 / MinX -40 deg)
-//   +0x144 CamRotY (yaw, rad), +0x150 TargetRotX
-//   +0x15c IsHandControl - 1 while the stick (or mouse) turns it: 0x183b8cc sets it
-//          when the input is not zero, not on a reset, and not while locked on
-//          (+0x260) unless the lock camera adjustment (+0x276) is on
-//   +0x1ec/+0x1f0 RotRange MaxX/MinX, +0x1f4/+0x1f8 RotRangeAtLock MaxX/MinX (deg)
-//   +0x240 LockRotChaseRate - how fast the lock-on turns the camera to the target
-//   +0x274 UpdateTargetRotXByLock, +0x275 UpdateTargetRotXByFrontLock,
-//   +0x276 the lock camera adjustment ("ロックカメラ調整が有効か")
-// The debug menu edits these same fields (its page holds pointers into the
-// camera, not copies); the per-area LockCamParam rows feed some of them again,
-// which is why they are written every frame rather than once.
+// The game's camera is made to suit the view once, as the game builds it: the
+// defaults its constructors write are patched (nothing is written each frame).
+// Each value lives in two places - ChrFollowCam has two constructors
+// (0x183a3c0.. and 0x183a7b0.., the second the one in play: its values are the
+// debug page's), and LOCK_TGT_MAN's lock-on rules are set by its constructor
+// (0x1c8dc71..) and again by its reset (0x1c8de03..); the debug pages point at
+// the fields both fill. ChrFollowCam (offsets from its debug page, 0x183f000..):
+//   +0x198/+0x19c ChrTransChaseRate(ForNormal), +0x1ac/+0x1b0 TargetChaseRateXZ
+//     (ForNormal), +0x1b8 TargetChaseRateY - 1: the camera keeps up with the
+//     hunter at once. Lagging, it trailed a running hunter and looked back at
+//     them, its yaw drifting from CamRotY and the stick's directions with it.
+//   +0x1bc/+0x1c0 TargetChaseRateMinAng/MaxAng - 0: no dead zone before the
+//     point looked at follows the hunter; +0x170 the pivot's sideways shift - 0.
+//   +0x1ec..+0x1f8 RotRange MaxX/MinX and at lock (radians; the page shows
+//     degrees) - 0: it never tilts, so the aim is level.
+//   +0x240 LockRotChaseRate - 0, +0x274/+0x275 UpdateTargetRotXByLock/FrontLock -
+//     off: the lock-on picks targets without turning the camera.
+//   The auto-rotation's four stores (disable-camera-auto-rotation's sites).
+// LOCK_TGT_MAN (offsets in its object):
+//   +0x2914 the invisible-lock timeout (2 s), +0x2924 ChrLockRangeMaxRadius
+//   (22 m), +0x294c/+0x2954 CamFrontNear/FarRangeLockHalfAng (60/30 degrees),
+//   +0x2958 CamFrontFarRangeLockRadius (22 m): seen from high above, the cones
+//   and the line of sight broke the lock early.
 //
-// The view's yaw is ours. The follow camera's own yaw drifts by itself - the
-// auto-rotation behind a running hunter, the lock-on turning it to the target -
-// and only its changes made by hand (IsHandControl, not locked on) turn the
-// view. The game's camera is then turned to the view's yaw and levelled, so the
-// stick's "up" is the screen's up whatever the follow camera did.
+// The view turns with CamRotY (+0x144), which only the stick or the mouse now
+// moves. When the game's camera leaves the follow camera - the monocular's
+// over-the-shoulder aim - the view glides to it, and back when it is put away.
 #include "bbhost_plugin.h"
 
 #include <chrono>
@@ -57,7 +63,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.1.0",
+    "0.2.0",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -65,8 +71,10 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "view", "The view", "The right stick or the mouse turns it left and right; the wheel zooms.", nullptr},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "enabled", "Isometric camera",
-     "The view from high above the hunter. Off: the game's own camera.", "true"},
+    {BB_OPT_BOOL, "enabled", "Isometric camera",
+     "The view from high above the hunter, and the game's camera made to suit it. Off: the game's own camera. Applies at "
+     "the next start.",
+     "true"},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "pitch", "Angle", "Degrees the view looks down below the horizon.", "55.0", 25, 89},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "distance", "Distance", "Metres from the hunter; the wheel zooms in and out from it.", "14.0",
      3, 40},
@@ -75,6 +83,15 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "1.0", 0, 2.5},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
      "Seconds the view takes to catch up with the hunter (0: fixed to them).", "0.08", 0, 0.5},
+    {BB_OPT_HEADING, "lock", "Lock-on", "Applies at the next start.", nullptr},
+    {BB_OPT_FLOAT, "lock_range", "Lock-on range", "Metres a target can be locked at and held (the game's 22).", "30.0", 10,
+     60},
+    {BB_OPT_FLOAT, "lock_angle", "Lock-on angle",
+     "Half the cone, in degrees, around where the hunter's camera looks that a target can be locked in (the game's 60 near, 30 "
+     "far); 180 is all round.",
+     "180.0", 30, 180},
+    {BB_OPT_FLOAT, "lock_hidden", "Hidden target timeout",
+     "Seconds a locked target may be out of sight before the lock lets go (the game's 2).", "8.0", 1, 30},
     {BB_OPT_HEADING, "play", "Gameplay", nullptr, nullptr},
     {BB_OPT_BOOL | BB_OPT_LIVE, "omni_roll", "Omni-roll",
      "Quicksteps and rolls in all four directions, as Modern Movement's (without its D-pad quick item).", "true"},
@@ -100,32 +117,82 @@ constexpr std::uint64_t kCaves = 0x4000000;
 struct Settings {
     bool enabled = true;
     float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f;
+    float lock_range = 30.0f, lock_angle = 180.0f, lock_hidden = 8.0f;
     bool omni_roll = true;
 } s;
 
 constexpr float kPi = 3.14159265358979f;
 constexpr float kZoomStep = 1.15f, kZoomNear = 3.0f, kZoomFar = 40.0f;
+// The game's camera off the follow camera by this much (metres, radians of
+// field of view) is another camera's - the monocular's: the view hands over.
+constexpr float kAwayPos = 0.3f, kAwayFov = 0.05f, kHandOver = 0.2f;  // seconds
 
-// The follow camera's fields (see the top).
-constexpr std::size_t kRotX = 0x140, kRotY = 0x144, kTargetRotX = 0x150, kHandControl = 0x15c, kLocked = 0x260;
-constexpr std::size_t kRotRange = 0x1ec;  // 4 floats: MaxX, MinX, AtLock MaxX, AtLock MinX
-constexpr std::size_t kLockRotChaseRate = 0x240, kLockFlags = 0x274;  // 3 bytes
+// A constant a constructor writes: the instruction at `at`, its value `skip`
+// bytes in, `size` bytes (4 a float, 1 a flag), from `was` to `want`.
+struct Default {
+    std::uint64_t at;
+    std::uint8_t skip, size;
+    float was;
+    float want;  // overwritten from the settings for the lock-on's
+};
+enum : int { kLockTimeout = 1, kLockRange, kLockAngle };
+struct Tagged {
+    Default d;
+    int from_setting;  // 0: fixed
+};
+// mov dword [rbx+off], imm32 = c7 83 off32 imm32 (value 6 in); movabs rax, imm64
+// = 48 b8 imm64 (the first field 2 in, the second 6); mov byte [rbx+off], imm8
+// = c6 83 off32 imm8 (6 in).
+Tagged kDefaults[] = {
+    // ChrFollowCam, both constructors: chase rates, RotRange, lock chase.
+    {{0x183a4b3, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a4bd, 6, 4, 0.1f, 1.0f}, 0},
+    {{0x183a4e5, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a4ef, 6, 4, 0.1f, 1.0f}, 0},
+    {{0x183a503, 6, 4, 0.03f, 1.0f}, 0},      {{0x183a585, 6, 4, 1.22173f, 0.0f}, 0},
+    {{0x183a58f, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a599, 6, 4, 0.872665f, 0.0f}, 0},
+    {{0x183a5a3, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a657, 6, 4, 0.1f, 0.0f}, 0},
+    {{0x183a6a6, 6, 1, 1, 0}, 0},             {{0x183a6ad, 6, 1, 1, 0}, 0},
+    {{0x183a8b1, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a8bb, 6, 4, 0.1f, 1.0f}, 0},
+    {{0x183a8e3, 6, 4, 0.1f, 1.0f}, 0},       {{0x183a8ed, 6, 4, 0.1f, 1.0f}, 0},
+    {{0x183a901, 6, 4, 0.03f, 1.0f}, 0},      {{0x183a983, 6, 4, 1.22173f, 0.0f}, 0},
+    {{0x183a98d, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183a997, 6, 4, 0.698132f, 0.0f}, 0},
+    {{0x183a9a1, 6, 4, -0.698132f, 0.0f}, 0}, {{0x183aa55, 6, 4, 0.3f, 0.0f}, 0},
+    // TargetChaseRateMinAng/MaxAng (+0x1bc/+0x1c0, 10 and 20 degrees): the
+    // point looked at did not follow the hunter until they were 10 degrees off
+    // it, so the camera (and the stick's directions) stayed up to 10 degrees off
+    // CamRotY; Max is left a hair above Min. FulcrumDistRateByLrMoveMaxDist
+    // (+0x170, the base constructor's only): the pivot moved with sideways steps.
+    {{0x183a50d, 6, 4, 0.174533f, 0.0f}, 0},  {{0x183a517, 6, 4, 0.349066f, 0.01f}, 0},
+    {{0x183a90b, 6, 4, 0.174533f, 0.0f}, 0},  {{0x183a915, 6, 4, 0.349066f, 0.01f}, 0},
+    {{0x183a44f, 6, 4, 0.3f, 0.0f}, 0},
+    // LOCK_TGT_MAN: its constructor, then its reset.
+    {{0x1c8dc8f, 6, 4, 2.0f, 0}, kLockTimeout},
+    {{0x1c8dcb7, 6, 4, 22.0f, 0}, kLockRange},
+    {{0x1c8dd1b, 6, 4, 1.047198f, 0}, kLockAngle},
+    {{0x1c8dd2f, 6, 4, 0.523599f, 0}, kLockAngle},
+    {{0x1c8dd39, 6, 4, 22.0f, 0}, kLockRange},
+    {{0x1c8de14, 6, 4, 2.0f, 0}, kLockTimeout},
+    {{0x1c8de25, 2, 4, 22.0f, 0}, kLockRange},
+    {{0x1c8de69, 6, 4, 1.047198f, 0}, kLockAngle},
+    {{0x1c8de7a, 6, 4, 0.523599f, 0}, kLockAngle},
+    {{0x1c8de8b, 6, 4, 22.0f, 0}, kLockRange},
+};
+// The auto-rotation's stores (disable-camera-auto-rotation.toml), 9 bytes each.
+const std::uint64_t kAutoRotation[] = {0x183c6e8, 0x183c984, 0x183dde6, 0x183c870};
 
-struct Camera {
-    std::uint8_t* follow = nullptr;  // the ChrFollowCam we wrote to
-    float saved_range[4]{};
-    float saved_chase = 0;
-    std::uint8_t saved_flags[3]{};
-    bool have_view = false;
-    float yaw = 0;           // the view's yaw (world: forward = (sin, 0, cos))
-    float last_game = 0;     // the game camera's yaw as it made it last frame
+// The follow camera's fields read each frame.
+constexpr std::size_t kRotY = 0x144;
+
+struct View {
     float zoom = 1.0f;
     float focus[3]{};
     bool have_focus = false;
-    float right_sign = 1.0f;  // the game's right is +/-(cos, 0, -sin)
-    bool view_ready = false;  // on_camera ran this frame: on_view may draw
+    float away = 0;        // 0 the iso view, 1 the game's camera (the monocular), eased between
+    float away_want = 0;   // what on_camera saw this frame
+    bool ready = false;    // on_camera ran this frame: on_view may draw
+    float yaw = 0, right_sign = 1.0f;
     std::chrono::steady_clock::time_point last;
-} cam;
+    bool started = false;
+} view;
 
 bool omni_applied = false;
 bool omni_owned[sizeof(kOmniRoll) / sizeof(kOmniRoll[0])]{};  // written by us, not found already in place
@@ -151,12 +218,9 @@ void read_options() {
     s.fov = number("iso.fov", 35.0f, 15, 75);
     s.height = number("iso.height", 1.0f, 0, 2.5f);
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
-}
-
-float wrap(float a) {
-    while (a > kPi) a -= 2 * kPi;
-    while (a < -kPi) a += 2 * kPi;
-    return a;
+    s.lock_range = number("iso.lock_range", 30.0f, 10, 60);
+    s.lock_angle = number("iso.lock_angle", 180.0f, 30, 180);
+    s.lock_hidden = number("iso.lock_hidden", 8.0f, 1, 30);
 }
 
 // The omni-roll: every site on, or the hooks back as the game had them (the
@@ -193,6 +257,57 @@ void omni_roll(bool on) {
         api->log("iso: omni-roll off (%d hooks given back)", written);
 }
 
+// The game's camera and lock-on as the view needs them, patched into the
+// constructors that build them (see the top): before the game runs, once.
+void camera_defaults() {
+    int written = 0, refused = 0;
+    for (Tagged& t : kDefaults) {
+        Default d = t.d;
+        if (t.from_setting == kLockTimeout) d.want = s.lock_hidden;
+        else if (t.from_setting == kLockRange) d.want = s.lock_range;
+        else if (t.from_setting == kLockAngle) d.want = s.lock_angle * kPi / 180.0f;
+        // The instruction checked by its opcode and the value it holds by
+        // what the game ships (within a rounding), then the value replaced.
+        std::uint8_t insn[10], want[4];
+        const bool movabs = d.skip == 2 || (d.skip == 6 && d.size == 4 && t.d.at >= 0x1c8de00 && t.d.at < 0x1c8de8b);
+        const std::uint8_t op[2] = {static_cast<std::uint8_t>(movabs ? 0x48 : d.size == 1 ? 0xc6 : 0xc7),
+                                    static_cast<std::uint8_t>(movabs ? 0xb8 : 0x83)};
+        float now = 0;
+        bool ok = api->read(d.at, insn, sizeof(insn)) == 0 && insn[0] == op[0] && insn[1] == op[1];
+        if (ok && d.size == 4) {
+            std::memcpy(&now, insn + d.skip, 4);
+            ok = std::fabs(now - d.was) <= 1e-4f * (std::fabs(d.was) > 1 ? std::fabs(d.was) : 1.0f) || now == d.want;
+            std::memcpy(want, &d.want, 4);
+        } else if (ok) {
+            ok = insn[d.skip] == static_cast<std::uint8_t>(d.was) || insn[d.skip] == static_cast<std::uint8_t>(d.want);
+            want[0] = static_cast<std::uint8_t>(d.want);
+        }
+        if (ok && api->patch(d.at + d.skip, insn + d.skip, want, d.size) == 0) {
+            ++written;
+        } else {
+            ++refused;
+            api->log("iso: 0x%llx is not the constant it should be; left alone", static_cast<unsigned long long>(d.at));
+        }
+    }
+    const std::uint8_t store_len = 9;
+    std::uint8_t nops[store_len];
+    std::memset(nops, 0x90, sizeof(nops));
+    for (const std::uint64_t at : kAutoRotation) {
+        std::uint8_t now[store_len];
+        // vmovss [r13+off], xmm: c4 c1 7a 11 ..; what is there is checked by its first four bytes.
+        if (api->read(at, now, store_len) == 0 && (std::memcmp(now, nops, store_len) == 0 ||
+                                                   (now[0] == 0xc4 && now[1] == 0xc1 && now[2] == 0x7a && now[3] == 0x11)) &&
+            api->patch(at, now, nops, store_len) == 0)
+            ++written;
+        else
+            ++refused;
+    }
+    api->log("iso: the game's camera and lock-on set for the view (%d constants and stores written, %d refused); lock-on "
+             "%.0f m, %.0f degrees, %.0f s hidden",
+             written, refused, static_cast<double>(s.lock_range), static_cast<double>(s.lock_angle),
+             static_cast<double>(s.lock_hidden));
+}
+
 std::uint8_t* follow_cam(BbCamera* c) {
     auto* manager = reinterpret_cast<std::uint8_t*>(c) - 0x10;
     std::uint64_t p = 0;
@@ -200,165 +315,140 @@ std::uint8_t* follow_cam(BbCamera* c) {
     return reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(p));
 }
 
-template <typename T>
-T field(const std::uint8_t* base, std::size_t at) {
-    T v;
-    std::memcpy(&v, base + at, sizeof(T));
+float field(const std::uint8_t* base, std::size_t at) {
+    float v;
+    std::memcpy(&v, base + at, sizeof(v));
     return v;
 }
-template <typename T>
-void set_field(std::uint8_t* base, std::size_t at, T v) {
-    std::memcpy(base + at, &v, sizeof(T));
-}
 
-// The follow camera's limits back as they were (the switch off, or another camera).
-void give_back() {
-    if (!cam.follow) return;
-    std::memcpy(cam.follow + kRotRange, cam.saved_range, sizeof(cam.saved_range));
-    set_field(cam.follow, kLockRotChaseRate, cam.saved_chase);
-    std::memcpy(cam.follow + kLockFlags, cam.saved_flags, sizeof(cam.saved_flags));
-    cam.follow = nullptr;
-}
-
-void take(std::uint8_t* f) {
-    if (cam.follow == f) return;
-    give_back();
-    float range[4];
-    std::memcpy(range, f + kRotRange, sizeof(range));
-    // A follow camera: its RotRange in degrees, MaxX above MinX.
-    if (!(range[0] > 0 && range[0] <= 90 && range[1] < range[0] && range[1] >= -90)) {
-        static int complaints = 0;
-        if (complaints++ < 4) api->log("iso: the camera manager's +0x60 is not a follow camera (RotRange %g/%g); left alone",
-                                       static_cast<double>(range[0]), static_cast<double>(range[1]));
-        return;
-    }
-    cam.follow = f;
-    std::memcpy(cam.saved_range, range, sizeof(range));
-    cam.saved_chase = field<float>(f, kLockRotChaseRate);
-    std::memcpy(cam.saved_flags, f + kLockFlags, sizeof(cam.saved_flags));
-    api->log("iso: follow camera %p (RotRange %g/%g, at lock %g/%g, lock chase %g)", static_cast<void*>(f),
-             static_cast<double>(range[0]), static_cast<double>(range[1]), static_cast<double>(range[2]),
-             static_cast<double>(range[3]), static_cast<double>(cam.saved_chase));
-}
-
-void release() {
-    give_back();
-    cam.have_view = false;
-    cam.have_focus = false;
-    cam.view_ready = false;
-    api->input_take(nullptr, 0, 0, 0, 0);
-}
-
-// The game's camera: its yaw followed by hand only, then turned to the view's
-// yaw and levelled - what the controls and the aim read.
+// The game's camera, read only: the view's yaw (CamRotY), and how far the
+// manager's camera is from the follow camera's (another camera taking over).
 void on_camera(BbCamera* c, void*) {
-    cam.view_ready = false;
-    if (!s.enabled || (api->loading_screen && api->loading_screen())) {
-        if (cam.follow || cam.have_view) release();
+    view.ready = false;
+    if (api->loading_screen && api->loading_screen()) {
+        view.have_focus = false;
         return;
     }
-    std::uint8_t* f = follow_cam(c);
+    const std::uint8_t* f = follow_cam(c);
     if (!f) return;
-    take(f);
-    if (cam.follow != f) return;
-
-    const float game = std::atan2(c->forward[0], c->forward[2]);
-    const float level_len = std::sqrt(c->forward[0] * c->forward[0] + c->forward[2] * c->forward[2]);
-    if (!std::isfinite(game) || level_len < 1e-3f) return;
-    const bool hand = field<std::uint8_t>(f, kHandControl) != 0, locked = field<std::uint8_t>(f, kLocked) != 0;
-    if (!cam.have_view) {
-        cam.yaw = game;
-        cam.zoom = 1.0f;
-        cam.have_view = true;
-        cam.last = std::chrono::steady_clock::now();
+    view.yaw = field(f, kRotY);
+    if (!std::isfinite(view.yaw)) return;
+    const auto* own = reinterpret_cast<const BbCamera*>(f + 0x10);
+    float d2 = 0;
+    for (int i = 0; i < 3; ++i) d2 += (c->position[i] - own->position[i]) * (c->position[i] - own->position[i]);
+    const float dfov = std::fabs(c->fov_y - own->fov_y);
+    float away = std::sqrt(d2) / kAwayPos;
+    if (dfov / kAwayFov > away) away = dfov / kAwayFov;
+    view.away_want = away > 1.0f ? 1.0f : away;
+    // The game's right: which way round its basis is.
+    const float rx = std::cos(view.yaw), rz = -std::sin(view.yaw);
+    view.right_sign = c->right[0] * rx + c->right[2] * rz < 0 ? -1.0f : 1.0f;
+    if (!view.started) {
+        view.started = true;
+        view.last = std::chrono::steady_clock::now();
         api->input_take(nullptr, 0, 0, 1, 0);  // the wheel zooms the view, not the game's camera
         api->log("iso: on (angle %.0f, distance %.1f m, fov %.0f)", static_cast<double>(s.pitch),
                  static_cast<double>(s.distance), static_cast<double>(s.fov));
-    } else if (hand && !locked) {
-        cam.yaw = wrap(cam.yaw + wrap(game - cam.last_game));
     }
-    cam.last_game = game;
-    // ISO_LOG=1: twice a second, what the follow camera did and the view's yaw.
-    static const bool trace = std::getenv("ISO_LOG") != nullptr;
-    static int frames = 0;
-    if (trace && frames++ % 30 == 0)
-        api->log("iso: game yaw %.3f view yaw %.3f hand %d locked %d rotX %.3f rotY %.3f fwd.y %.3f", static_cast<double>(game),
-                 static_cast<double>(cam.yaw), hand ? 1 : 0, locked ? 1 : 0, static_cast<double>(field<float>(f, kRotX)),
-                 static_cast<double>(field<float>(f, kRotY)), static_cast<double>(c->forward[1]));
-    // The game's right: which way round its basis is.
-    const float rx = std::cos(game), rz = -std::sin(game);
-    cam.right_sign = c->right[0] * rx + c->right[2] * rz < 0 ? -1.0f : 1.0f;
-
-    // Level and at the view's yaw.
-    const float sy = std::sin(cam.yaw), cy = std::cos(cam.yaw);
-    const float fwd[3] = {sy, 0, cy}, right[3] = {cam.right_sign * cy, 0, -cam.right_sign * sy};
-    for (int i = 0; i < 3; ++i) {
-        c->forward[i] = fwd[i];
-        c->right[i] = right[i];
-        c->up[i] = i == 1 ? 1.0f : 0.0f;
-    }
-    // The follow camera kept level too (its pitch is the aim's when it is not
-    // the matrix's), the stick's up and down given nothing to turn, and the
-    // lock-on left to pick targets without turning the camera to them.
-    set_field(f, kRotX, 0.0f);
-    set_field(f, kTargetRotX, 0.0f);
-    const float range[4] = {0, 0, 0, 0};
-    std::memcpy(f + kRotRange, range, sizeof(range));
-    set_field(f, kLockRotChaseRate, 0.0f);
-    std::memset(f + kLockFlags, 0, 3);
-
     // The wheel's notches: each 15% nearer or further.
     BbInput in;
     if (api->input(&in) == 0 && in.playing && in.wheel != 0) {
         const float base = s.distance > 0.1f ? s.distance : 0.1f;
-        float z = cam.zoom * std::pow(kZoomStep, -in.wheel);
+        float z = view.zoom * std::pow(kZoomStep, -in.wheel);
         if (z * base < kZoomNear) z = kZoomNear / base;
         if (z * base > kZoomFar) z = kZoomFar / base;
-        cam.zoom = z;
+        view.zoom = z;
     }
-    cam.view_ready = true;
+    // ISO_LOG=1: twice a second, the game's camera and the hunter.
+    static const bool trace = std::getenv("ISO_LOG") != nullptr;
+    static int frames = 0;
+    if (trace && frames++ % 30 == 0) {
+        float feet[3] = {}, facing = 0;
+        api->player_position(feet, &facing);
+        api->log("iso: rotY %.3f matrix yaw %.3f fwd.y %.3f away %.2f (%.2f m, fov %.3f/%.3f) facing %.3f at %.2f %.2f %.2f",
+                 static_cast<double>(view.yaw), static_cast<double>(std::atan2(c->forward[0], c->forward[2])),
+                 static_cast<double>(c->forward[1]), static_cast<double>(view.away_want), static_cast<double>(std::sqrt(d2)),
+                 static_cast<double>(c->fov_y), static_cast<double>(own->fov_y), static_cast<double>(facing),
+                 static_cast<double>(feet[0]), static_cast<double>(feet[1]), static_cast<double>(feet[2]));
+    }
+    view.ready = true;
 }
 
-// The drawn camera: from above, looking down at the hunter.
+void normalise(float v[3]) {
+    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-6f)
+        for (int i = 0; i < 3; ++i) v[i] /= l;
+}
+
+// The drawn camera: from above, looking down at the hunter - or, while another
+// camera has the game (the monocular), on the way to it or that camera itself.
 void on_view(BbCamera* c, void*) {
-    if (!cam.view_ready) return;
-    cam.view_ready = false;
+    if (!view.ready) return;
+    view.ready = false;
+    const auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - view.last).count();
+    view.last = now;
+    if (!(dt > 0) || dt > 0.25f) dt = 0.25f;
+    // Toward the other camera and back over kHandOver.
+    const float step = dt / kHandOver;
+    if (view.away < view.away_want) view.away = view.away + step < view.away_want ? view.away + step : view.away_want;
+    else view.away = view.away - step > view.away_want ? view.away - step : view.away_want;
+    if (view.away >= 1.0f) {
+        view.have_focus = false;  // the hunter may have moved while it was away: no glide back from there
+        return;                   // the game's own camera, as copied
+    }
     float feet[3], facing = 0;
     if (api->player_position(feet, &facing) != 0) return;
-    const auto now = std::chrono::steady_clock::now();
-    float dt = std::chrono::duration<float>(now - cam.last).count();
-    cam.last = now;
-    if (!(dt > 0) || dt > 0.25f) dt = 0.25f;
     const float target[3] = {feet[0], feet[1] + s.height, feet[2]};
     float moved = 0;
-    for (int i = 0; i < 3; ++i) moved += (target[i] - cam.focus[i]) * (target[i] - cam.focus[i]);
+    for (int i = 0; i < 3; ++i) moved += (target[i] - view.focus[i]) * (target[i] - view.focus[i]);
     // A warp or a load: no gliding across the map.
-    if (!cam.have_focus || moved > 25.0f * 25.0f || s.follow <= 0) {
-        std::memcpy(cam.focus, target, sizeof(target));
-        cam.have_focus = true;
+    if (!view.have_focus || moved > 25.0f * 25.0f || s.follow <= 0) {
+        std::memcpy(view.focus, target, sizeof(target));
+        view.have_focus = true;
     } else {
         const float k = 1.0f - std::exp(-dt / s.follow);
-        for (int i = 0; i < 3; ++i) cam.focus[i] += (target[i] - cam.focus[i]) * k;
+        for (int i = 0; i < 3; ++i) view.focus[i] += (target[i] - view.focus[i]) * k;
     }
     const float p = s.pitch * kPi / 180.0f, sp = std::sin(p), cp = std::cos(p);
-    const float sy = std::sin(cam.yaw), cy = std::cos(cam.yaw);
-    const float fwd[3] = {sy * cp, -sp, cy * cp};
-    const float up[3] = {sy * sp, cp, cy * sp};
-    const float right[3] = {cam.right_sign * cy, 0, -cam.right_sign * sy};
-    const float dist = s.distance * cam.zoom;
+    const float sy = std::sin(view.yaw), cy = std::cos(view.yaw);
+    float fwd[3] = {sy * cp, -sp, cy * cp};
+    float up[3] = {sy * sp, cp, cy * sp};
+    float fov = s.fov * kPi / 180.0f;
+    const float dist = s.distance * view.zoom;
+    float pos[3];
+    for (int i = 0; i < 3; ++i) pos[i] = view.focus[i] - fwd[i] * dist;
+    // Part way to the game's camera: eased, the basis made square again.
+    if (view.away > 0) {
+        const float t = view.away * view.away * (3 - 2 * view.away);
+        for (int i = 0; i < 3; ++i) {
+            pos[i] += (c->position[i] - pos[i]) * t;
+            fwd[i] += (c->forward[i] - fwd[i]) * t;
+            up[i] += (c->up[i] - up[i]) * t;
+        }
+        fov += (c->fov_y - fov) * t;
+        normalise(fwd);
+        const float d = up[0] * fwd[0] + up[1] * fwd[1] + up[2] * fwd[2];
+        for (int i = 0; i < 3; ++i) up[i] -= fwd[i] * d;
+        normalise(up);
+    }
+    // right = up x forward, turned the way the game's own basis is.
+    float right[3] = {up[1] * fwd[2] - up[2] * fwd[1], up[2] * fwd[0] - up[0] * fwd[2], up[0] * fwd[1] - up[1] * fwd[0]};
+    normalise(right);
+    const float along = right[0] * std::cos(view.yaw) - right[2] * std::sin(view.yaw);
+    const float flip = (along < 0 ? -1.0f : 1.0f) * view.right_sign;
     for (int i = 0; i < 3; ++i) {
         c->forward[i] = fwd[i];
         c->up[i] = up[i];
-        c->right[i] = right[i];
-        c->position[i] = cam.focus[i] - fwd[i] * dist;
+        c->right[i] = right[i] * flip;
+        c->position[i] = pos[i];
     }
-    c->fov_y = s.fov * kPi / 180.0f;
+    c->fov_y = fov;
 }
 
 void on_option(const char* key, const char* value, void*) {
     read_options();
     if (std::strcmp(key, "omni_roll") == 0) omni_roll(s.omni_roll);
-    if (std::strcmp(key, "enabled") == 0 && !s.enabled) release();
     api->log("iso: %s = %s", key, value ? value : "?");
 }
 
@@ -375,12 +465,15 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         return 1;
     }
     read_options();
-    if (host->on_camera(&on_camera, nullptr) != 0 || host->on_view(&on_view, nullptr) != 0) {
-        host->log("iso: the host has no camera hooks; off");
-        return 1;
-    }
     host->on_option("iso", &on_option, nullptr);
     omni_roll(s.omni_roll);
+    if (s.enabled) {
+        if (host->on_camera(&on_camera, nullptr) != 0 || host->on_view(&on_view, nullptr) != 0) {
+            host->log("iso: the host has no camera hooks; the view is off");
+        } else {
+            camera_defaults();
+        }
+    }
     host->log("iso: Isometric %s (angle %.0f, distance %.1f m, fov %.0f), omni-roll %s", s.enabled ? "on" : "off",
               static_cast<double>(s.pitch), static_cast<double>(s.distance), static_cast<double>(s.fov),
               s.omni_roll ? "on" : "off");
