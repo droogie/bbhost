@@ -768,7 +768,7 @@ Bytes add_list_slot(const Bytes& b, const std::string& list) {
     return out;
 }
 
-// The movie: eight sections, then the System list's scroll bar. PCDeck is
+// The movie: nine sections, then the System list's scroll bar. PCDeck is
 // opened on a Steam Deck only (engine/option_menu.cpp), but is always made.
 Bytes build_option_movie(const Bytes& src) {
     Bytes m = src;
@@ -791,6 +791,7 @@ Bytes build_option_movie(const Bytes& src) {
     section("PCCamera", 121020, 388, 4, 0, {"Item_4_0", "Item_5_0"});
     section("PCDeck", 123020, 389, 2, 0, {"Item_2_0", "Item_3_0", "Item_4_0", "Item_5_0"});
     section("PCEnhance", 124020, 390, 4, 0, {"Item_4_0", "Item_5_0"});
+    section("PCUpscale", 125020, 391, 5, 0, {"Item_5_0"});
     return add_scrollbar(m, "Top", 1290, 354.5);
 }
 

@@ -7,7 +7,7 @@
 # The port takes the next free blocks - 116000 PC Settings, 117000 PC
 # Graphics, 118000 PC Controls, 119000 Key Bindings, 120000 PC Effects, 121000
 # PC Camera, 122000 the title menu's Quit Game, 123000 Steam Deck (shown on a
-# Deck only), 124000 PC Enhancements - and 110006..110013 for the System rows
+# Deck only), 124000 PC Enhancements, 125000 PC Upscaling - and 110006..110014 for the System rows
 # that open them. All are unused in the shipped menu.msgbnd. (Motion blur,
 # depth of field and chromatic aberration moved to PC Effects with their
 # 117000 ids.)
@@ -36,6 +36,7 @@
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players, SKILL ISSUE. Each needs a restart.
+110014	PC Upscaling	FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116002	Mouse in Menus	Move and click to select.
@@ -176,3 +177,19 @@
 14000334	Too many Blood Echoes are held to be reborn.\nSpend some, then return to the altar.	
 14000335	Accept Rebirth	
 14000336	Undo Rebirth	
+125020	PC Upscaling	
+125000	Frame Generation	A frame made between each two of the game's, from the 3D alone. The game then runs at most half your refresh rate.
+125001	Sharpness	Sharpens the upscaled 3D (FSR or DLSS). 0 leaves the upscaler's picture as it is. Needs Upscaling on.
+125002	Reflection Quality	The reflections' resolution. Quarter is about four times cheaper; Half is the game's own, sharper.
+125003	Upscaling	FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
+125004	Upscaling Quality	How much smaller the 3D is drawn: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
+125030	Quarter	
+125031	Half	
+125032	Off	
+125033	FSR 3	
+125034	FSR 4	
+125035	DLSS	
+125036	Performance	
+125037	Balanced	
+125038	Quality	
+125039	Native AA	

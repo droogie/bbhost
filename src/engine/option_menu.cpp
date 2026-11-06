@@ -157,6 +157,10 @@ const char kOurDeckName[] = "PCDeck";
 // Hunters, the mirror, the rebirth, five players. Each is read once at start,
 // which its line help says.
 const char kOurEnhanceName[] = "PCEnhance";
+// The upscaler and what goes with it - Upscaling, its quality, Sharpness, Frame
+// generation, Reflection quality: the launcher's and F10's Graphics rows that
+// PC Graphics, whose seven slots are full, has no room for.
+const char kOurUpscaleName[] = "PCUpscale";
 
 // The overlay asset that has to supply that sprite. Opening a section whose
 // sprite the movie does not define is not something to find out at runtime, so
@@ -221,6 +225,12 @@ constexpr std::uint32_t kSystemEffectsRowId = 110010;
 constexpr std::uint32_t kSystemCameraRowId = 110011;
 constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
+constexpr std::uint32_t kSystemUpscaleRowId = 110014;
+// PC Upscaling, 125000: frame generation, sharpness, reflection quality (its
+// two entries 125030 Quarter, 125031 Half), then the two pick lists -
+// Upscaling (125032..125035) and its quality (125036..125039).
+constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
+                        kUpQuality = 125004;
 // PC Enhancements, 124000: four toggles, each for the next start (124000
 // was The Old Hunters, a patch of its own since: the setup window's Patches tab).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
@@ -706,6 +716,22 @@ Toggle g_enhance[] = {
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
 
+// PC Upscaling: the settings by their index, as F10 and the setup window keep
+// them (host/options.cpp) - one setting, one order, three front ends. Frame
+// generation a toggle, Sharpness a slider (its 0-100% in tenths), Reflection
+// quality a left/right pair, and the two lists last: a pick list opens over
+// the rows under it (as PC Settings' two do).
+Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
+Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
+const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
+std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
+const Choice kUpscalers[] = {{0, 125032}, {1, 125033}, {2, 125034}, {3, 125035}};      // Off, FSR 3, FSR 4, DLSS
+const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
+std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
+std::int32_t g_up_quality = 2, g_up_quality_last = -1;
+constexpr int kUpscaleRows = 5;
+
+
 void seed_camera_tuning() {
     const int t = host_opt_index("camera_tuning");
     g_cam_tuning = g_cam_tuning_last = static_cast<std::uint8_t>(t == 1 ? 1 : 0);
@@ -755,6 +781,36 @@ void push(Toggle& t) {
     host_log("pc-options: %s %s from the System menu", t.key, t.value ? "on" : "off");
 }
 
+void seed_upscale() {
+    seed(g_up_frame_gen);
+    seed(g_up_sharpness);
+    g_up_reflection = g_up_reflection_last = static_cast<std::uint8_t>(std::max(0, host_opt_index("ssr_quality")) == 1 ? 1 : 0);
+    g_up_scaler = g_up_scaler_last = std::max(0, host_opt_index("upscaler"));
+    g_up_quality = g_up_quality_last = std::max(0, host_opt_index("upscale_quality"));
+}
+
+// PC Upscaling's rows that are not toggles or sliders: a change here goes to
+// the setting; a change made in F10 is taken up so the row shows it next time.
+void push_upscale() {
+    push(g_up_frame_gen);
+    push(g_up_sharpness);
+    const auto pick = [](const char* key, std::int32_t& value, std::int32_t& last) {
+        if (value != last) {
+            last = value;
+            host_opt_set_index(key, value);
+            host_log("pc-options: %s entry %d from the System menu", key, value);
+        } else if (std::max(0, host_opt_index(key)) != last) {
+            value = last = std::max(0, host_opt_index(key));
+        }
+    };
+    std::int32_t reflection = g_up_reflection, reflection_last = g_up_reflection_last;
+    pick("ssr_quality", reflection, reflection_last);
+    g_up_reflection = static_cast<std::uint8_t>(reflection);
+    g_up_reflection_last = static_cast<std::uint8_t>(reflection_last);
+    pick("upscaler", g_up_scaler, g_up_scaler_last);
+    pick("upscale_quality", g_up_quality, g_up_quality_last);
+}
+
 void seed_controls() {
     seed(g_ctl_camera);
     const int sens = host_opt_index("mouse_sens");
@@ -787,7 +843,7 @@ constexpr int kGraphicsSlots = 7;
 constexpr int kRowCount = kToggleCount + 2;
 static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
-                  kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
+                  kEffectsRows <= kSectionSlots && kUpscaleRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
               "Add slots in engine/menu_assets.cpp (build_option_movie), or split into a second section.");
 
@@ -907,6 +963,26 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     add_slider_row(dialog, &g_fx_bloom.value, g_fx_bloom.id, default_of(g_fx_bloom));
     add_slider_row(dialog, &g_fx_saturation.value, g_fx_saturation.id, default_of(g_fx_saturation));
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
+}
+
+// PC Upscaling: a toggle, a slider and a pair, then Upscaling and its quality
+// as the two pick lists last (the quality's list opens over the Defaults
+// caption, Upscaling's over the quality's row - as PC Settings' two).
+GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
+    host_log("pc-options: PCUpscale opened, dialog=%p params=%p", dialog, params);
+    alignas(16) std::uint8_t scratch[0x100]{};
+    hle_call_guest<std::int64_t>(guest_fn(kScratchInit), &scratch);
+    seed_upscale();
+    add_toggle_row(dialog, &g_up_frame_gen.value, g_up_frame_gen.id, default_of(g_up_frame_gen));
+    add_slider_row(dialog, &g_up_sharpness.value, g_up_sharpness.id, default_of(g_up_sharpness));
+    add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
+                 static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
+    add_list_row(dialog, &g_up_scaler, kUpScaler, kUpscalers, static_cast<int>(sizeof(kUpscalers) / sizeof(kUpscalers[0])),
+                 std::max(0, host_opt_default_index("upscaler")));
+    add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
+                 static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
+                 std::max(0, host_opt_default_index("upscale_quality")));
+    log_rows("PCUpscale", dialog, kUpscaleRows, kUpscaleRows);
 }
 
 // PC Controls: the mouse camera, how fast it turns and which way, and the
@@ -1581,6 +1657,13 @@ GUEST_ABI std::int64_t pc_open_effects(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_effects_handler));
     return open_named(root, params, kOurEffectsName, handler, -1);
 }
+GUEST_ABI std::int64_t pc_open_upscale(void* root, void* params) {
+    static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_upscale_handler));
+    const std::int64_t dialog = open_named(root, params, kOurUpscaleName, handler, kUpscaleRows - 1);  // the quality
+    // Upscaling's list opens over the Defaults caption too.
+    if (g_defaults_view.dialog && g_defaults_view.pick) g_defaults_view.pick2 = dialog_widget(g_defaults_view.dialog, kUpscaleRows - 2);
+    return dialog;
+}
 GUEST_ABI std::int64_t pc_open_controls(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_controls_handler));
     return open_named(root, params, kOurControlsName, handler, -1);
@@ -1620,6 +1703,10 @@ GUEST_ABI void* pc_graphics_row_open(void* out, void* ctx) {
 }
 GUEST_ABI void* pc_effects_row_open(void* out, void* ctx) {
     static void* opener = hle_wrap_fn(reinterpret_cast<void*>(&pc_open_effects));
+    return row_open(out, ctx, opener);
+}
+GUEST_ABI void* pc_upscale_row_open(void* out, void* ctx) {
+    static void* opener = hle_wrap_fn(reinterpret_cast<void*>(&pc_open_upscale));
     return row_open(out, ctx, opener);
 }
 GUEST_ABI void* pc_controls_row_open(void* out, void* ctx) {
@@ -1701,6 +1788,8 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
          hle_wrap_fn(reinterpret_cast<void*>(&pc_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemGraphicsRowId)),
          hle_wrap_fn(reinterpret_cast<void*>(&pc_graphics_row_open))},
+        {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemUpscaleRowId)),
+         hle_wrap_fn(reinterpret_cast<void*>(&pc_upscale_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemEffectsRowId)),
          hle_wrap_fn(reinterpret_cast<void*>(&pc_effects_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemControlsRowId)),
@@ -1730,7 +1819,7 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
         GuestFunction f(kRowFunctorVTable, opener);
         hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);
     }
-    // PC Enhancements, PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera, Key Bindings. The list has five
+    // PC Enhancements, PC Settings, PC Graphics, PC Upscaling, PC Effects, PC Controls, PC Camera, Key Bindings. The list has five
     // lines and **scrolls**, with the scroll bar the port's movie gives it, so
     // rows past the fifth need no slot of their own.
     for (const auto& r : rows) {
@@ -1891,6 +1980,7 @@ void option_menu_poll() {
         seed_camera_tuning();
         seed_controls();
         seed_deck();
+        seed_upscale();
         g_resolution = host_opt_resolution_index();
         g_last_resolution = g_resolution;
         g_frame_cap = host_opt_frame_cap();
@@ -1935,6 +2025,7 @@ void option_menu_poll() {
     }
     for (auto& t : g_graphics) push(t);
     for (auto& t : g_effects) push(t);
+    push_upscale();
     push(g_gfx_ao);
     push(g_gfx_shadow);
     push(g_gfx_fog);
@@ -2059,7 +2150,7 @@ void option_menu_install(ElfImage* image) {
     if (!engine_call_site_hook(image, guest(kTitleFinalizeCall), guest(kTitleFinalize), reinterpret_cast<void*>(&title_finalize_hook)))
         host_log("pc-options: the title menu's Quit Game did not go in");
     g_installed = true;
-    host_log("pc-options: System gains %sPC Enhancements, PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera and Key Bindings",
+    host_log("pc-options: System gains %sPC Enhancements, PC Settings, PC Graphics, PC Upscaling, PC Effects, PC Controls, PC Camera and Key Bindings",
              host_steam_deck() ? "Steam Deck (a Steam Deck), " : "");
 }
 
