@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 14.
+/* bbhost plugin API, version 17.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 16
+#define BB_PLUGIN_API_VERSION 17
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -487,6 +487,15 @@ typedef struct BbHostApi {
      * white lines are drawn as black ones over white faces, then the faces
      * again subtracting. No plugin uses it today. */
     void (*draw_style)(int style);
+
+    /* Version 17: the recompiled follow camera's visual target. Register once
+     * from bb_plugin_image. fn receives the character whose controls the
+     * camera uses and returns a live ChrIns to follow, or NULL for unchanged.
+     * Called on the game thread for each update; never retain a dead actor.
+     * Only the model and moving-floor position are redirected, not input.
+     * Native-camera builds still require the plugin's native camera hooks.
+     * 0 on success; 1 outside image setup, for NULL, or if already owned. */
+    int (*on_camera_target)(void* (*fn)(void* character, void* user), void* user);
 } BbHostApi;
 
 #define BB_DRAW_AS_IS 0

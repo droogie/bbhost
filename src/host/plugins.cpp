@@ -8,6 +8,7 @@
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera_target.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/gx_state.h"
@@ -332,6 +333,10 @@ int api_lamp_warp(std::int32_t return_point) { return api_eboot_is_109() && worl
 int api_player_warp(std::uint32_t block, const float xyz[3], float yaw) { return api_eboot_is_109() && world_player_warp_queue(block, xyz, yaw) ? 0 : 1; }
 // Version 12: the loading screen, as the host's own test last saw it (engine/loading.h).
 int api_loading_screen() { return loading_screen_up() ? 1 : 0; }
+
+int api_on_camera_target(void* (*fn)(void*, void*), void* user) {
+    return g_in_image && api_eboot_is_109() && camera_target::register_callback(fn, user) ? 0 : 1;
+}
 
 int api_on_event_flag(void (*fn)(std::uint32_t, int, void*), void* user) {
     if (!fn || !api_eboot_is_109()) return 1;
@@ -1163,6 +1168,7 @@ const BbHostApi g_api = {
     &api_show_text,
     &api_on_scene_category,
     &api_draw_style,
+    &api_on_camera_target,
 };
 
 std::string read_file(const std::string& path) {

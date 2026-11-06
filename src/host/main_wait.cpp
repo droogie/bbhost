@@ -56,16 +56,16 @@ const std::int64_t g_log_wait_ns = [] {
     return static_cast<std::int64_t>(e ? std::atof(e) * 1e6 : 20e6);
 }();
 thread_local int t_log_waits = -1;  // -1: not looked up yet
-thread_local char t_thread_name[16];
+thread_local char t_thread_name[64];
 bool log_waits() {
     if (t_log_waits < 0) {
         t_log_waits = 0;
-#if !defined(_WIN32)
+        // Windows too: bbhost names its threads with pthread_setname_np there
+        // as well (winpthreads), so the name reads back the same way.
         pthread_getname_np(pthread_self(), t_thread_name, sizeof(t_thread_name));
         for (const std::string& p : g_log_threads) {
             if (!p.empty() && std::strncmp(t_thread_name, p.c_str(), p.size()) == 0) t_log_waits = 1;
         }
-#endif
     }
     return t_log_waits == 1;
 }
@@ -115,8 +115,9 @@ MainThreadWait::MainThreadWait(int kind) : kind_(kind) {
 MainThreadWait::~MainThreadWait() {
     if (!t0_) return;
     const auto ns = static_cast<std::uint64_t>(now_ns() - t0_);
-    if (!t_main_loop) {
-        if (static_cast<std::int64_t>(ns) >= g_log_wait_ns) {
+    // The main loop's own waits are logged as well when its name is listed.
+    if (!t_main_loop || (!g_log_threads.empty() && log_waits())) {
+        if (static_cast<std::int64_t>(ns) >= g_log_wait_ns && log_waits()) {
             std::string chain;
             for (std::uint64_t a : t_chain) {
                 if (!a) break;
@@ -126,7 +127,7 @@ MainThreadWait::~MainThreadWait() {
             }
             host_log("wait: %s waited %.1f ms%s%s", t_thread_name, static_cast<double>(ns) / 1e6, kKindTag[kind_], chain.c_str());
         }
-        return;
+        if (!t_main_loop) return;
     }
     g_waited_ns[kind_].fetch_add(ns, std::memory_order_relaxed);
     g_frame_wait_ns += ns;

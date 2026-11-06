@@ -18,6 +18,7 @@
 // same; with the three the mouse holds, ours also runs on the game's own
 // bytes holding them by its flag alone.
 #include "decomp/decomp.h"
+#include "engine/camera_target.h"
 #include "engine/frame_rate_step.h"
 #include "engine/mouse_camera.h"
 #include "engine/mouse_camera_step.h"
@@ -189,6 +190,28 @@ void make_params() {
 struct Chr {
     u8 *chr, *ctrl, *pivot_mod, *pad, *pad2, *mod;
 };
+
+u8* g_local_chr = nullptr;
+u8* g_follow_target = nullptr;
+void* spectator_target(void* chr, void*) {
+    return chr == g_local_chr ? g_follow_target : nullptr;
+}
+
+// Model the two native spectator hooks without redirecting the local pad.
+void spectator_reference(u8* chr, u8* ctrl, const Chr& local, const u8* target) {
+    std::memcpy(chr, local.chr, 0x400);
+    std::memcpy(ctrl, local.ctrl, 0x300);
+    put(chr, 0x58, ctrl);
+    if (!target) return;
+    const u8* owner;
+    const u8* pivot = nullptr;
+    const u8* model;
+    std::memcpy(&owner, target + 0x58, sizeof owner);
+    if (owner) std::memcpy(&pivot, owner + 8, sizeof pivot);
+    std::memcpy(&model, target + 0x3b0, sizeof model);
+    if (pivot) put(ctrl, 8, pivot);
+    if (model) put(chr, 0x3b0, model);
+}
 
 Chr make_chr() {
     Chr c{};
@@ -448,7 +471,9 @@ int main(int argc, char** argv) {
     g_mouse_camera_resume = 0x183ce67;
     std::memcpy(g_store_game, eboot_kit::at(kTurnStore), sizeof g_store_game);
     for (int i = 0; i < 2; ++i) std::memcpy(g_ramp_game[i], eboot_kit::at(kRampExits[i]), 14);
-    int mouse_frames = 0, held_frames = 0, original_frames = 0;
+    if (!camera_target::register_callback(spectator_target, nullptr) ||
+        camera_target::register_callback(spectator_target, nullptr)) return 1;
+    int mouse_frames = 0, held_frames = 0, original_frames = 0, spectator_frames = 0;
     u8* a = block(kCam);
     u8* b = block(kCam);
     u8 gsm_a[0x20], gsm_b[0x20];
@@ -496,11 +521,26 @@ int main(int argc, char** argv) {
                                                : 0u;
         place_hold_nops(nops);
         Chr chr = make_chr();
+        Chr remote = make_chr();
+        u8* reference_chr = block(0x400);
+        u8* reference_ctrl = block(0x300);
+        g_local_chr = chr.chr;
         make_camera(a);
         std::memcpy(b, a, kCam);
         make_keepout(a);
         for (int f = 0; f < frames; ++f) {
             vary_chr(chr);
+            vary_chr(remote);
+            const u8* remote_model;
+            const u8* remote_pivot;
+            std::memcpy(&remote_model, remote.chr + 0x3b0, sizeof remote_model);
+            std::memcpy(&remote_pivot, remote.ctrl + 8, sizeof remote_pivot);
+            g_follow_target = c % 3 != 0 && f % 5 != 0 ? remote.chr : nullptr;
+            // A retiring target can lose either attachment independently.
+            if (f % 7 == 0) put<u64>(remote.chr, 0x58, 0);
+            if (f % 11 == 0) put<u64>(remote.ctrl, 8, 0);
+            if (f % 13 == 0) put<u64>(remote.chr, 0x3b0, 0);
+            spectator_reference(reference_chr, reference_ctrl, chr, g_follow_target);
             vary_frame(a, b);
             const float dt = g_rng.chance(0.9) ? value(0.01f, 0.05f) : value(-0.1f, 1.0f);
             void* world = g_rng.chance(0.5) ? &dummy_world : nullptr;
@@ -520,7 +560,7 @@ int main(int argc, char** argv) {
             mouse_camera::g_counts.store(mouse_camera::pack(dx, dy));
             mouse_camera::begin_update();
             const u64 turns_before = mouse_camera::g_turns.load();
-            game(a, followed, world, dt);
+            game(a, followed ? reference_chr : nullptr, world, dt);
             const u8 free_a = bb_mouse_camera_free_now;
             if (mouse_camera::g_turns.load() != turns_before) ++mouse_frames;
             const std::vector<Cast> casts_a = g_casts;
@@ -538,6 +578,10 @@ int main(int argc, char** argv) {
             mouse_camera::g_counts.store(mouse_camera::pack(dx, dy));
             if (by_flag) place_hold_nops(0);
             follow_cam_update(b, followed, world, dt);
+            if (followed && g_follow_target) ++spectator_frames;
+            put(remote.chr, 0x58, remote.ctrl);
+            put(remote.ctrl, 8, remote_pivot);
+            put(remote.chr, 0x3b0, remote_model);
             if (by_flag) place_hold_nops(nops);
             if (nops) ++held_frames;
             // Whether the free camera ran: noted by the stubs in the game's code, by ours itself.
@@ -590,7 +634,7 @@ int main(int argc, char** argv) {
     frame_rate_step::g_frame_seconds.store(0.0f);
     frame_rate_step::g_camera_tuned_fps.store(0);
     std::printf("%s: %d cameras, %d frames, %d differ; %d frames turned by the mouse, %d with auto-rotation held, %d with "
-                "the Original camera tuning at a 1/30 s frame\n",
-                test, cameras, steps, bad, mouse_frames, held_frames, original_frames);
-    return bad || !mouse_frames || !held_frames || !original_frames ? 1 : 0;
+                "the Original camera tuning at a 1/30 s frame; %d spectator frames\n",
+                test, cameras, steps, bad, mouse_frames, held_frames, original_frames, spectator_frames);
+    return bad || !mouse_frames || !held_frames || !original_frames || !spectator_frames ? 1 : 0;
 }
