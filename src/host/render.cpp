@@ -6205,31 +6205,78 @@ constexpr std::uint64_t kSnapSalt = 0x5a4a9c11ull;
 constexpr std::uint64_t kGbufferSalt = 0x6b0ffe12ull;  // DrawState::host_gbuffer
 
 // The map's G-buffer draws mark the stencil, and the lights test it: a
-// pixel left unmarked is not lit. So a plugin's G-buffer draw takes the
-// stencil test, operations and reference of the last draw into the G-buffer
-// (six targets or more) that wrote depth with the stencil on.
-std::atomic<std::uint32_t> g_gb_stencil_id{0}, g_gb_stencil_ref{0}, g_gb_stencil_ref_bf{0};
+// pixel left unmarked is not lit, and the lights shade each mark's surfaces
+// their own way. So a plugin's G-buffer draw takes the stencil test,
+// operations and reference most of the frame's own G-buffer draws (six
+// targets or more, depth written with the stencil on) use - the map's (ref 9
+// in the Hunter's Dream: about three quarters of them; 8 and 12 are other
+// kinds of thing). It took the last such draw's, and the last one is no
+// longer a fixed one: run parts (BBHOST_RUN_COMMIT) record draws side by
+// side, and with Lo-Hit in the map's place the map's own are gone - each of
+// Lo-Hit's draws took 8, 9 or 12 in turn, lit another way each frame (the
+// "lit by the game" flicker). The states are counted, halved every 4096 so
+// the count follows an area's, and the most counted taken.
+// BBHOST_GB_STENCIL_REF=<n> (a test): that reference instead.
+struct GbStencilSlot {
+    std::atomic<std::uint64_t> key{0};  // depth-stencil id << 32 | ref (0: free)
+    std::atomic<std::uint32_t> ref_bf{0};
+    std::atomic<std::uint32_t> count{0};
+};
+GbStencilSlot g_gb_slots[8];
+std::atomic<std::uint64_t> g_gb_seen{0};
+std::atomic<std::uint64_t> g_gb_chosen{0};      // the most counted key (0: none yet)
+std::atomic<std::uint32_t> g_gb_chosen_bf{0};
+
+void gbuffer_stencil_count(std::uint32_t id, std::uint32_t ref, std::uint32_t ref_bf) {
+    const std::uint64_t key = static_cast<std::uint64_t>(id) << 32 | ref;
+    if (!key) return;
+    for (GbStencilSlot& sl : g_gb_slots) {
+        std::uint64_t k = sl.key.load(std::memory_order_relaxed);
+        if (!k && sl.key.compare_exchange_strong(k, key, std::memory_order_relaxed)) k = key;
+        if (k != key) continue;
+        sl.ref_bf.store(ref_bf, std::memory_order_relaxed);
+        sl.count.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+    // Every 256 draws the most counted is taken; every 4096 the counts halve.
+    const std::uint64_t n = g_gb_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n % 256 && n != 1) return;
+    std::uint64_t best = 0;
+    std::uint32_t best_n = 0, best_bf = 0;
+    for (GbStencilSlot& sl : g_gb_slots) {
+        const std::uint32_t c = n % 4096 ? sl.count.load(std::memory_order_relaxed) : sl.count.exchange(sl.count.load() / 2);
+        if (c > best_n) {
+            best_n = c;
+            best = sl.key.load(std::memory_order_relaxed);
+            best_bf = sl.ref_bf.load(std::memory_order_relaxed);
+        }
+    }
+    if (!best) return;
+    g_gb_chosen_bf.store(best_bf, std::memory_order_relaxed);
+    if (g_gb_chosen.exchange(best, std::memory_order_relaxed) != best)
+        host_log("render: a plugin's G-buffer draws take the stencil of the G-buffer's most common draws: state %u, reference %u",
+                 static_cast<unsigned>(best >> 32), static_cast<unsigned>(best & 0xffffffffu));
+}
+
 void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
     int bound = 0;
     for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
     if (bound < 6 || !s.gx_depth) return;
     if (!o.gbuffer) {
-        if (s.gx_depth->stencil_enable && s.gx_depth->depth_write) {
-            g_gb_stencil_id.store(o.depth_stencil_id, std::memory_order_relaxed);
-            g_gb_stencil_ref.store(s.stencil_ref, std::memory_order_relaxed);
-            g_gb_stencil_ref_bf.store(s.stencil_ref_bf, std::memory_order_relaxed);
-        }
+        if (s.gx_depth->stencil_enable && s.gx_depth->depth_write) gbuffer_stencil_count(o.depth_stencil_id, s.stencil_ref, s.stencil_ref_bf);
         return;
     }
-    const std::uint32_t from = g_gb_stencil_id.load(std::memory_order_relaxed);
-    if (!from) return;
-    const std::uint32_t id = gx_depth_stencil_merged(o.depth_stencil_id, from);
+    const std::uint64_t chosen = g_gb_chosen.load(std::memory_order_relaxed);
+    if (!chosen) return;
+    const std::uint32_t id = gx_depth_stencil_merged(o.depth_stencil_id, static_cast<std::uint32_t>(chosen >> 32));
     const GxDepthStencilDesc* merged = id ? gx_depth_stencil_desc(id) : nullptr;
     if (!merged) return;
     s.gx_depth = merged;
     s.gx_ids[1] = id;
-    s.stencil_ref = g_gb_stencil_ref.load(std::memory_order_relaxed);
-    s.stencil_ref_bf = g_gb_stencil_ref_bf.load(std::memory_order_relaxed);
+    s.stencil_ref = static_cast<std::uint32_t>(chosen & 0xffffffffu);
+    s.stencil_ref_bf = g_gb_chosen_bf.load(std::memory_order_relaxed);
+    static const char* force_ref = std::getenv("BBHOST_GB_STENCIL_REF");
+    if (force_ref) s.stencil_ref = s.stencil_ref_bf = static_cast<std::uint32_t>(std::strtoul(force_ref, nullptr, 0));
 }
 
 // The host's G-buffer shader (gbuffer_flat.frag) with its specialization
@@ -22490,9 +22537,42 @@ UpscaleFrame g_upscale;  // under g.mu
 // shadow maps (another depth), the post chain (rect lists) or the HUD and
 // menus (no depth). With the depth not seen for 8 flips (a rebuild of the
 // targets, a loading screen) none is.
+//
+// And only draws that write the 3D itself (scene_3d_target): the HUD, the
+// enemies' and allies' health bars and other world-placed UI can be drawn
+// with the scene's depth bound (tested against it, or not at all), into the
+// HUD's own target - they are the UI, never snapped, never jittered.
+bool scene_3d_target(const DrawState& s);  // below
 bool look_camera_draw(const DrawState& s) {
     const UpscaleFrame& u = g_upscale;
-    return u.depth && s.depth && s.depth->base == u.depth && !s.rect && u.seen_flip && hle_video_flip_count() + 1 - u.seen_flip <= 8;
+    return u.depth && s.depth && s.depth->base == u.depth && !s.rect && u.seen_flip && hle_video_flip_count() + 1 - u.seen_flip <= 8 &&
+           scene_3d_target(s);
+}
+
+// What the 3D's draws write, and nothing after it does: depth alone, the
+// scene (the composition and the transparency, its glow beside it), or the
+// G-buffer - several targets at once, or one of the G-buffer's own (learned
+// from the last draw into six or more: the snow coat writes five of them).
+// The lights' buffers and the HUD's target are left out: the lights read the
+// G-buffer by their pixel, a nudge or a snap only moves their volume's edge
+// (Numity1504's handoff: never jitter the lights), and the UI is the UI.
+// Learned from draws, not their order: a run part (BBHOST_RUN_COMMIT) may
+// record any of them at any time.
+std::atomic<std::uint64_t> g_gbuffer_targets[8] = {};
+bool scene_3d_target(const DrawState& s) {
+    int bound = 0;
+    for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
+    if (bound >= 6) {
+        for (int t = 0; t < 8; ++t) g_gbuffer_targets[t].store(s.color[t] ? s.color[t]->base : 0, std::memory_order_relaxed);
+    }
+    if (bound != 1) return true;  // depth alone, or several targets: the G-buffer's or the scene's with its glow
+    const RtImage* c = nullptr;
+    for (int t = 0; t < 8 && !c; ++t) c = s.color[t];
+    if (c->base == g_upscale.scene) return true;
+    for (const std::atomic<std::uint64_t>& b : g_gbuffer_targets) {
+        if (b.load(std::memory_order_relaxed) == c->base) return true;
+    }
+    return false;
 }
 
 // The colour grading's table: each frame the game copies the area's grading
@@ -26117,7 +26197,8 @@ static bool draw_impl(const GpuDraw& d) {
     vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
     // The upscaler's jitter (UpscaleFrame): a camera draw into the G-buffer's
     // depth, while the upscaler runs.
-    if (camera_draw && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && upscale_jitter_on() && g_upscale.ran_flip &&
+    if (camera_draw && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect && scene_3d_target(s) && upscale_jitter_on() &&
+        g_upscale.ran_flip &&
         hle_video_flip_count() + 1 - g_upscale.ran_flip <= 8 && upscaler_method()) {
         vp.x += upscale_jitter_sign() * g_upscale.jx;
         vp.y += upscale_jitter_sign() * g_upscale.jy;
