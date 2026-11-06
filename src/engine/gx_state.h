@@ -80,10 +80,22 @@ std::uint32_t gx_raster_id(std::uint64_t object);
 // kGxDrawDepthOnly (API 17) - the blend state's copy that writes no colour,
 // the depth tested and written; kGxDrawDepthEqual (API 17) - the depth
 // tested less-or-equal and not written, pulled toward the viewer a little, so
-// a draw lands on the depth an earlier depth-only draw of it wrote.
-constexpr int kGxDrawLines = 1, kGxDrawBlack = 2, kGxDrawSubtract = 4, kGxDrawDepthOnly = 8, kGxDrawDepthEqual = 16;
-constexpr int kGxDrawAll = kGxDrawLines | kGxDrawBlack | kGxDrawSubtract | kGxDrawDepthOnly | kGxDrawDepthEqual;
+// a draw lands on the depth an earlier depth-only draw of it wrote;
+// kGxDrawGbuffer (API 19) - drawn into the G-buffer with the host's pixel
+// shader in place of the draw's own (carried with the draw: gx_draw_gbuffer).
+constexpr int kGxDrawLines = 1, kGxDrawBlack = 2, kGxDrawSubtract = 4, kGxDrawDepthOnly = 8, kGxDrawDepthEqual = 16, kGxDrawGbuffer = 32;
+constexpr int kGxDrawAll = kGxDrawLines | kGxDrawBlack | kGxDrawSubtract | kGxDrawDepthOnly | kGxDrawDepthEqual | kGxDrawGbuffer;
 void gx_draw_style(int style);
+// Whether this thread's draws are restyled kGxDrawGbuffer (read at the call).
+bool gx_draw_gbuffer();
+// The depth-stencil description `depth_id` with `stencil_id`'s stencil test
+// and operations, as an id (0: either unknown): a G-buffer draw of a plugin's
+// marking the stencil as the map's G-buffer draws do, which the lights test.
+std::uint32_t gx_depth_stencil_merged(std::uint32_t depth_id, std::uint32_t stencil_id);
+// kGxDrawGbuffer draws' indirect light (plugin API 19; 0.03 by default,
+// BBHOST_GBUFFER_SPEC's first value at the start).
+void gx_gbuffer_ambient(float level);
+float gx_gbuffer_ambient_level();
 // The description behind an id; null for 0 or an unknown id. Stable for the run.
 const GxBlendDesc* gx_blend_desc(std::uint32_t id);
 const GxDepthStencilDesc* gx_depth_stencil_desc(std::uint32_t id);

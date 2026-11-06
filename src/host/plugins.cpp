@@ -1158,6 +1158,7 @@ void api_scene_filter(int filter) { scene_look_set_nearest(filter == BB_FILTER_N
 void api_scene_scale(int scale, std::uint32_t lines) { scene_look_set_scale(scale == BB_SCALE_NEAREST, lines); }
 void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
 void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
+void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
 
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
@@ -1177,6 +1178,7 @@ const BbHostApi g_api = {
     &api_on_scene_category,
     &api_draw_style,
     &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
+    &api_gbuffer_ambient,
 };
 
 std::string read_file(const std::string& path) {

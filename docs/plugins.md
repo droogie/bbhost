@@ -208,6 +208,16 @@ gives the Binary Ninja address.
   target's, once a pixel), `BB_DRAW_DEPTH_ONLY` (v17: no colour, the depth
   written), `BB_DRAW_DEPTH_EQUAL` (v17: tested less-or-equal against the depth
   an earlier depth-only draw of the same geometry wrote), or-ed.
+  `BB_DRAW_GBUFFER` (v19) draws into the G-buffer (a pass ahead of `3e/13`,
+  such as `3e/0c`) with the host's pixel shader (`gbuffer_flat.frag`) in
+  place of the draw's, marking the stencil as the map's G-buffer draws do,
+  so the game's lighting lights it as it does the map: the sun, the lamps
+  and their shadows, the fog. For the game's simple coloured draw (the debug
+  draw's): rgb the albedo (linear), alpha the face's world normal when
+  negative, `-(1 + u + 2048 v)` with u and v its octahedral coordinates in
+  11 bits. The Lo-Hit plugin's "Lit by the game" draws the collision this way.
+- `gbuffer_ambient(level)` (v19): `BB_DRAW_GBUFFER` draws' indirect light,
+  which the map gets from its lightmaps (0.03 by default).
 - The 3D's look (v18): how the camera's draws - the world, its characters, the
   sky and the effects, the draws with the scene's depth that are not
   full-screen rect lists - are drawn; the shadow maps, the post-processing and

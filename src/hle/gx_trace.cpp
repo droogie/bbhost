@@ -859,6 +859,7 @@ struct alignas(16) GxRec {
     std::int32_t sc[4] = {};
     std::uint64_t raster = 0;
     std::uint32_t blend_id = 0, ds_id = 0, raster_id = 0;  // engine/gx_state.h, at the call
+    bool gbuffer = false;  // restyled kGxDrawGbuffer at the call
     // The vertex-stage program's object (the domain shader's in a
     // tessellated draw), the pixel shader's and the input layout's, as
     // engine/gx_resources.h ids.
@@ -1153,6 +1154,7 @@ void snapshot(GxRec& r, std::uint64_t s) {
     r.blend_id = gx_blend_id(r.blend);
     r.ds_id = gx_depth_stencil_id(r.ds);
     r.raster_id = gx_raster_id(r.raster);
+    r.gbuffer = gx_draw_gbuffer();
     const auto slots = [](std::uint64_t base, int n, GxRec::Slot* out, std::uint8_t& count, int cap) {
         count = 0;
         for (int i = 0; i < n && count < cap; ++i) {
@@ -2416,6 +2418,7 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
     o.blend_id = r.blend_id;
     o.depth_stencil_id = r.ds_id;
     o.raster_id = r.raster_id;
+    o.gbuffer = r.gbuffer;
     o.vs_prog_id = r.vs_prog_id;
     o.ps_prog_id = r.ps_prog_id;
     o.il_id = r.il_id;

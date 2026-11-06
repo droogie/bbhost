@@ -360,6 +360,25 @@ std::uint32_t gx_raster_id(std::uint64_t object) {
     });
 }
 void gx_draw_style(int style) { t_style = style; }
+bool gx_draw_gbuffer() { return (t_style & kGxDrawGbuffer) != 0; }
+std::atomic<float> g_gbuffer_ambient{-1.0f};  // < 0: not set (the host's default)
+void gx_gbuffer_ambient(float level) { g_gbuffer_ambient.store(level < 0.0f ? 0.0f : level, std::memory_order_relaxed); }
+float gx_gbuffer_ambient_level() { return g_gbuffer_ambient.load(std::memory_order_relaxed); }
+std::uint32_t gx_depth_stencil_merged(std::uint32_t depth_id, std::uint32_t stencil_id) {
+    const auto* d = static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, depth_id));
+    const auto* st = static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, stencil_id));
+    if (!d || !st) return 0;
+    GxDepthStencilDesc c = *d;
+    c.stencil_enable = st->stencil_enable;
+    c.read_mask = st->read_mask;
+    c.write_mask = st->write_mask;
+    c.front = st->front;
+    c.back = st->back;
+    bool made = false;
+    const std::uint32_t id = intern(kDepthStencil, c, &made);
+    if (made) host_log("gx-state: depth-stencil %08x with %08x's stencil: %08x", depth_id, stencil_id, id);
+    return id;
+}
 const GxBlendDesc* gx_blend_desc(std::uint32_t id) { return static_cast<const GxBlendDesc*>(desc_of(kBlend, id)); }
 const GxDepthStencilDesc* gx_depth_stencil_desc(std::uint32_t id) {
     return static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, id));

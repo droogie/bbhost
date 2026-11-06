@@ -9,6 +9,9 @@
 //   wall_r = 46  wall_g = 20  wall_b = 108    # the walls' colour, as it comes out on the screen (0-255)
 //   floor_r = 32 floor_g = 56 floor_b = 128   # the floors'
 //   occluder_pass = "3e/04"  # where its depth-only play goes, for occlusion (ahead of the scene's objects)
+//   lit = false         # lit by the game: drawn into the G-buffer (host API 19), the colours its albedo
+//   ambient = 30        # lit: the light no lamp reaches, in thousandths (the map's comes from its lightmaps)
+//   sun = 0             # unlit: faces away from a fixed high sun darkened, 0-100
 //
 // What it draws. The world's hit manager (WorldHitMan) has a debug draw of
 // the parts the player last stood on (its two slots at +0x2de8/+0x2df0): each
@@ -74,6 +77,18 @@
 // (BB_DRAW_DEPTH_EQUAL). Drawn with its colour that early, it goes into the
 // G-buffer and comes out lit, near black.
 //
+// Lit (host API 19, `lit`). Drawn at 3e/25 the lo-hit is flat colour over
+// the lit scene: the lighting, the fog in it included, has run by then
+// (every pass from 3e/13 to 3e/25 gave the same frame). Lit, the coloured
+// play goes ahead of 3e/0c, where the G-buffer is still bound, styled
+// BB_DRAW_GBUFFER: the host draws it with its own pixel shader into the
+// G-buffer's targets - the colours as the albedo (linear: the game's lighting
+// and tone-mapping make the screen colour), each triangle's world normal in
+// its vertices' alpha (normal_batch) - and marks the stencil as the map's
+// draws do, which the lights test. The game then lights it as the map: the
+// sun, the lamps, the shadows, the fog. The map's lightmaps give it its light
+// where no lamp reaches; the lo-hit has none, so `ambient` stands in.
+//
 // The post-effects (Giga Performance Patch's) are the host's Performance mode
 // now (the setup window's main page, F10 > STARTUP).
 #include "bbhost_plugin.h"
@@ -97,7 +112,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.4.2",
+    "0.5.0",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -110,6 +125,12 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "show_hi_hit", "Hi-hit",
      "The hi-hit - what characters and objects collide with, in its full detail - in place of the lo-hit.", "false"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "lit", "Lit by the game",
+     "Lit as the map is - the sun, the lamps and the shadows they cast, the fog - with the colours below as its paint. "
+     "Off: flat colours over the lit scene.", "false"},
+    {BB_OPT_INT | BB_OPT_LIVE, "ambient", "Ambient light",
+     "Lit by the game: the light where no lamp or sun reaches (the map's own comes from its lightmaps). 0: black there.", "30",
+     0, 100},
     {BB_OPT_HEADING, "colours", "Colours", "As they come out on the screen, 0-255. Lo-hit and hi-hit alike.", nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "wall_r", "Walls: red", nullptr, "46", 0, 255},
     {BB_OPT_INT | BB_OPT_LIVE, "wall_g", "Walls: green", nullptr, "20", 0, 255},
@@ -117,6 +138,8 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_INT | BB_OPT_LIVE, "floor_r", "Floors: red", nullptr, "32", 0, 255},
     {BB_OPT_INT | BB_OPT_LIVE, "floor_g", "Floors: green", nullptr, "56", 0, 255},
     {BB_OPT_INT | BB_OPT_LIVE, "floor_b", "Floors: blue", nullptr, "128", 0, 255},
+    {BB_OPT_INT | BB_OPT_LIVE, "sun", "Sun shading",
+     "How much faces turned away from a high sun darken (0: off, 100: down to a quarter).", "0", 0, 100},
     {0}};
 
 namespace {
@@ -186,6 +209,12 @@ bool g_can_occlude = false;               // plugin API 17: the second segment a
 std::atomic<bool> g_occlusion{true};      // the depth-only play ahead of g_occluder_pass
 int g_occluder_pass = 0xf84;              // 3e/04: ahead of the scene's objects
 std::atomic<bool> g_depth_played{false};  // set by the depth-only play, taken by the coloured one
+// Lit (host API 19): the coloured play into the G-buffer at kLitPass, where
+// the game lights it (BB_DRAW_GBUFFER; 0 when not lit).
+constexpr int kLitPass = 0xf8c;  // 3e/0c: the G-buffer still bound, ahead of the lighting
+bool g_can_light = false;        // host API 19 and the depth-only play
+std::atomic<bool> g_lit{false};
+std::atomic<int> g_gbuffer_style{0};
 
 // In the scene, ahead of the pass's first chunk (a GX worker).
 void play_early(std::uint64_t cc, void*) {
@@ -194,7 +223,7 @@ void play_early(std::uint64_t cc, void*) {
     Params p;
     fill_params(p, cc);
     const bool on_depth = g_depth_played.exchange(false, std::memory_order_acq_rel);
-    if (on_depth) api->draw_style(BB_DRAW_DEPTH_EQUAL);
+    if (on_depth) api->draw_style(BB_DRAW_DEPTH_EQUAL | g_gbuffer_style.load(std::memory_order_relaxed));
     t_ours = true;
     g_play(list, &p);
     t_ours = false;
@@ -350,6 +379,7 @@ std::uint64_t make_buffer(const std::vector<Batch>& batches, std::uint32_t tris)
 }
 
 const float* g_shade_colours = nullptr;  // the two colours written for the game (write_colours)
+std::atomic<int> g_sun{0};               // the sun option, 0-100: how much faces away from it darken
 
 struct V3 {
     float x, y, z;
@@ -365,6 +395,8 @@ void shade_batch(Batch& b) {
     const float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
     if (dd <= 0.0f) return;
     constexpr float kLx = 0.6f, kLz = 0.8f;  // kShadeLight: across the map, level
+    constexpr V3 kSun = {0.3f, 0.86f, 0.41f};  // high, to one side (unit)
+    const float sun = static_cast<float>(g_sun.load(std::memory_order_relaxed)) / 100.0f;
     for (std::uint32_t t = 0; t < b.tris; ++t) {
         std::uint8_t* tri = b.verts.data() + std::size_t(t) * 3 * kVertex;
         float col[4];
@@ -384,8 +416,35 @@ void shade_batch(Batch& b) {
         const float wall = std::sqrt(std::max(0.0f, 1.0f - n.y * n.y));  // 1 upright, 0 level
         const float across = wall > 1e-4f ? std::fabs(n.x * kLx + n.z * kLz) / wall : 0.0f;
         const float k = wall * (1.0f - 0.3f * across);
-        const float out[4] = {c[4] + k * d[0], c[5] + k * d[1], c[6] + k * d[2], col[3]};
+        // The sun: faces turned to kSun lit, faces turned away down to a quarter.
+        const float lit = std::max(0.0f, n.x * kSun.x + n.y * kSun.y + n.z * kSun.z);
+        const float f = 1.0f - sun + sun * (0.25f + 0.75f * lit);
+        const float out[4] = {f * (c[4] + k * d[0]), f * (c[5] + k * d[1]), f * (c[6] + k * d[2]), col[3]};
         for (int v = 0; v < 3; ++v) std::memcpy(tri + v * kVertex + 0x10, out, sizeof out);
+    }
+}
+
+// Lit (g_lit): each triangle's world normal in its
+// vertices' alpha, as the host's G-buffer shader reads it (gbuffer_flat.frag):
+// -(1 + u + 2048 v), u and v its octahedral coordinates in 11 bits.
+void normal_batch(Batch& b) {
+    for (std::uint32_t t = 0; t < b.tris; ++t) {
+        std::uint8_t* tri = b.verts.data() + std::size_t(t) * 3 * kVertex;
+        V3 p[3];
+        for (int k = 0; k < 3; ++k) std::memcpy(&p[k], tri + k * kVertex, sizeof(V3));
+        const V3 e1 = sub3(p[1], p[0]), e2 = sub3(p[2], p[0]);
+        V3 n = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        const float l1 = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
+        if (l1 <= 0.0f) continue;
+        float u = n.x / l1, v = n.y / l1;
+        if (n.z < 0.0f) {
+            const float ou = u;
+            u = (1.0f - std::fabs(v)) * (ou >= 0.0f ? 1.0f : -1.0f);
+            v = (1.0f - std::fabs(ou)) * (v >= 0.0f ? 1.0f : -1.0f);
+        }
+        const auto q = [](float x) { return static_cast<std::uint32_t>(std::lround((std::clamp(x, -1.0f, 1.0f) * 0.5f + 0.5f) * 2047.0f)); };
+        const float code = -(1.0f + static_cast<float>(q(u) + 2048u * q(v)));
+        for (int k = 0; k < 3; ++k) std::memcpy(tri + k * kVertex + 0x1c, &code, sizeof code);
     }
 }
 
@@ -480,6 +539,8 @@ int on_mesh_draw(BbHookCtx* ctx, void*) {
         }
         slot.gen = g_mesh_gen.load(std::memory_order_relaxed);
         for (Batch& b : slot.batches) shade_batch(b);
+        if (g_gbuffer_style.load(std::memory_order_relaxed))
+            for (Batch& b : slot.batches) normal_batch(b);
         if (g_buffers_on && same && tris) {
             if (const std::uint64_t buffer = make_buffer(slot.batches, tris)) {
                 std::lock_guard<std::mutex> lock(g_mesh_mu);
@@ -728,6 +789,7 @@ void make_colours() {
     for (int k = 0; k < 6; ++k) {
         const int i = k < 3 ? k : k + 1;
         if (!g_early) g_colours[i] = static_cast<float>(g_rgb[k]) / 255.0f;
+        else if (g_gbuffer_style.load(std::memory_order_relaxed)) g_colours[i] = srgb_linear(g_rgb[k]);  // an albedo, lit by the game
         else if (g_rgb[k] == kDefaultRgb[k]) g_colours[i] = kEarlyColour[i];
         else g_colours[i] = 0.72f * srgb_linear(g_rgb[k]);
     }
@@ -769,6 +831,13 @@ bool read_rgb(int k, const char* v) {
     return true;
 }
 
+bool read_sun(const char* v) {
+    if (!v || !*v) return false;
+    const int n = static_cast<int>(std::strtod(v, nullptr));
+    const int s = n < 0 ? 0 : n > 100 ? 100 : n;
+    return g_sun.exchange(s, std::memory_order_relaxed) != s;
+}
+
 // "3e/05" (category/sub-category, hex) -> 0xf85; -1 when it is not one.
 int parse_pass(const char* v) {
     if (!v || !*v) return -1;
@@ -789,7 +858,23 @@ void set_pass(const char* v) {
     } else {
         g_pass = p;
     }
-    if (g_early) api->on_scene_category(g_pass, &play_early, nullptr);
+    if (g_early) api->on_scene_category(g_lit.load() ? kLitPass : g_pass, &play_early, nullptr);
+}
+
+// Lit by the game or not: the coloured play's pass and style, and the meshes
+// built again (an albedo and the normals in place of the screen colours).
+void set_lit(bool on) {
+    on = on && g_can_light;
+    if (g_lit.exchange(on) == on) return;
+    g_gbuffer_style.store(on ? BB_DRAW_GBUFFER : 0, std::memory_order_relaxed);
+    api->on_scene_category(on ? kLitPass : g_pass, &play_early, nullptr);
+    write_colours();
+}
+
+void set_ambient(const char* v) {
+    if (!g_can_light || !v || !*v) return;
+    const double n = std::strtod(v, nullptr);
+    api->gbuffer_ambient(static_cast<float>((n < 0 ? 0 : n > 100 ? 100 : n) / 1000.0));
 }
 
 bool truthy(const char* v) {
@@ -802,6 +887,11 @@ void on_option(const char* key, const char* value, void*) {
     else if (std::strcmp(key, "show_hi_hit") == 0) show_hi(truthy(value));
     else if (const int k = rgb_index(key); k >= 0) {
         if (read_rgb(k, value)) write_colours();
+    }
+    else if (std::strcmp(key, "lit") == 0) set_lit(truthy(value));
+    else if (std::strcmp(key, "ambient") == 0) set_ambient(value);
+    else if (std::strcmp(key, "sun") == 0) {
+        if (read_sun(value)) g_mesh_gen.fetch_add(1, std::memory_order_relaxed);
     }
     else if (std::strcmp(key, "occluder_pass") == 0 && g_can_occlude) {
         const int p = parse_pass(value);
@@ -853,6 +943,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         static const char* const kKeys[6] = {"lohit.wall_r", "lohit.wall_g", "lohit.wall_b",
                                              "lohit.floor_r", "lohit.floor_g", "lohit.floor_b"};
         for (int k = 0; k < 6; ++k) read_rgb(k, host->config(kKeys[k]));
+        read_sun(host->config("lohit.sun"));
     }
     // push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x48
     static const std::uint8_t hit_draw_entry[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
@@ -904,6 +995,13 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
             if (op >= 0) g_occluder_pass = op;
             host->on_scene_category(g_occluder_pass, &play_depth, nullptr);
         }
+        g_can_light = g_can_occlude && g_occlusion.load() && host->version >= 19 &&
+                      host->size >= offsetof(BbHostApi, gbuffer_ambient) + sizeof(void*);
+        if (g_can_light) {
+            const char* a = host->config("lohit.ambient");
+            set_ambient(a && *a ? a : "30");
+            set_lit(option_on("lohit.lit", false));
+        }
     }
     host->log("lohit: the lo-hit shown in place of the map (%d of 2 sites), %s (ahead of the scene's %02x/%02x), %s%s; "
               "meshes %s, colours %d,%d,%d / %d,%d,%d",
@@ -913,5 +1011,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
               g_rgb[2], g_rgb[3], g_rgb[4], g_rgb[5]);
     host->log("lohit: occlusion %s", !g_can_occlude ? "not available (needs plugin API 17 and the early play)"
                                      : g_occlusion.load() ? "on: its depth ahead of the scene's objects" : "off");
+    host->log("lohit: lit by the game %s", !g_can_light ? "not available (needs plugin API 19 and occlusion)"
+                                           : g_lit.load() ? "on: drawn into the G-buffer ahead of 3e/0c" : "off");
     return 0;
 }

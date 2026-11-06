@@ -178,6 +178,8 @@ struct GxDrawObjects {
     // engine/gx_state.h ids, taken at the call while the objects were alive;
     // 0 where the registry did not know the object.
     std::uint32_t blend_id = 0, depth_stencil_id = 0, raster_id = 0;
+    // A plugin's draw restyled into the G-buffer (kGxDrawGbuffer, API 19).
+    bool gbuffer = false;
     // The vertex-stage program's object (the domain shader's in a
     // tessellated draw), the pixel shader's and the input layout's, as
     // engine/gx_resources.h ids (0: not known); the renderer finds programs

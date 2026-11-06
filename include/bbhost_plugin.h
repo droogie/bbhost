@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 18
+#define BB_PLUGIN_API_VERSION 19
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -490,7 +490,16 @@ typedef struct BbHostApi {
      * the depth tested and written; BB_DRAW_DEPTH_EQUAL - the depth tested
      * less-or-equal and not written, pulled toward the viewer a little: a draw
      * made depth-only early in the scene (an occluder for the game's
-     * occlusion queries) and again later lands on its own depth. */
+     * occlusion queries) and again later lands on its own depth. Version 19:
+     * BB_DRAW_GBUFFER - drawn into the G-buffer, where the game's lighting
+     * lights it as it does the map (the sun, the lamps and their shadows, the
+     * fog), with the host's pixel shader in place of the draw's: for the
+     * game's simple coloured draw (the debug draw's), rgb the albedo (linear)
+     * and alpha the face's world normal when negative - -(1 + u + 2048 v), u
+     * and v its octahedral coordinates in 11 bits each (gbuffer_flat.frag).
+     * The draw marks the stencil as the map's G-buffer draws do, which the
+     * lights test. Only where the G-buffer is bound (a pass of the scene
+     * ahead of 3e/13, such as 3e/0c); elsewhere the draw is drawn as it is. */
     void (*draw_style)(int style);
 
     /* Version 18: the 3D's look. What the camera's draws - the 3D world, its
@@ -531,6 +540,10 @@ typedef struct BbHostApi {
      * sampled BB_FILTER_NEAREST, the grading stepping from entry to entry (16
      * shades a channel), or BB_FILTER_AS_IS, smoothly between them. */
     void (*grading_filter)(int filter);
+    /* Version 19: BB_DRAW_GBUFFER draws' indirect light - what a lightmap
+     * gives the map, which they have none of - from the next frame (0.03 by
+     * default; 0 leaves what no lamp reaches black). */
+    void (*gbuffer_ambient)(float level);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
@@ -545,6 +558,7 @@ typedef struct BbHostApi {
 #define BB_DRAW_SUBTRACT 4
 #define BB_DRAW_DEPTH_ONLY 8   /* version 17: no colour written, the depth tested and written */
 #define BB_DRAW_DEPTH_EQUAL 16 /* version 17: the depth tested less-or-equal, not written, pulled toward the viewer a little */
+#define BB_DRAW_GBUFFER 32     /* version 19: into the G-buffer, lit by the game (see draw_style) */
 
 #define BB_TEXT_LEFT 0u
 #define BB_TEXT_CENTRE 1u

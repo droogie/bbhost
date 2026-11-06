@@ -40,6 +40,7 @@
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
+#include "host/shaders/gbuffer_flat_frag.spv.h"
 #include "gcn/container.h"
 #include "gcn/gs_vertex.h"
 #include "gcn/lift.h"
@@ -3164,6 +3165,12 @@ struct DrawState {
     // cells across and down (0: none). After program_fp, so pipeline_key
     // leaves it out: draw_impl salts the key with it.
     float snap_cells[2] = {};
+    // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
+    // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
+    // whole and the rest masked (fixed_state). Salted into the key like the
+    // snap, with the ambient level its shader is made with.
+    bool host_gbuffer = false;
+    float gbuffer_ambient = 0.0f;
 };
 
 // BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
@@ -3776,6 +3783,12 @@ GfxFixedState fixed_state(const DrawState& s) {
         // The target's write mask where the pixel shader exports (draw_impl
         // makes it from either source; they agree on every draw compared).
         b.colorWriteMask = s.color_mask[t] & 0xf;
+        // A G-buffer draw (host_gbuffer): its shader writes targets 0-5 whole,
+        // unblended; the rest it leaves alone.
+        if (s.host_gbuffer) {
+            b = VkPipelineColorBlendAttachmentState{};
+            b.colorWriteMask = t < 6 ? 0xf : 0;
+        }
         // None of it written: no blend state either (masked_blend_state).
         const VkPipelineColorBlendAttachmentState kept = masked_blend_state(b, g_masked_blend);
         if (std::memcmp(&kept, &b, sizeof(b)) != 0) {
@@ -5454,6 +5467,7 @@ bool recipe_recordable(const DrawState& s) {
     // A plugin's snapped camera draw (DrawState::snap_cells): the lists keep no
     // grid, so a start would build it unsnapped - left to its draws.
     if (s.snap_cells[0] > 0.0f) return false;
+    if (s.host_gbuffer) return false;  // likewise its host pixel shader
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
@@ -6174,6 +6188,68 @@ std::mutex g_snap_origin_mu;
 std::unordered_map<std::uint64_t, SnapOrigin> g_snap_origin;  // by the twin's words
 std::atomic<std::uint64_t> g_snap_twins{0}, g_snap_refused{0};
 constexpr std::uint64_t kSnapSalt = 0x5a4a9c11ull;
+constexpr std::uint64_t kGbufferSalt = 0x6b0ffe12ull;  // DrawState::host_gbuffer
+
+// The map's G-buffer draws mark the stencil, and the lights test it: a
+// pixel left unmarked is not lit. So a plugin's G-buffer draw takes the
+// stencil test, operations and reference of the last draw into the G-buffer
+// (six targets or more) that wrote depth with the stencil on.
+std::atomic<std::uint32_t> g_gb_stencil_id{0}, g_gb_stencil_ref{0}, g_gb_stencil_ref_bf{0};
+void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
+    int bound = 0;
+    for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
+    if (bound < 6 || !s.gx_depth) return;
+    if (!o.gbuffer) {
+        if (s.gx_depth->stencil_enable && s.gx_depth->depth_write) {
+            g_gb_stencil_id.store(o.depth_stencil_id, std::memory_order_relaxed);
+            g_gb_stencil_ref.store(s.stencil_ref, std::memory_order_relaxed);
+            g_gb_stencil_ref_bf.store(s.stencil_ref_bf, std::memory_order_relaxed);
+        }
+        return;
+    }
+    const std::uint32_t from = g_gb_stencil_id.load(std::memory_order_relaxed);
+    if (!from) return;
+    const std::uint32_t id = gx_depth_stencil_merged(o.depth_stencil_id, from);
+    const GxDepthStencilDesc* merged = id ? gx_depth_stencil_desc(id) : nullptr;
+    if (!merged) return;
+    s.gx_depth = merged;
+    s.gx_ids[1] = id;
+    s.stencil_ref = g_gb_stencil_ref.load(std::memory_order_relaxed);
+    s.stencil_ref_bf = g_gb_stencil_ref_bf.load(std::memory_order_relaxed);
+}
+
+// The host's G-buffer shader (gbuffer_flat.frag) with its specialization
+// constants' defaults written in: 0 its ambient level - the indirect light it
+// writes in place of a lightmap, a plugin's (gx_gbuffer_ambient) once set -
+// 1 and 2 target 3's and 5's alpha (BBHOST_GBUFFER_SPEC=ambient,a3,a5, a
+// test; 0.03,0,0 without).
+const std::array<float, 3> g_gbuffer_spec = [] {
+    std::array<float, 3> v = {0.03f, 0.0f, 0.0f};
+    const char* e = std::getenv("BBHOST_GBUFFER_SPEC");
+    for (int k = 0; e && *e && k < 3; ++k) {
+        char* end = nullptr;
+        v[k] = std::strtof(e, &end);
+        e = end && *end == ',' ? end + 1 : nullptr;
+    }
+    return v;
+}();
+float gbuffer_ambient() {
+    const float set = gx_gbuffer_ambient_level();
+    return set >= 0.0f ? set : g_gbuffer_spec[0];
+}
+std::vector<std::uint32_t> gbuffer_ambient_words(float ambient) {
+    std::vector<std::uint32_t> w(std::begin(k_gbuffer_flat_frag_spv), std::end(k_gbuffer_flat_frag_spv));
+    const float spec[3] = {ambient, g_gbuffer_spec[1], g_gbuffer_spec[2]};
+    constexpr std::uint32_t kOpDecorate = 71, kOpSpecConstant = 50, kSpecId = 1;
+    std::uint32_t ids[3] = {};
+    for (std::size_t i = 5; i < w.size(); i += w[i] >> 16) {
+        if ((w[i] & 0xffff) == kOpDecorate && (w[i] >> 16) == 4 && w[i + 2] == kSpecId && w[i + 3] < 3) ids[w[i + 3]] = w[i + 1];
+        for (int k = 0; k < 3; ++k)
+            if ((w[i] & 0xffff) == kOpSpecConstant && ids[k] && w[i + 2] == ids[k]) std::memcpy(&w[i + 3], &spec[k], 4);
+        if (!(w[i] >> 16)) break;
+    }
+    return w;
+}
 
 void snap_refused(const std::string& name, const std::string& why) {
     g_snap_refused.fetch_add(1, std::memory_order_relaxed);
@@ -7137,6 +7213,18 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("PS module");
             if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
             if (ps_cacheable) cache_stage(ps_key, pl.ps.meta(), pl.ps.module, pl.ps.lifted);
+        }
+        // A G-buffer draw (DrawState::host_gbuffer): the host's shader with the
+        // draw's own bindings, which it leaves unread - the descriptor sets as
+        // the draw's shader has them.
+        if (s.host_gbuffer) {
+            gcn::TranslateResult host = pl.ps.meta();
+            host.spirv = gbuffer_ambient_words(s.gbuffer_ambient);
+            pl.ps.fresh() = std::move(host);
+            pl.ps.lifted = false;
+            pl.ps.module = VK_NULL_HANDLE;
+            if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("G-buffer PS module");
+            pl.ps_key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), pl.ps_key));
         }
     }
     // Vertex shader (+ fetch shader)
@@ -10742,6 +10830,34 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
                  pl.vs.meta().images.size(), pl.ps.meta().images.size(), fetch_dwords,
                  vertex_input ? vertex_input->elements.size() : 0, vertex_input ? vertex_input->bindings.size() : 0,
                  static_cast<long long>(ms_));
+    }
+    // BBHOST_DUMP_GBUFFER=<dir>: the pixel and vertex shaders of each
+    // pipeline drawing into six or more colour targets (the G-buffer's) - of
+    // every pipeline with BBHOST_DUMP_GBUFFER_ALL=1 - once a name, with the
+    // targets' formats logged.
+    static const char* const gbuffer_dir = std::getenv("BBHOST_DUMP_GBUFFER");
+    static const bool gbuffer_all = [] {
+        const char* e = std::getenv("BBHOST_DUMP_GBUFFER_ALL");
+        return e && e[0] == '1';
+    }();
+    if (gbuffer_dir && *gbuffer_dir && (gbuffer_all || f.color_formats.size() >= 6)) {
+        static std::mutex mu;
+        static std::unordered_set<std::string> seen;
+        std::lock_guard<std::mutex> lock(mu);
+        if (seen.insert(pl.name).second) {
+            std::string formats;
+            for (VkFormat cf : f.color_formats) formats += " " + std::to_string(static_cast<int>(cf));
+            host_log("render: dumped pipeline %s: VkFormats%s, depth %d, PS %zu words%s", pl.name.c_str(), formats.c_str(),
+                     static_cast<int>(f.depth_format), pl.ps.meta().spirv.size(), pl.ps.lifted ? " (lifted)" : "");
+            for (int vs = 0; vs < 2; ++vs) {
+                const std::vector<std::uint32_t>& words = vs ? pl.vs.meta().spirv : pl.ps.meta().spirv;
+                const std::string path = std::string(gbuffer_dir) + "/" + pl.name + (vs ? "-vs.spv" : "-ps.spv");
+                if (FILE* out = words.empty() ? nullptr : std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(words.data(), 4, words.size(), out);
+                    std::fclose(out);
+                }
+            }
+        }
     }
     return true;
 }
@@ -22895,6 +23011,7 @@ static bool draw_impl(const GpuDraw& d) {
             s.gx_ids[0] = o.blend_id;
             s.gx_ids[1] = o.depth_stencil_id;
             s.gx_ids[2] = o.raster_id;
+            gbuffer_stencil(s, o);
             if (!part) {  // the census leaves out a run part's draws (BBHOST_RUN_COMMIT)
                 ++g_gs_from_objects;
                 if (const std::uint32_t i = o.raster_id & 0x3fffffff; i < 64) {
@@ -22937,6 +23054,18 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     CachedProgram* ps_cp = s.ps_va ? program_for(ids ? ids->ps_prog_id : 0, s.ps_va) : nullptr;
+    if (d.gx_objects && d.gx_objects->gbuffer) {
+        static std::mutex gb_mu;
+        static std::set<std::string> gb_logged;
+        std::lock_guard<std::mutex> lk(gb_mu);
+        const std::string key = vs_cp->name + "+" + (ps_cp ? ps_cp->name : std::string("none"));
+        if (gb_logged.size() < 8 && gb_logged.insert(key).second) {
+            int colors = 0;
+            for (int t = 0; t < 8; ++t) colors += s.color[t] != nullptr;
+            host_log("render: G-buffer styled draw: VS %s PS %s, %d colour targets, depth %d", vs_cp->name.c_str(),
+                     ps_cp ? ps_cp->name.c_str() : "none", colors, s.depth ? s.depth->format : 0);
+        }
+    }
     if (s.ps_va && !ps_cp) {
         if (part && run->stop >= 0) return false;
         draw_failed(kFailPsProgram);
@@ -23254,6 +23383,18 @@ static bool draw_impl(const GpuDraw& d) {
     // the grid (build_gfx_pipeline), one per grid - the 3D's size and the
     // grid's lines decide it.
     s.snap_cells[0] = s.snap_cells[1] = 0.0f;
+    // A plugin's draw into the G-buffer (kGxDrawGbuffer): where six targets
+    // or more are bound, a pipeline with the host's pixel shader.
+    s.host_gbuffer = false;
+    if (d.gx_objects && d.gx_objects->gbuffer) {
+        int bound = 0;
+        for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
+        s.host_gbuffer = bound >= 6;
+        if (s.host_gbuffer) {
+            s.gbuffer_ambient = gbuffer_ambient();
+            key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), key));
+        }
+    }
     if (scene_look_snap() && look_camera_draw(s) && scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]))
         key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
     draw_stamp.to(kRenderCostKey);
