@@ -504,7 +504,8 @@ Manifest velomap_manifest() {
 
 // scene-rgba8, the scene's colour targets in 8 bits a channel (plugin API 18
 // scene_colour_bits: the Bloodborne PS1's 8-bit colour): Kyo's "rgba8f color space
-// (Perf Increase)" patch, site for site (patches/rgba8f-color-space.toml). The
+// (Perf Increase)" patch, site for site (its file, patches/rgba8f-color-space.toml,
+// left the patch list 2026-11-06). The
 // scene context's Initialize (sub_26c39f0) makes its colour targets in the
 // formats these bytes name - the game's 0x0a, RGBA16F, which the Performance
 // patch makes 0x1a (R11G11B10F) and, at 0x26c4b6f, 0x18 (R10G10B10A2) - and

@@ -300,7 +300,6 @@ wants one keeps its file in their own patches folder.
 | File | Patch |
 |---|---|
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
-| `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
@@ -313,7 +312,6 @@ wants one keeps its file in their own patches folder.
 | `smallest-hunter.toml` | **Smallest Hunter**: The smallest hunter (teeny). (off by default; one of hunter size) |
 | `zero-gravity.toml` | **Zero-Gravity Physics**: Havok's gravity at zero: objects and corpses float. (off by default; one of gravity) |
 | `anti-gravity.toml` | **Anti-Gravity Physics**: Havok's gravity reversed: objects and corpses fall upward. (off by default; one of gravity) |
-| `lower-specific-renders.toml` | **Lower specific renders (Perf Increase)**: Lowers the resolution of some renders (the velocity map, glow, the scaled depth): faster, with no visual difference unless Enable Screen Space Reflections is on. (off by default; one of low res renders; at the next start) |
 | `old-hunters.toml` | **The Old Hunters**: The Old Hunters is available: the game takes itself for the edition that includes it (on by default; at the next start) |
 | `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
 | `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |

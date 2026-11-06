@@ -90,31 +90,17 @@ int main() {
     // Screen Space Reflections is a setting now (engine/patch_manifest.cpp's
     // ssr): no file of its own.
     CHECK(seen.count("screen-space-reflections") == 0);
-    CHECK(seen.count("rgba8f-color-space") == 1);
-    CHECK(on.count("rgba8f-color-space") == 0);
+    // The two "(Perf Increase)" patches left the list (2026-11-06): rgba8f
+    // colour space lives on as bbhost's own scene-rgba8 (plugin API 18).
+    CHECK(seen.count("rgba8f-color-space") == 0);
+    CHECK(seen.count("lower-specific-renders") == 0);
 
-    // bbhost's own scene-rgba8 (a plugin's 8-bit colour, plugin API 18) is
-    // the rgba8f patch site for site: the same addresses, the eboot's bytes and
-    // the bytes written.
-    {
-        const std::vector<patch_file::Site> own = {
-#include "engine/scene_rgba8_sites.inc"
-        };
-        patch_file::Manifest m;
-        std::string err;
-        CHECK(patch_file::parse((fs::path(BB_PATCHES_DIR) / "rgba8f-color-space.toml").string(), &m, &err));
-        std::map<std::uint64_t, std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> file, ours;
-        for (const patch_file::Site& s : m.sites) file[s.address] = {s.expect, s.bytes};
-        for (const patch_file::Site& s : own) ours[s.address] = {s.expect, s.bytes};
-        CHECK(!ours.empty() && file == ours);
-    }
-
-    // The guard catches a dropped line: rgba8f color space's own file
-    // without its `enabled = false` reads as on.
+    // The guard catches a dropped line: Smaller Hunter's own file without its
+    // `enabled = false` reads as on.
     const fs::path dir = fs::temp_directory_path() / ("patch_defaults_test." + std::to_string(::getpid()));
     fs::create_directories(dir);
     {
-        std::ifstream in(fs::path(BB_PATCHES_DIR) / "rgba8f-color-space.toml");
+        std::ifstream in(fs::path(BB_PATCHES_DIR) / "smaller-hunter.toml");
         std::stringstream all;
         all << in.rdbuf();
         std::string text = all.str(), kept;
@@ -132,7 +118,7 @@ int main() {
         patch_file::Manifest m;
         std::string err;
         CHECK(patch_file::parse((dir / "without-enabled.toml").string(), &m, &err));
-        CHECK(m.name == "rgba8f-color-space" && m.enabled);
+        CHECK(m.name == "smaller-hunter" && m.enabled);
     }
 
     // What a player starts from turns nothing on.
