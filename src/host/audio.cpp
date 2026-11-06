@@ -1,4 +1,5 @@
 #include "host/audio.h"
+#include "host/audio_crush.h"
 #include "core/portable.h"
 #include "log.h"
 
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #if defined(BBHOST_HAVE_SDL3)
 #include <SDL3/SDL.h>
@@ -55,6 +57,10 @@ struct Out {
     std::chrono::steady_clock::time_point due{};
     double queued_avg = 0.0;
     std::atomic<int> max_pull{0};
+    // Old-hardware sound (audio_crush.h): its state across buffers and the
+    // buffer it writes into (the guest's own is left alone).
+    AudioCrushState crush;
+    std::vector<unsigned char> crushed;
 };
 
 void SDLCALL on_device_get(void* userdata, SDL_AudioStream*, int additional_amount, int total_amount) {
@@ -117,8 +123,9 @@ int host_audio_open(unsigned freq, unsigned channels, bool is_float, unsigned fr
     o.freq = freq;
     o.channels = channels;
     o.is_float = is_float;
-    // BBHOST_AUDIO_DUMP=<dir>: every output's samples, exactly as the game
-    // wrote them, to <dir>/audio-<handle>-<Hz>-<ch>ch-<f32|s16>.raw.
+    // BBHOST_AUDIO_DUMP=<dir>: every output's samples, exactly as the device
+    // gets them (the game's, after audio_crush), to
+    // <dir>/audio-<handle>-<Hz>-<ch>ch-<f32|s16>.raw.
     if (const char* dir = std::getenv("BBHOST_AUDIO_DUMP")) {
         const std::string path = std::string(dir) + "/audio-" + std::to_string(h) + "-" + std::to_string(freq) + "-" +
                                  std::to_string(channels) + "ch-" + (is_float ? "f32" : "s16") + ".raw";
@@ -149,6 +156,11 @@ void host_audio_write(int handle, const void* data, unsigned frames) {
         ++o->writers;
     }
     const unsigned bytes = frames * o->frame_bytes;
+    if (data && audio_crush_on()) {
+        o->crushed.resize(bytes);
+        audio_crush_apply(o->crush, data, o->crushed.data(), frames, o->channels, o->is_float, o->freq);
+        data = o->crushed.data();
+    }
     const auto start = std::chrono::steady_clock::now();
     {
         // The window's statistics (see Out). An underrun is counted from the

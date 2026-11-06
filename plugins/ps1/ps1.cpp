@@ -11,9 +11,13 @@
 //   colour_8bit = true     # the 3D's colour targets RGBA8 (and the colour grading unsmoothed)
 //   unfiltered = true      # the 3D's textures sampled nearest: no bilinear, trilinear or anisotropic filtering
 //   resolution = "Native"  # the 3D's size: Native (the Resolution setting, at most the window's), or 480p/360p/240p
+//   sound = "Off"          # old-hardware sound: Off, PS1, Crunchy or Custom
+//   sound_rate = 22050.0   # Custom's rate (Hz)
+//   sound_bits = 8.0       # Custom's bits a sample
 //
-// Everything here is the host's (plugin API 18): this file only says what the
-// options ask for, at the start and again as they change in the game.
+// Everything here is the host's (plugin API 18, and 21 for the sound): this
+// file only says what the options ask for, at the start and again as they
+// change in the game.
 //
 // What is the 3D. The host's camera draws: the draws with the scene's depth
 // that are not full-screen rect lists - the world, its characters, the sky,
@@ -58,6 +62,15 @@
 // draws the 3D at the window's size too (not above it, filtered down); 480,
 // 360p or 240p draw it that many lines high whatever the Resolution, as wide as the
 // window's shape gives.
+//
+// Old-hardware sound (audio_crush, API 21). Everything the game plays, as its
+// final mix reaches the device: low-passed (the PS1's SPU and its Gaussian
+// interpolation lost the top end), held down to a lower rate and truncated to
+// fewer bits, no dither. PS1: 22050 Hz, 12 bits, low-passed at 10 kHz -
+// muffled, a little grainy. Crunchy: 11025 Hz, 8 bits and no low-pass, so the
+// steps alias - a cheap sampler's. Custom: its own rate and bits, low-passed
+// just under the rate's Nyquist. Off by default; on a host before API 21 the
+// option does nothing and the look works as before.
 #include "bbhost_plugin.h"
 
 #include <cstddef>
@@ -71,7 +84,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "ps1",
     "Bloodborne PS1",
-    "0.2.0",
+    "0.3.0",
     "Kyo",
     "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
     "native.",
@@ -94,6 +107,15 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "Resolution setting, at most the window's. 480p, 360p and 240p: that many lines high, as wide as the window's shape gives "
      "(240p is 424 x 240 at 16:9, about 570 x 240 at 21:9), whatever the window's size.",
      "Native", 0, 0, "Native|480p|360p|240p"},
+    {BB_OPT_HEADING, "audio", "Sound", "Everything the game plays.", nullptr},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "sound", "Old-hardware sound",
+     "The game's sound as an old console's sound chip played it. PS1: 22050 Hz, 12 bits, the top end muffled above 10 kHz. "
+     "Crunchy: 11025 Hz and 8 bits, unfiltered, so it crackles. Custom: the rate and bits below.",
+     "Off", 0, 0, "Off|PS1|Crunchy|Custom"},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "sound_rate", "Custom rate (Hz)",
+     "Custom's sample rate: each sample held until the next at this rate, muffled just below half of it.", "22050.0", 2000.0, 48000.0},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "sound_bits", "Custom bits", "Custom's bits a sample: 16 is the game's own, 8 a crunchy sampler's.",
+     "8.0", 1.0, 16.0},
     {0}};
 
 namespace {
@@ -129,8 +151,57 @@ void set_colour_8bit(bool on) {
 }
 void set_resolution(const char* v) { api->scene_scale(BB_SCALE_NEAREST, lines_of(v)); }
 
+// Old-hardware sound: the choice and Custom's rate and bits, kept so a change
+// to one asks for all three again.
+struct Sound {
+    std::string choice = "Off";
+    double rate = 22050.0, bits = 8.0;
+} g_sound;
+
+bool has_audio_crush(const BbHostApi* host) {
+    return host->version >= 21 && host->size >= offsetof(BbHostApi, audio_crush) + sizeof(void*) && host->audio_crush;
+}
+
+void apply_sound() {
+    if (!has_audio_crush(api)) return;
+    const std::string& c = g_sound.choice;
+    if (c == "PS1") {
+        api->audio_crush(22050, 12, 10000.0f);
+    } else if (c == "Crunchy") {
+        api->audio_crush(11025, 8, 0.0f);
+    } else if (c == "Custom") {
+        const int rate = static_cast<int>(g_sound.rate + 0.5), bits = static_cast<int>(g_sound.bits + 0.5);
+        // 16 bits is the game's own: no truncation.
+        api->audio_crush(rate > 0 ? rate : 0, bits > 0 && bits < 16 ? bits : 0, rate > 0 ? 0.45f * static_cast<float>(rate) : 0.0f);
+    } else {
+        api->audio_crush(0, 0, 0.0f);
+    }
+}
+
+double number(const char* v, double fallback) {
+    char* end = nullptr;
+    const double n = v && *v ? std::strtod(v, &end) : 0.0;
+    return v && *v && end != v ? n : fallback;
+}
+
+void read_sound() {
+    // config()'s text lasts until the next call: each value copied first.
+    g_sound.choice = option("ps1.sound", "Off");
+    g_sound.rate = number(api->config("ps1.sound_rate"), 22050.0);
+    g_sound.bits = number(api->config("ps1.sound_bits"), 8.0);
+}
+
 void on_option(const char* key, const char* value, void*) {
-    if (std::strcmp(key, "snap") == 0) set_snap(value);
+    if (std::strcmp(key, "sound") == 0) {
+        g_sound.choice = value ? value : "Off";
+        apply_sound();
+    } else if (std::strcmp(key, "sound_rate") == 0) {
+        g_sound.rate = number(value, g_sound.rate);
+        apply_sound();
+    } else if (std::strcmp(key, "sound_bits") == 0) {
+        g_sound.bits = number(value, g_sound.bits);
+        apply_sound();
+    } else if (std::strcmp(key, "snap") == 0) set_snap(value);
     else if (std::strcmp(key, "unfiltered") == 0) set_unfiltered(truthy(value));
     else if (std::strcmp(key, "colour_8bit") == 0) set_colour_8bit(truthy(value));
     else if (std::strcmp(key, "resolution") == 0) set_resolution(value);
@@ -150,6 +221,8 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_init(const BbHostApi* host) {
     set_colour_8bit(truthy(option("ps1.colour_8bit", "true")));
     set_unfiltered(truthy(option("ps1.unfiltered", "true")));
     set_snap(option("ps1.snap", "240p"));
+    read_sound();
+    apply_sound();
     return 0;
 }
 
@@ -162,6 +235,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         host->scene_colour_bits(0);
         host->grading_filter(BB_FILTER_AS_IS);
         host->scene_scale(BB_SCALE_AS_IS, 0);
+        if (has_audio_crush(host)) host->audio_crush(0, 0, 0.0f);
         host->log("ps1: not the 1.09 eboot; off");
         return 1;
     }
@@ -169,7 +243,8 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     // config()'s text lasts until the next call: each value copied first.
     const std::string snap = option("ps1.snap", "240p"), resolution = option("ps1.resolution", "Native");
     const bool unfiltered = truthy(option("ps1.unfiltered", "true")), colour_8bit = truthy(option("ps1.colour_8bit", "true"));
-    host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, the 3D at %s", snap.c_str(),
-              unfiltered ? "unfiltered" : "as the game filters them", colour_8bit ? "8-bit" : "as the game makes it", resolution.c_str());
+    host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, the 3D at %s, sound %s", snap.c_str(),
+              unfiltered ? "unfiltered" : "as the game filters them", colour_8bit ? "8-bit" : "as the game makes it", resolution.c_str(),
+              has_audio_crush(host) ? g_sound.choice.c_str() : "as it is (needs plugin API 21)");
     return 0;
 }

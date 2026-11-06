@@ -170,6 +170,7 @@ add_executable(bbhost
   src/host/update_verify.cpp
   src/host/bindings.cpp
   src/host/audio.cpp
+  src/host/audio_crush.cpp
   src/host/frame_stats.cpp
   src/host/draw_digest.cpp
   src/host/perf_meter.cpp
@@ -952,6 +953,10 @@ if(UNIX)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
   add_test(NAME at9_test COMMAND at9_test)
   set_tests_properties(at9_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Old-hardware sound (host/audio_crush.h, plugin API 21) on hand-made buffers.
+  add_executable(audio_crush_test tests/audio_crush_test.cpp src/host/audio_crush.cpp)
+  target_include_directories(audio_crush_test PRIVATE src)
+  add_test(NAME audio_crush_test COMMAND audio_crush_test)
   # Labels written by the host once their submission has run, a counter for the GPU (tests/label_landing_test.cpp).
   add_executable(label_landing_test tests/label_landing_test.cpp src/core/portable.cpp)
   target_include_directories(label_landing_test PRIVATE src include)
@@ -960,7 +965,7 @@ if(UNIX)
   set_tests_properties(label_landing_test PROPERTIES ENVIRONMENT "BBHOST_LABEL_LANDING=1")
   if(SDL3_FOUND)
     # Audio output lifetimes under concurrent writes, on SDL's dummy driver.
-    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/core/portable.cpp)
+    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/host/audio_crush.cpp src/core/portable.cpp)
     target_include_directories(host_audio_test PRIVATE src)
     target_compile_definitions(host_audio_test PRIVATE BBHOST_HAVE_SDL3=1)
     target_link_libraries(host_audio_test PRIVATE SDL3::SDL3 pthread)
