@@ -841,14 +841,16 @@ DECOMP_LEAF void learn_chunk(u64 q, u64 range, u64 dt) {
 // capsules) are played after the scene into the display buffers, over the
 // effects and the post-processing. A plugin that wants one drawn inside the
 // scene - under the effects, against the scene's depth - is given a command
-// context of its own on the worker that records the first chunk at or after
-// the pass it names - a key's category and sub-category, (bits 22-27 << 6) |
-// bits 16-21: the chunk's first item's pass set up on it (the queue's
-// prepare: its targets bound), then the plugin's recording, queued under the
-// chunk's own key. The frame's end sorts the segments by key, stably, and ours
-// is appended first, so it plays just before the chunk. A chunk whose item
-// before it is already at or after the pass is not the first and gets none;
-// a frame without that pass gets the segment ahead of the next one.
+// context of its own on the worker that records the queue's first item at or
+// after the pass it names - a key's category and sub-category, (bits 22-27 <<
+// 6) | bits 16-21: that item's pass set up on it (the queue's prepare: its
+// targets bound), then the plugin's recording, queued under that item's key
+// and index. The worker's chunk is cut there (render_queue_chunk_job): the
+// game's job records the items before it and the items from it as two
+// segments, and the frame's end sorts the segments by key, stably, ours
+// appended ahead of the second, so it plays just before that item. A chunk
+// whose item before it is already at or after the pass is not the first and
+// gets none; a frame without that pass gets the segment ahead of the next one.
 // One slot per plugin function and user (plugin API 17; one in all before).
 struct InsertSlot {
     std::atomic<int> pass{-1};
@@ -924,23 +926,32 @@ void log_categories(u32 flips) {
                  kCategoryQueues);
 }
 
-DECOMP_LEAF void scene_insert_one(u64 functor, u64 range, u32 worker, const InsertSlot& slot) {
+// Where a slot's segment goes in this chunk: the queue's first item at or
+// after its pass, when it falls in the chunk (and the item before the chunk is
+// not already past it: then an earlier chunk took it); -1 none.
+DECOMP_LEAF int scene_insert_at(u64 q, u32 first, u32 end, const InsertSlot& slot) {
     const int want = slot.pass.load(std::memory_order_acquire);
-    const auto fn = slot.fn.load(std::memory_order_acquire);
-    if (want < 0 || !fn) return;
-    const u64 q = load<u64>(functor + 0x10);
-    const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
-    const u32 end = count > last ? last : count;
-    if (first >= end) return;
+    if (want < 0 || !slot.fn.load(std::memory_order_acquire) || first >= end) return -1;
     const u64 items = load<u64>(q + kItems);
     const auto pass_of = [items](u32 i) { return (load<u32>(items + static_cast<u64>(i) * kItemSize) >> 16) & 0xfff; };
-    // The chunk holding the queue's first item at or after the pass: a table
-    // entry can run across passes (3e/21-3e/25 is one), so that item need not
-    // start its chunk.
+    // A table entry can run across passes (3e/21-3e/25 is one), so that item
+    // need not start its chunk.
     u32 at = first;
     while (at != end && pass_of(at) < static_cast<u32>(want)) ++at;
-    if (at == end || (at == first && first > 0 && pass_of(first - 1) >= static_cast<u32>(want))) return;
-    const u32 key = load<u32>(items + static_cast<u64>(first) * kItemSize);
+    if (at == end || (at == first && first > 0 && pass_of(first - 1) >= static_cast<u32>(want))) return -1;
+    return static_cast<int>(at);
+}
+
+// The slot's segment, recorded ahead of item `at`: that item's pass set up on
+// its context (its targets bound) and queued under that item's key and index,
+// appended ahead of the game's segment from `at` on (render_queue_chunk_job
+// starts one there), so it plays just before it.
+DECOMP_LEAF void scene_insert_record(u64 functor, u32 at, u32 worker, const InsertSlot& slot) {
+    const auto fn = slot.fn.load(std::memory_order_acquire);
+    if (!fn) return;
+    const u64 q = load<u64>(functor + 0x10);
+    const u64 items = load<u64>(q + kItems);
+    const u32 key = load<u32>(items + static_cast<u64>(at) * kItemSize);
     const u64 gx = load<u64>(game_address(kGx));
     const u64 per_worker = load<u64>(load<u64>(gx + 0x58) + static_cast<u64>(worker) * 8);
     const u64 parent = load<u64>(functor + 8);
@@ -959,29 +970,72 @@ DECOMP_LEAF void scene_insert_one(u64 functor, u64 range, u32 worker, const Inse
     store<u32>(ctx + kCtxLow, key & 0xffff);
     fn(cc, slot.user.load(std::memory_order_acquire));
     game_function<OneFn>(kEndRecord)(cc);
-    game_function<QueueFn>(kQueueContext)(gx, cc, (key & 0xffff0000u) | (first & 0xffffu));
+    game_function<QueueFn>(kQueueContext)(gx, cc, (key & 0xffff0000u) | (at & 0xffffu));
     const u64 owner = game_function<OneFn>(kOwnerOf)(ctx);
     method<OneFn>(ctx, 0)(ctx);
     method<TwoFn>(owner, 0x70)(owner, ctx);
 }
 
-DECOMP_LEAF void scene_insert(u64 functor, u64 range, u32 worker) {
-    if (g_log_categories) count_categories(load<u64>(functor + 0x10), range);
-    for (const InsertSlot& slot : g_insert) scene_insert_one(functor, range, worker, slot);
+// The game's chunk job over [first, end) of the queue, timed when the costs
+// are wanted. `range` is the game's {first, last}; a part of it goes in a
+// pair of our own.
+DECOMP_LEAF u64 game_chunk(u64 functor, u64 range, u32 first, u32 last, u32 worker, bool learn) {
+    struct {
+        u32 first, last;
+    } part = {first, last};
+    const bool whole = first == load<u32>(range) && last == load<u32>(range + 4);
+    const u64 r = whole ? range : reinterpret_cast<u64>(&part);
+    const auto game = reinterpret_cast<ChunkJobFn>(g_game_chunk_job);
+    if (!learn) return game(functor, r, worker);
+    const u64 t0 = ticks();
+    const u64 ret = game(functor, r, worker);
+    learn_chunk(load<u64>(functor + 0x10), r, ticks() - t0);
+    return ret;
 }
 
 DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
-    scene_insert(functor, range, worker);
+    const u64 q = load<u64>(functor + 0x10);
+    if (g_log_categories) count_categories(q, range);
     const bool learn = learning();
     if (!g_census) {
-        // The game's job, timed when the costs are wanted.
-        const auto game = reinterpret_cast<ChunkJobFn>(g_game_chunk_job);
-        if (!learn) return game(functor, range, worker);
-        const u64 t0 = ticks();
-        const u64 ret = game(functor, range, worker);
-        learn_chunk(load<u64>(functor + 0x10), range, ticks() - t0);
-        return ret;
+        // The plugins' segments (on_scene_category) where their passes start
+        // in this chunk: the chunk cut there, the game's job run on each part
+        // and a segment recorded between them. It went ahead of the whole
+        // chunk, set up for its first item's pass: a chunk starting at 3e/05
+        // put Lo-Hit's G-buffer draw for 3e/0c ahead of the frame's objects,
+        // and a frame whose chunk started on another pass bound that pass's
+        // targets in another order.
+        const u32 first = load<u32>(range), last = load<u32>(range + 4), count = load<u32>(q + kCount);
+        const u32 end = count > last ? last : count;
+        int at[kInsertSlots];
+        bool any = false;
+        for (int k = 0; k < kInsertSlots; ++k) {
+            at[k] = scene_insert_at(q, first, end, g_insert[k]);
+            any = any || at[k] >= 0;
+        }
+        if (!any) return game_chunk(functor, range, first, last, worker, learn);
+        u64 ret = 0;
+        u32 from = first;
+        for (;;) {
+            // The next cut: the least `at` still ahead.
+            int next = -1;
+            for (int k = 0; k < kInsertSlots; ++k)
+                if (at[k] >= static_cast<int>(from) && (next < 0 || at[k] < next)) next = at[k];
+            if (next < 0) break;
+            if (static_cast<u32>(next) > from) ret = game_chunk(functor, range, from, static_cast<u32>(next), worker, learn);
+            for (int k = 0; k < kInsertSlots; ++k)
+                if (at[k] == next) {
+                    scene_insert_record(functor, static_cast<u32>(next), worker, g_insert[k]);
+                    at[k] = -1;
+                }
+            from = static_cast<u32>(next);
+        }
+        return from < last ? game_chunk(functor, range, from, last, worker, learn) : ret;
     }
+    // The census: the segments ahead of the chunk, set up for its first item.
+    for (const InsertSlot& slot : g_insert)
+        if (scene_insert_at(q, load<u32>(range), std::min(load<u32>(range + 4), load<u32>(q + kCount)), slot) >= 0)
+            scene_insert_record(functor, load<u32>(range), worker, slot);
     // The census's: ours, every item recorded.
     const u64 t0 = ticks();
     Chunk* rec = &g_chunk_ring[g_chunk_pos.fetch_add(1, std::memory_order_relaxed) & (kChunkRing - 1)];
@@ -1010,7 +1064,6 @@ DECOMP_LEAF u64 render_queue_chunk_job(u64 functor, u64 range, u32 worker) {
     const u64 per_worker = load<u64>(load<u64>(gx + 0x58) + static_cast<u64>(worker) * 8);
     const u64 parent = load<u64>(functor + 8);
     const u64 ctx = method<ContextFn>(parent, 0x80)(parent, per_worker, 0);
-    const u64 q = load<u64>(functor + 0x10);
     const u64 cc = load<u64>(ctx + kCtxCommand);
     game_function<OneFn>(kBeginRecord)(cc);
     const u64 lead = ticks() - t0;

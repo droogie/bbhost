@@ -3079,6 +3079,9 @@ int draw_vs_kind(const GfxPipeline& p, bool vertex_input, bool fetchless) {
     return p.lean || p.layout_only ? kDrawVsTranslated : kDrawVsFallback;
 }
 
+// DrawState::gbuffer_slots when the outputs go to targets 0-5 as bound.
+constexpr std::uint32_t kGbufferSlotsAsBound = 0 | 1 << 3 | 2 << 6 | 3 << 9 | 4 << 12 | 5 << 15;
+
 struct DrawState {
     std::uint64_t vs_va = 0, ps_va = 0, fetch_va = 0;
     std::uint32_t vs_rsrc1 = 0, vs_rsrc2 = 0, ps_rsrc1 = 0, ps_rsrc2 = 0;
@@ -3182,6 +3185,12 @@ struct DrawState {
     // snap, with the ambient level its shader is made with.
     bool host_gbuffer = false;
     float gbuffer_ambient = 0.0f;
+    // Which bound target each of its outputs 0-5 goes to, 3 bits each
+    // (gbuffer_targets): the G-buffer is not always bound in one order.
+    std::uint32_t gbuffer_slots = kGbufferSlotsAsBound;
+    // Its target 3's alpha, times 255 (gbuffer_group_take): the frame's light
+    // and fog group, as the game's own G-buffer draws write theirs.
+    int gbuffer_group = 0;
 };
 
 // BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
@@ -3794,11 +3803,14 @@ GfxFixedState fixed_state(const DrawState& s) {
         // The target's write mask where the pixel shader exports (draw_impl
         // makes it from either source; they agree on every draw compared).
         b.colorWriteMask = s.color_mask[t] & 0xf;
-        // A G-buffer draw (host_gbuffer): its shader writes targets 0-5 whole,
-        // unblended; the rest it leaves alone.
+        // A G-buffer draw (host_gbuffer): its shader writes six targets whole,
+        // unblended (0-5, or where gbuffer_slots puts them); the rest it leaves
+        // alone.
         if (s.host_gbuffer) {
             b = VkPipelineColorBlendAttachmentState{};
-            b.colorWriteMask = t < 6 ? 0xf : 0;
+            for (int k = 0; k < 6; ++k) {
+                if (static_cast<int>(s.gbuffer_slots >> (3 * k) & 7) == t) b.colorWriteMask = 0xf;
+            }
         }
         // None of it written: no blend state either (masked_blend_state).
         const VkPipelineColorBlendAttachmentState kept = masked_blend_state(b, g_masked_blend);
@@ -6267,12 +6279,117 @@ void gbuffer_stencil_count(std::uint32_t id, std::uint32_t ref, std::uint32_t re
                  static_cast<unsigned>(best >> 32), static_cast<unsigned>(best & 0xffffffffu));
 }
 
+// The G-buffer's targets in the map's own order (its 38 shaders' formats:
+// RGBA8 x2, RGBA8 sRGB, RGBA8, R11G11B10F, A2B10G10R10, R11G11B10F - normal,
+// gloss, albedo, specular, indirect light, baked specular, the seventh not
+// written), learned from the frame's own G-buffer draws. They are not always
+// bound in that order: some passes bind the same targets rotated (A2B10G10R10
+// first, the normal's last - 63a3f522's formats), and a plugin's G-buffer
+// draw played into such a pass wrote its normal into the baked specular and
+// left the normal target as it was - lit one way that frame and another the
+// next (the "lit by the game" flicker, the Hunter's Dream hall's two
+// brightnesses). So its outputs go to these targets wherever they are bound.
+std::atomic<std::uint64_t> g_gb_targets[7] = {};
+void gbuffer_targets_learn(const DrawState& s) {
+    static constexpr VkFormat kOrder[7] = {VK_FORMAT_R8G8B8A8_UNORM,    VK_FORMAT_R8G8B8A8_UNORM,           VK_FORMAT_R8G8B8A8_SRGB,
+                                           VK_FORMAT_R8G8B8A8_UNORM,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,  VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                                           VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+    for (int t = 0; t < 7; ++t) {
+        if (!s.color[t] || static_cast<VkFormat>(s.color[t]->format) != kOrder[t]) return;
+    }
+    for (int t = 0; t < 7; ++t) g_gb_targets[t].store(s.color[t]->base, std::memory_order_relaxed);
+}
+// DrawState::gbuffer_slots for a draw with these targets bound: each output's
+// slot, or as bound when one of the map's targets is not there (none learned).
+std::uint32_t gbuffer_slots(const DrawState& s) {
+    std::uint32_t slots = 0;
+    for (int k = 0; k < 6; ++k) {
+        const std::uint64_t want = g_gb_targets[k].load(std::memory_order_relaxed);
+        int at = -1;
+        for (int t = 0; t < 8 && at < 0 && want; ++t) {
+            if (s.color[t] && s.color[t]->base == want) at = t;
+        }
+        if (at < 0) return kGbufferSlotsAsBound;
+        slots |= static_cast<std::uint32_t>(at) << (3 * k);
+    }
+    return slots;
+}
+
+// The light and fog group. The map's and the objects' G-buffer shaders write
+// target 3's alpha as their instance's byte / 255 (cbInstanceData's first
+// dword), and the lighting reads it back as an index: the composite into
+// cbFog (x6: the fog), the directional light (8747a367+d92266b9) into cbLight
+// (x18: the sun's or the moon's colour and direction). The game numbers the
+// frame's groups afresh each frame - the Hunter's Dream hall's objects had 1,
+// 2, 4, 1, 3, 3 in six - so no fixed number holds one: a plugin's G-buffer
+// draw that wrote 0 was lit by whichever group came first that frame (the
+// "lit by the game" flicker, two or three brightnesses, and a sun from
+// another area's direction: the walls blown out at some angles). So each of
+// the frame's G-buffer draws counts its byte, and a plugin's takes the one
+// the most of them have since the last plugin draw took one. Lo-Hit's is
+// played after the frame's objects (render_queue_chunk_job cuts the chunk at
+// its pass) and in order (run parts stop at it), so they are counted first.
+std::mutex g_group_slots_mu;
+std::unordered_map<std::string, int> g_group_slots;  // by pixel program: cbInstanceData's slot, -1 none
+std::atomic<std::uint32_t> g_group_counts[256] = {};
+std::atomic<int> g_group_last{-1};  // the last one taken
+int group_slot(const std::string& ps_name) {
+    {
+        std::lock_guard<std::mutex> lk(g_group_slots_mu);
+        if (const auto it = g_group_slots.find(ps_name); it != g_group_slots.end()) return it->second;
+    }
+    int slot = -1;
+    if (const std::shared_ptr<const gcn::ShaderReflection> r = reflection_for(ps_name)) {
+        for (const gcn::ReflectedResource& res : r->resources)
+            if ((res.type & 0xff) == gcn::kResourceConstantBuffer && res.name == "cbInstanceData" && res.slot < 14) slot = static_cast<int>(res.slot);
+    }
+    std::lock_guard<std::mutex> lk(g_group_slots_mu);
+    g_group_slots.emplace(ps_name, slot);
+    return slot;
+}
+// A game G-buffer draw's group, counted: its first instance's (13 vec4s an
+// instance, the instance from the vertex normal's w) seventh vec4's first
+// dword in its pixel shader's cbInstanceData, through the buffer's record GX
+// keeps for the draw - the map's (6a833138+bb10e440) and the objects'
+// (0073ecc9+9abe2f09) shaders alike.
+void gbuffer_group_count(const GxStageRecords& ps, const std::string& ps_name) {
+    const int slot = group_slot(ps_name);
+    if (slot < 0 || !(ps.obj_cb_set >> slot & 1)) return;
+    std::uint32_t rec[2];
+    std::memcpy(rec, ps.obj_cb + slot * 16, sizeof(rec));
+    const std::uint64_t va = rec[0] | (static_cast<std::uint64_t>(rec[1] & 0xfff) << 32);
+    constexpr std::uint64_t kGroupDword = 6 * 4;
+    if (!va || !hle_kernel_va_mapped(va + kGroupDword * 4, 4)) return;
+    std::uint32_t group = 0;
+    std::memcpy(&group, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + kGroupDword * 4)), 4);
+    if (group < 256) g_group_counts[group].fetch_add(1, std::memory_order_relaxed);
+}
+// A plugin's G-buffer draw's group: the most counted since the last one taken
+// (then the counts start again), else the last.
+int gbuffer_group_take() {
+    int best = -1;
+    std::uint32_t most = 0;
+    for (int g = 0; g < 256; ++g) {
+        const std::uint32_t n = g_group_counts[g].exchange(0, std::memory_order_relaxed);
+        if (n > most) {
+            most = n;
+            best = g;
+        }
+    }
+    if (best >= 0) g_group_last.store(best, std::memory_order_relaxed);
+    const int g = g_group_last.load(std::memory_order_relaxed);
+    return g < 0 ? 0 : g;
+}
+
 void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
     int bound = 0;
     for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
     if (bound < 6 || !s.gx_depth) return;
     if (!o.gbuffer) {
-        if (s.gx_depth->stencil_enable && s.gx_depth->depth_write) gbuffer_stencil_count(o.depth_stencil_id, s.stencil_ref, s.stencil_ref_bf);
+        if (s.gx_depth->stencil_enable && s.gx_depth->depth_write) {
+            gbuffer_stencil_count(o.depth_stencil_id, s.stencil_ref, s.stencil_ref_bf);
+            gbuffer_targets_learn(s);
+        }
         return;
     }
     const std::uint64_t chosen = g_gb_chosen.load(std::memory_order_relaxed);
@@ -6307,9 +6424,11 @@ float gbuffer_ambient() {
     const float set = gx_gbuffer_ambient_level();
     return set >= 0.0f ? set : g_gbuffer_spec[0];
 }
-std::vector<std::uint32_t> gbuffer_ambient_words(float ambient) {
+std::vector<std::uint32_t> gbuffer_ambient_words(float ambient, std::uint32_t slots, int group) {
     std::vector<std::uint32_t> w(std::begin(k_gbuffer_flat_frag_spv), std::end(k_gbuffer_flat_frag_spv));
-    const float spec[3] = {ambient, g_gbuffer_spec[1], g_gbuffer_spec[2]};
+    std::array<float, 3> spec = g_gbuffer_spec;
+    spec[0] = ambient;
+    if (!std::getenv("BBHOST_GBUFFER_SPEC")) spec[1] = static_cast<float>(group) / 255.0f;  // the light and fog group
     constexpr std::uint32_t kOpDecorate = 71, kOpSpecConstant = 50, kSpecId = 1;
     std::uint32_t ids[3] = {};
     for (std::size_t i = 5; i < w.size(); i += w[i] >> 16) {
@@ -6317,6 +6436,18 @@ std::vector<std::uint32_t> gbuffer_ambient_words(float ambient) {
         for (int k = 0; k < 3; ++k)
             if ((w[i] & 0xffff) == kOpSpecConstant && ids[k] && w[i + 2] == ids[k]) std::memcpy(&w[i + 3], &spec[k], 4);
         if (!(w[i] >> 16)) break;
+    }
+    // Each output's location: the slot its target is bound at (gbuffer_slots).
+    if (slots != kGbufferSlotsAsBound) {
+        constexpr std::uint32_t kOpVariable = 59, kStorageOutput = 3, kLocation = 30;
+        std::set<std::uint32_t> outputs;
+        for (std::size_t i = 5; i < w.size() && (w[i] >> 16); i += w[i] >> 16) {
+            if ((w[i] & 0xffff) == kOpVariable && w[i + 3] == kStorageOutput) outputs.insert(w[i + 2]);
+        }
+        for (std::size_t i = 5; i < w.size() && (w[i] >> 16); i += w[i] >> 16) {
+            if ((w[i] & 0xffff) == kOpDecorate && w[i + 2] == kLocation && outputs.count(w[i + 1]) && w[i + 3] < 6)
+                w[i + 3] = slots >> (3 * w[i + 3]) & 7;
+        }
     }
     return w;
 }
@@ -7291,12 +7422,14 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // the draw's shader has them.
         if (s.host_gbuffer) {
             gcn::TranslateResult host = pl.ps.meta();
-            host.spirv = gbuffer_ambient_words(s.gbuffer_ambient);
+            host.spirv = gbuffer_ambient_words(s.gbuffer_ambient, s.gbuffer_slots, s.gbuffer_group);
             pl.ps.fresh() = std::move(host);
             pl.ps.lifted = false;
             pl.ps.module = VK_NULL_HANDLE;
             if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("G-buffer PS module");
-            pl.ps_key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), pl.ps_key));
+            pl.ps_key = fnv1a(&s.gbuffer_slots, sizeof(s.gbuffer_slots), pl.ps_key);
+            pl.ps_key = fnv1a(&s.gbuffer_group, sizeof(s.gbuffer_group), pl.ps_key);
+            pl.ps_key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(g_gbuffer_spec.data(), sizeof(g_gbuffer_spec), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), pl.ps_key)));
         }
     }
     // Vertex shader (+ fetch shader)
@@ -23203,6 +23336,9 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     CachedProgram* ps_cp = s.ps_va ? program_for(ids ? ids->ps_prog_id : 0, s.ps_va) : nullptr;
+    // A plugin's G-buffer draw is made in order, after the frame's own
+    // G-buffer draws counted their light and fog group (gbuffer_group_count).
+    if (d.gx_objects && d.gx_objects->gbuffer && run_part_stop(kRunStopRare)) return false;
     if (d.gx_objects && d.gx_objects->gbuffer) {
         static std::mutex gb_mu;
         static std::set<std::string> gb_logged;
@@ -23394,6 +23530,11 @@ static bool draw_impl(const GpuDraw& d) {
     }();
     t_snapshot_cbs = sf_snapshot && d.gx_token && d.gx_token_kind && std::strcmp(d.gx_token_kind, "scaleform") == 0;
     const GxDrawRecords* gx_records = d.gx && d.gx_render && d.gx_objects ? d.gx_objects->records : nullptr;
+    if (gx_records && ps_cp && !d.gx_objects->gbuffer && s.gx_depth && s.gx_depth->depth_write) {
+        int bound = 0;
+        for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
+        if (bound >= 6) gbuffer_group_count(gx_records->stage[kGxRecordPixel], ps_cp->name);
+    }
     const GxStageRecords* gx_stage[2] = {gx_records ? &gx_records->stage[s.gs ? kGxRecordGs : 0] : nullptr, gx_records ? &gx_records->stage[1] : nullptr};
     if (glitch_on()) {
         std::snprintf(t_draw_origin, sizeof(t_draw_origin), "%s token, gx inputs %s, gx_render %s, objects %s, records %s, partial %s, "
@@ -23541,6 +23682,10 @@ static bool draw_impl(const GpuDraw& d) {
         s.host_gbuffer = bound >= 6;
         if (s.host_gbuffer) {
             s.gbuffer_ambient = gbuffer_ambient();
+            s.gbuffer_slots = gbuffer_slots(s);
+            s.gbuffer_group = gbuffer_group_take();
+            key = fnv1a(&s.gbuffer_group, sizeof(s.gbuffer_group), key);
+            key = fnv1a(&s.gbuffer_slots, sizeof(s.gbuffer_slots), key);
             key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), key));
         }
     }
@@ -26744,8 +26889,16 @@ static bool draw_impl(const GpuDraw& d) {
             min_count = static_cast<std::uint32_t>(std::strtoul(want.c_str() + pc + 1, nullptr, 10));
             want = want.substr(0, pc);
         }
-        if (!done && pl.name.find(want) == 0 && d.index_count >= min_count && hle_video_flip_count() >= min_flip && ++seen == occurrence) {
-            done = true;
+        // BBHOST_DUMP_AT_DRAW_REPEAT=<n> (a test): the same again in each of the n flips after, files named by flip.
+        static int repeat = [] {
+            const char* e = std::getenv("BBHOST_DUMP_AT_DRAW_REPEAT");
+            return e ? std::atoi(e) : 0;
+        }();
+        static std::uint64_t next_flip = 0;
+        if (!done && pl.name.find(want) == 0 && d.index_count >= min_count && hle_video_flip_count() >= std::max(min_flip, next_flip) && ++seen == occurrence) {
+            done = repeat-- <= 0;
+            seen = 0;
+            next_flip = hle_video_flip_count() + 1;
             host_log("render: dumping every colour target after draw %llu of %s (targets %s / depth 0x%llx)",
                      static_cast<unsigned long long>(occurrence), pl.name.c_str(), s.color[0] ? "bound" : "none",
                      static_cast<unsigned long long>(s.depth ? s.depth->base : 0));
@@ -26753,7 +26906,8 @@ static bool draw_impl(const GpuDraw& d) {
             for (auto& kv : g_rts) {
                 if (!kv.second.initialised) continue;
                 char pth[96];
-                std::snprintf(pth, sizeof(pth), "build/rtd-%llx%s.ppm", static_cast<unsigned long long>(kv.first), kv.second.depth ? "-depth" : "");
+                std::snprintf(pth, sizeof(pth), "build/rtd-%llu-%llx%s.ppm", static_cast<unsigned long long>(hle_video_flip_count()),
+                              static_cast<unsigned long long>(kv.first), kv.second.depth ? "-depth" : "");
                 gpu::dump_rt_locked(kv.second, pth);
             }
         }
@@ -30225,10 +30379,11 @@ bool write_target_image(const TargetPixels& t) {
         for (std::uint32_t x = 0; x < t.width; ++x) {
             texel_nan = false;
             const std::uint8_t* p = t.data() + (static_cast<std::size_t>(y) * t.width + x) * t.bpp;
+            static const bool alpha_blue = std::getenv("BBHOST_DUMP_ALPHA_BLUE") != nullptr;  // a test: alpha in blue
             if (rgba8) {
                 row[x * 3 + 0] = bgra ? p[2] : p[0];
                 row[x * 3 + 1] = p[1];
-                row[x * 3 + 2] = bgra ? p[0] : p[2];
+                row[x * 3 + 2] = alpha_blue ? p[3] : bgra ? p[0] : p[2];
             } else if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
                 std::uint16_t h[3];
                 std::memcpy(h, p, 6);
