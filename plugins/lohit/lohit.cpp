@@ -112,7 +112,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.5.0",
+    "0.5.1",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -162,7 +162,22 @@ std::uint64_t g_rendman_slot = 0, g_gx_slot = 0;
 PlayFn g_play = nullptr;
 CameraFn g_camera_into = nullptr;
 
-std::atomic<bool> g_played_early{false};  // set by the early play, taken by the draw step's next play
+// Game frames (on_frame, the main thread), and the frame each play last ran
+// in (+1: 0 never). The draw step's own play of the list is skipped while the
+// early play has run in the last two frames. It was a flag the early play set
+// and the draw step took, but the two run on different threads in no fixed
+// order: some frames the draw step came first and drew the list flat over
+// the lit one, some the flag was taken a frame late and neither drew it (the
+// "lit by the game" flicker: lit, flat, gone). By frame, not by call: a
+// worker may record a frame's passes while the main thread is a frame on.
+std::atomic<std::uint64_t> g_frame{0};
+std::atomic<std::uint64_t> g_early_frame{0};
+void frame_tick(void*) { g_frame.fetch_add(1, std::memory_order_relaxed); }
+void stamp(std::atomic<std::uint64_t>& at) { at.store(g_frame.load(std::memory_order_relaxed) + 1, std::memory_order_release); }
+bool recent(const std::atomic<std::uint64_t>& at) {
+    const std::uint64_t f = at.load(std::memory_order_acquire);
+    return f && g_frame.load(std::memory_order_relaxed) + 1 - f <= 2;
+}
 thread_local bool t_ours = false;          // our own play passing through the hook
 int g_diag = -1;  // LOHIT_DIAG=1: the masks' and the meshes' counts, every 120 frames
 
@@ -208,7 +223,18 @@ void fill_params(Params& p, std::uint64_t cc) {
 bool g_can_occlude = false;               // plugin API 17: the second segment and the depth styles
 std::atomic<bool> g_occlusion{true};      // the depth-only play ahead of g_occluder_pass
 int g_occluder_pass = 0xf84;              // 3e/04: ahead of the scene's objects
-std::atomic<bool> g_depth_played{false};  // set by the depth-only play, taken by the coloured one
+// The frame the depth-only play last ran in. The coloured play lands on that
+// depth (BB_DRAW_DEPTH_EQUAL) when it is on and has played in the last two
+// frames (recent):
+// the two plays run on GX workers that build their passes side by side, so
+// this frame's depth may be recorded after the coloured play - the GPU still
+// runs 3e/04 ahead of 3e/0c. It was a flag the depth play set and the
+// coloured play took: whenever the coloured play's worker came first the
+// flag was not set, and that frame's lo-hit went without its depth test and
+// without the G-buffer style - drawn flat, unlit (the "lit by the game"
+// flicker, frame to frame).
+std::atomic<std::uint64_t> g_depth_frame{0};
+bool depth_play_on() { return g_can_occlude && g_occlusion.load(std::memory_order_relaxed) && g_cache_on && g_buffers_on; }
 // Lit (host API 19): the coloured play into the G-buffer at kLitPass, where
 // the game lights it (BB_DRAW_GBUFFER; 0 when not lit).
 constexpr int kLitPass = 0xf8c;  // 3e/0c: the G-buffer still bound, ahead of the lighting
@@ -222,20 +248,22 @@ void play_early(std::uint64_t cc, void*) {
     if (!list || !cc) return;
     Params p;
     fill_params(p, cc);
-    const bool on_depth = g_depth_played.exchange(false, std::memory_order_acq_rel);
-    if (on_depth) api->draw_style(BB_DRAW_DEPTH_EQUAL | g_gbuffer_style.load(std::memory_order_relaxed));
+    const bool on_depth = depth_play_on() && recent(g_depth_frame);
+    // The G-buffer style whenever lit, the depth test with it.
+    const int style = (on_depth ? BB_DRAW_DEPTH_EQUAL : 0) | g_gbuffer_style.load(std::memory_order_relaxed);
+    if (style) api->draw_style(style);
     t_ours = true;
     g_play(list, &p);
     t_ours = false;
-    if (on_depth) api->draw_style(BB_DRAW_AS_IS);
-    g_played_early.store(true, std::memory_order_release);
+    if (style) api->draw_style(BB_DRAW_AS_IS);
+    stamp(g_early_frame);
 }
 
 // Ahead of the scene's objects: the list's depth alone, for the occlusion tests.
 void play_depth(std::uint64_t cc, void*) {
     // The coloured play lands on this depth only when both draw the same
     // vertices: the meshes' buffers (built every frame, it comes out black).
-    if (!g_occlusion.load(std::memory_order_relaxed) || !g_cache_on || !g_buffers_on) return;
+    if (!depth_play_on()) return;
     const std::uint64_t list = first_list();
     if (!list || !cc) return;
     Params p;
@@ -245,14 +273,14 @@ void play_depth(std::uint64_t cc, void*) {
     g_play(list, &p);
     t_ours = false;
     api->draw_style(BB_DRAW_AS_IS);
-    g_depth_played.store(true, std::memory_order_release);
+    stamp(g_depth_frame);
 }
 
 // sub_135d780's entry: the draw step's own play of the first list, skipped
-// when it was played early since its last play.
+// while it is played early (in the last two frames).
 int on_play(BbHookCtx* ctx, void*) {
     if (t_ours || ctx->arg[0] != first_list()) return 0;
-    return g_played_early.exchange(false, std::memory_order_acq_rel) ? 1 : 0;
+    return recent(g_early_frame) ? 1 : 0;
 }
 
 // ---- The meshes, built once ----
@@ -986,6 +1014,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     write_colours();
     if (option_on("lohit.show_hi_hit", false)) show_hi(true);
     if (g_early) {
+        if (host->on_frame) host->on_frame(&frame_tick, nullptr);
         const char* c = host->config("lohit.pass");
         set_pass(c && *c ? c : "3e/25");
         g_can_occlude = host->version >= 17 && host->size >= offsetof(BbHostApi, draw_style) + sizeof(void*);
