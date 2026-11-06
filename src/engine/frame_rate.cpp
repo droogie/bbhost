@@ -825,22 +825,18 @@ static_assert(clock_loads_clear_of(kSixtySites) && clock_loads_clear_of(kFrameTi
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
-// The rates the Frame rate option offers besides 30 and Uncapped
-// (host/options.cpp, engine/option_menu.cpp, host/launcher.cpp list the
-// same): each runs the game's mode 2 with a 1/fps target. Uncapped runs the
+// The rates the Frame rate option lists besides 30 and Uncapped - 60, 90,
+// 120, 150, 180, 240, 360, 480, 960 (host/options.cpp, engine/option_menu.cpp)
+// - each run the game's mode 2 with a 1/fps target. Uncapped runs the
 // display's refresh rate the same way (engine/uncapped_limit.h), whatever it
-// is - 144, 165 - so any rate from 30 to 960 can run.
-constexpr int kFrameRates[] = {60, 90, 120, 150, 180, 240, 360, 480, 960};
+// is - 144, 165 - and the Custom limit the player's own number, so any rate
+// from 30 to 960 can run.
 
-// A frame rate as one of the modes: 30, a converted rate, or 0 (Uncapped).
-// Another number takes the nearest mode below it.
+// A frame rate as the game runs it: 30, a converted rate, or 0 (Uncapped).
+// Any number from 30 to 960 runs as itself (45 runs at 45); above 960 is 960.
 int mode_of(int fps) {
     if (fps <= 0) return 0;
-    int mode = 30;
-    for (const int r : kFrameRates) {
-        if (fps >= r) mode = r;
-    }
-    return mode;
+    return std::clamp(fps, 30, uncapped_limit::kMaxFps);
 }
 
 std::string mode_name(int fps) { return fps == 0 ? std::string("Display-Limited") : std::to_string(fps); }
@@ -1823,7 +1819,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
 }
 
 // The Frame rate option as the game started with it: 30, a rate of
-// kFrameRates, or 0 for Uncapped (frame_rate_install makes that the display's
+// the list or the Custom limit's (30 to 960), or 0 for Uncapped (frame_rate_install makes that the display's
 // refresh rate). BBHOST_GAME_FPS=30, 60, ... 960 or 0 (also "uncapped": atoi
 // reads 0) overrides it.
 int wanted_fps() {

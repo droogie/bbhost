@@ -482,6 +482,12 @@ immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
 off - and 60 when no display says a rate (headless). What counts frames cannot
 follow the frame's time, so a rate that moved with it (the Uncapped of earlier
 builds) ran those too fast or too slow.
+Custom limit, the tick box beside Frame rate (the setup window's Display card
+and F10's alike), runs the game at a number the player types instead, 30 to
+960 (45 runs it at 45, converted as the listed rates are); with frame
+generation on, twice as many frames are shown (45 shows 90). The file keeps it
+as `frame_cap_custom` and `frame_cap_custom_fps`; a rate picked from a list
+(the game's own System menu) unticks it.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -607,8 +613,8 @@ turned it on. `BBHOST_SOUND_CENSUS=1` (a test
 switch, at any rate) counts the sound thread's passes against the frames in
 the 300-flip report: how many frames began between one pass and the next.
 
-`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
-Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
+`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (any rate
+from 30 to 960, 0 is Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
 the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
 switch, at the converted rates) moves the target while the game runs:

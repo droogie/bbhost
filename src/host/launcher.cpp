@@ -316,18 +316,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // will run (host_effect_timing_row); a pick, one of the three, is the
     // player's own from Save or Play on.
     int effect_timing = -1;  // the pick, -1 none
-    // The game's frame rate (engine/frame_rate.h): 0 is Display-Limited, the display's refresh rate.
+    // The game's frame rate (engine/frame_rate.h), in the setting's order: 0 is
+    // Display-Limited, the display's refresh rate. The list's labels and
+    // bubbles are host_frame_rate_control's, F10's.
     static const int kCaps[] = {30, 60, 90, 120, 150, 180, 240, 360, 480, 960, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
-    static const char* const kCapLabels[] = {"30 fps",  "60 fps",  "90 fps",  "120 fps", "150 fps", "180 fps",
-                                             "240 fps", "360 fps", "480 fps", "960 fps", "Display-Limited"};
-    static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
-    // The bubble the open list shows over a rate: Display-Limited says what it is.
-    static const char* const kCapTips[] = {
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        "Caps the frame rate at your monitor's refresh rate, read when the game starts: 180 fps on a 180 Hz monitor, 144 on a "
-        "144 Hz one."};
-    static_assert(sizeof(kCapTips) / sizeof(kCapTips[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a bubble, or none, for every rate");
+    // Frame rate's Custom limit: ticked, the game runs at the number typed (30 to 960).
+    bool cap_custom = host_opt_frame_cap_custom();
+    int cap_custom_fps = host_opt_frame_cap_custom_fps();
     int cap_choice = kCapCount - 1;
     for (int k = 0; k < kCapCount; ++k) {
         if (kCaps[k] == frame_cap) cap_choice = k;
@@ -502,7 +498,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
-        host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set_frame_cap(kCaps[cap_choice]);  // unticks Custom limit, set again next
+        host_opt_set_frame_cap_custom(cap_custom, cap_custom_fps);
         host_opt_set("frame_clock", frame_clock);
         if (effect_timing >= 0) host_opt_choose_effect_timing(effect_timing);
         host_opt_set_index("camera_tuning", camera_tuning);
@@ -910,11 +907,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                     "at once. Fullscreen takes the display over at the mode nearest the "
                                                     "Resolution, which can change the screen's resolution.");
                 ui::row_label("Frame rate", row_lw);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##cap", &cap_choice, kCapLabels, kCapCount, kCapTips);
-                ui::tooltip_for_item("Frame rate",
-                                     "The game's own speed. Display-Limited caps it at your monitor's refresh rate when the game starts (180 fps on a "
-                                     "180 Hz monitor).");
+                // The list, or Custom limit's number, and its tick box - F10's own control.
+                host_frame_rate_control(&cap_choice, &cap_custom, &cap_custom_fps, ImGui::GetContentRegionAvail().x);
                 ui::toggle_row("Native frame clock (experimental)", nullptr, &frame_clock,
                                "Requires a restart. Timing follows each frame's real length, for PCs that do not hold their chosen frame rate.");
                 ui::row_label("Effect timing", row_lw);

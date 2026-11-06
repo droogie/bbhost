@@ -93,7 +93,24 @@ void host_opt_set_resolution_index(int i);
 // 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
 // file's key is still frame_cap. Same setting, same file.
 int host_opt_frame_cap();
+// A rate from the list: Custom limit is unticked with it.
 void host_opt_set_frame_cap(int fps);
+// Frame rate's Custom limit: its tick box and the number typed beside it (30
+// to 960, frame_cap_custom and frame_cap_custom_fps in the file). Ticked, the
+// game runs at that number in place of the list's rate.
+bool host_opt_frame_cap_custom();
+int host_opt_frame_cap_custom_fps();
+void host_opt_set_frame_cap_custom(bool on, int fps);
+// The rate the game runs at: Custom limit's number when it is ticked, else
+// Frame rate's (0 Display-Limited).
+int host_opt_frame_rate();
+// Custom limit's bubble, the setup window's and F10's.
+extern const char* const kHostFrameRateCustomNote;
+// Frame rate's control as the setup window and F10 both draw it, in `width`:
+// the list (`cap_index` into its rates, 30 to Display-Limited) - or, with
+// Custom limit ticked, a field to type the number into - and the Custom
+// limit tick box after it. True when one of the three changed.
+bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width);
 
 // Set one by name, from the rows the port adds to the game's own System menu
 // (engine/option_menu.h). The two front ends drive the same settings and the

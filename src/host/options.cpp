@@ -88,6 +88,8 @@ enum SettingId {
     kWindowMode,
     kVsync,
     kFrameCap,
+    kFrameCapCustom,
+    kFrameCapCustomFps,
     kFrameClock,
     kEffectTiming,
     kFpsCounter,
@@ -203,6 +205,14 @@ Setting g_set[kSettingCount] = {
      "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
      "rate (180 on a 180 Hz monitor). Changes at once between the rates above 30; to or from 30 needs a restart.",
      true},
+    // Frame rate's Custom limit, its tick box and its number, drawn in Frame
+    // rate's row (frame_rate_control) and not rows of their own: ticked, the
+    // game runs at the number typed (30 to 960; 45 runs the game at 45, as the
+    // listed rates run at theirs, and frame generation shows twice that) in
+    // place of the list's rate (frame_rate_of). A rate picked from a list (the
+    // game's own System menu, the Steam Deck row) unticks it.
+    {"frame_cap_custom", "Custom limit", {"Off", "On"}, 0, kHostFrameRateCustomNote, true},
+    {"frame_cap_custom_fps", "Custom frame rate", signed_steps(30, 960, "", false), 60 - 30, kHostFrameRateCustomNote, true},
     // The frame clock (engine/frame_clock.h), experimental and off by default:
     // what the frame rate otherwise sets once for the rate chosen at start
     // follows each frame's own length. Read once as the game starts
@@ -872,6 +882,14 @@ int fps_index(int fps) {
     return -1;
 }
 
+// The rate the game runs at for these indices of Frame rate, Custom limit and
+// its number: the number when ticked, else the list's.
+int frame_rate_of(int cap, int custom, int custom_fps) {
+    if (reads_on(g_set[kFrameCapCustom], custom)) return fps_from_label(g_set[kFrameCapCustomFps].values[static_cast<std::size_t>(custom_fps)]);
+    return fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(cap)]);
+}
+int frame_rate_now() { return frame_rate_of(g_set[kFrameCap].index, g_set[kFrameCapCustom].index, g_set[kFrameCapCustomFps].index); }
+
 std::string options_path() {
     // BBHOST_OPTIONS_PATH: a file of its own, so a scripted test that changes
     // settings (tools/menu_drive.sh) never writes the player's.
@@ -1040,12 +1058,15 @@ void apply(int id) {
             was[id] = s.index;
             break;
         }
-        case kFrameCap: {
+        case kFrameCap:
+        case kFrameCapCustom:
+        case kFrameCapCustomFps: {
             // From one converted rate to another at the next frame
             // (engine/frame_rate.h); otherwise, and before the game starts,
             // the presentation's cap, which says when it waits for the next
-            // start.
-            const int fps = fps_from_label(s.values[static_cast<std::size_t>(s.index)]);
+            // start. Custom limit's tick and number the same way: the rate
+            // they make with Frame rate's.
+            const int fps = frame_rate_now();
             if (!frame_rate_request(fps)) hle_video_set_fps_cap(fps);
             break;
         }
@@ -1206,7 +1227,7 @@ void rebuild_settings() {
     HostSettings h;
     h.fullscreen = index_of(kWindowMode) != 0;  // Borderless or Fullscreen
     h.vsync = on_of(kVsync);
-    h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
+    h.frame_cap = frame_rate_now();
     h.frame_clock = on_of(kFrameClock);
     h.effect_timing = kEffectTimingValues[std::clamp(index_of(kEffectTiming), 0, kEffectTimingCount - 1)];
     h.fps_counter = on_of(kFpsCounter);
@@ -1813,6 +1834,56 @@ const char* const* value_tips(int id, bool dlss) {
     }
 }
 
+// Frame rate's control, the setup window's and F10's alike, in `width`: the
+// list of rates - or, with Custom limit ticked, a field for the player's own
+// number, taken when the field is left or Enter pressed and held to 30-960 -
+// and the Custom limit tick box after it. `cap` is the list's index,
+// `custom` the tick, `custom_fps` the number. True when one of them changed.
+bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
+    static std::vector<std::string>* names = new std::vector<std::string>();
+    static std::vector<const char*> items, tips;
+    if (items.empty()) {
+        const Setting& f = g_set[kFrameCap];
+        for (const char* v : f.values) names->push_back(fps_from_label(v) ? std::string(v) + " fps" : std::string(v));
+        for (std::size_t v = 0; v < f.values.size(); ++v) {
+            items.push_back((*names)[v].c_str());
+            tips.push_back(fps_from_label(f.values[v]) ? nullptr
+                                                       : "Caps the frame rate at your monitor's refresh rate, read when the game "
+                                                         "starts: 180 fps on a 180 Hz monitor, 144 on a 144 Hz one.");
+        }
+    }
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const char* const kBox = "Custom limit";
+    const float box = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + ImGui::CalcTextSize(kBox).x;
+    const float field = std::max(ImGui::GetFrameHeight() * 2.0f, width - box - st.ItemSpacing.x);
+    bool changed = false;
+    ImGui::PushID("##frame_rate");
+    ImGui::SetNextItemWidth(field);
+    if (*custom) {
+        // What is being typed lives in the window's storage until it is taken.
+        ImGuiStorage* store = ImGui::GetStateStorage();
+        const ImGuiID key = ImGui::GetID("##typing");
+        int typing = store->GetInt(key, *custom_fps);
+        ImGui::InputInt("##fps", &typing, 0, 0);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            const int fps = std::clamp(typing, 30, 960);
+            if (fps != *custom_fps) {
+                *custom_fps = fps;
+                changed = true;
+            }
+        }
+        store->SetInt(key, ImGui::IsItemActive() ? typing : *custom_fps);
+    } else {
+        changed |= ui::combo("##cap", cap, items.data(), static_cast<int>(items.size()), tips.data());
+    }
+    ui::tooltip_for_item(g_set[kFrameCap].label, g_set[kFrameCap].note);
+    ImGui::SameLine(0, st.ItemSpacing.x);
+    changed |= ImGui::Checkbox(kBox, custom);
+    ui::tooltip_for_item(kBox, kHostFrameRateCustomNote);
+    ImGui::PopID();
+    return changed;
+}
+
 void setting_row(int id, const char* label = nullptr, const char* note = nullptr, const char* const* names = nullptr) {
     const Setting& s = g_set[id];
     if (!label) label = s.label;
@@ -1820,8 +1891,11 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     const float sc = ui::scale();
     const int n = static_cast<int>(s.values.size());
     const int cur = std::clamp(shown_index(id), 0, n - 1);
+    // Frame rate's with its Custom limit: the rate the three make.
+    const int custom = id == kFrameCap ? shown_index(kFrameCapCustom) : 0;
+    const int custom_fps = id == kFrameCap ? shown_index(kFrameCapCustomFps) : 0;
     const bool restart = s.restart && !g_setup_page && !(id == kResolution && res_live(cur)) &&
-                         !(id == kFrameCap && frame_rate_live(fps_from_label(s.values[static_cast<std::size_t>(cur)])));
+                         !(id == kFrameCap && frame_rate_live(frame_rate_of(cur, custom, custom_fps)));
     ImGui::PushID(id);
     int on_i = -1, off_i = -1;
     for (int v = 0; v < n; ++v) {
@@ -1863,7 +1937,23 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &pick, labels, et.index == kEffectTimingCount ? 4 : 3, tips);
         if (pick != shown && pick < kEffectTimingCount) change(id, pick);
-    } else if (id == kFrameCap || id == kResolution || id == kMenuTextSize) {
+    } else if (id == kFrameCap) {
+        // The list, or Custom limit's number, and its tick box (frame_rate_control).
+        int pick = cur;
+        bool on = reads_on(g_set[kFrameCapCustom], custom);
+        int fps = fps_from_label(g_set[kFrameCapCustomFps].values[static_cast<std::size_t>(custom_fps)]);
+        const bool was_on = on;
+        const int was_fps = fps;
+        const float fw = std::min(std::round(420 * sc), w * 0.62f);
+        ImGui::SetCursorScreenPos(ImVec2(p.x + w - fw, p.y));
+        if (frame_rate_control(&pick, &on, &fps, fw)) {
+            if (fps != was_fps) change(kFrameCapCustomFps, fps - 30);
+            if (on != was_on) change(kFrameCapCustom, on ? 1 : 0);
+            if (pick != cur) change(id, pick);
+        }
+        ImGui::PopID();
+        return;
+    } else if (id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
     } else if (n <= 4 || id == kShadowResolution) {
@@ -2147,6 +2237,10 @@ const char* const kHostShaderModeTips[2] = {
     "HLSL gives you trouble. The picture is the same either way.",
 };
 
+const char* const kHostFrameRateCustomNote =
+    "Tick to type your own frame rate, 30 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
+    "Frame generation on, twice as many frames are shown (45 shows 90). Unticked, Frame rate's list is used. Changes "
+    "at once between rates above 30; to or from 30 needs a restart.";
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";
@@ -2319,10 +2413,36 @@ void host_opt_set_frame_cap(int fps) {
     if (i < 0) {
         return;
     }
-    if (i == g_set[kFrameCap].index) return;
-    set_index(kFrameCap, i, false);
+    // A rate picked from a list (the game's own System menu) is the list's:
+    // Custom limit off with it.
+    const bool untick = on_of(kFrameCapCustom);
+    if (i == g_set[kFrameCap].index && !untick) return;
+    if (i != g_set[kFrameCap].index) set_index(kFrameCap, i, false);
+    if (untick) set_index(kFrameCapCustom, 0, false);
     save();
 }
+
+bool host_opt_frame_cap_custom() { return on_of(kFrameCapCustom); }
+int host_opt_frame_cap_custom_fps() {
+    return fps_from_label(g_set[kFrameCapCustomFps].values[static_cast<std::size_t>(g_set[kFrameCapCustomFps].index)]);
+}
+
+void host_opt_set_frame_cap_custom(bool on, int fps) {
+    const int i = std::clamp(fps, 30, 960) - 30;
+    const int tick = on ? 1 : 0;
+    if (i == g_set[kFrameCapCustomFps].index && tick == g_set[kFrameCapCustom].index) return;
+    if (i != g_set[kFrameCapCustomFps].index) set_index(kFrameCapCustomFps, i, false);
+    if (tick != g_set[kFrameCapCustom].index) set_index(kFrameCapCustom, tick, false);
+    save();
+}
+
+int host_opt_frame_rate() { return frame_rate_now(); }
+
+#if defined(BBHOST_HAVE_SDL3)
+bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width) {
+    return frame_rate_control(cap_index, custom, custom_fps, width);
+}
+#endif
 
 void host_opt_set(const char* key, bool on) {
     if (!key) {
@@ -2434,12 +2554,13 @@ namespace {
 int deck_profile_of(int fps) { return fps == 0 || fps >= 60 ? 1 : 0; }
 }  // namespace
 
-int host_deck_profile() { return deck_profile_of(host_opt_frame_cap()); }
+int host_deck_profile() { return deck_profile_of(host_opt_frame_rate()); }
 int host_deck_default_profile() { return deck_profile_of(host_opt_default_frame_cap()); }
 
 void host_set_deck_profile(int profile) {
     const bool sixty = profile == 1;
     if (const int i = fps_index(sixty ? 60 : 30); i >= 0 && i != g_set[kFrameCap].index) set_index(kFrameCap, i, false);
+    if (on_of(kFrameCapCustom)) set_index(kFrameCapCustom, 0, false);  // the Deck's rate, not a Custom limit's
     if (const int m = sixty ? 1 : 2; m != g_set[kModelDetail].index) set_index(kModelDetail, m, false);  // Low, Normal
     const char* const size = sixty ? "960x600" : "1280x800";
     for (std::size_t v = 0; v < g_set[kResolution].values.size(); ++v) {
