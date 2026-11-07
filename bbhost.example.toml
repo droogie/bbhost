@@ -177,10 +177,6 @@ all_post_processors = false
 # shipped one is off until true puts it in. The setup window's Patches tab
 # writes these; a manifest tied to a setting (skip-intro, debug-camera, ...)
 # follows that setting instead.
-# old-hunters: the game takes itself for the edition that includes The Old
-# Hunters (Kyo's 1.09 patch) and counts the DLC as installed; its title screen
-# reads "The Old Hunters Edition". Off: the base game.
-# old-hunters = true
 # fov-uncap = true
 
 [world]
@@ -188,7 +184,7 @@ all_post_processors = false
 # setup window's PC enhancements tab, F10 > PC ENHANCEMENTS and the game's
 # System > PC Enhancements turn each on or off for the next start, and what is
 # chosen there wins over these lines. Turn all three off for the game as it
-# shipped (The Old Hunters is a patch: old-hunters under [patches] above).
+# shipped (The Old Hunters is always on, part of bbhost).
 #
 # The mirror in the Hunter's Dream workshop: the developers placed a "Put on
 # Disguise" action there and never enabled it. true: it works - the first time

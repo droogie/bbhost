@@ -289,7 +289,11 @@ Faster loading screens (bbhost runs loading screens unpaced), Skip Intro
 (Skip company logos, built into bbhost) and Unlock Game Region (System >
 Language lists all 21 text languages on every disc, built into bbhost
 without changing the region, so online play keeps working), and the Intel
-Black Tonemap Fix (its bytes are the built-in performance patch's, always on)
+Black Tonemap Fix (its bytes are the built-in performance patch's, always on),
+The Old Hunters (built in and always on: the game is the edition that
+includes it) and Modern Movement's hold D-pad Down for the first quick item
+(built in, on; the NR ports' Controls carry their own copy, which it steps
+aside for)
 - and the ones a release does not
 carry: the debug patches (camera, dash, menu, Enemy Control), the rally and
 weapon-size changes, and the emulator workarounds and extras (FMOD Crash Fix,
@@ -312,7 +316,6 @@ wants one keeps its file in their own patches folder.
 | `smallest-hunter.toml` | **Smallest Hunter**: The smallest hunter (teeny). (off by default; one of hunter size) |
 | `zero-gravity.toml` | **Zero-Gravity Physics**: Havok's gravity at zero: objects and corpses float. (off by default; one of gravity) |
 | `anti-gravity.toml` | **Anti-Gravity Physics**: Havok's gravity reversed: objects and corpses fall upward. (off by default; one of gravity) |
-| `old-hunters.toml` | **The Old Hunters**: The Old Hunters is available: the game takes itself for the edition that includes it (on by default; at the next start) |
 | `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
 | `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |
 | `deflate-level.toml` | **Deflate level 1**: The game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s) (off by default) |

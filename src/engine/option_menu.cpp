@@ -232,7 +232,7 @@ constexpr std::uint32_t kSystemUpscaleRowId = 110014;
 constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
                         kUpQuality = 125004;
 // PC Enhancements, 124000: four toggles, each for the next start (124000
-// was The Old Hunters, a patch of its own since: the setup window's Patches tab).
+// was The Old Hunters, part of bbhost since: engine/patch_manifest.cpp).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
 // Steam Deck, 123000: its frame rate - the two configurations,
 // host_set_deck_profile - and the model detail.
