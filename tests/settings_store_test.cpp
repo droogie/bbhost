@@ -76,14 +76,16 @@ int main() {
 
     // The shader patches' mask: listening from the first ask, and following
     // a change made after that at once - nothing polls for it.
+    // (Motion blur is two patches - YEBIS's blur and the camera blur's build
+    // of it - then depth of field: bits 0 and 1, then 2.)
     CHECK(shader_patch_mask() == 0);
     HostSettings blur_off = store().now();
     blur_off.motion_blur = false;
     store().publish(blur_off);
-    CHECK(shader_patch_mask() == 1);
+    CHECK(shader_patch_mask() == 3);
     blur_off.depth_of_field = false;
     store().publish(blur_off);
-    CHECK(shader_patch_mask() == 3);
+    CHECK(shader_patch_mask() == 7);
     store().publish(HostSettings{});
     CHECK(shader_patch_mask() == 0);
 
