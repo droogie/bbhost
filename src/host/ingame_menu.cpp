@@ -566,21 +566,24 @@ const std::vector<Page>& menu_pages() {
                               "Changes to the game's code. Most turn on or off at once; the rest when the game starts again."});
         own(&g_plugins_page, {"Plugins", ui::Icon::Plugins, "Each plugin's settings and actions. Those marked change at once; the rest at the next start."});
     };
+    // The mouse and the prompts with the bindings: one page for input, after
+    // Graphics (Input's own place in the settings is before it).
+    auto add_controls = [&] {
+        own(&g_controls_page, {"Controls", ui::Icon::Keyboard,
+                               "The mouse and the prompts, and every action's key, mouse button and controller button."});
+    };
     for (int i = 0; i < host_options_page_count(); ++i) {
         Page p{host_options_page_name(i), ui::Icon::Settings, host_options_page_blurb(i)};
-        if (std::strcmp(p.name, "Input") == 0) {
-            // The mouse and the prompts with the bindings: one page for input.
-            own(&g_controls_page, {"Controls", ui::Icon::Keyboard,
-                                   "The mouse and the prompts, and every action's key, mouse button and controller button."});
-            continue;
-        }
+        if (std::strcmp(p.name, "Input") == 0) continue;
         for (const auto& k : kIcons) {
             if (std::strcmp(k.name, p.name) == 0) p.icon = k.icon;
         }
         pages.push_back(p);
         g_options_of.push_back(i);
+        if (std::strcmp(p.name, "Graphics") == 0) add_controls();
         if (std::strcmp(p.name, "PC Enhancements") == 0) add_mods();
     }
+    if (g_controls_page < 0) add_controls();  // no Graphics page: at the end
     if (g_patches_page < 0) add_mods();  // no PC Enhancements page: at the end
     return pages;
 }

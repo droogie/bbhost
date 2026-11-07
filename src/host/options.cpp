@@ -659,8 +659,8 @@ const Row g_rows[] = {
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kSfxTextureQuality},
-    {Row::Option, nullptr, kAnisotropicFiltering},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kAnisotropicFiltering},
     {Row::Option, nullptr, kHdMotionBlur},
     {Row::Option, nullptr, kHdMotionBlurRes},
     {Row::Option, nullptr, kSsao},
@@ -2344,9 +2344,10 @@ const char* upscaler_note() {
 
 // Rows that only mean something under another setting, left out while it is
 // off: the upscaler's preset with Upscaling off, the motion vectors with
-// Upscaling and Frame generation both off. (HD motion blur quality is greyed
-// with HD motion blur off instead: row_greyed.)
+// Upscaling and Frame generation both off, HD motion blur quality with HD
+// motion blur off.
 bool row_hidden(int id) {
+    if (id == kHdMotionBlurRes) return !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
     if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
     if (id == kTaaStrength) return shown_index(kUpscaler) != 1;  // (TAA's alone)
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
@@ -2355,8 +2356,7 @@ bool row_hidden(int id) {
 
 // Rows shown but not to be changed while the setting they need is off.
 bool row_greyed(int id) {
-    return (id == kHdMotionBlurRes && !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur))) ||
-           (id == kSsrQuality && !reads_on(g_set[kSsr], shown_index(kSsr)));
+    return id == kSsrQuality && !reads_on(g_set[kSsr], shown_index(kSsr));
 }
 
 void host_options_draw_page(int page) {
