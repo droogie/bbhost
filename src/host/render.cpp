@@ -6279,10 +6279,10 @@ void gbuffer_stencil_count(std::uint32_t id, std::uint32_t ref, std::uint32_t re
                  static_cast<unsigned>(best >> 32), static_cast<unsigned>(best & 0xffffffffu));
 }
 
-// The G-buffer's targets in the map's own order (its 38 shaders' formats:
-// RGBA8 x2, RGBA8 sRGB, RGBA8, R11G11B10F, A2B10G10R10, R11G11B10F - normal,
+// The G-buffer's targets in the map's own order (its 38 shaders': normal,
 // gloss, albedo, specular, indirect light, baked specular, the seventh not
-// written), learned from the frame's own G-buffer draws. They are not always
+// written - RGBA8 x2, RGBA8 sRGB, RGBA8, R11G11B10F, A2B10G10R10, R11G11B10F),
+// learned from the frame's own G-buffer draws. They are not always
 // bound in that order: some passes bind the same targets rotated (A2B10G10R10
 // first, the normal's last - 63a3f522's formats), and a plugin's G-buffer
 // draw played into such a pass wrote its normal into the baked specular and
@@ -6290,14 +6290,42 @@ void gbuffer_stencil_count(std::uint32_t id, std::uint32_t ref, std::uint32_t re
 // next (the "lit by the game" flicker, the Hunter's Dream hall's two
 // brightnesses). So its outputs go to these targets wherever they are bound.
 std::atomic<std::uint64_t> g_gb_targets[7] = {};
+// The orders seen, counted (halved every 1024): the map's is the one the most
+// of the frame's G-buffer draws bind. By what is bound, not by the targets'
+// formats - the Bloodborne PS1's 8-bit colour makes the float targets RGBA8,
+// and an order known by its formats was never found there: Lo-Hit's normal
+// went into the albedo, its walls coloured by where they face.
+struct GbOrder {
+    std::uint64_t base[7] = {};
+    std::uint32_t count = 0;
+};
+std::mutex g_gb_orders_mu;
+GbOrder g_gb_orders[4];
+std::uint32_t g_gb_orders_seen = 0;
 void gbuffer_targets_learn(const DrawState& s) {
-    static constexpr VkFormat kOrder[7] = {VK_FORMAT_R8G8B8A8_UNORM,    VK_FORMAT_R8G8B8A8_UNORM,           VK_FORMAT_R8G8B8A8_SRGB,
-                                           VK_FORMAT_R8G8B8A8_UNORM,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,  VK_FORMAT_A2B10G10R10_UNORM_PACK32,
-                                           VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+    std::uint64_t base[7];
     for (int t = 0; t < 7; ++t) {
-        if (!s.color[t] || static_cast<VkFormat>(s.color[t]->format) != kOrder[t]) return;
+        if (!s.color[t]) return;
+        base[t] = s.color[t]->base;
     }
-    for (int t = 0; t < 7; ++t) g_gb_targets[t].store(s.color[t]->base, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_gb_orders_mu);
+    GbOrder* slot = nullptr;
+    for (GbOrder& o : g_gb_orders)
+        if (o.count && std::memcmp(o.base, base, sizeof base) == 0) slot = &o;
+    if (!slot) {
+        slot = &g_gb_orders[0];
+        for (GbOrder& o : g_gb_orders)
+            if (o.count < slot->count) slot = &o;
+        std::memcpy(slot->base, base, sizeof base);
+        slot->count = 0;
+    }
+    ++slot->count;
+    if (++g_gb_orders_seen % 1024 == 0)
+        for (GbOrder& o : g_gb_orders) o.count /= 2;
+    const GbOrder* most = &g_gb_orders[0];
+    for (const GbOrder& o : g_gb_orders)
+        if (o.count > most->count) most = &o;
+    for (int t = 0; t < 7; ++t) g_gb_targets[t].store(most->base[t], std::memory_order_relaxed);
 }
 // DrawState::gbuffer_slots for a draw with these targets bound: each output's
 // slot, or as bound when one of the map's targets is not there (none learned).
@@ -6325,27 +6353,41 @@ std::uint32_t gbuffer_slots(const DrawState& s) {
 // draw that wrote 0 was lit by whichever group came first that frame (the
 // "lit by the game" flicker, two or three brightnesses, and a sun from
 // another area's direction: the walls blown out at some angles). So each of
-// the frame's G-buffer draws counts its byte, and a plugin's takes the one
-// the most of them have since the last plugin draw took one. Lo-Hit's is
+// the frame's G-buffer draws counts its byte, and a plugin's takes the map's
+// (gbuffer_group_take). Lo-Hit's is
 // played after the frame's objects (render_queue_chunk_job cuts the chunk at
 // its pass) and in order (run parts stop at it), so they are counted first.
+// Where a pixel program reads its group (cbInstanceData's slot, -1 none), and
+// whether it is the map's: lightmapped (g_DOLTexture), as the map's pieces'
+// shaders are (6a833138+bb10e440 and its kin).
+struct GroupSlot {
+    int slot = -1;
+    bool map = false;
+};
 std::mutex g_group_slots_mu;
-std::unordered_map<std::string, int> g_group_slots;  // by pixel program: cbInstanceData's slot, -1 none
-std::atomic<std::uint32_t> g_group_counts[256] = {};
-std::atomic<int> g_group_last{-1};  // the last one taken
-int group_slot(const std::string& ps_name) {
+std::unordered_map<std::string, GroupSlot> g_group_slots;  // by pixel program
+// Since the last take: each group's draws, the map's pieces' apart.
+std::atomic<std::uint32_t> g_group_counts[256] = {}, g_group_map_counts[256] = {};
+std::mutex g_group_take_mu;
+int g_group_last = -1;                 // the last one taken
+std::uint32_t g_group_last_total = 0;  // the draws the last whole take counted
+std::uint64_t g_group_last_flip = 0;   // at that flip
+GroupSlot group_slot(const std::string& ps_name) {
     {
         std::lock_guard<std::mutex> lk(g_group_slots_mu);
         if (const auto it = g_group_slots.find(ps_name); it != g_group_slots.end()) return it->second;
     }
-    int slot = -1;
+    GroupSlot gs;
     if (const std::shared_ptr<const gcn::ShaderReflection> r = reflection_for(ps_name)) {
-        for (const gcn::ReflectedResource& res : r->resources)
-            if ((res.type & 0xff) == gcn::kResourceConstantBuffer && res.name == "cbInstanceData" && res.slot < 14) slot = static_cast<int>(res.slot);
+        for (const gcn::ReflectedResource& res : r->resources) {
+            if ((res.type & 0xff) == gcn::kResourceConstantBuffer && res.name == "cbInstanceData" && res.slot < 14)
+                gs.slot = static_cast<int>(res.slot);
+            if ((res.type & 0xff) != gcn::kResourceConstantBuffer && res.name == "g_DOLTexture") gs.map = true;
+        }
     }
     std::lock_guard<std::mutex> lk(g_group_slots_mu);
-    g_group_slots.emplace(ps_name, slot);
-    return slot;
+    g_group_slots.emplace(ps_name, gs);
+    return gs;
 }
 // A game G-buffer draw's group, counted: its first instance's (13 vec4s an
 // instance, the instance from the vertex normal's w) seventh vec4's first
@@ -6353,32 +6395,47 @@ int group_slot(const std::string& ps_name) {
 // keeps for the draw - the map's (6a833138+bb10e440) and the objects'
 // (0073ecc9+9abe2f09) shaders alike.
 void gbuffer_group_count(const GxStageRecords& ps, const std::string& ps_name) {
-    const int slot = group_slot(ps_name);
-    if (slot < 0 || !(ps.obj_cb_set >> slot & 1)) return;
+    const GroupSlot gs = group_slot(ps_name);
+    if (gs.slot < 0 || !(ps.obj_cb_set >> gs.slot & 1)) return;
     std::uint32_t rec[2];
-    std::memcpy(rec, ps.obj_cb + slot * 16, sizeof(rec));
+    std::memcpy(rec, ps.obj_cb + gs.slot * 16, sizeof(rec));
     const std::uint64_t va = rec[0] | (static_cast<std::uint64_t>(rec[1] & 0xfff) << 32);
     constexpr std::uint64_t kGroupDword = 6 * 4;
     if (!va || !hle_kernel_va_mapped(va + kGroupDword * 4, 4)) return;
     std::uint32_t group = 0;
     std::memcpy(&group, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + kGroupDword * 4)), 4);
-    if (group < 256) g_group_counts[group].fetch_add(1, std::memory_order_relaxed);
+    if (group >= 256) return;
+    g_group_counts[group].fetch_add(1, std::memory_order_relaxed);
+    if (gs.map) g_group_map_counts[group].fetch_add(1, std::memory_order_relaxed);
 }
-// A plugin's G-buffer draw's group: the most counted since the last one taken
-// (then the counts start again), else the last.
+// A plugin's G-buffer draw's group, from the draws counted since the last
+// take (then counted afresh): the one the most of the map's own pieces have
+// (Lo-Hit stands in for the map; some of its pieces draw beside it), else the
+// one the most draws have. The most draws alone changed from frame to frame
+// in a busy place - Kyo's save: groups of 29, 4 and 34 draws, the 34 the
+// characters' and other things' blended for where they stand, one number one
+// frame and another the next - and Lo-Hit's light with it (19 and 34 mean).
+// With none counted, the last; likewise with fewer than half the draws the
+// last whole take counted - a frame's later G-buffer draws, made on run parts
+// beside Lo-Hit's in-order ones, can be counted between two of its draws -
+// unless that has gone on for 30 flips (a place with fewer draws).
 int gbuffer_group_take() {
-    int best = -1;
-    std::uint32_t most = 0;
+    std::uint32_t n[256], m[256], total = 0, most = 0, most_map = 0;
+    int best = -1, best_map = -1;
     for (int g = 0; g < 256; ++g) {
-        const std::uint32_t n = g_group_counts[g].exchange(0, std::memory_order_relaxed);
-        if (n > most) {
-            most = n;
-            best = g;
-        }
+        n[g] = g_group_counts[g].exchange(0, std::memory_order_relaxed);
+        m[g] = g_group_map_counts[g].exchange(0, std::memory_order_relaxed);
+        total += n[g];
+        if (n[g] > most) most = n[g], best = g;
+        if (m[g] > most_map) most_map = m[g], best_map = g;
     }
-    if (best >= 0) g_group_last.store(best, std::memory_order_relaxed);
-    const int g = g_group_last.load(std::memory_order_relaxed);
-    return g < 0 ? 0 : g;
+    std::lock_guard<std::mutex> lk(g_group_take_mu);
+    const std::uint64_t flip = hle_video_flip_count();
+    if (best < 0 || (total * 2 < g_group_last_total && flip - g_group_last_flip < 30)) return g_group_last < 0 ? 0 : g_group_last;
+    g_group_last_total = total;
+    g_group_last_flip = flip;
+    g_group_last = best_map >= 0 ? best_map : best;
+    return g_group_last;
 }
 
 void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
