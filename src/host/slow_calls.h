@@ -45,6 +45,15 @@
 // ns each - and a few stores into the thread's own slot; where a call was
 // timed already (the memory sites, a command buffer's end and begin, the
 // fence waits) its reads are shared, not added.
+//
+// BBHOST_TEST_SLOW_CALL=<call>:<ms>[:<every>[:lock]] (tests): <ms> more in
+// every <every>th call of that kind (present, acquire, submit, bind-sparse,
+// wait-fences, wait-semaphores, semaphore-value, device-idle, queue-idle,
+// allocate, map, free, begin, end; 1 by default: each one), slept inside the
+// call's scope as if the driver took that long. With `lock` the delayed call
+// holds a lock that every other thread's timed driver call takes as it
+// starts, as a driver's own lock would: what waits behind it then shows in
+// the line.
 #pragma once
 
 #include <atomic>
@@ -151,11 +160,11 @@ void final_report();
 // watchdog's report.
 std::string in_calls_now();
 
-// For tests (tests/slow_calls_test.cpp): the threshold set again as from
-// this value (null: unset), the counters zeroed.
-void test_configure(const char* slow_call_ms);
+// For tests (tests/slow_calls_test.cpp): the threshold and the test hook set
+// again as from these values (null: unset), the counters zeroed.
+void test_configure(const char* slow_call_ms, const char* test_slow_call = nullptr);
 struct TestCounts {
-    std::uint64_t calls = 0, ns = 0, over[3] = {}, logged = 0, unlogged = 0;
+    std::uint64_t calls = 0, ns = 0, over[3] = {}, logged = 0, unlogged = 0, delays = 0;
 };
 TestCounts test_counts(Call c);
 // The last line logged (its text, without the log's prefix).
