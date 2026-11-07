@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -966,6 +967,132 @@ void confirm_tick() {
     }
 }
 
+// ---- Shadow resolution while the game runs --------------------------------------
+//
+// The Shadow resolution setting's sizes (engine/patch_manifest.cpp
+// shadow_resolution_manifest) are made again at the quiet point below:
+//
+// The sun's: sub_12ac210, which each view's scene draw (sub_269cb70) calls
+// with the area's ShadowParam, compares the shadow object's size (+0x860,
+// +0x864) with the size its site gives and, when they differ, resizes it
+// through sub_12abf20 - which releases the five maps (sub_12abd40) before it
+// makes them again, the path the game takes between areas that ask for 2048
+// and 4096. So the site written (patch_manifest_refresh_live) is the whole
+// change: the next frame's draw makes them.
+//
+// The lamps' and torches': the light shadow manager (the graphics manager's
+// +0x5878) is made once, by sub_26440b0 from the size block its caller fills
+// at 0x261b0f3 (the spot maps' size and four LODs' counts, the cube faces'
+// size and theirs). sub_26440b0 starts by releasing everything it made
+// (sub_2643e80: the maps' arrays and the refcounted shared targets of each
+// LOD), and the maps are handed out to the lights afresh each frame
+// (sub_2644cf0, from per-LOD counters the release zeroes) - so it is run
+// again on the manager with the new sizes and the counts it has, between
+// frames with the command processor and the GPU idle.
+//
+// Both come from the render-target heap. At the start it is grown for the
+// largest entry a live change may reach (live_shadow_room_mib, below); a
+// change is made only when the heap has the room it needs now, and a larger
+// entry applies when the game next starts.
+constexpr std::uint64_t kLightShadowInit = 0x26440b0;
+constexpr std::uint64_t kLightShadowManager = 0x5878;  // the graphics manager's
+constexpr int kShadowLiveTier = 4;  // Ultra: the largest entry the heap is grown for by default
+std::atomic<bool> g_shadow_request{false};
+bool g_shadow_known = false;          // the built-in patch was read for this eboot
+std::uint64_t g_shadow_room_mib = 0;  // what the heap was grown by for the shadow maps
+ShadowMapSizes g_shadow_now{0, 512, 256};  // main thread: the sizes the maps are made at
+std::uint64_t g_shadow_now_mib = 0;        // and what they take past the game's
+
+// The heap's growth for the shadow maps: the starting entry's, and Ultra's
+// so a change up to it fits - except where the GPU's memory is tight (the
+// heap is imported for the GPU whole) or BBHOST_SHADOW_LIVE_ROOM=0. Giga's
+// ~1.8 GB is only there when the game starts at Giga.
+std::uint64_t live_shadow_room_mib() {
+    bool applied = false;
+    g_shadow_known = shadow_resolution_known(&applied);
+    if (!g_shadow_known) return 0;
+    g_shadow_now_mib = applied ? shadow_resolution_more_mib() : 0;
+    if (applied) g_shadow_now = shadow_resolution_sizes();
+    const char* e = std::getenv("BBHOST_SHADOW_LIVE_ROOM");
+    if ((e && e[0] == '0') || host_gpu_memory_tight()) return g_shadow_now_mib;
+    return std::max(g_shadow_now_mib, shadow_resolution_more_mib(kShadowLiveTier));
+}
+
+std::string sun_name(std::uint32_t sun) { return sun ? std::to_string(sun) : std::string("the area's"); }
+
+// The sizes the settings now ask for, made (main thread, at the quiet point).
+void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
+    const ShadowMapSizes want = shadow_resolution_sizes(), was = g_shadow_now;
+    if (want.sun == was.sun && want.spot == was.spot && want.cube == was.cube) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t want_mib = shadow_resolution_more_mib();
+    std::uint64_t largest = 0;
+    const std::uint64_t free_mib = target_heap_free_mib(dev, &largest);
+    // The release goes first in both, so a change needs what the new maps
+    // take past the old; and the largest single map (a cube's six faces are
+    // one texture) a block of its own.
+    const std::uint64_t need = want_mib > g_shadow_now_mib ? want_mib - g_shadow_now_mib : 0;
+    const std::uint64_t biggest = std::max({4ull * want.sun * want.sun, 4ull * want.spot * want.spot, 24ull * want.cube * want.cube}) >> 20;
+    if (need && (free_mib < need + 64 || largest < biggest)) {
+        host_log("shadows: the sun %s, lamps %u, torches %u need %llu MiB more of the render-target heap (%llu free, largest block %llu); "
+                 "they apply when the game next starts",
+                 sun_name(want.sun).c_str(), want.spot, want.cube, (unsigned long long)need, (unsigned long long)free_mib,
+                 (unsigned long long)largest);
+        return;
+    }
+    // The sun's (and the lights' block's) code sites from the settings now:
+    // the game's own bytes when they ask for the game's sizes.
+    bool changed = false;
+    std::string why;
+    if (!patch_manifest_refresh_live("shadow-resolution", want.sun != 0, &changed, &why)) {
+        host_log("shadows: the sizes' code cannot change now (%s); they apply when the game next starts", why.c_str());
+        return;
+    }
+    // The lamps' and torches': the manager made again with the counts it has.
+    const std::uint64_t mgr = at_<std::uint64_t>(gm + kLightShadowManager);
+    const char* lights = "made again";
+    ShadowMapSizes made = want;
+    if (want.spot != was.spot || want.cube != was.cube) {
+        std::uint32_t block[10] = {want.spot, 0, 0, 0, 0, want.cube, 0, 0, 0, 0};
+        bool ok = mgr != 0;
+        for (int l = 0; ok && l < 4; ++l) {
+            block[1 + l] = static_cast<std::uint32_t>(at_<std::uint64_t>(mgr + 0x10 + 0x18 * l + 8));
+            block[6 + l] = static_cast<std::uint32_t>(at_<std::uint64_t>(mgr + 0xa0 + 0x18 * l + 8));
+            ok = block[1 + l] <= 64 && block[6 + l] <= 64;  // the game's are 2, 4, 6, 10 and 2 a LOD
+        }
+        if (!ok) {
+            lights = "left as they were (the manager is not as expected)";
+            made.spot = was.spot;
+            made.cube = was.cube;
+        } else {
+            const std::uint64_t failed = gx_resources_create_failures();
+            hle_call_guest6(guest_fn(kLightShadowInit), static_cast<std::int64_t>(mgr),
+                            static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(block)), 0, 0, 0, 0);
+            if (gx_resources_create_failures() != failed) {
+                // Not all made: back to the sizes they had, which fit.
+                block[0] = was.spot;
+                block[5] = was.cube;
+                hle_call_guest6(guest_fn(kLightShadowInit), static_cast<std::int64_t>(mgr),
+                                static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(block)), 0, 0, 0, 0);
+                lights = "not all made: back to their sizes";
+                made.spot = was.spot;
+                made.cube = was.cube;
+            }
+        }
+    } else {
+        lights = "as they were";
+    }
+    g_shadow_now = made;
+    g_shadow_now_mib = want_mib;
+    std::uint64_t largest_after = 0;
+    const std::uint64_t free_after = target_heap_free_mib(dev, &largest_after);
+    host_log("shadows: the sun %s -> %s (at the next frame), lamps %u -> %u, torches %u -> %u while the game runs, in %lld ms; the lights' "
+             "maps %s (render-target heap %llu -> %llu MiB free, largest block %llu)",
+             sun_name(was.sun).c_str(), sun_name(want.sun).c_str(), was.spot, made.spot, was.cube, made.cube,
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()), lights,
+             (unsigned long long)free_mib, (unsigned long long)free_after, (unsigned long long)largest_after);
+}
+
 // The quiet point. The present step (sub_21976e0, main thread) queues the
 // frame's command context (sub_2594340) and calls the GX device's frame end,
 // sub_2598fd0 (0x2197853). In the device's queued mode (+0x84) that swaps
@@ -983,22 +1110,28 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
     const std::uint64_t f0 = hle_video_flip_count();
     if (g_next_test < g_tests.size() && f0 >= g_tests[g_next_test].first) g_request.store(g_tests[g_next_test++].second);
     const bool settled = std::chrono::steady_clock::now().time_since_epoch().count() >= g_request_not_before.load();
-    const std::uint64_t req = settled ? g_request.exchange(0) : 0;
+    std::uint64_t req = settled ? g_request.exchange(0) : 0;
+    const bool shadows = g_shadow_request.exchange(false);
     hle_call_guest6(guest_fn(kFrameEnd), static_cast<std::int64_t>(dev), 0, 0, 0, 0, 0);
     if (!g_old_depth.empty()) release_old_depth(f0);
     render_scale_flip(f0);
     confirm_tick();
-    if (!req) return 1;  // the frame end ran; back to the caller
-    const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
-    if (req == g_current.load() && !g_rebuild.exchange(false)) {
+    if (req && req == g_current.load() && !g_rebuild.exchange(false)) {
         g_request_confirm.store(false);
-        return 1;
+        req = 0;
     }
+    if (!req && !shadows) return 1;  // the frame end ran; back to the caller
+    const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
     const auto start = std::chrono::steady_clock::now();
     while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
         host_sleep_us(200);
     hle_gnm_cp_drain();  // the command processor has run everything submitted
     host_gpu_flush();    // and the host GPU has finished it
+    if (shadows) {
+        std::uint64_t d = 0, gm = 0;
+        if (device_ready(&d, &gm)) apply_shadow_sizes(d, gm);
+    }
+    if (!req) return 1;
     const bool confirm = g_request_confirm.exchange(false);
     const std::uint64_t before = g_current.load();
     if (resize(w, h)) {
@@ -1123,7 +1256,8 @@ void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
     constexpr std::uint64_t kGfxPrivateStock = 0x8ef00000ull;
     const char* e = std::getenv("BBHOST_GFX_HEAP_MORE_MIB");
     const bool given = e && *e;
-    const std::uint64_t shadows = given ? 0 : shadow_resolution_heap_mib();
+    const std::uint64_t room = live_shadow_room_mib();  // (and what a live change starts from)
+    const std::uint64_t shadows = given ? 0 : room;
     std::uint64_t more = given ? std::strtoull(e, nullptr, 10) : gfx_heap_more_mib(px) + shadows;
     if (!more) {
         if (!given) g_live_max_px = px;
@@ -1163,6 +1297,7 @@ void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
                  (unsigned long long)more, (unsigned long long)shadows);
     *sz = kGfxPrivateStock + (more << 20);
     g_live_max_px = given ? ~0ull : px;
+    g_shadow_room_mib = given ? more : std::min(shadows, more);
     host_log("resolution: GFX_GraphicsPrivate %llu -> %llu MiB (%llu MiB of it Shadow resolution's), direct memory %llu MiB - live "
              "changes up to %.1f million pixels",
              (unsigned long long)(kGfxPrivateStock >> 20), (unsigned long long)(*sz >> 20), (unsigned long long)shadows,
@@ -1392,4 +1527,12 @@ std::uint64_t live_resolution_current(unsigned* w, unsigned* h) {
     if (w) *w = static_cast<unsigned>(c >> 32);
     if (h) *h = static_cast<unsigned>(c & 0xffffffffu);
     return g_applied.load();
+}
+
+void live_shadows_request() {
+    if (g_installed && g_shadow_known) g_shadow_request.store(true);
+}
+
+bool live_shadows_can(int tier) {
+    return g_installed && g_shadow_known && shadow_resolution_more_mib(tier) <= g_shadow_room_mib;
 }
