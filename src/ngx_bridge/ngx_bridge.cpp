@@ -81,6 +81,7 @@ struct ub_context {
     std::string runtime_name, runtime_version;  // the DLSS runtime in the vendor folder
     float jitter_sx = 1.0f, jitter_sy = 1.0f;
     bool ngx_off = false;  // BBHOST_NGX_OFF=1
+    bool data_made = false;  // the data folder made (before NGX's first call)
     NVSDK_NGX_Logging_Level ngx_log_level = NVSDK_NGX_LOGGING_LEVEL_OFF;
     std::string last_error;
     std::string reason;  // why DLSS cannot run; "" while it still may
@@ -191,11 +192,20 @@ NVSDK_NGX_FeatureDiscoveryInfo discovery(ub_context* c) {
     return d;
 }
 
-// BBHOST_NGX_OFF=1: NGX is never called (the reason says so).
+// BBHOST_NGX_OFF=1: NGX is never called (the reason says so). Otherwise NGX
+// is about to be called: its data folder is made first, once - NGX may fail
+// without a word on one it cannot write, and its discovery calls are given it
+// too, before attach_device.
 bool ngx_kept_out(ub_context* c) {
-    if (!c->ngx_off) return false;
-    dlss_off(c, "NGX is kept out (BBHOST_NGX_OFF=1)");
-    return true;
+    if (c->ngx_off) {
+        dlss_off(c, "NGX is kept out (BBHOST_NGX_OFF=1)");
+        return true;
+    }
+    if (!c->data_made) {
+        c->data_made = true;
+        if (!make_dirs(c->data_folder)) say(c, UB_LOG_WARNING, "DLSS: NGX's data folder %s could not be made", c->data_folder.c_str());
+    }
+    return false;
 }
 
 // The machine has NVIDIA's own kernel driver: without it no NVIDIA GPU runs NGX.
@@ -584,8 +594,6 @@ ub_result UB_CALL attach_device(ub_context* c, const ub_device_desc* desc) {
         c->frames_in_flight = desc->frames_in_flight ? desc->frames_in_flight : 8;
         if (c->reason.empty() && (!c->device_ready || c->prepared_phys != desc->physical_device)) dlss_off(c, "prepare_device was not used for this device");
         if (c->reason.empty() && !ngx_kept_out(c)) {
-            // NGX may fail without a word when its data folder cannot be written.
-            if (!make_dirs(c->data_folder)) say(c, UB_LOG_WARNING, "DLSS: NGX's data folder %s could not be made", c->data_folder.c_str());
             NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(c->project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM, c->engine_version.c_str(),
                                                                       c->data_w.c_str(), c->instance, c->phys, c->device,
                                                                       desc->get_instance_proc_addr, desc->get_device_proc_addr, &c->common,
