@@ -22,6 +22,15 @@ std::string hle_fs_game_file(const std::string& rel);
 // A second overlay, behind `mods`: files the host made from the dump itself
 // (engine/menu_assets.h). /app0 reads find the player's mods first, then this.
 void hle_fs_set_generated_root(const char* dir);
+// The player's own file at an /app0-relative path ("dvdroot_ps4/..."), in the
+// mods folder (ignoring case), or empty when the mods folder has none. What the
+// host patches when a mod ships a bank the host adds its text to
+// (engine/menu_assets.h).
+std::string hle_fs_mods_file(const std::string& rel);
+// A layer *ahead* of `mods`, for the few files the host made from a mod's own
+// file: the mod's menu text with the port's strings added. Without it the mod's
+// file, found first, hides the generated one. Empty dir: none.
+void hle_fs_set_patched_root(const char* dir);
 // More of the host's generated files, behind that one, in the order added
 // (engine/change_appearance.h): a feature that is off adds none. At start,
 // before the game reads a file.
