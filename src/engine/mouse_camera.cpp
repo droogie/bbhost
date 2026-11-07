@@ -197,7 +197,7 @@ bool redirect(ElfImage* image, std::uint64_t va, std::size_t n, const void* dest
 
 }  // namespace
 
-float mouse_camera_degrees_per_count(int sensitivity) { return mouse_camera::degrees_per_count(sensitivity); }
+float mouse_camera_degrees_per_count(float sensitivity) { return mouse_camera::degrees_per_count(sensitivity); }
 
 bool mouse_camera_installed() { return g_mode != Mode::None; }
 
@@ -260,7 +260,7 @@ void mouse_camera_install(ElfImage* image) {
              mouse_camera_degrees_per_count(5), placed == 2 ? " (beside ours, compared)" : "");
 }
 
-void mouse_camera_publish(int sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation) {
+void mouse_camera_publish(float sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation) {
     const float per_count = mouse_camera_degrees_per_count(sensitivity);
     std::uint32_t bits;
     std::memcpy(&bits, &per_count, 4);

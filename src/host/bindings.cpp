@@ -108,6 +108,28 @@ const BindingInfo kInfo[kBindCount] = {
     {"debug_menu", "Debug Menu", "Opens and closes the developers' debug menu (the Debug Menu plugin).", 0, "`", 0},
 };
 
+// The controller's sixteen buttons (host_pad_*), in PadInput's order: their
+// names on the Controls page and in [pad], and the pad bit each one is.
+const char* const kPadNames[kPadInputs] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2",
+                                           "L3", "R3", "Options", "Touchpad", "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right"};
+const char* const kPadTokens[kPadInputs] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2",
+                                            "L3", "R3", "Options", "Touchpad", "Up", "Down", "Left", "Right"};
+const std::uint32_t kPadBits[kPadInputs] = {kCross, kCircle, kSquare, kTriangle, kL1, kR1, kL2, kR2,
+                                            kL3, kR3, kOptions, kTouchPad, kUp, kDown, kLeft, kRight};
+// What each button gives in play: the button whose bit it presses, itself
+// until rebound. Always a permutation (a rebind swaps two).
+std::atomic<int> g_pad_gives[kPadInputs] = {kPadCross, kPadCircle, kPadSquare, kPadTriangle, kPadL1, kPadR1, kPadL2, kPadR2,
+                                            kPadL3, kPadR3, kPadOptions, kPadTouchpad, kPadUp, kPadDown, kPadLeft, kPadRight};
+std::atomic<int> g_pad_capture{-1};
+std::atomic<std::int64_t> g_pad_capture_ms{0};
+
+int pad_input_of_bit(std::uint32_t bit) {
+    for (int i = 0; i < kPadInputs; ++i) {
+        if (kPadBits[i] == bit) return i;
+    }
+    return -1;
+}
+
 // Earlier names a bbhost.toml may still use.
 const struct {
     const char* old_name;
@@ -209,8 +231,9 @@ int action_named(const char* name) {
 // binding (host_bindings_serial).
 std::atomic<std::uint64_t> g_serial{1};
 
-// "E", "Mouse2", "X, Mouse2", "none": the whole binding.
-void set_from_text(int a, const std::string& text, const char* where) {
+// "E", "Mouse2", "X, Mouse2", "none": the whole binding, as a key and a mouse
+// input (0 for none).
+void parse_binding(int a, const std::string& text, const char* where, int* key_out, int* mouse_out) {
     int key = 0, mouse = 0;
     std::size_t pos = 0;
     while (pos <= text.size()) {
@@ -235,6 +258,13 @@ void set_from_text(int a, const std::string& text, const char* where) {
         }
         key = sc;
     }
+    *key_out = key;
+    *mouse_out = mouse;
+}
+
+void set_from_text(int a, const std::string& text, const char* where) {
+    int key = 0, mouse = 0;
+    parse_binding(a, text, where, &key, &mouse);
     g_key[a].store(key, std::memory_order_relaxed);
     g_mouse[a].store(mouse, std::memory_order_relaxed);
     g_serial.fetch_add(1, std::memory_order_relaxed);
@@ -292,6 +322,8 @@ bool host_bindings_parse(const char* name, const char* value) {
     return true;
 }
 
+static void pad_save(std::FILE* f);  // below
+
 void host_bindings_save(std::FILE* f) {
     std::fprintf(f, "\n[keys]\n");
     for (int a = 0; a < kBindCount; ++a) {
@@ -303,6 +335,7 @@ void host_bindings_save(std::FILE* f) {
         }
         std::fprintf(f, "%s = \"%s\"\n", kInfo[a].key, v.empty() ? "none" : v.c_str());
     }
+    pad_save(f);
 }
 
 int host_binding_key(int action) { return action >= 0 && action < kBindCount ? g_key[action].load() : 0; }
@@ -694,5 +727,176 @@ void host_bind_capture_note_held(bool any_down) {
     if (g_hold.load(std::memory_order_relaxed) &&
         (!any_down || now_ms() - g_hold_ms.load(std::memory_order_relaxed) > 1500)) {
         g_hold.store(false, std::memory_order_relaxed);
+    }
+}
+
+void host_binding_clear_key(int action) {
+    if (action < 0 || action >= kBindCount) return;
+    g_key[action].store(0, std::memory_order_relaxed);
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+    host_log("keys: %s's key cleared", kInfo[action].key);
+}
+
+void host_binding_clear_mouse(int action) {
+    if (action < 0 || action >= kBindCount) return;
+    g_mouse[action].store(0, std::memory_order_relaxed);
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+    host_log("keys: %s's mouse button cleared", kInfo[action].key);
+}
+
+namespace {
+// An action's default key and mouse input: the table's, unless bbhost.toml's
+// [keys] names it (host_bindings_load_defaults).
+void default_of(int action, int* key, int* mouse) {
+    *key = kInfo[action].def_key ? scancode_from_name(kInfo[action].def_key) : 0;
+    *mouse = kInfo[action].def_mouse;
+    for (const auto& [name, value] : config().keys) {
+        if (action_named(name.c_str()) == action) parse_binding(action, value, "bbhost.toml", key, mouse);
+    }
+}
+}  // namespace
+
+bool host_binding_at_default(int action) {
+    if (action < 0 || action >= kBindCount) return true;
+    int key = 0, mouse = 0;
+    default_of(action, &key, &mouse);
+    const int own = pad_input_of_bit(kInfo[action].button);
+    const int pad = host_pad_input_of(action);
+    return g_key[action].load() == key && g_mouse[action].load() == mouse && (pad < 0 || pad == own);
+}
+
+const char* host_key_name(int scancode) {
+    const char* k = scancode_name(scancode);
+    return k && std::strcmp(k, "`") == 0 ? "` (backtick)" : k;  // a lone ` is a speck
+}
+const char* host_mouse_name(int mouse) { return mouse >= 1 && mouse <= kMouseInputs ? kMouseNames[mouse] : nullptr; }
+
+void host_binding_reset(int action) {
+    if (action < 0 || action >= kBindCount) return;
+    int key = 0, mouse = 0;
+    default_of(action, &key, &mouse);
+    for (int b = 0; b < kBindCount; ++b) {
+        if (b == action || !contexts_meet(action, b)) continue;
+        if (key && g_key[b].load(std::memory_order_relaxed) == key) g_key[b].store(0, std::memory_order_relaxed);
+        if (mouse && g_mouse[b].load(std::memory_order_relaxed) == mouse) g_mouse[b].store(0, std::memory_order_relaxed);
+    }
+    g_key[action].store(key, std::memory_order_relaxed);
+    g_mouse[action].store(mouse, std::memory_order_relaxed);
+    if (const int own = pad_input_of_bit(kInfo[action].button); own >= 0 && host_pad_input_of(action) >= 0) {
+        // Its button back on itself: whichever button gives it now takes the
+        // one its own button gave.
+        for (int p = 0; p < kPadInputs; ++p) {
+            if (g_pad_gives[p].load() != own) continue;
+            g_pad_gives[p].store(g_pad_gives[own].load());
+            g_pad_gives[own].store(own);
+            break;
+        }
+    }
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+    host_log("keys: %s back to its defaults", kInfo[action].key);
+}
+
+void host_bindings_reset_all() {
+    host_bindings_load_defaults();
+    for (int p = 0; p < kPadInputs; ++p) g_pad_gives[p].store(p);
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+    host_log("keys: every binding back to its default");
+}
+
+const char* host_pad_input_name(int input) { return input >= 0 && input < kPadInputs ? kPadNames[input] : nullptr; }
+std::uint32_t host_pad_input_bit(int input) { return input >= 0 && input < kPadInputs ? kPadBits[input] : 0; }
+std::uint32_t host_pad_play_bit(int input) {
+    return input >= 0 && input < kPadInputs ? kPadBits[g_pad_gives[input].load(std::memory_order_relaxed)] : 0;
+}
+
+namespace {
+// The button whose press an action's is: its pad bit's, for an action that
+// works in play and has one (Gestures and Personal Effects share the
+// touchpad's).
+int pad_function_of(int action) {
+    if (action < 0 || action >= kBindCount || host_binding_in_menus(action) > 0) return -1;
+    return pad_input_of_bit(kInfo[action].button);
+}
+}  // namespace
+
+int host_pad_input_of(int action) {
+    const int f = pad_function_of(action);
+    if (f < 0) return -1;
+    for (int p = 0; p < kPadInputs; ++p) {
+        if (g_pad_gives[p].load(std::memory_order_relaxed) == f) return p;
+    }
+    return -1;
+}
+
+int host_pad_menu_input(int action) {
+    if (action < 0 || action >= kBindCount || host_binding_in_menus(action) <= 0) return -1;
+    std::uint32_t bit = kInfo[action].button;
+    if (action == kBindConfirm) bit = menu_confirm_button();
+    if (action == kBindBack) bit = menu_back_button();
+    return pad_input_of_bit(bit);
+}
+
+void host_pad_capture_begin(int action) {
+    if (pad_function_of(action) < 0) return;
+    g_capture.store(-1, std::memory_order_relaxed);  // one capture at a time
+    g_pad_capture_ms.store(now_ms(), std::memory_order_relaxed);
+    g_pad_capture.store(action, std::memory_order_relaxed);
+    host_log("pad: rebinding %s - press a controller button", kInfo[action].key);
+}
+
+int host_pad_capturing() { return g_pad_capture.load(std::memory_order_relaxed); }
+
+void host_pad_capture_cancel() {
+    const int a = g_pad_capture.exchange(-1);
+    if (a >= 0) host_log("pad: %s unchanged", kInfo[a].key);
+}
+
+bool host_pad_capture_input(int input) {
+    const int a = g_pad_capture.load(std::memory_order_relaxed);
+    if (a < 0 || input < 0 || input >= kPadInputs) return false;
+    if (now_ms() - g_pad_capture_ms.load(std::memory_order_relaxed) < 300) return true;  // the press that began it
+    const int f = pad_function_of(a);
+    for (int p = 0; p < kPadInputs; ++p) {
+        if (g_pad_gives[p].load() != f) continue;
+        // The pressed button gives the action's press; the one that gave it
+        // takes what the pressed button gave.
+        g_pad_gives[p].store(g_pad_gives[input].load());
+        g_pad_gives[input].store(f);
+        break;
+    }
+    g_pad_capture.store(-1, std::memory_order_relaxed);
+    g_serial.fetch_add(1, std::memory_order_relaxed);
+    host_log("pad: %s on %s", kInfo[a].key, kPadNames[input]);
+    return true;
+}
+
+bool host_pad_parse(const char* name, const char* value) {
+    const int a = action_named(name);
+    const int f = pad_function_of(a);
+    if (f < 0) return false;
+    const std::string v = trim(value ? value : "");
+    for (int input = 0; input < kPadInputs; ++input) {
+        if (v != kPadTokens[input]) continue;
+        for (int p = 0; p < kPadInputs; ++p) {
+            if (g_pad_gives[p].load() != f) continue;
+            g_pad_gives[p].store(g_pad_gives[input].load());
+            g_pad_gives[input].store(f);
+            break;
+        }
+        g_serial.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    host_log("pad: %s = \"%s\" - not a controller button", name, v.c_str());
+    return false;
+}
+
+// [pad]: the play actions with a button of their own, each on its button,
+// Gestures standing for the touchpad.
+static void pad_save(std::FILE* f) {
+    std::fprintf(f, "\n[pad]\n");
+    for (int a = 0; a < kBindCount; ++a) {
+        if (a == kBindEffects) continue;
+        const int p = host_pad_input_of(a);
+        if (p >= 0) std::fprintf(f, "%s = \"%s\"\n", kInfo[a].key, kPadTokens[p]);
     }
 }

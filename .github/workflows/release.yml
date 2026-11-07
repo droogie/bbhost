@@ -7,7 +7,8 @@
 # pins. The bundles go to the live server (https://thehuntersdream.com) by
 # default, and the playtest kits for the dev server (tools/package_playtest.sh)
 # are never among them: tools/check_release_bundle.sh fails the release
-# otherwise. Both builds are ThinLTO builds (-DBBHOST_LTO=ON, docs/building.md):
+# otherwise. Both builds are ThinLTO builds (-DBBHOST_LTO=ON, docs/building.md), the Windows one
+# also PGO from pgo/bbhost.proftext (CI_PGO=1):
 # a few percent more frame rate where the command processor is the limit.
 # The tests (build.yml) build without it.
 #
@@ -107,7 +108,7 @@ jobs:
       - name: build and package
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
-        run: CI_PACMAN=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON -DBBHOST_LTO=ON" tools/ci_windows.sh
+        run: CI_PACMAN=1 CI_PGO=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON -DBBHOST_LTO=ON" tools/ci_windows.sh
       - uses: actions/upload-artifact@v4
         with:
           retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}

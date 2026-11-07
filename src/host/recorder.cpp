@@ -1016,6 +1016,8 @@ std::uint64_t recorder_reserve_packets(std::uint32_t n) {
     return first;
 }
 
+std::uint64_t recorder_next_packet() { return g_pk_taken; }
+
 void recorder_append_packet(std::uint64_t number) {
     std::uint8_t* at = append_record(Op::kDrawState, sizeof(stream::DrawState));
     put_struct<stream::DrawState>(at)->packet = number;

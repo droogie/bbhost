@@ -166,15 +166,35 @@ GUEST_ABI int hle_user_event(std::int32_t* ev) {
     return static_cast<int>(0x80960005);  // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
 
+// The system language a console of the disc's region answers, as far as the
+// game's text goes. A save that has no language picked in System > Language
+// follows the system language, and since every region now keeps every
+// language as it is (engine/patch_manifest.cpp all-languages) the answer is
+// the text: English (UK) on a European or Asian disc, Japanese on a Japanese
+// one, English (US) on an American one - what each region's own mapping made
+// of English (US) before.
+int region_system_lang() {
+    // The game's region (sub_23b9190): USER_DEFINED_PARAM_1 modulo ten
+    // through its table at 0x4b36690, 0 past 5.
+    static constexpr int kRegion[] = {5, 0, 1, 2, 3, 4};
+    const int m = sfo_user_param(1) % 10;
+    const int region = m >= 0 && m <= 5 ? kRegion[m] : 0;
+    // Japan, Americas, Europe, Asia, region 4 (Europe's English alone), the
+    // build's own.
+    static constexpr int kLang[] = {0, 1, 18, 18, 18, 1};
+    return kLang[region];
+}
+
 GUEST_ABI int hle_sysparam_int(int id, int* value) {
     int v = 0;
     if (id == 1) {
-        // SCE_SYSTEM_SERVICE_PARAM_ID_LANG: English (US); BBHOST_SYSTEM_LANG=N
-        // another (2 French, 4 German, 18 English UK, ...) - for testing
-        // the other languages' message bundles.
+        // SCE_SYSTEM_SERVICE_PARAM_ID_LANG: the disc's region's
+        // (region_system_lang); BBHOST_SYSTEM_LANG=N another (1 English US,
+        // 2 French, 4 German, 18 English UK, ...) - for testing the other
+        // languages' message bundles.
         static const int lang = [] {
             const char* e = std::getenv("BBHOST_SYSTEM_LANG");
-            return e && *e ? std::atoi(e) : 1;
+            return e && *e ? std::atoi(e) : region_system_lang();
         }();
         v = lang;
     } else if (id == 1000) {
@@ -1878,7 +1898,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (now >= it->from) {
                 // A stick name (lup .. rright, bits above the pad's) deflects that stick fully
                 // for the hold, as BBHOST_AUTOPRESS's do: a test request's walk.
-                if (it->button & 0x1ef0000u) {
+                if (it->button & 0x3ef0000u) {
                     if (it->button & 0x10000u) p.ly = 0;
                     if (it->button & 0x20000u) p.ly = 255;
                     if (it->button & 0x40000u) p.lx = 0;
@@ -1887,6 +1907,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                     if (it->button & 0x400000u) p.ry = 255;
                     if (it->button & 0x800000u) p.rx = 0;
                     if (it->button & 0x1000000u) p.rx = 255;
+                    if (it->button & 0x2000000u) p.rx = 192;  // half way right: a partial turn
                 } else {
                     p.buttons |= it->button;
                 }
@@ -2252,6 +2273,7 @@ std::uint32_t hle_pad_button_named(const std::string& name) {
         std::uint32_t bit;
     } names[] = {{"lup", 0x10000u}, {"ldown", 0x20000u}, {"lleft", 0x40000u}, {"lright", 0x80000u},  // left stick, full
                  {"rup", 0x200000u}, {"rdown", 0x400000u}, {"rleft", 0x800000u}, {"rright", 0x1000000u},  // right stick, full
+                 {"rright_half", 0x2000000u},  // right stick, half way
                  {"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u},
                  {"options", 0x8u}, {"up", 0x10u},        {"down", 0x40u},     {"left", 0x80u},
                  {"right", 0x20u},  {"l1", 0x400u},       {"r1", 0x800u},      {"l2", 0x100u},

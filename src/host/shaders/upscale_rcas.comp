@@ -1,0 +1,52 @@
+#version 450
+// Sharpness (host/upscale_pass.cpp): FSR 1's RCAS - robust contrast-adaptive
+// sharpening, AMD's (fsr1/, MIT) - over the temporal upscaler's picture, which
+// is linear HDR (RGBA16F) where RCAS wants 0..1. Each texel goes through a
+// reversible tone map on its largest channel, c / (1 + max(c)), for RCAS and
+// back, c / (1 - max(c)), after - FSR 2's own pair for its HDR history. Alpha
+// is the centre texel's.
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;  // FsrRcasCon's: the sharpness in stops below the most
+    uvec4 size;  // x, y: the picture's width and height
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst_image;
+
+AF3 to_unit(AF3 c) { return c * ARcpF1(max(c.r, max(c.g, c.b)) + AF1_(1.0)); }
+AF3 from_unit(AF3 c) { return c * ARcpF1(max(AF1_(1.0 / 32768.0), AF1_(1.0) - max(c.r, max(c.g, c.b)))); }
+
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) {
+    const AF4 c = texelFetch(sampler2D(src_image, src_sampler), p, 0);
+    return AF4(to_unit(max(c.rgb, AF3_(0.0))), c.a);
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "fsr1/ffx_fsr1.h"
+
+void sharpen_pixel(AU2 pos) {
+    if (pos.x >= size.x || pos.y >= size.y) return;
+    AF3 c;
+    FsrRcasF(c.r, c.g, c.b, pos, con0);
+    const AF1 a = texelFetch(sampler2D(src_image, src_sampler), ASU2(pos), 0).a;
+    imageStore(dst_image, ASU2(pos), AF4(from_unit(c), a));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    sharpen_pixel(gxy);
+    gxy.x += 8u;
+    sharpen_pixel(gxy);
+    gxy.y += 8u;
+    sharpen_pixel(gxy);
+    gxy.x -= 8u;
+    sharpen_pixel(gxy);
+}

@@ -1,0 +1,209 @@
+#version 450
+// TAA (host/upscale_pass.cpp, Graphics > Upscaling: TAA): Numity1504's TAA
+// (his DLSS/FSR handoff, step 9, with step 8's ember mask in its TAA form),
+// natively, at the upscalers' call point: the scene with this frame's jitter
+// in its camera draws, the motion (shaders/camera_motion.comp: the camera's,
+// the characters' capture over it; render pixels, the last frame's place less
+// this one's) and the depth, at the scene's size in and out. His numbers are
+// kept as they stand - it is the look DLSS and FSR are judged against.
+//   1. The 3x3: this frame's picture unjittered (each sample weighted by its
+//      real distance from the pixel's centre, the jitter taken out: a
+//      Gaussian of 2.29, the nine weights worked out once a frame by the
+//      host), averaged as light; its statistics in tone-mapped YCoCg; the
+//      nearest surface by view distance.
+//   2. The motion of the nearest surface (edges keep their object's motion),
+//      but a background pixel beside a silhouette keeps its own when the two
+//      are far apart.
+//   3. The history there by 5-tap Catmull-Rom, clipped to the 3x3's box
+//      (mean +- 1.25 sigma within min/max) along the line to its centre, and
+//      blended at a tenth of this frame (TAA strength: a fifth to a
+//      twenty-fifth), up to a quarter at 32 pixels a frame; all of this frame where the history's remembered motion length
+//      is far from this one's (a surface just come into view).
+//   4. The ember mask: a bright new dot the TAA lost, whose light the game
+//      drew into its glow, goes back into this frame's picture - never into
+//      the history (no trail).
+// Blended as light, not tone-mapped values: a tone-mapped average squeezes a
+// pixel far brighter than its neighbours (20 among 0.05 gave 2.1, the light
+// 13.8) and dimmed the bloom around fire. fin() keeps a NaN or infinity out:
+// one in the history spreads frame after frame. Each 8x8 group reads its
+// 10x10 of colour and depth once into shared memory, and works out the
+// motion there itself (motion_at.glsl, camera_motion.comp's): no motion pass
+// runs ahead of it and no motion image is read back - written only for frame
+// generation and the motion tests (size.w bit 1), with the depth's R32 copy.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Constants {
+    // The motion pass's (camera_motion.comp's Params, the same order).
+    vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
+    vec4 now_r0, now_r1, now_r2;
+    vec4 prev_proj;  // the last camera's tangents (x <= 0: none), then the render size
+    vec4 prev_r0, prev_r1, prev_r2;
+    vec4 velo_k;
+    vec4 velo_size;
+    // TAA's.
+    uvec4 size;       // x, y: the scene's width and height; z: 1 no history (reset); w: bit 0 the glow is bound, bit 1 write the motion and the depth's copy
+    vec4 weights[3];  // the 3x3's weights for this jitter, row by row from the top left, summing to 1; the 12th this frame's share (TAA strength)
+};
+
+layout(set = 0, binding = 0) uniform texture2D scene;
+layout(set = 0, binding = 1) uniform texture2D history;
+layout(set = 0, binding = 2) uniform texture2D velo_map;  // the game's velocity map (velo_size.z == 0: none)
+layout(set = 0, binding = 3) uniform texture2D depth;     // the game's
+layout(set = 0, binding = 4) uniform sampler lin;  // linear, clamped to the edge
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D dst;       // the picture: this frame's, alpha the scene's
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D new_hist;  // the next frame's history, alpha the motion's length
+layout(set = 0, binding = 7) uniform texture2D glow;
+layout(set = 0, binding = 8) uniform texture2D cap_map;  // the characters' capture
+layout(set = 0, binding = 9) uniform writeonly image2D motion;          // R16G16_SFLOAT, for frame generation (size.w bit 1)
+layout(set = 0, binding = 10, r32f) uniform writeonly image2D depth_copy;
+
+#define MOTION_SAMPLER lin
+#include "motion_at.glsl"
+
+vec3 fin(vec3 x) { return clamp(mix(x, vec3(0.0), isnan(x)), vec3(0.0), vec3(65504.0)); }
+float max3(vec3 x) { return max(x.r, max(x.g, x.b)); }
+vec3 tm(vec3 x) { return x / (1.0 + max3(x)); }
+vec3 itm(vec3 t) { return t / max(1.0 - max3(t), 1.0 / 65504.0); }
+float luma(vec3 x) { return dot(x, vec3(0.2126, 0.7152, 0.0722)); }
+float bright(vec3 x) { return luma(tm(fin(x))); }
+vec3 ycocg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+
+// The view distance of a raw depth (step 4: valid when 0 < d < 100000), else 1e30.
+float view_distance(float raw) {
+    const float d = now_proj.w / (raw - now_proj.z);
+    return d > 0.0 && d < 100000.0 ? d : 1e30;
+}
+
+// The history at `pos` (pixels) by 5-tap Catmull-Rom through `lin`.
+vec3 history_at(vec2 pos, vec2 dims) {
+    const vec2 tc1 = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - tc1;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 tc12 = (tc1 + w2 / w12) / dims, tc0 = (tc1 - 1.0) / dims, tc3 = (tc1 + 2.0) / dims;
+    const float a = w12.x * w0.y, b = w0.x * w12.y, c = w12.x * w12.y, d = w3.x * w12.y, e = w12.x * w3.y;
+    const vec3 r = textureLod(sampler2D(history, lin), vec2(tc12.x, tc0.y), 0.0).rgb * a +
+                   textureLod(sampler2D(history, lin), vec2(tc0.x, tc12.y), 0.0).rgb * b +
+                   textureLod(sampler2D(history, lin), vec2(tc12.x, tc12.y), 0.0).rgb * c +
+                   textureLod(sampler2D(history, lin), vec2(tc3.x, tc12.y), 0.0).rgb * d +
+                   textureLod(sampler2D(history, lin), vec2(tc12.x, tc3.y), 0.0).rgb * e;
+    return fin(r / max(a + b + c + d + e, 1e-6));
+}
+
+// The history pulled to the box along the line to its centre.
+vec3 clip_box(vec3 lo, vec3 hi, vec3 q) {
+    const vec3 c = 0.5 * (hi + lo), ext = 0.5 * (hi - lo) + 1e-5;
+    const vec3 v = q - c;
+    const vec3 a = abs(v / ext);
+    const float m = max(a.x, max(a.y, a.z));
+    return m > 1.0 ? c + v / m : q;
+}
+
+shared vec3 tile_c[10][10];   // fin(scene), light
+shared float tile_d[10][10];  // view distance
+shared vec2 tile_m[10][10];   // motion
+
+void main() {
+    const ivec2 dims_i = ivec2(size.xy);
+    const ivec2 lim = dims_i - 1;
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8 - 1;
+    for (uint i = gl_LocalInvocationIndex; i < 100u; i += 64u) {
+        const ivec2 t = ivec2(int(i % 10u), int(i / 10u));
+        const ivec2 q = clamp(origin + t, ivec2(0), lim);
+        tile_c[t.y][t.x] = fin(texelFetch(sampler2D(scene, lin), q, 0).rgb);
+        const float raw = texelFetch(sampler2D(depth, lin), q, 0).r;
+        tile_d[t.y][t.x] = view_distance(raw);
+        tile_m[t.y][t.x] = motion_at(q, raw);
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= dims_i.x || p.y >= dims_i.y) return;
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy) + 1;
+    const vec2 dims = vec2(size.xy);
+
+    // 1. The 3x3.
+    vec3 cur = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), mn = vec3(1e30), mx = vec3(-1e30);
+    float best = 3e38;
+    ivec2 near_l = l;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const vec3 f = tile_c[l.y + y][l.x + x];
+            const vec3 t = ycocg(tm(f));
+            m1 += t;
+            m2 += t * t;
+            mn = min(mn, t);
+            mx = max(mx, t);
+            const int k = (y + 1) * 3 + x + 1;
+            cur += f * weights[k >> 2][k & 3];
+            const float d = tile_d[l.y + y][l.x + x];
+            if (d < best - 1e-6 * best) {
+                best = d;
+                near_l = l + ivec2(x, y);
+            }
+        }
+    }
+    const vec3 raw = tile_c[l.y][l.x];
+    const float own = tile_d[l.y][l.x];
+    float a = texelFetch(sampler2D(scene, lin), p, 0).a;
+    if (isnan(a) || isinf(a)) a = 1.0;
+
+    // 2. The motion of the nearest surface; the background beside a
+    // silhouette on its own.
+    // (A neighbour past the screen's edge is the edge pixel's, as clamped.)
+    vec2 mv = tile_m[near_l.y][near_l.x];
+    const vec2 mo = tile_m[l.y][l.x];
+    if (size.w >= 2u) {
+        imageStore(motion, p, vec4(mo, 0.0, 0.0));
+        imageStore(depth_copy, p, vec4(texelFetch(sampler2D(depth, lin), p, 0).r, 0.0, 0.0, 0.0));
+    }
+    if (near_l != l && own > 1.1 * best) {
+        if (!any(isnan(mo)) && !any(isinf(mo)) && length(mo - mv) > 0.5 * max(length(mo), length(mv)) + 2.0) mv = mo;
+    }
+    const bool mv_ok = !any(isnan(mv)) && !any(isinf(mv));
+
+    // 3. Where it was.
+    const vec2 prev = vec2(p) + 0.5 + mv;
+    const bool usable = size.z == 0u && mv_ok && all(greaterThanEqual(prev, vec2(0.0))) && all(lessThan(prev, dims));
+
+    // 4. The history, clipped and blended.
+    vec3 res, keep = vec3(0.0);
+    if (usable) {
+        const vec3 h = ycocg(tm(history_at(prev, dims)));
+        const vec3 mean = m1 / 9.0;
+        const vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+        const vec3 lo = max(mn, mean - 1.25 * sigma);
+        const vec3 hi = max(min(mx, mean + 1.25 * sigma), lo);
+        const vec3 hc = clip_box(lo, hi, h);
+        const float speed = length(mv);
+        const float share = weights[2].w;
+        float alpha = mix(share, max(share, 0.25), clamp(speed / 32.0, 0.0, 1.0));
+        const float hm = texelFetch(sampler2D(history, lin), clamp(ivec2(floor(prev)), ivec2(0), lim), 0).a;
+        const float m = max(speed, hm);
+        const float reject = clamp((abs(speed - hm) - (0.5 * m + 2.0)) / (0.25 * m + 2.0), 0.0, 1.0);
+        alpha = mix(alpha, 1.0, reject);
+        keep = itm(clamp(rgb(hc), vec3(0.0), vec3(1.0 - 1.0 / 65504.0)));
+        res = clamp(mix(keep, cur, alpha), vec3(0.0), vec3(65504.0));
+    } else {
+        res = clamp(cur, vec3(0.0), vec3(65504.0));
+    }
+
+    // 5. The ember mask (step 8, its TAA form).
+    float e = 0.0;
+    if ((size.w & 1u) != 0u) {
+        const float n = smoothstep(0.02, 0.12, bright(raw) - bright(res));
+        if (n > 0.0) {
+            const float g = luma(fin(texelFetch(sampler2D(glow, lin), p, 0).rgb));
+            e = n * clamp(g / max(luma(raw), 0.0001), 0.0, 1.0);
+        }
+    }
+
+    // 6. The writes.
+    const float len = mv_ok ? min(length(mv), 60000.0) : 0.0;
+    imageStore(new_hist, p, vec4(usable ? mix(res, keep, e) : res, len));
+    imageStore(dst, p, vec4(mix(res, raw, e), a));
+}

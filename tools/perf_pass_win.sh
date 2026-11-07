@@ -64,7 +64,7 @@ out=build/perf
 mkdir -p "$out/data" "$out/cfg"
 rm -rf "$out/data/saves"
 cp -r "$saves" "$out/data/saves"
-wm=""; [ -n "${PERF_FULLSCREEN:-}" ] && wm='window_mode = "Fullscreen"'
+wm=""; [ -n "${PERF_FULLSCREEN:-}" ] && wm='window_mode = "Borderless"'
 cat > "$out/cfg/bbhost.toml" <<TOML
 [paths]
 app0 = "$app0"

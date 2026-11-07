@@ -1,0 +1,28 @@
+#version 450
+// The motion as colours (host/upscale_pass.cpp, BBHOST_UPSCALE_SHOW_MOTION=1, a
+// test): in place of the upscaler's picture, each output pixel shows the
+// motion of the render pixel under it - x in red, y in green, around grey -
+// so what moves of itself stands apart from the camera's smooth field, and a
+// still camera on a still world is flat grey (Numity1504's handoff, step 4's
+// check).
+//
+// Compiled offline (tools/build_shaders.sh) into motion_view.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D motion;  // R16G16_SFLOAT, render pixels
+layout(set = 0, binding = 1) uniform sampler any_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 size;  // the output's width and height, then the motion's
+    vec4 k;     // x: the render pixels of motion a full step of colour stands for
+};
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) return;
+    const ivec2 m = clamp(ivec2((vec2(p) + 0.5) * size.zw / size.xy), ivec2(0), ivec2(size.zw) - 1);
+    const vec2 mv = texelFetch(sampler2D(motion, any_sampler), m, 0).rg;
+    const vec2 c = clamp(vec2(0.5) + mv / k.x, vec2(0.0), vec2(1.0));
+    imageStore(dst, p, vec4(c, 0.5, 1.0));
+}

@@ -41,6 +41,7 @@
 #include "decomp/gx/upload_heap.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
+#include "engine/texture_origin.h"
 #include "guest_abi.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
@@ -445,7 +446,7 @@ void note_rate(std::uint32_t bytes) {
 
 void register_entry(std::uint64_t key, Entry& e);
 
-void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool initial_data) {
+void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool initial_data, std::uint64_t data = 0) {
     if (!holder) return;
     Entry e;
     e.holder = key;
@@ -461,6 +462,9 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     e.info.created_submit = hle_gnm_submitted_total();
     e.info.id = id & 0xffffff;
     e.info.initial_data = initial_data;
+    // A texture's texels, from the first subresource's data (D3D11_SUBRESOURCE_DATA::pSysMem): the file they came from.
+    std::uint64_t texels = 0;
+    if (kind == kTexture && data && rd(data, &texels)) e.info.origin = texture_origin_of(texels);
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     const unsigned t = e.info.type < 5 ? e.info.type : 0;
     g_created[t].fetch_add(1, std::memory_order_relaxed);
@@ -1487,7 +1491,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
             key = holder;
         }
         if (holder) {
-            register_holder(key, holder, p.kind, p.type != 0);
+            register_holder(key, holder, p.kind, p.type != 0, p.type);
             if (key & kMemoryKey) {
                 std::uint64_t memory = 0;
                 rd(holder + 0x20, &memory);
@@ -1650,6 +1654,7 @@ void gx_resources_install(ElfImage* image) {
 // other creators are.
 void gx_resources_install_late(ElfImage* image) {
     if (!g_gx_res_after_thunk) return;
+    texture_origin_prepare();  // the map folders' texture names, before the first texture is made
     // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
     // its init tells the host of it (the entry above); the game's is hooked at
     // its prologue for the census (the arena then has no heap: today's path).

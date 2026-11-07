@@ -27,6 +27,8 @@
 //   practice_repeat = "Loop until stopped"     # or "Once", "N times" (practice_times attempts)
 //   practice_times = 3
 //   practice_phase = "2"                       # start its fights at phase 2 or 3 ("1": as the game does)
+//   practice_boss_hp = "Normal"                # or "Can't die", "Infinite": the boss for practising against
+//   practice_player_hp = "Normal"              # or "Can't die", "Infinite": the player, for learning its moves
 //
 // Practice (the menu's "Practice this boss") fights one boss again and
 // again: each fight starts at its fog wall as a rush's round does, a death
@@ -48,6 +50,13 @@
 // boss's thresholds and characters, from those scripts; a boss without a
 // later phase (or a chalice boss: their phase events are not mapped yet)
 // fights from the latest it has, and the message says so.
+//
+// Boss HP and Your HP are practice's cheats, for learning a fight rather than
+// winning it: Can't die is the debug menu's No Dead on the boss's characters
+// (or the player) - hits still take HP, down to 1 - and Infinite puts the HP
+// back after every hit as well: the boss stays in the phase its fight began
+// in, the player at full health. Neither is in a rush. A boss that cannot die
+// is never defeated, so an attempt ends only in a death, a Restart or Stop.
 //
 // Play it on a save of its own: bosses give their rewards again, and while a
 // run is under way the save holds woken bosses (restore.txt puts them back if
@@ -81,10 +90,10 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "boss_rush",
     "Boss rush",
-    "1.2.0",
+    "1.3.0",
     "bbhost",
-    "Fight the game's bosses back to back, timed, or practise one again and again, from its later phases too; deaths retry "
-    "the fight and the save's bosses are restored at the end.",
+    "Fight the game's bosses back to back, timed, or practise one again and again, from its later phases too, with a boss "
+    "or a player that cannot die; deaths retry the fight and the save's bosses are restored at the end.",
 };
 
 // The practice list: every boss in kBosses by name, in its order (checked
@@ -131,6 +140,14 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "2 or 3: as each fight begins the boss is put just under the HP its next phase starts at, and the game plays its own "
      "change. A boss without that phase starts at the latest it has (the message says so).",
      "1", 0, 0, "1|2|3"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "practice_boss_hp", "Boss HP",
+     "Can't die: hits take its HP down to 1 and no further, its phases still come. Infinite: its HP goes back up after every "
+     "hit, and it stays in the phase the fight began in. Either way the fight is not won: Restart or Stop ends it.",
+     "Normal", 0, 0, "Normal|Can't die|Infinite"},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "practice_player_hp", "Your HP",
+     "Can't die: hits still take your HP, down to 1 and no further. Infinite: back to full after every hit. For learning a "
+     "boss's moves and when to dodge them.",
+     "Normal", 0, 0, "Normal|Can't die|Infinite"},
     {BB_OPT_END}};
 
 namespace {
@@ -448,6 +465,9 @@ int g_phase_set = 1;        // the phase its boss's HP has been put at
 double g_phase_at = 0;      // the world's time of the next try at it
 int g_phase_tries = 0;
 bool g_phase2_seen = false;  // from phase 1: its boss has come under phase 2's threshold
+// The HP Infinite keeps each of the fight's characters at, by data module:
+// what it had once the fight had begun and its phase was set.
+std::map<const bb::ChrDataModule*, std::int32_t> g_hold;
 
 // Time, in seconds, from two clocks read once a frame (clocks()):
 //  - real time: the run's and the rounds' times, loading screens in, and the
@@ -579,8 +599,10 @@ void results_line(const std::string& line) {
 }
 // The practice over - its wins, or Stop: the summary, the save's flags back,
 // and (once a fight has been travelled to) home to the Hunter's Dream.
+void cheats_clear(const Boss* b, bool boss, bool player);
 void practice_end(const char* how, bool home, const std::string& say = "") {
     const Boss* b = g_run[0];
+    cheats_clear(b, true, true);
     give_back();
     const std::string sum = practice_summary(b);
     results_line(sum);
@@ -861,6 +883,7 @@ std::string practice_title(const Boss* b) {
 
 // The fight from its round's arrival, or a death's respawn: nothing begun.
 void reset_fight() {
+    g_hold.clear();  // the next fight's HP is its own
     g_fight_open = g_begun = g_phase2_seen = false;
     g_fight_t0 = -1;
     g_phase_set = 1;
@@ -968,6 +991,83 @@ void practice_watch(const Boss* b) {
         g_phase_set = g_phase;
     } else {
         g_phase_at = g_world_time + 0.25;
+    }
+}
+
+// Practice's cheats. No Dead is bit 4 of a character data module's flags
+// (+0x200): sub_1e577d0, which the death code asks, tests it before the
+// event system's immortality (bit 1, the fights' own scripts') and the debug
+// menu's All and Player No Dead - so it is the debug menu's per-character No
+// Dead, and nothing of the game's own sets or clears it.
+constexpr std::uint16_t kNoDead = 4;
+enum class Cheat { Normal, NoDeath, Infinite };
+Cheat cheat_of(const char* key) {
+    const std::string v = g.config(key, "Normal");
+    return v == "Can't die" ? Cheat::NoDeath : v == "Infinite" ? Cheat::Infinite : Cheat::Normal;
+}
+bool g_boss_cheat = false, g_player_cheat = false;  // No Dead set on them this practice
+
+bb::ChrDataModule* player_data() {
+    for (const BbChr& c : g.characters()) {
+        if (c.is_player && c.ins) return static_cast<bb::ChrIns*>(c.ins)->chr_data();
+    }
+    return nullptr;
+}
+// The boss's characters: its kFights row's, or those whose NpcParam names it
+// (a chalice boss).
+template <class Fn>
+void each_boss_chr(const Boss* b, Fn&& fn) {
+    if (const Fight* f = fight_of(b)) {
+        for (const std::int32_t e : f->chars) {
+            if (!e) continue;
+            if (bb::ChrDataModule* d = chr_data_of(e)) fn(d);
+        }
+        return;
+    }
+    for (const BbChr& c : g.characters()) {
+        const auto* npc = c.npc_param > 0 ? g.param<bb::params::NpcParam>(static_cast<std::uint32_t>(c.npc_param)) : nullptr;
+        if (!npc || !boss_name(b, npc->nameId) || !c.ins) continue;
+        if (bb::ChrDataModule* d = static_cast<bb::ChrIns*>(c.ins)->chr_data()) fn(d);
+    }
+}
+// No Dead off again: from the player, and from the boss's characters while
+// they are there (a boss unloaded took its flags with it).
+void cheats_clear(const Boss* b, bool boss, bool player) {
+    if (boss && g_boss_cheat) {
+        if (b) each_boss_chr(b, [](bb::ChrDataModule* d) { d->flags = static_cast<std::uint16_t>(d->flags & ~kNoDead); });
+        g_boss_cheat = false;
+        g_hold.clear();
+    }
+    if (player && g_player_cheat) {
+        if (bb::ChrDataModule* d = player_data()) d->flags = static_cast<std::uint16_t>(d->flags & ~kNoDead);
+        g_player_cheat = false;
+    }
+}
+// Each frame of a practice's fight in the world.
+void cheats_tick(const Boss* b) {
+    const Cheat boss = cheat_of("boss_rush.practice_boss_hp"), player = cheat_of("boss_rush.practice_player_hp");
+    cheats_clear(b, boss == Cheat::Normal, player == Cheat::Normal);
+    if (boss != Cheat::Normal) {
+        // Infinite holds its HP only once the fight has begun and its phase is
+        // set (practice_watch): before that the phase's HP is still to come.
+        const bool hold = boss == Cheat::Infinite && g_begun && g_phase_set >= g_phase;
+        if (boss != Cheat::Infinite) g_hold.clear();
+        each_boss_chr(b, [&](bb::ChrDataModule* d) {
+            d->flags = static_cast<std::uint16_t>(d->flags | kNoDead);
+            if (d->hp < 1) d->hp = 1;
+            if (!hold) return;
+            const auto it = g_hold.try_emplace(d, d->hp).first;
+            if (d->hp < it->second) d->hp = it->second;
+        });
+        g_boss_cheat = true;
+    }
+    if (player != Cheat::Normal) {
+        if (bb::ChrDataModule* d = player_data()) {
+            d->flags = static_cast<std::uint16_t>(d->flags | kNoDead);
+            if (d->hp < 1) d->hp = 1;
+            if (player == Cheat::Infinite && d->hp < d->max_hp) d->hp = d->max_hp;
+            g_player_cheat = true;
+        }
     }
 }
 
@@ -1166,7 +1266,10 @@ void tick() {
                 g_quiet_at = g_world_time + 1.0;
                 quiet_arena(b);
             }
-            if (g_practice) practice_watch(b);
+            if (g_practice) {
+                practice_watch(b);
+                cheats_tick(b);
+            }
         }
         if (g_test_watch && g_in_world && g_world_time >= g_watch_at) {
             g_watch_at = g_world_time + 2.0;

@@ -22,8 +22,7 @@ draw them, place by place. Two builds can be run against each other.
 | `hunters-nightmare` | Ludwig's arena | the first lamp, then the arena's edge |
 | `laurence-staircase` | The staircase up to the Nightmare Grand Cathedral, Laurence's arena | the first lamp, then the staircase's upper flight |
 
-The last five are The Old Hunters' and need it on (on by default; the run
-turns it on for them if a config has it off). An
+The last five are The Old Hunters' (always on in bbhost). An
 arena view stands just outside the boss's fog wall, facing in, where the boss
 rush plugin starts its rounds, without walking in. Two arenas are behind
 doors, which the run opens with the flags the boss rush uses.

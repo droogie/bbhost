@@ -43,8 +43,8 @@ inline void add(std::atomic<std::uint64_t>& to, float x, float y) {
 
 // DS3's degrees a count at a sensitivity of 0..10: 0.2 * (s * 0.15 + 0.5),
 // as its pad object computes it.
-inline float degrees_per_count(int sensitivity) {
-    const float s = static_cast<float>(sensitivity < 0 ? 0 : sensitivity > 10 ? 10 : sensitivity);
+inline float degrees_per_count(float sensitivity) {
+    const float s = sensitivity < 0.0f ? 0.0f : sensitivity > 10.0f ? 10.0f : sensitivity;
     return ((s * 0.1f) * 1.5f + 0.5f) * 0.2f;
 }
 

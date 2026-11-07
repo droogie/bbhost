@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -106,6 +107,9 @@ bool views_until_field(const Table& t, int off, float want) {
 
 // What camera.cpp links against.
 void host_settings_listen(HostSettingsListener fn) { store().listen(fn); }
+// The built-in fov-uncap patch put in or taken out (engine/patch_manifest.h):
+// nothing to patch here, the test's table is ours.
+bool patch_manifest_set_live(const std::string&, bool, std::string*) { return true; }
 bool host_read_safe(const void* addr, void* out, std::size_t n) {
     std::memcpy(out, addr, n);  // the tables here are all ours
     return true;

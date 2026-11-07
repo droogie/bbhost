@@ -31,6 +31,7 @@
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "host/options.h"
+#include "host/upscaler.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -3968,7 +3969,14 @@ bool init_locked() {
     ici.ppEnabledExtensionNames = iext.data();
     ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
     ici.ppEnabledLayerNames = layers.data();
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) {
+    // The upscaler bridge (host/upscaler.h) adds what DLSS needs to the
+    // instance and the device; without it, or when that fails, ours as asked.
+    upscaler_open();
+    const VkInstanceCreateInfo* ici_use = upscaler_prepare_instance(&ici);
+    VkResult ir = vkCreateInstance(ici_use, nullptr, &g.instance);
+    upscaler_instance_done(ir);
+    if (ir != VK_SUCCESS && upscaler_instance_retry(&ici, ici_use)) ir = vkCreateInstance(&ici, nullptr, &g.instance);
+    if (ir != VK_SUCCESS) {
         host_log("gpu: no Vulkan 1.3 instance%s", g_validate ? " (validation layer requested)" : "");
         return false;
     }
@@ -4254,6 +4262,20 @@ bool init_locked() {
             const char* e = std::getenv("BBHOST_DYNAMIC_DEPTH_CLAMP");
             g.dynamic_depth_clamp = q3.extendedDynamicState3DepthClampEnable && !(e && e[0] == '0');
         }
+        // GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear: z clipped at
+        // -w, not 0 - the point lights' cube shadows' casters): VK_EXT_depth_clip_control's
+        // [-1, 1]. Without it those draws lost everything in the near part of
+        // the light's range (render.cpp gl_clip_space_draw).
+        if (has("VK_EXT_depth_clip_control")) {
+            VkPhysicalDeviceDepthClipControlFeaturesEXT qc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &qc;
+            vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+            const char* e = std::getenv("BBHOST_GL_CLIP_SPACE");
+            g.has_depth_clip_control = qc.depthClipControl && !(e && e[0] == '0');
+        }
+        host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
+                                                                      : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4314,15 +4336,21 @@ bool init_locked() {
     // queue under its lock - as shadPS4 and vkcube make their devices. An A/B
     // for what Windows' per-process GPU counters see of a program that
     // presents from a queue of its own; it costs the command processor the present's blocking.
-    const float prio[2] = {1.0f, 1.0f};
+    // Frame generation (host/framegen.h) takes three more of the family's
+    // queues when it has five: AMD's frame generation swapchain presents,
+    // acquires and runs its async work on queues of its own (2, 3, 4).
+    const float prio[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g.family;
     const char* one_queue = std::getenv("BBHOST_VK_QUEUES");
     if (one_queue && one_queue[0] == '1') g.family_queues = 1;
-    qci.queueCount = g.family_queues >= 2 ? 2 : 1;
+    qci.queueCount = g.family_queues >= 5 ? 5 : g.family_queues >= 2 ? 2 : 1;
     qci.pQueuePriorities = prio;
     host_log("gpu: queue family %u (%u queues): %u queue%s, priority 1.0%s", g.family, usable[static_cast<std::size_t>(chosen)].queues,
-             qci.queueCount, qci.queueCount == 2 ? "s - the second the presenter's" : ", the presents on it too",
+             qci.queueCount,
+             qci.queueCount == 5   ? "s - the second the presenter's, three for frame generation"
+             : qci.queueCount == 2 ? "s - the second the presenter's"
+                                   : ", the presents on it too",
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
@@ -4348,6 +4376,7 @@ bool init_locked() {
         dext.push_back("VK_EXT_graphics_pipeline_library");
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
+    if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -4417,6 +4446,12 @@ bool init_locked() {
     if (g.dynamic_depth_clamp) {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
+    }
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    fdcc.depthClipControl = VK_TRUE;
+    if (g.has_depth_clip_control) {
+        fdcc.pNext = f13.pNext;
+        f13.pNext = &fdcc;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
@@ -4729,7 +4764,12 @@ bool init_locked() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<std::uint32_t>(dext.size());
     dci.ppEnabledExtensionNames = dext.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) == VK_SUCCESS && g.has_push_descriptor) {
+    const VkDeviceCreateInfo* dci_use = upscaler_prepare_device(g.instance, g.phys, &dci);
+    VkResult dr = vkCreateDevice(g.phys, dci_use, nullptr, &g.device);
+    upscaler_device_done(dr);
+    if (dr != VK_SUCCESS && dci_use != &dci) dr = vkCreateDevice(g.phys, &dci, nullptr, &g.device);
+    if (dr == VK_SUCCESS) upscaler_attach(g.instance, g.phys, g.device, kSlots + 2);
+    if (dr == VK_SUCCESS && g.has_push_descriptor) {
         g.cmd_push_descriptor_set =
             reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
         if (!g.cmd_push_descriptor_set) g.has_push_descriptor = false;
@@ -4793,6 +4833,9 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (g.family_queues >= 5) {
+        for (std::uint32_t i = 0; i < 3; ++i) vkGetDeviceQueue(g.device, g.family, 2 + i, &g.fg_queues[i]);
+    }
     if (f12.timelineSemaphore) {
         VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -9588,6 +9631,7 @@ GpuHandles host_gpu_handles() {
     h.device = g.device;
     h.queue = g.queue;
     h.present_queue = g.present_queue;
+    for (int i = 0; i < 3; ++i) h.fg_queues[i] = g.fg_queues[i];
     h.family = g.family;
     h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
     return h;

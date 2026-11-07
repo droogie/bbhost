@@ -859,6 +859,7 @@ struct alignas(16) GxRec {
     std::int32_t sc[4] = {};
     std::uint64_t raster = 0;
     std::uint32_t blend_id = 0, ds_id = 0, raster_id = 0;  // engine/gx_state.h, at the call
+    bool gbuffer = false;  // restyled kGxDrawGbuffer at the call
     // The vertex-stage program's object (the domain shader's in a
     // tessellated draw), the pixel shader's and the input layout's, as
     // engine/gx_resources.h ids.
@@ -1153,6 +1154,7 @@ void snapshot(GxRec& r, std::uint64_t s) {
     r.blend_id = gx_blend_id(r.blend);
     r.ds_id = gx_depth_stencil_id(r.ds);
     r.raster_id = gx_raster_id(r.raster);
+    r.gbuffer = gx_draw_gbuffer();
     const auto slots = [](std::uint64_t base, int n, GxRec::Slot* out, std::uint8_t& count, int cap) {
         count = 0;
         for (int i = 0; i < n && count < cap; ++i) {
@@ -1811,6 +1813,31 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     // A draw that binds a geometry shader has its GS's in slot 3
     // (kGxRecordGs; it has no hull), slot 2 unused.
     const bool gs = !tess && r.st[3].shader;
+    // BBHOST_ONEPASS_TRACE=1 (a test): at a GS draw's call, constant-buffer
+    // slot 0 of every stage's group in the pending state.
+    static const bool op_trace = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (op_trace && gs) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::uint64_t cb0[6] = {}, cbs[6] = {};
+            for (int stg = 0; stg < 6; ++stg) {
+                const std::uint64_t at = r.state + 0x598 + 0x4f8ull * static_cast<std::uint64_t>(stg) + 0x480;
+                cb0[stg] = rd64(at);
+                for (int k = 0; k < 14; ++k) cbs[stg] |= rd64(at + 8ull * static_cast<std::uint64_t>(k)) ? 1ull << k : 0;
+            }
+            host_log("onepass trace: GS call: shaders VS %llx GS %llx PS %llx; CB slot 0 by stage %llx %llx %llx %llx %llx %llx; "
+                     "CB slots set by stage %llx %llx %llx %llx %llx %llx",
+                     static_cast<unsigned long long>(r.st[0].shader), static_cast<unsigned long long>(r.st[3].shader),
+                     static_cast<unsigned long long>(r.st[4].shader), static_cast<unsigned long long>(cb0[0]),
+                     static_cast<unsigned long long>(cb0[1]), static_cast<unsigned long long>(cb0[2]), static_cast<unsigned long long>(cb0[3]),
+                     static_cast<unsigned long long>(cb0[4]), static_cast<unsigned long long>(cb0[5]), static_cast<unsigned long long>(cbs[0]),
+                     static_cast<unsigned long long>(cbs[1]), static_cast<unsigned long long>(cbs[2]), static_cast<unsigned long long>(cbs[3]),
+                     static_cast<unsigned long long>(cbs[4]), static_cast<unsigned long long>(cbs[5]));
+        }
+    }
     const int stage_of[kGxRecords] = {set0_stage, 4, 0, gs ? 3 : 1};
     const std::uint64_t shaders[kGxRecords] = {r.st[set0_stage].shader, r.st[4].shader, tess ? r.st[0].shader : 0,
                                                tess ? r.st[1].shader : gs ? r.st[3].shader : 0};
@@ -2391,6 +2418,7 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
     o.blend_id = r.blend_id;
     o.depth_stencil_id = r.ds_id;
     o.raster_id = r.raster_id;
+    o.gbuffer = r.gbuffer;
     o.vs_prog_id = r.vs_prog_id;
     o.ps_prog_id = r.ps_prog_id;
     o.il_id = r.il_id;

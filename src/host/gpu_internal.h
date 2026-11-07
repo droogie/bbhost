@@ -425,6 +425,7 @@ struct Gpu {
     std::uint32_t family = 0;
     VkQueue queue = VK_NULL_HANDLE;
     VkQueue present_queue = VK_NULL_HANDLE;  // the family's second queue, the presenter's own; null with one
+    VkQueue fg_queues[3] = {};  // queues 2-4 for frame generation's present, image acquire and async work; null under five
     std::uint32_t family_queues = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
     // The command buffer being recorded and its fence/pool: aliases of
@@ -553,6 +554,10 @@ struct Gpu {
     // turns it off): pre-rasterization libraries leave it to the draw.
     bool dynamic_depth_clamp = false;
     PFN_vkCmdSetDepthClampEnableEXT cmd_set_depth_clamp_enable = nullptr;
+    // VK_EXT_depth_clip_control (BBHOST_GL_CLIP_SPACE=0 turns it off): a draw
+    // in GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear) clips z
+    // at -w as the PS4 does, not at 0 (GfxFixedState::gl_clip_space).
+    bool has_depth_clip_control = false;
     // Graphics constant buffers, pushed per draw into set 2 (cb_push_on()):
     // the vertex stage's at bindings 112-127, the pixel stage's at 128-143.
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
@@ -1592,6 +1597,10 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
 // GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// `bytes` of host memory at `src` copied into the same ring now, for the draw
+// recording (a ring in host memory read in place); `loc` becomes the copy.
+// False, `loc` unchanged, past 1 MiB or with no room.
+bool shadow_copy_bytes_locked(const void* src, std::uint64_t bytes, Located& loc);
 // Whether shadow_snapshot_locked may copy any of [va, va+bytes) - a page of it
 // the game rewrites, or a range this cannot tell cheaply - before the caller
 // works out how much of it a draw reads.
@@ -1727,6 +1736,10 @@ struct GfxFixedState {
     // PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL (host/clip_control.h): the pipeline
     // takes rasterizer discard as a dynamic state and the draw sets it.
     bool rasterizer_discard = false;
+    // PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear (host/clip_control.h): GL's clip
+    // space, z from -w to w - the pipeline's viewport takes [-1, 1]
+    // (VK_EXT_depth_clip_control) and the draw its depth range from both ends.
+    bool gl_clip_space = false;
     bool depth_test = false, depth_write = false, depth_bounds_test = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
     VkStencilOpState front{}, back{};
@@ -1894,6 +1907,95 @@ std::string image_reuse_report_locked();
 // The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
 std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// The colour or depth target of lowest base in (after, below), or null (g_rts
+// only: textures.cpp's mip chains of targets).
+RtImage* next_render_target_locked(std::uint64_t after, std::uint64_t below);
+// The temporal upscaler at its call point (upscale_pass.cpp): the scene upscaled
+// in place, with the G-buffer's depth; false when it did not run. With frame
+// generation and no upscaler running, the motion and frame generation's
+// prepare alone (false: nothing upscaled, the draws not moved).
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow = nullptr);
+void upscale_pass_reset_locked();
+// Whether the frame's motion is taken: an upscaler running, or frame generation.
+bool upscale_motion_on();
+// Whether the game's velocity pass is given last frame's matrices (render.cpp
+// velo_previous_locked: rebuilt motion vectors), so a mesh's texel holds its
+// whole motion rather than its bones' alone: the matrices kept, and given
+// (velo_previous_given: all of those frames but BBHOST_VELO_PREV=alt's odd ones).
+bool velo_previous_due();
+bool velo_previous_given();
+// Whether a cloth's velocity draw is given its records of a frame ago
+// (render.cpp velo_cloth_twin_locked): the upscaler's motion on, whatever
+// reads the map (the game's blur too), but BBHOST_VELO_PREV=0 and =alt's odd
+// frames.
+bool velo_cloth_given();
+// The upscaler's frames so far, counted at its call point (after the
+// velocity pass): a frame's velocity draws share one.
+std::uint64_t upscale_velo_frame();
+// Frame generation's HUD-less picture (host/framegen.h): whether this frame
+// was prepared and its copy is still to make, and the copy of the display
+// buffer `display` as it is now, before the HUD's first draw into it.
+bool upscale_pass_hudless_due_locked();
+// A plugin's dither (scene_dither) over the HUD's target before the HUD.
+void scene_dither_locked(RtImage& t, std::uint32_t bits);
+void upscale_pass_hudless_locked(RtImage& display);
+// The copy made this frame, and handing it over with the display buffer the
+// HUD's target then goes to (the frame's prepare done with).
+bool upscale_pass_hudless_copied_locked();
+void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t display_w, std::uint32_t display_h);
+// Under render scale: the upscaler's picture, at the output size, for YEBIS's
+// copy to sample in place of a scene of scene_w x scene_h; null when there is
+// none (no upscale of that size has run, or the picture went back into the
+// scene).
+VkImageView upscale_pass_output_view_locked(std::uint32_t scene_w, std::uint32_t scene_h);
+// The texture LOD bias for the camera's draws while the upscaler runs (the
+// bridge's for its method, quality and output size); 0 otherwise, or with
+// BBHOST_UPSCALE_MIP_BIAS=0.
+float upscale_pass_mip_bias_locked();
+// The camera's view block for the upscaler's motion (upscale_pass.cpp): a
+// constant buffer of a camera draw's vertex stage at `base`, `bytes` long;
+// true when it is the engine's per-view block (taken once a frame).
+bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes);
+// Whether a vertex stage's constant buffer at `base` is the camera's view
+// block - a camera draw, the upscaler's jitter's (Numity1504's handoff, step
+// 3: full-screen passes, which read at 0..1, never) - noting the frame's
+// camera from it as upscale_camera_note_locked does.
+bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes);
+// The camera's view block as last read: its tangents and depth decode (view
+// distance = 1 / (depth_z raw + depth_w)); false before one was read.
+bool upscale_view_terms(float* tan_x, float* tan_y, float* depth_z, float* depth_w);
+// The characters' capture (upscale_pass.cpp): a skinned G-buffer draw's
+// capture address for its vertex shader (StageParams::lds_address), 0 for
+// none - from any thread, a run part's draw included: `order` is its place in
+// the stream (its packet's number), which the frame's draws are matched in;
+// the G-buffer's jittered viewport; whether the capture runs.
+std::uint64_t upscale_capture_draw_locked(std::uint64_t key, std::uint64_t order, std::uint64_t index_va, const void* indices, std::uint32_t count,
+                                          bool i32, std::int32_t base_vertex);
+void upscale_capture_viewport_locked(const VkViewport& vp);
+bool upscale_capture_on();
+void upscale_capture_part_draw();  // a run part's draw captured (counted)
+void upscale_capture_note_moving(std::uint64_t index_va);  // a velocity-pass mesh's index buffer
+bool upscale_capture_moving(std::uint64_t index_va);
+bool upscale_camera_noted();
+// The game's velocity map (the motion blur's) for the upscaler's motion: a
+// pass of it drawn into the target at `base` (`kind` 1: the camera's
+// full-screen pass, 2: a mesh's own, 3: the camera's pass with the camera
+// still), the scale its velocity is written with.
+void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky);
+// Before a draw of a velocity pass (render.cpp) into the map at `base`, `kind`
+// as above: whether the map is to be cleared first - the frame's first mesh
+// pass with no camera pass before it (nothing else clears it: the game does
+// only when it is made, and what a mesh drew stayed) - and the clear. Only
+// reads, the first (a run part may ask).
+bool upscale_velo_clear_due(std::uint64_t base, int kind);
+void upscale_velo_clear_locked(RtImage& velo);
+// Before the motion blur's dilation reads the image at `base`: whether it is
+// the map, not copied yet this frame, and the copy of it as its passes drew
+// it, which the motion then reads - the dilation writes its spread back into
+// the map, the moving meshes' motion over what is around them.
+bool upscale_velo_copy_due(std::uint64_t base);
+void upscale_velo_copy_locked(RtImage& velo);
+std::uint64_t upscale_pass_calls();
 // Copies left unmade (render.cpp, BBHOST_COPY_ELIDE; the rule in host/copy_elide.h).
 // copy_elide_live and copy_elide_hides only read (a run part may ask); the rest is
 // the command processor's, under g.mu.
@@ -1951,6 +2053,7 @@ struct DrawRec {
     std::uint32_t blend0, depth_ctl, mask0;
     std::uint32_t shader_mask, col_format;  // CB_SHADER_MASK, SPI_SHADER_COL_FORMAT
     bool indexed;
+    bool cut = false;  // its pixel stage the cutaway's twin (host/pixel_cutaway.h)
     // What the geometry came from: the index buffer, the vertex bindings
     // (vertex-input draws; 0 for a draw that fetches in its shader), the
     // base vertex, and an indirect draw's arguments.
@@ -2213,6 +2316,21 @@ extern std::atomic<std::uint64_t> g_splice_view_again[2];  // resolved again: th
 // id not made yet, a sampler not made yet.
 extern std::atomic<std::uint64_t> g_list_image_stops[3];
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
+// `base` with `bias` added to its LOD bias (the upscaler's mip bias for the
+// 3D's materials), made once and kept; `base` itself for a bias of 0 or a
+// sampler not made here. Null in a run part's draw that stopped for it to be
+// made in order (BBHOST_RUN_COMMIT).
+VkSampler sampler_with_lod_bias(VkSampler base, float bias);
+// `base` sampling the nearest texel of the nearest mip with no anisotropy (a
+// plugin's look, host/scene_look.h), made once and kept; `base` itself for a
+// depth comparison, one already nearest or one not made here. Null in a run
+// part's draw that stopped for it to be made in order.
+VkSampler sampler_nearest(VkSampler base);
+// `base` with anisotropic filtering of at least `level` (2-16, the device's
+// limit at most), made once and kept; `base` itself for a depth comparison,
+// a nearest or unmipmapped sampler, one already that sharp or one not made
+// here. Null in a run part's draw that stopped for it to be made in order.
+VkSampler sampler_anisotropic(VkSampler base, int level);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
 // cache_rw::Read, into `out` (stage 4b.1a's pool).
@@ -2584,6 +2702,9 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// Every texture image made from [lo, hi) dropped now (host_gpu_forget_region);
+// how many.
+std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi);
 // The generation of the live GX texture that takes a dead resource's image
 // (0: none, and the image goes): one made without data at the dead
 // resource's memory, or one covering the image [image_base, +image_bytes)
@@ -2888,6 +3009,9 @@ private:
 // to the stream in its order at the join; and the appended ops handed over.
 bool recorder_threaded();
 std::uint64_t recorder_reserve_packets(std::uint32_t n);
+// The number the command processor's next packet takes (an in-order draw's,
+// before its packet starts): with a run's reserved numbers, the stream's order.
+std::uint64_t recorder_next_packet();
 void recorder_append_packet(std::uint64_t number);
 void recorder_publish_appended();
 // Stage 4b.1b (gxvk_lists.h splice): the list packet of token slot `index`,

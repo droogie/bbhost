@@ -720,6 +720,15 @@ void draw_icon(ImDrawList* dl, Icon icon, ImVec2 at, float size, ImU32 col) {
         dl->AddCircleFilled(P(0.44f, -0.36f), 0.15f * h, col);
         break;
     }
+    case Icon::Keyboard: {
+        dl->AddRect(P(-0.95f, -0.56f), P(0.95f, 0.56f), col, 0.14f * h, th);
+        for (int row = 0; row < 2; ++row) {
+            for (int k = 0; k < 4; ++k)
+                dl->AddCircleFilled(P(-0.54f + 0.36f * static_cast<float>(k), -0.22f + 0.3f * static_cast<float>(row)), 0.08f * h, col);
+        }
+        dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, th);  // the space bar
+        break;
+    }
     }
 }
 
@@ -920,7 +929,7 @@ bool segmented(const char* id, int* v, const char* const* labels, int n, float w
     return changed;
 }
 
-bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips) {
+bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips, const bool* disabled) {
     // The frame's place, before the popup (when open) becomes the window.
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::CalcItemWidth(), h = ImGui::GetFrameHeight();
@@ -929,7 +938,8 @@ bool combo(const char* id, int* v, const char* const* items, int n, const char* 
     if (ImGui::BeginCombo(id, *v >= 0 && *v < n ? items[*v] : "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge)) {
         for (int i = 0; i < n; ++i) {
             const bool chosen = i == *v;
-            if (ImGui::Selectable(items[i], chosen) && !chosen) {
+            const bool off = disabled && disabled[i];
+            if (ImGui::Selectable(items[i], chosen, off ? ImGuiSelectableFlags_Disabled : 0) && !chosen && !off) {
                 *v = i;
                 changed = true;
             }
@@ -989,6 +999,18 @@ bool icon_button(const char* id, Icon icon, float size, const char* tip) {
     draw_icon(ImGui::GetWindowDrawList(), icon, (a + b) * 0.5f, size * 0.5f, c(ImGui::IsItemHovered() ? kText : kIce));
     if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) tooltip(nullptr, tip);
     return pressed;
+}
+
+float reset_width() { return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x * 0.5f; }
+
+bool reset_button(const char* id, bool at_default) {
+    ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 0.5f);
+    ImGui::BeginDisabled(at_default);
+    const bool pressed = icon_button(id, Icon::Refresh, 0.0f);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+        tooltip(nullptr, at_default ? "The default" : "Back to the default");
+    return pressed && !at_default;
 }
 
 bool ghost_button(const char* label, ImVec2 size) {

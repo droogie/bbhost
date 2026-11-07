@@ -321,10 +321,17 @@ void blend_all(GxBlendDesc& b, std::uint8_t src, std::uint8_t dst, std::uint8_t 
 // its depth written: the first face at a pixel passes, the next one there not.
 std::uint32_t gx_depth_stencil_id(std::uint64_t object) {
     const std::uint32_t id = lookup(kDepthStencil, object);
-    if (!(t_style & (kGxDrawLines | kGxDrawSubtract)) || !id) return id;
+    if (!(t_style & (kGxDrawLines | kGxDrawSubtract | kGxDrawDepthOnly | kGxDrawDepthEqual)) || !id) return id;
     return restyled<GxDepthStencilDesc>(kDepthStencil, id, "depth-stencil", [](GxDepthStencilDesc& d) {
         if (t_style & kGxDrawLines) {
             d.depth_write = 0;
+        } else if (t_style & kGxDrawDepthOnly) {
+            d.depth_enable = 1;
+            d.depth_write = 1;
+        } else if (t_style & kGxDrawDepthEqual) {
+            d.depth_enable = 1;
+            d.depth_write = 0;
+            d.depth_func = 3;  // LESS_OR_EQUAL
         } else {
             d.depth_write = 1;
             d.depth_func = 1;  // LESS (GX's compare functions are Vulkan's)
@@ -333,15 +340,17 @@ std::uint32_t gx_depth_stencil_id(std::uint64_t object) {
 }
 std::uint32_t gx_blend_id(std::uint64_t object) {
     const std::uint32_t id = lookup(kBlend, object);
-    if (!(t_style & (kGxDrawBlack | kGxDrawSubtract)) || !id) return id;
+    if (!(t_style & (kGxDrawBlack | kGxDrawSubtract | kGxDrawDepthOnly)) || !id) return id;
     return restyled<GxBlendDesc>(kBlend, id, "blend", [](GxBlendDesc& b) {
-        if (t_style & kGxDrawBlack) blend_all(b, 0, 0, 0);  // src * 0 + dst * 0
+        if (t_style & kGxDrawDepthOnly) {
+            for (GxBlendTarget& t : b.rt) t.mask = 0;  // no colour written
+        } else if (t_style & kGxDrawBlack) blend_all(b, 0, 0, 0);  // src * 0 + dst * 0
         else blend_all(b, 1, 1, 1);                         // src - dst
     });
 }
 std::uint32_t gx_raster_id(std::uint64_t object) {
     const std::uint32_t id = lookup(kRaster, object);
-    if (!(t_style & (kGxDrawLines | kGxDrawSubtract)) || !id) return id;
+    if (!(t_style & (kGxDrawLines | kGxDrawSubtract | kGxDrawDepthEqual)) || !id) return id;
     return restyled<GxRasterDesc>(kRaster, id, "rasterizer", [](GxRasterDesc& r) {
         const bool lines = t_style & kGxDrawLines;
         r.fill = lines ? 1 : r.fill;
@@ -351,6 +360,25 @@ std::uint32_t gx_raster_id(std::uint64_t object) {
     });
 }
 void gx_draw_style(int style) { t_style = style; }
+bool gx_draw_gbuffer() { return (t_style & kGxDrawGbuffer) != 0; }
+std::atomic<float> g_gbuffer_ambient{-1.0f};  // < 0: not set (the host's default)
+void gx_gbuffer_ambient(float level) { g_gbuffer_ambient.store(level < 0.0f ? 0.0f : level, std::memory_order_relaxed); }
+float gx_gbuffer_ambient_level() { return g_gbuffer_ambient.load(std::memory_order_relaxed); }
+std::uint32_t gx_depth_stencil_merged(std::uint32_t depth_id, std::uint32_t stencil_id) {
+    const auto* d = static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, depth_id));
+    const auto* st = static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, stencil_id));
+    if (!d || !st) return 0;
+    GxDepthStencilDesc c = *d;
+    c.stencil_enable = st->stencil_enable;
+    c.read_mask = st->read_mask;
+    c.write_mask = st->write_mask;
+    c.front = st->front;
+    c.back = st->back;
+    bool made = false;
+    const std::uint32_t id = intern(kDepthStencil, c, &made);
+    if (made) host_log("gx-state: depth-stencil %08x with %08x's stencil: %08x", depth_id, stencil_id, id);
+    return id;
+}
 const GxBlendDesc* gx_blend_desc(std::uint32_t id) { return static_cast<const GxBlendDesc*>(desc_of(kBlend, id)); }
 const GxDepthStencilDesc* gx_depth_stencil_desc(std::uint32_t id) {
     return static_cast<const GxDepthStencilDesc*>(desc_of(kDepthStencil, id));

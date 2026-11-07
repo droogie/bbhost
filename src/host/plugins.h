@@ -29,6 +29,7 @@ struct PluginOptionDesc {
     std::uint32_t type = 0;  // BB_OPT_*, without BB_OPT_LIVE
     bool live = false;       // takes effect at once in game
     std::string key, label, help, def, choices;
+    std::string when;        // BB_OPT_WHEN: "key=a|b", greyed out unless that option is one of them
     double min = 0, max = 0;
 };
 // A plugin file the manager shows: its info, settings and state.
@@ -51,6 +52,9 @@ std::vector<PluginEntry> plugins_scan();
 std::vector<PluginEntry> plugins_catalog();
 // Turns a plugin on or off in the per-user config (from the next start).
 void plugins_set_enabled(const std::string& name, bool on);
+// A plugin running in this session that turns on and off at once
+// (BB_PLUGIN_LIVE_SWITCH): its switch needs no restart.
+bool plugins_live_switch(const PluginEntry& p);
 // A plugin setting: written to the per-user config, and - in game - handed
 // to the plugin's on_option callback on the main thread.
 std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o);

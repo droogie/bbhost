@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 14.
+/* bbhost plugin API, version 18.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 16
+#define BB_PLUGIN_API_VERSION 25
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -115,6 +115,13 @@ typedef struct BbChr {
                                      vanilla player can be summoned into a world this plugin made; the
                                      server lets players advertising it (X-BBHost-Adopt) meet across
                                      this plugin's rules */
+#define BB_PLUGIN_LIVE_SWITCH 8u  /* version 21: turned on and off while the game runs. With BB_PLUGIN_OPT_IN it
+                                     is loaded even when off - bb_plugin_init and bb_plugin_image run, and
+                                     config("plugins.<name>") says whether it is on ("true") - and asks for
+                                     nothing until it is; the player's switch then comes to on_option as
+                                     the key "" ("true" or "false"), on the main thread, and the plugin
+                                     applies or takes back what it does. Not for BB_PLUGIN_GAMEPLAY
+                                     plugins (their rules are the session's): the host ignores it there. */
 typedef struct BbPluginInfo {
     uint32_t api_version;    /* BB_PLUGIN_API_VERSION it was built against */
     uint32_t flags;          /* BB_PLUGIN_* */
@@ -148,6 +155,12 @@ typedef struct BbPluginInfo {
 #define BB_OPT_HEADING 7   /* a section title: label (and help) only */
 #define BB_OPT_LIVE 0x100u /* or-ed into type: takes effect at once in game
                               (on_option); without it, at the next start */
+#define BB_OPT_WHEN 0x200u /* version 21, or-ed into the type of any option but a
+                              CHOICE: its `choices` is "key=value" ("key=a|b" for any
+                              of them), and the menus grey the row out unless the
+                              plugin's option `key` holds that value (older hosts
+                              show it as always). On a HEADING it covers the rows
+                              under it, up to the next heading. */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -189,6 +202,17 @@ typedef struct BbCamera {
     float aspect;          /* width over height */
     float near_z, far_z;   /* the clip planes' distances */
 } BbCamera;
+
+/* Version 23: view_cutaway2's numbers. */
+typedef struct BbCutaway {
+    float distance;      /* metres from the camera to the point it looks at */
+    float pitch;         /* radians the view looks down below the horizon */
+    float radius;        /* metres about the view's axis at that point (0: off) */
+    float widen;         /* metres wider for each metre nearer the camera */
+    float height;        /* metres above the point looked at where the cut starts */
+    float margin;        /* metres in front of the point looked at where the cut starts */
+    float feather;       /* metres over which it fades in */
+} BbCutaway;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -359,7 +383,9 @@ typedef struct BbHostApi {
     /* Version 9: settings and actions from the plugin menus, and files. */
     /* fn(key, value, user) when the player changes one of the calling
      * plugin's options in the in-game menu (key without the section; value
-     * as text). `name` is the plugin's BbPluginInfo name. Main thread. */
+     * as text). `name` is the plugin's BbPluginInfo name. Main thread.
+     * Version 21: a BB_PLUGIN_LIVE_SWITCH plugin also gets the key "" when
+     * the player turns it on ("true") or off ("false"). */
     int (*on_option)(const char* name, void (*fn)(const char* key, const char* value, void* user), void* user);
     /* fn(action, user) when the player presses one of the plugin's
      * BB_OPT_ACTION buttons in the in-game menu. Main thread. */
@@ -470,8 +496,9 @@ typedef struct BbHostApi {
      * thread state, on a worker: call only the game's draw code (BB_GUEST_ABI
      * pointers from guest_addr) and nothing of the host's but log. Not called
      * on a frame whose scene has nothing at or after the pass. One pass for
-     * all plugins - a later call replaces it; -1 takes it away. 0 on success;
-     * 1 for another eboot. */
+     * each fn and user (version 17, up to four in all; one for all plugins
+     * before) - a later call with the same fn and user replaces it; -1 takes
+     * it away. 0 on success; 1 for another eboot. */
     int (*on_scene_category)(int32_t pass, void (*fn)(uint64_t cc, void* user), void* user);
 
     /* Version 16. */
@@ -485,14 +512,138 @@ typedef struct BbHostApi {
      * there; pulled toward the viewer a little, its depth written). A shader
      * that shades from the triangle's slope on screen draws its lines dark:
      * white lines are drawn as black ones over white faces, then the faces
-     * again subtracting. No plugin uses it today. */
+     * again subtracting. Version 17: BB_DRAW_DEPTH_ONLY - no colour written,
+     * the depth tested and written; BB_DRAW_DEPTH_EQUAL - the depth tested
+     * less-or-equal and not written, pulled toward the viewer a little: a draw
+     * made depth-only early in the scene (an occluder for the game's
+     * occlusion queries) and again later lands on its own depth. Version 19:
+     * BB_DRAW_GBUFFER - drawn into the G-buffer, where the game's lighting
+     * lights it as it does the map (the sun, the lamps and their shadows, the
+     * fog), with the host's pixel shader in place of the draw's: for the
+     * game's simple coloured draw (the debug draw's), rgb the albedo (linear)
+     * and alpha the face's world normal when negative - -(1 + u + 2048 v), u
+     * and v its octahedral coordinates in 11 bits each (gbuffer_flat.frag).
+     * The draw marks the stencil as the map's G-buffer draws do, which the
+     * lights test. Only where the G-buffer is bound (a pass of the scene
+     * ahead of 3e/13, such as 3e/0c); elsewhere the draw is drawn as it is. */
     void (*draw_style)(int style);
+
+    /* Version 18: the 3D's look. What the camera's draws - the 3D world, its
+     * characters, its sky and effects: the draws with the scene's depth that
+     * are not full-screen rect lists, as the upscaler's jitter takes them - are
+     * drawn with. The shadow maps, the post-processing and the HUD and menus
+     * keep the game's own. scene_scale and scene_colour_bits decide the scene's
+     * targets: call them from bb_plugin_init for the start, or once the game
+     * runs from the main thread (on_frame, on_option), which makes the targets
+     * again at the next quiet point, as a Resolution change does - from
+     * bb_plugin_image they change nothing until then. The others: any thread,
+     * from the next frame. */
+    /* The 3D's vertices moved, as their stage writes them, to the nearest
+     * corner of a grid of the screen `lines` cells high and as many across as
+     * the 3D's shape gives (240: 427 x 240 at 16:9), as the PS1's landed on
+     * its pixels; BB_SNAP_PIXELS the 3D's own pixels; 0 off. */
+    void (*scene_snap)(uint32_t lines);
+    /* How the 3D samples its textures: BB_FILTER_NEAREST - the nearest texel of
+     * the nearest mip, no anisotropy (depth comparisons keep their own) - or
+     * BB_FILTER_AS_IS. */
+    void (*scene_filter)(int filter);
+    /* The 3D's size against the game's: BB_SCALE_NEAREST draws the game, its
+     * HUD and menus at the window's size and the 3D at the Resolution - or
+     * `lines` high (0: the Resolution) as wide as the window's shape - brought
+     * up to the window texel for texel, with no smoothing: no upscaler and no
+     * anti-aliasing; a Resolution as large as the window or larger draws the
+     * 3D at the window's size.
+     * BB_SCALE_AS_IS gives it back to the Resolution, Upscaling and
+     * anti-aliasing settings. */
+    void (*scene_scale)(int scale, uint32_t lines);
+    /* The scene's colour targets - the lit scene, its light and its
+     * reflections - in 8 bits a channel (RGBA8, as the rgba8f patch makes
+     * them), or (0) in the game's and its patches' formats. */
+    void (*scene_colour_bits)(int bits);
+    /* The colour grading's table - the area's CGrading textures
+     * (map/mXX/mXX_cgrading.tpf: m24_00_CGrading0001 ...), copied each frame
+     * into a 16x16x16 table that the post-processing's grading pass samples -
+     * sampled BB_FILTER_NEAREST, the grading stepping from entry to entry (16
+     * shades a channel), or BB_FILTER_AS_IS, smoothly between them. */
+    void (*grading_filter)(int filter);
+    /* Version 19: BB_DRAW_GBUFFER draws' indirect light - what a lightmap
+     * gives the map, which they have none of - from the next frame (0.03 by
+     * default; 0 leaves what no lamp reaches black). */
+    void (*gbuffer_ambient)(float level);
+
+    /* Version 20: the camera the scene is drawn from. */
+    /* fn(cam, user) each frame once the game has copied the player's camera
+     * (on_camera's, after its callbacks) into the scene's, before a scripted
+     * camera (a cutscene's) replaces it: what fn writes is what is drawn, while
+     * the game's own camera - the one the follow camera keeps, the controls
+     * move by and the aim reads - stays as on_camera left it. Not called in
+     * the game state on_camera reaches through its second hook (a warp's).
+     * Main thread. 0 on success; 1 for another eboot. */
+    int (*on_view)(void (*fn)(BbCamera* cam, void* user), void* user);
+
+    /* Version 21: old-hardware sound. Everything the game plays - its final
+     * mix, as it reaches the device - low-passed at `lowpass_hz` (a one-pole
+     * filter: the muffled top end of a PS1-era sound chip), held down to
+     * `rate_hz` (sample-and-hold, the steps kept across buffers), rounded to
+     * `bits` a sample (no dither: the crunch; quieter than half a step is
+     * silence) and, after a hold, smoothed at 0.45 of `rate_hz` as a DAC's
+     * output filter smoothed its steps. 0 turns each off; all three
+     * 0 is the game's own sound, which costs nothing. Any thread, from the
+     * next buffer. */
+    void (*audio_crush)(int rate_hz, int bits, float lowpass_hz);
+
+    /* Version 22: a cutaway for a high camera (the Isometric's). The camera's
+     * draws - the world, its characters, the effects, not the shadows - are
+     * clipped where they lie within `radius` of the view's axis and nearer
+     * than `near_z` along it (both in metres, view space): what stands between
+     * the camera and the character at the screen's middle, `near_z` the
+     * character's distance less a margin. `tan_x` and `tan_y` are the tangents
+     * of half the drawn view's field of view across and up (on_view's fov_y
+     * and aspect). radius 0 turns it off. Each new set of numbers makes the
+     * camera draws' pipelines again (rounded to 1/4 m), so set it as the
+     * distance or the field of view change, not every frame. Any thread. */
+    void (*view_cutaway)(float tan_x, float tan_y, float near_z, float radius);
+
+    /* Version 23: the cutaway per pixel, faded (BbCutaway). The map's own
+     * camera draws (never the characters, the objects or their parts) leave out, in their pixel
+     * stage, what lies within `radius` of the view's axis - `widen` metres
+     * wider for each metre nearer the camera than the point looked at - more
+     * than `height` metres above that point and more than `margin` in front of
+     * it, fading in over `feather` metres at each of those edges (a dither:
+     * the G-buffer has no blending). The view only turns and moves: `pitch`
+     * (radians below the horizon) and `distance` (to the point looked at, at
+     * the screen's middle) place it; the field of view and the depth come from
+     * the drawn view itself. NULL or radius 0 turns it off. Each new set makes
+     * the camera draws' pipelines again, so set it as the distance changes,
+     * not every frame. Any thread. */
+    void (*view_cutaway2)(const struct BbCutaway* cut);
+    /* Version 24: view_cutaway2's cone for the map's objects too (never the
+     * characters or what they carry), its tip `start` of the way from the
+     * point looked at toward the camera - 0.5 halfway - and the rest of it
+     * as view_cutaway2 sets it. Below 0 (the default) the objects are never
+     * cut. Any thread. */
+    void (*view_cutaway_objects)(float start);
+    /* Version 25: the finished picture - the 3D and its post effects, before
+     * the HUD and the menus are drawn over it - rounded to `bits` a channel
+     * through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a pixel
+     * of the 3D (scene_scale's lines: as coarse as the 3D). 5 is the PS1's
+     * 15-bit colour; 0 (the default) off. Any thread. */
+    void (*scene_dither)(uint32_t bits);
 } BbHostApi;
+
+#define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
+#define BB_FILTER_AS_IS 0          /* version 18: scene_filter, grading_filter: the game's filtering */
+#define BB_FILTER_NEAREST 1        /* version 18: the nearest texel of the nearest mip */
+#define BB_SCALE_AS_IS 0           /* version 18: scene_scale: the settings' sizes */
+#define BB_SCALE_NEAREST 1         /* version 18: the 3D at its own size, brought up nearest */
 
 #define BB_DRAW_AS_IS 0
 #define BB_DRAW_LINES 1
 #define BB_DRAW_BLACK 2
 #define BB_DRAW_SUBTRACT 4
+#define BB_DRAW_DEPTH_ONLY 8   /* version 17: no colour written, the depth tested and written */
+#define BB_DRAW_DEPTH_EQUAL 16 /* version 17: the depth tested less-or-equal, not written, pulled toward the viewer a little */
+#define BB_DRAW_GBUFFER 32     /* version 19: into the G-buffer, lit by the game (see draw_style) */
 
 #define BB_TEXT_LEFT 0u
 #define BB_TEXT_CENTRE 1u

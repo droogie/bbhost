@@ -15,11 +15,14 @@
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
+#include "host/upscaler.h"
 #include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <climits>
 #include <cmath>
@@ -91,8 +94,33 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<bool> g_ssao{true}, g_aa{true};
-// Bumped when the SSAO or AA setting changes: each renderer is given the
-// values once a generation (render_view_hook). 0: never changed - the game's.
+// Motion blur's flag (+0x2969) - what draws the velocity map, which an
+// upscaler's or frame generation's motion reads (host/upscale_pass.cpp) - on
+// for a renderer that can blur unless Performance mode takes it and nothing
+// needs the map; and the camera blur's switch (+0x2a10), which HD motion blur
+// turns on (engine/patch_manifest.cpp). Both as the start's manifests made
+// them until a setting changes.
+std::atomic<bool> g_velocity{true}, g_camera_blur{false};
+constexpr std::size_t kVelocityFlag = 0x2969, kCameraBlur = 0x2a10;
+// The resource setup makes the velocity map under either bit (`test ax, 0x420`
+// at 0x26c3d8f); the scene's main renderer has 0x400 alone.
+constexpr std::uint64_t kBlurCapability = 0x420;
+// Screen space reflections' switch (+0x2974): the patched resource setup sets
+// it as it makes the reflections' targets (engine/patch_manifest.cpp ssr), and
+// the scene renderer runs the pass each frame it is on. With the setting off
+// it is cleared every view - the targets stay until the next start.
+constexpr std::size_t kSsrFlag = 0x2974;
+std::atomic<bool> g_ssr_off{false};
+// The dynamic lights' shadows (+0x296e, the constructor's first flag; Kyo's
+// Disable Dynamic Light Shadows patch zeroed its immediate): with Dynamic
+// light shadows off cleared every view, on given back to the renderers it
+// was cleared on (the render thread alone).
+constexpr std::size_t kDynamicShadowFlag = 0x296e;
+std::atomic<bool> g_dyn_shadows_off{false};
+std::uint8_t* g_dyn_cleared[16] = {};
+// Bumped when the SSAO, AA, motion or HD motion blur settings change: each
+// renderer is given the values once a generation (render_view_hook). 0: never
+// changed - the game's.
 std::atomic<std::uint32_t> g_flags_gen{0};
 // The renderers given them, and the generation each was given (render_view_hook,
 // the render thread alone).
@@ -373,6 +401,24 @@ void motion_blur_apply(bool on) {
     host_log("graphics: motion blur %s (its velocity pass %s)", on ? "on" : "off", on ? "runs" : "skipped at the graphics manager's switch");
 }
 
+// [Ssr] Fade To Viewer Param, the graphics manager's +0x7680: what the ssr
+// manifest writes into the manager's constructor (-10000 over -0.8), written
+// into the live manager when the manifest goes in while the game runs.
+constexpr std::size_t kSsrFadeToViewer = 0x7680;
+}  // namespace
+
+void graphics_ssr_live_in() {
+    std::uint64_t gm = 0;
+    if (g_velocity_slide)
+        std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManagerOfBlur - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    const float fade = -10000.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(gm + kSsrFadeToViewer)), &fade, sizeof(fade));
+    host_log("graphics: screen space reflections' fade to viewer %g in the graphics manager", static_cast<double>(fade));
+}
+
+namespace {
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -389,17 +435,40 @@ void settings_changed(const HostSettings& hs) {
     // first view when the file asks for other than the game's own
     // (render_view_hook); never while they are the game's.
     static bool ssao_was = true, aa_was = true;
-    if (hs.ssao != ssao_was || hs.anti_alias != aa_was) {
-        ssao_was = hs.ssao;
-        aa_was = hs.anti_alias;
-        g_ssao.store(hs.ssao);
-        g_aa.store(hs.anti_alias);
+    // The velocity map and the camera blur as the start's manifests left them
+    // (performance-mode, hd-motion-blur), followed once one of these changes.
+    static const bool velocity_start = host_opt_motion_wanted() || !hs.performance_mode, camera_blur_start = hs.hd_motion_blur;
+    static bool velocity_was = velocity_start, camera_blur_was = camera_blur_start;
+    const bool velocity = host_opt_motion_wanted() || !hs.performance_mode;
+    // A plugin's 3D brought up nearest (host/scene_look.h, the Bloodborne PS1's):
+    // the AA (FXAA, after YEBIS's copy at the output size) would smooth its
+    // pixels again, so it is off while it is.
+    // Performance mode clears both (its patch's constructor writes until
+    // 2026-11-05), and with it on or off while the game runs they follow.
+    // TAA (Graphics > Upscaling) takes the AA's place: FXAA over its picture
+    // only blurred it again.
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && upscaler_method() != kUpscaleTaa;
+    const bool ssao = hs.ssao && !hs.performance_mode;
+    if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
+        ssao_was = ssao;
+        aa_was = aa;
+        velocity_was = velocity;
+        camera_blur_was = hs.hd_motion_blur;
+        g_ssao.store(ssao);
+        g_aa.store(aa);
+        g_velocity.store(velocity);
+        g_camera_blur.store(hs.hd_motion_blur);
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
+    g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
+    g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
+    // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
-    if (hs.motion_blur != blur_was) {
-        blur_was = hs.motion_blur;
-        motion_blur_apply(hs.motion_blur);
+    // Rebuilt motion vectors hold what the blur cannot read: it goes too.
+    const bool blur = hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits();
+    if (blur != blur_was) {
+        blur_was = blur;
+        motion_blur_apply(blur);
     }
     set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
@@ -1034,6 +1103,47 @@ const std::uint64_t* g_rend_man = nullptr;
 // Written when the setting changes (or the render manager's settings are
 // made again), not held every frame: the debug menu's LodLvBias changes it in
 // between and keeps it.
+// BBHOST_ONEPASS=1 (a probe): the debug menu's "OnePass CubeShadow" (the
+// graphics manager's +0x78b3, copied each frame into the light shadow
+// manager's +0x190 at 0x26aff57) held on, and the light shadow manager's
+// object and vtable logged once.
+void onepass_probe_tick() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS");
+        return e && e[0] == '1';
+    }();
+    if (!on || !g_velocity_slide) return;
+    // BBHOST_ONEPASS_AT=<s>: on only from that many seconds after the first frame (an A/B in one run).
+    static const double at_s = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_AT");
+        return e ? std::atof(e) : 0.0;
+    }();
+    static const auto t0 = std::chrono::steady_clock::now();
+    if (at_s > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < at_s) return;
+    std::uint64_t gm = 0;
+    std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    auto* g8 = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(gm));
+    g8[0x78b3] = 1;
+    static int logged = 0;
+    std::uint64_t lsm = 0;
+    std::memcpy(&lsm, g8 + 0x5878, 8);
+    if (lsm && logged < 2 && ++logged) {
+        const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(lsm));
+        const std::uint64_t base = g_velocity_slide - kPreferredGuestSlide;
+        std::string words;
+        for (int k = 0; k < 64; ++k) {
+            char b[40];
+            const std::uint64_t v = q[k];
+            const bool code = v > base && v - base < 0x5400000;
+            std::snprintf(b, sizeof b, " %x:%llx%s", k * 8, static_cast<unsigned long long>(code ? v - base : v), code ? "*" : "");
+            words += b;
+        }
+        host_log("graphics: onepass probe: light shadow manager 0x%llx, +0x190 = %u;%s", static_cast<unsigned long long>(lsm),
+                 reinterpret_cast<const std::uint8_t*>(q)[0x190], words.c_str());
+    }
+}
+
 void lod_bias_tick() {
     if (!g_rend_man || !*g_rend_man) return;
     const int want = g_lod_bias.load(std::memory_order_relaxed);
@@ -1154,6 +1264,7 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     camera_tick();
     lod_bias_tick();
+    onepass_probe_tick();
     if (g_task_steal) task_steal_tick();
     if (g_graphics_manager) light_grid_render_size_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
@@ -1188,6 +1299,30 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         g_made_any.store(false, std::memory_order_relaxed);
     }
     auto* r = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[0]));
+    // Screen space reflections off: every view, as a rebuild of the targets
+    // (a Resolution change) sets the switch again.
+    if (r && g_ssr_off.load(std::memory_order_relaxed)) r[kSsrFlag] = 0;
+    if (r) {
+        const bool off = g_dyn_shadows_off.load(std::memory_order_relaxed);
+        std::uint8_t** slot = nullptr;
+        for (std::uint8_t*& c : g_dyn_cleared) slot = c == r ? &c : !slot && !c ? &c : slot;
+        if (off) {
+            r[kDynamicShadowFlag] = 0;
+            if (slot && !*slot) *slot = r;
+        } else if (slot && *slot == r) {
+            r[kDynamicShadowFlag] = 1;
+            *slot = nullptr;
+        }
+    }
+    // The velocity map, while an upscaler or frame generation takes motion
+    // from it: on every view, whatever turned it off in between - the debug
+    // menu's sgScene motion blur switch is the same byte. The upscaler learns
+    // which meshes move from its draws (host/upscale_pass.cpp's capture).
+    if (r && host_opt_motion_wanted()) {
+        std::uint64_t caps = 0;
+        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        if ((caps & kBlurCapability) && !r[kVelocityFlag]) r[kVelocityFlag] = 1;
+    }
     if (r && gen) {
         GivenRenderer* g = nullptr;
         for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
@@ -1199,13 +1334,18 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
             std::memcpy(&caps, r + kCapabilities, sizeof(caps));
             const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
             const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
+            const std::uint8_t velocity = g_velocity.load(std::memory_order_relaxed) && (caps & kBlurCapability);
+            const std::uint8_t camera_blur = g_camera_blur.load(std::memory_order_relaxed) && (caps & kBlurCapability);
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {
-                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u", static_cast<void*>(r),
-                         static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa);
+                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u, velocity map %u -> %u, camera blur %u -> %u",
+                         static_cast<void*>(r), static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa, r[kVelocityFlag],
+                         velocity, r[kCameraBlur], camera_blur);
             }
             r[kSsaoFlag] = ssao;
             r[kAaFlag] = aa;
+            r[kVelocityFlag] = velocity;
+            r[kCameraBlur] = camera_blur;
         }
     }
     return 0;  // and the view renders as it would
@@ -1489,13 +1629,17 @@ void ui_stage_pin(ElfImage* image) {
 
 void resolution_patch(ElfImage* image, bool live) {
     int w = 0, h = 0;
-    if (!host_opt_resolution(&w, &h) || (w == 1920 && h == 1080)) {
+    // The game's size: the Resolution, or the window's with an upscaler and a
+    // smaller Resolution (the 3D then drawn at the Resolution, render_scale.cpp).
+    if (!host_opt_output_size(&w, &h) || (w == 1920 && h == 1080)) {
         // What it shipped with: nothing to write - but the words change
         // under a live resolution change, so the stage readers are pinned.
         if (live) ui_stage_pin(image);
         return;
     }
-    if (w < 256 || h < 144 || w > 7680 || h > 4320) {
+    // Up to the Resolution setting's widest and tallest entries: three 16:9
+    // 4K screens (11520x2160) and 8K (7680x4320).
+    if (w < 256 || h < 144 || w > 11520 || h > 4320) {
         host_log("graphics: %dx%d is outside the range this will write", w, h);
         return;
     }

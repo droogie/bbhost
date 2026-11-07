@@ -282,10 +282,19 @@ Shipped patches, in their order. Left out are the list's patches bbhost
 does itself - its resolutions and FPS++ (the Resolution and Frame rate
 settings), the light grids, Restore Change Appearance (PC Enhancements), the
 Model LODs and Disable AA, SSAO, DoF, Bloom, Motion Blur and Chromatic
-Aberration (PC Graphics), Increased camera distance (Camera distance),
+Aberration (PC Graphics), the HD Motion Blur sizes (HD motion blur and its
+resolution, PC Graphics), Increased camera distance (Camera distance),
 Increased Graphics Heap Sizes (bbhost grows that heap for the render size),
-Faster loading screens (bbhost runs loading screens unpaced) and Skip Intro
-(Skip company logos, built into bbhost) - and the ones a release does not
+Faster loading screens (bbhost runs loading screens unpaced), Skip Intro
+(Skip company logos, built into bbhost) and Unlock Game Region (System >
+Language lists all 21 text languages on every disc, built into bbhost
+without changing the region, so online play keeps working), and the Intel
+Black Tonemap Fix (its bytes are the built-in performance patch's, always on),
+The Old Hunters (built in and always on: the game is the edition that
+includes it) and Modern Movement's hold D-pad Down for the first quick item
+(built in, on; the NR ports' Controls carry their own copy, which it steps
+aside for)
+- and the ones a release does not
 carry: the debug patches (camera, dash, menu, Enemy Control), the rally and
 weapon-size changes, and the emulator workarounds and extras (FMOD Crash Fix,
 the Intel SFX workaround, Disable HTTP Requests, Disable Facegen, Enable TAA,
@@ -294,15 +303,9 @@ wants one keeps its file in their own patches folder.
 
 | File | Patch |
 |---|---|
-| `performance-v3-decals-on.toml` | **Performance Patch (Perf Increase)**: Modifies some of the game's debug parameters for better performance without affecting visuals (Kyo). (on by default; one of performance v3; at the next start) |
-| `performance-v3-velomap.toml` | **Performance Patch v3 (Velomap + Camera Blur)**: Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo) (off by default; one of performance v3; at the next start) |
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
-| `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
-| `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
-| `screen-space-reflections.toml` | **Enable Screen Space Reflections**: Screen space reflections on, with the depth renders back at the game's default resolutions. It loads last, so other patches' render changes give way to it. (off by default; at the next start) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
-| `intel-tonemap-fix.toml` | **Intel Black Tonemap Fix**: Fixes the black tonemap colours, most noticeable in the DLC's areas, when using an Intel CPU. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
 | `lower-object-physics.toml` | **Lower object/corpse physics**: Corpses resist being moved by the player or anything else. (off by default; one of object physics) |
 | `disable-camera-auto-rotation.toml` | **Disable Camera Auto Rotation via Movement**: The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work. (off by default; at the next start) |
@@ -311,19 +314,11 @@ wants one keeps its file in their own patches folder.
 | `auto-refill-from-storage.toml` | **Auto-Refill From Storage on Any Area Refresh/Reload**: Eligible consumables refill from your storage whenever an area is refreshed or reloaded, taking from storage as the game does, without dying or going back to the Hunter's Dream. The game's own auto-refill; no free items. (off by default) |
 | `smaller-hunter.toml` | **Smaller Hunter**: A smaller hunter (smol). (off by default; one of hunter size) |
 | `smallest-hunter.toml` | **Smallest Hunter**: The smallest hunter (teeny). (off by default; one of hunter size) |
-| `unlock-game-region.toml` | **Unlock Game Region (DISABLES ONLINE PLAY)**: Unlocks the game's region for more language options. Online play does not work while it is on. The Cross and Circle buttons are not swapped. (off by default; at the next start) |
 | `zero-gravity.toml` | **Zero-Gravity Physics**: Havok's gravity at zero: objects and corpses float. (off by default; one of gravity) |
 | `anti-gravity.toml` | **Anti-Gravity Physics**: Havok's gravity reversed: objects and corpses fall upward. (off by default; one of gravity) |
-| `hd-motion-blur-360p.toml` | **HD Motion Blur 360p (640x360)**: HD Motion Blur 360p (640x360) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-1080p.toml` | **HD Motion Blur 1080p (1920x1080)**: Motion blur's velocity map is half the render resolution by default; this makes it 1080p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-1440p.toml` | **HD Motion Blur 1440p (2560x1440)**: Motion blur's velocity map is half the render resolution by default; this makes it 1440p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-4k.toml` | **HD Motion Blur 4K (3840x2160)**: HD Motion Blur 4K (3840x2160) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
-| `lower-specific-renders.toml` | **Lower specific renders (Perf Increase)**: Lowers the resolution of some renders (the velocity map, glow, the scaled depth): faster, with no visual difference unless Enable Screen Space Reflections is on. (off by default; one of low res renders; at the next start) |
-| `old-hunters.toml` | **The Old Hunters**: The Old Hunters is available: the game takes itself for the edition that includes it (on by default; at the next start) |
 | `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
 | `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |
 | `deflate-level.toml` | **Deflate level 1**: The game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s) (off by default) |
-| `fov-uncap.toml` | **Uncapped field of view**: The field of view is no longer capped at 48 degrees (off by default) |
 | `glow-blur.toml` | **Glow: force on + Blur**: Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo) (off by default) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather

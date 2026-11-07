@@ -290,6 +290,14 @@ struct TranslateOptions {
     // Vertex stage: declare the position Invariant, so every pipeline computes
     // it identically from the same inputs (multipass depth tests rely on it).
     bool invariant_position = false;
+    // Vertex stage, no tessellation or geometry role: the clip position also
+    // goes to the device address in StageParams::lds_address, 16 bytes a
+    // vertex at address + 16 x the vertex index, when that address is not 0 -
+    // the upscaler's capture of a mesh's corners each frame, its motion drawn
+    // from this frame's and the last's (host/upscale_pass.cpp, as
+    // BBNextGenSuite's transform feedback). A draw that leaves it 0 stores
+    // nothing.
+    bool capture_position = false;
     std::uint32_t descriptor_set = 0;
     // Where constant-buffer bindings go (cb_ssbo): their descriptor set (-1:
     // descriptor_set) and the first binding. The host puts them in a

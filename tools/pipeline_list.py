@@ -48,12 +48,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shaderbnd  # noqa: E402
 
 MAGIC = 0x4D504242  # "BBPM"
-VERSION = 5  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes;
-#             4: compute records (ComputeRecipe); 5: geometry-shader pipelines (their ES and copy shader)
-READS = (2, 3, 4, 5)
+VERSION = 6  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes;
+#             4: compute records (ComputeRecipe); 5: geometry-shader pipelines (their ES and copy shader);
+#             6: a plugin's look (the PS1's snap, the Isometric's cutaway: flag 8192)
+READS = (2, 3, 4, 5, 6)
 COMPUTE_RECORD = 1 << 30  # a record's flags: a compute record
 VS_REF, PS_REF, LS_REF, HS_REF = 256, 512, 1024, 2048
-TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES, TESS_GS = 64, 128, 256, 1024, 4096
+TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES, TESS_GS, TESS_LOOK = 64, 128, 256, 1024, 4096, 8192
+LOOK_CELLS, LOOK_PIXEL_CUT = 6 * 4, 16 * 4  # render.cpp DrawState::snap_cells, host/pixel_cutaway.h PixelCut
 GS_ES_REF, GS_COPY_REF = 1, 2  # a geometry-shader section's own flags
 HAS_VERTEX_INPUT, RELINK = 4, 8
 GX_BLEND, GX_DEPTH, GX_RASTER = 66, 16, 20  # sizeof GxBlendDesc, GxDepthStencilDesc, GxRasterDesc
@@ -221,6 +223,15 @@ class Recipe:
             copy, copy_ref = program(r, gflags & GS_COPY_REF)
             copy_name = r.str()
             self.gs = {"regs": regs, "es": es, "es_ref": es_ref, "es_name": es_name, "copy": copy, "copy_ref": copy_ref, "copy_name": copy_name}
+        # A plugin's look (version 6, flag 8192): the snap and cutaway's
+        # numbers, then the cutaway per pixel's when it is on - kept as bytes.
+        self.look = None
+        if self.tess_flags & TESS_LOOK:
+            look_at = r.p
+            r.take(LOOK_CELLS)
+            if r.u32():
+                r.take(LOOK_PIXEL_CUT)
+            self.look = body[look_at:r.p]
         if r.p != r.end:
             raise ValueError("a record longer than its fields")
         return self
@@ -245,6 +256,8 @@ class Recipe:
             gflags = (GS_ES_REF if g["es"] is None else 0) | (GS_COPY_REF if g["copy"] is None else 0)
             out += [w32(gflags), g["regs"], program_bytes(g["es"], g["es_ref"]), wstr(g["es_name"]), program_bytes(g["copy"], g["copy_ref"]),
                     wstr(g["copy_name"])]
+        if self.tess_flags & TESS_LOOK:
+            out.append(self.look)
         return b"".join(out)
 
 

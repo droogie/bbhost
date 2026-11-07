@@ -1,0 +1,8 @@
+upscaler_bridge.h from Numity1504's upscaler_bridge (BBsuite), MIT (LICENSE.txt), as of
+1.1.0: 1.0.0 with ub_evaluate_desc's dlss_preset added at its end (DLSS's render preset;
+a 1.0.0 bridge reads a caller's struct as far as its own goes, and a 1.1.0 bridge reads a
+1.0.0 caller's dlss_preset as 0):
+the C API of upscaler_bridge.dll, which bbhost loads at run time when it sits
+beside bbhost.exe (src/host/upscaler.cpp). The dll and the vendor files it
+calls (nvngx_dlss.dll, amd_fidelityfx_loader_vk.dll,
+amd_fidelityfx_upscaler_vk.dll) are not in this repository.

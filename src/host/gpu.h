@@ -178,6 +178,8 @@ struct GxDrawObjects {
     // engine/gx_state.h ids, taken at the call while the objects were alive;
     // 0 where the registry did not know the object.
     std::uint32_t blend_id = 0, depth_stencil_id = 0, raster_id = 0;
+    // A plugin's draw restyled into the G-buffer (kGxDrawGbuffer, API 19).
+    bool gbuffer = false;
     // The vertex-stage program's object (the domain shader's in a
     // tessellated draw), the pixel shader's and the input layout's, as
     // engine/gx_resources.h ids (0: not known); the renderer finds programs
@@ -416,6 +418,10 @@ std::string host_gpu_segment_report(bool spliced_part);  // the builder's line (
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();
+// A region of guest memory given back whole, its objects' frees never seen
+// (YEBIS's private heap at a live resolution change, engine/live_resolution.cpp):
+// the targets, snapshots and texture images made in [lo, hi) are let go now.
+void host_gpu_forget_region(std::uint64_t lo, std::uint64_t hi);
 // Exit-time statistics.
 void host_gpu_report();
 // Submits the recorded work without waiting (the CP does this at the end of
@@ -790,6 +796,7 @@ struct GpuHandles {
     void* device = nullptr;          // VkDevice
     void* queue = nullptr;           // VkQueue
     void* present_queue = nullptr;   // VkQueue for presents only (the same family), or null
+    void* fg_queues[3] = {};         // VkQueues for frame generation: present, image acquire, async compute; null when the family has fewer than five
     std::uint32_t family = 0;
     bool fifo_latest_ready = false;  // the device may present in VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
 };

@@ -9,6 +9,7 @@
 #include "core/config.h"
 #include "engine/patch_manifest_file.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -37,8 +40,6 @@ namespace fs = std::filesystem;
 const std::map<std::string, std::string> kOnByDefault = {
     {"easier-run-range", ""},
     {"ingame-post-processors", "streaming.all_post_processors"},
-    {"old-hunters", ""},
-    {"performance-v3-decals-on", ""},
     {"quick-reentry", "loading.quick_reentry"},
 };
 
@@ -85,15 +86,20 @@ int main() {
         if (!on.count(name)) std::printf("  %s is on the list and not on by default\n", name.c_str());
     }
     CHECK(on == kOnByDefault);
-    CHECK(seen.count("screen-space-reflections") == 1);
-    CHECK(on.count("screen-space-reflections") == 0);
+    // Screen Space Reflections is a setting now (engine/patch_manifest.cpp's
+    // ssr): no file of its own.
+    CHECK(seen.count("screen-space-reflections") == 0);
+    // The two "(Perf Increase)" patches left the list (2026-11-06): rgba8f
+    // colour space lives on as bbhost's own scene-rgba8 (plugin API 18).
+    CHECK(seen.count("rgba8f-color-space") == 0);
+    CHECK(seen.count("lower-specific-renders") == 0);
 
-    // The guard catches a dropped line: Screen Space Reflections' own file
-    // without its `enabled = false` reads as on.
+    // The guard catches a dropped line: Smaller Hunter's own file without its
+    // `enabled = false` reads as on.
     const fs::path dir = fs::temp_directory_path() / ("patch_defaults_test." + std::to_string(::getpid()));
     fs::create_directories(dir);
     {
-        std::ifstream in(fs::path(BB_PATCHES_DIR) / "screen-space-reflections.toml");
+        std::ifstream in(fs::path(BB_PATCHES_DIR) / "smaller-hunter.toml");
         std::stringstream all;
         all << in.rdbuf();
         std::string text = all.str(), kept;
@@ -111,7 +117,7 @@ int main() {
         patch_file::Manifest m;
         std::string err;
         CHECK(patch_file::parse((dir / "without-enabled.toml").string(), &m, &err));
-        CHECK(m.name == "screen-space-reflections" && m.enabled);
+        CHECK(m.name == "smaller-hunter" && m.enabled);
     }
 
     // What a player starts from turns nothing on.

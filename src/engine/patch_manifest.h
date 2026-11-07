@@ -102,6 +102,21 @@ const char* patch_manifest_owner(std::uint64_t address, std::size_t n);
 std::vector<std::string> patch_manifests_gameplay();
 // Whether patch_manifests_apply has run: the list above is final after it.
 bool patch_manifests_done();
+// The Shadow resolution setting's entry `tier` (-1: the setting's now), with
+// Performance mode's sizes in Default's place: the sun's (0: the size each
+// area's ShadowParam asks), the lamps' spot maps and the torches' cube faces
+// (the game's 512 and 256 filled in).
+struct ShadowMapSizes {
+    std::uint32_t sun, spot, cube;
+};
+ShadowMapSizes shadow_resolution_sizes(int tier = -1);
+// What that entry's larger shadow maps take from the render-target heap past
+// the game's own, in MiB (a multiple of 64, with a margin); 0 when none is
+// larger (engine/live_resolution.cpp grows the heap by it).
+std::uint64_t shadow_resolution_more_mib(int tier = -1);
+// Whether bbhost's built-in patch was read for this eboot (and so can be
+// written while the game runs); *applied: whether the start applied it.
+bool shadow_resolution_known(bool* applied = nullptr);
 
 // A manifest while the game runs, for the patch menu (host/ingame_menu.cpp).
 struct PatchLiveState {
@@ -121,3 +136,10 @@ PatchLiveState patch_manifest_live_state(const std::string& name);
 // bytes that are no longer what it expects, live = false): the switch, which
 // the caller saves, then applies at the next start.
 bool patch_manifest_set_live(const std::string& name, bool on, std::string* why);
+// One of bbhost's own manifests made again from the settings now - its sites
+// follow them (HD motion blur's sizes, the velocity map's format and size) -
+// and put in (on) or left out, as patch_manifest_set_live does with the sites
+// as they are now. *changed: whether any of the game's bytes changed (the
+// scene's targets want making again: live_resolution_rebuild). False, and
+// why, when it cannot change now or a patch file of its name replaced it.
+bool patch_manifest_refresh_live(const std::string& name, bool on, bool* changed, std::string* why);

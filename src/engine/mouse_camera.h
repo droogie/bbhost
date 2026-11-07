@@ -32,11 +32,11 @@ void mouse_camera_install(ElfImage* image);
 bool mouse_camera_installed();
 
 // DS3's degrees per count at a sensitivity of 0..10.
-float mouse_camera_degrees_per_count(int sensitivity);
+float mouse_camera_degrees_per_count(float sensitivity);
 
 // For the pad read, every read: what the camera turns by, and whether the
 // camera's own turns are held (engine/mouse_camera_step.h).
-void mouse_camera_publish(int sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation);
+void mouse_camera_publish(float sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation);
 
 // For the pad read: whether the mouse has just flicked for a lock-on target
 // switch, and the right stick that switches it (-1..1, x right, y down).

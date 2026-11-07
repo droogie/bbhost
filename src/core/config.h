@@ -40,8 +40,9 @@ struct HostConfig {
     int height = 1080;         // video.height
     int fps_cap = 30;          // video.fps_cap
     std::string resolution;    // video.resolution: the Resolution setting's default entry ("1280x800"); F10's file has the last word
-    std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed" or "Fullscreen")
+    std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed", "Borderless" or "Fullscreen")
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
+    std::string texture_quality;  // video.texture_quality: the Texture quality setting's default ("Lowest", "Low", "Medium", "High")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,
@@ -89,6 +90,12 @@ struct HostConfig {
     // painting and its motes, the moon's breathing, the Play button's pulse
     // and shine, the page fade, the eased highlights. Off, it stands still.
     bool setup_animations = true;
+    // startup.setup_keep_open: Play starts the game as a process of its own
+    // and the setup window waits minimized, coming back when the game ends.
+    bool setup_keep_open = false;
+    // --no-setup: never the setup window, whatever startup.setup_window says
+    // (the game the setup window starts when it stays open).
+    bool setup_skip = false;
     // startup.setup_text_size: Menu text size's default in percent (100-400;
     // 0 none), for the setup window, F9 and F10 alike; the options file
     // (menu_text_size, host/options.cpp) holds the player's choice.
@@ -195,14 +202,14 @@ std::string config_user_dir();
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
-// The effects' timing above 30 fps when nothing asks for another: Smooth, the
-// Effect timing setting's default (F10's DISPLAY, the setup window's Game
+// The effects' timing above 30 fps when nothing asks for another: 60 fps
+// (auto: 30 at 30, 60 above), the Effect timing setting's default (F10's DISPLAY, the setup window's Game
 // page). One constant: the options file holds the setting only once a player
 // chose it (host/options.cpp), so a new default here reaches everyone else.
-inline constexpr char kEffectTimingDefault[] = "smooth";
+inline constexpr char kEffectTimingDefault[] = "auto";
 // The effects' timing above 30 fps, decided once as the game starts
 // (engine/frame_rate.cpp): BBHOST_SFX_STEP, else `setting` - the Effect timing
-// setting's "smooth", "30", "auto" or "fps" - once the player has chosen one
+// setting's "30", "auto" or "fps" - once the player has chosen one
 // (`chosen`), else [video] effect_steps, else kEffectTimingDefault. What each
 // value means at `fps` frames a second:
 //   smooth  whole 1/30 s steps for what the effects count in updates (a

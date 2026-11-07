@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 21 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -173,6 +173,11 @@ gives the Binary Ninja address.
   clip planes, all writable. The character's update has run by then; its next
   one moves by where this camera looks. The Quake plugin is a first-person
   view this way.
+- `on_view(fn, user)` (v20): each frame after the game has copied that camera
+  into the scene's, before a scripted camera replaces it: what `fn` writes is
+  drawn, while the game's own camera - which the follow camera keeps, the
+  controls move by and the aim reads - stays as `on_camera` left it. The
+  Isometric plugin draws its view this way.
 
 **Settings, UI and files**
 
@@ -191,21 +196,97 @@ gives the Binary Ninja address.
   the banner on an older host. The Quake plugin names the weapon it switches to
   this way, small, in the bottom left corner.
 - `on_scene_category(pass, fn, user)` (v15): drawing inside the scene.
-  `fn(cc, user)` runs once a frame on the GX worker that records the first
-  chunk of the scene's render queue at or after `pass` - a sort key's category
-  and sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
+  `fn(cc, user)` runs once a frame on the GX worker that records the scene's
+  render queue's first item at or after `pass` - a sort key's category and
+  sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
   logs those a frame holds) - in a GX command context of its own with that
-  chunk's pass set up, queued just ahead of it: what it records draws into the
-  scene's targets before that pass does. One pass for all plugins; -1 takes it
-  away. The Lo-Hit plugin plays the game's collision debug draw there, under
-  the effects.
+  item's pass set up, queued just ahead of it (the worker's chunk is cut
+  there): what it records draws into the scene's targets after the passes
+  before it and before that pass does. One pass for each `fn` and `user`
+  (v17, up to four; v15-16 one for all plugins); -1 takes it away. The Lo-Hit
+  plugin plays the game's collision debug draw there, under the effects.
 - `draw_style(style)` (v16): inside an `on_scene_category` fn, the draws the
   game's code records on that thread from then on restyled, until set back to
   `BB_DRAW_AS_IS` before fn returns: `BB_DRAW_LINES` (each triangle's edges a
   pixel wide, pulled toward the viewer, no depth written;
   `BBHOST_WIREFRAME_BIAS` -512 and `BBHOST_WIREFRAME_SLOPE` -1 by default),
   `BB_DRAW_BLACK` (zero written), `BB_DRAW_SUBTRACT` (the draw's colour less the
-  target's, once a pixel), or-ed.
+  target's, once a pixel), `BB_DRAW_DEPTH_ONLY` (v17: no colour, the depth
+  written), `BB_DRAW_DEPTH_EQUAL` (v17: tested less-or-equal against the depth
+  an earlier depth-only draw of the same geometry wrote), or-ed.
+  `BB_DRAW_GBUFFER` (v19) draws into the G-buffer (a pass ahead of `3e/13`,
+  such as `3e/0c`) with the host's pixel shader (`gbuffer_flat.frag`) in
+  place of the draw's, marking the stencil as the map's G-buffer draws do,
+  so the game's lighting lights it as it does the map: the sun, the lamps
+  and their shadows, the fog. For the game's simple coloured draw (the debug
+  draw's): rgb the albedo (linear), alpha the face's world normal when
+  negative, `-(1 + u + 2048 v)` with u and v its octahedral coordinates in
+  11 bits. Lo-Hit draws the collision this way (always, on a host with it).
+- `gbuffer_ambient(level)` (v19): `BB_DRAW_GBUFFER` draws' indirect light,
+  which the map gets from its lightmaps (0.03 by default).
+- `audio_crush(rate_hz, bits, lowpass_hz)` (v21): old-hardware sound. The
+  game's final mix, as it reaches the device, low-passed at `lowpass_hz` (one
+  pole), held down to `rate_hz` (sample-and-hold, kept across buffers so their
+  boundaries don't click), rounded to `bits` a sample with no dither (quieter
+  than half a step is silence) and, after a hold, smoothed by a second-order
+  low-pass at 0.45 of `rate_hz`, as a DAC's output filter took out the steps'
+  images above the rate; 0 turns each off, and all three 0 costs nothing. Any thread, from the next
+  buffer. The Bloodborne PS1 plugin's Sound.
+- `view_cutaway(tan_x, tan_y, near_z, radius)` (v22): a cutaway for a high
+  camera. The camera's draws are clipped (a clip distance added to their last
+  stage before the rasterizer) within `radius` metres of the view's axis and
+  nearer than `near_z` along it - the roof, ceiling or near wall between the
+  camera and the character it centres. Camera-relative, so it is set when the
+  distance or field of view change, not as the camera moves; each new set
+  makes the camera draws' pipelines again.
+- `view_cutaway2(const BbCutaway*)` (v23): the cutaway per pixel, faded. The
+  map's own draws into the G-buffer (never the characters, the objects or
+  their parts: the G-buffer's stencil marks them 8 and 12, the map 9) leave
+  out, in their pixel stage, what lies within `radius` of the view's axis -
+  `widen` metres wider for each metre nearer the camera than the point looked
+  at, a cone opening toward the camera - more than `height` metres above that
+  point and more than `margin` in front of it, faded over `feather` metres at
+  those edges by a screen-door dither (the G-buffer has no blending). `pitch`
+  and `distance` place the point; the field of view and the depth's decode
+  come from the drawn view's own block. Set it as the distance changes, not
+  every frame: each new set makes the map's pipelines again. NULL or radius 0
+  turns it off. The Isometric plugin's Cutaway; it costs a third of a
+  millisecond of GPU time a frame at 1080p.
+- `view_cutaway_objects(float start)` (v24): `view_cutaway2`'s cone for the
+  draws the stencil marks 8 and 12 too, its tip `start` of the way from the
+  point looked at toward the camera (0.5 halfway). Those marks hold the
+  characters and the map's objects alike - neither the stencil, the vertex
+  shader nor what moves tells them apart - so a character high between the
+  view and the point looked at is cut with the objects; nothing standing near
+  that point is. Below 0, the default, they are never cut. The Isometric
+  plugin's Cut objects; no GPU time to measure beyond the map's cut.
+- `scene_dither(bits)` (v25): the finished picture - the 3D and its post
+  effects, before the HUD and the menus are drawn over it - rounded to `bits`
+  a channel through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a
+  pixel of the 3D (`scene_scale`'s lines). 5 is the PS1's 15-bit colour; 0,
+  the default, off. The Bloodborne PS1's Dithering.
+- The 3D's look (v18): how the camera's draws - the world, its characters, the
+  sky and the effects, the draws with the scene's depth that are not
+  full-screen rect lists - are drawn; the shadow maps, the post-processing and
+  the HUD and menus keep the game's own. `scene_snap(lines)` moves each vertex,
+  as its stage writes it, to the nearest corner of a grid of the screen `lines`
+  cells high (as many across as the 3D's shape gives; `BB_SNAP_PIXELS` the
+  3D's own pixels; 0 off) - the PS1's wobble. `scene_filter(BB_FILTER_NEAREST)`
+  samples their textures nearest (the nearest mip, no anisotropy; depth
+  comparisons keep theirs). `scene_scale(BB_SCALE_NEAREST, lines)` draws the
+  game, its HUD and menus at the window's size and the 3D at the Resolution, or
+  `lines` high, brought up to the window texel for texel with no upscaler.
+  `scene_colour_bits(8)` makes the scene's colour targets RGBA8, as the rgba8f
+  patch does. `grading_filter(BB_FILTER_NEAREST)` samples the colour grading's
+  table nearest - the area's `CGrading` textures (`map/mXX/mXX_cgrading.tpf`)
+  are copied each frame into a 16x16x16 table that the grading pass samples -
+  so the grading steps from entry to entry, 16 shades a channel.
+  `scene_scale` and `scene_colour_bits` decide the scene's targets: call them
+  from `bb_plugin_init` for the start, or once the game runs from the main
+  thread (`on_frame`, `on_option`), which makes the targets again at the next
+  quiet point; the others work from any thread. With `scene_scale` on, the
+  game and its HUD are always the window's size and the 3D at most that. The
+  Bloodborne PS1 plugin is all of these.
 - `plugin_dir(name)` (v8): a data folder of the plugin's own.
 - `game_file(path, ...)` (v9): a game file by its `/app0` path, decompressed.
 - `overlay_file(name, path, data, size)` (v9): a file the game reads instead
@@ -281,12 +362,15 @@ setup window can download the latest signed plugins from the newest release.
 | Plugin | What it does |
 |---|---|
 | `randomizer` | Shuffles one-time pickups and shop stock from a seed, and optionally enemies: each regular enemy becomes another kind (model, AI and gear together), drawn from its own area or from the whole game, with optional roaming bosses. Writes a spoiler file. |
-| `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. Practice fights one boss, picked by name, again and again: once, N times, or until stopped, a death trying again from the fog wall and a win waking the boss for the next fight. Each fight that ends in a win or a death is an attempt, so Once and N times end after that many attempts; Restart starts the fight under way over from the fog wall without counting it. With Refill on, every attempt starts with the most blood vials and quicksilver bullets. A practice can start each fight at the boss's phase 2 or 3: once the fight begins, the boss is put just under the HP at which its own event script or AI changes phase, and the game plays the change itself (Ludwig's cutscene and Holy Blade, Gascoigne's beast, Lady Maria's blood and fire). Attempts, wins, deaths, the best and last clear times and, from phase 1, the time to phase 2 are shown after each fight and written to `results.txt`. |
+| `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. Practice fights one boss, picked by name, again and again: once, N times, or until stopped, a death trying again from the fog wall and a win waking the boss for the next fight. Each fight that ends in a win or a death is an attempt, so Once and N times end after that many attempts; Restart starts the fight under way over from the fog wall without counting it. With Refill on, every attempt starts with the most blood vials and quicksilver bullets. A practice can start each fight at the boss's phase 2 or 3: once the fight begins, the boss is put just under the HP at which its own event script or AI changes phase, and the game plays the change itself (Ludwig's cutscene and Holy Blade, Gascoigne's beast, Lady Maria's blood and fire). Attempts, wins, deaths, the best and last clear times and, from phase 1, the time to phase 2 are shown after each fight and written to `results.txt`. Boss HP and Your HP are practice's cheats, for learning a fight: Can't die keeps hits taking HP down to 1 and no further (the debug menu's No Dead), and Infinite also puts the HP back after every hit, so the boss stays in the phase its fight began in and the player stays at full health. A boss that cannot die is not defeated, so its fights end in a death, a Restart or Stop. |
 | `mutators` | Switchable rules: gravity, game speed, bullet time at low HP, one-hit deaths, blood drain, enemy HP, echo rate, random effects. |
 | `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. |
-| `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): the part you stand on and the parts connected to it, one step out (Whole map: every part loaded). It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, in the launcher's deep violet (walls) and dark blue (floors). Pair it with Performance mode (the setup window's main page) for the post-effects off. |
+| `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): every part loaded (Whole map, the default), or the part you stand on and the parts connected to it, one step out; Hi-hit shows the detailed collision characters and objects use instead. Each mesh is built once into a vertex buffer of its own and drawn with two draws a frame, where the game's debug draw rebuilt every triangle each frame and copied it twice (the triangles' edges the game drew over the faces, a second draw costing the GPU more than the faces, are left out). Its depth (plugin API 17) is drawn ahead of the scene's objects too, so the game's occlusion culling skips what is behind its walls, as the map's own geometry would. It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, by default in the launcher's deep violet (walls) and dark blue (floors); the Colours sliders set both (0-255, as they come out on the screen) for the lo-hit and the hi-hit. Pair it with Performance mode (the setup window's main page) for the post-effects off. |
+| `ps1` | Off until turned on. Bloodborne PS1: the 3D drawn as the first PlayStation drew it, the HUD and the menus left sharp at the window's size: its vertices snapped to a grid of the screen as it moves (Vertex snap: 240p, the PS1's own screen, by default; 480p, 360p, 120p or off), its textures unfiltered (no bilinear, trilinear or anisotropic filtering), its colour targets 8 bits a channel (8-bit colour, as the rgba8f patch makes them; the colour grading then steps between its table's entries too, where it is smooth without it), and the 3D at its own Resolution - Native (the Resolution setting, at most the window's), 480p, 360p or 240p, each as wide as the window's shape gives - brought up to the window pixel for pixel, with no smoothing. Upscaling and the anti-aliasing stand aside while it is on. Old-hardware sound (off by default) makes everything the game plays sound like an old console's sound chip: PS1 (22050 Hz, 12 bits, muffled above 10 kHz), Crunchy (11025 Hz, 8 bits, no low-pass going in, so it aliases) or Custom (a rate and bits of its own). Each option changes in the game (F9). |
 | `debug_menu` | Restores the developers' debug menu (`` ` `` opens it), in English or the developers' Japanese, and makes the debug font it draws with from the public-domain X11 fonts k14 and 7x14, so nothing has to be downloaded. Cheating against other players with it gets an account banned; trying it out online with friends is fine. |
 
 The gameplay plugins - all five - announce themselves in the session's
 ruleset, so the server keeps their players' messages, bloodstains and
-statistics apart from those of players without them.
+statistics apart from those of players without them. Lo-Hit and Bloodborne PS1
+change only the picture: they are not in the rules, and their players meet
+everyone.

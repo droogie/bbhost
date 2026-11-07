@@ -63,6 +63,20 @@ command processor is the limit on a Radeon 8060S: 148 and 136 fps against 134
 and 124 for the same build without it, alternating (+10%). A profile outlives
 small changes: a function it no longer matches is built as without one.
 
+The release's Windows build is built with the repository's profile,
+`pgo/bbhost.proftext` (`CI_PGO=1 tools/ci_windows.sh`, the release workflow):
+LLVM's text form, which any later `llvm-profdata` reads, with the source tree
+it was recorded in written `@SRC@` - a file-local function's name carries its
+source's absolute path (about 40% of them), so a profile used from another
+checkout would miss those. `tools/pgo_store.sh <profdata> <tree it was built
+from>` stores a new one; `tools/pgo_use.sh <out.profdata> [tree]` makes the
+`.profdata` for a tree. Record it again before a release (an instrumented
+build from a clean tree, headless runs in the places that limit the frame -
+Kyo's Central Yharnam house, the clinic, the burning Hunter's Dream - with
+`BBHOST_RUN_COMMIT=0 BBHOST_GXVK_BUFFERS=0`: a profile with the run commit's
+parts in it was no faster) and check it against the build without it. The
+Linux builds stay without: Ubuntu 24.04's Clang 18 is not the profile's.
+
 A ThreadSanitizer build (`-DCMAKE_CXX_FLAGS=-fsanitize=thread`, the same in
 `CMAKE_C_FLAGS` and the linker flags) runs with the write watch off unless
 `BBHOST_WRITE_WATCH=1`: a write fault inside one of ThreadSanitizer's atomics on

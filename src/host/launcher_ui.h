@@ -41,7 +41,7 @@ ImU32 tint(ImU32 col);
 enum class Icon {
     Game, Online, Enhance, Patches, Shaders, Plugins, Settings,
     Folder, File, Check, Warning, Info, Play, Moon, Search, Copy, User, Download, Refresh, SignIn,
-    Display, Image,
+    Display, Image, Keyboard,
 };
 
 // Once the ImGui context and its renderer backend exist: the fonts (the
@@ -108,13 +108,19 @@ bool segmented(const char* id, int* v, const char* const* labels, int n, float w
 // A dropdown with a slim chevron, as wide as SetNextItemWidth says. True when changed.
 // `tips`, when given, holds a bubble for each item (null for none), shown while
 // the item is hovered in the open list.
-bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips = nullptr);
+bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips = nullptr,
+           const bool* disabled = nullptr);  // `disabled`: entries shown greyed, not to be picked
 // `text` cut from the left ("...") to fit `width`.
 std::string fit_left(const std::string& text, float width);
 // The accent button: blue into violet. Disabled when !enabled.
 bool primary_button(const char* label, ImVec2 size, bool enabled = true);
 // A square button holding an icon.
 bool icon_button(const char* id, Icon icon, float size, const char* tip = nullptr);
+// A slider's reset to its default, a frame high, after it on the same line:
+// dimmed and doing nothing while the value is the default already. True when
+// pressed. reset_width() is the room it takes, its gap included.
+bool reset_button(const char* id, bool at_default);
+float reset_width();
 // A quiet button: a faint fill that lights when hovered.
 bool ghost_button(const char* label, ImVec2 size = ImVec2(0, 0));
 // The sidebar's entries: a dot of colour `dot` (0 for none) at the right, or

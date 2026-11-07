@@ -5,6 +5,7 @@
 #include "core/sha256.h"
 #include "engine/addr.h"
 #include "engine/patch_manifest.h"
+#include "host/controls_page.h"
 #include "host/launcher_ui.h"
 #include "host/options.h"
 #include "net/account.h"
@@ -62,7 +63,7 @@ constexpr int kTextSizes[] = {100, 125, 150, 175, 200, 250, 300, 350, 400};
 const char* const kTextSizeLabels[] = {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"};
 
 // The window's pages, as the sidebar lists them.
-enum Page { kPageGame, kPageOnline, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageSettings, kPageCount };
+enum Page { kPageGame, kPageGraphics, kPageControls, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageSettings, kPageCount };
 struct PageInfo {
     const char* name;
     const char* slug;  // its picture's name (BBHOST_SETUP_TEST=shot)
@@ -70,7 +71,8 @@ struct PageInfo {
 };
 constexpr PageInfo kPages[kPageCount] = {
     {"Game", "game", launcher_ui::Icon::Game},
-    {"Online", "online", launcher_ui::Icon::Online},
+    {"Graphics", "graphics", launcher_ui::Icon::Image},
+    {"Controls", "controls", launcher_ui::Icon::Keyboard},
     {"PC Enhancements", "pc-enhancements", launcher_ui::Icon::Enhance},
     {"Patches", "patches", launcher_ui::Icon::Patches},
     {"Shaders", "shaders", launcher_ui::Icon::Shaders},
@@ -215,6 +217,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_log("setup: no window (%s); edit %s instead", SDL_GetError(), config_user_file().c_str());
         return LauncherResult::Quit;
     }
+    // Controllers, for the Controls page's (ImGui's SDL backend opens them):
+    // without it a pad's presses never arrive.
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) host_log("setup: no controllers (%s)", SDL_GetError());
     // The text size, Menu text size (menu_text_size, the same setting as
     // F10's): 100% is the window as it has always been, 1120x720 at Windows'
     // display scaling, and every size in it - the window's own included -
@@ -256,7 +261,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     SDL_SetWindowMinimumSize(win, std::min(win_w, static_cast<int>(860 * scale)), std::min(win_h, static_cast<int>(580 * scale)));
     dark_title_bar(win);
     // V-Sync paces the window where the driver keeps it; the loop below caps
-    // it at 60 a second besides, for where it does not.
+    // it at 30 a second besides, for where it does not.
     SDL_SetRenderVSync(ren, 1);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -289,12 +294,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 #endif
     bool show_every_start = cfg.setup_always;
     bool animations = cfg.setup_animations;
+    bool keep_open = cfg.setup_keep_open;
+    // The game while the window stays open (keep_open): this executable again
+    // with --no-setup, the window minimized until it ends.
+    SDL_Process* game = nullptr;
     int text_applied = text_choice;
     float title_hue = 0.0f, title_vibrance = 0.0f;  // the title bar's colours as last set (dark_title_bar)  // the size the window has; a new choice goes in before the next frame
     bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
-    bool fullscreen = host_opt_index("window_mode") == 1;
+    int window_mode = std::max(0, host_opt_index("window_mode"));  // Windowed, Borderless, Fullscreen
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
     bool debug_camera = host_opt_get("debug_camera");
@@ -302,31 +311,19 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
     bool frame_clock = host_opt_get("frame_clock");
-    // Effect timing (Smooth by default): F10's DISPLAY row, read as the game
+    // Effect timing (60 fps by default): F10's DISPLAY row, read as the game
     // starts (engine/frame_rate.cpp; BBHOST_SFX_STEP wins). The row shows what
-    // will run (host_effect_timing_row); a pick, one of the four, is the
+    // will run (host_effect_timing_row); a pick, one of the three, is the
     // player's own from Save or Play on.
     int effect_timing = -1;  // the pick, -1 none
-    int resolution = host_opt_resolution_index();
-    // In the setting's order (host/options.cpp): by size within each shape.
-    static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
-                                               "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
-                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
-                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
-                                               "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
-                                               "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
-    // The game's frame rate (engine/frame_rate.h): 0 is Display-Limited, the display's refresh rate.
+    // The game's frame rate (engine/frame_rate.h), in the setting's order: 0 is
+    // Display-Limited, the display's refresh rate. The list's labels and
+    // bubbles are host_frame_rate_control's, F10's.
     static const int kCaps[] = {30, 60, 90, 120, 150, 180, 240, 360, 480, 960, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
-    static const char* const kCapLabels[] = {"30 fps",  "60 fps",  "90 fps",  "120 fps", "150 fps", "180 fps",
-                                             "240 fps", "360 fps", "480 fps", "960 fps", "Display-Limited"};
-    static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
-    // The bubble the open list shows over a rate: Display-Limited says what it is.
-    static const char* const kCapTips[] = {
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        "Caps the frame rate at your monitor's refresh rate, read when the game starts: 180 fps on a 180 Hz monitor, 144 on a "
-        "144 Hz one."};
-    static_assert(sizeof(kCapTips) / sizeof(kCapTips[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a bubble, or none, for every rate");
+    // Frame rate's Custom limit: ticked, the game runs at the number typed (10 to 960).
+    bool cap_custom = host_opt_frame_cap_custom();
+    int cap_custom_fps = host_opt_frame_cap_custom_fps();
     int cap_choice = kCapCount - 1;
     for (int k = 0; k < kCapCount; ++k) {
         if (kCaps[k] == frame_cap) cap_choice = k;
@@ -475,6 +472,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
         e.push_back({"startup", "setup_animations", animations ? "true" : "false"});
+        e.push_back({"startup", "setup_keep_open", keep_open ? "true" : "false"});
         e.push_back({"debug", "tooling", tooling ? "true" : "false"});
         // What this bbhost's file looks like (core/config.h): a value saved
         // from here is a choice.
@@ -496,16 +494,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         for (PatchRow& r : patch_rows) r.was = r.on;
         quick_reentry_was = quick_reentry;
         all_post_processors_was = all_post_processors;
-        host_opt_set_index("window_mode", fullscreen ? 1 : 0);
+        host_opt_set_index("window_mode", window_mode);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
-        host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set_frame_cap(kCaps[cap_choice]);  // unticks Custom limit, set again next
+        host_opt_set_frame_cap_custom(cap_custom, cap_custom_fps);
         host_opt_set("frame_clock", frame_clock);
         if (effect_timing >= 0) host_opt_choose_effect_timing(effect_timing);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
-        host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
         saved_note = "Saved";
@@ -514,22 +512,27 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         return true;
     };
 
-    // The window's pace: 60 frames a second at most. V-Sync alone left the loop
+    // The window's pace: 30 frames a second at most. V-Sync alone left the loop
     // drawing as fast as it could wherever the driver ignores it - a driver
     // setting that turns it off, a backend without it, a window the compositor
     // stopped showing - a whole core spent on a settings page. Each frame's
-    // deadline moves on by a sixtieth of a second on SDL's nanosecond clock,
+    // deadline moves on by a thirtieth of a second on SDL's nanosecond clock,
     // and what is left of it is slept after the present; a frame that ran a
     // whole frame past it starts the count again rather than hurrying to
     // catch up.
-    constexpr Uint64 kFrameNs = SDL_NS_PER_SECOND / 60;
+    constexpr Uint64 kFrameNs = SDL_NS_PER_SECOND / 30;
     Uint64 frame_due = SDL_GetTicksNS();
     while (!done) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // The Controls page choosing a binding takes the next press first.
+            if (controls_capture_event(ev)) continue;
             ImGui_ImplSDL3_ProcessEvent(&ev);
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) done = true;
         }
+        // The Graphics page's rows hand their changes to the window's pump, as
+        // F10's do in the game (host/options.h).
+        host_options_frame(0.0f, 0.0f);
         // A sign-in or sign-out in the account section: the token is kept in
         // the options file, written at once rather than at Save.
         if (host_account_take_save()) {
@@ -542,6 +545,26 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 if (!g_picked.empty()) f[g_pick_for].set(generic(g_picked));
                 if (g_pick_for == kEboot) eboot = check_eboot(f[kEboot].str());
                 g_pick_for = -1;
+            }
+        }
+        // The game it started has ended: the window comes back as a fresh
+        // start of its own (what the game saved - F10's settings, a sign-in -
+        // read again), or, if that cannot start, as it was.
+        if (game) {
+            int code = 0;
+            if (SDL_WaitProcess(game, false, &code)) {
+                SDL_DestroyProcess(game);
+                game = nullptr;
+                host_log("setup: the game ended (%d)", code);
+                std::string err;
+                if (SDL_Process* again = static_cast<SDL_Process*>(host_start_again("--setup", false, err))) {
+                    SDL_DestroyProcess(again);
+                    done = true;
+                    continue;
+                }
+                host_log("setup: %s", err.c_str());
+                SDL_RestoreWindow(win);
+                SDL_RaiseWindow(win);
             }
         }
         // Minimized, hidden or covered: nothing is drawn, and the loop waits
@@ -630,7 +653,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             page_at = ImGui::GetTime();
         };
         const bool compiling = compile_job.running();
-        const bool can_play = app0_ok && eboot.ok && !compiling;
+        const bool can_play = app0_ok && eboot.ok && !compiling && !game;
         bool play = false;
 
         // The sidebar: the name, the pages, and Play.
@@ -673,7 +696,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImU32 dot = 0;
                 char badge[16] = {};
                 if (i == kPageGame && !(app0_ok && eboot.ok)) dot = ui::kWarn;
-                if (i == kPageOnline && net::account_logged_in()) dot = ui::kGood;
                 if (i == kPageShaders) {
                     if (cv.running && cv.total) std::snprintf(badge, sizeof(badge), "%d%%", static_cast<int>(100 * cv.done / cv.total));
                     else if (recommend_compile) dot = ui::kWarn;
@@ -687,14 +709,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::BeginChild("##foot", ImVec2(w, foot), 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             if (keys) {
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x, 6 * scale));
-                ui::key_hint("F9", "In-game patches & plugins");
-                ui::key_hint("F10", "In-game settings");
+                ui::key_hint("F9", "In-game patches");
+                ui::key_hint("F10", "In-game menu");
                 ImGui::PopStyleVar();
                 ImGui::Dummy(ImVec2(0, 4 * scale));
             }
             play = ui::play_button("PLAY", ImVec2(w, play_h), can_play) || (test && !std::strcmp(test, "play") && ++frames > 30);
             if (!can_play && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ui::tooltip(nullptr, compiling ? "Play waits for the shader compile (Shaders)." : "Play needs the game folder and the 1.09 eboot (Game).");
+                ui::tooltip(nullptr, game        ? "The game is running; this window comes back when it ends."
+                                     : compiling ? "Play waits for the shader compile (Shaders)."
+                                                 : "Play needs the game folder and the 1.09 eboot (Game).");
             ImGui::Dummy(ImVec2(0, 4 * scale));
             const float half = (w - st.ItemSpacing.x) * 0.5f;
             if (ui::ghost_button("Save", ImVec2(half, 0))) save();
@@ -709,6 +733,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             if (!saved_note.empty() && (!saved_ok || ImGui::GetTime() - saved_at < 4.0)) {
                 note = saved_note;
                 note_col = saved_ok ? ui::kGood : ui::kBad;
+            } else if (game) {
+                note = "The game is running";
             } else if (compiling) {
                 note = "Waiting for the shader compile";
             } else if (!can_play) {
@@ -863,59 +889,93 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(7)), "DISPLAY");
+            // The display, and online beside it: the server and the account, the
+            // way F10 > ACCOUNT has it in the game (no password - this PC linked to
+            // the account signed into on the website with Discord, or an account
+            // held by this PC with a recovery code). The two cards share the
+            // taller one's height.
+            const std::string acct_detail = host_account_detail();
+            const float online_rows = 8.5f + (server == 2 ? 4.0f : 0.0f) + (acct_detail.empty() ? 0.0f : 1.0f) +
+                                      (cfg.profile.empty() ? 0.0f : 1.0f);
+            // A warning line or two under Frame rate and Frame generation (frame generation's limit).
+            const float cards_h =
+                card_h(std::max(7.0f + 1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
+                                online_rows));
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
-                static const char* const kModes[] = {"Windowed", "Fullscreen"};
-                int mode = fullscreen ? 1 : 0;
-                if (ui::segmented("##mode", &mode, kModes, 2, ImGui::GetContentRegionAvail().x)) fullscreen = mode == 1;
+                static const char* const kModes[] = {"Windowed", "Borderless", "Fullscreen"};
+                ui::segmented("##mode", &window_mode, kModes, 3, ImGui::GetContentRegionAvail().x);
+                ui::tooltip_for_item("Window mode", "Borderless fills the screen at the desktop's resolution and switches away "
+                                                    "at once. Fullscreen takes the display over at the mode nearest the "
+                                                    "Resolution, which can change the screen's resolution.");
                 ui::row_label("Frame rate", row_lw);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##cap", &cap_choice, kCapLabels, kCapCount, kCapTips);
-                ui::tooltip_for_item("Frame rate",
-                                     "The game's own speed. Display-Limited caps it at your monitor's refresh rate when the game starts (180 fps on a "
-                                     "180 Hz monitor).");
+                // The list, or Custom limit's number, and its tick box - F10's own control.
+                host_frame_rate_control(&cap_choice, &cap_custom, &cap_custom_fps, ImGui::GetContentRegionAvail().x);
                 ui::toggle_row("Native frame clock (experimental)", nullptr, &frame_clock,
                                "Requires a restart. Timing follows each frame's real length, for PCs that do not hold their chosen frame rate.");
                 ui::row_label("Effect timing", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 {
                     const HostEffectTimingRow et = host_effect_timing_row();
-                    const char* labels[5] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
-                                             kHostEffectTimingLabels[3], et.custom.c_str()};
-                    const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
-                                           kHostEffectTimingTips[3], et.tip.c_str()};
+                    const char* labels[4] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
+                                             et.custom.c_str()};
+                    const char* tips[4] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2], et.tip.c_str()};
                     int shown = effect_timing >= 0 ? effect_timing : et.index;
-                    if (ui::combo("##effects", &shown, labels, et.index == 4 ? 5 : 4, tips) && shown < 4) effect_timing = shown;
+                    if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
-                ui::row_label("Resolution", row_lw);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
-                ui::tooltip_for_item("Render resolution", "The size the game draws at. F10 in the game has every other setting.");
+                // Frame generation: the same setting as the Graphics page's,
+                // changed and saved at once.
+                {
+                    bool fg = host_opt_get("frame_generation");
+                    if (ui::toggle_row("Frame generation", nullptr, &fg,
+                                       "AMD FidelityFX frame generation: a frame made between each two of "
+                                       "the game's, from the 3D alone - the HUD and the menus are never interpolated. Works "
+                                       "with any Upscaling choice, Off included. While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped."))
+                        host_opt_set("frame_generation", fg);
+                    // While on, a Frame rate above half the refresh rate comes down to it (F10: as it turns on).
+                    if (fg) host_frame_rate_fit(&cap_choice, &cap_custom, &cap_custom_fps);
+                    host_frame_generation_warning(cap_choice, cap_custom, cap_custom_fps);
+                }
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");
                 ui::toggle_row("Performance mode", nullptr, &performance_mode,
-                               "Requires a restart. Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays.");
+                               "Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays. Can be changed in game (F10).");
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(7)), "ONLINE");
+            ui::card_begin("##online", ImVec2(0, cards_h), "ONLINE");
             {
-                ui::row_label("Server", 72 * scale);
-                static const char* const kShort[] = {"Live", "Playtest", "Custom"};
+                const float lw = std::min(72 * scale, ImGui::GetContentRegionAvail().x * 0.3f);
+                ui::row_label("Server", lw);
+                static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "Custom"};
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##server", &server, kShort, 3);
-                ui::tooltip_for_item(nullptr, server == 2 ? (f[kHost].str().empty() ? std::string("A server of your own: set it on the Online page.")
+                ui::combo("##server", &server, kServerLabels, 3);
+                ui::tooltip_for_item(nullptr, server == 2 ? (f[kHost].str().empty() ? std::string("A server of your own: its host below.")
                                                                                     : f[kHost].str())
                                                           : std::string(kServers[server].host));
+                if (server == 2) {
+                    ui::row_label("Host", lw);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::InputTextWithHint("##host", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
+                    ui::row_label("Scheme", lw);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::InputText("##scheme", scheme, sizeof(scheme));
+                    ui::toggle_row("Check the server's certificate", nullptr, &verify_tls);
+                    ui::toggle_row("Require an account", nullptr, &require_account, "Players sign in (here, or F10 > Account) to play online.");
+                }
+                if (!cfg.profile.empty()) dim_text("This run uses " + cfg.profile_config + ", whose own settings may choose another server.");
                 ImGui::Dummy(ImVec2(0, 4 * scale));
+                // Who is signed in, with Sign out (Cancel while a Discord link
+                // waits for approval) at the right.
+                const bool busy = host_account_busy();
                 const bool in = net::account_logged_in();
                 const float av = std::round(ImGui::GetFrameHeight() * 1.5f);
                 const ImVec2 at = ImGui::GetCursorScreenPos();
                 const float right = at.x + ImGui::GetContentRegionAvail().x;
-                const char* go_label = in ? "Manage" : "Sign in";
-                const float bw = ImGui::CalcTextSize(go_label).x + st.FramePadding.x * 3;
+                const char* out_label = busy ? "Cancel" : "Sign out";
+                const float bw = ImGui::CalcTextSize(out_label).x + st.FramePadding.x * 3;
                 ui::avatar(in ? net::account_name() : std::string(), av);
                 ImGui::SameLine(0, 12 * scale);
                 ImGui::BeginGroup();
@@ -925,17 +985,83 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::PushFont(ui::font_strong(), 0.0f);
                 ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
                 ImGui::PopFont();
+                const std::string outcome = host_account_outcome();
+                const bool plain = outcome.empty() || outcome == host_account_signed_in();
                 ImGui::PushFont(nullptr, 14.0f);
-                ImGui::PushStyleColor(ImGuiCol_Text, in ? ui::kGood : ui::kTextDim);
-                ImGui::TextUnformatted(in ? "Signed in" : "Sign in to play online");
+                ImGui::PushStyleColor(ImGuiCol_Text, in && plain ? ui::kGood : ui::kTextDim);
+                ImGui::TextUnformatted(!plain ? outcome.c_str() : in ? "Signed in" : "Sign in to play online");
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
                 ImGui::PopTextWrapPos();
                 ImGui::EndGroup();
                 ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y + (av - ImGui::GetFrameHeight()) * 0.5f));
-                if (in ? ui::ghost_button(go_label) : ui::primary_button(go_label, ImVec2(bw, 0))) go(kPageOnline);
+                ImGui::BeginDisabled(!busy && !in);
+                if (ui::ghost_button(out_label)) {
+                    apply_server();
+                    host_account_action(4, "", "");
+                }
+                ImGui::EndDisabled();
+                ui::tooltip_for_item(nullptr, busy ? "Stops the Discord link waiting for approval." : "Forgets this PC's token; the game is signed out.");
                 ImGui::SetCursorScreenPos(ImVec2(at.x, at.y + av));
-                ImGui::Dummy(ImVec2(0, 0));
+                ImGui::Dummy(ImVec2(0, 2 * scale));
+                // A code to type on the website, or a recovery code to keep.
+                if (!acct_detail.empty()) {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kIce);
+                    ImGui::PushFont(ui::font_strong(), 0.0f);
+                    ImGui::TextUnformatted(acct_detail.c_str());
+                    ImGui::PopFont();
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    if (ui::icon_button("##copy", ui::Icon::Copy, 0.0f, "Copy the code")) {
+                        // The code alone: the word after "Code" or "code".
+                        std::string code = acct_detail;
+                        for (const char* lead : {"Code ", "Recovery code ", "Website code "}) {
+                            if (acct_detail.rfind(lead, 0) == 0) code = acct_detail.substr(std::strlen(lead));
+                        }
+                        code = code.substr(0, code.find("  "));
+                        SDL_SetClipboardText(code.c_str());
+                    }
+                }
+                const float full = ImGui::GetContentRegionAvail().x;
+                const float half = (full - st.ItemSpacing.x) * 0.5f;
+                ImGui::BeginDisabled(busy);
+                // The way in for most players: lit until someone is signed in.
+                if (in ? ui::ghost_button("Log in with Discord", ImVec2(half, 0)) : ui::primary_button("Log in with Discord", ImVec2(half, 0))) {
+                    apply_server();
+                    host_account_action(0, "", "");
+                }
+                ui::tooltip_for_item(nullptr, "Opens the website: sign in there with Discord and approve the code.");
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!in);
+                if (ui::ghost_button("Website sign-in code", ImVec2(half, 0))) {
+                    apply_server();
+                    host_account_action(3, "", "");
+                }
+                ImGui::EndDisabled();
+                ui::tooltip_for_item(nullptr, "A code to sign in to the website as this account.");
+                // Or an account kept on this PC: a name to create it under, and
+                // its recovery code to bring it back.
+                const float btn = std::max(ImGui::CalcTextSize("Create account").x, ImGui::CalcTextSize("Recover").x) + st.FramePadding.x * 3;
+                const float field = std::max(40 * scale, full - btn - st.ItemSpacing.x);
+                ImGui::SetNextItemWidth(field);
+                ImGui::InputTextWithHint("##acct_name", "Account name", acct_name, sizeof(acct_name));
+                ImGui::SameLine();
+                if (ui::ghost_button("Create account", ImVec2(btn, 0))) {
+                    apply_server();
+                    host_account_action(1, acct_name, "");
+                }
+                ui::tooltip_for_item(nullptr, "An account held by this PC, under that name. Keep the recovery code it shows.");
+                ImGui::SetNextItemWidth(field);
+                ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
+                ImGui::SameLine();
+                if (ui::ghost_button("Recover", ImVec2(btn, 0))) {
+                    apply_server();
+                    host_account_action(2, acct_name, acct_code);
+                    acct_code[0] = 0;
+                }
+                ui::tooltip_for_item(nullptr, "The account of that name, back on this PC with its recovery code.");
+                ImGui::EndDisabled();
             }
             ui::card_end();
 
@@ -966,117 +1092,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ui::tooltip_for_item(nullptr, "Builds every shader up front, so the first start does not. Otherwise the game builds them while you play.");
                 ui::card_end();
             }
-        } else if (page == kPageOnline) {
-            const float w = ImGui::GetContentRegionAvail().x;
-            ui::card_begin("##server", ImVec2(w, 0), "SERVER");
-            {
-                ui::row_label("Server", label_w);
-                static const char* const kServerLabels[] = {kServers[0].label, kServers[1].label, "Custom"};
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                ui::combo("##server", &server, kServerLabels, 3);
-                if (server == 2) {
-                    ui::row_label("Host", label_w);
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputTextWithHint("##host", "server.example.com", f[kHost].text, sizeof(f[kHost].text));
-                    ui::row_label("Scheme", label_w);
-                    ImGui::SetNextItemWidth(120 * scale);
-                    ImGui::InputText("##scheme", scheme, sizeof(scheme));
-                    ui::toggle_row("Check the server's certificate", nullptr, &verify_tls);
-                    ui::toggle_row("Require an account", nullptr, &require_account, "Players sign in (here, or F10 > Account) to play online.");
-                }
-                if (!cfg.profile.empty()) dim_text("This run uses " + cfg.profile_config + ", whose own settings may choose another server.");
+        } else if (page == kPageGraphics) {
+            // F10's Graphics page in the game, row for row (host/options.h):
+            // the effects, detail and screen space reflections. Resolution is
+            // the Game page's, the shader form the Shaders page's.
+            for (int i = 0; i < host_options_page_count(); ++i) {
+                if (std::strcmp(host_options_page_name(i), "Graphics") == 0) host_options_draw_setup_page(i);
             }
-            ui::card_end();
-            ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
-            // The private server's account, as F10 > ACCOUNT in the game has
-            // it: no password - this PC linked to the account signed into on
-            // the website with Discord, or an account held by this PC with a
-            // recovery code. The calls go to the server chosen above.
-            ui::card_begin("##account", ImVec2(w, 0), "ACCOUNT");
-            {
-                const bool busy = host_account_busy();
-                const bool in = net::account_logged_in();
-                const float av = std::round(ImGui::GetFrameHeight() * 1.6f);
-                ui::avatar(in ? net::account_name() : std::string(), av);
-                ImGui::SameLine(0, 12 * scale);
-                ImGui::BeginGroup();
-                ImGui::PushFont(ui::font_strong(), 18.0f);
-                ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
-                ImGui::PopFont();
-                const std::string outcome = host_account_outcome();
-                dim_text(!outcome.empty() && outcome != host_account_signed_in() ? outcome
-                         : in                                                    ? std::string("Signed in")
-                                                                                 : std::string("Log in with Discord, or keep an account on this PC."),
-                         in && (outcome.empty() || outcome == host_account_signed_in()) ? ui::kGood : ui::kTextDim);
-                ImGui::EndGroup();
-                const std::string detail = host_account_detail();
-                if (!detail.empty()) {
-                    ImGui::Dummy(ImVec2(0, 2 * scale));
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::PushFont(ui::font_strong(), 18.0f);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kIce);
-                    ImGui::TextUnformatted(detail.c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::PopFont();
-                    ImGui::SameLine();
-                    if (ui::icon_button("##copy", ui::Icon::Copy, 0.0f, "Copy the code")) {
-                        // The code alone: the word after "Code" or "code".
-                        std::string code = detail;
-                        for (const char* lead : {"Code ", "Recovery code ", "Website code "}) {
-                            if (detail.rfind(lead, 0) == 0) code = detail.substr(std::strlen(lead));
-                        }
-                        code = code.substr(0, code.find("  "));
-                        SDL_SetClipboardText(code.c_str());
-                    }
-                }
-                ImGui::Dummy(ImVec2(0, 4 * scale));
-                ImGui::BeginDisabled(busy);
-                // The way in for most players: lit until someone is signed in.
-                if (in ? ImGui::Button("Log in with Discord") : ui::primary_button("Log in with Discord", ImVec2(0, 0))) {
-                    apply_server();
-                    host_account_action(0, "", "");
-                }
-                ImGui::EndDisabled();
-                ui::tooltip_for_item(nullptr, "Opens the website: sign in there with Discord and approve the code.");
-                ImGui::Dummy(ImVec2(0, 2 * scale));
-                ui::caption("OR AN ACCOUNT KEPT ON THIS PC");
-                const float field_w = std::round(240 * scale);
-                ImGui::BeginDisabled(busy);
-                ImGui::SetNextItemWidth(field_w);
-                ImGui::InputTextWithHint("##acct_name", "Name", acct_name, sizeof(acct_name));
-                ImGui::SameLine();
-                if (ImGui::Button("Create account")) {
-                    apply_server();
-                    host_account_action(1, acct_name, "");
-                }
-                ui::tooltip_for_item(nullptr, "An account held by this PC, under that name. Keep the recovery code it shows.");
-                ImGui::SetNextItemWidth(field_w);
-                ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
-                ImGui::SameLine();
-                if (ImGui::Button("Recover")) {
-                    apply_server();
-                    host_account_action(2, acct_name, acct_code);
-                    acct_code[0] = 0;
-                }
-                ui::tooltip_for_item(nullptr, "The account of that name, back on this PC with its recovery code.");
-                ImGui::BeginDisabled(!in);
-                if (ImGui::Button("Website sign-in code")) {
-                    apply_server();
-                    host_account_action(3, "", "");
-                }
-                ImGui::EndDisabled();
-                ui::tooltip_for_item(nullptr, "A code to sign in to the website as this account.");
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                // Also stops a Discord link that is waiting for approval.
-                ImGui::BeginDisabled(!busy && !in);
-                if (ImGui::Button(busy ? "Cancel" : "Sign out")) {
-                    apply_server();
-                    host_account_action(4, "", "");
-                }
-                ImGui::EndDisabled();
-            }
-            ui::card_end();
+        } else if (page == kPageControls) {
+            // F10's Controls page: the mouse and the prompts, then the
+            // bindings - the same settings and file.
+            controls_page_draw(true);
         } else if (page == kPageEnhancements) {
             ui::card_begin("##enhancements", ImVec2(ImGui::GetContentRegionAvail().x, 0));
             for (std::size_t i = 0; i < std::size(enhancements); ++i) {
@@ -1402,6 +1428,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                            "button's pulse and the light sweeping across it, the page fade and the sliding highlights. Off, the "
                            "window stands still.");
             ImGui::Dummy(ImVec2(0, 2 * scale));
+            ui::toggle_row("Keep this window open", "Minimized while the game runs; back when it ends.", &keep_open,
+                           "Play starts the game on its own and this window waits minimized in the taskbar, coming back when the "
+                           "game ends, ready to play again. Off, Play closes it.");
+            ImGui::Dummy(ImVec2(0, 2 * scale));
             // As a switch's row: its label and a line under it, the control (`cw` wide) at the right.
             const auto choice_row = [&](const char* label, const char* sub, float cw, const auto& control) {
                 const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -1428,30 +1458,35 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                      "usual size (with Windows' display scaling). A window larger than the screen stops at the screen and "
                                      "scrolls. Applies at once; F10 has the same setting.");
             });
-            // Menu hue and Menu vibrance: F10's sliders (a step each, its value shown),
-            // saved at once; a double click puts one back to 0.
+            // Menu hue and Menu vibrance: F10's sliders (a degree and a percent a
+            // step, the value shown), saved at once; the reset beside each, or a
+            // double click, puts it back to 0.
             const auto colour_slider = [&](const char* id, const char* key, int steps, int origin, int step, const char* unit,
                                            const char* title, const char* tip) {
                 int i = std::max(0, host_opt_index(key));
                 const int value = origin + step * i;
                 char shown[24];
                 std::snprintf(shown, sizeof(shown), value > 0 ? "+%d%s" : "%d%s", value, unit);
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ui::reset_width());
                 if (ImGui::SliderInt(id, &i, 0, steps - 1, shown, ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput))
                     host_opt_set_index(key, i);
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                     host_opt_set_index(key, -origin / step);
                 ui::tooltip_for_item(title, tip);
+                ImGui::PushID(id);
+                if (ui::reset_button("##reset", value == 0)) host_opt_set_index(key, -origin / step);
+                ImGui::PopID();
             };
             ImGui::Dummy(ImVec2(0, 2 * scale));
-            choice_row("Menu hue", "The colours of this window, F9 and F10.", 200 * scale, [&] {
-                colour_slider("##hue", "menu_hue", 24, -165, 15, "°", "Menu hue",
+            choice_row("Menu hue", "The colours of this window, F9 and F10.", 380 * scale, [&] {
+                colour_slider("##hue", "menu_hue", 361, -180, 1, "°", "Menu hue",
                               "Turns the colours of bbhost's own menus - this window and the in-game F9 and F10 menus - round the "
                               "colour wheel: 0 is their own blue and violet. The green, amber and red that mean ok, a warning and a "
                               "problem stay as they are. Double-click for 0; F10 has the same setting.");
             });
             ImGui::Dummy(ImVec2(0, 2 * scale));
-            choice_row("Menu vibrance", "-100% is black and white.", 200 * scale, [&] {
-                colour_slider("##vibrance", "menu_vibrance", 21, -100, 10, "%%", "Menu vibrance",
+            choice_row("Menu vibrance", "-100% is black and white.", 380 * scale, [&] {
+                colour_slider("##vibrance", "menu_vibrance", 201, -100, 1, "%%", "Menu vibrance",
                               "How much colour bbhost's own menus have: -100% is black and white, 0 their own, +100% the most. "
                               "Double-click for 0; F10 has the same setting.");
             });
@@ -1476,8 +1511,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::PopStyleVar();  // the fade
         ImGui::EndChild();
         if (play && can_play && save()) {
-            result = LauncherResult::Play;
-            done = true;
+            std::string err;
+            if (keep_open && !test) game = static_cast<SDL_Process*>(host_start_again("--no-setup", false, err));
+            if (game) {
+                host_log("setup: the game started; the window waits minimized");
+                SDL_MinimizeWindow(win);
+            } else {
+                if (!err.empty()) host_log("setup: %s; the game runs here instead", err.c_str());
+                result = LauncherResult::Play;
+                done = true;
+            }
         }
         ImGui::End();
 
@@ -1529,6 +1572,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // Closing the window while a compile runs: it is told to stop and write
     // what it has; the destructor waits for it.
     compile_job.cancel();
+    if (game) SDL_DestroyProcess(game);  // a game still running runs on
     if (devices_thread.joinable()) devices_thread.join();
     if (plugin_seen && test_shot.empty()) plugin_ui_mark_seen(plugin_ui);
     ui::shutdown();

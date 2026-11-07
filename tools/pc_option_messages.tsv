@@ -7,7 +7,7 @@
 # The port takes the next free blocks - 116000 PC Settings, 117000 PC
 # Graphics, 118000 PC Controls, 119000 Key Bindings, 120000 PC Effects, 121000
 # PC Camera, 122000 the title menu's Quit Game, 123000 Steam Deck (shown on a
-# Deck only), 124000 PC Enhancements - and 110006..110013 for the System rows
+# Deck only), 124000 PC Enhancements, 125000 PC Upscaling - and 110006..110014 for the System rows
 # that open them. All are unused in the shipped menu.msgbnd. (Motion blur,
 # depth of field and chromatic aberration moved to PC Effects with their
 # 117000 ids.)
@@ -36,12 +36,18 @@
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players, SKILL ISSUE. Each needs a restart.
+110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
 116000	Vertical Sync	Wait for the display. Off can tear.
-116001	Fullscreen	Borderless, at the desktop resolution.
+116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
 116005	Frame Rate	Applies on the next run. 30 is the game's own pace. Display-Limited runs at your refresh rate.
+116008	Texture Quality	Textures' size in video memory: Medium is half each way, Low a quarter. Changes at once.
+116045	Lowest
+116042	Low
+116043	Medium
+116044	High
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
@@ -99,6 +105,38 @@
 117043	2560x1600 (16:10)
 117044	1280x960 (4:3)
 117045	1440x1080 (4:3)
+117046	1366x768
+117047	5120x2880 (5K)
+117048	7680x4320 (8K)
+117049	1440x900 (16:10)
+117050	1680x1050 (16:10)
+117051	2880x1800 (16:10)
+117052	3840x2400 (16:10)
+117053	800x600 (4:3)
+117054	1024x768 (4:3)
+117055	1600x1200 (4:3)
+117056	2048x1536 (4:3)
+117057	1280x1024 (5:4)
+117058	1080x1080 (1:1)
+117059	1440x1440 (1:1)
+117060	1920x1920 (1:1)
+117061	3840x1600 (21:9)
+117062	6880x2880 (21:9)
+117063	3840x1200 (16:5, two 16:10 screens)
+117064	7680x2160 (32:9, 8K ultrawide)
+117065	4320x1200 (18:5)
+117066	3840x960 (4:1, three 4:3 screens)
+117067	4800x1200 (4:1, three 4:3 screens)
+117068	5760x1200 (24:5, three 16:10 screens)
+117069	7680x1600 (24:5, three 16:10 screens)
+117070	5400x1080 (5:1)
+117071	3840x720 (16:3, three 16:9 screens)
+117072	4800x900 (16:3, three 16:9 screens)
+117073	5760x1080 (16:3, three 16:9 screens)
+117074	7680x1440 (16:3, three 16:9 screens)
+117075	11520x2160 (16:3, three 16:9 screens)
+117076	7680x1080 (64:9, three 21:9 screens)
+117077	10320x1440 (43:6, three 21:9 screens)
 118000	Mouse Camera	The mouse turns the camera outside menus.
 118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
 118001	Camera Sensitivity	How fast the mouse turns the camera.
@@ -139,3 +177,21 @@
 14000334	Too many Blood Echoes are held to be reborn.\nSpend some, then return to the altar.	
 14000335	Accept Rebirth	
 14000336	Undo Rebirth	
+125020	PC Upscaling	
+125000	Frame Generation	A frame made between each two of the game's, from the 3D alone. The game then runs at most half your refresh rate.
+125001	Sharpness	Sharpens the anti-aliased or upscaled 3D (TAA, FSR or DLSS). 0 leaves the upscaler's picture as it is. Needs Upscaling on.
+125002	Reflection Quality	The reflections' resolution. Quarter is about four times cheaper; Half is the game's own, sharper.
+125003	Upscaling	TAA (bbhost's own, any GPU), FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
+125004	Upscaling Quality	How much smaller the 3D is drawn: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
+125005	TAA Strength	How much TAA smooths: higher is steadier and smoother, with more risk of a faint trail; lower is crisper. 5 is the default. TAA only.
+125030	Quarter	
+125031	Half	
+125032	Off	
+125033	FSR 3	
+125034	FSR 4	
+125035	DLSS	
+125036	Performance	
+125037	Balanced	
+125038	Quality	
+125039	Native AA	
+125040	TAA	

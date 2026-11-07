@@ -287,7 +287,7 @@ int main() {
         CHECK(is(config_effect_timing(120, "fps", false), kEffectTimingDefault, "the default"));
         // The default the docs name (docs/running.md, bbhost.example.toml): a
         // new one changes them with it.
-        CHECK(std::string(kEffectTimingDefault) == "smooth");
+        CHECK(std::string(kEffectTimingDefault) == "auto");
         // The values, each at the frame rates where it differs.
         const auto at = [](int fps, const char* v) { return config_effect_timing(fps, v, true); };
         EffectTiming t = at(120, "smooth");

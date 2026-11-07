@@ -17,6 +17,7 @@
 #include "host/options.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -156,6 +157,10 @@ const char kOurDeckName[] = "PCDeck";
 // Hunters, the mirror, the rebirth, five players. Each is read once at start,
 // which its line help says.
 const char kOurEnhanceName[] = "PCEnhance";
+// The upscaler and what goes with it - Upscaling, its quality, Sharpness, Frame
+// generation, Reflection quality: the launcher's and F10's Graphics rows that
+// PC Graphics, whose seven slots are full, has no room for.
+const char kOurUpscaleName[] = "PCUpscale";
 
 // The overlay asset that has to supply that sprite. Opening a section whose
 // sprite the movie does not define is not something to find out at runtime, so
@@ -220,8 +225,15 @@ constexpr std::uint32_t kSystemEffectsRowId = 110010;
 constexpr std::uint32_t kSystemCameraRowId = 110011;
 constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
+constexpr std::uint32_t kSystemUpscaleRowId = 110014;
+// PC Upscaling, 125000: frame generation, sharpness, TAA strength (125005),
+// reflection quality (its two entries 125030 Quarter, 125031 Half), then the
+// two pick lists - Upscaling (125032..125035, TAA 125040) and its quality
+// (125036..125039).
+constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
+                        kUpQuality = 125004, kUpTaaStrength = 125005;
 // PC Enhancements, 124000: four toggles, each for the next start (124000
-// was The Old Hunters, a patch of its own since: the setup window's Patches tab).
+// was The Old Hunters, part of bbhost since: engine/patch_manifest.cpp).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
 // Steam Deck, 123000: its frame rate - the two configurations,
 // host_set_deck_profile - and the model detail.
@@ -250,6 +262,9 @@ constexpr std::uint32_t kGfxShadowDistance = 117006, kGfxAoStrength = 117007, kG
 constexpr std::uint32_t kGfxShaders = 117009;
 constexpr std::uint32_t kFxBloom = 120000, kFxVignette = 120001, kFxSaturation = 120002;
 constexpr std::uint32_t kRowFrameCap = 116005;
+// Texture Quality (the Texture quality setting: Low, Medium, High; live), a
+// pick list of its four entries 116045, 116042..116044.
+constexpr std::uint32_t kRowTextureQuality = 116008;
 // The section title, StaticText_116020 in the generated movie.
 constexpr std::uint32_t kSectionTitleId = 116020;
 
@@ -504,6 +519,10 @@ Toggle g_toggles[] = {
     {"fps_counter", 116007, 0, 0xff},
 };
 constexpr int kToggleCount = static_cast<int>(sizeof(g_toggles) / sizeof(g_toggles[0]));
+// Texture Quality: the setting's entry (host/options.cpp texture_quality), its
+// list between the toggles and the frame rate's.
+const Choice kTextureQualities[] = {{0, 116045}, {1, 116042}, {2, 116043}, {3, 116044}};
+std::int32_t g_texture_quality = 3, g_texture_quality_last = 3;
 
 // A 0..10 slider row's byte, and what was pushed.
 struct Slider {
@@ -567,18 +586,79 @@ std::int32_t g_frame_cap = 30;
 // The render resolution, as the index into the setting's own list of names -
 // the row stores an int32 and the host owns what each one means, so the two
 // front ends cannot disagree about the order. The setting's order (host/
-// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 21:9, 32:9 (the
-// pick list scrolls past six). Each entry's text is its size's message, which
-// keeps its id whatever its place.
-const Choice kResolutions[] = {
-    {0, 117038},  {1, 117039},  {2, 117010},  {3, 117040},  {4, 117011},  {5, 117012},   // 640x360 .. 1920x1080
-    {6, 117013},  {7, 117041},  {8, 117014},  {9, 117015},                              // 2560x1440 .. 3840x2160
-    {10, 117036}, {11, 117037}, {12, 117035}, {13, 117042}, {14, 117043},               // 16:10
-    {15, 117044}, {16, 117045},                                                         // 4:3
-    {17, 117030}, {18, 117031}, {19, 117032},                                           // 21:9
-    {20, 117033}, {21, 117034},                                                         // 32:9
+// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 5:4, 1:1, then
+// the wide ones from 21:9 to three 21:9 screens (the pick list scrolls past
+// six). Each entry's text is its size's message, which keeps its id whatever
+// its place. The game's list holds 32 entries (its append, sub_1f1c0c0,
+// panics past them): PC Graphics lists the `listed` ones and the size the
+// setting holds when it is another; F10 and the setup window list them all.
+struct ResolutionChoice {
+    Choice choice;
+    bool listed;  // in PC Graphics' list
 };
-std::int32_t g_resolution = 5;
+constexpr ResolutionChoice kResolutions[] = {
+    {{0, 117038}, true },  // 640x360
+    {{1, 117039}, true },  // 960x540
+    {{2, 117010}, true },  // 1280x720
+    {{3, 117046}, true },  // 1366x768
+    {{4, 117040}, true },  // 1440x810
+    {{5, 117011}, true },  // 1600x900
+    {{6, 117012}, true },  // 1920x1080
+    {{7, 117013}, true },  // 2560x1440
+    {{8, 117041}, true },  // 2880x1620
+    {{9, 117014}, true },  // 3200x1800
+    {{10, 117015}, true },  // 3840x2160
+    {{11, 117047}, false},  // 5120x2880 (5K)
+    {{12, 117048}, false},  // 7680x4320 (8K)
+    {{13, 117036}, true },  // 960x600 (16:10, upscaled)
+    {{14, 117037}, true },  // 1024x640 (16:10, upscaled)
+    {{15, 117035}, true },  // 1280x800 (16:10)
+    {{16, 117049}, false},  // 1440x900 (16:10)
+    {{17, 117050}, true },  // 1680x1050 (16:10)
+    {{18, 117042}, true },  // 1920x1200 (16:10)
+    {{19, 117043}, true },  // 2560x1600 (16:10)
+    {{20, 117051}, false},  // 2880x1800 (16:10)
+    {{21, 117052}, false},  // 3840x2400 (16:10)
+    {{22, 117053}, false},  // 800x600 (4:3)
+    {{23, 117054}, false},  // 1024x768 (4:3)
+    {{24, 117044}, true },  // 1280x960 (4:3)
+    {{25, 117045}, true },  // 1440x1080 (4:3)
+    {{26, 117055}, false},  // 1600x1200 (4:3)
+    {{27, 117056}, false},  // 2048x1536 (4:3)
+    {{28, 117057}, false},  // 1280x1024 (5:4)
+    {{29, 117058}, false},  // 1080x1080 (1:1)
+    {{30, 117059}, false},  // 1440x1440 (1:1)
+    {{31, 117060}, false},  // 1920x1920 (1:1)
+    {{32, 117030}, true },  // 2560x1080 (21:9)
+    {{33, 117031}, true },  // 3440x1440 (21:9)
+    {{34, 117061}, true },  // 3840x1600 (21:9)
+    {{35, 117032}, true },  // 5120x2160 (21:9)
+    {{36, 117062}, false},  // 6880x2880 (21:9)
+    {{37, 117063}, true },  // 3840x1200 (16:5, two 16:10 screens)
+    {{38, 117033}, true },  // 3840x1080 (32:9)
+    {{39, 117034}, true },  // 5120x1440 (32:9)
+    {{40, 117064}, true },  // 7680x2160 (32:9, 8K ultrawide)
+    {{41, 117065}, false},  // 4320x1200 (18:5)
+    {{42, 117066}, false},  // 3840x960 (4:1, three 4:3 screens)
+    {{43, 117067}, false},  // 4800x1200 (4:1, three 4:3 screens)
+    {{44, 117068}, true },  // 5760x1200 (24:5, three 16:10 screens)
+    {{45, 117069}, false},  // 7680x1600 (24:5, three 16:10 screens)
+    {{46, 117070}, false},  // 5400x1080 (5:1)
+    {{47, 117071}, false},  // 3840x720 (16:3, three 16:9 screens)
+    {{48, 117072}, false},  // 4800x900 (16:3, three 16:9 screens)
+    {{49, 117073}, true },  // 5760x1080 (16:3, three 16:9 screens)
+    {{50, 117074}, true },  // 7680x1440 (16:3, three 16:9 screens)
+    {{51, 117075}, false},  // 11520x2160 (16:3, three 16:9 screens)
+    {{52, 117076}, true },  // 7680x1080 (64:9, three 21:9 screens)
+    {{53, 117077}, false},  // 10320x1440 (43:6, three 21:9 screens)
+};
+constexpr int listed_resolutions() {
+    int n = 0;
+    for (const ResolutionChoice& r : kResolutions) n += r.listed ? 1 : 0;
+    return n;
+}
+static_assert(listed_resolutions() <= 31, "the game's list holds 32 entries: the listed ones and the setting's own");
+std::int32_t g_resolution = 6;
 std::int32_t g_last_resolution = -1;
 std::int32_t g_last_frame_cap = -1;
 bool g_seeded = false;
@@ -619,9 +699,9 @@ constexpr int kCameraRows = 4;
 // as one (host_set_deck_profile), and the model detail as a pick list, which
 // no other section has. The pick list last, as everywhere.
 const Choice kDeckRates[2] = {{0, 123030}, {1, 123031}};
-const Choice kModelDetails[] = {{0, 123040}, {1, 123041}, {2, 123042}, {3, 123043}};
+const Choice kModelDetails[] = {{0, 123043}, {1, 123042}, {2, 123041}, {3, 123040}};  // Lowest, Low, Normal, Full
 std::uint8_t g_deck_rate = 0, g_deck_rate_last = 0xff;
-std::int32_t g_deck_model = 1, g_deck_model_last = -1;
+std::int32_t g_deck_model = 2, g_deck_model_last = -1;
 std::uint8_t* g_deck_dialog = nullptr;  // the section while it may be open (menu thread)
 std::uint64_t g_deck_vtable = 0;
 std::atomic<bool> g_deck_redraw{false};  // the model detail row shows a value the frame rate set
@@ -637,6 +717,27 @@ Toggle g_enhance[] = {
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
 
+// PC Upscaling: the settings by their index, as F10 and the setup window keep
+// them (host/options.cpp) - one setting, one order, three front ends. Frame
+// generation a toggle, Sharpness a slider (its 0-100% in tenths), Reflection
+// quality a left/right pair, and the two lists last: a pick list opens over
+// the rows under it (as PC Settings' two do).
+Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
+Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
+// TAA strength beside Sharpness: the section's lists have to come last, and it
+// has no rows that hide (F10 and the setup window show it under Upscaling, with
+// TAA alone).
+Slider g_up_taa_strength{"taa_strength", kUpTaaStrength, 0, 0xff};
+const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
+std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
+// Off, TAA, FSR 3, FSR 4, DLSS: the option's own order (host/options.cpp), TAA's message after the list's.
+const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034}, {4, 125035}};
+const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
+std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
+std::int32_t g_up_quality = 2, g_up_quality_last = -1;
+constexpr int kUpscaleRows = 6;
+
+
 void seed_camera_tuning() {
     const int t = host_opt_index("camera_tuning");
     g_cam_tuning = g_cam_tuning_last = static_cast<std::uint8_t>(t == 1 ? 1 : 0);
@@ -645,7 +746,7 @@ void seed_camera_tuning() {
 void seed_deck() {
     g_deck_rate = g_deck_rate_last = static_cast<std::uint8_t>(host_deck_profile());
     const int m = host_opt_index("model_detail");
-    g_deck_model = g_deck_model_last = m < 0 ? 1 : m;
+    g_deck_model = g_deck_model_last = m < 0 ? 2 : m;
 }
 
 // Every row opens showing what the setting is now - the F10 screen may have
@@ -659,20 +760,24 @@ void seed(Toggle& t) {
 // What the row's Defaults restores: the setting as it ships.
 std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) != t.invert ? 1 : 0; }
 
+// The game's sliders have eleven steps; the settings behind most of them have
+// 101 (0-100, Field of view's +0% to +100% among them), and a step of the
+// game's is a tenth of those - the nearest when it is between.
+int per_step(const char* key) { return std::strcmp(key, "shadow_distance") == 0 ? 1 : 10; }
 void seed(Slider& s) {
-    const int i = host_opt_index(s.key);
-    s.value = static_cast<std::uint8_t>(i < 0 ? 0 : i);
+    const int i = host_opt_index(s.key), k = per_step(s.key);
+    s.value = static_cast<std::uint8_t>(i < 0 ? 0 : std::min(10, (i + k / 2) / k));
     s.last = s.value;
 }
 std::uint8_t default_of(const Slider& s) {
-    const int i = host_opt_default_index(s.key);
-    return static_cast<std::uint8_t>(i < 0 ? 0 : i);
+    const int i = host_opt_default_index(s.key), k = per_step(s.key);
+    return static_cast<std::uint8_t>(i < 0 ? 0 : std::min(10, (i + k / 2) / k));
 }
-// A slider moved: its step is the setting's index.
+// A slider moved: its step, in the setting's steps.
 void push(Slider& s) {
     if (s.value == s.last) return;
     s.last = s.value;
-    host_opt_set_index(s.key, s.value);
+    host_opt_set_index(s.key, s.value * per_step(s.key));
     host_log("pc-options: %s %u from the System menu", s.key, s.value);
 }
 void push(Toggle& t) {
@@ -682,10 +787,42 @@ void push(Toggle& t) {
     host_log("pc-options: %s %s from the System menu", t.key, t.value ? "on" : "off");
 }
 
+void seed_upscale() {
+    seed(g_up_frame_gen);
+    seed(g_up_sharpness);
+    seed(g_up_taa_strength);
+    g_up_reflection = g_up_reflection_last = static_cast<std::uint8_t>(std::max(0, host_opt_index("ssr_quality")) == 1 ? 1 : 0);
+    g_up_scaler = g_up_scaler_last = std::max(0, host_opt_index("upscaler"));
+    g_up_quality = g_up_quality_last = std::max(0, host_opt_index("upscale_quality"));
+}
+
+// PC Upscaling's rows that are not toggles or sliders: a change here goes to
+// the setting; a change made in F10 is taken up so the row shows it next time.
+void push_upscale() {
+    push(g_up_frame_gen);
+    push(g_up_sharpness);
+    push(g_up_taa_strength);
+    const auto pick = [](const char* key, std::int32_t& value, std::int32_t& last) {
+        if (value != last) {
+            last = value;
+            host_opt_set_index(key, value);
+            host_log("pc-options: %s entry %d from the System menu", key, value);
+        } else if (std::max(0, host_opt_index(key)) != last) {
+            value = last = std::max(0, host_opt_index(key));
+        }
+    };
+    std::int32_t reflection = g_up_reflection, reflection_last = g_up_reflection_last;
+    pick("ssr_quality", reflection, reflection_last);
+    g_up_reflection = static_cast<std::uint8_t>(reflection);
+    g_up_reflection_last = static_cast<std::uint8_t>(reflection_last);
+    pick("upscaler", g_up_scaler, g_up_scaler_last);
+    pick("upscale_quality", g_up_quality, g_up_quality_last);
+}
+
 void seed_controls() {
     seed(g_ctl_camera);
     const int sens = host_opt_index("mouse_sens");
-    g_ctl_sens = static_cast<std::uint8_t>(sens < 0 ? 5 : sens);
+    g_ctl_sens = static_cast<std::uint8_t>(sens < 0 ? 5 : std::min(10, (sens + 5) / 10));
     g_ctl_sens_last = g_ctl_sens;
     for (int i = 0; i < 2; ++i) {
         g_ctl_axis[i] = host_opt_get(kAxisKeys[i]) ? 0 : 1;
@@ -709,12 +846,12 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 // adds it as it adds Key Bindings' two, and moves the Defaults label below it.
 constexpr int kGraphicsSlots = 7;
 
-// The port's rows: its toggles plus the frame-cap pick list, and in the
-// graphics section its toggles plus the resolution list.
-constexpr int kRowCount = kToggleCount + 1;
+// The port's rows: its toggles plus the Texture Quality and frame-cap pick
+// lists, and in the graphics section its toggles plus the resolution list.
+constexpr int kRowCount = kToggleCount + 2;
 static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
-                  kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
+                  kEffectsRows <= kSectionSlots && kUpscaleRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
               "Add slots in engine/menu_assets.cpp (build_option_movie), or split into a second section.");
 
@@ -766,6 +903,7 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
     for (auto& t : g_toggles) seed(t);
     g_frame_cap = host_opt_frame_cap();
     g_last_frame_cap = g_frame_cap;
+    g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
     // The toggles first and the pick list **last**. The engine's pick list is
     // translucent and opens directly under the row that owns it, so with the
     // list on row 0 its four entries sat over the five rows below and their
@@ -775,6 +913,11 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
     for (auto& t : g_toggles) {
         add_toggle_row(dialog, &t.value, t.id, default_of(t));
     }
+    // Texture Quality's three entries open over the frame rate's row alone,
+    // as Language's do over its one row.
+    add_list_row(dialog, &g_texture_quality, kRowTextureQuality, kTextureQualities,
+                 static_cast<int>(sizeof(kTextureQualities) / sizeof(kTextureQualities[0])),
+                 std::max(0, host_opt_default_index("texture_quality")));
     add_list_row(dialog, &g_frame_cap, kRowFrameCap, kFrameCaps,
                  static_cast<int>(sizeof(kFrameCaps) / sizeof(kFrameCaps[0])), host_opt_default_frame_cap());
     log_rows("PCSetting", dialog, kRowCount, kRowCount);
@@ -805,8 +948,11 @@ GUEST_ABI void pc_graphics_handler(void* dialog, void* params) {
     // other section: it is translucent and opens directly under the row that
     // owns it, so anywhere else its entries sit over the rows below and their
     // values read through the panel.
-    add_list_row(dialog, &g_resolution, kGfxResolution, kResolutions,
-                 static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])), host_opt_default_resolution_index());
+    Choice listed[32];
+    int count = 0;
+    for (const ResolutionChoice& r : kResolutions)
+        if (r.listed || r.choice.value == g_resolution) listed[count++] = r.choice;
+    add_list_row(dialog, &g_resolution, kGfxResolution, listed, count, host_opt_default_resolution_index());
     log_rows("PCGraphics", dialog, kGraphicsRows, kGraphicsRows);
 }
 
@@ -827,6 +973,27 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
 }
 
+// PC Upscaling: a toggle, two sliders and a pair, then Upscaling and its quality
+// as the two pick lists last (the quality's list opens over the Defaults
+// caption, Upscaling's over the quality's row - as PC Settings' two).
+GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
+    host_log("pc-options: PCUpscale opened, dialog=%p params=%p", dialog, params);
+    alignas(16) std::uint8_t scratch[0x100]{};
+    hle_call_guest<std::int64_t>(guest_fn(kScratchInit), &scratch);
+    seed_upscale();
+    add_toggle_row(dialog, &g_up_frame_gen.value, g_up_frame_gen.id, default_of(g_up_frame_gen));
+    add_slider_row(dialog, &g_up_sharpness.value, g_up_sharpness.id, default_of(g_up_sharpness));
+    add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
+    add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
+                 static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
+    add_list_row(dialog, &g_up_scaler, kUpScaler, kUpscalers, static_cast<int>(sizeof(kUpscalers) / sizeof(kUpscalers[0])),
+                 std::max(0, host_opt_default_index("upscaler")));
+    add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
+                 static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
+                 std::max(0, host_opt_default_index("upscale_quality")));
+    log_rows("PCUpscale", dialog, kUpscaleRows, kUpscaleRows);
+}
+
 // PC Controls: the mouse camera, how fast it turns and which way, and the
 // pointer in menus.
 GUEST_ABI void pc_controls_handler(void* dialog, void* params) {
@@ -836,7 +1003,7 @@ GUEST_ABI void pc_controls_handler(void* dialog, void* params) {
     seed_controls();
     add_toggle_row(dialog, &g_ctl_camera.value, g_ctl_camera.id, default_of(g_ctl_camera));
     const int sens = host_opt_default_index("mouse_sens");
-    add_slider_row(dialog, &g_ctl_sens, kCtlSensitivity, static_cast<std::uint8_t>(sens < 0 ? 5 : sens));
+    add_slider_row(dialog, &g_ctl_sens, kCtlSensitivity, static_cast<std::uint8_t>(sens < 0 ? 5 : std::min(10, (sens + 5) / 10)));
     for (int i = 0; i < 2; ++i) {
         // The game's list: 1 is Normal, 0 Reversed, and the setting is "invert".
         add_axis_row(dialog, &g_ctl_axis[i], kAxisIds[i], host_opt_default_get(kAxisKeys[i]) ? 0 : 1);
@@ -881,7 +1048,7 @@ GUEST_ABI void pc_deck_handler(void* dialog, void* params) {
     add_pair_row(dialog, &g_deck_rate, kDeckFrameRate, kDeckRates, static_cast<std::uint8_t>(host_deck_default_profile()));
     const int model_default = host_opt_default_index("model_detail");
     add_list_row(dialog, &g_deck_model, kDeckModelDetail, kModelDetails, static_cast<int>(sizeof(kModelDetails) / sizeof(kModelDetails[0])),
-                 model_default < 0 ? 1 : model_default);
+                 model_default < 0 ? 2 : model_default);
     log_rows("PCDeck", dialog, kDeckRows, kDeckRows);
 }
 
@@ -920,7 +1087,7 @@ int g_keys_page = 0;  // kept across opens, as DS3 keeps its tab
 constexpr int kKeysRows = 1 + kBindPerPage;
 std::uint8_t g_keys_value[kKeysRows];
 char16_t g_keys_label[kKeysRows][48];
-char16_t g_keys_help[kKeysRows][160];
+char16_t g_keys_help[kKeysRows][224];
 char16_t g_keys_text[kKeysRows][64];
 struct KeysScreen {
     std::uint8_t* dialog = nullptr;
@@ -1010,8 +1177,12 @@ void keys_fill(int page) {
         }
         const BindingInfo& b = host_binding_info(keys_action(r));
         to_utf16(g_keys_label[r], b.label);
-        char help[160];
-        std::snprintf(help, sizeof(help), "%s Enter or click to rebind, Delete to clear.", b.help);
+        // Triangle is a menu's Initialize; on the keyboard, whatever Menu
+        // Toggle Status is bound to (R unless moved).
+        const char* init = host_key_name(host_binding_key(kBindMenuStatus));
+        char help[224];
+        std::snprintf(help, sizeof(help), "%s Enter or click to rebind (Escape cancels), Delete to clear, Triangle%s%s%s to reset.",
+                      b.help, init ? " (" : "", init ? init : "", init ? ")" : "");
         to_utf16(g_keys_help[r], help);
         keys_fill_value(r);
     }
@@ -1094,6 +1265,14 @@ void keys_update(int row, bool focused) {
             // Right, or Circle / a click, is the next page; Left the previous.
             keys_fill(g_keys.page + ((edge & 0x80u) ? -1 : 1));
             rows_changed = values_changed = true;
+        } else if (keys_row_bound(row) && (edge & 0x1000u)) {
+            // Triangle (a menu's Initialize): this action back to its default
+            // key and mouse button. Every row again: a key it took back
+            // changes the row that had it.
+            host_binding_reset(keys_action(row));
+            for (int r = 1; r < kKeysRows; ++r) keys_fill_value(r);
+            values_changed = true;
+            g_keys_save.store(true, std::memory_order_relaxed);
         } else if (keys_row_bound(row) && host_bind_take_clear_key()) {
             host_binding_clear(keys_action(row));
             keys_fill_value(row);
@@ -1183,6 +1362,7 @@ constexpr std::size_t kPickItems = 0x100;  // a pick-list widget's drop-down lis
 struct DefaultsView {
     std::uint8_t* dialog = nullptr;
     std::uint8_t* pick = nullptr;  // the section's pick-list widget, or none
+    std::uint8_t* pick2 = nullptr;  // a second one above it (PC Settings' Texture Quality), or none
     bool hidden = false;
     char16_t first = 0;  // the caption's first character while it is emptied
 };
@@ -1219,7 +1399,7 @@ void keep_defaults_row(std::uint8_t* dialog, int pick_row) {
 void defaults_view_update(std::uint8_t* comp, bool focused) {
     DefaultsView& v = g_defaults_view;
     if (!v.dialog || !v.pick || !focused) return;
-    if (comp == v.pick + kPickItems && !v.hidden) {
+    if ((comp == v.pick + kPickItems || (v.pick2 && comp == v.pick2 + kPickItems)) && !v.hidden) {
         v.hidden = true;
         v.first = g_defaults_caption[0];
         g_defaults_caption[0] = 0;
@@ -1473,7 +1653,10 @@ void confirm_update() {
 // game's is redirected to get here.
 GUEST_ABI std::int64_t pc_open_section(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_section_handler));
-    return open_named(root, params, kOurSectionName, handler, kToggleCount);  // the frame cap
+    const std::int64_t dialog = open_named(root, params, kOurSectionName, handler, kToggleCount + 1);  // the frame cap
+    // Texture Quality's list opens over the Defaults caption too.
+    if (g_defaults_view.dialog && g_defaults_view.pick) g_defaults_view.pick2 = dialog_widget(g_defaults_view.dialog, kToggleCount);
+    return dialog;
 }
 GUEST_ABI std::int64_t pc_open_graphics(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_graphics_handler));
@@ -1482,6 +1665,13 @@ GUEST_ABI std::int64_t pc_open_graphics(void* root, void* params) {
 GUEST_ABI std::int64_t pc_open_effects(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_effects_handler));
     return open_named(root, params, kOurEffectsName, handler, -1);
+}
+GUEST_ABI std::int64_t pc_open_upscale(void* root, void* params) {
+    static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_upscale_handler));
+    const std::int64_t dialog = open_named(root, params, kOurUpscaleName, handler, kUpscaleRows - 1);  // the quality
+    // Upscaling's list opens over the Defaults caption too.
+    if (g_defaults_view.dialog && g_defaults_view.pick) g_defaults_view.pick2 = dialog_widget(g_defaults_view.dialog, kUpscaleRows - 2);
+    return dialog;
 }
 GUEST_ABI std::int64_t pc_open_controls(void* root, void* params) {
     static void* handler = hle_wrap_fn(reinterpret_cast<void*>(&pc_controls_handler));
@@ -1522,6 +1712,10 @@ GUEST_ABI void* pc_graphics_row_open(void* out, void* ctx) {
 }
 GUEST_ABI void* pc_effects_row_open(void* out, void* ctx) {
     static void* opener = hle_wrap_fn(reinterpret_cast<void*>(&pc_open_effects));
+    return row_open(out, ctx, opener);
+}
+GUEST_ABI void* pc_upscale_row_open(void* out, void* ctx) {
+    static void* opener = hle_wrap_fn(reinterpret_cast<void*>(&pc_open_upscale));
     return row_open(out, ctx, opener);
 }
 GUEST_ABI void* pc_controls_row_open(void* out, void* ctx) {
@@ -1603,6 +1797,8 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
          hle_wrap_fn(reinterpret_cast<void*>(&pc_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemGraphicsRowId)),
          hle_wrap_fn(reinterpret_cast<void*>(&pc_graphics_row_open))},
+        {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemUpscaleRowId)),
+         hle_wrap_fn(reinterpret_cast<void*>(&pc_upscale_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemEffectsRowId)),
          hle_wrap_fn(reinterpret_cast<void*>(&pc_effects_row_open))},
         {reinterpret_cast<void*>(static_cast<std::uintptr_t>(kSystemControlsRowId)),
@@ -1632,7 +1828,7 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
         GuestFunction f(kRowFunctorVTable, opener);
         hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);
     }
-    // PC Enhancements, PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera, Key Bindings. The list has five
+    // PC Enhancements, PC Settings, PC Graphics, PC Upscaling, PC Effects, PC Controls, PC Camera, Key Bindings. The list has five
     // lines and **scrolls**, with the scroll bar the port's movie gives it, so
     // rows past the fifth need no slot of their own.
     for (const auto& r : rows) {
@@ -1793,10 +1989,12 @@ void option_menu_poll() {
         seed_camera_tuning();
         seed_controls();
         seed_deck();
+        seed_upscale();
         g_resolution = host_opt_resolution_index();
         g_last_resolution = g_resolution;
         g_frame_cap = host_opt_frame_cap();
         g_last_frame_cap = g_frame_cap;
+        g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
         return;
     }
     // A row's byte is written by the game's list update as the player moves
@@ -1826,8 +2024,17 @@ void option_menu_poll() {
         g_resolution = g_last_resolution = host_opt_resolution_index();
         g_resolution_redraw.store(true);
     }
+    if (g_texture_quality != g_texture_quality_last) {
+        g_texture_quality_last = g_texture_quality;
+        host_opt_set_index("texture_quality", g_texture_quality);
+        host_log("pc-options: texture quality entry %d from the System menu", g_texture_quality);
+    } else if (host_opt_index("texture_quality") != g_texture_quality_last) {
+        // Changed in F10: PC Settings shows it when it opens again (its handler seeds it).
+        g_texture_quality = g_texture_quality_last = std::max(0, host_opt_index("texture_quality"));
+    }
     for (auto& t : g_graphics) push(t);
     for (auto& t : g_effects) push(t);
+    push_upscale();
     push(g_gfx_ao);
     push(g_gfx_shadow);
     push(g_gfx_fog);
@@ -1862,7 +2069,7 @@ void option_menu_poll() {
         host_log("pc-options: model detail %d from the System menu", g_deck_model);
     } else if (deck_rate) {
         const int m = host_opt_index("model_detail");
-        g_deck_model = g_deck_model_last = m < 0 ? 1 : m;
+        g_deck_model = g_deck_model_last = m < 0 ? 2 : m;
         g_deck_redraw.store(true);
     }
     if (g_frame_cap != g_last_frame_cap) {
@@ -1883,7 +2090,7 @@ void option_menu_poll() {
     }
     if (g_ctl_sens != g_ctl_sens_last) {
         g_ctl_sens_last = g_ctl_sens;
-        host_opt_set_index("mouse_sens", g_ctl_sens);
+        host_opt_set_index("mouse_sens", g_ctl_sens * 10);
         host_log("pc-options: mouse sensitivity %u from the System menu", g_ctl_sens);
     }
     for (int i = 0; i < 2; ++i) {
@@ -1952,7 +2159,7 @@ void option_menu_install(ElfImage* image) {
     if (!engine_call_site_hook(image, guest(kTitleFinalizeCall), guest(kTitleFinalize), reinterpret_cast<void*>(&title_finalize_hook)))
         host_log("pc-options: the title menu's Quit Game did not go in");
     g_installed = true;
-    host_log("pc-options: System gains %sPC Enhancements, PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera and Key Bindings",
+    host_log("pc-options: System gains %sPC Enhancements, PC Settings, PC Graphics, PC Upscaling, PC Effects, PC Controls, PC Camera and Key Bindings",
              host_steam_deck() ? "Steam Deck (a Steam Deck), " : "");
 }
 

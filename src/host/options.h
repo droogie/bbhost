@@ -36,6 +36,12 @@ int host_options_page_count();
 const char* host_options_page_name(int page);
 const char* host_options_page_blurb(int page);
 void host_options_draw_page(int page);
+// The same page in the setup window (host/launcher.cpp), before the game:
+// every setting applies as the game starts, so none says "next start", and
+// Resolution and Shaders - the setup window's own rows on its Game and Shaders
+// pages - are left out. Its changes are the setup window's to apply
+// (host_options_frame) and to save.
+void host_options_draw_setup_page(int page);
 // Runs `fn` on the window's thread at its next pump: the menus' changes to
 // settings and to bbhost.toml, which can touch the window or write files.
 void host_options_post(std::function<void()> fn);
@@ -55,13 +61,69 @@ bool host_opt_saved(const char* key);
 // The render resolution the player chose, or what BBHOST_RES says. False when
 // neither parses. Read once by the loader - it is a patch on the image.
 bool host_opt_resolution(int* w, int* h);
+// The game's own size - its post chain, the HUD and the menus, and the
+// upscaler's output: the Resolution, or with an upscaler chosen and a
+// Resolution smaller than the window, the window's size (Borderless and
+// Fullscreen: the screen's; Windowed: [video] width x height). The 3D is
+// then drawn at the Resolution (engine/render_scale.cpp) and upscaled, so a
+// low Resolution keeps the UI sharp. A plugin's 3D at a size of its own
+// (plugin API 18 scene_scale, host/scene_look.h: the Bloodborne PS1's) is the same
+// with no upscaler, the 3D brought up nearest - and with a height of its own
+// the game is the window's size whatever the Resolution. False as
+// host_opt_resolution.
+bool host_opt_output_size(int* w, int* h);
+// Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE) - none while a
+// plugin draws the 3D at a size of its own (host/scene_look.h scene_look_scale).
+bool host_opt_upscaler_chosen();
+// The settings published again as they are, so their listeners follow what
+// they read beside them (host/scene_look.h: a plugin's look changed). The
+// options' own thread: from elsewhere, through host_options_post.
+void host_opt_republish();
+// Whether anything takes the frame's motion: an upscaler chosen, or frame
+// generation on (which runs without one).
+bool host_opt_motion_wanted();
+// The rebuilt motion vectors (the Motion vectors setting, as it is now - it
+// changes live; BBHOST_MOTION_VECTORS=velomap|8|16|32 for tests): 8, 16 or
+// 32 bits, or 0 for the game's velocity map - and 0 while nothing takes the
+// motion (host_opt_motion_wanted).
+int host_opt_motion_rebuilt_bits();
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
 // The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
 // 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
 // file's key is still frame_cap. Same setting, same file.
 int host_opt_frame_cap();
+// A rate from the list: Custom limit is unticked with it.
 void host_opt_set_frame_cap(int fps);
+// Frame rate's Custom limit: its tick box and the number typed beside it (30
+// to 960, frame_cap_custom and frame_cap_custom_fps in the file). Ticked, the
+// game runs at that number in place of the list's rate.
+bool host_opt_frame_cap_custom();
+int host_opt_frame_cap_custom_fps();
+void host_opt_set_frame_cap_custom(bool on, int fps);
+// The rate the game runs at: Custom limit's number when it is ticked, else
+// Frame rate's (0 Display-Limited).
+int host_opt_frame_rate();
+// Custom limit's bubble, the setup window's and F10's.
+extern const char* const kHostFrameRateCustomNote;
+// Frame rate's control as the setup window and F10 both draw it, in `width`:
+// the list (`cap_index` into its rates, 30 to Display-Limited) - or, with
+// Custom limit ticked, a field to type the number into - and the Custom
+// limit tick box after it. True when one of the three changed.
+bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width);
+// With frame generation on the game runs at most half the display's refresh
+// rate (engine/frame_rate.cpp): the Custom limit's number is held to that and
+// Frame rate says so under its control. Frame generation's row says so too
+// when the rate is above it - the setup window's row with its own unsaved
+// Frame rate (F10's rows draw theirs). The count: how many such lines the two
+// rows show now, for the setup window's card height.
+void host_frame_generation_warning(int cap_index, bool custom, int custom_fps);
+// Frame generation turned on brings a Frame rate above half the refresh rate
+// down to it (the setting's own when it changes; this for the setup window's
+// unsaved values): a Custom limit's number to it, a listed rate to the list's
+// entry for it, or Custom limit at it when the list has none. True when changed.
+bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps);
+int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps);
 
 // Set one by name, from the rows the port adds to the game's own System menu
 // (engine/option_menu.h). The two front ends drive the same settings and the
@@ -104,14 +166,14 @@ std::uint64_t host_opt_serial();
 // What the Shaders setting's HLSL and Lifted mean, in a player's words: the
 // setup window's bubbles and F10's.
 extern const char* const kHostShaderModeTips[2];
-// The Effect timing setting's choices (Smooth, Original (30), 60 a second, Your
-// frame rate), what the row says and what each choice means, for the setup
-// window's row and F10's.
-extern const char* const kHostEffectTimingLabels[4];
+// The Effect timing setting's choices (30 fps, 60 fps, Frame rate-dependent),
+// what the row says and what each choice means, for the setup window's row and
+// F10's.
+extern const char* const kHostEffectTimingLabels[3];
 extern const char* const kHostEffectTimingNote;
-extern const char* const kHostEffectTimingTips[4];
+extern const char* const kHostEffectTimingTips[3];
 // The Effect timing row as the setup window and F10 show it: the choice that
-// will run (`index`, 0 to 3), or 4 when none of the four is it - bbhost.toml's
+// will run (`index`, 0 to 2), or 3 when none of the three is it - bbhost.toml's
 // [video] effect_steps or BBHOST_SFX_STEP asking for a number of steps or for
 // frame - with `custom` that fifth entry ("Custom: 5 (bbhost.toml)") and `tip`
 // its bubble.

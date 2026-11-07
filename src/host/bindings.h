@@ -147,3 +147,52 @@ void host_bindings_migrate_zoom();
 void host_bindings_migrate_menu_keys();
 bool host_bind_take_clear_key();
 void host_binding_clear(int action);
+// One side of a binding cleared (the Controls page: a right-click on its key
+// or its mouse button), and an action's key, mouse button and controller
+// button back to their defaults - another action giving up a key or button it
+// took meanwhile, as a capture makes it.
+void host_binding_clear_key(int action);
+void host_binding_clear_mouse(int action);
+void host_binding_reset(int action);
+// Whether an action's key, mouse button and controller button are all its
+// defaults (its reset would change nothing).
+bool host_binding_at_default(int action);
+// A key's name as the screens show it ("E", "Left Shift", "` (backtick)"),
+// and a mouse input's ("Right Button", "Wheel Up"); nullptr for none.
+const char* host_key_name(int scancode);
+const char* host_mouse_name(int mouse);
+// Every binding back to its default: the keys and mouse buttons bbhost.toml's
+// [keys] gives, and the controller as it is.
+void host_bindings_reset_all();
+
+// The controller, rebindable as the keys are (the Controls page, F10): each
+// of a pad's sixteen buttons - the face buttons, the shoulders and triggers,
+// the sticks' presses, Options, the touchpad and the d-pad - gives the press
+// of the action it is bound to. In play only: in a menu every button is
+// itself, so Cross and Circle answer and go back as the region has them. Every
+// action keeps a button: a rebind swaps, the action whose button was taken
+// getting the one the rebound action had. Saved in the options file's [pad].
+enum PadInput : int {
+    kPadCross, kPadCircle, kPadSquare, kPadTriangle, kPadL1, kPadR1, kPadL2, kPadR2,
+    kPadL3, kPadR3, kPadOptions, kPadTouchpad, kPadUp, kPadDown, kPadLeft, kPadRight,
+    kPadInputs,
+};
+const char* host_pad_input_name(int input);   // "Cross", "R2", "D-pad Up"; nullptr past the end
+std::uint32_t host_pad_input_bit(int input);  // the pad bit the button is, as a menu reads it
+std::uint32_t host_pad_play_bit(int input);   // the pad bit it gives in play
+// The button an action is on in play, or -1 for one with no pad button of its
+// own to move: the movement and look directions, the modifiers, the zoom, and
+// the menus' own (host_pad_menu_input).
+int host_pad_input_of(int action);
+// A menu-only action's button, which does not move; -1 for the rest.
+int host_pad_menu_input(int action);
+// Choosing: the next button pressed or trigger pulled after begin becomes the
+// action's (a press in the first 300 ms is the one that started it, not a
+// choice). Cancel ends it unchanged.
+void host_pad_capture_begin(int action);
+int host_pad_capturing();  // the action, or -1
+void host_pad_capture_cancel();
+// From the event pump. True when the press was the capture's.
+bool host_pad_capture_input(int input);
+// [pad] lines, `roll = "Cross"`: an action and the button it is on.
+bool host_pad_parse(const char* name, const char* value);

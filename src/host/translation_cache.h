@@ -105,6 +105,10 @@ int hlsl_lane_now();
 // the eboot's footer hash): the dump's and an edited file's header names it,
 // so a modder finds a shader by name. Taken by that lift.
 void hlsl_name_next(std::string name);
+// A cloth mesh's velocity vertex shader, by its GX name: its lift reads its
+// inputs 0 and 1 again at locations 14 and 15 for the previous position
+// (translation_cache.cpp velo_cloth_prev; render.cpp binds them).
+bool velo_cloth_vs(const std::string& name);
 // gpu.cpp's: a GX name's bundle entry ("GXFlver_Sword_Gbuf_[A].ppo"), for the
 // dump's header; read only when a dump or an edited file is printed.
 void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name));

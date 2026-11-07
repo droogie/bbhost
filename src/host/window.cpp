@@ -10,6 +10,7 @@
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "host/framegen.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
@@ -100,7 +101,10 @@ std::atomic<bool> g_ime_test_reopen{true};
 // The options screen's two display settings (host/options.h). Both can be set
 // before the presenter exists, so they are wishes the swapchain reads, not
 // calls into it.
-std::atomic<bool> g_want_fullscreen{false};
+// Window mode (host_window_set_mode): 0 windowed, 1 borderless, 2 fullscreen,
+// and the size Fullscreen's display mode is to be nearest.
+std::atomic<int> g_want_mode{0};
+std::atomic<int> g_mode_w{0}, g_mode_h{0};
 std::atomic<bool> g_want_vsync{true};
 // When the presenting thread last finished a present, and how many it has
 // finished: with V-Sync on that instant is a display vblank, which is the
@@ -297,6 +301,7 @@ struct Presenter {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;          // the renderer's: under host_gpu_lock
     VkQueue present_queue = VK_NULL_HANDLE;  // this thread's own, when the device has one
+    void* fg_queues[3] = {};                 // frame generation's three (host/gpu.h), null without them
     std::uint32_t family = 0;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -605,7 +610,25 @@ bool vk_create_swapchain() {
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
     // shadPS4 on the Radeon 8060S (ReShade's log there, 2026-10-07).
     [[maybe_unused]] const std::string modules_before = host_graphics_modules();
-    if (vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
+    // Frame generation: AMD's swapchain in place of ours (host/framegen.h),
+    // made afresh each time - the one before it gone first - and presenting on
+    // this thread's queue, the one vkQueuePresentKHR is called on below.
+    if (framegen_active()) {
+        framegen_destroy_swapchain(g_vk.device);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+    } else if (old && framegen_wanted()) {
+        // Frame generation switched on: AMD's swapchain takes no old one, and
+        // the surface holds one at a time - ours goes first, its last present done.
+        vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        vkDestroySwapchainKHR(g_vk.device, old, nullptr);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+    }
+    const bool fg = framegen_wanted() &&
+                    framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
+                                              g_vk.family, g_vk.fg_queues, &g_vk.swapchain);
+    if (!fg && vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
         host_log("vulkan: swapchain creation failed");
         return false;
     }
@@ -638,7 +661,7 @@ bool vk_create_swapchain() {
         const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
         host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
                  chosen.c_str(), have.c_str(),
-                 g_want_fullscreen.load() ? "fullscreen" : "windowed",
+                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
                                                                : "another format",
@@ -654,9 +677,10 @@ bool vk_create_swapchain() {
     g_swap_w.store(g_vk.extent.width, std::memory_order_relaxed);
     g_swap_h.store(g_vk.extent.height, std::memory_order_relaxed);
     std::uint32_t n = 0;
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, nullptr);
+    const auto get_images = framegen_active() ? framegen_get_images : vkGetSwapchainImagesKHR;
+    get_images(g_vk.device, g_vk.swapchain, &n, nullptr);
     g_vk.images.resize(n);
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
+    get_images(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
     for (VkImageView v : g_vk.views) {
         if (v) vkDestroyImageView(g_vk.device, v, nullptr);
     }
@@ -704,6 +728,7 @@ bool vk_start() {
     g_vk.device = static_cast<VkDevice>(h.device);
     g_vk.queue = static_cast<VkQueue>(h.queue);
     g_vk.present_queue = static_cast<VkQueue>(h.present_queue);
+    for (int i = 0; i < 3; ++i) g_vk.fg_queues[i] = h.fg_queues[i];
     g_vk.family = h.family;
     g_vk.latest_ready = h.fifo_latest_ready;
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
@@ -903,7 +928,10 @@ bool vk_present() {
     present_step("acquiring an image");
     // The image is ours once the acquire's fence signals (or, the old way, once
     // the GPU has waited on its semaphore: BBHOST_PRESENT_ACQUIRE_FENCE=0).
-    const bool by_fence = g_acquire_fence && g_vk.acquire_fence;
+    // AMD's frame generation swapchain is acquired as its sample does, with a
+    // semaphore.
+    const bool by_fence = g_acquire_fence && g_vk.acquire_fence && !framegen_active();
+    const auto acquire = framegen_active() ? framegen_acquire : vkAcquireNextImageKHR;
     const VkSemaphore acquire_sem = by_fence ? VK_NULL_HANDLE : g_vk.acquire_sem;
     const VkFence acquire_fence = by_fence ? g_vk.acquire_fence : VK_NULL_HANDLE;
     if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
@@ -914,7 +942,7 @@ bool vk_present() {
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -940,7 +968,8 @@ bool vk_present() {
             return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
-        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
+        r = (framegen_active() ? framegen_acquire : vkAcquireNextImageKHR)(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem,
+                                                                               acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
@@ -1078,6 +1107,9 @@ bool vk_present() {
                 // The menus (F9, F10) over everything else (host/ingame_menu.h).
                 const bool menu = ingame_menu_record_in_pass(g_vk.cmd, g_vk.extent);
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
+                if (have && framegen_active())
+                    framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src.x),
+                                   static_cast<std::int32_t>(src.y), src.w, src.h);
                 recorded = true;
                 wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 ++g_pstats.one_pass;
@@ -1131,6 +1163,9 @@ bool vk_present() {
             ++g_pstats.clears;
         } else {
             ++g_pstats.blits;
+            if (framegen_active())
+                framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src_x),
+                               static_cast<std::int32_t>(src_y), src_w, src_h);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
         // box and the options screen later. Drawing needs
@@ -1276,7 +1311,7 @@ bool vk_present() {
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    const VkResult pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();
@@ -1401,6 +1436,25 @@ std::uint8_t axis_to_u8(std::int16_t v) {
     return static_cast<std::uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
 }
 
+// A stick's two axes through its deadzones (Controls: host/settings.h
+// stick_inner, stick_outer), radially, so a diagonal keeps its direction:
+// inside `inner` of the full travel at rest, from `outer` out all the way,
+// the travel between spread over the whole range. 0 and 1 leave it as it is.
+void stick_deadzone(std::int16_t ax, std::int16_t ay, float inner, float outer, std::uint8_t* x, std::uint8_t* y) {
+    if (inner <= 0.0f && outer >= 1.0f) {
+        *x = axis_to_u8(ax);
+        *y = axis_to_u8(ay);
+        return;
+    }
+    const float fx = std::max(static_cast<float>(ax) / 32767.0f, -1.0f), fy = std::max(static_cast<float>(ay) / 32767.0f, -1.0f);
+    const float m = std::min(std::sqrt(fx * fx + fy * fy), 1.0f);
+    float k = 0.0f;
+    if (m > inner) k = std::min((m - inner) / std::max(outer - inner, 0.01f), 1.0f) / m;
+    const auto back = [](float f) { return static_cast<std::int16_t>(std::clamp(f, -1.0f, 1.0f) * 32767.0f); };
+    *x = axis_to_u8(back(fx * k));
+    *y = axis_to_u8(back(fy * k));
+}
+
 // A test harness's keys (the request "keys FILE", BBHOST_TEST_REQUESTS in
 // hle/video.cpp): FILE's lines "<ms> +<key>" and "<ms> -<key>" in SDL's key
 // names, played from the request on and read at this thread's pump (every
@@ -1450,6 +1504,18 @@ bool script_keys_step() {
     }
     return true;
 }
+
+// The controller's sixteen bindable buttons as SDL names them, in PadInput's
+// order; the triggers are axes (INVALID here).
+SDL_GamepadButton pad_sdl_button(int input) {
+    static constexpr SDL_GamepadButton kButtons[kPadInputs] = {
+        SDL_GAMEPAD_BUTTON_SOUTH,       SDL_GAMEPAD_BUTTON_EAST,        SDL_GAMEPAD_BUTTON_WEST,       SDL_GAMEPAD_BUTTON_NORTH,
+        SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID,
+        SDL_GAMEPAD_BUTTON_LEFT_STICK,  SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_START,       SDL_GAMEPAD_BUTTON_TOUCHPAD,
+        SDL_GAMEPAD_BUTTON_DPAD_UP,     SDL_GAMEPAD_BUTTON_DPAD_DOWN,   SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+    return input >= 0 && input < kPadInputs ? kButtons[input] : SDL_GAMEPAD_BUTTON_INVALID;
+}
+
 
 void update_pad() {
     // Before anything that returns early, so a script keeps its own time.
@@ -1519,43 +1585,49 @@ void update_pad() {
     bool touch_done = false, back_held = false;
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
-        auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
-            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) {
-                p.buttons |= bit;
-            }
-        };
-        btn(SDL_GAMEPAD_BUTTON_SOUTH, kCross);
-        btn(SDL_GAMEPAD_BUTTON_EAST, kCircle);
-        btn(SDL_GAMEPAD_BUTTON_WEST, kSquare);
-        btn(SDL_GAMEPAD_BUTTON_NORTH, kTriangle);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL1);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR1);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_STICK, kL3);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK, kR3);
-        btn(SDL_GAMEPAD_BUTTON_START, kOptions);
+        // The sixteen buttons, the triggers past a quarter of their travel, each
+        // giving in play the press it is bound to (host/bindings.h host_pad_*):
+        // a rebound one's play press goes to play_buttons, which a menu takes
+        // out again, and its own to menu_buttons, which a menu puts in, so in
+        // a menu every button is itself.
+        bool held[kPadInputs] = {};
+        for (int i = 0; i < kPadInputs; ++i) {
+            const SDL_GamepadButton b = pad_sdl_button(i);
+            held[i] = b != SDL_GAMEPAD_BUTTON_INVALID && static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b);
+        }
         back_held |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_BACK);  // below, after the touchpad's own fingers
-        btn(SDL_GAMEPAD_BUTTON_TOUCHPAD, kTouchPad);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_UP, kUp);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight);
         const auto further = [](std::uint8_t have, std::uint8_t v) {
             return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
-        p.lx = further(p.lx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX)));
-        p.ly = further(p.ly, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY)));
-        p.rx = further(p.rx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX)));
-        p.ry = further(p.ry, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY)));
+        const HostSettings& hs = host_settings_ref();
+        std::uint8_t lx = 0, ly = 0, rx = 0, ry = 0;
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY),
+                       hs.stick_inner[0], hs.stick_outer[0], &lx, &ly);
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY),
+                       hs.stick_inner[1], hs.stick_outer[1], &rx, &ry);
+        p.lx = further(p.lx, lx);
+        p.ly = further(p.ly, ly);
+        p.rx = further(p.rx, rx);
+        p.ry = further(p.ry, ry);
         const std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
         const std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-        p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
-        p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
-        if (lt > 8000) {
-            p.buttons |= kL2;
+        held[kPadL2] = lt > 8000;
+        held[kPadR2] = rt > 8000;
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (!held[i]) continue;
+            const std::uint32_t play = host_pad_play_bit(i), own = host_pad_input_bit(i);
+            p.buttons |= play;
+            if (play != own) {
+                p.play_buttons |= play;
+                p.menu_buttons |= own;
+            }
+            // A button bound to L2 or R2 pulls that trigger all the way.
+            if (play == kL2 && i != kPadL2) p.l2 = 255;
+            if (play == kR2 && i != kPadR2) p.r2 = 255;
         }
-        if (rt > 8000) {
-            p.buttons |= kR2;
-        }
+        // The triggers' travel, while they are themselves in play.
+        if (host_pad_play_bit(kPadL2) == kL2) p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
+        if (host_pad_play_bit(kPadR2) == kR2) p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
         // The touchpad, for the DualShock 4 and DualSense that have one. SDL
         // reports fingers normalised; the pad reports them in the surface's
         // own pixels, which is the space scePadGetControllerInformation told
@@ -1726,17 +1798,66 @@ bool host_test_keys_play(const char* path) {
 }
 
 
-void host_window_set_fullscreen(bool on) {
 #if defined(BBHOST_HAVE_SDL3)
-    if (g_want_fullscreen.exchange(on) == on) {
+namespace {
+// Borderless is SDL's fullscreen with no display mode of its own: the desktop's,
+// unchanged. Fullscreen is exclusive: the display set to the mode nearest the
+// resolution, at the desktop's refresh rate - or the desktop's own mode when
+// the display has none that large (a resolution above the display's, drawn
+// and scaled down).
+void apply_window_mode(int mode) {
+    if (mode == 2) {
+        const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+        const SDL_DisplayMode* desk = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+        SDL_DisplayMode m{};
+        const int w = g_mode_w.load(), h = g_mode_h.load();
+        if (desk && w > 0 && h > 0 && SDL_GetClosestFullscreenDisplayMode(d, w, h, desk->refresh_rate, false, &m)) {
+            SDL_SetWindowFullscreenMode(g_window, &m);
+            host_log("window: fullscreen, %dx%d at %.2f Hz", m.w, m.h, m.refresh_rate);
+        } else {
+            SDL_SetWindowFullscreenMode(g_window, desk);
+            host_log("window: fullscreen at the desktop's mode (none is %dx%d or larger)", w, h);
+        }
+    } else {
+        SDL_SetWindowFullscreenMode(g_window, nullptr);
+        host_log("window: %s", mode == 1 ? "borderless" : "windowed");
+    }
+    SDL_SetWindowFullscreen(g_window, mode != 0);
+}
+}  // namespace
+#endif
+
+
+#if defined(BBHOST_HAVE_SDL3)
+int host_pad_input_of_event(const SDL_Event& e) {
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (pad_sdl_button(i) == e.gbutton.button) return i;
+        }
+    } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.value > 8000) {
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) return kPadL2;
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) return kPadR2;
+    }
+    return -1;
+}
+#endif
+
+void host_window_set_mode(int mode, int width, int height) {
+#if defined(BBHOST_HAVE_SDL3)
+    // Both sizes stored either way: a new resolution moves Fullscreen's mode.
+    bool resized = false;
+    if (width > 0 && height > 0) {
+        resized = g_mode_w.exchange(width) != width;
+        resized = (g_mode_h.exchange(height) != height) || resized;
+    }
+    if (g_want_mode.exchange(mode) == mode && !(mode == 2 && resized)) {
         return;
     }
-    if (g_window) {
-        SDL_SetWindowFullscreen(g_window, on);
-        host_log("window: %s", on ? "fullscreen" : "windowed");
-    }
+    if (g_window) apply_window_mode(mode);
 #else
-    (void)on;
+    (void)mode;
+    (void)width;
+    (void)height;
 #endif
 }
 
@@ -1769,6 +1890,12 @@ std::uint64_t host_present_last_ns(std::uint64_t* serial) {
 #else
     *serial = 0;
     return 0;
+#endif
+}
+
+void host_window_recreate_swapchain() {
+#if defined(BBHOST_HAVE_SDL3)
+    g_swap_dirty.store(true);
 #endif
 }
 
@@ -1854,12 +1981,13 @@ bool window_start_impl(int width, int height, const char* title) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
-    // The options are read before the window exists, so a saved Fullscreen
-    // is only a wish until here (host_window_set_fullscreen).
-    const bool fullscreen = g_want_fullscreen.load();
+    // The options are read before the window exists, so a saved Borderless
+    // or Fullscreen is only a wish until here (host_window_set_mode). Both
+    // start as the desktop's fullscreen; Fullscreen then takes its own mode.
+    const int mode = g_want_mode.load();
     g_window = SDL_CreateWindow(title, width, height,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
-    if (g_window && fullscreen) host_log("window: fullscreen");
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (mode != 0 ? SDL_WINDOW_FULLSCREEN : 0));
+    if (g_window && mode != 0) apply_window_mode(mode);
     if (!g_window) {
         host_log("SDL_CreateWindow failed: %s", SDL_GetError());
         SDL_Quit();
@@ -2187,7 +2315,7 @@ bool host_window_pump() {
     const bool fps_on = host_settings_ref().fps_counter;
     g_fps_on.store(fps_on, std::memory_order_relaxed);
     if (fps_on) {
-        static int shown = 0;
+        static int shown = 0, shown_total = 0;  // the game's frames; with frame generation's, 0 without it
         static std::uint64_t shown_at = 0;
         // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
         // the last three refreshes, about a second. Task Manager's GPU column
@@ -2201,6 +2329,9 @@ bool host_window_pump() {
             double fps = g_fps_avg.load(std::memory_order_relaxed);
             if (last && now > last + 500'000'000) fps = std::min(fps, 1e9 / static_cast<double>(now - last));
             shown = last ? static_cast<int>(fps + 0.5) : 0;
+            // With frame generation, beside it in brackets what is on screen:
+            // the game's frames and the ones generated between them.
+            shown_total = last && framegen_active() ? static_cast<int>(fps * framegen_shown_per_frame() + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
             if (b.on && busy_was[0].on) {
@@ -2226,11 +2357,16 @@ bool host_window_pump() {
             std::lock_guard<std::mutex> ml(g_mouse_mu);
             dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
         }
-        char text[48];
-        if (gpu_pct >= 0) {
-            std::snprintf(text, sizeof(text), "%d FPS  GPU %d%%", shown, gpu_pct);
+        char rate[24], text[48];
+        if (shown_total > 0) {
+            std::snprintf(rate, sizeof(rate), "%d (%d) FPS", shown, shown_total);
         } else {
-            std::snprintf(text, sizeof(text), "%d FPS", shown);
+            std::snprintf(rate, sizeof(rate), "%d FPS", shown);
+        }
+        if (gpu_pct >= 0) {
+            std::snprintf(text, sizeof(text), "%s  GPU %d%%", rate, gpu_pct);
+        } else {
+            std::snprintf(text, sizeof(text), "%s", rate);
         }
         const float scale = 0.8f, w = host_overlay_text_width(scale, text);
         const float x = dw - w - 20.0f, y = 14.0f;

@@ -50,7 +50,10 @@
 // +0x2c4) are cleared so nothing drops the game back to 30.
 //
 // The choice is made when the game starts: the game's fixed 1/30 s steps are
-// constants in its code, and a rate needs them all changed together.
+// constants in its code, and a rate needs them all changed together. From
+// one converted rate to another the same code sites serve, so a change while
+// the game runs rewrites the rate's values alone (frame_rate_request); 30 on
+// either side needs the next start.
 
 // The frame time and the camera's flag code on the game's side reads:
 // engine/frame_rate_step.h.
@@ -67,6 +70,20 @@ void frame_rate_install_late(ElfImage* image);
 // The pace the game was started at: 30, or the rate it was converted to (one
 // of the option's, or Uncapped's refresh rate).
 int frame_rate_game_fps();
+
+// A Frame rate chosen while the game runs (a rate of the option's, 0 for
+// Display-Limited): taken at the next frame - the rated constants and counts
+// written again at its values, the cloth's caves put in above 60, the pace,
+// the flips and the effect timing with it - when the game started at a
+// converted rate and this is one too. False (nothing done) when the change
+// needs the next start: 30 on either side, or the cloth's caves refused.
+bool frame_rate_request(int fps);
+// Whether frame_rate_request takes `fps` while the game runs (the menus'
+// "next start" pill).
+bool frame_rate_live(int fps);
+// The Effect timing changed while the game runs: at a converted rate, set
+// again at the next frame from the settings (frame_rate.cpp retime_effects).
+void frame_rate_retime();
 
 // The frames a second the pace holds the world to: the rate the game was
 // started at. Any thread. The render queue's cut follows it
