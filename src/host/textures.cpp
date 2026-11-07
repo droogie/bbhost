@@ -5258,6 +5258,28 @@ std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_ba
     return 0;
 }
 
+// Every image made from [lo, hi) goes now (host/gpu.h host_gpu_forget_region:
+// a region given back whole, nothing new made in it yet). Retired the usual
+// way they would wait for the work in flight and then find the next YEBIS's
+// resources over the memory and stay - a shader-written image the next
+// resource takes - overlapping that YEBIS's own textures ("STALE? ... a
+// GPU-written texture holds").
+std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi) {
+    std::uint64_t n = 0;
+    for (auto it = g_surfaces.lower_bound(lo); it != g_surfaces.end() && it->first < hi;) {
+        Surface& sf = it->second;
+        drop_level_aliases_locked(sf.base);
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        if (sf.image) defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(it->second);
+        it = g_surfaces.erase(it);
+        ++n;
+    }
+    if (n) bump_view_epoch();
+    return n;
+}
+
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
     std::lock_guard<std::mutex> lk(g_retire_mu);
     g_retire_pending.push_back({base, bytes, after_submitted, gen});
@@ -5321,7 +5343,8 @@ void retire_surfaces_locked() {
             // texels and a texture made over the memory without data takes it
             // (below); the image of another generation stays. A surface with
             // no generation (on no resource at its last upload) goes when no
-            // live resource covers it, as before.
+            // live resource covers it and nothing wrote it after the resource
+            // died.
             if (res_identity_on() && e.gen && sf.gx_gen) {
                 if (sf.gx_gen != e.gen) {
                     g_retire_kept_other_gen.fetch_add(1, std::memory_order_relaxed);
@@ -5354,6 +5377,19 @@ void retire_surfaces_locked() {
                 }
                 g_retired_by_gen.fetch_add(1, std::memory_order_relaxed);
                 if (gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), nullptr)) g_retired_by_gen_live.fetch_add(1, std::memory_order_relaxed);
+            } else if (sf.written_seq > e.after) {
+                // Written by a submission made after the resource died, as
+                // above: the image is the memory's newer owner's, whether or not
+                // the registry knows that owner. A shader's texels are nowhere
+                // else, and retired, the next bind made the surface again from
+                // memory that never had them - the Hunter's Dream's colour
+                // grading table (16x256, e2c27f0c), written in the submission
+                // after a graphics change freed the old table at its address
+                // and read from that stale memory every frame after: the Dream
+                // black or dim until a restart.
+                g_retire_kept_written.fetch_add(1, std::memory_order_relaxed);
+                ++it;
+                continue;
             } else if (gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), nullptr)) {
                 g_retire_kept_live.fetch_add(1, std::memory_order_relaxed);
                 ++it;

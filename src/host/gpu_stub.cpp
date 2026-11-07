@@ -32,6 +32,7 @@ GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
 bool host_gpu_draw(const GpuDraw&) { return false; }
 int host_gpu_run_commit(const GpuDraw*, const std::uint64_t*, std::uint32_t, std::uint32_t&) { return 0; }
 void host_gpu_flush() {}
+void host_gpu_forget_region(std::uint64_t, std::uint64_t) {}
 void host_gpu_report() {}
 void host_gpu_submit() {}
 void host_gpu_save_pipeline_cache() {}

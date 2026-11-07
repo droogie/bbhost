@@ -16391,6 +16391,37 @@ std::string image_reuse_report_locked() {
 
 using namespace gpu;
 
+// A region given back whole (host/gpu.h host_gpu_forget_region): YEBIS's
+// private heap, which its shutdown returns before it frees the objects in it,
+// whose frees are then dropped (engine/live_resolution.cpp) - so no resource's
+// death ever let the targets, snapshots and texture images made there go.
+// Each graphics change that restarts YEBIS left the last one's registered
+// (53 targets and snapshots, 96 MiB, at the first; 36 and 64 MiB at each
+// after), and the YEBIS made next, laid out again a few hundred KiB apart
+// wherever a size before them changed (the velocity map's with HD motion
+// blur), had its textures over the old targets read as their stale memory
+// ("texture: STALE? ... uploaded from memory").
+void host_gpu_forget_region(std::uint64_t lo, std::uint64_t hi) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || hi <= lo) return;
+    std::uint64_t n = 0, bytes = 0;
+    for (int k = 0; k < 2; ++k) {
+        std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
+        for (auto it = m.lower_bound(lo); it != m.end() && it->first < hi;) {
+            ++n;
+            bytes += it->second.memory.size;
+            retire_target_locked(it, k == 1);
+            it = m.erase(it);
+        }
+    }
+    // And the texture images made from that memory, the shader-written ones
+    // among them (nothing new is made there until the next YEBIS starts).
+    const std::uint64_t images = textures_forget_region_locked(lo, hi);
+    host_log("render: a region given back whole, 0x%llx-0x%llx: %llu targets and snapshots (%llu MiB) and %llu texture images let go with it",
+             static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi), static_cast<unsigned long long>(n),
+             static_cast<unsigned long long>(bytes >> 20), static_cast<unsigned long long>(images));
+}
+
 std::string host_gpu_fill_stats() { return render_fill_stats(); }
 std::string host_gpu_target_copy_report() {
     std::lock_guard<GpuMutex> lock(g.mu);

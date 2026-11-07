@@ -2702,6 +2702,9 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// Every texture image made from [lo, hi) dropped now (host_gpu_forget_region);
+// how many.
+std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi);
 // The generation of the live GX texture that takes a dead resource's image
 // (0: none, and the image goes): one made without data at the dead
 // resource's memory, or one covering the image [image_base, +image_bytes)

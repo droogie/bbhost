@@ -418,6 +418,10 @@ std::string host_gpu_segment_report(bool spliced_part);  // the builder's line (
 // Runs queued work and waits for it; call before the command processor
 // reads or writes memory the shaders may touch.
 void host_gpu_flush();
+// A region of guest memory given back whole, its objects' frees never seen
+// (YEBIS's private heap at a live resolution change, engine/live_resolution.cpp):
+// the targets, snapshots and texture images made in [lo, hi) are let go now.
+void host_gpu_forget_region(std::uint64_t lo, std::uint64_t hi);
 // Exit-time statistics.
 void host_gpu_report();
 // Submits the recorded work without waiting (the CP does this at the end of

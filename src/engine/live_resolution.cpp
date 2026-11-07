@@ -175,6 +175,9 @@ GUEST_ABI std::int64_t yebis_shutdown_call_hook(std::uint64_t, const std::uint64
     g_dead_lo.store(lo);
     g_dead_hi.store(lo && size > 0 ? lo + static_cast<std::uint64_t>(size) : 0);
     hle_call_guest6(guest_fn(kYebisShutdown), static_cast<std::int64_t>(glue), 0, 0, 0, 0, 0);
+    // Its targets went with the region, unseen (the frees dropped above): the
+    // host lets them go too, before the next YEBIS makes its own there.
+    if (const std::uint64_t hi = g_dead_hi.load()) host_gpu_forget_region(lo, hi);
     g_dead_hi.store(0);
     g_dead_lo.store(0);
     return 1;
