@@ -30,6 +30,11 @@ bool scene_look_cutaway(float* out);
 struct PixelCut;
 void scene_look_set_pixel_cut(const PixelCut& cut);
 bool scene_look_pixel_cut(PixelCut* out);
+// The objects' cone (plugin API 24): the same cut for the map's objects, its
+// tip `start` of the way from the point looked at toward the camera; below 0
+// the objects are never cut.
+void scene_look_set_object_cut(float start);
+float scene_look_object_cut();
 
 // The camera draws' textures sampled nearest.
 void scene_look_set_nearest(bool on);

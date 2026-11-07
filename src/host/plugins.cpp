@@ -1244,6 +1244,13 @@ void api_view_cutaway2(const BbCutaway* c) {
         host_log("plugin: no cutaway per pixel");
 }
 
+// Version 24: the objects' cone (host/scene_look.h).
+void api_view_cutaway_objects(float start) {
+    scene_look_set_object_cut(start);
+    if (start >= 0.0f && start < 1.0f)
+        host_log("plugin: the map's objects cut too, by the same cone from %.2f of the way to the camera", static_cast<double>(start));
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1275,6 +1282,7 @@ const BbHostApi g_api = {
     &api_audio_crush,
     &api_view_cutaway,
     &api_view_cutaway2,
+    &api_view_cutaway_objects,
 };
 
 std::string read_file(const std::string& path) {

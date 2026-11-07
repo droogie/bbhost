@@ -79,6 +79,13 @@ void scene_look_set_pixel_cut(const PixelCut& cut) {
     g_pixel_cut.radius = round_to(cut.radius, 0.25f);
     g_pixel_cut_on.store(on, std::memory_order_release);
 }
+std::atomic<float> g_object_cut{-1.0f};
+void scene_look_set_object_cut(float start) {
+    // Rounded as the distance is: each new start is a new twin of the objects' pixel stages.
+    g_object_cut.store(start >= 0.0f && start < 1.0f ? std::round(start * 20.0f) / 20.0f : -1.0f, std::memory_order_relaxed);
+}
+float scene_look_object_cut() { return g_object_cut.load(std::memory_order_relaxed); }
+
 bool scene_look_pixel_cut(PixelCut* out) {
     if (!g_pixel_cut_on.load(std::memory_order_acquire)) return false;
     if (out) {

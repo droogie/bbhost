@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 23
+#define BB_PLUGIN_API_VERSION 24
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -617,6 +617,12 @@ typedef struct BbHostApi {
      * the camera draws' pipelines again, so set it as the distance changes,
      * not every frame. Any thread. */
     void (*view_cutaway2)(const struct BbCutaway* cut);
+    /* Version 24: view_cutaway2's cone for the map's objects too (never the
+     * characters or what they carry), its tip `start` of the way from the
+     * point looked at toward the camera - 0.5 halfway - and the rest of it
+     * as view_cutaway2 sets it. Below 0 (the default) the objects are never
+     * cut. Any thread. */
+    void (*view_cutaway_objects)(float start);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
