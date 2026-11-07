@@ -298,10 +298,11 @@ bool motion_pipeline_locked() {
 bool velo_seen_test();  // below
 VkImageView g_cap_map_view = VK_NULL_HANDLE;  // the characters' capture map (record_capture, below)
 
-void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
-                   std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
-                   int velo_mode, bool whole) {
-    float p[40] = {};
+// The motion pass's constants (camera_motion.comp's Params; TAA's open with
+// the same, taa_resolve.comp).
+void motion_params(float (&p)[40], std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w,
+                   std::uint32_t velo_h, int velo_mode, bool whole) {
+    std::memset(p, 0, sizeof(p));
     p[0] = g_cam_now.tan_x;
     p[1] = g_cam_now.tan_y;
     p[2] = g_cam_now.a;
@@ -346,6 +347,13 @@ void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout dep
         p[38] = static_cast<float>(velo_mode == 1 && whole ? 4 : velo_mode);
         p[39] = velo_tolerance();
     }
+}
+
+void record_motion(VkCommandBuffer cb, VkImageView depth_view, VkImageLayout depth_layout, VkImage motion, VkImageView motion_view,
+                   std::uint32_t w, std::uint32_t h, bool prev_ok, VkImageView velo, std::uint32_t velo_w, std::uint32_t velo_h,
+                   int velo_mode, bool whole) {
+    float p[40];
+    motion_params(p, w, h, prev_ok, velo, velo_w, velo_h, velo_mode, whole);
     const VkDescriptorSet set = alloc_set_locked(g_motion_set_layout);
     if (!set) return;
     const VkDescriptorImageInfo depth_info{VK_NULL_HANDLE, depth_view, depth_layout};
@@ -882,7 +890,10 @@ bool record_rcas(VkCommandBuffer cb, float sharpness) {
 // TAA (Graphics > Upscaling: TAA, host/upscaler.h kUpscaleTaa): Numity1504's
 // TAA (his handoff's step 9, with step 8's ember mask in its TAA form) in the
 // bridge's place, from the same inputs - the jittered scene, the motion, the
-// depth - plus the glow (shaders/taa_resolve.comp). Two histories (RGBA16F,
+// depth - plus the glow (shaders/taa_resolve.comp). The motion it works out
+// itself, from the motion pass's constants, velocity map and capture: the
+// motion pass is not run, and its image and the depth's R32 copy are written
+// only when something reads them (frame generation, the motion tests). Two histories (RGBA16F,
 // colour as light, alpha the motion's length there), one read and one
 // written, changing places each frame; the picture is g_output, alpha the
 // scene's. No mip bias and no sharpening of its own (Sharpness is the
@@ -892,6 +903,14 @@ VkDescriptorSetLayout g_taa_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_taa_layout = VK_NULL_HANDLE;
 VkPipeline g_taa_pipeline = VK_NULL_HANDLE;
 VkSampler g_taa_sampler = VK_NULL_HANDLE;  // linear, clamped: the history's Catmull-Rom taps
+constexpr std::uint32_t kTaaBindings = 11, kTaaPushBytes = 224;
+
+// taa_resolve.comp's bindings: 4 the sampler, 5 6 9 10 written, the rest read.
+VkDescriptorType taa_binding_type(std::uint32_t k) {
+    return k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER
+         : k == 5 || k == 6 || k == 9 || k == 10 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                 : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+}
 
 bool taa_pipeline_locked() {
     static bool tried = false;
@@ -903,16 +922,22 @@ bool taa_pipeline_locked() {
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.0f;
     if (vkCreateSampler(g.device, &si, nullptr, &g_taa_sampler) != VK_SUCCESS) return false;
-    VkDescriptorSetLayoutBinding binds[8] = {};
-    for (std::uint32_t k = 0; k < 8; ++k) {
-        binds[k] = {k, k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 || k == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                    1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    // The motion pass's constants and TAA's: more than the 128 bytes every
+    // device has (256 on AMD's, NVIDIA's and Intel's).
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    if (props.limits.maxPushConstantsSize < kTaaPushBytes) {
+        host_log("upscaler: TAA needs %u bytes of push constants, the device has %u; the game's own anti-aliasing", kTaaPushBytes,
+                 props.limits.maxPushConstantsSize);
+        return false;
     }
+    VkDescriptorSetLayoutBinding binds[kTaaBindings] = {};
+    for (std::uint32_t k = 0; k < kTaaBindings; ++k) binds[k] = {k, taa_binding_type(k), 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 8;
+    sli.bindingCount = kTaaBindings;
     sli.pBindings = binds;
     if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_taa_set_layout) != VK_SUCCESS) return false;
-    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, kTaaPushBytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &g_taa_set_layout;
@@ -937,12 +962,14 @@ bool taa_pipeline_locked() {
     return ok;
 }
 
-// This frame's TAA into g_output and the next frame's history. The scene and
-// the motion are readable; `depth` is the R32 copy when fresh, else the
-// game's (the motion is then zero and there is no history: this frame's 3x3
-// alone). `glow` (null: none this frame, no ember mask) the scene's size.
+// This frame's TAA into g_output and the next frame's history. The scene is
+// readable; `depth` the game's; `motion` the motion pass's constants
+// (motion_params), `velo` its velocity map (null: none) and the capture map
+// g_cap_map_view. `glow` (null: none this frame, no ember mask) the scene's
+// size. `write_motion`: g_motion and g_depth_r32 written too (frame
+// generation, the motion tests read them).
 bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkImageLayout depth_layout, float jitter_x, float jitter_y,
-                bool reset, const RtImage* glow) {
+                bool reset, const RtImage* glow, const float (&motion)[40], VkImageView velo, bool write_motion) {
     if (!taa_pipeline_locked()) return false;
     for (OwnImage& h : g_taa_hist) {
         if (!h.image && !make(h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_w, g_h)) {
@@ -961,32 +988,38 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     }
     // With no history (or no glow) the image is not read, but bound all the
     // same: the scene stands in for it.
-    const VkDescriptorImageInfo infos[8] = {
+    // With no velocity map or capture the scene stands in, unread.
+    const VkDescriptorImageInfo infos[kTaaBindings] = {
         {VK_NULL_HANDLE, scene.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, no_history ? scene.view : read.view, VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, g_motion.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, velo ? velo : scene.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, depth, depth_layout},
         {g_taa_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
         {VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, write.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, glow ? glow->view : scene.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, g_cap_map_view ? g_cap_map_view : scene.view,
+         g_cap_map_view ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, g_motion.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, g_depth_r32.view, VK_IMAGE_LAYOUT_GENERAL},
     };
-    VkWriteDescriptorSet wr[8] = {};
-    for (int k = 0; k < 8; ++k) {
+    VkWriteDescriptorSet wr[kTaaBindings] = {};
+    for (std::uint32_t k = 0; k < kTaaBindings; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
-        wr[k].dstBinding = static_cast<std::uint32_t>(k);
+        wr[k].dstBinding = k;
         wr[k].descriptorCount = 1;
-        wr[k].descriptorType =
-            k == 4 ? VK_DESCRIPTOR_TYPE_SAMPLER : k == 5 || k == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        wr[k].descriptorType = taa_binding_type(k);
         wr[k].pImageInfo = &infos[k];
     }
-    vkUpdateDescriptorSets(g.device, 8, wr, 0, nullptr);
+    vkUpdateDescriptorSets(g.device, kTaaBindings, wr, 0, nullptr);
     struct {
+        float motion[40];
         std::uint32_t size[4];
-        float cam[4];
         float weights[12];
-    } pc{{g_w, g_h, no_history ? 1u : 0u, glow ? 1u : 0u}, {jitter_x, jitter_y, g_cam_now.a, g_cam_now.r2w}, {}};
+    } pc{{}, {g_w, g_h, no_history ? 1u : 0u, (glow ? 1u : 0u) | (write_motion ? 2u : 0u)}, {}};
+    static_assert(sizeof(pc) == kTaaPushBytes);
+    std::memcpy(pc.motion, motion, sizeof(pc.motion));
     // The 3x3's weights: each sample lies at its centre less the jitter (the
     // picture moved by +j); exp(-2.29 d^2) of its distance from the pixel's
     // centre, normalised - the same for every pixel, so worked out here.
@@ -1001,12 +1034,25 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, write.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    if (write_motion) {
+        barrier(cb, g_motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT);
+        barrier(cb, g_depth_r32.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT);  // (every texel written again)
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa_pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_taa_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cb, g_taa_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cb, (g_w + 7) / 8, (g_h + 7) / 8, 1);
     barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT);
+    if (write_motion) {
+        barrier(cb, g_motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT);
+        barrier(cb, g_depth_r32.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT);
+        g_depth_r32_fresh = true;
+    }
     write.initialised = true;
     g_taa_read ^= 1;
     static bool told = false;
@@ -1671,14 +1717,25 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     // The next frame's map work (upscale_velo_clear_due, upscale_velo_copy_due).
     ++g_velo_frame;
     g_velo_camera_pass = false;
-    g_depth_r32_fresh = false;  // (record_motion writes this frame's)
+    g_depth_r32_fresh = false;  // (record_motion writes this frame's, or TAA)
+    // TAA works the motion out in its own pass (record_taa): the motion pass's
+    // constants are kept for it instead, here, before the cameras move on.
+    const bool taa = method == kUpscaleTaa && taa_pipeline_locked();
+    float taa_motion[40];
+    motion_params(taa_motion, g_w, g_h, false, VK_NULL_HANDLE, 0, 0, 0, false);
+    VkImageView taa_velo = VK_NULL_HANDLE;
     if (g_cam_noted && motion_mode != 0 && motion_pipeline_locked()) {
         if (capture_env()) capture_ready_locked();
         profile_begin_locked(&g_prof_motion);
         record_capture(cb, g_w, g_h);
         g_cap_map_view = g_cap.map.view;
-        record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
-                      velo_mode, whole);
+        if (taa) {
+            motion_params(taa_motion, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h, velo_mode, whole);
+            taa_velo = velo;
+        } else {
+            record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
+                          velo_mode, whole);
+        }
         profile_end_locked();
         g_check_whole = velo_seen_env() == 2 ? velo_seen_test() : whole;
         g_velo_cam[0] = g_velo_cam[1] = 0.0f;
@@ -1731,9 +1788,11 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     c.output = {g_output.image, g_output.view, VK_FORMAT_R16G16B16A16_SFLOAT,
                 g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED};
     profile_begin_locked(method == kUpscaleTaa ? &g_prof_taa : &g_prof_bridge);
-    const bool ok = method == kUpscaleTaa ? record_taa(cb, scene, c.depth.view, c.depth.layout, jitter_x, jitter_y, c.reset,
-                                                     glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr)
-                                          : upscaler_evaluate(cb, c);
+    const bool ok = method == kUpscaleTaa
+                        ? taa && record_taa(cb, scene, g_depth_view, depth_layout, jitter_x, jitter_y, c.reset,
+                                            glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr, taa_motion,
+                                            taa_velo, framegen_active() || show_motion() > 0.0f || check_motion() > 0.0f)
+                        : upscaler_evaluate(cb, c);
     profile_end_locked();
     // The bridge's binds are gone from cb: the next draw binds all of its own.
     ::run_forget_recorded_locked();
