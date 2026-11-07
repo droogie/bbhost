@@ -159,6 +159,18 @@ void final_report();
 // Every thread in a timed call now, longest first ("" when none): the hang
 // watchdog's report.
 std::string in_calls_now();
+// The timed call one thread is in now - `tid` its host_thread_id() - once it
+// has been in it for `min_ns` or more: the call, its time so far and where, in
+// the slow-call lines' words. False while that thread is in none, or in one
+// for less, and while nothing is timed. For a line about something else that
+// says what that thread was waiting on as it happened: the window's focus
+// lines ask it of the presenter (host/window.cpp).
+struct ThreadCall {
+    Call call = kCallCount;
+    std::uint64_t ns = 0;
+    char where[96] = {};
+};
+bool thread_in_call(std::uint32_t tid, std::uint64_t min_ns, ThreadCall* out);
 
 // For tests (tests/slow_calls_test.cpp): the threshold and the test hook set
 // again as from these values (null: unset), the counters zeroed.

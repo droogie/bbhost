@@ -3,13 +3,16 @@
 // then; its counts by call; the first lines in full and the rest counted; a
 // poll step's slack; the command processor's driver phase; the test hook's
 // delays, and with `lock` the calls that queue behind a delayed one; off,
-// nothing timed. Then the cost of a timed call against an untimed one.
+// nothing timed; one thread's call as another asks for it. Then the cost of a
+// timed call against an untimed one.
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/slow_calls.h"
 #include "log.h"
 
 #include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -258,6 +261,34 @@ void test_in_calls_now() {
     CHECK(slow_calls::in_calls_now().empty());
 }
 
+// One thread's call, asked for by its id from another: only once it has been
+// in it for the time asked, and not for a thread in none.
+void test_thread_in_call() {
+    slow_calls::test_configure("50");
+    std::atomic<std::uint32_t> tid{0};
+    std::thread a([&tid] {
+        name_thread("t-presenter");
+        tid.store(static_cast<std::uint32_t>(syscall(SYS_gettid)));
+        Scope timed(kFence);
+        sleep_ms(600);
+    });
+    while (!tid.load()) sleep_ms(1);
+    sleep_ms(20);
+    slow_calls::ThreadCall c;
+    CHECK(!slow_calls::thread_in_call(tid.load(), 300'000'000ull, &c));  // in it, not for 300 ms yet
+    sleep_ms(330);
+    CHECK(slow_calls::thread_in_call(tid.load(), 300'000'000ull, &c));
+    std::fprintf(stderr, "thread: %s %.1f ms (%s)\n", slow_calls::call_name(c.call), static_cast<double>(c.ns) / 1e6, c.where);
+    CHECK(c.call == slow_calls::kWaitFences && c.ns >= 300'000'000ull && c.ns < 600'000'000ull);
+    CHECK(std::string(c.where) == "a submission's fence");
+    const std::uint32_t own = static_cast<std::uint32_t>(syscall(SYS_gettid));
+    CHECK(!slow_calls::thread_in_call(own, 0, &c));  // this thread is in no call
+    a.join();
+    CHECK(!slow_calls::thread_in_call(tid.load(), 0, &c));  // out of it, its slot given back
+    slow_calls::test_configure("0");
+    CHECK(!slow_calls::thread_in_call(own, 0, &c));  // nothing timed
+}
+
 // What a timed call costs over an untimed one: the clock read twice and the
 // thread's slot written. Printed, not judged: a loaded machine's numbers move.
 void cost() {
@@ -290,6 +321,7 @@ int main() {
     test_hook_lock();
     test_off();
     test_in_calls_now();
+    test_thread_in_call();
     cost();
     if (g_failures) {
         std::fprintf(stderr, "slow_calls_test: %d failed\n", g_failures);

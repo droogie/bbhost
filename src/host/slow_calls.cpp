@@ -494,6 +494,24 @@ std::string in_calls_now() {
     return buf[0] == ' ' ? std::string(buf + 1) : std::string(buf);
 }
 
+bool thread_in_call(std::uint32_t tid, std::uint64_t min_ns, ThreadCall* out) {
+    if (!on() || !tid || !out) return false;
+    const std::uint64_t now = host_clock_monotonic_ns();
+    for (const Slot& s : g_slots) {
+        if (!s.taken.load(std::memory_order_acquire) || s.tid.load(std::memory_order_relaxed) != tid) continue;
+        const Site* site = s.site.load(std::memory_order_acquire);
+        if (!site) return false;
+        const std::uint64_t since = s.since.load(std::memory_order_relaxed);
+        const std::uint64_t ns = now > since ? now - since : 0;
+        if (ns < min_ns) return false;
+        out->call = site->call;
+        out->ns = ns;
+        where_text(*site, s.slack.load(std::memory_order_relaxed), out->where, sizeof(out->where));
+        return true;
+    }
+    return false;
+}
+
 void test_configure(const char* slow_call_ms, const char* test_slow_call) {
     g_cfg = parse(slow_call_ms, test_slow_call);
     std::lock_guard<std::mutex> lk(g_mu);
