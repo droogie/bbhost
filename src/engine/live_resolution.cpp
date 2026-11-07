@@ -1096,6 +1096,43 @@ void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
              (unsigned long long)free_mib, (unsigned long long)free_after, (unsigned long long)largest_after);
 }
 
+// The GX play thread's done event. sub_25b6620 makes the play object (the
+// device's +0x348) with GXRenderThread and three events; the thread
+// (sub_25b6910) sets +0x68 once it has played the queue the frame end handed
+// it (sub_2599af0) and made the frame's flip (0x25b6a68), and the frame end
+// (sub_2598fd0) waits on it before it hands over the next queue (0x25998db,
+// no time limit) and resets it. A Dantelion2 event (vtable 0x56b97a0, the
+// created flag bit 0 of +0x18): slot +0x20 polls it (0 once set), slot +0x18
+// waits for it - one condition wait of a number of microseconds, so it is
+// polled again after.
+constexpr std::uint64_t kPlayObject = 0x348, kPlayDone = 0x68, kEventVtable = 0x56b97a0;
+constexpr int kEventWait = 0x18, kEventPoll = 0x20;
+// How long the change waits for that play: longer than any frame plays -
+// lavapipe takes up to 14 s over a 2560x1440 frame at the Nightmare of
+// Mensis, and by its pixels more than twice that over a 3840x2160 one - so
+// that only a play that is not ending meets it, and the change then waits for
+// a later frame instead.
+constexpr auto kPlayDoneLimit = std::chrono::seconds(60);
+
+// 1: the frame the frame end handed over has been played and flipped; 0: not
+// within the limit; -1: no play object this knows at the device's +0x348.
+int wait_play_done(std::uint64_t dev) {
+    const std::uint64_t play = at_<std::uint64_t>(dev + kPlayObject);
+    const std::uint64_t ev = play ? play + kPlayDone : 0;
+    if (!ev || at_<std::uint64_t>(ev) != guest(kEventVtable) || !(at_<std::uint32_t>(ev + 0x18) & 1)) return -1;
+    const auto poll = [ev] {
+        const auto set = hle_call_guest6(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(ev) + kEventPoll))),
+                                         static_cast<std::int64_t>(ev), 0, 0, 0, 0, 0);
+        return static_cast<std::int32_t>(set) == 0;
+    };
+    const auto until = std::chrono::steady_clock::now() + kPlayDoneLimit;
+    while (!poll()) {
+        if (std::chrono::steady_clock::now() >= until) return 0;
+        call_slot(ev, kEventWait, 100000);  // a tenth of a second at a time
+    }
+    return 1;
+}
+
 // The quiet point. The present step (sub_21976e0, main thread) queues the
 // frame's command context (sub_2594340) and calls the GX device's frame end,
 // sub_2598fd0 (0x2197853). In the device's queued mode (+0x84) that swaps
@@ -1104,10 +1141,25 @@ void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
 // while the main loop goes on and the workers record the next frame. So the
 // change goes right after that call returns, before the main loop moves on:
 // the call is sent through a stub whose host side makes it itself, then
-// waits for the frame it ended to be shown (two flips: the queue runs a
-// frame behind), for the command processor and the host GPU to finish, and
+// waits for the GX thread to have played the frame it ended (its done event,
+// wait_play_done), for the command processor and the host GPU to finish, and
 // resizes. Nothing records meanwhile (the main thread is here) and nothing
-// recorded is still to be played.
+// recorded is still to be played. It waited for two flips, at most 500 ms:
+// a frame that played longer (lavapipe's at 1440p, 7 to 14 s) was still in
+// YEBIS's flip pass (sub_25d5f80) when the change's broadcast shut YEBIS
+// down (sub_25d2830 releases the post effect's constant buffer at +0x70 and
+// stores 0), and the pass's update of it (sub_2568a20) read the null
+// resource's bind flags. A play that does not end within the limit leaves
+// the change for a later frame rather than shutting YEBIS down under it.
+// Shadow resolution's change (apply_shadow_sizes), which releases maps the
+// play may still read, waits the same way and is kept for later with it.
+//
+// The wait cannot hold the play up: the main thread waits holding no lock of
+// the game's (the present step takes none around the frame end, which has
+// returned) nor of the host's (the hook keeps only atomics; the event's own
+// mutex is let go by its condition wait), and the play and its flip need
+// nothing of the main thread - the game's own frame end waits on the same
+// event, with no limit, every frame.
 GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::uint64_t dev = saved[5];  // rdi
     const std::uint64_t f0 = hle_video_flip_count();
@@ -1119,15 +1171,50 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
     if (!g_old_depth.empty()) release_old_depth(f0);
     render_scale_flip(f0);
     confirm_tick();
-    if (req && req == g_current.load() && !g_rebuild.exchange(false)) {
-        g_request_confirm.store(false);
-        req = 0;
+    // A request at the size the game has is made only as a rebuild there
+    // (live_resolution_rebuild); else it is dropped.
+    bool rebuild = false;
+    if (req && req == g_current.load()) {
+        rebuild = g_rebuild.exchange(false);
+        if (!rebuild) {
+            g_request_confirm.store(false);
+            req = 0;
+        }
     }
     if (!req && !shadows) return 1;  // the frame end ran; back to the caller
     const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
-    const auto start = std::chrono::steady_clock::now();
-    while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
-        host_sleep_us(200);
+    const int played = wait_play_done(dev);
+    if (played == 0) {
+        // Kept for a later frame (a request made meanwhile stands instead),
+        // and the shadow maps' change with it.
+        std::uint64_t none = 0;
+        if (req && g_request.compare_exchange_strong(none, req) && rebuild) g_rebuild.store(true);
+        if (shadows) g_shadow_request.store(true);
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            if (req)
+                host_log("resolution: the frame before the change to %ux%u was still being played after %lld s; the change waits for a "
+                         "later frame",
+                         w, h, static_cast<long long>(kPlayDoneLimit.count()));
+            else
+                host_log("resolution: the frame before the shadow maps' change was still being played after %lld s; the change waits "
+                         "for a later frame",
+                         static_cast<long long>(kPlayDoneLimit.count()));
+        }
+        return 1;
+    }
+    if (played < 0) {
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            host_log("resolution: no GX play thread's done event at the device's +0x%llx; the change waits for two flips instead",
+                     static_cast<unsigned long long>(kPlayObject));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
+            host_sleep_us(200);
+    }
     hle_gnm_cp_drain();  // the command processor has run everything submitted
     host_gpu_flush();    // and the host GPU has finished it
     if (shadows) {
