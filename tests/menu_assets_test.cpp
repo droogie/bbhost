@@ -80,8 +80,9 @@ int main() {
     }
     const std::set<std::string> gfx = section_rows(movie, "PCGraphics");
     CHECK(gfx == items(8));  // seven widget rows and the Defaults label
-    // PC Settings has seven rows (one added, as PC Graphics' seventh) and the
-    // label; PC Effects keeps six rows and the label.
+    // PC Settings has seven rows on Windows (one added, as PC Graphics'
+    // seventh), six elsewhere, and the label; PC Effects keeps six rows and
+    // the label.
     CHECK(section_rows(movie, "PCSetting") == items(kPcSettingSlots + 1));
     CHECK(section_rows(movie, "PCEffects") == items(7));
     // PC Enhancements: a row for each of its toggles (engine/option_menu.cpp's

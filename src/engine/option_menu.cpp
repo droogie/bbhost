@@ -511,14 +511,18 @@ struct Toggle {
     bool invert = false;
 };
 // PC Settings. The two pointer rows it had moved to PC Controls, beside the
-// rest of the mouse. Five toggles and the Texture Quality and frame rate pick
-// lists fill the section's seven slots (kPcSettingSlots).
+// rest of the mouse. On Windows five toggles and the Texture Quality and frame
+// rate pick lists fill the section's seven slots, elsewhere four and the lists
+// its six (engine/menu_assets.h kPcSettingSlots).
 Toggle g_toggles[] = {
     {"vsync", 116000, 1, 0xff},
     {"window_mode", 116001, 0, 0xff},
-    // Stay Borderless: Borderless never made exclusive by the driver (Windows;
-    // host/window.cpp).
+#if defined(_WIN32)
+    // Stay Borderless: Borderless never made exclusive by the driver
+    // (host/window.cpp). It does nothing elsewhere, so it has a row on Windows
+    // alone.
     {"stay_borderless", 116009, 0, 0xff},
+#endif
     {"skip_logos", 116004, 0, 0xff},
     // The frames per second the presenter counts (host/window.cpp).
     {"fps_counter", 116007, 0, 0xff},
@@ -853,9 +857,9 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 // PC Graphics has one slot more (its seventh row, HLSL Shaders): the generator
 // adds it as it adds Key Bindings' two, and moves the Defaults label below it.
 constexpr int kGraphicsSlots = 7;
-// PC Settings has one more too (Stay Borderless's, after Texture Quality's
-// list took the sixth): engine/menu_assets.h's kPcSettingSlots, which the
-// generator makes.
+// PC Settings has one more too on Windows (Stay Borderless's, after
+// Texture Quality's list took the sixth): engine/menu_assets.h's
+// kPcSettingSlots, which the generator makes.
 
 // The port's rows: its toggles plus the Texture Quality and frame-cap pick
 // lists, and in the graphics section its toggles plus the resolution list.

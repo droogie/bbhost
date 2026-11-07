@@ -39,7 +39,7 @@
 110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
-116009	Stay Borderless	Windows: Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
+116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.

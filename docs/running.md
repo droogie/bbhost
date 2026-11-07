@@ -463,7 +463,7 @@ KERNEL=="udmabuf", TAG+="uaccess"
 behind it, but the display stops handing the window its images back; the log's
 `slow call: vkWaitForFences ... (the acquired image)` lines say for how long.
 The graphics driver can take Borderless, a window that covers the screen, as
-exclusive fullscreen and switch into and out of it on its own: turn on
+exclusive fullscreen and switch into and out of it on its own: try
 [Stay borderless](#display-and-frame-rate), which keeps the window a window. A
 `window: keyboard focus` line logged while the picture is stopped says how
 long the presenter had been waiting by then (`the presenter 2.71 s into
@@ -512,8 +512,8 @@ Stay borderless (the row under Window mode in F10 and the setup window while
 Borderless is chosen, Stay Borderless in PC Settings; off by default) keeps
 Borderless a window that the driver never makes exclusive fullscreen, frame
 generation's swapchain too, and applies at once: try it if the picture freezes
-for a few seconds while the game keeps running. On Linux and the Steam Deck
-the setting does nothing.
+for a few seconds while the game keeps running. Linux and the Steam Deck have
+no such setting: there is no exclusive fullscreen to disallow.
 
 AMD cards on Windows run slower in a window, where the game has to draw hidden
 objects too: use Borderless or Fullscreen, and leave Stay borderless off

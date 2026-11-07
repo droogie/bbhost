@@ -34,7 +34,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 17;  // 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 18;  // 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -783,7 +783,7 @@ Bytes build_option_movie(const Bytes& src) {
         for (auto& d : drops) a.drop.push_back(d);
         m = add_option_section(m, a);
     };
-    section("PCSetting", 116020, 383, kPcSettingSlots, kPcSettingSlots - 6, {});  // seven rows: one added, the Defaults label below it
+    section("PCSetting", 116020, 383, kPcSettingSlots, kPcSettingSlots - 6, {});  // on Windows seven rows: one added, the Defaults label below it
     section("PCGraphics", 117020, 384, 7, 1, {});  // seven rows: one added, the Defaults label below it
     section("PCControls", 118020, 385, 6, 0, {});
     section("PCKeys", 119020, 386, std::nullopt, 2, {});

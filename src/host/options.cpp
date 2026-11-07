@@ -209,12 +209,13 @@ Setting g_set[kSettingCount] = {
     // Windows: Borderless's swapchain tells the driver it may not make the
     // window exclusive fullscreen (host/window.cpp, exclusive_policy). Live: a
     // change makes the swapchain again. Shown while Window mode is Borderless
-    // (row_hidden); elsewhere it is kept and does nothing.
+    // (row_hidden). Elsewhere it does nothing and has no row; a value in the
+    // file is kept.
     {"stay_borderless", "Stay borderless", {"Off", "On"}, 0,
-     "Applies on Windows. On: Borderless stays a window - the graphics driver never switches it to exclusive "
-     "fullscreen. Try it if the picture freezes for a few seconds while the game keeps running, for example while "
-     "another window has focus. AMD cards: leave it off unless you need it - it may make the game draw hidden objects "
-     "too, which lowers the frame rate.", false},
+     "On: Borderless stays a window - the graphics driver never switches it to exclusive fullscreen. Try it if the "
+     "picture freezes for a few seconds while the game keeps running, for example while another window has focus. AMD "
+     "cards: leave it off unless you need it - it may make the game draw hidden objects too, which lowers the frame "
+     "rate.", false},
     {"vsync", "V-Sync", {"Off", "On"}, 1,
      "Off presents as soon as a frame is ready, and can tear.", false},
     // The game's own pace (engine/frame_rate.h), the same eleven the game's
@@ -644,7 +645,9 @@ Setting g_set[kSettingCount] = {
 const Row g_rows[] = {
     {Row::Header, "GAME"},
     {Row::Option, nullptr, kWindowMode},
-    {Row::Option, nullptr, kStayBorderless},
+#if defined(_WIN32)
+    {Row::Option, nullptr, kStayBorderless},  // it does nothing elsewhere
+#endif
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
