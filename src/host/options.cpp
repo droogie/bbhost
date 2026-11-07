@@ -153,6 +153,7 @@ enum SettingId {
     kRebirth,
     kFivePlayers,
     kSkillIssue,
+    kFullPhantomHp,
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
@@ -582,7 +583,7 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
-    // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
+    // bbhost.toml's [world] says otherwise. Off, all of them, is the game as it
     // shipped. (The Old Hunters, a fourth in v0.2.9, is always on: engine/patch_manifest.cpp.)
     {"change_appearance", "Hunter's Dream mirror", {"Off", "On"}, 1,
      "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
@@ -593,6 +594,8 @@ Setting g_set[kSettingCount] = {
     // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
     {"skill_issue", "SKILL ISSUE", {"Off", "On"}, 1, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
      true},
+    {"full_phantom_hp", "Full Phantom HP", {"Off", "On"}, 1,
+     "Requires a restart. Your full HP when summoned to another world; each visitor's own setting decides.", true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
     // in-game menus' follows the game's resolution (height / 900), the setup
@@ -698,6 +701,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
+    {Row::Option, nullptr, kFullPhantomHp},
     {Row::Header, "SETTINGS"},
     {Row::Option, nullptr, kMenuTextSize},
     {Row::Option, nullptr, kMenuHue},
@@ -1291,6 +1295,7 @@ void apply(int id) {
         case kRebirth:
         case kFivePlayers:
         case kSkillIssue:
+        case kFullPhantomHp:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
         case kMenuHue:
@@ -1462,6 +1467,7 @@ void rebuild_settings() {
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
     h.skill_issue = on_of(kSkillIssue);
+    h.full_phantom_hp = on_of(kFullPhantomHp);
     settings_store().publish(h);
 }
 
@@ -1549,6 +1555,7 @@ void host_options_load() {
     g_set[kRebirth].index = config().rebirth ? 1 : 0;
     g_set[kFivePlayers].index = config().five_players ? 1 : 0;
     g_set[kSkillIssue].index = config().skill_issue ? 1 : 0;
+    g_set[kFullPhantomHp].index = config().full_phantom_hp ? 1 : 0;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -1592,7 +1599,7 @@ void host_options_load() {
                          static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kTextureQuality), static_cast<int>(kShaders),
                          static_cast<int>(kChangeAppearance), static_cast<int>(kRebirth), static_cast<int>(kFivePlayers),
-                         static_cast<int>(kSkillIssue)})
+                         static_cast<int>(kSkillIssue), static_cast<int>(kFullPhantomHp)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");

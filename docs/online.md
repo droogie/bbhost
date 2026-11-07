@@ -55,6 +55,11 @@ is the in-game online name. F10 has the same account screen in game.
   30).
 - **Shorter summon timeouts**: a summon sign that cannot be answered gives up
   after 30 seconds instead of three minutes (`online.sign_timeout_seconds`).
+- **Full Phantom HP**: a cooperator or invader keeps their full max HP in the
+  host's world instead of the game's 70%. It is each visitor's own setting:
+  the host's changes nothing for the hunters in its world, and every game in
+  the session shows a visitor's HP as the visitor's own game has it. A PC
+  enhancement, on by default; switch it off for the game as it shipped.
 - **Modded worlds stay apart**: sessions with gameplay plugins (the
   randomizer, the boss rush, mutators) announce their rules to the server,
   which keeps their messages, bloodstains, signs and statistics separate from

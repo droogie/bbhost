@@ -388,6 +388,30 @@ int main() {
         CHECK(!config_frame_clock(false, true, &from));
         unsetenv("BBHOST_FRAME_CLOCK");
     }
+    // [world] full_phantom_hp, the PC enhancement Full Phantom HP: on when the
+    // file has no such key, as written otherwise; BBHOST_FULL_PHANTOM_HP=0 or 1
+    // over the file, and over the options file's choice at the start
+    // (config_set_enhancements), which wins otherwise.
+    {
+        unsetenv("BBHOST_FULL_PHANTOM_HP");
+        HostConfig c = load("[player]\nname = \"Hunter\"\n");
+        CHECK(c.full_phantom_hp && config().full_phantom_hp);
+        c = load("[world]\nfull_phantom_hp = false\n");
+        CHECK(!c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, true);
+        CHECK(config().full_phantom_hp);  // the options file's choice
+        setenv("BBHOST_FULL_PHANTOM_HP", "0", 1);
+        c = load("[world]\nfull_phantom_hp = true\n");
+        CHECK(!c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, true);
+        CHECK(!config().full_phantom_hp);  // the environment's, kept
+        setenv("BBHOST_FULL_PHANTOM_HP", "1", 1);
+        c = load("[world]\nfull_phantom_hp = false\n");
+        CHECK(c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, false);
+        CHECK(config().full_phantom_hp);
+        unsetenv("BBHOST_FULL_PHANTOM_HP");
+    }
     // The template a first start writes types in the window.
     {
         const fs::path t = g_dir / "template.toml";
