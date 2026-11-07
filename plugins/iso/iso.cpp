@@ -15,6 +15,7 @@
 //   cutaway = true      # roofs and walls between the view and the hunter faded out
 //   cutaway_size = 2.0  # the cone's tip, metres across, just above the hunter
 //   cutaway_spread = 0.6  # metres wider for each metre toward the view
+//   cutaway_objects = true  # the map's objects too, by the cone from halfway to the view
 //
 // Always on with the view: the omni-roll (4-way quicksteps, Modern Movement's
 // without its quick item), the lock-on at 60 m all round with 30 s out of
@@ -70,7 +71,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.4.4",
+    "0.5.0",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -95,13 +96,17 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "1.0", 0, 2.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
      "Roofs, ceilings and walls between the view and the hunter faded out: a cone above the hunter, widening toward the "
-     "view. Players, enemies and objects (and what they carry) are never cut. Each zoom step builds the map's shaders "
-     "for it once (a short pause the first time).",
+     "view. Players and enemies (and what they carry) are never cut. Each zoom step builds the map's shaders for it "
+     "once (a short pause the first time).",
      "true"},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_size", "Cutaway size", "Metres across the cone's tip, just above the hunter.", "2.0",
      0.5, 6},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_spread", "Cutaway spread",
      "How fast the cone widens toward the view: metres wider for each metre nearer it.", "0.6", 0, 1.5},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway_objects", "Cut objects",
+     "The map's objects - furniture, crates, lamps - cut too, by the same cone from halfway between the hunter and the "
+     "view: what hangs or stands high between them goes, what stands near the hunter stays.",
+     "true"},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
      "Seconds the view takes to catch up with the hunter (0: fixed to them).", "0.08", 0, 0.5},
     {0}};
@@ -126,7 +131,7 @@ constexpr std::uint64_t kCaves = 0x4000000;
 struct Settings {
     bool enabled = true;
     float pitch = 55.0f, distance = 14.0f, fov = 35.0f, height = 1.0f, follow = 0.08f, flatten = 0;
-    bool cutaway = true;
+    bool cutaway = true, cutaway_objects = true;
     float cutaway_size = 2.0f, cutaway_spread = 0.6f;
 } s;
 
@@ -235,6 +240,8 @@ void read_options() {
     s.cutaway = !cu || !*cu || truthy(cu);
     s.cutaway_size = number("iso.cutaway_size", 2.0f, 0.5f, 6);
     s.cutaway_spread = number("iso.cutaway_spread", 0.6f, 0, 1.5f);
+    const char* co = api->config("iso.cutaway_objects");
+    s.cutaway_objects = !co || !*co || truthy(co);
 }
 
 // The omni-roll: every site on, or the hooks back as the game had them (the
@@ -433,13 +440,16 @@ int sound_update_hook(BbHookCtx* c, void*) {
 
 // The cutaway (plugin API 23): a cone over the hunter, its tip `size` across
 // a little above the point looked at, widening `spread` metres a metre toward
-// the camera, faded at its edges - roofs, ceilings and near walls, never the
-// characters, the objects or their parts (the host tells them by the
-// G-buffer's stencil). Sent when its numbers change - each new set builds the
-// map's pipelines again - and off while another camera has the view.
+// the camera, faded at its edges - roofs, ceilings and near walls. The map's
+// objects (plugin API 24) by the same cone from halfway to the camera (Kyo):
+// the host cannot tell them from the characters, so the characters take it
+// too - out of reach of all but one standing high between the view and the
+// hunter. Sent when its numbers change - each new set builds the map's
+// pipelines again - and off while another camera has the view.
 constexpr float kCutHeight = 0.6f;   // metres over the point looked at before anything is cut
 constexpr float kCutMargin = 0.5f;   // metres in front of it
 constexpr float kCutFeather = 1.5f;  // metres it fades in over
+constexpr float kObjectCutStart = 0.5f;  // the objects' cone: its tip halfway to the camera
 void cutaway(float dist) {
     static BbCutaway sent{};
     static bool sent_any = false;
@@ -452,6 +462,12 @@ void cutaway(float dist) {
         want.height = kCutHeight;
         want.margin = kCutMargin;
         want.feather = kCutFeather;
+    }
+    static float sent_start = -2.0f;
+    const float start = want.radius > 0 && s.cutaway_objects ? kObjectCutStart : -1.0f;
+    if (start != sent_start && api->version >= 24 && api->size >= offsetof(BbHostApi, view_cutaway_objects) + sizeof(void*)) {
+        sent_start = start;
+        api->view_cutaway_objects(start);
     }
     if (sent_any && std::fabs(want.distance - sent.distance) < 0.125f && want.radius == sent.radius && want.widen == sent.widen &&
         want.pitch == sent.pitch)
