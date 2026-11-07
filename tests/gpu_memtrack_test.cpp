@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 
 #include "host/gpu_memtrack.h"
+#include "host/slow_calls.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -11,8 +12,8 @@
 #include <vector>
 
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb, VkDeviceMemory* out,
-                         const char* file, int line);
-void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
+                         const char* file, int line, const slow_calls::Site& site);
+void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb, const slow_calls::Site& site);
 void bb_memory_set_local_types(std::uint32_t types);
 std::uint64_t bb_memory_local_bytes();
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes);
@@ -29,6 +30,12 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMem
     return VK_SUCCESS;
 }
 extern "C" VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**) {
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+// What the allocations' timing (host/slow_calls.cpp) asks the rest of bbhost.
+std::uint64_t hle_gnm_flip_calls() { return 0; }
+bool host_thread_name(char*, std::size_t) { return false; }
 
 namespace {
 constexpr std::uint64_t kMiB = 1ull << 20;
@@ -40,13 +47,16 @@ void check(bool ok, const char* what) {
     }
 }
 
+constexpr slow_calls::Site kSite{slow_calls::kAllocateMemory, "src/host/fake.cpp", 1};
+constexpr slow_calls::Site kFreeSite{slow_calls::kFreeMemory, "src/host/fake.cpp", 2};
+
 VkDeviceMemory alloc(std::uint32_t type, std::uint64_t bytes, int line) {
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = bytes;
     mai.memoryTypeIndex = type;
     VkDeviceMemory m = VK_NULL_HANDLE;
-    if (bb_alloc_memory(VK_NULL_HANDLE, &mai, nullptr, &m, "src/host/fake.cpp", line) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (bb_alloc_memory(VK_NULL_HANDLE, &mai, nullptr, &m, "src/host/fake.cpp", line, kSite) != VK_SUCCESS) return VK_NULL_HANDLE;
     return m;
 }
 
@@ -92,8 +102,8 @@ int main() {
     check(local_peak == 75 * kMiB && device_peak == 77 * kMiB, "the peaks");
 
     // Freed: the owner's bytes go, its peak stays.
-    bb_free_memory(VK_NULL_HANDLE, b0, nullptr);
-    bb_free_memory(VK_NULL_HANDLE, a0, nullptr);
+    bb_free_memory(VK_NULL_HANDLE, b0, nullptr, kFreeSite);
+    bb_free_memory(VK_NULL_HANDLE, a0, nullptr, kFreeSite);
     v = bb_memory_owner_totals();
     mirrors = find(v, "mirrors");
     rings = find(v, "rings");
@@ -109,9 +119,9 @@ int main() {
     check(alloc(0, 3 * kMiB, 51) == VK_NULL_HANDLE, "past the test limit");
     check(bb_memory_local_bytes() == 3 * kMiB, "a refused allocation is not counted");
 
-    bb_free_memory(VK_NULL_HANDLE, a1, nullptr);
-    bb_free_memory(VK_NULL_HANDLE, a2, nullptr);
-    bb_free_memory(VK_NULL_HANDLE, s0, nullptr);
+    bb_free_memory(VK_NULL_HANDLE, a1, nullptr, kFreeSite);
+    bb_free_memory(VK_NULL_HANDLE, a2, nullptr, kFreeSite);
+    bb_free_memory(VK_NULL_HANDLE, s0, nullptr, kFreeSite);
     if (g_failures) return 1;
     std::printf("gpu_memtrack_test: ok\n");
     return 0;

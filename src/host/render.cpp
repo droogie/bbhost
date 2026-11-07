@@ -24649,7 +24649,9 @@ static bool draw_impl(const GpuDraw& d) {
             // pre-execution CPU state.
             flush_locked();
             {
+                static constexpr slow_calls::Site kDetailIdle{slow_calls::kQueueIdle, "a draw's detail"};
                 QueueGuard queue;
+                slow_calls::Scope timed(kDetailIdle);
                 vkQueueWaitIdle(g.queue);  // not the device: the presenter's queue is not ours to wait on
             }
             host_log("render: detail for %s: index_va=0x%llx type=%u count=%u", pl.name.c_str(),
@@ -29788,6 +29790,8 @@ void host_gpu_hang_report() {
         const char* const step = host_present_step(present_for);
         host_log("hang: %s; the presenting thread is %s (%.1f s); the renderer's lock is held by %s", submit_thread_report().c_str(), step,
                  present_for, GpuMutex::name_of(g.mu.holder()).c_str());
+        // Every thread in a timed driver call now, and for how long (host/slow_calls.h).
+        if (const std::string calls = slow_calls::in_calls_now(); !calls.empty()) host_log("hang: in calls now: %s", calls.c_str());
         // Where the command stream's recorder is (recorder.cpp).
         if (const std::string s = stream_last_op(); !s.empty()) host_log("hang: %s", s.c_str());
     }
@@ -30487,7 +30491,9 @@ void host_gpu_watch_display(std::uint64_t display_va) {
     // frame it named had already rotated out and nothing was written at all.
     flush_locked();
     if (sync_frame) {
+        static constexpr slow_calls::Site kSyncFrameIdle{slow_calls::kQueueIdle, "BBHOST_SYNC_FRAME"};
         QueueGuard queue;
+        slow_calls::Scope timed(kSyncFrameIdle);
         vkQueueWaitIdle(g.queue);
     }
 }

@@ -17,6 +17,7 @@
 #include "hle/wait_reg_mem.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 
 #include <atomic>
 #include <chrono>
@@ -4092,6 +4093,7 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(n > slow ? (g_cp_dispatch_ns[k].load() - slow_ns) / (n - slow) : 0));
     }
     host_gpu_report();
+    slow_calls::final_report();
     list_resolve::report(true);
     gxvk_lists::report(true);
     for (int op = 0; op < 256; ++op) {

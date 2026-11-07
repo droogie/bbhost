@@ -2880,6 +2880,11 @@ VkCommandBuffer shadow_end_uploads_locked() {
     return cmd;
 }
 
+// The mirrors' binds, for the slow-call registry (host/slow_calls.h): the
+// queue taken first (every submission handed over before it), then the bind.
+constexpr slow_calls::Site kBindLockSite{slow_calls::kQueueLock, "the buffer shadow's binds"};
+constexpr slow_calls::Site kBindSite{slow_calls::kBindSparse, "the buffer shadow's mirrors"};
+
 VkSemaphore shadow_bind_sparse_locked() {
     VkSparseBufferMemoryBindInfo infos[gcn::kDmemChunks];
     std::uint32_t n = 0;
@@ -2904,7 +2909,8 @@ VkSemaphore shadow_bind_sparse_locked() {
     bsi.pSignalSemaphores = sem ? &sem : nullptr;
     VkResult r;
     {
-        QueueGuard queue;
+        QueueGuard queue(kBindLockSite);
+        slow_calls::Scope timed(kBindSite);
         r = vkQueueBindSparse(g.queue, 1, &bsi, VK_NULL_HANDLE);
     }
     static int logs = 0;

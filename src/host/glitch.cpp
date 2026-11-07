@@ -312,7 +312,9 @@ bool ensure_chain_locked(std::uint32_t w, std::uint32_t h, VkFormat format) {
     if (g_chain.image && g_chain.w == w && g_chain.h == h && g_chain.format == format) return true;
     if (g_chain.image) {
         {
+            static constexpr slow_calls::Site kResizeIdle{slow_calls::kDeviceIdle, "the glitch check's resize"};
             QueueGuard queue;
+            slow_calls::Scope timed(kResizeIdle);
             vkDeviceWaitIdle(g.device);  // a size change: rare (a resolution option)
         }
         vkDestroyImage(g.device, g_chain.image, nullptr);

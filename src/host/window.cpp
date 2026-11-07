@@ -20,6 +20,7 @@
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 #include "log.h"
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -620,7 +621,11 @@ bool vk_create_swapchain() {
     } else if (old && framegen_wanted()) {
         // Frame generation switched on: AMD's swapchain takes no old one, and
         // the surface holds one at a time - ours goes first, its last present done.
-        vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        {
+            static constexpr slow_calls::Site kFgSwitchIdleSite{slow_calls::kQueueIdle, "our swapchain going for frame generation's"};
+            slow_calls::Scope timed(kFgSwitchIdleSite);
+            vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        }
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         old = VK_NULL_HANDLE;
         sci.oldSwapchain = VK_NULL_HANDLE;
@@ -846,6 +851,17 @@ void host_fps_frame_start() {
 
 namespace {
 
+// The presenter's driver calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kLastCopySite{slow_calls::kWaitFences, "the last copy"};
+constexpr slow_calls::Site kRebuildIdleSite{slow_calls::kDeviceIdle, "a swapchain rebuild"};
+constexpr slow_calls::Site kAcquireSite{slow_calls::kAcquireImage, "the presenter"};
+constexpr slow_calls::Site kAcquireAgainSite{slow_calls::kAcquireImage, "after a rebuild"};
+constexpr slow_calls::Site kAcquiredSite{slow_calls::kWaitFences, "the acquired image"};
+constexpr slow_calls::Site kOwnCopySite{slow_calls::kQueueSubmit, "the copy, on the presenter's queue"};
+constexpr slow_calls::Site kCopySite{slow_calls::kQueueSubmit, "the copy"};
+constexpr slow_calls::Site kCopyGpuSite{slow_calls::kWaitFences, "the copy on the GPU"};
+constexpr slow_calls::Site kPresentSite{slow_calls::kQueuePresent, "present"};
+
 // Which step of a present this thread is on, for the hang watchdog: a present
 // that never comes back stops the flips, and everything behind them.
 std::atomic<const char*> g_present_step{"idle"};
@@ -899,7 +915,10 @@ bool vk_present() {
     // next vblank, and holding the GPU lock across that stalls the command
     // processor - the game's own thread - for most of a frame.
     present_step("waiting for the last present");
-    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    {
+        slow_calls::Scope timed(kLastCopySite);
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    }
     host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
     // While the window is minimized nothing is acquired or presented (the
     // game's flips do not wait for this thread), and once it is back the
@@ -920,7 +939,10 @@ bool vk_present() {
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         vk_create_swapchain();
         host_gpu_unlock();
@@ -942,7 +964,11 @@ bool vk_present() {
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r;
+    {
+        slow_calls::Scope timed(kAcquireSite);
+        r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -960,7 +986,10 @@ bool vk_present() {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         host_gpu_lock();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         const bool remade = vk_create_swapchain();
         host_gpu_unlock();
@@ -968,6 +997,7 @@ bool vk_present() {
             return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
+        slow_calls::Scope timed(kAcquireAgainSite);
         r = (framegen_active() ? framegen_acquire : vkAcquireNextImageKHR)(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem,
                                                                                acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
@@ -980,9 +1010,9 @@ bool vk_present() {
         // that is a vblank away; this thread sleeps through it, and the
         // renderer's queue never waits for the display.
         present_step("waiting for the acquired image");
-        const auto t0 = std::chrono::steady_clock::now();
+        slow_calls::Scope timed(kAcquiredSite, 0, true);  // its clock reads the figure's too
         vkWaitForFences(g_vk.device, 1, &g_vk.acquire_fence, VK_TRUE, UINT64_MAX);
-        g_pstats.acquire_wait_us += us(t0, std::chrono::steady_clock::now());
+        g_pstats.acquire_wait_us += timed.end() / 1000;
     }
     // The frame: the newest the game has flipped, taken now - after the waits
     // above, which last a GPU frame when the GPU is behind - not before them.
@@ -1252,7 +1282,11 @@ bool vk_present() {
         own.pCommandBuffers = &g_vk.cmd;
         own.signalSemaphoreCount = 2;
         own.pSignalSemaphores = signals;
-        const VkResult sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        VkResult sr;
+        {
+            slow_calls::Scope timed(kOwnCopySite);
+            sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        }
         if (sr != VK_SUCCESS) {
             // Nothing waits for a copy that never went in (present_reads_wait).
             VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
@@ -1274,7 +1308,10 @@ bool vk_present() {
         host_gpu_wait_submitted(ticket);
     } else {
         host_gpu_queue_lock();
-        vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        {
+            slow_calls::Scope timed(kCopySite);
+            vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        }
         host_gpu_queue_unlock();
         host_gpu_unlock();
         locked = false;
@@ -1284,6 +1321,7 @@ bool vk_present() {
     // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
     if (g_vk.gpu_wait) {
         present_step("waiting for the frame on the GPU");
+        slow_calls::Scope timed(kCopyGpuSite);
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
     }
     const auto t_gpu_done = std::chrono::steady_clock::now();
@@ -1311,7 +1349,11 @@ bool vk_present() {
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    VkResult pr;
+    {
+        slow_calls::Scope timed(kPresentSite);
+        pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    }
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();

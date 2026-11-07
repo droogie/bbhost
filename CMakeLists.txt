@@ -172,6 +172,7 @@ add_executable(bbhost
   src/host/audio.cpp
   src/host/audio_crush.cpp
   src/host/frame_stats.cpp
+  src/host/slow_calls.cpp
   src/host/draw_digest.cpp
   src/host/perf_meter.cpp
   src/host/main_wait.cpp
@@ -652,6 +653,13 @@ if(UNIX)
   add_executable(wait_reg_mem_test tests/wait_reg_mem_test.cpp)
   target_include_directories(wait_reg_mem_test PRIVATE src)
   add_test(NAME wait_reg_mem_test COMMAND wait_reg_mem_test)
+  # The slow-call registry without the game: the line, the counts, the test
+  # hook and its lock, the cost of a timed call (tests/slow_calls_test.cpp).
+  add_executable(slow_calls_test tests/slow_calls_test.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
+  target_include_directories(slow_calls_test PRIVATE src)
+  target_link_libraries(slow_calls_test PRIVATE Threads::Threads)
+  add_test(NAME slow_calls_test COMMAND slow_calls_test)
+  set_tests_properties(slow_calls_test PROPERTIES TIMEOUT 60)
   # FMOD's sound-group ring guard without the game (tests/fmod_ring_test.cpp).
   add_executable(fmod_ring_test tests/fmod_ring_test.cpp)
   target_include_directories(fmod_ring_test PRIVATE src)
@@ -941,9 +949,9 @@ if(UNIX)
     add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
     # The device memory tracker's owners and heap classes, with the driver's
     # allocation calls faked (host/gpu_memtrack.h; tests/gpu_memtrack_test.cpp).
-    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp)
+    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
     target_include_directories(gpu_memtrack_test PRIVATE src)
-    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers)
+    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers Threads::Threads)
     add_test(NAME gpu_memtrack_test COMMAND gpu_memtrack_test)
   endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).

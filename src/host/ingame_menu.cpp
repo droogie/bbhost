@@ -12,6 +12,7 @@
 #include "host/options.h"
 #include "host/plugin_ui.h"
 #include "host/settings.h"
+#include "host/slow_calls.h"
 #include "log.h"
 
 #include "imgui.h"
@@ -916,9 +917,14 @@ bool build_frame(VkExtent2D extent) {
         for (ImTextureData* tex : *dd->Textures) uploads = uploads || tex->Status != ImTextureStatus_OK;
     }
     if (uploads) {
+        // A submission and a wait for the queue to go idle, inside ImGui's backend.
+        static constexpr slow_calls::Site kMenuUploads{slow_calls::kQueueIdle, "the menus' texture uploads"};
         host_gpu_queue_lock();
-        for (ImTextureData* tex : *dd->Textures) {
-            if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+        {
+            slow_calls::Scope timed(kMenuUploads);
+            for (ImTextureData* tex : *dd->Textures) {
+                if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+            }
         }
         host_gpu_queue_unlock();
     }
