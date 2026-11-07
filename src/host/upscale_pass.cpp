@@ -1869,8 +1869,13 @@ bool upscale_pass_hudless_due_locked() { return g_fg_pending != 0; }
 
 // The PS1's dither (plugin API 25 scene_dither, shaders/ps1_dither.comp) over
 // `t` - the HUD's target, the post chain done and the HUD not yet drawn -
-// into an image of our own and blitted back. A cell of the pattern is a pixel
-// of the 3D: the plugin's lines (scene_scale), else the scene's own size.
+// into an image of our own and put back. A cell of the pattern is a pixel of
+// the 3D: the plugin's lines (scene_scale), else the scene's own size.
+// Ours is in the target's own format where that can be a storage image (an
+// sRGB one as its UNORM, the encoded value stored), copied back: a third of
+// the memory traffic of RGBA16F and a blit - 16 MiB a frame at 1080p against
+// 40, which an integrated GPU's shared memory felt (0.6 ms in two runs of
+// three). RGBA16F and the blit where it cannot.
 void scene_dither_locked(RtImage& t, std::uint32_t bits) {
     static VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     static VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -1878,6 +1883,7 @@ void scene_dither_locked(RtImage& t, std::uint32_t bits) {
     static bool tried = false;
     static OwnImage out;
     static std::uint32_t out_w = 0, out_h = 0;
+    static VkFormat out_format = VK_FORMAT_UNDEFINED;
     if (!tried) {
         tried = true;
         const VkDescriptorSetLayoutBinding binds[3] = {
@@ -1913,11 +1919,28 @@ void scene_dither_locked(RtImage& t, std::uint32_t bits) {
         host_log("plugin: the PS1's dither pass %s", pipeline ? "ready" : "failed to build; no dither");
     }
     if (!pipeline || !t.image || !t.view) return;
-    if (out.image && (out_w != t.width || out_h != t.height)) drop(out);
+    const bool srgb = t.format == VK_FORMAT_R8G8B8A8_SRGB || t.format == VK_FORMAT_B8G8R8A8_SRGB;
+    // The target's format as ours, its sRGB as UNORM, where it can be stored to.
+    const VkFormat same = t.format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+                          : t.format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
+                                                                : t.format;
+    static VkFormat asked = VK_FORMAT_UNDEFINED;  // the last format asked about, and its answer
+    static bool storable = false;
+    if (same != asked) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.phys, same, &fp);
+        asked = same;
+        storable = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+    }
+    const bool copy = storable;
+    const VkFormat want = copy ? same : VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (out.image && (out_w != t.width || out_h != t.height || out_format != want)) drop(out);
     if (!out.image) {
-        if (!make(out, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, t.width, t.height)) return;
+        if (!make(out, want, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, t.width, t.height)) return;
         out_w = t.width;
         out_h = t.height;
+        out_format = want;
+        host_log("plugin: the PS1's dither into an image of its own, format %d, %s back", static_cast<int>(want), copy ? "copied" : "blitted");
     }
     const VkDescriptorSet set = alloc_set_locked(set_layout);
     if (!set) return;
@@ -1942,11 +1965,10 @@ void scene_dither_locked(RtImage& t, std::uint32_t bits) {
     vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
     std::uint32_t lines = 0;
     const float cell = scene_look_scale(&lines) && lines ? static_cast<float>(t.height) / static_cast<float>(lines) : 1.0f;
-    const bool srgb = t.format == VK_FORMAT_R8G8B8A8_SRGB || t.format == VK_FORMAT_B8G8R8A8_SRGB;
     struct {
         std::uint32_t size[4];
         float cell[4];
-    } pc{{t.width, t.height, srgb ? 1u : 0u, bits}, {cell, cell, 0.0f, 0.0f}};
+    } pc{{t.width, t.height, (srgb ? 1u : 0u) | (srgb && copy ? 2u : 0u), bits}, {cell, cell, 0.0f, 0.0f}};
     barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, out.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
@@ -1959,10 +1981,17 @@ void scene_dither_locked(RtImage& t, std::uint32_t bits) {
             VK_ACCESS_TRANSFER_READ_BIT);
     barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkImageBlit b{};
-    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.srcOffsets[1] = b.dstOffsets[1] = {static_cast<std::int32_t>(t.width), static_cast<std::int32_t>(t.height), 1};
-    vkCmdBlitImage(cb, out.image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    if (copy) {
+        VkImageCopy r{};
+        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.extent = {t.width, t.height, 1};
+        vkCmdCopyImage(cb, out.image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else {
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = b.dstOffsets[1] = {static_cast<std::int32_t>(t.width), static_cast<std::int32_t>(t.height), 1};
+        vkCmdBlitImage(cb, out.image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    }
     barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     out.initialised = true;
