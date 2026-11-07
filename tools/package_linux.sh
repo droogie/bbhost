@@ -3,7 +3,9 @@
 # counterpart of tools/win_package.sh: the binary without its DWARF, the patch
 # manifests it applies (patches/, looked for next to the binary), the plugin
 # header, the example config, DXC's release library for the HLSL shader path
-# with its licences (tools/fetch_dxc.sh), a README with what the machine must
+# with its licences (tools/fetch_dxc.sh), DLSS - the NGX bridge built beside the
+# binary and NVIDIA's DLSS runtime (tools/fetch_ngx.sh), each with its licence -
+# a README with what the machine must
 # have, a launcher that keeps a log file, and the empty data/, logs/ and
 # build/ (frame dumps) the run writes into: the release's Linux bundle. Nothing in it picks
 # a server: bbhost's defaults are the live server's (https://thehuntersdream.com).
@@ -42,6 +44,25 @@ cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# DLSS on an NVIDIA RTX card: bbhost's NGX bridge (MIT; it holds NVIDIA's NGX
+# SDK library), which bbhost loads from beside itself (host/upscaler.cpp), and
+# NVIDIA's DLSS runtime, pinned and unmodified (tools/fetch_ngx.sh), each with
+# its licence - never bbhost's GPL. A build without the bridge (BBHOST_NGX=OFF,
+# or NVIDIA's SDK not fetched) packs neither; BBHOST_PACKAGE_DLSS=0 leaves them
+# out of one that has it. tools/check_release_bundle.sh fails a release without
+# them, and tools/package_steamdeck.sh takes them out of the Steam Deck's kit
+# (an AMD GPU).
+bridge=$(dirname "$bin")/libbbhost_ngx_bridge.so
+dlss=0
+if [ "${BBHOST_PACKAGE_DLSS:-1}" != 0 ] && [ -f "$bridge" ]; then
+    cp "$bridge" "$dir/libbbhost_ngx_bridge.so"
+    mkdir -p "$dir/licenses/ngx_bridge" "$dir/licenses/upscaler_bridge"
+    cp src/ngx_bridge/LICENSE "$dir/licenses/ngx_bridge/LICENSE"
+    cp third_party/upscaler_bridge/LICENSE.txt "$dir/licenses/upscaler_bridge/LICENSE.txt"
+    tools/fetch_ngx.sh runtime "$dir"
+    dlss=1
+fi
+dlss_runtime=$(tools/fetch_ngx.sh --files)
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -79,6 +100,30 @@ echo "bbhost: config ${args[1]:-per-user}, log $(pwd)/$log"
 exit "${PIPESTATUS[0]}"
 EOF
 chmod +x "$dir/run-bbhost.sh"
+
+# The README's Upscaling section, where the package has DLSS.
+dlss_text=
+if [ "$dlss" = 1 ]; then
+    dlss_text="Upscaling
+  Graphics > Upscaling offers TAA, bbhost's own (any GPU), and on an NVIDIA
+  RTX card with NVIDIA's own driver, a recent one, DLSS: its quality from
+  Performance to DLAA, and its model (K, J, L or M). DLSS runs through these
+  files beside bbhost, each under its own licence; bbhost's licence permits
+  combining bbhost with them (LICENSE-EXCEPTION):
+    - $dlss_runtime:
+      NVIDIA DLSS, Copyright (C) NVIDIA Corporation, from the DLSS SDK
+      (https://github.com/NVIDIA/DLSS), unmodified, for NVIDIA RTX graphics
+      cards only; licence in licenses/dlss. bbhost is not sponsored or
+      endorsed by NVIDIA.
+    - libbbhost_ngx_bridge.so: bbhost's NGX bridge (MIT licence, in
+      licenses/ngx_bridge), which bbhost calls DLSS through; it contains
+      NVIDIA's NGX SDK library, under NVIDIA's licence too. It implements the
+      Upscaler Bridge API by Numity1504 (MIT, licenses/upscaler_bridge).
+  On another GPU DLSS is not offered, and the log says why. FSR 3, FSR 4 and
+  frame generation run on Windows only.
+
+"
+fi
 
 cat > "$dir/README-linux.txt" <<EOF
 bbhost for Linux, build $name
@@ -126,7 +171,7 @@ window's Shaders tab compiles them all at once (Compile shaders now), and its
 Shaders setting picks Lifted to keep the translator's own. Without it that
 path keeps every shader as it was; nothing else uses it.
 
-Setup
+${dlss_text}Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run
   ./run-bbhost.sh from a terminal there. The first time, the setup window
   opens: pick the game folder and the decrypted eboot with the Browse buttons
@@ -222,6 +267,7 @@ stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
 cp -r "$dir" "$stage/"
 find "$stage" -type d -exec chmod 755 {} + && find "$stage" -type f -exec chmod 644 {} +
 chmod 755 "$stage/$name/bbhost" "$stage/$name/run-bbhost.sh"
+[ "$dlss" = 0 ] || chmod 755 "$stage/$name/libbbhost_ngx_bridge.so" "$stage/$name/$dlss_runtime"
 rm -f "$out/$name.tar.gz"
 tar czf "$out/$name.tar.gz" -C "$stage" --owner=0 --group=0 "$name"
 echo "package: $out/$name.tar.gz ($(( $(stat -c %s "$out/$name.tar.gz") / 1048576 )) MB); symbols: $out/$name.debug"

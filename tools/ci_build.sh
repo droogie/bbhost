@@ -99,6 +99,10 @@ fi
 # against its pins every run.
 DXC_CACHE=$P/dxc-cache tools/fetch_dxc.sh linux "$P/dxc" > "$W/dxc.log" 2>&1 || { cat "$W/dxc.log"; exit 1; }
 tail -1 "$W/dxc.log"
+# NVIDIA's NGX SDK for the NGX bridge (DLSS on Linux), which the configure step
+# fetches pinned (tools/fetch_ngx.sh): kept in the prefix too, beside the DLSS
+# runtime the Linux package takes from there.
+export NGX_CACHE=${NGX_CACHE:-$P/ngx-cache}
 
 # bbhost, its tools and tests.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig

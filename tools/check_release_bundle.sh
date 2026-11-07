@@ -78,6 +78,33 @@ while IFS= read -r exe; do
         [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
     done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
+# DLSS on Linux beside each Linux executable: bbhost's NGX bridge and NVIDIA's
+# pinned runtime, with their licences (tools/fetch_ngx.sh; without them the
+# release has no DLSS on Linux) - and none of it in a Steam Deck kit, whose GPU
+# is AMD's. NVIDIA's NGX code is in the bridge alone, never in bbhost.
+fetch_ngx=$(dirname "$0")/fetch_ngx.sh
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    if grep -aq 'NVSDK_NGX_VULKAN_Init' "$exe"; then fail "${exe#"$work"/}: NVIDIA's NGX code in bbhost itself"; fi
+    case "$b" in
+        */bbhost-steamdeck-*)
+            if ls "$b" | grep -E '^libbbhost_ngx_bridge\.so$|^libnvidia-ngx-dlss'; then fail "${b#"$work"/}: DLSS's files in a Steam Deck kit"; fi
+            for l in dlss ngx_bridge upscaler_bridge; do
+                [ ! -e "$b/licenses/$l" ] || fail "${b#"$work"/}: licenses/$l in a Steam Deck kit"
+            done
+            ;;
+        *)
+            [ -f "$b/libbbhost_ngx_bridge.so" ] || fail "${b#"$work"/}: no libbbhost_ngx_bridge.so beside bbhost (the NGX bridge: BBHOST_NGX, tools/fetch_ngx.sh)"
+            for f in $("$fetch_ngx" --files); do
+                [ -f "$b/$f" ] || fail "${b#"$work"/}: no $f beside bbhost (tools/fetch_ngx.sh)"
+                [ "$(sha256sum "$b/$f" | cut -d' ' -f1)" = "$("$fetch_ngx" --sha256 "$f")" ] || fail "${b#"$work"/}/$f: not the pinned file"
+            done
+            for l in dlss/LICENSE.txt ngx_bridge/LICENSE upscaler_bridge/LICENSE.txt; do
+                [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
+            done
+            ;;
+    esac
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost)
 # What a first start writes (core/config.cpp's template), in each executable.
 for b in "$d"/bbhost "$d"/bbhost.exe; do
     [ -f "$b" ] || continue
@@ -88,4 +115,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones with FidelityFX, DLSS and the upscaler bridge"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones with FidelityFX, DLSS and the upscaler bridge; the Linux ones with DLSS and the NGX bridge, the Steam Deck's without"
