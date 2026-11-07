@@ -90,6 +90,7 @@ struct Setting {
 
 enum SettingId {
     kWindowMode,
+    kStayBorderless,
     kVsync,
     kFrameCap,
     kFrameCapCustom,
@@ -194,9 +195,26 @@ Setting g_set[kSettingCount] = {
     // Borderless was this setting's Fullscreen until 2026-11-04 (an older
     // file's Fullscreen reads as Borderless: host_options_load).
     {"window_mode", "Window mode", {"Windowed", "Borderless", "Fullscreen"}, 0,
+#if defined(_WIN32)
+     "Windowed is a window you can move and resize. Borderless fills the screen at the desktop's resolution and "
+     "switches away at once; the graphics driver may still make it exclusive fullscreen (Stay borderless keeps it a "
+     "window). Fullscreen takes the display over at the mode nearest the Resolution, which can change the screen's "
+     "resolution. AMD cards: use Borderless or Fullscreen - in a window the game has to draw hidden objects too and "
+     "runs slower.",
+#else
      "Borderless fills the screen at the desktop's resolution and switches away at once. Fullscreen takes the display "
      "over at the mode nearest the Resolution, which can change the screen's resolution.",
+#endif
      false},
+    // Windows: Borderless's swapchain tells the driver it may not make the
+    // window exclusive fullscreen (host/window.cpp, exclusive_policy). Live: a
+    // change makes the swapchain again. Shown while Window mode is Borderless
+    // (row_hidden); elsewhere it is kept and does nothing.
+    {"stay_borderless", "Stay borderless", {"Off", "On"}, 0,
+     "Applies on Windows. On: Borderless stays a window - the graphics driver never switches it to exclusive "
+     "fullscreen. Try it if the picture freezes for a few seconds while the game keeps running, for example while "
+     "another window has focus. AMD cards: leave it off unless you need it - it may make the game draw hidden objects "
+     "too, which lowers the frame rate.", false},
     {"vsync", "V-Sync", {"Off", "On"}, 1,
      "Off presents as soon as a frame is ready, and can tear.", false},
     // The game's own pace (engine/frame_rate.h), the same eleven the game's
@@ -626,6 +644,7 @@ Setting g_set[kSettingCount] = {
 const Row g_rows[] = {
     {Row::Header, "GAME"},
     {Row::Option, nullptr, kWindowMode},
+    {Row::Option, nullptr, kStayBorderless},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
@@ -1138,6 +1157,7 @@ void apply(int id) {
             if (live_resolution_available() && w && h && cw && ch && (cw != w || ch != h)) live_resolution_request(w, h, false);
             break;
         }
+        case kStayBorderless: host_window_set_stay_borderless(reads_on(s, s.index)); break;
         case kVsync: host_window_set_vsync(reads_on(s, s.index)); break;
         case kFrameGeneration: {
             // AMD's swapchain made or dropped at the presenter's next frame
@@ -1392,6 +1412,7 @@ int index_of(int id) { return g_set[id].index; }
 void rebuild_settings() {
     HostSettings h;
     h.fullscreen = index_of(kWindowMode) != 0;  // Borderless or Fullscreen
+    h.stay_borderless = on_of(kStayBorderless);
     h.vsync = on_of(kVsync);
     h.frame_cap = frame_rate_now();
     h.frame_clock = on_of(kFrameClock);
@@ -2383,6 +2404,7 @@ bool row_hidden(int id) {
     if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
     if (id == kTaaStrength) return shown_index(kUpscaler) != 1;  // (TAA's alone)
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
+    if (id == kStayBorderless) return shown_index(kWindowMode) != 1;  // (Borderless's alone)
     return false;
 }
 
