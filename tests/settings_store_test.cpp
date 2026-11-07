@@ -48,6 +48,8 @@ void listener_count(const HostSettings& h) {
 
 // What the shader patches link against (host/settings.h), served by this store.
 void host_settings_listen(HostSettingsListener fn) { store().listen(fn); }
+// Motion vectors as the settings have them (host/options.cpp): not rebuilt.
+int host_opt_motion_rebuilt_bits() { return 0; }
 
 int main() {
     // The first snapshot: the defaults, numbered 1.
