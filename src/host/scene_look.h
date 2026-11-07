@@ -46,6 +46,10 @@ bool scene_look_nearest();
 void scene_look_set_scale(bool nearest, std::uint32_t lines);
 bool scene_look_scale(std::uint32_t* lines = nullptr);
 
+// The finished picture dithered to `bits` a channel before the HUD (plugin
+// API 25, host/upscale_pass.cpp scene_dither_locked): 0 off.
+void scene_look_set_dither(std::uint32_t bits);
+std::uint32_t scene_look_dither();
 // The scene's colour targets RGBA8.
 void scene_look_set_colour_8bit(bool on);
 bool scene_look_colour_8bit();

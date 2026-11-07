@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 24
+#define BB_PLUGIN_API_VERSION 25
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -623,6 +623,12 @@ typedef struct BbHostApi {
      * as view_cutaway2 sets it. Below 0 (the default) the objects are never
      * cut. Any thread. */
     void (*view_cutaway_objects)(float start);
+    /* Version 25: the finished picture - the 3D and its post effects, before
+     * the HUD and the menus are drawn over it - rounded to `bits` a channel
+     * through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a pixel
+     * of the 3D (scene_scale's lines: as coarse as the 3D). 5 is the PS1's
+     * 15-bit colour; 0 (the default) off. Any thread. */
+    void (*scene_dither)(uint32_t bits);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

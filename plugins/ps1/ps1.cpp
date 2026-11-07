@@ -10,6 +10,7 @@
 //   look_3d = true         # the PS1 look below (false: the game's own picture, the sound alone)
 //   snap = "240p"          # the grid the vertices land on: Off, 480p/360p/240p/120p
 //   colour_8bit = true     # the 3D's colour targets RGBA8 (and the colour grading unsmoothed)
+//   dither = true          # the picture in 15-bit colour through the PS1's 4x4 dither, before the HUD
 //   unfiltered = true      # the 3D's textures sampled nearest: no bilinear, trilinear or anisotropic filtering
 //   resolution = "Native"  # the 3D's size: Native (the Resolution setting, at most the window's), or 480p/360p/240p
 //   sound = "Off"          # old-hardware sound: Off, PS1, Crunchy or Custom
@@ -60,6 +61,14 @@
 // sampled nearest as well (grading_filter), and the grading steps from entry
 // to entry, 16 shades a channel.
 //
+// Dithering (scene_dither, API 25). The PS1's GPU drew in 15-bit colour, 5
+// bits a channel, and dithered its shading down to it with a 4x4 ordered
+// pattern: the fine cross-hatch over its gradients. The host rounds the
+// finished picture - the 3D and its post effects, before the HUD - to 5 bits
+// a channel through the same matrix, a cell of it a pixel of the 3D (at 240p
+// as coarse as the PS1's). On by default; on a host before API 25 it does
+// nothing.
+//
 // The 3D's size (scene_scale). While the plugin is on the 3D is drawn at the
 // Resolution and the game, its HUD and menus at the window's size, and the 3D
 // is brought up to the window texel for texel, with no smoothing: no upscaler
@@ -92,7 +101,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "ps1",
     "Bloodborne PS1",
-    "0.3.3",
+    "0.4.0",
     "Kyo",
     "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
     "native. Optionally the sound of an old console's sound chip. Turns on and off in the game.",
@@ -112,6 +121,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL | BB_OPT_LIVE, "colour_8bit", "8-bit colour",
      "The 3D's colour in 8 bits a channel, as the rgba8f patch makes it: the lighting bands and clips at white. The colour "
      "grading steps between its entries too, where it is smooth without it.",
+     "true"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "dither", "Dithering",
+     "The picture in the PS1's 15-bit colour, its gradients dithered with its 4x4 pattern - the fine cross-hatch over its "
+     "shading - in cells of the 3D's pixels. The HUD and the menus are not dithered.",
      "true"},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "resolution", "Resolution",
      "The 3D's resolution, brought up to the window pixel for pixel; the HUD and menus stay at the window's. Native: the "
@@ -165,6 +178,13 @@ void set_colour_8bit(bool on) {
 }
 void set_resolution(const char* v) { api->scene_scale(BB_SCALE_NEAREST, lines_of(v)); }
 
+bool has_dither(const BbHostApi* host) {
+    return host->version >= 25 && host->size >= offsetof(BbHostApi, scene_dither) + sizeof(void*) && host->scene_dither;
+}
+void set_dither(bool on) {
+    if (has_dither(api)) api->scene_dither(on ? 5 : 0);
+}
+
 // The PS1 look: on with the plugin and its "PS1 look".
 bool look_on() { return g_on && truthy(option("ps1.look_3d", "true")); }
 
@@ -177,6 +197,7 @@ void apply_look() {
         api->scene_colour_bits(0);
         api->grading_filter(BB_FILTER_AS_IS);
         api->scene_scale(BB_SCALE_AS_IS, 0);
+        set_dither(false);
         return;
     }
     // config()'s text lasts until the next call: each value copied first.
@@ -186,6 +207,7 @@ void apply_look() {
     set_colour_8bit(colour_8bit);
     set_unfiltered(unfiltered);
     set_snap(snap.c_str());
+    set_dither(truthy(option("ps1.dither", "true")));
 }
 
 // Old-hardware sound: the choice and Custom's rate and bits, kept so a change
@@ -250,6 +272,7 @@ void on_option(const char* key, const char* value, void*) {
     } else if (std::strcmp(key, "snap") == 0) set_snap(value);
     else if (std::strcmp(key, "unfiltered") == 0) set_unfiltered(truthy(value));
     else if (std::strcmp(key, "colour_8bit") == 0) set_colour_8bit(truthy(value));
+    else if (std::strcmp(key, "dither") == 0) set_dither(truthy(value));
     else if (std::strcmp(key, "resolution") == 0) set_resolution(value);
 }
 
@@ -281,6 +304,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         host->scene_colour_bits(0);
         host->grading_filter(BB_FILTER_AS_IS);
         host->scene_scale(BB_SCALE_AS_IS, 0);
+        if (has_dither(host)) host->scene_dither(0);
         if (has_audio_crush(host)) host->audio_crush(0, 0, 0.0f);
         host->log("ps1: not the 1.09 eboot; off");
         return 1;
@@ -295,9 +319,11 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     const bool unfiltered = truthy(option("ps1.unfiltered", "true")), colour_8bit = truthy(option("ps1.colour_8bit", "true"));
     const bool look = look_on();
     if (look) {
-        host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, the 3D at %s, sound %s", snap.c_str(),
+        const bool dither = truthy(option("ps1.dither", "true"));
+        host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, %s, the 3D at %s, sound %s", snap.c_str(),
                   unfiltered ? "unfiltered" : "as the game filters them", colour_8bit ? "8-bit" : "as the game makes it",
-                  resolution.c_str(), has_audio_crush(host) ? g_sound.choice.c_str() : "as it is (needs plugin API 21)");
+                  !dither ? "no dither" : has_dither(host) ? "dithered to 15-bit" : "no dither (needs plugin API 25)", resolution.c_str(),
+                  has_audio_crush(host) ? g_sound.choice.c_str() : "as it is (needs plugin API 21)");
     } else {
         host->log("ps1: Bloodborne PS1 on: the game's own picture, sound %s",
                   has_audio_crush(host) ? g_sound.choice.c_str() : "as it is (needs plugin API 21)");

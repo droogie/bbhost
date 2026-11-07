@@ -1,0 +1,43 @@
+#version 450
+// The PS1's colour (host/upscale_pass.cpp scene_dither_locked, plugin API 25
+// scene_dither): the finished picture - the 3D and its post effects, before
+// the HUD - rounded to `bits` a channel (5: the PS1's 15-bit colour) through
+// its GPU's 4x4 ordered dither, in cells of the 3D's pixels (`cell` window
+// pixels a side: 240p at 1080 is 4.5), so the pattern is as coarse as the 3D.
+// The PS1 added the matrix's -4..3 to each 8-bit channel, then kept its top
+// five bits; here the offset is scaled to the step of `bits`. An sRGB target
+// is read as light: rounded as its encoded value, as the PS1's DAC saw it.
+// Written to an image of our own (RGBA16F), blitted back over the target.
+//
+// Compiled offline (tools/build_shaders.sh) into ps1_dither.spv.h.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Params {
+    uvec4 size;  // x, y: the target's width and height; z: 1 an sRGB target; w: the bits a channel
+    vec4 cell;   // x, y: the window pixels a 3D pixel spans across and down
+};
+
+layout(set = 0, binding = 0) uniform texture2D src;
+layout(set = 0, binding = 1) uniform sampler any_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst;
+
+// The PS1 GPU's dither matrix, its offsets in 8-bit steps.
+const float kMatrix[16] = float[16](-4.0, 0.0, -3.0, 1.0, 2.0, -2.0, 3.0, -1.0, -3.0, 1.0, -4.0, 0.0, 3.0, -1.0, 2.0, -2.0);
+
+vec3 to_srgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c)); }
+vec3 to_linear(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c)); }
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) return;
+    const vec4 in_c = texelFetch(sampler2D(src, any_sampler), p, 0);
+    vec3 c = clamp(in_c.rgb, 0.0, 1.0);
+    if (size.z != 0u) c = to_srgb(c);
+    // The 3D pixel this window pixel shows, and its place in the matrix.
+    const ivec2 q = ivec2(floor((vec2(p) + 0.5) / max(cell.xy, vec2(1.0))));
+    const float levels = exp2(float(size.w)) - 1.0;  // 31 for 5 bits
+    const float offset = kMatrix[(q.y & 3) * 4 + (q.x & 3)] / 8.0;  // -0.5 .. 0.375 of a step
+    c = floor(clamp(c * levels + 0.5 + offset, 0.0, levels)) / levels;
+    if (size.z != 0u) c = to_linear(c);
+    imageStore(dst, p, vec4(c, in_c.a));
+}

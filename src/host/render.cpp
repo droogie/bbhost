@@ -26083,10 +26083,12 @@ static bool draw_impl(const GpuDraw& d) {
     // into that target first. So the target is learned from that pass, copied
     // before its first triangle-list draw (the HUD's) once the post chain's
     // last passes have written it, and the copy handed over with the display
-    // buffer the pass then writes.
-    if (upscale_pass_hudless_due_locked() && s.color[0]) {
+    // buffer the pass then writes. A plugin's dither (scene_dither) goes over
+    // the target at the same point, before the copy.
+    const std::uint32_t dither = scene_look_dither();
+    if ((upscale_pass_hudless_due_locked() || dither) && s.color[0]) {
         static std::uint64_t hud_target = 0;
-        static bool target_written = false;
+        static bool target_written = false, hud_begun = false;
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
             if (s.rect) {
@@ -26099,20 +26101,23 @@ static bool draw_impl(const GpuDraw& d) {
                         break;
                     }
                 }
-                upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
+                if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
             target_written = false;
+            hud_begun = false;
         } else if (dst == hud_target) {
             // The post chain's last passes write it as strips (prim 6) or
             // rects; the HUD's first draw is a triangle list (prim 4).
             if (s.prim != 4) {
                 target_written = true;
-            } else if (target_written && !upscale_pass_hudless_copied_locked()) {
+            } else if (target_written && !hud_begun) {
                 if (part) {
                     run_part_stop(kRunStopOrder);
                     return false;
                 }
-                upscale_pass_hudless_locked(*s.color[0]);
+                hud_begun = true;
+                if (dither) scene_dither_locked(*s.color[0], dither);
+                if (upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked()) upscale_pass_hudless_locked(*s.color[0]);
             }
         }
     }

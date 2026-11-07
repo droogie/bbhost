@@ -66,10 +66,12 @@
 #include "host/shaders/capture_motion_vert.spv.h"
 #include "host/shaders/motion_check.spv.h"
 #include "host/shaders/motion_view.spv.h"
+#include "host/shaders/ps1_dither.spv.h"
 #include "host/shaders/taa_resolve.spv.h"
 #include "host/shaders/upscale_embers.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
 #include "log.h"
@@ -1864,6 +1866,111 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
 }
 
 bool upscale_pass_hudless_due_locked() { return g_fg_pending != 0; }
+
+// The PS1's dither (plugin API 25 scene_dither, shaders/ps1_dither.comp) over
+// `t` - the HUD's target, the post chain done and the HUD not yet drawn -
+// into an image of our own and blitted back. A cell of the pattern is a pixel
+// of the 3D: the plugin's lines (scene_scale), else the scene's own size.
+void scene_dither_locked(RtImage& t, std::uint32_t bits) {
+    static VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkPipeline pipeline = VK_NULL_HANDLE;
+    static bool tried = false;
+    static OwnImage out;
+    static std::uint32_t out_w = 0, out_h = 0;
+    if (!tried) {
+        tried = true;
+        const VkDescriptorSetLayoutBinding binds[3] = {
+            {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sli.bindingCount = 3;
+        sli.pBindings = binds;
+        VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &set_layout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &range;
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smi.codeSize = sizeof(k_ps1_dither_spv);
+        smi.pCode = k_ps1_dither_spv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &set_layout) == VK_SUCCESS &&
+            vkCreatePipelineLayout(g.device, &pli, nullptr, &layout) == VK_SUCCESS &&
+            vkCreateShaderModule(g.device, &smi, nullptr, &module) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = module;
+            ci.stage.pName = "main";
+            ci.layout = layout;
+            if (vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &pipeline) != VK_SUCCESS) pipeline = VK_NULL_HANDLE;
+            vkDestroyShaderModule(g.device, module, nullptr);
+        }
+        host_log("plugin: the PS1's dither pass %s", pipeline ? "ready" : "failed to build; no dither");
+    }
+    if (!pipeline || !t.image || !t.view) return;
+    if (out.image && (out_w != t.width || out_h != t.height)) drop(out);
+    if (!out.image) {
+        if (!make(out, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, t.width, t.height)) return;
+        out_w = t.width;
+        out_h = t.height;
+    }
+    const VkDescriptorSet set = alloc_set_locked(set_layout);
+    if (!set) return;
+    begin_recording_locked();
+    if (t.view_clear) view_clear_apply_locked(t);
+    render_end_pass_locked();
+    VkCommandBuffer cb = g_cmd();
+    const VkDescriptorImageInfo infos[3] = {
+        {VK_NULL_HANDLE, t.view, VK_IMAGE_LAYOUT_GENERAL},
+        {g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
+        {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
+    };
+    VkWriteDescriptorSet wr[3] = {};
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = k;
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = k == 0 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : k == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[k].pImageInfo = &infos[k];
+    }
+    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    std::uint32_t lines = 0;
+    const float cell = scene_look_scale(&lines) && lines ? static_cast<float>(t.height) / static_cast<float>(lines) : 1.0f;
+    const bool srgb = t.format == VK_FORMAT_R8G8B8A8_SRGB || t.format == VK_FORMAT_B8G8R8A8_SRGB;
+    struct {
+        std::uint32_t size[4];
+        float cell[4];
+    } pc{{t.width, t.height, srgb ? 1u : 0u, bits}, {cell, cell, 0.0f, 0.0f}};
+    barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, out.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cb, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+    barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = b.dstOffsets[1] = {static_cast<std::int32_t>(t.width), static_cast<std::int32_t>(t.height), 1};
+    vkCmdBlitImage(cb, out.image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    out.initialised = true;
+    static std::uint32_t told = 0;
+    if (told != bits) host_log("plugin: the picture dithered to %u bits a channel, %ux%u in cells of %.2f pixels", bits, t.width, t.height,
+                               static_cast<double>(cell));
+    told = bits;
+}
 
 void upscale_pass_hudless_locked(RtImage& display) {  // `display`: the HUD's target
     if (!g_fg_pending) return;

@@ -252,6 +252,11 @@ gives the Binary Ninja address.
   every frame: each new set makes the map's pipelines again. NULL or radius 0
   turns it off. The Isometric plugin's Cutaway; it costs a third of a
   millisecond of GPU time a frame at 1080p.
+- `scene_dither(bits)` (v25): the finished picture - the 3D and its post
+  effects, before the HUD and the menus are drawn over it - rounded to `bits`
+  a channel through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a
+  pixel of the 3D (`scene_scale`'s lines). 5 is the PS1's 15-bit colour; 0,
+  the default, off. The Bloodborne PS1's Dithering.
 - The 3D's look (v18): how the camera's draws - the world, its characters, the
   sky and the effects, the draws with the scene's depth that are not
   full-screen rect lists - are drawn; the shadow maps, the post-processing and

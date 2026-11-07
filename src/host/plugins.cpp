@@ -1251,6 +1251,13 @@ void api_view_cutaway_objects(float start) {
         host_log("plugin: the map's objects cut too, by the same cone from %.2f of the way to the camera", static_cast<double>(start));
 }
 
+// Version 25: the PS1's dither over the finished picture (host/scene_look.h).
+void api_scene_dither(std::uint32_t bits) {
+    scene_look_set_dither(bits);
+    if (scene_look_dither()) host_log("plugin: the picture dithered to %u bits a channel before the HUD", scene_look_dither());
+    else host_log("plugin: the picture not dithered");
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1283,6 +1290,7 @@ const BbHostApi g_api = {
     &api_view_cutaway,
     &api_view_cutaway2,
     &api_view_cutaway_objects,
+    &api_scene_dither,
 };
 
 std::string read_file(const std::string& path) {

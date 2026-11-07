@@ -85,6 +85,9 @@ void scene_look_set_object_cut(float start) {
     g_object_cut.store(start >= 0.0f && start < 1.0f ? std::round(start * 20.0f) / 20.0f : -1.0f, std::memory_order_relaxed);
 }
 float scene_look_object_cut() { return g_object_cut.load(std::memory_order_relaxed); }
+std::atomic<std::uint32_t> g_dither{0};
+void scene_look_set_dither(std::uint32_t bits) { g_dither.store(bits >= 1 && bits <= 8 ? bits : 0, std::memory_order_relaxed); }
+std::uint32_t scene_look_dither() { return g_dither.load(std::memory_order_relaxed); }
 
 bool scene_look_pixel_cut(PixelCut* out) {
     if (!g_pixel_cut_on.load(std::memory_order_acquire)) return false;

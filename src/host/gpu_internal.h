@@ -1936,6 +1936,8 @@ std::uint64_t upscale_velo_frame();
 // was prepared and its copy is still to make, and the copy of the display
 // buffer `display` as it is now, before the HUD's first draw into it.
 bool upscale_pass_hudless_due_locked();
+// A plugin's dither (scene_dither) over the HUD's target before the HUD.
+void scene_dither_locked(RtImage& t, std::uint32_t bits);
 void upscale_pass_hudless_locked(RtImage& display);
 // The copy made this frame, and handing it over with the display buffer the
 // HUD's target then goes to (the frame's prepare done with).
