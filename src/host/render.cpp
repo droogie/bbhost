@@ -3188,9 +3188,6 @@ struct DrawState {
     // Which bound target each of its outputs 0-5 goes to, 3 bits each
     // (gbuffer_targets): the G-buffer is not always bound in one order.
     std::uint32_t gbuffer_slots = kGbufferSlotsAsBound;
-    // Its target 3's alpha, times 255 (gbuffer_group_take): the frame's light
-    // and fog group, as the game's own G-buffer draws write theirs.
-    int gbuffer_group = 0;
 };
 
 // BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
@@ -6343,101 +6340,6 @@ std::uint32_t gbuffer_slots(const DrawState& s) {
     return slots;
 }
 
-// The light and fog group. The map's and the objects' G-buffer shaders write
-// target 3's alpha as their instance's byte / 255 (cbInstanceData's first
-// dword), and the lighting reads it back as an index: the composite into
-// cbFog (x6: the fog), the directional light (8747a367+d92266b9) into cbLight
-// (x18: the sun's or the moon's colour and direction). The game numbers the
-// frame's groups afresh each frame - the Hunter's Dream hall's objects had 1,
-// 2, 4, 1, 3, 3 in six - so no fixed number holds one: a plugin's G-buffer
-// draw that wrote 0 was lit by whichever group came first that frame (the
-// "lit by the game" flicker, two or three brightnesses, and a sun from
-// another area's direction: the walls blown out at some angles). So each of
-// the frame's G-buffer draws counts its byte, and a plugin's takes the map's
-// (gbuffer_group_take). Lo-Hit's is
-// played after the frame's objects (render_queue_chunk_job cuts the chunk at
-// its pass) and in order (run parts stop at it), so they are counted first.
-// Where a pixel program reads its group (cbInstanceData's slot, -1 none), and
-// whether it is the map's: lightmapped (g_DOLTexture), as the map's pieces'
-// shaders are (6a833138+bb10e440 and its kin).
-struct GroupSlot {
-    int slot = -1;
-    bool map = false;
-};
-std::mutex g_group_slots_mu;
-std::unordered_map<std::string, GroupSlot> g_group_slots;  // by pixel program
-// Since the last take: each group's draws, the map's pieces' apart.
-std::atomic<std::uint32_t> g_group_counts[256] = {}, g_group_map_counts[256] = {};
-std::mutex g_group_take_mu;
-int g_group_last = -1;                 // the last one taken
-std::uint32_t g_group_last_total = 0;  // the draws the last whole take counted
-std::uint64_t g_group_last_flip = 0;   // at that flip
-GroupSlot group_slot(const std::string& ps_name) {
-    {
-        std::lock_guard<std::mutex> lk(g_group_slots_mu);
-        if (const auto it = g_group_slots.find(ps_name); it != g_group_slots.end()) return it->second;
-    }
-    GroupSlot gs;
-    if (const std::shared_ptr<const gcn::ShaderReflection> r = reflection_for(ps_name)) {
-        for (const gcn::ReflectedResource& res : r->resources) {
-            if ((res.type & 0xff) == gcn::kResourceConstantBuffer && res.name == "cbInstanceData" && res.slot < 14)
-                gs.slot = static_cast<int>(res.slot);
-            if ((res.type & 0xff) != gcn::kResourceConstantBuffer && res.name == "g_DOLTexture") gs.map = true;
-        }
-    }
-    std::lock_guard<std::mutex> lk(g_group_slots_mu);
-    g_group_slots.emplace(ps_name, gs);
-    return gs;
-}
-// A game G-buffer draw's group, counted: its first instance's (13 vec4s an
-// instance, the instance from the vertex normal's w) seventh vec4's first
-// dword in its pixel shader's cbInstanceData, through the buffer's record GX
-// keeps for the draw - the map's (6a833138+bb10e440) and the objects'
-// (0073ecc9+9abe2f09) shaders alike.
-void gbuffer_group_count(const GxStageRecords& ps, const std::string& ps_name) {
-    const GroupSlot gs = group_slot(ps_name);
-    if (gs.slot < 0 || !(ps.obj_cb_set >> gs.slot & 1)) return;
-    std::uint32_t rec[2];
-    std::memcpy(rec, ps.obj_cb + gs.slot * 16, sizeof(rec));
-    const std::uint64_t va = rec[0] | (static_cast<std::uint64_t>(rec[1] & 0xfff) << 32);
-    constexpr std::uint64_t kGroupDword = 6 * 4;
-    if (!va || !hle_kernel_va_mapped(va + kGroupDword * 4, 4)) return;
-    std::uint32_t group = 0;
-    std::memcpy(&group, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + kGroupDword * 4)), 4);
-    if (group >= 256) return;
-    g_group_counts[group].fetch_add(1, std::memory_order_relaxed);
-    if (gs.map) g_group_map_counts[group].fetch_add(1, std::memory_order_relaxed);
-}
-// A plugin's G-buffer draw's group, from the draws counted since the last
-// take (then counted afresh): the one the most of the map's own pieces have
-// (Lo-Hit stands in for the map; some of its pieces draw beside it), else the
-// one the most draws have. The most draws alone changed from frame to frame
-// in a busy place - Kyo's save: groups of 29, 4 and 34 draws, the 34 the
-// characters' and other things' blended for where they stand, one number one
-// frame and another the next - and Lo-Hit's light with it (19 and 34 mean).
-// With none counted, the last; likewise with fewer than half the draws the
-// last whole take counted - a frame's later G-buffer draws, made on run parts
-// beside Lo-Hit's in-order ones, can be counted between two of its draws -
-// unless that has gone on for 30 flips (a place with fewer draws).
-int gbuffer_group_take() {
-    std::uint32_t n[256], m[256], total = 0, most = 0, most_map = 0;
-    int best = -1, best_map = -1;
-    for (int g = 0; g < 256; ++g) {
-        n[g] = g_group_counts[g].exchange(0, std::memory_order_relaxed);
-        m[g] = g_group_map_counts[g].exchange(0, std::memory_order_relaxed);
-        total += n[g];
-        if (n[g] > most) most = n[g], best = g;
-        if (m[g] > most_map) most_map = m[g], best_map = g;
-    }
-    std::lock_guard<std::mutex> lk(g_group_take_mu);
-    const std::uint64_t flip = hle_video_flip_count();
-    if (best < 0 || (total * 2 < g_group_last_total && flip - g_group_last_flip < 30)) return g_group_last < 0 ? 0 : g_group_last;
-    g_group_last_total = total;
-    g_group_last_flip = flip;
-    g_group_last = best_map >= 0 ? best_map : best;
-    return g_group_last;
-}
-
 void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
     int bound = 0;
     for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
@@ -6465,12 +6367,15 @@ void gbuffer_stencil(DrawState& s, const GxDrawObjects& o) {
 // The host's G-buffer shader (gbuffer_flat.frag) with its specialization
 // constants' defaults written in: 0 its ambient level - the indirect light it
 // writes in place of a lightmap, a plugin's (gx_gbuffer_ambient) once set -
-// 1 and 2 target 3's and 5's alpha (BBHOST_GBUFFER_SPEC=ambient,a3,a5, a
-// test; 0.03,0,0 without).
-const std::array<float, 3> g_gbuffer_spec = [] {
-    std::array<float, 3> v = {0.03f, 0.0f, 0.0f};
+// 1 and 2 target 3's and 5's alpha (1: the light and fog group 255, none of
+// the game's - the shader says why), 3 its own sun's level
+// (BBHOST_GBUFFER_SPEC=ambient,a3,a5,sun, a test; 0.03,1,0,kSunLevel
+// without).
+constexpr float kGbufferSun = 0.45f;
+const std::array<float, 4> g_gbuffer_spec = [] {
+    std::array<float, 4> v = {0.03f, 1.0f, 0.0f, kGbufferSun};
     const char* e = std::getenv("BBHOST_GBUFFER_SPEC");
-    for (int k = 0; e && *e && k < 3; ++k) {
+    for (int k = 0; e && *e && k < 4; ++k) {
         char* end = nullptr;
         v[k] = std::strtof(e, &end);
         e = end && *end == ',' ? end + 1 : nullptr;
@@ -6481,16 +6386,15 @@ float gbuffer_ambient() {
     const float set = gx_gbuffer_ambient_level();
     return set >= 0.0f ? set : g_gbuffer_spec[0];
 }
-std::vector<std::uint32_t> gbuffer_ambient_words(float ambient, std::uint32_t slots, int group) {
+std::vector<std::uint32_t> gbuffer_ambient_words(float ambient, std::uint32_t slots) {
     std::vector<std::uint32_t> w(std::begin(k_gbuffer_flat_frag_spv), std::end(k_gbuffer_flat_frag_spv));
-    std::array<float, 3> spec = g_gbuffer_spec;
+    std::array<float, 4> spec = g_gbuffer_spec;
     spec[0] = ambient;
-    if (!std::getenv("BBHOST_GBUFFER_SPEC")) spec[1] = static_cast<float>(group) / 255.0f;  // the light and fog group
     constexpr std::uint32_t kOpDecorate = 71, kOpSpecConstant = 50, kSpecId = 1;
-    std::uint32_t ids[3] = {};
+    std::uint32_t ids[4] = {};
     for (std::size_t i = 5; i < w.size(); i += w[i] >> 16) {
-        if ((w[i] & 0xffff) == kOpDecorate && (w[i] >> 16) == 4 && w[i + 2] == kSpecId && w[i + 3] < 3) ids[w[i + 3]] = w[i + 1];
-        for (int k = 0; k < 3; ++k)
+        if ((w[i] & 0xffff) == kOpDecorate && (w[i] >> 16) == 4 && w[i + 2] == kSpecId && w[i + 3] < 4) ids[w[i + 3]] = w[i + 1];
+        for (int k = 0; k < 4; ++k)
             if ((w[i] & 0xffff) == kOpSpecConstant && ids[k] && w[i + 2] == ids[k]) std::memcpy(&w[i + 3], &spec[k], 4);
         if (!(w[i] >> 16)) break;
     }
@@ -7479,13 +7383,12 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // the draw's shader has them.
         if (s.host_gbuffer) {
             gcn::TranslateResult host = pl.ps.meta();
-            host.spirv = gbuffer_ambient_words(s.gbuffer_ambient, s.gbuffer_slots, s.gbuffer_group);
+            host.spirv = gbuffer_ambient_words(s.gbuffer_ambient, s.gbuffer_slots);
             pl.ps.fresh() = std::move(host);
             pl.ps.lifted = false;
             pl.ps.module = VK_NULL_HANDLE;
             if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("G-buffer PS module");
             pl.ps_key = fnv1a(&s.gbuffer_slots, sizeof(s.gbuffer_slots), pl.ps_key);
-            pl.ps_key = fnv1a(&s.gbuffer_group, sizeof(s.gbuffer_group), pl.ps_key);
             pl.ps_key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(g_gbuffer_spec.data(), sizeof(g_gbuffer_spec), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), pl.ps_key)));
         }
     }
@@ -23393,9 +23296,6 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     CachedProgram* ps_cp = s.ps_va ? program_for(ids ? ids->ps_prog_id : 0, s.ps_va) : nullptr;
-    // A plugin's G-buffer draw is made in order, after the frame's own
-    // G-buffer draws counted their light and fog group (gbuffer_group_count).
-    if (d.gx_objects && d.gx_objects->gbuffer && run_part_stop(kRunStopRare)) return false;
     if (d.gx_objects && d.gx_objects->gbuffer) {
         static std::mutex gb_mu;
         static std::set<std::string> gb_logged;
@@ -23587,11 +23487,6 @@ static bool draw_impl(const GpuDraw& d) {
     }();
     t_snapshot_cbs = sf_snapshot && d.gx_token && d.gx_token_kind && std::strcmp(d.gx_token_kind, "scaleform") == 0;
     const GxDrawRecords* gx_records = d.gx && d.gx_render && d.gx_objects ? d.gx_objects->records : nullptr;
-    if (gx_records && ps_cp && !d.gx_objects->gbuffer && s.gx_depth && s.gx_depth->depth_write) {
-        int bound = 0;
-        for (int t = 0; t < 8; ++t) bound += s.color[t] != nullptr;
-        if (bound >= 6) gbuffer_group_count(gx_records->stage[kGxRecordPixel], ps_cp->name);
-    }
     const GxStageRecords* gx_stage[2] = {gx_records ? &gx_records->stage[s.gs ? kGxRecordGs : 0] : nullptr, gx_records ? &gx_records->stage[1] : nullptr};
     if (glitch_on()) {
         std::snprintf(t_draw_origin, sizeof(t_draw_origin), "%s token, gx inputs %s, gx_render %s, objects %s, records %s, partial %s, "
@@ -23740,8 +23635,6 @@ static bool draw_impl(const GpuDraw& d) {
         if (s.host_gbuffer) {
             s.gbuffer_ambient = gbuffer_ambient();
             s.gbuffer_slots = gbuffer_slots(s);
-            s.gbuffer_group = gbuffer_group_take();
-            key = fnv1a(&s.gbuffer_group, sizeof(s.gbuffer_group), key);
             key = fnv1a(&s.gbuffer_slots, sizeof(s.gbuffer_slots), key);
             key = fnv1a(&s.gbuffer_ambient, sizeof(s.gbuffer_ambient), fnv1a(&kGbufferSalt, sizeof(kGbufferSalt), key));
         }

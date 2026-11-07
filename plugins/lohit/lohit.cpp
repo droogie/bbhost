@@ -9,7 +9,7 @@
 //   wall_r = 46  wall_g = 20  wall_b = 108    # the walls' colour, as it comes out on the screen (0-255)
 //   floor_r = 32 floor_g = 56 floor_b = 128   # the floors'
 //   occluder_pass = "3e/04"  # where its depth-only play goes, for occlusion (ahead of the scene's objects)
-//   ambient = 30        # the light no lamp reaches, in thousandths (the map's comes from its lightmaps)
+//   ambient = 80        # the light no lamp reaches, in thousandths (the map's comes from its lightmaps)
 //   sun = 0             # older hosts (unlit): faces away from a fixed high sun darkened, 0-100
 //
 // What it draws. The world's hit manager (WorldHitMan) has a debug draw of
@@ -84,9 +84,13 @@
 // G-buffer's targets - the colours as the albedo (linear: the game's lighting
 // and tone-mapping make the screen colour), each triangle's world normal in
 // its vertices' alpha (normal_batch) - and marks the stencil as the map's
-// draws do, which the lights test. The game then lights it as the map: the
-// sun, the lamps, the shadows, the fog. The map's lightmaps give it its light
-// where no lamp reaches; the lo-hit has none, so `ambient` stands in.
+// draws do, which the lights test. The game's lamps then light it, with the
+// shadows they cast. Its sun, moon and fog the game takes from an area's
+// group, which changed under Lo-Hit's walls from one step to the next (Kyo:
+// dark here, light there): it has none of them, but a sun of the host's own
+// from one fixed direction, the same everywhere (gbuffer_flat.frag). The
+// map's lightmaps give it its light where no lamp reaches; the lo-hit has
+// none, so `ambient` stands in.
 //
 // The post-effects (Giga Performance Patch's) are the host's Performance mode
 // now (the setup window's main page, F10 > Game).
@@ -111,7 +115,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "lohit",
     "Lo-Hit",
-    "0.5.2",
+    "0.5.3",
     "Kyo",
     "The map's lo-hit collision drawn in place of the map, with the effects showing over it.",
 };
@@ -125,7 +129,7 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL | BB_OPT_LIVE, "show_hi_hit", "Hi-hit",
      "The hi-hit - what characters and objects collide with, in its full detail - in place of the lo-hit.", "false"},
     {BB_OPT_INT | BB_OPT_LIVE, "ambient", "Ambient light",
-     "The light where no lamp or sun reaches (the map's own comes from its lightmaps). 0: black there.", "30",
+     "The light where no lamp or sun reaches (the map's own comes from its lightmaps). 0: black there.", "80",
      0, 100},
     {BB_OPT_HEADING, "colours", "Colours", "As they come out on the screen, 0-255. Lo-hit and hi-hit alike.", nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "wall_r", "Walls: red", nullptr, "46", 0, 255},
@@ -1021,7 +1025,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
                       host->size >= offsetof(BbHostApi, gbuffer_ambient) + sizeof(void*);
         if (g_can_light) {
             const char* a = host->config("lohit.ambient");
-            set_ambient(a && *a ? a : "30");
+            set_ambient(a && *a ? a : "80");
             set_lit(true);
         }
     }
