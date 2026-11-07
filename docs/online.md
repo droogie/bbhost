@@ -31,6 +31,13 @@ Accounts have no passwords: a PC is linked to an account (with Discord, or
 with an account held by that PC plus a recovery code), and the account's name
 is the in-game online name. F10 has the same account screen in game.
 
+Each time the setup window opens with an account, it asks the server whether
+the sign-in still holds, without making the window wait, and says what it
+found on the Game page's Online card and under Play: signed in,
+expired (or this PC was signed out elsewhere: log in with Discord again, or
+recover an account kept on this PC), or not checked when the server did not
+answer (with a Retry).
+
 ## How a session connects
 
 - **Matchmaking**: the game's Matching2 calls (create, search and join
