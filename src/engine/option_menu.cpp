@@ -15,6 +15,7 @@
 #include "hle/modules.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/upscaler.h"
 #include "log.h"
 
 #include <algorithm>
@@ -1001,8 +1002,12 @@ GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
     add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
                  static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
-    add_list_row(dialog, &g_up_scaler, kUpScaler, kUpscalers, static_cast<int>(sizeof(kUpscalers) / sizeof(kUpscalers[0])),
-                 std::max(0, host_opt_default_index("upscaler")));
+    // The upscalers this platform offers, and the one chosen (host/upscaler.h upscaler_offered).
+    Choice upscalers[sizeof(kUpscalers) / sizeof(kUpscalers[0])];
+    int n_upscalers = 0;
+    for (const Choice& ch : kUpscalers)
+        if (ch.value == g_up_scaler || upscaler_offered(ch.value)) upscalers[n_upscalers++] = ch;
+    add_list_row(dialog, &g_up_scaler, kUpScaler, upscalers, n_upscalers, std::max(0, host_opt_default_index("upscaler")));
     add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
                  static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
                  std::max(0, host_opt_default_index("upscale_quality")));

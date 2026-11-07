@@ -478,10 +478,17 @@ Setting g_set[kSettingCount] = {
     // no bridge and never draws the 3D smaller. One choice of the row, so TAA
     // and FSR or DLSS are never on together.
     {"upscaler", "Upscaling", {"Off", "TAA", "FSR 3", "FSR 4", "DLSS"}, 0,
+#if defined(_WIN32)
      "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
      "(any GPU) or DLSS (NVIDIA RTX) in place of the game's own anti-aliasing. FSR and DLSS need upscaler_bridge.dll and "
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
      "FSR 3 where it cannot run. Changes at once.",
+#else
+     // (host/upscaler.h upscaler_offered: FSR is Windows' alone, DLSS where it runs.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of "
+     "the game's own anti-aliasing. DLSS needs libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so beside bbhost, "
+     "as the Linux package has them; FSR runs on Windows only. Changes at once.",
+#endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
     // frame goes into the picture, the rest the history - 0% a fifth, 50% a
@@ -2200,13 +2207,30 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
         // a slider so their names fit.
         const char* const* tips = id == kShaders ? kHostShaderModeTips : value_tips(id, names != nullptr);
+        const char* const* labels = names ? names : s.values.data();
+        // Upscaling: the choices this platform offers, and the one made (host/upscaler.h upscaler_offered).
+        const char* up_labels[5];
+        const char* up_tips[5];
+        int up_of[5], m = n, pick = want;
+        if (id == kUpscaler) {
+            m = 0;
+            for (int v = 0; v < n && m < 5; ++v) {
+                if (v != cur && !upscaler_offered(v)) continue;
+                if (v == cur) pick = m;
+                up_labels[m] = labels[v];
+                up_tips[m] = tips ? tips[v] : nullptr;
+                up_of[m++] = v;
+            }
+            labels = up_labels;
+            if (tips) tips = up_tips;
+        }
         float bw = cw;
-        if (n > 4) {
+        if (m > 4) {
             bw = std::min(std::round(520 * sc), w * 0.62f);
             ImGui::SetCursorScreenPos(ImVec2(p.x + w - bw, p.y));
         }
-        ui::segmented("##v", &want, names ? names : s.values.data(), n, bw, tips,
-                      id == kShaders ? "Applies at the next start." : nullptr);
+        ui::segmented("##v", &pick, labels, m, bw, tips, id == kShaders ? "Applies at the next start." : nullptr);
+        want = id == kUpscaler ? up_of[std::clamp(pick, 0, m - 1)] : pick;
     } else {
         // A scale: the slider shows the step's own name (+10%, x1.4, 5).
         std::string shown;
@@ -2397,6 +2421,20 @@ const char* upscaler_note() {
     const UpscalerCaps caps = upscaler_caps();
     static std::string note;
     const bool dlss = u == 4;
+#if !defined(_WIN32)
+    // Linux: DLSS through the NGX bridge, and no FSR.
+    if (!dlss) {
+        note = "FSR runs on Windows only: the game's own anti-aliasing runs instead.";
+    } else if (!caps.loaded) {
+        note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
+               "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
+    } else if (!caps.dlss) {
+        note = "DLSS is not available here" + (caps.dlss_reason.empty() ? std::string() : " (" + caps.dlss_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
+    } else {
+        return g_set[kUpscaler].note;
+    }
+#else
     if (!caps.loaded) {
         note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
                "game's own anti-aliasing runs instead; Frame generation works without it.";
@@ -2408,6 +2446,7 @@ const char* upscaler_note() {
     } else {
         return g_set[kUpscaler].note;
     }
+#endif
     return note.c_str();
 }
 
