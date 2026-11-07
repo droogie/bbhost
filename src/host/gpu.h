@@ -812,6 +812,10 @@ struct GpuHandles {
     void* fg_queues[3] = {};         // VkQueues for frame generation: present, image acquire, async compute; null when the family has fewer than five
     std::uint32_t family = 0;
     bool fifo_latest_ready = false;  // the device may present in VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
+    // VK_EXT_full_screen_exclusive is on (Windows): a swapchain may chain
+    // VkSurfaceFullScreenExclusiveInfoEXT, and its present modes are asked with
+    // vkGetPhysicalDeviceSurfacePresentModes2EXT.
+    bool full_screen_exclusive = false;
 };
 GpuHandles host_gpu_handles();
 // The command processor wrote guest memory on the CPU (DMA, WRITE_DATA):

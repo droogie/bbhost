@@ -3984,6 +3984,24 @@ bool init_locked() {
                  app.pApplicationName, app.pEngineName ? app.pEngineName : "");
     std::vector<const char*> iext;
     for (const std::string& e : g_instance_exts) iext.push_back(e.c_str());
+#if defined(_WIN32)
+    // VK_KHR_get_surface_capabilities2, for a window, where the loader has it:
+    // the device's VK_EXT_full_screen_exclusive (below) needs it, and with that
+    // Stay borderless has Borderless's swapchain tell the driver it may not
+    // make the window exclusive fullscreen (window.cpp, exclusive_policy).
+    bool surface_caps2 = false;
+    if (g_want_present) {
+        std::uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> ie(n);
+        if (n) vkEnumerateInstanceExtensionProperties(nullptr, &n, ie.data());
+        for (std::uint32_t i = 0; i < n && i < ie.size(); ++i)
+            surface_caps2 |= std::strcmp(ie[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        bool asked = false;  // SDL's list may hold it already
+        for (const char* e : iext) asked |= std::strcmp(e, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        if (surface_caps2 && !asked) iext.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    }
+#endif
     std::vector<const char*> layers;
     if (g_validate) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -4365,6 +4383,24 @@ bool init_locked() {
             }
         }
 #endif
+#if defined(_WIN32)
+        // VK_EXT_full_screen_exclusive, with the instance's
+        // VK_KHR_get_surface_capabilities2 (above): the swapchain can say
+        // whether the driver may make the window exclusive fullscreen, and
+        // Stay borderless says it may not (window.cpp, exclusive_policy).
+        // Without it the driver decides, as it always did.
+        if (g_want_present && has_swapchain) {
+            const bool listed = has("VK_EXT_full_screen_exclusive");
+            g.full_screen_exclusive = listed && surface_caps2;
+            host_log("gpu: %s",
+                     g.full_screen_exclusive ? "VK_EXT_full_screen_exclusive on (and the instance's VK_KHR_get_surface_capabilities2): "
+                                               "Stay borderless keeps the driver from making Borderless exclusive fullscreen"
+                     : listed ? "VK_EXT_full_screen_exclusive left off - the instance has no VK_KHR_get_surface_capabilities2: "
+                                "the driver decides on exclusive fullscreen, Stay borderless or not"
+                              : "no VK_EXT_full_screen_exclusive on this device: the driver decides on exclusive fullscreen, "
+                                "Stay borderless or not");
+        }
+#endif
     }
 
     // A second queue, when the family has one, is the presenter's: a present
@@ -4419,8 +4455,10 @@ bool init_locked() {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
         if (g.fifo_latest_ready_ext) dext.push_back(g.fifo_latest_ready_ext);
+        if (g.full_screen_exclusive) dext.push_back("VK_EXT_full_screen_exclusive");
     } else {
         g.fifo_latest_ready_ext = nullptr;
+        g.full_screen_exclusive = false;
     }
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     ffault.deviceFault = VK_TRUE;
@@ -9691,6 +9729,7 @@ GpuHandles host_gpu_handles() {
     for (int i = 0; i < 3; ++i) h.fg_queues[i] = g.fg_queues[i];
     h.family = g.family;
     h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
+    h.full_screen_exclusive = g.full_screen_exclusive;
     return h;
 }
 

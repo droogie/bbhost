@@ -585,6 +585,10 @@ struct Gpu {
     // feature on: the presenter may ask for FIFO_LATEST_READY (window.cpp).
     // The extension's name, or null.
     const char* fifo_latest_ready_ext = nullptr;
+    // VK_EXT_full_screen_exclusive on (Windows, with the instance's
+    // VK_KHR_get_surface_capabilities2): the presenter's swapchain may say
+    // whether the driver can make the window exclusive fullscreen (window.cpp).
+    bool full_screen_exclusive = false;
     // Stage parameter ring: one block per queued dispatch/draw stage.
     VkBuffer ubo = VK_NULL_HANDLE;
     VkDeviceMemory ubo_mem = VK_NULL_HANDLE;
