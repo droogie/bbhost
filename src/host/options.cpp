@@ -493,11 +493,15 @@ void set_account_lines(const std::string& status, const std::string& detail) {
     g_acct_detail = detail;
 }
 
+// The server no longer takes this PC's sign-in (net::account_refused): what
+// the F10 Account section and the setup window say about it.
+constexpr const char kRefusedStatus[] = "Sign-in expired";
+constexpr const char kRefusedText[] = "Your sign-in has expired, or this PC was signed out. Online play needs a new sign-in.";
+
 std::string signed_in_line() {
     // The game read its NpId when it went online, so a sign-in after that
     // names the account to the server but not to the game until the next run.
-    if (net::account_refused())
-        return "Signed in as " + net::account_name() + " - the server refused it (expired or replaced): link this PC again";
+    if (net::account_refused()) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return "Signed in as " + net::account_name() +
            (hle_np_context_started() ? " (in full on the next launch)" : "");
 }
@@ -549,6 +553,8 @@ void update_action(int which) {
 }
 
 bool action_idle(int which) {
+    // A website code needs a sign-in the server still takes.
+    if (which == 3 && net::account_refused()) return false;
     if (which < 10) return !g_acct_busy.load();
     if (updater::busy()) return false;
     if (which == 11) return updater::update_available();
@@ -618,7 +624,11 @@ void account_action(int which, const std::string& name, const std::string& code)
 
 std::string account_status() {
     std::lock_guard<std::mutex> lk(g_acct_mu);
-    if (!g_acct_status.empty()) return g_acct_status;
+    // A refusal outranks an older "Signed in as" from the last action.
+    const bool refused = net::account_logged_in() && net::account_refused();
+    if (!g_acct_status.empty() && !(refused && !g_acct_busy.load() && g_acct_status.rfind("Signed in as ", 0) == 0))
+        return g_acct_status;
+    if (refused) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return net::account_logged_in() ? "Signed in as " + net::account_name() : "Not signed in";
 }
 
@@ -1445,6 +1455,11 @@ void account_page() {
     if (const std::string d = account_detail(); !d.empty()) {
         ImGui::Spacing();
         ui::banner(ui::Icon::Info, ui::kIce, d);
+    }
+    if (net::account_logged_in() && net::account_refused() && !g_acct_busy.load()) {
+        ImGui::Spacing();
+        ui::banner(ui::Icon::Warning, ui::kWarn,
+                   std::string(kRefusedText) + " Link with Discord again, or recover an account this PC holds with its recovery code below.");
     }
     ImGui::Spacing();
     action_button("Link with Discord", 0, true);
