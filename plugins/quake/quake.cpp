@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.19",
+    "0.3.20",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -1285,6 +1285,7 @@ constexpr std::uint32_t kGuns[] = {15000000, 35000000, 36000000, 6000000, 330000
 constexpr std::uint32_t kShotgunGun = 6000000;
 constexpr float kGemRate = 1.287f, kGemAdd = 7.3f;
 constexpr float kGrenadeSpeed = 700.0f;  // units a second
+constexpr std::uint16_t kGrenadeAtkPct = 270, kRocketAtkPct = 72;  // the shells' attack corrections (guns_apply)
 constexpr float kRocket = 900.0f * kUnit, kGrenade = kGrenadeSpeed * kUnit;
 struct BulletRule {
     std::uint32_t id;
@@ -1489,6 +1490,24 @@ void guns_apply() {
             a->atkObj = rocket->atkObj;
         }
     }
+    // The arc hits hardest (Kyo): the grenade's one hit (600 on a character,
+    // its burst 601 at the fuse, on the Cannon's 600) for what the rocket's direct hit and splash came to
+    // together (726 twice on an NG+7 enemy), and the rocket's two (620, 621,
+    // on the Church Cannon's 480) for about the grenade's one between them.
+    const auto correct = [](std::uint32_t id, std::uint16_t pct, bool saved) {
+        auto* a = g.param<bb::params::AtkParam_Pc>(id);
+        if (!a) return;
+        if (!saved) g_saved_atks.emplace_back(id, *a);
+        a->atkPhysCorrection = a->atkMagCorrection = a->atkFireCorrection = a->atkThunCorrection = pct;
+    };
+    const auto pct = [](const char* env, int fallback) {
+        const char* e = std::getenv(env);  // QUAKE_GL_PCT / QUAKE_RL_PCT (a test): tuning
+        return static_cast<std::uint16_t>(e ? std::atoi(e) : fallback);
+    };
+    correct(600, pct("QUAKE_GL_PCT", kGrenadeAtkPct), false);  // a grenade that hits a character
+    correct(601, pct("QUAKE_GL_PCT", kGrenadeAtkPct), false);
+    correct(620, pct("QUAKE_RL_PCT", kRocketAtkPct), false);
+    correct(621, pct("QUAKE_RL_PCT", kRocketAtkPct), true);  // saved with its object power
     g_guns_table = probe;
     g_guns_quake = true;
     g.log("quake: the guns at +10 whatever their level (%d rows), %d bullets flying as Quake 3's", weapons, bullets);
