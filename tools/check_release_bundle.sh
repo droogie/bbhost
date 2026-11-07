@@ -53,6 +53,20 @@ while IFS= read -r exe; do
     done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
 if find "$work" -iname 'dxil.dll' -o -iname 'libdxil.so*' | grep .; then fail "a bundle carries DXC's DXIL validator"; fi
+# The upscalers' runtime beside each Windows executable, the pinned files with
+# their licences (tools/fetch_upscalers.sh): without them a release has no FSR,
+# DLSS or frame generation.
+fetch_up=$(dirname "$0")/fetch_upscalers.sh
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    for f in $("$fetch_up" --files); do
+        [ -f "$b/$f" ] || fail "${b#"$work"/}: no $f beside bbhost.exe (tools/fetch_upscalers.sh)"
+        [ "$(sha256sum "$b/$f" | cut -d' ' -f1)" = "$("$fetch_up" --sha256 "$f")" ] || fail "${b#"$work"/}/$f: not the pinned file"
+    done
+    for l in fidelityfx/LICENSE.md dlss/LICENSE.txt upscaler_bridge/LICENSE.txt; do
+        [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
+    done
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
 # What a first start writes (core/config.cpp's template), in each executable.
 for b in "$d"/bbhost "$d"/bbhost.exe; do
     [ -f "$b" ] || continue
@@ -63,4 +77,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones with FidelityFX, DLSS and the upscaler bridge"

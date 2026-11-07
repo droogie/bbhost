@@ -35,6 +35,10 @@ cp "$exe" "$out/$name.debug.exe"
 # The HLSL path's compiler beside the exe, where bbhost looks first.
 tools/fetch_dxc.sh windows "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The upscalers' and frame generation's runtime beside the exe: AMD's
+# FidelityFX, NVIDIA's DLSS and the upscaler bridge, each under its own
+# licence (tools/fetch_upscalers.sh).
+tools/fetch_upscalers.sh "$dir"
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -140,6 +144,24 @@ The shader compiler
   now); its Shaders setting (also F10 under Graphics) picks Lifted to keep
   the translator's own. Without dxcompiler.dll that path keeps every shader
   as it was, and nothing else uses it.
+
+Upscaling and frame generation
+  Graphics > Upscaling's FSR 3, FSR 4 and DLSS and Frame generation run
+  through these files beside bbhost.exe, each its maker's own, unmodified and
+  under its own licence - not the GPL, which covers bbhost alone:
+    - amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll and
+      amd_fidelityfx_framegeneration_vk.dll: AMD FidelityFX (FSR 3, FSR 4 and
+      frame generation), Copyright (C) Advanced Micro Devices, Inc., from the
+      FidelityFX SDK (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK);
+      licence in licenses\\fidelityfx.
+    - nvngx_dlss.dll: NVIDIA DLSS, Copyright (C) NVIDIA Corporation, from the
+      DLSS SDK (https://github.com/NVIDIA/DLSS), for NVIDIA RTX graphics cards
+      only; licence in licenses\\dlss. bbhost is not sponsored or endorsed by
+      NVIDIA or AMD.
+    - upscaler_bridge.dll: the Upscaler Bridge by Numity1504 (MIT licence, in
+      licenses\\upscaler_bridge), which bbhost calls FSR and DLSS through.
+  TAA is bbhost's own and needs none of them. Without them, FSR, DLSS and
+  frame generation stay off.
 
 Plugins
   plugins/ holds the official ones, signed by the bbhost release key
