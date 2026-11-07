@@ -709,6 +709,39 @@ as before: the game could then run several frames ahead of the GPU after a
 loading screen and overwrite what it had not read yet, which could hold the
 GPU for minutes.
 
+## Upscaling
+
+Graphics > Upscaling (F10, the setup window's Graphics page, or System > PC
+Upscaling in the game) runs one of these in place of the game's own
+anti-aliasing:
+
+| Choice | Where it runs |
+|---|---|
+| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution |
+| DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
+| FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
+
+Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
+sharpens what TAA, FSR or DLSS gives.
+
+On Windows the package carries the upscalers' files beside `bbhost.exe`:
+Numity1504's Upscaler Bridge (`upscaler_bridge.dll`), which bbhost calls them
+through, NVIDIA's `nvngx_dlss.dll` and AMD's FidelityFX DLLs.
+
+On Linux, DLSS needs an NVIDIA RTX card with NVIDIA's own driver, a recent
+one (the driver brings NVIDIA's NGX, which runs DLSS; Nouveau and NVK cannot).
+The Linux package carries `libbbhost_ngx_bridge.so`, bbhost's NGX bridge (the
+Upscaler Bridge's API over NVIDIA's NGX, MIT), and NVIDIA's DLSS runtime,
+`libnvidia-ngx-dlss.so.310.9.16`, beside the binary; bbhost loads the bridge
+from its own folder at start. On any other GPU the Upscaling list offers Off
+and TAA, and the log's `upscaler:` lines say why DLSS is not available. The
+Steam Deck kit carries neither file (the Deck's GPU is AMD's).
+
+`BBHOST_UPSCALE=dlss|taa|fsr|fsr3` picks the method for a run over the
+setting, and `BBHOST_UPSCALER=0` loads no bridge at all. On Linux,
+`BBHOST_NGX_LOG=1` (2: verbose) has NVIDIA's NGX log into bbhost's log, and
+into its own files in `ngx/` in the settings folder.
+
 ## Online
 
 bbhost implements the PlayStation Network calls the game makes against a
