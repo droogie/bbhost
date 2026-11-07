@@ -459,14 +459,28 @@ fixes it:
 KERNEL=="udmabuf", TAG+="uaccess"
 ```
 
-**AMD on Windows, slower in a window.** Play in fullscreen (Fullscreen in PC
-Settings, or Window mode in F10). In a window the desktop composites the
-picture, and AMD's driver then never completes the game's occlusion queries -
-the same as when the window is not focused - so the game, getting no answers,
-stops culling hidden geometry. On a Radeon 8060S at 1920x1080 that is 112 fps
-uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55% busy
-against 37%. The log's `occlusion:` line, every 300 flips, then says `0 dumps`
-or `left not ready (N queries unavailable)`.
+**The picture stops for seconds in fullscreen on Windows.** The game goes on
+behind it, but the display stops handing the window its images back; the log's
+`slow call: vkWaitForFences ... (the acquired image)` lines say for how long.
+The graphics driver can take Borderless, a window that covers the screen, as
+exclusive fullscreen and switch into and out of it on its own: turn on
+[Stay borderless](#display-and-frame-rate), which keeps the window a window. A
+`window: keyboard focus` line logged while the picture is stopped says how
+long the presenter had been waiting by then (`the presenter 2.71 s into
+vkWaitForFences, the acquired image`), so the log shows whether switching away
+from the game and back ended the stop or came after it.
+
+<a id="amd-on-windows-slower-in-a-window"></a>
+**AMD on Windows, slower in a window.** Play in Borderless with Stay
+borderless off, or in Fullscreen (Window mode in F10 or the setup window;
+Fullscreen in PC Settings). In a window the desktop composites the picture,
+and AMD's driver then never completes the game's occlusion queries - the same
+as when the window is not focused - so the game, getting no answers, stops
+culling hidden geometry. Stay borderless keeps the game a window for
+the driver, and may be as slow. On a Radeon 8060S at 1920x1080 that is 112
+fps uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55%
+busy against 37%. The log's `occlusion:` line, every 300 flips, then says
+`0 dumps` or `left not ready (N queries unavailable)`.
 
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
@@ -483,6 +497,33 @@ The picture keeps its aspect ratio. The settings offer 16:9 sizes from
 32:9), and the resolution can be changed while playing.
 bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
+
+Window mode is one of three (the Game page of F10 or of the setup window;
+Fullscreen in the game's PC Settings fills the screen):
+- Windowed is a window you can move and resize.
+- Borderless covers the screen at the desktop's resolution and never changes
+  the display's mode, so switching away is instant. On Windows the graphics
+  driver may still take it as exclusive fullscreen, switching into and out of
+  it on its own.
+- Fullscreen takes the display over at the mode nearest the Resolution, which
+  can change the screen's resolution.
+
+Stay borderless (the row under Window mode in F10 and the setup window while
+Borderless is chosen, Stay Borderless in PC Settings; off by default) keeps
+Borderless a window that the driver never makes exclusive fullscreen, frame
+generation's swapchain too, and applies at once: try it if the picture freezes
+for a few seconds while the game keeps running. On Linux and the Steam Deck
+the setting does nothing.
+
+AMD cards on Windows run slower in a window, where the game has to draw hidden
+objects too: use Borderless or Fullscreen, and leave Stay borderless off
+unless you need it - it may do the same
+([AMD on Windows, slower in a window](#amd-on-windows-slower-in-a-window)).
+
+`[video] window_mode` in bbhost.toml is the default: `"Windowed"`,
+`"Borderless"` or `"Fullscreen"`. The log's `present: mode` line says which
+way each swapchain was made: `exclusive fullscreen disallowed (Stay
+borderless)`, or `the driver decides on exclusive fullscreen`.
 
 The frame rate is the game's own speed, chosen when it starts (a change
 applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
