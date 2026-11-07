@@ -56,6 +56,10 @@ unsigned host_cpu_threads();
 // pixels (each display's current mode). False when the platform does not say:
 // a headless run (host_set_headless), or a build without SDL off Windows.
 bool host_desktop_max_size(int* w, int* h);
+// The primary display's size in physical pixels (its current mode): where a
+// window opens when it is given no position, so the screen Borderless and
+// Fullscreen fill. False as host_desktop_max_size.
+bool host_desktop_primary_size(int* w, int* h);
 // The refresh rate of the display the window opens on (the primary one), as
 // the display gives it (59.94, 143.998), asked before the window shell starts:
 // the Uncapped frame rate's (engine/frame_rate.cpp). 0 when nothing says: a
