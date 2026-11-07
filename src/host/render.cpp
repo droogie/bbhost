@@ -5445,6 +5445,11 @@ struct PipelineRecipe {
     std::uint32_t order = 0;
     bool listed = false;  // from a shipped list (pipeline_manifest_load), not this player's own record
     bool loaded = false;  // read at the start (else recorded in this run)
+    // A plugin's look made ahead (look_prewarm): another recipe with the look's
+    // numbers, built but never kept in the manifest itself (a draw that takes
+    // it records its own); `look_gen` its prewarm, skipped once a newer begins.
+    bool derived = false;
+    std::uint32_t look_gen = 0;
 };
 // The state a build from `r` reads, its pointers aimed at `formats` and the
 // recipe's descriptions.
@@ -5486,10 +5491,11 @@ const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
 // the copies it was given).
 bool look_twin(const float look[6]);
 bool recipe_recordable(const DrawState& s) {
-    // A plugin's snapped camera draw (DrawState::snap_cells): the lists keep no
-    // grid, so a start would build it unsnapped - left to its draws.
-    if (look_twin(s.snap_cells) || s.pixel_cut_on) return false;
-    if (s.host_gbuffer) return false;  // likewise its host pixel shader
+    // A plugin's snapped or cut camera draw (DrawState::snap_cells, pixel_cut)
+    // is recorded with its numbers (recipe_file version 6): left to its draws,
+    // every effect's first sight compiled its twin on the command processor -
+    // the plugins' hitches as fire, blood and smoke first appeared each start.
+    if (s.host_gbuffer) return false;  // its host pixel shader: not kept
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
@@ -8443,6 +8449,10 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job);
 void precompile_manifest(const ManifestStage& m);
 void relink_pipeline(Precompiler& w, const PrecompileJob& job);
 void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe);
+// A plugin's look made ahead (look_prewarm): its generation, and its twins
+// built, failed and skipped (a newer look's took over), with their worker time.
+std::atomic<std::uint32_t> g_look_gen{0};
+std::atomic<std::uint64_t> g_look_prewarm[3] = {}, g_look_prewarm_us{0};
 void sweep_limit_update();
 // Parallel compiles at the start (Kyo's parallel preload, done natively): GX
 // creates its ~3,000 vertex and pixel shaders, and the manifest brings a few
@@ -8856,6 +8866,10 @@ namespace gpu {
 namespace {
 void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe) {
     const PipelineRecipe& r = *recipe;
+    if (r.derived && r.look_gen != g_look_gen.load(std::memory_order_relaxed)) {
+        g_look_prewarm[2].fetch_add(1, std::memory_order_relaxed);  // a newer look's prewarm took over
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     GfxPipeline* pl = nullptr;
     {
@@ -8950,6 +8964,16 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
             g_pmanifest.relinked.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    if (r.derived) {
+        // Not the manifest's: only its pipeline, for the draws to take.
+        if (ok) {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            g_pmanifest.built.emplace(key, pl);
+        }
+        g_look_prewarm[ok ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        g_look_prewarm_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+        return;
+    }
     g_pmanifest.build_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     std::size_t left = 0;
     {
@@ -8987,6 +9011,89 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - g_pmanifest.loaded_at).count(),
                  g_pmanifest.build_us.load() / 1e6);
     }
+}
+
+// A plugin's look made ahead: the Bloodborne PS1's snap (and a vertex
+// cutaway, its numbers beside it) is a twin of every camera draw's pipeline,
+// so an effect first drawn with it - or first drawn since the grid changed -
+// compiled its twin on the command processor: the plugins' hitches as fire,
+// blood and smoke appeared. The first camera draw with a new set of numbers
+// copies every recipe the manifest holds that could be a camera draw (one
+// with depth, not a rect list) with those numbers, and the precompile
+// workers build them behind what they already have queued; a draw then takes
+// its twin as it takes any pipeline the start built. With the cutaway per
+// pixel on (the Isometric's), the draws that write depth take that twin too,
+// whose numbers come from the draw's viewport and the camera: those are left
+// to their draws. At most 8 sets a run; a newer set skips what an older one
+// has not built yet.
+void look_prewarm(const float cells[6], bool pixel_cut) {
+    if (!pipeline_manifest_on() || !g_pmanifest.recording.load(std::memory_order_relaxed)) return;
+    struct Seen {
+        float cells[6];
+        bool pixel_cut;
+    };
+    static std::mutex mu;
+    static std::vector<Seen> seen;
+    std::uint32_t gen = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const Seen& v : seen)
+            if (v.pixel_cut == pixel_cut && !std::memcmp(v.cells, cells, sizeof(v.cells))) return;
+        if (seen.size() >= 8) return;
+        Seen v{};
+        std::memcpy(v.cells, cells, sizeof(v.cells));
+        v.pixel_cut = pixel_cut;
+        seen.push_back(v);
+        gen = g_look_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    // The copies off the command processor: the recipes' words are megabytes.
+    std::array<float, 6> c;
+    std::copy(cells, cells + 6, c.begin());
+    std::thread([c, pixel_cut, gen] {
+        std::vector<std::shared_ptr<PipelineRecipe>> twins;
+        {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            twins.reserve(g_pmanifest.by_key.size());
+            for (const auto& [key, rc] : g_pmanifest.by_key) {
+                const DrawState& s = rc->s;
+                if (rc->derived || look_twin(s.snap_cells) || s.pixel_cut_on || s.rect || !rc->depth_format) continue;
+                if (pixel_cut && (s.depth_control & 6u) == 6u) continue;
+                auto t = std::make_shared<PipelineRecipe>(*rc);
+                t->derived = true;
+                t->look_gen = gen;
+                t->key = 0;
+                std::copy(c.begin(), c.end(), t->s.snap_cells);
+                twins.push_back(std::move(t));
+            }
+        }
+        if (twins.empty()) return;
+        Precompiler& w = precompiler();
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            for (auto& t : twins) {
+                PrecompileJob job;
+                job.name = t->vs_name + "+" + t->ps_name;
+                job.type = 8;
+                job.recipe = std::move(t);
+                w.jobs.push_back(std::move(job));
+            }
+        }
+        w.cv.notify_all();
+        host_log("render: a plugin's look (grid %gx%g, cutaway radius %g%s): %zu of the manifest's pipelines queued for their twins ahead of "
+                 "their draws",
+                 static_cast<double>(c[0]), static_cast<double>(c[1]), static_cast<double>(c[5]), pixel_cut ? ", depth writers left to the cutaway per pixel" : "",
+                 twins.size());
+    }).detach();
+}
+// The draw's numbers, checked against this thread's last before the shared list.
+void look_prewarm_seen(const float cells[6]) {
+    thread_local float last[6] = {};
+    thread_local bool last_cut = false;
+    const bool cut = scene_look_pixel_cut(nullptr);
+    if (cut == last_cut && !std::memcmp(last, cells, sizeof(last))) return;
+    std::memcpy(last, cells, sizeof(last));
+    last_cut = cut;
+    look_prewarm(cells, cut);
 }
 
 // A translation error without its offset and detail, as a failure reason.
@@ -10018,8 +10125,8 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 5;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records; 5: geometry-shader
-                                       // pipelines (flag 4096: their ES and copy shader); 2-4 read as well
+constexpr std::uint32_t kVersion = 6;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records; 5: geometry-shader
+                                       // pipelines (flag 4096: their ES and copy shader); 6: a plugin's look (flag 8192); 2-5 read as well
 // A record's flags: a compute record (ComputeRecipe) rather than a pipeline's.
 constexpr std::uint32_t kComputeRecord = 1u << 30;
 using manifest_file::Reader;
@@ -10167,7 +10274,7 @@ void write(Writer& out, const PipelineRecipe& rc) {
     // LS and the hull as it names the others: flags 1024 and 2048).
     w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
           (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
-          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u));
+          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u) | (look_twin(s.snap_cells) || s.pixel_cut_on ? 8192u : 0u));
     for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
                             static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
         w.u32(v);
@@ -10211,6 +10318,13 @@ void write(Writer& out, const PipelineRecipe& rc) {
             words(w, cp->words);
             str(w, cp->name);
         }
+    }
+    if (look_twin(s.snap_cells) || s.pixel_cut_on) {
+        // A plugin's look (version 6, flag 8192): the snap and cutaway's
+        // numbers, then the cutaway per pixel's when it is on.
+        pod(w, s.snap_cells);
+        w.u32(s.pixel_cut_on ? 1u : 0u);
+        if (s.pixel_cut_on) pod(w, s.pixel_cut);
     }
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
@@ -10448,6 +10562,12 @@ bool read(Reader& in, PipelineRecipe& rc) {
         s.gs = true;
         rc.has_gs = true;
     }
+    // A plugin's look (version 6, flag 8192).
+    if (tf & 8192) {
+        pod(r, s.snap_cells);
+        s.pixel_cut_on = r.u32() != 0;
+        if (s.pixel_cut_on) pod(r, s.pixel_cut);
+    }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
     if (!rc.has_ls) s.ls_va = 0;
@@ -10533,6 +10653,11 @@ void precompile_report() {
                  static_cast<unsigned long long>(g_pmanifest.dropped.load()), static_cast<unsigned long long>(g_pmanifest.compute_built.load()),
                  static_cast<unsigned long long>(g_pmanifest.compute_failed.load()),
                  static_cast<unsigned long long>(g_pmanifest.compute_recorded.load()), ls_pass_report().c_str());
+        if (g_look_gen.load())
+            host_log("render: a plugin's look made ahead: %u sets of numbers, %llu twins built (%.1f s of worker time), %llu failed, %llu skipped "
+                     "for a newer set",
+                     g_look_gen.load(), static_cast<unsigned long long>(g_look_prewarm[0].load()), g_look_prewarm_us.load() / 1e6,
+                     static_cast<unsigned long long>(g_look_prewarm[1].load()), static_cast<unsigned long long>(g_look_prewarm[2].load()));
     }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
@@ -23665,7 +23790,10 @@ static bool draw_impl(const GpuDraw& d) {
     if ((scene_look_snap() || scene_look_cutaway(nullptr)) && look_camera_draw(s)) {
         if (scene_look_snap()) scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]);
         scene_look_cutaway(&s.snap_cells[2]);
-        if (look_twin(s.snap_cells)) key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
+        if (look_twin(s.snap_cells)) {
+            key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
+            look_prewarm_seen(s.snap_cells);
+        }
     }
     // The cutaway per pixel: the camera draws' pixel stages, with the draw's
     // viewport to take each pixel back to view space.
