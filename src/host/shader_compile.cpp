@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -37,6 +38,7 @@ namespace {
 
 std::vector<std::string> g_args;  // the arguments the setup window's child is started with
 std::string g_exe_name;          // this executable's file name (argv[0]'s)
+std::string g_run;               // the child's: the run id it was started with (--compile-shaders=<id>), for its record
 
 std::string data_dir(const std::string& data) {
     return (data.empty() ? config_default_data_dir() : data) + "/bbhost";
@@ -66,6 +68,12 @@ bool shader_compile_take_flag(int& argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--compile-shaders") == 0) {
             found = true;
+            continue;
+        }
+        if (std::strncmp(argv[i], "--compile-shaders=", 18) == 0) {
+            found = true;
+            const std::string id = argv[i] + 18;
+            if (!id.empty() && id.size() <= 32 && id.find_first_not_of("0123456789abcdef") == std::string::npos) g_run = id;
             continue;
         }
         argv[out++] = argv[i];
@@ -156,14 +164,20 @@ int shader_compile_session() {
     std::string hlsl_reasons;
     gpu::hlsl_counts(taken, compiled, kept, hlsl_reasons);
     const bool hlsl = gpu::hlsl_on();
-    // The record the setup window reads (shader_cache_state).
+    // One answer for the record, the last line and the exit code, whenever
+    // a "cancel" comes in.
+    const bool was_cancelled = cancelled.load();
+    // The record the setup window reads (shader_cache_state), and takes the
+    // result from when the lines below do not reach it: before them, with
+    // the run id it started this child with.
     {
         std::ofstream out(dir + "/shader-compile.txt", std::ios::trunc);
         const std::time_t now = std::time(nullptr);
         char when[64];
         std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", std::localtime(&now));
-        out << "result " << (cancelled.load() ? "cancelled" : "done") << "\n"
-            << "when " << when << "\n"
+        out << "result " << (was_cancelled ? "cancelled" : "done") << "\n";
+        if (!g_run.empty()) out << "run " << g_run << "\n";
+        out << "when " << when << "\n"
             << "bbhost " << BBHOST_VERSION << "\n"
             << "translator " << BBHOST_TRANSLATOR_FINGERPRINT << "\n"
             << "device " << device << "\n"
@@ -182,7 +196,7 @@ int shader_compile_session() {
         for (std::string l; std::getline(r2, l);) say("reason the lift kept: " + l);
     }
     char b[240];
-    std::snprintf(b, sizeof(b), "%s %llu %llu %llu %llu %llu %.1f %llu %llu", cancelled.load() ? "cancelled" : "done",
+    std::snprintf(b, sizeof(b), "%s %llu %llu %llu %llu %llu %.1f %llu %llu", was_cancelled ? "cancelled" : "done",
                   static_cast<unsigned long long>(p.done), static_cast<unsigned long long>(p.total), static_cast<unsigned long long>(p.failed),
                   static_cast<unsigned long long>(taken), static_cast<unsigned long long>(kept), seconds(),
                   static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total));
@@ -191,7 +205,7 @@ int shader_compile_session() {
     // Not fflush(nullptr): the stdin reader holds stdin's lock in getline.
     std::fflush(stdout);
     std::fflush(stderr);
-    std::_Exit(cancelled.load() ? 1 : 0);
+    std::_Exit(was_cancelled ? 1 : 0);
 }
 
 // ---- The setup window's side ------------------------------------------------------
@@ -283,14 +297,24 @@ ShaderCompileJob::~ShaderCompileJob() {
     if (proc_) SDL_DestroyProcess(static_cast<SDL_Process*>(proc_));
 }
 
-bool ShaderCompileJob::start(std::string& error) {
+bool ShaderCompileJob::start(const std::string& data, std::string& error) {
     if (running()) return true;
     if (thread_.joinable()) thread_.join();
     if (proc_) {
         SDL_DestroyProcess(static_cast<SDL_Process*>(proc_));
         proc_ = nullptr;
     }
-    auto* p = static_cast<SDL_Process*>(host_start_again("--compile-shaders", true, error));
+    // This run's id, which the child writes in its record.
+    {
+        std::random_device rd;
+        const std::uint64_t clock = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        const std::uint64_t r = ((static_cast<std::uint64_t>(rd()) << 32) ^ rd()) ^ (clock * 0x9e3779b97f4a7c15ull);
+        char id[17];
+        std::snprintf(id, sizeof(id), "%016llx", static_cast<unsigned long long>(r));
+        run_ = id;
+    }
+    record_ = data_dir(data) + "/shader-compile.txt";
+    auto* p = static_cast<SDL_Process*>(host_start_again(("--compile-shaders=" + run_).c_str(), true, error));
     if (!p) {
         std::lock_guard<std::mutex> lk(mu_);
         v_ = View{};
@@ -305,7 +329,7 @@ bool ShaderCompileJob::start(std::string& error) {
         v_.running = true;
         v_.phase = "starting";
     }
-    host_log("setup: compile-shaders started");
+    host_log("setup: compile-shaders started (run %s)", run_.c_str());
     thread_ = std::thread([this] { reader(); });
     return true;
 }
@@ -332,65 +356,76 @@ ShaderCompileJob::View ShaderCompileJob::view() const {
     return v_;
 }
 
-void ShaderCompileJob::reader() {
-    auto* p = static_cast<SDL_Process*>(proc_);
-    SDL_IOStream* out = SDL_GetProcessOutput(p);
-    std::string buf;
-    char chunk[4096];
-    const auto handle = [this](const std::string& line) {
-        const std::string pre = "compile-shaders: ";
-        if (line.rfind(pre, 0) != 0) return;
-        const std::string rest = line.substr(pre.size());
-        std::lock_guard<std::mutex> lk(mu_);
-        unsigned long long d = 0, t = 0, f = 0, h = 0, l = 0, rd = 0, rt = 0;
-        double secs = 0;
-        if (std::sscanf(rest.c_str(), "progress %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6 ||
-            std::sscanf(rest.c_str(), "done %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6 ||
-            std::sscanf(rest.c_str(), "cancelled %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6) {
-            v_.recipes_done = rd;
-            v_.recipes_total = rt;
-            v_.done = d;
-            v_.total = t;
-            v_.failed = f;
-            v_.hlsl = h;
-            v_.lift = l;
-            v_.seconds = secs;
-            // Time left from the rate since the first shader was done.
-            v_.eta = d > 20 && t > d ? secs * static_cast<double>(t - d) / static_cast<double>(d) : -1;
-            if (rest.rfind("done", 0) == 0) v_.finished = true;
-            if (rest.rfind("cancelled", 0) == 0) v_.cancelled = true;
-        } else if (rest.rfind("phase ", 0) == 0) {
-            v_.phase = rest.substr(6);
-        } else if (rest.rfind("reason ", 0) == 0) {
-            v_.reasons.push_back(rest.substr(7));
-        } else if (rest.rfind("error ", 0) == 0) {
-            v_.error = rest.substr(6);
+namespace {
+
+// The child's stdout and process, as shader_compile_read reads them.
+struct SdlCompileStream final : ShaderCompileStream {
+    SDL_Process* proc = nullptr;
+    SDL_IOStream* out = nullptr;
+    std::string read_error, wait_error;  // SDL's words for a failed read, a failed wait
+    std::size_t read(char* p, std::size_t n, Status& st) override {
+        if (!out) {
+            st = kEnd;
+            return 0;
         }
-    };
-    if (out) {
-        for (;;) {
-            const std::size_t n = SDL_ReadIO(out, chunk, sizeof(chunk));
-            if (n == 0) {
-                if (SDL_GetIOStatus(out) == SDL_IO_STATUS_NOT_READY) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    continue;
-                }
-                break;  // the child ended
-            }
-            buf.append(chunk, n);
-            for (std::size_t nl; (nl = buf.find('\n')) != std::string::npos;) {
-                std::string line = buf.substr(0, nl);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                buf.erase(0, nl + 1);
-                handle(line);
-            }
+        const std::size_t got = SDL_ReadIO(out, p, n);
+        if (got == 0) {
+            const SDL_IOStatus s = SDL_GetIOStatus(out);
+            st = s == SDL_IO_STATUS_NOT_READY ? kNotReady : s == SDL_IO_STATUS_EOF ? kEnd : kError;
+            if (st == kError) read_error = SDL_GetError();
+        }
+        return got;
+    }
+    bool exited(int& code) override {
+        if (SDL_WaitProcess(proc, false, &code)) return true;
+        // Still running clears SDL's error; a wait that failed sets it, and
+        // then nothing more can be known of the child.
+        const char* e = SDL_GetError();
+        if (!e || !*e) return false;
+        wait_error = e;
+        code = -1;
+        return true;
+    }
+    void pause() override { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+};
+
+}  // namespace
+
+void ShaderCompileJob::reader() {
+    SdlCompileStream s;
+    s.proc = static_cast<SDL_Process*>(proc_);
+    s.out = SDL_GetProcessOutput(s.proc);
+    const int code = shader_compile_read(
+        s,
+        [this](const std::string& line) {
+            std::lock_guard<std::mutex> lk(mu_);
+            shader_compile_take_line(v_, line);
+        },
+        [&s](ShaderCompileStream::Status st) {
+            host_log("setup: compile-shaders: the child's output %s while it runs%s%s; read on until it exits",
+                     st == ShaderCompileStream::kEnd ? "ended" : "could not be read", s.read_error.empty() ? "" : ": ",
+                     s.read_error.c_str());
+        });
+    host_log("setup: compile-shaders ended (exit %d)%s%s", code, s.wait_error.empty() ? "" : "; its wait failed: ",
+             s.wait_error.c_str());
+    // Without its last line, its record: written before it, read only then.
+    bool need_record = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        need_record = !v_.finished && !v_.cancelled && v_.error.empty();
+    }
+    std::vector<std::string> record;
+    if (need_record) {
+        std::ifstream in(record_);
+        for (std::string l; std::getline(in, l);) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            record.push_back(l);
         }
     }
-    int code = 0;
-    SDL_WaitProcess(p, true, &code);
-    host_log("setup: compile-shaders ended (exit %d)", code);
     std::lock_guard<std::mutex> lk(mu_);
-    v_.running = false;
-    if (!v_.finished && !v_.cancelled && v_.error.empty()) v_.error = "the compile ended early (exit " + std::to_string(code) + ")";
-    v_.phase = v_.finished ? "done" : v_.cancelled ? "cancelled" : "stopped";
+    if (shader_compile_finish(v_, code, record, run_))
+        host_log("setup: compile-shaders: its last line did not reach this window; the result (%s) is its record's: %s, run %s",
+                 v_.finished ? "done" : "cancelled", record_.c_str(), run_.c_str());
+    else if (need_record && (code == 0 || code == 1))
+        host_log("setup: compile-shaders: no last line, and %s holds no record of run %s", record_.c_str(), run_.c_str());
 }

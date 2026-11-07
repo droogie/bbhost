@@ -1057,6 +1057,11 @@ if(UNIX)
   add_executable(shader_compile_advice_test tests/shader_compile_advice_test.cpp)
   target_include_directories(shader_compile_advice_test PRIVATE src)
   add_test(NAME shader_compile_advice_test COMMAND shader_compile_advice_test)
+  # Its child's stdout read to its end, and the result from its record
+  # (host/shader_compile_read.h), on a scripted stream.
+  add_executable(shader_compile_read_test tests/shader_compile_read_test.cpp)
+  target_include_directories(shader_compile_read_test PRIVATE src)
+  add_test(NAME shader_compile_read_test COMMAND shader_compile_read_test)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
