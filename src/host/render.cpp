@@ -9085,6 +9085,21 @@ void look_prewarm(const float cells[6], bool pixel_cut) {
                  twins.size());
     }).detach();
 }
+// Ahead of any camera draw - the manifest read, or the plugin's snap set or
+// changed: the grid the 3D's planned size gives (the draws' own numbers, if
+// the 3D turns out another shape, start their own set as they come).
+void look_prewarm_start() {
+    RenderScale rs;
+    std::uint32_t w = 0, h = 0;
+    if (render_scale_on(&rs) || render_scale_plan(&rs)) {
+        w = rs.render_w;
+        h = rs.render_h;
+    }
+    float cells[6] = {};
+    if (scene_look_snap()) scene_look_snap_cells(w, h, &cells[0], &cells[1]);
+    scene_look_cutaway(&cells[2]);
+    if (look_twin(cells)) look_prewarm(cells, scene_look_pixel_cut(nullptr));
+}
 // The draw's numbers, checked against this thread's last before the shared list.
 void look_prewarm_seen(const float cells[6]) {
     thread_local float last[6] = {};
@@ -30821,6 +30836,8 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     }
     g_pmanifest.loaded.store(queue.size());
     g_pmanifest.queued.store(queue.size());
+    // A plugin's snap set before now, or set later (look_prewarm_start).
+    scene_look_on_snap_change(&look_prewarm_start);
     g_pmanifest.compute_loaded.store(compute_queue.size());
     if (!queue.empty() || !compute_queue.empty()) {
         Precompiler& w = precompiler();
@@ -30845,6 +30862,7 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         }
         w.cv.notify_all();
     }
+    look_prewarm_start();  // behind the manifest's own builds
     const bool same_translator = theirs.translator == ours.translator;
     const bool same_device = theirs.vendor == ours.vendor && theirs.device == ours.device && theirs.driver == ours.driver &&
                              !std::memcmp(theirs.uuid, ours.uuid, VK_UUID_SIZE);

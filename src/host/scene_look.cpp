@@ -18,6 +18,7 @@ std::atomic<std::uint32_t> g_scale_lines{0};
 std::atomic<bool> g_colour_8bit{false};
 std::atomic<bool> g_grading_nearest{false};
 std::atomic<void (*)()> g_targets_change{nullptr};
+std::atomic<void (*)()> g_snap_change{nullptr};
 std::mutex g_cut_mu;
 float g_cut[4] = {};  // under g_cut_mu
 std::atomic<bool> g_cut_on{false};
@@ -30,7 +31,11 @@ void targets_changed() {
 
 }  // namespace
 
-void scene_look_set_snap(std::uint32_t lines) { g_snap.store(lines, std::memory_order_relaxed); }
+void scene_look_set_snap(std::uint32_t lines) {
+    if (g_snap.exchange(lines, std::memory_order_relaxed) == lines) return;
+    if (void (*fn)() = g_snap_change.load(std::memory_order_acquire)) fn();
+}
+void scene_look_on_snap_change(void (*fn)()) { g_snap_change.store(fn, std::memory_order_release); }
 std::uint32_t scene_look_snap() { return g_snap.load(std::memory_order_relaxed); }
 
 bool scene_look_snap_cells(std::uint32_t w, std::uint32_t h, float* cells_x, float* cells_y) {

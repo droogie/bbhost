@@ -14,6 +14,9 @@
 constexpr std::uint32_t kSnapPixels = 0xffffffffu;
 void scene_look_set_snap(std::uint32_t lines);
 std::uint32_t scene_look_snap();
+// Called (the plugin's thread) after the snap changes: render.cpp makes its
+// twins of the manifest's pipelines ahead (look_prewarm_start).
+void scene_look_on_snap_change(void (*fn)());
 // The grid for a 3D of w x h: its cells across and down (false: no snap).
 bool scene_look_snap_cells(std::uint32_t w, std::uint32_t h, float* cells_x, float* cells_y);
 
