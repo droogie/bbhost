@@ -490,9 +490,12 @@ the default, and nothing waits on DXC:
   to take (the last compile's, else a guess: about 2-3 minutes on a Steam
   Deck); it never starts by itself. The run logs to
   `<data>/bbhost/shader-compile.log` and records its result in
-  `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
-  shaders, 3,682 DXC modules, 16 workers), on a laptop's RTX 3070 Ti (Ryzen 7
-  6800H, Windows) ~90 s and on the Steam Deck ~150 s. What it does not do is
+  `<data>/bbhost/shader-compile.txt` before its last lines, with the id of
+  the run the window started; a window that did not get those lines takes
+  the result from that record, never from an earlier run's. On the RTX 4070
+  it takes ~60 s (3,281 shaders, 3,682 DXC modules, 16 workers), on a
+  laptop's RTX 3070 Ti (Ryzen 7 6800H, Windows) ~90 s and on the Steam Deck
+  ~150 s. What it does not do is
   a first session's first sight: the variants a draw makes (clip-discard pixel
   shaders, vertex layouts, the eboot's own programs, the tessellation LS
   pipelines) come from the pipeline manifest, which only earlier sessions
@@ -820,25 +823,46 @@ where the command processor had been the limit.
 **On by default above 60 fps (`BBHOST_GXVK_HOMES` unset).** The constant
 buffers' homes - and with them the segments, and the run batching
 (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by default only
-where the frame rate can gain from them: a graphics card with room (the homes'
-own rule below: not an integrated GPU, no small video memory unless
-`BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget, no tight memory), 16 hardware
+where the frame rate can gain from them: a graphics card with room, or one
+with small video memory that has 6,144 MiB or more free at the start (the
+homes' own rule below: not an integrated GPU, no tight memory), 16 hardware
 threads or more that the process may run on (its CPU affinity, so a
-`taskset` counts), a frame rate above 60 (a fixed rate above 60, or
-Display-Limited on a display above 60 Hz), and the run commit off
-(`BBHOST_RUN_COMMIT`). At 60 and below the frame waits for its limit anyway,
-and the pool's two threads would cost about a core more for nothing, so
-everything there is as it was before them. The pool's splices give way to the
-run commit, which is on by default on Windows, and the homes beside it have
-not been measured there: on Windows they stay off by default, the run commit
-as it was, until a Windows measurement decides (`BBHOST_RUN_COMMIT=0` there
-lets the default decide). The homes are made as
+`taskset` counts), and a frame rate above 60 (a fixed rate above 60, or
+Display-Limited on a display above 60 Hz). At 60 and below the frame waits
+for its limit anyway, and the pool's two threads would cost about a core more
+for nothing, so everything there is as it was before them. On a card with
+small video memory the homes take the pool's budget (128 MiB, as on a card
+with room) and the game's memory is still imported a window at a time; under
+6,144 MiB free they stay off (on a 4 GB card the pool pushed images into host
+memory), unless `BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget.
+
+The pool's splices give way to the run commit (`BBHOST_RUN_COMMIT`). Turned
+on by its setting, it keeps the homes off by default. On by Windows' default
+alone, it gives way instead where the rest of the rule holds: there the draws
+are committed in order but for the pool's splices, as on Linux. Under Windows
+on an RTX 3070 Ti Laptop GPU with 16 hardware threads (1080p, uncapped,
+alternating runs, frames within noise, no draw failures), the homes and the
+segments without the run commit against the run commit:
+
+| the card | Old Yharnam | Nightmare of Mensis | Cainhurst's courtyard | Central Yharnam |
+|---|---|---|---|---|
+| as shipped (8 GB, 7,249 MiB free: small video memory, the 128 MiB budget, window imports) | +27% | +3.0% | +3.6% | +4.0% |
+| taken as a card with room (`BBHOST_SMALL_VRAM=0`: whole imports) | +29% | +2.5% | +2.2% | +3.4% |
+
+As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
+second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
+fewer threads, 60 fps and below, a card under 6,144 MiB free - the run commit
+stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play applies at the next start, as the frame rate
 itself does (F10 marks it). Off, one line says why (`gxvk homes: off by
-default here (...)`); on, the homes' line says what decided it.
-`BBHOST_GXVK_HOMES=1` or `=0` decides either way, and `BBHOST_GXVK_LISTS` the
-segments alone.
+default here (...)`); on, the homes' line says what decided it, and on
+Windows the run commit's line (`list-resolve: run commit ...`) says whether
+it gave way. `BBHOST_GXVK_HOMES=1` turns the homes on anywhere they can be
+made (where the rest of the rule holds, Windows' run commit gives way as with
+the default), `=0` keeps the path before them with the run commit as it was;
+`BBHOST_RUN_COMMIT` set decides the run commit either way, and
+`BBHOST_GXVK_LISTS` the segments alone.
 
 ### GX's objects as Vulkan objects (a design note)
 
@@ -1043,8 +1067,8 @@ version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
 handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps with 16 hardware
-threads or more, a card with room and the run commit off: "On by default above
-60 fps" above).** A
+threads or more and a card with room or 6,144 MiB free, the run commit giving
+way on Windows: "On by default above 60 fps" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
 copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
@@ -1067,9 +1091,10 @@ finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
 it stays the home. A home ends with its buffer, and a buffer made past the
 pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
-its life. Off on an integrated GPU, and with small video memory unless a
-budget is given (on a 4 GB card the pool's ~80 MiB pushed images into host
-memory). `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+its life. Off on an integrated GPU, and with small video memory under 6,144
+MiB free at the start unless a budget is given (on a 4 GB card the pool's ~80
+MiB pushed images into host memory); from 6,144 MiB free the pool's budget is
+the same 128 MiB. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
 the homes beside it with a CPU mirror of each, and checks each binding of a
 home against its mirror (and each capture against the bytes today's copy
 takes at the token); `=twins` keeps the homes as device-local twins

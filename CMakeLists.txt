@@ -122,6 +122,8 @@ add_executable(bbhost
   src/engine/dream_mirror_layout.cpp
   src/engine/chara_id.cpp
   src/engine/five_players.cpp
+  src/engine/phantom_hp.cpp
+  src/engine/auto_replenish.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
@@ -166,6 +168,7 @@ add_executable(bbhost
   src/host/bindings.cpp
   src/host/audio.cpp
   src/host/frame_stats.cpp
+  src/host/slow_calls.cpp
   src/host/draw_digest.cpp
   src/host/perf_meter.cpp
   src/host/main_wait.cpp
@@ -346,11 +349,13 @@ if(Vulkan_FOUND)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_LIB})
   endif()
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
-  # optimizer; without it every table is built. Not in the Windows build yet,
-  # though its prefix has the optimizer: it has not been run there.
+  # optimizer; without it every table is built - every GX draw's user data in
+  # full, each table's pointer into GX's ring, and the draw pool's list mode
+  # stops at each constant buffer read through one. Windows too: the prefix
+  # (tools/win_deps.sh) builds the optimizer at the Linux builds' tag.
   target_sources(bbhost PRIVATE src/host/shader_liveness.cpp)
   find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt)
-  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB AND NOT WIN32)
+  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()
@@ -617,6 +622,10 @@ if(UNIX)
   target_link_libraries(poll_pacing_test PRIVATE pthread)
   add_test(NAME poll_pacing_test COMMAND poll_pacing_test)
   set_tests_properties(poll_pacing_test PROPERTIES TIMEOUT 60)  # a turn never handed back hangs its threads
+  # The setup window's sign-in check: the server's answers read (net/sign_in_check.h).
+  add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
+  target_include_directories(sign_in_check_test PRIVATE src)
+  add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
@@ -634,6 +643,13 @@ if(UNIX)
   add_executable(wait_reg_mem_test tests/wait_reg_mem_test.cpp)
   target_include_directories(wait_reg_mem_test PRIVATE src)
   add_test(NAME wait_reg_mem_test COMMAND wait_reg_mem_test)
+  # The slow-call registry without the game: the line, the counts, the test
+  # hook and its lock, the cost of a timed call (tests/slow_calls_test.cpp).
+  add_executable(slow_calls_test tests/slow_calls_test.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
+  target_include_directories(slow_calls_test PRIVATE src)
+  target_link_libraries(slow_calls_test PRIVATE Threads::Threads)
+  add_test(NAME slow_calls_test COMMAND slow_calls_test)
+  set_tests_properties(slow_calls_test PROPERTIES TIMEOUT 60)
   # FMOD's sound-group ring guard without the game (tests/fmod_ring_test.cpp).
   add_executable(fmod_ring_test tests/fmod_ring_test.cpp)
   target_include_directories(fmod_ring_test PRIVATE src)
@@ -689,6 +705,9 @@ if(UNIX)
   add_executable(gxvk_homes_test tests/gxvk_homes_test.cpp)
   target_include_directories(gxvk_homes_test PRIVATE src include)
   add_test(NAME gxvk_homes_test COMMAND gxvk_homes_test)
+  add_executable(gxvk_rest_test tests/gxvk_rest_test.cpp)
+  target_include_directories(gxvk_rest_test PRIVATE src include)
+  add_test(NAME gxvk_rest_test COMMAND gxvk_rest_test)
   # Stage 4b.1a's lock: readers on eight threads beside one writer (host/cache_rw.h).
   add_executable(cache_rw_test tests/cache_rw_test.cpp src/host/cache_rw.cpp)
   target_include_directories(cache_rw_test PRIVATE src)
@@ -916,9 +935,9 @@ if(UNIX)
     add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
     # The device memory tracker's owners and heap classes, with the driver's
     # allocation calls faked (host/gpu_memtrack.h; tests/gpu_memtrack_test.cpp).
-    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp)
+    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
     target_include_directories(gpu_memtrack_test PRIVATE src)
-    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers)
+    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers Threads::Threads)
     add_test(NAME gpu_memtrack_test COMMAND gpu_memtrack_test)
   endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).
@@ -1018,6 +1037,17 @@ if(UNIX)
   add_executable(shader_compile_advice_test tests/shader_compile_advice_test.cpp)
   target_include_directories(shader_compile_advice_test PRIVATE src)
   add_test(NAME shader_compile_advice_test COMMAND shader_compile_advice_test)
+  # Its child's stdout read to its end, and the result from its record
+  # (host/shader_compile_read.h), on a scripted stream.
+  add_executable(shader_compile_read_test tests/shader_compile_read_test.cpp)
+  target_include_directories(shader_compile_read_test PRIVATE src)
+  add_test(NAME shader_compile_read_test COMMAND shader_compile_read_test)
+  if(SDL3_FOUND AND Vulkan_FOUND)
+    # The same end to end: bbhost started again as the setup window starts
+    # it, with children that pretend the compile (no GPU, no game).
+    add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
+    set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
+  endif()
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)

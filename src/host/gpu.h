@@ -397,6 +397,11 @@ bool host_gpu_splice(std::uint64_t id);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 std::string host_gpu_splice_report(bool window = false);
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the command processor
+// arrives at GX-native draw token `id`, before anything takes it; the line,
+// in three parts, with the pool's time parked (rdtsc ticks) and its parks.
+void host_gpu_lists_arrival(std::uint64_t id);
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks);  // part 0, 1, 2
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): at GX-native draw token `id`,
 // before its slot is taken - the members of a segment ready to splice whose
 // first member it is (null: none), their count and the segment's word; the
@@ -699,7 +704,7 @@ std::string host_gpu_clear_view_report();
 struct GpuStats {
     std::uint64_t draws, dispatches, flushes, gpu_us, pipelines, transfers, transfer_batches;
     // CP-thread wall time by phase, nanoseconds (see kPhaseNames).
-    std::uint64_t phase_ns[8];
+    std::uint64_t phase_ns[9];
     // host_gpu_draw calls, failures, and calls that had nothing to draw.
     std::uint64_t draw_calls, draw_failures, draws_empty;
     // The draws by how their pixel shader ran (DrawPs), and the failures by
@@ -756,8 +761,16 @@ enum DrawVsWhy {
 const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
-enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };
-static const char* const kPhaseNames[8] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait"};
+// kPhaseDriver: a command-processor thread inside a timed driver call
+// (host/slow_calls.h) - or a wait for the queue's lock or for a submission the
+// submission thread has still to hand over - in a command buffer's packets,
+// which `exec` includes, or after the job, outside it (its submission and the
+// slot it retires); a wait for the GPU's fence or timeline holds the GPU's
+// own time too. Last, so the line's fields before it keep their places for
+// the tools that read them.
+enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseDriver, kPhaseCount };
+static const char* const kPhaseNames[kPhaseCount] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait", "driver"};
+static_assert(sizeof(GpuStats::phase_ns) / sizeof(GpuStats::phase_ns[0]) == kPhaseCount, "a phase for each name");
 void host_gpu_phase_add(int phase, std::uint64_t ns);
 // Scoped wall-clock accumulator for a phase. `weight` books each reading that
 // many times over, so a caller can time one call in n; 0 reads no clock.

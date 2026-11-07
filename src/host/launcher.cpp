@@ -50,6 +50,11 @@ struct Server {
     bool verify_tls, require_account;
     const char* auth_server;  // where /auth/* goes ("": the NP server's origin)
 };
+// The server no longer takes this PC's sign-in (net::account_refused, from
+// the sign-in check): what the account places say, and the ways back in.
+constexpr const char kRefusedNotice[] =
+    "Your sign-in has expired, or this PC was signed out. Online play needs a new sign-in: log in with Discord again, "
+    "or recover an account kept on this PC with its recovery code.";
 // Both take only https and signed-in players; the playtest server as the
 // playtest kit's bbhost-playtest.toml has it.
 constexpr Server kServers[] = {
@@ -351,7 +356,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::chrono::steady_clock::time_point cache_state_at{};
     bool cache_state_devices = false, compile_was_running = false;
     // The PC enhancements, through the same calls: each is read when the
-    // game starts (main.cpp, config_set_enhancements). The same four the
+    // game starts (main.cpp, config_set_enhancements). The same ones the
     // game's System > PC Enhancements and F10 > PC ENHANCEMENTS have.
     struct Enhancement {
         const char* key;
@@ -373,6 +378,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
          false},
         {"skill_issue", "SKILL ISSUE", "The death message says SKILL ISSUE.",
          "When the hunter dies, the screen says SKILL ISSUE instead of YOU DIED, in every language.", false},
+        {"full_phantom_hp", "Full Phantom HP", "Your full HP when you are summoned into another hunter's world.",
+         "Summoned into another hunter's world as a cooperator or an invader, the game gives a hunter 70% of their HP. "
+         "With this on, yours stays whole. It is each visitor's own setting: a host's changes nothing for the hunters in "
+         "its world, and every game in the session shows a visitor's HP as the visitor's own game has it.",
+         false},
+        {"auto_replenish", "Auto-Replenish Items",
+         "Molotovs, knives and more refill from storage on a death in your world or in the Hunter's Dream.",
+         "Twenty more consumables refill from storage the way Blood Vials and Quicksilver Bullets do - after a death "
+         "in your own world and on arriving in the Hunter's Dream: Molotovs, knives, pebbles, papers, elixirs, "
+         "pellets, Bone Marrow Ash and more.",
+         false},
     };
     for (Enhancement& e : enhancements) e.on = host_opt_get(e.key);
     // The Patches page: every manifest the loader would read
@@ -452,6 +468,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     char acct_name[64] = {};
     char acct_code[64] = {};
     std::snprintf(acct_name, sizeof(acct_name), "%s", net::account_name().c_str());
+    bool focus_recovery = false;  // the recovery code's field takes the keys when the Online page opens (Recover)
     // The server the dropdown names, in memory: the account calls go there
     // whether or not it has been saved yet.
     auto apply_server = [&]() {
@@ -459,6 +476,65 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         config_set_online(custom ? f[kHost].str() : kServers[server].host, custom ? scheme : kServers[server].scheme,
                           custom ? verify_tls : kServers[server].verify_tls, custom ? require_account : kServers[server].require_account,
                           custom ? cfg.auth_server : kServers[server].auth_server);
+    };
+    // The sign-in check (net/account.h): whether the server still takes this
+    // PC's sign-in, asked on a thread of its own - at the start when a token is
+    // held, again once a sign-in, recovery or link has completed (a new sign-in
+    // has no check yet), when the server chosen changes, and on Retry. Nothing
+    // waits for it; the account section, the Game page and the line under Play
+    // say what it found.
+    std::string checked_server;  // the server the last check went to
+    auto server_key = [&]() {
+        const bool custom = server == 2;
+        return std::to_string(server) + "|" + (custom ? f[kHost].str() + "|" + scheme + (verify_tls ? "|v" : "|-") : std::string());
+    };
+    auto check_sign_in = [&]() {
+        apply_server();
+        checked_server = server_key();
+        net::account_check_start();
+    };
+    // What the window says of the sign-in: the account's line and its colour.
+    struct SignIn {
+        bool in = false, refused = false, checking = false, valid = false, unchecked = false, needed = false;
+        std::string line;      // under the name
+        std::string foot;      // the line under Play ("" none)
+        ImU32 col = 0;
+    };
+    auto sign_in_state = [&]() {
+        SignIn s;
+        s.in = net::account_logged_in();
+        s.needed = server == 2 ? require_account : kServers[server].require_account;
+        s.col = ui::kTextDim;
+        if (!s.in) {
+            s.line = s.needed ? "This server needs a sign-in to play online." : "Sign in to play online";
+            if (s.needed) s.foot = "Not signed in (offline)";
+            return s;
+        }
+        const net::AccountCheck c = net::account_check();
+        // A check on its way (another server chosen, Retry) speaks before an
+        // earlier answer.
+        s.refused = net::account_refused() && c.state != net::AccountCheckState::Checking;
+        if (s.refused) {
+            s.line = "Sign-in expired, or this PC was signed out";
+            s.foot = "Sign-in expired";
+            s.col = ui::kWarn;
+        } else if (c.state == net::AccountCheckState::Valid) {
+            s.valid = true;
+            s.line = s.foot = "Signed in as " + net::account_name();
+            s.col = ui::kGood;
+        } else if (c.state == net::AccountCheckState::Unchecked) {
+            s.unchecked = true;
+            const std::string why = c.status == 0 ? std::string("the server did not answer")
+                                    : c.why.find("ResKind") != std::string::npos
+                                        ? "this server has no sign-in check (HTTP " + std::to_string(c.status) + ")"
+                                        : "the server answered HTTP " + std::to_string(c.status);
+            s.line = "The sign-in could not be checked: " + why + ".";
+            s.foot = "Sign-in not checked";
+        } else {
+            s.checking = true;
+            s.line = s.foot = "Checking the sign-in...";
+        }
+        return s;
     };
     auto save = [&]() -> bool {
         std::vector<ConfigEdit> e;
@@ -536,6 +612,12 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             host_options_save_now();
             if (net::account_logged_in()) std::snprintf(acct_name, sizeof(acct_name), "%s", net::account_name().c_str());
         }
+        // The sign-in check: for a sign-in nothing has checked yet, or when the
+        // server chosen is not the one last asked - not while a field is being
+        // typed in (the custom host), nor while an account action runs.
+        if (net::account_logged_in() && !host_account_busy() && !ImGui::IsAnyItemActive() &&
+            (net::account_check().state == net::AccountCheckState::None || server_key() != checked_server))
+            check_sign_in();
         {
             std::lock_guard<std::mutex> lk(g_pick_mu);
             if (g_pick_for >= 0) {
@@ -621,7 +703,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             // The child reads the saved settings: save first.
             if (save()) {
                 std::string err;
-                compile_job.start(err);
+                compile_job.start(f[kData].str(), err);
             }
         };
         auto go = [&](int p) {
@@ -632,6 +714,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         const bool compiling = compile_job.running();
         const bool can_play = app0_ok && eboot.ok && !compiling;
         bool play = false;
+        const SignIn si = sign_in_state();
 
         // The sidebar: the name, the pages, and Play.
         {
@@ -673,7 +756,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImU32 dot = 0;
                 char badge[16] = {};
                 if (i == kPageGame && !(app0_ok && eboot.ok)) dot = ui::kWarn;
-                if (i == kPageOnline && net::account_logged_in()) dot = ui::kGood;
+                if (i == kPageOnline && (si.valid || si.refused)) dot = si.refused ? ui::kWarn : ui::kGood;
                 if (i == kPageShaders) {
                     if (cv.running && cv.total) std::snprintf(badge, sizeof(badge), "%d%%", static_cast<int>(100 * cv.done / cv.total));
                     else if (recommend_compile) dot = ui::kWarn;
@@ -703,9 +786,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                                       : ", which every copy of bbhost reads."));
             ImGui::SameLine();
             if (ui::ghost_button("Quit", ImVec2(half, 0)) || (test && !std::strcmp(test, "quit") && ++frames > 30)) done = true;
-            // One line under them: why Play waits, or what Save did.
+            // One line under them: why Play waits, or what Save did, or else
+            // how the sign-in stands (the check, above).
             std::string note;
             ImU32 note_col = ui::kTextDim;
+            bool sign_in_note = false;
             if (!saved_note.empty() && (!saved_ok || ImGui::GetTime() - saved_at < 4.0)) {
                 note = saved_note;
                 note_col = saved_ok ? ui::kGood : ui::kBad;
@@ -714,9 +799,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             } else if (!can_play) {
                 note = "Needs the game folder and 1.09 eboot";
                 note_col = ui::kWarn;
+            } else if (!si.foot.empty()) {
+                note = si.foot;
+                note_col = si.col;
+                sign_in_note = true;
             }
             if (!note.empty()) {
                 ImGui::PushFont(nullptr, 13.5f);
+                note = ui::fit_text(note, w);
                 const float nw = ImGui::CalcTextSize(note.c_str()).x;
                 ImGui::SetCursorPosX(std::max(0.0f, (w - nw) * 0.5f));
                 ImGui::PushStyleColor(ImGuiCol_Text, note_col);
@@ -724,6 +814,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
                 if (!saved_ok) ui::tooltip_for_item(nullptr, saved_note);
+                if (sign_in_note && (si.refused || si.unchecked || !si.in)) ui::tooltip_for_item(nullptr, si.refused ? kRefusedNotice : si.line);
             }
             ImGui::EndChild();
         }
@@ -744,9 +835,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 apply_server();
                 host_account_action(1, test_create, "");
             } else if (!host_account_busy()) {
-                host_log("setup: account test: %s; %s", host_account_outcome().c_str(), host_account_detail().c_str());
-                if (host_account_take_save()) host_options_save_now();
-                done = true;
+                // ... and once the new sign-in's check has its answer.
+                const net::AccountCheckState cs = net::account_check().state;
+                if (!net::account_logged_in() || (cs != net::AccountCheckState::None && cs != net::AccountCheckState::Checking)) {
+                    // The recovery code is never logged, a test's neither.
+                    host_log("setup: account test: %s; %s", host_account_outcome().c_str(),
+                             host_account_detail().empty() ? "no code shown" : "a recovery code shown (not logged)");
+                    if (host_account_take_save()) host_options_save_now();
+                    done = true;
+                }
             }
         }
 
@@ -910,32 +1007,62 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                                                     : f[kHost].str())
                                                           : std::string(kServers[server].host));
                 ImGui::Dummy(ImVec2(0, 4 * scale));
-                const bool in = net::account_logged_in();
+                // The account and how its sign-in stands (the check): Manage
+                // at the right, Sign in when nobody is, Retry when the check
+                // had no answer; a sign-in the server no longer takes says so
+                // under it, with the ways back in.
+                const bool in = si.in;
                 const float av = std::round(ImGui::GetFrameHeight() * 1.5f);
                 const ImVec2 at = ImGui::GetCursorScreenPos();
                 const float right = at.x + ImGui::GetContentRegionAvail().x;
-                const char* go_label = in ? "Manage" : "Sign in";
-                const float bw = ImGui::CalcTextSize(go_label).x + st.FramePadding.x * 3;
+                const char* go_label = !in ? "Sign in" : si.refused ? nullptr : si.unchecked ? "Retry" : "Manage";
+                const float bw = go_label ? ImGui::CalcTextSize(go_label).x + st.FramePadding.x * 3 : 0.0f;
                 ui::avatar(in ? net::account_name() : std::string(), av);
                 ImGui::SameLine(0, 12 * scale);
                 ImGui::BeginGroup();
                 ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, at.y + 1 * scale));
                 // The words stop short of the button.
-                ImGui::PushTextWrapPos(right - bw - 10 * scale - ImGui::GetWindowPos().x);
+                ImGui::PushTextWrapPos(right - (go_label ? bw + 10 * scale : 0.0f) - ImGui::GetWindowPos().x);
                 ImGui::PushFont(ui::font_strong(), 0.0f);
                 ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
                 ImGui::PopFont();
                 ImGui::PushFont(nullptr, 14.0f);
-                ImGui::PushStyleColor(ImGuiCol_Text, in ? ui::kGood : ui::kTextDim);
-                ImGui::TextUnformatted(in ? "Signed in" : "Sign in to play online");
+                ImGui::PushStyleColor(ImGuiCol_Text, si.col);
+                ImGui::TextUnformatted(si.line.c_str());
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
                 ImGui::PopTextWrapPos();
                 ImGui::EndGroup();
-                ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y + (av - ImGui::GetFrameHeight()) * 0.5f));
-                if (in ? ui::ghost_button(go_label) : ui::primary_button(go_label, ImVec2(bw, 0))) go(kPageOnline);
-                ImGui::SetCursorScreenPos(ImVec2(at.x, at.y + av));
+                const float text_bottom = ImGui::GetItemRectMax().y;
+                if (go_label) {
+                    ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y + (av - ImGui::GetFrameHeight()) * 0.5f));
+                    if (!in ? ui::primary_button(go_label, ImVec2(bw, 0)) : ui::ghost_button(go_label)) {
+                        if (si.unchecked) check_sign_in();
+                        else go(kPageOnline);
+                    }
+                    if (si.unchecked) ui::tooltip_for_item(nullptr, "Ask the server again.");
+                }
+                ImGui::SetCursorScreenPos(ImVec2(at.x, std::max(at.y + av, text_bottom)));
                 ImGui::Dummy(ImVec2(0, 0));
+                if (si.refused) {
+                    ImGui::Dummy(ImVec2(0, 2 * scale));
+                    dim_text("Online play needs a new sign-in: log in with Discord again, or recover an account kept on this PC.");
+                    ImGui::Dummy(ImVec2(0, 2 * scale));
+                    ImGui::BeginDisabled(host_account_busy());
+                    if (ui::primary_button("Log in with Discord", ImVec2(0, 0))) {
+                        apply_server();
+                        host_account_action(0, "", "");
+                        go(kPageOnline);
+                    }
+                    ImGui::EndDisabled();
+                    ui::tooltip_for_item(nullptr, "Opens the website: sign in there with Discord and approve the code.");
+                    ImGui::SameLine();
+                    if (ui::ghost_button("Recover")) {
+                        focus_recovery = true;
+                        go(kPageOnline);
+                    }
+                    ui::tooltip_for_item(nullptr, "An account kept on this PC comes back with its recovery code (Online).");
+                }
             }
             ui::card_end();
 
@@ -995,20 +1122,44 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ui::card_begin("##account", ImVec2(w, 0), "ACCOUNT");
             {
                 const bool busy = host_account_busy();
-                const bool in = net::account_logged_in();
+                const bool in = si.in;
                 const float av = std::round(ImGui::GetFrameHeight() * 1.6f);
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                const float right = at.x + ImGui::GetContentRegionAvail().x;
+                // Retry at the right while the check had no answer.
+                const char* retry = in && si.unchecked && !busy ? "Retry" : nullptr;
+                const float bw = retry ? ImGui::CalcTextSize(retry).x + st.FramePadding.x * 3 : 0.0f;
                 ui::avatar(in ? net::account_name() : std::string(), av);
                 ImGui::SameLine(0, 12 * scale);
                 ImGui::BeginGroup();
+                ImGui::PushTextWrapPos(right - (retry ? bw + 10 * scale : 0.0f) - ImGui::GetWindowPos().x);
                 ImGui::PushFont(ui::font_strong(), 18.0f);
                 ImGui::TextUnformatted(in ? net::account_name().c_str() : "Not signed in");
                 ImGui::PopFont();
+                // The last action's outcome while it says something of its own
+                // (a code asked for, a refusal); else how the sign-in stands.
                 const std::string outcome = host_account_outcome();
-                dim_text(!outcome.empty() && outcome != host_account_signed_in() ? outcome
-                         : in                                                    ? std::string("Signed in")
-                                                                                 : std::string("Log in with Discord, or keep an account on this PC."),
-                         in && (outcome.empty() || outcome == host_account_signed_in()) ? ui::kGood : ui::kTextDim);
+                const bool own = !outcome.empty() && outcome != host_account_signed_in();
+                const std::string not_in = si.needed ? "This server needs a sign-in to play online: log in with Discord, or keep an account on this PC."
+                                                     : "Log in with Discord, or keep an account on this PC.";
+                ImGui::PushFont(nullptr, 14.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, own ? ui::kTextDim : si.col);
+                ImGui::TextUnformatted((own ? outcome : in ? si.line : not_in).c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                ImGui::PopTextWrapPos();
                 ImGui::EndGroup();
+                if (retry) {
+                    const ImVec2 back = ImGui::GetCursorScreenPos();
+                    ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y + (av - ImGui::GetFrameHeight()) * 0.5f));
+                    if (ui::ghost_button(retry)) check_sign_in();
+                    ui::tooltip_for_item(nullptr, "Ask the server again.");
+                    ImGui::SetCursorScreenPos(back);
+                }
+                if (in && si.refused && !busy) {
+                    ImGui::Dummy(ImVec2(0, 2 * scale));
+                    ui::banner(ui::Icon::Warning, ui::kWarn, kRefusedNotice);
+                }
                 const std::string detail = host_account_detail();
                 if (!detail.empty()) {
                     ImGui::Dummy(ImVec2(0, 2 * scale));
@@ -1031,8 +1182,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ImGui::Dummy(ImVec2(0, 4 * scale));
                 ImGui::BeginDisabled(busy);
-                // The way in for most players: lit until someone is signed in.
-                if (in ? ImGui::Button("Log in with Discord") : ui::primary_button("Log in with Discord", ImVec2(0, 0))) {
+                // The way in for most players: lit until someone is signed in,
+                // and again when the server no longer takes the sign-in.
+                if (in && !si.refused ? ImGui::Button("Log in with Discord") : ui::primary_button("Log in with Discord", ImVec2(0, 0))) {
                     apply_server();
                     host_account_action(0, "", "");
                 }
@@ -1051,6 +1203,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ui::tooltip_for_item(nullptr, "An account held by this PC, under that name. Keep the recovery code it shows.");
                 ImGui::SetNextItemWidth(field_w);
+                if (focus_recovery && !busy) {
+                    ImGui::SetKeyboardFocusHere();
+                    focus_recovery = false;
+                }
                 ImGui::InputTextWithHint("##acct_code", "Recovery code", acct_code, sizeof(acct_code));
                 ImGui::SameLine();
                 if (ImGui::Button("Recover")) {
@@ -1059,7 +1215,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     acct_code[0] = 0;
                 }
                 ui::tooltip_for_item(nullptr, "The account of that name, back on this PC with its recovery code.");
-                ImGui::BeginDisabled(!in);
+                ImGui::BeginDisabled(!in || si.refused);  // a code needs a sign-in the server still takes
                 if (ImGui::Button("Website sign-in code")) {
                     apply_server();
                     host_account_action(3, "", "");

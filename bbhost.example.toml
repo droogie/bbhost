@@ -186,7 +186,7 @@ all_post_processors = false
 # The PC enhancements: additions to the game itself, all on by default. The
 # setup window's PC enhancements tab, F10 > PC ENHANCEMENTS and the game's
 # System > PC Enhancements turn each on or off for the next start, and what is
-# chosen there wins over these lines. Turn all three off for the game as it
+# chosen there wins over these lines. Turn them all off for the game as it
 # shipped (The Old Hunters is a patch: old-hunters under [patches] above).
 #
 # The mirror in the Hunter's Dream workshop: the developers placed a "Put on
@@ -214,6 +214,24 @@ five_players = true
 # The death screen's YOU DIED reads SKILL ISSUE instead, in every language.
 # The one enhancement off by default. BBHOST_SKILL_ISSUE=0 or 1 overrides.
 skill_issue = false
+
+# Full Phantom HP. Summoned into another hunter's world - a cooperator, an
+# invader, a covenant's adversary - the game gives a hunter 70% of their max
+# HP there. true: yours stays whole. It is each visitor's own setting: a
+# host's changes nothing for the hunters in its world, and every game in the
+# session shows a visitor's HP as the visitor's own game has it. false keeps
+# the game's 70%. BBHOST_FULL_PHANTOM_HP=0 or 1 overrides this setting.
+full_phantom_hp = true
+
+# Auto-Replenish Items. Blood Vials and Quicksilver Bullets refill from storage
+# up to what the hunter can carry, after a death in the hunter's own world and
+# on arriving in the Hunter's Dream. true: so do twenty more consumables -
+# Antidote, Sedative, Beast Blood Pellet, Blue Elixir, the Molotov and Rope
+# Molotov Cocktails and their delayed kinds, Poison Knife, Oil Urn, Pebble,
+# Throwing Knife, Pungent Blood Cocktail, Numbing Mist, Fire and Bolt Paper,
+# Bone Marrow Ash, Bold Hunter's Mark, Shining Coins and Lead Elixir. false
+# keeps the game's two. BBHOST_AUTO_REPLENISH=0 or 1 overrides this setting.
+auto_replenish = true
 
 # [plugins]
 # Gameplay plugins (docs/plugins.md): randomizer, boss_rush, mutators - each

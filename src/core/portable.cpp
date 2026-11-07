@@ -272,8 +272,13 @@ unsigned host_cpu_threads() {
     return std::max(1u, std::thread::hardware_concurrency());
 }
 
+namespace {
+thread_local char t_thread_name[32];  // host_thread_name's
+}  // namespace
+
 void host_thread_set_name(const char* name) {
     if (!name || !name[0]) return;
+    std::snprintf(t_thread_name, sizeof(t_thread_name), "%s", name);
 #if defined(_WIN32)
     pthread_setname_np(pthread_self(), name);
 #else
@@ -302,6 +307,20 @@ void host_thread_set_name(const char* name) {
     for (; i < 63 && name[i]; ++i) w[i] = static_cast<wchar_t>(static_cast<unsigned char>(name[i]));
     w[i] = 0;
     set_desc(GetCurrentThread(), w);
+#endif
+}
+
+bool host_thread_name(char* out, std::size_t n) {
+    if (!out || !n) return false;
+    if (t_thread_name[0]) {
+        std::snprintf(out, n, "%s", t_thread_name);
+        return true;
+    }
+    out[0] = 0;
+#if defined(_WIN32)
+    return false;
+#else
+    return pthread_getname_np(pthread_self(), out, n) == 0 && out[0];
 #endif
 }
 

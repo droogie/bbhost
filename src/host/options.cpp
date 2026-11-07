@@ -103,6 +103,8 @@ enum SettingId {
     kRebirth,
     kFivePlayers,
     kSkillIssue,
+    kFullPhantomHp,
+    kAutoReplenish,
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
@@ -147,8 +149,9 @@ Setting g_set[kSettingCount] = {
     // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
     // 60, and reads as 60 (host_options_load).
     // Read once as the game starts (engine/frame_rate.cpp), and with it the
-    // default for the draw work the pool prepares (host/gxvk_homes.h
-    // default_off): a restart setting.
+    // defaults for the draw work the pool prepares and, on Windows, the run
+    // commit's (host/gxvk_homes.h default_off, run_commit_gives_way): a
+    // restart setting.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
      "Requires a restart. 30 is the game's own pace; the others run its logic at that rate. Display-Limited caps it at your "
      "monitor's refresh rate when the game starts (180 on a 180 Hz monitor) and runs it the same way.",
@@ -317,7 +320,7 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
-    // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
+    // bbhost.toml's [world] says otherwise. Off, all of them, is the game as it
     // shipped. (The Old Hunters, a fourth in v0.2.9, is the patch old-hunters.)
     {"change_appearance", "Hunter's Dream mirror", {"On", "Off"}, 0,
      "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
@@ -327,6 +330,11 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
     // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
     {"skill_issue", "SKILL ISSUE", {"On", "Off"}, 0, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
+     true},
+    {"full_phantom_hp", "Full Phantom HP", {"On", "Off"}, 0,
+     "Requires a restart. Your full HP when summoned to another world; each visitor's own setting decides.", true},
+    {"auto_replenish", "Auto-Replenish Items", {"On", "Off"}, 0,
+     "Requires a restart. Molotovs, knives and more refill from storage on a death in your world or in the Dream.",
      true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
@@ -395,6 +403,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
+    {Row::Option, nullptr, kFullPhantomHp},
+    {Row::Option, nullptr, kAutoReplenish},
     {Row::Header, "STARTUP"},
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
@@ -483,11 +493,15 @@ void set_account_lines(const std::string& status, const std::string& detail) {
     g_acct_detail = detail;
 }
 
+// The server no longer takes this PC's sign-in (net::account_refused): what
+// the F10 Account section and the setup window say about it.
+constexpr const char kRefusedStatus[] = "Sign-in expired";
+constexpr const char kRefusedText[] = "Your sign-in has expired, or this PC was signed out. Online play needs a new sign-in.";
+
 std::string signed_in_line() {
     // The game read its NpId when it went online, so a sign-in after that
     // names the account to the server but not to the game until the next run.
-    if (net::account_refused())
-        return "Signed in as " + net::account_name() + " - the server refused it (expired or replaced): link this PC again";
+    if (net::account_refused()) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return "Signed in as " + net::account_name() +
            (hle_np_context_started() ? " (in full on the next launch)" : "");
 }
@@ -539,6 +553,8 @@ void update_action(int which) {
 }
 
 bool action_idle(int which) {
+    // A website code needs a sign-in the server still takes.
+    if (which == 3 && net::account_refused()) return false;
     if (which < 10) return !g_acct_busy.load();
     if (updater::busy()) return false;
     if (which == 11) return updater::update_available();
@@ -608,7 +624,11 @@ void account_action(int which, const std::string& name, const std::string& code)
 
 std::string account_status() {
     std::lock_guard<std::mutex> lk(g_acct_mu);
-    if (!g_acct_status.empty()) return g_acct_status;
+    // A refusal outranks an older "Signed in as" from the last action.
+    const bool refused = net::account_logged_in() && net::account_refused();
+    if (!g_acct_status.empty() && !(refused && !g_acct_busy.load() && g_acct_status.rfind("Signed in as ", 0) == 0))
+        return g_acct_status;
+    if (refused) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return net::account_logged_in() ? "Signed in as " + net::account_name() : "Not signed in";
 }
 
@@ -740,6 +760,8 @@ void apply(int id) {
         case kRebirth:
         case kFivePlayers:
         case kSkillIssue:
+        case kFullPhantomHp:
+        case kAutoReplenish:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
         case kMenuHue:
@@ -885,6 +907,8 @@ void rebuild_settings() {
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
     h.skill_issue = on_of(kSkillIssue);
+    h.full_phantom_hp = on_of(kFullPhantomHp);
+    h.auto_replenish = on_of(kAutoReplenish);
     settings_store().publish(h);
 }
 
@@ -956,6 +980,8 @@ void host_options_load() {
     g_set[kRebirth].index = config().rebirth ? 0 : 1;
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
     g_set[kSkillIssue].index = config().skill_issue ? 0 : 1;
+    g_set[kFullPhantomHp].index = config().full_phantom_hp ? 0 : 1;
+    g_set[kAutoReplenish].index = config().auto_replenish ? 0 : 1;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -992,7 +1018,8 @@ void host_options_load() {
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
                          static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
-                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
+                         static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue),
+                         static_cast<int>(kFullPhantomHp), static_cast<int>(kAutoReplenish)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
@@ -1428,6 +1455,11 @@ void account_page() {
     if (const std::string d = account_detail(); !d.empty()) {
         ImGui::Spacing();
         ui::banner(ui::Icon::Info, ui::kIce, d);
+    }
+    if (net::account_logged_in() && net::account_refused() && !g_acct_busy.load()) {
+        ImGui::Spacing();
+        ui::banner(ui::Icon::Warning, ui::kWarn,
+                   std::string(kRefusedText) + " Link with Discord again, or recover an account this PC holds with its recovery code below.");
     }
     ImGui::Spacing();
     action_button("Link with Discord", 0, true);

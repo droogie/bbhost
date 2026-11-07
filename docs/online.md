@@ -31,6 +31,15 @@ Accounts have no passwords: a PC is linked to an account (with Discord, or
 with an account held by that PC plus a recovery code), and the account's name
 is the in-game online name. F10 has the same account screen in game.
 
+Each time the setup window opens with an account, it asks the server whether
+the sign-in still holds, without making the window wait, and says what it
+found on the Game page, in the account section and under Play: signed in,
+expired (or this PC was signed out elsewhere: log in with Discord again, or
+recover an account kept on this PC), or not checked when the server did not
+answer (with a Retry). A sign-in the server refuses keeps the game offline
+instead of asking again all session; one refused while the game runs is said
+once over the game, and F10's Account section has the way back in.
+
 ## How a session connects
 
 - **Matchmaking**: the game's Matching2 calls (create, search and join
@@ -55,6 +64,11 @@ is the in-game online name. F10 has the same account screen in game.
   30).
 - **Shorter summon timeouts**: a summon sign that cannot be answered gives up
   after 30 seconds instead of three minutes (`online.sign_timeout_seconds`).
+- **Full Phantom HP**: a cooperator or invader keeps their full max HP in the
+  host's world instead of the game's 70%. It is each visitor's own setting:
+  the host's changes nothing for the hunters in its world, and every game in
+  the session shows a visitor's HP as the visitor's own game has it. A PC
+  enhancement, on by default; switch it off for the game as it shipped.
 - **Modded worlds stay apart**: sessions with gameplay plugins (the
   randomizer, the boss rush, mutators) announce their rules to the server,
   which keeps their messages, bloodstains, signs and statistics separate from

@@ -220,6 +220,28 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 // environment wins over the config. imports_whole() (gpu_internal.h) reads it.
 std::atomic<std::uint64_t> g_imports_made{0}, g_imports_merged{0}, g_import_bytes{0}, g_import_us{0};
 
+// The queue's calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kSubmitLockSite{slow_calls::kQueueLock, "a submission"};
+constexpr slow_calls::Site kSubmitSite{slow_calls::kQueueSubmit, "one job"};
+constexpr slow_calls::Site kSubmitMergedSite{slow_calls::kQueueSubmit, "merged jobs"};
+constexpr slow_calls::Site kSubmitInPlaceSite{slow_calls::kQueueSubmit, "in place"};
+constexpr slow_calls::Site kQueueGuardSite{slow_calls::kQueueLock, "a one-off use of the queue"};
+constexpr slow_calls::Site kHostQueueLockSite{slow_calls::kQueueLock, "the window's use of the queue"};
+constexpr slow_calls::Site kSlotFenceSite{slow_calls::kWaitFences, "a submission's fence"};
+constexpr slow_calls::Site kFailedIdleSite{slow_calls::kDeviceIdle, "a failed submission"};
+constexpr slow_calls::Site kLandingValueSite{slow_calls::kSemaphoreValue, "the label landing"};
+constexpr slow_calls::Site kLandingWaitSite{slow_calls::kWaitSemaphores, "the label landing"};
+constexpr slow_calls::Site kPresentReadsSite{slow_calls::kSemaphoreValue, "the presenter's copy"};
+constexpr slow_calls::Site kTimelineValueSite{slow_calls::kSemaphoreValue, "the timeline"};
+constexpr slow_calls::Site kTimelineWaitSite{slow_calls::kWaitSemaphores, "the timeline"};
+constexpr slow_calls::Site kPresenterTicketSite{slow_calls::kSubmitted, "the presenter's copy"};
+constexpr slow_calls::Site kFrameSubmittedSite{slow_calls::kSubmitted, "the frame's submissions"};
+constexpr slow_calls::Site kEndInPlaceSite{slow_calls::kEndCommands, "the command processor's"};
+constexpr slow_calls::Site kBeginInPlaceSite{slow_calls::kBeginCommands, "the command processor's"};
+// A wait bounded by a timeout this short is a poll step: its time past it is what counts.
+constexpr std::uint64_t kPollStepNs = 100'000'000ull;
+std::uint64_t poll_slack(std::uint64_t timeout_ns) { return timeout_ns <= kPollStepNs ? timeout_ns : 0; }
+
 // ---- The submission thread (BBHOST_SUBMIT_THREAD, on unless 0) ----
 // vkQueueSubmit off the command processor. The kernel's half of a submission
 // grows with the buffers it has to make resident - all of them, since shaders
@@ -313,7 +335,9 @@ void submit_job_now(const SubmitJob& job) {
     tl.add(si, job.serial);
     VkResult r;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitSite);
         r = vkQueueSubmit(g.queue, 1, &si, job.fence);
     }
     if (r != VK_SUCCESS) {
@@ -395,7 +419,9 @@ void submit_jobs_merged(const SubmitJob* jobs, std::uint32_t n) {
     VkResult r;
     std::uint32_t fences = 0;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitMergedSite);
         r = vkQueueSubmit(g.queue, 1, &si, last.fence);
         for (std::uint32_t i = 0; i + 1 < n && r == VK_SUCCESS; ++i) {
             if (!jobs[i].fence) continue;
@@ -635,6 +661,11 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
     return m;
 }
 
+// A dma-buf import's sparse binds, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kDmabufLockSite{slow_calls::kQueueLock, "a dma-buf import's binds"};
+constexpr slow_calls::Site kDmabufBindSite{slow_calls::kBindSparse, "a dma-buf import"};
+constexpr slow_calls::Site kDmabufFenceSite{slow_calls::kWaitFences, "a dma-buf import's binds"};
+
 // [offset, offset + size) of direct memory into c as dma-buf imports: a
 // buffer bound to one, or a sparse buffer over several. Under the GPU lock,
 // as every use of the renderer's queue is: the sparse binds go on it.
@@ -687,10 +718,14 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
     if (const VkResult r = vkCreateFence(g.device, &fci, nullptr, &fence); r != VK_SUCCESS) return r;
     VkResult r;
     {
-        QueueGuard queue;
+        QueueGuard queue(kDmabufLockSite);
+        slow_calls::Scope timed(kDmabufBindSite);
         r = vkQueueBindSparse(g.queue, 1, &bsi, fence);
     }
-    if (r == VK_SUCCESS) r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r == VK_SUCCESS) {
+        slow_calls::Scope timed(kDmabufFenceSite);
+        r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
     vkDestroyFence(g.device, fence, nullptr);
     return r;
 }
@@ -1358,7 +1393,9 @@ void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemap
 
 std::uint64_t stream_submitted_serial() { return g_stream_submitted.load(std::memory_order_acquire); }
 
-QueueGuard::QueueGuard() {
+QueueGuard::QueueGuard() : QueueGuard(kQueueGuardSite) {}
+QueueGuard::QueueGuard(const slow_calls::Site& site) {
+    slow_calls::Scope timed(site);
     queue_drain();
     g.queue_mu.lock();
 }
@@ -4058,7 +4095,8 @@ bool init_locked() {
             g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
         }
         twins_decide(c.type_rank == 4);
-        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight,
+                     host_gpu_memory_policy().free_at_start);
         {
             // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
             // the homes' own line said why (null: no second line).
@@ -4071,7 +4109,7 @@ bool init_locked() {
                               : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
                               : g.integrated                     ? "the homes are off on an integrated GPU"
                               : g.tight                          ? "the homes are off with tight memory"
-                                                                 : "the homes are off with small video memory";
+                                                                 : "the homes are off with small video memory, under 6 GiB free";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)
@@ -5184,9 +5222,9 @@ void begin_recording_locked() {
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             const VkCommandBuffer cmd = g_cmd();
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kBeginInPlaceSite, 0, true);  // its clock reads the figure's too
             vkBeginCommandBuffer(cmd, &bi);
-            bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            bump(g_stream_stats.endbegin_ns, timed.end());
         }
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
@@ -7130,15 +7168,20 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
     Gpu::Slot& sl = g.slots[k];
     waited_us = 0;
     if (g_device_lost.load(std::memory_order_acquire)) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
+    // A slow call's (host/slow_calls.h), its clock reads this wait's own: the
+    // monotonic count, steady_clock's on both hosts.
+    slow_calls::Scope timed(kSlotFenceSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
+    g.wait_started_ns.store(t0, std::memory_order_relaxed);
     g.waiting_slot.store(k, std::memory_order_relaxed);
     VkResult r = VK_TIMEOUT;
     double secs = 0.0;
     bool slow = false;
+    std::uint64_t t1 = t0;
     for (;;) {
         r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, fence_step_ns());
-        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        t1 = host_clock_monotonic_ns();
+        secs = static_cast<double>(t1 - t0) / 1e9;
         if (r != VK_TIMEOUT) break;
         slow = true;
         if (!sl.said_stuck) {
@@ -7149,6 +7192,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
         }
         if (secs >= fence_limit_s()) break;
     }
+    timed.end_at(t1);
     g.waiting_slot.store(-1, std::memory_order_relaxed);
     waited_us = static_cast<std::uint64_t>(secs * 1e6);
     if (r == VK_SUCCESS) {
@@ -7364,9 +7408,12 @@ void present_reads_wait(std::uint64_t target) {
     const auto start = std::chrono::steady_clock::now();
     for (int k = 0;; ++k) {
         std::uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v) != VK_SUCCESS || v >= target ||
-            g_device_lost.load(std::memory_order_relaxed))
-            return;
+        VkResult r;
+        {
+            slow_calls::Scope timed(kPresentReadsSite);
+            r = vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v);
+        }
+        if (r != VK_SUCCESS || v >= target || g_device_lost.load(std::memory_order_relaxed)) return;
         if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) break;
         if (k < 64) std::this_thread::yield();
         else host_sleep_us(250);
@@ -7382,7 +7429,9 @@ namespace {
 // host_gpu_wait_completed land, and the thread is the one landing.
 std::uint64_t timeline_value() {
     std::uint64_t v = 0;
-    if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
+    if (g_device_lost.load(std::memory_order_relaxed)) return ~0ull;
+    slow_calls::Scope timed(kLandingValueSite);
+    if (vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
     return v;
 }
 bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
@@ -7391,6 +7440,7 @@ bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
+    slow_calls::Scope timed(kLandingWaitSite, poll_slack(timeout_ns));
     return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
 }
 void landing_thread_start() {
@@ -7463,6 +7513,7 @@ void retire_slot_locked(int k) {
     if (!g.ok && g_sub_failed.load(std::memory_order_relaxed)) {
         // Its submission may never have gone in: the fence would never signal.
         QueueGuard queue;
+        slow_calls::Scope timed(kFailedIdleSite);
         vkDeviceWaitIdle(g.device);
         sl.in_flight = false;
         busy_retired_locked(sl, false);
@@ -9187,9 +9238,9 @@ void submit_locked() {
     const bool streamed = stream_on();
     if (!streamed) {
         const VkCommandBuffer cmd = g_cmd();
-        const std::uint64_t t0 = host_clock_monotonic_ns();
+        slow_calls::Scope timed(kEndInPlaceSite, 0, true);  // its clock reads the figure's too
         vkEndCommandBuffer(cmd);
-        bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+        bump(g_stream_stats.endbegin_ns, timed.end());
         bump(g_stream_stats.endbegin_n);
     }
     g.recording = false;
@@ -9269,7 +9320,11 @@ void submit_locked() {
         busy_submitted_locked(cur);
         TimelineSignal tl;
         tl.add(si, cur.serial);
-        const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        VkResult r;
+        {
+            slow_calls::Scope timed(kSubmitInPlaceSite);
+            r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        }
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
@@ -9515,7 +9570,7 @@ bool host_gpu_available() {
 GpuStats host_gpu_stats() {
     GpuStats st{g.draws.load(),      g.dispatches.load(),        g.flushes, g.gpu_us.load(),
                 g.gfx_pipelines.load(), g.transfers.load(), g.transfer_batches.load(), {}};
-    for (int i = 0; i < 8; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kPhaseCount; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
@@ -9579,7 +9634,9 @@ const char* host_gpu_vs_why_name(int why) {
                                                     "a short stride",      "data outside one buffer"};
     return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
-void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
+void host_gpu_phase_add(int phase, std::uint64_t ns) {
+    if (phase >= 0 && phase < kPhaseCount) g.phase_ns[phase].fetch_add(ns, std::memory_order_relaxed);
+}
 
 GpuHandles host_gpu_handles() {
     GpuHandles h;
@@ -9597,11 +9654,15 @@ void host_gpu_lock() { g.mu.lock(); }
 bool host_gpu_device_lost() { return g_device_lost.load(std::memory_order_acquire); }
 void host_gpu_unlock() { g.mu.unlock(); }
 void host_gpu_queue_lock() {
+    slow_calls::Scope timed(kHostQueueLockSite);
     queue_drain();
     g.queue_mu.lock();
 }
 void host_gpu_queue_unlock() { g.queue_mu.unlock(); }
-void host_gpu_queue_lock_only() { g.queue_mu.lock(); }
+void host_gpu_queue_lock_only() {
+    slow_calls::Scope timed(kHostQueueLockSite);
+    g.queue_mu.lock();
+}
 
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence) {
     if (!g_sub_running) return 0;
@@ -9624,6 +9685,7 @@ std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wai
 
 void host_gpu_wait_submitted(std::uint64_t ticket) {
     if (!ticket) return;
+    slow_calls::Scope timed(kPresenterTicketSite);  // ends after the lock is let go
     std::unique_lock<std::mutex> lk(g_sub_mu);
     if (ticket & kForeignTicket) {
         // A kForeignSubmit: once the recorder has replayed up to it and
@@ -9640,7 +9702,8 @@ void host_gpu_wait_work_submitted(std::uint64_t need) {
     // Its serial is need - 1: in the driver once stream_submitted_serial() is
     // past it. Bounded, and over at a lost device, whose recording is dropped
     // and never submitted: the presenter must not sit here for good.
-    const std::uint64_t t0 = host_clock_monotonic_ns();
+    slow_calls::Scope timed(kFrameSubmittedSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
     for (std::uint64_t spins = 0; stream_submitted_serial() < need; ++spins) {
         if (g_device_lost.load(std::memory_order_acquire)) return;
         if (spins < 4096) {
@@ -11488,7 +11551,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     }
     if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;
     // A candidate's twin made, let go or dropped, a pass ended: in order.
-    if (run_part_stop(kRunStopBuffers)) return false;
+    if (run_part_stop_buffers(kBsTwin)) return false;
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -13410,8 +13473,12 @@ std::uint64_t host_gpu_work_needs() {
 std::uint64_t host_gpu_submissions_completed() {
     if (g_timeline_on.load(std::memory_order_acquire)) {
         std::uint64_t v = 0;
-        if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
-            v = ~0ull;  // nothing more will run: nothing to wait for
+        bool read = false;
+        if (!g_device_lost.load(std::memory_order_relaxed)) {
+            slow_calls::Scope timed(kTimelineValueSite);
+            read = vkGetSemaphoreCounterValue(g.device, g.timeline, &v) == VK_SUCCESS;
+        }
+        if (!read) v = ~0ull;  // nothing more will run: nothing to wait for
         // What counts as run has its labels in memory (label_landing.h).
         if (landing_on()) label_landing::land_through(v);
         return v;
@@ -13447,7 +13514,11 @@ bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
-    const bool done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    bool done;
+    {
+        slow_calls::Scope timed(kTimelineWaitSite, poll_slack(timeout_ns));
+        done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    }
     if (done && landing_on()) label_landing::land_through(need);  // its labels in memory before the caller reads it
     return done;
 }

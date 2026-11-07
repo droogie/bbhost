@@ -12,6 +12,7 @@
 #include "bbhost_version.h"
 #include "host/plugins.h"
 #include "net/account.h"
+#include "replay/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -352,6 +353,21 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
         }
         curl_slist_free_all(list);
         curl_easy_cleanup(c);
+        // A 401 in the account service's words ({ResKind, Message}) is the
+        // server refusing this PC's sign-in, as on the host's own requests
+        // (net/http.cpp): marked once, so the game stays signed out where an
+        // account is required instead of asking again all session, and the
+        // player is told what to do.
+        if (status == 401) {
+            json::Value reply;
+            std::string perr;
+            if (json::parse(std::string(body.begin(), body.end()), reply, perr) && reply.type == json::Value::Type::Object &&
+                reply.find("ResKind")) {
+                const json::Value* msg = reply.find("Message");
+                net::account_mark_refused(msg && msg->type == json::Value::Type::String && !msg->string.empty() ? msg->string
+                                                                                                              : "HTTP 401");
+            }
+        }
     }
 #else
     (void)method;

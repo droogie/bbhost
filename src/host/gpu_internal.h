@@ -25,9 +25,17 @@
 #include <string>
 
 #include "host/gpu_memtrack.h"
+#include "host/slow_calls.h"
+// A static site for the slow-call registry at each place the macro below
+// expands (host/slow_calls.h): the file and line name it.
+#define BB_SLOW_CALL_SITE(call) \
+    ([]() -> const ::slow_calls::Site& { static constexpr ::slow_calls::Site s{(call), __FILE__, __LINE__}; return s; }())
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
-                         VkDeviceMemory* out, const char* file, int line);
-void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
+                         VkDeviceMemory* out, const char* file, int line, const slow_calls::Site& site);
+// vkMapMemory, timed as a slow call (host/slow_calls.h).
+VkResult bb_map_memory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags,
+                       void** data, const slow_calls::Site& site);
+void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb, const slow_calls::Site& site);
 std::string bb_memory_sites_report();
 // BBHOST_TEST_VRAM_MB: allocations in the memory types of `types` (a bit each)
 // fail with VK_ERROR_OUT_OF_DEVICE_MEMORY once they would hold more than
@@ -42,8 +50,10 @@ std::uint64_t bb_memory_local_bytes();
 // Whether BBHOST_TEST_VRAM_MB acts out a smaller card: its limit, and what
 // our allocations hold against it.
 bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
-#define vkAllocateMemory(d, i, a, m) bb_alloc_memory((d), (i), (a), (m), __FILE__, __LINE__)
-#define vkFreeMemory(d, m, a) bb_free_memory((d), (m), (a))
+#define vkAllocateMemory(d, i, a, m) bb_alloc_memory((d), (i), (a), (m), __FILE__, __LINE__, BB_SLOW_CALL_SITE(::slow_calls::kAllocateMemory))
+#define vkFreeMemory(d, m, a) bb_free_memory((d), (m), (a), BB_SLOW_CALL_SITE(::slow_calls::kFreeMemory))
+#define vkMapMemory(dev, mem, off, size, flags, out) \
+    bb_map_memory((dev), (mem), (off), (size), (flags), (out), BB_SLOW_CALL_SITE(::slow_calls::kMapMemory))
 
 #include <array>
 #include <atomic>
@@ -675,7 +685,7 @@ struct Gpu {
     // The GPU busy meter (gpu_busy.cpp) is on: the slots and the presenter
     // have their timestamp pairs.
     bool busy = false;
-    std::atomic<std::uint64_t> phase_ns[8] = {};
+    std::atomic<std::uint64_t> phase_ns[kPhaseCount] = {};
 };
 extern Gpu g;
 
@@ -1002,8 +1012,11 @@ std::string submit_merge_report();   // the submission thread's jobs and queue s
 // buffer snapshots) run to the end of their last 64-byte line (gpu.cpp,
 // BBHOST_WC_LINES).
 extern const bool g_wc_whole_lines;
+// `site`: what holds it, for the slow-call registry (host/slow_calls.h): the
+// drain and the lock are timed as a wait for the queue's lock.
 struct QueueGuard {
     QueueGuard();
+    explicit QueueGuard(const slow_calls::Site& site);
     ~QueueGuard();
     QueueGuard(const QueueGuard&) = delete;
     QueueGuard& operator=(const QueueGuard&) = delete;
@@ -1532,6 +1545,19 @@ inline bool run_part() {
     if (!list_resolve::parts()) return false;
     const RunDraw* const r = t_run_draw;
     return r && r->part;
+}
+// The 'buffers' stops by where they are met (BBHOST_GXVK_LISTS_TIMES counts a
+// list-mode draw's first by its site): a constant buffer neither a home, in
+// GX's upload heap nor a known heap snapshot; one realigned or not snapshotted
+// for the list arena; one read through the page table; a vertex record in no
+// import; a twin candidate's range; the vertex copies' ring in host memory.
+enum BuffersStop : int { kBsCbLookups, kBsCbArena, kBsCbPageTable, kBsVertexNoImport, kBsTwin, kBsSnapRing, kBuffersStops };
+extern thread_local constinit int t_buffers_stop;
+inline bool run_part_stop_buffers(int site) {
+    if (list_resolve::parts()) {
+        if (const RunDraw* const r = t_run_draw; r && r->part && r->stop < 0) t_buffers_stop = site;
+    }
+    return run_part_stop(kRunStopBuffers);
 }
 // A run part's draw that has stopped (its first stop kept).
 inline bool run_part_stopped() {
@@ -2212,6 +2238,7 @@ extern std::atomic<std::uint64_t> g_splice_view_again[2];  // resolved again: th
 // Stage 4b.1b's list mode: its draws' image stops, by kind (textures.cpp) - a view by its T#'s words, a view by
 // id not made yet, a sampler not made yet.
 extern std::atomic<std::uint64_t> g_list_image_stops[3];
+extern std::atomic<std::uint64_t> g_list_view_stop_why[4];  // (BBHOST_GXVK_LISTS_TIMES: the views by id not found, by why)
 VkSampler sampler_find(const std::uint32_t* ssharp, bool compare);
 // render.cpp: a stored GX-native draw's lookups (programs, fetch shader,
 // translations, stage plans, views, samplers) through the reader paths, under
@@ -2221,6 +2248,7 @@ void lists_look_draw(const GpuDrawInputs& in, const GxDrawObjects& o, gxvk_lists
 // draw committed ahead of the command processor, in its list mode, into the
 // record the command processor's splice reads (render.cpp host_gpu_splice).
 void lists_commit(std::uint64_t id);
+void lists_thread_end();  // a pool thread ending: its commits' statistics and times added to the totals
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): a pool thread cuts list record
 // `rec` (host/gxvk_lists_internal.h ListRec) into segments and builds each -
 // its draws' params blocks and merged notes, and with
@@ -2358,8 +2386,10 @@ void copy_versions_flush_locked();
 void home_copies_flush_locked();
 // Stage 4b.3c (BBHOST_GXVK_HOMES=1, host/gxvk_homes.h): GX's constant buffers' device-local homes, the command
 // processor's side (gxvk_homes_vk.cpp), every one under g.mu.
-// At the device's choice: homes on (1, compare) unless the GPU is integrated or its memory tight; the pool's budget.
-void homes_decide(bool integrated, bool small_vram, bool tight);
+// At the device's choice: homes on (1, compare, or by the default) unless the GPU is integrated, its memory tight or its
+// small video memory under host/gxvk_homes.h kSmallHomesFreeMiB free (`free_at_start`, bytes, the memory policy's); the
+// pool's budget; and the run commit's Windows default given way where the default's rule holds.
+void homes_decide(bool integrated, bool small_vram, bool tight, std::uint64_t free_at_start);
 // A recording begins: the homes GX made and ended since are in the index by address, ended ones taken back once no
 // draw recorded before their end is still to come, their ranges freed once the work that read them has run.
 void homes_begin_recording_locked();

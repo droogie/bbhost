@@ -14,6 +14,7 @@
 // command processor released this one: the slot's state orders every access.
 #include "host/gxvk_lists.h"
 #include "host/gxvk_lists_internal.h"
+#include "host/gxvk_rest.h"
 
 #include "hle/modules.h"
 #include "host/cache_rw.h"
@@ -23,6 +24,7 @@
 #include "core/host_clock.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -40,7 +42,10 @@
 #endif
 #if !defined(_WIN32)
 #include <fstream>
+#include <linux/perf_event.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace gxvk_lists {
@@ -91,6 +96,68 @@ using detail::g_feed_next;
 using detail::g_feed_pos;
 using detail::kFeed;
 Shared g_fed, g_feed_lapped, g_feed_skipped, g_lists_fed;
+Shared g_parked_ticks, g_parks;  // BBHOST_GXVK_LISTS_TIMES: the threads' time parked (rdtsc ticks)
+
+// BBHOST_GXVK_LISTS_TIMES on Linux: each pool thread's own hardware counters (user space only) - cycles, instructions,
+// last-level cache misses and its task clock - read for the lines, so a commit's cost can be told clock-, cache- or
+// contention-bound. None where perf_event_open refuses (counted).
+#if !defined(_WIN32)
+constexpr int kHwCounters = 4;  // cycles, instructions, LLC misses, task clock (ns)
+constexpr int kHwThreads = 8;
+int g_hw_fd[kHwThreads][kHwCounters];
+std::atomic<int> g_hw_threads{0};
+std::atomic<int> g_hw_refused{0};
+void hw_open() {
+    const int t = g_hw_threads.fetch_add(1, std::memory_order_relaxed);
+    if (t >= kHwThreads) return;
+    const std::pair<std::uint32_t, std::uint64_t> what[kHwCounters] = {{PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+                                                                      {PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+                                                                      {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+                                                                      {PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK}};
+    for (int k = 0; k < kHwCounters; ++k) {
+        perf_event_attr a{};
+        a.size = sizeof(a);
+        a.type = what[k].first;
+        a.config = what[k].second;
+        a.exclude_kernel = 1;
+        a.exclude_hv = 1;
+        g_hw_fd[t][k] = static_cast<int>(syscall(SYS_perf_event_open, &a, 0, -1, -1, 0));
+        if (g_hw_fd[t][k] < 0) g_hw_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+std::string hw_line() {
+    const int n = std::min(g_hw_threads.load(std::memory_order_relaxed), kHwThreads);
+    u64 sum[kHwCounters] = {};
+    for (int t = 0; t < n; ++t) {
+        for (int k = 0; k < kHwCounters; ++k) {
+            u64 v = 0;
+            if (g_hw_fd[t][k] >= 0 && read(g_hw_fd[t][k], &v, sizeof(v)) == sizeof(v)) sum[k] += v;
+        }
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), " | hardware (%d threads, %d refused): cycles %llu, instructions %llu, llc misses %llu, task clock ns %llu", n,
+                  g_hw_refused.load(std::memory_order_relaxed), static_cast<ull>(sum[0]), static_cast<ull>(sum[1]), static_cast<ull>(sum[2]),
+                  static_cast<ull>(sum[3]));
+    return buf;
+}
+#else
+void hw_open() {}
+std::string hw_line() { return std::string(); }
+#endif
+
+// ---- the rest at a frame cap (host/gxvk_lists.h resting) ----
+const bool g_rest_on = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS_REST");
+    return !(e && e[0] == '0');
+}();
+// BBHOST_GXVK_LISTS_REST=cycle:N (a check, as lavapipe never meets a cap): rest N frames, work N frames, whatever the
+// limiter waited - every transition met mid-list, as play meets them.
+const unsigned g_rest_cycle = [] {
+    const char* e = std::getenv("BBHOST_GXVK_LISTS_REST");
+    return e && std::strncmp(e, "cycle:", 6) == 0 ? static_cast<unsigned>(std::max(1L, std::strtol(e + 6, nullptr, 10))) : 0u;
+}();
+std::atomic<u64> g_cp_busy_ns{0};  // bb-cp0's jobs' time (one writer)
+std::atomic<u64> g_rests{0}, g_rested_ns{0};  // the rests begun, and their time (ended ones)
 
 // ---- the answers -----------------------------------------------------------
 // One record per token slot (the slot ring's size and index).
@@ -159,11 +226,17 @@ void look(u64 id) {
     g_look_ns.add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
 }
 
+void pool_main_loop(int index);
 void pool_main(int index) {
     char name[16];
     std::snprintf(name, sizeof(name), "bb-list%d", index);
     host_thread_set_name(name);
     host_thread_set_class(HostThreadClass::GpuFeed, name);
+    if (g_times) hw_open();
+    pool_main_loop(index);
+    if (splice()) gpu::lists_thread_end();  // its statistics merged (the exit's lines come after the join)
+}
+void pool_main_loop(int index) {
     unsigned idle = 0;
     while (!g_stop.load(std::memory_order_acquire)) {
         u64 pos = g_feed_next.load(std::memory_order_relaxed);
@@ -178,13 +251,20 @@ void pool_main(int index) {
             } else {
                 // (Stage 4b.2: a list's close is fed from FinishCommandList's leaf, which wakes nobody - a parked
                 // thread looks again within half a millisecond.)
+                const std::uint64_t p0 = g_times ? __builtin_ia32_rdtsc() : 0;
                 std::unique_lock<std::mutex> lk(g_park_mu);
                 g_sleepers.fetch_add(1, std::memory_order_seq_cst);
                 if (g_feed_next.load(std::memory_order_seq_cst) >= g_feed_pos.load(std::memory_order_seq_cst) &&
                     !g_stop.load(std::memory_order_acquire))
-                    g_park_cv.wait_for(lk, segments() ? std::chrono::microseconds(500) : std::chrono::microseconds(2000));
+                    g_park_cv.wait_for(lk, resting()   ? std::chrono::microseconds(100000)  // (nothing is fed meanwhile)
+                                           : segments() ? std::chrono::microseconds(500)
+                                                        : std::chrono::microseconds(2000));
                 g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
                 idle = 0;
+                if (p0) {
+                    g_parked_ticks.add(__builtin_ia32_rdtsc() - p0);
+                    g_parks.add();
+                }
             }
             if (index == 0 && host_tooling()) {
                 const u64 flip = hle_video_flip_count();
@@ -228,6 +308,11 @@ void pool_main(int index) {
             continue;
         }
         if (splice()) {
+            // The slot two entries on - the other pool thread most likely takes the next - asked for while this draw
+            // is committed: a GX thread's core wrote its lines, and the copy that starts a commit waited for them.
+            const Feed& ahead = g_feed[(pos + 2) & (kFeed - 1)];
+            if (ahead.seq.load(std::memory_order_relaxed) == pos + 3 && ahead.kind.load(std::memory_order_relaxed) == detail::kFeedDraw)
+                hle_gx_native_prefetch(ahead.id.load(std::memory_order_relaxed), false);
             gpu::lists_commit(id);  // stage 4b.1b
         } else {
             look(id);
@@ -394,6 +479,16 @@ void report_line(bool at_exit) {
             host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(false).c_str());
             host_log("gxvk-lists (%s): stage 4b.2: %s", what, host_gpu_segment_report(true).c_str());
         }
+        if (g_times) {
+            for (int part = 0; part < 4; ++part)
+                host_log("gxvk-lists (%s): %s%s", what, host_gpu_lists_times_report(part, g_parked_ticks.get(), g_parks.get()).c_str(),
+                         part == 1 ? hw_line().c_str() : "");
+        }
+        if (g_rest_on && (g_rests.load(std::memory_order_relaxed) || at_exit)) {
+            const u64 rests = g_rests.load(std::memory_order_relaxed);
+            host_log("gxvk-lists (%s): the pool rested %llu times at a frame cap, %.1f s in the ended ones%s", what, static_cast<ull>(rests),
+                     static_cast<double>(g_rested_ns.load(std::memory_order_relaxed)) / 1e9, resting() ? "; resting now" : "");
+        }
         return;
     }
     host_log("gxvk-lists (%s): the pool looked at %llu draws, %.2f us a draw (fed %llu; the command processor first %llu; feed lapped "
@@ -480,9 +575,78 @@ void keep_off_pool_cpus() {
 #endif
 }
 
+std::atomic<bool> g_resting{false};
+
+void cp_busy(std::uint64_t ns) { g_cp_busy_ns.store(g_cp_busy_ns.load(std::memory_order_relaxed) + ns, std::memory_order_relaxed); }
+
+void frame_paced(std::uint64_t wait_ns, float cap_fps) {
+    if (!g_rest_on || !pool_mode()) return;
+    if (g_rest_cycle) {
+        static u64 n = 0;
+        const bool rest = (n++ / g_rest_cycle) & 1;
+        if (rest != resting()) {
+            g_resting.store(rest, std::memory_order_relaxed);
+            if (rest) g_rests.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    // The main thread's alone: windows of half a second (or 120 frames), each decided by host/gxvk_rest.h.
+    static u64 last = 0, win_ns = 0, win_wait = 0, frames = 0, cp_at = 0;
+    static gxvk_rest::State state;
+    static int logs = 0;
+    const u64 now = host_clock_monotonic_ns();
+    if (!last) {
+        last = now;
+        cp_at = g_cp_busy_ns.load(std::memory_order_relaxed);
+        return;
+    }
+    win_ns += now - last;
+    last = now;
+    win_wait += wait_ns;
+    ++frames;
+    if (win_ns < 500'000'000ull && frames < 120) return;
+    gxvk_rest::Window w;
+    w.slack = static_cast<double>(win_wait) / static_cast<double>(win_ns);
+    const u64 cp_now = g_cp_busy_ns.load(std::memory_order_relaxed);
+    w.cp = static_cast<double>(cp_now - cp_at) / static_cast<double>(win_ns);
+    w.cap_fps = cap_fps;
+    const double fps = static_cast<double>(frames) * 1e9 / static_cast<double>(win_ns);
+    cp_at = cp_now;
+    win_ns = win_wait = frames = 0;
+    const u64 rest_at = state.rest_at;
+    switch (gxvk_rest::step(state, w, now)) {
+    case gxvk_rest::kRest:
+        g_resting.store(true, std::memory_order_relaxed);
+        g_rests.fetch_add(1, std::memory_order_relaxed);
+        if (logs++ < 16)
+            host_log("gxvk-lists: the pool rests - the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f), the command "
+                     "processor busy %.0f%%: its draws are drawn in order (BBHOST_GXVK_LISTS_REST=0: never)",
+                     100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp);
+        break;
+    case gxvk_rest::kWake:
+        g_resting.store(false, std::memory_order_relaxed);
+        g_rested_ns.fetch_add(now - rest_at, std::memory_order_relaxed);
+        if (logs++ < 16)
+            host_log("gxvk-lists: the pool works again after %.1f s - the frame waits %.0f%% of its time (%.0f fps, cap %.0f), the command "
+                     "processor busy %.0f%%; the next rest no sooner than %.0f s on",
+                     static_cast<double>(now - rest_at) / 1e9, 100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp,
+                     static_cast<double>(state.backoff_ns) / 1e9);
+        break;
+    case gxvk_rest::kStay: break;
+    }
+}
+
 void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    detail::feed_push(id, detail::kFeedDraw);
+    if (resting()) return;  // nothing fed, no list record: the command processor draws it in order (counted there)
+    if (g_times) {
+        detail::DrawTime& t = detail::g_draw_times[id & (detail::kTimeSlots - 1)];
+        t.id.store(id, std::memory_order_relaxed);
+        t.stored.store(__builtin_ia32_rdtsc(), std::memory_order_relaxed);
+        t.feed.store(detail::feed_push(id, detail::kFeedDraw), std::memory_order_relaxed);
+    } else {
+        detail::feed_push(id, detail::kFeedDraw);
+    }
     if (segments() && ctx && ctx != detail::g_immediate.load(std::memory_order_relaxed)) {
         // Stage 4b.2: into its context's open list record (this thread's while it records the context).
         if (detail::CtxSlot* s = detail::ctx_slot(ctx)) {

@@ -388,6 +388,51 @@ int main() {
         CHECK(!config_frame_clock(false, true, &from));
         unsetenv("BBHOST_FRAME_CLOCK");
     }
+    // [world] full_phantom_hp, the PC enhancement Full Phantom HP: on when the
+    // file has no such key, as written otherwise; BBHOST_FULL_PHANTOM_HP=0 or 1
+    // over the file, and over the options file's choice at the start
+    // (config_set_enhancements), which wins otherwise.
+    {
+        unsetenv("BBHOST_FULL_PHANTOM_HP");
+        HostConfig c = load("[player]\nname = \"Hunter\"\n");
+        CHECK(c.full_phantom_hp && config().full_phantom_hp);
+        c = load("[world]\nfull_phantom_hp = false\n");
+        CHECK(!c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, true, true);
+        CHECK(config().full_phantom_hp);  // the options file's choice
+        setenv("BBHOST_FULL_PHANTOM_HP", "0", 1);
+        c = load("[world]\nfull_phantom_hp = true\n");
+        CHECK(!c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, true, true);
+        CHECK(!config().full_phantom_hp);  // the environment's, kept
+        setenv("BBHOST_FULL_PHANTOM_HP", "1", 1);
+        c = load("[world]\nfull_phantom_hp = false\n");
+        CHECK(c.full_phantom_hp);
+        config_set_enhancements(true, true, true, false, false, true);
+        CHECK(config().full_phantom_hp);
+        unsetenv("BBHOST_FULL_PHANTOM_HP");
+    }
+    // [world] auto_replenish, Auto-Replenish Items, the same way.
+    {
+        unsetenv("BBHOST_AUTO_REPLENISH");
+        HostConfig c = load("[player]\nname = \"Hunter\"\n");
+        CHECK(c.auto_replenish && config().auto_replenish);
+        c = load("[world]\nauto_replenish = false\n");
+        CHECK(!c.auto_replenish);
+        config_set_enhancements(true, true, true, false, true, true);
+        CHECK(config().auto_replenish);
+        setenv("BBHOST_AUTO_REPLENISH", "0", 1);
+        c = load("[world]\nauto_replenish = true\n");
+        CHECK(!c.auto_replenish);
+        config_set_enhancements(true, true, true, false, true, true);
+        CHECK(!config().auto_replenish);
+        setenv("BBHOST_AUTO_REPLENISH", "1", 1);
+        c = load("[world]\nauto_replenish = false\n");
+        CHECK(c.auto_replenish);
+        config_set_enhancements(true, true, true, false, true, false);
+        CHECK(config().auto_replenish);
+        unsetenv("BBHOST_AUTO_REPLENISH");
+    }
     // The template a first start writes types in the window.
     {
         const fs::path t = g_dir / "template.toml";

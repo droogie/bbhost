@@ -83,6 +83,8 @@ struct HostSettings {
     bool rebirth = true;
     bool five_players = true;
     bool skill_issue = false;
+    bool full_phantom_hp = true;
+    bool auto_replenish = true;
 };
 
 // A copy of the current settings (no lock: the snapshot published last).
