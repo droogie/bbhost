@@ -36,6 +36,7 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice, VkDeviceMemory, 
 // What the allocations' timing (host/slow_calls.cpp) asks the rest of bbhost.
 std::uint64_t hle_gnm_flip_calls() { return 0; }
 bool host_thread_name(char*, std::size_t) { return false; }
+void host_gpu_phase_add(int, std::uint64_t) {}
 
 namespace {
 constexpr std::uint64_t kMiB = 1ull << 20;

@@ -35,7 +35,11 @@
 // The first 50 such lines are logged in full, then counted. The 300-flip
 // report says how many calls of each kind took 10, 50 and 200 ms or more in
 // its window, the exit report since the start with their counts and time, and
-// a hang watchdog's report names the calls under way.
+// a hang watchdog's report names the calls under way. The command processor's
+// time in timed calls is a phase of its own ("driver" on the `stall:` and
+// `cp-thread ms:` lines): inside its packets, where `exec` includes it as it
+// includes the other phases, and after each job, where no phase did - the
+// job's submission and the slot it retires.
 //
 // The cost: the clock read as a call starts and as it ends - two reads, ~20
 // ns each - and a few stores into the thread's own slot; where a call was
@@ -122,6 +126,20 @@ private:
     std::uint64_t t0_ = 0;
     Slot* slot_ = nullptr;  // where it is published (null: no slot, not timed, or inside another timed call)
     bool counted_ = false;  // timed (not only measured)
+};
+
+// While it lives, the calling thread's timed calls are the command
+// processor's "driver" phase as well (gnm_exec.cpp's cp_thread).
+class CpPhase {
+public:
+    CpPhase() noexcept;
+    ~CpPhase();
+    CpPhase(const CpPhase&) = delete;
+    CpPhase& operator=(const CpPhase&) = delete;
+
+private:
+    Slot* slot_ = nullptr;
+    bool prev_ = false;
 };
 
 // The 300-flip report's line: this window's calls of 10, 50 and 200 ms and

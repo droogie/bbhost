@@ -3207,6 +3207,12 @@ void cp_thread(Queue* q, int id) {
         // behind it (core/host_clock.h, BBHOST_THREAD_PRIO=0).
         host_thread_set_class(HostThreadClass::GpuFeed, name);
     }
+    // The thread's timed driver calls (host/slow_calls.h) are its "driver"
+    // phase: those in a command buffer's packets, inside exec, and those
+    // after each job, outside it - the job's submission and the slot it
+    // retires, a wait for the fence or for the submission thread no other
+    // phase holds.
+    const slow_calls::CpPhase driver_phase;
     CpuProfile profile = id == 0 ? cpu_profile_config() : CpuProfile{};
     // BBHOST_CP_IDLE_LOG=1: every 10 s for queue 0, how many jobs it took,
     // how often it found its queue empty and how long it slept on the

@@ -4,6 +4,7 @@
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "hle/modules.h"
+#include "host/gpu.h"
 #include "log.h"
 
 #include <algorithm>
@@ -72,6 +73,7 @@ struct alignas(64) Slot {
     std::atomic<const char*> name{nullptr};  // its thread's name (interned)
     std::atomic<std::uint32_t> tid{0};
     std::atomic<std::uint32_t> taken{0};
+    bool cp_phase = false;  // the owner's alone: its calls are the command processor's driver phase too
     // The owner's counts (one writer: plain loads and stores), read by the reports.
     alignas(64) std::atomic<std::uint64_t> calls[kCallCount] = {};
     std::atomic<std::uint64_t> ns[kCallCount] = {};
@@ -141,6 +143,7 @@ struct Keeper {
         t_slot = nullptr;
         std::lock_guard<std::mutex> lk(g_mu);
         s->site.store(nullptr, std::memory_order_release);
+        s->cp_phase = false;
         for (int k = 0; k < kCallCount; ++k) {
             g_out_calls[k].fetch_add(s->calls[k].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
             g_out_ns[k].fetch_add(s->ns[k].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
@@ -158,6 +161,7 @@ Slot* claim() {
         std::uint32_t free = 0;
         if (!s.taken.compare_exchange_strong(free, 1, std::memory_order_acq_rel)) continue;
         s.site.store(nullptr, std::memory_order_relaxed);
+        s.cp_phase = false;
         s.tid.store(thread_id(), std::memory_order_relaxed);
         s.name.store(this_thread_name(), std::memory_order_release);
         t_slot = &s;
@@ -311,6 +315,7 @@ std::uint64_t Scope::end_at(std::uint64_t t1) noexcept {
     if (Slot* s = slot_) {
         slot_ = nullptr;
         s->site.store(nullptr, std::memory_order_release);
+        if (s->cp_phase) host_gpu_phase_add(kPhaseDriver, d);
     }
     if (own) {
         add_own(own->calls[c], 1);
@@ -342,6 +347,18 @@ void Scope::next(const Site& next) noexcept {
         s->site.store(site_, std::memory_order_release);
         slot_ = s;
     }
+}
+
+CpPhase::CpPhase() noexcept {
+    if (!on()) return;
+    slot_ = t_slot ? t_slot : claim();
+    if (!slot_) return;
+    prev_ = slot_->cp_phase;
+    slot_->cp_phase = true;
+}
+
+CpPhase::~CpPhase() {
+    if (slot_ && slot_ == t_slot) slot_->cp_phase = prev_;
 }
 
 std::string window_report() {
