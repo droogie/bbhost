@@ -792,13 +792,16 @@ std::vector<Manifest> built_in_manifests() {
 // is all-languages without its online cost, the Intel Black Tonemap Fix's
 // six bytes are the performance patch's own (always on), and Disable Dynamic
 // Light Shadows is the Dynamic light shadows setting, and The Old Hunters is
-// bbhost's own, always on. A
+// bbhost's own, always on. rgba8f color space and Lower specific renders left
+// the list (the PS1 plugin's 8-bit colour is scene-rgba8, API 18): a player
+// who had them on would otherwise keep them, with no row to turn them off. A
 // package unpacked over an older one still has them in its patches folder;
 // they are passed over, not applied twice.
 bool retired_file(const std::string& file) {
     return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
            file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml" ||
-           file == "disable-dynamic-light-shadow.toml" || file == "old-hunters.toml";
+           file == "disable-dynamic-light-shadow.toml" || file == "old-hunters.toml" || file == "rgba8f-color-space.toml" ||
+           file == "lower-specific-renders.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.
