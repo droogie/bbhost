@@ -1,27 +1,37 @@
 #pragma once
-// The real size of a render target, learned from the scissors that draw into
-// it (render.cpp target_image). CB_COLOR*_PITCH and CB_COLOR*_SLICE (and
-// DB_DEPTH_SIZE for depth) carry only the tile-padded size, but a target
-// sampled as a texture is addressed in normalized coordinates over its image:
-// a 392-wide target held in a 512-wide image makes every u 392/512 too small,
-// and down a bloom pyramid that compounds. A scissor edge is believed as the
-// real extent when padding it to a tiling granularity gives exactly the padded
-// size (plausible); an edge equal to the padded size says nothing, since many
-// passes scissor to the whole surface.
+// The real size of a render target (render.cpp target_image). CB_COLOR*_PITCH
+// and CB_COLOR*_SLICE (and DB_DEPTH_SIZE for depth) carry only the
+// tile-padded size, but a target sampled as a texture is addressed in
+// normalized coordinates over its image: a 392-wide target held in a 512-wide
+// image makes every u 392/512 too small, and down a bloom pyramid that
+// compounds. What says the size, in order: the texture of the draw's view
+// (GpuDrawInputs::color_extent); the live texture the registry has at the
+// target's base, GX's (the T# GX built) or YEBIS's (the T# its device built,
+// when its render target is the one the draw's registers describe:
+// registered_fits); then what the target's scissors taught (Table). A scissor
+// edge is believed when padding it to a tiling granularity gives exactly the
+// padded size (plausible); an edge equal to the padded size says nothing,
+// since many passes scissor to the whole surface.
 //
-// The sizes were kept by address alone, and YEBIS gives one address to targets
-// of another geometry. At 2560x1440 its cutscenes' glare pyramid starts
-// 523x441, at addresses its glare later draws 640x360 levels into, in a
-// 640-pixel pitch. Such a level scissors to its whole pitch, 640, which may
-// not replace a learned size, so the 523 stayed for the session: the next
-// pass read the 523-wide image through a 640-wide T#, stretching it by
-// 640/523, twice down the chain - the sky through a window, bright at x 217 of
-// 640, glared at 264 and then 322, a soft bright rectangle to the right of it.
-// At 1920x1080 the level is 480 in a 512 pitch and its scissor 480 replaced
-// the stale size, which is why only 1440p showed it. A learned size now
-// belongs to the geometry it was learned under: the target's base, pitch and
-// padded height (Key). Two targets of one geometry at one address still share
-// one, and a scissor the padded size still cannot replace it there
+// YEBIS's draws bind no view, and the registry gave no size for its textures,
+// so every YEBIS target was sized from its scissors - and those sizes were
+// kept by address alone, while YEBIS gives one address to targets of another
+// geometry. At 2560x1440 its other glare pyramid (the one the Hunter's Dream
+// draws: 392x331 at 1920x1080) starts 523x441, at addresses its glare later
+// draws 640x360 levels into - a 640-pixel pitch and 384 rows at the Nightmare
+// of Mensis. Such a level scissors to its whole pitch, 640, which may not
+// replace a learned size, so the 523 stayed for the session: the next pass
+// read the 523-wide image through a 640-wide T#, stretching it by 640/523,
+// twice down the chain - the sky through a window, bright at x 217 of 640,
+// glared at 264 and then 322, a soft bright rectangle to the right of it. At
+// 1920x1080 the level is 480 in a 512 pitch and its scissor replaced the stale
+// width; the stale heights left on its smaller levels there came out larger
+// than the levels, and a T# smaller than its target reads its corner - which
+// is why only 1440p showed it. YEBIS's targets now take the size of the
+// texture YEBIS made (yebis_texture), and a learned size belongs to the
+// geometry it was learned under: the target's base, pitch and padded height
+// (Key). Two targets of one geometry at one address still share a learned
+// size, and a scissor the padded size still cannot replace it there
 // (Step::padded_over, counted in the exit report). Pure;
 // tests/rt_extent_test.cpp checks it.
 
@@ -130,9 +140,9 @@ public:
         return a;
     }
 
-    // A view's texture says the target's size (GpuDrawInputs::color_extent, or
-    // the live GX texture at its base): what a draw with no view of the same
-    // target then makes it. True when that changed what was known.
+    // A texture says the target's size (its view's, or the registry's live
+    // texture at its base): what a draw with no view and no registered texture
+    // then makes the same target. True when that changed what was known.
     bool view(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t w, std::uint32_t h) {
         Sizes& s = map_[key(base, pitch, padded_h)];
         if (s.w == w && s.h == h) return false;
@@ -154,5 +164,62 @@ private:
     bool by_geometry_;
     std::unordered_map<Key, Sizes, KeyHash> map_;
 };
+
+// A YEBIS 2D texture as its object holds it (YEBIS's CreateTexture2D,
+// 0x15df570, and its 0x15df840; the registry reads it, gx_resources.cpp): the
+// T# its device built at +0xc4 (sub_1487ee0, from the description's width and
+// height) - its base in 256-byte units in word 0 (set when the memory is
+// handed out, rebased by a discard Map, zeroed by the destructor's free
+// 0x2e4b230), width - 1 and height - 1 in word 2, the surface's pitch - 1 in
+// word 4 (bits 13-26). (The sce::Gnm render target at +0x108 is a depth
+// target's only: a colour target's comes with its view.)
+constexpr std::uint32_t kYebisTsharp = 0xc4;
+struct YebisTexture {
+    std::uint64_t memory = 0;   // the T#'s base
+    std::uint32_t w = 0, h = 0;  // the T#'s size
+    std::uint32_t pitch = 0;     // the T#'s pitch: the surface's padded width
+};
+inline YebisTexture yebis_texture(const std::uint32_t (&t)[8]) {
+    YebisTexture y;
+    y.memory = static_cast<std::uint64_t>(t[0]) << 8;
+    y.w = (t[2] & 0x3fff) + 1;
+    y.h = ((t[2] >> 14) & 0x3fff) + 1;
+    y.pitch = ((t[4] >> 13) & 0x3fff) + 1;
+    return y;
+}
+// Whether the object at a registered texture's address is still that live
+// texture: its vtable the 2D texture's (the destructor's base classes put
+// theirs) and its T# on the memory the registry holds for it (the free zeroes
+// the base). A texture whose destructor the registry missed never sizes a
+// target.
+inline bool yebis_live(std::uint64_t vtable, std::uint64_t texture_vtable, const YebisTexture& t, std::uint64_t memory) {
+    if (RT_EXTENT_MUTANT(8)) return vtable == texture_vtable;  // the T#'s base not checked
+    return vtable == texture_vtable && t.memory == memory && memory;
+}
+
+// Whether `padded_h` is what the tiling pads `h` rows to: whole 8-row micro
+// tiles, or a 64-, 128- or 256-row alignment (plausible).
+inline bool rows_pad_to(std::uint32_t h, std::uint32_t padded_h) {
+    return padded_h == h || padded_h == ((h + 7) & ~7u) || plausible(h, padded_h);
+}
+
+// The registry's live 2D texture at a target's base (gx_texture_extent).
+struct Registered {
+    std::uint32_t w = 0, h = 0;  // 0: none
+    bool yebis = false;
+    std::uint32_t pitch = 0;  // YEBIS's: its T#'s pitch
+};
+// Whether it sizes a draw's target whose registers pad it to pitch x
+// padded_h. GX's when it fits, as GX's T# names the texture the memory holds.
+// YEBIS's when it is the surface the registers describe - its pitch the
+// draw's, its rows what the tiling pads to the draw's padded height - and it
+// fits: YEBIS's textures share memory with others of other sizes, and its
+// draws bind no view to say which they mean (a 640x360 texture there must not
+// size the 523x441 target of a 640-wide, 448-row surface).
+inline bool registered_fits(const Registered& r, std::uint32_t pitch, std::uint32_t padded_h) {
+    if (!r.w || !r.h || r.w > pitch || r.h > padded_h) return false;
+    if (!r.yebis || RT_EXTENT_MUTANT(7)) return true;  // (7: YEBIS's surface not compared)
+    return r.pitch == pitch && rows_pad_to(r.h, padded_h);
+}
 
 }  // namespace rt_extent

@@ -1973,12 +1973,12 @@ bool rt_image_memory(VkImage image, ImageMemory& out) {
 // later pass with a smaller scissor cannot resize the image - rt_image()
 // recreates on a size change, and that costs a flush and a vkDeviceWaitIdle.
 // Per target is by its geometry: its base, pitch and padded height
-// (host/rt_extent.h). By the base alone, a size YEBIS's cutscenes' glare
-// pyramid left at an address (523 wide at 2560x1440) stayed on the 640-wide
-// glare level it later drew there, which glared to the right of the sky and
-// of bright highlights. BBHOST_RT_LEARN_BY_GEOMETRY=0: by the base alone, as
+// (host/rt_extent.h). By the base alone, a size YEBIS's other glare pyramid
+// left at an address (523 wide at 2560x1440) stayed on the 640-wide glare
+// level YEBIS later drew there, which glared to the right of the sky and of
+// bright highlights. BBHOST_RT_LEARN_BY_GEOMETRY=0: by the base alone, as
 // before; =2: by the geometry, with the base alone's answers worked out beside
-// them, and where the two differ counted and the first logged.
+// them, and where the two differ counted and each logged once.
 const int g_rt_learn_mode = [] {
     const char* e = std::getenv("BBHOST_RT_LEARN_BY_GEOMETRY");
     return e && *e ? std::atoi(e) : 1;
@@ -2125,6 +2125,41 @@ std::uint64_t reuse_idle_ms() {
     return ms;
 }
 
+// What asks for a target (target_image), as target_gen counts draws whose
+// view was not seen made: a GX draw (the wrapper's), YEBIS's draws,
+// Scaleform's, packet draws, clear tokens.
+enum TargetAsker { kAskGx, kAskYebis, kAskScaleform, kAskPacket, kAskClear, kAskers };
+// Why a colour target was sized from its scissors rather than by a texture:
+// no live texture of the registry's begins at its base; a YEBIS texture
+// there that is not the surface the draw's registers describe; a
+// GX texture there larger than the padded size; YEBIS's textures not asked
+// (BBHOST_RT_EXTENT_FROM_YEBIS=0).
+enum LearnedWhy { kLearnedNoTexture, kLearnedOtherTarget, kLearnedNoFit, kLearnedOff, kLearnedWhys };
+// Under g.mu: target lookups sized from their scissors, by asker and colour /
+// depth; YEBIS's colour ones by why; targets sized by YEBIS's textures, and
+// YEBIS textures at a target's base that were not its surface.
+std::uint64_t g_learned_by[kAskers][2] = {}, g_learned_yebis_why[kLearnedWhys] = {};
+std::uint64_t g_extent_from_yebis = 0, g_extent_yebis_refused = 0;
+
+// Each target and its sizes logged once, the first 48 of a kind (0: the base
+// alone's answers, 1: YEBIS's targets sized from their scissors): a chain's
+// targets miss target_image's memo every frame.
+bool log_once_locked(int kind, std::uint64_t base, std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+    static std::set<std::array<std::uint64_t, 3>> seen[2];
+    if (seen[kind].size() >= 48) return false;
+    return seen[kind].insert({base, (static_cast<std::uint64_t>(a) << 32) | b, (static_cast<std::uint64_t>(c) << 32) | d}).second;
+}
+
+void learn_differ_locked(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t scissor_right,
+                         std::uint32_t scissor_bottom, bool depth, std::uint32_t w, std::uint32_t h, const rt_extent::Answer& b, const char* by) {
+    ++g_rt_learn_differ;
+    if (log_once_locked(0, base, w, h, b.w, b.h)) {
+        host_log("render: %s target 0x%llx (pitch %u, %u rows, scissor %ux%u): %ux%u by %s, %ux%u by its base alone (flip %llu)",
+                 depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, w, h, by, b.w,
+                 b.h, static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
 // The size to make the image of the target at `base` whose registers pad it to
 // `pitch` x `padded_h`, from a draw's scissor edges (0 for a clear), learning
 // from them (host/rt_extent.h). CB_COLOR_PITCH pads the same way
@@ -2132,8 +2167,9 @@ std::uint64_t reuse_idle_ms() {
 // normalized coordinates over the image's width: a 392-wide target held in a
 // 512-wide image makes every u 392/512 too small. Down a bloom pyramid that
 // compounds, which is why the composited frame was a smear along its left edge.
+// `compare`: =2's answer by the base alone worked out beside this one.
 rt_extent::Answer learned_extent_locked(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t scissor_right,
-                                        std::uint32_t scissor_bottom, bool depth) {
+                                        std::uint32_t scissor_bottom, bool depth, bool compare = true) {
     const rt_extent::Answer a = g_rt_extents.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
     if (a.changed) ++g_rt_gen;
     if (a.padded_over_w || a.padded_over_h) {
@@ -2152,21 +2188,31 @@ rt_extent::Answer learned_extent_locked(std::uint64_t base, std::uint32_t pitch,
                      a.h, static_cast<unsigned long long>(hle_video_flip_count()));
         }
     }
-    if (g_rt_learn_mode == 2) {
+    if (g_rt_learn_mode == 2 && compare) {
         const rt_extent::Answer b = g_rt_extents_by_base.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
         if (b.changed) ++g_rt_gen;  // (so the memo asks both again)
-        if (b.w != a.w || b.h != a.h) {
-            ++g_rt_learn_differ;
-            static std::atomic<int> logs{0};
-            if (logs.fetch_add(1) < 24) {
-                host_log("render: %s target 0x%llx (pitch %u, %u rows, scissor %ux%u): %ux%u by its geometry, %ux%u by its base alone "
-                         "(flip %llu)",
-                         depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom,
-                         a.w, a.h, b.w, b.h, static_cast<unsigned long long>(hle_video_flip_count()));
-            }
-        }
+        if (b.w != a.w || b.h != a.h) learn_differ_locked(base, pitch, padded_h, scissor_right, scissor_bottom, depth, a.w, a.h, b, "its geometry");
     }
     return a;
+}
+
+// A target sized from its scissors, counted by what asked; YEBIS's colour
+// ones by why, each logged once - the targets the registry does not size yet.
+void learned_census_locked(int asker, bool depth, int why, std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h,
+                           std::uint32_t scissor_right, std::uint32_t scissor_bottom, const GxTextureExtent& te) {
+    ++g_learned_by[asker][depth ? 1 : 0];
+    if (asker != kAskYebis || depth || why < 0) return;
+    ++g_learned_yebis_why[why];
+    if (log_once_locked(1, base, static_cast<std::uint32_t>(why), pitch, padded_h, (scissor_right << 16) | scissor_bottom)) {
+        static const char* const kWhy[kLearnedWhys] = {"no live texture of the registry's begins there", "a YEBIS texture there is another surface",
+                                                       "a GX texture there is larger", "YEBIS's textures not asked"};
+        host_log("render: YEBIS's colour target 0x%llx (pitch %u, %u rows, scissor %ux%u) sized from its scissors: %s%s (flip %llu)",
+                 static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, kWhy[why],
+                 why == kLearnedOtherTarget ? (" (" + std::to_string(te.width) + "x" + std::to_string(te.height) + " in a pitch of " +
+                                               std::to_string(te.pitch) + ")").c_str()
+                                            : "",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
 }
 
 void copy_layers_locked(RtImage& from, RtImage& to);
@@ -2566,6 +2612,7 @@ const int g_view_extents = [] {
 }();
 std::uint64_t g_extent_used = 0, g_extent_guessed = 0, g_extent_checked = 0, g_extent_disagree = 0;  // under g.mu
 std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws from the GX texture at the target
+std::uint64_t g_extent_disagree_yebis = 0;  // under g.mu: =2's disagreements where the texture was YEBIS's
 bool g_target_memo_hit = false;  // whether target_image's last answer came from its slot's memo (stage 2's census)
 
 // What a target's lookup applies whenever it answers from its memo: the
@@ -2579,25 +2626,49 @@ void target_hit(RtImage& rt, std::uint32_t res_gen) {
     g_target_memo_hit = true;
 }
 
+// What a draw is, as a target lookup counts it (TargetAsker).
+int target_asker(const GpuDraw& d) {
+    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
+    return !d.gx_token ? kAskPacket : kind && std::strcmp(kind, "yebis") == 0 ? kAskYebis : kind && std::strcmp(kind, "scaleform") == 0 ? kAskScaleform : kAskGx;
+}
+
+// `asker`: what asks (TargetAsker), or the draw it is worked out from when a
+// lookup is counted (learned_census_locked) - only then, not for every target
+// of every draw (two string compares each).
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0, int asker = kAskGx,
+                      const GpuDraw* draw = nullptr) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0, res_gen = 0;
+        std::uint32_t registered = 0;  // the size of the registry's texture that sized it ((w << 16) | h; 0: none)
+        bool yebis = false;            // that texture YEBIS's
         RtImage* rt = nullptr;
     };
     static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
+    // The memo is keyed by the extent asked (a view's), not the one the
+    // registry answered with: keyed by that, every lookup of a target a texture
+    // of the registry's sized missed it - every one of YEBIS's draws a whole
+    // lookup. Such an answer stands while the registry still gives that
+    // texture at the base (a texture made or destroyed there since, or one
+    // YEBIS's object no longer is, asks again).
+    const auto still_registered = [&] {
+        GxTextureExtent t;
+        return gx_texture_extent(base, &t) && t.yebis == m.yebis && ((t.width << 16) | t.height) == m.registered &&
+               rt_extent::registered_fits(rt_extent::Registered{t.width, t.height, t.yebis, t.pitch}, padded_w, padded_h);
+    };
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
-        m.res_gen == res_gen) {
+        m.res_gen == res_gen && (!m.registered || still_registered())) {
         target_hit(*m.rt, res_gen);
         return m.rt;
     }
     g_target_memo_hit = false;
     std::uint32_t w = 0, h = 0;
+    const std::uint32_t asked_extent = extent;  // the view's (the registry's below)
     // No view to take it from (YEBIS's draws, the wrapper's): the live GX
     // texture that begins at the target's memory says its size - the game's
     // own description of what is there now. The learned sizes below were per
@@ -2607,34 +2678,63 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     // of, and the glare sampled the stale rest - magenta, until a reload.
     // They are kept per geometry now (learned_extent_locked); two targets
     // their registers pad to one size at one address still share them.
-    // BBHOST_RT_EXTENT_FROM_GX=0: the learned sizes only.
+    // The registry knows YEBIS's textures too (BBHOST_RES_YEBIS) but gave no
+    // size for them, so every YEBIS target took its size from its scissors -
+    // which at 2560x1440 left the glare's 640-wide level 523 wide. A YEBIS
+    // target takes the size of the texture YEBIS made at its base now, when
+    // that texture is the surface the draw's registers describe
+    // (rt_extent::registered_fits).
+    // BBHOST_RT_EXTENT_FROM_GX=0: the learned sizes only;
+    // BBHOST_RT_EXTENT_FROM_YEBIS=0: GX's textures only, YEBIS's targets from
+    // their scissors as before.
     static const bool extent_from_gx = [] {
         const char* e = std::getenv("BBHOST_RT_EXTENT_FROM_GX");
         return !(e && e[0] == '0');
     }();
+    static const bool extent_from_yebis = [] {
+        const char* e = std::getenv("BBHOST_RT_EXTENT_FROM_YEBIS");
+        return !(e && e[0] == '0');
+    }();
+    bool from_yebis = false;
+    int fallback = -1;  // why a YEBIS draw's colour target was not sized by the registry (kLearnedWhy)
+    GxTextureExtent te;
     if (!extent && extent_from_gx && !depth) {
-        std::uint32_t t[8];
-        if (gx_resource_tsharp(base, t)) {
-            const std::uint32_t tw = (t[2] & 0x3fff) + 1, th = ((t[2] >> 14) & 0x3fff) + 1;
-            if (tw <= padded_w && th <= padded_h) {
-                extent = (tw << 16) | th;
-                ++g_extent_from_gx;
+        if (gx_texture_extent(base, &te)) {
+            const rt_extent::Registered r{te.width, te.height, te.yebis, te.pitch};
+            if (te.yebis && !extent_from_yebis) {
+                fallback = kLearnedOff;
+            } else if (rt_extent::registered_fits(r, padded_w, padded_h)) {
+                extent = (te.width << 16) | te.height;
+                from_yebis = te.yebis;
+                ++(te.yebis ? g_extent_from_yebis : g_extent_from_gx);
+            } else {
+                fallback = te.yebis ? kLearnedOtherTarget : kLearnedNoFit;
+                if (te.yebis) ++g_extent_yebis_refused;
             }
+        } else {
+            fallback = kLearnedNoTexture;
         }
     }
     const std::uint32_t ew = extent >> 16, eh = extent & 0xffff;
     // The texture's extent stands when it fits the padded one it came padded to.
     const bool use_extent = g_view_extents && extent && ew <= padded_w && eh <= padded_h;
     if (!use_extent || g_view_extents == 2) {
-        const rt_extent::Answer a = learned_extent_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth);
+        // (BBHOST_RT_LEARN_BY_GEOMETRY=2 compares a target YEBIS's texture
+        // sized below, with the guess by the base alone it had before.)
+        const rt_extent::Answer a =
+            learned_extent_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth, !(use_extent && from_yebis));
         w = a.w;
         h = a.h;
     }
+    if (!use_extent)
+        learned_census_locked(draw ? target_asker(*draw) : asker, depth, fallback, base, padded_w, padded_h, scissor_right, scissor_bottom, te);
     if (use_extent && g_view_extents == 2) ++g_extent_checked;
     if (use_extent && g_view_extents == 2 && (w != ew || h != eh)) {
+        if (from_yebis) ++g_extent_disagree_yebis;
         if (g_extent_disagree++ < 24) {
-            host_log("render: %s target 0x%llx: the scissor makes it %ux%u (padded %ux%u), its view's texture %ux%u",
-                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), w, h, padded_w, padded_h, ew, eh);
+            host_log("render: %s target 0x%llx: the scissor makes it %ux%u (padded %ux%u), its %s texture %ux%u",
+                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), w, h, padded_w, padded_h,
+                     from_yebis ? "YEBIS" : asked_extent ? "view's" : "GX", ew, eh);
         }
     }
     if (use_extent && g_view_extents == 1) {
@@ -2644,13 +2744,26 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         // What the scissor would have to teach is known now: draws with no
         // view (the wrapper's, YEBIS's) and the texture cache size this
         // target the same way instead of making it again at another size.
-        if (g_rt_extents.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
-        if (g_rt_learn_mode == 2 && g_rt_extents_by_base.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
+        // Not a YEBIS texture's size: YEBIS's draws ask the registry while
+        // the texture lives, and a size kept past its death would size
+        // whatever the memory holds next.
+        if (!from_yebis && g_rt_extents.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
+        if (g_rt_learn_mode == 2 && from_yebis) {
+            // Before, YEBIS's targets were guessed from their scissors by the
+            // base alone: what that would have made this one.
+            const rt_extent::Answer b = g_rt_extents_by_base.draw(base, padded_w, padded_h, scissor_right, scissor_bottom);
+            if (b.changed) ++g_rt_gen;
+            if (b.w != ew || b.h != eh) learn_differ_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth, ew, eh, b, "YEBIS's texture");
+        } else if (g_rt_learn_mode == 2 && g_rt_extents_by_base.view(base, padded_w, padded_h, ew, eh)) {
+            ++g_rt_gen;
+        }
     } else {
         ++g_extent_guessed;
     }
     RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, res_gen);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, res_gen, rt};
+    const std::uint32_t registered = use_extent && g_view_extents == 1 && !asked_extent ? extent : 0;
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, asked_extent, res_gen,
+             registered, from_yebis, rt};
     return rt;
 }
 
@@ -14235,7 +14348,9 @@ void render_report() {
                  "guessed from the scissor %llu%s",
                  static_cast<unsigned long long>(g_extent_used), static_cast<unsigned long long>(g_extent_from_gx),
                  static_cast<unsigned long long>(g_extent_guessed),
-                 g_view_extents == 2 ? ("; compared " + std::to_string(g_extent_checked) + ", disagreeing " + std::to_string(g_extent_disagree)).c_str() : "");
+                 g_view_extents == 2 ? ("; compared " + std::to_string(g_extent_checked) + ", disagreeing " + std::to_string(g_extent_disagree) +
+                                        " (YEBIS's textures " + std::to_string(g_extent_disagree_yebis) + ")").c_str()
+                                     : "");
     }
     {
         std::lock_guard<GpuMutex> lk(g.mu);
@@ -14246,6 +14361,18 @@ void render_report() {
                  "for its geometry, the size kept, in %llu lookups of a width and %llu of a height%s",
                  g_rt_extents.size(), g_rt_learn_mode ? "geometries (base, pitch, padded height)" : "targets by the base alone (BBHOST_RT_LEARN_BY_GEOMETRY=0)",
                  static_cast<unsigned long long>(g_rt_padded_over[0]), static_cast<unsigned long long>(g_rt_padded_over[1]), differ.c_str());
+        using ull = unsigned long long;
+        const auto& l = g_learned_by;
+        host_log("render: targets sized by YEBIS's textures %llu (a YEBIS texture at the base another surface %llu); sized from "
+                 "their scissors (colour/depth): GX draws %llu/%llu, YEBIS's %llu/%llu, Scaleform's %llu/%llu, packet draws %llu/%llu, clear "
+                 "tokens %llu/%llu; YEBIS's colour ones: no texture of the registry's at the base %llu, another surface %llu, a larger GX "
+                 "texture %llu, not asked %llu",
+                 static_cast<ull>(g_extent_from_yebis), static_cast<ull>(g_extent_yebis_refused), static_cast<ull>(l[kAskGx][0]),
+                 static_cast<ull>(l[kAskGx][1]), static_cast<ull>(l[kAskYebis][0]), static_cast<ull>(l[kAskYebis][1]),
+                 static_cast<ull>(l[kAskScaleform][0]), static_cast<ull>(l[kAskScaleform][1]), static_cast<ull>(l[kAskPacket][0]),
+                 static_cast<ull>(l[kAskPacket][1]), static_cast<ull>(l[kAskClear][0]), static_cast<ull>(l[kAskClear][1]),
+                 static_cast<ull>(g_learned_yebis_why[kLearnedNoTexture]), static_cast<ull>(g_learned_yebis_why[kLearnedOtherTarget]),
+                 static_cast<ull>(g_learned_yebis_why[kLearnedNoFit]), static_cast<ull>(g_learned_yebis_why[kLearnedOff]));
     }
     if (g_view_by_id) {
         host_log("render: %s%s", texture_view_by_id_report().c_str(),
@@ -19290,7 +19417,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
             return r && !r->depth ? r : nullptr;
         }
         return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
-                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c));
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c), kAskClear);
     }
     const VkFormat df = db_format(c.z_info, c.stencil_info);
     if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
@@ -19306,7 +19433,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
         return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
     }
     const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
-    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c));
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c), kAskClear);
     if (r) {
         // What a draw binding the view learns about its HTILE, so fills of
         // that HTILE from anywhere else still find the target.
@@ -22167,8 +22294,7 @@ bool host_gpu_draw(const GpuDraw& d) {
 // counted by what the draw is when not known.
 std::uint32_t target_gen(const GpuDraw& d, std::uint32_t gen) {
     if (gen) return gen;
-    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
-    ++g_draw_gen_none[!d.gx_token ? 3 : kind && std::strcmp(kind, "yebis") == 0 ? 1 : kind && std::strcmp(kind, "scaleform") == 0 ? 2 : 0];
+    ++g_draw_gen_none[target_asker(d)];
     return 0;
 }
 
@@ -22294,7 +22420,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
         const std::uint32_t slice_start = linear_general ? 0 : std::min(c[3] & 0x7ff, layers - 1);
         s.color[t] = target_image(t, base, fmt, pitch, padded_h, scissor_right, scissor_bottom, false, layers,
                                   static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t],
-                                  target_gen(d, in.color_gen[t]));
+                                  target_gen(d, in.color_gen[t]), kAskGx, &d);
         out.looked[t] = s.color[t];
         out.reached |= 1u << t;
         textures_census_target(0, in.color_gen[t] != 0, g_target_memo_hit);
@@ -22374,7 +22500,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen));
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen), kAskGx, &d);
                 out.looked[8] = s.depth;
                 out.reached |= 1u << 8;
                 textures_census_target(1, in.depth_gen != 0, g_target_memo_hit);
@@ -30649,6 +30775,16 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                     std::fprintf(f, "    render target vkformat %d %ux%u x%u layers%s%s\n", static_cast<int>(rt->format),
                                  rt->width, rt->height, rt->layers, rt->initialised ? "" : " (never drawn)",
                                  rt->depth ? " depth" : "");
+                }
+                // The registry's live texture there: the size the target takes from it (target_image).
+                if (GxTextureExtent te; gx_texture_extent(kv.first, &te)) {
+                    if (te.yebis) {
+                        std::fprintf(f, "    registered: YEBIS texture %ux%u, pitch %u (generation %llu)\n", te.width, te.height, te.pitch,
+                                     static_cast<unsigned long long>(te.gen));
+                    } else {
+                        std::fprintf(f, "    registered: GX texture %ux%u (generation %llu)\n", te.width, te.height,
+                                     static_cast<unsigned long long>(te.gen));
+                    }
                 }
                 const std::string d = texture_describe_locked(kv.first);
                 if (!d.empty()) {

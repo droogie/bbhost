@@ -112,6 +112,19 @@ void gx_resources_memory_protected(std::uint64_t va, std::size_t len, int prot);
 // The T# GX built for the live 2D texture whose memory begins at `memory`,
 // base filled in; false when the registry has none.
 bool gx_resource_tsharp(std::uint64_t memory, std::uint32_t out[8]);
+// The size of the live 2D texture whose memory begins at `memory`, as what
+// made it describes it: GX's T# for one of GX's, the T# YEBIS's device built
+// for one of YEBIS's (BBHOST_RES_YEBIS), with that T#'s pitch - read from
+// YEBIS's object at a lookup (once a flip), and nothing when that object is
+// no longer the live texture registered there (host/rt_extent.h,
+// yebis_live). False when the registry has neither.
+struct GxTextureExtent {
+    std::uint32_t width = 0, height = 0;
+    bool yebis = false;
+    std::uint32_t pitch = 0;  // YEBIS's: its T#'s pitch
+    std::uint64_t gen = 0;
+};
+bool gx_texture_extent(std::uint64_t memory, GxTextureExtent* out);
 // The bytes of [va, va + bytes) that live resources hold, by kind, added to `out` (the import census, gpu.cpp,
 // BBHOST_IMPORT_CENSUS=1): [0] vertex or index buffers stage 1b can keep (immutable, or default made with data; no
 // constant, unordered-access or stream-output bind), [1] dynamic buffers, [2] buffers the GPU writes (unordered access,
