@@ -1549,6 +1549,15 @@ float pace_target_of_rate() {
 // but AMD's generation is not in it (host/gpu_busy.cpp counts our command
 // buffers): 84% there was a full GPU in the 2026-11-06 runs. BBHOST_FG_PACE=0:
 // the cap as it is.
+// A change of the upscaler, its quality, Sharpness, TAA strength or frame
+// generation lets the held pace go and skips the next 64 frames (the scene's
+// targets made again at a new size, the bridge's context): it was learned
+// from a picture that is no longer drawn, and the rebuild's hitch would
+// otherwise be held as the pace (Kyo, 2026-11-07: swapping in game "tanks
+// performance until restarting" - FSR 3 held at 62 real frames of the 90 it
+// made, the limiter waiting 5.7 ms a frame). And a held pace the limiter
+// waits on for more than a tenth of each frame comes down at once to what the
+// frames take, not 2% each 256 frames.
 struct FgPace {
     bool on = true;
     double headroom = 1.03;  // the held interval over the one the frames manage (BBHOST_FG_PACE_HEADROOM=<percent>)
@@ -1557,6 +1566,8 @@ struct FgPace {
     double interval_s = 0.0, wait_s = 0.0;
     std::uint64_t last_ns = 0, window_ns = 0, busy_ns = 0, gpu_on = 0;
     std::uint32_t windows = 0;
+    std::uint64_t settings_key = 0;  // the upscaler's settings the pace was learned under
+    std::uint32_t skip = 0;          // frames still to let pass after a change
 };
 FgPace g_fg_pace = [] {
     FgPace p;
@@ -1580,6 +1591,25 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
         return;
     }
     if (!was || now_ns - was > 200000000ull) return;  // a stall (a load, a hitch) is not a frame to pace by
+    {
+        const HostSettings& h = host_settings_ref();
+        const std::uint64_t key = static_cast<std::uint64_t>(h.upscaler) | static_cast<std::uint64_t>(h.upscale_quality) << 8 |
+                                  static_cast<std::uint64_t>(h.frame_generation) << 16 |
+                                  static_cast<std::uint64_t>(h.sharpness * 100.0f + 0.5f) << 24 |
+                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40;
+        if (key != p.settings_key) {
+            if (p.settings_key && p.held_s > 0.0f)
+                host_log("frame rate: frame generation's held pace %.1f fps let go: the upscaler's settings changed", 1.0 / p.held_s);
+            p.settings_key = key;
+            p.held_s = 0.0f;
+            p.n = 0;
+            p.skip = 64;
+        }
+        if (p.skip) {
+            --p.skip;
+            return;
+        }
+    }
     if (p.n == 0) {
         p.interval_s = p.wait_s = 0.0;
         p.window_ns = was;
@@ -1603,6 +1633,10 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
         if (interval > cap * 1.05) p.held_s = static_cast<float>(interval * p.headroom);
     } else if (wait < interval * 0.02) {
         p.held_s = static_cast<float>(interval * p.headroom);  // the limiter no longer holds them: as fast as they go, the pace follows
+    } else if (wait > interval * 0.10) {
+        // The limiter waits a tenth of each frame or more: the frames take
+        // less than the pace - it comes down to what they take.
+        p.held_s = static_cast<float>(std::max((interval - wait) * p.headroom, static_cast<double>(cap)));
     } else if (p.windows % 8 == 0) {
         p.held_s *= 0.98f;  // a little faster now and then: the scene may have got lighter
     }

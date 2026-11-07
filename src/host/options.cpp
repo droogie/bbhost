@@ -1126,16 +1126,41 @@ void apply(int id) {
                 targets_follow_settings(s.label, false);
             }
             const bool turned_on = was >= 0 && was != s.index && reads_on(s, s.index);
+            const bool turned_off = was >= 0 && was != s.index && !reads_on(s, s.index);
             was = s.index;
             // Turned on: a frame rate above half the refresh rate comes down
-            // to it (fg_limit; 120 -> 90 at 180 Hz, a Custom limit's 166 -> 90).
+            // to it (fg_limit; 120 -> 90 at 180 Hz, a Custom limit's 166 -> 90),
+            // and the rate it was is kept: turned off again, the frame rate
+            // goes back to it - unless the player chose another since. (It
+            // stayed at the lowered rate: Kyo's 960 held at 90 with frame
+            // generation off, "it just doesn't work anymore" until the setting
+            // was put back by hand.)
+            struct Lowered {
+                bool on = false;
+                int from[3] = {}, to[3] = {};  // Frame rate, Custom limit, its number: before and after
+            };
+            static Lowered lowered;
             int cap = g_set[kFrameCap].index, custom = g_set[kFrameCapCustom].index, custom_fps = g_set[kFrameCapCustomFps].index;
             if (turned_on && frame_rate_fit(&cap, &custom, &custom_fps, fg_limit(true))) {
                 host_log("options: frame generation on: the frame rate %d comes down to %d, half the display's refresh rate",
                          frame_rate_now(), frame_rate_of(cap, custom, custom_fps));
+                lowered = {true,
+                           {g_set[kFrameCap].index, g_set[kFrameCapCustom].index, g_set[kFrameCapCustomFps].index},
+                           {cap, custom, custom_fps}};
                 if (custom_fps != g_set[kFrameCapCustomFps].index) set_index(kFrameCapCustomFps, custom_fps, false);
                 if (custom != g_set[kFrameCapCustom].index) set_index(kFrameCapCustom, custom, false);
                 if (cap != g_set[kFrameCap].index) set_index(kFrameCap, cap, false);
+            } else if (turned_off && lowered.on) {
+                lowered.on = false;
+                if (g_set[kFrameCap].index == lowered.to[0] && g_set[kFrameCapCustom].index == lowered.to[1] &&
+                    g_set[kFrameCapCustomFps].index == lowered.to[2]) {
+                    const int was_fps = frame_rate_now();
+                    if (lowered.from[2] != g_set[kFrameCapCustomFps].index) set_index(kFrameCapCustomFps, lowered.from[2], false);
+                    if (lowered.from[1] != g_set[kFrameCapCustom].index) set_index(kFrameCapCustom, lowered.from[1], false);
+                    if (lowered.from[0] != g_set[kFrameCap].index) set_index(kFrameCap, lowered.from[0], false);
+                    host_log("options: frame generation off: the frame rate back from %d to %d, as it was before it came on", was_fps,
+                             frame_rate_now());
+                }
             }
             break;
         }
