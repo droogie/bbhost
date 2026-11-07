@@ -366,6 +366,41 @@ bool host_desktop_max_size(int* w, int* h) {
 #endif
 }
 
+bool host_desktop_primary_size(int* w, int* h) {
+#if defined(_WIN32)
+    // The primary display's mode in physical pixels (EnumDisplaySettings with
+    // no device name: the primary one, whatever the DPI awareness).
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (g_headless.load() || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
+        return false;
+    *w = static_cast<int>(dm.dmPelsWidth);
+    *h = static_cast<int>(dm.dmPelsHeight);
+    return true;
+#elif defined(BBHOST_HAVE_SDL3)
+    // As host_desktop_max_size, the primary display alone.
+    if (g_headless.load()) return false;
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
+    int bw = 0, bh = 0;
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) {
+            const float d = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+            bw = static_cast<int>(static_cast<float>(m->w) * d + 0.5f);
+            bh = static_cast<int>(static_cast<float>(m->h) * d + 0.5f);
+        }
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
+}
+
 float host_desktop_refresh_hz() {
 #if defined(BBHOST_HAVE_SDL3)
     // The primary display, where SDL makes a window it is given no position
