@@ -226,11 +226,12 @@ constexpr std::uint32_t kSystemCameraRowId = 110011;
 constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
 constexpr std::uint32_t kSystemUpscaleRowId = 110014;
-// PC Upscaling, 125000: frame generation, sharpness, reflection quality (its
-// two entries 125030 Quarter, 125031 Half), then the two pick lists -
-// Upscaling (125032..125035) and its quality (125036..125039).
+// PC Upscaling, 125000: frame generation, sharpness, TAA strength (125005),
+// reflection quality (its two entries 125030 Quarter, 125031 Half), then the
+// two pick lists - Upscaling (125032..125035, TAA 125040) and its quality
+// (125036..125039).
 constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
-                        kUpQuality = 125004;
+                        kUpQuality = 125004, kUpTaaStrength = 125005;
 // PC Enhancements, 124000: four toggles, each for the next start (124000
 // was The Old Hunters, part of bbhost since: engine/patch_manifest.cpp).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
@@ -723,6 +724,10 @@ constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhan
 // the rows under it (as PC Settings' two do).
 Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
 Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
+// TAA strength beside Sharpness: the section's lists have to come last, and it
+// has no rows that hide (F10 and the setup window show it under Upscaling, with
+// TAA alone).
+Slider g_up_taa_strength{"taa_strength", kUpTaaStrength, 0, 0xff};
 const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
 std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
 // Off, TAA, FSR 3, FSR 4, DLSS: the option's own order (host/options.cpp), TAA's message after the list's.
@@ -730,7 +735,7 @@ const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034},
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
 std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
 std::int32_t g_up_quality = 2, g_up_quality_last = -1;
-constexpr int kUpscaleRows = 5;
+constexpr int kUpscaleRows = 6;
 
 
 void seed_camera_tuning() {
@@ -785,6 +790,7 @@ void push(Toggle& t) {
 void seed_upscale() {
     seed(g_up_frame_gen);
     seed(g_up_sharpness);
+    seed(g_up_taa_strength);
     g_up_reflection = g_up_reflection_last = static_cast<std::uint8_t>(std::max(0, host_opt_index("ssr_quality")) == 1 ? 1 : 0);
     g_up_scaler = g_up_scaler_last = std::max(0, host_opt_index("upscaler"));
     g_up_quality = g_up_quality_last = std::max(0, host_opt_index("upscale_quality"));
@@ -795,6 +801,7 @@ void seed_upscale() {
 void push_upscale() {
     push(g_up_frame_gen);
     push(g_up_sharpness);
+    push(g_up_taa_strength);
     const auto pick = [](const char* key, std::int32_t& value, std::int32_t& last) {
         if (value != last) {
             last = value;
@@ -966,7 +973,7 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
 }
 
-// PC Upscaling: a toggle, a slider and a pair, then Upscaling and its quality
+// PC Upscaling: a toggle, two sliders and a pair, then Upscaling and its quality
 // as the two pick lists last (the quality's list opens over the Defaults
 // caption, Upscaling's over the quality's row - as PC Settings' two).
 GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
@@ -976,6 +983,7 @@ GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     seed_upscale();
     add_toggle_row(dialog, &g_up_frame_gen.value, g_up_frame_gen.id, default_of(g_up_frame_gen));
     add_slider_row(dialog, &g_up_sharpness.value, g_up_sharpness.id, default_of(g_up_sharpness));
+    add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
     add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
                  static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
     add_list_row(dialog, &g_up_scaler, kUpScaler, kUpscalers, static_cast<int>(sizeof(kUpscalers) / sizeof(kUpscalers[0])),

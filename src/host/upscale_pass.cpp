@@ -962,6 +962,15 @@ bool taa_pipeline_locked() {
     return ok;
 }
 
+// TAA strength (host/settings.h, 0..1) as this frame's share of the
+// picture: 0 a fifth, 0.5 a tenth (Numity1504's), 1 a twenty-fifth (Unreal
+// Engine 4's TAA), between them in steps even to the eye (each the last
+// times the same).
+float taa_share() {
+    const float s = std::clamp(host_settings_ref().taa_strength, 0.0f, 1.0f);
+    return s <= 0.5f ? 0.2f * std::pow(0.5f, s * 2.0f) : 0.1f * std::pow(0.4f, (s - 0.5f) * 2.0f);
+}
+
 // This frame's TAA into g_output and the next frame's history. The scene is
 // readable; `depth` the game's; `motion` the motion pass's constants
 // (motion_params), `velo` its velocity map (null: none) and the capture map
@@ -1030,6 +1039,7 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
         sum += pc.weights[k];
     }
     for (int k = 0; k < 9; ++k) pc.weights[k] /= std::max(sum, 1e-6f);
+    pc.weights[11] = taa_share();
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, write.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,

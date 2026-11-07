@@ -112,6 +112,9 @@ struct HostSettings {
     // Sharpness: RCAS over the upscaler's picture (host/upscale_pass.cpp),
     // 0 none to 1 the most (AMD's scale). Followed live.
     float sharpness = 0.0f;
+    // TAA strength: how much of each new frame TAA keeps, 0 (a fifth) to 1
+    // (a twenty-fifth); 0.5 a tenth. Followed live.
+    float taa_strength = 0.5f;
     // Frame generation (host/framegen.h): AMD's frame generation swapchain,
     // read once as the presenter makes its swapchain.
     bool frame_generation = false;

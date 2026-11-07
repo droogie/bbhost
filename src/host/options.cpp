@@ -136,6 +136,7 @@ enum SettingId {
     kHdMotionBlur,
     kHdMotionBlurRes,
     kUpscaler,
+    kTaaStrength,
     kUpscaleQuality,
     kDlssPreset,
     kSharpness,
@@ -445,6 +446,15 @@ Setting g_set[kSettingCount] = {
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
      "FSR 3 where it cannot run. Changes at once.",
      false},
+    // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
+    // frame goes into the picture, the rest the history - 0% a fifth, 50% a
+    // tenth (Numity1504's, the default), 100% a twenty-fifth (Unreal Engine
+    // 4's own TAA). Moving fast, up to a quarter all the same (less trail).
+    {"taa_strength", "TAA strength", signed_steps(0, 100, "%", false), 50,
+     "How much TAA smooths: higher keeps more of the past frames - steadier, smoother edges, with more risk of a faint trail "
+     "behind what moves; lower is crisper and quicker to follow. 50% is the default; 100% is like Unreal Engine's TAA. "
+     "Changes at once. TAA only.",
+     false},
     // The upscaler's render size against the output (Resolution): Native AA
     // the same (DLAA, FSR native AA), Quality 1/1.5, Balanced about 1/1.7,
     // Performance 1/2 each way (engine/render_scale.cpp). A change rebuilds
@@ -653,6 +663,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFrameGeneration},
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
+    {Row::Option, nullptr, kTaaStrength},  // (shown with TAA only: row_hidden)
     // The preset row (preset_row): for FSR its preset - the Upscaling quality
     // setting, which has no row of its own - for DLSS that quality and DLSS's
     // preset, greyed with Upscaling off. The Resolution the upscaler brings the
@@ -1383,6 +1394,7 @@ void rebuild_settings() {
         static constexpr int kPresets[] = {11, 10, 12, 13};  // the menu's K, J, L, M
         h.dlss_preset = kPresets[std::clamp(index_of(kDlssPreset), 0, 3)];
         h.sharpness = static_cast<float>(std::clamp(index_of(kSharpness), 0, 100)) / 100.0f;
+        h.taa_strength = static_cast<float>(std::clamp(index_of(kTaaStrength), 0, 100)) / 100.0f;
         h.frame_generation = on_of(kFrameGeneration);
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
     }
@@ -2281,6 +2293,7 @@ const char* upscaler_note() {
 // with HD motion blur off instead: row_greyed.)
 bool row_hidden(int id) {
     if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
+    if (id == kTaaStrength) return shown_index(kUpscaler) != 1;  // (TAA's alone)
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
     return false;
 }

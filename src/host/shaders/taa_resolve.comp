@@ -16,8 +16,8 @@
 //      are far apart.
 //   3. The history there by 5-tap Catmull-Rom, clipped to the 3x3's box
 //      (mean +- 1.25 sigma within min/max) along the line to its centre, and
-//      blended at a tenth of this frame, up to a quarter at 32 pixels a
-//      frame; all of this frame where the history's remembered motion length
+//      blended at a tenth of this frame (TAA strength: a fifth to a
+//      twenty-fifth), up to a quarter at 32 pixels a frame; all of this frame where the history's remembered motion length
 //      is far from this one's (a surface just come into view).
 //   4. The ember mask: a bright new dot the TAA lost, whose light the game
 //      drew into its glow, goes back into this frame's picture - never into
@@ -43,7 +43,7 @@ layout(push_constant) uniform Constants {
     vec4 velo_size;
     // TAA's.
     uvec4 size;       // x, y: the scene's width and height; z: 1 no history (reset); w: bit 0 the glow is bound, bit 1 write the motion and the depth's copy
-    vec4 weights[3];  // the 3x3's weights for this jitter, row by row from the top left, summing to 1 (the 10th unused)
+    vec4 weights[3];  // the 3x3's weights for this jitter, row by row from the top left, summing to 1; the 12th this frame's share (TAA strength)
 };
 
 layout(set = 0, binding = 0) uniform texture2D scene;
@@ -180,7 +180,8 @@ void main() {
         const vec3 hi = max(min(mx, mean + 1.25 * sigma), lo);
         const vec3 hc = clip_box(lo, hi, h);
         const float speed = length(mv);
-        float alpha = 0.1 + 0.15 * clamp(speed / 32.0, 0.0, 1.0);
+        const float share = weights[2].w;
+        float alpha = mix(share, max(share, 0.25), clamp(speed / 32.0, 0.0, 1.0));
         const float hm = texelFetch(sampler2D(history, lin), clamp(ivec2(floor(prev)), ivec2(0), lim), 0).a;
         const float m = max(speed, hm);
         const float reject = clamp((abs(speed - hm) - (0.5 * m + 2.0)) / (0.25 * m + 2.0), 0.0, 1.0);

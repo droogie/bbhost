@@ -183,6 +183,7 @@
 125002	Reflection Quality	The reflections' resolution. Quarter is about four times cheaper; Half is the game's own, sharper.
 125003	Upscaling	TAA (bbhost's own, any GPU), FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
 125004	Upscaling Quality	How much smaller the 3D is drawn: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
+125005	TAA Strength	How much TAA smooths: higher is steadier and smoother, with more risk of a faint trail; lower is crisper. 5 is the default. TAA only.
 125030	Quarter	
 125031	Half	
 125032	Off	
