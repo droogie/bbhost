@@ -44,6 +44,13 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
+#if defined(_WIN32)
+// VK_EXT_full_screen_exclusive's structure and query (exclusive_policy) are
+// Windows' own, in the header that takes <windows.h>'s types.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 #endif
 
 // The swapchain's extent (width << 32 | height) for host_window_pixels; 0 before one.
@@ -99,13 +106,15 @@ std::uint32_t g_plugin_pressed = 0;                                   // under g
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
-// The options screen's two display settings (host/options.h). Both can be set
+// The options screen's display settings (host/options.h). All can be set
 // before the presenter exists, so they are wishes the swapchain reads, not
 // calls into it.
 // Window mode (host_window_set_mode): 0 windowed, 1 borderless, 2 fullscreen,
 // and the size Fullscreen's display mode is to be nearest.
 std::atomic<int> g_want_mode{0};
 std::atomic<int> g_mode_w{0}, g_mode_h{0};
+// Stay borderless: Borderless never made exclusive (exclusive_policy).
+std::atomic<bool> g_want_stay_borderless{false};
 std::atomic<bool> g_want_vsync{true};
 // When the presenting thread last finished a present, and how many it has
 // finished: with V-Sync on that instant is a display vblank, which is the
@@ -327,6 +336,13 @@ struct Presenter {
     VkFence acquire_fence = VK_NULL_HANDLE;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
+    // The device has VK_EXT_full_screen_exclusive on (gpu.cpp, Windows): the
+    // swapchain can say whether the driver may make the window exclusive
+    // fullscreen (exclusive_policy).
+    bool full_screen_exclusive = false;
+#if defined(_WIN32)
+    PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT present_modes2 = nullptr;  // that extension's mode query
+#endif
     bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
     std::uint64_t present_value = 0;  // the last own-queue copy's value on host_gpu_present_timeline()
     std::mutex mu;
@@ -443,6 +459,84 @@ const char* present_mode_name(VkPresentModeKHR m) {
     }
 }
 
+// Whether the driver may take the window as exclusive fullscreen, said as the
+// swapchain is made (Windows, VK_EXT_full_screen_exclusive). Borderless (the
+// window mode) is a window at the desktop's size (SDL's fullscreen with no
+// display mode of its own), and a swapchain that says nothing gets the
+// driver's DEFAULT, which on Windows lets NVIDIA's and AMD's drivers take a
+// window that covers the screen as exclusive fullscreen - with the switches
+// into and out of it that come with that. Stay borderless (the setting)
+// says DISALLOWED there: the window stays a window. Everything else says
+// nothing, as before the setting - Fullscreen, which sets the display's own
+// mode, among it. Off Windows there is no such extension and nothing to say.
+// On NVIDIA's driver (610.60, an RTX 3070 Ti laptop over Remote Desktop,
+// 2026-11-07) the first swapchain that disallows it loads d3d12.dll inside
+// vkCreateSwapchainKHR - the driver presents through DXGI from then on (the
+// `present: Windows' graphics modules` line) - where a start with the default
+// kept the driver's own path: presents returned in 0.3 ms against 5.5 ms.
+struct ExclusivePolicy {
+#if defined(_WIN32)
+    VkSurfaceFullScreenExclusiveInfoEXT info{VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
+#endif
+    bool chained = false;   // `info` goes on the swapchain and on its present modes' query
+    const char* text = "";  // for the `present: mode` line
+};
+ExclusivePolicy exclusive_policy() {
+    ExclusivePolicy p;
+#if defined(_WIN32)
+    const bool stay = g_want_mode.load() == 1 && g_want_stay_borderless.load();
+    if (stay && g_vk.full_screen_exclusive) {
+        p.info.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        p.chained = true;
+        p.text = ", exclusive fullscreen disallowed (Stay borderless)";
+    } else if (g_vk.full_screen_exclusive) {
+        p.text = ", the driver decides on exclusive fullscreen";
+    } else {
+        p.text = stay ? ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive: Stay borderless "
+                        "cannot disallow it)"
+                      : ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive)";
+    }
+#endif
+    return p;
+}
+
+// The present modes the surface offers a swapchain with `policy`: with it
+// chained, VK_EXT_full_screen_exclusive's own query, since a driver may offer
+// other modes to a window it may not make exclusive; else the plain one.
+std::vector<VkPresentModeKHR> surface_present_modes(const ExclusivePolicy& policy) {
+    std::vector<VkPresentModeKHR> modes;
+    std::uint32_t n = 0;
+#if defined(_WIN32)
+    if (policy.chained && g_vk.present_modes2) {
+        VkPhysicalDeviceSurfaceInfo2KHR si{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+        si.pNext = &policy.info;
+        si.surface = g_vk.surface;
+        VkResult r = g_vk.present_modes2(g_vk.phys, &si, &n, nullptr);
+        if (r == VK_SUCCESS && n) {
+            modes.resize(n);
+            r = g_vk.present_modes2(g_vk.phys, &si, &n, modes.data());
+            if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+                modes.resize(n);
+                return modes;
+            }
+        }
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            host_log("present: vkGetPhysicalDeviceSurfacePresentModes2EXT gave %d (%u modes); the surface's modes are asked without the policy",
+                     static_cast<int>(r), n);
+        modes.clear();
+        n = 0;
+    }
+#else
+    (void)policy;
+#endif
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, nullptr);
+    modes.resize(n);
+    if (n) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, modes.data());
+    modes.resize(n);
+    return modes;
+}
+
 // The present mode for the V-Sync setting, from what the surface offers.
 // V-Sync on: MAILBOX (the newest finished frame goes up at the next refresh, no
 // tearing, no queue of frames behind the display), else FIFO_LATEST_READY (the
@@ -452,12 +546,9 @@ const char* present_mode_name(VkPresentModeKHR m) {
 // FIFO is the only mode a surface must support, so it is what is left.
 // BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
 // (FIFO when the surface lacks it); =old is the choice before this one (FIFO
-// with V-Sync; MAILBOX, else IMMEDIATE, without).
-VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
-    std::uint32_t nmodes = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-    std::vector<VkPresentModeKHR> modes(nmodes);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
+// with V-Sync; MAILBOX, else IMMEDIATE, without). `modes` are the surface's
+// (surface_present_modes).
+VkPresentModeKHR choose_present_mode(bool vsync, const std::vector<VkPresentModeKHR>& modes, std::string& why) {
     const auto offered = [&](VkPresentModeKHR m) {
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
         if (m == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR && !g_vk.latest_ready) return false;  // the device's extension is off
@@ -606,9 +697,16 @@ bool vk_create_swapchain() {
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     std::string why;
     const bool vsync = g_want_vsync.load();
-    sci.presentMode = choose_present_mode(vsync, why);
+    // Stay borderless's say on exclusive fullscreen, and the modes the
+    // surface offers with it.
+    const ExclusivePolicy policy = exclusive_policy();
+    const std::vector<VkPresentModeKHR> modes = surface_present_modes(policy);
+    sci.presentMode = choose_present_mode(vsync, modes, why);
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
+#if defined(_WIN32)
+    if (policy.chained) sci.pNext = &policy.info;
+#endif
     // Windows' graphics modules before and after: a driver that presents
     // through DXGI (a D3D12 queue of its own copying our images into a DXGI
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
@@ -633,11 +731,15 @@ bool vk_create_swapchain() {
         old = VK_NULL_HANDLE;
         sci.oldSwapchain = VK_NULL_HANDLE;
     }
+    // AMD's swapchain is made from this create info too: framegen_create_swapchain
+    // copies it whole into AMD's ffxCreateContextDescFrameGenerationSwapChainVK
+    // (its createInfo), pNext and all, so Stay borderless's word on
+    // exclusive fullscreen (chained above) goes to the swapchain AMD makes.
     const bool fg = framegen_wanted() &&
                     framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
                                               g_vk.family, g_vk.fg_queues, &g_vk.swapchain);
     if (!fg && vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
-        host_log("vulkan: swapchain creation failed");
+        host_log("vulkan: swapchain creation failed%s", policy.text);
         return false;
     }
     [[maybe_unused]] const std::string modules_after = host_graphics_modules();
@@ -660,16 +762,13 @@ bool vk_create_swapchain() {
                 default: return "other";
             }
         };
-        std::uint32_t nmodes = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-        std::vector<VkPresentModeKHR> modes(nmodes);
-        if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
         std::string have;
         for (VkPresentModeKHR m : modes) have += std::string(have.empty() ? "" : " ") + mode_name(m);
         const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
-        host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
+        host_log("present: mode %s%s (the surface has: %s), %s%s%s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
                  chosen.c_str(), have.c_str(),
-                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed",
+                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed", policy.text,
+                 fg && policy.chained ? " - in AMD's frame generation swapchain's create info" : "",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
                                                                : "another format",
@@ -739,6 +838,13 @@ bool vk_start() {
     for (int i = 0; i < 3; ++i) g_vk.fg_queues[i] = h.fg_queues[i];
     g_vk.family = h.family;
     g_vk.latest_ready = h.fifo_latest_ready;
+    g_vk.full_screen_exclusive = h.full_screen_exclusive;
+#if defined(_WIN32)
+    if (g_vk.full_screen_exclusive) {
+        g_vk.present_modes2 = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT>(
+            vkGetInstanceProcAddr(g_vk.instance, "vkGetPhysicalDeviceSurfacePresentModes2EXT"));
+    }
+#endif
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
         host_log("vulkan: surface creation failed: %s", SDL_GetError());
         return false;
@@ -957,8 +1063,9 @@ bool vk_present() {
         host_log("present: the window is back; the swapchain is made again");
         g_swap_dirty.store(true);
     }
-    // A V-Sync change has no surface event behind it, so the options screen
-    // asks for the rebuild the acquire would otherwise never be told to do.
+    // A V-Sync change has no surface event behind it, nor has Stay
+    // borderless's, so the options screen asks for the rebuild the acquire
+    // would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
         host_gpu_queue_lock();
@@ -1915,14 +2022,43 @@ void host_window_set_mode(int mode, int width, int height) {
         resized = g_mode_w.exchange(width) != width;
         resized = (g_mode_h.exchange(height) != height) || resized;
     }
-    if (g_want_mode.exchange(mode) == mode && !(mode == 2 && resized)) {
+    const int was = g_want_mode.exchange(mode);
+    if (was == mode && !(mode == 2 && resized)) {
         return;
     }
-    if (g_window) apply_window_mode(mode);
+    if (g_window) {
+        apply_window_mode(mode);
+#if defined(_WIN32)
+        // With Stay borderless on, the swapchain says something in Borderless alone
+        // (exclusive_policy): made again when the mode goes to or from it,
+        // whether or not the window's size changes with it.
+        if (g_want_stay_borderless.load() && (was == 1) != (mode == 1)) g_swap_dirty.store(true);
+#endif
+    }
 #else
     (void)mode;
     (void)width;
     (void)height;
+#endif
+}
+
+void host_window_set_stay_borderless(bool on) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (g_want_stay_borderless.exchange(on) == on) {
+        return;
+    }
+    if (g_window) {
+#if defined(_WIN32)
+        // Only Borderless's swapchain changes (exclusive_policy).
+        const bool borderless = g_want_mode.load() == 1;
+        if (borderless) g_swap_dirty.store(true);
+        host_log("window: stay borderless %s%s", on ? "on" : "off", borderless ? "; the swapchain is made again" : ", for Borderless");
+#else
+        host_log("window: stay borderless %s (it applies on Windows; nothing changes here)", on ? "on" : "off");
+#endif
+    }
+#else
+    (void)on;
 #endif
 }
 

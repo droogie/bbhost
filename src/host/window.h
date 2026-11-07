@@ -197,7 +197,7 @@ std::uint64_t host_input_serial();
 // position they map to, as one line for a log.
 void host_mouse_describe(char* out, std::size_t n);
 
-// Live display settings, driven by the options screen (host/options.h). Both
+// Live display settings, driven by the options screen (host/options.h). All
 // are safe before the window exists: they record the wish and the presenter
 // picks it up when it comes up. V-Sync off rebuilds the swapchain on the next
 // present with whichever no-wait mode the surface supports.
@@ -206,6 +206,11 @@ void host_mouse_describe(char* out, std::size_t n);
 // to the mode nearest width x height - the resolution - at the desktop's
 // refresh rate). A width and height of 0 keep the last ones.
 void host_window_set_mode(int mode, int width = 0, int height = 0);
+// Stay borderless (Windows) makes Borderless's swapchain tell the
+// driver it may not take the window as exclusive fullscreen; a change of it,
+// or of the window mode to or from Borderless while it is on, rebuilds the
+// swapchain the same way. Elsewhere it is recorded and does nothing.
+void host_window_set_stay_borderless(bool on);
 // The presenter's swapchain made again at its next frame (frame generation
 // switched: AMD's swapchain or its own).
 void host_window_recreate_swapchain();
