@@ -13,7 +13,7 @@
 #include <set>
 
 #if defined(BBHOST_HAVE_CURL)
-#include <curl/curl.h>
+#include "net/curl_tls.h"
 #endif
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -117,16 +117,7 @@ HttpResult perform(const std::string& url, const std::string* post, const HttpCa
         curl_easy_setopt(c, CURLOPT_XFERINFODATA, &call.abandon);
     }
     curl_easy_setopt(c, CURLOPT_USERAGENT, "bbhost/" BBHOST_VERSION);
-    if (!config().online_verify_tls) {
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-    }
-#if defined(_WIN32)
-    // schannel also asks the CA whether the certificate was revoked and fails
-    // when that lookup cannot be made (firewalls, captive networks); the chain
-    // and name are still checked.
-    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
-#endif
+    configure_curl_tls(c, config().online_verify_tls);
     if (post) {
         curl_easy_setopt(c, CURLOPT_POST, 1L);
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, post->c_str());
