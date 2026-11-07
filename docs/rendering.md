@@ -490,9 +490,12 @@ the default, and nothing waits on DXC:
   to take (the last compile's, else a guess: about 2-3 minutes on a Steam
   Deck); it never starts by itself. The run logs to
   `<data>/bbhost/shader-compile.log` and records its result in
-  `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
-  shaders, 3,682 DXC modules, 16 workers), on a laptop's RTX 3070 Ti (Ryzen 7
-  6800H, Windows) ~90 s and on the Steam Deck ~150 s. What it does not do is
+  `<data>/bbhost/shader-compile.txt` before its last lines, with the id of
+  the run the window started; a window that did not get those lines takes
+  the result from that record, never from an earlier run's. On the RTX 4070
+  it takes ~60 s (3,281 shaders, 3,682 DXC modules, 16 workers), on a
+  laptop's RTX 3070 Ti (Ryzen 7 6800H, Windows) ~90 s and on the Steam Deck
+  ~150 s. What it does not do is
   a first session's first sight: the variants a draw makes (clip-discard pixel
   shaders, vertex layouts, the eboot's own programs, the tessellation LS
   pipelines) come from the pipeline manifest, which only earlier sessions

@@ -632,7 +632,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             // The child reads the saved settings: save first.
             if (save()) {
                 std::string err;
-                compile_job.start(err);
+                compile_job.start(f[kData].str(), err);
             }
         };
         auto go = [&](int p) {

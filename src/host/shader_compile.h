@@ -11,9 +11,14 @@
 // the game uses (host_gpu_set_compile_session). The child prints its
 // progress on stdout ("compile-shaders: ..." lines), logs to
 // <data>/bbhost/shader-compile.log, ends with the caches written, and on
-// "cancel" (or its stdin closing) drops what it has not begun and writes what
-// it has. What it did is kept in <data>/bbhost/shader-compile.txt.
+// "cancel" drops what it has not begun and writes what it has. What it did
+// is kept in <data>/bbhost/shader-compile.txt, written before its last lines,
+// with the run id the window started it with (--compile-shaders=<id>): a
+// window that did not get those lines takes the result from there
+// (host/shader_compile_read.h).
 #pragma once
+
+#include "host/shader_compile_read.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -24,13 +29,13 @@
 #include <vector>
 
 // main.cpp, before the configuration is read: whether the arguments ask for
-// the compile session (the flag is taken out of them), and the arguments the
-// setup window starts its child with.
+// the compile session (--compile-shaders or --compile-shaders=<run id>; the
+// flag is taken out of them), and the arguments the setup window starts its
+// child with.
 bool shader_compile_take_flag(int& argc, char** argv);
 void shader_compile_set_args(int argc, char** argv);
 // The child's run, once the game's folders are known; its exit code.
 int shader_compile_session();
-
 // What the setup window shows before anything runs.
 struct ShaderCacheState {
     std::string dir;                // <data>/bbhost
@@ -92,18 +97,13 @@ std::vector<std::string> shader_vulkan_devices();
 class ShaderCompileJob {
 public:
     ~ShaderCompileJob();
-    bool start(std::string& error);
+    // `data` is the data folder the child's configuration names, as for
+    // shader_cache_state: where its record is.
+    bool start(const std::string& data, std::string& error);
     void cancel();
     bool running() const;
     // Under the job's own lock, what the child said last.
-    struct View {
-        bool running = false, finished = false, cancelled = false, failed_to_run = false;
-        std::uint64_t done = 0, total = 0, failed = 0, hlsl = 0, lift = 0;
-        std::uint64_t recipes_done = 0, recipes_total = 0;  // pipelines from the manifest and the shipped list
-        double seconds = 0, eta = -1;
-        std::string phase, error;
-        std::vector<std::string> reasons;
-    };
+    using View = ShaderCompileView;
     View view() const;
 
 private:
@@ -112,4 +112,6 @@ private:
     View v_;
     void* proc_ = nullptr;  // SDL_Process
     std::thread thread_;
+    std::string run_;     // the id the child was started with, which its record carries
+    std::string record_;  // <data>/bbhost/shader-compile.txt
 };
