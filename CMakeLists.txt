@@ -622,6 +622,10 @@ if(UNIX)
   target_link_libraries(poll_pacing_test PRIVATE pthread)
   add_test(NAME poll_pacing_test COMMAND poll_pacing_test)
   set_tests_properties(poll_pacing_test PROPERTIES TIMEOUT 60)  # a turn never handed back hangs its threads
+  # The setup window's sign-in check: the server's answers read (net/sign_in_check.h).
+  add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
+  target_include_directories(sign_in_check_test PRIVATE src)
+  add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
