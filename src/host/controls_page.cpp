@@ -183,7 +183,12 @@ void controls_page_draw(bool setup_window) {
             } else {
                 const char* fixed = pad_fixed(a);
                 cell("##pad", fixed ? fixed : "-", false, cw, false);
-                if (host_pad_menu_input(a) >= 0) ui::tooltip_for_item(info.label, "A menu's own button: it does not move.");
+                if (a == kBindConfirm || a == kBindBack)
+                    ui::tooltip_for_item(info.label, "Follows the button the game's own OK or Back is on in play "
+                                                     "(Interact or Dodge): move that action to move this.");
+                else if (host_pad_menu_input(a) >= 0)
+                    ui::tooltip_for_item(info.label, "A menu's own button: it moves only to make way for Menu Confirm "
+                                                     "and Menu Back.");
             }
 
             ImGui::TableSetColumnIndex(4);
