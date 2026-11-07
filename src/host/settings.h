@@ -82,6 +82,9 @@ struct HostSettings {
     // (Lowest, 0.125x). Followed live.
     int texture_quality = 0;
     int sfx_texture_quality = 0;  // the same for the effects' textures (sfx/)
+    // Anisotropic filtering for the 3D's textures: 0 the game's own, else
+    // 2, 4, 8 or 16 at least (host/render.cpp anisotropy_samplers). Live.
+    int anisotropy = 0;
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
     bool dynamic_shadows = true;  // the dynamic lights' shadows (graphics_patch.cpp, +0x296e)
     // Shadow resolution (engine/patch_manifest.cpp's shadow-resolution, read once as

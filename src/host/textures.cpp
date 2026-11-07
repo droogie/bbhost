@@ -4404,6 +4404,49 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias) {
     return out;
 }
 
+VkSampler sampler_anisotropic(VkSampler base, int level) {
+    if (!base || level < 2) return base;
+    // The answer for this thread's last few, in front of the map (samplers
+    // are never destroyed, so an entry never goes stale).
+    struct Memo {
+        VkSampler base = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+        int level = 0;
+    };
+    static thread_local Memo memo[64];
+    Memo& m = memo[(reinterpret_cast<std::uintptr_t>(base) >> 4) & 63];
+    if (m.base == base && m.level == level) return m.out;
+    // Read by a run part's draw, written in order.
+    static std::map<std::pair<VkSampler, int>, VkSampler> made;
+    const auto key = std::make_pair(base, level);
+    VkSampler out = base;
+    if (const auto it = made.find(key); it != made.end()) {
+        out = it->second;
+    } else {
+        if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+        const auto rec = g_sampler_records.find(base);
+        const float want = std::min(static_cast<float>(level), g.max_anisotropy);
+        // A texture's: filtered smoothly, with mipmaps to blend, no depth
+        // comparison - not a target read texel for texel or a lookup table.
+        if (rec != g_sampler_records.end() && !rec->second.compareEnable && rec->second.minFilter == VK_FILTER_LINEAR &&
+            rec->second.maxLod > 0.25f && !(rec->second.anisotropyEnable && rec->second.maxAnisotropy >= want) && want > 1.0f) {
+            VkSamplerCreateInfo sci = rec->second;
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = want;
+            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;  // trilinear under it, as anisotropic filtering wants
+            if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+                g_sampler_records[out] = sci;
+            else
+                out = base;
+        }
+        cache_rw::Write cw(cache_rw::kSamplers);
+        made[key] = out;
+    }
+    m.base = base;
+    m.out = out;
+    m.level = level;
+    return out;
+}
+
 VkSampler sampler_nearest(VkSampler base) {
     if (!base) return base;
     // The answer for this thread's last few, in front of the map (samplers

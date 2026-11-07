@@ -131,6 +131,7 @@ enum SettingId {
     kModelDetail,
     kTextureQuality,
     kSfxTextureQuality,
+    kAnisotropicFiltering,
     kSsr,
     kSsrQuality,
     kHdMotionBlur,
@@ -394,6 +395,17 @@ Setting g_set[kSettingCount] = {
      "The size of the effects' textures - fire, blood, magic, smoke - in video memory, apart from Texture quality: High is the "
      "game's own, Medium half each way, Low a quarter, Lowest an eighth. Changes at once.",
      false},
+    // Anisotropic filtering for the 3D's textures (host/render.cpp
+    // anisotropy_samplers): Game leaves each sampler as the game made it;
+    // 2x-16x raise every smoothly filtered, mipmapped texture a camera draw
+    // samples to at least that (the device's limit at most). The post effects,
+    // the HUD, depth comparisons and nearest samplers (the Bloodborne PS1's
+    // unfiltered textures) keep theirs.
+    {"anisotropic_filtering", "Anisotropic filtering", {"Game", "2x", "4x", "8x", "16x"}, 0,
+     "Keeps textures seen at a slant - floors, roads, walls running into the distance - sharp instead of blurring. Game is "
+     "the game's own (some surfaces only); 16x the sharpest, for a little GPU time. The HUD and post effects are untouched. "
+     "Changes at once.",
+     false},
     // The game's screen space reflections, off as it shipped
     // (engine/patch_manifest.cpp ssr_manifest): its reflection pass at the
     // game's own half size. On while the game runs puts the patch in and
@@ -645,6 +657,7 @@ const Row g_rows[] = {
     {Row::Header, "GRAPHICS"},
     {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kSfxTextureQuality},
+    {Row::Option, nullptr, kAnisotropicFiltering},
     {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kHdMotionBlur},
     {Row::Option, nullptr, kHdMotionBlurRes},
@@ -1177,6 +1190,7 @@ void apply(int id) {
         case kRightStickOuter:
         case kTextureQuality:  // the textures follow them at the next submission (host/textures.cpp)
         case kSfxTextureQuality:
+        case kAnisotropicFiltering:
             break;  // the settings object carries them (host/settings.h)
         case kSsao:
         case kMotionBlur:
@@ -1383,6 +1397,7 @@ void rebuild_settings() {
     }
     h.texture_quality = 3 - std::clamp(index_of(kTextureQuality), 0, 3);  // the levels left out: High none, Lowest three
     h.sfx_texture_quality = 3 - std::clamp(index_of(kSfxTextureQuality), 0, 3);
+    h.anisotropy = std::clamp(index_of(kAnisotropicFiltering), 0, 4) == 0 ? 0 : 1 << std::clamp(index_of(kAnisotropicFiltering), 0, 4);
     h.ssr = on_of(kSsr);
     h.ssr_half = index_of(kSsrQuality) == 1;
     h.hd_motion_blur = on_of(kHdMotionBlur);
@@ -2076,7 +2091,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     } else if (id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
-    } else if (n <= 4 || id == kShadowResolution || id == kUpscaler) {
+    } else if (n <= 4 || id == kShadowResolution || id == kUpscaler || id == kAnisotropicFiltering) {
         // Shadow resolution's six sizes and Upscaling's five (Off, TAA, FSR 3,
         // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
         // a slider so their names fit.

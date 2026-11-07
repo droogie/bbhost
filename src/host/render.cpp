@@ -16,6 +16,7 @@
 #include "host/gpu_internal.h"
 #include "host/options.h"
 #include "host/scene_look.h"
+#include "host/settings.h"
 #include "host/upscaler.h"
 #include "host/pixel_cutaway.h"
 #include "host/vertex_cutaway.h"
@@ -22755,6 +22756,26 @@ bool grading_table(const std::uint32_t* t) {
 // not known is taken as a texture's in a camera draw. Depth comparisons keep
 // theirs (sampler_nearest). False in a run part's draw that stopped for a
 // sampler to be made in order.
+// Anisotropic filtering, the setting's level (host/settings.h: 0 the
+// game's own): each pixel-stage sampler of a camera draw (look_camera_draw -
+// the world, its characters, the sky, the effects; not the shadows, the post
+// chain or the HUD) at least that sharp (sampler_anisotropic, which leaves
+// depth comparisons, nearest and unmipmapped samplers alone). False in a run
+// part's draw that stopped for a sampler to be made in order.
+bool anisotropy_samplers(const DrawState& s, StageImages& si) {
+    const int level = host_settings_ref().anisotropy;
+    if (level < 2 || !look_camera_draw(s)) return true;
+    for (VkSampler& smp : si.samplers) {
+        if (!smp) continue;  // unresolved: the dummy is bound
+        const VkSampler a = sampler_anisotropic(smp, level);
+        if (!a) return false;  // a run part's draw: made in order
+        smp = a;
+    }
+    static std::atomic<int> told{0};
+    if (told.exchange(level) != level) host_log("render: the 3D's textures at %dx anisotropic filtering or more", level);
+    return true;
+}
+
 bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
     const bool camera = scene_look_nearest() && look_camera_draw(s);
     const bool copy = scene_look_scale() && g_upscale.scene && pl.name == "0b0acf50+ccbf44a6";
@@ -23886,6 +23907,9 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // Anisotropic filtering (Graphics > Anisotropic filtering): the camera's
+    // draws' textures, before a plugin's look (nearest wins over it).
+    if (!anisotropy_samplers(s, stage_images[1])) return false;  // a run part's draw: made in order
     // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
     // the colour grading's tables as its rule says, the 3D brought up nearest.
     if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
