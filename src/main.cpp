@@ -1003,6 +1003,15 @@ int main(int argc, char** argv) {
     // --compile-shaders (host/shader_compile.h): no window, no game.
     const bool compile_session = shader_compile_take_flag(argc, argv);
     shader_compile_set_args(argc, argv);
+    // --compile-selftest DIR (host/shader_compile.h): the window's side of
+    // that button end to end, with the log on as the setup window has it by
+    // default (on Windows, its console).
+    if (const std::string dir = shader_compile_selftest_dir(argc, argv); !dir.empty()) {
+        decide_log(true);
+        const int rc = shader_compile_selftest(dir);
+        std::fflush(nullptr);
+        std::_Exit(rc);
+    }
 #else
     const bool compile_session = false;
 #endif

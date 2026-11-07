@@ -1038,6 +1038,12 @@ if(UNIX)
   add_executable(shader_compile_read_test tests/shader_compile_read_test.cpp)
   target_include_directories(shader_compile_read_test PRIVATE src)
   add_test(NAME shader_compile_read_test COMMAND shader_compile_read_test)
+  if(SDL3_FOUND AND Vulkan_FOUND)
+    # The same end to end: bbhost started again as the setup window starts
+    # it, with children that pretend the compile (no GPU, no game).
+    add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
+    set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
+  endif()
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
