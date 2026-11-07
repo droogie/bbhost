@@ -206,7 +206,9 @@ bool config_saves_locally();
 // The folder saves go to when paths.data is not set (the per-user data folder).
 std::string config_default_data_dir();
 // The per-user folder the config and the F10 settings live in: %APPDATA%/bbhost,
-// $XDG_CONFIG_HOME/bbhost or ~/.config/bbhost; BBHOST_CONFIG_DIR replaces it.
+// $XDG_DATA_HOME/bbhost or ~/.local/share/bbhost (an older bbhost's
+// ~/.config/bbhost is moved there at start: core/config_move.h);
+// BBHOST_CONFIG_DIR replaces it.
 std::string config_user_dir();
 // The directory the running executable is in ("." when unknown).
 std::string config_exe_dir();

@@ -96,6 +96,7 @@ add_executable(bbhost
   src/host/scene_look.cpp
   src/core/tls_rewrite.cpp
   src/core/config.cpp
+  src/core/config_move.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
   src/core/sfo.cpp
@@ -688,20 +689,27 @@ if(UNIX)
   target_include_directories(image_file_test PRIVATE src)
   target_link_libraries(image_file_test PRIVATE ZLIB::ZLIB)
   add_test(NAME image_file_test COMMAND image_file_test)
-  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(config_test PRIVATE CONFIG_MUTANTS)  # the play-log migration's mutants
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
+  # The per-user settings folder's move on Linux (core/config_move.h), in
+  # temporary folders: a HOME and XDG folders of its own.
+  add_executable(config_move_test tests/config_move_test.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
+  target_include_directories(config_move_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_compile_definitions(config_move_test PRIVATE CONFIG_MOVE_TEST)
+  add_dependencies(config_move_test bbhost_version)
+  add_test(NAME config_move_test COMMAND config_move_test)
   # The session's online rules: a gameplay patch manifest makes them say modded.
-  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(ruleset_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(ruleset_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(ruleset_test bbhost_version)
   add_test(NAME ruleset_test COMMAND ruleset_test)
   # The shipped manifests read as the game reads them: the ones on by default
   # are exactly the expected list (Screen Space Reflections stays off).
-  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(patch_defaults_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(patch_defaults_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(patch_defaults_test bbhost_version)
@@ -1051,7 +1059,7 @@ if(UNIX)
   # includes) against the game's option movie and message bundles. The
   # config is menu_assets_ensure's (SKILL ISSUE in the bundle's stamp): clang
   # drops that call with the test's empty roots, GCC keeps it.
-  add_executable(menu_assets_test tests/menu_assets_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(menu_assets_test tests/menu_assets_test.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(menu_assets_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(menu_assets_test PRIVATE ZLIB::ZLIB)
   add_dependencies(menu_assets_test bbhost_version)
