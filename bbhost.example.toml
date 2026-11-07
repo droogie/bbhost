@@ -220,6 +220,16 @@ skill_issue = false
 # the game's 70%. BBHOST_FULL_PHANTOM_HP=0 or 1 overrides this setting.
 full_phantom_hp = true
 
+# Auto-Replenish Items. Blood Vials and Quicksilver Bullets refill from storage
+# up to what the hunter can carry, after a death in the hunter's own world and
+# on arriving in the Hunter's Dream. true: so do twenty more consumables -
+# Antidote, Sedative, Beast Blood Pellet, Blue Elixir, the Molotov and Rope
+# Molotov Cocktails and their delayed kinds, Poison Knife, Oil Urn, Pebble,
+# Throwing Knife, Pungent Blood Cocktail, Numbing Mist, Fire and Bolt Paper,
+# Bone Marrow Ash, Bold Hunter's Mark, Shining Coins and Lead Elixir. false
+# keeps the game's two. BBHOST_AUTO_REPLENISH=0 or 1 overrides this setting.
+auto_replenish = true
+
 # [plugins]
 # Gameplay plugins (docs/plugins.md): randomizer, boss_rush, mutators - each
 # off unless set true.

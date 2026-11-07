@@ -54,8 +54,9 @@ to run on a PC - it needs a place to live. bbhost provides that place:
   Hunter's Dream mirror opens the character appearance editor (a feature cut
   from the release), "Rebirth in the Nightmare" at the Altar of
   Despair lets you redistribute your levels, the late areas allow two
-  invaders, as the chalice dungeons do, and a hunter summoned into another's
-  world keeps their full HP.
+  invaders, as the chalice dungeons do, a hunter summoned into another's
+  world keeps their full HP, and Molotovs, knives, pebbles and more refill
+  from storage as Blood Vials do.
 - **Online play** through a private server: co-op, invasions, messages,
   bloodstains and summon signs between bbhost players.
 - **Mods** without touching the game files: replacement files, param tables
