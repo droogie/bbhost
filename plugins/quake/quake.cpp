@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.20",
+    "0.3.21",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -1285,7 +1285,7 @@ constexpr std::uint32_t kGuns[] = {15000000, 35000000, 36000000, 6000000, 330000
 constexpr std::uint32_t kShotgunGun = 6000000;
 constexpr float kGemRate = 1.287f, kGemAdd = 7.3f;
 constexpr float kGrenadeSpeed = 700.0f;  // units a second
-constexpr std::uint16_t kGrenadeAtkPct = 270, kRocketAtkPct = 72;  // the shells' attack corrections (guns_apply)
+constexpr std::uint16_t kGrenadeAtkPct = 185, kRocketAtkPct = 126;  // the shells' attack corrections (guns_apply)
 constexpr float kRocket = 900.0f * kUnit, kGrenade = kGrenadeSpeed * kUnit;
 struct BulletRule {
     std::uint32_t id;
@@ -1490,10 +1490,11 @@ void guns_apply() {
             a->atkObj = rocket->atkObj;
         }
     }
-    // The arc hits hardest (Kyo): the grenade's one hit (600 on a character,
-    // its burst 601 at the fuse, on the Cannon's 600) for what the rocket's direct hit and splash came to
-    // together (726 twice on an NG+7 enemy), and the rocket's two (620, 621,
-    // on the Church Cannon's 480) for about the grenade's one between them.
+    // The grenade and the rocket hit alike, as Quake 3's do (100 each, with
+    // 100 of splash): the grenade's one hit (600 on a character, its burst
+    // 601 at the fuse, on the Cannon's 600) and the rocket's direct hit and
+    // splash together (620, 621, on the Church Cannon's 480) each about 1000
+    // on an NG+7 enemy (1012, 504 twice).
     const auto correct = [](std::uint32_t id, std::uint16_t pct, bool saved) {
         auto* a = g.param<bb::params::AtkParam_Pc>(id);
         if (!a) return;
